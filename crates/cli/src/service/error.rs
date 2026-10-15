@@ -754,7 +754,7 @@ impl Error {
                 "the upgrade is kept, not rolled back: confirm that no `pohunekd ensure-official-runtimes` process of that release is running (`pgrep -fl ensure-official-runtimes`), then rerun `pohunek service upgrade`",
             ),
             Self::ManagerEnvironment { .. } => Some(
-                "the daemon job runs with the PATH its definition records, or on Linux the systemd user manager's Environment PATH when it records none; check that source and retry; nothing was changed",
+                "the daemon job's PATH comes from its definition when it records one, otherwise from the service manager's environment (the systemd user manager's Environment on Linux, the launchd domain on macOS); make that manager's environment readable, that is its bus reachable and its answer well formed, and retry; nothing was changed",
             ),
             Self::UpgradeRuntimesFailed { .. } => Some(
                 "run `<staged>/pohunekd ensure-official-runtimes --dry-run` by hand with the same XDG environment to see its output, then retry",

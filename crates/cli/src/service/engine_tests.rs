@@ -41,9 +41,9 @@ use crate::service::definition::initial_config;
 use crate::service::inherited::Token;
 use crate::service::layout::tests::{anchor_bytes, stage_dir, write_anchor};
 use crate::service::layout::CLI_NAME;
-use crate::service::manager_env::UserManager;
 #[cfg(target_os = "macos")]
 use crate::service::manager_env::{ActiveJob, LaunchdJob};
+use crate::service::manager_env::{EnvironmentFailure, UserManager};
 use crate::service::preflight::{Judging, ReleasePlan};
 use crate::service::runtimes::Running;
 use crate::service::usage::tests::{
@@ -2136,8 +2136,8 @@ struct FakeUserManager(Result<Vec<String>, String>);
 impl UserManager for FakeUserManager {
     fn environment(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>> {
-        let value = self.0.clone();
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, EnvironmentFailure>> + Send + '_>> {
+        let value = self.0.clone().map_err(EnvironmentFailure::Unreachable);
         Box::pin(async move { value })
     }
 }
@@ -2569,6 +2569,7 @@ fn the_debug_forms_of_the_job_environment_name_the_variables_and_never_their_val
         source: PathSource::Recorded,
         loaded_default: None,
         variables,
+        manager_unreachable: None,
     };
     let active = crate::service::manager_env::ActiveJob {
         domain: None,
@@ -2579,6 +2580,78 @@ fn the_debug_forms_of_the_job_environment_name_the_variables_and_never_their_val
         assert!(debug.contains("CLAUDE_CONFIG_DIR"), "{debug}");
         assert!(!debug.contains(SENTINEL), "{debug}");
     }
+}
+
+/// A user manager that answers with the given failure.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct FailingManager(crate::service::manager_env::EnvironmentFailure);
+
+#[cfg(target_os = "linux")]
+impl UserManager for FailingManager {
+    fn environment(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Vec<String>, crate::service::manager_env::EnvironmentFailure>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let failure = self.0.clone();
+        Box::pin(async move { Err(failure) })
+    }
+}
+
+/// A job that records its `PATH` takes no variables from a manager that cannot
+/// be reached, and says so; a manager that answers unusably fails the judgement.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_recorded_path_job_degrades_only_when_no_manager_is_reachable() {
+    use crate::service::manager_env::EnvironmentFailure;
+    use pohunek_platform::shell_env::SearchPath;
+
+    let mut harness = Harness::new();
+    let search_path =
+        SearchPath::new(vec![std::path::PathBuf::from("/usr/bin")]).expect("a trusted directory");
+    let config = crate::service::definition::config_with_search_path(
+        &harness.context,
+        Path::new("/opt/pohunek"),
+        crate::service::VERSION,
+        search_path,
+    )
+    .expect("the recorded configuration");
+
+    harness.context = harness
+        .context
+        .clone()
+        .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unreachable(
+            "no session bus".to_owned(),
+        ))));
+    let job = crate::service::engine::job_path(&harness.context, &config, None)
+        .await
+        .expect("an unreachable manager does not stop a recorded PATH");
+    assert!(job.variables.is_empty(), "no manager variables are applied");
+    assert_eq!(job.manager_unreachable.as_deref(), Some("no session bus"));
+    let warnings = crate::service::engine::manager_warnings(&job);
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("judged at the default store locations")),
+        "{warnings:?}"
+    );
+
+    harness.context = harness
+        .context
+        .clone()
+        .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unusable(
+            "the answer is not a list".to_owned(),
+        ))));
+    let error = crate::service::engine::job_path(&harness.context, &config, None)
+        .await
+        .expect_err("an unusable answer fails closed");
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
 }
 
 #[cfg(target_os = "linux")]

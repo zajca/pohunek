@@ -4390,13 +4390,17 @@ async fn a_stopped_session_whose_profile_changed_is_judged_as_resume_refuses_it(
 /// resumed through it once, so its launch pin names the package rather than
 /// the built-in runtime: the upgrade leaves its runtime source unchanged.
 async fn stopped_pinned_claude(tag: &str) -> StoppedClaude {
+    stopped_pinned_claude_with(tag, &real_official(RuntimeId::CLAUDE)).await
+}
+
+/// [`stopped_pinned_claude`] pinned to `package` instead of the official one.
+async fn stopped_pinned_claude_with(tag: &str, package: &Package) -> StoppedClaude {
     let session = stopped_built_in_claude(tag).await;
-    let package = real_official(RuntimeId::CLAUDE);
     install_real_official(
         &session.fixture,
         &session.fixture.registry,
         RuntimeId::CLAUDE,
-        &package,
+        package,
         5,
     )
     .await;
@@ -4808,6 +4812,66 @@ async fn a_spent_probe_budget_leaves_a_missing_reference_unverified() {
         pohunek_service_config::preflight::CODE_REFERENCE_UNVERIFIED
     );
     assert_eq!(resumed.code, "agent_native_reference_missing");
+}
+
+/// The official Claude package with its native reference existence declared
+/// `check = "none"`: its recovery reads no store, so it has nothing to verify.
+fn real_unchecked_official_claude() -> Package {
+    let mut entries = crate::agent::host::fixture::official_package_entries(RuntimeId::CLAUDE);
+    let descriptor = String::from_utf8(entries[0].contents.clone()).expect("UTF-8 descriptor");
+    let mut lines: Vec<&str> = Vec::new();
+    let mut skipping = false;
+    for line in descriptor.lines() {
+        if line == "[native_reference.existence]" {
+            lines.push(line);
+            lines.push("check = \"none\"");
+            skipping = true;
+        } else if skipping && line.starts_with('[') {
+            skipping = false;
+            lines.push(line);
+        } else if !skipping {
+            lines.push(line);
+        }
+    }
+    entries[0].contents = format!("{}\n", lines.join("\n")).into_bytes();
+    Package::from_entries(&entries)
+}
+
+#[tokio::test]
+async fn a_spent_probe_budget_keeps_an_unchecked_reference_adoptable_as_resume_accepts_it() {
+    // A runtime that reads no store has nothing to verify, so the spent budget
+    // cannot make its reference unverified: resume accepts it, and so does the
+    // judgement.
+    let session = stopped_pinned_claude_with(
+        "preflight-spent-budget-unchecked",
+        &real_unchecked_official_claude(),
+    )
+    .await;
+
+    let (verdict, code) = stopped_preflight_verdict_entered(
+        &session.fixture,
+        &session.store_path,
+        &session.id,
+        spent_budget_entry(),
+    );
+    let restarted = restart(&session.fixture).await;
+    let resumed = restarted
+        .registry
+        .resume_with(&session.id, crate::session::ProfileChange::Refuse)
+        .await
+        .expect("resume accepts an unchecked reference");
+
+    assert_eq!(verdict, Verdict::Adoptable);
+    assert_eq!(code, pohunek_service_config::preflight::CODE_ADOPTABLE);
+    assert_eq!(
+        resumed.runtime.as_ref().map(|runtime| runtime.state),
+        Some(protocol::RuntimeState::Live)
+    );
+    restarted
+        .registry
+        .remove(&session.id)
+        .await
+        .expect("remove the resumed session");
 }
 
 #[tokio::test]

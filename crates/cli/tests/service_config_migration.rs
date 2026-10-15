@@ -281,7 +281,11 @@ fn check_with_setup(host: &Host, setup: impl FnOnce(&Path, &Path, &[u8])) -> (bo
     let backup_before = fs::read(store.config_backup_path()).ok();
 
     let env_of = |base: &Path| base.to_str().expect("UTF-8 roots").to_owned();
+    // The child gets only what the fixture names: an inherited session bus
+    // address would reach the host's real user manager.
     let output = Command::new(pohunek_test_support::bin_exe("pohunek"))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .args(["service", "check", "--json"])
         .env("XDG_RUNTIME_DIR", env_of(&run))
         .env("XDG_STATE_HOME", env_of(&state))
@@ -455,6 +459,19 @@ fn check_accepts_a_current_schema_config_without_a_migration() {
             .and_then(|report| report.get("config_schema_migration"))
             .is_some_and(Value::is_null),
         "{envelope}: a current-schema file needs no migration"
+    );
+    // The host has no reachable user manager, and the job records its PATH, so
+    // the check still passes and says which way its verdicts may err.
+    let warnings = envelope
+        .get("ok")
+        .and_then(|report| report.get("warnings"))
+        .and_then(Value::as_array)
+        .expect("the check reports its warnings");
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("judged at the default store locations"))),
+        "{envelope}: an unreachable manager is a visible warning"
     );
 }
 

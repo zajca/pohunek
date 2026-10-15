@@ -678,7 +678,9 @@ fn judge_reference(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<J
     // The reference scan is not a version probe, so it runs under the same
     // deadline as the probes: once the budget is spent, a reference that was
     // not checked is unverified, never adoptable and never already not resumable.
-    if judging.probes.remaining().is_zero() {
+    // An unchecked reference reads nothing, so resume's judgement holds whatever
+    // the budget is.
+    if existence.scans_store() && judging.probes.remaining().is_zero() {
         return Some((
             Verdict::WouldLoseRecovery,
             CODE_REFERENCE_UNVERIFIED.to_owned(),

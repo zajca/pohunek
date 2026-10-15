@@ -2296,7 +2296,12 @@ upgrade journaled while the job was loaded, else the persisted launchd
 configuration, the best evidence available. A rollback judges with the same order,
 so the `PATH` it uses is the one the restored job gets where launchd can still
 report it; a `warning:` line names a journal that gave no default. An
-unrecognized `launchctl print` output refuses the upgrade with `service_manager_environment_unavailable`. The
+unrecognized `launchctl print` output refuses the upgrade with `service_manager_environment_unavailable`.
+A job that records its `PATH` and whose systemd user manager cannot be reached (its bus is not
+reachable) is not refused: it takes no manager variables, and `service check|upgrade` prints a
+`warning` that native references are judged at the default store locations, so a verdict may read
+`already_not_resumable` or `would_lose_recovery` for a conversation stored under a variable-set
+location, or `adoptable` for one present only at the default location. The
 preflight resolves programs with the daemon's own resolver, which skips an
 untrusted candidate the same way at launch. See
 [update after release](knowledge/runbooks/update-after-release.md).

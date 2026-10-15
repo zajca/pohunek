@@ -249,6 +249,7 @@ async fn finish_check(
         )
         .await?;
         gated.warnings = engine::job_warnings(context, &job);
+        gated.warnings.extend(engine::manager_warnings(&job));
         checked.report.accepted_runtime_loss = gated.accepted;
         checked.report.preflight = Some(gated.report.clone());
         if let Some(pending) = &mut checked.report.pending_transaction {
@@ -272,6 +273,7 @@ async fn finish_check(
         .await?;
         checked.report.accepted_runtime_loss |= gated.accepted;
         checked.report.preflight = Some(gated.report);
+        checked.report.warnings = engine::manager_warnings(&job);
     }
     Ok(checked.report)
 }
@@ -773,6 +775,7 @@ pub(crate) fn check_local(
         preflight: None,
         accepted_runtime_loss: false,
         config_schema_migration,
+        warnings: Vec::new(),
     };
     Ok(Checked {
         report,

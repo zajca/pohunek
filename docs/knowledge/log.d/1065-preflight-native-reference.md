@@ -27,3 +27,9 @@
   launchd domain environment on macOS), so a store variable such as
   `CLAUDE_CONFIG_DIR` is read as the job reads it. Variable values never appear in
   the report or in errors.
+- A job that records its `PATH` no longer fails when its systemd user manager cannot be
+  reached: the check runs without the manager's variables and reports a `warning`. A
+  manager that answers unusably, or a job that takes its `PATH` from the manager, still
+  fails closed.
+- A runtime whose native reference is not checked (`check = "none"`) is not held by the
+  preflight budget, since it reads nothing.

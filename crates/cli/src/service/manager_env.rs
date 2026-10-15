@@ -20,12 +20,24 @@ use pohunek_worker_protocol::BaseEnv;
 
 use super::error::Error;
 
+/// Why the service manager's environment was not read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvironmentFailure {
+    /// No service manager answers: its bus cannot be reached. The job then has
+    /// no manager environment to inherit from, and the caller decides what that
+    /// means for its own step.
+    Unreachable(String),
+    /// The manager answered, but its answer cannot be used.
+    Unusable(String),
+}
+
 /// Reads the environment the systemd user manager gives its units.
 pub trait UserManager: Debug + Send + Sync {
-    /// Returns the `KEY=VALUE` entries of the manager's environment, or the
-    /// reason they cannot be read.
-    fn environment(&self)
-        -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>>;
+    /// Returns the `KEY=VALUE` entries of the manager's environment, or why they
+    /// cannot be read.
+    fn environment(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, EnvironmentFailure>> + Send + '_>>;
 }
 
 /// Reads the environment through the platform's D-Bus client on Linux.
@@ -36,7 +48,7 @@ impl UserManager for SystemdUserManager {
     #[cfg(target_os = "linux")]
     fn environment(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, EnvironmentFailure>> + Send + '_>> {
         use super::settings;
 
         Box::pin(async {
@@ -44,7 +56,22 @@ impl UserManager for SystemdUserManager {
                 settings::MANAGER_ENVIRONMENT_TIMEOUT,
             )
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| {
+                // Only a connection that cannot be made means no manager is reachable.
+                let unreachable = matches!(
+                    error,
+                    pohunek_platform::supervisor::Error::Unavailable {
+                        operation: "connect",
+                        ..
+                    }
+                );
+                let detail = error.to_string();
+                if unreachable {
+                    EnvironmentFailure::Unreachable(detail)
+                } else {
+                    EnvironmentFailure::Unusable(detail)
+                }
+            })
         })
     }
 
@@ -52,10 +79,10 @@ impl UserManager for SystemdUserManager {
     #[cfg(not(target_os = "linux"))]
     fn environment(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>> {
-        Box::pin(std::future::ready(Err(
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, EnvironmentFailure>> + Send + '_>> {
+        Box::pin(std::future::ready(Err(EnvironmentFailure::Unreachable(
             "the systemd user manager exists only on Linux".to_owned(),
-        )))
+        ))))
     }
 }
 
@@ -79,8 +106,21 @@ impl Debug for UserManagerEnvironment {
     }
 }
 
+/// Reads the environment of the systemd user manager through `manager` once.
+///
+/// # Errors
+///
+/// Returns the manager's [`EnvironmentFailure`].
+pub async fn read_user_manager_entries(
+    manager: &dyn UserManager,
+) -> Result<Vec<String>, EnvironmentFailure> {
+    manager.environment().await
+}
+
 /// Reads the environment of the systemd user manager through `manager` once,
-/// and selects its variables with `allowlist`.
+/// and selects its variables with `allowlist`. Every failure to read it is an
+/// error: a caller that may go on without the manager uses
+/// [`read_user_manager_entries`] instead.
 ///
 /// # Errors
 ///
@@ -90,10 +130,26 @@ pub async fn user_manager_environment(
     manager: &dyn UserManager,
     allowlist: &[String],
 ) -> Result<UserManagerEnvironment, Error> {
-    let entries = manager
-        .environment()
+    let entries = read_user_manager_entries(manager)
         .await
-        .map_err(|detail| Error::ManagerEnvironment { detail })?;
+        .map_err(|failure| {
+            let (EnvironmentFailure::Unreachable(detail) | EnvironmentFailure::Unusable(detail)) =
+                failure;
+            Error::ManagerEnvironment { detail }
+        })?;
+    selected_environment(&entries, allowlist)
+}
+
+/// Selects the `PATH` and the allowlisted variables of the manager's `entries`.
+///
+/// # Errors
+///
+/// Returns [`Error::ManagerEnvironment`] when an allowlisted variable cannot be
+/// carried by a job environment.
+pub fn selected_environment(
+    entries: &[String],
+    allowlist: &[String],
+) -> Result<UserManagerEnvironment, Error> {
     let prefix = format!("{SEARCH_PATH_VARIABLE}=");
     let search_path = entries
         .iter()

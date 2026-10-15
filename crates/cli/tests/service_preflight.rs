@@ -19,7 +19,9 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-use pohunek_cli::service::manager_env::{user_manager_environment, UserManager};
+use pohunek_cli::service::manager_env::{
+    user_manager_environment, EnvironmentFailure, UserManager,
+};
 use pohunek_cli::service::preflight::{
     decide, gate, gate_upgrade, AdoptionPreflight as _, DaemonPreflight, ReleasePlan,
 };
@@ -603,8 +605,8 @@ struct FakeUserManager(Result<Vec<String>, String>);
 impl UserManager for FakeUserManager {
     fn environment(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>> {
-        let value = self.0.clone();
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, EnvironmentFailure>> + Send + '_>> {
+        let value = self.0.clone().map_err(EnvironmentFailure::Unreachable);
         Box::pin(async move { value })
     }
 }

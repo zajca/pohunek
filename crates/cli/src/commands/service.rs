@@ -606,6 +606,9 @@ fn render_check(report: &report::CheckReport) -> String {
             "migration  service.toml is upgraded from schema {schema}: the daemon stops before the write, and a rollback restores the exact previous file"
         );
     }
+    for warning in &report.warnings {
+        let _ = writeln!(text, "warning    {warning}");
+    }
     let _ = writeln!(text, "prefix     {}", report.prefix.display());
     let _ = writeln!(text, "config     {}", report.config_path.display());
     if let (Some(pending), Some(action)) = (&report.pending_transaction, report.pending_action) {
@@ -1082,6 +1085,7 @@ mod tests {
             preflight: None,
             accepted_runtime_loss: false,
             config_schema_migration: None,
+            warnings: Vec::new(),
         });
         assert!(
             text.contains("install of pohunek 1.0.0 would pass its preflight (namespace ns), checked under the transaction lock"),
@@ -1172,6 +1176,7 @@ mod tests {
             preflight: Some(preflight),
             accepted_runtime_loss: false,
             config_schema_migration: None,
+            warnings: Vec::new(),
         });
 
         assert!(
@@ -1227,6 +1232,7 @@ mod tests {
             preflight: Some(preflight),
             accepted_runtime_loss: false,
             config_schema_migration: None,
+            warnings: Vec::new(),
         });
 
         assert!(

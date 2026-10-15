@@ -2758,6 +2758,9 @@ pub(crate) struct JobPath {
     /// excluded. A preflight judges with them, so they stay out of the logs and
     /// errors: only their names may appear there.
     pub(crate) variables: BTreeMap<String, String>,
+    /// Why the service manager's environment was not read, when the job records
+    /// its `PATH` and no manager is reachable. Its variables are then not applied.
+    pub(crate) manager_unreachable: Option<String>,
 }
 
 // The variables are printed by name only: their values may be secrets.
@@ -2768,8 +2771,23 @@ impl std::fmt::Debug for JobPath {
             .field("source", &self.source)
             .field("loaded_default", &self.loaded_default)
             .field("variables", &self.variables.keys().collect::<Vec<_>>())
+            .field("manager_unreachable", &self.manager_unreachable)
             .finish_non_exhaustive()
     }
+}
+
+/// The warning a judgement of a recorded-`PATH` job carries when no service
+/// manager is reachable. The verdicts may err in either direction, so the text
+/// says which way and what the operator does before relying on them.
+pub(crate) fn manager_warnings(job: &JobPath) -> Vec<String> {
+    let Some(detail) = &job.manager_unreachable else {
+        return Vec::new();
+    };
+    let warning = format!(
+        "the service manager's environment was not read ({detail}), so the store variables it may set, such as CLAUDE_CONFIG_DIR, are not applied: native references are judged at the default store locations. A conversation stored under a variable-set location may be reported missing (already_not_resumable or would_lose_recovery), and a conversation present only at the default location may be reported adoptable. Start the user's service manager or make its bus reachable, then run the check again before relying on the verdicts."
+    );
+    tracing::warn!(detail = %detail, "{warning}");
+    vec![warning]
 }
 
 /// The `PATH` of the daemon job of `config`, which every preflight and runtime
@@ -2827,12 +2845,18 @@ pub(crate) async fn recorded_job_path(
     journal_default: Option<&str>,
 ) -> Result<JobPath, Error> {
     if !recorded.is_empty() {
-        let variables = manager_variables(context, allowlist).await?;
+        // The recorded `PATH` does not depend on the manager, so an unreachable
+        // manager only means its variables are not applied; see `manager_warnings`.
+        let ManagerVariables {
+            variables,
+            unreachable,
+        } = manager_variables(context, allowlist).await?;
         return Ok(JobPath {
             value: recorded.to_env_value(),
             source: PathSource::Recorded,
             loaded_default: None,
             variables,
+            manager_unreachable: unreachable,
         });
     }
     if cfg!(target_os = "linux") {
@@ -2848,34 +2872,59 @@ pub(crate) async fn recorded_job_path(
             source: PathSource::UserManager,
             loaded_default: None,
             variables: environment.variables,
+            manager_unreachable: None,
         });
     }
     launchd_job_path(context, journal_default, allowlist).await
 }
 
+/// The allowlisted variables a recorded-`PATH` job takes from its service
+/// manager, and the reason they are absent when no manager is reachable.
+pub(crate) struct ManagerVariables {
+    /// The variables the manager's environment selects, empty when it is not read.
+    pub(crate) variables: BTreeMap<String, String>,
+    /// Why the manager's environment was not read, when no manager is reachable.
+    pub(crate) unreachable: Option<String>,
+}
+
 /// The allowlisted variables the service manager gives the job when the job
 /// records its `PATH`: the user manager's environment on Linux, the launchd
 /// domain's environment on macOS, and none where no service manager exists.
+///
+/// An unreachable user manager yields no variables and a reason; every other
+/// failure to read or select them is an error.
 #[cfg(target_os = "linux")]
 async fn manager_variables(
     context: &Context,
     allowlist: &[String],
-) -> Result<BTreeMap<String, String>, Error> {
-    Ok(
-        manager_env::user_manager_environment(context.user_manager(), allowlist)
-            .await?
-            .variables,
-    )
+) -> Result<ManagerVariables, Error> {
+    match manager_env::read_user_manager_entries(context.user_manager()).await {
+        Ok(entries) => Ok(ManagerVariables {
+            variables: manager_env::selected_environment(&entries, allowlist)?.variables,
+            unreachable: None,
+        }),
+        Err(manager_env::EnvironmentFailure::Unreachable(detail)) => Ok(ManagerVariables {
+            variables: BTreeMap::new(),
+            unreachable: Some(detail),
+        }),
+        Err(manager_env::EnvironmentFailure::Unusable(detail)) => {
+            Err(Error::ManagerEnvironment { detail })
+        }
+    }
 }
 
-/// See the Linux variant.
+/// See the Linux variant. A launchd domain without a GUI session reports no
+/// environment, which is not a failure; a launchctl that cannot run is one.
 #[cfg(target_os = "macos")]
 async fn manager_variables(
     context: &Context,
     allowlist: &[String],
-) -> Result<BTreeMap<String, String>, Error> {
+) -> Result<ManagerVariables, Error> {
     let active = active_launchd_job(context).await?;
-    manager_env::allowlisted_variables(active.domain_environment, allowlist)
+    Ok(ManagerVariables {
+        variables: manager_env::allowlisted_variables(active.domain_environment, allowlist)?,
+        unreachable: None,
+    })
 }
 
 /// See the Linux variant.
@@ -2883,8 +2932,11 @@ async fn manager_variables(
 async fn manager_variables(
     _context: &Context,
     _allowlist: &[String],
-) -> Result<BTreeMap<String, String>, Error> {
-    Ok(BTreeMap::new())
+) -> Result<ManagerVariables, Error> {
+    Ok(ManagerVariables {
+        variables: BTreeMap::new(),
+        unreachable: None,
+    })
 }
 
 /// The launchd `PATH` of a job without its own (macOS), in launchd's order: the
@@ -2927,6 +2979,7 @@ async fn launchd_job_path(
         source,
         loaded_default,
         variables,
+        manager_unreachable: None,
     })
 }
 
