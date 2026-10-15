@@ -1056,7 +1056,11 @@ deduplication behavior for rollback compatibility.
 Raw attach input uses stream-scoped monotonic IDs on one ordered framed
 connection. The worker validates the next sequence and executes the bytes
 through the shared PTY write serializer without inserting them into the
-lifetime control dedup map. The daemon does not retry a raw chunk after losing
+lifetime control dedup map. A chunk the PTY has not accepted yet, because the
+program does not read its input, stays pending while the stream keeps carrying
+output; the worker reads the next chunk only once that one is acknowledged, and
+the daemon bridge and the attach client likewise keep forwarding output while
+their own input write waits. The daemon does not retry a raw chunk after losing
 its worker connection. This gives at-most-once retry behavior: a final chunk may
 be lost during simultaneous connection failure, but it is never duplicated by
 reconnection. A stream-local input failure is sent as a typed `Error` frame

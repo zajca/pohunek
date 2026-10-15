@@ -638,10 +638,10 @@ async fn a_stalled_attach_write_keeps_its_stream_while_control_input_fails_with_
         .await
         .expect("send attach input");
 
-    // The worker does not forward output on a stream while that stream's own
-    // input write is pending, so the echo is observed on a second attach
-    // stream. The attach stream holds the dimension ordering guard until it is
-    // dropped, and a second attach waits for that guard, so release it first.
+    // The echo is observed on a second attach stream, as another client of
+    // the session sees it. The attach stream holds the dimension ordering
+    // guard until it is dropped, and a second attach waits for that guard, so
+    // release it first.
     attach.dimension_update = None;
     let mut observer = worker
         .open_attach(
@@ -701,6 +701,134 @@ async fn a_stalled_attach_write_keeps_its_stream_while_control_input_fails_with_
     drop(observer);
     worker
         .stop(TransactionId::new("stall-cleanup").expect("transaction id"))
+        .await
+        .expect("stop the gated child");
+}
+
+/// Child script that prints [`CHILD_OUTPUT_MARKER`] once the gate file named
+/// by `$1` exists, then leaves its terminal unread until the gate file named
+/// by `$2` exists, and then drains stdin for good.
+const GATED_OUTPUT_THEN_DRAIN_SCRIPT: &str = "while [ ! -e \"$1\" ]; do sleep 0.05; done; \
+     printf 'child-output-marker\\n'; \
+     while [ ! -e \"$2\" ]; do sleep 0.05; done; exec cat >/dev/null";
+
+/// Line the gated child prints while the attach write is still pending.
+const CHILD_OUTPUT_MARKER: &[u8] = b"child-output-marker";
+
+/// Attach stream whose own input write is pending while it reads output.
+const WRITING_STREAM_ID: &str = "attach-writing";
+
+/// Reads the attach stream until its output contains `marker`, failing if the
+/// stream acknowledges its pending write first.
+async fn await_output_before_ack(attach: &mut DataStream, marker: &[u8], what: &str) {
+    let mut output = Vec::new();
+    tokio::time::timeout(DEADLINE, async {
+        while !output.windows(marker.len()).any(|window| window == marker) {
+            let frame = read_frame(&mut attach.stream)
+                .await
+                .expect("read attach frame")
+                .expect("attach stream stays open");
+            match frame.header().kind {
+                FrameKind::Output { .. } | FrameKind::TerminalSnapshot { .. } => {
+                    output.extend_from_slice(frame.payload());
+                }
+                FrameKind::InputAck { .. } => {
+                    panic!("the write was acknowledged before the child read it ({what})")
+                }
+                FrameKind::Error { .. } | FrameKind::Close { .. } | FrameKind::Exit { .. } => {
+                    panic!(
+                        "attach stream ended before {what}: {:?}",
+                        frame.header().kind
+                    )
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_elapsed| panic!("the writing attach stream receives {what}"));
+}
+
+#[tokio::test]
+async fn an_attach_stream_receives_output_while_its_own_input_waits_for_the_child_to_read() {
+    let mut fixture = Fixture::start();
+    let worker = fixture.connect(CURRENT_VERSION).await;
+    let output_gate = fixture.root.join("output-gate");
+    let drain_gate = fixture.root.join("drain-gate");
+    let mut initialize = fixture.initialize(worker.worker_id().await);
+    initialize.executable = PathBuf::from("/bin/sh");
+    initialize.arguments = vec![
+        "-c".to_owned(),
+        GATED_OUTPUT_THEN_DRAIN_SCRIPT.to_owned(),
+        "sh".to_owned(),
+        output_gate.to_str().expect("UTF-8 fixture path").to_owned(),
+        drain_gate.to_str().expect("UTF-8 fixture path").to_owned(),
+    ];
+    worker
+        .initialize(initialize)
+        .await
+        .expect("initialize the gated child");
+
+    let stream_id = StreamId::new(WRITING_STREAM_ID).expect("stream id");
+    let mut attach = worker
+        .open_attach(stream_id.clone(), AttachStart { dimensions: None })
+        .await
+        .expect("open attach stream");
+    let write_id = WriteId::new(format!("attach-{WRITING_STREAM_ID}-1")).expect("write id");
+    let text = oversized_text();
+    let input = DataFrame::new(
+        FrameHeader {
+            version: attach.version,
+            stream_id: stream_id.clone(),
+            worker_instance_id: attach.worker_instance_id.clone(),
+            kind: FrameKind::Input {
+                write_id: write_id.clone(),
+            },
+        },
+        text.clone(),
+    )
+    .expect("attach input frame");
+    write_frame(&mut attach.stream, &input)
+        .await
+        .expect("send attach input");
+
+    // The input exceeds the terminal's input queue and the child does not
+    // read it, so the write stays pending. The stream still shows the echo of
+    // what the terminal accepted, and output the child produces meanwhile.
+    await_output_before_ack(&mut attach, &[b'x'; OVERSIZED_LINE_BYTES], "the input echo").await;
+    std::fs::File::create(&output_gate).expect("create the output gate");
+    await_output_before_ack(&mut attach, CHILD_OUTPUT_MARKER, "the child's output").await;
+
+    std::fs::File::create(&drain_gate).expect("create the drain gate");
+    let (acked, bytes_written) = tokio::time::timeout(DEADLINE, async {
+        loop {
+            let frame = read_frame(&mut attach.stream)
+                .await
+                .expect("read attach frame")
+                .expect("attach stream stays open until its write is acknowledged");
+            match frame.header().kind.clone() {
+                FrameKind::InputAck {
+                    write_id,
+                    bytes_written,
+                } => return (write_id, bytes_written),
+                FrameKind::Error { error } => {
+                    panic!("the attach stream failed instead of acknowledging: {error:?}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the attach write is acknowledged after the child drains");
+    assert_eq!(acked, write_id);
+    assert_eq!(
+        bytes_written,
+        u64::try_from(text.len()).expect("text length")
+    );
+
+    drop(attach);
+    worker
+        .stop(TransactionId::new("writing-stream-cleanup").expect("transaction id"))
         .await
         .expect("stop the gated child");
 }
