@@ -4193,6 +4193,80 @@ async fn a_trusted_copy_of_the_agent_is_found_by_the_resolver_and_by_the_preflig
     );
 }
 
+#[tokio::test]
+async fn an_agent_only_in_an_untrusted_path_directory_is_refused_by_resume_and_the_preflight_alike()
+{
+    const AGENT: &str = "agent-untrusted-path";
+    // The resolver reads the process `PATH` and the preflight its subprocess
+    // environment, so the test sets `PATH` in a process of its own.
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let session = stopped_probeless_claude("preflight-untrusted-path", |_| AGENT.to_owned()).await;
+    // The only copy sits in a directory another user can write.
+    let untrusted = agent_directory(&session.fixture, "untrusted-path", 0o777, AGENT);
+    let mut environment = pohunek_test_support::process_env::ProcessEnv::lock();
+    environment.set("PATH", &untrusted);
+
+    let (verdict, code) =
+        stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
+    let restarted = restart(&session.fixture).await;
+
+    assert_eq!(verdict, Verdict::WouldLoseRecovery);
+    assert_eq!(code, "agent_binary_missing");
+    assert_eq!(
+        refused_resume_code(&restarted.registry, &session.id).await,
+        code
+    );
+}
+
+#[tokio::test]
+async fn a_trusted_copy_later_on_the_path_is_found_by_the_resolver_and_by_the_preflight_alike() {
+    const AGENT: &str = "agent-trusted-later";
+    // As above, `PATH` and `HOME` change only in a process of the test's own.
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let session = stopped_probeless_claude("preflight-trusted-later", |_| AGENT.to_owned()).await;
+    let untrusted = agent_directory(&session.fixture, "untrusted-first", 0o777, AGENT);
+    let trusted = agent_directory(&session.fixture, "trusted-later", 0o755, AGENT);
+    // The conversation the base-kind launch reads lives under the default Claude
+    // home of `HOME`, which the test owns.
+    let home = session.fixture.dir.join("home");
+    let conversations = home.join(".claude").join("projects").join("work");
+    fs::create_dir_all(&conversations).expect("the conversation directory");
+    fs::write(conversations.join(format!("{CONVERSATION}.jsonl")), b"{}\n")
+        .expect("the conversation");
+    let mut environment = pohunek_test_support::process_env::ProcessEnv::lock();
+    environment.set(
+        "PATH",
+        std::env::join_paths([&untrusted, &trusted]).expect("the PATH"),
+    );
+    environment.set("HOME", &home);
+
+    let (verdict, code) =
+        stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
+    let restarted = restart(&session.fixture).await;
+    // Both sides skip the untrusted first copy and resolve the trusted one.
+    // Resume then stops at the native reference, which a base-kind launch
+    // without a declared store cannot satisfy; the preflight does not judge
+    // references, so only the resolver is compared here.
+    let resumed = restarted
+        .registry
+        .resume_with(&session.id, crate::session::ProfileChange::Refuse)
+        .await
+        .expect_err("resume stops at the native reference");
+
+    assert_ne!(
+        code, "agent_binary_missing",
+        "the preflight finds the trusted copy: {verdict:?}"
+    );
+    assert_ne!(
+        resumed.code, "agent_binary_missing",
+        "resume finds the trusted copy"
+    );
+}
+
 /// The entry of a command whose probe budget is already spent: the whole budget
 /// passed before the judgement started.
 fn spent_budget_entry() -> std::time::Instant {
