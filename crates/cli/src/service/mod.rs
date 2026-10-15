@@ -232,6 +232,7 @@ async fn finish_check(
                     detail: "previous version has no valid installation directory".to_owned(),
                 })?;
         let job = engine::journal_job_path(context, record).await?;
+        let warnings = engine::job_warnings(context, &job);
         let mut gated = rollback::gate(
             rollback::Inputs {
                 preflight,
@@ -247,9 +248,9 @@ async fn finish_check(
             &job.variables,
             accept_runtime_loss,
         )
-        .await?;
-        gated.warnings = engine::job_warnings(context, &job);
-        gated.warnings.extend(engine::manager_warnings(&job));
+        .await
+        .map_err(|error| error.with_warnings(&warnings))?;
+        gated.warnings.clone_from(&warnings);
         checked.report.accepted_runtime_loss = gated.accepted;
         checked.report.preflight = Some(gated.report.clone());
         if let Some(pending) = &mut checked.report.pending_transaction {
@@ -260,6 +261,7 @@ async fn finish_check(
     }
     if checked.adoption == Adoption::Required {
         let job = engine::installed_job_path(context).await?;
+        let warnings = engine::job_warnings(context, &job);
         let gated = preflight::gate_upgrade(
             preflight,
             context,
@@ -270,10 +272,11 @@ async fn finish_check(
             preflight::ReleasePlan::Included,
             accept_runtime_loss,
         )
-        .await?;
+        .await
+        .map_err(|error| error.with_warnings(&warnings))?;
         checked.report.accepted_runtime_loss |= gated.accepted;
         checked.report.preflight = Some(gated.report);
-        checked.report.warnings = engine::manager_warnings(&job);
+        checked.report.warnings = warnings;
     }
     Ok(checked.report)
 }

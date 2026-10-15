@@ -1718,6 +1718,38 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    /// Only an absent bus is "no bus": a socket that accepts and hangs up before
+    /// the handshake is a bus that refuses the client, which stays an error.
+    #[tokio::test]
+    async fn an_absent_bus_is_no_bus_and_a_bus_that_hangs_up_is_not() {
+        let dir = pohunek_test_support::tempdir().expect("scratch directory");
+        let timeout = Duration::from_secs(5);
+
+        let missing = dir.path().join("absent-bus");
+        let error = read_user_manager_environment(
+            Some(&format!("unix:path={}", missing.display())),
+            timeout,
+        )
+        .await
+        .expect_err("no bus listens at the socket");
+        assert!(error.is_no_bus(), "{error}");
+
+        let socket = dir.path().join("hang-up-bus");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind the socket");
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+        let error = read_user_manager_environment(
+            Some(&format!("unix:path={}", socket.display())),
+            timeout,
+        )
+        .await
+        .expect_err("the bus hangs up before the handshake");
+        assert!(!error.is_no_bus(), "{error}");
+    }
+
     use crate::process::StartIdentity;
     use crate::supervisor::JobSpec;
 

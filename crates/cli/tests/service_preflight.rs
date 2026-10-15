@@ -358,7 +358,7 @@ async fn the_real_daemon_names_a_session_it_would_not_adopt_and_the_flag_accepts
     )
     .await
     .expect_err("a record that cannot be loaded is refused");
-    let Error::UpgradeAtRisk { sessions } = &error else {
+    let Error::UpgradeAtRisk { sessions, .. } = &error else {
         panic!("{error:?}");
     };
     assert_eq!(sessions.len(), 1);
@@ -527,7 +527,7 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
     )
     .await
     .expect_err("a stopped session at risk needs the flag");
-    let Error::UpgradeAtRisk { sessions } = &error else {
+    let Error::UpgradeAtRisk { sessions, .. } = &error else {
         panic!("{error:?}");
     };
     assert_eq!(sessions, std::slice::from_ref(&stopped));

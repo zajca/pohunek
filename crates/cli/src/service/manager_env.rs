@@ -57,16 +57,10 @@ impl UserManager for SystemdUserManager {
             )
             .await
             .map_err(|error| {
-                // Only a connection that cannot be made means no manager is reachable.
-                let unreachable = matches!(
-                    error,
-                    pohunek_platform::supervisor::Error::Unavailable {
-                        operation: "connect",
-                        ..
-                    }
-                );
+                // Only an absent bus means no manager is reachable; a bus that
+                // refuses the client is an answer that cannot be used.
                 let detail = error.to_string();
-                if unreachable {
+                if error.is_no_bus() {
                     EnvironmentFailure::Unreachable(detail)
                 } else {
                     EnvironmentFailure::Unusable(detail)

@@ -277,7 +277,10 @@ pub fn decide(report: PreflightReport, accept_runtime_loss: bool) -> Result<Gate
             warnings: Vec::new(),
         })
     } else {
-        Err(Error::UpgradeAtRisk { sessions: at_risk })
+        Err(Error::UpgradeAtRisk {
+            sessions: at_risk,
+            warnings: Vec::new(),
+        })
     }
 }
 

@@ -430,10 +430,12 @@ pub enum Error {
 
     /// The new daemon would not adopt, or would adopt without native
     /// recovery, live sessions of the running daemon.
-    #[error("{}", at_risk_summary("upgrade", sessions))]
+    #[error("{}", at_risk_summary("upgrade", sessions, warnings))]
     UpgradeAtRisk {
         /// The sessions the preflight judged at risk, ordered by id.
         sessions: Vec<SessionVerdict>,
+        /// Warnings of the judgement, so a refusal explains a degraded verdict.
+        warnings: Vec<String>,
     },
 
     /// The new daemon would refuse to start with the installed metadata store.
@@ -521,12 +523,14 @@ pub enum Error {
     },
 
     /// The previous daemon may lose live runtime or recovery on rollback.
-    #[error("{}", at_risk_summary(&format!("rollback to {version}"), sessions))]
+    #[error("{}", at_risk_summary(&format!("rollback to {version}"), sessions, warnings))]
     RollbackAtRisk {
         /// Version that would be restored.
         version: String,
         /// Sessions requiring explicit acceptance.
         sessions: Vec<SessionVerdict>,
+        /// Warnings of the judgement, so a refusal explains a degraded verdict.
+        warnings: Vec<String>,
     },
 
     /// The previous daemon gave no trustworthy rollback verdict.
@@ -647,6 +651,28 @@ impl From<crate::workflow::Error> for Error {
 }
 
 impl Error {
+    /// Attaches the warnings of a degraded judgement to a refusal that the
+    /// judgement produced, so the operator reads them with the refusal.
+    ///
+    /// The at-risk refusals keep them in a slot of their own; the preflight
+    /// failures append them to their detail. Other errors are returned unchanged.
+    #[must_use]
+    pub(crate) fn with_warnings(mut self, warnings: &[String]) -> Self {
+        match &mut self {
+            Self::UpgradeAtRisk { warnings: slot, .. }
+            | Self::RollbackAtRisk { warnings: slot, .. } => slot.extend_from_slice(warnings),
+            Self::UpgradePreflightFailed { detail, .. }
+            | Self::RollbackPreflightFailed { detail, .. } => {
+                for warning in warnings {
+                    detail.push_str("; warning: ");
+                    detail.push_str(warning);
+                }
+            }
+            _ => {}
+        }
+        self
+    }
+
     /// Stable machine-readable code for `--json` error output.
     #[must_use]
     pub fn code(&self) -> &'static str {
@@ -842,7 +868,7 @@ fn refusals_summary(refusals: &[Refusal]) -> String {
         .join("; ")
 }
 
-fn at_risk_summary(action: &str, sessions: &[SessionVerdict]) -> String {
+fn at_risk_summary(action: &str, sessions: &[SessionVerdict], warnings: &[String]) -> String {
     let mut text = format!(
         "{action} refused: {} live session(s) have unverified runtime or recovery",
         sessions.len()
@@ -858,6 +884,9 @@ fn at_risk_summary(action: &str, sessions: &[SessionVerdict]) -> String {
             "\n  {}{name}: {} [{}] {}",
             session.session_id, session.verdict, session.code, session.detail
         );
+    }
+    for warning in warnings {
+        let _ = write!(text, "\n  warning: {warning}");
     }
     text
 }

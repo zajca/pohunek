@@ -448,6 +448,44 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Whether the error means there is no bus to talk to: no session bus
+    /// address can be determined, or nothing listens at the socket it names.
+    ///
+    /// A bus that answers but refuses the client (authentication, handshake,
+    /// permissions) is not this, so a caller must not treat it as absent.
+    #[must_use]
+    pub fn is_no_bus(&self) -> bool {
+        let Self::Unavailable {
+            operation: "connect",
+            source,
+        } = self
+        else {
+            return false;
+        };
+        no_bus_source(source.as_ref())
+    }
+}
+
+/// The bus error behind a failed connection, classified as no bus or not.
+#[cfg(target_os = "linux")]
+fn no_bus_source(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    match source.downcast_ref::<zbus::Error>() {
+        Some(zbus::Error::Address(_)) => true,
+        Some(zbus::Error::InputOutput(io)) => matches!(
+            io.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        ),
+        _ => false,
+    }
+}
+
+/// The user bus is a Linux service manager's; no other host has one to miss.
+#[cfg(not(target_os = "linux"))]
+fn no_bus_source(_source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    false
+}
+
 /// Boxed native supervisor operation.
 pub type Operation<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'a>>;
 

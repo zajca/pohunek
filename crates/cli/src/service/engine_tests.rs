@@ -2409,7 +2409,7 @@ async fn a_stopped_session_at_risk_needs_the_flag_like_a_live_one() {
         .upgrade(&harness.staged(V2), V2)
         .await
         .expect_err("the stopped session would lose its recovery");
-    let Error::UpgradeAtRisk { sessions } = &error else {
+    let Error::UpgradeAtRisk { sessions, .. } = &error else {
         panic!("{error:?}");
     };
     assert_eq!(sessions, std::slice::from_ref(&stopped));
@@ -2634,7 +2634,7 @@ async fn a_recorded_path_job_degrades_only_when_no_manager_is_reachable() {
         .expect("an unreachable manager does not stop a recorded PATH");
     assert!(job.variables.is_empty(), "no manager variables are applied");
     assert_eq!(job.manager_unreachable.as_deref(), Some("no session bus"));
-    let warnings = crate::service::engine::manager_warnings(&job);
+    let warnings = crate::service::engine::job_warnings(&harness.context, &job);
     assert!(
         warnings
             .iter()
@@ -6024,7 +6024,7 @@ async fn an_upgrade_refuses_live_sessions_whose_records_cannot_be_migrated_and_t
         .await
         .expect_err("the upgrade is refused");
 
-    let Error::UpgradeAtRisk { sessions } = &error else {
+    let Error::UpgradeAtRisk { sessions, .. } = &error else {
         panic!("{error:?}");
     };
     let listed: Vec<_> = sessions
@@ -6170,6 +6170,53 @@ async fn the_adoption_preflight_is_skipped_when_no_daemon_swap_starts() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
+/// A check of a recorded-`PATH` job with no reachable bus that refuses at-risk
+/// sessions still tells the operator the verdicts may err: the refusal carries
+/// the warning.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_refused_check_without_a_bus_shows_the_warning_with_the_refusal() {
+    use crate::service::manager_env::EnvironmentFailure;
+
+    let mut harness = Harness::new();
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Managed {
+            login_shell: None,
+            shell_defaulted: false,
+            fallback_directories: vec!["/usr/bin".to_owned()],
+        })
+        .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unreachable(
+            "no session bus".to_owned(),
+        ))));
+    harness.install(V1).await.expect("install");
+    seed_live_session(&harness, SESSION, "w-1");
+    edit_stored_line(&harness, SESSION, |line| {
+        line.as_object_mut().expect("record").remove("runtime");
+    });
+    let daemon_dir = harness.staged(V2);
+
+    let refused = crate::service::check_with_preflight(
+        &harness.context,
+        &daemon_dir,
+        &InProcessPreflight::default(),
+        V2,
+        false,
+    )
+    .await
+    .expect_err("the at-risk session refuses the check");
+    assert!(
+        matches!(refused, Error::UpgradeAtRisk { .. }),
+        "{refused:?}"
+    );
+    let text = refused.to_string();
+    assert!(
+        text.contains("judged at the default store locations"),
+        "the refusal carries the warning: {text}"
+    );
+}
+
 #[tokio::test]
 async fn check_asks_the_preflight_of_an_upgrade_and_honours_the_flag() {
     let harness = Harness::new();
@@ -6224,7 +6271,7 @@ async fn a_session_created_between_staging_and_the_swap_is_caught_by_the_late_pr
         .await
         .expect_err("the late preflight refuses");
 
-    let Error::UpgradeAtRisk { sessions } = &error else {
+    let Error::UpgradeAtRisk { sessions, .. } = &error else {
         panic!("{error:?}");
     };
     assert_eq!(sessions[0].session_id, SESSION);

@@ -33,3 +33,7 @@
   fails closed.
 - A runtime whose native reference is not checked (`check = "none"`) is not held by the
   preflight budget, since it reads nothing.
+- Only an absent user bus (no address, or nothing listening at the socket) counts as an
+  unreachable service manager. A bus that refuses the client stays an error. A degraded
+  judgement's warning reaches every upgrade, rollback and check output, and a refusal that
+  the judgement produced carries it too.

@@ -2378,11 +2378,19 @@ pub(crate) fn pending_report(record: &Record) -> PendingReport {
     }
 }
 
-/// The warnings a job `PATH` owes the operator: the persisted launchd
-/// configuration was used because the job is not loaded and the transaction
-/// journal holds no launchd default. Only a transaction can have one.
-#[cfg(target_os = "macos")]
+/// Every warning a judgement made with `job` owes the operator. Each caller
+/// that judges with the job's `PATH` or variables reports them through this, so
+/// none can forget one.
 pub(crate) fn job_warnings(context: &Context, job: &JobPath) -> Vec<String> {
+    let mut warnings = persisted_path_warnings(context, job);
+    warnings.extend(manager_warnings(job));
+    warnings
+}
+
+/// The warning of a launchd `PATH` that was persisted: the job is not loaded and
+/// the transaction journal holds no launchd default. Only a transaction can have one.
+#[cfg(target_os = "macos")]
+fn persisted_path_warnings(context: &Context, job: &JobPath) -> Vec<String> {
     if job.source != PathSource::Persisted {
         return Vec::new();
     }
@@ -2397,7 +2405,7 @@ pub(crate) fn job_warnings(context: &Context, job: &JobPath) -> Vec<String> {
 
 /// No launchd job runs on other hosts, so no `PATH` is persisted there.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn job_warnings(_context: &Context, _job: &JobPath) -> Vec<String> {
+fn persisted_path_warnings(_context: &Context, _job: &JobPath) -> Vec<String> {
     Vec::new()
 }
 
@@ -2779,7 +2787,7 @@ impl std::fmt::Debug for JobPath {
 /// The warning a judgement of a recorded-`PATH` job carries when no service
 /// manager is reachable. The verdicts may err in either direction, so the text
 /// says which way and what the operator does before relying on them.
-pub(crate) fn manager_warnings(job: &JobPath) -> Vec<String> {
+fn manager_warnings(job: &JobPath) -> Vec<String> {
     let Some(detail) = &job.manager_unreachable else {
         return Vec::new();
     };
