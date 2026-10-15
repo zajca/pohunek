@@ -388,9 +388,33 @@ struct MenuEffectContext<'a> {
     modal: Option<&'a ModalState>,
 }
 
+/// Terminal input routed to the attach stream and not yet written to it.
+///
+/// The attach loop writes it from an arm of its own, so the daemon's output
+/// keeps being shown while a paste waits for the program to read it, and it
+/// reads stdin again only once the queue is empty.
+#[derive(Debug, Default)]
+struct PendingStreamInput {
+    bytes: Vec<u8>,
+    /// Stdin ended: the stream's write half shuts down once `bytes` is written.
+    closing: bool,
+}
+
+impl PendingStreamInput {
+    /// Drops the `written` bytes the attach stream took from the queue.
+    fn take_written(&mut self, written: usize) -> Result<(), CliError> {
+        if written == 0 {
+            return Err(CliError::Io(std::io::ErrorKind::WriteZero.into()));
+        }
+        self.bytes.drain(..written);
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct StdinInputContext<'a, W, O> {
     socket_write: &'a mut W,
+    stream_input: &'a mut PendingStreamInput,
     stdout: &'a mut O,
     client: &'a mut Client,
     stream_id: &'a str,
@@ -406,6 +430,7 @@ impl<W, O> StdinInputContext<'_, W, O> {
     fn reborrow(&mut self) -> StdinInputContext<'_, W, O> {
         StdinInputContext {
             socket_write: self.socket_write,
+            stream_input: self.stream_input,
             stdout: self.stdout,
             client: self.client,
             stream_id: self.stream_id,
@@ -1624,6 +1649,11 @@ where
         }
         match shortcut {
             Shortcut::Detach => {
+                // The input typed before the shortcut is written to the
+                // stream before the detach request is sent.
+                ctx.socket_write.write_all(&ctx.stream_input.bytes).await?;
+                ctx.socket_write.flush().await?;
+                ctx.stream_input.bytes.clear();
                 ctx.terminal.take();
                 let _ = send_detach(ctx.client, ctx.stream_id).await;
                 return Ok(Some(AttachStreamEnd::Detached));
@@ -1680,8 +1710,7 @@ where
         .await;
     }
 
-    ctx.socket_write.write_all(input).await?;
-    ctx.socket_write.flush().await?;
+    ctx.stream_input.bytes.extend_from_slice(input);
     Ok(None)
 }
 
@@ -1700,8 +1729,8 @@ where
         if let Some(end) = route_stdin_input(&pending, ctx.reborrow()).await? {
             return Ok(Some(end));
         }
-        ctx.socket_write.shutdown().await?;
-        return Ok(Some(AttachStreamEnd::InputClosed));
+        ctx.stream_input.closing = true;
+        return Ok(None);
     }
     handle_stdin_input(&buffer[..bytes_read], ctx).await
 }
@@ -1739,6 +1768,10 @@ where
 /// Uses [`tokio::io::split`] (generic) rather than a transport-specific
 /// `into_split`, so the loop is identical for the local socket and a remote TCP
 /// connection.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the attach select loop keeps stream input, output, stdin, resize, status and menu ordering in one place"
+)]
 async fn forward_attached_stream<S>(
     stream: S,
     mut client: Client,
@@ -1768,9 +1801,17 @@ where
     )
     .await?;
 
+    let mut stream_input = PendingStreamInput::default();
     let outcome: Result<AttachStreamEnd, CliError> = async {
         loop {
+            if stream_input.closing && stream_input.bytes.is_empty() {
+                socket_write.shutdown().await?;
+                return Ok(AttachStreamEnd::InputClosed);
+            }
             tokio::select! {
+                written = socket_write.write(&stream_input.bytes), if !stream_input.bytes.is_empty() => {
+                    stream_input.take_written(written?)?;
+                }
                 read = socket_read.read(&mut socket_buf) => {
                     let input = &socket_buf[..read?];
                     let args = (&control.target, &mut terminal);
@@ -1784,9 +1825,10 @@ where
                     &mut stdin,
                     &mut stdin_buf,
                     shortcut_deadline,
-                ) => {
+                ), if stream_input.bytes.is_empty() && !stream_input.closing => {
                     let ctx = StdinInputContext {
                         socket_write: &mut socket_write,
+                        stream_input: &mut stream_input,
                         stdout: &mut stdout,
                         client: &mut client,
                         stream_id: &stream_id,
@@ -2509,6 +2551,7 @@ mod tests {
     #[derive(Debug)]
     struct StdinTestState {
         client: Client,
+        stream_input: PendingStreamInput,
         stream_id: String,
         terminal: Option<RawTerminal>,
         modal: Option<ModalState>,
@@ -2522,6 +2565,7 @@ mod tests {
         fn new(client: Client, paths: Paths, menu_active: bool) -> Self {
             Self {
                 client,
+                stream_input: PendingStreamInput::default(),
                 stream_id: "stream-test".to_owned(),
                 terminal: None,
                 modal: None,
@@ -2543,6 +2587,7 @@ mod tests {
         ) -> StdinInputContext<'a, DuplexStream, Vec<u8>> {
             StdinInputContext {
                 socket_write,
+                stream_input: &mut self.stream_input,
                 stdout,
                 client: &mut self.client,
                 stream_id: &self.stream_id,
@@ -2597,7 +2642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stdin_eof_routes_pending_input_before_shutdown() {
+    async fn stdin_eof_queues_pending_input_and_closes_the_stream_input() {
         let (client, _server, paths, _socket) = connect_stdin_test_client().await;
         let mut state = StdinTestState::new(client, paths, false);
         let decoded = state
@@ -2605,7 +2650,7 @@ mod tests {
             .push(b"\x1b[92;", MenuInputMode::Unavailable);
         assert!(decoded.bytes.is_empty());
         state.shortcut_deadline = Some(time::Instant::now());
-        let (mut socket_write, mut socket_read) = tokio::io::duplex(64);
+        let (mut socket_write, _socket_read) = tokio::io::duplex(64);
         let mut stdout = Vec::new();
         let mut buffer = [];
 
@@ -2616,14 +2661,12 @@ mod tests {
         )
         .await
         .expect("handle stdin EOF");
-        let mut forwarded = Vec::new();
-        socket_read
-            .read_to_end(&mut forwarded)
-            .await
-            .expect("read forwarded pending bytes");
 
-        assert_eq!(end, Some(AttachStreamEnd::InputClosed));
-        assert_eq!(forwarded, b"\x1b[92;");
+        // The attach loop writes the queue and then shuts the stream's write
+        // half down.
+        assert_eq!(end, None);
+        assert_eq!(state.stream_input.bytes, b"\x1b[92;");
+        assert!(state.stream_input.closing);
         assert!(!state.shortcuts.has_pending());
         assert_eq!(state.shortcut_deadline, None);
     }
@@ -2637,20 +2680,15 @@ mod tests {
             .push(b"\x1b[92;", MenuInputMode::Unavailable);
         assert!(decoded.bytes.is_empty());
         state.shortcut_deadline = Some(time::Instant::now());
-        let (mut socket_write, mut socket_read) = tokio::io::duplex(64);
+        let (mut socket_write, _socket_read) = tokio::io::duplex(64);
         let mut stdout = Vec::new();
 
         let end = flush_shortcut_input(state.context(&mut socket_write, &mut stdout))
             .await
             .expect("flush timed-out shortcut input");
-        let mut forwarded = [0_u8; 5];
-        socket_read
-            .read_exact(&mut forwarded)
-            .await
-            .expect("read timed-out input");
 
         assert_eq!(end, None);
-        assert_eq!(&forwarded, b"\x1b[92;");
+        assert_eq!(state.stream_input.bytes, b"\x1b[92;");
         assert!(!state.shortcuts.has_pending());
         assert_eq!(state.shortcut_deadline, None);
     }
@@ -2687,6 +2725,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn input_typed_before_the_detach_shortcut_reaches_the_stream_first() {
+        let (client, server, paths, _socket) = connect_stdin_test_client().await;
+        let server_task = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            let request = read_status_test_request(&mut server).await;
+            assert_request(
+                &request,
+                method::SESSION_DETACH,
+                json!({"stream_id": "stream-test"}),
+            );
+            write_status_test_response(
+                &mut server,
+                &request,
+                json!({"detached": true, "error": null}),
+            )
+            .await;
+        });
+        let mut state = StdinTestState::new(client, paths, false);
+        let (mut socket_write, mut socket_read) = tokio::io::duplex(64);
+        let mut stdout = Vec::new();
+
+        let end = handle_stdin_input(
+            b"typed\x1b[93;5u",
+            state.context(&mut socket_write, &mut stdout),
+        )
+        .await
+        .expect("handle input and the CSI-u detach");
+        server_task.await.expect("detach test daemon");
+        drop(socket_write);
+        let mut forwarded = Vec::new();
+        socket_read
+            .read_to_end(&mut forwarded)
+            .await
+            .expect("read attached PTY input");
+
+        assert_eq!(end, Some(AttachStreamEnd::Detached));
+        assert_eq!(forwarded, b"typed");
+        assert!(state.stream_input.bytes.is_empty());
+    }
+
+    #[tokio::test]
     async fn csi_u_escape_closes_open_menu_without_leaking_text() {
         let (client, _server, paths, _socket) = connect_stdin_test_client().await;
         let mut state = StdinTestState::new(client, paths, true);
@@ -2707,6 +2786,7 @@ mod tests {
         assert_eq!(end, None);
         assert_eq!(state.menu.state, Some(MenuState::Closed));
         assert!(leaked.is_empty());
+        assert!(state.stream_input.bytes.is_empty());
     }
 
     #[test]
