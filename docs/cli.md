@@ -108,11 +108,13 @@ upgrade of the release files. It runs in this order:
 
 1. Service: without an installed service it installs the release binaries next
    to the running `pohunek`. When those binaries are an extracted release
-   archive (a `MANIFEST` or `packaging/verify-archive` beside them), setup
+   archive (a `MANIFEST` or a `packaging/` directory beside them), setup
    first verifies the archive with its own `packaging/verify-archive`, as
    `packaging/install-daemon.sh` does, and stops before any change if the
    archive is refused or incomplete; nothing from the archive runs before
-   that. The install itself applies the runtime packages
+   that. The check covers the archive's integrity and structure against its
+   `MANIFEST`; whether the archive is an authentic release is what
+   `gh attestation verify` of the download establishes. The install itself applies the runtime packages
    and profile pins that the host's profiles, sessions and integrations need;
    it reports them. An installed service of the same version is kept.
    An installed service of another version is a gap: run

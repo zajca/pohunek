@@ -309,6 +309,18 @@ fn seal_release(release: &Path) {
     setup_release::seal(release);
 }
 
+/// Changes the sealed fixture daemon after sealing, so that it leaves
+/// [`RAN_MARKER`] beside itself if it ever runs.
+fn tamper_with_daemon(release: &Path) {
+    let daemon = release.join(pohunek_paths::DAEMON_EXECUTABLE_NAME);
+    let mut script = fs::read_to_string(&daemon).expect("read the fixture daemon");
+    script.insert_str(
+        script.find('\n').expect("a shebang line") + 1,
+        &format!(": > \"${{0%/*}}/{RAN_MARKER}\"\n"),
+    );
+    fs::write(&daemon, script).expect("tamper with the sealed daemon");
+}
+
 /// A sealed archive whose member changed after sealing is refused before its
 /// daemon runs: the fixture daemon, which the change makes leave a marker,
 /// never runs, the reason names the digest mismatch, and nothing is written.
@@ -318,13 +330,7 @@ fn a_tampered_sealed_archive_stops_setup_before_its_daemon_runs() {
     let binary = release_with_fixture(&env, REFUSED_REPORT);
     let release = binary.parent().expect("release directory").to_path_buf();
     seal_release(&release);
-    let daemon = release.join(pohunek_paths::DAEMON_EXECUTABLE_NAME);
-    let mut script = fs::read_to_string(&daemon).expect("read the fixture daemon");
-    script.insert_str(
-        script.find('\n').expect("a shebang line") + 1,
-        &format!(": > \"${{0%/*}}/{RAN_MARKER}\"\n"),
-    );
-    fs::write(&daemon, script).expect("tamper with the sealed daemon");
+    tamper_with_daemon(&release);
     let before = tree(env.root());
 
     let output = run_setup(&env, &binary, &["setup", "--yes"]);
@@ -339,6 +345,41 @@ fn a_tampered_sealed_archive_stops_setup_before_its_daemon_runs() {
             && stderr.contains("failed its verification")
             && stderr.contains("digest mismatch"),
         "stderr names the verification failure: {stderr}"
+    );
+    assert!(
+        !release.join(RAN_MARKER).exists(),
+        "the tampered daemon never runs"
+    );
+    assert_eq!(tree(env.root()), before, "a refused archive writes nothing");
+}
+
+/// A `pohunek` reached through a symbolic link in another directory, as a
+/// link on the `PATH` would be, verifies the archive it resolves to: the
+/// tampered archive is refused although the link's own directory carries no
+/// manifest.
+#[test]
+fn a_linked_cli_verifies_the_archive_it_resolves_to() {
+    let env = TestEnv::new().expect("private environment");
+    let binary = release_with_fixture(&env, REFUSED_REPORT);
+    let release = binary.parent().expect("release directory").to_path_buf();
+    seal_release(&release);
+    tamper_with_daemon(&release);
+    let links = env.root().join("links");
+    fs::create_dir_all(&links).expect("create the link directory");
+    let link = links.join("pohunek");
+    std::os::unix::fs::symlink(&binary, &link).expect("link the CLI");
+    let before = tree(env.root());
+
+    let output = run_setup(&env, &link, &["setup", "--yes"]);
+
+    assert!(
+        !output.status.success(),
+        "a tampered archive exits non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed its verification") && stderr.contains("digest mismatch"),
+        "the resolved archive is verified: {stderr}"
     );
     assert!(
         !release.join(RAN_MARKER).exists(),
@@ -368,6 +409,70 @@ fn a_sealed_archive_without_its_manifest_stops_setup() {
     assert!(
         stderr.contains("failed its verification") && stderr.contains("has no MANIFEST"),
         "stderr names the missing manifest: {stderr}"
+    );
+    assert_eq!(tree(env.root()), before, "a refused archive writes nothing");
+}
+
+/// An archive verifier that is a symbolic link is refused before it runs,
+/// whatever it points to.
+#[test]
+fn a_linked_archive_verifier_is_refused_before_it_runs() {
+    let env = TestEnv::new().expect("private environment");
+    let binary = release_with_fixture(&env, REFUSED_REPORT);
+    let release = binary.parent().expect("release directory").to_path_buf();
+    seal_release(&release);
+    let substitute = env.root().join("substitute-verifier");
+    fs::write(
+        &substitute,
+        format!(
+            "#!/bin/sh\n: > \"{}\"\nexit 0\n",
+            release.join(RAN_MARKER).display()
+        ),
+    )
+    .expect("write the substitute verifier");
+    let verifier = release.join("packaging/verify-archive");
+    fs::remove_file(&verifier).expect("remove the verifier");
+    std::os::unix::fs::symlink(&substitute, &verifier).expect("link the verifier");
+    let before = tree(env.root());
+
+    let output = run_setup(&env, &binary, &["setup", "--yes"]);
+
+    assert!(!output.status.success(), "a linked verifier exits non-zero");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is not a regular file of this user or root"),
+        "stderr names the verifier: {stderr}"
+    );
+    assert!(
+        !release.join(RAN_MARKER).exists(),
+        "the linked verifier never runs"
+    );
+    assert_eq!(tree(env.root()), before, "a refused archive writes nothing");
+}
+
+/// An archive without its manifest and its verifier still carries its
+/// `packaging/` directory, so it is refused instead of planned unverified.
+#[test]
+fn an_archive_without_manifest_and_verifier_stops_setup() {
+    let env = TestEnv::new().expect("private environment");
+    let binary = release_with_fixture(&env, REFUSED_REPORT);
+    let release = binary.parent().expect("release directory").to_path_buf();
+    seal_release(&release);
+    fs::remove_file(release.join("MANIFEST")).expect("remove the manifest");
+    fs::remove_file(release.join("packaging/verify-archive")).expect("remove the verifier");
+    let before = tree(env.root());
+
+    let output = run_setup(&env, &binary, &["setup", "--yes"]);
+
+    assert!(
+        !output.status.success(),
+        "a stripped archive exits non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("has no usable packaging/verify-archive")
+            && !stderr.contains("fixture refusal"),
+        "the archive is refused before its daemon plans: {stderr}"
     );
     assert_eq!(tree(env.root()), before, "a refused archive writes nothing");
 }
@@ -405,6 +510,11 @@ fn a_dry_run_on_a_fresh_host_prints_the_preview_and_changes_nothing() {
     setup_release::sign(&release, &pohunek_test_support::catalog::test_key());
     setup_release::seal(&release);
     let binary = release.join("pohunek");
+    // A state directory without a service, as a removed installation or
+    // another tool leaves it: the dry run creates no lock file in it.
+    let state = env.state_home().join("pohunek");
+    fs::create_dir_all(&state).expect("create the state directory");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("owner-only state");
     let before = tree(env.root());
 
     let output = run_setup(&env, &binary, &["setup", "--dry-run", "--json"]);

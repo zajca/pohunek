@@ -57,7 +57,7 @@ use crate::commands::setup::{config_files, install_config_into, ConfigResult};
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::service::engine::{install_layout, installed_job_path};
-use crate::service::report::{IntegrationReinstall, StatusReport};
+use crate::service::report::IntegrationReinstall;
 use crate::service::runtimes::DaemonRuntimes;
 use crate::service::{self, Context, VERSION};
 use crate::target::LOCAL_HOST;
@@ -76,8 +76,10 @@ const RELEASE_PACKAGES_DIR: &str = "packages";
 /// Manifest at the root of a sealed release archive (`packaging/write-manifest`).
 const ARCHIVE_MANIFEST: &str = "MANIFEST";
 
-/// The archive's own verifier, which its installer `packaging/install-daemon.sh`
-/// runs before anything from the archive.
+/// The archive's directory of installer scripts, and its own verifier, which
+/// its installer `packaging/install-daemon.sh` runs before anything from the
+/// archive.
+const ARCHIVE_PACKAGING_DIR: &str = "packaging";
 const ARCHIVE_VERIFIER: &str = "packaging/verify-archive";
 
 /// Component and binaries the daemon archive must carry, as
@@ -415,7 +417,9 @@ async fn plan_in(
     staged: &Path,
     planner: &dyn ReleasePlanner,
 ) -> Result<HostPlan, CliError> {
-    let status = service::status_in(context).await?;
+    // Read without side effects, so the plan a dry run prints leaves the host
+    // as it was.
+    let status = service::installed_facts(context)?;
     if let Some(pending) = &status.pending_transaction {
         return Err(CliError::SetupBlocked {
             detail: format!(
@@ -445,7 +449,7 @@ async fn plan_in(
     } else {
         // The plan runs the release's daemon, so a sealed archive is verified
         // before anything from it runs.
-        verify_sealed_archive(staged).await?;
+        verify_sealed_archive(staged, context.uid()).await?;
         // The search path a fresh install records, so the plan judges the
         // packages against the PATH the daemon job will get.
         let (search, _report) = context.install_search_path()?;
@@ -1157,22 +1161,29 @@ fn hook_lines(hooks: &[IntegrationReinstall], status: &str) -> Vec<String> {
 /// `packaging/verify-archive`, with the arguments `packaging/install-daemon.sh`
 /// gives it, before anything from the release runs.
 ///
-/// A release that carries a `MANIFEST` or the verifier is an extracted
-/// archive, so both must be present and the verifier must accept it: a
-/// removed manifest or verifier fails like a modified member. A directory with
+/// A release that carries a `MANIFEST` or a `packaging/` entry is an extracted
+/// archive, so the verifier must be there and must accept it: a removed
+/// manifest or verifier fails like a modified member. A directory with
 /// neither is a development build or a package manager's layout, which ships
-/// no manifest.
+/// no manifest; such a directory is indistinguishable from an archive whose
+/// every archive file was removed, which the download's attestation, not
+/// this check, rules out. The verifier runs only as a regular file of this
+/// user or root that no other account can write, the rule it then applies to
+/// the whole archive.
 ///
 /// # Errors
 ///
 /// Returns [`CliError::SetupBlocked`] with the verifier's reason when the
 /// archive is refused or the verifier cannot run.
-async fn verify_sealed_archive(staged: &Path) -> Result<(), CliError> {
+async fn verify_sealed_archive(staged: &Path, uid: u32) -> Result<(), CliError> {
+    use std::os::unix::fs::MetadataExt as _;
+
     let blocked = |detail: String| CliError::SetupBlocked { detail };
     let manifest = staged.join(ARCHIVE_MANIFEST);
     let verifier = staged.join(ARCHIVE_VERIFIER);
+    let packaging = staged.join(ARCHIVE_PACKAGING_DIR);
     let mut sealed = false;
-    for path in [&manifest, &verifier] {
+    for path in [&manifest, &packaging] {
         match fs::symlink_metadata(path) {
             Ok(_) => sealed = true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -1186,6 +1197,21 @@ async fn verify_sealed_archive(staged: &Path) -> Result<(), CliError> {
     }
     if !sealed {
         return Ok(());
+    }
+    let metadata = fs::symlink_metadata(&verifier).map_err(|error| {
+        blocked(format!(
+            "the release archive has no usable {ARCHIVE_VERIFIER}: {error}"
+        ))
+    })?;
+    if !metadata.file_type().is_file()
+        || (metadata.uid() != uid && metadata.uid() != 0)
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(blocked(format!(
+            "{} is not a regular file of this user or root closed to other accounts; \
+             extract the archive again",
+            verifier.display()
+        )));
     }
     let output = tokio::process::Command::new("/bin/sh")
         .arg(&verifier)
@@ -1215,7 +1241,7 @@ async fn verify_sealed_archive(staged: &Path) -> Result<(), CliError> {
 ///
 /// Returns [`CliError::SetupBlocked`] when the recorded prefix has no version
 /// directory for this release.
-fn installed_version_dir(status: &StatusReport) -> Result<PathBuf, CliError> {
+fn installed_version_dir(status: &service::InstalledFacts) -> Result<PathBuf, CliError> {
     let prefix = status
         .prefix
         .as_deref()

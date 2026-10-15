@@ -929,6 +929,54 @@ async fn status_of(context: &Context) -> Result<report::StatusReport, Error> {
     Engine::new(context, &backend).status(Some(&config)).await
 }
 
+/// The installation facts a plan reads, without side effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InstalledFacts {
+    /// Whether `service.toml` records an installation.
+    pub(crate) installed: bool,
+    /// The recorded active version, when installed.
+    pub(crate) active_version: Option<String>,
+    /// The recorded install prefix, when installed.
+    pub(crate) prefix: Option<PathBuf>,
+    /// The interrupted transaction whose record is pending, if any.
+    pub(crate) pending_transaction: Option<report::PendingReport>,
+}
+
+/// Reads whether the installation `context` describes is installed, at which
+/// version and prefix, and whether a transaction record is pending.
+///
+/// Unlike [`status_in`] it only reads files: it probes no transaction lock,
+/// contacts no service manager or daemon, and creates nothing, so a preview
+/// can call it without touching the host. `service.toml` is verified as the
+/// other commands verify it.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] for a `service.toml` that does not describe
+/// this process's installation, [`Error::Record`] for a malformed record,
+/// and a filesystem error for an unsafe state directory.
+pub(crate) fn installed_facts(context: &Context) -> Result<InstalledFacts, Error> {
+    let store = record::Store::new(context.paths().state_dir.clone());
+    let pending_transaction = store
+        .load()?
+        .map(|pending| engine::pending_report(&pending));
+    if !exists(&context.config_path())? {
+        return Ok(InstalledFacts {
+            installed: false,
+            active_version: None,
+            prefix: None,
+            pending_transaction,
+        });
+    }
+    let config = verified_config(context)?;
+    Ok(InstalledFacts {
+        installed: true,
+        active_version: Some(config.active_version().to_owned()),
+        prefix: Some(config.prefix().to_path_buf()),
+        pending_transaction,
+    })
+}
+
 pub(crate) fn staged_dir(context: &Context, from: Option<PathBuf>) -> Result<PathBuf, Error> {
     match from {
         Some(from) => absolute("--from", from),

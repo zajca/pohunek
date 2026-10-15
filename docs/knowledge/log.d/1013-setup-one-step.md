@@ -39,8 +39,11 @@
   `pohunek setup --dry-run --json`.
 - Setup run from an extracted release archive verifies it first with the
   archive's own `packaging/verify-archive`, as `packaging/install-daemon.sh`
-  does, and stops before any change on a modified member or a removed
-  manifest.
+  does, and stops before any change on a modified member, a removed
+  manifest or verifier, or a verifier that is a link or writable by another
+  account.
+- The setup plan reads the installation without side effects: no
+  transaction lock probe, no service manager contact, no file created.
 - Setup installs only the hooks the daemon does not report as current, so a
   run on a ready host applies nothing and a modified hook is still repaired.
 - The install quick start, the setup guide and the Homebrew path in the macOS
