@@ -759,6 +759,8 @@ cleanup() {
             # which the invoking user cannot signal; kill the user's processes
             # so sudo exits before it is reaped.
             kill_throwaway_user_processes
+            # Also stop sudo itself, in case the signal arrived before it forked.
+            /usr/bin/sudo -n /bin/kill -KILL "$ns_pid" 2>/dev/null || true
         elif [ "$chosen" != sudo ]; then
             # Signal the private group before reaping its leader, so its ID
             # cannot be reused for an unrelated process group.
@@ -774,11 +776,8 @@ cleanup() {
             [ -f "$pidfile" ] || continue
             sid=$(cat -- "$pidfile" 2>/dev/null) || continue
             case $sid in '' | *[!0-9]*) continue ;; esac
-            if [ -n "$tuser_created" ]; then
-                /usr/bin/sudo -n /bin/kill -KILL -- "-$sid" 2>/dev/null || true
-            else
-                /bin/kill -KILL -- "-$sid" 2>/dev/null || true
-            fi
+            # Never with sudo: the pidfile is writable by the consumer; the throwaway user's own processes are killed with pkill -U.
+            /bin/kill -KILL -- "-$sid" 2>/dev/null || true
         done
     fi
     # Kill the host_probe listeners if they were started.

@@ -993,7 +993,7 @@ done
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-            if workload_uid is not None and workload_uid != os.getuid():
+            if workload_uid is not None and 40000 <= workload_uid <= 59999:
                 subprocess.run(["sudo", "-n", "pkill", "-KILL", "-U", str(workload_uid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
                 process.communicate(timeout=10)
