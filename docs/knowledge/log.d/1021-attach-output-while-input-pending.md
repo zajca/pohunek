@@ -13,4 +13,5 @@
   keeps the input in order and bounded. An attach write runs in a task of its
   own, so it keeps the PTY execution lock until every byte is accepted even
   if its stream ends first, and a control input waiting behind it keeps its
-  stall bound.
+  stall bound. The CLI sends the detach request for a detach shortcut once
+  the input typed before it is written, showing output meanwhile.
