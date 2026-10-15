@@ -77,13 +77,18 @@ session. In the `session.new` result its `detail` also carries the last
 setup failed. The stored session and the logs keep the warning without that
 tail. Stdout is never kept, and a successful hook's stderr is discarded.
 `session.new` never waits for processes a hook leaves running in the
-background; their stderr is drained and discarded while the daemon runs, but
-after a daemon restart their next stderr write raises `SIGPIPE`. A hook that
-starts long-lived processes redirects their stderr (`>/dev/null 2>&1` or a log
-file); `hooks.stderr_tail_bytes = 0` keeps hook stderr on `/dev/null`. When such
-a process still holds the stderr two seconds after the hook ended, the daemon
-logs a WARN naming the hook's event and script ("a background process still
-holds the hook's stderr; ...").
+background; their stderr is drained and discarded. When such a process still
+holds the stderr two seconds after the hook ended, the daemon hands the pipe to
+a small drain process (`/bin/cat` reading it into `/dev/null`, in a process
+group of its own) and logs that at DEBUG with the hook's event and script and
+the drain's PID. The drain outlives a daemon restart as the process does, so its
+stderr writes keep succeeding, and it ends when the process closes its stderr.
+A restart while the hook runs, or within those two seconds, still leaves the
+process with a closed pipe: its next stderr write raises `SIGPIPE`. If the
+drain cannot start, the daemon keeps discarding and logs a WARN instead. A hook
+that starts long-lived processes can still redirect their stderr
+(`>/dev/null 2>&1` or a log file); `hooks.stderr_tail_bytes = 0` keeps hook
+stderr on `/dev/null`.
 
 Removing a worktree that a live session still uses is refused with the typed
 `worktree_in_use` error; the same code is reserved for `session.remove` when

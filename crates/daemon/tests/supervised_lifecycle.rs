@@ -1557,3 +1557,201 @@ async fn refuse(stream: tokio::net::UnixStream) {
         let _flushed = writer.flush().await;
     }
 }
+
+/// Variable naming the D-Bus session bus, over which a daemon reaches the
+/// systemd user manager.
+#[cfg(target_os = "linux")]
+const SESSION_BUS_VARIABLE: &str = "DBUS_SESSION_BUS_ADDRESS";
+
+/// Name of the drain process the daemon hands a held hook stderr to.
+const DRAIN_COMM: &str = "cat";
+
+/// Writes the hook's background writer must complete after the restart: at
+/// one per 100 ms, about three seconds of writing to a stderr that would have
+/// raised `SIGPIPE` on the first.
+const WRITES_AFTER_RESTART: usize = 30;
+
+/// Creates a git repository with one commit in `dir`, with the scrubbed
+/// environment of `env`.
+fn init_git_repo(env: &pohunek_test_support::env::TestEnv, dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).expect("repository directory");
+    let git = |args: &[&str]| {
+        let out = env
+            .command("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["-c", "init.defaultBranch=main", "init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(dir.join("README.md"), "init\n").expect("write README");
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+}
+
+/// Writes a host `post-create` hook that leaves a background writer behind:
+/// it writes to the hook's stderr every 100 ms and appends a line to
+/// `write_log` after each successful write, and records its PID in `pid_file`.
+fn background_writer_hook(
+    fixture: &Installation,
+    write_log: &std::path::Path,
+    pid_file: &std::path::Path,
+) {
+    let hooks = fixture.paths.config_dir.join("hooks");
+    std::fs::create_dir_all(&hooks).expect("hook directory");
+    let hook = hooks.join("post-create");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\n\
+             (while :; do echo tick >&2 || exit 1; echo w >> '{write_log}'; sleep 0.1; done) &\n\
+             echo $! > '{pid}'\n",
+            write_log = write_log.display(),
+            pid = pid_file.display()
+        ),
+    )
+    .expect("write the hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).expect("hook mode");
+}
+
+/// Lines the background writer has appended so far.
+fn write_count(write_log: &std::path::Path) -> usize {
+    std::fs::read_to_string(write_log).map_or(0, |text| text.lines().count())
+}
+
+/// Creates a worktree session whose `post-create` hook leaves a writer on its
+/// stderr, waits until the daemon handed that stderr to a drain, and returns
+/// the writer and the drain.
+async fn hand_off_hook_stderr(
+    fixture: &Installation,
+    daemon_pid: u32,
+    write_log: &std::path::Path,
+) -> (ProcessIdentity, ProcessIdentity) {
+    let pid_file = fixture.root.join("writer.pid");
+    background_writer_hook(fixture, write_log, &pid_file);
+    let repo = fixture.root.join("repo");
+    let env = pohunek_test_support::env::TestEnv::new().expect("git environment");
+    init_git_repo(&env, &repo);
+    let mut params = fixture.new_params("held-stderr");
+    params.cwd = None;
+    params.repo = Some(repo);
+    params.branch = Some("held".to_owned());
+    fixture
+        .client()
+        .await
+        .call::<method::SessionNew>(params)
+        .await
+        .expect("create the worktree session");
+    let writer_pid = eventually("the writer records its PID", || async {
+        std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+    })
+    .await;
+    let writer = fixture.identity(writer_pid).expect("the writer runs");
+    // The hand-off follows the hook's end by the release grace.
+    let drain = eventually("the daemon hands the hook's stderr to a drain", || async {
+        fixture
+            .children_named(daemon_pid, DRAIN_COMM)
+            .into_iter()
+            .next()
+    })
+    .await;
+    (writer, drain)
+}
+
+/// Asserts that the writer keeps writing to its stderr after the daemon's
+/// restart, [`WRITES_AFTER_RESTART`] more times, so it got no `SIGPIPE`.
+async fn assert_writer_survives(
+    fixture: &Installation,
+    writer: ProcessIdentity,
+    write_log: &std::path::Path,
+) {
+    let start = write_count(write_log);
+    eventually(
+        "the writer keeps writing to its stderr after the restart",
+        || async { (write_count(write_log) >= start + WRITES_AFTER_RESTART).then_some(()) },
+    )
+    .await;
+    assert!(
+        fixture.is_running(writer),
+        "the hook's background writer died after the daemon restart"
+    );
+}
+
+/// The numbered descriptors `pid` holds, as `lsof` lists them.
+#[cfg(target_os = "macos")]
+fn open_descriptors(pid: u32) -> Vec<u32> {
+    let output = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "0-65535", "-F", "f"])
+        .output()
+        .expect("run lsof");
+    let mut descriptors: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix('f'))
+        .filter_map(|fd| fd.parse().ok())
+        .collect();
+    descriptors.sort_unstable();
+    descriptors
+}
+
+/// A hook's background process that writes to stderr survives a restart of
+/// the daemon the native manager supervises (launchd): the daemon handed its
+/// stderr to a drain, which the restart does not end. The drain holds only
+/// its three standard descriptors.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hook_descendant_writing_stderr_survives_a_daemon_restart() {
+    let fixture = Installation::new(Settings::default()).await;
+    let daemon = fixture.start_daemon().await;
+    let write_log = fixture.root.join("writer.write_log");
+    let (writer, drain) = hand_off_hook_stderr(&fixture, daemon.pid, &write_log).await;
+    assert_eq!(
+        open_descriptors(drain.pid),
+        [0, 1, 2],
+        "the drain inherits only its stdio"
+    );
+
+    fixture.restart_daemon().await;
+
+    assert!(fixture.is_running(drain), "the drain outlives the daemon");
+    assert_writer_survives(&fixture, writer, &write_log).await;
+    signal(writer.pid, Signal::SIGKILL);
+    fixture.wait_gone(drain, "drain after its writer").await;
+}
+
+/// A hook's background process that writes to stderr survives a restart of
+/// a daemon no service manager supervises: the daemon handed its stderr to a
+/// drain, which the daemon's exit does not end.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_hook_descendant_writing_stderr_survives_an_unsupervised_daemon_restart() {
+    let fixture = Installation::new(Settings::default()).await;
+    // The daemon reaches the user manager over this test's session bus; the
+    // fixture's own runtime directory has no bus socket.
+    let bus = [(
+        SESSION_BUS_VARIABLE,
+        std::env::var(SESSION_BUS_VARIABLE).expect("the session bus address is exported"),
+    )];
+    let mut daemon = fixture.spawn_daemon(&bus).await;
+    let daemon_pid = daemon.id().expect("the daemon runs");
+    let write_log = fixture.root.join("writer.write_log");
+    let (writer, drain) = hand_off_hook_stderr(&fixture, daemon_pid, &write_log).await;
+
+    daemon.kill().await.expect("stop the daemon");
+    let _restarted = fixture.spawn_daemon(&bus).await;
+
+    assert!(fixture.is_running(drain), "the drain outlives the daemon");
+    assert_writer_survives(&fixture, writer, &write_log).await;
+    signal(writer.pid, Signal::SIGKILL);
+    fixture.wait_gone(drain, "drain after its writer").await;
+}

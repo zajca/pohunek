@@ -348,14 +348,15 @@ impl Installation {
 
     /// Runs the daemon as a direct child process instead of a native job.
     ///
-    /// Only for scenarios that must control the daemon's own environment,
-    /// which a native job definition restricts to the bootstrap variables.
-    /// The child is killed when the returned handle drops.
+    /// For scenarios that must control the daemon's own environment, which a
+    /// native job definition restricts to the bootstrap variables, or that
+    /// need a daemon no service manager supervises. The child is killed when
+    /// the returned handle drops.
     #[cfg_attr(
         target_os = "macos",
         expect(
             dead_code,
-            reason = "only the systemd outage scenario controls the daemon's bus"
+            reason = "the systemd outage and unsupervised-restart scenarios are Linux only"
         )
     )]
     pub(crate) async fn spawn_daemon(
@@ -612,6 +613,18 @@ impl Installation {
     /// Current identity of `pid`, if it runs.
     pub(crate) fn identity(&self, pid: u32) -> Option<ProcessIdentity> {
         self.inspector.identity(pid).expect("inspect a process")
+    }
+
+    /// The processes of this user whose parent is `parent` and whose command
+    /// name is `comm`.
+    pub(crate) fn children_named(&self, parent: u32, comm: &str) -> Vec<ProcessIdentity> {
+        self.inspector
+            .same_user_processes()
+            .expect("list this user's processes")
+            .into_iter()
+            .filter(|fact| fact.ppid == parent && fact.comm == comm)
+            .map(|fact| fact.identity())
+            .collect()
     }
 
     /// Whether exactly `process` still runs.

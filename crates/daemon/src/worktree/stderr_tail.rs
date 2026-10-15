@@ -9,17 +9,22 @@
 //!    for the tail. The thread reads only what is buffered in the pipe at that
 //!    moment, so a descendant that keeps writing cannot stall the caller, and
 //!    hands the tail over.
-//! 3. The thread then reads and discards until EOF and exits; nobody joins it.
-//!    A process the hook left running in the background keeps a stderr that
-//!    neither fills up nor raises `SIGPIPE` while the daemon runs. Each such
-//!    process keeps the thread and its descriptor until it closes stderr.
+//! 3. The thread then reads and discards for up to a release grace after the
+//!    hook ended, and exits at EOF; nobody joins it. A process the hook left
+//!    running in the background keeps a stderr that neither fills up nor
+//!    raises `SIGPIPE`.
+//! 4. When the pipe is still open a release grace after the hook ended, the
+//!    thread hands the read end to a detached drain process
+//!    ([`super::stderr_drain`]) and closes its own, so the background process
+//!    keeps a readable stderr after a daemon restart too. The thread then
+//!    waits for the drain, which ends when the last writer closes stderr, so
+//!    the drain is reaped while the daemon runs. A drain that cannot start
+//!    leaves the discard in the daemon, with a warning naming the hook.
 //!
 //! The caller never waits for EOF, because such a descendant may hold the write
-//! end open indefinitely. The read end lives in the daemon, so after a daemon
-//! restart a remaining descendant's next stderr write raises `SIGPIPE`; a hook
-//! that starts long-lived processes redirects their stderr itself. When the pipe
-//! is still open a release grace after the hook ended, the thread logs a warning
-//! naming the hook, so the owner learns which hook to fix.
+//! end open indefinitely. Until the hand-off, the read end lives in the daemon:
+//! a daemon restart while the hook runs, or within the release grace after it,
+//! still raises `SIGPIPE` in a descendant that writes to stderr afterwards.
 
 // Rust guideline compliant 2026-10-14
 
@@ -33,7 +38,9 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
-use tracing::warn;
+use tracing::{debug, warn};
+
+use super::stderr_drain;
 
 /// Bytes read from the pipe in one call.
 ///
@@ -57,7 +64,8 @@ pub(super) struct CaptureSettings {
     /// Longest wait of the reader before it notices a request.
     pub wake_interval: Duration,
     /// How long after the hook ended the pipe may stay open before the reader
-    /// warns that a background process still holds it.
+    /// hands it to a drain process. Until then a daemon restart still gives a
+    /// background process that writes to stderr `SIGPIPE`.
     pub release_grace: Duration,
 }
 
@@ -342,12 +350,35 @@ impl Reader {
                 Instant::now() + self.settings.release_grace,
             )
         {
-            warn!(
-                event = self.origin.event,
-                script = %self.origin.script.display(),
-                "a background process still holds the hook's stderr; redirect its stderr or set hooks.stderr_tail_bytes = 0, or it gets SIGPIPE after a daemon restart"
-            );
-            discard_until_eof(reader, &mut chunk);
+            self.hand_off(&mut chunk);
+        }
+    }
+
+    /// Hands the still open pipe to a drain process and waits for it, or keeps
+    /// discarding here when the drain cannot start.
+    fn hand_off(self, chunk: &mut [u8]) {
+        match stderr_drain::spawn_drain(&self.pipe) {
+            Ok(mut drain) => {
+                debug!(
+                    event = self.origin.event,
+                    script = %self.origin.script.display(),
+                    drain_pid = drain.id(),
+                    "a background process still holds the hook's stderr; a drain process reads it from now on"
+                );
+                drop(self.pipe);
+                // Reaps the drain once the last writer is gone; a daemon exit
+                // leaves it to the init process.
+                let _ = drain.wait();
+            }
+            Err(error) => {
+                warn!(
+                    event = self.origin.event,
+                    script = %self.origin.script.display(),
+                    %error,
+                    "a background process still holds the hook's stderr and no drain process could take it; redirect its stderr or set hooks.stderr_tail_bytes = 0, or it gets SIGPIPE after a daemon restart"
+                );
+                discard_until_eof(&self.pipe, chunk);
+            }
         }
     }
 }
