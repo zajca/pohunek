@@ -46,3 +46,9 @@
   absent socket (not found, or refused) means no service manager is reachable.
 - Every refusal of an upgrade, rollback or check gate that a degraded judgement produced
   carries that judgement's warning.
+- An upgrade or rollback whose judgement ran without the service manager's variables and
+  covered a stopped session is refused with `service_manager_variables_unread` unless
+  `--accept-runtime-loss` is given, since that session's reference was checked at the default
+  store location. Without stopped sessions no verdict depends on those variables, so the
+  gate passes with the warning. `service check` only warns.
+  On macOS a missing launchd `gui/<uid>` domain (no GUI session) degrades the same way.

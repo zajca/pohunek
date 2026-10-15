@@ -2270,8 +2270,8 @@ whose frozen program resume would not find is `would_lose_recovery` with
 check, which then needs no flag. A relocated store (`agent_native_store_relocated`)
 or a store-condition refusal (`agent_native_reference_missing` from an unresolvable
 root, a scan limit or a changed store) is `would_lose_recovery` with resume's code,
-because the running release may detect it differently. A reported reference (one that is not pinned to a package
-digest) keeps its check across the upgrade only when the preflight can show it identical: a package pinned to the session's digest, which
+because the running release may detect it differently. A reported reference (one the runtime reports rather than the launch
+assigns) keeps its check across the upgrade only when the preflight can show it identical: a package pinned to the session's digest, which
 content addressing fixes, or a built-in that the upgrade adopts from a 0.34.0 to 0.34.2 store (store schema 5) whose adopted package declares
 the existence check of the v0.34.2 golden. Any other reported reference is `would_lose_recovery` with resume's code and a detail that names the
 reason: a built-in the upgrade does not adopt, an adopted package from a store that is not schema 5, or a package whose check differs from the
@@ -2301,11 +2301,16 @@ configuration, the best evidence available. A rollback judges with the same orde
 so the `PATH` it uses is the one the restored job gets where launchd can still
 report it; a `warning:` line names a journal that gave no default. An
 unrecognized `launchctl print` output refuses the upgrade with `service_manager_environment_unavailable`.
-A job that records its `PATH` and whose systemd user manager cannot be reached (its bus is not
-reachable) is not refused: it takes no manager variables, and `service check|upgrade` prints a
-`warning` that native references are judged at the default store locations, so a verdict may read
+A job that records its `PATH` and whose service manager cannot be read (on Linux the systemd user
+manager's bus is not reachable; on macOS launchd has no `gui/<uid>` domain, as without a GUI
+session) takes no manager variables. `service check` is not refused: it prints a `warning` that
+native references are judged at the default store locations, so a verdict may read
 `already_not_resumable` or `would_lose_recovery` for a conversation stored under a variable-set
-location, or `adoptable` for one present only at the default location. The
+location, or `adoptable` for one present only at the default location. When such a judgement
+covers a stopped session, whose native reference check reads a store location, `service upgrade`
+and a rollback refuse it with `service_manager_variables_unread` before any effect, unless
+`--accept-runtime-loss` is given; a judgement without stopped sessions does not depend on those
+variables and proceeds with the warning. The
 preflight resolves programs with the daemon's own resolver, which skips an
 untrusted candidate the same way at launch. See
 [update after release](knowledge/runbooks/update-after-release.md).

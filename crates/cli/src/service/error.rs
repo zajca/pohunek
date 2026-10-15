@@ -490,6 +490,17 @@ pub enum Error {
         detail: String,
     },
 
+    /// The service manager's environment was not read, so the preflight judged a
+    /// stopped session's native reference without the store variables the daemon
+    /// job gets. Refused unless the operator accepts runtime loss.
+    #[error(
+        "the service manager's environment was not read ({detail}), so the preflight cannot judge native references with the store variables the daemon job gets"
+    )]
+    ManagerVariablesUnread {
+        /// Why the manager's environment was not read.
+        detail: String,
+    },
+
     /// The official runtime step did not produce a usable report, or its
     /// apply left work undone.
     #[error("the official runtime step of {} failed: {detail}", binary.display())]
@@ -717,6 +728,7 @@ impl Error {
             Self::UpgradeRuntimesFailed { .. } => "service_upgrade_runtimes_failed",
             Self::UpgradeRuntimesUnconfirmed { .. } => "service_upgrade_runtimes_unconfirmed",
             Self::ManagerEnvironment { .. } => "service_manager_environment_unavailable",
+            Self::ManagerVariablesUnread { .. } => "service_manager_variables_unread",
             Self::RuntimeBackup { .. } => "service_runtime_backup_invalid",
             Self::RollbackStoreUnusable { .. } => "service_rollback_store_unusable",
             Self::RollbackAtRisk { .. } => "service_rollback_sessions_at_risk",
@@ -781,6 +793,9 @@ impl Error {
             ),
             Self::ManagerEnvironment { .. } => Some(
                 "the daemon job's PATH comes from its definition when it records one, otherwise from the service manager's environment (the systemd user manager's Environment on Linux, the launchd domain on macOS); make that manager's environment readable, that is its bus reachable and its answer well formed, and retry; nothing was changed",
+            ),
+            Self::ManagerVariablesUnread { .. } => Some(
+                "make the service manager's environment readable (on Linux, the systemd user manager's bus reachable; on macOS, the user logged in to a GUI session so launchd has the gui/<uid> domain) and retry, or pass --accept-runtime-loss to accept that a session judged without those variables may lose its recovery; nothing was changed",
             ),
             Self::UpgradeRuntimesFailed { .. } => Some(
                 "run `<staged>/pohunekd ensure-official-runtimes --dry-run` by hand with the same XDG environment to see its output, then retry",

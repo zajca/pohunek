@@ -2245,10 +2245,11 @@ async fn a_recorded_path_job_without_a_launchd_domain_warns_like_an_absent_bus()
     assert!(job.manager_unreachable.is_some(), "{job:?}");
     let warnings = crate::service::engine::job_warnings(&harness.context, &job);
     assert!(
-        warnings
-            .iter()
-            .any(|warning| warning.contains("judged at the default store locations")),
-        "{warnings:?}"
+        warnings.iter().any(
+            |warning| warning.contains("judged at the default store locations")
+                && warning.contains("GUI session")
+        ),
+        "the warning names the macOS remedy: {warnings:?}"
     );
 }
 
@@ -6365,11 +6366,10 @@ async fn a_refused_check_without_a_bus_shows_the_warning_with_the_refusal() {
     );
 }
 
-/// An upgrade whose gate refuses at-risk sessions on a recorded-`PATH` job with
-/// no bus carries the warning in its refusal, as the check does.
+/// A harness whose daemon job records its `PATH` and whose user manager has no
+/// reachable bus, so its judgements run without the manager's variables.
 #[cfg(target_os = "linux")]
-#[tokio::test]
-async fn a_refused_upgrade_without_a_bus_shows_the_warning_with_the_refusal() {
+fn harness_without_a_bus() -> Harness {
     use crate::service::manager_env::EnvironmentFailure;
 
     let mut harness = Harness::new();
@@ -6384,46 +6384,94 @@ async fn a_refused_upgrade_without_a_bus_shows_the_warning_with_the_refusal() {
         .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unreachable(
             "no session bus".to_owned(),
         ))));
-    harness.install(V1).await.expect("install");
-    seed_live_session(&harness, SESSION, "w-1");
-    edit_stored_line(&harness, SESSION, |line| {
-        line.as_object_mut().expect("record").remove("runtime");
-    });
-
-    let refused = harness
-        .upgrade(V2)
-        .await
-        .expect_err("the at-risk session refuses the upgrade");
-    assert!(
-        matches!(refused, Error::UpgradeAtRisk { .. }),
-        "{refused:?}"
-    );
-    let text = refused.to_string();
-    assert!(
-        text.contains("judged at the default store locations"),
-        "the refusal carries the warning: {text}"
-    );
+    harness
 }
 
-/// A rollback refused for at-risk sessions on a recorded-`PATH` job with no bus
-/// carries the warning in its refusal.
+/// A preflight that reports one adoptable stopped session, whose native
+/// reference check reads a store location.
+#[cfg(target_os = "linux")]
+fn preflight_with_a_stopped_session() -> Box<ScriptedPreflight> {
+    Box::new(ScriptedPreflight {
+        stopped: vec![SessionVerdict {
+            session_id: OTHER_SESSION.to_owned(),
+            name: None,
+            verdict: Verdict::Adoptable,
+            code: "adoptable".to_owned(),
+            detail: "the stopped session's conversation is in its store".to_owned(),
+        }],
+        ..ScriptedPreflight::default()
+    })
+}
+
+/// An upgrade that judged a stopped session without the manager's variables
+/// refuses even when that session reads adoptable: its reference was checked at
+/// the default store location. Accepting runtime loss covers that, so the same
+/// upgrade then proceeds.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn a_refused_rollback_without_a_bus_shows_the_warning_with_the_refusal() {
-    use crate::service::manager_env::EnvironmentFailure;
+async fn an_upgrade_judged_without_the_managers_variables_refuses_unless_loss_is_accepted() {
+    let harness = harness_without_a_bus();
+    harness.install(V1).await.expect("install");
 
-    let mut harness = Harness::new();
-    harness.context = harness
-        .context
-        .clone()
-        .with_path_discovery(crate::service::context::PathDiscovery::Managed {
-            login_shell: None,
-            shell_defaulted: false,
-            fallback_directories: vec!["/usr/bin".to_owned()],
-        })
-        .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unreachable(
-            "no session bus".to_owned(),
-        ))));
+    let refused = harness
+        .engine()
+        .with_adoption_preflight(preflight_with_a_stopped_session())
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("a stopped session judged without the manager's variables refuses");
+    assert!(
+        matches!(refused, Error::ManagerVariablesUnread { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(refused.code(), "service_manager_variables_unread");
+    assert!(refused.to_string().contains("no session bus"), "{refused}");
+    assert_eq!(harness.pending(), None);
+    harness.assert_installed(V1);
+
+    let report = harness
+        .engine()
+        .with_runtime_loss_accepted(true)
+        .with_adoption_preflight(preflight_with_a_stopped_session())
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("accepted runtime loss covers the degraded judgement");
+    assert!(report.rolled_back.is_none());
+    harness.assert_installed(V2);
+}
+
+/// A judgement without stopped sessions reads no store location, so the
+/// manager's variables cannot change it: the upgrade proceeds without the flag
+/// and reports the warning.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_upgrade_without_stopped_sessions_proceeds_without_the_managers_variables() {
+    let harness = harness_without_a_bus();
+    harness.install(V1).await.expect("install");
+    seed_live_session(&harness, SESSION, "w-1");
+
+    let report = harness
+        .upgrade(V2)
+        .await
+        .expect("no verdict depends on the manager's variables");
+    assert!(!report.accepted_runtime_loss);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("judged at the default store locations")),
+        "{:?}",
+        report.warnings
+    );
+    harness.assert_installed(V2);
+}
+
+/// A rollback that judged a stopped session without the manager's variables
+/// refuses and keeps its transaction unless runtime loss is accepted, as the
+/// upgrade does.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_rollback_judged_without_the_managers_variables_refuses_unless_loss_is_accepted() {
+    let harness = harness_without_a_bus();
     harness.install(V1).await.expect("install");
     let mut engine = harness.engine();
     engine.interrupt_after = Some(Step::Registered);
@@ -6431,21 +6479,30 @@ async fn a_refused_rollback_without_a_bus_shows_the_warning_with_the_refusal() {
         .upgrade(&harness.staged(V2), V2)
         .await
         .expect_err("interrupted after the registration");
-    seed_unadoptable_session(&harness);
+    let pending = harness.pending().expect("the interrupted upgrade is kept");
 
     let refused = harness
-        .upgrade(V1)
+        .engine()
+        .with_adoption_preflight(preflight_with_a_stopped_session())
+        .upgrade(&harness.staged(V1), V1)
         .await
-        .expect_err("the rollback needs consent");
+        .expect_err("a stopped session judged without the manager's variables refuses");
     assert!(
-        matches!(refused, Error::RollbackAtRisk { .. }),
+        matches!(refused, Error::ManagerVariablesUnread { .. }),
         "{refused:?}"
     );
-    let text = refused.to_string();
-    assert!(
-        text.contains("judged at the default store locations"),
-        "the refusal carries the warning: {text}"
-    );
+    assert_eq!(harness.pending(), Some(pending));
+    assert_eq!(harness.config().expect("config").active_version(), V2);
+
+    let report = harness
+        .engine()
+        .with_runtime_loss_accepted(true)
+        .with_adoption_preflight(preflight_with_a_stopped_session())
+        .upgrade(&harness.staged(V1), V1)
+        .await
+        .expect("accepted runtime loss covers the degraded judgement");
+    assert!(report.rolled_back.is_some());
+    harness.assert_installed(V1);
 }
 
 #[tokio::test]

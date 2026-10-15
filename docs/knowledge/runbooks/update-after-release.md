@@ -674,6 +674,16 @@ it. If that `PATH` cannot be read, the command stops with
 `service_manager_environment_unavailable` before any effect; the flag does not
 override it.
 
+A job that records its own `PATH` still takes store variables such as
+`CLAUDE_CONFIG_DIR` from the service manager. When that manager cannot be read
+(no reachable user bus on Linux, no launchd `gui/<uid>` domain on macOS),
+`service check` warns that native references were judged at the default store
+locations. When that judgement covers a stopped session, `service upgrade` or a
+rollback stops with `service_manager_variables_unread` before any effect; make
+the manager readable and rerun, or pass `--accept-runtime-loss` to accept that a
+session judged that way may lose its recovery. Without stopped sessions the
+upgrade proceeds with the warning.
+
 Sessions whose runtime has ended but that keep native resume or fork are judged
 by the same rules and listed under stopped sessions (`stopped_sessions` in the
 `--json` report, and a `stopped` section in the text output). A stopped session

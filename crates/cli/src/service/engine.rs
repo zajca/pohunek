@@ -165,6 +165,7 @@ use pohunek_platform::process::{HostInspector, Pid, ProcessInspector};
 use pohunek_platform::supervisor::{
     self, JobDefinition, Namespace, ServiceObservation, ServiceState, WorkerKey,
 };
+use pohunek_service_config::preflight::PreflightReport;
 use pohunek_service_config::runtimes::EnsureReport;
 use pohunek_service_config::{ServiceConfig, UpgradeSource, SCHEMA_VERSION};
 use protocol::SessionInfo;
@@ -807,6 +808,7 @@ impl<'a> Engine<'a> {
         )
         .await
         .map_err(|error| error.with_warnings(&warnings))?;
+        require_manager_variables(&job, &gated.report, self.accept_runtime_loss)?;
         Ok((Some(gated), Some(job)))
     }
 
@@ -1116,7 +1118,15 @@ impl<'a> Engine<'a> {
                 )
                 .await
                 {
-                    Ok(gated) => late.gated = Some(gated),
+                    Ok(gated) => {
+                        if let Err(error) =
+                            require_manager_variables(&job, &gated.report, self.accept_runtime_loss)
+                        {
+                            late.refused = true;
+                            return Err(error);
+                        }
+                        late.gated = Some(gated);
+                    }
                     Err(error) => {
                         late.refused = true;
                         return Err(error.with_warnings(&warnings));
@@ -1124,7 +1134,7 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        self.run_runtimes(record, layout, late, &job.value, &job.variables, &warnings)
+        self.run_runtimes(record, layout, late, &job, &warnings)
             .await?;
         self.checkpoint(Step::Runtimes)?;
         if replaces_daemon(record.step) {
@@ -1261,7 +1271,15 @@ impl<'a> Engine<'a> {
             )
             .await
             {
-                Ok(gated) => late.gated = Some(gated),
+                Ok(gated) => {
+                    if let Err(error) =
+                        require_manager_variables(&job, &gated.report, self.accept_runtime_loss)
+                    {
+                        late.refused = true;
+                        return Err(error);
+                    }
+                    late.gated = Some(gated);
+                }
                 Err(error) => {
                     late.refused = true;
                     // Nothing stopped or written yet; the record rolls
@@ -1299,13 +1317,13 @@ impl<'a> Engine<'a> {
         record: &mut Record,
         layout: &InstallLayout,
         late: &mut LateGate,
-        search_path: &str,
-        variables: &BTreeMap<String, String>,
+        job: &JobPath,
         warnings: &[String],
     ) -> Result<(), Error> {
         if record.step >= Step::Runtimes {
             return Ok(());
         }
+        let search_path = job.value.as_str();
         let dir = layout
             .version_dir(&record.version)
             .ok_or_else(|| Error::Record {
@@ -1349,21 +1367,21 @@ impl<'a> Engine<'a> {
             // release judges the live sessions again, with the same decision as
             // the late gate. A refusal or a preflight that cannot run fails this
             // step, which rolls the apply back.
-            late.gated = Some(
-                preflight::gate_upgrade(
-                    &*self.preflight,
-                    self.context,
-                    &dir,
-                    self.reported(&record.version),
-                    search_path,
-                    variables,
-                    // The apply has run, so the installed packages are the plan's result.
-                    preflight::ReleasePlan::Omitted,
-                    self.accept_runtime_loss,
-                )
-                .await
-                .map_err(|error| error.with_warnings(warnings))?,
-            );
+            let gated = preflight::gate_upgrade(
+                &*self.preflight,
+                self.context,
+                &dir,
+                self.reported(&record.version),
+                search_path,
+                &job.variables,
+                // The apply has run, so the installed packages are the plan's result.
+                preflight::ReleasePlan::Omitted,
+                self.accept_runtime_loss,
+            )
+            .await
+            .map_err(|error| error.with_warnings(warnings))?;
+            require_manager_variables(job, &gated.report, self.accept_runtime_loss)?;
+            late.gated = Some(gated);
         }
         self.advance(record, Step::Runtimes)
     }
@@ -1651,6 +1669,7 @@ impl<'a> Engine<'a> {
         )
         .await
         .map_err(|error| error.with_warnings(&warnings))?;
+        require_manager_variables(&job, &gated.report, self.accept_runtime_loss)?;
         gated.warnings = warnings;
         Ok(gated)
     }
@@ -2395,6 +2414,27 @@ pub(crate) fn job_warnings(context: &Context, job: &JobPath) -> Vec<String> {
     warnings
 }
 
+/// Refuses a transaction gate's judgement that ran without the service
+/// manager's variables and judged a stopped session, unless runtime loss is
+/// accepted. Only a stopped session's native reference check reads a store
+/// location those variables can move; judged at the default location, it may
+/// pass a session that loses its recovery, or call a lost one unchanged. A
+/// judgement without stopped sessions does not depend on the variables.
+pub(crate) fn require_manager_variables(
+    job: &JobPath,
+    report: &PreflightReport,
+    accept_runtime_loss: bool,
+) -> Result<(), Error> {
+    match &job.manager_unreachable {
+        Some(detail) if !accept_runtime_loss && !report.stopped_sessions.is_empty() => {
+            Err(Error::ManagerVariablesUnread {
+                detail: detail.clone(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The warning of a launchd `PATH` that was persisted: the job is not loaded and
 /// the transaction journal holds no launchd default. Only a transaction can have one.
 #[cfg(target_os = "macos")]
@@ -2792,6 +2832,14 @@ impl std::fmt::Debug for JobPath {
     }
 }
 
+/// What makes the service manager's environment readable on this platform.
+#[cfg(target_os = "macos")]
+const MANAGER_REMEDY: &str =
+    "Log the user in to a GUI session, so launchd has its gui/<uid> domain";
+/// What makes the service manager's environment readable on this platform.
+#[cfg(not(target_os = "macos"))]
+const MANAGER_REMEDY: &str = "Start the user's service manager or make its bus reachable";
+
 /// The warning a judgement of a recorded-`PATH` job carries when no service
 /// manager is reachable. The verdicts may err in either direction, so the text
 /// says which way and what the operator does before relying on them.
@@ -2800,7 +2848,7 @@ fn manager_warnings(job: &JobPath) -> Vec<String> {
         return Vec::new();
     };
     let warning = format!(
-        "the service manager's environment was not read ({detail}), so the store variables it may set, such as CLAUDE_CONFIG_DIR, are not applied: native references are judged at the default store locations. A conversation stored under a variable-set location may be reported missing (already_not_resumable or would_lose_recovery), and a conversation present only at the default location may be reported adoptable. Start the user's service manager or make its bus reachable, then run the check again before relying on the verdicts."
+        "the service manager's environment was not read ({detail}), so the store variables it may set, such as CLAUDE_CONFIG_DIR, are not applied: native references are judged at the default store locations. A conversation stored under a variable-set location may be reported missing (already_not_resumable or would_lose_recovery), and a conversation present only at the default location may be reported adoptable. {MANAGER_REMEDY}, then run the check again before relying on the verdicts. An upgrade or rollback refuses such a judgement of a stopped session unless --accept-runtime-loss is given."
     );
     tracing::warn!(detail = %detail, "{warning}");
     vec![warning]
