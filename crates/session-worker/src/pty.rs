@@ -1438,8 +1438,8 @@ impl OutputPause {
     fn new(tty_name: &Path) -> Result<Self, PtyError> {
         let tty = open(
             tty_name,
-            // Non-blocking so the held-echo write never waits for another
-            // writer's hold on the terminal.
+            // Non-blocking so the held-echo write never waits on the
+            // caller's thread for a child's write that holds the terminal.
             OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC | OFlags::NONBLOCK,
             Mode::empty(),
         )
@@ -1467,11 +1467,12 @@ impl OutputPause {
 /// the child itself reads or writes. A zero-length write flushes the pending
 /// echo without sending a byte, and emits nothing when no echo is pending.
 ///
-/// Two outcomes are expected and logged at debug: `EAGAIN`, when a child's
-/// write holds the terminal and its next write flushes the echo, and `EIO`,
-/// when the terminal is hung up and no echo is awaited. Any other failure
-/// leaves only that echo held, so it is reported rather than failing the
-/// resumed operation.
+/// Two outcomes are expected and logged at debug. `EAGAIN` means a child's
+/// write holds the terminal; that write emits the held echo as it continues
+/// (`echo_held_behind_a_childs_last_write_follows_that_write`). `EIO` means
+/// the terminal is hung up and no echo is awaited. Any other failure leaves
+/// only that echo held, so it is reported rather than failing the resumed
+/// operation.
 fn release_held_echo(tty: &OwnedFd) {
     match rustix::io::write(tty, &[]) {
         Ok(_) => {}
@@ -1481,7 +1482,7 @@ fn release_held_echo(tty: &OwnedFd) {
                 Level::DEBUG,
                 error.type = "io",
                 error.code = error.raw_os_error(),
-                "PTY echo held during an output pause is left to the terminal's next write",
+                "PTY echo held during an output pause is left to the terminal's writer",
             );
         }
         Err(error) => {
@@ -2023,8 +2024,10 @@ mod tests {
     /// Bounds each signal of the held-echo scenarios. Every wait ends on an
     /// explicit terminal signal; expiry means the signal never came.
     const HELD_ECHO_DEADLINE: Duration = Duration::from_secs(5);
-    /// Avoids busy-spinning while the line discipline accepts paused input.
-    const HELD_ECHO_POLL: Duration = Duration::from_millis(10);
+    /// One child write larger than the PTY's output buffering, so it blocks on
+    /// suspended output while it holds the terminal.
+    #[cfg(target_os = "linux")]
+    const HOLDING_WRITE_BYTES: usize = 100_000;
     /// A complete line, so the terminal reports it readable once accepted.
     const PAUSED_INPUT: &[u8] = b"echo-during-pause\n";
 
@@ -3332,6 +3335,20 @@ mod tests {
         .unwrap_or_else(|_elapsed| panic!("{what} within the deadline: {observed:?}"));
     }
 
+    /// Waits until the line discipline has accepted the whole of
+    /// [`PAUSED_INPUT`], and so has echoed it during the pause.
+    async fn await_paused_input_accepted(pause: &super::OutputPause) {
+        let tty = &pause.tty;
+        pohunek_test_support::wait::wait_until(
+            "the line discipline accepts the paused input",
+            || async move {
+                (rustix::io::ioctl_fionread(tty).expect("FIONREAD") >= PAUSED_INPUT.len() as u64)
+                    .then_some(())
+            },
+        )
+        .await;
+    }
+
     /// Starts a child that never reads its terminal, pauses the terminal's
     /// output, and writes [`PAUSED_INPUT`]. Returns once the line discipline
     /// has accepted the whole line, and so has echoed it during the pause.
@@ -3357,21 +3374,61 @@ mod tests {
         .await
         .expect("input deadline")
         .expect("the terminal accepts the paused input");
-        tokio::time::timeout(HELD_ECHO_DEADLINE, async {
-            while rustix::io::ioctl_fionread(&pause.tty).expect("FIONREAD")
-                < PAUSED_INPUT.len() as u64
-            {
-                tokio::time::sleep(HELD_ECHO_POLL).await;
-            }
-        })
-        .await
-        .expect("the line discipline accepts the paused input");
+        await_paused_input_accepted(&pause).await;
         (pty, output, pause, cwd)
     }
 
     #[tokio::test]
     async fn echo_of_input_accepted_during_an_output_pause_follows_its_resume() {
         let (pty, mut output, pause, _cwd) = pause_with_accepted_input().await;
+        pause.resume().expect("resume output");
+        await_marker(&mut output, PAUSED_INPUT.trim_ascii_end(), "the held echo").await;
+        let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
+    }
+
+    /// A child write holds the terminal through the pause and is the child's
+    /// last, so the resume's zero-length write is refused; the held echo
+    /// still reaches the master as that write continues.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn echo_held_behind_a_childs_last_write_follows_that_write() {
+        let cwd = crate::test_support::child_cwd();
+        let gate = cwd.path().join("gate");
+        let script = format!(
+            "printf ready; while [ ! -e '{}' ]; do sleep 0.05; done; \
+             dd if=/dev/zero bs={HOLDING_WRITE_BYTES} count=1 2>/dev/null; exec sleep 3600",
+            gate.display()
+        );
+        let pty = spawn(shell(&script, cwd.path()));
+        let mut output = pty.subscribe_output(None).expect("subscribe");
+        await_marker(&mut output, b"ready", "the child's readiness").await;
+
+        let pause = super::OutputPause::new(&pty.tty_name).expect("pause output");
+        std::fs::File::create(&gate).expect("release the child's write");
+        // The child's single write blocks on the suspended output while it
+        // holds the terminal, so a non-blocking write is refused meanwhile.
+        // Output stays suspended until the resume, so that write cannot end
+        // before it, and the resume's own write is refused the same way.
+        let tty = &pause.tty;
+        pohunek_test_support::wait::wait_until(
+            "the child's write holds the terminal",
+            || async move {
+                (rustix::io::write(tty, &[]) == Err(rustix::io::Errno::AGAIN)).then_some(())
+            },
+        )
+        .await;
+        tokio::time::timeout(
+            HELD_ECHO_DEADLINE,
+            pty.input().execute_stream(vec![InputFragment {
+                bytes: PAUSED_INPUT.to_vec(),
+                delay_after: Duration::ZERO,
+            }]),
+        )
+        .await
+        .expect("input deadline")
+        .expect("the terminal accepts the paused input");
+        await_paused_input_accepted(&pause).await;
+
         pause.resume().expect("resume output");
         await_marker(&mut output, PAUSED_INPUT.trim_ascii_end(), "the held echo").await;
         let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
