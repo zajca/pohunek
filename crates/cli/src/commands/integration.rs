@@ -715,7 +715,8 @@ pub struct IntegrationEnv {
 /// Reinstalls the integrations an upgrade listed, after the new daemon is ready.
 ///
 /// Each runtime's daemon-backed hook goes through `integration.install`.
-/// Hermes is reinstalled only in homes that carry the pohunek ownership
+/// With a `hermes_search_path`, Hermes is reinstalled with the `hermes`
+/// executable found on it, only in homes that carry the pohunek ownership
 /// marker: the default home and its named profiles are the candidates, and a
 /// home without the marker is reported as a gap with the command that installs
 /// it, because nothing is written into a home this installation does not own.
@@ -724,14 +725,14 @@ pub struct IntegrationEnv {
 pub(crate) async fn reinstall_after_upgrade(
     env: &IntegrationEnv,
     actions: &[IntegrationAction],
-    hermes: bool,
+    hermes_search_path: Option<&OsStr>,
 ) -> Vec<IntegrationReinstall> {
     let mut results = Vec::new();
     for action in actions {
         results.push(reinstall_runtime(&env.paths, action).await);
     }
-    if hermes {
-        results.extend(reinstall_hermes_homes(env));
+    if let Some(search_path) = hermes_search_path {
+        results.extend(reinstall_hermes_homes(env, search_path));
     }
     results
 }
@@ -874,8 +875,9 @@ fn hermes_homes(env: &IntegrationEnv) -> HermesHomes {
     }
 }
 
-/// Plans the Hermes reinstall of every home below `env`, as the upgrade does.
-fn reinstall_hermes_homes(env: &IntegrationEnv) -> Vec<IntegrationReinstall> {
+/// Plans the Hermes reinstall of every home below `env`, as the upgrade does,
+/// and updates each marked home with the `hermes` found on `search_path`.
+fn reinstall_hermes_homes(env: &IntegrationEnv, search_path: &OsStr) -> Vec<IntegrationReinstall> {
     let found = hermes_homes(env);
     let Some(home) = found.home else {
         return found.failures;
@@ -892,9 +894,7 @@ fn reinstall_hermes_homes(env: &IntegrationEnv) -> Vec<IntegrationReinstall> {
                 &env.state_dir,
             ) {
                 HermesPlan::Done(result) => result,
-                HermesPlan::Update(update) => {
-                    execute_hermes_update(&update, &plugins, env::var_os("PATH").as_deref())
-                }
+                HermesPlan::Update(update) => execute_hermes_update(&update, &plugins, search_path),
             },
         ),
     );
@@ -958,7 +958,7 @@ pub(crate) fn reinstall_previewed_hermes_homes(
                 }
                 HermesPlan::Done(result) => result,
                 HermesPlan::Update(update) if shown.status == HERMES_UPDATE => {
-                    execute_hermes_update(&update, &plugins, Some(search_path))
+                    execute_hermes_update(&update, &plugins, search_path)
                 }
                 HermesPlan::Update(update) if shown.status == HERMES_CURRENT => {
                     if hermes_home_is_current(&update, &plugins, search_path) {
@@ -1155,17 +1155,14 @@ pub(crate) fn plan_hermes_home(
 fn execute_hermes_update(
     update: &HermesUpdate,
     plugins: &Path,
-    search_path: Option<&OsStr>,
+    search_path: &OsStr,
 ) -> IntegrationReinstall {
     let failed = |detail: String| IntegrationReinstall {
         integration: update.integration.clone(),
         status: "failed",
         detail: Some(detail),
     };
-    let executable = match search_path
-        .ok_or_else(|| hermes_error(HermesError::InvalidHermesExecutable))
-        .and_then(resolve_hermes_from_path)
-    {
+    let executable = match resolve_hermes_from_path(search_path) {
         Ok(executable) => executable,
         Err(error) => return failed(error.to_string()),
     };

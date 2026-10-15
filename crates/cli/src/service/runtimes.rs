@@ -9,6 +9,7 @@
 
 // Rust guideline compliant 2026-10-14
 
+use std::ffi::OsStr;
 use std::fmt::Debug;
 use std::future::Future;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -67,11 +68,13 @@ const STATE_DIR_MODE: u32 = 0o700;
 /// Reinstalls the integration hooks a release lists, once its daemon serves.
 pub trait IntegrationStep: Debug + Send + Sync {
     /// Returns one outcome per listed hook home, and the Hermes plugin
-    /// outcomes, all resolved in `env`.
+    /// outcomes, all resolved in `env`. The Hermes plugin is updated with the
+    /// `hermes` executable found on `search_path`, the daemon job's `PATH`.
     fn reinstall<'a>(
         &'a self,
         env: &'a IntegrationEnv,
         actions: &'a [IntegrationAction],
+        search_path: &'a str,
     ) -> Pin<Box<dyn Future<Output = Vec<IntegrationReinstall>> + Send + 'a>>;
 }
 
@@ -84,9 +87,12 @@ impl IntegrationStep for CliIntegrations {
         &'a self,
         env: &'a IntegrationEnv,
         actions: &'a [IntegrationAction],
+        search_path: &'a str,
     ) -> Pin<Box<dyn Future<Output = Vec<IntegrationReinstall>> + Send + 'a>> {
         Box::pin(crate::commands::integration::reinstall_after_upgrade(
-            env, actions, true,
+            env,
+            actions,
+            Some(OsStr::new(search_path)),
         ))
     }
 }
