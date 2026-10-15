@@ -2856,7 +2856,21 @@ impl SessionRegistry {
             .clone();
         if let Some(gate) = gate {
             gate.entered.notify_one();
-            gate.release.notified().await;
+            // Registered before the hold is re-read, so a release that follows
+            // a disarm either wakes this wait or finds the hold already gone.
+            let released = gate.release.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if self
+                .inner
+                .report_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+            {
+                return;
+            }
+            released.await;
         }
     }
 
