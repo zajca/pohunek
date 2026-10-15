@@ -40,6 +40,15 @@ const WS_UNSUPPORTED_DATA = 1003;
 const HTTP_NOT_FOUND = 404;
 const HTTP_UPGRADE_REQUIRED = 426;
 const RELAY_SOCKET_TIMEOUT_MS = 5_000;
+// Request timeout of the relay suite's clients. A round trip through the
+// in-process relay takes milliseconds but exceeded 20 ms on a loaded macOS
+// runner (#494); this leaves ample headroom and stays below bun's 5 s test
+// timeout, so a lost reply fails as the client's `request_timeout`.
+const RELAY_REQUEST_TIMEOUT_MS = 2_000;
+// Request timeout of the scenario that asserts the timeout itself; the daemon
+// reply it waits for is delayed past it by `TIMEOUT_REPLY_DELAY_MS`.
+const TIMEOUT_TEST_REQUEST_MS = 20;
+const TIMEOUT_REPLY_DELAY_MS = 60;
 
 interface RelayFixture {
   daemon: MockDaemon;
@@ -138,7 +147,7 @@ describe("WebSocket transport through relay", () => {
   test("oversized daemon reply closes the WebSocket with a framing error", async () => {
     const fixture = await startRelayFixture([{ kind: "oversized" }]);
     try {
-      const client = await fixture.client(200);
+      const client = await fixture.client();
 
       const error = await expectClientError(client.call("daemon.health", null));
 
@@ -174,12 +183,12 @@ describe("WebSocket transport through relay", () => {
     const fixture = await startRelayFixture([
       {
         kind: "delay",
-        ms: 60,
+        ms: TIMEOUT_REPLY_DELAY_MS,
         line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), { status: "ok" }),
       },
     ]);
     try {
-      const client = await fixture.client();
+      const client = await fixture.client(TIMEOUT_TEST_REQUEST_MS);
 
       const firstError = await expectClientError(client.call("daemon.health", null));
       expect(firstError.toProtocolError().class).toBe("transport");
@@ -509,7 +518,7 @@ async function startRelayFixture(steps: Parameters<typeof startUnixDaemon>[0]): 
     return {
       daemon,
       relay,
-      client: (requestTimeoutMs = 20): Promise<Client> => Client.connectWs(relay.url, RELAY_HOST, { requestTimeoutMs }),
+      client: (requestTimeoutMs = RELAY_REQUEST_TIMEOUT_MS): Promise<Client> => Client.connectWs(relay.url, RELAY_HOST, { requestTimeoutMs }),
       raw: (): Promise<RawStream> => connectRawWs(relay.url, RELAY_HOST),
       attach: (streamId: string): Promise<RawStream> => attachRawWs(relay.url, RELAY_HOST, streamId),
       close: async (): Promise<void> => {
