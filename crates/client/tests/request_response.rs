@@ -659,6 +659,106 @@ async fn direct_request_timeout_assignment_bounds_session_creation_with_input() 
     inhibitor.release().await;
 }
 
+/// Daemon-side duration of a creation the fixture answers: a slow create hook,
+/// far above the client's 5 s default request timeout.
+const SLOW_CREATION: Duration = Duration::from_mins(6);
+
+#[tokio::test(start_paused = true)]
+async fn session_creation_without_input_outlasts_the_default_request_timeout() {
+    let inhibitor = AutoAdvanceInhibitor::new();
+    let socket_file = SocketFile::new();
+    let listener = UnixListener::bind(socket_file.path()).expect("bind fixture daemon");
+    let (request_tx, request_rx) = oneshot::channel();
+    let (reply_tx, reply_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (primary, _) = listener.accept().await.expect("accept primary connection");
+        let mut primary = BufReader::new(primary);
+        let mut health_line = String::new();
+        primary
+            .read_line(&mut health_line)
+            .await
+            .expect("read health request");
+        let health: Request =
+            serde_json::from_str(trim_line_end(&health_line)).expect("parse health request");
+        write_health_reply(primary.get_mut(), health.id()).await;
+
+        // The creation may arrive on a dedicated connection or on the primary
+        // one; the test asserts which.
+        let mut create_line = String::new();
+        let (mut stream, dedicated) = tokio::select! {
+            accepted = listener.accept() => {
+                let (dedicated, _) = accepted.expect("accept creation connection");
+                let mut dedicated = BufReader::new(dedicated);
+                dedicated
+                    .read_line(&mut create_line)
+                    .await
+                    .expect("read creation request");
+                (dedicated, true)
+            }
+            read = primary.read_line(&mut create_line) => {
+                read.expect("read creation request");
+                (primary, false)
+            }
+        };
+        let create: Request =
+            serde_json::from_str(trim_line_end(&create_line)).expect("parse creation request");
+        let create_id = create.id().to_owned();
+        request_tx
+            .send((create, dedicated))
+            .expect("report creation request");
+        reply_rx
+            .await
+            .expect("the test releases the creation reply");
+        let response = Response::err(
+            protocol::PROTOCOL_VERSION,
+            create_id,
+            ProtocolError::new(
+                ErrorClass::Runtime,
+                "fixture_create_finished",
+                "the fixture daemon finished the creation",
+                None,
+            ),
+        )
+        .expect("create fixture response");
+        // The client may have given up already; the reply is best effort.
+        let _ = stream
+            .get_mut()
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&response).expect("response JSON")
+                )
+                .as_bytes(),
+            )
+            .await;
+    });
+
+    let mut client = Client::connect_local_with_options(socket_file.path(), no_origin_options())
+        .await
+        .expect("connect fixture daemon");
+    client.handshake().await.expect("negotiate protocol");
+    let params = serde_json::from_value(json!({"agent": "shell", "cols": 80, "rows": 24}))
+        .expect("valid creation parameters");
+    let creation = tokio::spawn(async move { client.session_new(params).await });
+    let (request, dedicated) = request_rx.await.expect("creation request reached daemon");
+    assert_eq!(request.method(), protocol::method::SESSION_NEW);
+    assert!(request.params().get("extended_input_ready_wait").is_none());
+    tokio::time::advance(SLOW_CREATION).await;
+    reply_tx.send(()).expect("release the creation reply");
+
+    let error = creation
+        .await
+        .expect("creation task completed")
+        .expect_err("the fixture daemon reports a typed error");
+    assert!(
+        matches!(&error, ClientError::Protocol(source) if source.code == "fixture_create_finished"),
+        "the client waits for the daemon's reply instead of timing out: {error:?}"
+    );
+    assert!(dedicated, "the creation runs on a dedicated connection");
+    server.await.expect("fixture daemon completed");
+    inhibitor.release().await;
+}
+
 /// Daemon-side duration of each turn wait the fixture answers, far above the
 /// client's 5 s default request timeout and the 30 min default ceiling.
 const TURN_WAIT_FIXTURE_DELAY: Duration = Duration::from_mins(45);

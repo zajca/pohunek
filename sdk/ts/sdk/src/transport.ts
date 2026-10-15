@@ -34,10 +34,11 @@ export interface Transport {
 
 export const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
-/** Budget for `session.new` with initial input: three 10-minute native service
- * ceilings (worker connection, initialization, reader grace), two 5-minute
- * setup/start hooks, and 20 minutes for the rest of creation. */
-export const SESSION_NEW_INPUT_REQUEST_BUDGET_MS = 60 * 60 * 1_000;
+/** Budget for `session.new`: three 10-minute native service ceilings (worker
+ * connection, initialization and, with initial input, reader grace), the
+ * `pre-create` and `post-create` hooks with a host and a repository layer of
+ * 5 minutes each, and 10 minutes for the rest of creation. */
+export const SESSION_NEW_REQUEST_BUDGET_MS = 60 * 60 * 1_000;
 
 export function resolveConnectOptions(options: ConnectOptions = {}): ResolvedConnectOptions {
   return {

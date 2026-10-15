@@ -16,6 +16,21 @@ configured default, then the repository default. When an explicit base branch
 is not present locally, Pohunek fetches that branch from `origin` before it
 considers falling back to the repository default.
 
+The base branch only applies to a branch the worktree creates. A `--branch`
+that already exists locally is checked out as it is. When `--base-branch` was
+given explicitly and that existing branch is at another commit than the base,
+for example a local pull-request branch behind its `origin` copy, the
+`session.new` result carries a `base_branch_fallback` warning whose `detail`
+names both commits. The warning arrives with the created session, so a caller
+that must not let the agent act on another commit starts the session without
+`--input`, checks `warnings`, and only then sends the prompt with
+`session input`.
+
+A branch the worktree creates from a base has no upstream. The base is fetched
+into a temporary ref, not a remote-tracking branch, and an upstream set to a
+base with another name would make a plain `git push` target the base branch.
+Set one when the branch is first pushed, with `git push -u origin <branch>`.
+
 Worktrees are useful when an agent should make branch-scoped edits without
 touching the main checkout. They also make remote project sessions practical:
 the daemon resolves the project on the target host and creates the worktree in
@@ -68,7 +83,12 @@ the agent, it checks that the launch cwd is still a directory; when the worktree
 was removed after binding, the launch is refused with `session_cwd_missing`,
 nothing is started, and the failed create is compensated as above. The daemon
 logs the bind, each removal with its reason, and a failed or timed-out
-post-create or pre-remove hook at WARN, without the hook's output.
+post-create or pre-remove hook at WARN, without the hook's output. Every hook
+run also logs `hook started` and `hook finished` at INFO with the session id,
+the event, the layer (`host` or `repository`), the script, and its timeout,
+duration (`duration_ms`) and outcome. `session.new` answers only after its
+`pre-create` and `post-create` hooks finished, each layer bounded by 5 minutes,
+so these lines show whether a slow create was waiting on a hook.
 
 A failing `pre-create` or `post-create` hook leaves a `hook` warning on the
 session. In the `session.new` result its `detail` also carries the last

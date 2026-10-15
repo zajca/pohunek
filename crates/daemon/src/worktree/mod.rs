@@ -540,6 +540,16 @@ impl WorktreeManager {
             .map(StoreMutation::into_value)
             .map_err(|err| store_error("persist worktree binding", &err))?;
         let added = Self::create_worktree(&repository, &path, &req.branch, &start_point);
+        if let Ok(true) = added {
+            Self::warn_ignored_base_branch(
+                &repository,
+                &path,
+                req,
+                &base_branch,
+                &start_point,
+                &mut warnings,
+            );
+        }
         // The new branch holds the commit from here on.
         drop(fetched);
         if let Err(add_error) = added {
@@ -1107,6 +1117,65 @@ impl WorktreeManager {
         Ok(default)
     }
 
+    /// Warns when the worktree at `path` checked out an existing `req.branch`
+    /// at another commit than the explicitly requested base.
+    ///
+    /// An existing branch is checked out as it is, so the worktree holds that
+    /// branch's commit, not the base's. The worktree's own `HEAD` is compared,
+    /// so a pre-create hook that moved the branch is reported as checked out.
+    /// The warning reaches the `session.new` result; a caller that must not let
+    /// the agent act on another commit starts the session without initial
+    /// input and checks it first. A commit that cannot be resolved counts as
+    /// different.
+    fn warn_ignored_base_branch(
+        repository: &Path,
+        path: &Path,
+        req: &WorktreeRequest,
+        base_branch: &str,
+        start_point: &str,
+        warnings: &mut Vec<SessionWarning>,
+    ) {
+        let explicit_base = req
+            .base_branch
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|base| !base.is_empty());
+        if !explicit_base {
+            return;
+        }
+        let branch_commit = git_capture(path, &["rev-parse", "--verify", "HEAD^{commit}"]);
+        // A start point other than the base's name is the fetched commit; the
+        // local base is named by its full ref, so a same-named tag cannot win.
+        let base_rev = if start_point == base_branch {
+            format!("refs/heads/{base_branch}^{{commit}}")
+        } else {
+            format!("{start_point}^{{commit}}")
+        };
+        let base_commit = git_capture(repository, &["rev-parse", "--verify", &base_rev]);
+        if let (Ok(branch_commit), Ok(base_commit)) = (&branch_commit, &base_commit) {
+            if branch_commit == base_commit {
+                return;
+            }
+        }
+        let describe = |resolved: &Result<String, String>| match resolved {
+            Ok(commit) => commit.clone(),
+            Err(message) => format!("unresolved ({message})"),
+        };
+        warnings.push(SessionWarning {
+            kind: SessionWarningKind::BaseBranchFallback,
+            message: format!(
+                "Branch {:?} already exists, so the worktree checks it out as it is and base branch {base_branch:?} was ignored.",
+                req.branch
+            ),
+            detail: Some(format!(
+                "{} is checked out at {}; base branch {base_branch:?} is at {}",
+                req.branch,
+                describe(&branch_commit),
+                describe(&base_commit)
+            )),
+        });
+    }
+
     /// Determine the start-point for a **new** branch: the freshly fetched base
     /// when a fetch from `origin` succeeds, else the local `base_branch` (with a
     /// non-fatal `fetch` warning on failure). A fetch is only attempted when an
@@ -1142,13 +1211,13 @@ impl WorktreeManager {
     }
 
     /// Run `git worktree add`, checking out an existing branch or creating a new
-    /// one from the base ref.
+    /// one from the base ref. Returns whether it checked out an existing branch.
     fn create_worktree(
         repository: &Path,
         path: &Path,
         branch: &str,
         start_point: &str,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<bool, ProtocolError> {
         let exists = matches!(branch_exists(repository, branch), Ok(true));
         let result = if exists {
             // The branch already exists (e.g. a recreate after the dir was lost):
@@ -1157,7 +1226,7 @@ impl WorktreeManager {
         } else {
             worktree_add_new(repository, path, branch, start_point)
         };
-        result.map_err(|message| {
+        result.map(|()| exists).map_err(|message| {
             // Git allows only one worktree per branch: a concurrent or prior
             // session already holding this branch fails with "already checked
             // out"/"already used by worktree". Surface that as a clear typed
@@ -1873,28 +1942,147 @@ pub(crate) fn run_hook(
     if let Some(config_dir) = config_dir {
         let host_script = config_dir.join("hooks").join(event.as_env());
         if host_script.is_file() {
-            run_one_hook(
-                event,
-                &host_script,
-                cwd,
-                &env,
-                timeout,
+            run_timed_hook(
+                &HookRun {
+                    event,
+                    layer: HookLayer::Host,
+                    session_id: &ctx.session_id,
+                    script: &host_script,
+                    cwd,
+                    env: &env,
+                    timeout,
+                },
                 warnings,
                 stderr_tails.as_mut(),
             );
         }
     }
     if let Some(in_repo_script) = resolve_in_repo_hook(event, in_repo_dir) {
-        run_one_hook(
-            event,
-            &in_repo_script,
-            cwd,
-            &env,
-            timeout,
+        run_timed_hook(
+            &HookRun {
+                event,
+                layer: HookLayer::Repository,
+                session_id: &ctx.session_id,
+                script: &in_repo_script,
+                cwd,
+                env: &env,
+                timeout,
+            },
             warnings,
             stderr_tails.as_mut(),
         );
     }
+}
+
+/// Records a hook that could not be spawned as a non-fatal `Hook` warning.
+fn hook_not_spawned(
+    event: HookEvent,
+    script: &Path,
+    err: &dyn std::fmt::Display,
+    warnings: &mut Vec<SessionWarning>,
+) -> HookRunOutcome {
+    warn!(
+        script = %script.display(),
+        error = %err,
+        event = event.as_env(),
+        "hook could not be spawned"
+    );
+    warnings.push(hook_warning(
+        event,
+        format!("failed to spawn {}: {err}", script.display()),
+    ));
+    HookRunOutcome::NotSpawned
+}
+
+/// How one hook script run ended, as the daemon log reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookRunOutcome {
+    Succeeded,
+    Failed,
+    TimedOut,
+    WaitFailed,
+    NotSpawned,
+}
+
+impl HookRunOutcome {
+    fn of(outcome: &SetupOutcome) -> Self {
+        match outcome {
+            SetupOutcome::Exited(status) if status.success() => Self::Succeeded,
+            SetupOutcome::Exited(_) => Self::Failed,
+            SetupOutcome::TimedOut => Self::TimedOut,
+            SetupOutcome::WaitError(_) => Self::WaitFailed,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::WaitFailed => "wait_failed",
+            Self::NotSpawned => "not_spawned",
+        }
+    }
+}
+
+/// Which configuration layer a hook script comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookLayer {
+    /// `<config_dir>/hooks/`, shared by every project on the host.
+    Host,
+    /// The repository's own hook.
+    Repository,
+}
+
+impl HookLayer {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Repository => "repository",
+        }
+    }
+}
+
+/// One hook script run and what identifies it in the daemon log.
+#[derive(Debug, Clone, Copy)]
+struct HookRun<'a> {
+    event: HookEvent,
+    layer: HookLayer,
+    session_id: &'a str,
+    script: &'a Path,
+    cwd: &'a Path,
+    env: &'a [(String, String)],
+    timeout: Duration,
+}
+
+/// [`run_one_hook`], logging when the hook starts and how long it took.
+///
+/// A create waits for its create hooks before `session.new` answers, so these
+/// two lines tell a slow hook apart from a slow or lost create.
+fn run_timed_hook(
+    run: &HookRun<'_>,
+    warnings: &mut Vec<SessionWarning>,
+    stderr_tails: Option<&mut StderrTails<'_>>,
+) {
+    info!(
+        session_id = %run.session_id,
+        event = run.event.as_env(),
+        layer = run.layer.as_str(),
+        script = %run.script.display(),
+        timeout_ms = u64::try_from(run.timeout.as_millis()).unwrap_or(u64::MAX),
+        "hook started"
+    );
+    let started = Instant::now();
+    let outcome = run_one_hook(run, warnings, stderr_tails);
+    info!(
+        session_id = %run.session_id,
+        event = run.event.as_env(),
+        layer = run.layer.as_str(),
+        script = %run.script.display(),
+        duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        outcome = outcome.as_str(),
+        "hook finished"
+    );
 }
 
 impl HookContext {
@@ -1911,29 +2099,21 @@ impl HookContext {
 /// reason, never the hook's output, so it is safe to store and log. A failing
 /// hook's stderr tail goes to `stderr_tails` only.
 fn run_one_hook(
-    event: HookEvent,
-    script: &Path,
-    cwd: &Path,
-    env: &[(String, String)],
-    timeout: Duration,
+    run: &HookRun<'_>,
     warnings: &mut Vec<SessionWarning>,
     stderr_tails: Option<&mut StderrTails<'_>>,
-) {
+) -> HookRunOutcome {
+    let HookRun {
+        event,
+        script,
+        cwd,
+        env,
+        timeout,
+        ..
+    } = *run;
     let interpreter = match crate::agent::trusted_program(SETUP_SCRIPT_INTERPRETER) {
         Ok(interpreter) => interpreter,
-        Err(err) => {
-            warn!(
-                script = %script.display(),
-                error = %err,
-                event = event.as_env(),
-                "hook could not be spawned"
-            );
-            warnings.push(hook_warning(
-                event,
-                format!("failed to spawn {}: {err}", script.display()),
-            ));
-            return;
-        }
+        Err(err) => return hook_not_spawned(event, script, &err, warnings),
     };
     let mut builder = Command::new(interpreter);
     builder
@@ -1956,23 +2136,11 @@ fn run_one_hook(
     drop(builder);
     let mut child = match spawned {
         Ok(child) => child,
-        Err(err) => {
-            warn!(
-                script = %script.display(),
-                error = %err,
-                event = event.as_env(),
-                "hook could not be spawned"
-            );
-            warnings.push(hook_warning(
-                event,
-                format!("failed to spawn {}: {err}", script.display()),
-            ));
-            return;
-        }
+        Err(err) => return hook_not_spawned(event, script, &err, warnings),
     };
 
     let outcome = wait_with_timeout(&mut child, timeout);
-    let failed = !matches!(&outcome, SetupOutcome::Exited(status) if status.success());
+    let result = HookRunOutcome::of(&outcome);
     match outcome {
         SetupOutcome::Exited(status) if status.success() => {}
         SetupOutcome::Exited(status) => {
@@ -2017,6 +2185,7 @@ fn run_one_hook(
         }
     }
     // A successful hook's stderr is dropped with the capture, without waiting.
+    let failed = result != HookRunOutcome::Succeeded;
     if let (true, Some(capture), Some(tails)) = (failed, capture, stderr_tails) {
         if let Some(text) = capture.finish().and_then(|tail| tail.render()) {
             tails.tails.push(HookStderrTail {
@@ -2025,6 +2194,7 @@ fn run_one_hook(
             });
         }
     }
+    result
 }
 
 /// Points the hook's stderr at a new capture when `tails` asks for one, else at

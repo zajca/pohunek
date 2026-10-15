@@ -614,7 +614,13 @@ pub(crate) async fn run_new(
     };
     let result = client
         .call::<method::SessionNew>(new_params(&args)?)
-        .await?;
+        .await
+        .map_err(|error| match error {
+            CliError::Client(source @ pohunek_client::ClientError::RequestTimeout { .. }) => {
+                CliError::SessionNewOutcomeUnknown(source)
+            }
+            other => other,
+        })?;
     let info = &result.session;
 
     // We asked the daemon to inject an initial prompt but it did not confirm

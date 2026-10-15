@@ -2374,8 +2374,10 @@ pub enum SessionWarningKind {
     /// A `git fetch` from the configured remote failed; the worktree was bound
     /// from the local base ref instead, which may be out of date.
     Fetch,
-    /// The requested base branch did not exist; the worktree was bound from the
-    /// repository's default branch instead.
+    /// The requested base branch was not used: it did not exist and the
+    /// worktree was bound from the repository's default branch, or the
+    /// session's branch already existed locally at another commit and was
+    /// checked out as it is. The `message` says which.
     BaseBranchFallback,
     /// The repository setup script failed; the worktree was kept without it.
     SetupScript,

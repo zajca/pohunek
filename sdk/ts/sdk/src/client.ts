@@ -30,7 +30,7 @@ import { decodeHostGovernanceInspect } from "./governance";
 import { hasValidWireOrigin, type RequestOrigin } from "./origin";
 import { Subscription } from "./subscription";
 import type { ConnectOptions, ControlChannel, ResolvedConnectOptions, Transport } from "./transport";
-import { resolveConnectOptions, SESSION_NEW_INPUT_REQUEST_BUDGET_MS } from "./transport";
+import { resolveConnectOptions, SESSION_NEW_REQUEST_BUDGET_MS } from "./transport";
 import { WsTransport } from "./transport-ws";
 
 // A 128-bit prefix keeps independently started SDK clients collision-resistant.
@@ -97,11 +97,12 @@ export class Client {
     method: K,
     params: Methods[K]["params"],
   ): Promise<Methods[K]["output"]> {
-    if (method === "session.new" && hasInitialInput(params)) {
+    if (method === "session.new") {
+      const creation = params as SessionNewParams;
       return this.callDedicated(
         "session.new",
-        { ...(params as SessionNewParams), extended_input_ready_wait: true },
-        SESSION_NEW_INPUT_REQUEST_BUDGET_MS,
+        hasInitialInput(creation) ? { ...creation, extended_input_ready_wait: true } : creation,
+        SESSION_NEW_REQUEST_BUDGET_MS,
       );
     }
     if (method === "session.input" && isWaitingSessionInput(params)) {
