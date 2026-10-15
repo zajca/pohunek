@@ -251,6 +251,7 @@ pub struct PtyOwner {
     output_reader: Arc<Mutex<Box<dyn Read + Send>>>,
     output_readiness: Arc<OutputReadiness>,
     tty_name: Arc<PathBuf>,
+    held_echo: Arc<HeldEchoRelease>,
     input: WriteCoordinator,
     resize: Arc<AsyncMutex<ResizeState>>,
     cleanup: Arc<AsyncMutex<CleanupState>>,
@@ -636,6 +637,7 @@ impl PtyOwner {
             output_reader,
             output_readiness,
             tty_name,
+            held_echo: Arc::new(HeldEchoRelease::default()),
             input,
             resize: Arc::new(AsyncMutex::new(ResizeState {
                 cols: command.cols,
@@ -709,11 +711,12 @@ impl PtyOwner {
         let output_reader = Arc::clone(&self.output_reader);
         let output_readiness = Arc::clone(&self.output_readiness);
         let tty_name = Arc::clone(&self.tty_name);
+        let held_echo = Arc::clone(&self.held_echo);
         let output_pause = tokio::task::spawn_blocking(move || {
             // Stop the producer before contending for the ordering gate. This
             // makes the remaining queue finite even when the reader repeatedly
             // drains batches from an otherwise unbounded producer.
-            let output_pause = OutputPause::new(&tty_name)?;
+            let output_pause = OutputPause::new(&tty_name, held_echo)?;
             let _order = output_order
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -785,11 +788,12 @@ impl PtyOwner {
         let output_reader = Arc::clone(&self.output_reader);
         let output_readiness = Arc::clone(&self.output_readiness);
         let tty_name = Arc::clone(&self.tty_name);
+        let held_echo = Arc::clone(&self.held_echo);
         let (output_pause, subscriber) = tokio::task::spawn_blocking(move || {
             // Stop the producer before contending for the ordering gate. This
             // makes the remaining queue finite even when the reader repeatedly
             // drains batches from an otherwise unbounded producer.
-            let output_pause = OutputPause::new(&tty_name)?;
+            let output_pause = OutputPause::new(&tty_name, held_echo)?;
             let _order = output_order
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1364,6 +1368,8 @@ fn duration_timespec(duration: Duration) -> rustix::event::Timespec {
 #[derive(Debug)]
 struct OutputPause {
     tty: OwnedFd,
+    tty_name: PathBuf,
+    held_echo: Arc<HeldEchoRelease>,
     resumed: bool,
 }
 
@@ -1435,16 +1441,20 @@ fn terminal_output_queue(_tty: &OwnedFd) -> Result<usize, PtyError> {
 }
 
 impl OutputPause {
-    fn new(tty_name: &Path) -> Result<Self, PtyError> {
+    fn new(tty_name: &Path, held_echo: Arc<HeldEchoRelease>) -> Result<Self, PtyError> {
         let tty = open(
             tty_name,
-            OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+            // Non-blocking so the held-echo write never waits on the
+            // caller's thread for a child's write that holds the terminal.
+            OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC | OFlags::NONBLOCK,
             Mode::empty(),
         )
         .map_err(rustix_errno_to_pty_error)?;
         tcflow(&tty, Action::OOff).map_err(rustix_errno_to_pty_error)?;
         Ok(Self {
             tty,
+            tty_name: tty_name.to_path_buf(),
+            held_echo,
             resumed: false,
         })
     }
@@ -1452,8 +1462,142 @@ impl OutputPause {
     fn resume(mut self) -> Result<(), PtyError> {
         tcflow(&self.tty, Action::OOn).map_err(rustix_errno_to_pty_error)?;
         self.resumed = true;
+        release_held_echo(&self.tty, &self.tty_name, &self.held_echo);
         Ok(())
     }
+}
+
+/// Emits the echo a terminal held back while its output was suspended.
+///
+/// Linux's line discipline keeps the echo of input it accepts during a pause
+/// in its pending echo buffer, and resuming output does not emit it; the next
+/// write to the terminal does. Without that write the echo would wait until
+/// the child itself reads or writes. A zero-length write flushes the pending
+/// echo without sending a byte, and emits nothing when no echo is pending.
+///
+/// The write does not block the caller. `EAGAIN` means a child's write holds
+/// the terminal. That write processes pending echo only when it began, so
+/// echo accepted while it waited stays held after it ends; `held_echo` then
+/// repeats the zero-length write once the terminal is free. `EIO` means the
+/// terminal is hung up and no echo is awaited. Any other failure leaves only
+/// that echo held, so it is reported rather than failing the resumed
+/// operation.
+fn release_held_echo(tty: &OwnedFd, tty_name: &Path, held_echo: &Arc<HeldEchoRelease>) {
+    match rustix::io::write(tty, &[]) {
+        Ok(_) | Err(rustix::io::Errno::IO) => {}
+        Err(rustix::io::Errno::AGAIN) => held_echo.release_after_writer(tty_name),
+        Err(error) => report_held_echo_failure(error.raw_os_error()),
+    }
+}
+
+/// The deferred releases of one terminal's held echo.
+///
+/// At most one helper thread per terminal waits for the child's write that
+/// holds it. A release requested while that thread is pending makes it write
+/// once more, which covers echo accepted after its own write.
+#[derive(Debug, Default)]
+struct HeldEchoRelease {
+    state: Mutex<HeldEchoState>,
+}
+
+#[derive(Debug, Default)]
+struct HeldEchoState {
+    /// A helper thread is waiting for the terminal or writing to it.
+    helper: bool,
+    /// A release is requested and not yet served by a write.
+    requested: bool,
+}
+
+impl HeldEchoRelease {
+    /// Repeats the zero-length write from a helper thread once the child's
+    /// write that holds the terminal is done.
+    ///
+    /// The blocking descriptor is opened before the thread starts, so the
+    /// terminal stays open for the release even if the child exits right
+    /// after its write. The thread's write waits for that write, which ends
+    /// when the PTY reader drains it or the child is stopped or exits. If the
+    /// descriptor or the thread cannot be had, the pending releases are
+    /// dropped; the failure is reported unless it is `EIO`, a hung-up
+    /// terminal that awaits no echo.
+    fn release_after_writer(self: &Arc<Self>, tty_name: &Path) {
+        if !self.request() {
+            return;
+        }
+        let tty = match open(
+            tty_name,
+            OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(tty) => tty,
+            Err(error) => {
+                self.abandon();
+                if error != rustix::io::Errno::IO {
+                    report_held_echo_failure(error.raw_os_error());
+                }
+                return;
+            }
+        };
+        let release = Arc::clone(self);
+        let spawned = thread::Builder::new()
+            .name("pohunek-worker-pty-echo".to_owned())
+            .spawn(move || release.write_while_requested(&tty));
+        if let Err(error) = spawned {
+            self.abandon();
+            report_held_echo_failure(error.raw_os_error().unwrap_or_default());
+        }
+    }
+
+    /// Writes zero bytes to `tty` for as long as releases are requested.
+    fn write_while_requested(&self, tty: &OwnedFd) {
+        while self.take_request() {
+            match rustix::io::write(tty, &[]) {
+                Ok(_) | Err(rustix::io::Errno::IO) => {}
+                Err(error) => report_held_echo_failure(error.raw_os_error()),
+            }
+        }
+    }
+
+    /// Records a release; returns whether the caller must start the helper.
+    fn request(&self) -> bool {
+        let mut state = self.lock_state();
+        state.requested = true;
+        !std::mem::replace(&mut state.helper, true)
+    }
+
+    /// Takes the pending request for one write, or ends the helper when none
+    /// is pending.
+    fn take_request(&self) -> bool {
+        let mut state = self.lock_state();
+        if std::mem::take(&mut state.requested) {
+            true
+        } else {
+            state.helper = false;
+            false
+        }
+    }
+
+    /// Ends a helper that could not start, dropping the releases it held.
+    fn abandon(&self) {
+        let mut state = self.lock_state();
+        state.helper = false;
+        state.requested = false;
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, HeldEchoState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+fn report_held_echo_failure(code: i32) {
+    event!(
+        name: "worker.pty.held_echo_release.failed",
+        Level::WARN,
+        error.type = "io",
+        error.code = code,
+        "PTY echo held during an output pause was not released",
+    );
 }
 
 impl Drop for OutputPause {
@@ -1467,6 +1611,8 @@ impl Drop for OutputPause {
                     error.code = error.raw_os_error(),
                     "Last-resort PTY output resume failed; output may remain paused",
                 );
+            } else {
+                release_held_echo(&self.tty, &self.tty_name, &self.held_echo);
             }
         }
     }
@@ -1946,7 +2092,7 @@ mod tests {
         OutputReady, OutputReadyState, PtyError, PtyOwner, ResizeCommit, ResizeState,
         SnapshotDrain, SpawnGuard, StartupLatch, OUTPUT_DRAIN_BATCH_BYTES, READ_CHUNK_BYTES,
     };
-    use crate::{InputFragment, InputPlan, OutputEvent, OutputHub, WorkerConfig};
+    use crate::{InputFragment, InputPlan, OutputEvent, OutputHub, OutputSubscriber, WorkerConfig};
     use pohunek_platform::process::{HostInspector, ProcessInspector};
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::collections::{HashMap, VecDeque};
@@ -1978,6 +2124,11 @@ mod tests {
     const OVERSIZED_INPUT_BYTES: usize = 1024 * 1024;
     /// Bounds each step of the oversized-input round trip.
     const OVERSIZED_INPUT_DEADLINE: Duration = Duration::from_secs(10);
+    /// Bounds each signal of the held-echo scenarios. Every wait ends on an
+    /// explicit terminal signal; expiry means the signal never came.
+    const HELD_ECHO_DEADLINE: Duration = Duration::from_secs(5);
+    /// A complete line, so the terminal reports it readable once accepted.
+    const PAUSED_INPUT: &[u8] = b"echo-during-pause\n";
 
     #[test]
     fn non_reaping_wait_retries_interrupts_without_falling_back_to_reap() {
@@ -2347,7 +2498,8 @@ mod tests {
         await_output(&pty, b"ready").await;
         let before = pty.output().next_offset();
 
-        let pause = super::OutputPause::new(&pty.tty_name).expect("pause output");
+        let pause = super::OutputPause::new(&pty.tty_name, std::sync::Arc::clone(&pty.held_echo))
+            .expect("pause output");
         // Read-write opens of a FIFO never wait for a peer on XNU, and holding
         // both ends keeps the release buffered until the fixture reads it.
         let written = tokio::io::unix::AsyncFd::with_interest(
@@ -3260,6 +3412,183 @@ mod tests {
             .expect("exit deadline")
             .expect("exit");
         assert_eq!(exit.exit_code, Some(0), "the child consumed every byte");
+    }
+
+    /// Reads `output` until it contains `marker`.
+    async fn await_marker(output: &mut OutputSubscriber, marker: &[u8], what: &str) {
+        let mut observed = Vec::new();
+        tokio::time::timeout(HELD_ECHO_DEADLINE, async {
+            while !observed
+                .windows(marker.len())
+                .any(|window| window == marker)
+            {
+                match output.recv().await {
+                    Some(OutputEvent::Replay(chunk) | OutputEvent::Output(chunk)) => {
+                        observed.extend_from_slice(&chunk.bytes);
+                    }
+                    Some(OutputEvent::Gap { .. } | OutputEvent::TerminalSnapshot(_)) => {}
+                    other => panic!("output ended before {what}: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_elapsed| panic!("{what} within the deadline: {observed:?}"));
+    }
+
+    /// Waits until the line discipline has accepted the whole of
+    /// [`PAUSED_INPUT`], and so has echoed it during the pause.
+    async fn await_paused_input_accepted(pause: &super::OutputPause) {
+        let tty = &pause.tty;
+        pohunek_test_support::wait::wait_until(
+            "the line discipline accepts the paused input",
+            || async move {
+                (rustix::io::ioctl_fionread(tty).expect("FIONREAD") >= PAUSED_INPUT.len() as u64)
+                    .then_some(())
+            },
+        )
+        .await;
+    }
+
+    /// Starts a child that never reads its terminal, pauses the terminal's
+    /// output, and writes [`PAUSED_INPUT`]. Returns once the line discipline
+    /// has accepted the whole line, and so has echoed it during the pause.
+    async fn pause_with_accepted_input() -> (
+        PtyOwner,
+        OutputSubscriber,
+        super::OutputPause,
+        tempfile::TempDir,
+    ) {
+        let cwd = crate::test_support::child_cwd();
+        let pty = spawn(shell("printf ready; exec sleep 3600", cwd.path()));
+        let mut output = pty.subscribe_output(None).expect("subscribe");
+        await_marker(&mut output, b"ready", "the child's readiness").await;
+
+        let pause = super::OutputPause::new(&pty.tty_name, std::sync::Arc::clone(&pty.held_echo))
+            .expect("pause output");
+        tokio::time::timeout(
+            HELD_ECHO_DEADLINE,
+            pty.input().execute_stream(vec![InputFragment {
+                bytes: PAUSED_INPUT.to_vec(),
+                delay_after: Duration::ZERO,
+            }]),
+        )
+        .await
+        .expect("input deadline")
+        .expect("the terminal accepts the paused input");
+        await_paused_input_accepted(&pause).await;
+        (pty, output, pause, cwd)
+    }
+
+    #[tokio::test]
+    async fn echo_of_input_accepted_during_an_output_pause_follows_its_resume() {
+        let (pty, mut output, pause, _cwd) = pause_with_accepted_input().await;
+        pause.resume().expect("resume output");
+        await_marker(&mut output, PAUSED_INPUT.trim_ascii_end(), "the held echo").await;
+        let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
+    }
+
+    /// A one-byte child write holds the terminal through the pause and is the
+    /// child's last, so the resume's zero-length write is refused. That write
+    /// processed pending echo only when it began, so the held echo follows
+    /// only from the release once the terminal is free.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn echo_held_behind_a_childs_short_last_write_follows_that_write() {
+        let cwd = crate::test_support::child_cwd();
+        let gate = cwd.path().join("gate");
+        let script = format!(
+            "printf ready; while [ ! -e '{}' ]; do sleep 0.05; done; \
+             printf x; exec sleep 3600",
+            gate.display()
+        );
+        let pty = spawn(shell(&script, cwd.path()));
+        let mut output = pty.subscribe_output(None).expect("subscribe");
+        await_marker(&mut output, b"ready", "the child's readiness").await;
+
+        let pause = super::OutputPause::new(&pty.tty_name, std::sync::Arc::clone(&pty.held_echo))
+            .expect("pause output");
+        std::fs::File::create(&gate).expect("release the child's write");
+        // The child's single write blocks on the suspended output while it
+        // holds the terminal, so a non-blocking write is refused meanwhile.
+        // Output stays suspended until the resume, so that write cannot end
+        // before it, and the resume's own write is refused the same way.
+        let tty = &pause.tty;
+        pohunek_test_support::wait::wait_until(
+            "the child's write holds the terminal",
+            || async move {
+                (rustix::io::write(tty, &[]) == Err(rustix::io::Errno::AGAIN)).then_some(())
+            },
+        )
+        .await;
+        tokio::time::timeout(
+            HELD_ECHO_DEADLINE,
+            pty.input().execute_stream(vec![InputFragment {
+                bytes: PAUSED_INPUT.to_vec(),
+                delay_after: Duration::ZERO,
+            }]),
+        )
+        .await
+        .expect("input deadline")
+        .expect("the terminal accepts the paused input");
+        await_paused_input_accepted(&pause).await;
+
+        pause.resume().expect("resume output");
+        await_marker(&mut output, PAUSED_INPUT.trim_ascii_end(), "the held echo").await;
+        let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn resuming_the_output_of_a_terminal_without_echo_adds_no_output() {
+        let cwd = crate::test_support::child_cwd();
+        let pty = spawn(shell(
+            "stty -echo; printf ready; IFS= read -r line; printf 'got:%s;' \"$line\"; exec sleep 3600",
+            cwd.path(),
+        ));
+        let mut output = pty.subscribe_output(None).expect("subscribe");
+        await_marker(&mut output, b"ready", "the child's readiness").await;
+
+        let pause = super::OutputPause::new(&pty.tty_name, std::sync::Arc::clone(&pty.held_echo))
+            .expect("pause output");
+        tokio::time::timeout(
+            HELD_ECHO_DEADLINE,
+            pty.input().execute_stream(vec![InputFragment {
+                bytes: PAUSED_INPUT.to_vec(),
+                delay_after: Duration::ZERO,
+            }]),
+        )
+        .await
+        .expect("input deadline")
+        .expect("the terminal accepts the paused input");
+        pause.resume().expect("resume output");
+
+        let reply = b"got:echo-during-pause;";
+        let mut observed = Vec::new();
+        tokio::time::timeout(HELD_ECHO_DEADLINE, async {
+            while !observed.ends_with(reply) {
+                match output.recv().await {
+                    Some(OutputEvent::Replay(chunk) | OutputEvent::Output(chunk)) => {
+                        observed.extend_from_slice(&chunk.bytes);
+                    }
+                    Some(OutputEvent::Gap { .. } | OutputEvent::TerminalSnapshot(_)) => {}
+                    other => panic!("output ended before the child's reply: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_elapsed| panic!("the child's reply within the deadline: {observed:?}"));
+        assert_eq!(
+            observed, reply,
+            "the resume writes nothing to a terminal that does not echo"
+        );
+        let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn echo_of_input_accepted_during_an_abandoned_output_pause_follows_its_drop() {
+        let (pty, mut output, pause, _cwd) = pause_with_accepted_input().await;
+        drop(pause);
+        await_marker(&mut output, PAUSED_INPUT.trim_ascii_end(), "the held echo").await;
+        let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
     }
 
     #[test]
