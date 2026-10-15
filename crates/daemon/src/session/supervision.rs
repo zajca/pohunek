@@ -15,8 +15,9 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use pohunek_platform::process::{
-    sweep_runtime, HostInspector, ProcessCoalitions, ProcessIdentity, ProcessInspector, SkipReason,
-    SpawnId, StartIdentity, SweepReport, SweepRequest,
+    survey_runtime, sweep_runtime, HostInspector, ProcessCoalitions, ProcessIdentity,
+    ProcessInspector, SkipReason, Skipped, SpawnId, StartIdentity, SweepReport, SweepRequest,
+    SweepSurvey,
 };
 use pohunek_platform::supervisor::{
     Error as SupervisorError, ServiceId, ServiceObservation, WorkerKey,
@@ -67,7 +68,7 @@ pub(crate) const CREATE_COMPENSATION_PENDING: &str = "create_compensation_pendin
 /// during the pass is only found by the next one. Three passes absorb a
 /// short fork chain of a dying PTY tree; a runtime that still yields targets
 /// after that is reported as unconfirmed instead of being swept forever.
-const MAX_SWEEP_PASSES: usize = 3;
+pub(super) const MAX_SWEEP_PASSES: usize = 3;
 
 /// Most unreadable-marker processes a removal refusal names.
 ///
@@ -691,9 +692,11 @@ impl SessionRegistry {
     /// Reaps the processes an ended generation's runtime left behind.
     ///
     /// Runs [`sweep_runtime`] until a pass selects nothing, at most
-    /// [`MAX_SWEEP_PASSES`] times. When only unreadable-marker processes remain,
-    /// the sweep re-reads the process table until the settle window of the
-    /// calling operation closes ([`with_settle_window`]; one sweep grace at
+    /// [`MAX_SWEEP_PASSES`] times. The last pass may end the last process of
+    /// the runtime, so after it a survey that sends no signal
+    /// ([`survey_runtime`]) decides whether anything is left. When only
+    /// unreadable-marker processes remain, the sweep re-reads the process
+    /// table until the settle window of the calling operation closes ([`with_settle_window`]; one sweep grace at
     /// most, shared by every runtime the operation sweeps), so a process that
     /// is caught between images or about to exit does not leave the cleanup
     /// unconfirmed. An unconfirmed exit or a sweep error stops
@@ -818,7 +821,7 @@ impl SessionRegistry {
             let settling = only_unreadable && settle_unreadable(grace).await;
             let role = if settling {
                 PassRole::Settling
-            } else if only_unreadable || passes + 1 >= MAX_SWEEP_PASSES {
+            } else if only_unreadable {
                 PassRole::Deciding
             } else {
                 PassRole::Intermediate
@@ -850,8 +853,13 @@ impl SessionRegistry {
                 return SweepOutcome::complete();
             }
             passes += 1;
-            if only_unreadable || passes >= MAX_SWEEP_PASSES {
+            if only_unreadable {
                 break report;
+            }
+            if passes >= MAX_SWEEP_PASSES {
+                return self
+                    .verify_last_pass(session_id, worker_instance_id, grace, request)
+                    .await;
             }
         };
         tracing::warn!(
@@ -860,26 +868,79 @@ impl SessionRegistry {
             sweep.passes = passes,
             "lost runtime still had marked or unreadable processes after the sweep settled"
         );
-        self.unreadable_outcome(&deciding_pass)
+        self.unreadable_outcome(&deciding_pass.skipped)
     }
 
-    /// The outcome of a sweep whose deciding pass still selected processes.
+    /// Decides a lost-runtime sweep after its last signalling pass, sending no
+    /// signal.
+    ///
+    /// Nothing attributed to the runtime and nothing skipped confirms the
+    /// cleanup. When only unreadable-marker processes remain, the survey
+    /// repeats while the operation's settle window is open (see
+    /// [`settle_unreadable`]) and then leaves the cleanup unconfirmed with
+    /// them; anything else left, or a survey that cannot run, counts as
+    /// another blocker.
+    async fn verify_last_pass(
+        &self,
+        session_id: &str,
+        worker_instance_id: &str,
+        grace: Duration,
+        request: &SweepRequest,
+    ) -> SweepOutcome {
+        loop {
+            let survey = match survey_runtime(self.inner.inspector.as_ref(), request) {
+                Ok(survey) => survey,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id,
+                        worker_instance_id,
+                        error = %error,
+                        "lost runtime cleanup verification aborted; remaining processes are left alone"
+                    );
+                    return SweepOutcome::blocked_by_other();
+                }
+            };
+            let only_unreadable = survey.attributed.is_empty()
+                && !survey.skipped.is_empty()
+                && survey
+                    .skipped
+                    .iter()
+                    .all(|skipped| skipped.reason == SkipReason::MarkersUnreadable);
+            let settling = only_unreadable && settle_unreadable(grace).await;
+            log_sweep_survey(session_id, worker_instance_id, &survey, settling);
+            if survey.is_empty() {
+                return SweepOutcome::complete();
+            }
+            if settling {
+                continue;
+            }
+            tracing::warn!(
+                session_id,
+                worker_instance_id,
+                sweep.attributed = survey.attributed.len(),
+                sweep.skipped = survey.skipped.len(),
+                "lost runtime still had marked or unreadable processes after the last sweep pass"
+            );
+            if !survey.attributed.is_empty() {
+                return SweepOutcome::blocked_by_other();
+            }
+            return self.unreadable_outcome(&survey.skipped);
+        }
+    }
+
+    /// The outcome of a sweep that ended with `skipped` processes left.
     ///
     /// Only unreadable-marker skips leave the runtime's own processes
-    /// accounted for; anything else the pass signalled or skipped could be a
-    /// live member, so it counts as another blocker.
-    fn unreadable_outcome(&self, report: &SweepReport) -> SweepOutcome {
-        let only_unreadable = report.terminated.is_empty()
-            && report.killed.is_empty()
-            && report
-                .skipped
-                .iter()
-                .all(|skipped| skipped.reason == SkipReason::MarkersUnreadable);
-        if !only_unreadable {
+    /// accounted for; anything else skipped could be a live member, so it
+    /// counts as another blocker.
+    fn unreadable_outcome(&self, skipped: &[Skipped]) -> SweepOutcome {
+        if !skipped
+            .iter()
+            .all(|skipped| skipped.reason == SkipReason::MarkersUnreadable)
+        {
             return SweepOutcome::blocked_by_other();
         }
-        let unreadable = report
-            .skipped
+        let unreadable = skipped
             .iter()
             .map(|skipped| UnreadableCandidate {
                 identity: skipped.identity,
@@ -1581,7 +1642,8 @@ enum PassRole {
     /// A re-read while only unreadable-marker processes remain; the pass number
     /// repeats until the settle window closes.
     Settling,
-    /// A pass after which the sweep runs again.
+    /// A pass after which the sweep runs again or, after the last one, a
+    /// survey decides the outcome.
     Intermediate,
     /// The pass whose report decides the outcome.
     Deciding,
@@ -1619,9 +1681,42 @@ fn log_sweep_pass(
         "swept processes of a lost runtime"
     );
     // The deciding pass settles the outcome, so it alone names the cause.
-    if unmarked > 0 && role == PassRole::Deciding {
-        let pids = report
-            .skipped
+    if role == PassRole::Deciding {
+        warn_unmarked(session_id, worker_instance_id, &report.skipped);
+    }
+}
+
+/// Logs what the survey after the last sweep pass found, and on the survey
+/// that decides the outcome warns about session processes it could not
+/// attribute.
+fn log_sweep_survey(
+    session_id: &str,
+    worker_instance_id: &str,
+    survey: &SweepSurvey,
+    settling: bool,
+) {
+    tracing::info!(
+        session_id,
+        worker_instance_id,
+        sweep.attributed = survey.attributed.len(),
+        sweep.skipped = survey.skipped.len(),
+        sweep.settling = settling,
+        "verified the cleanup of a lost runtime"
+    );
+    if !settling {
+        warn_unmarked(session_id, worker_instance_id, &survey.skipped);
+    }
+}
+
+/// Warns about the `skipped` session processes that carry no worker-instance
+/// marker, which keep the cleanup unconfirmed.
+fn warn_unmarked(session_id: &str, worker_instance_id: &str, skipped: &[Skipped]) {
+    let unmarked = skipped
+        .iter()
+        .filter(|skipped| skipped.reason == SkipReason::InstanceUnmarked)
+        .count();
+    if unmarked > 0 {
+        let pids = skipped
             .iter()
             .filter(|skipped| skipped.reason == SkipReason::InstanceUnmarked)
             .take(MAX_LOGGED_UNMARKED_PROCESSES)

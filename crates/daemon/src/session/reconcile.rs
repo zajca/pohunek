@@ -12693,6 +12693,137 @@ handler = "codex-hook-v1"
             assert_eq!(fixture.supervisor.retired(), vec![id]);
         }
 
+        /// Generations of [`FORKING_HOLDER`] after the first: the sweep's
+        /// first two passes each end one and leave the next, so its last
+        /// allowed pass ends the last one.
+        #[cfg(target_os = "linux")]
+        const LAST_PASS_GENERATIONS: u8 = 2;
+
+        #[cfg(target_os = "linux")]
+        const _: () = assert!(
+            LAST_PASS_GENERATIONS as usize + 1
+                == super::super::super::supervision::MAX_SWEEP_PASSES
+        );
+
+        /// Holder whose every generation answers `SIGTERM` by forking the next
+        /// one and exiting, and whose last generation just exits.
+        ///
+        /// Arguments: generations after the first, the barrier directory, the
+        /// directory where each generation publishes its PID as `gen-<n>` and,
+        /// once its `SIGTERM` handler is installed, again as `ready-<n>`, and a
+        /// FIFO that nobody writes, read with a timeout so the waits start no
+        /// process. A generation is a forked subshell, never a new image, so it
+        /// keeps the holder's markers and working directory. Every generation
+        /// starts with `SIGTERM` ignored and publishes `gen-<n>` before
+        /// installing its handler, so a published `gen-<n>` proves generation
+        /// `<n>` ran. A parent exits only once its child is ready, and a sweep
+        /// pass that ends one generation waits for that exit, so the next pass
+        /// finds exactly the next generation with its handler installed; only a
+        /// child that takes longer than the sweep grace to start, after which
+        /// the pass kills its parent, can miss its `SIGTERM`, and then `gen-0`
+        /// is missing.
+        #[cfg(target_os = "linux")]
+        const FORKING_HOLDER: &str = r#"generation() {
+  local depth=$1
+  printf '%s' "$BASHPID" > "$dir/gen-$depth"
+  trap 'if [ "$depth" -gt 0 ]; then forked; fi; exit 0' TERM
+  printf '%s' "$BASHPID" > "$dir/ready-$depth"
+  while [ -d "$barrier" ]; do read -r -t 0.05 -u 4 _; done
+}
+forked() {
+  trap '' TERM
+  generation "$((depth - 1))" &
+  while [ ! -e "$dir/ready-$((depth - 1))" ]; do read -r -t 0.01 -u 4 _; done
+}
+barrier=$2
+dir=$3
+exec 4<>"$4"
+trap '' TERM
+generation "$1"
+"#;
+
+        /// Removes the forking holder's barrier when dropped, also while a
+        /// failure unwinds, so every generation still running ends.
+        #[cfg(target_os = "linux")]
+        struct ReleaseHolder(PathBuf);
+
+        #[cfg(target_os = "linux")]
+        impl Drop for ReleaseHolder {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+
+        /// A runtime whose holder forks a new generation on every `SIGTERM`
+        /// is swept in all allowed passes; the last pass ends the last
+        /// generation, so nothing of the runtime is left and the cleanup is
+        /// confirmed.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_holder_ended_by_the_last_sweep_pass_leaves_the_runtime_lost_with_its_cleanup_confirmed(
+        ) {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let barrier = fixture.root.join("holder-barrier");
+            std::fs::create_dir(&barrier).expect("holder barrier");
+            let release = ReleaseHolder(barrier.clone());
+            let generations = fixture.root.join("holder-generations");
+            std::fs::create_dir(&generations).expect("holder generations directory");
+            let fifo = fixture.root.join("holder-idle");
+            nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("holder idle fifo");
+            let chain = fixture.root.join("forking-holder.sh");
+            std::fs::write(&chain, FORKING_HOLDER).expect("write the forking holder");
+            // The holder is reparented away from the test process, so the exit
+            // of every generation is observable without reaping.
+            let launched = std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &format!(
+                        "trap '' HUP; /bin/bash '{chain}' {LAST_PASS_GENERATIONS} '{barrier}' \
+                         '{generations}' '{fifo}' </dev/null >/dev/null 2>&1 &",
+                        chain = chain.display(),
+                        barrier = barrier.display(),
+                        generations = generations.display(),
+                        fifo = fifo.display(),
+                    ),
+                ])
+                .current_dir(&fixture.root)
+                .env("POHUNEK_WORKER_INSTANCE_ID", "runtime-s-324")
+                .status()
+                .expect("launch the forking holder");
+            assert!(launched.success(), "the forking holder launches");
+            let first = super::wait_for_pid_file(
+                &generations.join(format!("ready-{LAST_PASS_GENERATIONS}")),
+            )
+            .await;
+            assert_in_fixture_view(first, &fixture.root);
+            persist_record(&fixture.root, "s-324", Some("runtime-s-324"));
+            write_live_journal(
+                &fixture.root,
+                "s-324",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-324"),
+            );
+            let id = service_id("s-324", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-324").await;
+            let last_published = generations.join("gen-0").exists();
+            drop(release);
+            assert!(
+                last_published,
+                "the last generation ran, so the sweep's last pass found and ended it"
+            );
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            assert_eq!(fixture.supervisor.retired(), vec![id]);
+        }
+
         #[tokio::test]
         async fn a_sweep_never_reaches_a_stand_in_of_another_fixture_with_the_same_marker() {
             // Scenarios run concurrently, and two of them can mark stand-ins for
