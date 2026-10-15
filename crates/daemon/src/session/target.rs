@@ -1122,7 +1122,9 @@ impl SessionRegistry {
         .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
         let stop_grace_ms = u64::try_from(self.inner.config.stop_grace.as_millis())
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
-        let stop_policy = StopPolicy::new(stop_grace_ms)
+        let kill_reap_ms = u64::try_from(self.inner.config.kill_reap_deadline.as_millis())
+            .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
+        let stop_policy = StopPolicy::with_kill_reap(stop_grace_ms, kill_reap_ms)
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
         let input_stall_ms = u64::try_from(self.inner.config.input_write_stall_timeout.as_millis())
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;

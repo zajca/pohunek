@@ -241,8 +241,8 @@ pub const COMPAT_INITIAL_INPUT_STARTUP_GRACE: Duration = Duration::from_millis(5
 ///
 /// The grace is how long a worker waits for the PTY to reach EOF after it
 /// signals the session's process group with `SIGTERM`, and then once more after
-/// `SIGKILL`, before it force-closes the PTY; a stop therefore waits at most
-/// two graces for a process that ignores both signals. 500 ms is long enough for
+/// `SIGKILL`, before it force-closes the PTY; only a root still alive then is
+/// awaited longer, up to [`DEFAULT_KILL_REAP_DEADLINE`]. 500 ms is long enough for
 /// a shell or an agent CLI on a loaded host to handle `SIGTERM` and flush its
 /// final output, and short enough that an explicit stop returns in about a
 /// second. Raising it delays every stop of a stuck process; lowering it risks a
@@ -256,6 +256,25 @@ pub const COMPAT_INITIAL_INPUT_STARTUP_GRACE: Duration = Duration::from_millis(5
 /// set the `stop_grace` field of the registry or worker configuration. The value
 /// stays below [`MAX_DEADLINE`].
 pub const DEFAULT_STOP_GRACE: Duration = Duration::from_millis(500);
+
+/// Default deadline of daemon and session workers for the death of a stopped
+/// session's root process after `SIGKILL`.
+///
+/// `SIGKILL` cannot be caught or ignored, so a root that has not exited one
+/// [`DEFAULT_STOP_GRACE`] after it is only held by the kernel: by uninterruptible
+/// I/O, by tearing down a large address space, or by a host too loaded to
+/// schedule the exit. A real agent CLI at a prompt can need more than one grace
+/// for that on a busy CI runner. Three seconds covers such a host many times
+/// over; a root still alive after it is stuck in the kernel, and the stop
+/// reports it with the state it is in. Together with the grace before
+/// `SIGKILL` that report still arrives within the five-second default request
+/// deadline of the public clients, instead of a client timeout.
+///
+/// Like the grace, this is not a `service.toml` key: the daemon sends it to
+/// each worker in the `Initialize` stop policy, and a worker falls back to this
+/// value when the policy does not carry it. It is never shorter than
+/// [`DEFAULT_STOP_GRACE`] and stays below [`MAX_DEADLINE`].
+pub const DEFAULT_KILL_REAP_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Longest accepted path in bytes.
 ///

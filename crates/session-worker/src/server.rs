@@ -628,6 +628,7 @@ struct State {
     /// Public protocol version the daemon selected for this runtime's hooks.
     public_protocol_version: Option<u32>,
     stop_grace: Duration,
+    kill_reap_deadline: Duration,
     terminal_retention: Duration,
     exit: Option<ExitStatus>,
     stop_requested: bool,
@@ -652,6 +653,7 @@ impl State {
             hook_schema: None,
             public_protocol_version: None,
             stop_grace: crate::config::DEFAULT_STOP_GRACE,
+            kill_reap_deadline: crate::config::DEFAULT_KILL_REAP_DEADLINE,
             terminal_retention: Duration::from_hours(24),
             exit: None,
             stop_requested: false,
@@ -1240,6 +1242,17 @@ fn resolve_hook_schema(
         .transpose()
 }
 
+/// The stop grace and post-kill reap deadline of `policy`. A daemon of the
+/// previous release sends no reap deadline; `fallback` then applies, never
+/// shorter than the grace that daemon chose.
+fn stop_deadlines(policy: protocol::StopPolicy, fallback: Duration) -> (Duration, Duration) {
+    let grace = Duration::from_millis(policy.grace_ms());
+    let kill_reap = policy
+        .kill_reap_ms()
+        .map_or_else(|| fallback.max(grace), Duration::from_millis);
+    (grace, kill_reap)
+}
+
 async fn initialize_request(
     shared: &Arc<Shared>,
     connection: &Connection,
@@ -1307,7 +1320,8 @@ async fn initialize_request(
         .map_err(|error| control_error(ControlCode::InvalidRequest, error, false))?;
     let dedup_entries = usize::try_from(initialize.limits.write_dedup_entries())
         .map_err(|error| control_error(ControlCode::InvalidRequest, error, false))?;
-    let stop_grace = Duration::from_millis(initialize.stop_policy.grace_ms());
+    let (stop_grace, kill_reap_deadline) =
+        stop_deadlines(initialize.stop_policy, shared.config.kill_reap_deadline);
     let retention = Duration::from_millis(initialize.limits.terminal_retention_ms());
     let effective_config = WorkerConfig {
         history_bytes,
@@ -1317,6 +1331,7 @@ async fn initialize_request(
             .input_policy
             .map(|policy| Duration::from_millis(policy.stall_ms())),
         stop_grace,
+        kill_reap_deadline,
         terminal_retention: retention,
         ..shared.config.clone()
     };
@@ -1395,6 +1410,7 @@ async fn spawn_running(
         let child_process = wire_identity(pty.identity())?;
         state.phase = WireRuntimePhase::Running;
         state.stop_grace = config.stop_grace;
+        state.kill_reap_deadline = config.kill_reap_deadline;
         state.terminal_retention = config.terminal_retention;
         state.launch_agent_base = Some(agent_base);
         state.hook_schema = hook_schema;
@@ -1411,7 +1427,13 @@ async fn spawn_running(
         (pty, child_process, committed)
     };
     if let Err(error) = committed {
-        let _ = pty.stop("journal-failure", config.stop_grace).await;
+        let _ = pty
+            .stop(
+                "journal-failure",
+                config.stop_grace,
+                config.kill_reap_deadline,
+            )
+            .await;
         return Err(control_error(ControlCode::RuntimeFault, error, false));
     }
     Ok((pty, child_process))
@@ -1773,13 +1795,17 @@ async fn stop_request(
         let mut state = shared.state.lock().await;
         prepare_stop(&mut state)?
     };
-    let (pty, grace) = match preparation {
+    let (pty, grace, kill_reap) = match preparation {
         StopPreparation::AlreadyCommitted(exit) => {
             return Ok(ResponseKind::Stopped { exit: Some(exit) });
         }
-        StopPreparation::Begin { pty, grace } => (pty, grace),
+        StopPreparation::Begin {
+            pty,
+            grace,
+            kill_reap,
+        } => (pty, grace, kill_reap),
     };
-    pty.stop(transaction_id.as_str(), grace)
+    pty.stop(transaction_id.as_str(), grace, kill_reap)
         .await
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
     let committed = tokio::time::timeout(
@@ -1801,7 +1827,11 @@ async fn stop_request(
 
 enum StopPreparation {
     AlreadyCommitted(ExitStatus),
-    Begin { pty: PtyOwner, grace: Duration },
+    Begin {
+        pty: PtyOwner,
+        grace: Duration,
+        kill_reap: Duration,
+    },
 }
 
 fn prepare_stop(state: &mut State) -> Result<StopPreparation, ControlError> {
@@ -1831,6 +1861,7 @@ fn prepare_stop(state: &mut State) -> Result<StopPreparation, ControlError> {
     Ok(StopPreparation::Begin {
         pty,
         grace: state.stop_grace,
+        kill_reap: state.kill_reap_deadline,
     })
 }
 
@@ -2086,7 +2117,11 @@ async fn coordinate_runtime_completion(
         Ok(exit) => exit,
         Err(error) => {
             let _ = pty
-                .stop("root-observation-failure", shared.config.stop_grace)
+                .stop(
+                    "root-observation-failure",
+                    shared.config.stop_grace,
+                    shared.config.kill_reap_deadline,
+                )
                 .await;
             mark_runtime_faulted(&shared, worker_instance_id, WorkerError::Pty(error)).await;
             shared.shutdown.cancel();
@@ -2543,13 +2578,13 @@ async fn wait_for_output_completion(
                     process.pid = pty.identity().pid,
                     "PTY drain deadline expired; terminating the retained process group",
                 );
-                let grace = {
+                let (grace, kill_reap) = {
                     let state = shared.state.lock().await;
-                    state.stop_grace
+                    (state.stop_grace, state.kill_reap_deadline)
                 };
                 // A forced close is not an error: the sealed completion read
                 // below records it and the root's exit is known.
-                pty.stop("natural-drain-timeout", grace)
+                pty.stop("natural-drain-timeout", grace, kill_reap)
                     .await
                     .map_err(WorkerError::Pty)?;
                 pty.output_completion().ok_or_else(|| {
@@ -7738,9 +7773,13 @@ mod tests {
         assert_eq!(reference.native_reference, "switched");
         assert_eq!(reference.sequence, 2);
         drop(state);
-        pty.stop("test-cleanup", server.shared.config.stop_grace)
-            .await
-            .unwrap();
+        pty.stop(
+            "test-cleanup",
+            server.shared.config.stop_grace,
+            server.shared.config.kill_reap_deadline,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -7761,9 +7800,13 @@ mod tests {
             "first"
         );
         drop(state);
-        pty.stop("test-cleanup", server.shared.config.stop_grace)
-            .await
-            .unwrap();
+        pty.stop(
+            "test-cleanup",
+            server.shared.config.stop_grace,
+            server.shared.config.kill_reap_deadline,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -7832,9 +7875,13 @@ mod tests {
             Some("continuation")
         );
         assert!(committed.pending_launch_claims.is_empty());
-        pty.stop("test-cleanup", server.shared.config.stop_grace)
-            .await
-            .unwrap();
+        pty.stop(
+            "test-cleanup",
+            server.shared.config.stop_grace,
+            server.shared.config.kill_reap_deadline,
+        )
+        .await
+        .unwrap();
         drop(server);
     }
 
@@ -7896,9 +7943,13 @@ mod tests {
             "expires_at": expiry(), "reference_kind": null, "native_reference": null,
         });
         assert!(!send_hook(&server, &pty, unknown).await);
-        pty.stop("test-cleanup", server.shared.config.stop_grace)
-            .await
-            .unwrap();
+        pty.stop(
+            "test-cleanup",
+            server.shared.config.stop_grace,
+            server.shared.config.kill_reap_deadline,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -7912,9 +7963,13 @@ mod tests {
         assert!(state.journal.native_reference_claim.is_none());
         assert!(state.journal.pending_launch_claims.is_empty());
         drop(state);
-        pty.stop("test-cleanup", server.shared.config.stop_grace)
-            .await
-            .unwrap();
+        pty.stop(
+            "test-cleanup",
+            server.shared.config.stop_grace,
+            server.shared.config.kill_reap_deadline,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -7934,9 +7989,13 @@ mod tests {
         assert_eq!(state.journal.launch_identity, accepted);
         assert!(state.journal.pending_launch_claims.is_empty());
         drop(state);
-        pty.stop("test-cleanup", server.shared.config.stop_grace)
-            .await
-            .unwrap();
+        pty.stop(
+            "test-cleanup",
+            server.shared.config.stop_grace,
+            server.shared.config.kill_reap_deadline,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -7952,9 +8011,13 @@ mod tests {
         });
         assert!(!send_hook(&server, &pty, notification).await);
         assert_eq!(server.shared.state.lock().await.journal, before);
-        pty.stop("test-cleanup", server.shared.config.stop_grace)
-            .await
-            .unwrap();
+        pty.stop(
+            "test-cleanup",
+            server.shared.config.stop_grace,
+            server.shared.config.kill_reap_deadline,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -7987,9 +8050,13 @@ mod tests {
             "expires_at": expiry(), "reference_kind": "path", "native_reference": "/x",
         });
         assert!(send_hook(&server, &pty, accepted).await);
-        pty.stop("test-cleanup", server.shared.config.stop_grace)
-            .await
-            .unwrap();
+        pty.stop(
+            "test-cleanup",
+            server.shared.config.stop_grace,
+            server.shared.config.kill_reap_deadline,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -8020,9 +8087,13 @@ mod tests {
             !send_hook(&server, &pty, stop).await,
             "stop is not an admitted action"
         );
-        pty.stop("test-cleanup", server.shared.config.stop_grace)
-            .await
-            .unwrap();
+        pty.stop(
+            "test-cleanup",
+            server.shared.config.stop_grace,
+            server.shared.config.kill_reap_deadline,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -8057,9 +8128,13 @@ mod tests {
             .journal
             .subagents
             .is_empty());
-        pty.stop("test-cleanup", server.shared.config.stop_grace)
-            .await
-            .unwrap();
+        pty.stop(
+            "test-cleanup",
+            server.shared.config.stop_grace,
+            server.shared.config.kill_reap_deadline,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -8095,9 +8170,13 @@ mod tests {
         );
         assert!(send_hook(&server, &pty, stop(6)).await);
         assert_eq!(child(&server).await, (SubagentPhase::Completed, 6));
-        pty.stop("test-cleanup", server.shared.config.stop_grace)
-            .await
-            .unwrap();
+        pty.stop(
+            "test-cleanup",
+            server.shared.config.stop_grace,
+            server.shared.config.kill_reap_deadline,
+        )
+        .await
+        .unwrap();
     }
 
     /// Opens the controller connection `initialize_request` requires.
@@ -8156,9 +8235,13 @@ mod tests {
         );
         if let Some(pty) = state.pty.clone() {
             drop(state);
-            pty.stop("test-cleanup", server.shared.config.stop_grace)
-                .await
-                .unwrap();
+            pty.stop(
+                "test-cleanup",
+                server.shared.config.stop_grace,
+                server.shared.config.kill_reap_deadline,
+            )
+            .await
+            .unwrap();
         }
     }
 
@@ -8182,6 +8265,56 @@ mod tests {
         assert_eq!(state.phase, super::WireRuntimePhase::Uninitialized);
         assert!(state.pty.is_none());
         assert!(state.journal.hook_schema.is_none());
+    }
+
+    /// A daemon of the previous release sends a stop policy with only
+    /// `grace_ms`. The worker accepts any such grace and waits for a killed
+    /// root at least that long; only an explicit pair whose reap deadline is
+    /// shorter than its grace is refused.
+    #[tokio::test]
+    async fn an_initialize_without_a_reap_deadline_waits_at_least_its_grace() {
+        // A grace longer than the worker's own reap default, which the
+        // fallback must not undercut.
+        let grace = crate::config::DEFAULT_KILL_REAP_DEADLINE + Duration::from_secs(1);
+        let grace_ms = u64::try_from(grace.as_millis()).expect("grace in milliseconds");
+        let directory = pohunek_test_support::tempdir().expect("fixture directory");
+        let server = environment_fixture(directory.path(), "abcd2345")
+            .await
+            .expect("bind worker");
+        let mut initialize =
+            environment_initialize(Some(base_environment(&[("PATH", "/usr/bin:/bin")])), &[]);
+        initialize.executable = std::path::PathBuf::from("/bin/sh");
+        initialize.arguments = vec!["-c".to_owned(), "read -r line".to_owned()];
+        initialize.stop_policy =
+            serde_json::from_value(serde_json::json!({ "grace_ms": grace_ms }))
+                .expect("a previous-release stop policy decodes");
+        let (connection, lease_id) = controller_connection(&server);
+
+        super::initialize_request(&server.shared, &connection, &lease_id, initialize)
+            .await
+            .expect("a previous-release grace is accepted");
+
+        let state = server.shared.state.lock().await;
+        assert_eq!(state.stop_grace, grace);
+        assert_eq!(state.kill_reap_deadline, grace);
+        let inconsistent = serde_json::from_value::<protocol::StopPolicy>(serde_json::json!({
+            "grace_ms": grace_ms,
+            "kill_reap_ms": grace_ms - 1,
+        }));
+        assert!(
+            inconsistent.is_err(),
+            "an explicit reap deadline shorter than the grace is refused"
+        );
+        if let Some(pty) = state.pty.clone() {
+            drop(state);
+            pty.stop(
+                "test-cleanup",
+                server.shared.config.stop_grace,
+                server.shared.config.kill_reap_deadline,
+            )
+            .await
+            .unwrap();
+        }
     }
 
     /// A peer that no longer exists leaves the journal untouched.
@@ -8268,9 +8401,13 @@ mod tests {
             "original"
         );
 
-        pty.stop("test-cleanup", server.shared.config.stop_grace)
-            .await
-            .unwrap();
+        pty.stop(
+            "test-cleanup",
+            server.shared.config.stop_grace,
+            server.shared.config.kill_reap_deadline,
+        )
+        .await
+        .unwrap();
         drop(server);
     }
 
@@ -8303,9 +8440,13 @@ mod tests {
         assert!(state.journal.pending_launch_claims.is_empty());
         assert!(state.journal.active_identity.is_none());
         drop(state);
-        pty.stop("test-cleanup", server.shared.config.stop_grace)
-            .await
-            .unwrap();
+        pty.stop(
+            "test-cleanup",
+            server.shared.config.stop_grace,
+            server.shared.config.kill_reap_deadline,
+        )
+        .await
+        .unwrap();
         drop(server);
     }
 
@@ -8874,9 +9015,13 @@ mod tests {
             assert_eq!(retry_status, status);
             assert_eq!(state.phase, super::WireRuntimePhase::Exited);
         };
-        pty.stop("test-cleanup", server_stop_grace())
-            .await
-            .expect("stop fixture PTY");
+        pty.stop(
+            "test-cleanup",
+            server_stop_grace(),
+            crate::WorkerConfig::new().kill_reap_deadline,
+        )
+        .await
+        .expect("stop fixture PTY");
         drop(server);
     }
 
@@ -9189,9 +9334,13 @@ mod tests {
             .await
             .expect("stream task")
             .expect("client EOF ends the stream cleanly");
-        pty.stop("test-cleanup", server_stop_grace())
-            .await
-            .expect("stop fixture PTY");
+        pty.stop(
+            "test-cleanup",
+            server_stop_grace(),
+            crate::WorkerConfig::new().kill_reap_deadline,
+        )
+        .await
+        .expect("stop fixture PTY");
     }
 
     /// An observation stream proves its peer again after it stops waiting.
@@ -10257,9 +10406,13 @@ mod tests {
             .pty
             .clone()
             .expect("running PTY");
-        pty.stop("test-cleanup", server_stop_grace())
-            .await
-            .expect("stop child");
+        pty.stop(
+            "test-cleanup",
+            server_stop_grace(),
+            crate::WorkerConfig::new().kill_reap_deadline,
+        )
+        .await
+        .expect("stop child");
         // The runtime monitors journal the terminal state in the background;
         // the fixture directory must outlive that write.
         pohunek_test_support::wait::wait_until("the worker to journal the child exit", || async {

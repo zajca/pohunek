@@ -213,9 +213,18 @@ pub enum PtyError {
         /// Reused or changed PID.
         pid: u32,
     },
-    /// Process did not exit within both stop windows.
+    /// The root's exit could not be awaited: its observer ended without one.
     #[error("timed out waiting for managed process exit")]
     ExitTimeout,
+    /// The root process was still alive when the deadline after `SIGKILL`
+    /// passed: the kernel holds it, or it left the signalled process group.
+    #[error("managed process was not reaped {deadline:?} after SIGKILL: {state}")]
+    RootUnreaped {
+        /// The wait after `SIGKILL` that passed.
+        deadline: Duration,
+        /// The root's observed state.
+        state: String,
+    },
     /// PTY output did not close after hard process-group termination.
     #[error("PTY output remained open after hard process-group termination")]
     OutputCloseTimeout,
@@ -845,6 +854,10 @@ impl PtyOwner {
 
     /// Idempotently stops the retained process group.
     ///
+    /// The group gets `SIGTERM`, then `SIGKILL` after `grace`. The root's death
+    /// after `SIGKILL` is awaited for `kill_reap` in all, which covers a root
+    /// the kernel holds for a while, and the output for one more `grace`.
+    ///
     /// Returns the root's exit once the root has been reaped. When a process
     /// outside the group kept the PTY open past the stop deadline, the output
     /// is force-closed and the exit is still returned: whether the output
@@ -855,8 +868,15 @@ impl PtyOwner {
     ///
     /// # Errors
     ///
-    /// Returns [`PtyError`] for signal, identity, timeout, or join failures.
-    pub async fn stop(&self, _stop_id: &str, grace: Duration) -> Result<Exit, PtyError> {
+    /// Returns [`PtyError::RootUnreaped`] with the root's state when it is
+    /// still alive `kill_reap` after `SIGKILL`, and [`PtyError`] for signal,
+    /// identity or join failures.
+    pub async fn stop(
+        &self,
+        _stop_id: &str,
+        grace: Duration,
+        kill_reap: Duration,
+    ) -> Result<Exit, PtyError> {
         let mut cleanup = self.cleanup.lock().await;
         match &*cleanup {
             CleanupState::Finished(exit) => return Ok(exit.clone()),
@@ -912,14 +932,41 @@ impl PtyOwner {
                         return self.finish_observation_failure(&mut cleanup, message);
                     }
                     Ok(result) => result?,
-                    Err(_elapsed)
-                        if matches!(&*self.exit_rx.borrow(), Some(RootObservation::Exited(_))) =>
-                    {
+                    Err(_elapsed) => {
+                        // `SIGKILL` cannot be ignored, so a root still running
+                        // is only held by the kernel; its death is awaited for
+                        // the rest of `kill_reap`. Once it is dead, the output
+                        // has had a full grace since the kill and is
+                        // force-closed. A root alive past the deadline keeps
+                        // the cleanup active: the group authority and the
+                        // output stay held, and a later stop signals again.
+                        let remaining = kill_reap.saturating_sub(grace);
+                        match tokio::time::timeout(remaining, self.wait_exit()).await {
+                            Ok(Err(PtyError::ChildObservation { message })) => {
+                                self.force_output_close()?;
+                                self.release_authority(
+                                    &mut cleanup,
+                                    CleanupState::ObservationAuthorityReleased(message.clone()),
+                                )?;
+                                return self.finish_observation_failure(&mut cleanup, message);
+                            }
+                            Ok(result) => {
+                                result?;
+                            }
+                            Err(_elapsed) => {
+                                return Err(PtyError::RootUnreaped {
+                                    deadline: kill_reap,
+                                    state: root_state(
+                                        self.identity.pid,
+                                        self.identity.process_group,
+                                    ),
+                                });
+                            }
+                        }
                         *cleanup = CleanupState::ForcedClosing;
                         let completion = self.seal_and_release_output(&mut cleanup)?;
                         return self.finish_sealed_cleanup(&mut cleanup, completion).await;
                     }
-                    Err(_elapsed) => return Err(PtyError::ExitTimeout),
                 }
             }
         };
@@ -1972,6 +2019,50 @@ fn closed_before_boundary(output: &OutputHub) -> PtyError {
     ))
 }
 
+/// Describes the state of the unreaped root `pid` for a failed stop: its
+/// scheduler state and, when it differs, the process group it is in.
+///
+/// The worker holds the root unreaped, so `pid` still names it.
+#[cfg(target_os = "linux")]
+fn root_state(pid: u32, process_group: i32) -> String {
+    use std::fmt::Write as _;
+
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return "its state could not be read".to_owned();
+    };
+    // `comm` is parenthesized and may hold spaces, so the fields after it
+    // start at the last `)`: state, ppid, pgrp.
+    let mut fields = stat
+        .rsplit_once(')')
+        .map(|(_, rest)| rest.split_whitespace())
+        .into_iter()
+        .flatten();
+    let state = fields.next().unwrap_or("?");
+    let group = fields.nth(1).and_then(|group| group.parse::<i32>().ok());
+    let mut described = match state {
+        "D" => "in uninterruptible sleep (D)".to_owned(),
+        "R" => "running (R)".to_owned(),
+        "S" => "sleeping (S)".to_owned(),
+        "T" | "t" => format!("stopped ({state})"),
+        "Z" => "exited but not yet observed (Z)".to_owned(),
+        other => format!("in state {other}"),
+    };
+    if let Some(group) = group.filter(|group| *group != process_group) {
+        let _ = write!(
+            described,
+            ", outside the signalled process group {process_group} (in {group})"
+        );
+    }
+    described
+}
+
+/// Describes the state of the unreaped root for a failed stop where the
+/// platform offers no cheap process state.
+#[cfg(not(target_os = "linux"))]
+fn root_state(_pid: u32, _process_group: i32) -> String {
+    "still running".to_owned()
+}
+
 fn observe_child_exit(pid: u32) -> Result<Exit, io::Error> {
     let native_pid = i32::try_from(pid)
         .ok()
@@ -2157,6 +2248,10 @@ mod tests {
     /// a loaded host was slow, and a child that dies on SIGTERM does not wait it out.
     fn stop_grace() -> Duration {
         WorkerConfig::new().stop_grace
+    }
+
+    fn kill_reap() -> Duration {
+        WorkerConfig::new().kill_reap_deadline
     }
 
     fn shell(script: &str, cwd: &std::path::Path) -> Command {
@@ -2549,7 +2644,10 @@ mod tests {
         assert_eq!(pause.held_bytes().expect("TIOCOUTQ"), 0);
         pause.resume().expect("resume output");
 
-        let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
+        let _ = pty
+            .stop("cleanup", stop_grace(), kill_reap())
+            .await
+            .expect("cleanup");
     }
 
     #[tokio::test]
@@ -2744,11 +2842,14 @@ mod tests {
             .execute_control("daemon-test", 1, operation)
             .await
             .expect("deduplicate");
-        let exit = pty.stop("stop-1", stop_grace()).await.expect("stop");
+        let exit = pty
+            .stop("stop-1", stop_grace(), kill_reap())
+            .await
+            .expect("stop");
 
         assert!(!exit.success);
         assert_eq!(
-            pty.stop("stop-1", stop_grace())
+            pty.stop("stop-1", stop_grace(), kill_reap())
                 .await
                 .expect("duplicate stop"),
             exit
@@ -2837,7 +2938,7 @@ mod tests {
 
         let stopped = pohunek_test_support::wait::guard(
             "stop to end the remaining group",
-            pty.stop("stop-after-revoke", stop_grace()),
+            pty.stop("stop-after-revoke", stop_grace(), kill_reap()),
         )
         .await
         .expect("stop the remaining group");
@@ -2851,6 +2952,225 @@ mod tests {
             || async { kill(descendant.0, None).is_err().then_some(()) },
         )
         .await;
+    }
+
+    /// Libtest name of [`held_root_child`], re-executed as the PTY child.
+    #[cfg(target_os = "linux")]
+    const HELD_ROOT_CHILD_TEST: &str = "pty::tests::held_root_child";
+    /// Libtest name of [`held_root_tracer`], started by [`held_root_child`].
+    #[cfg(target_os = "linux")]
+    const HELD_ROOT_TRACER_TEST: &str = "pty::tests::held_root_tracer";
+    /// Names the root the tracer image traces.
+    #[cfg(target_os = "linux")]
+    const HELD_ROOT_PID_VAR: &str = "POHUNEK_TEST_HELD_ROOT_PID";
+    /// How long, in milliseconds, the tracer keeps the killed root unreaped.
+    #[cfg(target_os = "linux")]
+    const HELD_ROOT_HOLD_VAR: &str = "POHUNEK_TEST_HELD_ROOT_HOLD_MS";
+    /// What the held root prints once its tracer holds it.
+    #[cfg(target_os = "linux")]
+    const HELD_ROOT_READY: &str = "held-root-traced";
+    /// The stop grace of the held-root scenarios: short, because the root never
+    /// answers `SIGTERM` and every scenario waits it out once.
+    #[cfg(target_os = "linux")]
+    const HELD_ROOT_GRACE: Duration = Duration::from_millis(200);
+    /// How long the tracer keeps the killed root unreaped: longer than
+    /// [`HELD_ROOT_GRACE`], so a stop that waited one grace after `SIGKILL`
+    /// would give up, and well inside the default post-kill reap deadline.
+    #[cfg(target_os = "linux")]
+    const HELD_ROOT_HOLD: Duration = Duration::from_secs(1);
+
+    /// A root process whose death after `SIGKILL` the kernel withholds from the
+    /// worker for a while, as a root in uninterruptible I/O or on a loaded host.
+    ///
+    /// Not a test of its own: the held-root scenarios re-execute the test binary
+    /// to run it as the PTY child. It starts [`held_root_tracer`] in a process
+    /// group of its own, lets it trace this process, and waits forever. A traced
+    /// process stops instead of acting on `SIGTERM`, and its death is reported
+    /// to the tracer first: the worker sees it only once the tracer lets go.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "re-executed as the PTY child of the held-root stop scenarios"]
+    fn held_root_child() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::process::CommandExt as _;
+
+        let hold = std::env::var(HELD_ROOT_HOLD_VAR).expect("the hold of the tracer");
+        #[expect(
+            clippy::zombie_processes,
+            reason = "this root waits until SIGKILL ends it; the orphaned tracer is reaped by init"
+        )]
+        let mut tracer = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--ignored", "--exact", HELD_ROOT_TRACER_TEST, "--nocapture"])
+            .env(HELD_ROOT_PID_VAR, std::process::id().to_string())
+            .env(HELD_ROOT_HOLD_VAR, hold)
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start the tracer");
+        let tracer_pid = rustix::process::Pid::from_raw(
+            i32::try_from(tracer.id()).expect("the tracer pid fits i32"),
+        )
+        .expect("the tracer pid is positive");
+        rustix::process::set_ptracer(rustix::process::PTracer::ProcessID(tracer_pid))
+            .expect("allow the tracer to trace this process");
+        let mut permit = tracer.stdin.take().expect("the tracer's stdin");
+        permit
+            .write_all(b"traceable\n")
+            .expect("tell the tracer to attach");
+        drop(permit);
+        std::io::BufReader::new(tracer.stdout.take().expect("the tracer's stdout"))
+            .lines()
+            .map(|line| line.expect("read the tracer"))
+            .find(|line| line == "seized")
+            .expect("the tracer attaches");
+        println!("{HELD_ROOT_READY}");
+        loop {
+            std::thread::park();
+        }
+    }
+
+    /// Traces [`held_root_child`] and keeps its death unreported to the worker
+    /// for the hold it is given, then lets go by exiting.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "started by held_root_child"]
+    fn held_root_tracer() {
+        use std::io::BufRead as _;
+
+        let root = std::env::var(HELD_ROOT_PID_VAR)
+            .expect("the root to trace")
+            .parse::<i32>()
+            .expect("a root pid");
+        let hold = Duration::from_millis(
+            std::env::var(HELD_ROOT_HOLD_VAR)
+                .expect("the hold")
+                .parse()
+                .expect("a hold in milliseconds"),
+        );
+        let mut permit = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut permit)
+            .expect("the root allows tracing");
+        let root = nix::unistd::Pid::from_raw(root);
+        nix::sys::ptrace::seize(root, nix::sys::ptrace::Options::empty()).expect("trace the root");
+        println!("seized");
+        nix::sys::wait::waitid(
+            nix::sys::wait::Id::Pid(root),
+            nix::sys::wait::WaitPidFlag::WEXITED
+                | nix::sys::wait::WaitPidFlag::WNOWAIT
+                | nix::sys::wait::WaitPidFlag::__WALL,
+        )
+        .expect("the root dies");
+        // timing-allowed: #1137 the hold is the kernel delay this fixture stands for
+        std::thread::sleep(hold);
+    }
+
+    /// Spawns [`held_root_child`] with a tracer hold of `hold` and waits until
+    /// the tracer holds it.
+    #[cfg(target_os = "linux")]
+    async fn spawn_held_root(cwd: &std::path::Path, hold: Duration) -> PtyOwner {
+        let mut env = crate::test_support::child_env();
+        env.push((HELD_ROOT_HOLD_VAR.to_owned(), hold.as_millis().to_string()));
+        let pty = spawn(Command {
+            program: std::env::current_exe()
+                .expect("test executable")
+                .into_os_string()
+                .into_string()
+                .expect("test executable path is UTF-8"),
+            args: ["--ignored", "--exact", HELD_ROOT_CHILD_TEST, "--nocapture"]
+                .map(str::to_owned)
+                .to_vec(),
+            base: EnvBase::Empty,
+            env,
+            cwd: cwd.to_path_buf(),
+            cols: 200,
+            rows: 24,
+        });
+        let mut output = pty.subscribe_output(Some(0)).expect("subscribe output");
+        let mut seen = Vec::new();
+        pohunek_test_support::wait::guard("the root to be traced", async {
+            while !String::from_utf8_lossy(&seen).contains(HELD_ROOT_READY) {
+                match output
+                    .recv()
+                    .await
+                    .expect("output before the root is traced")
+                {
+                    OutputEvent::Replay(chunk) | OutputEvent::Output(chunk) => {
+                        seen.extend_from_slice(&chunk.bytes);
+                    }
+                    OutputEvent::Exit { .. } => panic!(
+                        "the held root ended before it was traced: {}",
+                        String::from_utf8_lossy(&seen)
+                    ),
+                    OutputEvent::Gap { .. } | OutputEvent::TerminalSnapshot(_) => {}
+                }
+            }
+        })
+        .await;
+        pty
+    }
+
+    // A root whose death after `SIGKILL` reaches the worker only later than one
+    // grace is still a stop: `SIGKILL` cannot be ignored, so the worker waits
+    // for it up to the post-kill reap deadline. The tracer that withholds the
+    // death relies on Linux ptrace semantics.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stop_waits_for_a_killed_root_the_kernel_reports_late() {
+        let cwd = crate::test_support::child_cwd();
+        let pty = spawn_held_root(cwd.path(), HELD_ROOT_HOLD).await;
+
+        let stopped = pohunek_test_support::wait::guard(
+            "stop to outlast the held root",
+            pty.stop("stop-held-root", HELD_ROOT_GRACE, kill_reap()),
+        )
+        .await
+        .expect("stop a root that dies late after SIGKILL");
+
+        assert_eq!(stopped.signal.as_deref(), Some("SIGKILL"), "{stopped:?}");
+        assert!(
+            read_process_start(pty.identity().pid).is_err(),
+            "the root is reaped once the stop returns"
+        );
+    }
+
+    // A root still unreaped when the post-kill deadline passes fails the stop,
+    // and the failure names the state the root is in.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_root_unreaped_past_the_post_kill_deadline_fails_the_stop_with_its_state() {
+        let cwd = crate::test_support::child_cwd();
+        let pty = spawn_held_root(cwd.path(), HELD_ROOT_HOLD).await;
+        // Shorter than the hold, so the deadline passes while the tracer holds
+        // the killed root.
+        let deadline = HELD_ROOT_GRACE * 2;
+
+        let refused = pohunek_test_support::wait::guard(
+            "stop to give up on the held root",
+            pty.stop("stop-held-root-too-long", HELD_ROOT_GRACE, deadline),
+        )
+        .await
+        .expect_err("a root held past the deadline fails the stop");
+
+        assert!(
+            matches!(
+                &refused,
+                PtyError::RootUnreaped { deadline: passed, state }
+                    if *passed == deadline && state.contains("(Z)")
+            ),
+            "{refused:?}"
+        );
+        // Once the tracer lets go, the stop completes.
+        let stopped = pohunek_test_support::wait::guard(
+            "stop to complete after the tracer lets go",
+            pty.stop("stop-held-root-released", HELD_ROOT_GRACE, kill_reap()),
+        )
+        .await
+        .expect("stop after the root is released");
+        assert_eq!(stopped.signal.as_deref(), Some("SIGKILL"), "{stopped:?}");
     }
 
     // Needs a descendant that keeps the PTY open after the root exits. Darwin
@@ -2890,7 +3210,11 @@ mod tests {
         // group would never return, which the hang guard reports by name.
         let stopped = pohunek_test_support::wait::guard(
             "stop to terminate the descendant group",
-            pty.stop("stop-after-root-exit", WorkerConfig::new().stop_grace),
+            pty.stop(
+                "stop-after-root-exit",
+                WorkerConfig::new().stop_grace,
+                WorkerConfig::new().kill_reap_deadline,
+            ),
         )
         .await
         .expect("stop descendant group");
@@ -2953,15 +3277,23 @@ mod tests {
         // hang guard replaces a wall-clock bound on the stop.
         let stopped = pohunek_test_support::wait::guard(
             "stop to force-close the escaped output",
-            pty.stop("stop-escaped-descendant", Duration::from_millis(50)),
+            pty.stop(
+                "stop-escaped-descendant",
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+            ),
         )
         .await
         .expect("a forced output close still returns the root exit");
         assert_eq!(stopped, root_exit);
         assert_eq!(
-            pty.stop("stop-escaped-descendant-again", Duration::from_millis(50))
-                .await
-                .expect("a repeated stop returns the same exit"),
+            pty.stop(
+                "stop-escaped-descendant-again",
+                Duration::from_millis(50),
+                Duration::from_millis(50)
+            )
+            .await
+            .expect("a repeated stop returns the same exit"),
             root_exit
         );
         assert!(matches!(
@@ -3029,7 +3361,7 @@ mod tests {
         assert_eq!(finished, root_exit);
         assert!(!pty.output_forced_closed());
         assert_eq!(
-            pty.stop("repeat-after-natural-winner", stop_grace())
+            pty.stop("repeat-after-natural-winner", stop_grace(), kill_reap())
                 .await
                 .expect("repeat stop"),
             root_exit
@@ -3247,7 +3579,7 @@ mod tests {
         );
 
         let exit = pty
-            .stop("cleanup", stop_grace())
+            .stop("cleanup", stop_grace(), kill_reap())
             .await
             .expect("stop still reaps the root after a forced output close");
         assert!(!exit.success, "the root was signalled, not left to finish");
@@ -3263,7 +3595,10 @@ mod tests {
         assert!(!pty.resize("attach-1", 1, 80, 24).await.expect("older"));
         assert_eq!(pty.dimensions().await, (100, 40));
 
-        let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
+        let _ = pty
+            .stop("cleanup", stop_grace(), kill_reap())
+            .await
+            .expect("cleanup");
     }
 
     #[tokio::test]
@@ -3333,7 +3668,7 @@ mod tests {
         drop(subscriber);
 
         let _ = pty
-            .stop("cleanup-noisy", stop_grace())
+            .stop("cleanup-noisy", stop_grace(), kill_reap())
             .await
             .expect("cleanup");
     }
@@ -3371,7 +3706,10 @@ mod tests {
             .expect("drain");
         assert_eq!(state, OutputReadState::Lapsed);
 
-        let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
+        let _ = pty
+            .stop("cleanup", stop_grace(), kill_reap())
+            .await
+            .expect("cleanup");
     }
 
     /// Input larger than the kernel's PTY queues is written in full.

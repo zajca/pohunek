@@ -22,6 +22,10 @@ pub(crate) const DEFAULT_DATA_TOKEN_TTL: Duration = Duration::from_secs(10);
 pub(crate) const DEFAULT_INPUT_DEDUP_ENTRIES: usize = 4_096;
 /// Default graceful stop window before hard termination, shared with the daemon.
 pub(crate) const DEFAULT_STOP_GRACE: Duration = pohunek_service_config::DEFAULT_STOP_GRACE;
+/// Default wait for the root's death after hard termination, shared with the
+/// daemon.
+pub(crate) const DEFAULT_KILL_REAP_DEADLINE: Duration =
+    pohunek_service_config::DEFAULT_KILL_REAP_DEADLINE;
 /// Default window for descendants to finish writing after the root exits.
 pub(crate) const DEFAULT_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default wait for a durable terminal commit before acknowledging stop.
@@ -121,6 +125,18 @@ pub enum ConfigError {
         /// Inclusive upper bound.
         maximum: Duration,
     },
+    /// A duration is shorter than another it must cover.
+    #[error("{field} must not be shorter than {minimum_field} ({minimum:?}), got {actual:?}")]
+    DurationMinimum {
+        /// Configuration field name.
+        field: &'static str,
+        /// Rejected duration.
+        actual: Duration,
+        /// Field whose value is the inclusive lower bound.
+        minimum_field: &'static str,
+        /// Inclusive lower bound.
+        minimum: Duration,
+    },
 }
 
 /// Frozen policy for one worker process.
@@ -147,6 +163,9 @@ pub struct WorkerConfig {
     pub input_stall: Option<Duration>,
     /// Grace period between soft and hard stop.
     pub stop_grace: Duration,
+    /// How long after the hard stop the root's death is awaited before the
+    /// stop fails; never shorter than [`Self::stop_grace`].
+    pub kill_reap_deadline: Duration,
     /// Maximum natural PTY drain after the root process exits.
     pub post_exit_drain_timeout: Duration,
     /// Maximum wait for terminal journal persistence in a stop RPC.
@@ -188,6 +207,7 @@ impl WorkerConfig {
             input_dedup_entries: DEFAULT_INPUT_DEDUP_ENTRIES,
             input_stall: None,
             stop_grace: DEFAULT_STOP_GRACE,
+            kill_reap_deadline: DEFAULT_KILL_REAP_DEADLINE,
             post_exit_drain_timeout: DEFAULT_POST_EXIT_DRAIN_TIMEOUT,
             terminal_commit_wait_timeout: DEFAULT_TERMINAL_COMMIT_WAIT_TIMEOUT,
             terminal_retention: DEFAULT_TERMINAL_RETENTION,
@@ -257,6 +277,7 @@ impl WorkerConfig {
             }
         }
         validate_duration("stop_grace", self.stop_grace)?;
+        validate_kill_reap(self.stop_grace, self.kill_reap_deadline)?;
         validate_duration("post_exit_drain_timeout", self.post_exit_drain_timeout)?;
         validate_duration(
             "terminal_commit_wait_timeout",
@@ -328,6 +349,19 @@ fn validate_count(field: &'static str, actual: usize, maximum: usize) -> Result<
             field,
             actual,
             maximum,
+        });
+    }
+    Ok(())
+}
+
+/// Rejects a post-kill reap deadline shorter than the stop grace it follows.
+fn validate_kill_reap(stop_grace: Duration, kill_reap: Duration) -> Result<(), ConfigError> {
+    if kill_reap < stop_grace {
+        return Err(ConfigError::DurationMinimum {
+            field: "kill_reap_deadline",
+            actual: kill_reap,
+            minimum_field: "stop_grace",
+            minimum: stop_grace,
         });
     }
     Ok(())

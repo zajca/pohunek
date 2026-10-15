@@ -125,7 +125,7 @@ async fn idle_sessions_do_not_spin_or_leak_descriptors() {
     for pty in idle.iter().chain(std::iter::once(&hung_up)) {
         pohunek_test_support::wait::guard(
             "a session to stop",
-            pty.stop("resources", config.stop_grace),
+            pty.stop("resources", config.stop_grace, config.kill_reap_deadline),
         )
         .await
         .expect("stop session");
