@@ -311,7 +311,12 @@
       "conclusion": "skipped"
     },
     {
-      "name": "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated)",
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, ubuntu-latest)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, macos-15)",
       "status": "completed",
       "conclusion": "success"
     },
