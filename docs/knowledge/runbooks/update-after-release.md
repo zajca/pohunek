@@ -688,8 +688,11 @@ something is applied after the old daemon stops: the package registry, the
 catalog state and the host profiles are backed up owner-private first, and the
 backup is restored when anything fails. Once the new daemon is ready, the
 integration hooks the release lists are reinstalled. A failure there is reported
-and does not roll the upgrade back. A Hermes home without the pohunek marker is
-reported as a gap with the command that installs it; nothing is written into it.
+and does not roll the upgrade back. A marked Hermes home is updated with the
+`hermes` executable on the daemon job's `PATH`, the one the runtime plan ran
+with, not the `PATH` of the shell that runs the upgrade. A Hermes home without
+the pohunek marker is reported as a gap with the command that installs it;
+nothing is written into it.
 
 The manual migration below remains the fallback for a host that cannot run the
 upgrade's runtime step, for example to move its sessions before an upgrade.

@@ -425,6 +425,7 @@ impl IntegrationStep for NoIntegrations {
         &'a self,
         _env: &'a IntegrationEnv,
         _actions: &'a [IntegrationAction],
+        _search_path: &'a str,
     ) -> Pin<Box<dyn Future<Output = Vec<IntegrationReinstall>> + Send + 'a>> {
         Box::pin(async { Vec::new() })
     }
@@ -3012,20 +3013,26 @@ async fn a_post_apply_preflight_that_cannot_run_restores_the_backup_and_fails() 
     harness.assert_installed(V1);
 }
 
-/// Records the integration homes an upgrade asked to reinstall.
+/// Records the integration homes an upgrade asked to reinstall, and the
+/// search path of each reinstall.
 #[derive(Debug, Clone, Default)]
-struct RecordingIntegrations(Arc<Mutex<Vec<IntegrationAction>>>);
+struct RecordingIntegrations(Arc<Mutex<Vec<IntegrationAction>>>, Arc<Mutex<Vec<String>>>);
 
 impl IntegrationStep for RecordingIntegrations {
     fn reinstall<'a>(
         &'a self,
         _env: &'a IntegrationEnv,
         actions: &'a [IntegrationAction],
+        search_path: &'a str,
     ) -> Pin<Box<dyn Future<Output = Vec<IntegrationReinstall>> + Send + 'a>> {
         self.0
             .lock()
             .expect("record lock")
             .extend(actions.iter().cloned());
+        self.1
+            .lock()
+            .expect("search path lock")
+            .push(search_path.to_owned());
         Box::pin(async { Vec::new() })
     }
 }
@@ -3200,6 +3207,43 @@ async fn each_listed_hook_home_is_reinstalled_in_its_own_profile() {
             .collect::<Vec<_>>(),
         [None, Some("work".to_owned())],
         "the profile home is reinstalled in its profile"
+    );
+}
+
+/// The integrations an upgrade reinstalls, the Hermes plugin among them, get
+/// the daemon job's `PATH`, the one the runtime plan ran with, and never the
+/// `PATH` of the CLI that runs the upgrade.
+#[tokio::test]
+async fn an_upgrade_reinstalls_the_integrations_with_the_job_path() {
+    let mut harness = Harness::new();
+    set_job_path(&mut harness, CURRENT_PATH);
+    harness.install(V1).await.expect("install");
+    harness.runtimes.script().search_paths.clear();
+    assert_ne!(
+        std::env::var_os("PATH").as_deref(),
+        Some(std::ffi::OsStr::new(CURRENT_PATH)),
+        "the CLI's PATH must differ from the job's"
+    );
+    let recorded = RecordingIntegrations::default();
+
+    harness
+        .engine()
+        .with_integration_step(Box::new(recorded.clone()))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("upgrade");
+
+    let reinstalled = recorded.1.lock().expect("search path lock").clone();
+    assert_eq!(
+        reinstalled,
+        [CURRENT_PATH],
+        "one reinstall, with the job's PATH"
+    );
+    let planned = harness.runtimes.script().search_paths.clone();
+    assert_eq!(
+        planned.last().map(String::as_str),
+        Some(CURRENT_PATH),
+        "the plan the reinstall acts on ran with the same PATH: {planned:?}"
     );
 }
 

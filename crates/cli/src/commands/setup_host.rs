@@ -662,7 +662,7 @@ async fn apply_steps(
             stale.push(integration.clone());
         }
     }
-    let mut hooks = reinstall_after_upgrade(&env, &stale, false).await;
+    let mut hooks = reinstall_after_upgrade(&env, &stale, None).await;
     if !hermes_homes.is_empty() {
         hooks.extend(reinstall_previewed_hermes_homes(
             &env,

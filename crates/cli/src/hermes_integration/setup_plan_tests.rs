@@ -1,8 +1,8 @@
-//! Scenarios of the Hermes step of bare `pohunek setup`: planning the marked
-//! Hermes homes and applying the plan with the `hermes` of a given search
-//! path, against an installed official Hermes package and a controlled
-//! `hermes`. They need the test Python interpreter, as every module below
-//! `hermes_integration` does.
+//! Scenarios of the Hermes step of bare `pohunek setup` and of the Hermes
+//! reinstall of `pohunek service upgrade`: planning the marked Hermes homes
+//! and applying the plan with the `hermes` of a given search path, against an
+//! installed official Hermes package and a controlled `hermes`. They need the
+//! test Python interpreter, as every module below `hermes_integration` does.
 
 // Rust guideline compliant 2026-10-15
 
@@ -27,6 +27,7 @@ use crate::commands::integration::{
     HERMES_UPDATE,
 };
 use crate::service::report::IntegrationReinstall;
+use crate::service::runtimes::{CliIntegrations, IntegrationStep as _};
 
 fn private_directory(path: &Path) {
     fs::create_dir_all(path).expect("create private directory");
@@ -318,6 +319,35 @@ fn a_hermes_update_runs_the_hermes_of_the_given_search_path() {
         default_home(&replanned).status,
         HERMES_CURRENT,
         "{replanned:?}"
+    );
+}
+
+/// The upgrade's reinstall updates a marked home with the `hermes` on the
+/// daemon job's `PATH` it is given, which the `PATH` of the CLI process does
+/// not hold.
+#[tokio::test]
+async fn an_upgrade_reinstall_runs_the_hermes_of_the_job_path() {
+    let host = HermesHost::new();
+    fs::write(&host.state, "disabled\n").expect("disable the plugin");
+    let job_path = host.search_path.to_str().expect("UTF-8 search path");
+    assert!(
+        std::env::var_os("PATH").is_none_or(|path| std::env::split_paths(&path)
+            .all(|entry| entry.as_os_str() != host.search_path.as_os_str())),
+        "the process PATH must not hold the controlled hermes"
+    );
+
+    let applied = CliIntegrations.reinstall(&host.env, &[], job_path).await;
+
+    assert_eq!(default_home(&applied).status, "installed", "{applied:?}");
+    assert!(
+        host.calls().contains("plugins enable pohunek"),
+        "the job's hermes enabled the plugin: {}",
+        host.calls()
+    );
+    assert_eq!(
+        default_home(&hermes_home_plan(&host.env, &host.search_path, false)).status,
+        HERMES_CURRENT,
+        "the home is current afterwards"
     );
 }
 

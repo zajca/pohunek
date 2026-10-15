@@ -1356,7 +1356,8 @@ impl<'a> Engine<'a> {
     }
 
     /// Reads the integration hooks the new daemon's release lists and
-    /// reinstalls them. Runs after the transaction, so a failure here is only
+    /// reinstalls them, with the daemon job's `PATH` for both the plan and the
+    /// Hermes executable. Runs after the transaction, so a failure here is only
     /// reported and never rolls the upgrade back.
     async fn reinstall_integrations(
         &self,
@@ -1367,11 +1368,11 @@ impl<'a> Engine<'a> {
     ) -> (Option<EnsureReport>, Vec<IntegrationReinstall>) {
         let plan = match layout.version_dir(version) {
             Some(dir) => match job_path(self.context, config, journal_default).await {
-                Ok(job) => {
-                    self.runtimes
-                        .run(self.context, &dir, true, &job.value)
-                        .await
-                }
+                Ok(job) => self
+                    .runtimes
+                    .run(self.context, &dir, true, &job.value)
+                    .await
+                    .map(|plan| (plan, job)),
                 Err(error) => Err(error),
             },
             None => Err(Error::Record {
@@ -1380,13 +1381,16 @@ impl<'a> Engine<'a> {
             }),
         };
         match plan {
-            Ok(plan) => {
+            Ok((plan, job)) => {
                 let env = IntegrationEnv {
                     paths: Paths::from_base(self.context.paths()),
                     home: self.context.home().map(Path::to_path_buf),
                     state_dir: self.context.paths().state_dir.clone(),
                 };
-                let results = self.integrations.reinstall(&env, &plan.integrations).await;
+                let results = self
+                    .integrations
+                    .reinstall(&env, &plan.integrations, &job.value)
+                    .await;
                 (Some(plan), results)
             }
             Err(error) => (
