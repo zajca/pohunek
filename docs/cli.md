@@ -54,7 +54,6 @@ discovered records still print. The `--json` records list peers only.
 | `pohunek service status [--json]` | Daemon job, namespace, installed versions, worker jobs per generation, and any interrupted or running install transaction. |
 | `pohunek service check [--prefix <dir>] [--accept-runtime-loss] [--preflight-budget <SECONDS>] [--json]` | Run every check the install (or, for an existing service, the upgrade) of this version makes before its first effect — `HOME` and XDG roots, the prefix, every directory it writes, a pending transaction, the recorded installation, and for an upgrade the live-session preflight — without changing anything; fails with the error code that command would. |
 
-`--preflight-budget <SECONDS>` (1 to 300, default 20) sets the probe and reference-check budget of this release's upgrade preflight only. A rollback judges with the previous release's daemon, which does not take the flag, so the rollback's preflight always uses the default budget.
 | `pohunek service lock -- <command> [args...]` | Run a command while holding the service transaction lock; `pohunek service` commands it runs reuse the lock with the holder token in `POHUNEK_SERVICE_LOCK_TOKEN`, every other one is refused until it exits; the lock ends with this process, never with a process the command left behind. Exits with the command's status. |
 | `pohunek plugin list / inspect / doctor` | List installed runtime packages, show one (record, health, declared runtime), or verify every package root; `doctor` exits 1 when findings exist. Local daemon only; `--host` is rejected. |
 | `pohunek plugin install <archive> (--sha256 <digest> \| --catalog <file>)` | Validate a package archive with a dry run and print what it declares (program, arguments, resume/fork support); installs only after repeating the command with `--yes`. A third-party archive is trusted solely by the digest you supply; `--catalog` authorizes official packages. `--no-enable` installs it disabled. |
@@ -105,6 +104,8 @@ discovered records still print. The `--json` records list peers only.
 | `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot; `--request-stdin` reads the request from stdin, `--request-timeout-ms` and `--meta k=v` as on `session new`. |
 | `pohunek agent-skill` | Print the complete bundled agent skill; `--json` wraps the skill text and its `content_sha256` in the process envelope. Fully local — `--host` is accepted and ignored. |
 | `pohunek prompt render / link` | Render provider prompt templates and work-item link metadata (called by external launchers). |
+
+`--preflight-budget <SECONDS>` (1 to 300, default 20) sets the probe and reference-check budget of this release's upgrade preflight only. A rollback judges with the previous release's daemon, which does not take the flag, so the rollback's preflight always uses the default budget.
 
 ### Working across hosts
 

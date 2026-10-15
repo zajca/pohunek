@@ -1380,7 +1380,7 @@ impl<'a> Engine<'a> {
         journal_default: Option<&str>,
     ) -> (Option<EnsureReport>, Vec<IntegrationReinstall>) {
         let plan = match layout.version_dir(version) {
-            Some(dir) => match job_path(self.context, config, journal_default).await {
+            Some(dir) => match job_search_path(self.context, config, journal_default).await {
                 Ok(job) => self
                     .runtimes
                     .run(self.context, &dir, true, &job.value)
@@ -2845,6 +2845,44 @@ pub(crate) async fn job_path(
     .await
 }
 
+/// The `PATH` a daemon job whose `service.toml` records `config`'s search path
+/// gets, without the manager variables. Callers that need only the `PATH` use
+/// this: a recorded `PATH` reads no service manager at all.
+///
+/// # Errors
+///
+/// See [`job_path`].
+pub(crate) async fn job_search_path(
+    context: &Context,
+    config: &ServiceConfig,
+    journal_default: Option<&str>,
+) -> Result<JobPath, Error> {
+    recorded_job_search_path(context, config.search_path(), journal_default).await
+}
+
+/// The `PATH` of a daemon job that records `recorded`, as [`job_search_path`]
+/// gives it. Only a job that records no `PATH` reads the manager, for its `PATH`.
+///
+/// # Errors
+///
+/// See [`job_path`].
+pub(crate) async fn recorded_job_search_path(
+    context: &Context,
+    recorded: &SearchPath,
+    journal_default: Option<&str>,
+) -> Result<JobPath, Error> {
+    if !recorded.is_empty() {
+        return Ok(JobPath {
+            value: recorded.to_env_value(),
+            source: PathSource::Recorded,
+            loaded_default: None,
+            variables: BTreeMap::new(),
+            manager_unreachable: None,
+        });
+    }
+    recorded_job_path(context, recorded, &[], journal_default).await
+}
+
 /// The `PATH` and the allowlisted manager variables of a daemon job whose
 /// `service.toml` records `recorded` and `allowlist`, by the rules of
 /// [`job_path`]. A fresh install records the search path
@@ -2943,10 +2981,21 @@ async fn manager_variables(
         .domain_environment(context.uid())
         .await
         .map_err(|detail| Error::ManagerEnvironment { detail })?;
-    Ok(ManagerVariables {
-        variables: manager_env::allowlisted_variables(domain, allowlist)?,
-        unreachable: None,
-    })
+    match domain {
+        Some(domain) => Ok(ManagerVariables {
+            variables: manager_env::allowlisted_variables(domain, allowlist)?,
+            unreachable: None,
+        }),
+        // Without a GUI session launchd has no domain to read, so the store
+        // variables it may set are not applied.
+        None => Ok(ManagerVariables {
+            variables: BTreeMap::new(),
+            unreachable: Some(format!(
+                "launchd has no user domain for uid {} (no GUI session)",
+                context.uid()
+            )),
+        }),
+    }
 }
 
 /// See the Linux variant.

@@ -2270,8 +2270,12 @@ whose frozen program resume would not find is `would_lose_recovery` with
 check, which then needs no flag. A relocated store (`agent_native_store_relocated`)
 or a store-condition refusal (`agent_native_reference_missing` from an unresolvable
 root, a scan limit or a changed store) is `would_lose_recovery` with resume's code,
-because the running release may detect it differently; so is any session the
-upgrade adopts from the built-in runtime, since its check changes with the runtime. A stopped session whose reference the preflight budget
+because the running release may detect it differently. A reported reference (one that is not pinned to a package
+digest) keeps its check across the upgrade only when the preflight can show it identical: a package pinned to the session's digest, which
+content addressing fixes, or a built-in that the upgrade adopts from a 0.34.0 to 0.34.2 store (store schema 5) whose adopted package declares
+the existence check of the v0.34.2 golden. Any other reported reference is `would_lose_recovery` with resume's code and a detail that names the
+reason: a built-in the upgrade does not adopt, an adopted package from a store that is not schema 5, or a package whose check differs from the
+golden. Hermes has no golden here, so its reported references are fail-closed too. A stopped session whose reference the preflight budget
 reached before its check is `would_lose_recovery` with `reference_unverified_within_budget`: the reference is not known to be present, so it is
 never adoptable, and the detail gives the number of such sessions in the report. The budget is 20 seconds by default, bounds the version probes and
 the reference checks together, and is raised with `service upgrade|check --preflight-budget <SECONDS>` (1 to 300; the CLI's preflight deadline

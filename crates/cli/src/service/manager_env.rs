@@ -247,13 +247,15 @@ pub trait LaunchdJob: Debug + Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<ActiveJob, String>> + Send + 'a>>;
 
     /// Returns the variables of the domain `gui/<uid>`, `PATH` included, without
-    /// naming any job. Reads no state the install or upgrade has to create.
+    /// naming any job. `None` when launchd has no such domain (no GUI session).
+    /// Reads no state the install or upgrade has to create.
     fn domain_environment(&self, uid: u32) -> DomainEnvironment<'_>;
 }
 
-/// A pending read of a launchd domain's variables, in launchd's order.
+/// A pending read of a launchd domain's variables, in launchd's order, or
+/// `None` when the domain does not exist.
 pub type DomainEnvironment<'a> =
-    Pin<Box<dyn Future<Output = Result<Vec<(String, String)>, String>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<Option<Vec<(String, String)>>, String>> + Send + 'a>>;
 
 /// Reads the active state through `launchctl`.
 #[derive(Debug, Clone, Copy, Default)]

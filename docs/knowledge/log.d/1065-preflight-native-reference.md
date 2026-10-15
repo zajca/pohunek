@@ -5,14 +5,19 @@
   own code and message.
 - A stopped session whose conversation is absent from its declared store
   (`agent_native_reference_missing`), or whose stored reference is malformed, is
-  `already_not_resumable` when the upgrade does not change the check. `service
+  `already_not_resumable` when the upgrade keeps the check. A reported reference
+  keeps its check only when it is pinned to a package digest, or when a 0.34.0 to
+  0.34.2 store (schema 5) is adopted into the official package whose check equals
+  the v0.34.2 golden (`V034_GOLDENS`, guarded by a test). Other reported references
+  are `would_lose_recovery` with the reason. `service
   upgrade` then does not require `--accept-runtime-loss` for it, and `service
   check` still lists it.
 - A relocated store (`agent_native_store_relocated`) or a store-condition
   refusal is `would_lose_recovery` with resume's code: the running release may
   detect those differently, so the preflight cannot prove it refuses too.
 - A session the upgrade adopts from the built-in runtime stays
-  `would_lose_recovery` when its reference check fails.
+  `would_lose_recovery` when its reference check fails, unless the v0.34 identity
+  above proves the check.
 - The preflight budget bounds the native reference checks as well as the version
   probes. A stopped session whose reference is not checked before the budget is
   spent is `would_lose_recovery` with `reference_unverified_within_budget`; the

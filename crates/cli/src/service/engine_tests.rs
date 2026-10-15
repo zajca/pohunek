@@ -2161,6 +2161,8 @@ struct FakeLaunchd {
     job_reads: AtomicUsize,
     /// How many times the domain alone was asked for.
     domain_reads: AtomicUsize,
+    /// Whether launchd has no user domain, as without a GUI session.
+    no_domain: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -2170,6 +2172,15 @@ impl FakeLaunchd {
             state: Mutex::new(value),
             job_reads: AtomicUsize::new(0),
             domain_reads: AtomicUsize::new(0),
+            no_domain: false,
+        }
+    }
+
+    /// The fake of a launchd with no user domain: no GUI session.
+    fn without_domain() -> Self {
+        Self {
+            no_domain: true,
+            ..Self::new(Ok(ActiveJob::default()))
         }
     }
 
@@ -2190,19 +2201,55 @@ impl LaunchdJob for FakeLaunchd {
         Box::pin(async move { value })
     }
 
-    fn domain_environment<'a>(
-        &'a self,
-        _uid: u32,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, String)>, String>> + Send + 'a>> {
+    fn domain_environment(&self, _uid: u32) -> crate::service::manager_env::DomainEnvironment<'_> {
         self.domain_reads.fetch_add(1, Ordering::SeqCst);
-        let value = self
-            .state
-            .lock()
-            .expect("launchd state")
-            .clone()
-            .map(|job| job.domain_environment);
+        let value = if self.no_domain {
+            Ok(None)
+        } else {
+            self.state
+                .lock()
+                .expect("launchd state")
+                .clone()
+                .map(|job| Some(job.domain_environment))
+        };
         Box::pin(async move { value })
     }
+}
+
+/// On macOS, a recorded-`PATH` job without a launchd user domain (no GUI session,
+/// for example an upgrade over SSH) is degraded like a bus that cannot be
+/// reached: the warning says the store variables were not applied.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_recorded_path_job_without_a_launchd_domain_warns_like_an_absent_bus() {
+    let mut harness = Harness::new();
+    let fake = Arc::new(FakeLaunchd::without_domain());
+    harness.context = harness
+        .context
+        .clone()
+        .with_launchd_job(Arc::clone(&fake) as Arc<dyn LaunchdJob>);
+    let config = crate::service::definition::config_with_search_path(
+        &harness.context,
+        Path::new("/opt/pohunek"),
+        crate::service::VERSION,
+        pohunek_platform::shell_env::SearchPath::new(vec![std::path::PathBuf::from("/usr/bin")])
+            .expect("a trusted directory"),
+    )
+    .expect("the recorded configuration");
+
+    let job = crate::service::engine::job_path(&harness.context, &config, None)
+        .await
+        .expect("a recorded PATH judges without a domain");
+
+    assert!(job.variables.is_empty(), "no domain, no variables");
+    assert!(job.manager_unreachable.is_some(), "{job:?}");
+    let warnings = crate::service::engine::job_warnings(&harness.context, &job);
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("judged at the default store locations")),
+        "{warnings:?}"
+    );
 }
 
 /// On macOS a recorded-`PATH` job reads only the launchd domain: asking for the
@@ -2668,6 +2715,41 @@ impl UserManager for FailingManager {
         let failure = self.0.clone();
         Box::pin(async move { Err(failure) })
     }
+}
+
+/// The `PATH`-only read of a recorded job never asks the manager: an unusable
+/// manager fails the variables a judgement needs, not the `PATH` a plan needs.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_recorded_path_plan_does_not_depend_on_the_manager_variables() {
+    use crate::service::manager_env::EnvironmentFailure;
+    use pohunek_platform::shell_env::SearchPath;
+
+    let mut harness = Harness::new();
+    let search_path =
+        SearchPath::new(vec![std::path::PathBuf::from("/usr/bin")]).expect("a trusted directory");
+    let config = crate::service::definition::config_with_search_path(
+        &harness.context,
+        Path::new("/opt/pohunek"),
+        crate::service::VERSION,
+        search_path,
+    )
+    .expect("the recorded configuration");
+    harness.context = harness
+        .context
+        .clone()
+        .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unusable(
+            "the answer is not a list".to_owned(),
+        ))));
+
+    let plan = crate::service::engine::job_search_path(&harness.context, &config, None)
+        .await
+        .expect("the recorded PATH is the plan's PATH without the manager");
+    assert_eq!(plan.value, "/usr/bin");
+    assert!(plan.variables.is_empty());
+    crate::service::engine::job_path(&harness.context, &config, None)
+        .await
+        .expect_err("the judgement's variables still fail closed");
 }
 
 /// A job that records its `PATH` takes no variables from a manager that cannot

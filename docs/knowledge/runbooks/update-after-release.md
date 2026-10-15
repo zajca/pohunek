@@ -628,9 +628,13 @@ the upgrade is not what ends it.
   summary counts it apart from the sessions at risk. A relocated store
   (`agent_native_store_relocated`) or a store-condition refusal is `would lose
   recovery` with resume's code: the running release may detect those
-  differently, so the preflight cannot prove it refuses too. A session that the
-  upgrade adopts from the built-in runtime is also `would lose recovery`, with
-  the same code, because its reference check changes with the runtime.
+  differently, so the preflight cannot prove it refuses too. A reported reference
+  keeps its check only where the preflight can prove it identical: a session
+  pinned to a package digest, or a built-in that a 0.34.0 to 0.34.2 store (schema
+  5) adopts into the official package whose check equals the v0.34.2 golden. Any
+  other session the upgrade adopts from the built-in runtime is `would lose
+  recovery`, with the same code and a detail that names the reason. Sources
+  outside those are fail-closed, so the verdict is `would lose recovery` there.
 - `would not be adopted`: the new daemon would not manage the worker
   (`record_unreadable`, `worker_without_session_record`, `store_unusable`,
   `worker_generation_missing`,

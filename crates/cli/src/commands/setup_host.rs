@@ -60,7 +60,7 @@ use crate::commands::setup::{config_files, install_config_into, ConfigResult};
 use crate::error::CliError;
 use crate::hermes_integration::runner::safe_ancestor;
 use crate::paths::Paths;
-use crate::service::engine::{install_layout, installed_job_path, recorded_job_path};
+use crate::service::engine::{install_layout, installed_job_path, recorded_job_search_path};
 use crate::service::report::IntegrationReinstall;
 use crate::service::runtimes::DaemonRuntimes;
 use crate::service::{self, Context, VERSION};
@@ -514,13 +514,8 @@ async fn plan_in(
         // install records, or the service manager's own when it records none,
         // so the plan judges the packages as the installed daemon will.
         let (search, _report) = context.install_search_path()?;
-        // A fresh install records the default allowlist; the plan reads only the
-        // job's PATH.
-        let allowlist: Vec<String> = pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST
-            .iter()
-            .map(|pattern| (*pattern).to_owned())
-            .collect();
-        let job = recorded_job_path(context, &search, &allowlist, None)
+        // The plan reads only the job's PATH, so no manager variables are selected.
+        let job = recorded_job_search_path(context, &search, None)
             .await
             .map_err(|error| CliError::SetupBlocked {
                 detail: format!(

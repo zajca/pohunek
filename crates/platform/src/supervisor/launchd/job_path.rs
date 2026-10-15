@@ -115,7 +115,10 @@ pub async fn job_path_sources(
 }
 
 /// Reads the variables of the user domain `gui/<uid>`, `PATH` included, without
-/// naming any job. A domain with no GUI session has none.
+/// naming any job.
+///
+/// `None` means launchd has no such domain, which is the case without a GUI
+/// session. A domain that exists with no variables is `Some` of an empty list.
 ///
 /// # Errors
 ///
@@ -123,28 +126,22 @@ pub async fn job_path_sources(
 pub async fn domain_environment_of(
     uid: u32,
     deadline: Duration,
-) -> Result<Vec<(String, String)>, Error> {
+) -> Result<Option<Vec<(String, String)>>, Error> {
     let launchctl = Launchctl::new(deadline).with_output_cap(PRINT_OUTPUT_CAP);
-    redacted_domain_environment(&launchctl, &format!("gui/{uid}")).await
+    domain_environment(&launchctl, &format!("gui/{uid}")).await
 }
 
-/// The variables of `domain`, with a parse failure reported without the line
-/// it could not read.
-async fn redacted_domain_environment(
-    launchctl: &Launchctl,
-    domain: &str,
-) -> Result<Vec<(String, String)>, Error> {
-    domain_environment(launchctl, domain)
-        .await
-        .map_err(|error| match error {
-            // The parser quotes the line it could not read, and a line of the
-            // domain's environment carries a value, so only the condition is kept.
-            Error::InvalidData { operation, .. } => Error::InvalidData {
-                operation,
-                detail: "unrecognized launchctl print output in the domain environment".to_owned(),
-            },
-            other => other,
-        })
+/// A domain-entry parse failure quotes the line it could not read, and a line of
+/// the domain's environment carries a variable's value, so only the condition is
+/// kept. Other errors are not from the entries and pass unchanged.
+fn redact_domain_line(error: Error) -> Error {
+    match error {
+        Error::InvalidData { operation, .. } => Error::InvalidData {
+            operation,
+            detail: "unrecognized launchctl print output in the domain environment".to_owned(),
+        },
+        other => other,
+    }
 }
 
 /// [`job_path_sources`] through the given runner, so tests can answer for launchd.
@@ -153,7 +150,10 @@ pub(crate) async fn resolve(
     domain: &str,
     label: &str,
 ) -> Result<JobPathSources, Error> {
-    let domain_environment = domain_environment(launchctl, domain).await?;
+    // Without the domain the job is not loaded either, so it has no variables.
+    let domain_environment = domain_environment(launchctl, domain)
+        .await?
+        .unwrap_or_default();
     let domain_value = named_path(
         domain_environment
             .iter()
@@ -181,19 +181,21 @@ pub(crate) async fn resolve(
     })
 }
 
-/// The variables of the domain's environment, empty when the domain sets none or
-/// has no GUI session.
+/// The variables of `domain`, with a parse failure reported without the line it
+/// could not read. `None` when launchd has no such domain.
 async fn domain_environment(
     launchctl: &Launchctl,
     domain: &str,
-) -> Result<Vec<(String, String)>, Error> {
+) -> Result<Option<Vec<(String, String)>>, Error> {
     let completion = launchctl
         .run("print", &[OsStr::new(domain)])
         .await
         .map_err(|error| run_error(OPERATION, error))?;
     match completion.status {
-        Status::Success => domain_entries(printed(&completion)?),
-        Status::NoSuchDomain => Ok(Vec::new()),
+        Status::Success => domain_entries(printed(&completion)?)
+            .map(Some)
+            .map_err(redact_domain_line),
+        Status::NoSuchDomain => Ok(None),
         _ => Err(status_error(OPERATION, domain, &completion)),
     }
 }
@@ -584,8 +586,9 @@ mod tests {
         });
     }
 
-    /// A domain line the parser cannot read is reported by the domain-only read
-    /// without the line, which may carry a variable's value.
+    /// A domain line the parser cannot read is reported without the line, which
+    /// may carry a variable's value, by the domain-only read and by the job's
+    /// path resolution, which reads the same domain.
     #[test]
     fn an_unreadable_domain_line_is_reported_without_its_text() {
         runtime().block_on(async {
@@ -593,13 +596,46 @@ mod tests {
             let domain = "gui/501 = {\n\tenvironment = {\n\t\tSECRET_STORE=/sentinel/secret-value\n\t}\n\tservices = {\n\t}\n}\n";
             let launchctl = fake(dir.path(), Reply::Output(domain), Reply::Status(113), None);
 
-            let error = redacted_domain_environment(&launchctl, "gui/501")
+            let error = domain_environment(&launchctl, "gui/501")
                 .await
                 .expect_err("the line has no separator");
             assert!(matches!(error, Error::InvalidData { .. }), "{error}");
             let text = format!("{error} {error:?}");
             assert!(!text.contains("/sentinel/secret-value"), "{text}");
             assert!(!text.contains("SECRET_STORE"), "{text}");
+
+            let launchctl = fake(dir.path(), Reply::Output(domain), Reply::Status(113), None);
+            let error = resolve(&launchctl, "gui/501", "job")
+                .await
+                .expect_err("the job's resolution reads the same domain");
+            let text = format!("{error} {error:?}");
+            assert!(!text.contains("/sentinel/secret-value"), "{text}");
+            assert!(!text.contains("SECRET_STORE"), "{text}");
+        });
+    }
+
+    /// A domain launchd does not have is `None`, which is not the same as a
+    /// domain with no variables: only the first means no GUI session.
+    #[test]
+    fn a_missing_domain_is_distinct_from_an_empty_one() {
+        runtime().block_on(async {
+            let dir = pohunek_test_support::tempdir().expect("scratch directory");
+            let launchctl = fake(dir.path(), Reply::Status(112), Reply::Status(113), None);
+            assert_eq!(
+                domain_environment(&launchctl, "gui/9999")
+                    .await
+                    .expect("read"),
+                None
+            );
+
+            let empty = "gui/501 = {\n\tservices = {\n\t}\n}\n";
+            let launchctl = fake(dir.path(), Reply::Output(empty), Reply::Status(113), None);
+            assert_eq!(
+                domain_environment(&launchctl, "gui/501")
+                    .await
+                    .expect("read"),
+                Some(Vec::new())
+            );
         });
     }
 

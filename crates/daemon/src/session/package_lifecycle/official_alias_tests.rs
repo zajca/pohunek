@@ -4471,15 +4471,211 @@ async fn a_built_in_session_whose_conversation_is_missing_is_judged_lost_when_th
     )
     .expect("remove the conversation");
 
-    let (verdict, code) =
-        stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
+    let (verdict, code, detail) = stopped_preflight_judgement_entered(
+        &session.fixture,
+        &session.store_path,
+        &session.id,
+        std::time::Instant::now(),
+    );
     let restarted = restart(&session.fixture).await;
 
-    assert_eq!(verdict, Verdict::WouldLoseRecovery);
+    // The store is the current schema, not a v0.34.x store, so the adopted check
+    // cannot be shown identical to the running release's.
+    assert_eq!(verdict, Verdict::WouldLoseRecovery, "{detail}");
+    assert!(detail.contains("oldest schema is current"), "{detail}");
     assert_eq!(code, "agent_native_reference_missing");
     assert_eq!(
         refused_resume_code(&restarted.registry, &session.id).await,
         code
+    );
+}
+
+/// Rewrites the schema of every record line of the store at `store_path` to
+/// `version`, as an older release would have written it. Records keep the
+/// current shape, which schema 5 shares: its migration to 6 changes nothing.
+fn relabel_store_schema(store_path: &Path, version: u32) {
+    let text = fs::read_to_string(store_path).expect("read the store");
+    let mut relabelled = String::new();
+    for line in text.lines() {
+        let mut value: serde_json::Value = serde_json::from_str(line).expect("a JSON record line");
+        if let Some(object) = value.as_object_mut() {
+            if object.contains_key("schema_version") {
+                object.insert("schema_version".to_owned(), serde_json::json!(version));
+            }
+        }
+        relabelled.push_str(&value.to_string());
+        relabelled.push('\n');
+    }
+    fs::write(store_path, relabelled).expect("write the store");
+}
+
+/// The official claude package with its descriptor edited by `edit`.
+fn real_official_claude_edited(edit: impl FnOnce(&str) -> String) -> Package {
+    let mut entries = crate::agent::host::fixture::official_package_entries(RuntimeId::CLAUDE);
+    let descriptor = String::from_utf8(entries[0].contents.clone()).expect("UTF-8 descriptor");
+    let edited = edit(&descriptor);
+    assert_ne!(edited, descriptor, "the edit changes the descriptor");
+    entries[0].contents = edited.into_bytes();
+    Package::from_entries(&entries)
+}
+
+#[tokio::test]
+async fn an_adopted_v034_claude_session_whose_conversation_is_missing_is_already_not_resumable() {
+    // A 0.34 store is schema 5, and the adopted official package declares the
+    // check v0.34.2 declared: the running release refuses the same reference.
+    let session = stopped_built_in_claude("preflight-adopted-v034-missing").await;
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &real_official(RuntimeId::CLAUDE),
+        5,
+    )
+    .await;
+    fs::remove_file(
+        session
+            .fixture
+            .dir
+            .join("claude-home")
+            .join("projects")
+            .join("work")
+            .join(format!("{CONVERSATION}.jsonl")),
+    )
+    .expect("remove the conversation");
+    relabel_store_schema(&session.store_path, 5);
+
+    let (verdict, code, detail) = stopped_preflight_judgement_entered(
+        &session.fixture,
+        &session.store_path,
+        &session.id,
+        std::time::Instant::now(),
+    );
+    // The daemon migrates the store at startup, after the upgrade's judgement.
+    crate::store::migrate_at_startup(&session.store_path).expect("migrate the v0.34 store");
+    let restarted = restart(&session.fixture).await;
+
+    assert_eq!(verdict, Verdict::AlreadyNotResumable, "{detail}");
+    assert_eq!(code, "agent_native_reference_missing");
+    assert_eq!(
+        refused_resume_code(&restarted.registry, &session.id).await,
+        code
+    );
+}
+
+#[tokio::test]
+async fn an_adopted_claude_session_from_a_store_that_is_not_v034_stays_would_lose_recovery() {
+    // The same adopted session, but the store is schema 6: the running release
+    // may check the reference differently, so the verdict cannot be precise.
+    let session = stopped_built_in_claude("preflight-adopted-schema-six").await;
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &real_official(RuntimeId::CLAUDE),
+        5,
+    )
+    .await;
+    fs::remove_file(
+        session
+            .fixture
+            .dir
+            .join("claude-home")
+            .join("projects")
+            .join("work")
+            .join(format!("{CONVERSATION}.jsonl")),
+    )
+    .expect("remove the conversation");
+    relabel_store_schema(&session.store_path, 6);
+
+    let (verdict, code, detail) = stopped_preflight_judgement_entered(
+        &session.fixture,
+        &session.store_path,
+        &session.id,
+        std::time::Instant::now(),
+    );
+
+    assert_eq!(verdict, Verdict::WouldLoseRecovery, "{detail}");
+    assert_eq!(code, "agent_native_reference_missing");
+    assert!(
+        detail.contains("oldest schema is 6, not 5"),
+        "the detail names the store: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn an_adopted_claude_package_that_changed_its_check_stays_would_lose_recovery() {
+    // The adopted package declares the existence check differently from the
+    // v0.34.2 golden, so the running release's check cannot be shown identical.
+    let session = stopped_built_in_claude("preflight-adopted-changed-check").await;
+    let changed = real_official_claude_edited(|descriptor| {
+        descriptor.replace("max_depth = 1", "max_depth = 2")
+    });
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &changed,
+        5,
+    )
+    .await;
+    fs::remove_file(
+        session
+            .fixture
+            .dir
+            .join("claude-home")
+            .join("projects")
+            .join("work")
+            .join(format!("{CONVERSATION}.jsonl")),
+    )
+    .expect("remove the conversation");
+    relabel_store_schema(&session.store_path, 5);
+
+    let (verdict, code, detail) = stopped_preflight_judgement_entered(
+        &session.fixture,
+        &session.store_path,
+        &session.id,
+        std::time::Instant::now(),
+    );
+
+    assert_eq!(verdict, Verdict::WouldLoseRecovery, "{detail}");
+    assert_eq!(code, "agent_native_reference_missing");
+    assert!(
+        detail.contains("differs from the v0.34.2 golden"),
+        "the detail names the golden: {detail}"
+    );
+}
+
+/// The v0.34.2 claude golden declares the native reference check the official
+/// claude package declares. If this fails, the package changed its check: the
+/// preflight then judges adopted 0.34 references fail-closed until the golden is
+/// reviewed and updated.
+#[test]
+fn the_v034_claude_golden_declares_the_official_claude_packages_check() {
+    let entries = crate::agent::host::fixture::official_package_entries(RuntimeId::CLAUDE);
+    let descriptor = std::str::from_utf8(&entries[0].contents).expect("UTF-8 descriptor");
+    let detect = std::str::from_utf8(&entries[1].contents).expect("UTF-8 manifest");
+    let official = crate::agent::host::RuntimeDefinition::from_toml(
+        descriptor,
+        |identity| crate::agent::host::DefinitionOrigin::Package {
+            package: identity,
+            digest: PackageDigest::parse(crate::agent::host::fixture::OFFICIAL_CLAUDE_DIGEST)
+                .expect("valid digest"),
+        },
+        |_name| {
+            crate::detect::Manifest::parse_str(detect)
+                .map(std::sync::Arc::new)
+                .ok()
+                .ok_or(crate::agent::host::DefinitionError::UnknownManifest)
+        },
+    )
+    .expect("the official claude descriptor parses");
+
+    assert_eq!(
+        upgrade_preflight::golden_check(RuntimeId::CLAUDE),
+        upgrade_preflight::GoldenCheck::Declared(official.hook_existence().cloned()),
+        "the official claude package changed its native reference existence check: the \
+         v0.34.2 golden declares another check, so the preflight judges adopted 0.34 \
+         references fail-closed until the golden is reviewed and updated"
     );
 }
 

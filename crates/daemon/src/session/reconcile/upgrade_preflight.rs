@@ -31,6 +31,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pohunek_service_config::preflight::{
@@ -54,7 +55,7 @@ use pohunek_service_config::runtimes::{
     CODE_SERVICE_CONFIG_UNREADABLE, ENSURE_REPORT_VERSION,
 };
 use pohunek_worker_protocol::{negotiate, BaseEnv, Version, VersionRange, SUPPORTED_RANGE};
-use protocol::{BindingProvenance, ProtocolError};
+use protocol::{BindingProvenance, LaunchBinding, PackageDigest, ProtocolError, RuntimeId};
 
 use super::{
     import_worker_identities, import_worker_subagents, initial_input_orphaned,
@@ -63,15 +64,17 @@ use super::{
     JournalReject, WorkerJournalScan,
 };
 use crate::agent::host::{
-    adopts, validate_launch_runtime_with_timeout_detailed, BuiltinSource, PackageSource,
-    PackageStore, RuntimeDefinition, RuntimeHost, Spawn,
+    adopts, validate_launch_runtime_with_timeout_detailed, BuiltinSource, DefinitionError,
+    DefinitionOrigin, LaunchPin, PackageSource, PackageStore, RuntimeDefinition, RuntimeHost,
+    Spawn,
 };
 use crate::agent::{
-    NativeReferenceProvenance, ProfileRegistry, ReferenceCheckFailure, RefusalPhase,
-    ValidatedLaunchProgram,
+    NativeReferenceProvenance, ProfileRegistry, ReferenceCheckFailure, ReferenceExistence,
+    RefusalPhase, ValidatedLaunchProgram,
 };
 use crate::capabilities::LaunchValidationFailure;
 use crate::catalog_anchor::CatalogTrust;
+use crate::detect::Manifest;
 use crate::procwatch::ProcessInspector;
 use crate::runtime::environment::effective_variable;
 use crate::runtime::lifecycle::IDENTITY_MISMATCH;
@@ -225,13 +228,18 @@ pub fn run_with(
         .checked_add(options.probe_budget)
         .unwrap_or(options.entry);
     let probes = ProbeLedger::new(deadline, options.probe_budget);
+    let dry = Store::new(inputs.store_path.clone()).dry_run_migration();
+    let store_from = dry.as_ref().ok().and_then(|dry| match dry.state {
+        DryRunState::WouldMigrate { from } => Some(from),
+        DryRunState::Missing | DryRunState::UpToDate => None,
+    });
     let judging = Judging {
         runtimes: &runtimes,
         profiles: &profiles,
         base_env: &base_env,
         probes: &probes,
+        store_from,
     };
-    let dry = Store::new(inputs.store_path.clone()).dry_run_migration();
     let (store, sessions, unmanaged_workers, stopped_sessions) = match dry {
         Ok(dry) => {
             let (sessions, unmanaged) =
@@ -634,17 +642,153 @@ fn judge_stopped(
     })
 }
 
+/// The v0.34.2 built-in runtimes whose native reference check is compiled in as
+/// a golden copy: the runtime id, its `runtime.toml`, and its `detect.toml`.
+/// Hermes is not listed: its golden names a version probe parser this daemon
+/// does not compile in, so a Hermes reference over an adopted package stays
+/// fail-closed.
+const V034_GOLDENS: [(&str, &str, &str); 2] = [
+    (
+        RuntimeId::CLAUDE,
+        include_str!("../../../../../compat/claude/builtin-v0.34/runtime.toml"),
+        include_str!("../../../../../compat/claude/builtin-v0.34/detect.toml"),
+    ),
+    (
+        RuntimeId::CODEX,
+        include_str!("../../../../../compat/codex/builtin-v0.34/runtime.toml"),
+        include_str!("../../../../../compat/codex/builtin-v0.34/detect.toml"),
+    ),
+];
+
+/// What the v0.34.2 golden of a runtime declares for its native reference check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GoldenCheck {
+    /// No golden is compiled in for the runtime, or it does not parse.
+    Missing,
+    /// The golden's existence declaration, `None` when it declares none.
+    Declared(Option<ReferenceExistence>),
+}
+
+/// The native reference existence check v0.34.2 declared for `runtime`, parsed
+/// from its golden with the descriptor parser.
+pub(crate) fn golden_check(runtime: &str) -> GoldenCheck {
+    let Some((_, descriptor, detect)) = V034_GOLDENS.iter().find(|(id, _, _)| *id == runtime)
+    else {
+        return GoldenCheck::Missing;
+    };
+    let parsed = RuntimeDefinition::from_toml(
+        descriptor,
+        |package| DefinitionOrigin::Builtin {
+            package: Some(package),
+        },
+        |name| {
+            if name != runtime {
+                return Err(DefinitionError::UnknownManifest);
+            }
+            Manifest::parse_str(detect)
+                .ok()
+                .map(Arc::new)
+                .ok_or(DefinitionError::UnknownManifest)
+        },
+    );
+    match parsed {
+        Ok(definition) => GoldenCheck::Declared(definition.hook_existence().cloned()),
+        Err(_) => GoldenCheck::Missing,
+    }
+}
+
+/// The digest of a package-pinned binding, if it is pinned to one.
+fn package_digest(binding: &LaunchBinding) -> Option<&PackageDigest> {
+    match &binding.provenance {
+        BindingProvenance::Package { package_digest, .. } => Some(package_digest),
+        BindingProvenance::Builtin { .. } => None,
+    }
+}
+
+/// Whether the running release's native reference check for a reference is the
+/// one the upgrade serves.
+enum CheckIdentity {
+    /// The check is the same on both sides of the upgrade.
+    Unchanged,
+    /// The check cannot be shown identical; the reason is the verdict's detail.
+    Unproven(String),
+}
+
+/// The identity of the native reference check of `binding`, judged against the
+/// `definition` the upgrade serves.
+///
+/// An assigned reference is frozen in its launch, so its check is the session's
+/// own. A reported reference reads the check of the running release's
+/// definition, which is provable identical only in two cases: a package pinned
+/// to the session's digest, which content addressing fixes, or a built-in that
+/// the upgrade adopts from a v0.34.x store, whose check must equal the v0.34.2
+/// golden. Every other reported reference is unproven.
+fn reported_check_identity(
+    binding: &ResumeBinding,
+    definition: &RuntimeDefinition,
+    judging: &Judging<'_>,
+) -> CheckIdentity {
+    if !matches!(
+        binding.native_reference_provenance,
+        NativeReferenceProvenance::Reported
+    ) {
+        return CheckIdentity::Unchanged;
+    }
+    let pinned = match &binding.launch_binding {
+        LaunchPin::Pinned(frozen) => package_digest(frozen),
+        LaunchPin::Unpinned => None,
+    };
+    if pinned.is_some() && pinned == package_digest(definition.binding()) {
+        return CheckIdentity::Unchanged;
+    }
+    if !adopts(&binding.launch_binding, definition) {
+        return CheckIdentity::Unproven(
+            "the recovery runs a built-in runtime that the upgrade does not replace with a \
+             package pinned to its digest, so the running release's native reference check \
+             cannot be shown identical"
+                .to_owned(),
+        );
+    }
+    if judging.store_from != Some(STORE_SCHEMA_V034) {
+        return CheckIdentity::Unproven(format!(
+            "the store's oldest schema is {}, not {STORE_SCHEMA_V034} as a v0.34.x daemon \
+             writes it, so the adopted package's native reference check cannot be shown \
+             identical to the one the running release checks",
+            judging
+                .store_from
+                .map_or_else(|| "current".to_owned(), |from| from.to_string())
+        ));
+    }
+    let runtime = definition.binding().runtime_id.as_str();
+    match golden_check(runtime) {
+        GoldenCheck::Missing => CheckIdentity::Unproven(format!(
+            "no v0.34.2 golden of runtime {runtime} is compiled in to compare the adopted \
+             package's native reference check with"
+        )),
+        GoldenCheck::Declared(golden) if golden.as_ref() == definition.hook_existence() => {
+            CheckIdentity::Unchanged
+        }
+        GoldenCheck::Declared(_) => CheckIdentity::Unproven(
+            "the adopted package's native reference check differs from the v0.34.2 golden, so \
+             the package changed its check"
+                .to_owned(),
+        ),
+    }
+}
+
+/// The store schema a v0.34.0 to v0.34.2 daemon writes.
+const STORE_SCHEMA_V034: u32 = 5;
+
 /// The native reference check resume runs after [`judge_launch`] passed: the
 /// stopped session's conversation must still exist where its launch looks for
 /// it. Resume refuses a missing or relocated reference before any launch, with
 /// the code and message this returns.
 ///
-/// The verdict is [`Verdict::AlreadyNotResumable`] when the upgrade does not
-/// change the check: the check frozen into the session's launch, or a check
-/// read from a runtime definition the session already launched from. A check
-/// read from a definition the upgrade adopts is judged
-/// [`Verdict::WouldLoseRecovery`], since the running release checks another
-/// reference. `None` when the reference verifies, or when no check is declared.
+/// The verdict is [`Verdict::AlreadyNotResumable`] only when the upgrade keeps
+/// the check: an assigned reference, or a reported reference whose check
+/// [`reported_check_identity`] proves identical. A reported reference whose
+/// check cannot be proven identical is [`Verdict::WouldLoseRecovery`] with the
+/// reason. `None` when the reference verifies, or when no check is declared.
 fn judge_reference(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judgement> {
     let binding = candidate.recovery.as_ref()?;
     let capabilities = &candidate.info.capabilities;
@@ -659,20 +803,33 @@ fn judge_reference(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<J
         recovery_profile_in(judging.profiles, binding, ProfileChange::Refuse, fork).ok()?;
     let definition = recovery_definition(judging.runtimes, binding).ok()?;
     let base = judging.base_env.as_ref().ok()?;
+    let identity = reported_check_identity(binding, &definition, judging);
     let launch = binding_native_launch(binding, &definition);
     let existence = reference_existence(binding, launch.as_ref(), &definition)?;
     let session_ref = match session_ref_from_binding(launch.as_ref()?.reference_kind(), binding) {
         Ok(session_ref) => session_ref,
         Err(error) => {
-            return Some((
-                Verdict::AlreadyNotResumable,
-                error.code.clone(),
-                format!(
-                    "resume refuses the session's native reference ({}: {}) before any launch, \
-                     and the upgrade does not change it",
-                    error.code, error.msg
+            return Some(match identity {
+                CheckIdentity::Unchanged => (
+                    Verdict::AlreadyNotResumable,
+                    error.code.clone(),
+                    format!(
+                        "resume refuses the session's native reference ({}: {}) before any \
+                         launch, and the upgrade does not change it",
+                        error.code, error.msg
+                    ),
                 ),
-            ));
+                CheckIdentity::Unproven(reason) => (
+                    Verdict::WouldLoseRecovery,
+                    error.code.clone(),
+                    format!(
+                        "resume refuses the session's native reference ({}: {}) before any \
+                         launch, and {reason}; restore the conversation, or upgrade with \
+                         --accept-runtime-loss",
+                        error.code, error.msg
+                    ),
+                ),
+            });
         }
     };
     // The reference scan is not a version probe, so it runs under the same
@@ -697,23 +854,17 @@ fn judge_reference(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<J
     )
     .err()?;
     let error = existence.refusal(failure, RefusalPhase::Recovery);
-    let upgrade_changes_check = matches!(
-        binding.native_reference_provenance,
-        NativeReferenceProvenance::Reported
-    ) && adopts(&binding.launch_binding, &definition);
-    Some(if upgrade_changes_check {
-        (
+    Some(match identity {
+        CheckIdentity::Unproven(reason) => (
             Verdict::WouldLoseRecovery,
             error.code.clone(),
             format!(
                 "resume refuses the session's native reference ({}: {}) before any launch, and \
-                 the upgrade replaces the runtime whose reference check it runs; restore the \
-                 conversation, or upgrade with --accept-runtime-loss",
+                 {reason}; restore the conversation, or upgrade with --accept-runtime-loss",
                 error.code, error.msg
             ),
-        )
-    } else if stored_reference_fact(failure) {
-        (
+        ),
+        CheckIdentity::Unchanged if stored_reference_fact(failure) => (
             Verdict::AlreadyNotResumable,
             error.code.clone(),
             format!(
@@ -721,9 +872,8 @@ fn judge_reference(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<J
                  the running release too, so the upgrade does not lose its recovery",
                 error.code, error.msg
             ),
-        )
-    } else {
-        (
+        ),
+        CheckIdentity::Unchanged => (
             Verdict::WouldLoseRecovery,
             error.code.clone(),
             format!(
@@ -732,7 +882,7 @@ fn judge_reference(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<J
                  store, or upgrade with --accept-runtime-loss",
                 error.code, error.msg
             ),
-        )
+        ),
     })
 }
 
@@ -969,6 +1119,9 @@ fn not_adopted(code: impl Into<String>, detail: impl Into<String>) -> Judgement 
 /// What the preflight judges against: the runtimes the new daemon serves, the
 /// profiles over them, and the base environment a launch inherits.
 struct Judging<'a> {
+    /// The schema of the store as the startup migration finds it, when the
+    /// store is older than this release. A v0.34.x daemon writes schema 5.
+    store_from: Option<u32>,
     runtimes: &'a RuntimeHost,
     profiles: &'a ProfileRegistry,
     /// The base environment, or the reason it cannot be built.
