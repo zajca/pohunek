@@ -791,6 +791,7 @@ jobs:
               - 'sdk/ts/sdk/test/e2e.test.ts'
               - 'sdk/ts/sdk/test/hermes-plugin.e2e.test.ts'
               - '.github/workflows/ci.yml'
+              - '.config/nextest.toml'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
             # Generated TS binding drift lives under a schedule or when the
@@ -2322,6 +2323,11 @@ jobs:
           shared-key: hermes-macos
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-nextest
+
       # Runs the shell tests with /bin/bash (3.2) first on PATH, so the
       # provisioner and the smoke run under the stock macOS shell.
       - name: Check fail-closed Hermes provisioning and smoke scripts
@@ -2364,8 +2370,20 @@ jobs:
           # group-writable framework builds the harness refuses.
           printf 'python=%s\n' "${hermes_bin%/*}/python" >> "$GITHUB_OUTPUT"
 
+      # Every xtask lib test whose name contains `hermes`, one process each.
+      # Each run keeps its JUnit report under its own name, because both runs
+      # of this job write the macos profile's single report path; that path is
+      # cleared first, so a run that writes no report copies none.
       - name: Test Hermes harness natively
-        run: cargo test --locked -p xtask --lib hermes
+        shell: /bin/bash {0}
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/hermes-junit"
+          rm -f target/nextest/macos/junit.xml || exit 1
+          cargo nextest run --locked --profile macos -p xtask --lib -E 'test(hermes)'
+          status=$?
+          cp target/nextest/macos/junit.xml "$RUNNER_TEMP/hermes-junit/harness.xml" || status=1
+          exit "$status"
 
       - name: Build offline documentation
         run: cargo xtask docs site
@@ -2476,7 +2494,27 @@ jobs:
           POHUNEK_HERMES_E2E: "1"
           POHUNEK_HERMES_BIN: ${{ steps.hermes.outputs.bin }}
           POHUNEK_PYTHON_BIN: ${{ steps.hermes.outputs.python }}
-        run: cargo test --locked -p pohunek-cli --test hermes_package -- --include-ignored --test-threads 1
+        shell: /bin/bash {0}
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/hermes-junit"
+          rm -f target/nextest/macos/junit.xml || exit 1
+          cargo nextest run --locked --profile macos -p pohunek-cli --test hermes_package --run-ignored all --test-threads 1
+          status=$?
+          cp target/nextest/macos/junit.xml "$RUNNER_TEMP/hermes-junit/package.xml" || status=1
+          exit "$status"
+
+      - name: Summarize flaky tests
+        if: always()
+        run: python3 scripts/junit-flaky-summary --label "hermes macos" "$RUNNER_TEMP/hermes-junit/harness.xml" "$RUNNER_TEMP/hermes-junit/package.xml"
+
+      - name: Upload Hermes macOS test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-macos-junit
+          path: ${{ runner.temp }}/hermes-junit/
+          if-no-files-found: warn
 
       # Persist the staged runtime only after the gate and smoke passed.
       - name: Persist Hermes runtime cache

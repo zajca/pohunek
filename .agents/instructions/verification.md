@@ -48,6 +48,11 @@ The `macOS tier packages (arm64)` job covers the other macOS packages,
 `run-macos-tier` from a 13-package archive. `check-macos --scope all` checks
 the full set. It never runs on a pull request: only pushes, the daily schedule,
 and `main` or `nightly` dispatches start it.
+The Hermes macOS job (`hermes-compatibility-macos`) runs the xtask Hermes
+harness tests and the real-Hermes `hermes_package` scenario with `cargo nextest
+run --profile macos`. Under that profile the tests of xtask's `hermes::tests`
+run one at a time (test group `hermes-pty`), because its PTY scenarios take
+turns on an in-process mutex that a process per test cannot share.
 The real-systemd suites (`crates/platform/tests/systemd.rs`,
 `crates/daemon/tests/systemd_durable_worker.rs`,
 `crates/cli/tests/service_systemd.rs`,
