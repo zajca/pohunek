@@ -676,6 +676,22 @@ by the same rules and listed under stopped sessions (`stopped_sessions` in the
 that would lose its resume or fork is at risk and needs `--accept-runtime-loss`
 like a live one.
 
+When the preflight budget (20 seconds by default) runs out before a stopped
+session's native reference is checked, the session is `would_lose_recovery` with
+`reference_unverified_within_budget`, and its detail gives how many sessions are
+unverified this way. Run `pohunek service check --preflight-budget <SECONDS>`
+(up to 300), then `pohunek service upgrade --from <archive dir> --preflight-budget
+<SECONDS>` with the same value; the CLI's preflight deadline grows with the
+budget. The installer (`packaging/install-daemon.sh`) passes no budget, so an
+installer user runs the archive's own CLI directly:
+`<archive dir>/pohunek service check --preflight-budget <SECONDS>`, then
+`<archive dir>/pohunek service upgrade --from <archive dir> --preflight-budget <SECONDS>`.
+Unlike the wrapper, a direct run does not take the service transaction lock
+around both commands and does not print the hook asset step afterwards
+(`pohunek integration doctor`, then `pohunek integration install --agent <agent>`
+for each outdated agent). `--accept-runtime-loss` accepts such sessions only
+after the check has been reviewed.
+
 ### Official runtime packages during an upgrade
 
 The preflight also carries the release's official runtime plan, from

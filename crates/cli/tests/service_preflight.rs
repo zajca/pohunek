@@ -19,7 +19,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-use pohunek_cli::service::manager_env::{user_manager_search_path, UserManager};
+use pohunek_cli::service::manager_env::{user_manager_environment, UserManager};
 use pohunek_cli::service::preflight::{
     decide, gate, gate_upgrade, AdoptionPreflight as _, DaemonPreflight, ReleasePlan,
 };
@@ -292,6 +292,7 @@ async fn the_real_daemon_reports_a_clean_live_session_adoptable() {
         &archive,
         VERSION,
         "/usr/bin:/bin",
+        &std::collections::BTreeMap::new(),
         false,
     )
     .await
@@ -327,6 +328,7 @@ async fn an_already_not_resumable_session_is_listed_without_requiring_the_flag()
         &daemon,
         VERSION,
         "/usr/bin:/bin",
+        &std::collections::BTreeMap::new(),
         ReleasePlan::Included,
         false,
     )
@@ -349,6 +351,7 @@ async fn the_real_daemon_names_a_session_it_would_not_adopt_and_the_flag_accepts
         &archive,
         VERSION,
         "/usr/bin:/bin",
+        &std::collections::BTreeMap::new(),
         false,
     )
     .await
@@ -367,6 +370,7 @@ async fn the_real_daemon_names_a_session_it_would_not_adopt_and_the_flag_accepts
         &archive,
         VERSION,
         "/usr/bin:/bin",
+        &std::collections::BTreeMap::new(),
         true,
     )
     .await
@@ -417,6 +421,7 @@ async fn a_preflight_that_fails_or_prints_garbage_fails_closed() {
             &archive,
             VERSION,
             "/usr/bin:/bin",
+            &std::collections::BTreeMap::new(),
             true,
         )
         .await
@@ -488,6 +493,7 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
         &daemon,
         VERSION,
         "/usr/bin:/bin",
+        &std::collections::BTreeMap::new(),
         ReleasePlan::Included,
         true,
     )
@@ -513,6 +519,7 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
         &daemon,
         VERSION,
         "/usr/bin:/bin",
+        &std::collections::BTreeMap::new(),
         ReleasePlan::Included,
         false,
     )
@@ -529,6 +536,7 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
         &daemon,
         VERSION,
         "/usr/bin:/bin",
+        &std::collections::BTreeMap::new(),
         ReleasePlan::Included,
         true,
     )
@@ -564,6 +572,7 @@ async fn the_daemon_judges_with_the_path_its_job_carries() {
         &wrapper,
         VERSION,
         &search_path,
+        &std::collections::BTreeMap::new(),
         false,
     )
     .await
@@ -576,6 +585,7 @@ async fn the_daemon_judges_with_the_path_its_job_carries() {
         &wrapper,
         VERSION,
         "/usr/bin:/bin",
+        &std::collections::BTreeMap::new(),
         false,
     )
     .await
@@ -624,7 +634,7 @@ async fn the_daemon_judges_with_the_user_managers_path_and_an_unreadable_one_fai
         format!("PATH={manager_path}"),
     ]));
 
-    let search_path = user_manager_search_path(&manager)
+    let search_path = search_path_of(&manager)
         .await
         .expect("the manager reports its PATH");
     assert_eq!(search_path, manager_path);
@@ -634,6 +644,7 @@ async fn the_daemon_judges_with_the_user_managers_path_and_an_unreadable_one_fai
         &wrapper,
         VERSION,
         &search_path,
+        &std::collections::BTreeMap::new(),
         false,
     )
     .await
@@ -643,14 +654,14 @@ async fn the_daemon_judges_with_the_user_managers_path_and_an_unreadable_one_fai
 
     std::fs::remove_file(&marker).expect("reset marker");
     let unreadable = FakeUserManager(Err("no session bus".to_owned()));
-    let error = user_manager_search_path(&unreadable)
+    let error = search_path_of(&unreadable)
         .await
         .expect_err("an unreadable environment is an error, not an empty PATH");
     assert_eq!(error.code(), "service_manager_environment_unavailable");
     assert!(error.to_string().contains("no session bus"), "{error}");
 
     let no_path = FakeUserManager(Ok(vec!["HOME=/home/u".to_owned()]));
-    let error = user_manager_search_path(&no_path)
+    let error = search_path_of(&no_path)
         .await
         .expect_err("an environment without PATH is an error");
     assert_eq!(error.code(), "service_manager_environment_unavailable");
@@ -668,7 +679,7 @@ async fn a_user_manager_path_is_judged_as_the_job_gets_it_even_with_an_open_dire
     let value = format!("{}:/usr/bin", open.display());
     let manager = FakeUserManager(Ok(vec!["HOME=/home/u".to_owned(), format!("PATH={value}")]));
 
-    let search_path = user_manager_search_path(&manager)
+    let search_path = search_path_of(&manager)
         .await
         .expect("the job's PATH is used as it is");
     assert_eq!(search_path, value);
@@ -677,9 +688,178 @@ async fn a_user_manager_path_is_judged_as_the_job_gets_it_even_with_an_open_dire
     // is carried as it is.
     let control = FakeUserManager(Ok(vec!["PATH=/usr/bin:\u{7}/bin".to_owned()]));
     assert_eq!(
-        user_manager_search_path(&control).await.expect("carried"),
+        search_path_of(&control).await.expect("carried"),
         "/usr/bin:\u{7}/bin"
     );
+}
+
+/// Stages a `pohunekd` that reports `reported` as its version, appends its
+/// arguments to `record`, and prints `report` for an argument list matching the
+/// shell pattern `accept`. Any other list exits 9, as a release without the flag
+/// does when it is given an argument it does not know.
+fn recording_stand_in(
+    root: &Path,
+    reported: &str,
+    record: &Path,
+    accept: &str,
+    report: &PreflightReport,
+) -> PathBuf {
+    let archive = root.join(format!("stand-in-{reported}"));
+    std::fs::create_dir_all(&archive).expect("archive dir");
+    let report_file = archive.join("report.json");
+    std::fs::write(&report_file, serde_json::to_vec(report).expect("serialize")).expect("write");
+    let script = archive.join("pohunekd");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'pohunekd {reported}'; exit 0; fi\n\
+             printf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n{accept}) cat '{}' ;;\n*) exit 9 ;;\nesac\n",
+            record.display(),
+            report_file.display()
+        ),
+    )
+    .expect("write script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("make script executable");
+    archive
+}
+
+#[tokio::test]
+async fn a_raised_probe_budget_reaches_only_this_releases_upgrade_judgement() {
+    let host = Host::new();
+    host.seed_live_session(false);
+    let report = daemon_report(None, Vec::new());
+    let record = host.root.join("argv-record");
+    let no_variables = std::collections::BTreeMap::new();
+    // A previous release accepts only the protocol it had: the bare upgrade-preflight argument.
+    let previous = recording_stand_in(
+        &host.root,
+        "0.0.1",
+        &record,
+        "\"upgrade-preflight\"",
+        &report,
+    );
+    let current = recording_stand_in(
+        &host.root,
+        VERSION,
+        &record,
+        "\"upgrade-preflight\"*",
+        &report,
+    );
+    let raised = host
+        .context
+        .clone()
+        .with_preflight_budget(std::time::Duration::from_secs(90));
+    let argv = || std::fs::read_to_string(&record).unwrap_or_default();
+
+    // The rollback judges with the previous release's daemon: no flag, so it runs.
+    gate(
+        &DaemonPreflight,
+        &raised,
+        &previous,
+        "0.0.1",
+        "/usr/bin:/bin",
+        &no_variables,
+        false,
+    )
+    .await
+    .expect("the rollback's judgement runs the previous release's protocol");
+    assert_eq!(
+        argv(),
+        "upgrade-preflight\n",
+        "a rollback never sends the budget"
+    );
+    std::fs::remove_file(&record).expect("reset record");
+
+    // This release's upgrade with a raised budget sends the flag.
+    gate_upgrade(
+        &DaemonPreflight,
+        &raised,
+        &current,
+        VERSION,
+        "/usr/bin:/bin",
+        &no_variables,
+        ReleasePlan::Omitted,
+        false,
+    )
+    .await
+    .expect("this release accepts the raised budget");
+    assert_eq!(argv(), "upgrade-preflight --probe-budget-secs 90\n");
+    std::fs::remove_file(&record).expect("reset record");
+
+    // The default budget keeps the argument list every release accepts.
+    gate_upgrade(
+        &DaemonPreflight,
+        &host.context,
+        &current,
+        VERSION,
+        "/usr/bin:/bin",
+        &no_variables,
+        ReleasePlan::Omitted,
+        false,
+    )
+    .await
+    .expect("the default budget judges");
+    assert_eq!(
+        argv(),
+        "upgrade-preflight\n",
+        "the default argument list is unchanged"
+    );
+}
+
+#[tokio::test]
+async fn the_manager_variables_reach_the_spawned_daemon_and_their_values_stay_out_of_errors() {
+    const NAME: &str = "CLAUDE_CONFIG_DIR";
+    const SENTINEL: &str = "/manager/sentinel-store-7f3a";
+    let host = Host::new();
+    host.seed_live_session(false);
+    let variables = std::collections::BTreeMap::from([(NAME.to_owned(), SENTINEL.to_owned())]);
+    let received = host.root.join("received-store");
+    let real = host.archive().join("pohunekd");
+    // The stand-in records the variable it was started with, then runs the real daemon.
+    let recording = scripted_daemon(
+        &host.root.join("recording-variables"),
+        &format!(
+            "printf '%s' \"${NAME}\" > '{}'\nexec '{}' \"$@\"",
+            received.display(),
+            real.display()
+        ),
+    );
+
+    let gated = gate(
+        &DaemonPreflight,
+        &host.context,
+        &recording,
+        VERSION,
+        "/usr/bin:/bin",
+        &variables,
+        false,
+    )
+    .await
+    .expect("the daemon judges with the manager's variable");
+    assert_eq!(gated.report.sessions.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(&received).expect("the daemon's record"),
+        SENTINEL,
+        "the spawned daemon received the manager's variable"
+    );
+
+    // A daemon that cannot start fails the run with diagnostics. The value of the
+    // variable is not part of any error, because it may be a secret.
+    let failing = scripted_daemon(&host.root.join("failing-variables"), "exit 3");
+    let error = gate(
+        &DaemonPreflight,
+        &host.context,
+        &failing,
+        VERSION,
+        "/usr/bin:/bin",
+        &variables,
+        false,
+    )
+    .await
+    .expect_err("a daemon that exits without a report fails the gate");
+    assert!(!error.to_string().contains(SENTINEL), "{error}");
+    assert!(!format!("{error:?}").contains(SENTINEL), "{error:?}");
 }
 
 #[tokio::test]
@@ -705,7 +885,7 @@ async fn a_user_manager_path_reaches_the_spawned_daemon_byte_for_byte() {
         ),
     );
 
-    let search_path = user_manager_search_path(&manager)
+    let search_path = search_path_of(&manager)
         .await
         .expect("a value a process environment carries is used");
     assert_eq!(search_path, value);
@@ -715,6 +895,7 @@ async fn a_user_manager_path_reaches_the_spawned_daemon_byte_for_byte() {
         &recording,
         VERSION,
         &search_path,
+        &std::collections::BTreeMap::new(),
         false,
     )
     .await
@@ -729,7 +910,7 @@ async fn a_user_manager_path_reaches_the_spawned_daemon_byte_for_byte() {
     // Only a NUL byte cannot be carried by a process environment.
     let nul = FakeUserManager(Ok(vec!["PATH=/usr/bin\u{0}/bin".to_owned()]));
     assert_eq!(
-        user_manager_search_path(&nul)
+        search_path_of(&nul)
             .await
             .expect_err("a NUL byte is refused")
             .code(),
@@ -754,7 +935,10 @@ async fn the_release_plan_flag_reaches_the_daemon_only_for_the_upgrade_judgement
     );
     let without_plan = scripted_daemon(
         &host.root.join("without-plan"),
-        &format!("[ -z \"$2\" ] || exit 8\nexec '{}' \"$@\"", real.display()),
+        &format!(
+            "[ \"$2\" != '{RELEASE_PLAN_FLAG}' ] || exit 8\nexec '{}' \"$@\"",
+            real.display()
+        ),
     );
 
     // The report carries the release plan only when the flag reached the
@@ -765,6 +949,8 @@ async fn the_release_plan_flag_reaches_the_daemon_only_for_the_upgrade_judgement
             &host.context,
             &with_plan.join("pohunekd"),
             "/usr/bin:/bin",
+            &std::collections::BTreeMap::new(),
+            None,
             ReleasePlan::Included,
         )
         .await
@@ -777,6 +963,7 @@ async fn the_release_plan_flag_reaches_the_daemon_only_for_the_upgrade_judgement
         &without_plan,
         VERSION,
         "/usr/bin:/bin",
+        &std::collections::BTreeMap::new(),
         false,
     )
     .await
@@ -788,6 +975,7 @@ async fn the_release_plan_flag_reaches_the_daemon_only_for_the_upgrade_judgement
         &without_plan,
         VERSION,
         "/usr/bin:/bin",
+        &std::collections::BTreeMap::new(),
         ReleasePlan::Included,
         false,
     )
@@ -811,6 +999,7 @@ async fn a_missing_daemon_is_a_staged_binary_error() {
         &empty,
         VERSION,
         "/usr/bin:/bin",
+        &std::collections::BTreeMap::new(),
         true,
     )
     .await
@@ -832,6 +1021,7 @@ async fn a_live_agent_session_that_reported_its_identity_is_adoptable_under_the_
         &archive,
         VERSION,
         "/usr/bin:/bin",
+        &std::collections::BTreeMap::new(),
         false,
     )
     .await
@@ -850,4 +1040,15 @@ async fn a_live_agent_session_that_reported_its_identity_is_adoptable_under_the_
         })
         .collect();
     assert_eq!(verdicts, [(SESSION, Verdict::Adoptable, "adoptable")]);
+}
+
+/// The `PATH` the manager gives the job: a manager environment without one is an
+/// error, as the job would have no `PATH` to run with.
+async fn search_path_of(manager: &dyn UserManager) -> Result<String, Error> {
+    user_manager_environment(manager, &[])
+        .await?
+        .search_path
+        .ok_or_else(|| Error::ManagerEnvironment {
+            detail: "it sets no PATH entry".to_owned(),
+        })
 }

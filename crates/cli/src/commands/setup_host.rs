@@ -514,7 +514,13 @@ async fn plan_in(
         // install records, or the service manager's own when it records none,
         // so the plan judges the packages as the installed daemon will.
         let (search, _report) = context.install_search_path()?;
-        let job = recorded_job_path(context, &search, None)
+        // A fresh install records the default allowlist; the plan reads only the
+        // job's PATH.
+        let allowlist: Vec<String> = pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST
+            .iter()
+            .map(|pattern| (*pattern).to_owned())
+            .collect();
+        let job = recorded_job_path(context, &search, &allowlist, None)
             .await
             .map_err(|error| CliError::SetupBlocked {
                 detail: format!(

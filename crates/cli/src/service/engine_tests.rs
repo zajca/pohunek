@@ -5,7 +5,6 @@
 //! directories, `service.toml`, the record, the CLI copy, journals) is real
 //! and lives below a temporary root.
 
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -190,6 +189,8 @@ impl AdoptionPreflight for InProcessPreflight {
         context: &'a Context,
         _daemon: &'a Path,
         _search_path: &'a str,
+        _variables: &'a BTreeMap<String, String>,
+        _probe_budget: Option<Duration>,
         _plan: ReleasePlan,
     ) -> Judging<'a> {
         Box::pin(async move {
@@ -219,6 +220,8 @@ struct ScriptedPreflight {
     search_paths: Arc<Mutex<Vec<String>>>,
     /// The release-plan choice of every judgment, in call order.
     plans: Arc<Mutex<Vec<ReleasePlan>>>,
+    /// The manager variables of every judgment, in call order.
+    variables: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
 }
 
 impl AdoptionPreflight for ScriptedPreflight {
@@ -227,6 +230,8 @@ impl AdoptionPreflight for ScriptedPreflight {
         context: &'a Context,
         daemon: &'a Path,
         search_path: &'a str,
+        variables: &'a BTreeMap<String, String>,
+        probe_budget: Option<Duration>,
         plan: ReleasePlan,
     ) -> Judging<'a> {
         Box::pin(async move {
@@ -235,8 +240,14 @@ impl AdoptionPreflight for ScriptedPreflight {
                 .expect("search path lock")
                 .push(search_path.to_owned());
             self.plans.lock().expect("plan lock").push(plan);
-            let mut report: PreflightReport =
-                self.inner.judge(context, daemon, search_path, plan).await?;
+            self.variables
+                .lock()
+                .expect("variables lock")
+                .push(variables.clone());
+            let mut report: PreflightReport = self
+                .inner
+                .judge(context, daemon, search_path, variables, probe_budget, plan)
+                .await?;
             report.runtimes = self.runtimes.clone();
             report.stopped_sessions = self.stopped.clone();
             Ok(report)
@@ -2175,6 +2186,7 @@ fn loaded_job(default: impl Into<String>) -> ActiveJob {
     ActiveJob {
         domain: None,
         loaded_default: Some(default.into()),
+        domain_environment: Vec::new(),
     }
 }
 
@@ -2190,6 +2202,7 @@ fn domain_over(domain: &str, default: Option<&str>) -> ActiveJob {
     ActiveJob {
         domain: Some(domain.to_owned()),
         loaded_default: default.map(str::to_owned),
+        domain_environment: Vec::new(),
     }
 }
 
@@ -2451,6 +2464,98 @@ async fn interrupted_upgrade_journal(harness: &mut Harness) {
         .upgrade(&harness.staged(V2), V2)
         .await
         .expect_err("interrupted after the registration");
+}
+
+/// A manager variable the default allowlist selects, and one it does not.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const ALLOWLISTED_MANAGER_VARIABLE: (&str, &str) = ("LC_CTYPE", "C.UTF-8");
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const UNLISTED_MANAGER_VARIABLE: (&str, &str) = ("CLAUDE_CONFIG_DIR", "/manager/unlisted-store");
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_upgrade_judges_with_the_allowlisted_manager_variables_and_no_others() {
+    let mut harness = Harness::new();
+    set_job_path(&mut harness, CURRENT_PATH);
+    let (allowed_name, allowed_value) = ALLOWLISTED_MANAGER_VARIABLE;
+    let (unlisted_name, unlisted_value) = UNLISTED_MANAGER_VARIABLE;
+    harness.context = harness
+        .context
+        .clone()
+        .with_user_manager(Arc::new(FakeUserManager(Ok(vec![
+            format!("PATH={CURRENT_PATH}"),
+            format!("{allowed_name}={allowed_value}"),
+            format!("{unlisted_name}={unlisted_value}"),
+        ]))));
+    harness.install(V1).await.expect("install");
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.variables);
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("the upgrade judges and applies");
+
+    let judged = judged.lock().expect("variables lock").clone();
+    assert!(!judged.is_empty(), "the upgrade judged");
+    for variables in &judged {
+        assert_eq!(
+            variables.get(allowed_name).map(String::as_str),
+            Some(allowed_value),
+            "an allowlisted manager variable reaches the judgement"
+        );
+        assert!(
+            !variables.contains_key(unlisted_name),
+            "a manager variable outside the allowlist never reaches the judgement"
+        );
+        assert!(
+            !variables.contains_key("PATH"),
+            "PATH is carried by the search path, not the variables"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn an_upgrade_judges_with_the_allowlisted_launchd_domain_variables_and_no_others() {
+    let mut harness = Harness::new();
+    let (allowed_name, allowed_value) = ALLOWLISTED_MANAGER_VARIABLE;
+    let (unlisted_name, unlisted_value) = UNLISTED_MANAGER_VARIABLE;
+    harness.context = harness
+        .context
+        .clone()
+        .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(ActiveJob {
+            domain: Some(CURRENT_PATH.to_owned()),
+            loaded_default: None,
+            domain_environment: vec![
+                ("PATH".to_owned(), CURRENT_PATH.to_owned()),
+                (allowed_name.to_owned(), allowed_value.to_owned()),
+                (unlisted_name.to_owned(), unlisted_value.to_owned()),
+            ],
+        }))));
+    harness.install(V1).await.expect("install");
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.variables);
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("the upgrade judges and applies");
+
+    let judged = judged.lock().expect("variables lock").clone();
+    assert!(!judged.is_empty(), "the upgrade judged");
+    for variables in &judged {
+        assert_eq!(
+            variables.get(allowed_name).map(String::as_str),
+            Some(allowed_value)
+        );
+        assert!(!variables.contains_key(unlisted_name));
+        assert!(!variables.contains_key("PATH"));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2889,6 +2994,8 @@ impl AdoptionPreflight for PostApplyPreflight {
         context: &'a Context,
         daemon: &'a Path,
         search_path: &'a str,
+        variables: &'a BTreeMap<String, String>,
+        probe_budget: Option<Duration>,
         plan: ReleasePlan,
     ) -> Judging<'a> {
         Box::pin(async move {
@@ -2897,7 +3004,7 @@ impl AdoptionPreflight for PostApplyPreflight {
             let new_release = daemon.components().any(|part| part.as_os_str() == V2);
             if !self.runtimes.applied() || !new_release || self.post == PostApply::Clean {
                 return InProcessPreflight::default()
-                    .judge(context, daemon, search_path, plan)
+                    .judge(context, daemon, search_path, variables, probe_budget, plan)
                     .await;
             }
             self.judged_after_apply.fetch_add(1, Ordering::SeqCst);
@@ -2908,7 +3015,7 @@ impl AdoptionPreflight for PostApplyPreflight {
                 });
             }
             let mut report = InProcessPreflight::default()
-                .judge(context, daemon, search_path, plan)
+                .judge(context, daemon, search_path, variables, probe_budget, plan)
                 .await?;
             report.sessions.push(SessionVerdict {
                 session_id: "s-after-apply".to_owned(),
@@ -6127,6 +6234,8 @@ impl AdoptionPreflight for FailingFrom {
         context: &'a Context,
         daemon: &'a Path,
         search_path: &'a str,
+        variables: &'a BTreeMap<String, String>,
+        probe_budget: Option<Duration>,
         plan: ReleasePlan,
     ) -> Judging<'a> {
         let call = self.inner.calls.load(Ordering::SeqCst);
@@ -6138,7 +6247,8 @@ impl AdoptionPreflight for FailingFrom {
                 })
             });
         }
-        self.inner.judge(context, daemon, search_path, plan)
+        self.inner
+            .judge(context, daemon, search_path, variables, probe_budget, plan)
     }
 }
 
@@ -7350,6 +7460,8 @@ impl AdoptionPreflight for CountingFailure {
         _context: &'a Context,
         daemon: &'a Path,
         _search_path: &'a str,
+        _variables: &'a BTreeMap<String, String>,
+        _probe_budget: Option<Duration>,
         _plan: ReleasePlan,
     ) -> Judging<'a> {
         self.0.fetch_add(1, Ordering::SeqCst);

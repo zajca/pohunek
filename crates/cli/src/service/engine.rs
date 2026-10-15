@@ -156,6 +156,7 @@
 
 // Rust guideline compliant 2026-10-14
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -799,6 +800,7 @@ impl<'a> Engine<'a> {
             from,
             self.reported(version),
             &job.value,
+            &job.variables,
             preflight::ReleasePlan::Included,
             self.accept_runtime_loss,
         )
@@ -1105,6 +1107,7 @@ impl<'a> Engine<'a> {
                     dir,
                     self.reported(&version),
                     &job.value,
+                    &job.variables,
                     preflight::ReleasePlan::Included,
                     self.accept_runtime_loss,
                 )
@@ -1118,7 +1121,8 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        self.run_runtimes(record, layout, late, &job.value).await?;
+        self.run_runtimes(record, layout, late, &job.value, &job.variables)
+            .await?;
         self.checkpoint(Step::Runtimes)?;
         if replaces_daemon(record.step) {
             let resuming = record.step == Step::Registering;
@@ -1247,6 +1251,7 @@ impl<'a> Engine<'a> {
                 dir,
                 self.reported(&record.version),
                 &job.value,
+                &job.variables,
                 preflight::ReleasePlan::Included,
                 self.accept_runtime_loss,
             )
@@ -1291,6 +1296,7 @@ impl<'a> Engine<'a> {
         layout: &InstallLayout,
         late: &mut LateGate,
         search_path: &str,
+        variables: &BTreeMap<String, String>,
     ) -> Result<(), Error> {
         if record.step >= Step::Runtimes {
             return Ok(());
@@ -1345,6 +1351,7 @@ impl<'a> Engine<'a> {
                     &dir,
                     self.reported(&record.version),
                     search_path,
+                    variables,
                     // The apply has run, so the installed packages are the plan's result.
                     preflight::ReleasePlan::Omitted,
                     self.accept_runtime_loss,
@@ -1632,6 +1639,7 @@ impl<'a> Engine<'a> {
             previous,
             self.reported(previous),
             &job.value,
+            &job.variables,
             self.accept_runtime_loss,
         )
         .await?;
@@ -2746,6 +2754,10 @@ pub(crate) struct JobPath {
     /// `value` is. An upgrade journals it; `None` when the job is not loaded and
     /// always on Linux.
     pub(crate) loaded_default: Option<String>,
+    /// The allowlisted variables the service manager gives the job, `PATH`
+    /// excluded. A preflight judges with them, so they stay out of the logs and
+    /// errors: only their names may appear there.
+    pub(crate) variables: BTreeMap<String, String>,
 }
 
 /// The `PATH` of the daemon job of `config`, which every preflight and runtime
@@ -2778,11 +2790,18 @@ pub(crate) async fn job_path(
     config: &ServiceConfig,
     journal_default: Option<&str>,
 ) -> Result<JobPath, Error> {
-    recorded_job_path(context, config.search_path(), journal_default).await
+    recorded_job_path(
+        context,
+        config.search_path(),
+        config.environment_allowlist(),
+        journal_default,
+    )
+    .await
 }
 
-/// The `PATH` of a daemon job whose `service.toml` records `recorded`, by the
-/// rules of [`job_path`]. A fresh install records the search path
+/// The `PATH` and the allowlisted manager variables of a daemon job whose
+/// `service.toml` records `recorded` and `allowlist`, by the rules of
+/// [`job_path`]. A fresh install records the search path
 /// [`Context::install_search_path`] resolves, so this is the `PATH` its job
 /// will get before anything is written.
 ///
@@ -2792,24 +2811,68 @@ pub(crate) async fn job_path(
 pub(crate) async fn recorded_job_path(
     context: &Context,
     recorded: &SearchPath,
+    allowlist: &[String],
     journal_default: Option<&str>,
 ) -> Result<JobPath, Error> {
     if !recorded.is_empty() {
+        let variables = manager_variables(context, allowlist).await?;
         return Ok(JobPath {
             value: recorded.to_env_value(),
             source: PathSource::Recorded,
             loaded_default: None,
+            variables,
         });
     }
     if cfg!(target_os = "linux") {
-        let value = manager_env::user_manager_search_path(context.user_manager()).await?;
+        let environment =
+            manager_env::user_manager_environment(context.user_manager(), allowlist).await?;
+        let value = environment
+            .search_path
+            .ok_or_else(|| Error::ManagerEnvironment {
+                detail: "it sets no PATH entry".to_owned(),
+            })?;
         return Ok(JobPath {
             value,
             source: PathSource::UserManager,
             loaded_default: None,
+            variables: environment.variables,
         });
     }
-    launchd_job_path(context, journal_default).await
+    launchd_job_path(context, journal_default, allowlist).await
+}
+
+/// The allowlisted variables the service manager gives the job when the job
+/// records its `PATH`: the user manager's environment on Linux, the launchd
+/// domain's environment on macOS, and none where no service manager exists.
+#[cfg(target_os = "linux")]
+async fn manager_variables(
+    context: &Context,
+    allowlist: &[String],
+) -> Result<BTreeMap<String, String>, Error> {
+    Ok(
+        manager_env::user_manager_environment(context.user_manager(), allowlist)
+            .await?
+            .variables,
+    )
+}
+
+/// See the Linux variant.
+#[cfg(target_os = "macos")]
+async fn manager_variables(
+    context: &Context,
+    allowlist: &[String],
+) -> Result<BTreeMap<String, String>, Error> {
+    let active = active_launchd_job(context).await?;
+    manager_env::allowlisted_variables(active.domain_environment, allowlist)
+}
+
+/// See the Linux variant.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+async fn manager_variables(
+    _context: &Context,
+    _allowlist: &[String],
+) -> Result<BTreeMap<String, String>, Error> {
+    Ok(BTreeMap::new())
 }
 
 /// The launchd `PATH` of a job without its own (macOS), in launchd's order: the
@@ -2820,18 +2883,16 @@ pub(crate) async fn recorded_job_path(
 async fn launchd_job_path(
     context: &Context,
     journal_default: Option<&str>,
+    allowlist: &[String],
 ) -> Result<JobPath, Error> {
     use super::manager_env::ActiveJob;
 
-    let label = context.namespace()?.daemon_label();
     let ActiveJob {
         domain,
         loaded_default,
-    } = context
-        .launchd_job()
-        .active_path(context.uid(), &label)
-        .await
-        .map_err(|detail| Error::ManagerEnvironment { detail })?;
+        domain_environment,
+    } = active_launchd_job(context).await?;
+    let variables = manager_env::allowlisted_variables(domain_environment, allowlist)?;
     let (value, source) = if let Some(value) = domain {
         (value, PathSource::Domain)
     } else if let Some(value) = loaded_default.clone() {
@@ -2853,7 +2914,19 @@ async fn launchd_job_path(
         value,
         source,
         loaded_default,
+        variables,
     })
+}
+
+/// The launchd state of the daemon job of `context`.
+#[cfg(target_os = "macos")]
+async fn active_launchd_job(context: &Context) -> Result<super::manager_env::ActiveJob, Error> {
+    let label = context.namespace()?.daemon_label();
+    context
+        .launchd_job()
+        .active_path(context.uid(), &label)
+        .await
+        .map_err(|detail| Error::ManagerEnvironment { detail })
 }
 
 /// Only macOS has launchd.
@@ -2861,6 +2934,7 @@ async fn launchd_job_path(
 fn launchd_job_path<'a>(
     _context: &'a Context,
     _journal_default: Option<&'a str>,
+    _allowlist: &'a [String],
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<JobPath, Error>> + Send + 'a>> {
     Box::pin(std::future::ready(Err(Error::ManagerEnvironment {
         detail: "a launchd job exists only on macOS".to_owned(),

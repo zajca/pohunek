@@ -19,7 +19,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use package::PackageDigest;
-use pohunek_service_config::preflight::{Verdict, CODE_RUNTIME_SOURCE_NOT_SERVED};
+use pohunek_service_config::preflight::{PreflightReport, Verdict, CODE_RUNTIME_SOURCE_NOT_SERVED};
 use pohunek_test_support::wait::wait_until;
 use protocol::{
     PackageBindProfileParams, PackageBindStatus, PackageErrorKind, PackageInstallStatus,
@@ -4262,6 +4262,18 @@ fn stopped_preflight_verdict_entered(
     id: &protocol::SessionId,
     entry: std::time::Instant,
 ) -> (Verdict, String) {
+    let (verdict, code, _detail) =
+        stopped_preflight_judgement_entered(fixture, store_path, id, entry);
+    (verdict, code)
+}
+
+/// The preflight report of the stopped sessions of `store_path` for a command
+/// that entered at `entry`, judged with the test registry's environment.
+fn stopped_preflight_report_entered(
+    fixture: &Fixture,
+    store_path: &Path,
+    entry: std::time::Instant,
+) -> PreflightReport {
     let report = crate::session::upgrade_preflight::run_with(
         &crate::session::upgrade_preflight::PreflightInputs {
             store_path: store_path.to_path_buf(),
@@ -4286,6 +4298,18 @@ fn stopped_preflight_verdict_entered(
         },
         &crate::procwatch::HostInspector::new(),
     );
+    report
+}
+
+/// The verdict, code and detail of the stopped session `id` for a command that
+/// entered at `entry`.
+fn stopped_preflight_judgement_entered(
+    fixture: &Fixture,
+    store_path: &Path,
+    id: &protocol::SessionId,
+    entry: std::time::Instant,
+) -> (Verdict, String, String) {
+    let report = stopped_preflight_report_entered(fixture, store_path, entry);
     let verdict = report
         .stopped_sessions
         .iter()
@@ -4296,7 +4320,11 @@ fn stopped_preflight_verdict_entered(
                 report.stopped_sessions
             )
         });
-    (verdict.verdict, verdict.code.clone())
+    (
+        verdict.verdict,
+        verdict.code.clone(),
+        verdict.detail.clone(),
+    )
 }
 
 #[tokio::test]
@@ -4745,9 +4773,11 @@ fn spent_budget_entry() -> std::time::Instant {
 }
 
 #[tokio::test]
-async fn a_spent_probe_budget_resolves_a_runtime_without_a_probe_and_judges_its_reference() {
+async fn a_spent_probe_budget_leaves_a_missing_reference_unverified() {
     // The package declares no version probe, so resolving the executable is the
-    // whole check, and it spends none of the budget.
+    // whole check, and it spends none of the budget. The reference check itself
+    // is not run once the budget is spent, so the missing conversation is only
+    // unverified: resume refuses it, but the judgement cannot show that yet.
     const AGENT: &str = "agent-probeless-resolves";
     let session = stopped_probeless_claude("preflight-spent-budget-resolves", |fixture| {
         agent_directory(fixture, "probeless-directory", 0o755, AGENT)
@@ -4770,11 +4800,95 @@ async fn a_spent_probe_budget_resolves_a_runtime_without_a_probe_and_judges_its_
         .await
         .expect_err("resume stops at the native reference");
 
-    // The executable resolves without a probe, so the judgement reaches the
-    // reference check, which refuses the conversation resume cannot find.
+    // Resume refuses the missing conversation with its own code, which the
+    // judgement does not report while the budget is spent.
     assert_eq!(verdict, Verdict::WouldLoseRecovery);
-    assert_eq!(code, "agent_native_reference_missing");
-    assert_eq!(code, resumed.code);
+    assert_eq!(
+        code,
+        pohunek_service_config::preflight::CODE_REFERENCE_UNVERIFIED
+    );
+    assert_eq!(resumed.code, "agent_native_reference_missing");
+}
+
+#[tokio::test]
+async fn a_spent_probe_budget_leaves_a_present_conversation_unverified_not_adoptable() {
+    // The conversation exists, so resume would accept it, but the budget is spent
+    // before its reference is checked. Only a checked reference may be adopted.
+    let session = stopped_pinned_claude("preflight-spent-budget-present").await;
+
+    let (verdict, code, detail) = stopped_preflight_judgement_entered(
+        &session.fixture,
+        &session.store_path,
+        &session.id,
+        spent_budget_entry(),
+    );
+
+    assert_eq!(verdict, Verdict::WouldLoseRecovery);
+    assert_eq!(
+        code,
+        pohunek_service_config::preflight::CODE_REFERENCE_UNVERIFIED
+    );
+    assert!(
+        detail.contains("1 stopped session(s) in this report are unverified")
+            && detail.contains("--preflight-budget"),
+        "the detail names the count and the setting: {detail}"
+    );
+}
+
+/// Adds `copies` stopped sessions to the store of `store_path`, each a copy of
+/// the lines naming `id` with its session identifier replaced. Returns their
+/// identifiers.
+fn duplicate_stopped_session(store_path: &Path, id: &str, copies: usize) -> Vec<String> {
+    let text = std::fs::read_to_string(store_path).expect("read the store");
+    let lines: Vec<&str> = text.lines().filter(|line| line.contains(id)).collect();
+    let mut appended = String::new();
+    let mut ids = Vec::new();
+    for copy in 1..=copies {
+        let copy_id = format!("{id}-copy{copy}");
+        for line in &lines {
+            appended.push_str(&line.replace(id, &copy_id));
+            appended.push('\n');
+        }
+        ids.push(copy_id);
+    }
+    std::fs::write(store_path, format!("{text}{appended}")).expect("write the store");
+    ids
+}
+
+#[tokio::test]
+async fn a_spent_budget_leaves_every_unverified_session_with_the_same_count() {
+    // Three stopped sessions over one store: none of their references is checked
+    // once the budget is spent, and each detail names the same count.
+    let session = stopped_pinned_claude("preflight-spent-budget-many").await;
+    let mut ids = duplicate_stopped_session(&session.store_path, &session.id.0, 2);
+    ids.push(session.id.0.clone());
+
+    let report = stopped_preflight_report_entered(
+        &session.fixture,
+        &session.store_path,
+        spent_budget_entry(),
+    );
+
+    for id in &ids {
+        let verdict = report
+            .stopped_sessions
+            .iter()
+            .find(|candidate| &candidate.session_id == id)
+            .unwrap_or_else(|| panic!("the stopped session {id} is judged"));
+        assert_eq!(verdict.verdict, Verdict::WouldLoseRecovery, "{id}");
+        assert_eq!(
+            verdict.code,
+            pohunek_service_config::preflight::CODE_REFERENCE_UNVERIFIED,
+            "{id}"
+        );
+        assert!(
+            verdict
+                .detail
+                .contains("3 stopped session(s) in this report are unverified"),
+            "{id}: {}",
+            verdict.detail
+        );
+    }
 }
 
 #[tokio::test]

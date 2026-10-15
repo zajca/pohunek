@@ -112,8 +112,9 @@ pub async fn install_in(
 pub async fn upgrade(
     from: Option<PathBuf>,
     accept_runtime_loss: bool,
+    preflight_budget: Duration,
 ) -> Result<report::UpgradeReport, Error> {
-    let context = Context::resolve()?;
+    let context = Context::resolve()?.with_preflight_budget(preflight_budget);
     let inherited = inherited_lock(&context)?;
     let from = staged_dir(&context, from)?;
     let backend = connect_installed(&context).await?;
@@ -162,8 +163,9 @@ pub async fn uninstall(options: UninstallOptions) -> Result<report::UninstallRep
 pub async fn check(
     prefix: Option<PathBuf>,
     accept_runtime_loss: bool,
+    preflight_budget: Duration,
 ) -> Result<report::CheckReport, Error> {
-    let context = Context::resolve()?;
+    let context = Context::resolve()?.with_preflight_budget(preflight_budget);
     let inherited = inherited_lock(&context)?;
     let checked = check_local(&context, prefix, VERSION, inherited.is_some())?;
     // Install's order: the rollback of an interrupted install discovers before
@@ -242,6 +244,7 @@ async fn finish_check(
             previous,
             previous,
             &job.value,
+            &job.variables,
             accept_runtime_loss,
         )
         .await?;
@@ -262,6 +265,7 @@ async fn finish_check(
             daemon_dir,
             version,
             &job.value,
+            &job.variables,
             preflight::ReleasePlan::Included,
             accept_runtime_loss,
         )

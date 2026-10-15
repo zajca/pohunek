@@ -2271,7 +2271,12 @@ check, which then needs no flag. A relocated store (`agent_native_store_relocate
 or a store-condition refusal (`agent_native_reference_missing` from an unresolvable
 root, a scan limit or a changed store) is `would_lose_recovery` with resume's code,
 because the running release may detect it differently; so is any session the
-upgrade adopts from the built-in runtime, since its check changes with the runtime. For a runtime that declares a version probe, the
+upgrade adopts from the built-in runtime, since its check changes with the runtime. A stopped session whose reference the preflight budget
+reached before its check is `would_lose_recovery` with `reference_unverified_within_budget`: the reference is not known to be present, so it is
+never adoptable, and the detail gives the number of such sessions in the report. The budget is 20 seconds by default, bounds the version probes and
+the reference checks together, and is raised with `service upgrade|check --preflight-budget <SECONDS>` (1 to 300; the CLI's preflight deadline
+grows with it). The flag reaches only this release's upgrade preflight: a rollback's preflight runs the previous release's daemon with the default
+budget. The flag is sent to the daemon as `--probe-budget-secs` only when it differs from the default. An installer user (`packaging/install-daemon.sh`) cannot pass a budget, so it runs the archive's own commands: `<archive dir>/pohunek service check --preflight-budget <SECONDS>`, then `<archive dir>/pohunek service upgrade --from <archive dir> --preflight-budget <SECONDS>`. The wrapper runs both under `pohunek service lock` and passes `--accept-runtime-loss` to both when given; after a successful run it prints the hook asset step (`pohunek integration doctor` and `pohunek integration install --agent <agent>`), which a direct `service upgrade` does not print.  For a runtime that declares a version probe, the
 preflight runs the same isolated, bounded probe resume runs (the frozen program
 with the probe's arguments, a private `HOME` and working directory), so
 `service check` executes those programs. It writes no pohunek state. Identical

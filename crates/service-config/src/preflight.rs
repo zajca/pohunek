@@ -26,35 +26,62 @@ use crate::runtimes::{EnsureReport, Refusal};
 /// binary without it, because that binary never applies the plan.
 pub const RELEASE_PLAN_FLAG: &str = "--release-plan";
 
-/// Deadline the installer gives one `pohunekd upgrade-preflight` run.
+/// Deadline the installer gives one `pohunekd upgrade-preflight` run when the
+/// probe budget is the default [`PROBE_BUDGET`].
 ///
-/// [`PROBE_BUDGET`] is kept below it, so a probe budget that runs out still
-/// leaves the installer time to read a complete report before the deadline.
+/// A longer probe budget raises the deadline by the same amount, see
+/// [`preflight_timeout`].
 pub const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Time one preflight run may spend on version probes, counted from the entry of
-/// the command.
+/// Default time one preflight run may spend on version probes and reference
+/// checks, counted from the entry of the command.
 ///
 /// The probe deadline is the entry of `pohunekd upgrade-preflight` plus this
 /// budget, so the journal scan, the release plan and the registry load count
 /// against it too. A session whose probe would start at or after the deadline
-/// is judged `would_lose_recovery` with [`CODE_PROBE_BUDGET_EXHAUSTED`]: the
-/// judgement stays pessimistic instead of running past [`PREFLIGHT_TIMEOUT`].
+/// is judged `would_lose_recovery` with [`CODE_PROBE_BUDGET_EXHAUSTED`]; a
+/// stopped session whose native reference is not checked before the deadline
+/// is judged `would_lose_recovery` with [`CODE_REFERENCE_UNVERIFIED`]. The
+/// judgement stays pessimistic instead of running past the installer deadline.
+/// The operator raises the budget with `--preflight-budget` up to
+/// [`MAX_PROBE_BUDGET`].
 pub const PROBE_BUDGET: Duration = Duration::from_secs(20);
+
+/// Smallest and largest probe budget an operator may pass, in whole seconds.
+pub const MIN_PROBE_BUDGET_SECS: u64 = 1;
+/// See [`MIN_PROBE_BUDGET_SECS`].
+pub const MAX_PROBE_BUDGET_SECS: u64 = 300;
 
 /// Time reserved after the probe deadline for the rest of the judgement and for
 /// the report to be printed. A probe that started before the deadline ends by
 /// its own bounded timeout, so the run ends within this margin of the deadline.
 pub const REPORT_MARGIN: Duration = Duration::from_secs(5);
 
-// The probe deadline and the report margin must end before the installer's
-// deadline.
+/// The installer's deadline for one preflight run with `budget` as its probe
+/// budget: the default deadline, or the budget plus the report margin when that
+/// is longer.
+#[must_use]
+pub fn preflight_timeout(budget: Duration) -> Duration {
+    PREFLIGHT_TIMEOUT.max(budget.saturating_add(REPORT_MARGIN))
+}
+
+// The default probe deadline and the report margin must end before the default
+// installer deadline.
 const _: () =
     assert!(PROBE_BUDGET.as_secs() + REPORT_MARGIN.as_secs() < PREFLIGHT_TIMEOUT.as_secs());
+
+/// Argument that passes the probe budget, in whole seconds, to the daemon's
+/// `upgrade-preflight` run.
+pub const PROBE_BUDGET_FLAG: &str = "--probe-budget-secs";
 
 /// Machine code of a session whose version probe the probe budget did not
 /// reach.
 pub const CODE_PROBE_BUDGET_EXHAUSTED: &str = "probe_budget_exhausted";
+
+/// Machine code of a stopped session whose native reference the probe budget
+/// did not reach. The reference is unverified, so it is never adoptable and is
+/// never reported as already not resumable.
+pub const CODE_REFERENCE_UNVERIFIED: &str = "reference_unverified_within_budget";
 
 /// Version of the report layout; a reader refuses any other value.
 ///

@@ -13,3 +13,17 @@
   detect those differently, so the preflight cannot prove it refuses too.
 - A session the upgrade adopts from the built-in runtime stays
   `would_lose_recovery` when its reference check fails.
+- The preflight budget bounds the native reference checks as well as the version
+  probes. A stopped session whose reference is not checked before the budget is
+  spent is `would_lose_recovery` with `reference_unverified_within_budget`; the
+  detail gives the count of such sessions. `service upgrade` and `service check`
+  take `--preflight-budget <SECONDS>` (1 to 300, default 20). The CLI's preflight
+  deadline grows with it. The flag reaches only this release's upgrade preflight, not
+  a rollback's. An installer user runs `<archive dir>/pohunek service check
+  --preflight-budget <SECONDS>` and then `<archive dir>/pohunek service upgrade --from
+  <archive dir> --preflight-budget <SECONDS>`; the installer script cannot pass it.
+- The upgrade preflight judges with the allowlisted variables the service manager
+  gives the daemon job (the systemd user manager's environment on Linux, the
+  launchd domain environment on macOS), so a store variable such as
+  `CLAUDE_CONFIG_DIR` is read as the job reads it. Variable values never appear in
+  the report or in errors.

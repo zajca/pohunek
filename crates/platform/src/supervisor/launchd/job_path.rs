@@ -73,6 +73,9 @@ pub struct JobPathSources {
     /// The `default environment` `PATH` of the loaded job; `None` when the job
     /// is not loaded (or launchd reports no such section for it).
     pub loaded_default: Option<String>,
+    /// Every variable of the domain's `environment`, in launchd's order,
+    /// `PATH` included. Empty when the domain sets none.
+    pub domain_environment: Vec<(String, String)>,
 }
 
 /// Reads the `PATH` the job `label` of `gui/<uid>` runs with when its
@@ -101,7 +104,13 @@ pub(crate) async fn resolve(
     domain: &str,
     label: &str,
 ) -> Result<JobPathSources, Error> {
-    let domain_value = domain_path(launchctl, domain).await?;
+    let domain_environment = domain_environment(launchctl, domain).await?;
+    let domain_value = named_path(
+        domain_environment
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+        false,
+    )?;
     let target = format!("{domain}/{label}");
     let completion = launchctl
         .run("print", &[OsStr::new(&target)])
@@ -119,18 +128,23 @@ pub(crate) async fn resolve(
     Ok(JobPathSources {
         domain: domain_value,
         loaded_default,
+        domain_environment,
     })
 }
 
-/// The domain's `PATH`, or `None` when the domain sets none or has no GUI session.
-async fn domain_path(launchctl: &Launchctl, domain: &str) -> Result<Option<String>, Error> {
+/// The variables of the domain's environment, empty when the domain sets none or
+/// has no GUI session.
+async fn domain_environment(
+    launchctl: &Launchctl,
+    domain: &str,
+) -> Result<Vec<(String, String)>, Error> {
     let completion = launchctl
         .run("print", &[OsStr::new(domain)])
         .await
         .map_err(|error| run_error(OPERATION, error))?;
     match completion.status {
-        Status::Success => domain_environment_path(printed(&completion)?),
-        Status::NoSuchDomain => Ok(None),
+        Status::Success => domain_entries(printed(&completion)?),
+        Status::NoSuchDomain => Ok(Vec::new()),
         _ => Err(status_error(OPERATION, domain, &completion)),
     }
 }
@@ -158,7 +172,7 @@ fn utf8<'a>(operation: &'static str, bytes: &'a [u8]) -> Result<&'a str, Error> 
     })
 }
 
-/// The `PATH` of the domain environment of `launchctl print gui/<uid>` output.
+/// The variables of the domain environment of `launchctl print gui/<uid>` output.
 ///
 /// Output is recognized as a domain print by its top-level `services` section,
 /// which every domain print has. launchd omits the `environment` section of a
@@ -170,7 +184,7 @@ fn utf8<'a>(operation: &'static str, bytes: &'a [u8]) -> Result<&'a str, Error> 
 ///
 /// Returns [`Error::InvalidData`] for output without a `services` section, for
 /// a repeated environment section, and for an unrecognized entry.
-fn domain_environment_path(output: &str) -> Result<Option<String>, Error> {
+fn domain_entries(output: &str) -> Result<Vec<(String, String)>, Error> {
     let services = output
         .lines()
         .filter(|line| line.trim_start() == DOMAIN_SERVICES)
@@ -183,8 +197,12 @@ fn domain_environment_path(output: &str) -> Result<Option<String>, Error> {
     }
     let mut found = sections(output, DOMAIN_SECTION)?;
     match found.len() {
-        0 => Ok(None),
-        1 => named_path(&found.remove(0), false),
+        0 => Ok(Vec::new()),
+        1 => Ok(found
+            .remove(0)
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect()),
         count => Err(unrecognized(
             "launchctl print",
             &format!("{count} domain environment sections"),
@@ -206,7 +224,7 @@ fn domain_environment_path(output: &str) -> Result<Option<String>, Error> {
 /// Returns [`Error::InvalidData`] for output of any other shape.
 fn default_path(output: &str) -> Result<String, Error> {
     let entries = single_section(output, DEFAULT_SECTION)?;
-    named_path(&entries, true)?
+    named_path(entries.iter().copied(), true)?
         .ok_or_else(|| unrecognized("launchctl print", "the default environment names no PATH"))
 }
 
@@ -225,10 +243,13 @@ fn single_section<'a>(output: &'a str, heading: &str) -> Result<Vec<(&'a str, &'
 /// The value of `PATH` among `entries`.
 ///
 /// `required` makes a missing `PATH` an error; `PATH` may occur at most once.
-fn named_path(entries: &[(&str, &str)], required: bool) -> Result<Option<String>, Error> {
+fn named_path<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a str)>,
+    required: bool,
+) -> Result<Option<String>, Error> {
     let mut path: Option<&str> = None;
     for (name, value) in entries {
-        if *name != PATH_NAME {
+        if name != PATH_NAME {
             continue;
         }
         if path.is_some() || value.is_empty() {
@@ -411,6 +432,13 @@ mod tests {
                 JobPathSources {
                     domain: Some("/opt/set/bin:/usr/bin ".to_owned()),
                     loaded_default: Some("/usr/bin:/bin:/usr/sbin:/sbin".to_owned()),
+                    domain_environment: vec![
+                        (
+                            "SSH_AUTH_SOCK".to_owned(),
+                            "/work/com.apple.launchd.example/Listeners".to_owned(),
+                        ),
+                        ("PATH".to_owned(), "/opt/set/bin:/usr/bin ".to_owned()),
+                    ],
                 }
             );
         });
@@ -433,6 +461,10 @@ mod tests {
                 JobPathSources {
                     domain: None,
                     loaded_default: Some("/usr/bin:/bin:/usr/sbin:/sbin".to_owned()),
+                    domain_environment: vec![(
+                        "SSH_AUTH_SOCK".to_owned(),
+                        "/work/com.apple.launchd.example/Listeners".to_owned(),
+                    )],
                 }
             );
         });
@@ -455,6 +487,10 @@ mod tests {
                 JobPathSources {
                     domain: None,
                     loaded_default: Some("/usr/bin:/bin ".to_owned()),
+                    domain_environment: vec![(
+                        "SSH_AUTH_SOCK".to_owned(),
+                        "/work/com.apple.launchd.example/Listeners".to_owned(),
+                    )],
                 }
             );
         });
@@ -474,7 +510,13 @@ mod tests {
                 resolve(&launchctl, "gui/501", "job")
                     .await
                     .expect("resolved"),
-                JobPathSources::default()
+                JobPathSources {
+                    domain_environment: vec![(
+                        "SSH_AUTH_SOCK".to_owned(),
+                        "/work/com.apple.launchd.example/Listeners".to_owned(),
+                    )],
+                    ..JobPathSources::default()
+                }
             );
         });
     }
@@ -510,6 +552,7 @@ mod tests {
                 JobPathSources {
                     domain: None,
                     loaded_default: Some("/usr/bin:/bin:/usr/sbin:/sbin".to_owned()),
+                    domain_environment: Vec::new(),
                 }
             );
         });

@@ -11,9 +11,13 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Subcommand, ValueHint};
-use pohunek_service_config::preflight::{PreflightReport, SessionVerdict, StoreState, Verdict};
+use pohunek_service_config::preflight::{
+    PreflightReport, SessionVerdict, StoreState, Verdict, MAX_PROBE_BUDGET_SECS,
+    MIN_PROBE_BUDGET_SECS, PROBE_BUDGET,
+};
 use pohunek_service_config::runtimes::{CatalogStatus, EnsureReport, PackageStatus};
 
 use crate::commands::render_json;
@@ -60,6 +64,15 @@ pub(crate) enum Action {
         /// metadata store the new daemon cannot start with.
         #[arg(long)]
         accept_runtime_loss: bool,
+        /// Probe budget, in seconds, of the preflight that judges the live
+        /// sessions: the version probes and native reference checks run within
+        /// it. The default is 20; the installer's deadline grows with it.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            value_parser = clap::value_parser!(u64).range(MIN_PROBE_BUDGET_SECS..=MAX_PROBE_BUDGET_SECS)
+        )]
+        preflight_budget: Option<u64>,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -108,6 +121,15 @@ pub(crate) enum Action {
         /// native recovery, as `service upgrade --accept-runtime-loss` would.
         #[arg(long)]
         accept_runtime_loss: bool,
+        /// Probe budget, in seconds, of the preflight that judges the live
+        /// sessions: the version probes and native reference checks run within
+        /// it. The default is 20; the installer's deadline grows with it.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            value_parser = clap::value_parser!(u64).range(MIN_PROBE_BUDGET_SECS..=MAX_PROBE_BUDGET_SECS)
+        )]
+        preflight_budget: Option<u64>,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -166,17 +188,21 @@ pub(crate) async fn run(action: Action) -> Result<ExitCode, CliError> {
         Action::Upgrade {
             from,
             accept_runtime_loss,
+            preflight_budget,
             json,
         } => {
-            let report = service::upgrade(from, accept_runtime_loss).await?;
+            let budget = preflight_budget.map_or(PROBE_BUDGET, Duration::from_secs);
+            let report = service::upgrade(from, accept_runtime_loss, budget).await?;
             emit(json, &report, render_upgrade)
         }
         Action::Check {
             prefix,
             accept_runtime_loss,
+            preflight_budget,
             json,
         } => {
-            let report = service::check(prefix, accept_runtime_loss).await?;
+            let budget = preflight_budget.map_or(PROBE_BUDGET, Duration::from_secs);
+            let report = service::check(prefix, accept_runtime_loss, budget).await?;
             emit(json, &report, render_check)
         }
         Action::Uninstall {
@@ -950,6 +976,7 @@ mod tests {
             Action::Upgrade {
                 from: Some(_),
                 accept_runtime_loss: false,
+                preflight_budget: None,
                 json: false
             }
         ));
@@ -958,6 +985,7 @@ mod tests {
             Action::Upgrade {
                 from: None,
                 accept_runtime_loss: true,
+                preflight_budget: None,
                 json: true
             }
         ));
@@ -977,7 +1005,7 @@ mod tests {
             .expect_err("upgrade takes no --prefix");
         assert!(matches!(
             parse(&["check", "--prefix", "/p", "--json"]),
-            Action::Check { prefix: Some(prefix), json: true, accept_runtime_loss: false }
+            Action::Check { prefix: Some(prefix), json: true, accept_runtime_loss: false, .. }
                 if prefix == Path::new("/p")
         ));
         assert!(matches!(
@@ -985,6 +1013,7 @@ mod tests {
             Action::Check {
                 prefix: None,
                 accept_runtime_loss: false,
+                preflight_budget: None,
                 json: false
             }
         ));
@@ -992,9 +1021,28 @@ mod tests {
             parse(&["check", "--accept-runtime-loss"]),
             Action::Check {
                 accept_runtime_loss: true,
+                preflight_budget: None,
                 ..
             }
         ));
+        assert!(matches!(
+            parse(&["upgrade", "--preflight-budget", "90"]),
+            Action::Upgrade {
+                preflight_budget: Some(90),
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["check", "--preflight-budget", "300"]),
+            Action::Check {
+                preflight_budget: Some(300),
+                ..
+            }
+        ));
+        for rejected in ["0", "301", "soon"] {
+            Harness::try_parse_from(["service", "check", "--preflight-budget", rejected])
+                .expect_err("the budget is a whole number of seconds from 1 to 300");
+        }
         Harness::try_parse_from(["service", "install", "--accept-runtime-loss"])
             .expect_err("install has no sessions to lose");
         Harness::try_parse_from(["service", "uninstall", "--accept-runtime-loss"])

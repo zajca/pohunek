@@ -46,7 +46,9 @@ use pohunek_service_config::preflight::{
 };
 use tracing::warn;
 
-use pohunek_service_config::preflight::{CODE_PROBE_BUDGET_EXHAUSTED, PROBE_BUDGET};
+use pohunek_service_config::preflight::{
+    CODE_PROBE_BUDGET_EXHAUSTED, CODE_REFERENCE_UNVERIFIED, MAX_PROBE_BUDGET_SECS, PROBE_BUDGET,
+};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Refusal, CODE_RUNTIME_PLAN_UNAVAILABLE,
     CODE_SERVICE_CONFIG_UNREADABLE, ENSURE_REPORT_VERSION,
@@ -222,7 +224,7 @@ pub fn run_with(
         .entry
         .checked_add(options.probe_budget)
         .unwrap_or(options.entry);
-    let probes = ProbeLedger::new(deadline);
+    let probes = ProbeLedger::new(deadline, options.probe_budget);
     let judging = Judging {
         runtimes: &runtimes,
         profiles: &profiles,
@@ -576,6 +578,7 @@ fn judge_stopped_sessions(dry: &DryRun, judging: &Judging<'_>) -> Vec<SessionVer
             detail,
         });
     }
+    fill_unverified_counts(&mut verdicts, judging.probes.budget);
     verdicts.sort_by(|left: &SessionVerdict, right| left.session_id.cmp(&right.session_id));
     verdicts
 }
@@ -672,6 +675,16 @@ fn judge_reference(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<J
             ));
         }
     };
+    // The reference scan is not a version probe, so it runs under the same
+    // deadline as the probes: once the budget is spent, a reference that was
+    // not checked is unverified, never adoptable and never already not resumable.
+    if judging.probes.remaining().is_zero() {
+        return Some((
+            Verdict::WouldLoseRecovery,
+            CODE_REFERENCE_UNVERIFIED.to_owned(),
+            unverified_detail(0, judging.probes.budget),
+        ));
+    }
     let failure = check_recovery_reference(
         &existence,
         &session_ref,
@@ -719,6 +732,34 @@ fn judge_reference(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<J
             ),
         )
     })
+}
+
+/// The detail of a stopped session whose native reference the budget did not
+/// reach. `count` is the number of such sessions in the report.
+fn unverified_detail(count: usize, budget: Duration) -> String {
+    format!(
+        "the native reference of this session was not checked because the preflight budget of \
+         {} seconds was spent first; {count} stopped session(s) in this report are unverified \
+         this way. Run `pohunek service check|upgrade --preflight-budget <SECONDS>` with a \
+         budget up to {} seconds, or upgrade with --accept-runtime-loss",
+        budget.as_secs(),
+        MAX_PROBE_BUDGET_SECS,
+    )
+}
+
+/// Writes the number of unverified sessions into each of their details, so the
+/// count is the same for every session and in both report formats.
+fn fill_unverified_counts(verdicts: &mut [SessionVerdict], budget: Duration) {
+    let count = verdicts
+        .iter()
+        .filter(|verdict| verdict.code == CODE_REFERENCE_UNVERIFIED)
+        .count();
+    for verdict in verdicts
+        .iter_mut()
+        .filter(|verdict| verdict.code == CODE_REFERENCE_UNVERIFIED)
+    {
+        verdict.detail = unverified_detail(count, budget);
+    }
 }
 
 /// Whether a failed reference check reports a fact of the stored data itself,
@@ -939,6 +980,8 @@ struct Judging<'a> {
 /// many sessions launch it.
 struct ProbeLedger {
     deadline: Instant,
+    /// The budget the deadline was computed from, for the messages that name it.
+    budget: Duration,
     outcomes: RefCell<HashMap<ProbeKey, ProbeOutcome>>,
 }
 
@@ -956,9 +999,10 @@ struct ProbeKey {
 }
 
 impl ProbeLedger {
-    fn new(deadline: Instant) -> Self {
+    fn new(deadline: Instant, budget: Duration) -> Self {
         Self {
             deadline,
+            budget,
             outcomes: RefCell::new(HashMap::new()),
         }
     }
@@ -1521,9 +1565,10 @@ fn judge_launch(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judg
             format!(
                 "the version probes of this upgrade's judgement used their total budget of {} \
                  seconds before this session's agent was probed, so its recovery cannot be \
-                 verified; stop the agent that hangs its version probe, or upgrade with \
-                 --accept-runtime-loss",
-                PROBE_BUDGET.as_secs()
+                 verified; stop the agent that hangs its version probe, run `pohunek service \
+                 check|upgrade --preflight-budget <SECONDS>` with a larger budget, or upgrade \
+                 with --accept-runtime-loss",
+                judging.probes.budget.as_secs()
             ),
         )),
     }

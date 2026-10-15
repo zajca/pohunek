@@ -20,7 +20,7 @@ use pohunek_platform::supervisor::WorkerKey;
 use pohunek_service_config::preflight::{
     PreflightReport, SessionVerdict, StoreReport, StoreState, Verdict, REPORT_VERSION,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use super::backend::Backend;
@@ -62,6 +62,7 @@ pub(super) async fn gate(
     previous: &str,
     reported_version: &str,
     search_path: &str,
+    variables: &BTreeMap<String, String>,
     accept_runtime_loss: bool,
 ) -> Result<Gated, Error> {
     let judged = if let Some(reader) = LegacyReader::from_version(previous) {
@@ -81,6 +82,7 @@ pub(super) async fn gate(
             daemon_dir,
             reported_version,
             search_path,
+            variables,
             accept_runtime_loss,
         )
         .await

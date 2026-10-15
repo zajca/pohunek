@@ -1,19 +1,22 @@
-//! The `PATH` the systemd user manager gives its units.
+//! The environment the service manager gives the daemon job.
 //!
 //! The daemon's systemd user unit records no `PATH` when the install chose
-//! unmanaged discovery, so the daemon inherits the user manager's `PATH`. A
-//! preflight or runtime step that must judge with the daemon's `PATH` reads
-//! the manager's `Environment` property through the platform's D-Bus client.
-//! A manager that cannot answer is an error: the caller never falls back to an
-//! empty `PATH` or to the CLI's own.
+//! unmanaged discovery, so the daemon inherits the user manager's `PATH`. The
+//! same manager environment carries the allowlisted variables a daemon reads,
+//! such as a store location, so a preflight judges with them too. A manager
+//! that cannot answer is an error: the caller never falls back to an empty
+//! `PATH` or to the CLI's own environment. Values are never part of an error.
 
 // Rust guideline compliant 2026-10-14
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 
 use pohunek_platform::supervisor::SEARCH_PATH_VARIABLE;
+use pohunek_worker_protocol::BaseEnv;
 
 use super::error::Error;
 
@@ -56,25 +59,73 @@ impl UserManager for SystemdUserManager {
     }
 }
 
-/// Reads the `PATH` of the systemd user manager through `manager`, byte for byte.
-///
-/// The daemon job runs with exactly this value, and its own resolver and version
-/// probes read it as it is, so it is handed to the preflight and runtime spawns
-/// unchanged. Trust, relative entries, and duplicates are the daemon's to judge.
+/// What the systemd user manager gives the daemon job, read once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserManagerEnvironment {
+    /// The manager's `PATH`, byte for byte, when it sets one. The daemon job
+    /// runs with exactly this value.
+    pub search_path: Option<String>,
+    /// The manager's variables the allowlist selects, `PATH` excluded.
+    pub variables: BTreeMap<String, String>,
+}
+
+/// Reads the environment of the systemd user manager through `manager` once,
+/// and selects its variables with `allowlist`.
 ///
 /// # Errors
 ///
-/// Returns [`Error::ManagerEnvironment`] when the environment cannot be read,
-/// has no `PATH` entry, or holds a `PATH` that a process environment cannot carry.
-pub async fn user_manager_search_path(manager: &dyn UserManager) -> Result<String, Error> {
-    let failure = |detail: String| Error::ManagerEnvironment { detail };
-    let environment = manager.environment().await.map_err(failure)?;
+/// Returns [`Error::ManagerEnvironment`] when the environment cannot be read or
+/// an allowlisted variable cannot be carried by a job environment.
+pub async fn user_manager_environment(
+    manager: &dyn UserManager,
+    allowlist: &[String],
+) -> Result<UserManagerEnvironment, Error> {
+    let entries = manager
+        .environment()
+        .await
+        .map_err(|detail| Error::ManagerEnvironment { detail })?;
     let prefix = format!("{SEARCH_PATH_VARIABLE}=");
-    let value = environment
+    let search_path = entries
         .iter()
         .find_map(|entry| entry.strip_prefix(prefix.as_str()))
-        .ok_or_else(|| failure("it sets no PATH entry".to_owned()))?;
-    carry(value).map_err(failure)
+        .map(carry)
+        .transpose()
+        .map_err(|detail| Error::ManagerEnvironment { detail })?;
+    let pairs = entries.iter().filter_map(|entry| {
+        entry
+            .split_once('=')
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+    });
+    Ok(UserManagerEnvironment {
+        search_path,
+        variables: allowlisted_variables(pairs, allowlist)?,
+    })
+}
+
+/// Selects the variables of a service manager environment that `allowlist`
+/// names, with the job's own `PATH` left out.
+///
+/// The selection is the one a daemon applies to its launch environment, so a
+/// variable the daemon would not inherit is never passed to a preflight. Errors
+/// name variables, never their values.
+///
+/// # Errors
+///
+/// Returns [`Error::ManagerEnvironment`] for an invalid pattern or a selected
+/// variable that a base environment cannot hold.
+pub fn allowlisted_variables(
+    entries: impl IntoIterator<Item = (String, String)>,
+    allowlist: &[String],
+) -> Result<BTreeMap<String, String>, Error> {
+    let vars = entries
+        .into_iter()
+        .filter(|(name, _)| name != SEARCH_PATH_VARIABLE)
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)));
+    let base =
+        BaseEnv::from_allowlist(allowlist, vars).map_err(|error| Error::ManagerEnvironment {
+            detail: format!("the service manager's environment cannot be carried: {error}"),
+        })?;
+    Ok(base.into_inner())
 }
 
 /// The `PATH` value of a job, if a process environment can carry it.
@@ -101,6 +152,8 @@ pub struct ActiveJob {
     pub domain: Option<String>,
     /// The `default environment` `PATH` of the loaded job, when it is loaded.
     pub loaded_default: Option<String>,
+    /// The domain's `environment` variables, `PATH` included, in launchd's order.
+    pub domain_environment: Vec<(String, String)>,
 }
 
 /// Reads launchd's active state of the daemon job.
@@ -136,6 +189,7 @@ impl LaunchdJob for SystemLaunchd {
             Ok(ActiveJob {
                 domain: sources.domain,
                 loaded_default: sources.loaded_default,
+                domain_environment: sources.domain_environment,
             })
         })
     }
