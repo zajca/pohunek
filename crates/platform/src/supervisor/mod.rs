@@ -465,6 +465,37 @@ impl Error {
         };
         no_bus_source(source.as_ref())
     }
+
+    /// Whether the error is a session bus address zbus cannot use: one it cannot
+    /// parse, or none of whose transports it can connect through. Such text may
+    /// quote the address, which the caller's environment supplies, so a caller
+    /// that reports it names the condition instead.
+    #[must_use]
+    pub fn is_bus_address_invalid(&self) -> bool {
+        let Self::Unavailable {
+            operation: "connect",
+            source,
+        } = self
+        else {
+            return false;
+        };
+        bus_address_source(source.as_ref())
+    }
+}
+
+/// Whether a failed connection's bus error is an address zbus cannot use.
+#[cfg(target_os = "linux")]
+fn bus_address_source(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    matches!(
+        source.downcast_ref::<zbus::Error>(),
+        Some(zbus::Error::Address(_))
+    )
+}
+
+/// No other host connects to a session bus.
+#[cfg(not(target_os = "linux"))]
+fn bus_address_source(_source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    false
 }
 
 /// The bus error behind a failed connection, classified as no bus or not.

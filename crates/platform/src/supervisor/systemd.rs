@@ -1733,6 +1733,7 @@ mod tests {
         .await
         .expect_err("no bus listens at the socket");
         assert!(error.is_no_bus(), "{error}");
+        assert!(!error.is_bus_address_invalid(), "{error}");
         // The error text does not carry the socket path: it names only the failure.
         assert!(
             !error.to_string().contains(&missing.display().to_string()),
@@ -1746,6 +1747,14 @@ mod tests {
             .expect_err("the address cannot be parsed");
         assert!(!error.is_no_bus(), "{error}");
         assert!(!error.to_string().contains("not an address"), "{error}");
+
+        // An address whose parse error quotes part of it is recognized, so a
+        // caller reports the condition instead of the text.
+        let error = read_user_manager_environment(Some("sentinel-token:"), timeout)
+            .await
+            .expect_err("the address cannot be parsed");
+        assert!(error.is_bus_address_invalid(), "{error}");
+        assert!(!error.is_no_bus(), "{error}");
 
         let socket = dir.path().join("hang-up-bus");
         let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind the socket");

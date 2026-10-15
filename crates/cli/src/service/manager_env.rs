@@ -59,7 +59,11 @@ impl UserManager for SystemdUserManager {
             .map_err(|error| {
                 // Only an absent bus means no manager is reachable; a bus that
                 // refuses the client is an answer that cannot be used.
-                let detail = error.to_string();
+                let detail = if error.is_bus_address_invalid() {
+                    "the session bus address cannot be used (zbus address error)".to_owned()
+                } else {
+                    error.to_string()
+                };
                 if error.is_no_bus() {
                     EnvironmentFailure::Unreachable(detail)
                 } else {
