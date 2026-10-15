@@ -126,34 +126,53 @@ impl Host {
         dump_runtime_logs(self.env.root());
     }
 
-    /// Prints the visible screen of up to five sessions.
+    /// Prints the visible screen of up to five sessions, with diagnostics for each.
     fn dump_session_screens(&self) {
-        let Some(listed) = self.try_json(&["session", "list"]) else {
-            return;
+        let listed = match self.try_json(&["session", "list"]) {
+            Ok(listed) => listed,
+            Err(error) => {
+                eprintln!("session list at the failure failed: {error}");
+                return;
+            }
         };
         let Some(sessions) = listed["ok"].as_array() else {
+            eprintln!("session list at the failure: {listed}");
             return;
         };
+        if sessions.is_empty() {
+            eprintln!("session list at the failure: no sessions");
+        }
         for id in sessions.iter().filter_map(|s| s["id"].as_str()).take(5) {
-            let Some(screen) = self.try_json(&["session", "screen", id]) else {
-                continue;
-            };
-            let Some(lines) = screen["ok"]["visible_lines"].as_array() else {
-                continue;
-            };
-            eprintln!("screen of {id} at the failure:");
-            for line in lines.iter().filter_map(Value::as_str) {
-                eprintln!("{}", line.trim_end());
+            match self.try_json(&["session", "screen", id]) {
+                Ok(screen) => match screen["ok"]["visible_lines"].as_array() {
+                    Some(lines) => {
+                        eprintln!("screen of {id} at the failure:");
+                        for line in lines.iter().filter_map(Value::as_str) {
+                            eprintln!("{}", line.trim_end());
+                        }
+                    }
+                    None => eprintln!("screen of {id} at the failure: {screen}"),
+                },
+                Err(error) => eprintln!("screen of {id} at the failure failed: {error}"),
+            }
+            match self.try_json(&["session", "inspect", id]) {
+                Ok(inspect) => eprintln!("inspect of {id} at the failure: {inspect}"),
+                Err(error) => eprintln!("inspect of {id} at the failure failed: {error}"),
             }
         }
     }
 
-    /// Runs `pohunek <arguments> --json` without panicking.
-    fn try_json(&self, arguments: &[&str]) -> Option<Value> {
+    /// Runs `pohunek <arguments> --json`, reporting errors descriptively.
+    fn try_json(&self, arguments: &[&str]) -> Result<Value, String> {
         let mut command = self.env.command(self.layout.path("pohunek"));
         command.args(arguments).arg("--json");
-        let output = run_bounded(command, &format!("pohunek {arguments:?}"), CLI_TIMEOUT).ok()?;
-        serde_json::from_slice(&output.stdout).ok()
+        let output = run_bounded(command, &format!("pohunek {arguments:?}"), CLI_TIMEOUT)?;
+        if !output.status.success() {
+            let code = output.status.code().unwrap_or(-1);
+            return Err(format!("exit {code:?}: {}", tail(&output.stderr, 2048)));
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("invalid JSON ({error}): {}", tail(&output.stdout, 2048)))
     }
 
     /// Runs the layout's `pohunek` with `arguments` in the hermetic environment.
@@ -309,6 +328,12 @@ impl Drop for Host {
     }
 }
 
+/// Returns the last `max` bytes of `bytes` as a lossy UTF-8 string.
+fn tail(bytes: &[u8], max: usize) -> String {
+    let start = bytes.len().saturating_sub(max);
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
+}
+
 /// Prints the last `LOG_TAIL_BYTES` of runtime log files found in the directory tree.
 fn dump_runtime_logs(root: &Path) {
     let mut logs = Vec::new();
@@ -317,16 +342,14 @@ fn dump_runtime_logs(root: &Path) {
         let Ok(bytes) = fs::read(&path) else {
             continue;
         };
-        let start = bytes.len().saturating_sub(LOG_TAIL_BYTES);
-        let tail = &bytes[start..];
         eprintln!("--- {}", path.display());
-        eprintln!("{}", String::from_utf8_lossy(tail));
+        eprintln!("{}", tail(&bytes, LOG_TAIL_BYTES));
     }
 }
 
-/// Recursively collects up to 20 log file paths, depth ≤ 8, skipping symlinks.
+/// Recursively collects up to 30 log file paths, depth ≤ 8, skipping symlinks.
 fn collect_logs(dir: &Path, depth: usize, logs: &mut Vec<std::path::PathBuf>) {
-    if depth > 8 || logs.len() >= 20 {
+    if depth > 8 || logs.len() >= 30 {
         return;
     }
     let Ok(entries) = fs::read_dir(dir) else {
@@ -350,9 +373,12 @@ fn collect_logs(dir: &Path, depth: usize, logs: &mut Vec<std::path::PathBuf>) {
             let is_log = path
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("log"));
-            if (is_log || name.contains("stderr")) && name != "daemon.out" {
+            let is_jsonl = path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"));
+            if (is_log || is_jsonl || name.contains("stderr")) && name != "daemon.out" {
                 logs.push(path);
-                if logs.len() >= 20 {
+                if logs.len() >= 30 {
                     return;
                 }
             }
