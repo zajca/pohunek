@@ -947,8 +947,8 @@ pub(crate) struct InstalledFacts {
 ///
 /// Unlike [`status_in`] it only reads files: it probes no transaction lock,
 /// contacts no service manager or daemon, and creates nothing, so a preview
-/// can call it without touching the host. `service.toml` is verified as the
-/// other commands verify it.
+/// can call it without touching the host. `service.toml` and the versions
+/// directory are verified as `status` verifies them.
 ///
 /// # Errors
 ///
@@ -969,6 +969,10 @@ pub(crate) fn installed_facts(context: &Context) -> Result<InstalledFacts, Error
         });
     }
     let config = verified_config(context)?;
+    // The versions directory is opened as the owner's trusted directory, as
+    // `status` opens it, so an untrusted one fails before a plan runs the
+    // installed daemon.
+    layout::installed_versions(config.layout())?;
     Ok(InstalledFacts {
         installed: true,
         active_version: Some(config.active_version().to_owned()),

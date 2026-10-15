@@ -470,7 +470,8 @@ fn an_archive_without_manifest_and_verifier_stops_setup() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("has no usable packaging/verify-archive")
+        stderr.contains("has no usable")
+            && stderr.contains("packaging/verify-archive")
             && !stderr.contains("fixture refusal"),
         "the archive is refused before its daemon plans: {stderr}"
     );

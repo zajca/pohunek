@@ -1168,8 +1168,8 @@ fn hook_lines(hooks: &[IntegrationReinstall], status: &str) -> Vec<String> {
 /// no manifest; such a directory is indistinguishable from an archive whose
 /// every archive file was removed, which the download's attestation, not
 /// this check, rules out. The verifier runs only as a regular file of this
-/// user or root that no other account can write, the rule it then applies to
-/// the whole archive.
+/// user or root, reached through directories of this user or root, that no
+/// other account can write: the rule it then applies to the whole archive.
 ///
 /// # Errors
 ///
@@ -1198,20 +1198,40 @@ async fn verify_sealed_archive(staged: &Path, uid: u32) -> Result<(), CliError> 
     if !sealed {
         return Ok(());
     }
-    let metadata = fs::symlink_metadata(&verifier).map_err(|error| {
-        blocked(format!(
-            "the release archive has no usable {ARCHIVE_VERIFIER}: {error}"
-        ))
-    })?;
-    if !metadata.file_type().is_file()
-        || (metadata.uid() != uid && metadata.uid() != 0)
-        || metadata.mode() & 0o022 != 0
-    {
-        return Err(blocked(format!(
-            "{} is not a regular file of this user or root closed to other accounts; \
-             extract the archive again",
-            verifier.display()
-        )));
+    // The verifier, and the directories it is reached through, must be
+    // closed to other accounts, so none can swap it between this check and
+    // its run; the verifier then applies the same rule to the whole archive.
+    for (path, directory) in [
+        (staged, true),
+        (packaging.as_path(), true),
+        (verifier.as_path(), false),
+    ] {
+        let metadata = fs::symlink_metadata(path).map_err(|error| {
+            blocked(format!(
+                "the release archive has no usable {}: {error}",
+                path.display()
+            ))
+        })?;
+        let kind_matches = if directory {
+            metadata.file_type().is_dir()
+        } else {
+            metadata.file_type().is_file()
+        };
+        if !kind_matches
+            || (metadata.uid() != uid && metadata.uid() != 0)
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(blocked(format!(
+                "{} is not a {} of this user or root closed to other accounts; \
+                 extract the archive again",
+                path.display(),
+                if directory {
+                    "directory"
+                } else {
+                    "regular file"
+                }
+            )));
+        }
     }
     let output = tokio::process::Command::new("/bin/sh")
         .arg(&verifier)
