@@ -56,11 +56,15 @@ turns on an in-process mutex that a process per test cannot share.
 The real-systemd suites (`crates/platform/tests/systemd.rs`,
 `crates/daemon/tests/systemd_durable_worker.rs`,
 `crates/cli/tests/service_systemd.rs`,
+`crates/cli/tests/setup_host_native.rs`,
+`crates/cli/tests/setup_host.rs`,
 `crates/daemon/tests/supervised_lifecycle.rs`,
 `crates/cli/tests/service_upgrade.rs`,
-`crates/cli/tests/workflow_systemd.rs`) are `#[ignore]`d on Linux and need
+`crates/cli/tests/workflow_systemd.rs`,
+`crates/cli/tests/workflow_reactions.rs`) have their real-systemd scenarios
+`#[ignore]`d on Linux, and those need
 `POHUNEK_SYSTEMD_E2E=1` plus a running user manager; the Linux CI job
-`real systemd supervision` runs all six with `--ignored --test-threads 1`
+`real systemd supervision` runs all nine with `--ignored --test-threads 1`
 after building the daemon, worker, and CLI binaries. Run them locally the same
 way (`POHUNEK_DAEMON_BIN`, `POHUNEK_WORKER_BIN`, and `POHUNEK_CLI_BIN` point the
 suites at the built binaries). The `upgrade from the previous release` CI job (`.github/workflows/upgrade.yml`,

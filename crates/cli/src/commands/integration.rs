@@ -8,6 +8,7 @@
 // Rust guideline compliant 2026-10-12
 
 use std::env;
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -52,6 +53,11 @@ const HERMES_EXECUTABLE_NAME: &str = "hermes";
 const HOME_ENVIRONMENT_VARIABLE: &str = "HOME";
 /// The directory of named Hermes profiles below the default Hermes root.
 const HERMES_PROFILES_DIR: &str = "profiles";
+/// Planned status of a marked Hermes home whose plugin the apply updates.
+pub(crate) const HERMES_UPDATE: &str = "update";
+/// Planned status of a marked Hermes home that is already current, which the
+/// apply leaves as it is.
+pub(crate) const HERMES_CURRENT: &str = "current";
 
 /// Agent selector accepted by `integration --agent`.
 ///
@@ -796,19 +802,41 @@ pub(crate) struct HermesUpdate {
     policy_path: PathBuf,
 }
 
-/// Plans the Hermes reinstall of every candidate home below `env`.
-fn reinstall_hermes_homes(env: &IntegrationEnv) -> Vec<IntegrationReinstall> {
+/// A Hermes home to plan: its integration name, the selector that names it
+/// on the command line, and the target it resolves to.
+type HermesSelection = (String, String, TargetSelection);
+
+/// The Hermes homes below an environment: the default home, then every named
+/// profile of it, with the selector that names each.
+///
+/// A profiles directory that cannot be listed is a failure of its own. The
+/// homes it would have named are not planned, and the failure says so.
+struct HermesHomes {
+    /// The user's home, or `None` when it is not known.
+    home: Option<PathBuf>,
+    /// The homes to plan, in order.
+    selections: Vec<HermesSelection>,
+    /// The failures of finding the homes.
+    failures: Vec<IntegrationReinstall>,
+}
+
+/// Finds the Hermes homes below `env`.
+fn hermes_homes(env: &IntegrationEnv) -> HermesHomes {
     let Some(home) = env.home.as_deref() else {
-        return vec![IntegrationReinstall {
-            integration: "hermes".to_owned(),
-            status: "failed",
-            detail: Some(
-                CliError::MissingEnv {
-                    var: HOME_ENVIRONMENT_VARIABLE.to_owned(),
-                }
-                .to_string(),
-            ),
-        }];
+        return HermesHomes {
+            home: None,
+            selections: Vec::new(),
+            failures: vec![IntegrationReinstall {
+                integration: "hermes".to_owned(),
+                status: "failed",
+                detail: Some(
+                    CliError::MissingEnv {
+                        var: HOME_ENVIRONMENT_VARIABLE.to_owned(),
+                    }
+                    .to_string(),
+                ),
+            }],
+        };
     };
     let root = home.join(".hermes");
     let mut selections = vec![(
@@ -816,39 +844,269 @@ fn reinstall_hermes_homes(env: &IntegrationEnv) -> Vec<IntegrationReinstall> {
         format!("--hermes-home {}", root.display()),
         TargetSelection::CustomHome(root.clone()),
     )];
-    for profile in hermes_profile_names(&root.join(HERMES_PROFILES_DIR)) {
-        if let Ok(name) = ProfileName::new(profile.clone()) {
-            selections.push((
-                format!("hermes profile {profile}"),
-                format!("--hermes-profile {profile}"),
-                TargetSelection::Profile(name),
-            ));
-        }
-    }
-    let plugins = env.state_dir.join(pohunek_paths::PLUGINS_SUBDIR);
-    selections
-        .into_iter()
-        .map(|(integration, selector, selection)| {
-            match plan_hermes_home(integration, &selector, selection, home, &env.state_dir) {
-                HermesPlan::Done(result) => result,
-                HermesPlan::Update(update) => execute_hermes_update(&update, &plugins),
+    let mut failures = Vec::new();
+    let profiles_dir = root.join(HERMES_PROFILES_DIR);
+    match hermes_profile_names(&profiles_dir) {
+        Ok(names) => {
+            for profile in names {
+                if let Ok(name) = ProfileName::new(profile.clone()) {
+                    selections.push((
+                        format!("hermes profile {profile}"),
+                        format!("--hermes-profile {profile}"),
+                        TargetSelection::Profile(name),
+                    ));
+                }
             }
-        })
-        .collect()
+        }
+        Err(error) => failures.push(IntegrationReinstall {
+            integration: "hermes profiles".to_owned(),
+            status: "failed",
+            detail: Some(format!(
+                "cannot list {}: {error}; its profile homes were not planned",
+                profiles_dir.display()
+            )),
+        }),
+    }
+    HermesHomes {
+        home: Some(home.to_path_buf()),
+        selections,
+        failures,
+    }
+}
+
+/// Plans the Hermes reinstall of every home below `env`, as the upgrade does.
+fn reinstall_hermes_homes(env: &IntegrationEnv) -> Vec<IntegrationReinstall> {
+    let found = hermes_homes(env);
+    let Some(home) = found.home else {
+        return found.failures;
+    };
+    let plugins = env.state_dir.join(pohunek_paths::PLUGINS_SUBDIR);
+    let mut results = found.failures;
+    results.extend(
+        found.selections.into_iter().map(
+            |(integration, selector, selection)| match plan_hermes_home(
+                integration,
+                &selector,
+                selection,
+                &home,
+                &env.state_dir,
+            ) {
+                HermesPlan::Done(result) => result,
+                HermesPlan::Update(update) => {
+                    execute_hermes_update(&update, &plugins, env::var_os("PATH").as_deref())
+                }
+            },
+        ),
+    );
+    results
+}
+
+/// Reinstalls exactly the Hermes homes a preview showed, and no others, with
+/// the `hermes` executable found on `search_path`.
+///
+/// A previewed home that is a gap stays a gap. A previewed home that is
+/// marked is updated, and one that was current is checked again and left as
+/// it is; a current home that changed since is reported and not written. A
+/// home that was a gap in the preview and carries the marker now is not
+/// updated, because the owner did not see it marked. A previewed home that can
+/// no longer be found is reported, and a home that appeared after the preview
+/// is not touched.
+pub(crate) fn reinstall_previewed_hermes_homes(
+    env: &IntegrationEnv,
+    previewed: &[IntegrationReinstall],
+    search_path: &OsStr,
+) -> Vec<IntegrationReinstall> {
+    let found = hermes_homes(env);
+    let Some(home) = found.home else {
+        return found.failures;
+    };
+    let plugins = env.state_dir.join(pohunek_paths::PLUGINS_SUBDIR);
+    let mut results = found.failures;
+    let mut selections = found.selections;
+    for shown in previewed {
+        let Some(index) = selections
+            .iter()
+            .position(|(integration, _, _)| *integration == shown.integration)
+        else {
+            results.push(IntegrationReinstall {
+                integration: shown.integration.clone(),
+                status: "failed",
+                detail: Some(
+                    "this Hermes home was in the preview and can no longer be found; nothing was written"
+                        .to_owned(),
+                ),
+            });
+            continue;
+        };
+        let (integration, selector, selection) = selections.swap_remove(index);
+        results.push(
+            match plan_hermes_home(integration, &selector, selection, &home, &env.state_dir) {
+                // A home marked in the preview that is unmarked now is a failure:
+                // the owner was shown an update, and nothing was written.
+                HermesPlan::Done(result)
+                    if matches!(shown.status, HERMES_UPDATE | HERMES_CURRENT)
+                        && result.status == "gap" =>
+                {
+                    IntegrationReinstall {
+                        integration: result.integration,
+                        status: "failed",
+                        detail: Some(
+                            "this home was marked in the preview and is not marked now; nothing was written"
+                                .to_owned(),
+                        ),
+                    }
+                }
+                HermesPlan::Done(result) => result,
+                HermesPlan::Update(update) if shown.status == HERMES_UPDATE => {
+                    execute_hermes_update(&update, &plugins, Some(search_path))
+                }
+                HermesPlan::Update(update) if shown.status == HERMES_CURRENT => {
+                    if hermes_home_is_current(&update, &plugins, search_path) {
+                        IntegrationReinstall {
+                            integration: update.integration,
+                            status: HERMES_CURRENT,
+                            detail: None,
+                        }
+                    } else {
+                        IntegrationReinstall {
+                            integration: update.integration,
+                            status: "failed",
+                            detail: Some(
+                                "this home was current in the preview and has changed since; nothing was written, re-run `pohunek setup`"
+                                    .to_owned(),
+                            ),
+                        }
+                    }
+                }
+                HermesPlan::Update(update) => IntegrationReinstall {
+                    integration: update.integration,
+                    status: "failed",
+                    detail: Some(
+                        "this home was a gap in the preview and carries the pohunek marker now; nothing was written"
+                            .to_owned(),
+                    ),
+                },
+            },
+        );
+    }
+    results
+}
+
+/// Every Hermes home the apply acts on, planned without writing anything, with
+/// the `hermes` executable found on `search_path`.
+///
+/// A home with the pohunek marker is `update`, the same home the apply
+/// updates, or `current` when its plugin already is the selected package's,
+/// intact and enabled, and `selection_changes` is false: the apply then writes
+/// nothing to it. A run that changes the selected Hermes package plans every
+/// marked home as `update`. A home without the marker is a `gap` with the
+/// command that installs it. A home that cannot be planned, or a profiles
+/// directory that cannot be listed, is `failed`.
+pub(crate) fn hermes_home_plan(
+    env: &IntegrationEnv,
+    search_path: &OsStr,
+    selection_changes: bool,
+) -> Vec<IntegrationReinstall> {
+    let found = hermes_homes(env);
+    let Some(home) = found.home else {
+        return found.failures;
+    };
+    let plugins = env.state_dir.join(pohunek_paths::PLUGINS_SUBDIR);
+    let mut results = found.failures;
+    results.extend(
+        found.selections.into_iter().map(
+            |(integration, selector, selection)| match plan_hermes_home(
+                integration,
+                &selector,
+                selection,
+                &home,
+                &env.state_dir,
+            ) {
+                HermesPlan::Done(result) => result,
+                HermesPlan::Update(update) => {
+                    let status = if !selection_changes
+                        && hermes_home_is_current(&update, &plugins, search_path)
+                    {
+                        HERMES_CURRENT
+                    } else {
+                        HERMES_UPDATE
+                    };
+                    IntegrationReinstall {
+                        integration: update.integration,
+                        status,
+                        detail: None,
+                    }
+                }
+            },
+        ),
+    );
+    results
+}
+
+/// Whether the plugin of a marked Hermes home is installed from the selected
+/// package, unmodified and enabled, with a usable policy and no leftover of an
+/// interrupted transaction, as the `hermes` found on `search_path` reports it,
+/// and that `hermes` is the pinned release an update would require.
+/// It writes nothing: it runs the read-only `hermes --version` and
+/// `hermes plugins list --json` and the installed-plugin probe.
+///
+/// Any failure to tell is `false`: the home is then planned as an update,
+/// whose apply reports the failure.
+fn hermes_home_is_current(update: &HermesUpdate, plugins: &Path, search_path: &OsStr) -> bool {
+    let Ok(executable) = resolve_hermes_from_path(search_path) else {
+        return false;
+    };
+    let Ok(mut runner) = HermesRunner::new(&executable) else {
+        return false;
+    };
+    if runner.verify_version(&update.target).is_err() {
+        return false;
+    }
+    let Ok(bundle) = assets::selected_bundle(plugins, &update.policy_path) else {
+        return false;
+    };
+    if Policy::load_private(&update.policy_path).is_err() {
+        return false;
+    }
+    lifecycle::inspect(
+        &mut runner,
+        &update.target,
+        &update.policy_path,
+        Ok(&bundle),
+    )
+    .is_ok_and(|state| {
+        state.installed
+            && state.enabled
+            && !state.modified
+            && !state.outdated
+            && !state.package_source_missing
+            && state.package_source_error.is_none()
+            && !state.stale_stage
+            && !state.stale_backup
+    })
 }
 
 /// Names of the directories below a Hermes profiles directory, sorted.
-fn hermes_profile_names(profiles: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(profiles) else {
-        return Vec::new();
+///
+/// A missing directory names no profile. Any other failure to read it is an
+/// error, so no profile home is silently left out.
+fn hermes_profile_names(profiles: &Path) -> std::io::Result<Vec<String>> {
+    let entries = match fs::read_dir(profiles) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
-    let mut names: Vec<String> = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .collect();
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            if let Ok(name) = entry.file_name().into_string() {
+                names.push(name);
+            }
+        }
+    }
     names.sort();
-    names
+    Ok(names)
 }
 
 /// Plans the reinstall of one Hermes home: an update when its marker exists,
@@ -892,14 +1150,22 @@ pub(crate) fn plan_hermes_home(
     }
 }
 
-/// Updates the plugin of a planned Hermes home from the package store at `plugins`.
-fn execute_hermes_update(update: &HermesUpdate, plugins: &Path) -> IntegrationReinstall {
+/// Updates the plugin of a planned Hermes home from the package store at
+/// `plugins`, with the `hermes` executable found on `search_path`.
+fn execute_hermes_update(
+    update: &HermesUpdate,
+    plugins: &Path,
+    search_path: Option<&OsStr>,
+) -> IntegrationReinstall {
     let failed = |detail: String| IntegrationReinstall {
         integration: update.integration.clone(),
         status: "failed",
         detail: Some(detail),
     };
-    let executable = match resolve_hermes_executable(None) {
+    let executable = match search_path
+        .ok_or_else(|| hermes_error(HermesError::InvalidHermesExecutable))
+        .and_then(resolve_hermes_from_path)
+    {
         Ok(executable) => executable,
         Err(error) => return failed(error.to_string()),
     };
@@ -2245,6 +2511,9 @@ mod tests {
         let profiles = temp.path().join(".hermes").join("profiles");
         fs::create_dir_all(profiles.join("work")).expect("profile");
         fs::write(profiles.join("not-a-dir"), b"x").expect("file");
-        assert_eq!(super::hermes_profile_names(&profiles), ["work"]);
+        assert_eq!(
+            super::hermes_profile_names(&profiles).expect("list profiles"),
+            ["work"]
+        );
     }
 }

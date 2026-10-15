@@ -1126,7 +1126,7 @@ fn validate_safe_ancestors(path: &Path, uid: u32, error: Error) -> Result<(), Er
     Ok(())
 }
 
-pub(super) fn safe_ancestor(
+pub(crate) fn safe_ancestor(
     owner: u32,
     mode: u32,
     directory: bool,

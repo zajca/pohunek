@@ -1340,7 +1340,8 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         self.assertIn(
             "ci-only  launchd-suite: the launchd suites (crates/platform/tests/launchd.rs, "
             "crates/daemon/tests/supervised_lifecycle.rs, crates/cli/tests/service_launchd.rs, "
-            "crates/cli/tests/service_upgrade.rs and crates/cli/tests/workflow_launchd.rs) "
+            "crates/cli/tests/service_upgrade.rs, crates/cli/tests/setup_host_native.rs and "
+            "crates/cli/tests/workflow_launchd.rs) "
             "run only on macOS (ci-only)",
             output,
         )

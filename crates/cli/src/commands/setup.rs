@@ -1,20 +1,23 @@
 //! `pohunek setup config` — materialize the default config and prompt templates.
 //!
-//! All operations are local filesystem writes (no daemon involvement), mirroring
-//! the `doctor` command's shape (sync, takes `&Paths`, renders human or `--json`).
-//! The command embeds the default config and prompt templates at build time
-//! (string constants) and writes them into the user's XDG config dir:
+//! The config operations are local filesystem writes (no daemon involvement),
+//! mirroring the `doctor` command's shape (sync, takes `&Paths`, renders human
+//! or `--json`). The command embeds the default config and prompt templates at
+//! build time (string constants) and writes them into the user's XDG config dir:
 //!
 //! - `setup config` writes a default `attach.conf` plus the `prompts/issue.tmpl`
 //!   and `prompts/pr.tmpl` templates the daemon resolves for project actions,
 //!   never overwriting an existing file unless `--force` is given.
-//! - `setup` (no subcommand) is `setup config` without `--force`.
 //! - `setup completions` delegates to the completion module and writes one
 //!   shell's generated script into its conventional per-user directory.
+//!
+//! Bare `setup` is the host orchestrator in [`super::setup_host`]; its config
+//! step calls [`install_config`] without `--force`.
 
 use std::fmt::Write as _;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -70,10 +73,12 @@ Please address the outstanding work on this PR, then summarize what you did.
 ";
 
 /// Result of `setup config`: which files were created vs left untouched.
-#[derive(Debug, Serialize)]
-struct ConfigResult {
-    created: Vec<String>,
-    skipped: Vec<String>,
+#[derive(Debug, Default, Serialize)]
+pub struct ConfigResult {
+    /// Files written by this run.
+    pub created: Vec<String>,
+    /// Files that already existed and were left untouched.
+    pub skipped: Vec<String>,
 }
 
 /// Write a default `attach.conf` and prompt templates.
@@ -97,30 +102,72 @@ pub(crate) fn run_config(paths: &Paths, force: bool, json: bool) -> Result<(), C
 /// Write the default config + prompt templates, skipping any file that already
 /// exists unless `force` is set. Tracks created vs skipped so a re-run is
 /// transparent about what it touched.
-fn install_config(paths: &Paths, force: bool) -> Result<ConfigResult, CliError> {
-    let prompts_dir = paths.config_dir.join("prompts");
-    fs::create_dir_all(&prompts_dir)?;
+pub(crate) fn install_config(paths: &Paths, force: bool) -> Result<ConfigResult, CliError> {
+    let mut result = ConfigResult::default();
+    install_config_into(paths, force, &mut result)?;
+    Ok(result)
+}
 
-    let files: &[(PathBuf, &str)] = &[
-        (paths.config_dir.join(ATTACH_CONF_FILE), ATTACH_CONF),
-        (prompts_dir.join("issue.tmpl"), ISSUE_TMPL),
-        (prompts_dir.join("pr.tmpl"), PR_TMPL),
-    ];
+/// Writes the config files like [`install_config`], recording each file in
+/// `result` as soon as it is created or kept. A failure part way through
+/// leaves in `result` the files written before it.
+///
+/// # Errors
+///
+/// Returns the error of the first file that cannot be inspected or written.
+pub(crate) fn install_config_into(
+    paths: &Paths,
+    force: bool,
+    result: &mut ConfigResult,
+) -> Result<(), CliError> {
+    fs::create_dir_all(paths.config_dir.join("prompts"))?;
 
-    let mut created = Vec::new();
-    let mut skipped = Vec::new();
-    for (path, body) in files {
+    for (path, body) in config_files(paths) {
         // Preserve user edits: only write when the file is absent or `force` is
         // set. `try_exists` distinguishes "absent" from "cannot tell", surfacing
         // the latter as an error rather than silently overwriting.
         if !force && path.try_exists()? {
-            skipped.push(path.display().to_string());
+            result.skipped.push(path.display().to_string());
             continue;
         }
-        fs::write(path, body)?;
-        created.push(path.display().to_string());
+        write_atomically(&path, body)?;
+        result.created.push(path.display().to_string());
     }
-    Ok(ConfigResult { created, skipped })
+    Ok(())
+}
+
+/// Writes `body` to `path` through a temporary file beside it, then renames
+/// it into place. A failed write leaves no partial file where a later run
+/// would find the file and skip it.
+fn write_atomically(path: &Path, body: &str) -> std::io::Result<()> {
+    let name = path.file_name().map_or_else(
+        || "config".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let temp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+/// The config files `setup config` writes, with their default contents.
+pub(crate) fn config_files(paths: &Paths) -> [(PathBuf, &'static str); 3] {
+    let prompts_dir = paths.config_dir.join("prompts");
+    [
+        (paths.config_dir.join(ATTACH_CONF_FILE), ATTACH_CONF),
+        (prompts_dir.join("issue.tmpl"), ISSUE_TMPL),
+        (prompts_dir.join("pr.tmpl"), PR_TMPL),
+    ]
 }
 
 // --- human rendering --------------------------------------------------------

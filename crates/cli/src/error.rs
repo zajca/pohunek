@@ -164,6 +164,54 @@ pub(crate) enum CliError {
         host: String,
     },
 
+    /// Bare `pohunek setup` needs the owner's consent and the run cannot ask
+    /// for it (`--yes` is missing and stdin is not a terminal, or `--json`).
+    /// Nothing is changed.
+    #[error("setup changes this host and needs your consent; nothing was changed")]
+    SetupConsentRequired,
+
+    /// The owner declined the plan shown by bare `pohunek setup`.
+    #[error("setup was not confirmed; nothing was changed")]
+    SetupDeclined,
+
+    /// Bare `pohunek setup` stopped before its first write: the plan refuses
+    /// it, or the installed service needs another step first.
+    #[error("setup stopped before any change: {detail}")]
+    SetupBlocked {
+        /// The refusals or the gap that blocks the run, with the next step.
+        detail: String,
+    },
+
+    /// Bare `pohunek setup` stopped after it started changing the host. The
+    /// changes made so far are kept; re-running setup completes them.
+    #[error("setup did not complete: {detail}{}", changes_text(.applied))]
+    SetupIncomplete {
+        /// What was left undone, with the next step.
+        detail: String,
+        /// The changes made before the stop, in order.
+        applied: Vec<String>,
+    },
+
+    /// Bare `pohunek setup` installed the service, and the plan read from the
+    /// installed version does not match the preview. The installed service
+    /// and the changes the install engine made are kept; a re-run plans from
+    /// the installed service.
+    #[error(
+        "setup stopped after installing pohunek {version} at {}: {detail}{}. Nothing else was changed.",
+        prefix.display(),
+        changes_text(.applied)
+    )]
+    SetupInstalledOnly {
+        /// The version that was installed.
+        version: String,
+        /// The prefix it was installed under.
+        prefix: PathBuf,
+        /// The changes made, in order: the service and the install engine's.
+        applied: Vec<String>,
+        /// What differs from the preview.
+        detail: String,
+    },
+
     /// Failed to spawn the daemon process.
     #[error("failed to start daemon: {0}")]
     Spawn(String),
@@ -335,6 +383,51 @@ impl CliError {
                 "starting a session on a remote host requires explicit confirmation".to_owned(),
                 Some("re-run with `--yes` to confirm the remote session".to_owned()),
             ),
+            CliError::SetupConsentRequired => ProtocolError::new(
+                ErrorClass::Configuration,
+                "setup_consent_required",
+                "setup changes this host and needs your consent; nothing was changed".to_owned(),
+                Some(
+                    "run `pohunek setup --dry-run --json` to see the plan without changing anything, then `pohunek setup --yes` to apply it; in a terminal, `pohunek setup` shows the plan and asks"
+                        .to_owned(),
+                ),
+            ),
+            CliError::SetupInstalledOnly {
+                version,
+                prefix,
+                applied,
+                detail,
+            } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "setup_plan_changed_after_install",
+                format!(
+                    "setup stopped after installing pohunek {version} at {}: {detail}{}. Nothing else was changed.",
+                    prefix.display(),
+                    changes_text(applied)
+                ),
+                Some(
+                    "fix the cause named above, then re-run `pohunek setup`; it plans from the installed service and does not reinstall it"
+                        .to_owned(),
+                ),
+            ),
+            CliError::SetupDeclined => ProtocolError::new(
+                ErrorClass::Configuration,
+                "setup_declined",
+                "setup was not confirmed; nothing was changed".to_owned(),
+                Some("re-run `pohunek setup` and confirm, or pass `--yes`".to_owned()),
+            ),
+            CliError::SetupBlocked { detail } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "setup_blocked",
+                format!("setup stopped before any change: {detail}"),
+                Some("resolve the reported refusal or gap, then re-run `pohunek setup`".to_owned()),
+            ),
+            CliError::SetupIncomplete { detail, applied } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "setup_incomplete",
+                format!("setup did not complete: {detail}{}", changes_text(applied)),
+                Some("resolve the reported item, then re-run `pohunek setup`; finished steps are kept".to_owned()),
+            ),
             CliError::RemoteConfirmationDeclined { host } => ProtocolError::new(
                 ErrorClass::Configuration,
                 "confirmation_declined",
@@ -402,6 +495,16 @@ impl CliError {
     /// The recovery hint to surface beneath this error, when one applies.
     pub(crate) fn recover_hint(&self) -> Option<String> {
         self.to_protocol_error().recover
+    }
+}
+
+/// The changes a setup stop reports, as a suffix of its message: empty when
+/// nothing was changed yet.
+pub(crate) fn changes_text(applied: &[String]) -> String {
+    if applied.is_empty() {
+        String::new()
+    } else {
+        format!(". Changes made: {}", applied.join("; "))
     }
 }
 

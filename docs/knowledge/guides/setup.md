@@ -9,14 +9,21 @@ intents: [setup, help]
 
 # Local Setup
 
-Start with structured inspection:
+On a new host, run `pohunek setup` from the extracted daemon archive (or after
+`brew install`). It installs the login service, the official runtime packages
+and hooks for the agents on the service `PATH`, and the missing config files,
+and reports each gap with its next step; `docs/cli.md`, "Host setup", lists
+every step.
+Run it again after you install an agent; on a ready host it changes nothing.
+
+To inspect a host, start with structured inspection:
 
 1. Run `pohunek doctor --json` to check local binaries, socket paths, and
    writable state directories. The check list depends on the platform; see
    [Doctor checks by platform](#doctor-checks-by-platform).
 2. Run `pohunek service status --json` to see whether the daemon is installed
-   as a login service. If `installed` is false, install it with
-   `pohunek service install` (see below). For development only,
+   as a login service. If `installed` is false, run `pohunek setup`, or install
+   only the service with `pohunek service install` (see below). For development only,
    `pohunek daemon start --dev-subprocess --detach` runs a daemon with plain
    subprocess workers and no service configuration.
 3. Run `pohunek health --json` or `pohunek status --json` to confirm the daemon
@@ -154,7 +161,28 @@ The installer refuses a unit or `LaunchAgents` directory that is group- or
 world-writable and names the fix (`chmod go-w <path>`); it never changes
 permissions itself.
 
-Local configuration is installed through `pohunek setup`. The subcommands are:
+`pohunek setup` is the host setup. Without a subcommand it previews the service
+install or the kept service, the official runtime packages, profile pins, hooks
+and gaps of this host, asks once (`--yes` applies unattended; without a
+terminal and without `--yes`, or with `--json` and no `--yes`, it refuses;
+`--dry-run` prints the plan and changes nothing), and then installs the service and
+the packages, pins the profiles, installs the hooks of the homes that exist, and
+writes the missing config files. It never upgrades an installed service: a
+different installed version is a gap, and `pohunek service upgrade` runs first.
+Every Hermes home the run acts on is listed in the preview. A marked home
+whose plugin is already current is kept as it is, and setup runs the
+`hermes` found on the daemon job's `PATH`. A home without the
+pohunek marker is a gap that names the
+`pohunek integration hermes install` command; setup never chooses its access
+policy and never writes into it. If the plan read after the service install
+differs from the preview in a way the install engine does not account for,
+setup stops with the service installed, names the install's changes, and
+changes nothing else; a re-run converges. A pending interrupted install stops
+setup before any change, and so does a gap the install's own runtime step
+would refuse (a used runtime without a package for this platform). On an
+installed host the plan is read again after the consent, and a host that
+changed while the preview was shown stops the run before any change.
+The subcommands are:
 
 - `pohunek setup config` writes a default `attach.conf` (the `pohunek attach`
   reconnect settings, every key commented at its default) and the
@@ -163,9 +191,9 @@ Local configuration is installed through `pohunek setup`. The subcommands are:
   given.
 - `pohunek setup completions <bash|zsh|fish>` installs shell completion.
 
-A bare `pohunek setup` is `pohunek setup config` without `--force`; `--json`
-returns the `created` and `skipped` file lists. Desktop launchers (rofi, sway)
-and the issue/PR pickers are not part of core; they live in `zajca/pohunek-work`
+`pohunek setup config` returns the `created` and `skipped` file lists with
+`--json`; the bare `pohunek setup` reports them among its results. Desktop
+launchers (rofi, sway) and the issue/PR pickers are not part of core; they live in `zajca/pohunek-work`
 and call the public `pohunek` CLI. Upgrading from a release that installed
 launchers: remove `<data_dir>/bin/{lib.sh,pohunek-rofi,pohunek-rofi-issue,pohunek-launch-issue,pohunek-launch-pr}`
 and `<config_home>/sway/config.d/pohunek.conf` as described in the

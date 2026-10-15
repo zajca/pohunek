@@ -70,7 +70,8 @@ port is retained.
 | `pohunek integration status` | Inspect daemon-managed Codex/Claude hooks on the effective `--host` (`--profile` and `--all-profiles` select profile config homes and are local-only), or one explicitly selected local Hermes target. |
 | `pohunek integration doctor / uninstall` | Diagnose or remove daemon-managed Codex/Claude hooks (`doctor` follows `--host`; `uninstall` targets the local daemon; both accept `--profile NAME` and `--all-profiles`, local-only), or, with `--agent hermes`, one explicitly selected local Hermes plugin target. |
 | `pohunek integration update --agent hermes` | Atomically refresh one explicitly selected local Hermes plugin target. |
-| `pohunek setup [config]` | Install the default `attach.conf` and prompt templates (a bare `setup` is `setup config`). |
+| `pohunek setup [--yes \| --dry-run] [--json]` | The one host setup: installs the service from this release, applies the official runtime packages, profile pins and hooks for the runtimes this host has, and writes the missing config files. It previews every change and asks once; `--yes` applies without asking, and without a terminal or with `--json` it needs `--yes`. `--dry-run` prints the plan and changes nothing. It never upgrades an installed service. |
+| `pohunek setup config [--force] [--json]` | Install the default `attach.conf` and prompt templates; existing files are kept unless `--force`. |
 | `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
 | `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot. |
 | `pohunek agent-skill` | Print the complete bundled agent skill; `--json` wraps the skill text and its `content_sha256` in the process envelope. Fully local — `--host` is accepted and ignored. |
@@ -99,6 +100,112 @@ The human `host inspect` table adds `config_home_id=...` to every runtime that
 declares a config home. Entries that show the same value launch against the same
 config directory (one account); the value is an opaque keyed digest and never a
 path.
+
+### Host setup
+
+Bare `pohunek setup` is the command to run on a host once, and again after an
+upgrade of the release files. It runs in this order:
+
+1. Service: without an installed service it installs the release binaries next
+   to the running `pohunek`. When those binaries are an extracted release
+   archive (a `MANIFEST` or a `packaging/` directory beside them), setup
+   first verifies the archive with its own `packaging/verify-archive`, as
+   `packaging/install-daemon.sh` does, and stops before any change if the
+   archive is refused or incomplete; nothing from the archive runs before
+   that. The check covers the archive's integrity and structure against its
+   `MANIFEST`; whether the archive is an authentic release is what
+   `gh attestation verify` of the download establishes. The install itself applies the runtime packages
+   and profile pins that the host's profiles, sessions and integrations need;
+   it reports them. An installed service of the same version is kept.
+   An installed service of another version is a gap: run
+   `pohunek service upgrade` first, because setup never upgrades.
+2. Plan: the release's planner reads the runtime catalog and reports every
+   runtime whose package program is on the service `PATH`, with the gaps that
+   remain (the agent is not on the `PATH`, its config home is missing, or the
+   platform has no package). The plan only reads.
+3. Preview and consent: every effect and gap is printed before anything is
+   written, including the catalog trust state (`record` means the install or
+   the apply records it; on an installed service with no official package to
+   install, nothing records it and the preview says so, to be recorded with the
+   next official package install or `pohunek service upgrade`) and every Hermes
+   home the apply acts on. The owner
+   confirms once. A plan the planner refuses stops the run before its first
+   change. An interrupted `pohunek service install` or `upgrade` that is still
+   pending stops the run before any change too; the stop names the command that
+   resumes it, or `pohunek service uninstall` to roll it back.
+4. Apply: after a fresh install, setup reads the plan again and checks that it
+   matches the preview. It allows only the transitions the install engine
+   reports: a previewed package the engine installed is now present, and a
+   previewed profile the engine pinned has left the plan. Setup then installs
+   the remaining packages, enables and selects a package that the install left
+   disabled or unselected, pins the remaining profiles, and installs the hooks in
+   the homes that exist, except a hook the daemon already reports as current. A runtime already served by another package is left
+   untouched.
+
+   The Hermes homes applied are exactly the homes the preview listed. A home
+   with the pohunek marker is updated, unless the preview lists it as
+   `current`: its plugin already is the selected package's, unmodified and
+   enabled, the `hermes` is the pinned release, and the run selects no other
+   Hermes package, so it is kept
+   without a write. Setup runs the `hermes` executable on the daemon job's
+   `PATH`, the one the plan detects Hermes with. A home without the marker
+   is a gap: setup
+   does not choose a Hermes access policy for you, so it names the
+   `pohunek integration hermes install` command for such a home and writes
+   nothing into it. A home that appears after the preview is not touched; a
+   listed home that has gone is reported. A profiles directory that cannot be
+   read is reported as a failure. A gap does not fail the run.
+5. Config: the missing config files are written and existing files are kept.
+6. Verdict: the plan is read again. Every runtime the preview planned must be
+   present in it, it must carry no refusal, and it must not list a runtime the
+   preview did not show. Every profile pin the preview showed must be done. No
+   hook may have failed. Then the daemon's health and `doctor` run. Hook gaps
+   are listed, not failed.
+
+If the plan read after the service install differs from the preview in any way
+the install engine does not account for, setup stops there. The output names the
+installed version, the prefix and the changes the install made; setup itself
+changed nothing else. Fix the cause the output names and run `pohunek setup`
+again: it plans from the installed service and converges without reinstalling
+it.
+
+On a host without the service, a gap that the install's own runtime step would
+refuse stops setup before any change: a runtime a profile, session or
+integration uses that has no package for this platform. Remove or repin that
+profile, then run `pohunek setup` again. On a host with the service, setup reads
+the plan again after you confirm; if the host changed while you read the
+preview, for example a profile was pinned meanwhile, it stops before any change
+and asks for a new run.
+
+The run is refused when it cannot ask: without a terminal and without `--yes`,
+or with `--json` and no `--yes`. The refusal changes nothing, and its hint
+names `pohunek setup --dry-run --json` to read the plan and `--yes` to apply
+it.
+
+`--dry-run` reads the plan and prints it, then exits: in a terminal as the
+preview a run shows before it asks, and with `--json` as one document whose
+`ok` is that preview, the same object a `--json --yes` run carries in
+`preview`. It asks nothing and changes nothing: no service, package, profile,
+hook or config file, and it takes no lock a run would wait for. Like a run's
+plan, it runs the agents' read-only queries: the version probes of the
+release daemon's detection and, for a marked Hermes home, `hermes --version`
+and `hermes plugins list --json`, which tell whether it is the pinned Hermes
+release and whether the plugin is enabled. A plan that
+blocks the run, such as an installed service of another version or a release
+archive that fails its verification, is the same error the run returns.
+`--dry-run` with `--yes`, or with a setup subcommand, is a usage error.
+
+`--json --yes` applies the plan without asking and prints one result document.
+It carries the full preview in `preview` (service, packages, profiles,
+integrations, gaps, catalog, every Hermes home and the config files), then the
+`applied` lines, the hook outcomes, the config result and the verdict. It
+prints no separate preview, because it cannot ask: to read the plan first, run
+`pohunek setup --dry-run --json`.
+
+A failure after the first change prints an error instead of a result, and its
+message lists the changes made (`Changes made: ...`); `--json` carries the same
+text in `msg`. The finished steps are kept, including the config files created
+so far. Run `pohunek setup` again to complete them. `--host` is ignored.
 
 ### Shell completion
 

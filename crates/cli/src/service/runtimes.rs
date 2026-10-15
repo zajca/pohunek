@@ -20,8 +20,8 @@ use std::time::Duration;
 use pohunek_paths::DAEMON_EXECUTABLE_NAME;
 use pohunek_platform::filesystem::{AdvisoryLock, EntryKind, FsError, TrustedDir};
 use pohunek_service_config::runtimes::{
-    CatalogStatus, EnsureReport, IntegrationAction, PackageStatus, ProfileStatus, DRY_RUN_FLAG,
-    ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG,
+    CatalogStatus, EnsureReport, IntegrationAction, PackageStatus, ProfileStatus, DETECT_FLAG,
+    DRY_RUN_FLAG, ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG,
 };
 use tokio::io::AsyncReadExt as _;
 
@@ -137,11 +137,32 @@ impl RuntimeStep for DaemonRuntimes {
         dry_run: bool,
         search_path: &'a str,
     ) -> Running<'a> {
-        Box::pin(run_daemon(*self, context, dir, dry_run, search_path))
+        Box::pin(run_daemon(*self, context, dir, dry_run, false, search_path))
+    }
+}
+
+impl DaemonRuntimes {
+    /// Plans the runtimes of the release in `dir` that the host can use, with
+    /// [`DETECT_FLAG`]. A dry run only: nothing is changed, so it may run before
+    /// any service exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of a dry run: the daemon cannot run, does not finish,
+    /// exits unsuccessfully, or prints a report this CLI does not read.
+    pub async fn plan_detected(
+        &self,
+        context: &Context,
+        dir: &Path,
+        search_path: &str,
+    ) -> Result<EnsureReport, Error> {
+        run_daemon(*self, context, dir, true, true, search_path).await
     }
 }
 
 /// Runs the step's daemon with the environment the installed daemon gets.
+///
+/// `detect` adds [`DETECT_FLAG`] and is only meaningful for a dry run.
 ///
 /// A run that outlives its timeout is ended and reaped before this returns, so
 /// a caller that restores state after the error never races the process. When
@@ -152,6 +173,7 @@ async fn run_daemon(
     context: &Context,
     dir: &Path,
     dry_run: bool,
+    detect: bool,
     search_path: &str,
 ) -> Result<EnsureReport, Error> {
     let daemon = dir.join(DAEMON_EXECUTABLE_NAME);
@@ -163,6 +185,9 @@ async fn run_daemon(
     command.arg(ENSURE_RUNTIMES_ARG);
     if dry_run {
         command.arg(DRY_RUN_FLAG);
+    }
+    if detect {
+        command.arg(DETECT_FLAG);
     }
     command
         .env_clear()
@@ -625,6 +650,7 @@ mod tests {
             &context,
             root.as_path(),
             true,
+            false,
             "/usr/bin:/bin",
         )
         .await
@@ -634,6 +660,7 @@ mod tests {
             DaemonRuntimes::default(),
             &context,
             root.as_path(),
+            false,
             false,
             "/usr/bin:/bin",
         )
@@ -673,6 +700,7 @@ mod tests {
             &context,
             root.as_path(),
             true,
+            false,
             &search_path,
         )
         .await
@@ -681,6 +709,7 @@ mod tests {
             DaemonRuntimes::default(),
             &context,
             root.as_path(),
+            false,
             false,
             &search_path,
         )
@@ -692,6 +721,7 @@ mod tests {
                 &context,
                 root.as_path(),
                 true,
+                false,
                 "/usr/bin:/bin",
             )
             .await
@@ -712,6 +742,7 @@ mod tests {
                 &context,
                 root.as_path(),
                 true,
+                false,
                 "/usr/bin:/bin",
             )
             .await
@@ -733,6 +764,7 @@ mod tests {
                 &context,
                 root.as_path(),
                 false,
+                false,
                 "/usr/bin:/bin",
             )
             .await
@@ -752,6 +784,7 @@ mod tests {
                 DaemonRuntimes::default(),
                 &context,
                 root.as_path(),
+                false,
                 false,
                 "/usr/bin:/bin",
             )

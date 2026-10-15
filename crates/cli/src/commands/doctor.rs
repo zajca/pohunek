@@ -46,6 +46,23 @@ const JOB_FAILED: &str = "failed";
 /// Only returns an error if paths cannot be resolved at all; individual failed
 /// checks are reported in the output, not returned as errors.
 pub(crate) async fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
+    let report = diagnose(paths).await?;
+
+    if json {
+        print!("{}", render_json(&report)?);
+    } else {
+        print_human(&report);
+    }
+
+    Ok(report.overall != Status::Fail)
+}
+
+/// Collects every doctor check without printing them.
+///
+/// # Errors
+///
+/// Only returns an error if paths cannot be resolved at all, as [`run`] does.
+pub(crate) async fn diagnose(paths: &Paths) -> Result<Report, CliError> {
     let home_dir = std::env::var_os(pohunek_paths::HOME).map(PathBuf::from);
     let worker = worker_candidate(&paths.config_dir);
     let supervision = supervision_mode(&paths.config_dir);
@@ -109,15 +126,7 @@ pub(crate) async fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
         }
         None => checks.push(unavailable_daemon_check()),
     }
-    let report = Report::from_checks(checks);
-
-    if json {
-        print!("{}", render_json(&report)?);
-    } else {
-        print_human(&report);
-    }
-
-    Ok(report.overall != Status::Fail)
+    Ok(Report::from_checks(checks))
 }
 
 /// Report a current directory that cannot be determined.

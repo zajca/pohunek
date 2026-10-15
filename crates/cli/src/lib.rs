@@ -16,6 +16,13 @@ mod error;
 mod hermes_integration;
 mod paths;
 mod process;
+pub mod host_setup {
+    //! Bare `pohunek setup` as a library: the plan, then the apply, against the
+    //! installation an explicit [`crate::service::Context`] describes.
+    pub use crate::commands::setup_host::{
+        apply, plan, HostPlan, ReleasePlanner, ServiceStep, SetupError, SetupReport, Verdict,
+    };
+}
 pub mod service;
 mod target;
 mod workflow;
@@ -178,15 +185,26 @@ enum Commands {
         action: MigrationAction,
     },
 
-    /// Set up the default config and shell completion on this machine.
+    /// Set up this machine to run pohunek: the service, the runtime packages,
+    /// the integration hooks and the config.
     ///
-    /// With no subcommand, writes the default config and prompt templates
-    /// (`setup config` without `--force`). `setup completions` installs
-    /// completion for a selected shell. All operations are local filesystem
-    /// writes; `--host` is ignored.
+    /// With no subcommand this is the one host setup: it previews every change
+    /// and asks once, then installs the service, the official runtime packages
+    /// and hooks, and writes the missing config files. `--yes` applies without
+    /// asking; without a terminal or with `--json` it needs `--yes`.
+    /// `--dry-run` prints the plan and changes nothing. Setup never upgrades
+    /// an installed service. `setup config` and `setup
+    /// completions` only write their own files. `--host` is ignored.
     Setup {
         #[command(subcommand)]
         action: Option<SetupAction>,
+        /// Apply the plan without asking (bare `setup`).
+        #[arg(long)]
+        yes: bool,
+        /// Print the plan, as the run would preview it, and change nothing
+        /// (bare `setup`).
+        #[arg(long, conflicts_with = "yes")]
+        dry_run: bool,
         /// Emit machine-readable JSON instead of human text (bare `setup`).
         #[arg(long)]
         json: bool,
@@ -1576,7 +1594,7 @@ impl Commands {
             Commands::Service { action } => action.wants_json(),
             Commands::Plugin { action } => action.wants_json(),
             Commands::Workflow { action } => action.wants_json(),
-            Commands::Setup { action, json } => {
+            Commands::Setup { action, json, .. } => {
                 action.as_ref().map_or(*json, SetupAction::wants_json)
             }
             Commands::Host { action } => action.wants_json(),
@@ -1818,6 +1836,9 @@ pub async fn run_cli() -> ExitCode {
         return error::render_clap_error(&err, error::args_request_json(&args));
     }
     if let Some(err) = session_wait_usage_error(&cli) {
+        return error::render_clap_error(&err, error::args_request_json(&args));
+    }
+    if let Some(err) = setup_dry_run_usage_error(&cli) {
         return error::render_clap_error(&err, error::args_request_json(&args));
     }
     // Capture whether the active command requested `--json` before `run` consumes
@@ -2472,12 +2493,16 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Setup { action, json } => {
-            // Setup is purely local: it writes this machine's config and
-            // completion files. It ignores `--host`.
+        Commands::Setup {
+            action,
+            yes,
+            json,
+            dry_run,
+        } => {
+            // Setup is purely local: it configures this machine. It ignores `--host`.
             let paths = Paths::resolve()?;
             match action {
-                None => commands::setup::run_config(&paths, false, json)?,
+                None => commands::setup_host::run(yes, json, dry_run).await?,
                 Some(SetupAction::Completions {
                     shell,
                     dynamic,
@@ -2824,6 +2849,21 @@ fn session_wait_usage_error(cli: &Cli) -> Option<clap::Error> {
         "`session wait` targets must all be on one host, got `{first}` and `{other}`; \
          run one wait per host"
     )))
+}
+
+/// `--dry-run` previews bare `pohunek setup` only. A subcommand writes its own
+/// files, so the flag never rides along unnoticed: the pair is refused.
+fn setup_dry_run_usage_error(cli: &Cli) -> Option<clap::Error> {
+    match &cli.command {
+        Commands::Setup {
+            action: Some(_),
+            dry_run: true,
+            ..
+        } => Some(usage_conflict(
+            "--dry-run previews bare `pohunek setup` only and cannot be used with a setup subcommand",
+        )),
+        _ => None,
+    }
 }
 
 /// A usage error for arguments that conflict, rendered like clap's own.

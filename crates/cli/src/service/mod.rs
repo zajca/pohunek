@@ -73,16 +73,29 @@ pub async fn install(
     from: Option<PathBuf>,
     prefix: Option<PathBuf>,
 ) -> Result<report::InstallReport, Error> {
-    let context = Context::resolve()?;
-    let inherited = inherited_lock(&context)?;
-    let from = staged_dir(&context, from)?;
+    install_in(&Context::resolve()?, from, prefix).await
+}
+
+/// Installs this CLI's version as [`install`] does, for the installation
+/// `context` describes instead of the one the process environment selects.
+///
+/// # Errors
+///
+/// Returns the errors of [`install`].
+pub async fn install_in(
+    context: &Context,
+    from: Option<PathBuf>,
+    prefix: Option<PathBuf>,
+) -> Result<report::InstallReport, Error> {
+    let inherited = inherited_lock(context)?;
+    let from = staged_dir(context, from)?;
     let prefix = match prefix {
         Some(prefix) => absolute("--prefix", prefix)?,
         None => context.default_prefix()?,
     };
     let namespace = context.namespace()?;
-    let backend = Backend::connect(&context, &namespace, settings::LAUNCHCTL_COMMAND).await?;
-    engine(&context, &backend, inherited)
+    let backend = Backend::connect(context, &namespace, settings::LAUNCHCTL_COMMAND).await?;
+    engine(context, &backend, inherited)
         .install(&from, &prefix, VERSION)
         .await
 }
@@ -862,6 +875,16 @@ pub async fn status() -> Result<report::StatusReport, Error> {
     status_of(&Context::resolve()?).await
 }
 
+/// Reports the installation `context` describes, as [`status`] does for the
+/// process environment.
+///
+/// # Errors
+///
+/// Returns the errors of [`status`].
+pub async fn status_in(context: &Context) -> Result<report::StatusReport, Error> {
+    status_of(context).await
+}
+
 /// Reports the installation `context` locates.
 ///
 /// A recorded installation is verified like [`upgrade`] and [`uninstall`]
@@ -906,7 +929,59 @@ async fn status_of(context: &Context) -> Result<report::StatusReport, Error> {
     Engine::new(context, &backend).status(Some(&config)).await
 }
 
-fn staged_dir(context: &Context, from: Option<PathBuf>) -> Result<PathBuf, Error> {
+/// The installation facts a plan reads, without side effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InstalledFacts {
+    /// Whether `service.toml` records an installation.
+    pub(crate) installed: bool,
+    /// The recorded active version, when installed.
+    pub(crate) active_version: Option<String>,
+    /// The recorded install prefix, when installed.
+    pub(crate) prefix: Option<PathBuf>,
+    /// The interrupted transaction whose record is pending, if any.
+    pub(crate) pending_transaction: Option<report::PendingReport>,
+}
+
+/// Reads whether the installation `context` describes is installed, at which
+/// version and prefix, and whether a transaction record is pending.
+///
+/// Unlike [`status_in`] it only reads files: it probes no transaction lock,
+/// contacts no service manager or daemon, and creates nothing, so a preview
+/// can call it without touching the host. `service.toml` and the versions
+/// directory are verified as `status` verifies them.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] for a `service.toml` that does not describe
+/// this process's installation, [`Error::Record`] for a malformed record,
+/// and a filesystem error for an unsafe state directory.
+pub(crate) fn installed_facts(context: &Context) -> Result<InstalledFacts, Error> {
+    let store = record::Store::new(context.paths().state_dir.clone());
+    let pending_transaction = store
+        .load()?
+        .map(|pending| engine::pending_report(&pending));
+    if !exists(&context.config_path())? {
+        return Ok(InstalledFacts {
+            installed: false,
+            active_version: None,
+            prefix: None,
+            pending_transaction,
+        });
+    }
+    let config = verified_config(context)?;
+    // The versions directory is opened as the owner's trusted directory, as
+    // `status` opens it, so an untrusted one fails before a plan runs the
+    // installed daemon.
+    layout::installed_versions(config.layout())?;
+    Ok(InstalledFacts {
+        installed: true,
+        active_version: Some(config.active_version().to_owned()),
+        prefix: Some(config.prefix().to_path_buf()),
+        pending_transaction,
+    })
+}
+
+pub(crate) fn staged_dir(context: &Context, from: Option<PathBuf>) -> Result<PathBuf, Error> {
     match from {
         Some(from) => absolute("--from", from),
         None => Ok(context
