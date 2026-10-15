@@ -18,16 +18,28 @@ use protocol::RuntimeRef;
 
 use crate::agent::host::TranscriptParser;
 
-use super::watch::{TranscriptWatch, WatcherDegraded};
+use super::watch::{TranscriptWatch, WatcherDegraded, RECONCILE_INTERVAL};
 use super::{
     start_transcript_index, ExternalSessions, TranscriptIndex, TranscriptRoot, WatcherHandle,
 };
 
-/// Upper bound on waiting for a filesystem change to reach the index.
+/// Upper bound on a filesystem change reaching the index.
 ///
-/// Generous because `FSEvents` delivers events on its own thread with kernel
-/// coalescing latency; a healthy run finishes in milliseconds.
-const LIVE_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// A third of [`RECONCILE_INTERVAL`]: arming plus one wait stay below the pass
+/// the watcher schedules when it starts, so a live event, never that pass,
+/// satisfies the wait. A healthy run takes milliseconds.
+const LIVE_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+const _: () = assert!(2 * LIVE_EVENT_TIMEOUT.as_millis() < RECONCILE_INTERVAL.as_millis());
+/// Upper bound on waiting for a watcher state. Those waits request passes
+/// themselves, so the bound is not tied to the pass interval.
+const STATE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Directory below a root that holds the arming probe; it exists before the
+/// watcher starts, so creating it raises no tree change of its own.
+const ARMING_DIR: &str = "arming";
+/// Transcript a test rewrites until a live event indexes it.
+const ARMING_FILE: &str = "arming-probe.jsonl";
+/// Session id of the arming probe.
+const ARMING_SESSION: &str = "arming-probe";
 /// Interval at which the tests tick the retry like the observer's sweep.
 const SWEEP_TICK: Duration = Duration::from_millis(200);
 /// Directory mode that denies every access.
@@ -56,12 +68,58 @@ fn write_transcript(path: &Path, session_id: &str) {
     fs::write(path, record(session_id)).expect("write transcript");
 }
 
+/// Creates the directory of the arming probe below `root`; called before the
+/// watcher starts.
+fn prepare_arming_probe(root: &Path) -> PathBuf {
+    let dir = root.join(ARMING_DIR);
+    fs::create_dir_all(&dir).expect("create probe directory");
+    dir.join(ARMING_FILE)
+}
+
+/// Rewrites `probe` until a live event has indexed it.
+///
+/// A backend can start delivering events only some time after it reports the
+/// root registered. A change made earlier reaches the index only through the
+/// next periodic pass, so a scenario that changes the tree right after start
+/// first waits here for proof that live events arrive.
+async fn arm(index: &TranscriptIndex, sessions: &ExternalSessions, probe: &Path) {
+    let indexed = || {
+        index
+            .inner
+            .lock()
+            .expect("index")
+            .get(probe)
+            .and_then(|candidate| candidate.native_session_id.clone())
+            .is_some_and(|session_id| session_id == ARMING_SESSION)
+    };
+    let arming = async {
+        loop {
+            let notified = sessions.inner.rescan.notified();
+            fs::write(probe, record(ARMING_SESSION)).expect("write arming probe");
+            if indexed() {
+                return;
+            }
+            let _ = tokio::time::timeout(SWEEP_TICK, notified).await;
+            if indexed() {
+                return;
+            }
+        }
+    };
+    tokio::time::timeout(LIVE_EVENT_TIMEOUT, arming)
+        .await
+        .unwrap_or_else(|_elapsed| {
+            panic!("no live event indexed the arming probe {}", probe.display())
+        });
+}
+
 impl Live {
     /// Starts watching `<base>/projects`, which the caller may create first.
+    /// When the root exists, the watcher is armed before this returns.
     async fn start(prepare: impl FnOnce(&Path, &Path)) -> Self {
         let base = pohunek_test_support::tempdir().expect("fixture base");
         let root = base.path().join("projects");
         prepare(base.path(), &root);
+        let probe = root.is_dir().then(|| prepare_arming_probe(&root));
         let sessions = ExternalSessions::new();
         let roots = vec![TranscriptRoot {
             parser: TranscriptParser::JsonlHeadV1,
@@ -70,6 +128,9 @@ impl Live {
             private: false,
         }];
         let (index, handle) = start_transcript_index(&roots, &sessions).await;
+        if let Some(probe) = probe {
+            arm(&index, &sessions, &probe).await;
+        }
         Self {
             base,
             root,
@@ -92,28 +153,58 @@ impl Live {
         self.index.inner.lock().expect("index").contains_key(path)
     }
 
-    async fn wait_until(&self, what: &str, done: impl Fn(&Self) -> bool) {
+    async fn wait_until(&self, what: &str, bound: Duration, done: impl Fn(&Self) -> bool) {
         let wait = async {
             while !done(self) {
                 self.sessions.inner.rescan.notified().await;
             }
         };
-        tokio::time::timeout(LIVE_TEST_TIMEOUT, wait)
+        tokio::time::timeout(bound, wait)
             .await
             .unwrap_or_else(|_elapsed| panic!("timed out waiting for {what}"));
     }
 
+    /// Waits for a live event to index `session_id` at `path`.
     async fn wait_for_session(&self, path: &Path, session_id: &str) {
-        self.wait_until(&format!("{session_id} at {}", path.display()), |live| {
-            live.session_id(path).as_deref() == Some(session_id)
-        })
+        self.wait_for_session_within(path, session_id, LIVE_EVENT_TIMEOUT)
+            .await;
+    }
+
+    /// Waits for `session_id` at `path` once the scenario has caused a pass,
+    /// requested or raised by a tree change. A pass re-registers the root and
+    /// restarts the backend's stream (#1151), so the change may arrive only
+    /// through a pass.
+    async fn wait_for_session_after_pass(&self, path: &Path, session_id: &str) {
+        self.wait_for_session_within(path, session_id, STATE_TIMEOUT)
+            .await;
+    }
+
+    async fn wait_for_session_within(&self, path: &Path, session_id: &str, bound: Duration) {
+        self.wait_until(
+            &format!("{session_id} at {}", path.display()),
+            bound,
+            |live| live.session_id(path).as_deref() == Some(session_id),
+        )
         .await;
     }
 
+    /// Waits for a live event to drop `path` from the index.
     async fn wait_until_gone(&self, path: &Path) {
-        self.wait_until(&format!("{} to leave the index", path.display()), |live| {
-            !live.is_indexed(path)
-        })
+        self.wait_until_gone_within(path, LIVE_EVENT_TIMEOUT).await;
+    }
+
+    /// Waits for `path` to leave the index once the scenario has caused a pass;
+    /// see [`Self::wait_for_session_after_pass`].
+    async fn wait_until_gone_after_pass(&self, path: &Path) {
+        self.wait_until_gone_within(path, STATE_TIMEOUT).await;
+    }
+
+    async fn wait_until_gone_within(&self, path: &Path, bound: Duration) {
+        self.wait_until(
+            &format!("{} to leave the index", path.display()),
+            bound,
+            |live| !live.is_indexed(path),
+        )
         .await;
     }
 
@@ -132,7 +223,7 @@ impl Live {
                 }
             }
         };
-        tokio::time::timeout(LIVE_TEST_TIMEOUT, wait)
+        tokio::time::timeout(STATE_TIMEOUT, wait)
             .await
             .unwrap_or_else(|_elapsed| panic!("timed out waiting for watcher state {what}"));
     }
@@ -234,11 +325,12 @@ async fn a_recreated_directory_is_followed() {
     live.wait_until_gone(&old).await;
     write_transcript(&fresh, "fresh");
 
-    live.wait_for_session(&fresh, "fresh").await;
+    // Removing `p` raised a pass.
+    live.wait_for_session_after_pass(&fresh, "fresh").await;
 
     let later = live.root.join("p/later.jsonl");
     write_transcript(&later, "later");
-    live.wait_for_session(&later, "later").await;
+    live.wait_for_session_after_pass(&later, "later").await;
 }
 
 #[tokio::test]
@@ -269,7 +361,7 @@ async fn a_root_missing_at_start_is_picked_up_when_it_appears() {
 
     live.wait_for_state("active", |state| state == TranscriptWatch::Active)
         .await;
-    live.wait_for_session(&path, "late").await;
+    live.wait_for_session_after_pass(&path, "late").await;
 }
 
 #[tokio::test]
@@ -284,18 +376,18 @@ async fn a_recreated_root_is_watched_again() {
         state == TranscriptWatch::Degraded(WatcherDegraded::RootsMissing)
     })
     .await;
-    live.wait_until_gone(&before).await;
+    live.wait_until_gone_after_pass(&before).await;
 
     let after = live.root.join("p/after.jsonl");
     write_transcript(&after, "after");
     live.handle.request_reconcile();
     live.wait_for_state("active", |state| state == TranscriptWatch::Active)
         .await;
-    live.wait_for_session(&after, "after").await;
+    live.wait_for_session_after_pass(&after, "after").await;
 
     let live_write = live.root.join("p/live.jsonl");
     write_transcript(&live_write, "live");
-    live.wait_for_session(&live_write, "live").await;
+    live.wait_for_session_after_pass(&live_write, "live").await;
 }
 
 /// Restores directory permissions so the fixture can be removed.
@@ -362,7 +454,7 @@ async fn an_unreadable_directory_is_reported_without_reading_outside_the_root() 
         live.handle.request_reconcile();
         live.wait_for_state("active", |state| state == TranscriptWatch::Active)
             .await;
-        live.wait_for_session(&locked.join("l.jsonl"), "locked")
+        live.wait_for_session_after_pass(&locked.join("l.jsonl"), "locked")
             .await;
     }
 }
@@ -377,7 +469,7 @@ async fn a_root_replaced_by_a_file_drops_its_candidates() {
     fs::write(&live.root, b"not a directory").expect("replace with file");
     live.handle.request_reconcile();
 
-    live.wait_until_gone(&path).await;
+    live.wait_until_gone_after_pass(&path).await;
     live.wait_for_state("roots missing", |state| {
         state == TranscriptWatch::Degraded(WatcherDegraded::RootsMissing)
     })
@@ -420,12 +512,12 @@ async fn a_redirected_symlinked_root_is_followed() {
     fs::rename(&staged, &live.root).expect("redirect atomically");
     live.handle.request_reconcile();
 
-    live.wait_for_session(&new, "new").await;
-    live.wait_until_gone(&old).await;
+    live.wait_for_session_after_pass(&new, "new").await;
+    live.wait_until_gone_after_pass(&old).await;
 
     let later = live.root.join("p/later.jsonl");
     fs::write(live.base.path().join("b/p/later.jsonl"), record("later")).expect("write later");
-    live.wait_for_session(&later, "later").await;
+    live.wait_for_session_after_pass(&later, "later").await;
 }
 
 #[tokio::test]
@@ -435,6 +527,7 @@ async fn a_nested_root_keeps_its_own_agent_kind_in_scans_and_live_events() {
     let inner = outer.join("codex");
     write_transcript(&outer.join("p/c.jsonl"), "claude-session");
     write_transcript(&inner.join("2026/x.jsonl"), "codex-session");
+    let probe = prepare_arming_probe(&inner);
     let sessions = ExternalSessions::new();
     let roots = vec![
         TranscriptRoot {
@@ -452,6 +545,7 @@ async fn a_nested_root_keeps_its_own_agent_kind_in_scans_and_live_events() {
     ];
 
     let (index, _handle) = start_transcript_index(&roots, &sessions).await;
+    arm(&index, &sessions, &probe).await;
     let agent_of = |path: &Path| {
         index
             .inner
@@ -477,7 +571,7 @@ async fn a_nested_root_keeps_its_own_agent_kind_in_scans_and_live_events() {
             sessions.inner.rescan.notified().await;
         }
     };
-    tokio::time::timeout(LIVE_TEST_TIMEOUT, wait)
+    tokio::time::timeout(LIVE_EVENT_TIMEOUT, wait)
         .await
         .expect("live transcript indexed");
     assert_eq!(agent_of(&live), Some(RuntimeRef::codex()));
