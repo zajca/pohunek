@@ -1106,9 +1106,12 @@ descriptor `runtime.toml`, next to its launch command, detection manifest and
 resume command: `bracketed_paste`, `submit_delay_ms`, `text_policy`
 (`unrestricted` or `hermes_safe_text`), the optional
 `submit_delay_configurable`, which lets a submit delay configured on the daemon
-for that runtime replace the declared one, and the optional `ready`
+for that runtime replace the declared one, the optional `ready`
 (`bracketed_paste` or `screen_idle`) that says which signal shows the agent
-reads initial input (for example `runtime-packages/claude/runtime.toml`). The
+reads initial input (for example `runtime-packages/claude/runtime.toml`), and
+the optional `startup_grace_ms`, the shortest wait for that signal the runtime
+needs, which a longer host grace extends (for example
+`runtime-packages/hermes/runtime.toml`). The
 daemon parses the table into the runtime definition
 (`crates/daemon/src/agent/host/definition.rs`), and the worker input plan below
 applies it.

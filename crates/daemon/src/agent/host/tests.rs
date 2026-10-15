@@ -1563,3 +1563,49 @@ fn the_reserved_runtimes_declare_their_config_homes() {
     assert_eq!(declared("hermes"), None);
     assert_eq!(declared("shell"), None);
 }
+
+/// A package descriptor's `[input] startup_grace_ms` is a whole positive
+/// number of milliseconds no longer than the host accepts for its own grace;
+/// anything else refuses the descriptor.
+#[test]
+fn a_descriptor_startup_grace_is_bounded_like_the_host_grace() {
+    let document = super::fixture::pi_shaped_document(
+        std::path::Path::new("/usr/bin/pi"),
+        super::fixture::PI_SHAPED_NO_CHECK,
+    );
+    let parse = |grace: &str| {
+        RuntimeDefinition::from_toml(
+            &document.replace(
+                "text_policy = \"unrestricted\"",
+                &format!("text_policy = \"unrestricted\"\nstartup_grace_ms = {grace}"),
+            ),
+            |package| DefinitionOrigin::Package {
+                package,
+                digest: PackageDigest::parse(super::fixture::PACKAGE_DIGEST).expect("valid digest"),
+            },
+            |_name| Ok(Arc::new(generic_shell_manifest().clone())),
+        )
+    };
+    assert_eq!(
+        parse("30000").expect("a bounded grace").startup_grace(),
+        Some(Duration::from_secs(30))
+    );
+    let longest = pohunek_service_config::MAX_DEADLINE.as_millis();
+    for invalid in ["0".to_owned(), (longest + 1).to_string()] {
+        assert!(
+            matches!(
+                parse(&invalid),
+                Err(DefinitionError::Field {
+                    field: "input.startup_grace_ms",
+                    ..
+                })
+            ),
+            "{invalid}"
+        );
+    }
+    let undeclared = super::fixture::pi_shaped_definition(
+        std::path::Path::new("/usr/bin/pi"),
+        super::fixture::PI_SHAPED_NO_CHECK,
+    );
+    assert_eq!(undeclared.startup_grace(), None);
+}

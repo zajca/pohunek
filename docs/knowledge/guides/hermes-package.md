@@ -108,10 +108,12 @@ package.
 ## What the package declares
 
 The descriptor equals the built-in Hermes descriptor release 0.34.2 shipped
-except for two fields: `detect_manifest` names the package's `detect.toml`
-instead of that release's embedded `hermes` manifest, and the version probe is
+except for four fields: `detect_manifest` names the package's `detect.toml`
+instead of that release's embedded `hermes` manifest, the version probe is
 the data-driven `semver-line-v1` parser instead of that release's compiled
-`hermes-v1` parser, which this daemon does not compile in. `detect.toml` is
+`hermes-v1` parser, which this daemon does not compile in, and `[input]`
+declares `ready = "screen_idle"` and `startup_grace_ms = 30000`, which that
+release's descriptor could not carry. `detect.toml` is
 byte for byte the built-in detection manifest of release 0.34.2. Golden copies
 of both built-in files are in `compat/hermes/builtin-v0.34/` (`runtime.toml`,
 `detect.toml`), each below a two-line header that names its source path and
@@ -120,6 +122,22 @@ tag; the package tests compare the package with them.
 - Launch: `hermes chat`; resume is `hermes chat --resume <reference>` with an
   `id` reference; fork is unsupported. Later input is a bracketed paste
   followed by Enter 150 ms later, filtered by the `hermes_safe_text` policy.
+- Readiness: `ready = "screen_idle"`. Hermes 0.20.0 queries the terminal's
+  background colour while it starts and restores the terminal mode with
+  `TCSAFLUSH`, which discards every byte queued so far (measured 0.7 to 1.25 s
+  after spawn), and its prompt reads input only after that. Only the
+  rendered idle prompt, the `idle_prompt` or `tui_idle_status` rule of the
+  detection manifest, starts the initial input.
+- Startup grace: `startup_grace_ms = 30000`. A first start after an install
+  that wrote no Python bytecode (a `uv` install does not) compiles every module
+  before the prompt renders, which took more than 5 s on a CI runner; later
+  starts render well within the 5000 ms host default. For a current client the
+  readiness wait lasts up to the longer of this and the host's
+  `initial_startup_grace_ms`, and ends as soon as the prompt renders; an older
+  client without `extended_input_ready_wait` keeps the host's grace. A
+  session whose prompt does not render within its wait fails `session.new`
+  with `session_input_not_ready` and is rolled back; the initial input is not
+  written.
 - Version: `version_probe = { parser = "semver-line-v1", args = ["--version"],
   min = "0.20.0", below = "0.20.1", line = "Hermes Agent v{version}
   {annotation}" }`, which accepts the locked banner `Hermes Agent v0.20.0

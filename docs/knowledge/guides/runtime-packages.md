@@ -313,14 +313,38 @@ after the host's startup grace ends for a silent agent
   evidence from the detection manifest.
 - `ready = "screen_idle"`: only the screen-sourced idle evidence of the
   detection manifest counts. Declare it when the agent enables bracketed paste
-  before its input accepts a paste, so the enable signal arrives too early. The
-  Claude package declares it; its `live_prompt_box` rule is the evidence.
+  before its input accepts a paste, or discards input queued during its start,
+  so the enable signal or the grace would release the input too early.
 
-A `screen_idle` session whose screen shows no readiness by the end of the grace
+The official packages declare:
+
+The `[input]` table may also declare `startup_grace_ms`, the shortest wait for
+that readiness the runtime needs to start, in whole milliseconds from 1 to the
+longest grace the host accepts. For a client that sends
+`extended_input_ready_wait` (the current CLI and SDK), the wait then lasts up to
+the longer of it and the host's `input.initial_startup_grace_ms` (in
+`service.toml`, 5000 ms on a fresh install), so a host raises it for a slower
+machine but cannot shorten it below what the runtime declares. The grace is an
+upper bound, not a delay: the input is written as soon as readiness shows, and
+the full wait passes only when it never does. A client without that option
+keeps the host's grace (`screen_idle`) or the 500 ms silent-reader bound.
+
+The official packages declare:
+
+| Runtime | `ready` | `startup_grace_ms` | Evidence |
+|---|---|---|---|
+| Claude | `screen_idle` | absent (host grace) | `live_prompt_box`: Claude drops pastes sent before its prompt box renders |
+| Pi | `screen_idle` | absent (host grace) | `idle_editor_rule`: Pi enables bracketed paste before it draws any screen |
+| Hermes | `screen_idle` | 30000 | `idle_prompt` or `tui_idle_status`: Hermes discards queued terminal input during its start, and its first start after install compiles its Python modules first |
+| Codex | absent (`bracketed_paste`) | absent (host grace) | Codex reports idle only in its terminal title, which `screen_idle` does not count (#1114) |
+
+A `screen_idle` session whose screen shows no readiness by the end of that wait
 fails `session.new` with `session_input_not_ready`, nothing is written, and the
-session is rolled back. The `[input]` table is parsed strictly: a daemon of
-release 0.34.x rejects a descriptor that carries `ready`, so a package with this
-key needs a daemon that knows it.
+session is rolled back. A `screen_idle` runtime gets the host's whole grace even
+from a client without `extended_input_ready_wait`. The `[input]` table is parsed
+strictly: a daemon of release 0.34.x rejects a descriptor that carries `ready`
+or `startup_grace_ms`, so a package with either key needs a daemon that knows
+it.
 
 Readiness is `screen_idle` only while the effective detection manifest has an
 idle rule on a screen region (for example `live_prompt_box`). A host profile

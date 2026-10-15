@@ -17,6 +17,15 @@ version_probe = { parser = "semver-line-v1", args = ["--version"], min = "0.20.0
 bracketed_paste = true
 submit_delay_ms = 150
 text_policy = "hermes_safe_text"
+# Hermes flushes the terminal's queued input while it starts, after a terminal
+# query and before its prompt reads input, so input written earlier is lost:
+# only the rendered idle prompt (detect rules `idle_prompt`, `tui_idle_status`)
+# shows that it reads input.
+ready = "screen_idle"
+# A first start after install compiles every Python module before the prompt
+# renders, which takes longer than a host's default startup grace; a host with a
+# longer `input.initial_startup_grace_ms` waits that long instead.
+startup_grace_ms = 30000
 
 [resume]
 supported = true

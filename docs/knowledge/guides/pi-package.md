@@ -43,6 +43,15 @@ reserved, so either way of installing serves it.
 
 - Launch: `pi` with the first prompt as a positional argument, and bracketed
   paste followed by a separate Enter 150 ms later for later input.
+- Readiness: `ready = "screen_idle"`. Pi 1.0.2 enables bracketed paste about
+  130 ms after spawn, before it draws any screen, so a host profile's initial
+  input (written into the terminal, not passed as an argument) waits for the
+  idle editor frame, the `idle_editor_rule` of the detection manifest. A
+  session whose editor frame does not show within the host's
+  `initial_startup_grace_ms` fails `session.new` with
+  `session_input_not_ready` and is rolled back; the initial input is not
+  written. The manifest recognises the editor frame from 20 columns up, so
+  such a launch into a narrower terminal is always refused.
 - Version: `pi --version` prints exactly the release on standard output
   (extension noise goes to standard error, which the probe discards). The
   descriptor accepts `[1.0.0, 1.1.0)`; any other release, or output that is not

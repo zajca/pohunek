@@ -382,6 +382,10 @@ pub struct RuntimeDefinition {
     /// reference, as declared by `[native_reference.existence]`; `None` for a
     /// hook runtime that leaves the check undeclared.
     hook_existence: Option<ReferenceExistence>,
+    /// The shortest wait for initial-input readiness this runtime needs to
+    /// start, as declared by `[input] startup_grace_ms`; `None` leaves the
+    /// host's grace alone.
+    startup_grace: Option<Duration>,
 }
 
 impl RuntimeDefinition {
@@ -492,6 +496,7 @@ impl RuntimeDefinition {
             config_home: None,
             transcripts: None,
             hook_existence: None,
+            startup_grace: None,
         })
     }
 
@@ -501,6 +506,31 @@ impl RuntimeDefinition {
     pub fn with_hook_existence(mut self, existence: ReferenceExistence) -> Self {
         self.hook_existence = Some(existence);
         self
+    }
+
+    /// This definition declaring that a launch with initial input waits at
+    /// least `grace` for the agent to show input readiness.
+    ///
+    /// The declaration is separate from [`DefinitionParts`] because it bounds
+    /// the daemon's wait and takes no part in launching the agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DefinitionError::Field`] for a grace that is zero, not a
+    /// whole number of milliseconds, or longer than the host accepts for its
+    /// own startup grace.
+    pub fn with_startup_grace(mut self, grace: Duration) -> Result<Self, DefinitionError> {
+        if grace.is_zero()
+            || grace > pohunek_service_config::MAX_DEADLINE
+            || !grace.subsec_nanos().is_multiple_of(NANOS_PER_MILLI)
+        {
+            return Err(DefinitionError::Field {
+                field: "input.startup_grace_ms",
+                reason: "must be whole milliseconds between 1 and the host's longest grace",
+            });
+        }
+        self.startup_grace = Some(grace);
+        Ok(self)
     }
 
     /// This definition declaring `config_home` as the directory its agent keeps
@@ -651,6 +681,7 @@ impl RuntimeDefinition {
             Some(existence) => definition.with_hook_existence(existence),
             None => definition,
         };
+        let definition = with_declared_startup_grace(definition, raw.input.startup_grace_ms)?;
         with_declared_files(definition, config_home, transcripts)
     }
 
@@ -694,6 +725,14 @@ impl RuntimeDefinition {
     #[must_use]
     pub fn input_readiness(&self) -> InputReadiness {
         self.input_readiness
+    }
+
+    /// The shortest wait for initial-input readiness the runtime declares for
+    /// a client that opts into the extended wait; the host's longer grace
+    /// still applies.
+    #[must_use]
+    pub fn startup_grace(&self) -> Option<Duration> {
+        self.startup_grace
     }
 
     /// Whether the daemon's configured submit delay replaces the descriptor's.
@@ -780,6 +819,18 @@ impl RuntimeDefinition {
 
 /// `definition` declaring where its agent keeps its own files: the config home
 /// and the transcript tree below it.
+/// `definition` with the `[input] startup_grace_ms` its descriptor declares,
+/// if any.
+fn with_declared_startup_grace(
+    definition: RuntimeDefinition,
+    millis: Option<u64>,
+) -> Result<RuntimeDefinition, DefinitionError> {
+    match millis {
+        Some(millis) => definition.with_startup_grace(Duration::from_millis(millis)),
+        None => Ok(definition),
+    }
+}
+
 fn with_declared_files(
     definition: RuntimeDefinition,
     config_home: Option<ConfigHome>,
@@ -1108,6 +1159,9 @@ struct RawInput {
     /// Absent means bracketed-paste readiness.
     #[serde(default)]
     ready: RawInputReadiness,
+    /// Absent means the host's startup grace alone bounds the readiness wait.
+    #[serde(default)]
+    startup_grace_ms: Option<u64>,
 }
 
 /// Readiness names accepted in `[input]`.

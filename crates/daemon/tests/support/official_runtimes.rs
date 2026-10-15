@@ -43,7 +43,7 @@ use protocol::{
 /// The runtimes the official packages serve, each built from
 /// `runtime-packages/<runtime>` and locked by
 /// `compat/<runtime>/compatibility-lock.json`.
-const OFFICIAL_RUNTIMES: [&str; 3] = ["codex", "claude", "hermes"];
+const OFFICIAL_RUNTIMES: [&str; 4] = ["codex", "claude", "hermes", "pi"];
 
 /// Sequence number of the one catalog a test signs.
 const CATALOG_SEQUENCE: u64 = 1;
