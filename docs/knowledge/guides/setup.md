@@ -178,7 +178,10 @@ policy and never writes into it. If the plan read after the service install
 differs from the preview in a way the install engine does not account for,
 setup stops with the service installed, names the install's changes, and
 changes nothing else; a re-run converges. A pending interrupted install stops
-setup before any change.
+setup before any change, and so does a gap the install's own runtime step
+would refuse (a used runtime without a package for this platform). On an
+installed host the plan is read again after the consent, and a host that
+changed while the preview was shown stops the run before any change.
 The subcommands are:
 
 - `pohunek setup config` writes a default `attach.conf` (the `pohunek attach`

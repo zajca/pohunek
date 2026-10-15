@@ -650,8 +650,9 @@ fn a_dry_run_on_a_fresh_host_prints_the_preview_and_changes_nothing() {
 
     assert!(
         output.status.success(),
-        "a dry run succeeds: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "a dry run succeeds: {}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
     );
     let document = json_document(&output);
     let preview = &document["ok"];

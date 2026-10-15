@@ -491,6 +491,117 @@ async fn a_second_setup_on_a_configured_host_is_a_no_op() {
     );
 }
 
+/// A fresh host whose plan lists a gap that the install engine's runtime step,
+/// which applies without detection, refuses: a profile's runtime without a
+/// package for this platform. The run stops before any change instead of
+/// rolling the install back.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_refusal_of_the_install_runtime_step_stops_setup_before_any_change() {
+    let mut installation = Installation::new();
+    let release = release(&installation);
+    // A recorded search path, as a managed install records one: the job's PATH
+    // is then known without asking the service manager, which on macOS
+    // derives the namespace and creates the state roots.
+    installation.context =
+        installation
+            .context
+            .clone()
+            .with_path_discovery(PathDiscovery::Managed {
+                login_shell: None,
+                shell_defaulted: false,
+                fallback_directories: vec!["/usr/bin".to_owned(), "/bin".to_owned()],
+            });
+    let planner = ScriptedPlanner::new(vec![serde_json::from_value(json!({
+        "report_version": 1,
+        "daemon_version": VERSION,
+        "dry_run": true,
+        "packages": [],
+        "catalog": "unavailable",
+        "profiles": [],
+        "integrations": [],
+        "gaps": [{
+            "runtime": "codex",
+            "code": "official_package_unavailable_for_platform",
+            "detail": "the release catalog lists no single package of this runtime for this platform",
+        }],
+        "refusals": [],
+    }))
+    .expect("a planner report of this layout")]);
+    let roots = ["state", "config", "data"].map(|name| installation.root.join(name));
+    let before = roots.each_ref().map(|root| snapshot(root));
+
+    let error = plan(&installation.context, &release, &planner)
+        .await
+        .expect_err("the engine's refusal stops the run");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("setup stopped before any change")
+            && message.contains("installing the service refuses what this plan lists as gaps")
+            && message.contains("codex"),
+        "the stop names the refusal: {message}"
+    );
+    assert!(
+        !installed_at_this_version(&installation).await,
+        "no service is installed"
+    );
+    assert_eq!(
+        roots.each_ref().map(|root| snapshot(root)),
+        before,
+        "nothing is written"
+    );
+}
+
+/// On an installed host, a plan that changed between the preview and the
+/// consent stops the run before it applies anything: a profile pinned
+/// meanwhile is not overwritten with the preview's choice.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_host_that_changed_after_the_preview_stops_setup_before_it_applies() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let first = ScriptedPlanner::new(vec![report(&json!([]))]);
+    let host_plan = plan(&installation.context, &release, &first)
+        .await
+        .expect("first plan");
+    apply(&installation.context, host_plan, &first)
+        .await
+        .expect("first setup applies");
+    // The preview pins the profile; by the consent it no longer needs it.
+    let changing = ScriptedPlanner::new(vec![
+        planned(&claude("present"), &unpinned_profile()),
+        planned(&claude("present"), &json!([])),
+    ]);
+    let host_plan = plan(&installation.context, &release, &changing)
+        .await
+        .expect("plan of the installed host");
+    assert_eq!(host_plan.preview.service, ServiceStep::Present);
+    let config_before = snapshot(&config_dir(&installation));
+
+    let error = apply(&installation.context, host_plan, &changing)
+        .await
+        .expect_err("the changed host stops the run");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("setup stopped before any change")
+            && message.contains("the host changed since the preview"),
+        "the stop names the change: {message}"
+    );
+    assert_eq!(
+        snapshot(&config_dir(&installation)),
+        config_before,
+        "the config is unchanged"
+    );
+}
+
 /// A planner report with the given packages and profiles and no integrations.
 fn planned(packages: &Value, profiles: &Value) -> EnsureReport {
     serde_json::from_value(json!({

@@ -39,7 +39,8 @@ use std::pin::Pin;
 
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Gap, IntegrationAction, PackageAction, PackageStatus,
-    ProfileAction, ProfileStatus, Refusal, RELEASE_RUNTIME_DIR,
+    ProfileAction, ProfileStatus, Refusal, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
+    RELEASE_RUNTIME_DIR,
 };
 use protocol::{
     method, DoctorStatus, IntegrationInstallState, IntegrationRecovery, IntegrationStatusParams,
@@ -123,6 +124,17 @@ const CONFIRM_PROMPT: &str = "Apply this plan? [y/N] ";
 
 /// Package status the install engine leaves a package in once it installed it.
 const ENGINE_INSTALLED: &str = "installed";
+
+/// Gap codes that the install engine's runtime step, which runs without
+/// detection, reports as refusals for every runtime the plan lists them for.
+///
+/// Detection only adds the runtimes the catalog lists for this platform, so a
+/// runtime without a package here is one the host uses. The same gap also
+/// names a runtime the release catalog lists more than once for this
+/// platform; setup refuses that release even where the engine would not plan
+/// the runtime. A runtime served by another package can be a detected one the
+/// engine never plans, so that gap is not here.
+const ENGINE_REFUSED_GAPS: [&str; 1] = [CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM];
 
 /// Profile status the install engine leaves a profile in once it pinned it.
 const ENGINE_BOUND: &str = "bound";
@@ -389,6 +401,36 @@ fn serves_hermes(plan: &EnsureReport) -> bool {
         .any(|package| package.runtime == HERMES_RUNTIME)
 }
 
+/// Stops a run that would install the service while the plan lists a gap that
+/// the install engine's own runtime step refuses.
+///
+/// The engine applies the plan without detection. There, a runtime the host
+/// uses (a profile, a session or an integration) without a package for this
+/// platform is a refusal, and a refusal rolls the install back. The plan lists
+/// it as a gap, so it stops the run here, before any change.
+///
+/// # Errors
+///
+/// Returns [`CliError::SetupBlocked`] naming every such gap.
+fn refuse_install_gaps(plan: &EnsureReport) -> Result<(), CliError> {
+    let refused: Vec<String> = plan
+        .gaps
+        .iter()
+        .filter(|gap| ENGINE_REFUSED_GAPS.contains(&gap.code.as_str()))
+        .map(|gap| format!("{}: {} ({})", gap.runtime, gap.detail, gap.code))
+        .collect();
+    if refused.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::SetupBlocked {
+        detail: format!(
+            "installing the service refuses what this plan lists as gaps: {}; remove or repin \
+             the profile that uses the runtime, then re-run `pohunek setup`",
+            refused.join("; ")
+        ),
+    })
+}
+
 /// Whether the plan installs or selects a Hermes package, which changes the
 /// plugin every marked Hermes home is updated to.
 fn changes_hermes_selection(plan: &EnsureReport) -> bool {
@@ -495,6 +537,9 @@ async fn plan_in(
             detail: refusal_text(&previewed.refusals),
         });
     }
+    if matches!(service, ServiceStep::Install { .. }) {
+        refuse_install_gaps(&previewed)?;
+    }
     let config = config_files(&paths_of(context))
         .into_iter()
         .map(|(path, _default)| {
@@ -595,11 +640,10 @@ async fn apply_steps(
         ServiceStep::Install { from } => {
             install_service(context, Path::new(from), previewed, applied, planner).await?
         }
-        ServiceStep::Present => (
-            plan.dir.clone(),
-            plan.search_path.clone(),
-            previewed.clone(),
-        ),
+        ServiceStep::Present => {
+            let current = recheck_present(context, plan, planner).await?;
+            (plan.dir.clone(), plan.search_path.clone(), current)
+        }
     };
 
     let paths = paths_of(context);
@@ -710,6 +754,36 @@ async fn install_service(
         });
     }
     Ok((version_dir, installed_search, after))
+}
+
+/// Reads the plan of an installed host again after the consent, so the apply
+/// acts on the host as it is now, not as it was when the preview was shown.
+///
+/// The owner may have taken a while to answer, and a profile pinned or a
+/// package changed meanwhile would otherwise be overwritten with the preview's
+/// choice. The plan must match the preview exactly; nothing is changed
+/// otherwise. A change made between this read and the pin it affects is not
+/// seen: the pin request cannot name the pin it expects to replace.
+///
+/// # Errors
+///
+/// Returns [`CliError::SetupBlocked`] with the first difference, and the
+/// errors of the plan.
+async fn recheck_present(
+    context: &Context,
+    plan: &HostPlan,
+    planner: &dyn ReleasePlanner,
+) -> Result<EnsureReport, CliError> {
+    let current = planner.plan(context, &plan.dir, &plan.search_path).await?;
+    check_transitions(&plan.previewed, &current, None).map_err(|detail| {
+        CliError::SetupBlocked {
+            detail: format!(
+                "the host changed since the preview ({detail}); re-run `pohunek setup` to see \
+                 the new plan"
+            ),
+        }
+    })?;
+    Ok(current)
 }
 
 /// The changes the install engine's runtime step made, as the install report

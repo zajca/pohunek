@@ -169,6 +169,14 @@ changed nothing else. Fix the cause the output names and run `pohunek setup`
 again: it plans from the installed service and converges without reinstalling
 it.
 
+On a host without the service, a gap that the install's own runtime step would
+refuse stops setup before any change: a runtime a profile, session or
+integration uses that has no package for this platform. Remove or repin that
+profile, then run `pohunek setup` again. On a host with the service, setup reads
+the plan again after you confirm; if the host changed while you read the
+preview, for example a profile was pinned meanwhile, it stops before any change
+and asks for a new run.
+
 The run is refused when it cannot ask: without a terminal and without `--yes`,
 or with `--json` and no `--yes`. The refusal changes nothing, and its hint
 names `pohunek setup --dry-run --json` to read the plan and `--yes` to apply

@@ -28,6 +28,11 @@
   (installed packages, pinned profiles, a recorded catalog) are accepted only
   as reported by its runtime step.
 - A pending interrupted install stops setup before any change.
+- On a host without the service, a gap that the install engine's runtime step
+  refuses (a used runtime without a package for this platform) stops setup
+  before any change instead of rolling the install back.
+- On an installed host, setup reads the plan again after the consent; a host
+  that changed while the preview was shown stops the run before any change.
 - A package the install left disabled or unselected is enabled and selected.
 - The Hermes homes applied are the homes previewed; the apply does not
   rediscover them.
