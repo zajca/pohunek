@@ -3298,6 +3298,75 @@ printf '%s' 'Redacted input.' | pohunek session input s-42 --stdin --json
 The resulting stdout remains exactly one JSON envelope. The input bytes do not
 appear in that envelope, diagnostics, or structured logs.
 
+### Assistant request and creation outcome
+
+`pohunek assistant` takes its free-form request either as positional words or
+through `--request-stdin`, never both. With `--request-stdin` the CLI reads
+bounded UTF-8 text from stdin, under the same limits and control-character rules
+as `session new --input-stdin`. It trims surrounding whitespace and embeds the
+result in the opening prompt exactly where the positional words go, so both forms
+create the same session and print the same `--json` result. Empty input, input
+that is empty after trimming, and invalid input fail with `cli_usage` before the
+CLI starts or dials any daemon. A stdin request cannot also answer the remote
+confirmation prompt, so a remote launch with `--request-stdin` needs `--yes`
+(`confirmation_required`), as a `--json` launch does.
+
+`--request-timeout-ms <u32>` overrides the response deadline of the creation
+request only, with the same parser and meaning as on `session new`. Without it,
+the creation uses the Rust SDK's dedicated initial-input budget. `--meta
+key=value` (repeatable) writes caller metadata atomically with the session, as
+on `session new`.
+
+#### Creation outcome
+
+A launch sends exactly one `session.new` request, and the CLI never resends it.
+Only the CLI's own refusals before that request prove that no session was
+created: `cli_usage` (including an invalid stdin request),
+`confirmation_required`, `no_capable_agent`, `materialization_failed` and
+`agent_cannot_read_bundle`.
+
+Any other failure leaves the outcome unknown, because the caller cannot tell
+whether it came before or after the request:
+
+- `request_timeout`.
+- A transport error, such as `remote_daemon_unavailable`, `host_unreachable`
+  or a framing or I/O error. The same code reports both a connection that
+  never opened and a reply lost after the request was sent.
+- A typed daemon error for `session.new`. Most of them mean the create failed
+  and was rolled back, as described for `session.new` above. Some are returned
+  after the session was recorded, for example `session_runtime_reconnecting`.
+
+`session.new` has no idempotency key, so pohunek cannot make a retry safe. A
+retry while the first create is still running creates a second session. A
+caller-chosen correlation key makes every attempt visible. Pass one, for
+example `--meta launch=<unique id>`, and keep it for every attempt of the same
+launch. The key name is the caller's convention: pohunek reserves and
+interprets none. After an unknown outcome, look the key up before deciding:
+
+```bash
+printf '%s' 'Why does attach fail on my laptop?' \
+  | pohunek assistant --request-stdin --meta launch=7f3a9c --json
+# After an unknown outcome:
+pohunek session list --meta-eq launch=7f3a9c --json
+```
+
+A protocol-3 host keeps the metadata but refuses metadata filters with
+`daemon_protocol_too_old` before the request is sent. On such a host, list
+without the filter (`pohunek session list --json`) and match each session's
+`metadata` instead.
+
+How to read the result:
+
+- **A listed session** is that launch. It may still be starting: the record is
+  written after the launch and its pre-create and post-create hooks finish, but
+  before the opening prompt is delivered. It can still be rolled back by
+  `session_input_not_ready` or `session_input_stalled`.
+- **An empty list** is not proof that nothing was created. A create still in
+  progress is listed only once its launch and hooks finish, which can take
+  many minutes.
+- **After a retry**, more than one session under the key means duplicates. The
+  caller keeps one and stops the rest.
+
 ## Agent Skill CLI
 
 `pohunek agent-skill` prints the complete bundled agent skill for coding
