@@ -2211,10 +2211,11 @@ impl LaunchdJob for FakeLaunchd {
 #[tokio::test]
 async fn a_recorded_path_job_on_macos_reads_the_domain_and_never_the_job() {
     let mut harness = Harness::new();
+    let (allowed_name, allowed_value) = ALLOWLISTED_MANAGER_VARIABLE;
     let fake = Arc::new(FakeLaunchd::new(Ok(ActiveJob {
         domain: None,
         loaded_default: None,
-        domain_environment: vec![("CLAUDE_CONFIG_DIR".to_owned(), "/manager/store".to_owned())],
+        domain_environment: vec![(allowed_name.to_owned(), allowed_value.to_owned())],
     })));
     harness.context = harness
         .context
@@ -2240,8 +2241,8 @@ async fn a_recorded_path_job_on_macos_reads_the_domain_and_never_the_job() {
     );
     assert_eq!(fake.domain_reads.load(Ordering::SeqCst), 1);
     assert_eq!(
-        job.variables.get("CLAUDE_CONFIG_DIR").map(String::as_str),
-        Some("/manager/store")
+        job.variables.get(allowed_name).map(String::as_str),
+        Some(allowed_value)
     );
 }
 
