@@ -2228,12 +2228,12 @@ and prints one JSON document (`PreflightReport` in `crates/service-config`,
 `sessions` (per live session `session_id`, `verdict` `adoptable`,
 `would_lose_recovery` or `would_not_be_adopted`, a stable `code`, and a human
 `detail`, plus the owner-set `name` when there is one), `stopped_sessions` (the
-same verdicts for sessions whose runtime has ended but that keep native resume or
-fork; at risk under the same flag), `runtimes` (absent when the release carries no
+same verdicts, plus `already_not_resumable`, for sessions whose runtime has ended
+but that keep native resume or fork; at risk under the same flag), `runtimes` (absent when the release carries no
 `runtime/` tree; otherwise the `EnsureReport` of the release's official runtime
 plan with `packages`, `profiles`, `integrations` and `refusals`), and
 `unmanaged_workers` (ids of live worker journals the store has no record of; the
-running daemon does not manage them either, so they never refuse the upgrade). A session that is not `adoptable` fails the command with the CLI error
+running daemon does not manage them either, so they never refuse the upgrade). A session that is neither `adoptable` nor `already_not_resumable` fails the command with the CLI error
 code `service_upgrade_sessions_at_risk` unless `--accept-runtime-loss` is given;
 a `refused` store fails it with `service_upgrade_store_unusable` and a preflight
 that cannot run or be parsed with `service_upgrade_preflight_failed`, neither of
@@ -2264,7 +2264,14 @@ code (`agent_profile_missing`, `agent_profile_changed` or
 `agent_profile_revision_unavailable`), and a stopped session record the new
 binary cannot load is `would_lose_recovery` with `record_unreadable`. A session
 whose frozen program resume would not find is `would_lose_recovery` with
-`agent_binary_missing`; for a runtime that declares a version probe, the
+`agent_binary_missing`. A stopped session whose conversation is absent from its declared store
+(`agent_native_reference_missing`), or whose stored reference is malformed, is
+`already_not_resumable` with resume's code when the upgrade does not change the
+check, which then needs no flag. A relocated store (`agent_native_store_relocated`)
+or a store-condition refusal (`agent_native_reference_missing` from an unresolvable
+root, a scan limit or a changed store) is `would_lose_recovery` with resume's code,
+because the running release may detect it differently; so is any session the
+upgrade adopts from the built-in runtime, since its check changes with the runtime. For a runtime that declares a version probe, the
 preflight runs the same isolated, bounded probe resume runs (the frozen program
 with the probe's arguments, a private `HOME` and working directory), so
 `service check` executes those programs. It writes no pohunek state. Identical

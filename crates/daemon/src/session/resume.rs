@@ -17,7 +17,7 @@ use std::sync::Arc;
 use crate::agent::host::{ProfileRevision, RuntimeDefinition};
 use crate::agent::{
     InputRules, LaunchEnv, LaunchView, NativeReferenceProvenance, ProfileRegistry,
-    ReferenceExistence, ResolvedAgent, StoreRoot,
+    ReferenceCheckFailure, ReferenceExistence, ResolvedAgent, StoreRoot,
 };
 use crate::detect::Manifest;
 use crate::runtime::environment::{base_environment, effective_variable};
@@ -1314,14 +1314,14 @@ async fn verify_recovery_reference(
     let cwd = binding.cwd.clone();
     let checked = existence.clone();
     let verdict = tokio::task::spawn_blocking(move || {
-        let lookup =
-            |name: &str| effective_variable(&base_environment, profile_env.as_slice(), name);
-        checked.check_relocation(&LaunchView {
-            env: &lookup,
-            args: &args,
-            cwd: &cwd,
-        })?;
-        checked.verify(&session_ref, &lookup)
+        check_recovery_reference(
+            &checked,
+            &session_ref,
+            &base_environment,
+            profile_env.as_slice(),
+            &args,
+            &cwd,
+        )
     })
     .await
     .map_err(|_join_error| {
@@ -1346,6 +1346,30 @@ async fn verify_recovery_reference(
     })
 }
 
+/// The reference check resume runs before it relaunches a session: first the
+/// relocation refusal for the launch's arguments, working directory and store
+/// variable, then the existence scan of `session_ref`. Both read the launch
+/// environment, which is `base_environment` overlaid by `profile_env`.
+///
+/// Reads files and lists directories: the async resume path runs it on the
+/// blocking pool, and the synchronous upgrade preflight calls it directly.
+pub(super) fn check_recovery_reference(
+    existence: &ReferenceExistence,
+    session_ref: &SessionRef,
+    base_environment: &BaseEnv,
+    profile_env: &[(String, String)],
+    args: &[String],
+    cwd: &std::path::Path,
+) -> Result<(), ReferenceCheckFailure> {
+    let lookup = |name: &str| effective_variable(base_environment, profile_env, name);
+    existence.check_relocation(&LaunchView {
+        env: &lookup,
+        args,
+        cwd,
+    })?;
+    existence.verify(session_ref, &lookup)
+}
+
 /// The existence check the native-reference preflight and the last-activity
 /// enrichment run on `binding`, from the runtime descriptor alone.
 ///
@@ -1355,7 +1379,7 @@ async fn verify_recovery_reference(
 /// the check undeclared, and any path-kind reference, verifies nothing: the
 /// runtime pointed the reference into its own store.
 #[must_use]
-fn reference_existence(
+pub(super) fn reference_existence(
     binding: &ResumeBinding,
     launch: Option<&NativeSessionLaunch>,
     definition: &RuntimeDefinition,
@@ -1599,7 +1623,7 @@ pub(super) fn recovery_contract(
 /// A binding written without a snapshot program carries no frozen spec and
 /// resolves to its runtime definition's spec; a binding with a snapshot is
 /// authoritative, so an absent spec means the session does not recover natively.
-fn binding_native_launch(
+pub(super) fn binding_native_launch(
     binding: &ResumeBinding,
     definition: &RuntimeDefinition,
 ) -> Option<NativeSessionLaunch> {
@@ -1613,7 +1637,7 @@ fn binding_native_launch(
     }
 }
 
-fn session_ref_from_binding(
+pub(super) fn session_ref_from_binding(
     reference_kind: SessionRefKind,
     binding: &ResumeBinding,
 ) -> Result<SessionRef, ProtocolError> {

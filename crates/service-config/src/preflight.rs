@@ -140,13 +140,17 @@ pub enum Verdict {
     /// The worker is not adopted: its runtime is lost, quarantined or left
     /// unmanaged.
     WouldNotBeAdopted,
+    /// The stopped session's native reference is missing or relocated, and
+    /// the upgrade does not change that: resume refuses it on the running
+    /// release as well, so the upgrade loses no recovery.
+    AlreadyNotResumable,
 }
 
 impl Verdict {
     /// Whether the upgrade must be refused unless the operator accepts loss.
     #[must_use]
     pub const fn at_risk(self) -> bool {
-        !matches!(self, Self::Adoptable)
+        !matches!(self, Self::Adoptable | Self::AlreadyNotResumable)
     }
 
     /// The wire spelling.
@@ -156,6 +160,7 @@ impl Verdict {
             Self::Adoptable => "adoptable",
             Self::WouldLoseRecovery => "would_lose_recovery",
             Self::WouldNotBeAdopted => "would_not_be_adopted",
+            Self::AlreadyNotResumable => "already_not_resumable",
         }
     }
 }
@@ -245,8 +250,8 @@ pub struct PreflightReport {
 }
 
 impl PreflightReport {
-    /// The live and stopped sessions whose verdict is not
-    /// [`Verdict::Adoptable`].
+    /// The live and stopped sessions whose verdict is at risk: every verdict
+    /// except [`Verdict::Adoptable`] and [`Verdict::AlreadyNotResumable`].
     pub fn at_risk(&self) -> impl Iterator<Item = &SessionVerdict> {
         self.sessions
             .iter()

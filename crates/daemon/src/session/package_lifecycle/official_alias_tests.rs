@@ -4274,7 +4274,15 @@ fn stopped_preflight_verdict_entered(
             release: None,
             profiles_dir: Some(fixture.agents.clone()),
             host_state_dir: Some(fixture.dir.join("state")),
-            launch: Ok(crate::runtime::LaunchEnvironment::subprocess_default()),
+            // The environment the test registry launches under, so the judgement reads the
+            // same home and variables that resume does.
+            launch: Ok(crate::runtime::LaunchEnvironment::new(
+                pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST
+                    .iter()
+                    .map(|pattern| (*pattern).to_owned())
+                    .collect(),
+                crate::test_support::thread_environment_source(),
+            )),
         },
         &crate::procwatch::HostInspector::new(),
     );
@@ -4348,6 +4356,125 @@ async fn a_stopped_session_whose_profile_changed_is_judged_as_resume_refuses_it(
         refused_resume_code(&restarted.registry, &session.id).await,
         code
     );
+}
+
+/// A stopped Claude session that the official package has adopted and that
+/// resumed through it once, so its launch pin names the package rather than
+/// the built-in runtime: the upgrade leaves its runtime source unchanged.
+async fn stopped_pinned_claude(tag: &str) -> StoppedClaude {
+    let session = stopped_built_in_claude(tag).await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &package,
+        5,
+    )
+    .await;
+    bind_claude_profile(&session.fixture).await;
+    let restarted = restart(&session.fixture).await;
+    restarted
+        .registry
+        .resume_with(&session.id, crate::session::ProfileChange::Refuse)
+        .await
+        .expect("the first resume adopts and pins the package");
+    restarted
+        .registry
+        .stop(&session.id)
+        .await
+        .expect("stop the resumed session");
+    StoppedClaude {
+        fixture: restarted,
+        store_path: session.store_path,
+        id: session.id,
+    }
+}
+
+#[tokio::test]
+async fn a_stopped_session_whose_conversation_is_missing_is_judged_as_resume_refuses_it() {
+    let session = stopped_pinned_claude("preflight-missing-conversation").await;
+    let conversation = session
+        .fixture
+        .dir
+        .join("claude-home")
+        .join("projects")
+        .join("work")
+        .join(format!("{CONVERSATION}.jsonl"));
+    fs::remove_file(&conversation).expect("remove the conversation");
+
+    let (verdict, code) =
+        stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
+    let restarted = restart(&session.fixture).await;
+
+    assert_eq!(verdict, Verdict::AlreadyNotResumable);
+    assert_eq!(code, "agent_native_reference_missing");
+    assert_eq!(
+        refused_resume_code(&restarted.registry, &session.id).await,
+        code
+    );
+}
+
+#[tokio::test]
+async fn a_built_in_session_whose_conversation_is_missing_is_judged_lost_when_the_upgrade_adopts_it(
+) {
+    let session = stopped_built_in_claude("preflight-adopted-missing-conversation").await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &package,
+        5,
+    )
+    .await;
+    fs::remove_file(
+        session
+            .fixture
+            .dir
+            .join("claude-home")
+            .join("projects")
+            .join("work")
+            .join(format!("{CONVERSATION}.jsonl")),
+    )
+    .expect("remove the conversation");
+
+    let (verdict, code) =
+        stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
+    let restarted = restart(&session.fixture).await;
+
+    assert_eq!(verdict, Verdict::WouldLoseRecovery);
+    assert_eq!(code, "agent_native_reference_missing");
+    assert_eq!(
+        refused_resume_code(&restarted.registry, &session.id).await,
+        code
+    );
+}
+
+#[tokio::test]
+async fn a_stopped_session_whose_conversation_exists_stays_adoptable_as_resume_accepts_it() {
+    let session = stopped_pinned_claude("preflight-present-conversation").await;
+
+    let (verdict, code) =
+        stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
+    let restarted = restart(&session.fixture).await;
+    let resumed = restarted
+        .registry
+        .resume_with(&session.id, crate::session::ProfileChange::Refuse)
+        .await
+        .expect("resume accepts the present conversation");
+
+    assert_eq!(verdict, Verdict::Adoptable);
+    assert_eq!(code, pohunek_service_config::preflight::CODE_ADOPTABLE);
+    assert_eq!(
+        resumed.runtime.as_ref().map(|runtime| runtime.state),
+        Some(protocol::RuntimeState::Live)
+    );
+    restarted
+        .registry
+        .remove(&session.id)
+        .await
+        .expect("remove the resumed session");
 }
 
 #[tokio::test]
@@ -4618,7 +4745,7 @@ fn spent_budget_entry() -> std::time::Instant {
 }
 
 #[tokio::test]
-async fn a_spent_probe_budget_still_adopts_a_runtime_without_a_probe_whose_executable_resolves() {
+async fn a_spent_probe_budget_resolves_a_runtime_without_a_probe_and_judges_its_reference() {
     // The package declares no version probe, so resolving the executable is the
     // whole check, and it spends none of the budget.
     const AGENT: &str = "agent-probeless-resolves";
@@ -4643,12 +4770,11 @@ async fn a_spent_probe_budget_still_adopts_a_runtime_without_a_probe_whose_execu
         .await
         .expect_err("resume stops at the native reference");
 
-    assert_eq!(verdict, Verdict::Adoptable);
-    assert_eq!(code, pohunek_service_config::preflight::CODE_ADOPTABLE);
-    assert_ne!(
-        resumed.code, "agent_binary_missing",
-        "resume resolves the executable"
-    );
+    // The executable resolves without a probe, so the judgement reaches the
+    // reference check, which refuses the conversation resume cannot find.
+    assert_eq!(verdict, Verdict::WouldLoseRecovery);
+    assert_eq!(code, "agent_native_reference_missing");
+    assert_eq!(code, resumed.code);
 }
 
 #[tokio::test]

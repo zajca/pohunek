@@ -309,6 +309,35 @@ async fn the_real_daemon_reports_a_clean_live_session_adoptable() {
 }
 
 #[tokio::test]
+async fn an_already_not_resumable_session_is_listed_without_requiring_the_flag() {
+    let host = Host::new();
+    let not_resumable = SessionVerdict {
+        session_id: SESSION.to_owned(),
+        name: None,
+        verdict: Verdict::AlreadyNotResumable,
+        code: "agent_native_reference_missing".to_owned(),
+        detail: "resume refuses the session's native reference before any launch".to_owned(),
+    };
+    let report = daemon_report(None, vec![not_resumable.clone()]);
+    let daemon = reporting_daemon(&host.root, "not-resumable", &report);
+
+    let gated = gate_upgrade(
+        &DaemonPreflight,
+        &host.context,
+        &daemon,
+        VERSION,
+        "/usr/bin:/bin",
+        ReleasePlan::Included,
+        false,
+    )
+    .await
+    .expect("a session the running release already refuses is not at risk");
+    assert!(!gated.accepted);
+    assert_eq!(gated.report.stopped_sessions, vec![not_resumable]);
+    assert_eq!(gated.report.at_risk().count(), 0);
+}
+
+#[tokio::test]
 async fn the_real_daemon_names_a_session_it_would_not_adopt_and_the_flag_accepts_it() {
     let host = Host::new();
     host.seed_live_session(true);

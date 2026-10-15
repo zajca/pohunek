@@ -621,6 +621,16 @@ the upgrade is not what ends it.
   profile, or accept the loss. A stopped session record the new binary cannot
   load is `record_unreadable` in the stopped list; its recovery is lost at
   startup.
+- `already not resumable`: a stopped session whose conversation is absent from
+  its declared store (`agent_native_reference_missing`), or whose stored
+  reference is malformed, is refused by resume on the running release too. The
+  upgrade does not change that, so it needs no `--accept-runtime-loss`; the
+  summary counts it apart from the sessions at risk. A relocated store
+  (`agent_native_store_relocated`) or a store-condition refusal is `would lose
+  recovery` with resume's code: the running release may detect those
+  differently, so the preflight cannot prove it refuses too. A session that the
+  upgrade adopts from the built-in runtime is also `would lose recovery`, with
+  the same code, because its reference check changes with the runtime.
 - `would not be adopted`: the new daemon would not manage the worker
   (`record_unreadable`, `worker_without_session_record`, `store_unusable`,
   `worker_generation_missing`,

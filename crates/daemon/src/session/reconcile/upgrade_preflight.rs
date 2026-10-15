@@ -61,17 +61,23 @@ use super::{
     JournalReject, WorkerJournalScan,
 };
 use crate::agent::host::{
-    validate_launch_runtime_with_timeout_detailed, BuiltinSource, PackageSource, PackageStore,
-    RuntimeDefinition, RuntimeHost, Spawn,
+    adopts, validate_launch_runtime_with_timeout_detailed, BuiltinSource, PackageSource,
+    PackageStore, RuntimeDefinition, RuntimeHost, Spawn,
 };
-use crate::agent::{ProfileRegistry, ValidatedLaunchProgram};
+use crate::agent::{
+    NativeReferenceProvenance, ProfileRegistry, ReferenceCheckFailure, RefusalPhase,
+    ValidatedLaunchProgram,
+};
 use crate::capabilities::LaunchValidationFailure;
 use crate::catalog_anchor::CatalogTrust;
 use crate::procwatch::ProcessInspector;
 use crate::runtime::environment::effective_variable;
 use crate::runtime::lifecycle::IDENTITY_MISMATCH;
 use crate::runtime::LaunchEnvironment;
-use crate::session::resume::{binding_program, recovery_contract, recovery_definition};
+use crate::session::resume::{
+    binding_native_launch, binding_program, check_recovery_reference, recovery_contract,
+    recovery_definition, reference_existence, session_ref_from_binding,
+};
 use crate::session::resume::{recovery_profile_in, ProfileChange};
 use crate::session::{plan_official_runtimes, EnsureInputs, OfficialPlan};
 use crate::session::{runtime_hook_schema, HookSchemaLookup};
@@ -613,14 +619,120 @@ fn judge_stopped(
     }
     Some(match recovery_loss(facts, &candidate, judging) {
         Some(loss) => loss,
-        None => (
-            Verdict::Adoptable,
-            CODE_ADOPTABLE.to_owned(),
-            "the stored native recovery resumes and forks through the runtime source this \
-             daemon serves"
-                .to_owned(),
-        ),
+        None => judge_reference(&candidate, judging).unwrap_or_else(|| {
+            (
+                Verdict::Adoptable,
+                CODE_ADOPTABLE.to_owned(),
+                "the stored native recovery resumes and forks through the runtime source this \
+                 daemon serves"
+                    .to_owned(),
+            )
+        }),
     })
+}
+
+/// The native reference check resume runs after [`judge_launch`] passed: the
+/// stopped session's conversation must still exist where its launch looks for
+/// it. Resume refuses a missing or relocated reference before any launch, with
+/// the code and message this returns.
+///
+/// The verdict is [`Verdict::AlreadyNotResumable`] when the upgrade does not
+/// change the check: the check frozen into the session's launch, or a check
+/// read from a runtime definition the session already launched from. A check
+/// read from a definition the upgrade adopts is judged
+/// [`Verdict::WouldLoseRecovery`], since the running release checks another
+/// reference. `None` when the reference verifies, or when no check is declared.
+fn judge_reference(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judgement> {
+    let binding = candidate.recovery.as_ref()?;
+    let capabilities = &candidate.info.capabilities;
+    if !capabilities.resume && !capabilities.fork {
+        return None;
+    }
+    // judge_pin and judge_launch refuse a definition, profile or base
+    // environment that does not resolve before this check is reached, so the
+    // lookups below succeed for every session that gets here.
+    let fork = !capabilities.resume;
+    let profile =
+        recovery_profile_in(judging.profiles, binding, ProfileChange::Refuse, fork).ok()?;
+    let definition = recovery_definition(judging.runtimes, binding).ok()?;
+    let base = judging.base_env.as_ref().ok()?;
+    let launch = binding_native_launch(binding, &definition);
+    let existence = reference_existence(binding, launch.as_ref(), &definition)?;
+    let session_ref = match session_ref_from_binding(launch.as_ref()?.reference_kind(), binding) {
+        Ok(session_ref) => session_ref,
+        Err(error) => {
+            return Some((
+                Verdict::AlreadyNotResumable,
+                error.code.clone(),
+                format!(
+                    "resume refuses the session's native reference ({}: {}) before any launch, \
+                     and the upgrade does not change it",
+                    error.code, error.msg
+                ),
+            ));
+        }
+    };
+    let failure = check_recovery_reference(
+        &existence,
+        &session_ref,
+        base,
+        profile.env.as_slice(),
+        &binding.args,
+        &binding.cwd,
+    )
+    .err()?;
+    let error = existence.refusal(failure, RefusalPhase::Recovery);
+    let upgrade_changes_check = matches!(
+        binding.native_reference_provenance,
+        NativeReferenceProvenance::Reported
+    ) && adopts(&binding.launch_binding, &definition);
+    Some(if upgrade_changes_check {
+        (
+            Verdict::WouldLoseRecovery,
+            error.code.clone(),
+            format!(
+                "resume refuses the session's native reference ({}: {}) before any launch, and \
+                 the upgrade replaces the runtime whose reference check it runs; restore the \
+                 conversation, or upgrade with --accept-runtime-loss",
+                error.code, error.msg
+            ),
+        )
+    } else if stored_reference_fact(failure) {
+        (
+            Verdict::AlreadyNotResumable,
+            error.code.clone(),
+            format!(
+                "resume refuses the session's native reference ({}: {}) before any launch on \
+                 the running release too, so the upgrade does not lose its recovery",
+                error.code, error.msg
+            ),
+        )
+    } else {
+        (
+            Verdict::WouldLoseRecovery,
+            error.code.clone(),
+            format!(
+                "resume refuses the session's native reference ({}: {}) before any launch, but \
+                 the preflight cannot show that the running release refuses it too; restore the \
+                 store, or upgrade with --accept-runtime-loss",
+                error.code, error.msg
+            ),
+        )
+    })
+}
+
+/// Whether a failed reference check reports a fact of the stored data itself,
+/// independent of the daemon version: a conversation absent from the declared
+/// store, or a stored reference that is not a plain identifier. Relocation
+/// and settings checks depend on the daemon's detection rules, and the
+/// store-condition failures depend on the host's state at the time of the
+/// check, so the running release may decide differently and they are not
+/// judged as already not resumable.
+fn stored_reference_fact(failure: ReferenceCheckFailure) -> bool {
+    matches!(
+        failure,
+        ReferenceCheckFailure::Missing | ReferenceCheckFailure::InvalidReference
+    )
 }
 
 /// Judges every record the loader skipped that names a session no other verdict

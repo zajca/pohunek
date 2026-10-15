@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Subcommand, ValueHint};
-use pohunek_service_config::preflight::{PreflightReport, SessionVerdict, StoreState};
+use pohunek_service_config::preflight::{PreflightReport, SessionVerdict, StoreState, Verdict};
 use pohunek_service_config::runtimes::{CatalogStatus, EnsureReport, PackageStatus};
 
 use crate::commands::render_json;
@@ -356,17 +356,26 @@ fn render_sessions(
         .iter()
         .filter(|session| session.verdict.at_risk())
         .count();
+    let not_resumable = sessions
+        .iter()
+        .filter(|session| session.verdict == Verdict::AlreadyNotResumable)
+        .count();
     let _ = writeln!(
         text,
-        "{heading:<10} {} {kind}, {} adoptable{}",
+        "{heading:<10} {} {kind}, {} adoptable{}{}",
         sessions.len(),
-        sessions.len() - at_risk,
+        sessions.len() - at_risk - not_resumable,
         if at_risk == 0 {
             String::new()
         } else if accepted_runtime_loss {
             format!(", {at_risk} at risk (accepted with --accept-runtime-loss)")
         } else {
             format!(", {at_risk} at risk")
+        },
+        if not_resumable == 0 {
+            String::new()
+        } else {
+            format!(", {not_resumable} already not resumable before the upgrade")
         }
     );
     for session in sessions {
@@ -1040,7 +1049,7 @@ mod tests {
 
     /// A plan with one live and two stopped sessions; the refusals of a plan go to its error.
     fn runtime_plan_preflight() -> PreflightReport {
-        use pohunek_service_config::preflight::{StoreReport, Verdict, REPORT_VERSION};
+        use pohunek_service_config::preflight::{StoreReport, REPORT_VERSION};
         use pohunek_service_config::runtimes::{
             IntegrationAction, PackageAction, ProfileAction, ProfileStatus, UseReason,
             ENSURE_REPORT_VERSION,
@@ -1139,6 +1148,47 @@ mod tests {
         );
         assert!(
             text.contains("  s-stopped-a: would_lose_recovery"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn check_counts_an_already_not_resumable_session_apart_from_the_at_risk_ones() {
+        let session = |id: &str, verdict: Verdict| SessionVerdict {
+            session_id: id.to_owned(),
+            name: None,
+            verdict,
+            code: "test_code".to_owned(),
+            detail: "test detail".to_owned(),
+        };
+        let mut preflight = runtime_plan_preflight();
+        preflight.stopped_sessions = vec![
+            session("s-stopped-a", Verdict::AlreadyNotResumable),
+            session("s-stopped-b", Verdict::WouldLoseRecovery),
+            session("s-stopped-c", Verdict::Adoptable),
+        ];
+        let text = render_check(&report::CheckReport {
+            operation: "upgrade",
+            version: "1.0.0".to_owned(),
+            prefix: PathBuf::from("/p"),
+            namespace: "ns".to_owned(),
+            config_path: PathBuf::from("/c/pohunek/service.toml"),
+            pending_transaction: None,
+            pending_action: None,
+            locked: false,
+            preflight: Some(preflight),
+            accepted_runtime_loss: false,
+            config_schema_migration: None,
+        });
+
+        assert!(
+            text.contains(
+                "stopped    3 with native resume or fork, 1 adoptable, 1 at risk, 1 already not resumable before the upgrade\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("  s-stopped-a: already_not_resumable"),
             "{text}"
         );
     }
