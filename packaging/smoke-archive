@@ -468,6 +468,8 @@ inner_main() {
         /bin/cp "$node_dir/node" "$inputs/node-bin/node" || fail "cannot copy node to inputs"
         /bin/chmod 0755 "$inputs/node-bin/node" || fail "cannot chmod node in inputs"
         node_dir=$inputs/node-bin
+        # The copies are the temporary user's own; upstream trees such as uv's venv .lock can be group- or world-writable, which the product's executable trust check rejects
+        /bin/chmod -R go-w "$inputs" || fail "cannot drop group/other write from the copied inputs"
         # Fail closed if anything under $inputs is group- or other-writable
         bad=$(/usr/bin/find "$inputs" \( -perm -020 -o -perm -002 \) ! -type l -print | head -n 1)
         [ -z "$bad" ] || fail "a copied input is writable by others: $bad"
