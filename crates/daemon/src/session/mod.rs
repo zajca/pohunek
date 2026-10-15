@@ -3249,7 +3249,7 @@ impl SessionRegistry {
             debug!(session_id = %session_id.0, "expired or overlong native-id report; ignoring");
             return not_recorded;
         }
-        let (worker, expected_agent, expected_base, ref_kind) = {
+        let (expected_agent, expected_base, ref_kind) = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(&session_id) else {
                 debug!(session_id = %session_id.0, "native-id report for an unknown session; ignoring");
@@ -3259,16 +3259,11 @@ impl SessionRegistry {
                 debug!(session_id = %session_id.0, "native-id report for a terminal session; ignoring");
                 return not_recorded;
             }
-            let RuntimeHandle::Worker(worker) = &entry.runtime else {
-                debug!(session_id = %session_id.0, "native-id report for an unavailable runtime; ignoring");
-                return not_recorded;
-            };
             let Some(ref_kind) = entry.snapshot.native_ref_kind() else {
                 debug!(session_id = %session_id.0, "native-id report for a session without recovery support; ignoring");
                 return not_recorded;
             };
             (
-                worker.clone(),
                 entry.info.agent.clone(),
                 agent_kind_label(&entry.info.agent_base).to_owned(),
                 ref_kind,
@@ -3278,20 +3273,16 @@ impl SessionRegistry {
             debug!(session_id = %session_id.0, "native-id report provider mismatch; ignoring");
             return not_recorded;
         }
-        let schema = match self
+        let Some(Ok(schema)) = self
             .session_hook_admission(
                 &session_id,
                 pohunek_worker_protocol::HookAction::IdentityReport,
                 &expected_base,
+                "native-id report",
             )
             .await
-        {
-            Some(Ok(schema)) => schema,
-            Some(Err(denial)) => {
-                debug!(session_id = %session_id.0, ?denial, "native-id report refused by the hook schema; ignoring");
-                return not_recorded;
-            }
-            None => return not_recorded,
+        else {
+            return not_recorded;
         };
         if schema.launch_process == LaunchProcess::FrozenRootEntrypoint {
             return Err(unattested(
@@ -3299,6 +3290,19 @@ impl SessionRegistry {
                 NativeReportRefusal::FrozenRootSchema,
             ));
         }
+        // Read after the admission, which may have waited for the worker to
+        // reconnect and so replace the session's worker handle.
+        let worker = {
+            let sessions = self.inner.sessions.lock().await;
+            match sessions.get(&session_id).map(|entry| &entry.runtime) {
+                Some(RuntimeHandle::Worker(worker)) => worker.clone(),
+                Some(RuntimeHandle::Unavailable(_)) => {
+                    debug!(session_id = %session_id.0, "native-id report for an unavailable runtime; ignoring");
+                    return not_recorded;
+                }
+                None => return not_recorded,
+            }
+        };
         let worker_snapshot = match worker.inspect().await {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -6531,7 +6535,8 @@ fn agent_kind_label(agent: &RuntimeRef) -> &str {
 impl SessionRegistry {
     /// Checks a hook operation reported through the public socket against the
     /// hook schema of session `id`'s runtime, with the admission rule the
-    /// worker applies on its own socket.
+    /// worker applies on its own socket. `operation` names the report in the
+    /// WARN that every refusal logs.
     ///
     /// A session this registry does not hold is admitted here: the callers
     /// already ignore a report for an unknown session.
@@ -6540,109 +6545,180 @@ impl SessionRegistry {
     /// [`SessionEntry::pinned`]. A session without one (this daemon did not
     /// serve its pin at adoption) is checked with the schema its live worker
     /// journaled, the rule the worker applies on its own socket, so the
-    /// definition serving the runtime id now never decides. A worker that
-    /// journaled none, or cannot be asked, falls back to the schema the pin
-    /// resolves to now ([`Self::session_hook_schema`]), which for an unserved
-    /// built-in pin is none, so the report is refused.
+    /// definition serving the runtime id now never decides. When the worker
+    /// cannot be asked, the admission waits for it within the configured
+    /// `worker_connect_deadline` (see [`Self::journaled_hook_schema`]). Only a
+    /// worker that answered without a known schema, or a session without a
+    /// live worker to ask, falls back to the schema the pin resolves to now
+    /// ([`Self::session_hook_schema`]), which for an unserved built-in pin is
+    /// none, so the report is refused.
     ///
     /// # Errors
     ///
-    /// Returns the [`pohunek_worker_protocol::HookDenial`] when the session's
-    /// runtime has no schema, the schema does not admit `action`, or
-    /// `provider` may not report it.
+    /// Returns the [`HookAdmissionError`] when the session's runtime has no
+    /// schema, the schema does not admit `action`, `provider` may not report
+    /// it, or the worker could not report its schema within the bound.
     pub async fn admit_session_hook(
         &self,
         id: &SessionId,
         action: pohunek_worker_protocol::HookAction,
         provider: &str,
-    ) -> Result<(), pohunek_worker_protocol::HookDenial> {
-        match self.session_hook_admission(id, action, provider).await {
+        operation: &str,
+    ) -> Result<(), HookAdmissionError> {
+        match self
+            .session_hook_admission(id, action, provider, operation)
+            .await
+        {
             None => Ok(()),
             Some(admission) => admission.map(|_schema| ()),
         }
     }
 
     /// The hook schema that admits `action` from `provider` on session `id`,
-    /// or the denial. `None` when the session is unknown.
+    /// or the refusal, which is logged at WARN naming `operation`. `None` when
+    /// the session is unknown.
     async fn session_hook_admission(
         &self,
         id: &SessionId,
         action: pohunek_worker_protocol::HookAction,
         provider: &str,
-    ) -> Option<
-        Result<&'static pohunek_worker_protocol::HookSchema, pohunek_worker_protocol::HookDenial>,
-    > {
-        let (agent_base, pinned, pin, worker) = {
+        operation: &str,
+    ) -> Option<Result<&'static pohunek_worker_protocol::HookSchema, HookAdmissionError>> {
+        let (agent_base, pinned, pin) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id)?;
-            let worker = match &entry.runtime {
-                RuntimeHandle::Worker(worker) => Some(worker.clone()),
-                RuntimeHandle::Unavailable(_) => None,
-            };
             (
                 entry.info.agent_base.clone(),
                 entry.pinned.clone(),
                 entry.snapshot.launch_binding.clone(),
-                worker,
             )
         };
         let schema = match pinned {
             Some(definition) => definition.hook_schema(),
-            None => match self.journaled_hook_schema(id, worker.as_ref()).await {
-                Some(schema) => Some(schema),
-                None => self.session_hook_schema(&agent_base, &pin),
+            None => match self.journaled_hook_schema(id, operation).await? {
+                JournaledHookSchema::Journaled(schema) => Some(schema),
+                JournaledHookSchema::Absent => self.session_hook_schema(&agent_base, &pin),
+                JournaledHookSchema::Unavailable => {
+                    let refusal = HookAdmissionError::SchemaUnavailable {
+                        bound: self.inner.config.worker_connect_deadline,
+                    };
+                    log_hook_refusal(id, operation, &refusal);
+                    return Some(Err(refusal));
+                }
             },
         };
-        Some(pohunek_worker_protocol::admit_hook(
-            schema,
-            action,
-            provider,
-            Some(agent_kind_label(&agent_base)),
-        ))
+        Some(
+            pohunek_worker_protocol::admit_hook(
+                schema,
+                action,
+                provider,
+                Some(agent_kind_label(&agent_base)),
+            )
+            .map_err(|denial| {
+                let refusal = HookAdmissionError::Denied(denial);
+                log_hook_refusal(id, operation, &refusal);
+                refusal
+            }),
+        )
     }
 
     /// Whether the hook schema of session `id` admits `action` from
-    /// `provider`; a refusal is logged with `report` naming the operation.
+    /// `provider`; a refusal is logged naming the `operation`.
     async fn hook_report_admitted(
         &self,
         id: &SessionId,
         action: pohunek_worker_protocol::HookAction,
         provider: &str,
-        report: &str,
+        operation: &str,
     ) -> bool {
-        match self.admit_session_hook(id, action, provider).await {
-            Ok(()) => true,
-            Err(denial) => {
-                debug!(session_id = %id.0, ?denial, "{report} refused by the hook schema; ignoring");
-                false
-            }
-        }
+        self.admit_session_hook(id, action, provider, operation)
+            .await
+            .is_ok()
     }
 
-    /// The hook schema the live `worker` of session `id` journaled, when it
-    /// can be asked and names a schema this daemon knows.
+    /// The hook schema the live worker of session `id` journaled, read for
+    /// the hook report `operation`. `None` when the session is unknown.
     ///
-    /// A worker that cannot be asked is logged at WARN: admission then falls
-    /// back to the schema the pin resolves to, which refuses every report of a
-    /// session whose pin is not served until the worker answers again.
+    /// A worker that cannot be asked, because its inspect fails or it is
+    /// starting or reconnecting, is asked again every `WORKER_CONNECT_RETRY`
+    /// until the configured `worker_connect_deadline`, measured from the first
+    /// attempt; an inspect still pending at the deadline is abandoned. A report
+    /// that comes in while the worker reconnects is therefore admitted by the
+    /// worker's schema once it is back, never by the pin's.
     async fn journaled_hook_schema(
         &self,
         id: &SessionId,
-        worker: Option<&Worker>,
-    ) -> Option<&'static pohunek_worker_protocol::HookSchema> {
-        let snapshot = match worker?.inspect().await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                warn!(
-                    name: "session.hook.journaled_schema_unavailable",
-                    session_id = %id.0,
-                    error = %error,
-                    "the worker cannot report its journaled hook schema; hook admission falls back to the session's pin"
-                );
-                return None;
+        operation: &str,
+    ) -> Option<JournaledHookSchema> {
+        let deadline = tokio::time::Instant::now() + self.inner.config.worker_connect_deadline;
+        let mut waiting_logged = false;
+        loop {
+            let runtime = {
+                let sessions = self.inner.sessions.lock().await;
+                sessions.get(id)?.runtime.clone()
+            };
+            match runtime {
+                RuntimeHandle::Worker(worker) => {
+                    match tokio::time::timeout_at(deadline, self.inspect_hook_schema(&worker)).await
+                    {
+                        Ok(Ok(schema)) => {
+                            return Some(schema.map_or(
+                                JournaledHookSchema::Absent,
+                                JournaledHookSchema::Journaled,
+                            ));
+                        }
+                        // The watcher logs the lost connection at WARN, and a
+                        // refusal is logged at WARN when the bound ends.
+                        Ok(Err(error)) if !waiting_logged => {
+                            waiting_logged = true;
+                            info!(
+                                name: "session.hook.journaled_schema_unavailable",
+                                session_id = %id.0,
+                                operation,
+                                error = %error,
+                                "the worker cannot report its journaled hook schema; the hook admission waits for it"
+                            );
+                        }
+                        Ok(Err(error)) => {
+                            debug!(session_id = %id.0, operation, error = %error, "the worker still cannot report its journaled hook schema");
+                        }
+                        Err(_elapsed) => {}
+                    }
+                }
+                RuntimeHandle::Unavailable(
+                    state @ (RuntimeState::Starting | RuntimeState::Reconnecting),
+                ) => {
+                    if !waiting_logged {
+                        waiting_logged = true;
+                        info!(
+                            session_id = %id.0,
+                            operation,
+                            state = ?state,
+                            "the hook admission waits for the session's worker to come back"
+                        );
+                    }
+                }
+                RuntimeHandle::Unavailable(_) => return Some(JournaledHookSchema::Absent),
             }
-        };
-        pohunek_worker_protocol::hook_schema(snapshot.hook_schema.as_deref()?)
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Some(JournaledHookSchema::Unavailable);
+            }
+            tokio::time::sleep(WORKER_CONNECT_RETRY.min(deadline - now)).await;
+        }
+    }
+
+    /// The hook schema `worker` journaled, `None` when it journaled none this
+    /// daemon knows.
+    async fn inspect_hook_schema(
+        &self,
+        worker: &Worker,
+    ) -> Result<Option<&'static pohunek_worker_protocol::HookSchema>, WorkerError> {
+        let snapshot = worker.inspect().await?;
+        Ok(snapshot
+            .hook_schema
+            .as_deref()
+            .and_then(pohunek_worker_protocol::hook_schema))
     }
 
     /// The hook schema of the runtime a session of `agent_base` launched with
@@ -6664,6 +6740,51 @@ impl SessionRegistry {
             );
         }
         lookup.schema()
+    }
+}
+
+/// Why a hook report reaching the public socket is not admitted.
+#[derive(Debug)]
+pub enum HookAdmissionError {
+    /// The session's hook schema does not admit the report.
+    Denied(pohunek_worker_protocol::HookDenial),
+    /// The session's live worker could not report its journaled hook schema
+    /// within `bound`.
+    SchemaUnavailable {
+        /// The configured `worker_connect_deadline` the admission waited.
+        bound: Duration,
+    },
+}
+
+/// What the live worker of a session without a launch pin reports about its
+/// journaled hook schema.
+enum JournaledHookSchema {
+    /// The worker journaled this schema.
+    Journaled(&'static pohunek_worker_protocol::HookSchema),
+    /// The worker answered without a schema this daemon knows, or the session
+    /// has no live worker to ask.
+    Absent,
+    /// The worker could not be asked within the bound.
+    Unavailable,
+}
+
+/// Logs the refusal of the hook report `operation` on session `id` at WARN.
+fn log_hook_refusal(id: &SessionId, operation: &str, refusal: &HookAdmissionError) {
+    match refusal {
+        HookAdmissionError::Denied(denial) => warn!(
+            name: "session.hook.report_refused",
+            session_id = %id.0,
+            operation,
+            ?denial,
+            "the hook report is refused by the session's hook schema"
+        ),
+        HookAdmissionError::SchemaUnavailable { bound } => warn!(
+            name: "session.hook.report_refused",
+            session_id = %id.0,
+            operation,
+            bound_ms = bound.as_millis(),
+            "the hook report is refused: the worker's hook schema was unavailable after the bound"
+        ),
     }
 }
 

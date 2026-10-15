@@ -1066,6 +1066,283 @@ async fn a_built_in_session_adopted_after_a_takeover_is_observed_only_through_it
         .expect("remove the adopted session");
 }
 
+/// An adopted built-in session that this daemon serves no pin for, whose
+/// worker connection was given up, so its inspect fails until the worker is
+/// reconnected.
+struct ReleasedWorker {
+    restarted: Fixture,
+    id: protocol::SessionId,
+    expected: crate::session::RuntimeWatchIdentity,
+    /// The inspect failure of the released connection.
+    lost: crate::runtime::WorkerError,
+    socket_path: PathBuf,
+    /// A native-id report of the session's root, built while the worker
+    /// still answered.
+    native_report: protocol::SessionReportNativeIdParams,
+}
+
+impl ReleasedWorker {
+    /// A built-in Hermes session adopted after the official package took
+    /// `hermes` over.
+    async fn hermes(tag: &str) -> Self {
+        let launched = launch_built_in_hermes(tag).await;
+        let id = launched.created.id.clone();
+        take_hermes_over(&launched.fixture).await;
+        let restarted = adopt(&launched).await;
+        Self::release(restarted, id, RuntimeId::HERMES).await
+    }
+
+    /// A session of the built-in `runtime`, adopted by a daemon that ships no
+    /// built-in and has no package serving `runtime`.
+    async fn built_in(runtime: &'static str, tag: &str) -> Self {
+        let key = signing_key("root");
+        let dir = temp_dir(tag);
+        let store_path = temp_store_path(tag);
+        let fixture = Fixture::with_anchor_and_store(
+            &format!("{tag}-plugins"),
+            anchor(&[&key], Vec::new()),
+            store_path.clone(),
+        );
+        fixture.write_profile(
+            PROFILE,
+            &format!(
+                "base = \"{runtime}\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\n"
+            ),
+        );
+        let previous = compiled_in_daemon(&fixture, &store_path);
+        let created = previous
+            .create(protocol::SessionNewParams {
+                agent: PROFILE.to_owned(),
+                cwd: Some(dir),
+                ..params()
+            })
+            .await
+            .expect("a session of the built-in runtime");
+        let adopted = fixture.reopen_with_workers_of(&previous).await;
+        Box::pin(adopted.registry.reconcile_workers())
+            .await
+            .expect("startup reconciliation");
+        Self::release(adopted, created.id, runtime).await
+    }
+
+    /// Gives up the daemon's connection to the worker of the adopted session
+    /// `id` of `runtime`. The session's worker watcher is stopped first, so
+    /// the scenario, not the watcher's next poll, decides when the worker is
+    /// reconnected.
+    async fn release(restarted: Fixture, id: protocol::SessionId, runtime: &str) -> Self {
+        let (worker, expected) = {
+            let sessions = restarted.registry.inner.sessions.lock().await;
+            let entry = sessions.get(&id).expect("the adopted session");
+            assert!(entry.pinned.is_none(), "the built-in pin is not served");
+            let crate::session::RuntimeHandle::Worker(worker) = &entry.runtime else {
+                panic!("the adopted session has a live worker");
+            };
+            entry.runtime_watch_cancel.cancel();
+            (
+                worker.clone(),
+                crate::session::RuntimeWatchIdentity::from_info(&entry.info)
+                    .expect("the adopted runtime identity"),
+            )
+        };
+        let native_report = native_report_params(
+            &restarted.registry,
+            id.clone(),
+            runtime.to_owned(),
+            format!("{runtime}-conversation-reconnect"),
+            None,
+        )
+        .await;
+        worker
+            .release_controller()
+            .await
+            .expect("release the daemon's controller lease");
+        let lost = worker
+            .inspect()
+            .await
+            .expect_err("the released connection cannot inspect the worker");
+        let socket_path = restarted
+            .registry
+            .inner
+            .config
+            .worker_runtime_root
+            .as_ref()
+            .expect("the fixture's worker runtime root")
+            .join(&id.0)
+            .join(pohunek_paths::WORKER_SOCKET_NAME);
+        Self {
+            restarted,
+            id,
+            expected,
+            lost,
+            socket_path,
+            native_report,
+        }
+    }
+
+    /// The watcher's reconnection: the runtime turns `Reconnecting`, then the
+    /// reconnected worker replaces the lost connection.
+    async fn reconnect(&self) {
+        let registry = &self.restarted.registry;
+        assert!(
+            registry
+                .reconnect_worker(
+                    &self.id,
+                    &self.expected,
+                    &self.socket_path,
+                    &tokio_util::sync::CancellationToken::new(),
+                    &self.lost,
+                    registry.inner.config.worker_connect_deadline,
+                )
+                .await
+                .is_some(),
+            "the worker is reconnected"
+        );
+    }
+
+    /// Starts a Hermes notification's hook admission and returns once the
+    /// admission logged `waiting`, so it is pending while the worker is away.
+    async fn admission_waiting_on(
+        &self,
+        logs: &crate::runtime::lifecycle::tests::LogCapture,
+        waiting: &'static str,
+    ) -> tokio::task::JoinHandle<Result<(), crate::session::HookAdmissionError>> {
+        let registry = self.restarted.registry.clone();
+        let reported = self.id.clone();
+        let admission = tokio::spawn(async move {
+            registry
+                .admit_session_hook(
+                    &reported,
+                    pohunek_worker_protocol::HookAction::Notification,
+                    RuntimeId::HERMES,
+                    "hook notification",
+                )
+                .await
+        });
+        wait_until("the hook admission waits for the worker", || async {
+            logs.text().contains(waiting).then_some(())
+        })
+        .await;
+        admission
+    }
+}
+
+#[tokio::test]
+async fn a_hook_report_while_an_unpinned_sessions_worker_reconnects_is_admitted_by_its_journaled_schema(
+) {
+    let released = ReleasedWorker::hermes("alias-reconnect").await;
+    let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+    let _subscriber = logs.install();
+    let admission = released
+        .admission_waiting_on(&logs, "the worker cannot report its journaled hook schema")
+        .await;
+
+    released.reconnect().await;
+    admission
+        .await
+        .expect("the admission task joins")
+        .expect("the report is admitted by the schema the reconnected worker journaled");
+
+    // A report the journaled schema refuses is logged at WARN with the
+    // session and the operation.
+    released
+        .restarted
+        .registry
+        .admit_session_hook(
+            &released.id,
+            pohunek_worker_protocol::HookAction::Notification,
+            "unlisted-provider",
+            "hook notification",
+        )
+        .await
+        .expect_err("the Hermes schema refuses a provider it does not list");
+    let refusal = logs
+        .text()
+        .lines()
+        .find(|line| line.contains("the hook report is refused by the session's hook schema"))
+        .map(str::to_owned)
+        .expect("the refusal is logged");
+    assert!(
+        refusal.contains("WARN")
+            && refusal.contains(&released.id.0)
+            && refusal.contains("operation=\"hook notification\""),
+        "{refusal}"
+    );
+}
+
+#[tokio::test]
+async fn a_hook_report_while_an_unpinned_sessions_runtime_is_reconnecting_is_admitted_once_its_worker_is_back(
+) {
+    let released = ReleasedWorker::hermes("alias-reconnecting").await;
+    let registry = &released.restarted.registry;
+    // The worker stayed unreachable for the connect deadline while its
+    // supervisor could not tell whether it is alive.
+    assert!(
+        matches!(
+            registry
+                .mark_worker_unavailable(
+                    &released.id,
+                    &released.expected,
+                    protocol::RuntimeState::Reconnecting,
+                    crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE,
+                )
+                .await,
+            crate::session::RuntimeTransitionOutcome::Applied(_)
+        ),
+        "the runtime is reconnecting without a worker handle"
+    );
+    let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+    let _subscriber = logs.install();
+    let admission = released
+        .admission_waiting_on(
+            &logs,
+            "the hook admission waits for the session's worker to come back",
+        )
+        .await;
+
+    let reconnected =
+        crate::runtime::Worker::connect_discovered(&released.socket_path, "reconnected-daemon")
+            .await
+            .expect("reconnect the worker");
+    assert!(
+        matches!(
+            registry
+                .adopt_reconnected_worker(&released.id, &released.expected, reconnected)
+                .await,
+            crate::session::RuntimeTransitionOutcome::Applied(_)
+        ),
+        "the reconnected worker replaces the unavailable runtime"
+    );
+    admission
+        .await
+        .expect("the admission task joins")
+        .expect("the report is admitted by the schema the reconnected worker journaled");
+}
+
+#[tokio::test]
+async fn a_native_id_report_while_an_unpinned_sessions_worker_reconnects_is_recorded_through_the_reconnected_worker(
+) {
+    // Claude's hook schema takes a native-id report from the runtime's own
+    // process; Hermes's takes its launch identity only from the worker.
+    let released = ReleasedWorker::built_in(RuntimeId::CLAUDE, "alias-native-reconnect").await;
+    let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+    let _subscriber = logs.install();
+    let registry = released.restarted.registry.clone();
+    let report = released.native_report.clone();
+    let recorded = tokio::spawn(async move { registry.report_as_root(report).await.recorded });
+    wait_until("the native-id report waits for the worker", || async {
+        logs.text()
+            .contains("the worker cannot report its journaled hook schema")
+            .then_some(())
+    })
+    .await;
+
+    released.reconnect().await;
+    assert!(
+        recorded.await.expect("the report task joins"),
+        "the report is validated against the reconnected worker and recorded"
+    );
+}
+
 /// Asserts that the adopted session `id` of `fixture` is observed with the
 /// generic manifest and its launch-time input framing, never through the
 /// package that serves `hermes` now.
@@ -1147,6 +1424,7 @@ async fn assert_hooks_not_attributed_through_the_package(
             id,
             pohunek_worker_protocol::HookAction::Notification,
             RuntimeId::HERMES,
+            "hook notification",
         )
         .await
         .expect("the journaled schema admits a Hermes notification");
