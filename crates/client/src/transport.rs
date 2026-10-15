@@ -531,8 +531,9 @@ impl Client {
     /// Send one typed control-method request and decode its success payload.
     ///
     /// This is the public SDK path for normal request/response methods.
-    /// `session.input`, `session.new`, and `session.wait_turn` take the same
-    /// dedicated-connection budgets as their typed helpers. The lower-level
+    /// `session.input`, `session.new`, `session.wait`, `session.wait_turn`,
+    /// and `session.output` take the same dedicated-connection budgets as
+    /// their typed helpers. The lower-level
     /// [`Self::request`] remains available for callers that need raw JSON
     /// envelopes or are testing framing behavior directly.
     pub async fn call<M>(&mut self, params: M::Params) -> Result<M::Output, ClientError>
@@ -554,6 +555,18 @@ impl Client {
         if M::NAME == protocol::method::SESSION_NEW {
             let params = serde_json::from_value::<SessionNewParams>(serde_json::to_value(params)?)?;
             let result = self.session_new(params).await?;
+            return Ok(serde_json::from_value(serde_json::to_value(result)?)?);
+        }
+        if M::NAME == protocol::method::SESSION_WAIT {
+            let params =
+                serde_json::from_value::<SessionWaitParams>(serde_json::to_value(params)?)?;
+            let result = self.session_wait(params).await?;
+            return Ok(serde_json::from_value(serde_json::to_value(result)?)?);
+        }
+        if M::NAME == protocol::method::SESSION_OUTPUT {
+            let params =
+                serde_json::from_value::<SessionOutputParams>(serde_json::to_value(params)?)?;
+            let result = self.session_output(params).await?;
             return Ok(serde_json::from_value(serde_json::to_value(result)?)?);
         }
         self.call_direct::<M>(params).await
@@ -670,7 +683,8 @@ impl Client {
             self.call_dedicated::<protocol::method::SessionOutput>(params, wait_ms)
                 .await
         } else {
-            self.call::<protocol::method::SessionOutput>(params).await
+            self.call_direct::<protocol::method::SessionOutput>(params)
+                .await
         }
     }
 

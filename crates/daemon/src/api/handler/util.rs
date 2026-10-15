@@ -31,16 +31,42 @@ where
     match tokio::task::spawn_blocking(op).await {
         Ok(Ok(value)) => ok_value(request, &value),
         Ok(Err(err)) => error_value(request, err),
-        Err(_) => error_value(
-            request,
-            protocol::ProtocolError::new(
-                protocol::ErrorClass::Daemon,
-                panic_code,
-                panic_msg,
-                panic_hint.map(str::to_owned),
-            ),
-        ),
+        Err(_) => error_value(request, task_panicked(panic_code, panic_msg, panic_hint)),
     }
+}
+
+/// [`run_blocking`] whose success is bounded like [`ok_value_bounded`]: a result
+/// that does not fit one control line answers `too_large`.
+pub(super) async fn run_blocking_bounded<T, F>(
+    request: &Request,
+    op: F,
+    panic_code: &'static str,
+    panic_msg: &'static str,
+    too_large: protocol::ProtocolError,
+) -> Response
+where
+    T: Serialize + Send + 'static,
+    F: FnOnce() -> Result<T, protocol::ProtocolError> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(op).await {
+        Ok(Ok(value)) => ok_value_bounded(request, &value, too_large),
+        Ok(Err(err)) => error_value(request, err),
+        Err(_) => error_value(request, task_panicked(panic_code, panic_msg, None)),
+    }
+}
+
+/// The daemon error for a blocking task that panicked.
+fn task_panicked(
+    code: &'static str,
+    msg: &'static str,
+    hint: Option<&'static str>,
+) -> protocol::ProtocolError {
+    protocol::ProtocolError::new(
+        protocol::ErrorClass::Daemon,
+        code,
+        msg,
+        hint.map(str::to_owned),
+    )
 }
 
 /// Deserialize required `request.params` into `T`, or a typed `bad_request`.

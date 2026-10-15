@@ -664,9 +664,9 @@ const TURN_WAIT_FIXTURE_DELAY: Duration = Duration::from_mins(45);
 /// with an explicit and an omitted timeout.
 const TURN_WAIT_FIXTURE_CALLS: usize = 4;
 
-/// A turn-wait request the fixture daemon received, answered once the test
-/// sends on `reply`.
-type HeldTurnWait = (Request, oneshot::Sender<()>);
+/// A wait request a fixture daemon received, answered once the test sends on
+/// `reply`.
+type HeldWait = (Request, oneshot::Sender<()>);
 
 /// Serves the turn-wait scenario: a health reply on the shared connection,
 /// then [`TURN_WAIT_FIXTURE_CALLS`] dedicated turn waits, each held until the
@@ -674,7 +674,7 @@ type HeldTurnWait = (Request, oneshot::Sender<()>);
 /// the shared connection goes to `stray_tx`.
 fn spawn_turn_wait_daemon(
     listener: UnixListener,
-    request_tx: tokio::sync::mpsc::UnboundedSender<HeldTurnWait>,
+    request_tx: tokio::sync::mpsc::UnboundedSender<HeldWait>,
     stray_tx: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -806,6 +806,198 @@ async fn turn_wait_deadline_covers_the_requested_and_the_daemon_default_duration
         client = returned;
         let result = result.expect("the dedicated deadline outlasts the daemon-side wait");
         assert_eq!(result.reason, protocol::SessionWaitTurnReason::Timeout);
+    }
+    server.await.expect("fixture daemon completed");
+    drop(socket_file);
+    inhibitor.release().await;
+}
+
+/// Longer than the client's 5 s default request timeout and within the
+/// protocol's wait ceiling, so only a connection sized to the wait outlasts it.
+const GENERIC_WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
+
+/// Waits the generic-call fixture daemon answers: `session.wait` and a waiting
+/// `session.output`.
+const GENERIC_WAIT_FIXTURE_CALLS: usize = 2;
+
+/// Serves the generic-wait scenario: a health reply on the shared connection,
+/// then [`GENERIC_WAIT_FIXTURE_CALLS`] dedicated waits, each held until the
+/// test releases it. Each dedicated request goes to `request_tx`; a request on
+/// the shared connection goes to `stray_tx`.
+fn spawn_generic_wait_daemon(
+    listener: UnixListener,
+    request_tx: tokio::sync::mpsc::UnboundedSender<HeldWait>,
+    stray_tx: tokio::sync::mpsc::UnboundedSender<String>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let (primary, _) = listener.accept().await.expect("accept primary connection");
+        let mut primary = BufReader::new(primary);
+        let mut health_line = String::new();
+        primary
+            .read_line(&mut health_line)
+            .await
+            .expect("read health request");
+        let health: Request =
+            serde_json::from_str(trim_line_end(&health_line)).expect("parse health request");
+        write_health_reply(primary.get_mut(), health.id()).await;
+        // A wait sent on the shared connection is reported, so a call that
+        // skips the dedicated connection fails at once.
+        tokio::spawn(async move {
+            let mut stray = String::new();
+            if primary
+                .read_line(&mut stray)
+                .await
+                .is_ok_and(|read| read > 0)
+            {
+                let _ = stray_tx.send(stray);
+            }
+        });
+        for _ in 0..GENERIC_WAIT_FIXTURE_CALLS {
+            let (dedicated, _) = listener.accept().await.expect("accept wait connection");
+            let mut dedicated = BufReader::new(dedicated);
+            let mut wait_line = String::new();
+            dedicated
+                .read_line(&mut wait_line)
+                .await
+                .expect("read wait request");
+            let wait: Request =
+                serde_json::from_str(trim_line_end(&wait_line)).expect("parse wait request");
+            let wait_id = wait.id().to_owned();
+            let result = if wait.method() == protocol::method::SESSION_WAIT {
+                generic_wait_result()
+            } else {
+                generic_output_result()
+            };
+            let (reply, release) = oneshot::channel();
+            request_tx.send((wait, reply)).expect("report wait request");
+            release.await.expect("the test releases the wait");
+            let response = Response::ok(protocol::PROTOCOL_VERSION, wait_id, result)
+                .expect("create wait response");
+            dedicated
+                .get_mut()
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::to_string(&response).expect("response JSON")
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write wait response");
+        }
+    })
+}
+
+/// A `session.wait` result for session `s-1` whose wait timed out.
+fn generic_wait_result() -> Value {
+    json!({
+        "reason": "timeout",
+        "session": {
+            "id": "s-1",
+            "agent": "shell",
+            "agent_base": "shell",
+            "cwd": "/work",
+            "pid": 4242,
+            "cols": 80,
+            "rows": 24,
+            "state": "running",
+            "state_source": "process",
+            "created_at": "2026-08-04T12:00:00Z",
+            "updated_at": "2026-08-04T12:00:00Z"
+        }
+    })
+}
+
+/// An empty `session.output` result for session `s-1` whose wait timed out.
+fn generic_output_result() -> Value {
+    let runtime =
+        protocol::SessionRuntimeIdentity::new("runtime-1", protocol::RuntimeGeneration::new(1))
+            .expect("valid runtime identity");
+    let output = protocol::SessionOutputResult::new(
+        protocol::SessionId("s-1".to_owned()),
+        runtime,
+        protocol::OutputOffset::new(0),
+        protocol::OutputOffset::new(0),
+        protocol::OutputOffset::new(0),
+        protocol::OutputOffset::new(0),
+        "",
+        None,
+        false,
+        true,
+    )
+    .expect("valid empty output result");
+    serde_json::to_value(output).expect("serialize output result")
+}
+
+#[tokio::test(start_paused = true)]
+async fn generic_waits_outlast_the_default_request_timeout_on_dedicated_connections() {
+    let inhibitor = AutoAdvanceInhibitor::new();
+    let socket_file = SocketFile::new();
+    let listener = UnixListener::bind(socket_file.path()).expect("bind fixture daemon");
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stray_tx, mut stray_rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = spawn_generic_wait_daemon(listener, request_tx, stray_tx);
+
+    let mut client = Client::connect_local_with_options(socket_file.path(), no_origin_options())
+        .await
+        .expect("connect fixture daemon");
+    client.handshake().await.expect("negotiate protocol");
+    let runtime =
+        protocol::SessionRuntimeIdentity::new("runtime-1", protocol::RuntimeGeneration::new(1))
+            .expect("valid runtime identity");
+    let wait = protocol::SessionWaitParams::new(
+        protocol::SessionId("s-1".to_owned()),
+        None,
+        Some("2026-08-04T12:00:00Z".to_owned()),
+        None,
+        None,
+        None,
+        None,
+        GENERIC_WAIT_MS,
+    )
+    .expect("valid session wait params");
+    let output = protocol::SessionOutputParams::new(
+        protocol::SessionId("s-1".to_owned()),
+        Some(runtime),
+        Some(protocol::OutputOffset::new(0)),
+        1,
+        Some(GENERIC_WAIT_MS),
+    )
+    .expect("valid waiting output params");
+    for method in [
+        protocol::method::SESSION_WAIT,
+        protocol::method::SESSION_OUTPUT,
+    ] {
+        let wait = wait.clone();
+        let output = output.clone();
+        let waiting = tokio::spawn(async move {
+            let timed_out = if method == protocol::method::SESSION_WAIT {
+                client
+                    .call::<protocol::method::SessionWait>(wait)
+                    .await
+                    .map(|result| result.reason == protocol::SessionWaitReason::Timeout)
+            } else {
+                client
+                    .call::<protocol::method::SessionOutput>(output)
+                    .await
+                    .map(|result| result.timed_out())
+            };
+            (client, timed_out)
+        });
+        let (request, reply) = tokio::select! {
+            request = request_rx.recv() => request.expect("the wait reached the daemon"),
+            stray = stray_rx.recv() => panic!("{method} used the shared connection: {stray:?}"),
+        };
+        assert_eq!(request.method(), method);
+        // The daemon-side wait lasts its full duration before it answers.
+        tokio::time::advance(Duration::from_millis(u64::from(GENERIC_WAIT_MS)) + TIMER_TICK).await;
+        reply.send(()).expect("release the wait");
+        let (returned, timed_out) = waiting.await.expect("wait task joins");
+        client = returned;
+        assert!(
+            timed_out.expect("the dedicated deadline outlasts the daemon-side wait"),
+            "{method}"
+        );
     }
     server.await.expect("fixture daemon completed");
     drop(socket_file);

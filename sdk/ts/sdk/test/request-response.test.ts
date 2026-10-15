@@ -620,6 +620,62 @@ describe("Client request/response", () => {
     }
   });
 
+  test("generic calls route session.wait and a waiting session.output through dedicated connections", async () => {
+    const wait = { reason: "timeout", session: minimalSessionInfo() } as const;
+    const output = {
+      session_id: "s-target",
+      worker_instance_id: "runtime-target",
+      runtime_generation: "1",
+      history_start_offset: "0",
+      start_offset: "0",
+      next_offset: "0",
+      runtime_end_offset: "0",
+      data_base64: "",
+      has_more: false,
+      timed_out: true,
+    } as const;
+    // The health reply selects the protocol version the dedicated connections
+    // inherit. Each daemon-side wait outlasts the shared connection's request
+    // timeout and ends within the dedicated deadline sized to the requested wait.
+    const daemon = await startUnixDaemon([
+      {
+        kind: "reply",
+        line: (line) => okResponseLine(requestIdFromLine(line), {
+          status: "ok",
+          daemon_version: "test",
+          protocol_version: PROTOCOL_VERSION,
+        }),
+      },
+      { kind: "delay", ms: 60, line: (line) => okResponseLine(requestIdFromLine(line), wait) },
+      { kind: "delay", ms: 60, line: (line) => okResponseLine(requestIdFromLine(line), output) },
+    ]);
+    try {
+      const client = await connectClient(daemon, undefined, { requestTimeoutMs: 20 });
+      await client.call("daemon.health", null);
+
+      expect(await client.call("session.wait", {
+        session_id: "s-target",
+        after_updated_at: "2026-08-04T00:00:00Z",
+        timeout_ms: 200,
+      })).toEqual(wait);
+      expect(await client.call("session.output", {
+        session_id: "s-target",
+        runtime: { worker_instance_id: "runtime-target", runtime_generation: "1" },
+        after_offset: "0",
+        max_bytes: 128,
+        wait_ms: 200,
+      })).toEqual(output);
+
+      for (const method of ["daemon.health", "session.wait", "session.output"]) {
+        const sent = parseRequestLine(await daemon.nextRequest());
+        expect(sent["method"]).toBe(method);
+      }
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("session.new with initial input has a dedicated response budget", async () => {
     const created = { ...minimalSessionInfo(), applied_input: true };
     const daemon = startMemoryDaemon([

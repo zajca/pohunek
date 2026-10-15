@@ -417,6 +417,36 @@ fn notifications_all_hosts_conflicts_with_host_under_json() {
 }
 
 #[test]
+fn human_argument_conflicts_end_with_a_newline() {
+    // Each conflict is detected after parsing, so the message is the CLI's own
+    // text rather than one clap renders.
+    for arguments in [
+        &["--host", "host-b", "notifications", "list", "--all-hosts"][..],
+        &[
+            "session",
+            "wait",
+            "s-1",
+            "s-2",
+            "--state",
+            "done",
+            "--timeout-ms",
+            "100",
+        ],
+        &["session", "wait", "local/s-1", "host-b/s-2"],
+    ] {
+        let out = pohunek().args(arguments).output().expect("spawn pohunek");
+
+        assert_eq!(out.status.code(), Some(2), "{arguments:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "{arguments:?}: {out:?}");
+        let stderr = String::from_utf8(out.stderr).expect("UTF-8 usage error");
+        assert!(
+            stderr.ends_with('\n') && !stderr.ends_with("\n\n"),
+            "{arguments:?}: {stderr:?}"
+        );
+    }
+}
+
+#[test]
 fn notifications_watch_refuses_a_deleted_status_filter_under_json() {
     // A deletion streams as `notification_deleted` with only the id, so a
     // watch filtered on `deleted` could never print anything.
