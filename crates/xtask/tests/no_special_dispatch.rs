@@ -10,11 +10,13 @@
 //!
 //! The names that remain are data, work owned by another issue, or the
 //! implementation of a compiled integration handler (which runtime uses a
-//! handler is decided by its descriptor, never by a name here). The one
+//! handler is decided by its descriptor, never by a name here). One
 //! exception is the frozen descriptor data of a retired built-in that a handler
 //! keeps (`RetiredBuiltin`, the 0.34 built-in Codex and Claude): it binds the
 //! official alias to the handler by name, but only to inspect and remove hooks
-//! that built-in installed while nothing serves the alias, never to install. Each
+//! that built-in installed while nothing serves the alias, never to install. The upgrade preflight
+//! likewise keeps the 0.34.2 built-in descriptors as frozen data, only to compare
+//! their native reference check with the package that adopts them. Each
 //! allow-list entry pins the exact trimmed text of every source line that still
 //! names an agent in one file (a SHA-256 over those lines for the large
 //! integration files owned wholesale by one issue) and states which issue
@@ -254,6 +256,19 @@ const ALLOW_LIST: &[Entry] = &[
 ]),
         Owner::Handlers,
         "compiled Claude and Codex handler implementations: they own their provider ids, paths and asset code",
+    ),
+    (
+        "crates/daemon/src/session/reconcile/upgrade_preflight.rs",
+        Approved::Lines(&[
+    "RuntimeId::CLAUDE,",
+    "RuntimeId::CODEX,",
+    "include_str!(\"../../../../../compat/claude/builtin-v0.34/detect.toml\"),",
+    "include_str!(\"../../../../../compat/claude/builtin-v0.34/runtime.toml\"),",
+    "include_str!(\"../../../../../compat/codex/builtin-v0.34/detect.toml\"),",
+    "include_str!(\"../../../../../compat/codex/builtin-v0.34/runtime.toml\"),",
+]),
+        Owner::Data,
+        "#1065 upgrade-source rule: frozen v0.34.2 built-in descriptors; a reported reference adopted from a schema-5 (v0.34.x) store is already_not_resumable only when the adopting package declares the same native reference check; never used to launch",
     ),
     (
         "crates/daemon/src/store/legacy_binding.rs",

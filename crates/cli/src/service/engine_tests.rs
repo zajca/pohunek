@@ -22,7 +22,7 @@ use pohunek_platform::process::{
     Error as ProcessError, ExitWatch, OwnershipMarkers, ProcessFact, ProcessIdentity, StartIdentity,
 };
 use pohunek_platform::supervisor::{DaemonSupervisor, Operation as Pending, ServiceId, Supervisor};
-use pohunek_service_config::preflight::{PreflightReport, SessionVerdict, StoreState, Verdict};
+use pohunek_service_config::preflight::{SessionVerdict, StoreState, Verdict};
 use pohunek_service_config::runtimes::{
     CatalogStatus, IntegrationAction, PackageAction, PackageStatus, ProfileAction, ProfileStatus,
     Refusal, UseReason, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, ENSURE_REPORT_VERSION,
@@ -6370,8 +6370,6 @@ async fn a_refused_check_without_a_bus_shows_the_warning_with_the_refusal() {
 /// reachable bus, so its judgements run without the manager's variables.
 #[cfg(target_os = "linux")]
 fn harness_without_a_bus() -> Harness {
-    use crate::service::manager_env::EnvironmentFailure;
-
     let mut harness = Harness::new();
     harness.context = harness
         .context
