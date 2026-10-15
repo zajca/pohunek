@@ -14,6 +14,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import select
 import selectors
 import shutil
@@ -473,8 +474,27 @@ if [ -n "${POHUNEK_TEST_TEMP_ROOT:-}" ]; then echo "ENV-TEMP-ROOT=$POHUNEK_TEST_
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("pi ok", result.stdout)
         self.assertIn("codex ok", result.stdout)
-        self.assertIn(f"ENV-PATH={self.stage}/pi/bin:{node_dir}:/usr/bin:/bin", result.stdout)
-        self.assertIn(f"ENV-PATH={self.stage}/codex/bin:{node_dir}:/usr/bin:/bin", result.stdout)
+        if sys.platform.startswith("darwin"):
+            # On Darwin, stage and node are copied to a temporary-user-owned pki dir
+            pi_dirs = []
+            codex_dirs = []
+            for line in result.stdout.splitlines():
+                pi_match = re.match(r"^ENV-PATH=(/private/tmp/pki\.[A-Za-z0-9]+)/stage/pi/bin:\1/node-bin:/usr/bin:/bin$", line)
+                if pi_match:
+                    pi_dirs.append(pi_match.group(1))
+                codex_match = re.match(r"^ENV-PATH=(/private/tmp/pki\.[A-Za-z0-9]+)/stage/codex/bin:\1/node-bin:/usr/bin:/bin$", line)
+                if codex_match:
+                    codex_dirs.append(codex_match.group(1))
+            self.assertTrue(pi_dirs, "pi ENV-PATH not found")
+            self.assertTrue(codex_dirs, "codex ENV-PATH not found")
+            pki_dirs_union = set(pi_dirs) | set(codex_dirs)
+            self.assertEqual(len(pki_dirs_union), 1, f"Expected one pki dir, found {pki_dirs_union}")
+            pki_dir = pki_dirs_union.pop()
+            # Verify pki dir is cleaned up
+            self.assertFalse(Path(pki_dir).exists(), f"pki dir {pki_dir} still exists after cleanup")
+        else:
+            self.assertIn(f"ENV-PATH={self.stage}/pi/bin:{node_dir}:/usr/bin:/bin", result.stdout)
+            self.assertIn(f"ENV-PATH={self.stage}/codex/bin:{node_dir}:/usr/bin:/bin", result.stdout)
         self.assertIn("/runtime/runtime-catalog.json", result.stdout)
         self.assertIn(f"--exact the_release_binaries_serve_the_runtime_out_of_process", result.stdout)
         # On Darwin, seven POHUNEK variables (six consumer-contract + POHUNEK_TEST_TEMP_ROOT).
