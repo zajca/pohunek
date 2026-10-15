@@ -1566,8 +1566,10 @@ const SESSION_BUS_VARIABLE: &str = "DBUS_SESSION_BUS_ADDRESS";
 /// Name of the drain process the daemon hands a held hook stderr to.
 const DRAIN_COMM: &str = "cat";
 
-/// How long the hook's background writer must keep writing after the restart.
-const WRITER_SURVIVES: Duration = Duration::from_secs(3);
+/// Writes the hook's background writer must complete after the restart: at
+/// one per 100 ms, about three seconds of writing to a stderr that would have
+/// raised `SIGPIPE` on the first.
+const WRITES_AFTER_RESTART: usize = 30;
 
 /// Creates a git repository with one commit in `dir`, with the scrubbed
 /// environment of `env`.
@@ -1666,22 +1668,22 @@ async fn hand_off_hook_stderr(
     (writer, drain)
 }
 
-/// Asserts that the writer is alive and keeps writing to its stderr for
-/// [`WRITER_SURVIVES`], so it got no `SIGPIPE` after the daemon's restart.
+/// Asserts that the writer keeps writing to its stderr after the daemon's
+/// restart, [`WRITES_AFTER_RESTART`] more times, so it got no `SIGPIPE`.
 async fn assert_writer_survives(
     fixture: &Installation,
     writer: ProcessIdentity,
     write_log: &std::path::Path,
 ) {
     let start = write_count(write_log);
-    tokio::time::sleep(WRITER_SURVIVES).await;
+    eventually(
+        "the writer keeps writing to its stderr after the restart",
+        || async { (write_count(write_log) >= start + WRITES_AFTER_RESTART).then_some(()) },
+    )
+    .await;
     assert!(
         fixture.is_running(writer),
         "the hook's background writer died after the daemon restart"
-    );
-    assert!(
-        write_count(write_log) > start + 10,
-        "the writer kept writing to its stderr after the restart"
     );
 }
 
