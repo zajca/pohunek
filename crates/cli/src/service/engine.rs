@@ -2929,16 +2929,22 @@ async fn manager_variables(
     }
 }
 
-/// See the Linux variant. A launchd domain without a GUI session reports no
+/// See the Linux variant. Only the domain is read: the job's label would derive
+/// the namespace, which creates the state and runtime roots, and a recorded
+/// `PATH` needs none of that. A launchd domain without a GUI session reports no
 /// environment, which is not a failure; a launchctl that cannot run is one.
 #[cfg(target_os = "macos")]
 async fn manager_variables(
     context: &Context,
     allowlist: &[String],
 ) -> Result<ManagerVariables, Error> {
-    let active = active_launchd_job(context).await?;
+    let domain = context
+        .launchd_job()
+        .domain_environment(context.uid())
+        .await
+        .map_err(|detail| Error::ManagerEnvironment { detail })?;
     Ok(ManagerVariables {
-        variables: manager_env::allowlisted_variables(active.domain_environment, allowlist)?,
+        variables: manager_env::allowlisted_variables(domain, allowlist)?,
         unreachable: None,
     })
 }

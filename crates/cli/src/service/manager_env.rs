@@ -245,7 +245,15 @@ pub trait LaunchdJob: Debug + Send + Sync {
         uid: u32,
         label: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<ActiveJob, String>> + Send + 'a>>;
+
+    /// Returns the variables of the domain `gui/<uid>`, `PATH` included, without
+    /// naming any job. Reads no state the install or upgrade has to create.
+    fn domain_environment(&self, uid: u32) -> DomainEnvironment<'_>;
 }
+
+/// A pending read of a launchd domain's variables, in launchd's order.
+pub type DomainEnvironment<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<(String, String)>, String>> + Send + 'a>>;
 
 /// Reads the active state through `launchctl`.
 #[derive(Debug, Clone, Copy, Default)]
@@ -281,6 +289,26 @@ impl LaunchdJob for SystemLaunchd {
         _uid: u32,
         _label: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<ActiveJob, String>> + Send + 'a>> {
+        Box::pin(std::future::ready(Err(
+            "launchd exists only on macOS".to_owned()
+        )))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn domain_environment(&self, uid: u32) -> DomainEnvironment<'_> {
+        Box::pin(async move {
+            pohunek_platform::supervisor::launchd::domain_environment_of(
+                uid,
+                super::settings::LAUNCHCTL_COMMAND,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+    }
+
+    /// launchd exists only on macOS.
+    #[cfg(not(target_os = "macos"))]
+    fn domain_environment(&self, _uid: u32) -> DomainEnvironment<'_> {
         Box::pin(std::future::ready(Err(
             "launchd exists only on macOS".to_owned()
         )))

@@ -2155,16 +2155,26 @@ fn launchd_domain_xml(value: &str) -> String {
 /// while a test runs, as a job that is unloaded mid-upgrade does.
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
-struct FakeLaunchd(Mutex<Result<ActiveJob, String>>);
+struct FakeLaunchd {
+    state: Mutex<Result<ActiveJob, String>>,
+    /// How many times the job's state was asked for.
+    job_reads: AtomicUsize,
+    /// How many times the domain alone was asked for.
+    domain_reads: AtomicUsize,
+}
 
 #[cfg(target_os = "macos")]
 impl FakeLaunchd {
     fn new(value: Result<ActiveJob, String>) -> Self {
-        Self(Mutex::new(value))
+        Self {
+            state: Mutex::new(value),
+            job_reads: AtomicUsize::new(0),
+            domain_reads: AtomicUsize::new(0),
+        }
     }
 
     fn set(&self, value: Result<ActiveJob, String>) {
-        *self.0.lock().expect("launchd state") = value;
+        *self.state.lock().expect("launchd state") = value;
     }
 }
 
@@ -2175,9 +2185,64 @@ impl LaunchdJob for FakeLaunchd {
         _uid: u32,
         _label: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<ActiveJob, String>> + Send + 'a>> {
-        let value = self.0.lock().expect("launchd state").clone();
+        self.job_reads.fetch_add(1, Ordering::SeqCst);
+        let value = self.state.lock().expect("launchd state").clone();
         Box::pin(async move { value })
     }
+
+    fn domain_environment<'a>(
+        &'a self,
+        _uid: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, String)>, String>> + Send + 'a>> {
+        self.domain_reads.fetch_add(1, Ordering::SeqCst);
+        let value = self
+            .state
+            .lock()
+            .expect("launchd state")
+            .clone()
+            .map(|job| job.domain_environment);
+        Box::pin(async move { value })
+    }
+}
+
+/// On macOS a recorded-`PATH` job reads only the launchd domain: asking for the
+/// job would derive the namespace, which creates the state and runtime roots.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_recorded_path_job_on_macos_reads_the_domain_and_never_the_job() {
+    let mut harness = Harness::new();
+    let fake = Arc::new(FakeLaunchd::new(Ok(ActiveJob {
+        domain: None,
+        loaded_default: None,
+        domain_environment: vec![("CLAUDE_CONFIG_DIR".to_owned(), "/manager/store".to_owned())],
+    })));
+    harness.context = harness
+        .context
+        .clone()
+        .with_launchd_job(Arc::clone(&fake) as Arc<dyn LaunchdJob>);
+    let config = crate::service::definition::config_with_search_path(
+        &harness.context,
+        Path::new("/opt/pohunek"),
+        crate::service::VERSION,
+        pohunek_platform::shell_env::SearchPath::new(vec![std::path::PathBuf::from("/usr/bin")])
+            .expect("a trusted directory"),
+    )
+    .expect("the recorded configuration");
+
+    let job = crate::service::engine::job_path(&harness.context, &config, None)
+        .await
+        .expect("the recorded PATH judges");
+
+    assert_eq!(
+        fake.job_reads.load(Ordering::SeqCst),
+        0,
+        "the job is never asked for"
+    );
+    assert_eq!(fake.domain_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        job.variables.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+        Some("/manager/store")
+    );
 }
 
 /// A loaded job whose `default environment` sets `PATH` to `default`.

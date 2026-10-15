@@ -114,6 +114,20 @@ pub async fn job_path_sources(
     resolve(&launchctl, &format!("gui/{uid}"), label).await
 }
 
+/// Reads the variables of the user domain `gui/<uid>`, `PATH` included, without
+/// naming any job. A domain with no GUI session has none.
+///
+/// # Errors
+///
+/// Returns the errors of [`job_path_sources`] for the domain's own `launchctl print`.
+pub async fn domain_environment_of(
+    uid: u32,
+    deadline: Duration,
+) -> Result<Vec<(String, String)>, Error> {
+    let launchctl = Launchctl::new(deadline).with_output_cap(PRINT_OUTPUT_CAP);
+    domain_environment(&launchctl, &format!("gui/{uid}")).await
+}
+
 /// [`job_path_sources`] through the given runner, so tests can answer for launchd.
 pub(crate) async fn resolve(
     launchctl: &Launchctl,
