@@ -3780,6 +3780,15 @@ Connection APIs:
   current provider policy.
 - `Client::connect_with_registry(host, socket_path, registry)`: the same routing
   with a caller-supplied registry; ambiguous names fail closed.
+- `names_this_machine(host, connect_timeout)` and `names_this_machine_in(host,
+  connect_timeout, &registry)`: whether a host name is this machine's own
+  overlay identity, resolved with `OverlayRegistry::resolve_target`. A
+  provider's `resolve_selector` matches its own identity at the same steps as
+  a peer's, so a name both carry is `overlay_host_ambiguous`. `local`, an
+  unknown name, an unavailable provider, and a `@<port>` route answer `false`.
+  `Client::connect` itself still treats only `""` and `"local"` as local; the
+  CLI applies this check before it connects (see `docs/cli.md`, host
+  resolution).
 - `Client::connect_local(socket_path)`: direct Unix socket.
 - `Client::connect_trusted_tcp_addr(host, addr)`: direct TCP for a route already
   validated by configured overlay discovery, with host context preserved for

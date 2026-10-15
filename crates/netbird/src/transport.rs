@@ -4,8 +4,9 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use overlay::{
-    BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, OverlayError,
-    OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, ResolvedPeer,
+    BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, LocalIdentity,
+    OverlayError, OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, ResolvedPeer,
+    ResolvedSelector,
 };
 
 use crate::{NetbirdError, NetbirdStatus, Peer};
@@ -80,6 +81,20 @@ impl OverlayTransport for NetbirdTransport {
             Ok(discover_from_status(&status))
         })
     }
+
+    fn resolve_selector<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedSelector> {
+        Box::pin(async move {
+            let status = load_status(self.id()).await?;
+            selector_from_status(&status, host, self.id())
+        })
+    }
+
+    fn local_identity(&self) -> OverlayFuture<'_, Option<LocalIdentity>> {
+        Box::pin(async move {
+            let status = load_status(self.id()).await?;
+            Ok(local_identity_from_status(&status, self.id()))
+        })
+    }
 }
 
 /// Build the production registry from fail-fast `NetBird` configuration.
@@ -140,6 +155,29 @@ fn resolve_from_status(
 ) -> Result<ResolvedPeer, OverlayError> {
     let peer = crate::host::resolve_peer(status, host).map_err(|error| map_error(error, id))?;
     Ok(resolved_peer(peer))
+}
+
+fn selector_from_status(
+    status: &NetbirdStatus,
+    host: &str,
+    id: &OverlayId,
+) -> Result<ResolvedSelector, OverlayError> {
+    match crate::host::resolve_selector(status, host).map_err(|error| map_error(error, id))? {
+        crate::host::Selected::LocalHost => Ok(ResolvedSelector::LocalHost),
+        crate::host::Selected::Peer(peer) => Ok(ResolvedSelector::Peer(resolved_peer(peer))),
+    }
+}
+
+/// This machine's identity from its own status: the root fqdn and the
+/// `NetBird` IP, never the OS hostname.
+fn local_identity_from_status(status: &NetbirdStatus, id: &OverlayId) -> Option<LocalIdentity> {
+    let fqdn = status.self_fqdn().map(str::to_owned);
+    let address = status.self_netbird_ip();
+    (fqdn.is_some() || address.is_some()).then(|| LocalIdentity {
+        overlay: id.clone(),
+        fqdn,
+        address,
+    })
 }
 
 fn resolve_identity_from_status(

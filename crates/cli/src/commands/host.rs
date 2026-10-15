@@ -31,9 +31,25 @@ pub(crate) async fn run_discover(refresh: bool, json: bool) -> Result<(), CliErr
     if json {
         print!("{}", crate::commands::render_json(&records)?);
     } else {
-        print!("{}", render_records_human(&records));
+        print!(
+            "{}",
+            render_records_human(&local_identities().await, &records)
+        );
     }
     Ok(())
+}
+
+/// This machine's identity on each configured overlay that reports one; empty
+/// when no overlay is configured or none answers within the client's connect
+/// timeout, so a stuck overlay CLI never withholds the discovered records.
+async fn local_identities() -> Vec<pohunek_client::LocalIdentity> {
+    let Ok(registry) = pohunek_client::default_overlay_registry() else {
+        return Vec::new();
+    };
+    let deadline = pohunek_client::ClientOptions::default().connect_timeout;
+    tokio::time::timeout(deadline, registry.local_identities())
+        .await
+        .unwrap_or_default()
 }
 
 /// Run `host list`: the same discovery core as `discover`, emphasizing the
@@ -97,9 +113,15 @@ pub(crate) async fn run_governance_inspect(
     Ok(())
 }
 
-/// Render the discovered hosts as an aligned table.
-fn render_records_human(records: &[HostRecord]) -> String {
-    let name_of = |r: &HostRecord| r.name.clone().unwrap_or_else(|| "-".to_owned());
+/// Status label of this machine's own row.
+const LOCAL_STATUS: &str = "local";
+
+/// Render this machine and the discovered hosts as an aligned table.
+///
+/// This machine comes first, one row per overlay that reports it, named by its
+/// own overlay name and routed as `local`: that name selects the local daemon in
+/// `--host` on this machine and over the overlay from every peer.
+fn render_records_human(local: &[pohunek_client::LocalIdentity], records: &[HostRecord]) -> String {
     let route_of = |record: &HostRecord| {
         let identity = record
             .peer_id
@@ -124,17 +146,47 @@ fn render_records_human(records: &[HostRecord]) -> String {
             })
             .unwrap_or_else(|| "-".to_owned())
     };
+    let local_name = |identity: &pohunek_client::LocalIdentity| {
+        identity
+            .fqdn
+            .as_deref()
+            .and_then(|fqdn| fqdn.split('.').next())
+            .filter(|label| !label.is_empty())
+            .map(str::to_owned)
+            .or_else(|| identity.address.map(|address| address.to_string()))
+            .unwrap_or_else(|| "-".to_owned())
+    };
+    let rows = local
+        .iter()
+        .map(|identity| {
+            [
+                local_name(identity),
+                crate::target::LOCAL_HOST.to_owned(),
+                LOCAL_STATUS.to_owned(),
+                "-".to_owned(),
+            ]
+        })
+        .chain(records.iter().map(|record| {
+            let (status, version) = class_columns(&record.class);
+            [
+                record.name.clone().unwrap_or_else(|| "-".to_owned()),
+                route_of(record),
+                status.to_owned(),
+                version,
+            ]
+        }))
+        .collect::<Vec<_>>();
     let route_header = "ROUTE";
 
-    let name_width = records
+    let name_width = rows
         .iter()
-        .map(|r| name_of(r).len())
+        .map(|row| row[0].len())
         .max()
         .unwrap_or(0)
         .max("NAME".len());
-    let route_width = records
+    let route_width = rows
         .iter()
-        .map(|record| route_of(record).len())
+        .map(|row| row[1].len())
         .max()
         .unwrap_or(0)
         .max(route_header.len());
@@ -145,13 +197,10 @@ fn render_records_human(records: &[HostRecord]) -> String {
         "{:<name_width$}  {:<route_width$}  STATUS         VERSION",
         "NAME", route_header,
     );
-    for r in records {
-        let (status, version) = class_columns(&r.class);
+    for [name, route, status, version] in rows {
         let _ = writeln!(
             output,
-            "{:<name_width$}  {:<route_width$}  {status:<13}  {version}",
-            name_of(r),
-            route_of(r),
+            "{name:<name_width$}  {route:<route_width$}  {status:<13}  {version}",
         );
     }
     output
@@ -443,7 +492,7 @@ mod tests {
                 class: HostClass::Candidate,
             },
         ];
-        let output = render_records_human(&records);
+        let output = render_records_human(&[], &records);
         let header = output.lines().next().expect("header");
         for column in ["NAME", "ROUTE", "STATUS", "VERSION"] {
             assert!(header.contains(column), "header missing {column}: {header}");

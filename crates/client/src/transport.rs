@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{SinkExt, StreamExt};
-use overlay::OverlayRegistry;
+use overlay::{HostTarget, OverlayRegistry, RegistryError};
 use protocol::compat::{self, CompatError};
 use protocol::{
     AttachHeader, DoctorReport, Event, HostGovernanceStatus, Method, ProtocolError,
@@ -1492,6 +1492,56 @@ async fn connect_tcp(
 #[must_use]
 pub fn is_local_host(host: &str) -> bool {
     host.is_empty() || host == LOCAL_HOST
+}
+
+/// Return whether `host` names this machine by its own overlay identity.
+///
+/// Literal `local` and empty names answer `false` here without consulting any
+/// overlay; [`is_local_host`] covers them. A route with an explicit `@port`
+/// always selects TCP. A name that resolves to no peer but to this machine on
+/// one or more overlays is this machine. A name that names this machine and a
+/// peer is the typed ambiguous-host error. An unknown name, an unavailable
+/// provider, or a missing overlay configuration answers `false`, so the
+/// connection that follows reports what it reports today.
+///
+/// # Errors
+///
+/// Returns [`ClientError`] for an ambiguous selector and for an invalid route.
+pub async fn names_this_machine(
+    host: &str,
+    connect_timeout: Duration,
+) -> Result<bool, ClientError> {
+    if is_local_host(host) {
+        return Ok(false);
+    }
+    let Ok(registry) = crate::default_overlay_registry() else {
+        return Ok(false);
+    };
+    names_this_machine_in(host, connect_timeout, &registry).await
+}
+
+/// [`names_this_machine`] through an explicit overlay registry.
+///
+/// # Errors
+///
+/// Returns [`ClientError`] for an ambiguous selector and for an invalid route.
+pub async fn names_this_machine_in(
+    host: &str,
+    connect_timeout: Duration,
+    registry: &OverlayRegistry,
+) -> Result<bool, ClientError> {
+    if is_local_host(host) {
+        return Ok(false);
+    }
+    let target = RemoteTarget::parse(host)?;
+    if target.port.is_some() {
+        return Ok(false);
+    }
+    match tokio::time::timeout(connect_timeout, registry.resolve_target(target.selector)).await {
+        Ok(Ok(HostTarget::Local)) => Ok(true),
+        Ok(Err(error @ RegistryError::AmbiguousHost { .. })) => Err(ClientError::from(error)),
+        Ok(Ok(HostTarget::Remote(_)) | Err(_)) | Err(_) => Ok(false),
+    }
 }
 
 async fn resolve_remote_addr(

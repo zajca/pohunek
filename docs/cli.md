@@ -18,6 +18,33 @@ session targets and URLs. The selector is decoded and re-resolved through
 current provider state before every new connection while the discovered daemon
 port is retained.
 
+A host name resolves in this order:
+
+1. `local` or an empty name: this machine's daemon, with no overlay lookup.
+2. This machine's own overlay identity, which the overlay client reports in its
+   own status (for `NetBird`, the root `fqdn` and `netbirdIp`; never the OS
+   hostname). It matches by exact fqdn, own overlay IP, or short name (first
+   DNS label), and `<overlay>:<name>` matches on that overlay only. Such a name
+   selects the local daemon exactly like `local`: the same socket, no mesh
+   dial, and local behaviour in every command, so one host name works on the
+   machine itself and from its peers. A short name that this machine and a
+   peer both carry is `overlay_host_ambiguous`, never a silent choice. A
+   `@<port>` route and a typed `peer~` or `fqdn~` selector always name a peer.
+3. A peer of a configured overlay, dialed over its route.
+4. Anything else: `host_unknown`. When the overlay status cannot be read, steps
+   2 and 3 are skipped and the error is the one the connection reports.
+
+Only the hosts a command selects are resolved: each target's host, a
+positional host such as `host inspect <host>`, and `--host` where the command
+reads it. A `--host` that the command ignores, or that an explicit
+`<host>/<session-id>` overrides, is never looked up, so it cannot fail the
+command.
+
+`pohunek host list` and `host discover` show this machine first, named by its
+own overlay name, with route and status `local`. When the overlay status does
+not answer within the 5 s connect timeout, that row is left out and the
+discovered records still print. The `--json` records list peers only.
+
 | Command | What it does |
 |---|---|
 | `pohunek doctor` | Environment health: binaries, socket, state dirs, NetBird, agents. |

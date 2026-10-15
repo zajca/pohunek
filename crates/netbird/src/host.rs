@@ -40,69 +40,116 @@ pub(crate) fn resolve_peer<'a>(
     status: &'a NetbirdStatus,
     name: &str,
 ) -> Result<&'a crate::Peer, NetbirdError> {
+    match resolve_staged(status, name, None)? {
+        Selected::Peer(peer) => Ok(peer),
+        Selected::LocalHost => unreachable!("no own identity is matched without one"),
+    }
+}
+
+/// What a selector names in one status snapshot.
+#[derive(Debug)]
+pub(crate) enum Selected<'a> {
+    /// This machine itself.
+    LocalHost,
+    /// One current peer.
+    Peer(&'a crate::Peer),
+}
+
+/// Resolve `name` against this machine's own identity and its peers.
+///
+/// The own `NetBird` IP, fqdn and short hostname are matched at the same steps
+/// as a peer's (see [`resolve_host`]), so a name that this machine and a peer
+/// both carry at one step is ambiguous, never a silent choice.
+///
+/// # Errors
+///
+/// Returns [`NetbirdError::HostAmbiguous`] for such a collision and
+/// [`NetbirdError::HostUnknown`] when nothing matches.
+pub(crate) fn resolve_selector<'a>(
+    status: &'a NetbirdStatus,
+    name: &str,
+) -> Result<Selected<'a>, NetbirdError> {
+    let own = OwnIdentity {
+        address: status.self_netbird_ip(),
+        fqdn: status.self_fqdn(),
+    };
+    resolve_staged(status, name, Some(own))
+}
+
+/// One matching step: whether a peer matches, and whether this machine does.
+type Stage<'f> = (&'f dyn Fn(&crate::Peer) -> bool, bool);
+
+/// This machine's identity as its own status reports it.
+#[derive(Debug, Clone, Copy)]
+struct OwnIdentity<'a> {
+    address: Option<IpAddr>,
+    fqdn: Option<&'a str>,
+}
+
+fn resolve_staged<'a>(
+    status: &'a NetbirdStatus,
+    name: &str,
+    own: Option<OwnIdentity<'_>>,
+) -> Result<Selected<'a>, NetbirdError> {
     let needle = name.trim();
+    let needle_ip = needle
+        .parse::<IpAddr>()
+        .ok()
+        .filter(|ip| is_netbird_ip(*ip));
+    let own_address = own.and_then(|own| own.address);
+    let own_fqdn = own.and_then(|own| own.fqdn);
 
     // 1. Public keys are provider identities and remain stable across IP changes.
-    if let Some(peer) = unique_peer(
-        status
-            .peers()
-            .iter()
-            .filter(|peer| peer.peer_id() == Some(needle)),
-        name,
-    )? {
-        return Ok(peer);
-    }
-
-    // 2. A raw NetBird IP is accepted only when current peer state contains it.
-    if let Ok(ip) = needle.parse::<IpAddr>() {
-        if is_netbird_ip(ip) {
-            if let Some(peer) = unique_peer(
-                status.peers().iter().filter(|peer| peer.ip() == Some(ip)),
-                name,
-            )? {
-                return Ok(peer);
-            }
-        }
-    }
-
+    let by_peer_id = |peer: &crate::Peer| peer.peer_id() == Some(needle);
+    // 2. A raw NetBird IP is accepted only when current state contains it.
+    let by_ip = |peer: &crate::Peer| needle_ip.is_some() && peer.ip() == needle_ip;
     // 3. Exact fqdn match.
-    if let Some(peer) = unique_peer(
-        status.peers().iter().filter(|peer| {
-            peer.fqdn
-                .as_deref()
-                .is_some_and(|fqdn| fqdn.eq_ignore_ascii_case(needle))
-        }),
-        name,
-    )? {
-        return Ok(peer);
-    }
-
+    let by_fqdn = |peer: &crate::Peer| {
+        peer.fqdn
+            .as_deref()
+            .is_some_and(|fqdn| fqdn.eq_ignore_ascii_case(needle))
+    };
     // 4. Short hostname (first DNS label) match.
-    if let Some(peer) = unique_peer(
-        status.peers().iter().filter(|peer| {
-            peer.fqdn
-                .as_deref()
-                .and_then(short_hostname)
-                .is_some_and(|short| short.eq_ignore_ascii_case(needle))
-        }),
-        name,
-    )? {
-        return Ok(peer);
-    }
-
+    let by_short = |peer: &crate::Peer| {
+        peer.fqdn
+            .as_deref()
+            .and_then(short_hostname)
+            .is_some_and(|short| short.eq_ignore_ascii_case(needle))
+    };
     // 5. Literal IP string equal to a peer's netbirdIp (e.g. a CIDR-bearing
     //    peer string the caller pasted verbatim is normalized by `Peer::ip`).
-    if let Some(peer) = unique_peer(
-        status.peers().iter().filter(|peer| {
-            peer.netbird_ip
-                .as_deref()
-                .is_some_and(|raw| raw.eq_ignore_ascii_case(needle))
-        }),
-        name,
-    )? {
-        return Ok(peer);
+    let by_raw_ip = |peer: &crate::Peer| {
+        peer.netbird_ip
+            .as_deref()
+            .is_some_and(|raw| raw.eq_ignore_ascii_case(needle))
+    };
+    let stages: [Stage<'_>; 5] = [
+        (&by_peer_id, false),
+        (&by_ip, needle_ip.is_some() && own_address == needle_ip),
+        (
+            &by_fqdn,
+            own_fqdn.is_some_and(|fqdn| fqdn.eq_ignore_ascii_case(needle)),
+        ),
+        (
+            &by_short,
+            own_fqdn
+                .and_then(short_hostname)
+                .is_some_and(|short| short.eq_ignore_ascii_case(needle)),
+        ),
+        (&by_raw_ip, false),
+    ];
+    for (matches_peer, matches_own) in stages {
+        let peer = unique_peer(
+            status.peers().iter().filter(|peer| matches_peer(peer)),
+            name,
+        )?;
+        match (peer, matches_own) {
+            (Some(_), true) => return Err(NetbirdError::HostAmbiguous(name.to_owned())),
+            (Some(peer), false) => return Ok(Selected::Peer(peer)),
+            (None, true) => return Ok(Selected::LocalHost),
+            (None, false) => {}
+        }
     }
-
     Err(NetbirdError::HostUnknown(name.to_owned()))
 }
 
