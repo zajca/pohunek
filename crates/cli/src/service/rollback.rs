@@ -125,6 +125,7 @@ async fn legacy_report(
         unmanaged_workers: Vec::new(),
         stopped_sessions: Vec::new(),
         runtimes: None,
+        profile_warnings: Vec::new(),
     })
 }
 

@@ -167,6 +167,8 @@ struct Bind {
     name: String,
     base: RuntimeId,
     digest: PackageDigest,
+    /// The profile text with its package pin, as the apply writes it.
+    text: String,
 }
 
 /// The official runtimes the host uses, with the reasons, in id order.
@@ -327,6 +329,19 @@ pub struct OfficialPlan {
     /// The definitions the planned packages serve, verified exactly as an apply
     /// verifies them.
     pub definitions: Vec<RuntimeDefinition>,
+    /// The host profiles the apply rewrites, with the text it writes for each.
+    pub profiles: Vec<PlannedProfile>,
+}
+
+/// A host profile the apply rewrites with its package pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedProfile {
+    /// Profile name.
+    pub name: String,
+    /// The runtime the profile is based on, which the planned packages serve.
+    pub base: RuntimeId,
+    /// The profile file text after the pin is applied.
+    pub text: String,
 }
 
 /// Computes the plan without changing anything, whatever `inputs.dry_run` says.
@@ -359,9 +374,19 @@ fn plan_with(inputs: &EnsureInputs, detect: bool) -> Result<OfficialPlan, Ensure
         .iter()
         .map(|plan| plan.definition.clone())
         .collect();
+    let profiles = computed
+        .binds
+        .iter()
+        .map(|bind| PlannedProfile {
+            name: bind.name.clone(),
+            base: bind.base.clone(),
+            text: bind.text.clone(),
+        })
+        .collect();
     Ok(OfficialPlan {
         report: computed.dry_report(true),
         definitions,
+        profiles,
     })
 }
 
@@ -1576,6 +1601,7 @@ fn plan_binds(
             name: profile.name.clone(),
             base: profile.base.clone(),
             digest: entry.digest.clone(),
+            text: rewritten,
         });
     }
     Ok(binds)

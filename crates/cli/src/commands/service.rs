@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use clap::{Subcommand, ValueHint};
 use pohunek_service_config::preflight::{
-    PreflightReport, SessionVerdict, StoreState, Verdict, MAX_PROBE_BUDGET_SECS,
+    PreflightReport, ProfileWarning, SessionVerdict, StoreState, Verdict, MAX_PROBE_BUDGET_SECS,
     MIN_PROBE_BUDGET_SECS, PROBE_BUDGET,
 };
 use pohunek_service_config::runtimes::{CatalogStatus, EnsureReport, PackageStatus};
@@ -363,6 +363,27 @@ fn render_preflight(text: &mut String, preflight: &PreflightReport, accepted_run
         &preflight.stopped_sessions,
         accepted_runtime_loss,
     );
+    render_profile_warnings(text, &preflight.profile_warnings);
+}
+
+/// Appends the count line of the host profiles that load with a reduced
+/// guarantee and one line per profile. Warnings never block the upgrade.
+fn render_profile_warnings(text: &mut String, warnings: &[ProfileWarning]) {
+    if warnings.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        text,
+        "profiles   {} with a warning, not blocking the upgrade",
+        warnings.len()
+    );
+    for warning in warnings {
+        let _ = writeln!(
+            text,
+            "  {}: [{}] {}",
+            warning.profile, warning.code, warning.detail
+        );
+    }
 }
 
 /// Appends the count line of `sessions` and one line per session.
@@ -1132,6 +1153,7 @@ mod tests {
                 session("s-stopped-b", Verdict::WouldNotBeAdopted),
             ],
             unmanaged_workers: Vec::new(),
+            profile_warnings: Vec::new(),
             runtimes: Some(EnsureReport {
                 report_version: ENSURE_REPORT_VERSION,
                 daemon_version: "1.0.0".to_owned(),
@@ -1163,7 +1185,12 @@ mod tests {
 
     #[test]
     fn check_renders_the_runtime_plan_and_every_stopped_session() {
-        let preflight = runtime_plan_preflight();
+        let mut preflight = runtime_plan_preflight();
+        preflight.profile_warnings = vec![ProfileWarning {
+            profile: "claude-norule".to_owned(),
+            code: "profile_without_screen_readiness".to_owned(),
+            detail: "profile claude-norule with manifest norule: the fix".to_owned(),
+        }];
         let text = render_check(&report::CheckReport {
             operation: "upgrade",
             version: "1.0.0".to_owned(),
@@ -1201,6 +1228,13 @@ mod tests {
         );
         assert!(
             text.contains("  s-stopped-a: would_lose_recovery"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "profiles   1 with a warning, not blocking the upgrade\n  claude-norule: \
+                 [profile_without_screen_readiness] profile claude-norule with manifest norule: the fix\n"
+            ),
             "{text}"
         );
     }

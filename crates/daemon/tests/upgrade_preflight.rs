@@ -28,9 +28,10 @@ use pohunek_daemon::store::STORE_SCHEMA_VERSION;
 use pohunek_service_config::preflight::{
     PreflightReport, StoreState, Verdict, CODE_ADOPTABLE, CODE_GENERATION_MISSING,
     CODE_JOURNAL_MISSING, CODE_JOURNAL_SCHEMA_UNSUPPORTED, CODE_NO_SESSION_RECORD,
-    CODE_PROTOCOL_INCOMPATIBLE, CODE_RECORD_UNREADABLE, CODE_RECOVERY_UNMAPPABLE,
-    CODE_RESUME_RECORD_UNREADABLE, CODE_RUNTIME_IDENTITY_MISMATCH, CODE_RUNTIME_SOURCE_NOT_SERVED,
-    CODE_STORE_UNUSABLE, CODE_WORKER_ENDED, CODE_WORKER_NOT_RUNNING, REPORT_VERSION,
+    CODE_PROFILE_WITHOUT_SCREEN_READINESS, CODE_PROTOCOL_INCOMPATIBLE, CODE_RECORD_UNREADABLE,
+    CODE_RECOVERY_UNMAPPABLE, CODE_RESUME_RECORD_UNREADABLE, CODE_RUNTIME_IDENTITY_MISMATCH,
+    CODE_RUNTIME_SOURCE_NOT_SERVED, CODE_STORE_UNUSABLE, CODE_WORKER_ENDED,
+    CODE_WORKER_NOT_RUNNING, REPORT_VERSION,
 };
 use pohunek_service_config::preflight::{
     CODE_PROBE_BUDGET_EXHAUSTED, PREFLIGHT_TIMEOUT, PROBE_BUDGET, RELEASE_PLAN_FLAG,
@@ -1475,6 +1476,27 @@ fn write_profile(dir: &Path, name: &str, base: &str) {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure the profile");
 }
 
+/// An override manifest with an idle rule on the prompt box, which keeps the
+/// screen readiness of the Claude package.
+const CLAUDE_IDLE_RULE_MANIFEST: &str = "[[rules]]\n\
+     id = \"custom_prompt_box\"\n\
+     state = \"idle\"\n\
+     priority = 950\n\
+     region = \"prompt_box_body\"\n\
+     line_regex = ['^\\s*\u{276f}']\n";
+
+/// Writes one host profile over `base` whose detection-manifest override is
+/// `manifests/<manifest>.toml`, as the owner keeps it.
+fn write_override_profile(dir: &Path, name: &str, base: &str, manifest: &str) {
+    let path = dir.join(format!("{name}.toml"));
+    fs::write(
+        &path,
+        format!("base = \"{base}\"\nmanifest = \"{manifest}\"\n"),
+    )
+    .expect("write the profile");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure the profile");
+}
+
 /// A `0700` directory, created with its parents.
 fn private_dir(path: PathBuf) -> PathBuf {
     fs::DirBuilder::new()
@@ -1589,6 +1611,172 @@ fn a_0_34_2_host_with_built_in_sessions_is_adoptable_through_the_release_plan() 
             .join("plugins")
             .exists(),
         "no package store appears"
+    );
+}
+
+#[test]
+fn a_profile_whose_override_lacks_screen_readiness_is_warned_before_the_upgrade() {
+    let host = Host::new();
+    let catalog = official_runtimes::OfficialCatalog::new();
+    let release = host.env.root().join("release").join("runtime");
+    catalog.write_release(&release, &["claude"]);
+    let profiles = private_dir(host.env.config_home().join("pohunek").join("agents"));
+    let manifests = private_dir(profiles.join("manifests"));
+    fs::write(manifests.join("norule.toml"), "rules = []\n").expect("write the manifest");
+    fs::write(manifests.join("withrule.toml"), CLAUDE_IDLE_RULE_MANIFEST)
+        .expect("write the manifest with an idle rule");
+    write_override_profile(&profiles, "claude-norule", "claude", "norule");
+    write_override_profile(&profiles, "claude-withrule", "claude", "withrule");
+    write_profile(&profiles, "claude-plain", "claude");
+    host.write_store(&[built_in_line("claude", "s-1", "w-one")]);
+    host.write_journal("s-1", "w-one", &journal("s-1", "w-one"));
+
+    let report = run_with(
+        &host.inputs(),
+        &release_options(&host, &release, &catalog, &profiles),
+        &HostInspector::new(),
+    );
+
+    assert_eq!(
+        verdict_of(&report, "s-1"),
+        (&Verdict::Adoptable, CODE_ADOPTABLE),
+        "{:?}",
+        report.sessions
+    );
+    assert_eq!(report.at_risk().count(), 0, "{report:?}");
+    let plan = report.runtimes.as_ref().expect("the release plan");
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    let warned: Vec<(&str, &str)> = report
+        .profile_warnings
+        .iter()
+        .map(|warning| (warning.profile.as_str(), warning.code.as_str()))
+        .collect();
+    assert_eq!(
+        warned,
+        [("claude-norule", CODE_PROFILE_WITHOUT_SCREEN_READINESS)],
+        "{:?}",
+        report.profile_warnings
+    );
+    let detail = &report.profile_warnings[0].detail;
+    assert!(
+        detail.contains("claude-norule") && detail.contains("norule"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn a_profile_pinned_to_a_planned_digest_is_warned_before_its_package_is_installed() {
+    // The profile already names the digest the release plan installs, and no
+    // package is installed yet, so the plan leaves the profile as it is.
+    let host = Host::new();
+    let catalog = official_runtimes::OfficialCatalog::new();
+    let release = host.env.root().join("release").join("runtime");
+    catalog.write_release(&release, &["claude"]);
+    let profiles = private_dir(host.env.config_home().join("pohunek").join("agents"));
+    let manifests = private_dir(profiles.join("manifests"));
+    fs::write(manifests.join("norule.toml"), "rules = []\n").expect("write the manifest");
+    let path = profiles.join("claude-pinned.toml");
+    fs::write(
+        &path,
+        format!(
+            "base = \"claude\"\n{}manifest = \"norule\"\n",
+            official_runtimes::profile_pin("claude")
+        ),
+    )
+    .expect("write the pinned profile");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure the profile");
+    // The package store exists but does not hold the planned digest yet.
+    let plugins = host.env.state_home().join("pohunek").join("plugins");
+    private_dir(host.env.state_home().join("pohunek").join("plugins"));
+    PackageStore::open(&plugins).expect("the plugin root opens");
+    // A pin to a digest neither installed nor planned resolves nowhere, so it
+    // stays out of the warnings.
+    let unplanned = format!(
+        "base = \"claude\"\n{}manifest = \"norule\"\n",
+        official_runtimes::profile_pin("claude").replace(
+            &official_runtimes::profile_pin("claude")
+                .lines()
+                .find(|line| line.starts_with("digest"))
+                .expect("the pin has a digest")
+                .to_owned(),
+            &format!("digest = \"sha256:{}\"", "00".repeat(32)),
+        )
+    );
+    fs::write(profiles.join("claude-unplanned.toml"), unplanned).expect("write the unplanned pin");
+    fs::set_permissions(
+        profiles.join("claude-unplanned.toml"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("secure the profile");
+    host.write_store(&[built_in_line("claude", "s-1", "w-one")]);
+    host.write_journal("s-1", "w-one", &journal("s-1", "w-one"));
+
+    let report = run_with(
+        &host.inputs(),
+        &release_options(&host, &release, &catalog, &profiles),
+        &HostInspector::new(),
+    );
+
+    let plan = report.runtimes.as_ref().expect("the release plan");
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert!(
+        plan.profiles.is_empty(),
+        "the plan leaves the pinned profile: {:?}",
+        plan.profiles
+    );
+    let warned: Vec<(&str, &str)> = report
+        .profile_warnings
+        .iter()
+        .map(|warning| (warning.profile.as_str(), warning.code.as_str()))
+        .collect();
+    assert_eq!(
+        warned,
+        [("claude-pinned", CODE_PROFILE_WITHOUT_SCREEN_READINESS)],
+        "{:?}",
+        report.profile_warnings
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_profile_whose_override_lacks_screen_readiness_is_warned_after_the_apply() {
+    // The apply has pinned the profiles already, so the preflight without a
+    // release plan judges them as they are on disk.
+    let host = Host::serving().await;
+    let profiles = private_dir(host.env.config_home().join("pohunek").join("agents"));
+    let manifests = private_dir(profiles.join("manifests"));
+    fs::write(manifests.join("norule.toml"), "rules = []\n").expect("write the manifest");
+    fs::write(manifests.join("withrule.toml"), CLAUDE_IDLE_RULE_MANIFEST)
+        .expect("write the manifest with an idle rule");
+    for (name, manifest) in [("claude-norule", "norule"), ("claude-withrule", "withrule")] {
+        let path = profiles.join(format!("{name}.toml"));
+        fs::write(
+            &path,
+            format!(
+                "base = \"claude\"\n{}manifest = \"{manifest}\"\n",
+                official_runtimes::profile_pin("claude")
+            ),
+        )
+        .expect("write the pinned profile");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure the profile");
+    }
+    let options = PreflightOptions {
+        profiles_dir: Some(profiles.clone()),
+        ..PreflightOptions::default()
+    };
+
+    let report = run_with(&host.inputs(), &options, &HostInspector::new());
+
+    assert!(report.runtimes.is_none(), "{:?}", report.runtimes);
+    let warned: Vec<(&str, &str)> = report
+        .profile_warnings
+        .iter()
+        .map(|warning| (warning.profile.as_str(), warning.code.as_str()))
+        .collect();
+    assert_eq!(
+        warned,
+        [("claude-norule", CODE_PROFILE_WITHOUT_SCREEN_READINESS)],
+        "{:?}",
+        report.profile_warnings
     );
 }
 

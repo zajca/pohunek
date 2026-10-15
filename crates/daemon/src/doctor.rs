@@ -234,7 +234,8 @@ fn configured_profile_checks(
 
 /// Doctor detail of a profile whose override manifest cannot report the screen
 /// readiness its base runtime declares (`input.ready = "screen_idle"`).
-const PROFILE_WITHOUT_SCREEN_READINESS: &str = "The profile's override manifest has no idle rule on a screen region, so its sessions write the initial prompt once bracketed paste is on instead of waiting for the prompt to render, and the agent may drop it; add an idle rule on a screen region to the override, such as the package's live_prompt_box rule on prompt_box_body.";
+const PROFILE_WITHOUT_SCREEN_READINESS: &str =
+    pohunek_service_config::preflight::PROFILE_WITHOUT_SCREEN_READINESS_DETAIL;
 
 fn configured_profile_result(result: Result<(), RuntimeFailure>) -> (DoctorStatus, &'static str) {
     match result {
