@@ -19,7 +19,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use package::PackageDigest;
-use pohunek_service_config::preflight::{Verdict, CODE_RUNTIME_SOURCE_NOT_SERVED};
+use pohunek_service_config::preflight::{PreflightReport, Verdict, CODE_RUNTIME_SOURCE_NOT_SERVED};
 use pohunek_test_support::wait::wait_until;
 use protocol::{
     PackageBindProfileParams, PackageBindStatus, PackageErrorKind, PackageInstallStatus,
@@ -4262,6 +4262,18 @@ fn stopped_preflight_verdict_entered(
     id: &protocol::SessionId,
     entry: std::time::Instant,
 ) -> (Verdict, String) {
+    let (verdict, code, _detail) =
+        stopped_preflight_judgement_entered(fixture, store_path, id, entry);
+    (verdict, code)
+}
+
+/// The preflight report of the stopped sessions of `store_path` for a command
+/// that entered at `entry`, judged with the test registry's environment.
+fn stopped_preflight_report_entered(
+    fixture: &Fixture,
+    store_path: &Path,
+    entry: std::time::Instant,
+) -> PreflightReport {
     let report = crate::session::upgrade_preflight::run_with(
         &crate::session::upgrade_preflight::PreflightInputs {
             store_path: store_path.to_path_buf(),
@@ -4274,10 +4286,30 @@ fn stopped_preflight_verdict_entered(
             release: None,
             profiles_dir: Some(fixture.agents.clone()),
             host_state_dir: Some(fixture.dir.join("state")),
-            launch: Ok(crate::runtime::LaunchEnvironment::subprocess_default()),
+            // The environment the test registry launches under, so the judgement reads the
+            // same home and variables that resume does.
+            launch: Ok(crate::runtime::LaunchEnvironment::new(
+                pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST
+                    .iter()
+                    .map(|pattern| (*pattern).to_owned())
+                    .collect(),
+                crate::test_support::thread_environment_source(),
+            )),
         },
         &crate::procwatch::HostInspector::new(),
     );
+    report
+}
+
+/// The verdict, code and detail of the stopped session `id` for a command that
+/// entered at `entry`.
+fn stopped_preflight_judgement_entered(
+    fixture: &Fixture,
+    store_path: &Path,
+    id: &protocol::SessionId,
+    entry: std::time::Instant,
+) -> (Verdict, String, String) {
+    let report = stopped_preflight_report_entered(fixture, store_path, entry);
     let verdict = report
         .stopped_sessions
         .iter()
@@ -4288,7 +4320,11 @@ fn stopped_preflight_verdict_entered(
                 report.stopped_sessions
             )
         });
-    (verdict.verdict, verdict.code.clone())
+    (
+        verdict.verdict,
+        verdict.code.clone(),
+        verdict.detail.clone(),
+    )
 }
 
 #[tokio::test]
@@ -4348,6 +4384,326 @@ async fn a_stopped_session_whose_profile_changed_is_judged_as_resume_refuses_it(
         refused_resume_code(&restarted.registry, &session.id).await,
         code
     );
+}
+
+/// A stopped Claude session that the official package has adopted and that
+/// resumed through it once, so its launch pin names the package rather than
+/// the built-in runtime: the upgrade leaves its runtime source unchanged.
+async fn stopped_pinned_claude(tag: &str) -> StoppedClaude {
+    stopped_pinned_claude_with(tag, &real_official(RuntimeId::CLAUDE)).await
+}
+
+/// [`stopped_pinned_claude`] pinned to `package` instead of the official one.
+async fn stopped_pinned_claude_with(tag: &str, package: &Package) -> StoppedClaude {
+    let session = stopped_built_in_claude(tag).await;
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        package,
+        5,
+    )
+    .await;
+    bind_claude_profile(&session.fixture).await;
+    let restarted = restart(&session.fixture).await;
+    restarted
+        .registry
+        .resume_with(&session.id, crate::session::ProfileChange::Refuse)
+        .await
+        .expect("the first resume adopts and pins the package");
+    restarted
+        .registry
+        .stop(&session.id)
+        .await
+        .expect("stop the resumed session");
+    StoppedClaude {
+        fixture: restarted,
+        store_path: session.store_path,
+        id: session.id,
+    }
+}
+
+#[tokio::test]
+async fn a_stopped_session_whose_conversation_is_missing_is_judged_as_resume_refuses_it() {
+    let session = stopped_pinned_claude("preflight-missing-conversation").await;
+    let conversation = session
+        .fixture
+        .dir
+        .join("claude-home")
+        .join("projects")
+        .join("work")
+        .join(format!("{CONVERSATION}.jsonl"));
+    fs::remove_file(&conversation).expect("remove the conversation");
+
+    let (verdict, code) =
+        stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
+    let restarted = restart(&session.fixture).await;
+
+    assert_eq!(verdict, Verdict::AlreadyNotResumable);
+    assert_eq!(code, "agent_native_reference_missing");
+    assert_eq!(
+        refused_resume_code(&restarted.registry, &session.id).await,
+        code
+    );
+}
+
+#[tokio::test]
+async fn a_built_in_session_whose_conversation_is_missing_is_judged_lost_when_the_upgrade_adopts_it(
+) {
+    let session = stopped_built_in_claude("preflight-adopted-missing-conversation").await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &package,
+        5,
+    )
+    .await;
+    fs::remove_file(
+        session
+            .fixture
+            .dir
+            .join("claude-home")
+            .join("projects")
+            .join("work")
+            .join(format!("{CONVERSATION}.jsonl")),
+    )
+    .expect("remove the conversation");
+
+    let (verdict, code, detail) = stopped_preflight_judgement_entered(
+        &session.fixture,
+        &session.store_path,
+        &session.id,
+        std::time::Instant::now(),
+    );
+    let restarted = restart(&session.fixture).await;
+
+    // The store is the current schema, not a v0.34.x store, so the adopted check
+    // cannot be shown identical to the running release's.
+    assert_eq!(verdict, Verdict::WouldLoseRecovery, "{detail}");
+    assert!(detail.contains("oldest schema is current"), "{detail}");
+    assert_eq!(code, "agent_native_reference_missing");
+    assert_eq!(
+        refused_resume_code(&restarted.registry, &session.id).await,
+        code
+    );
+}
+
+/// Rewrites the schema of every record line of the store at `store_path` to
+/// `version`, as an older release would have written it. Records keep the
+/// current shape, which schema 5 shares: its migration to 6 changes nothing.
+fn relabel_store_schema(store_path: &Path, version: u32) {
+    let text = fs::read_to_string(store_path).expect("read the store");
+    let mut relabelled = String::new();
+    for line in text.lines() {
+        let mut value: serde_json::Value = serde_json::from_str(line).expect("a JSON record line");
+        if let Some(object) = value.as_object_mut() {
+            if object.contains_key("schema_version") {
+                object.insert("schema_version".to_owned(), serde_json::json!(version));
+            }
+        }
+        relabelled.push_str(&value.to_string());
+        relabelled.push('\n');
+    }
+    fs::write(store_path, relabelled).expect("write the store");
+}
+
+/// The official claude package with its descriptor edited by `edit`.
+fn real_official_claude_edited(edit: impl FnOnce(&str) -> String) -> Package {
+    let mut entries = crate::agent::host::fixture::official_package_entries(RuntimeId::CLAUDE);
+    let descriptor = String::from_utf8(entries[0].contents.clone()).expect("UTF-8 descriptor");
+    let edited = edit(&descriptor);
+    assert_ne!(edited, descriptor, "the edit changes the descriptor");
+    entries[0].contents = edited.into_bytes();
+    Package::from_entries(&entries)
+}
+
+#[tokio::test]
+async fn an_adopted_v034_claude_session_whose_conversation_is_missing_is_already_not_resumable() {
+    // A 0.34 store is schema 5, and the adopted official package declares the
+    // check v0.34.2 declared: the running release refuses the same reference.
+    let session = stopped_built_in_claude("preflight-adopted-v034-missing").await;
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &real_official(RuntimeId::CLAUDE),
+        5,
+    )
+    .await;
+    fs::remove_file(
+        session
+            .fixture
+            .dir
+            .join("claude-home")
+            .join("projects")
+            .join("work")
+            .join(format!("{CONVERSATION}.jsonl")),
+    )
+    .expect("remove the conversation");
+    relabel_store_schema(&session.store_path, 5);
+
+    let (verdict, code, detail) = stopped_preflight_judgement_entered(
+        &session.fixture,
+        &session.store_path,
+        &session.id,
+        std::time::Instant::now(),
+    );
+    // The daemon migrates the store at startup, after the upgrade's judgement.
+    crate::store::migrate_at_startup(&session.store_path).expect("migrate the v0.34 store");
+    let restarted = restart(&session.fixture).await;
+
+    assert_eq!(verdict, Verdict::AlreadyNotResumable, "{detail}");
+    assert_eq!(code, "agent_native_reference_missing");
+    assert_eq!(
+        refused_resume_code(&restarted.registry, &session.id).await,
+        code
+    );
+}
+
+#[tokio::test]
+async fn an_adopted_claude_session_from_a_store_that_is_not_v034_stays_would_lose_recovery() {
+    // The same adopted session, but the store is schema 6: the running release
+    // may check the reference differently, so the verdict cannot be precise.
+    let session = stopped_built_in_claude("preflight-adopted-schema-six").await;
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &real_official(RuntimeId::CLAUDE),
+        5,
+    )
+    .await;
+    fs::remove_file(
+        session
+            .fixture
+            .dir
+            .join("claude-home")
+            .join("projects")
+            .join("work")
+            .join(format!("{CONVERSATION}.jsonl")),
+    )
+    .expect("remove the conversation");
+    relabel_store_schema(&session.store_path, 6);
+
+    let (verdict, code, detail) = stopped_preflight_judgement_entered(
+        &session.fixture,
+        &session.store_path,
+        &session.id,
+        std::time::Instant::now(),
+    );
+
+    assert_eq!(verdict, Verdict::WouldLoseRecovery, "{detail}");
+    assert_eq!(code, "agent_native_reference_missing");
+    assert!(
+        detail.contains("oldest schema is 6, not 5"),
+        "the detail names the store: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn an_adopted_claude_package_that_changed_its_check_stays_would_lose_recovery() {
+    // The adopted package declares the existence check differently from the
+    // v0.34.2 golden, so the running release's check cannot be shown identical.
+    let session = stopped_built_in_claude("preflight-adopted-changed-check").await;
+    let changed = real_official_claude_edited(|descriptor| {
+        descriptor.replace("max_depth = 1", "max_depth = 2")
+    });
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &changed,
+        5,
+    )
+    .await;
+    fs::remove_file(
+        session
+            .fixture
+            .dir
+            .join("claude-home")
+            .join("projects")
+            .join("work")
+            .join(format!("{CONVERSATION}.jsonl")),
+    )
+    .expect("remove the conversation");
+    relabel_store_schema(&session.store_path, 5);
+
+    let (verdict, code, detail) = stopped_preflight_judgement_entered(
+        &session.fixture,
+        &session.store_path,
+        &session.id,
+        std::time::Instant::now(),
+    );
+
+    assert_eq!(verdict, Verdict::WouldLoseRecovery, "{detail}");
+    assert_eq!(code, "agent_native_reference_missing");
+    assert!(
+        detail.contains("differs from the v0.34.2 golden"),
+        "the detail names the golden: {detail}"
+    );
+}
+
+/// The v0.34.2 claude golden declares the native reference check the official
+/// claude package declares. The golden is the released v0.34.2 descriptor and
+/// never changes; if this fails, the package changed its check, the preflight
+/// judges adopted 0.34 references fail-closed, and the upgrade-source rule is
+/// what gets reviewed.
+#[test]
+fn the_v034_claude_golden_declares_the_official_claude_packages_check() {
+    let entries = crate::agent::host::fixture::official_package_entries(RuntimeId::CLAUDE);
+    let descriptor = std::str::from_utf8(&entries[0].contents).expect("UTF-8 descriptor");
+    let detect = std::str::from_utf8(&entries[1].contents).expect("UTF-8 manifest");
+    let official = crate::agent::host::RuntimeDefinition::from_toml(
+        descriptor,
+        |identity| crate::agent::host::DefinitionOrigin::Package {
+            package: identity,
+            digest: PackageDigest::parse(crate::agent::host::fixture::OFFICIAL_CLAUDE_DIGEST)
+                .expect("valid digest"),
+        },
+        |_name| {
+            crate::detect::Manifest::parse_str(detect)
+                .map(std::sync::Arc::new)
+                .ok()
+                .ok_or(crate::agent::host::DefinitionError::UnknownManifest)
+        },
+    )
+    .expect("the official claude descriptor parses");
+
+    assert_eq!(
+        upgrade_preflight::golden_check(RuntimeId::CLAUDE),
+        upgrade_preflight::GoldenCheck::Declared(official.hook_existence().cloned()),
+        "the official claude package changed its native reference existence check: the \
+         v0.34.2 golden declares another check, so the preflight judges adopted 0.34 \
+         references fail-closed; review the upgrade-source rule, not the golden"
+    );
+}
+
+#[tokio::test]
+async fn a_stopped_session_whose_conversation_exists_stays_adoptable_as_resume_accepts_it() {
+    let session = stopped_pinned_claude("preflight-present-conversation").await;
+
+    let (verdict, code) =
+        stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
+    let restarted = restart(&session.fixture).await;
+    let resumed = restarted
+        .registry
+        .resume_with(&session.id, crate::session::ProfileChange::Refuse)
+        .await
+        .expect("resume accepts the present conversation");
+
+    assert_eq!(verdict, Verdict::Adoptable);
+    assert_eq!(code, pohunek_service_config::preflight::CODE_ADOPTABLE);
+    assert_eq!(
+        resumed.runtime.as_ref().map(|runtime| runtime.state),
+        Some(protocol::RuntimeState::Live)
+    );
+    restarted
+        .registry
+        .remove(&session.id)
+        .await
+        .expect("remove the resumed session");
 }
 
 #[tokio::test]
@@ -4618,9 +4974,11 @@ fn spent_budget_entry() -> std::time::Instant {
 }
 
 #[tokio::test]
-async fn a_spent_probe_budget_still_adopts_a_runtime_without_a_probe_whose_executable_resolves() {
+async fn a_spent_probe_budget_leaves_a_missing_reference_unverified() {
     // The package declares no version probe, so resolving the executable is the
-    // whole check, and it spends none of the budget.
+    // whole check, and it spends none of the budget. The reference check itself
+    // is not run once the budget is spent, so the missing conversation is only
+    // unverified: resume refuses it, but the judgement cannot show that yet.
     const AGENT: &str = "agent-probeless-resolves";
     let session = stopped_probeless_claude("preflight-spent-budget-resolves", |fixture| {
         agent_directory(fixture, "probeless-directory", 0o755, AGENT)
@@ -4643,12 +5001,155 @@ async fn a_spent_probe_budget_still_adopts_a_runtime_without_a_probe_whose_execu
         .await
         .expect_err("resume stops at the native reference");
 
+    // Resume refuses the missing conversation with its own code, which the
+    // judgement does not report while the budget is spent.
+    assert_eq!(verdict, Verdict::WouldLoseRecovery);
+    assert_eq!(
+        code,
+        pohunek_service_config::preflight::CODE_REFERENCE_UNVERIFIED
+    );
+    assert_eq!(resumed.code, "agent_native_reference_missing");
+}
+
+/// The official Claude package with its native reference existence declared
+/// `check = "none"`: its recovery reads no store, so it has nothing to verify.
+fn real_unchecked_official_claude() -> Package {
+    let mut entries = crate::agent::host::fixture::official_package_entries(RuntimeId::CLAUDE);
+    let descriptor = String::from_utf8(entries[0].contents.clone()).expect("UTF-8 descriptor");
+    let mut lines: Vec<&str> = Vec::new();
+    let mut skipping = false;
+    for line in descriptor.lines() {
+        if line == "[native_reference.existence]" {
+            lines.push(line);
+            lines.push("check = \"none\"");
+            skipping = true;
+        } else if skipping && line.starts_with('[') {
+            skipping = false;
+            lines.push(line);
+        } else if !skipping {
+            lines.push(line);
+        }
+    }
+    entries[0].contents = format!("{}\n", lines.join("\n")).into_bytes();
+    Package::from_entries(&entries)
+}
+
+#[tokio::test]
+async fn a_spent_probe_budget_keeps_an_unchecked_reference_adoptable_as_resume_accepts_it() {
+    // A runtime that reads no store has nothing to verify, so the spent budget
+    // cannot make its reference unverified: resume accepts it, and so does the
+    // judgement.
+    let session = stopped_pinned_claude_with(
+        "preflight-spent-budget-unchecked",
+        &real_unchecked_official_claude(),
+    )
+    .await;
+
+    let (verdict, code) = stopped_preflight_verdict_entered(
+        &session.fixture,
+        &session.store_path,
+        &session.id,
+        spent_budget_entry(),
+    );
+    let restarted = restart(&session.fixture).await;
+    let resumed = restarted
+        .registry
+        .resume_with(&session.id, crate::session::ProfileChange::Refuse)
+        .await
+        .expect("resume accepts an unchecked reference");
+
     assert_eq!(verdict, Verdict::Adoptable);
     assert_eq!(code, pohunek_service_config::preflight::CODE_ADOPTABLE);
-    assert_ne!(
-        resumed.code, "agent_binary_missing",
-        "resume resolves the executable"
+    assert_eq!(
+        resumed.runtime.as_ref().map(|runtime| runtime.state),
+        Some(protocol::RuntimeState::Live)
     );
+    restarted
+        .registry
+        .remove(&session.id)
+        .await
+        .expect("remove the resumed session");
+}
+
+#[tokio::test]
+async fn a_spent_probe_budget_leaves_a_present_conversation_unverified_not_adoptable() {
+    // The conversation exists, so resume would accept it, but the budget is spent
+    // before its reference is checked. Only a checked reference may be adopted.
+    let session = stopped_pinned_claude("preflight-spent-budget-present").await;
+
+    let (verdict, code, detail) = stopped_preflight_judgement_entered(
+        &session.fixture,
+        &session.store_path,
+        &session.id,
+        spent_budget_entry(),
+    );
+
+    assert_eq!(verdict, Verdict::WouldLoseRecovery);
+    assert_eq!(
+        code,
+        pohunek_service_config::preflight::CODE_REFERENCE_UNVERIFIED
+    );
+    assert!(
+        detail.contains("1 stopped session(s) in this report are unverified")
+            && detail.contains("--preflight-budget"),
+        "the detail names the count and the setting: {detail}"
+    );
+}
+
+/// Adds `copies` stopped sessions to the store of `store_path`, each a copy of
+/// the lines naming `id` with its session identifier replaced. Returns their
+/// identifiers.
+fn duplicate_stopped_session(store_path: &Path, id: &str, copies: usize) -> Vec<String> {
+    let text = std::fs::read_to_string(store_path).expect("read the store");
+    let lines: Vec<&str> = text.lines().filter(|line| line.contains(id)).collect();
+    let mut appended = String::new();
+    let mut ids = Vec::new();
+    for copy in 1..=copies {
+        let copy_id = format!("{id}-copy{copy}");
+        for line in &lines {
+            appended.push_str(&line.replace(id, &copy_id));
+            appended.push('\n');
+        }
+        ids.push(copy_id);
+    }
+    std::fs::write(store_path, format!("{text}{appended}")).expect("write the store");
+    ids
+}
+
+#[tokio::test]
+async fn a_spent_budget_leaves_every_unverified_session_with_the_same_count() {
+    // Three stopped sessions over one store: none of their references is checked
+    // once the budget is spent, and each detail names the same count.
+    let session = stopped_pinned_claude("preflight-spent-budget-many").await;
+    let mut ids = duplicate_stopped_session(&session.store_path, &session.id.0, 2);
+    ids.push(session.id.0.clone());
+
+    let report = stopped_preflight_report_entered(
+        &session.fixture,
+        &session.store_path,
+        spent_budget_entry(),
+    );
+
+    for id in &ids {
+        let verdict = report
+            .stopped_sessions
+            .iter()
+            .find(|candidate| &candidate.session_id == id)
+            .unwrap_or_else(|| panic!("the stopped session {id} is judged"));
+        assert_eq!(verdict.verdict, Verdict::WouldLoseRecovery, "{id}");
+        assert_eq!(
+            verdict.code,
+            pohunek_service_config::preflight::CODE_REFERENCE_UNVERIFIED,
+            "{id}"
+        );
+        assert!(
+            verdict
+                .detail
+                .contains("3 stopped session(s) in this report are unverified"),
+            "{id}: {}",
+            verdict.detail
+        );
+    }
 }
 
 #[tokio::test]

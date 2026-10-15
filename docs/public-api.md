@@ -2228,12 +2228,12 @@ and prints one JSON document (`PreflightReport` in `crates/service-config`,
 `sessions` (per live session `session_id`, `verdict` `adoptable`,
 `would_lose_recovery` or `would_not_be_adopted`, a stable `code`, and a human
 `detail`, plus the owner-set `name` when there is one), `stopped_sessions` (the
-same verdicts for sessions whose runtime has ended but that keep native resume or
-fork; at risk under the same flag), `runtimes` (absent when the release carries no
+same verdicts, plus `already_not_resumable`, for sessions whose runtime has ended
+but that keep native resume or fork; at risk under the same flag), `runtimes` (absent when the release carries no
 `runtime/` tree; otherwise the `EnsureReport` of the release's official runtime
 plan with `packages`, `profiles`, `integrations` and `refusals`), and
 `unmanaged_workers` (ids of live worker journals the store has no record of; the
-running daemon does not manage them either, so they never refuse the upgrade). A session that is not `adoptable` fails the command with the CLI error
+running daemon does not manage them either, so they never refuse the upgrade). A session that is neither `adoptable` nor `already_not_resumable` fails the command with the CLI error
 code `service_upgrade_sessions_at_risk` unless `--accept-runtime-loss` is given;
 a `refused` store fails it with `service_upgrade_store_unusable` and a preflight
 that cannot run or be parsed with `service_upgrade_preflight_failed`, neither of
@@ -2264,7 +2264,23 @@ code (`agent_profile_missing`, `agent_profile_changed` or
 `agent_profile_revision_unavailable`), and a stopped session record the new
 binary cannot load is `would_lose_recovery` with `record_unreadable`. A session
 whose frozen program resume would not find is `would_lose_recovery` with
-`agent_binary_missing`; for a runtime that declares a version probe, the
+`agent_binary_missing`. A stopped session whose conversation is absent from its declared store
+(`agent_native_reference_missing`), or whose stored reference is malformed, is
+`already_not_resumable` with resume's code when the upgrade does not change the
+check, which then needs no flag. A relocated store (`agent_native_store_relocated`)
+or a store-condition refusal (`agent_native_reference_missing` from an unresolvable
+root, a scan limit or a changed store) is `would_lose_recovery` with resume's code,
+because the running release may detect it differently. A reported reference (one the runtime reports rather than the launch
+assigns) keeps its check across the upgrade only when the preflight can show it identical: a package pinned to the session's digest, which
+content addressing fixes, or a built-in that the upgrade adopts from a 0.34.0 to 0.34.2 store (store schema 5) whose adopted package declares
+the existence check of the v0.34.2 golden. Any other reported reference is `would_lose_recovery` with resume's code and a detail that names the
+reason: a built-in the upgrade does not adopt, an adopted package from a store that is not schema 5, or a package whose check differs from the
+golden. Hermes has no golden here, so its reported references are fail-closed too. A stopped session whose reference the preflight budget
+reached before its check is `would_lose_recovery` with `reference_unverified_within_budget`: the reference is not known to be present, so it is
+never adoptable, and the detail gives the number of such sessions in the report. The budget is 20 seconds by default, bounds the version probes and
+the reference checks together, and is raised with `service upgrade|check --preflight-budget <SECONDS>` (1 to 300; the CLI's preflight deadline
+grows with it). The flag reaches only this release's upgrade preflight: a rollback's preflight runs the previous release's daemon with the default
+budget. The flag is sent to the daemon as `--probe-budget-secs` only when it differs from the default. An installer user (`packaging/install-daemon.sh`) cannot pass a budget, so it runs the archive's own commands: `<archive dir>/pohunek service check --preflight-budget <SECONDS>`, then `<archive dir>/pohunek service upgrade --from <archive dir> --preflight-budget <SECONDS>`. The wrapper runs both under `pohunek service lock` and passes `--accept-runtime-loss` to both when given; after a successful run it prints the hook asset step (`pohunek integration doctor` and `pohunek integration install --agent <agent>`), which a direct `service upgrade` does not print.  For a runtime that declares a version probe, the
 preflight runs the same isolated, bounded probe resume runs (the frozen program
 with the probe's arguments, a private `HOME` and working directory), so
 `service check` executes those programs. It writes no pohunek state. Identical
@@ -2284,7 +2300,18 @@ upgrade journaled while the job was loaded, else the persisted launchd
 configuration, the best evidence available. A rollback judges with the same order,
 so the `PATH` it uses is the one the restored job gets where launchd can still
 report it; a `warning:` line names a journal that gave no default. An
-unrecognized `launchctl print` output refuses the upgrade with `service_manager_environment_unavailable`. The
+unrecognized `launchctl print` output refuses the upgrade with `service_manager_environment_unavailable`.
+A job whose service manager's variables cannot be read takes none: on Linux a job that records
+its `PATH` whose systemd user manager's bus is not reachable, and on macOS any job when launchd has
+no `gui/<uid>` domain, as without a GUI session (a job without a recorded `PATH` then takes the
+persisted launchd configuration's `PATH`). `service check` is not refused: it prints a `warning` that
+native references are judged at the default store locations, so a verdict may read
+`already_not_resumable` or `would_lose_recovery` for a conversation stored under a variable-set
+location, or `adoptable` for one present only at the default location. When such a judgement
+covers a stopped session, whose native reference check reads a store location, `service upgrade`
+and a rollback refuse it with `service_manager_variables_unread` before any effect, unless
+`--accept-runtime-loss` is given; a judgement without stopped sessions does not depend on those
+variables and proceeds with the warning. The
 preflight resolves programs with the daemon's own resolver, which skips an
 untrusted candidate the same way at launch. See
 [update after release](knowledge/runbooks/update-after-release.md).

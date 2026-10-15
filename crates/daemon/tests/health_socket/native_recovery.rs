@@ -1648,3 +1648,120 @@ async fn claude_mismatched_durable_worker_refuses_resume_and_fork() {
         "neither request can launch an agent"
     );
 }
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the scenario is one sequence: install, create, stop, move the store, judge, resume"
+)]
+async fn pi_package_relocated_store_is_judged_would_lose_as_resume_refuses_it() {
+    let bin = temp_dir("pi-judged-bin");
+    let state = temp_dir("pi-judged-state");
+    let cwd = temp_dir("pi-judged-cwd");
+    let agents = temp_dir("pi-judged-agents");
+    let config = temp_dir("pi-judged-config");
+    let program = bin.join("pi-fixture.sh");
+    write_executable(
+        &program,
+        "#!/bin/sh\nprintf '\\033[?2004h'\nwhile IFS= read -r line; do :; done\n",
+    );
+    let (archive, digest) = pi_archive_from_descriptor(pi_relocating_descriptor(&program));
+    let archive_path = state.join("pi.tar.zst");
+    std::fs::write(&archive_path, archive).expect("write fixture Pi archive");
+    let config_home = config.join("pi");
+    std::fs::create_dir(&config_home).expect("create Pi agent dir");
+    std::fs::write(
+        agents.join("pi-plain.toml"),
+        format!(
+            "base = \"pi\"\npackage = \"acme.runtime.pi\"\ndigest = \"{digest}\"\n\
+             [env]\nPI_CODING_AGENT_DIR = \"{}\"\n",
+            config_home.display()
+        ),
+    )
+    .expect("write pinned Pi profile");
+    let socket = temp_socket("pi-judged-store");
+    let registry_config = SessionRegistryConfig {
+        shell_command: support::hermetic_shell(),
+        store_path: Some(state.join("metadata.jsonl")),
+        agents_dir: Some(agents.to_path_buf()),
+        plugins_dir: Some(state.join("plugins")),
+        host_state_dir: Some(state.join("host-state")),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, server, _worker_home) =
+        spawn_server_with_config(&socket, "0.0.0", registry_config).await;
+    let mut control = connect(&socket).await;
+    install_pi_archive(&mut control, &archive_path, &digest).await;
+    let session: SessionInfo = serde_json::from_value(ok_payload(
+        new_pi_session(&mut control, "pi-plain", &cwd).await,
+    ))
+    .expect("create Pi session in the default store");
+    let project = config_home.join("sessions/--project--");
+    std::fs::create_dir_all(&project).expect("create the default store");
+    std::fs::write(
+        project.join(format!(
+            "2026-10-12T00-00-00-000Z_{}.jsonl",
+            session
+                .native_session_id
+                .as_deref()
+                .expect("Pi gets an assigned ID")
+        )),
+        "{}\n",
+    )
+    .expect("write Pi transcript");
+    let id = serde_json::to_value(&session.id).expect("serialize session id");
+    ok_payload(
+        exchange(
+            &mut control,
+            &Request::make("pi-judged-stop", method::SESSION_STOP, id.clone()),
+        )
+        .await,
+    );
+    // The project moves the store after the session stopped; the profile is unchanged.
+    std::fs::create_dir(cwd.join(".pi")).expect("create project settings dir");
+    std::fs::write(
+        cwd.join(".pi/settings.json"),
+        r#"{"sessionDir": "/elsewhere"}"#,
+    )
+    .expect("write project settings");
+    let report = pohunek_daemon::session::upgrade_preflight::run_with(
+        &pohunek_daemon::session::upgrade_preflight::PreflightInputs {
+            store_path: state.join("metadata.jsonl"),
+            worker_state_root: state.join("no-workers"),
+            plugins_dir: state.join("plugins"),
+        },
+        &pohunek_daemon::session::upgrade_preflight::PreflightOptions {
+            probe_budget: pohunek_service_config::preflight::PROBE_BUDGET,
+            entry: std::time::Instant::now(),
+            release: None,
+            profiles_dir: Some(agents.to_path_buf()),
+            host_state_dir: Some(state.join("host-state")),
+            launch: Ok(pohunek_daemon::runtime::LaunchEnvironment::subprocess_default()),
+        },
+        &pohunek_daemon::procwatch::HostInspector::new(),
+    );
+    let resumed = exchange(
+        &mut control,
+        &Request::make(
+            "pi-judged-resume",
+            method::SESSION_RESUME,
+            serde_json::json!({ "session_id": session.id }),
+        ),
+    )
+    .await;
+    let _ = shutdown.send(());
+    server.await.expect("Pi control server stops");
+
+    let judged = report
+        .stopped_sessions
+        .iter()
+        .find(|verdict| verdict.session_id == session.id.0)
+        .expect("the stopped session is judged");
+    let refusal = err_payload(resumed);
+    assert_eq!(
+        judged.verdict,
+        pohunek_service_config::preflight::Verdict::WouldLoseRecovery
+    );
+    assert_eq!(judged.code, "agent_native_store_relocated", "{judged:?}");
+    assert_eq!(judged.code, refusal.code, "{refusal:?}");
+}

@@ -621,6 +621,20 @@ the upgrade is not what ends it.
   profile, or accept the loss. A stopped session record the new binary cannot
   load is `record_unreadable` in the stopped list; its recovery is lost at
   startup.
+- `already not resumable`: a stopped session whose conversation is absent from
+  its declared store (`agent_native_reference_missing`), or whose stored
+  reference is malformed, is refused by resume on the running release too. The
+  upgrade does not change that, so it needs no `--accept-runtime-loss`; the
+  summary counts it apart from the sessions at risk. A relocated store
+  (`agent_native_store_relocated`) or a store-condition refusal is `would lose
+  recovery` with resume's code: the running release may detect those
+  differently, so the preflight cannot prove it refuses too. A reported reference
+  keeps its check only where the preflight can prove it identical: a session
+  pinned to a package digest, or a built-in that a 0.34.0 to 0.34.2 store (schema
+  5) adopts into the official package whose check equals the v0.34.2 golden. Any
+  other session the upgrade adopts from the built-in runtime is `would lose
+  recovery`, with the same code and a detail that names the reason. Sources
+  outside those are fail-closed, so the verdict is `would lose recovery` there.
 - `would not be adopted`: the new daemon would not manage the worker
   (`record_unreadable`, `worker_without_session_record`, `store_unusable`,
   `worker_generation_missing`,
@@ -660,11 +674,37 @@ it. If that `PATH` cannot be read, the command stops with
 `service_manager_environment_unavailable` before any effect; the flag does not
 override it.
 
+A job that records its own `PATH` still takes store variables such as
+`CLAUDE_CONFIG_DIR` from the service manager. When that manager cannot be read
+(no reachable user bus on Linux, no launchd `gui/<uid>` domain on macOS),
+`service check` warns that native references were judged at the default store
+locations. When that judgement covers a stopped session, `service upgrade` or a
+rollback stops with `service_manager_variables_unread` before any effect; make
+the manager readable and rerun, or pass `--accept-runtime-loss` to accept that a
+session judged that way may lose its recovery. Without stopped sessions the
+upgrade proceeds with the warning.
+
 Sessions whose runtime has ended but that keep native resume or fork are judged
 by the same rules and listed under stopped sessions (`stopped_sessions` in the
 `--json` report, and a `stopped` section in the text output). A stopped session
 that would lose its resume or fork is at risk and needs `--accept-runtime-loss`
 like a live one.
+
+When the preflight budget (20 seconds by default) runs out before a stopped
+session's native reference is checked, the session is `would_lose_recovery` with
+`reference_unverified_within_budget`, and its detail gives how many sessions are
+unverified this way. Run `pohunek service check --preflight-budget <SECONDS>`
+(up to 300), then `pohunek service upgrade --from <archive dir> --preflight-budget
+<SECONDS>` with the same value; the CLI's preflight deadline grows with the
+budget. The installer (`packaging/install-daemon.sh`) passes no budget, so an
+installer user runs the archive's own CLI directly:
+`<archive dir>/pohunek service check --preflight-budget <SECONDS>`, then
+`<archive dir>/pohunek service upgrade --from <archive dir> --preflight-budget <SECONDS>`.
+Unlike the wrapper, a direct run does not take the service transaction lock
+around both commands and does not print the hook asset step afterwards
+(`pohunek integration doctor`, then `pohunek integration install --agent <agent>`
+for each outdated agent). `--accept-runtime-loss` accepts such sessions only
+after the check has been reviewed.
 
 ### Official runtime packages during an upgrade
 

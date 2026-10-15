@@ -5,7 +5,6 @@
 //! directories, `service.toml`, the record, the CLI copy, journals) is real
 //! and lives below a temporary root.
 
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,7 +22,7 @@ use pohunek_platform::process::{
     Error as ProcessError, ExitWatch, OwnershipMarkers, ProcessFact, ProcessIdentity, StartIdentity,
 };
 use pohunek_platform::supervisor::{DaemonSupervisor, Operation as Pending, ServiceId, Supervisor};
-use pohunek_service_config::preflight::{PreflightReport, SessionVerdict, StoreState, Verdict};
+use pohunek_service_config::preflight::{SessionVerdict, StoreState, Verdict};
 use pohunek_service_config::runtimes::{
     CatalogStatus, IntegrationAction, PackageAction, PackageStatus, ProfileAction, ProfileStatus,
     Refusal, UseReason, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, ENSURE_REPORT_VERSION,
@@ -42,9 +41,9 @@ use crate::service::definition::initial_config;
 use crate::service::inherited::Token;
 use crate::service::layout::tests::{anchor_bytes, stage_dir, write_anchor};
 use crate::service::layout::CLI_NAME;
-use crate::service::manager_env::UserManager;
 #[cfg(target_os = "macos")]
 use crate::service::manager_env::{ActiveJob, LaunchdJob};
+use crate::service::manager_env::{EnvironmentFailure, UserManager};
 use crate::service::preflight::{Judging, ReleasePlan};
 use crate::service::runtimes::Running;
 use crate::service::usage::tests::{
@@ -190,6 +189,8 @@ impl AdoptionPreflight for InProcessPreflight {
         context: &'a Context,
         _daemon: &'a Path,
         _search_path: &'a str,
+        _variables: &'a BTreeMap<String, String>,
+        _probe_budget: Option<Duration>,
         _plan: ReleasePlan,
     ) -> Judging<'a> {
         Box::pin(async move {
@@ -219,6 +220,8 @@ struct ScriptedPreflight {
     search_paths: Arc<Mutex<Vec<String>>>,
     /// The release-plan choice of every judgment, in call order.
     plans: Arc<Mutex<Vec<ReleasePlan>>>,
+    /// The manager variables of every judgment, in call order.
+    variables: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
 }
 
 impl AdoptionPreflight for ScriptedPreflight {
@@ -227,6 +230,8 @@ impl AdoptionPreflight for ScriptedPreflight {
         context: &'a Context,
         daemon: &'a Path,
         search_path: &'a str,
+        variables: &'a BTreeMap<String, String>,
+        probe_budget: Option<Duration>,
         plan: ReleasePlan,
     ) -> Judging<'a> {
         Box::pin(async move {
@@ -235,8 +240,14 @@ impl AdoptionPreflight for ScriptedPreflight {
                 .expect("search path lock")
                 .push(search_path.to_owned());
             self.plans.lock().expect("plan lock").push(plan);
-            let mut report: PreflightReport =
-                self.inner.judge(context, daemon, search_path, plan).await?;
+            self.variables
+                .lock()
+                .expect("variables lock")
+                .push(variables.clone());
+            let mut report: PreflightReport = self
+                .inner
+                .judge(context, daemon, search_path, variables, probe_budget, plan)
+                .await?;
             report.runtimes = self.runtimes.clone();
             report.stopped_sessions = self.stopped.clone();
             Ok(report)
@@ -2125,8 +2136,8 @@ struct FakeUserManager(Result<Vec<String>, String>);
 impl UserManager for FakeUserManager {
     fn environment(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>> {
-        let value = self.0.clone();
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, EnvironmentFailure>> + Send + '_>> {
+        let value = self.0.clone().map_err(EnvironmentFailure::Unreachable);
         Box::pin(async move { value })
     }
 }
@@ -2144,16 +2155,37 @@ fn launchd_domain_xml(value: &str) -> String {
 /// while a test runs, as a job that is unloaded mid-upgrade does.
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
-struct FakeLaunchd(Mutex<Result<ActiveJob, String>>);
+struct FakeLaunchd {
+    state: Mutex<Result<ActiveJob, String>>,
+    /// How many times the job's state was asked for.
+    job_reads: AtomicUsize,
+    /// How many times the domain alone was asked for.
+    domain_reads: AtomicUsize,
+    /// Whether launchd has no user domain, as without a GUI session.
+    no_domain: bool,
+}
 
 #[cfg(target_os = "macos")]
 impl FakeLaunchd {
     fn new(value: Result<ActiveJob, String>) -> Self {
-        Self(Mutex::new(value))
+        Self {
+            state: Mutex::new(value),
+            job_reads: AtomicUsize::new(0),
+            domain_reads: AtomicUsize::new(0),
+            no_domain: false,
+        }
+    }
+
+    /// The fake of a launchd with no user domain: no GUI session.
+    fn without_domain() -> Self {
+        Self {
+            no_domain: true,
+            ..Self::new(Ok(ActiveJob::default()))
+        }
     }
 
     fn set(&self, value: Result<ActiveJob, String>) {
-        *self.0.lock().expect("launchd state") = value;
+        *self.state.lock().expect("launchd state") = value;
     }
 }
 
@@ -2164,9 +2196,102 @@ impl LaunchdJob for FakeLaunchd {
         _uid: u32,
         _label: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<ActiveJob, String>> + Send + 'a>> {
-        let value = self.0.lock().expect("launchd state").clone();
+        self.job_reads.fetch_add(1, Ordering::SeqCst);
+        let value = self.state.lock().expect("launchd state").clone();
         Box::pin(async move { value })
     }
+
+    fn domain_environment(&self, _uid: u32) -> crate::service::manager_env::DomainEnvironment<'_> {
+        self.domain_reads.fetch_add(1, Ordering::SeqCst);
+        let value = if self.no_domain {
+            Ok(None)
+        } else {
+            self.state
+                .lock()
+                .expect("launchd state")
+                .clone()
+                .map(|job| job.domain_environment)
+        };
+        Box::pin(async move { value })
+    }
+}
+
+/// On macOS, a recorded-`PATH` job without a launchd user domain (no GUI session,
+/// for example an upgrade over SSH) is degraded like a bus that cannot be
+/// reached: the warning says the store variables were not applied.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_recorded_path_job_without_a_launchd_domain_warns_like_an_absent_bus() {
+    let mut harness = Harness::new();
+    let fake = Arc::new(FakeLaunchd::without_domain());
+    harness.context = harness
+        .context
+        .clone()
+        .with_launchd_job(Arc::clone(&fake) as Arc<dyn LaunchdJob>);
+    let config = crate::service::definition::config_with_search_path(
+        &harness.context,
+        Path::new("/opt/pohunek"),
+        crate::service::VERSION,
+        pohunek_platform::shell_env::SearchPath::new(vec![std::path::PathBuf::from("/usr/bin")])
+            .expect("a trusted directory"),
+    )
+    .expect("the recorded configuration");
+
+    let job = crate::service::engine::job_path(&harness.context, &config, None)
+        .await
+        .expect("a recorded PATH judges without a domain");
+
+    assert!(job.variables.is_empty(), "no domain, no variables");
+    assert!(job.manager_unreachable.is_some(), "{job:?}");
+    let warnings = crate::service::engine::job_warnings(&harness.context, &job);
+    assert!(
+        warnings.iter().any(
+            |warning| warning.contains("judged at the default store locations")
+                && warning.contains("GUI session")
+        ),
+        "the warning names the macOS remedy: {warnings:?}"
+    );
+}
+
+/// On macOS a recorded-`PATH` job reads only the launchd domain: asking for the
+/// job would derive the namespace, which creates the state and runtime roots.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_recorded_path_job_on_macos_reads_the_domain_and_never_the_job() {
+    let mut harness = Harness::new();
+    let (allowed_name, allowed_value) = ALLOWLISTED_MANAGER_VARIABLE;
+    let fake = Arc::new(FakeLaunchd::new(Ok(ActiveJob {
+        domain: None,
+        loaded_default: None,
+        domain_environment: Some(vec![(allowed_name.to_owned(), allowed_value.to_owned())]),
+    })));
+    harness.context = harness
+        .context
+        .clone()
+        .with_launchd_job(Arc::clone(&fake) as Arc<dyn LaunchdJob>);
+    let config = crate::service::definition::config_with_search_path(
+        &harness.context,
+        Path::new("/opt/pohunek"),
+        crate::service::VERSION,
+        pohunek_platform::shell_env::SearchPath::new(vec![std::path::PathBuf::from("/usr/bin")])
+            .expect("a trusted directory"),
+    )
+    .expect("the recorded configuration");
+
+    let job = crate::service::engine::job_path(&harness.context, &config, None)
+        .await
+        .expect("the recorded PATH judges");
+
+    assert_eq!(
+        fake.job_reads.load(Ordering::SeqCst),
+        0,
+        "the job is never asked for"
+    );
+    assert_eq!(fake.domain_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        job.variables.get(allowed_name).map(String::as_str),
+        Some(allowed_value)
+    );
 }
 
 /// A loaded job whose `default environment` sets `PATH` to `default`.
@@ -2175,13 +2300,17 @@ fn loaded_job(default: impl Into<String>) -> ActiveJob {
     ActiveJob {
         domain: None,
         loaded_default: Some(default.into()),
+        domain_environment: Some(Vec::new()),
     }
 }
 
 /// A job that is not loaded, in a domain that sets no `PATH`.
 #[cfg(target_os = "macos")]
 fn not_loaded() -> ActiveJob {
-    ActiveJob::default()
+    ActiveJob {
+        domain_environment: Some(Vec::new()),
+        ..ActiveJob::default()
+    }
 }
 
 /// A domain that sets `domain`, with the job loaded at `default` or not.
@@ -2190,6 +2319,7 @@ fn domain_over(domain: &str, default: Option<&str>) -> ActiveJob {
     ActiveJob {
         domain: Some(domain.to_owned()),
         loaded_default: default.map(str::to_owned),
+        domain_environment: Some(Vec::new()),
     }
 }
 
@@ -2239,6 +2369,56 @@ async fn a_job_that_is_not_loaded_falls_back_to_the_persisted_domain_configurati
         judged.iter().all(|path| path == DOMAIN_PATH),
         "a job that is down judges with the best evidence available: {judged:?}"
     );
+}
+
+/// On macOS a job without a recorded `PATH` and without a launchd user domain
+/// (no GUI session, for example a check over SSH) takes its `PATH` from the
+/// persisted configuration and no variables. It is degraded like a recorded-`PATH`
+/// job without a domain: the warning names the remedy, and a gate that judged a
+/// stopped session refuses.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_job_without_a_recorded_path_or_a_launchd_domain_is_judged_without_its_variables() {
+    const DOMAIN_PATH: &str = "/opt/pohunek-test/bin:/usr/bin:/bin";
+    let mut harness = Harness::new();
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(DOMAIN_PATH)).expect("domain configuration");
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged)
+        .with_launchd_domain_config(&domain)
+        .with_launchd_job(Arc::new(FakeLaunchd::without_domain()));
+    harness.install(V1).await.expect("install");
+    let config = harness.config().expect("config");
+    assert!(config.search_path().is_empty());
+
+    let job = crate::service::engine::job_path(&harness.context, &config, None)
+        .await
+        .expect("the persisted configuration gives the PATH");
+    assert_eq!(job.value, DOMAIN_PATH);
+    assert!(job.variables.is_empty(), "no domain, no variables");
+    assert!(job.manager_unreachable.is_some(), "{job:?}");
+    let warnings = crate::service::engine::job_warnings(&harness.context, &job);
+    assert!(
+        warnings.iter().any(
+            |warning| warning.contains("judged at the default store locations")
+                && warning.contains("GUI session")
+        ),
+        "{warnings:?}"
+    );
+
+    let refused = harness
+        .engine()
+        .with_adoption_preflight(preflight_with_a_stopped_session())
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("a stopped session judged without the domain's variables refuses");
+    assert!(
+        matches!(refused, Error::ManagerVariablesUnread { .. }),
+        "{refused:?}"
+    );
+    harness.assert_installed(V1);
 }
 
 #[cfg(target_os = "macos")]
@@ -2396,7 +2576,7 @@ async fn a_stopped_session_at_risk_needs_the_flag_like_a_live_one() {
         .upgrade(&harness.staged(V2), V2)
         .await
         .expect_err("the stopped session would lose its recovery");
-    let Error::UpgradeAtRisk { sessions } = &error else {
+    let Error::UpgradeAtRisk { sessions, .. } = &error else {
         panic!("{error:?}");
     };
     assert_eq!(sessions, std::slice::from_ref(&stopped));
@@ -2451,6 +2631,229 @@ async fn interrupted_upgrade_journal(harness: &mut Harness) {
         .upgrade(&harness.staged(V2), V2)
         .await
         .expect_err("interrupted after the registration");
+}
+
+/// A manager variable the default allowlist selects, and one it does not.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const ALLOWLISTED_MANAGER_VARIABLE: (&str, &str) = ("LC_CTYPE", "C.UTF-8");
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const UNLISTED_MANAGER_VARIABLE: (&str, &str) = ("CLAUDE_CONFIG_DIR", "/manager/unlisted-store");
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_upgrade_judges_with_the_allowlisted_manager_variables_and_no_others() {
+    let mut harness = Harness::new();
+    set_job_path(&mut harness, CURRENT_PATH);
+    let (allowed_name, allowed_value) = ALLOWLISTED_MANAGER_VARIABLE;
+    let (unlisted_name, unlisted_value) = UNLISTED_MANAGER_VARIABLE;
+    harness.context = harness
+        .context
+        .clone()
+        .with_user_manager(Arc::new(FakeUserManager(Ok(vec![
+            format!("PATH={CURRENT_PATH}"),
+            format!("{allowed_name}={allowed_value}"),
+            format!("{unlisted_name}={unlisted_value}"),
+        ]))));
+    harness.install(V1).await.expect("install");
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.variables);
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("the upgrade judges and applies");
+
+    let judged = judged.lock().expect("variables lock").clone();
+    assert!(!judged.is_empty(), "the upgrade judged");
+    for variables in &judged {
+        assert_eq!(
+            variables.get(allowed_name).map(String::as_str),
+            Some(allowed_value),
+            "an allowlisted manager variable reaches the judgement"
+        );
+        assert!(
+            !variables.contains_key(unlisted_name),
+            "a manager variable outside the allowlist never reaches the judgement"
+        );
+        assert!(
+            !variables.contains_key("PATH"),
+            "PATH is carried by the search path, not the variables"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn an_upgrade_judges_with_the_allowlisted_launchd_domain_variables_and_no_others() {
+    let mut harness = Harness::new();
+    let (allowed_name, allowed_value) = ALLOWLISTED_MANAGER_VARIABLE;
+    let (unlisted_name, unlisted_value) = UNLISTED_MANAGER_VARIABLE;
+    harness.context = harness
+        .context
+        .clone()
+        .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(ActiveJob {
+            domain: Some(CURRENT_PATH.to_owned()),
+            loaded_default: None,
+            domain_environment: Some(vec![
+                ("PATH".to_owned(), CURRENT_PATH.to_owned()),
+                (allowed_name.to_owned(), allowed_value.to_owned()),
+                (unlisted_name.to_owned(), unlisted_value.to_owned()),
+            ]),
+        }))));
+    harness.install(V1).await.expect("install");
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.variables);
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("the upgrade judges and applies");
+
+    let judged = judged.lock().expect("variables lock").clone();
+    assert!(!judged.is_empty(), "the upgrade judged");
+    for variables in &judged {
+        assert_eq!(
+            variables.get(allowed_name).map(String::as_str),
+            Some(allowed_value)
+        );
+        assert!(!variables.contains_key(unlisted_name));
+        assert!(!variables.contains_key("PATH"));
+    }
+}
+
+/// The debug form of the job's launch facts and of launchd's active state names
+/// the variables and never prints their values.
+#[test]
+fn the_debug_forms_of_the_job_environment_name_the_variables_and_never_their_values() {
+    const SENTINEL: &str = "/sentinel/secret-store-value";
+    let variables = BTreeMap::from([("CLAUDE_CONFIG_DIR".to_owned(), SENTINEL.to_owned())]);
+    let job = JobPath {
+        value: CURRENT_PATH.to_owned(),
+        source: PathSource::Recorded,
+        loaded_default: None,
+        variables,
+        manager_unreachable: None,
+    };
+    let active = crate::service::manager_env::ActiveJob {
+        domain: None,
+        loaded_default: None,
+        domain_environment: Some(vec![("CLAUDE_CONFIG_DIR".to_owned(), SENTINEL.to_owned())]),
+    };
+    for debug in [format!("{job:?}"), format!("{active:?}")] {
+        assert!(debug.contains("CLAUDE_CONFIG_DIR"), "{debug}");
+        assert!(!debug.contains(SENTINEL), "{debug}");
+    }
+}
+
+/// A user manager that answers with the given failure.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct FailingManager(crate::service::manager_env::EnvironmentFailure);
+
+#[cfg(target_os = "linux")]
+impl UserManager for FailingManager {
+    fn environment(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Vec<String>, crate::service::manager_env::EnvironmentFailure>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let failure = self.0.clone();
+        Box::pin(async move { Err(failure) })
+    }
+}
+
+/// The `PATH`-only read of a recorded job never asks the manager: an unusable
+/// manager fails the variables a judgement needs, not the `PATH` a plan needs.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_recorded_path_plan_does_not_depend_on_the_manager_variables() {
+    use crate::service::manager_env::EnvironmentFailure;
+    use pohunek_platform::shell_env::SearchPath;
+
+    let mut harness = Harness::new();
+    let search_path =
+        SearchPath::new(vec![std::path::PathBuf::from("/usr/bin")]).expect("a trusted directory");
+    let config = crate::service::definition::config_with_search_path(
+        &harness.context,
+        Path::new("/opt/pohunek"),
+        crate::service::VERSION,
+        search_path,
+    )
+    .expect("the recorded configuration");
+    harness.context = harness
+        .context
+        .clone()
+        .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unusable(
+            "the answer is not a list".to_owned(),
+        ))));
+
+    let plan = crate::service::engine::job_search_path(&harness.context, &config, None)
+        .await
+        .expect("the recorded PATH is the plan's PATH without the manager");
+    assert_eq!(plan.value, "/usr/bin");
+    assert!(plan.variables.is_empty());
+    crate::service::engine::job_path(&harness.context, &config, None)
+        .await
+        .expect_err("the judgement's variables still fail closed");
+}
+
+/// A job that records its `PATH` takes no variables from a manager that cannot
+/// be reached, and says so; a manager that answers unusably fails the judgement.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_recorded_path_job_degrades_only_when_no_manager_is_reachable() {
+    use crate::service::manager_env::EnvironmentFailure;
+    use pohunek_platform::shell_env::SearchPath;
+
+    let mut harness = Harness::new();
+    let search_path =
+        SearchPath::new(vec![std::path::PathBuf::from("/usr/bin")]).expect("a trusted directory");
+    let config = crate::service::definition::config_with_search_path(
+        &harness.context,
+        Path::new("/opt/pohunek"),
+        crate::service::VERSION,
+        search_path,
+    )
+    .expect("the recorded configuration");
+
+    harness.context = harness
+        .context
+        .clone()
+        .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unreachable(
+            "no session bus".to_owned(),
+        ))));
+    let job = crate::service::engine::job_path(&harness.context, &config, None)
+        .await
+        .expect("an unreachable manager does not stop a recorded PATH");
+    assert!(job.variables.is_empty(), "no manager variables are applied");
+    assert_eq!(job.manager_unreachable.as_deref(), Some("no session bus"));
+    let warnings = crate::service::engine::job_warnings(&harness.context, &job);
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("judged at the default store locations")),
+        "{warnings:?}"
+    );
+
+    harness.context = harness
+        .context
+        .clone()
+        .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unusable(
+            "the answer is not a list".to_owned(),
+        ))));
+    let error = crate::service::engine::job_path(&harness.context, &config, None)
+        .await
+        .expect_err("an unusable answer fails closed");
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
 }
 
 #[cfg(target_os = "linux")]
@@ -2889,6 +3292,8 @@ impl AdoptionPreflight for PostApplyPreflight {
         context: &'a Context,
         daemon: &'a Path,
         search_path: &'a str,
+        variables: &'a BTreeMap<String, String>,
+        probe_budget: Option<Duration>,
         plan: ReleasePlan,
     ) -> Judging<'a> {
         Box::pin(async move {
@@ -2897,7 +3302,7 @@ impl AdoptionPreflight for PostApplyPreflight {
             let new_release = daemon.components().any(|part| part.as_os_str() == V2);
             if !self.runtimes.applied() || !new_release || self.post == PostApply::Clean {
                 return InProcessPreflight::default()
-                    .judge(context, daemon, search_path, plan)
+                    .judge(context, daemon, search_path, variables, probe_budget, plan)
                     .await;
             }
             self.judged_after_apply.fetch_add(1, Ordering::SeqCst);
@@ -2908,7 +3313,7 @@ impl AdoptionPreflight for PostApplyPreflight {
                 });
             }
             let mut report = InProcessPreflight::default()
-                .judge(context, daemon, search_path, plan)
+                .judge(context, daemon, search_path, variables, probe_budget, plan)
                 .await?;
             report.sessions.push(SessionVerdict {
                 session_id: "s-after-apply".to_owned(),
@@ -5821,7 +6226,7 @@ async fn an_upgrade_refuses_live_sessions_whose_records_cannot_be_migrated_and_t
         .await
         .expect_err("the upgrade is refused");
 
-    let Error::UpgradeAtRisk { sessions } = &error else {
+    let Error::UpgradeAtRisk { sessions, .. } = &error else {
         panic!("{error:?}");
     };
     let listed: Vec<_> = sessions
@@ -5967,6 +6372,189 @@ async fn the_adoption_preflight_is_skipped_when_no_daemon_swap_starts() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
+/// A check of a recorded-`PATH` job with no reachable bus that refuses at-risk
+/// sessions still tells the operator the verdicts may err: the refusal carries
+/// the warning.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_refused_check_without_a_bus_shows_the_warning_with_the_refusal() {
+    use crate::service::manager_env::EnvironmentFailure;
+
+    let mut harness = Harness::new();
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Managed {
+            login_shell: None,
+            shell_defaulted: false,
+            fallback_directories: vec!["/usr/bin".to_owned()],
+        })
+        .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unreachable(
+            "no session bus".to_owned(),
+        ))));
+    harness.install(V1).await.expect("install");
+    seed_live_session(&harness, SESSION, "w-1");
+    edit_stored_line(&harness, SESSION, |line| {
+        line.as_object_mut().expect("record").remove("runtime");
+    });
+    let daemon_dir = harness.staged(V2);
+
+    let refused = crate::service::check_with_preflight(
+        &harness.context,
+        &daemon_dir,
+        &InProcessPreflight::default(),
+        V2,
+        false,
+    )
+    .await
+    .expect_err("the at-risk session refuses the check");
+    assert!(
+        matches!(refused, Error::UpgradeAtRisk { .. }),
+        "{refused:?}"
+    );
+    let text = refused.to_string();
+    assert!(
+        text.contains("judged at the default store locations"),
+        "the refusal carries the warning: {text}"
+    );
+}
+
+/// A harness whose daemon job records its `PATH` and whose user manager has no
+/// reachable bus, so its judgements run without the manager's variables.
+#[cfg(target_os = "linux")]
+fn harness_without_a_bus() -> Harness {
+    let mut harness = Harness::new();
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Managed {
+            login_shell: None,
+            shell_defaulted: false,
+            fallback_directories: vec!["/usr/bin".to_owned()],
+        })
+        .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unreachable(
+            "no session bus".to_owned(),
+        ))));
+    harness
+}
+
+/// A preflight that reports one adoptable stopped session, whose native
+/// reference check reads a store location.
+fn preflight_with_a_stopped_session() -> Box<ScriptedPreflight> {
+    Box::new(ScriptedPreflight {
+        stopped: vec![SessionVerdict {
+            session_id: OTHER_SESSION.to_owned(),
+            name: None,
+            verdict: Verdict::Adoptable,
+            code: "adoptable".to_owned(),
+            detail: "the stopped session's conversation is in its store".to_owned(),
+        }],
+        ..ScriptedPreflight::default()
+    })
+}
+
+/// An upgrade that judged a stopped session without the manager's variables
+/// refuses even when that session reads adoptable: its reference was checked at
+/// the default store location. Accepting runtime loss covers that, so the same
+/// upgrade then proceeds.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_upgrade_judged_without_the_managers_variables_refuses_unless_loss_is_accepted() {
+    let harness = harness_without_a_bus();
+    harness.install(V1).await.expect("install");
+
+    let refused = harness
+        .engine()
+        .with_adoption_preflight(preflight_with_a_stopped_session())
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("a stopped session judged without the manager's variables refuses");
+    assert!(
+        matches!(refused, Error::ManagerVariablesUnread { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(refused.code(), "service_manager_variables_unread");
+    assert!(refused.to_string().contains("no session bus"), "{refused}");
+    assert_eq!(harness.pending(), None);
+    harness.assert_installed(V1);
+
+    let report = harness
+        .engine()
+        .with_runtime_loss_accepted(true)
+        .with_adoption_preflight(preflight_with_a_stopped_session())
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("accepted runtime loss covers the degraded judgement");
+    assert!(report.rolled_back.is_none());
+    harness.assert_installed(V2);
+}
+
+/// A judgement without stopped sessions reads no store location, so the
+/// manager's variables cannot change it: the upgrade proceeds without the flag
+/// and reports the warning.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_upgrade_without_stopped_sessions_proceeds_without_the_managers_variables() {
+    let harness = harness_without_a_bus();
+    harness.install(V1).await.expect("install");
+    seed_live_session(&harness, SESSION, "w-1");
+
+    let report = harness
+        .upgrade(V2)
+        .await
+        .expect("no verdict depends on the manager's variables");
+    assert!(!report.accepted_runtime_loss);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("judged at the default store locations")),
+        "{:?}",
+        report.warnings
+    );
+    harness.assert_installed(V2);
+}
+
+/// A rollback that judged a stopped session without the manager's variables
+/// refuses and keeps its transaction unless runtime loss is accepted, as the
+/// upgrade does.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_rollback_judged_without_the_managers_variables_refuses_unless_loss_is_accepted() {
+    let harness = harness_without_a_bus();
+    harness.install(V1).await.expect("install");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after the registration");
+    let pending = harness.pending().expect("the interrupted upgrade is kept");
+
+    let refused = harness
+        .engine()
+        .with_adoption_preflight(preflight_with_a_stopped_session())
+        .upgrade(&harness.staged(V1), V1)
+        .await
+        .expect_err("a stopped session judged without the manager's variables refuses");
+    assert!(
+        matches!(refused, Error::ManagerVariablesUnread { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(harness.pending(), Some(pending));
+    assert_eq!(harness.config().expect("config").active_version(), V2);
+
+    let report = harness
+        .engine()
+        .with_runtime_loss_accepted(true)
+        .with_adoption_preflight(preflight_with_a_stopped_session())
+        .upgrade(&harness.staged(V1), V1)
+        .await
+        .expect("accepted runtime loss covers the degraded judgement");
+    assert!(report.rolled_back.is_some());
+    harness.assert_installed(V1);
+}
+
 #[tokio::test]
 async fn check_asks_the_preflight_of_an_upgrade_and_honours_the_flag() {
     let harness = Harness::new();
@@ -6021,7 +6609,7 @@ async fn a_session_created_between_staging_and_the_swap_is_caught_by_the_late_pr
         .await
         .expect_err("the late preflight refuses");
 
-    let Error::UpgradeAtRisk { sessions } = &error else {
+    let Error::UpgradeAtRisk { sessions, .. } = &error else {
         panic!("{error:?}");
     };
     assert_eq!(sessions[0].session_id, SESSION);
@@ -6127,6 +6715,8 @@ impl AdoptionPreflight for FailingFrom {
         context: &'a Context,
         daemon: &'a Path,
         search_path: &'a str,
+        variables: &'a BTreeMap<String, String>,
+        probe_budget: Option<Duration>,
         plan: ReleasePlan,
     ) -> Judging<'a> {
         let call = self.inner.calls.load(Ordering::SeqCst);
@@ -6138,7 +6728,8 @@ impl AdoptionPreflight for FailingFrom {
                 })
             });
         }
-        self.inner.judge(context, daemon, search_path, plan)
+        self.inner
+            .judge(context, daemon, search_path, variables, probe_budget, plan)
     }
 }
 
@@ -7350,6 +7941,8 @@ impl AdoptionPreflight for CountingFailure {
         _context: &'a Context,
         daemon: &'a Path,
         _search_path: &'a str,
+        _variables: &'a BTreeMap<String, String>,
+        _probe_budget: Option<Duration>,
         _plan: ReleasePlan,
     ) -> Judging<'a> {
         self.0.fetch_add(1, Ordering::SeqCst);

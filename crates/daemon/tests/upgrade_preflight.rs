@@ -1515,6 +1515,9 @@ fn a_0_34_2_host_with_built_in_sessions_is_adoptable_through_the_release_plan() 
     let profiles = private_dir(host.env.config_home().join("pohunek").join("agents"));
     write_profile(&profiles, "official-claude", "claude");
     write_profile(&profiles, "official-codex", "codex");
+    let transcripts = host.env.home().join(".claude/projects/work");
+    fs::create_dir_all(&transcripts).expect("transcript dir");
+    fs::write(transcripts.join("native-fixture-2.jsonl"), b"{}\n").expect("transcript");
     let mut stopped = built_in_line("claude", "s-3", "w-three");
     stopped["runtime"]["state"] = json!("lost");
     host.write_store(&[
@@ -2215,6 +2218,9 @@ async fn a_package_pinned_session_whose_root_is_missing_is_judged_through_the_re
 #[tokio::test]
 async fn the_release_plan_judges_the_upgrade_only_when_the_binary_is_given_its_flag() {
     let host = Host::serving().await;
+    let transcripts = host.env.home().join(".claude/projects/work");
+    fs::create_dir_all(&transcripts).expect("transcript dir");
+    fs::write(transcripts.join("native-fixture-2.jsonl"), b"{}\n").expect("transcript");
     // The claude root is gone: only the release plan restores it.
     let digest = official_digest("claude");
     fs::remove_dir_all(

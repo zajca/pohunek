@@ -40,7 +40,7 @@ use package::ANCHOR_FILE_NAME;
 use pohunek_cli::host_setup::{apply, plan, ReleasePlanner, ServiceStep, SetupReport};
 use pohunek_cli::service::context::PathDiscovery;
 #[cfg(target_os = "linux")]
-use pohunek_cli::service::manager_env::UserManager;
+use pohunek_cli::service::manager_env::{EnvironmentFailure, UserManager};
 use pohunek_cli::service::runtimes::DaemonRuntimes;
 use pohunek_cli::service::{self, Context, VERSION};
 use pohunek_service_config::runtimes::{EnsureReport, PackageStatus};
@@ -392,7 +392,7 @@ struct FakeUserManager(Vec<String>);
 impl UserManager for FakeUserManager {
     fn environment(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, EnvironmentFailure>> + Send + '_>> {
         let value = self.0.clone();
         Box::pin(async move { Ok(value) })
     }

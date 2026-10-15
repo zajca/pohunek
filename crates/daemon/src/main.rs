@@ -27,7 +27,7 @@
 //! invoke it.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -68,7 +68,10 @@ use pohunek_daemon::session::{
 };
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
 use pohunek_platform::supervisor::{self, Namespace};
-use pohunek_service_config::preflight::{PROBE_BUDGET, RELEASE_PLAN_FLAG};
+use pohunek_service_config::preflight::{
+    MAX_PROBE_BUDGET_SECS, MIN_PROBE_BUDGET_SECS, PROBE_BUDGET, PROBE_BUDGET_FLAG,
+    RELEASE_PLAN_FLAG,
+};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Refusal, CODE_DAEMON_RUNNING, DETECT_FLAG, DRY_RUN_FLAG,
     ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
@@ -176,17 +179,17 @@ async fn main() -> ExitCode {
     {
         return print_version();
     }
-    if std::env::args_os()
-        .skip(1)
-        .eq([OsString::from(UPGRADE_PREFLIGHT_ARG)])
-    {
-        return print_upgrade_preflight(false, entry);
-    }
-    if std::env::args_os().skip(1).eq([
-        OsString::from(UPGRADE_PREFLIGHT_ARG),
-        OsString::from(RELEASE_PLAN_FLAG),
-    ]) {
-        return print_upgrade_preflight(true, entry);
+    let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if arguments.first().map(OsString::as_os_str) == Some(OsStr::new(UPGRADE_PREFLIGHT_ARG)) {
+        return match parse_upgrade_preflight_arguments(&arguments[1..]) {
+            Ok((release_plan, probe_budget)) => {
+                print_upgrade_preflight(release_plan, probe_budget, entry)
+            }
+            Err(error) => {
+                eprintln!("pohunekd: {UPGRADE_PREFLIGHT_ARG}: {error}");
+                ExitCode::FAILURE
+            }
+        };
     }
     if std::env::args_os()
         .skip(1)
@@ -235,12 +238,50 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Parses the arguments after `upgrade-preflight`: an optional `--release-plan`
+/// and an optional `--probe-budget-secs <SECONDS>`, in that order. Without the
+/// budget the default of [`PROBE_BUDGET`] applies.
+fn parse_upgrade_preflight_arguments(arguments: &[OsString]) -> Result<(bool, Duration), String> {
+    let mut rest = arguments;
+    let release_plan = match rest.first() {
+        Some(first) if first.as_os_str() == OsStr::new(RELEASE_PLAN_FLAG) => {
+            rest = &rest[1..];
+            true
+        }
+        _ => false,
+    };
+    let probe_budget = match rest {
+        [] => PROBE_BUDGET,
+        [flag, value] if flag.as_os_str() == OsStr::new(PROBE_BUDGET_FLAG) => {
+            let text = value
+                .to_str()
+                .ok_or_else(|| "the probe budget is not valid text".to_owned())?;
+            let seconds: u64 = text.parse().map_err(|error| {
+                format!("the probe budget `{text}` is not a whole number of seconds: {error}")
+            })?;
+            if !(MIN_PROBE_BUDGET_SECS..=MAX_PROBE_BUDGET_SECS).contains(&seconds) {
+                return Err(format!(
+                    "the probe budget must be from {MIN_PROBE_BUDGET_SECS} to {MAX_PROBE_BUDGET_SECS} seconds, not {seconds}"
+                ));
+            }
+            Duration::from_secs(seconds)
+        }
+        _ => return Err("unexpected arguments".to_owned()),
+    };
+    Ok((release_plan, probe_budget))
+}
+
 /// Prints the preflight report of the installed state as JSON.
 ///
 /// With `release_plan` the judgement also serves the runtimes the release step
 /// would leave behind; without it the judgement serves the installed packages
-/// only, as a rollback's preflight must.
-fn print_upgrade_preflight(release_plan: bool, entry: std::time::Instant) -> ExitCode {
+/// only, as a rollback's preflight must. `probe_budget` bounds the version
+/// probes and reference checks, counted from `entry`.
+fn print_upgrade_preflight(
+    release_plan: bool,
+    probe_budget: Duration,
+    entry: std::time::Instant,
+) -> ExitCode {
     let report = Paths::resolve()
         .map_err(|error| error.to_string())
         .and_then(|paths| {
@@ -257,7 +298,7 @@ fn print_upgrade_preflight(release_plan: bool, entry: std::time::Instant) -> Exi
                 }),
                 profiles_dir: Some(paths.config_dir.join(PROFILES_SUBDIR)),
                 host_state_dir: Some(paths.state_dir.clone()),
-                probe_budget: PROBE_BUDGET,
+                probe_budget,
                 entry,
                 launch: launch_environment(&paths, false),
             };

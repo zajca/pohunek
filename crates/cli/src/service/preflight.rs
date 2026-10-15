@@ -9,16 +9,19 @@
 
 // Rust guideline compliant 2026-06-26
 
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
+use std::time::Duration;
 
 use pohunek_paths::DAEMON_EXECUTABLE_NAME;
 use pohunek_platform::supervisor::SEARCH_PATH_VARIABLE;
 use pohunek_service_config::preflight::{
-    PreflightReport, SessionVerdict, PREFLIGHT_TIMEOUT, RELEASE_PLAN_FLAG, REPORT_VERSION,
+    preflight_timeout, PreflightReport, SessionVerdict, PROBE_BUDGET, PROBE_BUDGET_FLAG,
+    RELEASE_PLAN_FLAG, REPORT_VERSION,
 };
 use tokio::io::AsyncReadExt as _;
 
@@ -27,6 +30,7 @@ use super::error::Error;
 use super::layout;
 use super::runtimes;
 use super::settings;
+use super::VERSION;
 
 /// Argument that makes the daemon print its preflight report.
 pub const PREFLIGHT_ARGUMENT: &str = "upgrade-preflight";
@@ -62,12 +66,15 @@ pub type Judging<'a> = Pin<Box<dyn Future<Output = Result<PreflightReport, Error
 pub trait AdoptionPreflight: Debug + Send + Sync {
     /// Returns the report of the daemon executable `daemon` for the state
     /// `context` locates, run with the `PATH` `search_path` gives the daemon
-    /// job.
+    /// job and the service manager's allowlisted `variables`. `probe_budget`
+    /// is passed to the daemon only when it is `Some`.
     fn judge<'a>(
         &'a self,
         context: &'a Context,
         daemon: &'a Path,
         search_path: &'a str,
+        variables: &'a BTreeMap<String, String>,
+        probe_budget: Option<Duration>,
         plan: ReleasePlan,
     ) -> Judging<'a>;
 }
@@ -82,9 +89,18 @@ impl AdoptionPreflight for DaemonPreflight {
         context: &'a Context,
         daemon: &'a Path,
         search_path: &'a str,
+        variables: &'a BTreeMap<String, String>,
+        probe_budget: Option<Duration>,
         plan: ReleasePlan,
     ) -> Judging<'a> {
-        Box::pin(run_daemon(context, daemon, search_path, plan))
+        Box::pin(run_daemon(
+            context,
+            daemon,
+            search_path,
+            variables,
+            probe_budget,
+            plan,
+        ))
     }
 }
 
@@ -123,6 +139,7 @@ pub async fn gate(
     daemon_dir: &Path,
     version: &str,
     search_path: &str,
+    variables: &BTreeMap<String, String>,
     accept_runtime_loss: bool,
 ) -> Result<Gated, Error> {
     let report = judge_daemon(
@@ -131,7 +148,9 @@ pub async fn gate(
         daemon_dir,
         version,
         search_path,
+        variables,
         ReleasePlan::Omitted,
+        false,
     )
     .await?;
     decide(report, accept_runtime_loss)
@@ -148,16 +167,31 @@ pub async fn gate(
 ///
 /// Returns [`Error::UpgradeRuntimesRefused`] for a refused plan, and the errors
 /// of [`gate`] otherwise.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the judgement inputs are passed one by one, as gate does, and the plan is the eighth"
+)]
 pub async fn gate_upgrade(
     preflight: &dyn AdoptionPreflight,
     context: &Context,
     daemon_dir: &Path,
     version: &str,
     search_path: &str,
+    variables: &BTreeMap<String, String>,
     plan: ReleasePlan,
     accept_runtime_loss: bool,
 ) -> Result<Gated, Error> {
-    let report = judge_daemon(preflight, context, daemon_dir, version, search_path, plan).await?;
+    let report = judge_daemon(
+        preflight,
+        context,
+        daemon_dir,
+        version,
+        search_path,
+        variables,
+        plan,
+        true,
+    )
+    .await?;
     if let Some(plan) = &report.runtimes {
         runtimes::check_plan(plan)?;
     }
@@ -165,17 +199,34 @@ pub async fn gate_upgrade(
 }
 
 /// Checks the staged `daemon` is of `version` and returns its report.
+///
+/// A raised probe budget reaches only a daemon of this CLI's release, and only
+/// from the upgrade path (`own_release`): an older daemon, such as a rollback's
+/// previous release, rejects the flag and would start a full daemon instead.
+/// Without the flag that daemon runs its default budget, which keeps the
+/// judgement pessimistic.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the judgement inputs are passed one by one, as gate does, and the plan is the eighth"
+)]
 async fn judge_daemon(
     preflight: &dyn AdoptionPreflight,
     context: &Context,
     daemon_dir: &Path,
     version: &str,
     search_path: &str,
+    variables: &BTreeMap<String, String>,
     plan: ReleasePlan,
+    own_release: bool,
 ) -> Result<PreflightReport, Error> {
     let daemon = daemon_dir.join(DAEMON_EXECUTABLE_NAME);
     probe_daemon(&daemon, version).await?;
-    preflight.judge(context, &daemon, search_path, plan).await
+    let budget = context.preflight_budget();
+    let probe_budget =
+        (own_release && version == VERSION && budget != PROBE_BUDGET).then_some(budget);
+    preflight
+        .judge(context, &daemon, search_path, variables, probe_budget, plan)
+        .await
 }
 
 /// Verifies the daemon binary before using it as compatibility evidence.
@@ -226,7 +277,10 @@ pub fn decide(report: PreflightReport, accept_runtime_loss: bool) -> Result<Gate
             warnings: Vec::new(),
         })
     } else {
-        Err(Error::UpgradeAtRisk { sessions: at_risk })
+        Err(Error::UpgradeAtRisk {
+            sessions: at_risk,
+            warnings: Vec::new(),
+        })
     }
 }
 
@@ -235,6 +289,8 @@ async fn run_daemon(
     context: &Context,
     daemon: &Path,
     search_path: &str,
+    variables: &BTreeMap<String, String>,
+    probe_budget: Option<Duration>,
     plan: ReleasePlan,
 ) -> Result<PreflightReport, Error> {
     let failure = |detail: String| Error::UpgradePreflightFailed {
@@ -246,8 +302,17 @@ async fn run_daemon(
     if let Some(flag) = plan.argument() {
         command.arg(flag);
     }
+    // Without a raised budget the argument list is the one every release accepts.
+    if let Some(budget) = probe_budget {
+        command
+            .arg(PROBE_BUDGET_FLAG)
+            .arg(budget.as_secs().to_string());
+    }
+    // The manager's variables come first, so the bootstrap roots, which name the
+    // paths this CLI resolved, always win over a variable of the same name.
     command
         .env_clear()
+        .envs(variables)
         .envs(context.bootstrap_environment()?)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -276,14 +341,13 @@ async fn run_daemon(
         let status = child.wait().await;
         (report, diagnostics, status)
     };
-    let (report, diagnostics, status) = tokio::time::timeout(PREFLIGHT_TIMEOUT, run)
-        .await
-        .map_err(|_elapsed| {
-            failure(format!(
-                "it did not finish within {} s",
-                PREFLIGHT_TIMEOUT.as_secs()
-            ))
-        })?;
+    let deadline = preflight_timeout(probe_budget.unwrap_or(PROBE_BUDGET));
+    let (report, diagnostics, status) =
+        tokio::time::timeout(deadline, run)
+            .await
+            .map_err(|_elapsed| {
+                failure(format!("it did not finish within {} s", deadline.as_secs()))
+            })?;
     let status = status.map_err(|error| failure(format!("cannot wait for it: {error}")))?;
     if !status.success() {
         let diagnostics = String::from_utf8_lossy(&diagnostics.unwrap_or_default())

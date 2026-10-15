@@ -112,8 +112,9 @@ pub async fn install_in(
 pub async fn upgrade(
     from: Option<PathBuf>,
     accept_runtime_loss: bool,
+    preflight_budget: Duration,
 ) -> Result<report::UpgradeReport, Error> {
-    let context = Context::resolve()?;
+    let context = Context::resolve()?.with_preflight_budget(preflight_budget);
     let inherited = inherited_lock(&context)?;
     let from = staged_dir(&context, from)?;
     let backend = connect_installed(&context).await?;
@@ -162,8 +163,9 @@ pub async fn uninstall(options: UninstallOptions) -> Result<report::UninstallRep
 pub async fn check(
     prefix: Option<PathBuf>,
     accept_runtime_loss: bool,
+    preflight_budget: Duration,
 ) -> Result<report::CheckReport, Error> {
-    let context = Context::resolve()?;
+    let context = Context::resolve()?.with_preflight_budget(preflight_budget);
     let inherited = inherited_lock(&context)?;
     let checked = check_local(&context, prefix, VERSION, inherited.is_some())?;
     // Install's order: the rollback of an interrupted install discovers before
@@ -230,6 +232,7 @@ async fn finish_check(
                     detail: "previous version has no valid installation directory".to_owned(),
                 })?;
         let job = engine::journal_job_path(context, record).await?;
+        let warnings = engine::job_warnings(context, &job);
         let mut gated = rollback::gate(
             rollback::Inputs {
                 preflight,
@@ -242,10 +245,12 @@ async fn finish_check(
             previous,
             previous,
             &job.value,
+            &job.variables,
             accept_runtime_loss,
         )
-        .await?;
-        gated.warnings = engine::job_warnings(context, &job);
+        .await
+        .map_err(|error| error.with_warnings(&warnings))?;
+        gated.warnings.clone_from(&warnings);
         checked.report.accepted_runtime_loss = gated.accepted;
         checked.report.preflight = Some(gated.report.clone());
         if let Some(pending) = &mut checked.report.pending_transaction {
@@ -256,18 +261,22 @@ async fn finish_check(
     }
     if checked.adoption == Adoption::Required {
         let job = engine::installed_job_path(context).await?;
+        let warnings = engine::job_warnings(context, &job);
         let gated = preflight::gate_upgrade(
             preflight,
             context,
             daemon_dir,
             version,
             &job.value,
+            &job.variables,
             preflight::ReleasePlan::Included,
             accept_runtime_loss,
         )
-        .await?;
+        .await
+        .map_err(|error| error.with_warnings(&warnings))?;
         checked.report.accepted_runtime_loss |= gated.accepted;
         checked.report.preflight = Some(gated.report);
+        checked.report.warnings = warnings;
     }
     Ok(checked.report)
 }
@@ -769,6 +778,7 @@ pub(crate) fn check_local(
         preflight: None,
         accepted_runtime_loss: false,
         config_schema_migration,
+        warnings: Vec::new(),
     };
     Ok(Checked {
         report,

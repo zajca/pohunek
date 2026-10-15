@@ -13,8 +13,8 @@
 //!
 //! The persisted `user.plist` of the launchd configuration is not read here: a
 //! `launchctl config user path` value takes effect only after a reboot. A job
-//! that is not loaded has no default section, so [`JobPathSources::default()`]
-//! tells the caller to fall back to the best evidence it has.
+//! that is not loaded has no default section, so `loaded_default` is `None` and
+//! the caller falls back to the best evidence it has.
 //!
 //! `launchctl print` output is not a stable interface, so each section is read
 //! strictly and anything unrecognized is an error rather than a guess. Values
@@ -66,13 +66,32 @@ const EXCERPT_CHARS: usize = 160;
 /// Both are read whatever the other says: the domain's value is readable whether
 /// or not the job is loaded, and the job's default exists only while it is
 /// loaded. The caller decides their order.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct JobPathSources {
     /// The domain's `PATH`, set with `launchctl setenv`, when the domain has one.
     pub domain: Option<String>,
     /// The `default environment` `PATH` of the loaded job; `None` when the job
     /// is not loaded (or launchd reports no such section for it).
     pub loaded_default: Option<String>,
+    /// Every variable of the domain's `environment`, in launchd's order,
+    /// `PATH` included; empty when the domain sets none, `None` when launchd has
+    /// no such domain (no GUI session).
+    pub domain_environment: Option<Vec<(String, String)>>,
+}
+
+// The domain's variables are printed by name only: their values may be secrets.
+impl std::fmt::Debug for JobPathSources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Option<Vec<&str>> = self
+            .domain_environment
+            .as_ref()
+            .map(|entries| entries.iter().map(|(name, _)| name.as_str()).collect());
+        f.debug_struct("JobPathSources")
+            .field("domain", &self.domain)
+            .field("loaded_default", &self.loaded_default)
+            .field("domain_environment", &names)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Reads the `PATH` the job `label` of `gui/<uid>` runs with when its
@@ -95,13 +114,50 @@ pub async fn job_path_sources(
     resolve(&launchctl, &format!("gui/{uid}"), label).await
 }
 
+/// Reads the variables of the user domain `gui/<uid>`, `PATH` included, without
+/// naming any job.
+///
+/// `None` means launchd has no such domain, which is the case without a GUI
+/// session. A domain that exists with no variables is `Some` of an empty list.
+///
+/// # Errors
+///
+/// Returns the errors of [`job_path_sources`] for the domain's own `launchctl print`.
+pub async fn domain_environment_of(
+    uid: u32,
+    deadline: Duration,
+) -> Result<Option<Vec<(String, String)>>, Error> {
+    let launchctl = Launchctl::new(deadline).with_output_cap(PRINT_OUTPUT_CAP);
+    domain_environment(&launchctl, &format!("gui/{uid}")).await
+}
+
+/// A domain-entry parse failure quotes the line it could not read, and a line of
+/// the domain's environment carries a variable's value, so only the condition is
+/// kept. Other errors are not from the entries and pass unchanged.
+fn redact_domain_line(error: Error) -> Error {
+    match error {
+        Error::InvalidData { operation, .. } => Error::InvalidData {
+            operation,
+            detail: "unrecognized launchctl print output in the domain environment".to_owned(),
+        },
+        other => other,
+    }
+}
+
 /// [`job_path_sources`] through the given runner, so tests can answer for launchd.
 pub(crate) async fn resolve(
     launchctl: &Launchctl,
     domain: &str,
     label: &str,
 ) -> Result<JobPathSources, Error> {
-    let domain_value = domain_path(launchctl, domain).await?;
+    let domain_environment = domain_environment(launchctl, domain).await?;
+    let domain_value = named_path(
+        domain_environment
+            .iter()
+            .flatten()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+        false,
+    )?;
     let target = format!("{domain}/{label}");
     let completion = launchctl
         .run("print", &[OsStr::new(&target)])
@@ -119,17 +175,24 @@ pub(crate) async fn resolve(
     Ok(JobPathSources {
         domain: domain_value,
         loaded_default,
+        domain_environment,
     })
 }
 
-/// The domain's `PATH`, or `None` when the domain sets none or has no GUI session.
-async fn domain_path(launchctl: &Launchctl, domain: &str) -> Result<Option<String>, Error> {
+/// The variables of `domain`, with a parse failure reported without the line it
+/// could not read. `None` when launchd has no such domain.
+async fn domain_environment(
+    launchctl: &Launchctl,
+    domain: &str,
+) -> Result<Option<Vec<(String, String)>>, Error> {
     let completion = launchctl
         .run("print", &[OsStr::new(domain)])
         .await
         .map_err(|error| run_error(OPERATION, error))?;
     match completion.status {
-        Status::Success => domain_environment_path(printed(&completion)?),
+        Status::Success => domain_entries(printed(&completion)?)
+            .map(Some)
+            .map_err(redact_domain_line),
         Status::NoSuchDomain => Ok(None),
         _ => Err(status_error(OPERATION, domain, &completion)),
     }
@@ -158,7 +221,7 @@ fn utf8<'a>(operation: &'static str, bytes: &'a [u8]) -> Result<&'a str, Error> 
     })
 }
 
-/// The `PATH` of the domain environment of `launchctl print gui/<uid>` output.
+/// The variables of the domain environment of `launchctl print gui/<uid>` output.
 ///
 /// Output is recognized as a domain print by its top-level `services` section,
 /// which every domain print has. launchd omits the `environment` section of a
@@ -170,7 +233,7 @@ fn utf8<'a>(operation: &'static str, bytes: &'a [u8]) -> Result<&'a str, Error> 
 ///
 /// Returns [`Error::InvalidData`] for output without a `services` section, for
 /// a repeated environment section, and for an unrecognized entry.
-fn domain_environment_path(output: &str) -> Result<Option<String>, Error> {
+fn domain_entries(output: &str) -> Result<Vec<(String, String)>, Error> {
     let services = output
         .lines()
         .filter(|line| line.trim_start() == DOMAIN_SERVICES)
@@ -183,8 +246,12 @@ fn domain_environment_path(output: &str) -> Result<Option<String>, Error> {
     }
     let mut found = sections(output, DOMAIN_SECTION)?;
     match found.len() {
-        0 => Ok(None),
-        1 => named_path(&found.remove(0), false),
+        0 => Ok(Vec::new()),
+        1 => Ok(found
+            .remove(0)
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect()),
         count => Err(unrecognized(
             "launchctl print",
             &format!("{count} domain environment sections"),
@@ -206,7 +273,7 @@ fn domain_environment_path(output: &str) -> Result<Option<String>, Error> {
 /// Returns [`Error::InvalidData`] for output of any other shape.
 fn default_path(output: &str) -> Result<String, Error> {
     let entries = single_section(output, DEFAULT_SECTION)?;
-    named_path(&entries, true)?
+    named_path(entries.iter().copied(), true)?
         .ok_or_else(|| unrecognized("launchctl print", "the default environment names no PATH"))
 }
 
@@ -225,10 +292,13 @@ fn single_section<'a>(output: &'a str, heading: &str) -> Result<Vec<(&'a str, &'
 /// The value of `PATH` among `entries`.
 ///
 /// `required` makes a missing `PATH` an error; `PATH` may occur at most once.
-fn named_path(entries: &[(&str, &str)], required: bool) -> Result<Option<String>, Error> {
+fn named_path<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a str)>,
+    required: bool,
+) -> Result<Option<String>, Error> {
     let mut path: Option<&str> = None;
     for (name, value) in entries {
-        if *name != PATH_NAME {
+        if name != PATH_NAME {
             continue;
         }
         if path.is_some() || value.is_empty() {
@@ -411,6 +481,13 @@ mod tests {
                 JobPathSources {
                     domain: Some("/opt/set/bin:/usr/bin ".to_owned()),
                     loaded_default: Some("/usr/bin:/bin:/usr/sbin:/sbin".to_owned()),
+                    domain_environment: Some(vec![
+                        (
+                            "SSH_AUTH_SOCK".to_owned(),
+                            "/work/com.apple.launchd.example/Listeners".to_owned(),
+                        ),
+                        ("PATH".to_owned(), "/opt/set/bin:/usr/bin ".to_owned()),
+                    ]),
                 }
             );
         });
@@ -433,6 +510,10 @@ mod tests {
                 JobPathSources {
                     domain: None,
                     loaded_default: Some("/usr/bin:/bin:/usr/sbin:/sbin".to_owned()),
+                    domain_environment: Some(vec![(
+                        "SSH_AUTH_SOCK".to_owned(),
+                        "/work/com.apple.launchd.example/Listeners".to_owned(),
+                    )]),
                 }
             );
         });
@@ -455,6 +536,10 @@ mod tests {
                 JobPathSources {
                     domain: None,
                     loaded_default: Some("/usr/bin:/bin ".to_owned()),
+                    domain_environment: Some(vec![(
+                        "SSH_AUTH_SOCK".to_owned(),
+                        "/work/com.apple.launchd.example/Listeners".to_owned(),
+                    )]),
                 }
             );
         });
@@ -474,11 +559,86 @@ mod tests {
                 resolve(&launchctl, "gui/501", "job")
                     .await
                     .expect("resolved"),
-                JobPathSources::default()
+                JobPathSources {
+                    domain_environment: Some(vec![(
+                        "SSH_AUTH_SOCK".to_owned(),
+                        "/work/com.apple.launchd.example/Listeners".to_owned(),
+                    )]),
+                    ..JobPathSources::default()
+                }
             );
         });
     }
 
+    #[test]
+    fn the_debug_form_of_the_domain_sources_names_the_variables_and_never_their_values() {
+        runtime().block_on(async {
+            let dir = pohunek_test_support::tempdir().expect("scratch directory");
+            let domain = "gui/501 = {\n\tenvironment = {\n\t\tSECRET_STORE => /sentinel/secret-value\n\t}\n\tservices = {\n\t}\n}\n";
+            let launchctl = fake(dir.path(), Reply::Output(domain), Reply::Status(113), None);
+            let sources = resolve(&launchctl, "gui/501", "job").await.expect("resolved");
+
+            let debug = format!("{sources:?}");
+            assert!(debug.contains("SECRET_STORE"), "the name is shown: {debug}");
+            assert!(!debug.contains("/sentinel/secret-value"), "no value: {debug}");
+        });
+    }
+
+    /// A domain line the parser cannot read is reported without the line, which
+    /// may carry a variable's value, by the domain-only read and by the job's
+    /// path resolution, which reads the same domain.
+    #[test]
+    fn an_unreadable_domain_line_is_reported_without_its_text() {
+        runtime().block_on(async {
+            let dir = pohunek_test_support::tempdir().expect("scratch directory");
+            let domain = "gui/501 = {\n\tenvironment = {\n\t\tSECRET_STORE=/sentinel/secret-value\n\t}\n\tservices = {\n\t}\n}\n";
+            let launchctl = fake(dir.path(), Reply::Output(domain), Reply::Status(113), None);
+
+            let error = domain_environment(&launchctl, "gui/501")
+                .await
+                .expect_err("the line has no separator");
+            assert!(matches!(error, Error::InvalidData { .. }), "{error}");
+            let text = format!("{error} {error:?}");
+            assert!(!text.contains("/sentinel/secret-value"), "{text}");
+            assert!(!text.contains("SECRET_STORE"), "{text}");
+
+            let launchctl = fake(dir.path(), Reply::Output(domain), Reply::Status(113), None);
+            let error = resolve(&launchctl, "gui/501", "job")
+                .await
+                .expect_err("the job's resolution reads the same domain");
+            let text = format!("{error} {error:?}");
+            assert!(!text.contains("/sentinel/secret-value"), "{text}");
+            assert!(!text.contains("SECRET_STORE"), "{text}");
+        });
+    }
+
+    /// A domain launchd does not have is `None`, which is not the same as a
+    /// domain with no variables: only the first means no GUI session.
+    #[test]
+    fn a_missing_domain_is_distinct_from_an_empty_one() {
+        runtime().block_on(async {
+            let dir = pohunek_test_support::tempdir().expect("scratch directory");
+            let launchctl = fake(dir.path(), Reply::Status(112), Reply::Status(113), None);
+            assert_eq!(
+                domain_environment(&launchctl, "gui/9999")
+                    .await
+                    .expect("read"),
+                None
+            );
+
+            let empty = "gui/501 = {\n\tservices = {\n\t}\n}\n";
+            let launchctl = fake(dir.path(), Reply::Output(empty), Reply::Status(113), None);
+            assert_eq!(
+                domain_environment(&launchctl, "gui/501")
+                    .await
+                    .expect("read"),
+                Some(Vec::new())
+            );
+        });
+    }
+
+    /// Without a GUI session launchd has no domain, so the job is not loaded and
+    /// the domain's variables are reported missing, not empty.
     #[test]
     fn a_domain_without_a_gui_session_loads_no_job_so_the_job_is_not_loaded() {
         runtime().block_on(async {
@@ -488,7 +648,11 @@ mod tests {
                 resolve(&launchctl, "gui/9999", "job")
                     .await
                     .expect("resolved"),
-                JobPathSources::default()
+                JobPathSources {
+                    domain: None,
+                    loaded_default: None,
+                    domain_environment: None,
+                }
             );
         });
     }
@@ -510,6 +674,7 @@ mod tests {
                 JobPathSources {
                     domain: None,
                     loaded_default: Some("/usr/bin:/bin:/usr/sbin:/sbin".to_owned()),
+                    domain_environment: Some(Vec::new()),
                 }
             );
         });

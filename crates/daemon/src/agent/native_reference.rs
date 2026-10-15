@@ -255,6 +255,15 @@ pub enum ReferenceExistence {
     File(FileExistence),
 }
 
+impl ReferenceExistence {
+    /// Whether verifying the reference reads the agent's store. An unchecked
+    /// reference reads nothing, so no scan budget applies to it.
+    #[must_use]
+    pub fn scans_store(&self) -> bool {
+        matches!(self, Self::File(_))
+    }
+}
+
 /// The `check` of an existence declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

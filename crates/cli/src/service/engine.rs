@@ -156,6 +156,7 @@
 
 // Rust guideline compliant 2026-10-14
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -164,6 +165,7 @@ use pohunek_platform::process::{HostInspector, Pid, ProcessInspector};
 use pohunek_platform::supervisor::{
     self, JobDefinition, Namespace, ServiceObservation, ServiceState, WorkerKey,
 };
+use pohunek_service_config::preflight::PreflightReport;
 use pohunek_service_config::runtimes::EnsureReport;
 use pohunek_service_config::{ServiceConfig, UpgradeSource, SCHEMA_VERSION};
 use protocol::SessionInfo;
@@ -793,16 +795,20 @@ impl<'a> Engine<'a> {
             return Ok((None, None));
         }
         let job = installed_job_path(self.context).await?;
+        let warnings = job_warnings(self.context, &job);
         let gated = preflight::gate_upgrade(
             &*self.preflight,
             self.context,
             from,
             self.reported(version),
             &job.value,
+            &job.variables,
             preflight::ReleasePlan::Included,
             self.accept_runtime_loss,
         )
-        .await?;
+        .await
+        .map_err(|error| error.with_warnings(&warnings))?;
+        require_manager_variables(&job, &gated.report, self.accept_runtime_loss)?;
         Ok((Some(gated), Some(job)))
     }
 
@@ -1096,7 +1102,8 @@ impl<'a> Engine<'a> {
         // The job is resolved here, after the hook and after a migration's stop,
         // so the value the runtime step gets is the one the new daemon gets.
         let job = job_path(self.context, config, record.launchd_default_path.as_deref()).await?;
-        late.warnings.extend(job_warnings(self.context, &job));
+        let warnings = job_warnings(self.context, &job);
+        late.warnings.extend(warnings.iter().cloned());
         if swap {
             if let Some(dir) = config.daemon_executable().parent() {
                 match preflight::gate_upgrade(
@@ -1105,20 +1112,30 @@ impl<'a> Engine<'a> {
                     dir,
                     self.reported(&version),
                     &job.value,
+                    &job.variables,
                     preflight::ReleasePlan::Included,
                     self.accept_runtime_loss,
                 )
                 .await
                 {
-                    Ok(gated) => late.gated = Some(gated),
+                    Ok(gated) => {
+                        if let Err(error) =
+                            require_manager_variables(&job, &gated.report, self.accept_runtime_loss)
+                        {
+                            late.refused = true;
+                            return Err(error);
+                        }
+                        late.gated = Some(gated);
+                    }
                     Err(error) => {
                         late.refused = true;
-                        return Err(error);
+                        return Err(error.with_warnings(&warnings));
                     }
                 }
             }
         }
-        self.run_runtimes(record, layout, late, &job.value).await?;
+        self.run_runtimes(record, layout, late, &job, &warnings)
+            .await?;
         self.checkpoint(Step::Runtimes)?;
         if replaces_daemon(record.step) {
             let resuming = record.step == Step::Registering;
@@ -1239,7 +1256,8 @@ impl<'a> Engine<'a> {
             (hook.0)();
         }
         let job = job_path(self.context, config, record.launchd_default_path.as_deref()).await?;
-        late.warnings.extend(job_warnings(self.context, &job));
+        let warnings = job_warnings(self.context, &job);
+        late.warnings.extend(warnings.iter().cloned());
         if let Some(dir) = config.daemon_executable().parent() {
             match preflight::gate_upgrade(
                 &*self.preflight,
@@ -1247,17 +1265,26 @@ impl<'a> Engine<'a> {
                 dir,
                 self.reported(&record.version),
                 &job.value,
+                &job.variables,
                 preflight::ReleasePlan::Included,
                 self.accept_runtime_loss,
             )
             .await
             {
-                Ok(gated) => late.gated = Some(gated),
+                Ok(gated) => {
+                    if let Err(error) =
+                        require_manager_variables(&job, &gated.report, self.accept_runtime_loss)
+                    {
+                        late.refused = true;
+                        return Err(error);
+                    }
+                    late.gated = Some(gated);
+                }
                 Err(error) => {
                     late.refused = true;
                     // Nothing stopped or written yet; the record rolls
                     // back without stopping any daemon.
-                    return Err(error);
+                    return Err(error.with_warnings(&warnings));
                 }
             }
         }
@@ -1290,11 +1317,13 @@ impl<'a> Engine<'a> {
         record: &mut Record,
         layout: &InstallLayout,
         late: &mut LateGate,
-        search_path: &str,
+        job: &JobPath,
+        warnings: &[String],
     ) -> Result<(), Error> {
         if record.step >= Step::Runtimes {
             return Ok(());
         }
+        let search_path = job.value.as_str();
         let dir = layout
             .version_dir(&record.version)
             .ok_or_else(|| Error::Record {
@@ -1338,19 +1367,21 @@ impl<'a> Engine<'a> {
             // release judges the live sessions again, with the same decision as
             // the late gate. A refusal or a preflight that cannot run fails this
             // step, which rolls the apply back.
-            late.gated = Some(
-                preflight::gate_upgrade(
-                    &*self.preflight,
-                    self.context,
-                    &dir,
-                    self.reported(&record.version),
-                    search_path,
-                    // The apply has run, so the installed packages are the plan's result.
-                    preflight::ReleasePlan::Omitted,
-                    self.accept_runtime_loss,
-                )
-                .await?,
-            );
+            let gated = preflight::gate_upgrade(
+                &*self.preflight,
+                self.context,
+                &dir,
+                self.reported(&record.version),
+                search_path,
+                &job.variables,
+                // The apply has run, so the installed packages are the plan's result.
+                preflight::ReleasePlan::Omitted,
+                self.accept_runtime_loss,
+            )
+            .await
+            .map_err(|error| error.with_warnings(warnings))?;
+            require_manager_variables(job, &gated.report, self.accept_runtime_loss)?;
+            late.gated = Some(gated);
         }
         self.advance(record, Step::Runtimes)
     }
@@ -1367,7 +1398,7 @@ impl<'a> Engine<'a> {
         journal_default: Option<&str>,
     ) -> (Option<EnsureReport>, Vec<IntegrationReinstall>) {
         let plan = match layout.version_dir(version) {
-            Some(dir) => match job_path(self.context, config, journal_default).await {
+            Some(dir) => match job_search_path(self.context, config, journal_default).await {
                 Ok(job) => self
                     .runtimes
                     .run(self.context, &dir, true, &job.value)
@@ -1620,6 +1651,7 @@ impl<'a> Engine<'a> {
                     detail: "previous version has no valid installation directory".to_owned(),
                 })?;
         let job = journal_job_path(self.context, record).await?;
+        let warnings = job_warnings(self.context, &job);
         let mut gated = rollback::gate(
             rollback::Inputs {
                 preflight: &*self.preflight,
@@ -1632,10 +1664,13 @@ impl<'a> Engine<'a> {
             previous,
             self.reported(previous),
             &job.value,
+            &job.variables,
             self.accept_runtime_loss,
         )
-        .await?;
-        gated.warnings = job_warnings(self.context, &job);
+        .await
+        .map_err(|error| error.with_warnings(&warnings))?;
+        require_manager_variables(&job, &gated.report, self.accept_runtime_loss)?;
+        gated.warnings = warnings;
         Ok(gated)
     }
 
@@ -2370,11 +2405,40 @@ pub(crate) fn pending_report(record: &Record) -> PendingReport {
     }
 }
 
-/// The warnings a job `PATH` owes the operator: the persisted launchd
-/// configuration was used because the job is not loaded and the transaction
-/// journal holds no launchd default. Only a transaction can have one.
-#[cfg(target_os = "macos")]
+/// Every warning a judgement made with `job` owes the operator. Each caller
+/// that judges with the job's `PATH` or variables reports them through this, so
+/// none can forget one.
 pub(crate) fn job_warnings(context: &Context, job: &JobPath) -> Vec<String> {
+    let mut warnings = persisted_path_warnings(context, job);
+    warnings.extend(manager_warnings(job));
+    warnings
+}
+
+/// Refuses a transaction gate's judgement that ran without the service
+/// manager's variables and judged a stopped session, unless runtime loss is
+/// accepted. Only a stopped session's native reference check reads a store
+/// location those variables can move; judged at the default location, it may
+/// pass a session that loses its recovery, or call a lost one unchanged. A
+/// judgement without stopped sessions does not depend on the variables.
+pub(crate) fn require_manager_variables(
+    job: &JobPath,
+    report: &PreflightReport,
+    accept_runtime_loss: bool,
+) -> Result<(), Error> {
+    match &job.manager_unreachable {
+        Some(detail) if !accept_runtime_loss && !report.stopped_sessions.is_empty() => {
+            Err(Error::ManagerVariablesUnread {
+                detail: detail.clone(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The warning of a launchd `PATH` that was persisted: the job is not loaded and
+/// the transaction journal holds no launchd default. Only a transaction can have one.
+#[cfg(target_os = "macos")]
+fn persisted_path_warnings(context: &Context, job: &JobPath) -> Vec<String> {
     if job.source != PathSource::Persisted {
         return Vec::new();
     }
@@ -2389,7 +2453,7 @@ pub(crate) fn job_warnings(context: &Context, job: &JobPath) -> Vec<String> {
 
 /// No launchd job runs on other hosts, so no `PATH` is persisted there.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn job_warnings(_context: &Context, _job: &JobPath) -> Vec<String> {
+fn persisted_path_warnings(_context: &Context, _job: &JobPath) -> Vec<String> {
     Vec::new()
 }
 
@@ -2714,6 +2778,19 @@ pub(crate) async fn installed_job_path(context: &Context) -> Result<JobPath, Err
     job_path(context, &source.config, None).await
 }
 
+/// The `PATH` the installed daemon job runs with, as [`job_search_path`] gives
+/// it: no manager variables are selected.
+///
+/// # Errors
+///
+/// See [`job_path`].
+pub(crate) async fn installed_job_search_path(context: &Context) -> Result<JobPath, Error> {
+    let source = load_config_for_upgrade(&context.config_path())?.ok_or(Error::NotInstalled {
+        path: context.config_path(),
+    })?;
+    job_search_path(context, &source.config, None).await
+}
+
 /// Where the `PATH` of a job without its own came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PathSource {
@@ -2736,7 +2813,7 @@ pub(crate) enum PathSource {
 }
 
 /// The `PATH` a daemon job runs with, byte for byte, and where it came from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct JobPath {
     /// The value the job's processes get.
     pub(crate) value: String,
@@ -2746,6 +2823,49 @@ pub(crate) struct JobPath {
     /// `value` is. An upgrade journals it; `None` when the job is not loaded and
     /// always on Linux.
     pub(crate) loaded_default: Option<String>,
+    /// The allowlisted variables the service manager gives the job, `PATH`
+    /// excluded. A preflight judges with them, so they stay out of the logs and
+    /// errors: only their names may appear there.
+    pub(crate) variables: BTreeMap<String, String>,
+    /// Why the service manager's environment was not read: on Linux a job that
+    /// records its `PATH` with no reachable manager, on macOS any job when launchd
+    /// has no user domain. Its variables are then not applied.
+    pub(crate) manager_unreachable: Option<String>,
+}
+
+// The variables are printed by name only: their values may be secrets.
+impl std::fmt::Debug for JobPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobPath")
+            .field("value", &self.value)
+            .field("source", &self.source)
+            .field("loaded_default", &self.loaded_default)
+            .field("variables", &self.variables.keys().collect::<Vec<_>>())
+            .field("manager_unreachable", &self.manager_unreachable)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What makes the service manager's environment readable on this platform.
+#[cfg(target_os = "macos")]
+const MANAGER_REMEDY: &str =
+    "Log the user in to a GUI session, so launchd has its gui/<uid> domain";
+/// What makes the service manager's environment readable on this platform.
+#[cfg(not(target_os = "macos"))]
+const MANAGER_REMEDY: &str = "Start the user's service manager or make its bus reachable";
+
+/// The warning a judgement carries when the service manager's variables were
+/// not read ([`JobPath::manager_unreachable`]). The verdicts may err in either direction, so the text
+/// says which way and what the operator does before relying on them.
+fn manager_warnings(job: &JobPath) -> Vec<String> {
+    let Some(detail) = &job.manager_unreachable else {
+        return Vec::new();
+    };
+    let warning = format!(
+        "the service manager's environment was not read ({detail}), so the store variables it may set, such as CLAUDE_CONFIG_DIR, are not applied: native references are judged at the default store locations. A conversation stored under a variable-set location may be reported missing (already_not_resumable or would_lose_recovery), and a conversation present only at the default location may be reported adoptable. {MANAGER_REMEDY}, then run the check again before relying on the verdicts. An upgrade or rollback refuses such a judgement of a stopped session unless --accept-runtime-loss is given."
+    );
+    tracing::warn!(detail = %detail, "{warning}");
+    vec![warning]
 }
 
 /// The `PATH` of the daemon job of `config`, which every preflight and runtime
@@ -2778,18 +2898,37 @@ pub(crate) async fn job_path(
     config: &ServiceConfig,
     journal_default: Option<&str>,
 ) -> Result<JobPath, Error> {
-    recorded_job_path(context, config.search_path(), journal_default).await
+    recorded_job_path(
+        context,
+        config.search_path(),
+        config.environment_allowlist(),
+        journal_default,
+    )
+    .await
 }
 
-/// The `PATH` of a daemon job whose `service.toml` records `recorded`, by the
-/// rules of [`job_path`]. A fresh install records the search path
-/// [`Context::install_search_path`] resolves, so this is the `PATH` its job
-/// will get before anything is written.
+/// The `PATH` a daemon job whose `service.toml` records `config`'s search path
+/// gets, without the manager variables. Callers that need only the `PATH` use
+/// this: a recorded `PATH` reads no service manager at all.
 ///
 /// # Errors
 ///
 /// See [`job_path`].
-pub(crate) async fn recorded_job_path(
+pub(crate) async fn job_search_path(
+    context: &Context,
+    config: &ServiceConfig,
+    journal_default: Option<&str>,
+) -> Result<JobPath, Error> {
+    recorded_job_search_path(context, config.search_path(), journal_default).await
+}
+
+/// The `PATH` of a daemon job that records `recorded`, as [`job_search_path`]
+/// gives it. Only a job that records no `PATH` reads the manager, for its `PATH`.
+///
+/// # Errors
+///
+/// See [`job_path`].
+pub(crate) async fn recorded_job_search_path(
     context: &Context,
     recorded: &SearchPath,
     journal_default: Option<&str>,
@@ -2799,17 +2938,135 @@ pub(crate) async fn recorded_job_path(
             value: recorded.to_env_value(),
             source: PathSource::Recorded,
             loaded_default: None,
+            variables: BTreeMap::new(),
+            manager_unreachable: None,
+        });
+    }
+    recorded_job_path(context, recorded, &[], journal_default).await
+}
+
+/// The `PATH` and the allowlisted manager variables of a daemon job whose
+/// `service.toml` records `recorded` and `allowlist`, by the rules of
+/// [`job_path`]. A fresh install records the search path
+/// [`Context::install_search_path`] resolves, so this is the `PATH` its job
+/// will get before anything is written.
+///
+/// # Errors
+///
+/// See [`job_path`].
+pub(crate) async fn recorded_job_path(
+    context: &Context,
+    recorded: &SearchPath,
+    allowlist: &[String],
+    journal_default: Option<&str>,
+) -> Result<JobPath, Error> {
+    if !recorded.is_empty() {
+        // The recorded `PATH` does not depend on the manager, so an unreachable
+        // manager only means its variables are not applied; see `manager_warnings`.
+        let ManagerVariables {
+            variables,
+            unreachable,
+        } = manager_variables(context, allowlist).await?;
+        return Ok(JobPath {
+            value: recorded.to_env_value(),
+            source: PathSource::Recorded,
+            loaded_default: None,
+            variables,
+            manager_unreachable: unreachable,
         });
     }
     if cfg!(target_os = "linux") {
-        let value = manager_env::user_manager_search_path(context.user_manager()).await?;
+        let environment =
+            manager_env::user_manager_environment(context.user_manager(), allowlist).await?;
+        let value = environment
+            .search_path
+            .ok_or_else(|| Error::ManagerEnvironment {
+                detail: "it sets no PATH entry".to_owned(),
+            })?;
         return Ok(JobPath {
             value,
             source: PathSource::UserManager,
             loaded_default: None,
+            variables: environment.variables,
+            manager_unreachable: None,
         });
     }
-    launchd_job_path(context, journal_default).await
+    launchd_job_path(context, journal_default, allowlist).await
+}
+
+/// The allowlisted variables a recorded-`PATH` job takes from its service
+/// manager, and the reason they are absent when no manager is reachable.
+pub(crate) struct ManagerVariables {
+    /// The variables the manager's environment selects, empty when it is not read.
+    pub(crate) variables: BTreeMap<String, String>,
+    /// Why the manager's environment was not read, when no manager is reachable.
+    pub(crate) unreachable: Option<String>,
+}
+
+/// The allowlisted variables the service manager gives the job when the job
+/// records its `PATH`: the user manager's environment on Linux, the launchd
+/// domain's environment on macOS, and none where no service manager exists.
+///
+/// An unreachable user manager yields no variables and a reason; every other
+/// failure to read or select them is an error.
+#[cfg(target_os = "linux")]
+async fn manager_variables(
+    context: &Context,
+    allowlist: &[String],
+) -> Result<ManagerVariables, Error> {
+    match manager_env::read_user_manager_entries(context.user_manager()).await {
+        Ok(entries) => Ok(ManagerVariables {
+            variables: manager_env::selected_environment(&entries, allowlist)?.variables,
+            unreachable: None,
+        }),
+        Err(manager_env::EnvironmentFailure::Unreachable(detail)) => Ok(ManagerVariables {
+            variables: BTreeMap::new(),
+            unreachable: Some(detail),
+        }),
+        Err(manager_env::EnvironmentFailure::Unusable(detail)) => {
+            Err(Error::ManagerEnvironment { detail })
+        }
+    }
+}
+
+/// See the Linux variant. Only the domain is read: the job's label would derive
+/// the namespace, which creates the state and runtime roots, and a recorded
+/// `PATH` needs none of that. A launchd domain without a GUI session reports no
+/// environment, which is not a failure; a launchctl that cannot run is one.
+#[cfg(target_os = "macos")]
+async fn manager_variables(
+    context: &Context,
+    allowlist: &[String],
+) -> Result<ManagerVariables, Error> {
+    let domain = context
+        .launchd_job()
+        .domain_environment(context.uid())
+        .await
+        .map_err(|detail| Error::ManagerEnvironment { detail })?;
+    match domain {
+        Some(domain) => Ok(ManagerVariables {
+            variables: manager_env::allowlisted_variables(domain, allowlist)?,
+            unreachable: None,
+        }),
+        // Without a GUI session launchd has no domain to read, so the store
+        // variables it may set are not applied.
+        None => Ok(ManagerVariables {
+            variables: BTreeMap::new(),
+            unreachable: Some(no_launchd_domain(context)),
+        }),
+    }
+}
+
+/// See the Linux variant.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+async fn manager_variables(
+    _context: &Context,
+    _allowlist: &[String],
+) -> Result<ManagerVariables, Error> {
+    Ok(ManagerVariables {
+        variables: BTreeMap::new(),
+        unreachable: None,
+    })
 }
 
 /// The launchd `PATH` of a job without its own (macOS), in launchd's order: the
@@ -2820,18 +3077,22 @@ pub(crate) async fn recorded_job_path(
 async fn launchd_job_path(
     context: &Context,
     journal_default: Option<&str>,
+    allowlist: &[String],
 ) -> Result<JobPath, Error> {
     use super::manager_env::ActiveJob;
 
-    let label = context.namespace()?.daemon_label();
     let ActiveJob {
         domain,
         loaded_default,
-    } = context
-        .launchd_job()
-        .active_path(context.uid(), &label)
-        .await
-        .map_err(|detail| Error::ManagerEnvironment { detail })?;
+        domain_environment,
+    } = active_launchd_job(context).await?;
+    let (variables, unreachable) = match domain_environment {
+        Some(entries) => (
+            manager_env::allowlisted_variables(entries, allowlist)?,
+            None,
+        ),
+        None => (BTreeMap::new(), Some(no_launchd_domain(context))),
+    };
     let (value, source) = if let Some(value) = domain {
         (value, PathSource::Domain)
     } else if let Some(value) = loaded_default.clone() {
@@ -2853,7 +3114,30 @@ async fn launchd_job_path(
         value,
         source,
         loaded_default,
+        variables,
+        manager_unreachable: unreachable,
     })
+}
+
+/// Why launchd's variables were not read: it has no user domain for `context`'s
+/// user, which is the case without a GUI session.
+#[cfg(target_os = "macos")]
+fn no_launchd_domain(context: &Context) -> String {
+    format!(
+        "launchd has no user domain for uid {} (no GUI session)",
+        context.uid()
+    )
+}
+
+/// The launchd state of the daemon job of `context`.
+#[cfg(target_os = "macos")]
+async fn active_launchd_job(context: &Context) -> Result<super::manager_env::ActiveJob, Error> {
+    let label = context.namespace()?.daemon_label();
+    context
+        .launchd_job()
+        .active_path(context.uid(), &label)
+        .await
+        .map_err(|detail| Error::ManagerEnvironment { detail })
 }
 
 /// Only macOS has launchd.
@@ -2861,6 +3145,7 @@ async fn launchd_job_path(
 fn launchd_job_path<'a>(
     _context: &'a Context,
     _journal_default: Option<&'a str>,
+    _allowlist: &'a [String],
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<JobPath, Error>> + Send + 'a>> {
     Box::pin(std::future::ready(Err(Error::ManagerEnvironment {
         detail: "a launchd job exists only on macOS".to_owned(),

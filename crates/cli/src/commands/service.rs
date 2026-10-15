@@ -11,9 +11,13 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Subcommand, ValueHint};
-use pohunek_service_config::preflight::{PreflightReport, SessionVerdict, StoreState};
+use pohunek_service_config::preflight::{
+    PreflightReport, SessionVerdict, StoreState, Verdict, MAX_PROBE_BUDGET_SECS,
+    MIN_PROBE_BUDGET_SECS, PROBE_BUDGET,
+};
 use pohunek_service_config::runtimes::{CatalogStatus, EnsureReport, PackageStatus};
 
 use crate::commands::render_json;
@@ -60,6 +64,15 @@ pub(crate) enum Action {
         /// metadata store the new daemon cannot start with.
         #[arg(long)]
         accept_runtime_loss: bool,
+        /// Probe budget, in seconds, of the preflight that judges the live
+        /// sessions: the version probes and native reference checks run within
+        /// it. The default is 20; the installer's deadline grows with it.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            value_parser = clap::value_parser!(u64).range(MIN_PROBE_BUDGET_SECS..=MAX_PROBE_BUDGET_SECS)
+        )]
+        preflight_budget: Option<u64>,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -108,6 +121,15 @@ pub(crate) enum Action {
         /// native recovery, as `service upgrade --accept-runtime-loss` would.
         #[arg(long)]
         accept_runtime_loss: bool,
+        /// Probe budget, in seconds, of the preflight that judges the live
+        /// sessions: the version probes and native reference checks run within
+        /// it. The default is 20; the installer's deadline grows with it.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            value_parser = clap::value_parser!(u64).range(MIN_PROBE_BUDGET_SECS..=MAX_PROBE_BUDGET_SECS)
+        )]
+        preflight_budget: Option<u64>,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -166,17 +188,21 @@ pub(crate) async fn run(action: Action) -> Result<ExitCode, CliError> {
         Action::Upgrade {
             from,
             accept_runtime_loss,
+            preflight_budget,
             json,
         } => {
-            let report = service::upgrade(from, accept_runtime_loss).await?;
+            let budget = preflight_budget.map_or(PROBE_BUDGET, Duration::from_secs);
+            let report = service::upgrade(from, accept_runtime_loss, budget).await?;
             emit(json, &report, render_upgrade)
         }
         Action::Check {
             prefix,
             accept_runtime_loss,
+            preflight_budget,
             json,
         } => {
-            let report = service::check(prefix, accept_runtime_loss).await?;
+            let budget = preflight_budget.map_or(PROBE_BUDGET, Duration::from_secs);
+            let report = service::check(prefix, accept_runtime_loss, budget).await?;
             emit(json, &report, render_check)
         }
         Action::Uninstall {
@@ -356,17 +382,26 @@ fn render_sessions(
         .iter()
         .filter(|session| session.verdict.at_risk())
         .count();
+    let not_resumable = sessions
+        .iter()
+        .filter(|session| session.verdict == Verdict::AlreadyNotResumable)
+        .count();
     let _ = writeln!(
         text,
-        "{heading:<10} {} {kind}, {} adoptable{}",
+        "{heading:<10} {} {kind}, {} adoptable{}{}",
         sessions.len(),
-        sessions.len() - at_risk,
+        sessions.len() - at_risk - not_resumable,
         if at_risk == 0 {
             String::new()
         } else if accepted_runtime_loss {
             format!(", {at_risk} at risk (accepted with --accept-runtime-loss)")
         } else {
             format!(", {at_risk} at risk")
+        },
+        if not_resumable == 0 {
+            String::new()
+        } else {
+            format!(", {not_resumable} already not resumable before the upgrade")
         }
     );
     for session in sessions {
@@ -570,6 +605,9 @@ fn render_check(report: &report::CheckReport) -> String {
             text,
             "migration  service.toml is upgraded from schema {schema}: the daemon stops before the write, and a rollback restores the exact previous file"
         );
+    }
+    for warning in &report.warnings {
+        let _ = writeln!(text, "warning    {warning}");
     }
     let _ = writeln!(text, "prefix     {}", report.prefix.display());
     let _ = writeln!(text, "config     {}", report.config_path.display());
@@ -941,6 +979,7 @@ mod tests {
             Action::Upgrade {
                 from: Some(_),
                 accept_runtime_loss: false,
+                preflight_budget: None,
                 json: false
             }
         ));
@@ -949,6 +988,7 @@ mod tests {
             Action::Upgrade {
                 from: None,
                 accept_runtime_loss: true,
+                preflight_budget: None,
                 json: true
             }
         ));
@@ -968,7 +1008,7 @@ mod tests {
             .expect_err("upgrade takes no --prefix");
         assert!(matches!(
             parse(&["check", "--prefix", "/p", "--json"]),
-            Action::Check { prefix: Some(prefix), json: true, accept_runtime_loss: false }
+            Action::Check { prefix: Some(prefix), json: true, accept_runtime_loss: false, .. }
                 if prefix == Path::new("/p")
         ));
         assert!(matches!(
@@ -976,6 +1016,7 @@ mod tests {
             Action::Check {
                 prefix: None,
                 accept_runtime_loss: false,
+                preflight_budget: None,
                 json: false
             }
         ));
@@ -983,9 +1024,28 @@ mod tests {
             parse(&["check", "--accept-runtime-loss"]),
             Action::Check {
                 accept_runtime_loss: true,
+                preflight_budget: None,
                 ..
             }
         ));
+        assert!(matches!(
+            parse(&["upgrade", "--preflight-budget", "90"]),
+            Action::Upgrade {
+                preflight_budget: Some(90),
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["check", "--preflight-budget", "300"]),
+            Action::Check {
+                preflight_budget: Some(300),
+                ..
+            }
+        ));
+        for rejected in ["0", "301", "soon"] {
+            Harness::try_parse_from(["service", "check", "--preflight-budget", rejected])
+                .expect_err("the budget is a whole number of seconds from 1 to 300");
+        }
         Harness::try_parse_from(["service", "install", "--accept-runtime-loss"])
             .expect_err("install has no sessions to lose");
         Harness::try_parse_from(["service", "uninstall", "--accept-runtime-loss"])
@@ -1025,6 +1085,7 @@ mod tests {
             preflight: None,
             accepted_runtime_loss: false,
             config_schema_migration: None,
+            warnings: Vec::new(),
         });
         assert!(
             text.contains("install of pohunek 1.0.0 would pass its preflight (namespace ns), checked under the transaction lock"),
@@ -1040,7 +1101,7 @@ mod tests {
 
     /// A plan with one live and two stopped sessions; the refusals of a plan go to its error.
     fn runtime_plan_preflight() -> PreflightReport {
-        use pohunek_service_config::preflight::{StoreReport, Verdict, REPORT_VERSION};
+        use pohunek_service_config::preflight::{StoreReport, REPORT_VERSION};
         use pohunek_service_config::runtimes::{
             IntegrationAction, PackageAction, ProfileAction, ProfileStatus, UseReason,
             ENSURE_REPORT_VERSION,
@@ -1115,6 +1176,7 @@ mod tests {
             preflight: Some(preflight),
             accepted_runtime_loss: false,
             config_schema_migration: None,
+            warnings: Vec::new(),
         });
 
         assert!(
@@ -1139,6 +1201,48 @@ mod tests {
         );
         assert!(
             text.contains("  s-stopped-a: would_lose_recovery"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn check_counts_an_already_not_resumable_session_apart_from_the_at_risk_ones() {
+        let session = |id: &str, verdict: Verdict| SessionVerdict {
+            session_id: id.to_owned(),
+            name: None,
+            verdict,
+            code: "test_code".to_owned(),
+            detail: "test detail".to_owned(),
+        };
+        let mut preflight = runtime_plan_preflight();
+        preflight.stopped_sessions = vec![
+            session("s-stopped-a", Verdict::AlreadyNotResumable),
+            session("s-stopped-b", Verdict::WouldLoseRecovery),
+            session("s-stopped-c", Verdict::Adoptable),
+        ];
+        let text = render_check(&report::CheckReport {
+            operation: "upgrade",
+            version: "1.0.0".to_owned(),
+            prefix: PathBuf::from("/p"),
+            namespace: "ns".to_owned(),
+            config_path: PathBuf::from("/c/pohunek/service.toml"),
+            pending_transaction: None,
+            pending_action: None,
+            locked: false,
+            preflight: Some(preflight),
+            accepted_runtime_loss: false,
+            config_schema_migration: None,
+            warnings: Vec::new(),
+        });
+
+        assert!(
+            text.contains(
+                "stopped    3 with native resume or fork, 1 adoptable, 1 at risk, 1 already not resumable before the upgrade\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("  s-stopped-a: already_not_resumable"),
             "{text}"
         );
     }

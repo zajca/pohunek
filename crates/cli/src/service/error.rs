@@ -430,10 +430,12 @@ pub enum Error {
 
     /// The new daemon would not adopt, or would adopt without native
     /// recovery, live sessions of the running daemon.
-    #[error("{}", at_risk_summary("upgrade", sessions))]
+    #[error("{}", at_risk_summary("upgrade", sessions, warnings))]
     UpgradeAtRisk {
         /// The sessions the preflight judged at risk, ordered by id.
         sessions: Vec<SessionVerdict>,
+        /// Warnings of the judgement, so a refusal explains a degraded verdict.
+        warnings: Vec<String>,
     },
 
     /// The new daemon would refuse to start with the installed metadata store.
@@ -488,6 +490,17 @@ pub enum Error {
         detail: String,
     },
 
+    /// The service manager's environment was not read, so the preflight judged a
+    /// stopped session's native reference without the store variables the daemon
+    /// job gets. Refused unless the operator accepts runtime loss.
+    #[error(
+        "the service manager's environment was not read ({detail}), so the preflight cannot judge native references with the store variables the daemon job gets"
+    )]
+    ManagerVariablesUnread {
+        /// Why the manager's environment was not read.
+        detail: String,
+    },
+
     /// The official runtime step did not produce a usable report, or its
     /// apply left work undone.
     #[error("the official runtime step of {} failed: {detail}", binary.display())]
@@ -521,12 +534,14 @@ pub enum Error {
     },
 
     /// The previous daemon may lose live runtime or recovery on rollback.
-    #[error("{}", at_risk_summary(&format!("rollback to {version}"), sessions))]
+    #[error("{}", at_risk_summary(&format!("rollback to {version}"), sessions, warnings))]
     RollbackAtRisk {
         /// Version that would be restored.
         version: String,
         /// Sessions requiring explicit acceptance.
         sessions: Vec<SessionVerdict>,
+        /// Warnings of the judgement, so a refusal explains a degraded verdict.
+        warnings: Vec<String>,
     },
 
     /// The previous daemon gave no trustworthy rollback verdict.
@@ -647,6 +662,28 @@ impl From<crate::workflow::Error> for Error {
 }
 
 impl Error {
+    /// Attaches the warnings of a degraded judgement to a refusal that the
+    /// judgement produced, so the operator reads them with the refusal.
+    ///
+    /// The at-risk refusals keep them in a slot of their own; the preflight
+    /// failures append them to their detail. Other errors are returned unchanged.
+    #[must_use]
+    pub(crate) fn with_warnings(mut self, warnings: &[String]) -> Self {
+        match &mut self {
+            Self::UpgradeAtRisk { warnings: slot, .. }
+            | Self::RollbackAtRisk { warnings: slot, .. } => slot.extend_from_slice(warnings),
+            Self::UpgradePreflightFailed { detail, .. }
+            | Self::RollbackPreflightFailed { detail, .. } => {
+                for warning in warnings {
+                    detail.push_str("; warning: ");
+                    detail.push_str(warning);
+                }
+            }
+            _ => {}
+        }
+        self
+    }
+
     /// Stable machine-readable code for `--json` error output.
     #[must_use]
     pub fn code(&self) -> &'static str {
@@ -691,6 +728,7 @@ impl Error {
             Self::UpgradeRuntimesFailed { .. } => "service_upgrade_runtimes_failed",
             Self::UpgradeRuntimesUnconfirmed { .. } => "service_upgrade_runtimes_unconfirmed",
             Self::ManagerEnvironment { .. } => "service_manager_environment_unavailable",
+            Self::ManagerVariablesUnread { .. } => "service_manager_variables_unread",
             Self::RuntimeBackup { .. } => "service_runtime_backup_invalid",
             Self::RollbackStoreUnusable { .. } => "service_rollback_store_unusable",
             Self::RollbackAtRisk { .. } => "service_rollback_sessions_at_risk",
@@ -754,7 +792,10 @@ impl Error {
                 "the upgrade is kept, not rolled back: confirm that no `pohunekd ensure-official-runtimes` process of that release is running (`pgrep -fl ensure-official-runtimes`), then rerun `pohunek service upgrade`",
             ),
             Self::ManagerEnvironment { .. } => Some(
-                "the daemon job runs with the PATH its definition records, or on Linux the systemd user manager's Environment PATH when it records none; check that source and retry; nothing was changed",
+                "the daemon job's PATH comes from its definition when it records one, otherwise from the service manager's environment (the systemd user manager's Environment on Linux, the launchd domain on macOS); make that manager's environment readable, that is its bus reachable and its answer well formed, and retry; nothing was changed",
+            ),
+            Self::ManagerVariablesUnread { .. } => Some(
+                "make the service manager's environment readable (on Linux, the systemd user manager's bus reachable; on macOS, the user logged in to a GUI session so launchd has the gui/<uid> domain) and retry, or pass --accept-runtime-loss to accept that a session judged without those variables may lose its recovery; nothing was changed",
             ),
             Self::UpgradeRuntimesFailed { .. } => Some(
                 "run `<staged>/pohunekd ensure-official-runtimes --dry-run` by hand with the same XDG environment to see its output, then retry",
@@ -842,7 +883,7 @@ fn refusals_summary(refusals: &[Refusal]) -> String {
         .join("; ")
 }
 
-fn at_risk_summary(action: &str, sessions: &[SessionVerdict]) -> String {
+fn at_risk_summary(action: &str, sessions: &[SessionVerdict], warnings: &[String]) -> String {
     let mut text = format!(
         "{action} refused: {} live session(s) have unverified runtime or recovery",
         sessions.len()
@@ -858,6 +899,9 @@ fn at_risk_summary(action: &str, sessions: &[SessionVerdict]) -> String {
             "\n  {}{name}: {} [{}] {}",
             session.session_id, session.verdict, session.code, session.detail
         );
+    }
+    for warning in warnings {
+        let _ = write!(text, "\n  warning: {warning}");
     }
     text
 }

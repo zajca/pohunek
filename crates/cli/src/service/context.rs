@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use pohunek_paths::{BasePaths, PathEnv, HOME, XDG_RUNTIME_DIR};
 use pohunek_platform::filesystem::TrustedDir;
@@ -14,6 +15,7 @@ use pohunek_platform::shell_env::{
     PRINTENV_EXECUTABLE,
 };
 use pohunek_platform::supervisor::{self, Namespace};
+use pohunek_service_config::preflight::PROBE_BUDGET;
 
 use super::error::{fs_error, io_error, Error};
 use super::manager_env::{LaunchdJob, SystemLaunchd, SystemdUserManager, UserManager};
@@ -86,6 +88,8 @@ pub struct Context {
     user_manager: Arc<dyn UserManager>,
     launchd_domain_config: PathBuf,
     launchd_job: Arc<dyn LaunchdJob>,
+    /// The probe budget the adoption preflight of this command runs under.
+    preflight_budget: Duration,
 }
 
 /// The launchd user-domain configuration of this host.
@@ -126,7 +130,22 @@ impl Context {
             user_manager: Arc::new(SystemdUserManager),
             launchd_domain_config: default_launchd_domain_config(),
             launchd_job: Arc::new(SystemLaunchd),
+            preflight_budget: PROBE_BUDGET,
         }
+    }
+
+    /// Returns this context running the adoption preflight with `budget` as its
+    /// probe budget.
+    #[must_use]
+    pub fn with_preflight_budget(mut self, budget: Duration) -> Self {
+        self.preflight_budget = budget;
+        self
+    }
+
+    /// The probe budget of the adoption preflight.
+    #[must_use]
+    pub fn preflight_budget(&self) -> Duration {
+        self.preflight_budget
     }
 
     /// Returns this context reading the systemd user manager through `manager`.

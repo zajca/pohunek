@@ -448,6 +448,76 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Whether the error means there is no bus to talk to: no session bus
+    /// address can be determined, or nothing listens at the socket it names.
+    ///
+    /// A bus that answers but refuses the client (authentication, handshake,
+    /// permissions) is not this, so a caller must not treat it as absent.
+    #[must_use]
+    pub fn is_no_bus(&self) -> bool {
+        let Self::Unavailable {
+            operation: "connect",
+            source,
+        } = self
+        else {
+            return false;
+        };
+        no_bus_source(source.as_ref())
+    }
+
+    /// Whether the error is a session bus address zbus cannot use: one it cannot
+    /// parse, or none of whose transports it can connect through. Such text may
+    /// quote the address, which the caller's environment supplies, so a caller
+    /// that reports it names the condition instead.
+    #[must_use]
+    pub fn is_bus_address_invalid(&self) -> bool {
+        let Self::Unavailable {
+            operation: "connect",
+            source,
+        } = self
+        else {
+            return false;
+        };
+        bus_address_source(source.as_ref())
+    }
+}
+
+/// Whether a failed connection's bus error is an address zbus cannot use.
+#[cfg(target_os = "linux")]
+fn bus_address_source(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    matches!(
+        source.downcast_ref::<zbus::Error>(),
+        Some(zbus::Error::Address(_))
+    )
+}
+
+/// No other host connects to a session bus.
+#[cfg(not(target_os = "linux"))]
+fn bus_address_source(_source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    false
+}
+
+/// The bus error behind a failed connection, classified as no bus or not.
+#[cfg(target_os = "linux")]
+fn no_bus_source(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    // An address that cannot be parsed is a configuration error, not an absent
+    // bus: it fails closed, so only the socket's absence counts.
+    match source.downcast_ref::<zbus::Error>() {
+        Some(zbus::Error::InputOutput(io)) => matches!(
+            io.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        ),
+        _ => false,
+    }
+}
+
+/// The user bus is a Linux service manager's; no other host has one to miss.
+#[cfg(not(target_os = "linux"))]
+fn no_bus_source(_source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    false
+}
+
 /// Boxed native supervisor operation.
 pub type Operation<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'a>>;
 

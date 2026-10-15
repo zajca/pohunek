@@ -189,6 +189,10 @@ pub struct CheckReport {
     /// A migration stops the daemon before it rewrites `service.toml` and
     /// restores the exact pre-upgrade bytes on rollback.
     pub config_schema_migration: Option<u32>,
+    /// Conditions of the check's inputs that the operator must be told, such as
+    /// a service manager whose environment was not read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// A version directory garbage collection kept.
