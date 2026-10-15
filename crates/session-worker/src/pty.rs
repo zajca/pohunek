@@ -3822,7 +3822,10 @@ mod tests {
         let (pty, mut output, pause, _cwd) = pause_with_accepted_input().await;
         pause.resume().expect("resume output");
         await_marker(&mut output, PAUSED_INPUT.trim_ascii_end(), "the held echo").await;
-        let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
+        let _ = pty
+            .stop("cleanup", stop_grace(), kill_reap())
+            .await
+            .expect("cleanup");
     }
 
     /// A one-byte child write holds the terminal through the pause and is the
@@ -3872,7 +3875,10 @@ mod tests {
 
         pause.resume().expect("resume output");
         await_marker(&mut output, PAUSED_INPUT.trim_ascii_end(), "the held echo").await;
-        let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
+        let _ = pty
+            .stop("cleanup", stop_grace(), kill_reap())
+            .await
+            .expect("cleanup");
     }
 
     #[tokio::test]
@@ -3918,7 +3924,10 @@ mod tests {
             observed, reply,
             "the resume writes nothing to a terminal that does not echo"
         );
-        let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
+        let _ = pty
+            .stop("cleanup", stop_grace(), kill_reap())
+            .await
+            .expect("cleanup");
     }
 
     #[tokio::test]
@@ -3926,7 +3935,10 @@ mod tests {
         let (pty, mut output, pause, _cwd) = pause_with_accepted_input().await;
         drop(pause);
         await_marker(&mut output, PAUSED_INPUT.trim_ascii_end(), "the held echo").await;
-        let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
+        let _ = pty
+            .stop("cleanup", stop_grace(), kill_reap())
+            .await
+            .expect("cleanup");
     }
 
     #[test]
