@@ -196,10 +196,18 @@ def process_snapshot(pids):
     return "; ".join(snapshot)
 
 
+def darwin_leftovers():
+    """Paths and throwaway users the macOS smoke creates outside TMPDIR."""
+    paths = set(glob.glob("/private/tmp/pk*.*")) | set(glob.glob("/private/var/pks-home.*"))
+    users = subprocess.run(["dscl", ".", "-list", "/Users"], stdout=subprocess.PIPE, text=True, check=True).stdout.split()
+    return paths | {f"user:{user}" for user in users if user.startswith("pksmoke")}
+
+
 class _SmokeArchiveFixture:
     def setUp(self):
         # On Darwin, create base in /private/tmp and chmod it so the throwaway user can read it
         if sys.platform.startswith("darwin"):
+            self.darwin_before = darwin_leftovers()
             self.base = Path(tempfile.mkdtemp(prefix="pohunek-smoke-test-", dir="/private/tmp")).resolve()
             os.chmod(self.base, 0o755)
         else:
@@ -323,7 +331,8 @@ class _SmokeArchiveFixture:
     def assert_cleaned_up(self):
         self.assertEqual(list(self.tmpdir.iterdir()), [], "the temp directory was left behind")
         self.assertEqual(processes_with_marker(), [], "a process was left behind")
-
+        if sys.platform.startswith("darwin"):
+            self.assertEqual(darwin_leftovers(), self.darwin_before, "the macOS smoke left a temp directory, home or throwaway user behind")
 
     def assert_termination_kills_namespace(self, isolation):
         fifo_probe = (
@@ -939,6 +948,59 @@ done
     def test_termination_kills_the_userns_namespace_and_its_workload(self):
         self.assert_termination_kills_namespace("userns")
 
+    @needs_isolated_run
+    @unittest.skipUnless(sys.platform.startswith("darwin"), "the throwaway-user sandbox is macOS-only")
+    def test_termination_kills_the_sandbox_run_and_removes_the_throwaway_user(self):
+        self.write_consumer(
+            STUB_PREAMBLE
+            + f"sleep {MARKER_SLEEP} &\n"
+            + "echo SMOKE-CONSUMER-READY\nwait\n"
+        )
+        env = dict(os.environ)
+        env["TMPDIR"] = str(self.tmpdir)
+        command = [
+            str(SCRIPT), "--archive", str(self.archive), "--stage", str(self.stage),
+            "--consumer", str(self.consumer), "--runtime", "pi",
+        ]
+        process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        workload_uid = None
+        try:
+            output = b""
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while b"SMOKE-CONSUMER-READY\n" not in output:
+                    self.assertTrue(selector.select(timeout=120), "consumer did not become ready")
+                    chunk = os.read(process.stdout.fileno(), 4096)
+                    self.assertTrue(chunk, "consumer exited before becoming ready")
+                    output += chunk
+            markers = processes_with_marker()
+            self.assertEqual(len(markers), 1, "consumer workload did not start")
+            workload_uid = int(subprocess.run(["ps", "-o", "uid=", "-p", markers[0]], stdout=subprocess.PIPE, text=True, check=True).stdout.strip())
+            self.assertNotEqual(workload_uid, os.getuid(), "the workload does not run as the throwaway user")
+            os.kill(process.pid, signal.SIGTERM)
+            try:
+                _, stderr = process.communicate(timeout=60)
+            except subprocess.TimeoutExpired as error:
+                raise AssertionError("cancellation did not finish within 60s") from error
+            self.assertEqual(process.returncode, 143, stderr.decode(errors="replace"))
+            self.assertEqual(processes_with_marker(), [], "the workload survived cancellation")
+            survivors = subprocess.run(["pgrep", "-U", str(workload_uid)], stdout=subprocess.PIPE, text=True).stdout.split()
+            self.assertEqual(survivors, [], "a process of the throwaway user survived cancellation")
+            self.assert_cleaned_up()
+        finally:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if workload_uid is not None and workload_uid != os.getuid():
+                subprocess.run(["sudo", "-n", "pkill", "-KILL", "-U", str(workload_uid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "userns isolation is Linux-only")
     def test_the_userns_strategy_can_be_forced(self):
         result = self.smoke("--isolation=userns", "--runtime", "pi")
@@ -976,23 +1038,11 @@ done
         "needs macOS without passwordless sudo",
     )
     def test_macos_without_passwordless_sudo_fails_closed(self):
-        before_pks = set(glob.glob("/private/tmp/pks.*"))
-        before_pk = set(glob.glob("/private/tmp/pk.*"))
-        before_pkh = set(glob.glob("/private/tmp/pkh.*"))
-
         result = self.smoke("--runtime", "pi")
-
-        after_pks = set(glob.glob("/private/tmp/pks.*"))
-        after_pk = set(glob.glob("/private/tmp/pk.*"))
-        after_pkh = set(glob.glob("/private/tmp/pkh.*"))
 
         self.assertNotEqual(result.returncode, 0, "smoke should fail without passwordless sudo")
         self.assertIn("needs passwordless sudo (sudo -n)", result.stderr)
         self.assert_cleaned_up()
-        # Verify no temp directories were created by the smoke
-        self.assertEqual(before_pks, after_pks, "leftover /private/tmp/pks.* directory")
-        self.assertEqual(before_pk, after_pk, "leftover /private/tmp/pk.* directory")
-        self.assertEqual(before_pkh, after_pkh, "leftover /private/tmp/pkh.* directory")
 
 
 @unittest.skipUnless(

@@ -733,6 +733,17 @@ tuid=
 tuser_created=
 stage_chowned=
 codex_dir=
+
+# Kill every process of the throwaway user, polling up to 10 s.
+kill_throwaway_user_processes() {
+    poll=0
+    while [ "$poll" -lt 100 ] && /usr/bin/pgrep -U "$tuid" >/dev/null 2>&1; do
+        /usr/bin/sudo -n /usr/bin/pkill -KILL -U "$tuid" 2>/dev/null || true
+        sleep 0.1
+        poll=$((poll + 1))
+    done
+}
+
 cleanup() {
     status=$?
     trap '' EXIT
@@ -743,7 +754,12 @@ cleanup() {
     fi
     exec 3>&-
     if [ -n "$ns_pid" ]; then
-        if [ "$chosen" != sudo ]; then
+        if [ "$chosen" = sandbox ] && [ -n "$tuser_created" ]; then
+            # The sandbox runs as the throwaway user under a root-owned sudo,
+            # which the invoking user cannot signal; kill the user's processes
+            # so sudo exits before it is reaped.
+            kill_throwaway_user_processes
+        elif [ "$chosen" != sudo ]; then
             # Signal the private group before reaping its leader, so its ID
             # cannot be reused for an unrelated process group.
             /bin/kill -KILL -- "-$ns_pid" 2>/dev/null || kill -KILL "$ns_pid" 2>/dev/null || true
@@ -758,7 +774,11 @@ cleanup() {
             [ -f "$pidfile" ] || continue
             sid=$(cat -- "$pidfile" 2>/dev/null) || continue
             case $sid in '' | *[!0-9]*) continue ;; esac
-            /bin/kill -KILL -- "-$sid" 2>/dev/null || true
+            if [ -n "$tuser_created" ]; then
+                /usr/bin/sudo -n /bin/kill -KILL -- "-$sid" 2>/dev/null || true
+            else
+                /bin/kill -KILL -- "-$sid" 2>/dev/null || true
+            fi
         done
     fi
     # Kill the host_probe listeners if they were started.
@@ -770,12 +790,7 @@ cleanup() {
     fi
     # Darwin throwaway user cleanup
     if [ -n "$tuser_created" ]; then
-        poll=0
-        while [ "$poll" -lt 100 ] && /usr/bin/pgrep -U "$tuid" >/dev/null 2>&1; do
-            /usr/bin/sudo -n /usr/bin/pkill -KILL -U "$tuid" 2>/dev/null || true
-            sleep 0.1
-            poll=$((poll + 1))
-        done
+        kill_throwaway_user_processes
         if /usr/bin/pgrep -U "$tuid" >/dev/null 2>&1; then
             printf 'smoke-archive: processes of %s survived cleanup\n' "$tuser" >&2
             /bin/ps -U "$tuid" -o pid,ppid,stat,command | while read -r line; do
@@ -1075,12 +1090,13 @@ if [ "$chosen" = sandbox ]; then
         probe_darwin_sudo || fail "the macOS smoke runs the consumer as a throwaway local user and needs passwordless sudo (sudo -n) to create it; refusing to run as the invoking user"
         create_throwaway_user
         if [ -n "$tuser" ]; then
+            # Set before the first chown so cleanup reverts a partial handover.
+            stage_chowned=1
             /usr/bin/sudo -n /usr/sbin/chown "$tuser:20" "$stage" || fail "cannot chown stage to throwaway user"
             for rt in $runtimes; do
                 /usr/bin/sudo -n /usr/sbin/chown -R "$tuser:20" "$stage/$rt" || fail "cannot chown $stage/$rt to throwaway user"
                 /usr/bin/sudo -n /bin/chmod -R go-w "$stage/$rt" || fail "cannot drop group/other write from $stage/$rt"
             done
-            stage_chowned=1
         fi
     fi
 fi
