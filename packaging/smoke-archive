@@ -771,12 +771,13 @@ cleanup() {
     # macOS: the consumer runs in its own session (setsid) inside the sandbox,
     # so killing the sandbox shell does not reach it; kill each live session
     # recorded by the inner shell before the temp tree goes away.
-    if [ "$chosen" = sandbox ]; then
+    # With a throwaway user, pkill -U covers these sessions and the pidfile is not trusted at all.
+    if [ "$chosen" = sandbox ] && [ -z "$tuser_created" ]; then
         for pidfile in "$work"/run/.stray_*.pid; do
             [ -f "$pidfile" ] || continue
             sid=$(cat -- "$pidfile" 2>/dev/null) || continue
-            case $sid in '' | *[!0-9]*) continue ;; esac
-            # Never with sudo: the pidfile is writable by the consumer; the throwaway user's own processes are killed with pkill -U.
+            case $sid in '' | *[!0-9]* | 0* | 1) continue ;; esac
+            # The pidfile is consumer-writable: never sudo, and never group 0 or 1.
             /bin/kill -KILL -- "-$sid" 2>/dev/null || true
         done
     fi
