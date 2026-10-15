@@ -606,7 +606,9 @@ create_throwaway_user() {
     /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" UniqueID "$tuid" || fail "cannot create the throwaway user $tuser"
     /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" PrimaryGroupID 20 || fail "cannot create the throwaway user $tuser"
     /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" UserShell /usr/bin/false || fail "cannot create the throwaway user $tuser"
-    /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" NFSHomeDirectory /var/empty || fail "cannot create the throwaway user $tuser"
+    thome=$(/usr/bin/sudo -n /usr/bin/mktemp -d /private/var/pks-home.XXXXXX) || fail "cannot create the throwaway user's home"
+    case $thome in /private/var/pks-home.*) ;; *) fail "throwaway home is not /private/var/pks-home.*: $thome" ;; esac
+    /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" NFSHomeDirectory "$thome" || fail "cannot create the throwaway user $tuser"
     /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" RealName "pohunek archive smoke" || fail "cannot create the throwaway user $tuser"
     /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" IsHidden 1 || fail "cannot create the throwaway user $tuser"
     poll=0
@@ -627,6 +629,9 @@ create_throwaway_user() {
         /private/tmp/pki.*) ;;
         *) fail "inputs directory is not in /private/tmp/pki.*: $inputs" ;;
     esac
+    /usr/bin/sudo -n /usr/sbin/chown "$tuser:20" "$thome" || fail "cannot hand the home to $tuser"
+    /usr/bin/sudo -n /bin/chmod 0700 "$thome" || fail "cannot chmod the throwaway home"
+    /usr/bin/sudo -n -u "$tuser" /bin/mkdir -p "$thome/Library/Preferences" || fail "cannot create the throwaway user's Library/Preferences"
 }
 
 if [ "${1:-}" = __inner ]; then
@@ -716,6 +721,7 @@ host_probe=
 host_probe_listener_pid=
 host_probe_w_listener_pid=
 inputs=
+thome=
 if [ "$uname_s" = Darwin ]; then
     sock_root=$(mktemp -d /tmp/pk.XXXX) || fail "cannot create socket root directory"
     sock_root=$(cd "$sock_root" && pwd -P)
@@ -794,6 +800,12 @@ cleanup() {
             *) printf 'smoke-archive: refusing to remove %s\n' "$inputs" >&2; status=1 ;;
         esac
         [ -e "$inputs" ] && { printf 'smoke-archive: inputs directory %s still exists\n' "$inputs" >&2; status=1; }
+        case $thome in
+            /private/var/pks-home.*) /usr/bin/sudo -n /bin/rm -rf -- "$thome" || true ;;
+            '') ;;
+            *) printf 'smoke-archive: refusing to remove %s\n' "$thome" >&2; status=1 ;;
+        esac
+        [ -n "$thome" ] && [ -e "$thome" ] && { printf 'smoke-archive: throwaway home %s still exists\n' "$thome" >&2; status=1; }
         /usr/bin/sudo -n /usr/bin/dscl . -delete "/Users/$tuser" 2>/dev/null || true
         if /usr/bin/dscl . -read "/Users/$tuser" >/dev/null 2>&1; then
             printf 'smoke-archive: throwaway user %s still exists\n' "$tuser" >&2
@@ -1015,6 +1027,7 @@ run_sandbox() {
     # stays denied. DNS (/private/var/run/mDNSResponder) stays denied.
     cd /
     [ -n "$tuser" ] || fail "no throwaway user; refusing to run the macOS smoke as the invoking user"
+    # codex 0.157+ reads preferences from the dscl home, which must exist and be owned by the user (openai/codex#50072); see create_throwaway_user
     exec /usr/bin/sudo -n -u "$tuser" /usr/bin/sandbox-exec -p "$profile" /usr/bin/env -i PATH="$root_path" /bin/sh "$work/smoke-archive" __inner sandbox "$work" "$root" "$stage" "$work/consumer" "$node_dir" "$sock_root" "$host_probe" "$inputs" $runtimes
 }
 probe_userns() {
