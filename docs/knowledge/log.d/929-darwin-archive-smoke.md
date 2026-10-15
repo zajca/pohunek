@@ -13,4 +13,10 @@
   carries (`claude`, `codex`, `hermes`, `pi`) can be installed offline and serve
   agents on the target platform. Leftover processes are checked with a weaker
   detection on macOS (#1010).
+- The macOS scenarios of `scripts/tests/test_smoke_archive` that require the
+  isolated run are skipped on machines without passwordless sudo, and the
+  macos-15 `smoke` job runs them with `POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN=1`.
+  The host probe uses a permission-protected unix socket (mode 0755) and a
+  world-connectable one (mode 0777) to verify that the sandbox profile itself
+  denies unix sockets, independently of file permissions.
 - Documented in `guides/hermes-operator`, `runbooks/install-on-macos`.

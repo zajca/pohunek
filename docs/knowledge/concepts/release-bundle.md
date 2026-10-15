@@ -129,8 +129,12 @@ same absolute path and checks it with `cargo xtask compat verify-stage`: a
 consumer may write into the stage it ran from (a provisioned Python upstream
 writes bytecode and state files), and the smoke refuses a stage that differs
 from its manifests. Each consumer report must name the catalog
-entry's package digest and the SHA-256 of the archive's own binaries. The
-procedure and its limits are in `docs/development.md` ("Archive smoke").
+entry's package digest and the SHA-256 of the archive's own binaries. On macOS,
+the Apple Silicon archive runs under `sandbox-exec` as a throwaway local user
+created per run (random uid 40000-59999, via `dscl`); creating it needs
+passwordless `sudo -n`, and without it the smoke fails closed after archive and
+stage validation. The procedure and its limits are in
+`docs/development.md` ("Archive smoke").
 
 ## Release workflows
 
@@ -170,7 +174,8 @@ source ref equal to the tag, GitHub-hosted runners only), collects the flat inpu
 directory and runs `cargo xtask release assemble` with the commit time from
 `git log`, then `verify-inventory` with the same `--anchor`. `attest-bundle` attests every file of the
 bundle, `smoke` runs `packaging/smoke-archive` on every Linux daemon archive
-with the isolation strategy a probe step proved available, and `verdict` fails
+with the isolation strategy a probe step proved available, and on the Apple
+Silicon archive under `sandbox-exec` on macos-15, and `verdict` fails
 unless exactly the jobs of the mode succeeded (a skipped job counts as success
 to a caller). The bundle is the artifact `release-bundle`.
 

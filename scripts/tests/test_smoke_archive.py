@@ -114,6 +114,13 @@ needs_isolated_run = unittest.skipIf(
     "the macOS isolated run needs passwordless sudo for the throwaway user",
 )
 
+# If the environment requires isolated run scenarios, fail if they're not available.
+if os.environ.get("POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN") == "1":
+    if not can_run_smoke_archive_tests():
+        raise RuntimeError("POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN=1 requires the smoke archive tests to be runnable on this platform")
+    if sys.platform.startswith("darwin") and not darwin_sudo_available():
+        raise RuntimeError("POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN=1 requires passwordless sudo on macOS for the throwaway user")
+
 
 def processes_with_marker():
     found = []
@@ -185,7 +192,12 @@ def process_snapshot(pids):
 
 class _SmokeArchiveFixture:
     def setUp(self):
-        self.base = Path(tempfile.mkdtemp(prefix="pohunek-smoke-test-")).resolve()
+        # On Darwin, create base in /private/tmp and chmod it so the throwaway user can read it
+        if sys.platform.startswith("darwin"):
+            self.base = Path(tempfile.mkdtemp(prefix="pohunek-smoke-test-", dir="/private/tmp")).resolve()
+            os.chmod(self.base, 0o755)
+        else:
+            self.base = Path(tempfile.mkdtemp(prefix="pohunek-smoke-test-")).resolve()
         self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
         self.tmpdir = self.base / "tmp"
         self.tmpdir.mkdir()

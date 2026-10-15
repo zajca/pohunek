@@ -330,8 +330,12 @@ network_check() {
         # Test that unix sockets outside the permitted paths are blocked.
         [ -n "$host_probe" ] || fail "the host unix-socket probe is missing"
         [ -S "$host_probe/s" ] || fail "the host unix-socket probe is missing"
+        [ -S "$host_probe/w" ] || fail "the host unix-socket probe is missing"
         if printf x | /usr/bin/nc -U -w 2 "$host_probe/s" >/dev/null 2>&1; then
-            fail "the sandbox does not block unrelated host unix sockets"
+            fail "the sandbox does not block unrelated host unix sockets: $host_probe/s"
+        fi
+        if printf x | /usr/bin/nc -U -w 2 "$host_probe/w" >/dev/null 2>&1; then
+            fail "the sandbox does not block unrelated host unix sockets: $host_probe/w"
         fi
     else
         # Linux: check iproute2 state.
@@ -667,6 +671,7 @@ check_dir=$work
 sock_root=
 host_probe=
 host_probe_listener_pid=
+host_probe_w_listener_pid=
 if [ "$uname_s" = Darwin ]; then
     sock_root=$(mktemp -d /tmp/pk.XXXX) || fail "cannot create socket root directory"
     sock_root=$(cd "$sock_root" && pwd -P)
@@ -705,9 +710,12 @@ cleanup() {
             /bin/kill -KILL -- "-$sid" 2>/dev/null || true
         done
     fi
-    # Kill the host_probe listener if it was started.
+    # Kill the host_probe listeners if they were started.
     if [ -n "$host_probe_listener_pid" ]; then
         /bin/kill "$host_probe_listener_pid" 2>/dev/null || true
+    fi
+    if [ -n "$host_probe_w_listener_pid" ]; then
+        /bin/kill "$host_probe_w_listener_pid" 2>/dev/null || true
     fi
     # Darwin throwaway user cleanup
     if [ -n "$tuser_created" ]; then
@@ -992,20 +1000,28 @@ if [ "$chosen" = sudo ]; then
     exec 3<> "$work/sudo-cancel"
 fi
 
-# Darwin sandbox: set up a host unix socket outside the permitted roots to
-# verify the sandbox cannot reach it.
+# Darwin sandbox: set up two host unix sockets outside the permitted roots to
+# verify the sandbox cannot reach them. Socket s (mode 0755) proves that file
+# permissions isolate the invoking user's sockets. Socket w (mode 0777) proves
+# that the sandbox profile itself denies unix sockets, independently of permissions.
 if [ "$chosen" = sandbox ]; then
     host_probe=$(mktemp -d /tmp/pkh.XXXX) || fail "cannot create host probe directory"
     host_probe=$(cd "$host_probe" && pwd -P)
-    /usr/bin/nc -lU "$host_probe/s" >/dev/null 2>&1 &
+    chmod 711 "$host_probe" || fail "cannot chmod host probe directory"
+    /usr/bin/nc -lkU "$host_probe/s" >/dev/null 2>&1 &
     host_probe_listener_pid=$!
-    # Wait for the socket to be created before entering the sandbox.
+    /usr/bin/nc -lkU "$host_probe/w" >/dev/null 2>&1 &
+    host_probe_w_listener_pid=$!
+    # Wait for both sockets to be created before entering the sandbox.
     n=0
-    while [ ! -S "$host_probe/s" ] && [ "$n" -lt 50 ]; do
+    while ([ ! -S "$host_probe/s" ] || [ ! -S "$host_probe/w" ]) && [ "$n" -lt 50 ]; do
         sleep 0.01
         n=$((n + 1))
     done
     [ -S "$host_probe/s" ] || fail "failed to create host probe socket: $host_probe/s"
+    [ -S "$host_probe/w" ] || fail "failed to create host probe socket: $host_probe/w"
+    chmod 755 "$host_probe/s" || fail "cannot chmod host probe socket s"
+    chmod 777 "$host_probe/w" || fail "cannot chmod host probe socket w"
     if [ "$uname_s" = Darwin ] && [ -n "$tuser" ]; then
         chmod 711 "$work"
         cp -- "$self" "$work/smoke-archive"
@@ -1017,9 +1033,17 @@ if [ "$chosen" = sandbox ]; then
             fail "the throwaway user cannot read and enter: $(printf '%s\n' "$output" | head -n 1)"
         fi
         [ -S "$host_probe/s" ] || fail "host probe socket is missing"
+        [ -S "$host_probe/w" ] || fail "host probe socket is missing"
         if /usr/bin/sudo -n -u "$tuser" /usr/bin/nc -U -w 2 "$host_probe/s" </dev/null >/dev/null 2>&1; then
             fail "the throwaway user reaches a socket of the invoking user"
         fi
+        if ! printf x | /usr/bin/sudo -n -u "$tuser" /usr/bin/nc -U -w 2 "$host_probe/w" >/dev/null 2>&1; then
+            fail "the throwaway user cannot reach the world-connectable probe socket outside the sandbox; the sandbox probe would prove nothing"
+        fi
+        [ -S "$host_probe/s" ] || fail "the host probe listener exited"
+        [ -S "$host_probe/w" ] || fail "the host probe listener exited"
+        /bin/kill -0 "$host_probe_listener_pid" 2>/dev/null || fail "the host probe listener exited"
+        /bin/kill -0 "$host_probe_w_listener_pid" 2>/dev/null || fail "the host probe listener exited"
     fi
 fi
 

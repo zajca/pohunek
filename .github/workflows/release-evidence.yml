@@ -594,6 +594,17 @@ jobs:
           version: "0.9.28"
           enable-cache: false
 
+      # The smoke scenarios of the throwaway-user path need passwordless sudo,
+      # which only the macOS runner has; on Linux they run in ci.yml.
+      - name: Run the archive smoke scenarios on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN: "1"
+        run: |
+          set -euo pipefail
+          python3 -m unittest -v scripts.tests.test_smoke_archive
+
       - name: Build xtask
         run: cargo build --locked -p xtask
 

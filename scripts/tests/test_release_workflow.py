@@ -831,6 +831,16 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
         self.assertIn("          - os: macos-15\n            smoke_target: aarch64-apple-darwin", smoke)
         self.assertIn("SMOKE_TARGET: ${{ matrix.smoke_target }}", smoke)
 
+    def test_smoke_runs_archive_scenarios_on_macos(self):
+        smoke = self.evidence_jobs["smoke"]
+        self.assertIn("python3 -m unittest -v scripts.tests.test_smoke_archive", smoke)
+        self.assertIn("if: runner.os == 'macOS'", smoke)
+        self.assertIn("POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN: \"1\"", smoke)
+        self.assertLess(
+            smoke.index("python3 -m unittest -v scripts.tests.test_smoke_archive"),
+            smoke.index("scripts/release-workflow/run-smoke"),
+        )
+
     def test_the_consumer_test_name_matches_the_smoke(self):
         pattern = r"consumer_test=(\S+)"
         smoke = re.search(pattern, (ROOT / "packaging" / "smoke-archive").read_text()).group(1)
