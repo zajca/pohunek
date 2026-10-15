@@ -10,6 +10,8 @@ pub(crate) mod error;
 pub(crate) mod lifecycle;
 pub(crate) mod policy;
 pub(crate) mod runner;
+#[cfg(test)]
+mod setup_plan_tests;
 pub(crate) mod skill;
 pub(crate) mod target;
 #[cfg(test)]

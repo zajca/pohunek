@@ -29,6 +29,7 @@
 
 // Rust guideline compliant 2026-10-14
 
+use std::ffi::OsStr;
 use std::fmt::{self, Write as _};
 use std::fs;
 use std::future::Future;
@@ -52,11 +53,13 @@ use crate::commands::doctor;
 use crate::commands::health;
 use crate::commands::integration::{
     hermes_home_plan, reinstall_after_upgrade, reinstall_previewed_hermes_homes, IntegrationEnv,
+    HERMES_CURRENT, HERMES_UPDATE,
 };
 use crate::commands::setup::{config_files, install_config_into, ConfigResult};
 use crate::error::CliError;
+use crate::hermes_integration::runner::safe_ancestor;
 use crate::paths::Paths;
-use crate::service::engine::{install_layout, installed_job_path};
+use crate::service::engine::{install_layout, installed_job_path, recorded_job_path};
 use crate::service::report::IntegrationReinstall;
 use crate::service::runtimes::DaemonRuntimes;
 use crate::service::{self, Context, VERSION};
@@ -91,6 +94,9 @@ const DAEMON_ARCHIVE_BINARIES: [&str; 3] = ["pohunek", "pohunekd", "pohunek-sess
 /// directory of the caller's `PATH` cannot stand in for `uname`, `find` or the
 /// digest tool it relies on.
 const VERIFIER_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// The superuser, the one other account a release directory may belong to.
+const ROOT_UID: u32 = 0;
 
 /// Suffix of a release package archive, named after the runtime id.
 ///
@@ -383,6 +389,18 @@ fn serves_hermes(plan: &EnsureReport) -> bool {
         .any(|package| package.runtime == HERMES_RUNTIME)
 }
 
+/// Whether the plan installs or selects a Hermes package, which changes the
+/// plugin every marked Hermes home is updated to.
+fn changes_hermes_selection(plan: &EnsureReport) -> bool {
+    plan.packages.iter().any(|package| {
+        package.runtime == HERMES_RUNTIME
+            && matches!(
+                package.status,
+                PackageStatus::Install | PackageStatus::Installed
+            )
+    })
+}
+
 /// Whether the default Hermes home, `$HOME/.hermes`, is a directory. Its
 /// named profiles live below it, so without it there is no home to plan.
 fn hermes_home_exists(env: &IntegrationEnv) -> bool {
@@ -450,15 +468,25 @@ async fn plan_in(
         // The plan runs the release's daemon, so a sealed archive is verified
         // before anything from it runs.
         verify_sealed_archive(staged, context.uid()).await?;
-        // The search path a fresh install records, so the plan judges the
-        // packages against the PATH the daemon job will get.
+        // The PATH the daemon job of a fresh install gets: the search path the
+        // install records, or the service manager's own when it records none,
+        // so the plan judges the packages as the installed daemon will.
         let (search, _report) = context.install_search_path()?;
+        let job = recorded_job_path(context, &search, None)
+            .await
+            .map_err(|error| CliError::SetupBlocked {
+                detail: format!(
+                    "the plan needs the PATH the user service manager gives the daemon \
+                     job, and it cannot be read ({error}); run setup in a login session \
+                     of this user, where the user service manager runs"
+                ),
+            })?;
         (
             ServiceStep::Install {
                 from: staged.display().to_string(),
             },
             staged.to_path_buf(),
-            search.to_env_value(),
+            job.value,
         )
     };
     let previewed = planner.plan(context, &dir, &search_path).await?;
@@ -482,7 +510,11 @@ async fn plan_in(
     // whenever the plan serves Hermes and its default home exists.
     let env = integration_env(context);
     let hermes_homes = if serves_hermes(&previewed) && hermes_home_exists(&env) {
-        hermes_home_plan(&env)
+        hermes_home_plan(
+            &env,
+            OsStr::new(&search_path),
+            changes_hermes_selection(&previewed),
+        )
     } else {
         Vec::new()
     };
@@ -588,9 +620,14 @@ async fn apply_steps(
     }
     let mut hooks = reinstall_after_upgrade(&env, &stale, false).await;
     if !hermes_homes.is_empty() {
-        hooks.extend(reinstall_previewed_hermes_homes(&env, hermes_homes));
+        hooks.extend(reinstall_previewed_hermes_homes(
+            &env,
+            hermes_homes,
+            OsStr::new(&search_path),
+        ));
     }
-    for hook in &hooks {
+    // A current Hermes home was left as it is, so it is not a change.
+    for hook in hooks.iter().filter(|hook| hook.status != HERMES_CURRENT) {
         applied.push(format!("hook {}: {}", hook.integration, hook.status));
     }
 
@@ -1170,6 +1207,8 @@ fn hook_lines(hooks: &[IntegrationReinstall], status: &str) -> Vec<String> {
 /// this check, rules out. The verifier runs only as a regular file of this
 /// user or root, reached through directories of this user or root, that no
 /// other account can write: the rule it then applies to the whole archive.
+/// Every directory above the release obeys it too, except that a root-owned
+/// sticky directory such as `/tmp` may be shared.
 ///
 /// # Errors
 ///
@@ -1198,6 +1237,32 @@ async fn verify_sealed_archive(staged: &Path, uid: u32) -> Result<(), CliError> 
     if !sealed {
         return Ok(());
     }
+    // Every directory above the release is closed to other accounts, so none
+    // can rename the checked tree away and put its own verifier at this path
+    // before `/bin/sh` opens it. In a root-owned sticky directory no other
+    // account can move an entry it does not own.
+    for ancestor in staged.ancestors().skip(1) {
+        let metadata = fs::symlink_metadata(ancestor).map_err(|error| {
+            blocked(format!(
+                "cannot inspect {}, a directory above the release archive: {error}",
+                ancestor.display()
+            ))
+        })?;
+        if !safe_ancestor(
+            metadata.uid(),
+            metadata.mode(),
+            metadata.file_type().is_dir(),
+            uid,
+            ROOT_UID,
+        ) {
+            return Err(blocked(format!(
+                "{}, a directory above the release archive, is not a directory of this \
+                 user or root closed to other accounts; extract the archive below one \
+                 that is",
+                ancestor.display()
+            )));
+        }
+    }
     // The verifier, and the directories it is reached through, must be
     // closed to other accounts, so none can swap it between this check and
     // its run; the verifier then applies the same rule to the whole archive.
@@ -1218,7 +1283,7 @@ async fn verify_sealed_archive(staged: &Path, uid: u32) -> Result<(), CliError> 
             metadata.file_type().is_file()
         };
         if !kind_matches
-            || (metadata.uid() != uid && metadata.uid() != 0)
+            || (metadata.uid() != uid && metadata.uid() != ROOT_UID)
             || metadata.mode() & 0o022 != 0
         {
             return Err(blocked(format!(
@@ -1385,7 +1450,8 @@ fn render_plan(plan: &HostPlan) -> String {
     let _ = writeln!(out, "hermes homes:");
     for home in &preview.hermes_homes {
         let state = match home.status {
-            "update" => "updated (marked by pohunek)".to_owned(),
+            HERMES_UPDATE => "updated (marked by pohunek)".to_owned(),
+            HERMES_CURRENT => "kept (current)".to_owned(),
             "gap" => format!("left alone: {}", home.detail.as_deref().unwrap_or_default()),
             _ => format!(
                 "cannot be planned: {}",

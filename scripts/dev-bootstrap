@@ -280,6 +280,7 @@ SYSTEMD_SUITE_FILES = (
     ("pohunek-daemon", "crates/daemon/tests/systemd_durable_worker.rs"),
     ("pohunek-cli", "crates/cli/tests/service_systemd.rs"),
     ("pohunek-cli", "crates/cli/tests/setup_host_native.rs"),
+    ("pohunek-cli", "crates/cli/tests/setup_host.rs"),
     ("pohunek-daemon", "crates/daemon/tests/supervised_lifecycle.rs"),
     ("pohunek-cli", "crates/cli/tests/service_upgrade.rs"),
     ("pohunek-cli", "crates/cli/tests/workflow_systemd.rs"),

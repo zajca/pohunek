@@ -2774,7 +2774,22 @@ pub(crate) async fn job_path(
     config: &ServiceConfig,
     journal_default: Option<&str>,
 ) -> Result<JobPath, Error> {
-    let recorded = config.search_path();
+    recorded_job_path(context, config.search_path(), journal_default).await
+}
+
+/// The `PATH` of a daemon job whose `service.toml` records `recorded`, by the
+/// rules of [`job_path`]. A fresh install records the search path
+/// [`Context::install_search_path`] resolves, so this is the `PATH` its job
+/// will get before anything is written.
+///
+/// # Errors
+///
+/// See [`job_path`].
+pub(crate) async fn recorded_job_path(
+    context: &Context,
+    recorded: &SearchPath,
+    journal_default: Option<&str>,
+) -> Result<JobPath, Error> {
     if !recorded.is_empty() {
         return Ok(JobPath {
             value: recorded.to_env_value(),

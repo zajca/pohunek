@@ -39,6 +39,8 @@ use package::ANCHOR_FILE_NAME;
 
 use pohunek_cli::host_setup::{apply, plan, ReleasePlanner, ServiceStep, SetupReport};
 use pohunek_cli::service::context::PathDiscovery;
+#[cfg(target_os = "linux")]
+use pohunek_cli::service::manager_env::UserManager;
 use pohunek_cli::service::runtimes::DaemonRuntimes;
 use pohunek_cli::service::{self, Context, VERSION};
 use pohunek_service_config::runtimes::{EnsureReport, PackageStatus};
@@ -354,6 +356,81 @@ async fn a_plan_that_changes_after_the_install_stops_then_converges_on_rerun() {
         converged.config.created.len(),
         3,
         "the config is written on the re-run"
+    );
+}
+
+/// Planner that records the search path of each plan and reports an empty
+/// plan.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct RecordingPlanner {
+    search_paths: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg(target_os = "linux")]
+impl ReleasePlanner for RecordingPlanner {
+    fn plan<'a>(
+        &'a self,
+        _context: &'a Context,
+        _dir: &'a Path,
+        search_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<EnsureReport, service::Error>> + Send + 'a>> {
+        self.search_paths
+            .lock()
+            .expect("search path record")
+            .push(search_path.to_owned());
+        Box::pin(async { Ok(report(&json!([]))) })
+    }
+}
+
+/// Stands in for the systemd user manager's `Environment` property.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct FakeUserManager(Vec<String>);
+
+#[cfg(target_os = "linux")]
+impl UserManager for FakeUserManager {
+    fn environment(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>> {
+        let value = self.0.clone();
+        Box::pin(async move { Ok(value) })
+    }
+}
+
+/// On a fresh Linux host whose install records no search path, the job
+/// inherits the systemd user manager's `PATH`, so the preview plans with that
+/// `PATH` and not with an empty one.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"]
+async fn a_fresh_unmanaged_host_is_planned_with_the_user_managers_path() {
+    let mut installation = Installation::new();
+    let release = release(&installation);
+    let tools = installation.root.join("manager-tools");
+    directory(&tools, SEARCH_DIR);
+    let manager_path = path_text(&tools);
+    installation.context = installation
+        .context
+        .clone()
+        .with_path_discovery(PathDiscovery::Unmanaged)
+        .with_user_manager(std::sync::Arc::new(FakeUserManager(vec![format!(
+            "PATH={manager_path}"
+        )])));
+    let planner = RecordingPlanner::default();
+
+    let host_plan = plan(&installation.context, &release, &planner)
+        .await
+        .expect("plan the host");
+
+    assert!(
+        matches!(host_plan.preview.service, ServiceStep::Install { .. }),
+        "a fresh host installs the service"
+    );
+    assert_eq!(
+        *planner.search_paths.lock().expect("search path record"),
+        vec![manager_path],
+        "the preview plans with the user manager's PATH"
     );
 }
 

@@ -3,10 +3,12 @@
 //!
 //! Every scenario starts from a private environment and checks that the host
 //! is unchanged after the run: the file tree under the test root is the same
-//! before and after. The refusal and plan scenarios need no service manager,
-//! because they stop before the first write. The apply path needs a real
-//! service manager and the release daemon's `--detect` planner, so it is
-//! covered by the release harness rather than here.
+//! before and after. The consent and archive scenarios need no service
+//! manager, because they stop before the plan. On Linux the plan of a fresh
+//! host reads the systemd user manager's `PATH`, so the scenarios that reach
+//! the plan are ignored unless `POHUNEK_SYSTEMD_E2E=1` runs them with the
+//! user's session bus (the CI job `real systemd supervision`); macOS runs them
+//! in every test run. The apply path is covered by `setup_host_native.rs`.
 
 #![cfg(unix)]
 
@@ -32,6 +34,10 @@ const RELEASE_DIR: &str = "release";
 
 /// File, beside the fixture daemon, that holds the report it prints.
 const FIXTURE_REPORT_FILE: &str = "fixture-report.json";
+
+/// Variable naming the D-Bus session bus, over which the CLI reads the systemd
+/// user manager's environment.
+const SESSION_BUS_VARIABLE: &str = "DBUS_SESSION_BUS_ADDRESS";
 
 /// Report the fixture daemon prints for a plan it refuses.
 const REFUSED_REPORT: &str = r#"{
@@ -86,12 +92,36 @@ fn tree(root: &Path) -> BTreeMap<PathBuf, Option<u64>> {
 }
 
 /// Runs `pohunek` with `arguments` from `binary`, with no terminal on stdin.
+///
+/// On Linux the run reaches this user's systemd user manager over the session
+/// bus, as a login session does: a fresh host's plan reads the `PATH` the
+/// manager gives the daemon job.
 fn run_setup(env: &TestEnv, binary: &Path, arguments: &[&str]) -> Output {
-    env.command(binary)
+    let mut command = env.command(binary);
+    if let Some(address) = session_bus_address() {
+        command.env(SESSION_BUS_VARIABLE, address);
+    }
+    command
         .args(arguments)
         .stdin(Stdio::null())
         .output()
         .expect("spawn pohunek")
+}
+
+/// The session bus address of this test process: its own variable, or the
+/// bus socket of its runtime directory. `None` on macOS, which has no
+/// systemd user manager.
+fn session_bus_address() -> Option<std::ffi::OsString> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    std::env::var_os(SESSION_BUS_VARIABLE).or_else(|| {
+        std::env::var_os("XDG_RUNTIME_DIR").map(|runtime| {
+            let mut address = std::ffi::OsString::from("unix:path=");
+            address.push(Path::new(&runtime).join("bus"));
+            address
+        })
+    })
 }
 
 /// Copies the CLI under test into a release directory with a fixture daemon.
@@ -170,6 +200,10 @@ fn json_setup_without_yes_is_refused_with_a_stable_code() {
 /// A plan the release daemon refuses stops setup before the service, the
 /// packages, the hooks and the config are touched, even with `--yes`.
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager on the session bus"
+)]
 fn a_refused_plan_stops_setup_before_any_write() {
     let env = TestEnv::new().expect("private environment");
     let binary = release_with_fixture(&env, REFUSED_REPORT);
@@ -190,6 +224,10 @@ fn a_refused_plan_stops_setup_before_any_write() {
 /// A plan report of a version this CLI does not read is an unusable plan, so
 /// setup stops before any write, with the reason.
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager on the session bus"
+)]
 fn an_unreadable_plan_stops_setup_before_any_write() {
     let env = TestEnv::new().expect("private environment");
     let binary = release_with_fixture(&env, UNREADABLE_REPORT);
@@ -294,6 +332,9 @@ fn a_pending_install_stops_setup_before_any_change() {
         "a pending install writes no configuration, package or hook"
     );
 }
+
+/// Mode of a directory every account can write, without the sticky bit.
+const SHARED_WRITABLE_MODE: u32 = 0o777;
 
 /// File the fixture daemon of a tampered archive creates when it runs.
 const RAN_MARKER: &str = "fixture-daemon-ran";
@@ -450,6 +491,85 @@ fn a_linked_archive_verifier_is_refused_before_it_runs() {
     assert_eq!(tree(env.root()), before, "a refused archive writes nothing");
 }
 
+/// On a fresh Linux host whose systemd user manager cannot be reached, the
+/// `PATH` the daemon job would get is unknown, so a dry run stops before its
+/// daemon plans and writes nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fresh_host_without_a_user_manager_stops_the_dry_run() {
+    let env = TestEnv::new().expect("private environment");
+    let binary = release_with_fixture(&env, REFUSED_REPORT);
+    let missing_bus = env.root().join("no-session-bus");
+    let before = tree(env.root());
+
+    let output = env
+        .command(&binary)
+        .env(
+            SESSION_BUS_VARIABLE,
+            format!("unix:path={}", missing_bus.display()),
+        )
+        .args(["setup", "--dry-run"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn pohunek");
+
+    assert!(!output.status.success(), "the dry run stops");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("setup stopped before any change")
+            && stderr.contains("user service manager")
+            && !stderr.contains("fixture refusal"),
+        "stderr names the unreadable manager before any plan: {stderr}"
+    );
+    assert_eq!(
+        tree(env.root()),
+        before,
+        "the stopped dry run writes nothing"
+    );
+}
+
+/// A release below a directory another account can write is refused before
+/// its verifier runs, because that account could swap the checked tree for
+/// its own between the check and the run.
+#[test]
+fn a_release_below_a_shared_writable_directory_is_refused_before_its_verifier_runs() {
+    let env = TestEnv::new().expect("private environment");
+    let binary = release_with_fixture(&env, REFUSED_REPORT);
+    let release = binary.parent().expect("release directory").to_path_buf();
+    seal_release(&release);
+    let verifier = release.join("packaging/verify-archive");
+    fs::write(
+        &verifier,
+        format!(
+            "#!/bin/sh\n: > \"{}\"\nexit 0\n",
+            env.root().join(RAN_MARKER).display()
+        ),
+    )
+    .expect("write the marking verifier");
+    let shared = env.root().join("shared");
+    fs::create_dir(&shared).expect("create the shared directory");
+    fs::set_permissions(&shared, fs::Permissions::from_mode(SHARED_WRITABLE_MODE))
+        .expect("open the shared directory to other accounts");
+    let moved = shared.join(release.file_name().expect("release name"));
+    fs::rename(&release, &moved).expect("move the release below the shared directory");
+    let before = tree(env.root());
+
+    let output = run_setup(&env, &moved.join("pohunek"), &["setup", "--yes"]);
+
+    assert!(!output.status.success(), "the release is refused");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("a directory above the release archive")
+            && stderr.contains(&shared.display().to_string()),
+        "stderr names the shared directory: {stderr}"
+    );
+    assert!(
+        !env.root().join(RAN_MARKER).exists(),
+        "the verifier never runs"
+    );
+    assert_eq!(tree(env.root()), before, "a refused archive writes nothing");
+}
+
 /// An archive without its manifest and its verifier still carries its
 /// `packaging/` directory, so it is refused instead of planned unverified.
 #[test]
@@ -481,6 +601,10 @@ fn an_archive_without_manifest_and_verifier_stops_setup() {
 /// An intact sealed archive passes the verification, so setup goes on to run
 /// its daemon's plan, which this fixture refuses.
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager on the session bus"
+)]
 fn an_intact_sealed_archive_passes_verification_and_is_planned() {
     let env = TestEnv::new().expect("private environment");
     let binary = release_with_fixture(&env, REFUSED_REPORT);
@@ -504,6 +628,10 @@ fn an_intact_sealed_archive_passes_verification_and_is_planned() {
 /// this build's binaries, signed and sealed like an extracted archive, so the
 /// dry run verifies it and its daemon plans with `--detect`.
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager on the session bus"
+)]
 fn a_dry_run_on_a_fresh_host_prints_the_preview_and_changes_nothing() {
     let env = TestEnv::new().expect("private environment");
     let release = env.root().join(RELEASE_DIR);

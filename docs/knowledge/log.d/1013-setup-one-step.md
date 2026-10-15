@@ -14,6 +14,14 @@
   runs first. Setup never upgrades.
 - A Hermes home without the pohunek marker is a gap with its install command;
   setup never picks its access policy. Gaps do not fail the verdict.
+- A marked Hermes home whose plugin is already the selected package's,
+  unmodified and enabled, is `current` in the preview and is not written,
+  unless the run selects another Hermes package. Setup plans and applies the
+  Hermes homes with the `hermes` on the daemon job's `PATH`.
+- On a fresh host the plan judges the packages with the `PATH` the daemon job
+  will get: the search path the install records, or the user service
+  manager's own `PATH` when it records none. Setup stops before any change
+  when that `PATH` cannot be read.
 - A plan that changes after the service install stops with the service
   installed. The stop names the changes the install engine made, and setup
   changes nothing else; a re-run converges. The install engine's own changes
@@ -40,13 +48,17 @@
 - Setup run from an extracted release archive verifies it first with the
   archive's own `packaging/verify-archive`, as `packaging/install-daemon.sh`
   does, and stops before any change on a modified member, a removed
-  manifest or verifier, or a verifier that is a link or writable by another
-  account.
+  manifest or verifier, a verifier that is a link or writable by another
+  account, or a directory above the release that another account can write
+  (a root-owned sticky directory such as `/tmp` may be shared).
 - The setup plan reads the installation without side effects: no
-  transaction lock probe, no service manager contact, no file created.
+  transaction lock probe, no change to the service manager, no file
+  created. On a fresh host it reads the `PATH` the user service manager
+  gives its jobs.
 - Setup installs only the hooks the daemon does not report as current, so a
   run on a ready host applies nothing and a modified hook is still repaired.
 - The install quick start, the setup guide and the Homebrew path in the macOS
   runbook use `pohunek setup`.
 - The CI job `real systemd supervision` also runs the native setup suite,
-  including a fresh host set up from a signed release by one run.
+  including a fresh host set up from a signed release by one run, and the
+  setup binary runs that plan a fresh host with the user manager's `PATH`.

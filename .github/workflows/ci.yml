@@ -1008,6 +1008,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-cli --test setup_host_native -- --ignored --test-threads 1
 
+      # The `pohunek setup` binary runs that plan a fresh host read the PATH
+      # the systemd user manager gives the daemon job.
+      - name: pohunek setup binary on a fresh host
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-cli --test setup_host -- --ignored --test-threads 1
+
       - name: Supervised worker lifecycle
         if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-daemon --test supervised_lifecycle -- --ignored --test-threads 1
