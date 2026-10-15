@@ -31,6 +31,19 @@ import {
   type MockDaemon,
 } from "./mock-daemon";
 
+// The dedicated-routing scenarios prove that a call on a dedicated connection
+// outlives the shared connection's request timeout. The shared timeout must
+// still fit a direct round trip, which exceeded 20 ms on a loaded runner
+// (#494), and each delayed daemon reply outlasts it while staying inside the
+// dedicated deadline (the wire wait plus the SDK's 1 s headroom).
+const SHARED_REQUEST_TIMEOUT_MS = 1_000;
+const DEDICATED_REPLY_DELAY_MS = 1_500;
+// Wire wait of the generic-routing scenario; with the headroom it sizes a 4 s
+// dedicated deadline, 2.5 s beyond `DEDICATED_REPLY_DELAY_MS`.
+const DEDICATED_WIRE_WAIT_MS = 3_000;
+// Bun's per-test timeout for a scenario with two delayed replies.
+const DEDICATED_SCENARIO_TIMEOUT_MS = 10_000;
+
 describe("Client request/response", () => {
   test("call decodes a typed session.list output and sends method params", async () => {
     const session = minimalSessionInfo();
@@ -579,7 +592,7 @@ describe("Client request/response", () => {
     const daemon = await startUnixDaemon([
       {
         kind: "delay",
-        ms: 60,
+        ms: DEDICATED_REPLY_DELAY_MS,
         line: (line) => okResponseLine(requestIdFromLine(line), input),
       },
       {
@@ -592,7 +605,7 @@ describe("Client request/response", () => {
       },
     ]);
     try {
-      const client = await connectClient(daemon, undefined, { requestTimeoutMs: 20 });
+      const client = await connectClient(daemon, undefined, { requestTimeoutMs: SHARED_REQUEST_TIMEOUT_MS });
 
       expect(await client.sessionInput({
         session_id: "s-target",
@@ -618,7 +631,7 @@ describe("Client request/response", () => {
     } finally {
       await daemon.close();
     }
-  });
+  }, DEDICATED_SCENARIO_TIMEOUT_MS);
 
   test("generic calls route session.wait and a waiting session.output through dedicated connections", async () => {
     const wait = { reason: "timeout", session: minimalSessionInfo() } as const;
@@ -646,24 +659,24 @@ describe("Client request/response", () => {
           protocol_version: PROTOCOL_VERSION,
         }),
       },
-      { kind: "delay", ms: 60, line: (line) => okResponseLine(requestIdFromLine(line), wait) },
-      { kind: "delay", ms: 60, line: (line) => okResponseLine(requestIdFromLine(line), output) },
+      { kind: "delay", ms: DEDICATED_REPLY_DELAY_MS, line: (line) => okResponseLine(requestIdFromLine(line), wait) },
+      { kind: "delay", ms: DEDICATED_REPLY_DELAY_MS, line: (line) => okResponseLine(requestIdFromLine(line), output) },
     ]);
     try {
-      const client = await connectClient(daemon, undefined, { requestTimeoutMs: 20 });
+      const client = await connectClient(daemon, undefined, { requestTimeoutMs: SHARED_REQUEST_TIMEOUT_MS });
       await client.call("daemon.health", null);
 
       expect(await client.call("session.wait", {
         session_id: "s-target",
         after_updated_at: "2026-08-04T00:00:00Z",
-        timeout_ms: 200,
+        timeout_ms: DEDICATED_WIRE_WAIT_MS,
       })).toEqual(wait);
       expect(await client.call("session.output", {
         session_id: "s-target",
         runtime: { worker_instance_id: "runtime-target", runtime_generation: "1" },
         after_offset: "0",
         max_bytes: 128,
-        wait_ms: 200,
+        wait_ms: DEDICATED_WIRE_WAIT_MS,
       })).toEqual(output);
 
       for (const method of ["daemon.health", "session.wait", "session.output"]) {
@@ -674,7 +687,7 @@ describe("Client request/response", () => {
     } finally {
       await daemon.close();
     }
-  });
+  }, DEDICATED_SCENARIO_TIMEOUT_MS);
 
   test("session.new with initial input has a dedicated response budget", async () => {
     const created = { ...minimalSessionInfo(), applied_input: true };
