@@ -13,6 +13,8 @@
 #   absence of the spinner and of "Action Required", not from a title of its own.
 # - workspace_trust_prompt: the first-run trust dialog pinned at the top of the
 #   screen.
+# - folder_trust_prompt: the folder trust dialog Codex 0.160 shows for a
+#   working directory with a project-local .codex/config.toml.
 # - live_strong_blocker and weak_blocker: confirmation prompts on screen.
 
 [process]
@@ -47,6 +49,25 @@ all = [
   { line_regex = ['(?i)^\s*(?:do you )?trust (?:the contents of this directory|this repository)\?\s*$'] },
   { line_regex = ['(?i)^\s*(?:›|❯)?\s*1\.\s*yes\b'] },
   { line_regex = ['(?i)^\s*2\.\s*no\b'] },
+]
+
+# Codex 0.160 asks "Trust this folder?" below its "Folder access" heading and
+# above a paragraph that wraps to more lines the narrower the terminal is, so
+# its choices sit lower than the first-run dialog's. Requiring the heading as a
+# line of its own keeps a reply that quotes the question and its choices from
+# reading as the dialog. The region holds the dialog down to 30 columns; below
+# that the question itself wraps and the rule does not apply.
+[[rules]]
+id = "folder_trust_prompt"
+state = "blocked"
+priority = 1000
+region = "top_non_empty_lines(16)"
+visible_blocker = true
+all = [
+  { line_regex = ['(?i)^\s*folder access\s*$'] },
+  { line_regex = ['(?i)^\s*trust this folder\?'] },
+  { line_regex = ['(?i)^\s*(?:›|❯)?\s*1\.\s*trust and continue\s*$'] },
+  { line_regex = ['(?i)^\s*(?:›|❯)?\s*2\.\s*back to agent command\b'] },
 ]
 
 [[rules]]

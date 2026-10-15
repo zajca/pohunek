@@ -132,17 +132,17 @@ classifies every one of them through the package manifest.
 
 ## Gaps found
 
-- **The folder dialog is not classified.** Codex 0.160.0 shows `Trust this
-  folder? Codex can read, edit, and run files here…` with `1. Trust and
-  continue` and `2. Back to Agent Command Center`; it appears when the working
-  directory carries a project-local `.codex/config.toml`. The
-  `workspace_trust_prompt` rule matches the older wording (`Do you trust the
-  contents of this directory?`, `1. Yes, continue`), so the real dialog is read
-  by no rule and the session keeps the byte-activity fallback. The package keeps
-  the built-in rule unchanged and a test pins the non-match
-  (`every_captured_screen_is_classified_by_its_title` expects no screen or title
-  evidence for the captured trust dialogs). A rule for the
-  new wording is a change to both manifests, decided by the owner.
+- **The folder dialog is blocked from 30 columns.** Codex 0.160.0 shows `Trust
+  this folder? Codex can read, edit, and run files here…` with `1. Trust and
+  continue` and `2. Back to Agent Command Center`. It appears when the working
+  directory carries a project-local `.codex/config.toml`. The dialog sets no
+  title. The package's `folder_trust_prompt` rule reads it from the screen as
+  blocked when its `Folder access` heading, the question and both choices are
+  in the top 16 non-empty lines; a reply that quotes the question and choices
+  without the heading line is not the dialog. Below 30 columns the question wraps
+  and the session keeps the byte-activity fallback. The built-in
+  `workspace_trust_prompt` rule for the older wording (`Do you trust the
+  contents of this directory?`, `1. Yes, continue`) is kept unchanged.
 - **Hooks run in a descendant process.** Codex 0.160.0 runs its hooks from a
   `codex app-server --listen unix:// --managed-daemon` process below the
   launched `codex`: a direct child of the native binary, which is itself a child
@@ -194,10 +194,13 @@ absence of egress), and the older folder-dialog wording the rule still names.
 
 - `crates/cli/tests/codex_package.rs` always runs: it builds the directory
   twice and requires identical bytes, parses it with the daemon's install
-  parser, compares every descriptor fact and the whole manifest with the
-  v0.34.2 built-in Codex goldens in `compat/codex/builtin-v0.34/` (as parsed
+  parser, compares every descriptor fact and the manifest with the v0.34.2
+  built-in Codex goldens in `compat/codex/builtin-v0.34/` (as parsed
   definitions, as TOML data, and by feeding both manifests every captured frame,
-  title and synthetic dialog), requires the
+  title and synthetic dialog). Those comparisons leave out the package's
+  `folder_trust_prompt` rule and the folder dialog frames only it reads; a
+  separate test reads every captured folder dialog frame with the package
+  manifest. It requires the
   supported range to equal `compat/codex/compatibility-lock.json`, reads the
   version banner, runs the title, screen and process rules, and asserts the
   `--sha256` install refusal above.

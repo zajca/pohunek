@@ -98,7 +98,8 @@ pub struct OverlayFrame {
     /// Optional footer rendered after body lines when space permits.
     pub footer: Option<String>,
     /// Zero-based cursor cell: the row is relative to the first body line and
-    /// the column to the box interior.
+    /// the column to the first text cell of that line, after the interior's
+    /// left padding.
     ///
     /// `None` hides the physical cursor while the overlay is visible.
     pub cursor: Option<(u16, u16)>,
@@ -530,7 +531,9 @@ fn overlay_cursor_position(geometry: OverlayGeometry, row: u16, col: u16) -> Opt
         .saturating_add(OVERLAY_TITLE_ROWS)
         .saturating_add(geometry.header_rows)
         .min(interior_height.saturating_sub(1));
-    let col = col.min(interior_width.saturating_sub(1));
+    let col = OVERLAY_LEFT_PADDING_COLUMNS
+        .saturating_add(col)
+        .min(interior_width.saturating_sub(1));
     Some((
         geometry
             .row
