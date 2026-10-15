@@ -463,7 +463,7 @@ impl Layout {
     }
 
     /// Every pohunek process that belongs to the environment rooted at `scope`
-    /// (its environment holds a value below `scope`), as `(pid, binary name)`.
+    /// (see [`belongs_to`]), as `(pid, binary name)`.
     ///
     /// # Errors
     ///
@@ -479,6 +479,7 @@ impl Layout {
         let Ok(processes) = fs::read_dir("/proc") else {
             return Ok(found);
         };
+        let canonical_scope = io("canonicalize scope", fs::canonicalize(scope))?;
         let own = std::process::id();
         for entry in processes.flatten() {
             let Some(pid) = entry
@@ -488,7 +489,7 @@ impl Layout {
             else {
                 continue;
             };
-            if pid == own || !belongs_to(&entry.path(), scope) {
+            if pid == own || !belongs_to(&entry.path(), scope, &canonical_scope) {
                 continue;
             }
             let command = fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
@@ -746,21 +747,37 @@ fn process_ended(directory: &Path) -> bool {
         .is_some_and(|state| matches!(state, "Z" | "X" | "x"))
 }
 
-/// Whether a value of the process environment of `directory` (a `/proc/<pid>`
-/// entry) lies below `scope`.
+/// Whether the process of `directory` (a `/proc/<pid>` entry) belongs to the
+/// environment rooted at `scope`: its executable or working directory lies
+/// below `canonical_scope`, or a value of its environment lies below `scope`.
+///
+/// The environment alone can miss a live process. Between the point where
+/// `execve` closes the spawner's close-on-exec pipe and the point where the
+/// new image's environment is set up, `/proc/<pid>/environ` reads empty, so a
+/// child just returned by `spawn` can show none. Its executable is already the
+/// new image then, and its working directory is inherited at fork.
+///
+/// A non-dumpable process hides all three and is never placed in the scope:
+/// the host's own pohunek under the systemd user manager is non-dumpable and
+/// must not count as a process of this environment.
 #[cfg(target_os = "linux")]
-fn belongs_to(directory: &Path, scope: &Path) -> bool {
+fn belongs_to(directory: &Path, scope: &Path, canonical_scope: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt as _;
 
-    fs::read(directory.join("environ")).is_ok_and(|bytes| {
-        bytes
-            .split(|byte| *byte == 0)
-            .filter_map(|entry| {
-                let separator = entry.iter().position(|byte| *byte == b'=')?;
-                Some(&entry[separator + 1..])
-            })
-            .any(|value| Path::new(std::ffi::OsStr::from_bytes(value)).starts_with(scope))
-    })
+    let below = |link: &str| {
+        fs::read_link(directory.join(link)).is_ok_and(|path| path.starts_with(canonical_scope))
+    };
+    below("exe")
+        || below("cwd")
+        || fs::read(directory.join("environ")).is_ok_and(|bytes| {
+            bytes
+                .split(|byte| *byte == 0)
+                .filter_map(|entry| {
+                    let separator = entry.iter().position(|byte| *byte == b'=')?;
+                    Some(&entry[separator + 1..])
+                })
+                .any(|value| Path::new(std::ffi::OsStr::from_bytes(value)).starts_with(scope))
+        })
 }
 
 /// What an installed file is made of.
