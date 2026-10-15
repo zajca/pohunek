@@ -1873,28 +1873,147 @@ pub(crate) fn run_hook(
     if let Some(config_dir) = config_dir {
         let host_script = config_dir.join("hooks").join(event.as_env());
         if host_script.is_file() {
-            run_one_hook(
-                event,
-                &host_script,
-                cwd,
-                &env,
-                timeout,
+            run_timed_hook(
+                &HookRun {
+                    event,
+                    layer: HookLayer::Host,
+                    session_id: &ctx.session_id,
+                    script: &host_script,
+                    cwd,
+                    env: &env,
+                    timeout,
+                },
                 warnings,
                 stderr_tails.as_mut(),
             );
         }
     }
     if let Some(in_repo_script) = resolve_in_repo_hook(event, in_repo_dir) {
-        run_one_hook(
-            event,
-            &in_repo_script,
-            cwd,
-            &env,
-            timeout,
+        run_timed_hook(
+            &HookRun {
+                event,
+                layer: HookLayer::Repository,
+                session_id: &ctx.session_id,
+                script: &in_repo_script,
+                cwd,
+                env: &env,
+                timeout,
+            },
             warnings,
             stderr_tails.as_mut(),
         );
     }
+}
+
+/// Records a hook that could not be spawned as a non-fatal `Hook` warning.
+fn hook_not_spawned(
+    event: HookEvent,
+    script: &Path,
+    err: &dyn std::fmt::Display,
+    warnings: &mut Vec<SessionWarning>,
+) -> HookRunOutcome {
+    warn!(
+        script = %script.display(),
+        error = %err,
+        event = event.as_env(),
+        "hook could not be spawned"
+    );
+    warnings.push(hook_warning(
+        event,
+        format!("failed to spawn {}: {err}", script.display()),
+    ));
+    HookRunOutcome::NotSpawned
+}
+
+/// How one hook script run ended, as the daemon log reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookRunOutcome {
+    Succeeded,
+    Failed,
+    TimedOut,
+    WaitFailed,
+    NotSpawned,
+}
+
+impl HookRunOutcome {
+    fn of(outcome: &SetupOutcome) -> Self {
+        match outcome {
+            SetupOutcome::Exited(status) if status.success() => Self::Succeeded,
+            SetupOutcome::Exited(_) => Self::Failed,
+            SetupOutcome::TimedOut => Self::TimedOut,
+            SetupOutcome::WaitError(_) => Self::WaitFailed,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::WaitFailed => "wait_failed",
+            Self::NotSpawned => "not_spawned",
+        }
+    }
+}
+
+/// Which configuration layer a hook script comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookLayer {
+    /// `<config_dir>/hooks/`, shared by every project on the host.
+    Host,
+    /// The repository's own hook.
+    Repository,
+}
+
+impl HookLayer {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Repository => "repository",
+        }
+    }
+}
+
+/// One hook script run and what identifies it in the daemon log.
+#[derive(Debug, Clone, Copy)]
+struct HookRun<'a> {
+    event: HookEvent,
+    layer: HookLayer,
+    session_id: &'a str,
+    script: &'a Path,
+    cwd: &'a Path,
+    env: &'a [(String, String)],
+    timeout: Duration,
+}
+
+/// [`run_one_hook`], logging when the hook starts and how long it took.
+///
+/// A create waits for its create hooks before `session.new` answers, so these
+/// two lines tell a slow hook apart from a slow or lost create.
+fn run_timed_hook(
+    run: &HookRun<'_>,
+    warnings: &mut Vec<SessionWarning>,
+    stderr_tails: Option<&mut StderrTails<'_>>,
+) {
+    info!(
+        session_id = %run.session_id,
+        event = run.event.as_env(),
+        layer = run.layer.as_str(),
+        script = %run.script.display(),
+        timeout_ms = u64::try_from(run.timeout.as_millis()).unwrap_or(u64::MAX),
+        "hook started"
+    );
+    let started = Instant::now();
+    let outcome = run_one_hook(run, warnings, stderr_tails);
+    info!(
+        session_id = %run.session_id,
+        event = run.event.as_env(),
+        layer = run.layer.as_str(),
+        script = %run.script.display(),
+        duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        outcome = outcome.as_str(),
+        "hook finished"
+    );
 }
 
 impl HookContext {
@@ -1911,29 +2030,21 @@ impl HookContext {
 /// reason, never the hook's output, so it is safe to store and log. A failing
 /// hook's stderr tail goes to `stderr_tails` only.
 fn run_one_hook(
-    event: HookEvent,
-    script: &Path,
-    cwd: &Path,
-    env: &[(String, String)],
-    timeout: Duration,
+    run: &HookRun<'_>,
     warnings: &mut Vec<SessionWarning>,
     stderr_tails: Option<&mut StderrTails<'_>>,
-) {
+) -> HookRunOutcome {
+    let HookRun {
+        event,
+        script,
+        cwd,
+        env,
+        timeout,
+        ..
+    } = *run;
     let interpreter = match crate::agent::trusted_program(SETUP_SCRIPT_INTERPRETER) {
         Ok(interpreter) => interpreter,
-        Err(err) => {
-            warn!(
-                script = %script.display(),
-                error = %err,
-                event = event.as_env(),
-                "hook could not be spawned"
-            );
-            warnings.push(hook_warning(
-                event,
-                format!("failed to spawn {}: {err}", script.display()),
-            ));
-            return;
-        }
+        Err(err) => return hook_not_spawned(event, script, &err, warnings),
     };
     let mut builder = Command::new(interpreter);
     builder
@@ -1956,23 +2067,11 @@ fn run_one_hook(
     drop(builder);
     let mut child = match spawned {
         Ok(child) => child,
-        Err(err) => {
-            warn!(
-                script = %script.display(),
-                error = %err,
-                event = event.as_env(),
-                "hook could not be spawned"
-            );
-            warnings.push(hook_warning(
-                event,
-                format!("failed to spawn {}: {err}", script.display()),
-            ));
-            return;
-        }
+        Err(err) => return hook_not_spawned(event, script, &err, warnings),
     };
 
     let outcome = wait_with_timeout(&mut child, timeout);
-    let failed = !matches!(&outcome, SetupOutcome::Exited(status) if status.success());
+    let result = HookRunOutcome::of(&outcome);
     match outcome {
         SetupOutcome::Exited(status) if status.success() => {}
         SetupOutcome::Exited(status) => {
@@ -2017,6 +2116,7 @@ fn run_one_hook(
         }
     }
     // A successful hook's stderr is dropped with the capture, without waiting.
+    let failed = result != HookRunOutcome::Succeeded;
     if let (true, Some(capture), Some(tails)) = (failed, capture, stderr_tails) {
         if let Some(text) = capture.finish().and_then(|tail| tail.render()) {
             tails.tails.push(HookStderrTail {
@@ -2025,6 +2125,7 @@ fn run_one_hook(
             });
         }
     }
+    result
 }
 
 /// Points the hook's stderr at a new capture when `tails` asks for one, else at

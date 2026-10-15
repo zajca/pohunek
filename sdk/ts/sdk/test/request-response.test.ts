@@ -747,6 +747,43 @@ describe("Client request/response", () => {
     }
   });
 
+  test("session.new without initial input has the same dedicated response budget", async () => {
+    const created = minimalSessionInfo();
+    const daemon = startMemoryDaemon([
+      {
+        kind: "reply",
+        line: (line) => okResponseLine(requestIdFromLine(line), created),
+      },
+    ]);
+    if (daemon.endpoint.kind !== "memory") {
+      throw new Error("memory daemon returned a different transport");
+    }
+    const source = daemon.endpoint.transport;
+    let controlConnections = 0;
+    const transport: Transport = {
+      control: (): ReturnType<Transport["control"]> => {
+        controlConnections += 1;
+        return source.control();
+      },
+      raw: (): ReturnType<Transport["raw"]> => source.raw(),
+    };
+    try {
+      const client = await Client.connectTransport(transport);
+      expect(await client.call("session.new", {
+        agent: "claude",
+        cols: 80,
+        rows: 24,
+      })).toEqual(created);
+      expect(controlConnections).toBe(2);
+      const request = parseRequestLine(await daemon.nextRequest());
+      expect(request["method"]).toBe("session.new");
+      expect(request["params"]).toEqual({ agent: "claude", cols: 80, rows: 24 });
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("session.new with input rejects a closed client before opening a connection", async () => {
     const daemon = startMemoryDaemon([]);
     if (daemon.endpoint.kind !== "memory") {

@@ -32,12 +32,14 @@ use crate::ClientError;
 pub const LOCAL_HOST: &str = "local";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Initial input can wait for bounded worker startup, setup, and the host's
-/// configured reader grace. In a native service, worker connection,
-/// initialization, and reader grace can each reach 10 minutes; setup and
-/// start hooks each have a 5-minute cap. The remaining 20 minutes cover the
-/// rest of creation, so this client bound does not race those valid settings.
-const SESSION_NEW_INPUT_REQUEST_BUDGET_MS: u32 = 60 * 60 * 1_000;
+/// A creation waits for bounded worker startup, the project's create hooks
+/// and, with initial input, the host's configured reader grace. In a native
+/// service, worker connection, initialization, and reader grace can each reach
+/// 10 minutes. The pre-create and post-create hooks each run a host layer and
+/// a repository layer capped at 5 minutes, 20 minutes in all. The remaining
+/// 10 minutes cover the rest of creation, so this client bound does not race
+/// those valid settings.
+const SESSION_NEW_REQUEST_BUDGET_MS: u32 = 60 * 60 * 1_000;
 /// Transport processing budget added after a validated daemon-side deadline.
 ///
 /// One second leaves room for request framing, waiter teardown, scheduling,
@@ -572,25 +574,23 @@ impl Client {
         self.call_direct::<M>(params).await
     }
 
-    /// Start a session, reserving a dedicated response budget when its initial
-    /// input must wait for the agent's reader.
+    /// Start a session on a dedicated connection whose response budget covers
+    /// the daemon's bounded creation: worker startup, the project's create
+    /// hooks and, with initial input, the wait for the agent's reader.
     pub async fn session_new(
         &mut self,
         mut params: SessionNewParams,
     ) -> Result<SessionNewResult, ClientError> {
         if params.input.is_some() {
             params.extended_input_ready_wait = Some(true);
-            let timeout = session_new_input_request_timeout(self.options);
-            let mut client = self
-                .connect_dedicated(self.options.with_request_timeout(timeout))
-                .await?;
-            client
-                .call_direct::<protocol::method::SessionNew>(params)
-                .await
-        } else {
-            self.call_direct::<protocol::method::SessionNew>(params)
-                .await
         }
+        let timeout = session_new_request_timeout(self.options);
+        let mut client = self
+            .connect_dedicated(self.options.with_request_timeout(timeout))
+            .await?;
+        client
+            .call_direct::<protocol::method::SessionNew>(params)
+            .await
     }
 
     async fn call_direct<M>(&mut self, params: M::Params) -> Result<M::Output, ClientError>
@@ -1281,11 +1281,11 @@ fn dedicated_request_timeout(configured: Duration, wire_timeout_ms: u32) -> Dura
         .max(configured)
 }
 
-fn session_new_input_request_timeout(options: ClientOptions) -> Duration {
+fn session_new_request_timeout(options: ClientOptions) -> Duration {
     if options.request_timeout_explicit || options.request_timeout != DEFAULT_REQUEST_TIMEOUT {
         options.request_timeout
     } else {
-        dedicated_request_timeout(options.request_timeout, SESSION_NEW_INPUT_REQUEST_BUDGET_MS)
+        dedicated_request_timeout(options.request_timeout, SESSION_NEW_REQUEST_BUDGET_MS)
     }
 }
 

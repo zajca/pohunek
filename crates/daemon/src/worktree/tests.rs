@@ -1761,6 +1761,48 @@ fn host_global_and_in_repo_post_create_run_host_global_first() {
     );
 }
 
+#[test]
+fn each_create_hook_logs_its_start_and_its_duration_and_outcome() {
+    let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+    let _subscriber = logs.install();
+    let config_dir = unique_dir("hook-timing-config");
+    fs::create_dir_all(config_dir.join("hooks")).expect("host hooks dir");
+    fs::write(config_dir.join("hooks/post-create"), "#!/bin/sh\nexit 0\n")
+        .expect("write host hook");
+    let mgr = manager_with_config_dir("hook-timing", config_dir);
+    let repo = init_repo("hook-timing-repo");
+    commit_hook(&repo, "post-create", "#!/bin/sh\nexit 3\n");
+
+    mgr.bind(&request("s-timed", &repo, "feat/x"))
+        .expect("bind");
+
+    let text = logs.text();
+    for (layer, outcome) in [("host", "succeeded"), ("repository", "failed")] {
+        let lines = |message: &str| {
+            text.lines()
+                .filter(|line| {
+                    line.contains(message)
+                        && line.contains("session_id=s-timed")
+                        && line.contains("event=\"post-create\"")
+                        && line.contains(&format!("layer=\"{layer}\""))
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let started = lines("hook started");
+        assert_eq!(started.len(), 1, "{layer} hook start: {text}");
+        assert!(started[0].contains("timeout_ms="), "{}", started[0]);
+        let finished = lines("hook finished");
+        assert_eq!(finished.len(), 1, "{layer} hook end: {text}");
+        assert!(finished[0].contains("duration_ms="), "{}", finished[0]);
+        assert!(
+            finished[0].contains(&format!("outcome=\"{outcome}\"")),
+            "{}",
+            finished[0]
+        );
+    }
+}
+
 /// Release grace of the held-stderr scenario: short, so the hand-off follows the
 /// hook within moments.
 const HELD_STDERR_RELEASE_GRACE: Duration = Duration::from_millis(200);

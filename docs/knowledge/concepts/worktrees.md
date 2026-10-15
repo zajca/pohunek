@@ -68,7 +68,12 @@ the agent, it checks that the launch cwd is still a directory; when the worktree
 was removed after binding, the launch is refused with `session_cwd_missing`,
 nothing is started, and the failed create is compensated as above. The daemon
 logs the bind, each removal with its reason, and a failed or timed-out
-post-create or pre-remove hook at WARN, without the hook's output.
+post-create or pre-remove hook at WARN, without the hook's output. Every hook
+run also logs `hook started` and `hook finished` at INFO with the session id,
+the event, the layer (`host` or `repository`), the script, and its timeout,
+duration (`duration_ms`) and outcome. `session.new` answers only after its
+`pre-create` and `post-create` hooks finished, each layer bounded by 5 minutes,
+so these lines show whether a slow create was waiting on a hook.
 
 A failing `pre-create` or `post-create` hook leaves a `hook` warning on the
 session. In the `session.new` result its `detail` also carries the last

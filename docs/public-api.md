@@ -3273,10 +3273,30 @@ diagnostics, or logs. The CLI validates observation byte/wait bounds and paired
 runtime coordinates before dialing. `session wait` and waiting `session output`
 use the Rust SDK's dedicated connections and preserve inherited request-origin
 markers. `session new --request-timeout-ms <u32>` overrides the response deadline
-for that creation request; zero is rejected. Without that flag, a creation with
-initial input uses the Rust SDK's dedicated response budget described below.
-An explicitly shorter deadline may expire after the daemon created the session;
-inspect the session list before deciding what to do next.
+for that creation request; zero is rejected. Without that flag, every creation
+uses the Rust SDK's dedicated creation budget described below, which covers
+the daemon's bounded worker startup and create hooks. `session new` sends one
+`session.new` request and never resends it. Only its own refusals before that
+request (`cli_usage`, `confirmation_required`, `confirmation_declined`) prove
+that nothing was created. Any other failure may come after the daemon created
+the session:
+- `request_timeout`, which also carries a recovery hint saying so, because the
+  daemon still finishes or rolls back the create;
+- a reply lost after the request was sent (`framing` locally,
+  `remote_daemon_unavailable` for a remote host);
+- a typed daemon error returned after the session was recorded, such as
+  `session_runtime_reconnecting`.
+
+A session is listed only once its target, the `pre-create` and `post-create`
+hooks included, and its launch are done, and a listed session can still be
+rolled back while its initial input is delivered (`session_input_not_ready`,
+`session_input_stalled`). A caller that must know gives each create a unique
+key such as `--meta launch=<id>` and looks it up with
+`pohunek session list --meta-eq launch=<id> --json` before retrying. An empty
+list does not prove that nothing was created, and `session.new` has no
+idempotency key: a retry can create a second session, which the same key
+shows, so the caller can stop the extra one.
+
 Initial input waits for an editable prompt or bracketed-paste enable signal,
 up to the bounded startup grace for a silent agent; the body and submit key
 are sent as separate PTY writes under the runtime input rules. A runtime that
@@ -3710,17 +3730,19 @@ Public exports:
 - `Client`: framed request/response and subscription client.
 - `ClientOptions`: `request_timeout` and `connect_timeout`, both defaulting to
   5 seconds, and `origin_source`, set with `with_origin_source`. A typed
-  `session.new` with initial input uses a dedicated connection with a response
-  budget of 60 minutes plus 1 second of transport headroom. This covers the
-  valid host bounds of up to 10 minutes each for worker connection, worker
-  initialization, and reader grace, plus bounded setup and start hooks, with
-  room for other creation work. `with_request_timeout` explicitly overrides
+  `session.new` uses a dedicated connection with a response budget of 60
+  minutes plus 1 second of transport headroom. This covers the valid host
+  bounds of up to 10 minutes each for worker connection, worker
+  initialization, and, with initial input, reader grace, plus the create
+  hooks: `pre-create` and `post-create` each run a host layer and a repository
+  layer capped at 5 minutes. The rest is room for other creation work.
+  `with_request_timeout` explicitly overrides
   that budget, including with a shorter deadline; assigning a nondefault value
   to the public `ClientOptions.request_timeout` field has the same effect.
   Dropping the Rust request
   future ends the client's wait; it does not prove the daemon canceled a
-  creation already in progress. `session.new` without initial input and raw
-  envelope requests retain the ordinary timeout.
+  creation already in progress. Raw envelope requests retain the ordinary
+  timeout.
 - `ConnectionOptions.request_timeout` in the assistant host API is `None` by
   default, preserving these SDK budgets. `Some(duration)` is an explicit
   override even when `duration` equals the ordinary 5-second default. An
@@ -3926,8 +3948,8 @@ Public exports:
   does not export a separate `ClientOptions` alias. It carries
   `connectTimeoutMs` and `requestTimeoutMs`, both defaulting to 5000 ms, plus an
   optional validated `origin: {sessionId, daemonId}` pair. A typed `session.new`
-  with initial input uses the same dedicated 60-minute response budget and
-  1-second transport headroom unless `requestTimeoutMs` is explicitly supplied;
+  uses the same dedicated 60-minute response budget and 1-second transport
+  headroom unless `requestTimeoutMs` is explicitly supplied;
   an explicit value replaces the dedicated budget. A timed-out creation may
   still have completed on the daemon, so inspect sessions before any retry.
   The typed call opts into the configured host reader grace when it sends

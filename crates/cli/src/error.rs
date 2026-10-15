@@ -60,6 +60,11 @@ pub(crate) enum CliError {
     #[error(transparent)]
     Client(#[from] SdkClientError),
 
+    /// `session new` got no reply before its deadline, so the daemon may still
+    /// finish the create.
+    #[error(transparent)]
+    SessionNewOutcomeUnknown(SdkClientError),
+
     /// Prompt rendering failed before any daemon request was made.
     #[error(transparent)]
     Prompt(#[from] pohunek_prompt::Error),
@@ -267,6 +272,18 @@ impl CliError {
             }
             CliError::Protocol(err) => err.clone(),
             CliError::Client(err) => err.to_protocol_error(),
+            CliError::SessionNewOutcomeUnknown(err) => {
+                let mut error = err.to_protocol_error();
+                error.recover = Some(
+                    "the daemon may still create the session: give each create a unique \
+                     `--meta <key>=<value>` and look for it with `pohunek session list \
+                     --meta-eq <key>=<value>` before retrying; an empty list does not prove that \
+                     nothing was created, and a retry can create a second session, which the \
+                     same key shows"
+                        .to_owned(),
+                );
+                error
+            }
             CliError::Prompt(err) => ProtocolError::new(
                 ErrorClass::Configuration,
                 "prompt_render_failed",
