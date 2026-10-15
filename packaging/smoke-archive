@@ -38,6 +38,10 @@
 #           root, then the invoking uid/gid is restored with `setpriv` before
 #           anything else runs, with all capabilities dropped.
 #   sandbox `/usr/bin/sandbox-exec` with a profile denying egress (macOS only).
+#           On macOS, the smoke runs the consumer as a throwaway local user
+#           created with passwordless sudo; it fails closed without sudo. Codex's
+#           socket directory is unique to that user; the user and its leftovers
+#           are removed and verified on exit.
 # When no suitable strategy is available the script fails; there is no
 # un-isolated fallback.
 #
@@ -436,7 +440,7 @@ inner_main() {
 
         if [ "$isolation" = sandbox ]; then
             # On macOS, run the consumer in a new session to detect stray processes.
-            pidfile="$work/stray_$rt.pid"
+            pidfile="$work/run/.stray_$rt.pid"
             consumer_exit=0
             /usr/bin/perl -MPOSIX -e 'my ($pidfile, $dir) = splice(@ARGV, 0, 2); POSIX::setsid() > 0 or die "setsid: $!"; open(my $fh, ">", $pidfile) or die "$pidfile: $!"; print $fh "$$\n"; close($fh); chdir($dir) or die "$dir: $!"; exec { $ARGV[0] } @ARGV or die "exec: $!"' \
                 "$pidfile" "$run/cwd" \
@@ -532,6 +536,43 @@ sudo_supervisor() {
     return "$sudo_status"
 }
 
+create_throwaway_user() {
+    retry=0
+    while [ "$retry" -lt 20 ]; do
+        tuid=$(( 40000 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 20000 ))
+        [ -n "$(/usr/bin/dscl . -search /Users UniqueID "$tuid" 2>/dev/null)" ] && { retry=$((retry + 1)); continue; }
+        [ -e "/private/tmp/codex-daemon-$tuid" ] && { retry=$((retry + 1)); continue; }
+        [ -e "/private/tmp/pohunek-$tuid" ] && { retry=$((retry + 1)); continue; }
+        tuser=pksmoke$tuid
+        /usr/bin/dscl . -read "/Users/$tuser" >/dev/null 2>&1 && { retry=$((retry + 1)); continue; }
+        break
+    done
+    if [ "$retry" -ge 20 ]; then
+        fail "cannot find a unique throwaway uid after 20 retries"
+    fi
+    tuser_created=1
+    /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" || fail "cannot create the throwaway user $tuser"
+    /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" UniqueID "$tuid" || fail "cannot create the throwaway user $tuser"
+    /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" PrimaryGroupID 20 || fail "cannot create the throwaway user $tuser"
+    /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" UserShell /usr/bin/false || fail "cannot create the throwaway user $tuser"
+    /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" NFSHomeDirectory /var/empty || fail "cannot create the throwaway user $tuser"
+    /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" RealName "pohunek archive smoke" || fail "cannot create the throwaway user $tuser"
+    /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" IsHidden 1 || fail "cannot create the throwaway user $tuser"
+    poll=0
+    while [ "$poll" -lt 50 ]; do
+        current_uid=$(/usr/bin/id -u "$tuser" 2>/dev/null)
+        if [ "$current_uid" = "$tuid" ]; then
+            break
+        fi
+        sleep 0.1
+        poll=$((poll + 1))
+    done
+    if [ "$poll" -ge 50 ]; then
+        fail "throwaway user $tuser uid is not $tuid after polling"
+    fi
+    codex_dir=/private/tmp/codex-daemon-$tuid
+}
+
 if [ "${1:-}" = __inner ]; then
     shift
     inner_main "$@"
@@ -622,6 +663,10 @@ if [ "$uname_s" = Darwin ]; then
 fi
 ns_pid=
 chosen=
+tuser=
+tuid=
+tuser_created=
+codex_dir=
 cleanup() {
     status=$?
     trap '' EXIT
@@ -643,7 +688,7 @@ cleanup() {
     # so killing the sandbox shell does not reach it; kill each live session
     # recorded by the inner shell before the temp tree goes away.
     if [ "$chosen" = sandbox ]; then
-        for pidfile in "$work"/stray_*.pid; do
+        for pidfile in "$work"/run/.stray_*.pid; do
             [ -f "$pidfile" ] || continue
             sid=$(cat -- "$pidfile" 2>/dev/null) || continue
             case $sid in '' | *[!0-9]*) continue ;; esac
@@ -654,9 +699,49 @@ cleanup() {
     if [ -n "$host_probe_listener_pid" ]; then
         /bin/kill "$host_probe_listener_pid" 2>/dev/null || true
     fi
-    rm -rf -- "$work"
+    # Darwin throwaway user cleanup
+    if [ -n "$tuser_created" ]; then
+        /usr/bin/sudo -n /usr/bin/pkill -KILL -U "$tuid" 2>/dev/null || true
+        poll=0
+        while /usr/bin/pgrep -U "$tuid" >/dev/null 2>&1 && [ "$poll" -lt 50 ]; do
+            sleep 0.1
+            poll=$((poll + 1))
+        done
+        if /usr/bin/pgrep -U "$tuid" >/dev/null 2>&1; then
+            printf 'smoke-archive: processes of %s survived cleanup\n' "$tuser" >&2
+            status=1
+        fi
+        case $tuid in
+            '' | *[!0-9]*) ;;
+            *)
+                /usr/bin/sudo -n /bin/rm -rf -- "/private/tmp/codex-daemon-$tuid" "/private/tmp/pohunek-$tuid" || true
+                [ -e "/private/tmp/codex-daemon-$tuid" ] && { printf 'smoke-archive: /private/tmp/codex-daemon-%s still exists\n' "$tuid" >&2; status=1; }
+                [ -e "/private/tmp/pohunek-$tuid" ] && { printf 'smoke-archive: /private/tmp/pohunek-%s still exists\n' "$tuid" >&2; status=1; }
+                ;;
+        esac
+        /usr/bin/sudo -n /usr/bin/dscl . -delete "/Users/$tuser" 2>/dev/null || true
+        if /usr/bin/dscl . -read "/Users/$tuser" >/dev/null 2>&1; then
+            printf 'smoke-archive: throwaway user %s still exists\n' "$tuser" >&2
+            status=1
+        fi
+    fi
+    if [ -n "$tuser_created" ]; then
+        case $work in
+            /private/tmp/pks.*) /usr/bin/sudo -n /bin/rm -rf -- "$work" || true ;;
+            *) printf 'smoke-archive: refusing to remove %s\n' "$work" >&2; status=1 ;;
+        esac
+    else
+        rm -rf -- "$work"
+    fi
     if [ -n "$sock_root" ]; then
-        rm -rf -- "$sock_root"
+        if [ -n "$tuser_created" ]; then
+            case $sock_root in
+                /private/tmp/pk.*) /usr/bin/sudo -n /bin/rm -rf -- "$sock_root" || true ;;
+                *) printf 'smoke-archive: refusing to remove %s\n' "$sock_root" >&2; status=1 ;;
+            esac
+        else
+            rm -rf -- "$sock_root"
+        fi
     fi
     if [ -n "$host_probe" ]; then
         rm -rf -- "$host_probe"
@@ -807,6 +892,10 @@ run_sandbox() {
         *'"'*) fail "socket root contains quote: $sock_root" ;;
         *'\\'*) fail "socket root contains backslash: $sock_root" ;;
     esac
+    case $codex_dir in
+        *'"'*) fail "codex directory contains quote: $codex_dir" ;;
+        *'\\'*) fail "codex directory contains backslash: $codex_dir" ;;
+    esac
     profile=$(printf '%s\n' \
         '(version 1)' \
         '(allow default)' \
@@ -818,15 +907,26 @@ run_sandbox() {
         "(allow network-bind (local unix-socket (subpath \"$sock_root\")))" \
         "(allow network* (remote unix-socket (subpath \"$work\")))" \
         "(allow network-bind (local unix-socket (subpath \"$work\")))" \
+        "(allow network* (remote unix-socket (subpath \"$codex_dir\")))" \
+        "(allow network-bind (local unix-socket (subpath \"$codex_dir\")))" \
         '(allow process-exec* (literal "/bin/ps") (with no-sandbox))')
-    # Unix sockets are local IPC, not egress. The socket path for the smoke's own
-    # roots (sock_root and work) is narrowed to subpaths only, so the smoke cannot
-    # reach unrelated host sockets. /bin/ps is setuid, so the sandbox cannot exec
-    # it; it runs unsandboxed as a fixed read-only system tool so the test-support
-    # worker-leak check can read the process table; egress stays denied. DNS
-    # (/private/var/run/mDNSResponder) stays denied.
-    exec /usr/bin/sandbox-exec -p "$profile" /usr/bin/env -i PATH="$root_path" \
-        /bin/sh "$self" __inner sandbox "$work" "$root" "$stage" "$work/consumer" "$node_dir" "$sock_root" "$host_probe" $runtimes
+    # Unix sockets are local IPC, not egress. The socket paths for smoke's own
+    # roots (sock_root and work) and the throwaway user's codex directory
+    # (codex_dir) are narrowed to subpaths only, so the smoke cannot reach
+    # unrelated host sockets. Codex binds its app-server socket under
+    # /private/tmp/codex-daemon-<uid>, and that directory is unique to the
+    # throwaway uid. The real user's sockets are unreachable by permissions
+    # as well as by the profile. /bin/ps is setuid, so the sandbox cannot
+    # exec it; it runs unsandboxed as a fixed read-only system tool so the
+    # test-support worker-leak check can read the process table; egress
+    # stays denied. DNS (/private/var/run/mDNSResponder) stays denied.
+    cd /
+    if [ "$uname_s" = Darwin ]; then
+        [ -n "$tuser" ] || fail "no throwaway user; refusing to run the macOS smoke as the invoking user"
+        exec /usr/bin/sudo -n -u "$tuser" /usr/bin/sandbox-exec -p "$profile" /usr/bin/env -i PATH="$root_path" /bin/sh "$work/smoke-archive" __inner sandbox "$work" "$root" "$stage" "$work/consumer" "$node_dir" "$sock_root" "$host_probe" $runtimes
+    else
+        exec /usr/bin/sandbox-exec -p "$profile" /usr/bin/env -i PATH="$root_path" /bin/sh "$self" __inner sandbox "$work" "$root" "$stage" "$work/consumer" "$node_dir" "$sock_root" "$host_probe" $runtimes
+    fi
 }
 probe_userns() {
     /usr/bin/env -i PATH="$root_path" /usr/bin/unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc /usr/bin/true >/dev/null 2>&1
@@ -838,6 +938,9 @@ probe_sudo() {
 }
 probe_sandbox() {
     /usr/bin/sandbox-exec -p '(version 1)(allow default)(deny network*)' /usr/bin/true >/dev/null 2>&1
+}
+probe_darwin_sudo() {
+    [ -x /usr/bin/sudo ] && [ -x /usr/bin/dscl ] && /usr/bin/sudo -n /usr/bin/true >/dev/null 2>&1
 }
 
 chosen=$isolation
@@ -865,6 +968,12 @@ case $chosen in
     sandbox) probe_sandbox || fail "isolation sandbox is not available on this host" ;;
     *) fail "unknown isolation strategy: $chosen" ;;
 esac
+if [ "$chosen" = sandbox ]; then
+    if [ "$uname_s" = Darwin ]; then
+        probe_darwin_sudo || fail "the macOS smoke runs the consumer as a throwaway local user and needs passwordless sudo (sudo -n) to create it; refusing to run as the invoking user"
+        create_throwaway_user
+    fi
+fi
 if [ "$chosen" = sudo ]; then
     /usr/bin/mkfifo "$work/sudo-cancel"
     exec 3<> "$work/sudo-cancel"
@@ -884,6 +993,21 @@ if [ "$chosen" = sandbox ]; then
         n=$((n + 1))
     done
     [ -S "$host_probe/s" ] || fail "failed to create host probe socket: $host_probe/s"
+    if [ "$uname_s" = Darwin ] && [ -n "$tuser" ]; then
+        chmod 711 "$work"
+        cp -- "$self" "$work/smoke-archive"
+        chmod 755 "$work/smoke-archive"
+        mkdir -p "$work/t"
+        /usr/bin/sudo -n /usr/sbin/chown -R "$tuser" "$work/run" "$work/t" "$sock_root" || fail "cannot set permissions for the throwaway user"
+        output=$(/usr/bin/sudo -n -u "$tuser" /bin/sh -c 'for p do [ -r "$p" ] && [ -x "$p" ] || { printf "%s\n" "$p"; exit 1; }; done' sh "$root" "$stage" "$node_dir" "$work/consumer" "$work/smoke-archive" 2>&1) && preflight_status=0 || preflight_status=$?
+        if [ "$preflight_status" -ne 0 ]; then
+            fail "the throwaway user cannot read and enter: $(printf '%s\n' "$output" | head -n 1)"
+        fi
+        [ -S "$host_probe/s" ] || fail "host probe socket is missing"
+        if /usr/bin/sudo -n -u "$tuser" /usr/bin/nc -U -w 2 "$host_probe/s" </dev/null >/dev/null 2>&1; then
+            fail "the throwaway user reaches a socket of the invoking user"
+        fi
+    fi
 fi
 
 # The namespace runs in the background so a signal reaches the trap at once.
