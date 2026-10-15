@@ -2301,9 +2301,10 @@ configuration, the best evidence available. A rollback judges with the same orde
 so the `PATH` it uses is the one the restored job gets where launchd can still
 report it; a `warning:` line names a journal that gave no default. An
 unrecognized `launchctl print` output refuses the upgrade with `service_manager_environment_unavailable`.
-A job that records its `PATH` and whose service manager cannot be read (on Linux the systemd user
-manager's bus is not reachable; on macOS launchd has no `gui/<uid>` domain, as without a GUI
-session) takes no manager variables. `service check` is not refused: it prints a `warning` that
+A job whose service manager's variables cannot be read takes none: on Linux a job that records
+its `PATH` whose systemd user manager's bus is not reachable, and on macOS any job when launchd has
+no `gui/<uid>` domain, as without a GUI session (a job without a recorded `PATH` then takes the
+persisted launchd configuration's `PATH`). `service check` is not refused: it prints a `warning` that
 native references are judged at the default store locations, so a verdict may read
 `already_not_resumable` or `would_lose_recovery` for a conversation stored under a variable-set
 location, or `adoptable` for one present only at the default location. When such a judgement

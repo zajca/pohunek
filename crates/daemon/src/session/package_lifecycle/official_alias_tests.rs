@@ -4646,9 +4646,10 @@ async fn an_adopted_claude_package_that_changed_its_check_stays_would_lose_recov
 }
 
 /// The v0.34.2 claude golden declares the native reference check the official
-/// claude package declares. If this fails, the package changed its check: the
-/// preflight then judges adopted 0.34 references fail-closed until the golden is
-/// reviewed and updated.
+/// claude package declares. The golden is the released v0.34.2 descriptor and
+/// never changes; if this fails, the package changed its check, the preflight
+/// judges adopted 0.34 references fail-closed, and the upgrade-source rule is
+/// what gets reviewed.
 #[test]
 fn the_v034_claude_golden_declares_the_official_claude_packages_check() {
     let entries = crate::agent::host::fixture::official_package_entries(RuntimeId::CLAUDE);
@@ -4675,7 +4676,7 @@ fn the_v034_claude_golden_declares_the_official_claude_packages_check() {
         upgrade_preflight::GoldenCheck::Declared(official.hook_existence().cloned()),
         "the official claude package changed its native reference existence check: the \
          v0.34.2 golden declares another check, so the preflight judges adopted 0.34 \
-         references fail-closed until the golden is reviewed and updated"
+         references fail-closed; review the upgrade-source rule, not the golden"
     );
 }
 

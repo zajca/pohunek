@@ -216,18 +216,18 @@ pub struct ActiveJob {
     pub domain: Option<String>,
     /// The `default environment` `PATH` of the loaded job, when it is loaded.
     pub loaded_default: Option<String>,
-    /// The domain's `environment` variables, `PATH` included, in launchd's order.
-    pub domain_environment: Vec<(String, String)>,
+    /// The domain's `environment` variables, `PATH` included, in launchd's
+    /// order; `None` when launchd has no such domain (no GUI session).
+    pub domain_environment: Option<Vec<(String, String)>>,
 }
 
 // The domain's variables are printed by name only: their values may be secrets.
 impl Debug for ActiveJob {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let names: Vec<&str> = self
+        let names: Option<Vec<&str>> = self
             .domain_environment
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect();
+            .as_ref()
+            .map(|entries| entries.iter().map(|(name, _)| name.as_str()).collect());
         f.debug_struct("ActiveJob")
             .field("domain", &self.domain)
             .field("loaded_default", &self.loaded_default)

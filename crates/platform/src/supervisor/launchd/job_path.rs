@@ -13,8 +13,8 @@
 //!
 //! The persisted `user.plist` of the launchd configuration is not read here: a
 //! `launchctl config user path` value takes effect only after a reboot. A job
-//! that is not loaded has no default section, so [`JobPathSources::default()`]
-//! tells the caller to fall back to the best evidence it has.
+//! that is not loaded has no default section, so `loaded_default` is `None` and
+//! the caller falls back to the best evidence it has.
 //!
 //! `launchctl print` output is not a stable interface, so each section is read
 //! strictly and anything unrecognized is an error rather than a guess. Values
@@ -74,18 +74,18 @@ pub struct JobPathSources {
     /// is not loaded (or launchd reports no such section for it).
     pub loaded_default: Option<String>,
     /// Every variable of the domain's `environment`, in launchd's order,
-    /// `PATH` included. Empty when the domain sets none.
-    pub domain_environment: Vec<(String, String)>,
+    /// `PATH` included; empty when the domain sets none, `None` when launchd has
+    /// no such domain (no GUI session).
+    pub domain_environment: Option<Vec<(String, String)>>,
 }
 
 // The domain's variables are printed by name only: their values may be secrets.
 impl std::fmt::Debug for JobPathSources {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let names: Vec<&str> = self
+        let names: Option<Vec<&str>> = self
             .domain_environment
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect();
+            .as_ref()
+            .map(|entries| entries.iter().map(|(name, _)| name.as_str()).collect());
         f.debug_struct("JobPathSources")
             .field("domain", &self.domain)
             .field("loaded_default", &self.loaded_default)
@@ -150,13 +150,11 @@ pub(crate) async fn resolve(
     domain: &str,
     label: &str,
 ) -> Result<JobPathSources, Error> {
-    // Without the domain the job is not loaded either, so it has no variables.
-    let domain_environment = domain_environment(launchctl, domain)
-        .await?
-        .unwrap_or_default();
+    let domain_environment = domain_environment(launchctl, domain).await?;
     let domain_value = named_path(
         domain_environment
             .iter()
+            .flatten()
             .map(|(name, value)| (name.as_str(), value.as_str())),
         false,
     )?;
@@ -483,13 +481,13 @@ mod tests {
                 JobPathSources {
                     domain: Some("/opt/set/bin:/usr/bin ".to_owned()),
                     loaded_default: Some("/usr/bin:/bin:/usr/sbin:/sbin".to_owned()),
-                    domain_environment: vec![
+                    domain_environment: Some(vec![
                         (
                             "SSH_AUTH_SOCK".to_owned(),
                             "/work/com.apple.launchd.example/Listeners".to_owned(),
                         ),
                         ("PATH".to_owned(), "/opt/set/bin:/usr/bin ".to_owned()),
-                    ],
+                    ]),
                 }
             );
         });
@@ -512,10 +510,10 @@ mod tests {
                 JobPathSources {
                     domain: None,
                     loaded_default: Some("/usr/bin:/bin:/usr/sbin:/sbin".to_owned()),
-                    domain_environment: vec![(
+                    domain_environment: Some(vec![(
                         "SSH_AUTH_SOCK".to_owned(),
                         "/work/com.apple.launchd.example/Listeners".to_owned(),
-                    )],
+                    )]),
                 }
             );
         });
@@ -538,10 +536,10 @@ mod tests {
                 JobPathSources {
                     domain: None,
                     loaded_default: Some("/usr/bin:/bin ".to_owned()),
-                    domain_environment: vec![(
+                    domain_environment: Some(vec![(
                         "SSH_AUTH_SOCK".to_owned(),
                         "/work/com.apple.launchd.example/Listeners".to_owned(),
-                    )],
+                    )]),
                 }
             );
         });
@@ -562,10 +560,10 @@ mod tests {
                     .await
                     .expect("resolved"),
                 JobPathSources {
-                    domain_environment: vec![(
+                    domain_environment: Some(vec![(
                         "SSH_AUTH_SOCK".to_owned(),
                         "/work/com.apple.launchd.example/Listeners".to_owned(),
-                    )],
+                    )]),
                     ..JobPathSources::default()
                 }
             );
@@ -639,6 +637,8 @@ mod tests {
         });
     }
 
+    /// Without a GUI session launchd has no domain, so the job is not loaded and
+    /// the domain's variables are reported missing, not empty.
     #[test]
     fn a_domain_without_a_gui_session_loads_no_job_so_the_job_is_not_loaded() {
         runtime().block_on(async {
@@ -648,7 +648,11 @@ mod tests {
                 resolve(&launchctl, "gui/9999", "job")
                     .await
                     .expect("resolved"),
-                JobPathSources::default()
+                JobPathSources {
+                    domain: None,
+                    loaded_default: None,
+                    domain_environment: None,
+                }
             );
         });
     }
@@ -670,7 +674,7 @@ mod tests {
                 JobPathSources {
                     domain: None,
                     loaded_default: Some("/usr/bin:/bin:/usr/sbin:/sbin".to_owned()),
-                    domain_environment: Vec::new(),
+                    domain_environment: Some(Vec::new()),
                 }
             );
         });

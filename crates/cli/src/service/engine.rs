@@ -2778,6 +2778,19 @@ pub(crate) async fn installed_job_path(context: &Context) -> Result<JobPath, Err
     job_path(context, &source.config, None).await
 }
 
+/// The `PATH` the installed daemon job runs with, as [`job_search_path`] gives
+/// it: no manager variables are selected.
+///
+/// # Errors
+///
+/// See [`job_path`].
+pub(crate) async fn installed_job_search_path(context: &Context) -> Result<JobPath, Error> {
+    let source = load_config_for_upgrade(&context.config_path())?.ok_or(Error::NotInstalled {
+        path: context.config_path(),
+    })?;
+    job_search_path(context, &source.config, None).await
+}
+
 /// Where the `PATH` of a job without its own came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PathSource {
@@ -2814,8 +2827,9 @@ pub(crate) struct JobPath {
     /// excluded. A preflight judges with them, so they stay out of the logs and
     /// errors: only their names may appear there.
     pub(crate) variables: BTreeMap<String, String>,
-    /// Why the service manager's environment was not read, when the job records
-    /// its `PATH` and no manager is reachable. Its variables are then not applied.
+    /// Why the service manager's environment was not read: on Linux a job that
+    /// records its `PATH` with no reachable manager, on macOS any job when launchd
+    /// has no user domain. Its variables are then not applied.
     pub(crate) manager_unreachable: Option<String>,
 }
 
@@ -2840,8 +2854,8 @@ const MANAGER_REMEDY: &str =
 #[cfg(not(target_os = "macos"))]
 const MANAGER_REMEDY: &str = "Start the user's service manager or make its bus reachable";
 
-/// The warning a judgement of a recorded-`PATH` job carries when no service
-/// manager is reachable. The verdicts may err in either direction, so the text
+/// The warning a judgement carries when the service manager's variables were
+/// not read ([`JobPath::manager_unreachable`]). The verdicts may err in either direction, so the text
 /// says which way and what the operator does before relying on them.
 fn manager_warnings(job: &JobPath) -> Vec<String> {
     let Some(detail) = &job.manager_unreachable else {
@@ -3038,10 +3052,7 @@ async fn manager_variables(
         // variables it may set are not applied.
         None => Ok(ManagerVariables {
             variables: BTreeMap::new(),
-            unreachable: Some(format!(
-                "launchd has no user domain for uid {} (no GUI session)",
-                context.uid()
-            )),
+            unreachable: Some(no_launchd_domain(context)),
         }),
     }
 }
@@ -3075,7 +3086,13 @@ async fn launchd_job_path(
         loaded_default,
         domain_environment,
     } = active_launchd_job(context).await?;
-    let variables = manager_env::allowlisted_variables(domain_environment, allowlist)?;
+    let (variables, unreachable) = match domain_environment {
+        Some(entries) => (
+            manager_env::allowlisted_variables(entries, allowlist)?,
+            None,
+        ),
+        None => (BTreeMap::new(), Some(no_launchd_domain(context))),
+    };
     let (value, source) = if let Some(value) = domain {
         (value, PathSource::Domain)
     } else if let Some(value) = loaded_default.clone() {
@@ -3098,8 +3115,18 @@ async fn launchd_job_path(
         source,
         loaded_default,
         variables,
-        manager_unreachable: None,
+        manager_unreachable: unreachable,
     })
+}
+
+/// Why launchd's variables were not read: it has no user domain for `context`'s
+/// user, which is the case without a GUI session.
+#[cfg(target_os = "macos")]
+fn no_launchd_domain(context: &Context) -> String {
+    format!(
+        "launchd has no user domain for uid {} (no GUI session)",
+        context.uid()
+    )
 }
 
 /// The launchd state of the daemon job of `context`.

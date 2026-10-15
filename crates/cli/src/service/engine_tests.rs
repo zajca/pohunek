@@ -2210,7 +2210,7 @@ impl LaunchdJob for FakeLaunchd {
                 .lock()
                 .expect("launchd state")
                 .clone()
-                .map(|job| Some(job.domain_environment))
+                .map(|job| job.domain_environment)
         };
         Box::pin(async move { value })
     }
@@ -2263,7 +2263,7 @@ async fn a_recorded_path_job_on_macos_reads_the_domain_and_never_the_job() {
     let fake = Arc::new(FakeLaunchd::new(Ok(ActiveJob {
         domain: None,
         loaded_default: None,
-        domain_environment: vec![(allowed_name.to_owned(), allowed_value.to_owned())],
+        domain_environment: Some(vec![(allowed_name.to_owned(), allowed_value.to_owned())]),
     })));
     harness.context = harness
         .context
@@ -2300,14 +2300,17 @@ fn loaded_job(default: impl Into<String>) -> ActiveJob {
     ActiveJob {
         domain: None,
         loaded_default: Some(default.into()),
-        domain_environment: Vec::new(),
+        domain_environment: Some(Vec::new()),
     }
 }
 
 /// A job that is not loaded, in a domain that sets no `PATH`.
 #[cfg(target_os = "macos")]
 fn not_loaded() -> ActiveJob {
-    ActiveJob::default()
+    ActiveJob {
+        domain_environment: Some(Vec::new()),
+        ..ActiveJob::default()
+    }
 }
 
 /// A domain that sets `domain`, with the job loaded at `default` or not.
@@ -2316,7 +2319,7 @@ fn domain_over(domain: &str, default: Option<&str>) -> ActiveJob {
     ActiveJob {
         domain: Some(domain.to_owned()),
         loaded_default: default.map(str::to_owned),
-        domain_environment: Vec::new(),
+        domain_environment: Some(Vec::new()),
     }
 }
 
@@ -2366,6 +2369,56 @@ async fn a_job_that_is_not_loaded_falls_back_to_the_persisted_domain_configurati
         judged.iter().all(|path| path == DOMAIN_PATH),
         "a job that is down judges with the best evidence available: {judged:?}"
     );
+}
+
+/// On macOS a job without a recorded `PATH` and without a launchd user domain
+/// (no GUI session, for example a check over SSH) takes its `PATH` from the
+/// persisted configuration and no variables. It is degraded like a recorded-`PATH`
+/// job without a domain: the warning names the remedy, and a gate that judged a
+/// stopped session refuses.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_job_without_a_recorded_path_or_a_launchd_domain_is_judged_without_its_variables() {
+    const DOMAIN_PATH: &str = "/opt/pohunek-test/bin:/usr/bin:/bin";
+    let mut harness = Harness::new();
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(DOMAIN_PATH)).expect("domain configuration");
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged)
+        .with_launchd_domain_config(&domain)
+        .with_launchd_job(Arc::new(FakeLaunchd::without_domain()));
+    harness.install(V1).await.expect("install");
+    let config = harness.config().expect("config");
+    assert!(config.search_path().is_empty());
+
+    let job = crate::service::engine::job_path(&harness.context, &config, None)
+        .await
+        .expect("the persisted configuration gives the PATH");
+    assert_eq!(job.value, DOMAIN_PATH);
+    assert!(job.variables.is_empty(), "no domain, no variables");
+    assert!(job.manager_unreachable.is_some(), "{job:?}");
+    let warnings = crate::service::engine::job_warnings(&harness.context, &job);
+    assert!(
+        warnings.iter().any(
+            |warning| warning.contains("judged at the default store locations")
+                && warning.contains("GUI session")
+        ),
+        "{warnings:?}"
+    );
+
+    let refused = harness
+        .engine()
+        .with_adoption_preflight(preflight_with_a_stopped_session())
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("a stopped session judged without the domain's variables refuses");
+    assert!(
+        matches!(refused, Error::ManagerVariablesUnread { .. }),
+        "{refused:?}"
+    );
+    harness.assert_installed(V1);
 }
 
 #[cfg(target_os = "macos")]
@@ -2643,11 +2696,11 @@ async fn an_upgrade_judges_with_the_allowlisted_launchd_domain_variables_and_no_
         .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(ActiveJob {
             domain: Some(CURRENT_PATH.to_owned()),
             loaded_default: None,
-            domain_environment: vec![
+            domain_environment: Some(vec![
                 ("PATH".to_owned(), CURRENT_PATH.to_owned()),
                 (allowed_name.to_owned(), allowed_value.to_owned()),
                 (unlisted_name.to_owned(), unlisted_value.to_owned()),
-            ],
+            ]),
         }))));
     harness.install(V1).await.expect("install");
     let preflight = ScriptedPreflight::default();
@@ -2688,7 +2741,7 @@ fn the_debug_forms_of_the_job_environment_name_the_variables_and_never_their_val
     let active = crate::service::manager_env::ActiveJob {
         domain: None,
         loaded_default: None,
-        domain_environment: vec![("CLAUDE_CONFIG_DIR".to_owned(), SENTINEL.to_owned())],
+        domain_environment: Some(vec![("CLAUDE_CONFIG_DIR".to_owned(), SENTINEL.to_owned())]),
     };
     for debug in [format!("{job:?}"), format!("{active:?}")] {
         assert!(debug.contains("CLAUDE_CONFIG_DIR"), "{debug}");
@@ -6387,7 +6440,6 @@ fn harness_without_a_bus() -> Harness {
 
 /// A preflight that reports one adoptable stopped session, whose native
 /// reference check reads a store location.
-#[cfg(target_os = "linux")]
 fn preflight_with_a_stopped_session() -> Box<ScriptedPreflight> {
     Box::new(ScriptedPreflight {
         stopped: vec![SessionVerdict {
