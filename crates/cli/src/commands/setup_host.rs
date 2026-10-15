@@ -307,12 +307,16 @@ pub async fn apply(
 ///
 /// # Errors
 ///
-/// Returns [`CliError::SetupConsentRequired`] without `--yes` when no
+/// With `dry_run` it only prints the plan. Otherwise it returns
+/// [`CliError::SetupConsentRequired`] without `--yes` when no
 /// confirmation can be asked, [`CliError::SetupDeclined`] when the owner says
 /// no, [`CliError::SetupBlocked`] before any change, and
 /// [`CliError::SetupIncomplete`] or [`CliError::SetupInstalledOnly`] when a
 /// step after the first change fails.
-pub(crate) async fn run(yes: bool, json: bool) -> Result<(), CliError> {
+pub(crate) async fn run(yes: bool, json: bool, dry_run: bool) -> Result<(), CliError> {
+    if dry_run {
+        return preview_only(json).await;
+    }
     if !yes && (json || !io::stdin().is_terminal()) {
         return Err(CliError::SetupConsentRequired);
     }
@@ -331,6 +335,27 @@ pub(crate) async fn run(yes: bool, json: bool) -> Result<(), CliError> {
         print!("{}", crate::commands::render_json(&report)?);
     } else {
         print!("{}", render_report(&report));
+    }
+    Ok(())
+}
+
+/// Run `pohunek setup --dry-run`: reads the plan the run would preview and
+/// prints it, the preview document with `--json`, and changes nothing.
+///
+/// # Errors
+///
+/// Returns the errors of reading the plan, as a run returns them before its
+/// first change.
+async fn preview_only(json: bool) -> Result<(), CliError> {
+    let context = Context::resolve()?;
+    let staged = service::staged_dir(&context, None)?;
+    let planner = DaemonRuntimes::default();
+    let plan = plan_in(&context, &staged, &planner).await?;
+    if json {
+        print!("{}", crate::commands::render_json(&plan.preview)?);
+    } else {
+        print!("{}", render_plan(&plan));
+        println!("dry run: nothing was changed");
     }
     Ok(())
 }

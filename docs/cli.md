@@ -70,7 +70,7 @@ port is retained.
 | `pohunek integration status` | Inspect daemon-managed Codex/Claude hooks on the effective `--host` (`--profile` and `--all-profiles` select profile config homes and are local-only), or one explicitly selected local Hermes target. |
 | `pohunek integration doctor / uninstall` | Diagnose or remove daemon-managed Codex/Claude hooks (`doctor` follows `--host`; `uninstall` targets the local daemon; both accept `--profile NAME` and `--all-profiles`, local-only), or, with `--agent hermes`, one explicitly selected local Hermes plugin target. |
 | `pohunek integration update --agent hermes` | Atomically refresh one explicitly selected local Hermes plugin target. |
-| `pohunek setup [--yes] [--json]` | The one host setup: installs the service from this release, applies the official runtime packages, profile pins and hooks for the runtimes this host has, and writes the missing config files. It previews every change and asks once; `--yes` applies without asking, and without a terminal or with `--json` it needs `--yes`. It never upgrades an installed service. |
+| `pohunek setup [--yes \| --dry-run] [--json]` | The one host setup: installs the service from this release, applies the official runtime packages, profile pins and hooks for the runtimes this host has, and writes the missing config files. It previews every change and asks once; `--yes` applies without asking, and without a terminal or with `--json` it needs `--yes`. `--dry-run` prints the plan and changes nothing. It never upgrades an installed service. |
 | `pohunek setup config [--force] [--json]` | Install the default `attach.conf` and prompt templates; existing files are kept unless `--force`. |
 | `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
 | `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot. |
@@ -161,16 +161,26 @@ changed nothing else. Fix the cause the output names and run `pohunek setup`
 again: it plans from the installed service and converges without reinstalling
 it.
 
-The run is refused with the hint `--yes` when it cannot ask: without a terminal
-and without `--yes`, or with `--json` and no `--yes`. The refusal changes
-nothing.
+The run is refused when it cannot ask: without a terminal and without `--yes`,
+or with `--json` and no `--yes`. The refusal changes nothing, and its hint
+names `pohunek setup --dry-run --json` to read the plan and `--yes` to apply
+it.
+
+`--dry-run` reads the plan and prints it, then exits: in a terminal as the
+preview a run shows before it asks, and with `--json` as one document whose
+`ok` is that preview, the same object a `--json --yes` run carries in
+`preview`. It asks nothing and changes nothing: no service, package, profile,
+hook or config file, and it takes no lock a run would wait for. A plan that
+blocks the run, such as an installed service of another version or a release
+archive that fails its verification, is the same error the run returns.
+`--dry-run` with `--yes`, or with a setup subcommand, is a usage error.
 
 `--json --yes` applies the plan without asking and prints one result document.
 It carries the full preview in `preview` (service, packages, profiles,
 integrations, gaps, catalog, every Hermes home and the config files), then the
 `applied` lines, the hook outcomes, the config result and the verdict. It
 prints no separate preview, because it cannot ask: to read the plan first, run
-`pohunek setup` in a terminal.
+`pohunek setup --dry-run --json`.
 
 A failure after the first change prints an error instead of a result, and its
 message lists the changes made (`Changes made: ...`); `--json` carries the same

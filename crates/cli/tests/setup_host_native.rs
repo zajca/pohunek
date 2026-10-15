@@ -21,8 +21,8 @@
 
 #[path = "support/native.rs"]
 mod native;
-#[path = "support/sealed_archive.rs"]
-mod sealed_archive;
+#[path = "support/setup_release.rs"]
+mod setup_release;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -35,22 +35,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ed25519_dalek::SigningKey;
 use native::Installation;
-use package::directory::build_directory_archive;
-use package::{read_archive, CatalogEntry, Limits, PackageDigest, ANCHOR_FILE_NAME};
+use package::ANCHOR_FILE_NAME;
 
 use pohunek_cli::host_setup::{apply, plan, ReleasePlanner, ServiceStep, SetupReport};
 use pohunek_cli::service::context::PathDiscovery;
 use pohunek_cli::service::runtimes::DaemonRuntimes;
 use pohunek_cli::service::{self, Context, VERSION};
-use pohunek_daemon::agent::host::definition_from_archive;
 use pohunek_service_config::runtimes::{EnsureReport, PackageStatus};
-use pohunek_test_support::catalog::{
-    anchor_for, attestations_for, catalog_of, host_platform, signed, test_key, ANY_CORE,
-    RUNTIME_API, WINDOW_END,
-};
+use pohunek_test_support::catalog::test_key;
 use pohunek_test_support::fs::copy_shell_image;
 use pohunek_test_support::workspace_root;
-use protocol::{method, BindingProvenance, RuntimeId, SessionId, SessionNewParams};
+use protocol::{method, SessionId, SessionNewParams};
 use serde_json::{json, Value};
 
 /// Error code of a setup that stopped after the service install.
@@ -766,10 +761,6 @@ async fn a_recorded_catalog_on_an_installed_host_is_a_note_not_an_effect() {
     assert!(outcome.preview.catalog_note.is_some());
 }
 
-/// Runtime packages the fresh-host release carries. `pi` is installed only by
-/// the third run, once its agent is on the search path.
-const FRESH_HOST_RUNTIMES: [&str; 3] = ["claude", "codex", "pi"];
-
 /// Program names of the official agents, which the search path of the
 /// scenario offers only as its own fakes.
 const OFFICIAL_AGENTS: [&str; 4] = ["claude", "codex", "hermes", "pi"];
@@ -803,14 +794,6 @@ const SEARCH_DIR: u32 = 0o755;
 /// Mode of a fake agent and of its interpreter copy.
 const EXECUTABLE: u32 = 0o755;
 const PRIVATE_EXECUTABLE: u32 = 0o700;
-
-/// Sequence number of the release catalog the scenario signs.
-const CATALOG_SEQUENCE: u64 = 1;
-
-/// Name of the release's package directory and archive suffix, as the release
-/// daemon reads them.
-const PACKAGES_DIR: &str = "packages";
-const ARCHIVE_SUFFIX: &str = ".tar.zst";
 
 /// The release directory's `runtime/` entry, which the release daemon reads
 /// beside its own executable.
@@ -873,58 +856,15 @@ fn supported_banner(runtime: &str) -> String {
         .replace("{release}", release)
 }
 
-/// The package archive of `runtime-packages/<runtime>`, built the way
-/// `pohunek plugin install` receives it, and the catalog entry that
-/// authorizes it on this host.
-fn official_archive(runtime: &str) -> (Vec<u8>, CatalogEntry) {
-    let source = workspace_root().join("runtime-packages").join(runtime);
-    let bytes = build_directory_archive(&source, &Limits::DEFAULT)
-        .unwrap_or_else(|error| panic!("the {runtime} package builds: {error:?}"));
-    let archive = read_archive(&bytes, &Limits::DEFAULT).expect("the archive reads");
-    let digest: PackageDigest = archive.digest().clone();
-    let definition = definition_from_archive(archive.entries(), &digest)
-        .unwrap_or_else(|error| panic!("the {runtime} package parses: {error:?}"));
-    let BindingProvenance::Package { package, .. } = definition.binding().provenance.clone() else {
-        panic!("the {runtime} package has package provenance");
-    };
-    let entry = CatalogEntry {
-        package_id: package.id,
-        runtime_id: RuntimeId::parse(runtime).expect("runtime id"),
-        version: package.version,
-        digest,
-        runtime_api: RUNTIME_API,
-        platforms: vec![host_platform()],
-        attestations: attestations_for(&[host_platform()]),
-        core: ANY_CORE.to_owned(),
-    };
-    (bytes, entry)
-}
-
-/// Writes the release's `runtime/` directory: one archive per fresh-host
-/// runtime under `packages/`, and a catalog of them signed by `key`.
-fn write_release_runtime(runtime: &Path, key: &SigningKey) {
-    let packages = runtime.join(PACKAGES_DIR);
-    fs::create_dir_all(&packages).expect("packages directory");
-    let mut entries = Vec::new();
-    for name in FRESH_HOST_RUNTIMES {
-        let (bytes, entry) = official_archive(name);
-        fs::write(packages.join(format!("{name}{ARCHIVE_SUFFIX}")), bytes)
-            .expect("write the package archive");
-        entries.push(entry);
-    }
-    let catalog = catalog_of(CATALOG_SEQUENCE, WINDOW_END, entries);
-    fs::write(runtime.join(CATALOG_FILE), signed(key, catalog)).expect("write the catalog");
-}
-
 /// Stages the release the scenario installs from as an extracted daemon
 /// archive: this build's binaries, the throwaway trust anchor beside the
 /// daemon and the signed `runtime/`, sealed with the archive's verifier and
 /// `MANIFEST`, so setup verifies it before it runs anything from it.
 fn stage_release(installation: &Installation, key: &SigningKey) -> PathBuf {
-    let release = installation.stage();
-    fs::write(release.join(ANCHOR_FILE_NAME), anchor_for(key)).expect("write the trust anchor");
-    write_release_runtime(&release.join(RUNTIME_DIR), key);
-    sealed_archive::seal(&release);
+    let release = installation.root.join("archive");
+    setup_release::stage_binaries(&release);
+    setup_release::sign(&release, key);
+    setup_release::seal(&release);
     release
 }
 
@@ -1181,7 +1121,24 @@ fn installs(report: &SetupReport) -> Vec<&str> {
 /// search path, carries the release's trust into the installed version and
 /// installs both hooks, through which both agents then start.
 async fn first_run_sets_up_claude_and_codex(host: &FreshHost) {
+    // The plan alone, which `pohunek setup --dry-run` prints, writes nothing
+    // and is the preview the run then shows.
+    let before_dry_run = state_of(&host.roots());
+    let dry_run = plan(&host.installation.context, &host.release, &host.planner)
+        .await
+        .expect("the dry run plans")
+        .preview;
+    assert_eq!(
+        state_of(&host.roots()),
+        before_dry_run,
+        "a dry run changes no file"
+    );
     let outcome = host.run().await;
+    assert_eq!(
+        serde_json::to_value(&dry_run).expect("the dry run serializes"),
+        serde_json::to_value(&outcome.preview).expect("the preview serializes"),
+        "the dry run prints the preview of the run"
+    );
     assert!(matches!(
         outcome.preview.service,
         ServiceStep::Install { .. }

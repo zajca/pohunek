@@ -388,7 +388,7 @@ impl CliError {
                 "setup_consent_required",
                 "setup changes this host and needs your consent; nothing was changed".to_owned(),
                 Some(
-                    "run `pohunek setup` in a terminal to review the plan and confirm it, or `pohunek setup --yes` to apply it without a review"
+                    "run `pohunek setup --dry-run --json` to see the plan without changing anything, then `pohunek setup --yes` to apply it; in a terminal, `pohunek setup` shows the plan and asks"
                         .to_owned(),
                 ),
             ),

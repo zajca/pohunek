@@ -164,7 +164,8 @@ permissions itself.
 `pohunek setup` is the host setup. Without a subcommand it previews the service
 install or the kept service, the official runtime packages, profile pins, hooks
 and gaps of this host, asks once (`--yes` applies unattended; without a
-terminal and without `--yes`, or with `--json` and no `--yes`, it refuses), and then installs the service and
+terminal and without `--yes`, or with `--json` and no `--yes`, it refuses;
+`--dry-run` prints the plan and changes nothing), and then installs the service and
 the packages, pins the profiles, installs the hooks of the homes that exist, and
 writes the missing config files. It never upgrades an installed service: a
 different installed version is a gap, and `pohunek service upgrade` runs first.

@@ -20,8 +20,8 @@ use std::process::{Output, Stdio};
 
 use pohunek_test_support::env::TestEnv;
 
-#[path = "support/sealed_archive.rs"]
-mod sealed_archive;
+#[path = "support/setup_release.rs"]
+mod setup_release;
 use serde_json::Value;
 
 /// Mode of the fixture daemon: owner and group and other may execute it.
@@ -159,10 +159,10 @@ fn json_setup_without_yes_is_refused_with_a_stable_code() {
     assert_eq!(error["code"], "setup_consent_required");
     assert_eq!(error["class"], "configuration");
     assert!(
-        error["recover"]
-            .as_str()
-            .is_some_and(|hint| hint.contains("--yes")),
-        "the recovery hint names --yes: {error}"
+        error["recover"].as_str().is_some_and(
+            |hint| hint.contains("--yes") && hint.contains("`pohunek setup --dry-run --json`")
+        ),
+        "the recovery hint names the preview command and --yes: {error}"
     );
     assert_eq!(tree(env.root()), before, "a refused setup writes nothing");
 }
@@ -300,13 +300,13 @@ const RAN_MARKER: &str = "fixture-daemon-ran";
 
 /// Turns the fixture release into an extracted daemon archive: a fixture
 /// session worker beside the daemon, then the archive's verifier and a sealed
-/// `MANIFEST` (see `support/sealed_archive.rs`).
+/// `MANIFEST` (see `support/setup_release.rs`).
 fn seal_release(release: &Path) {
     let worker = release.join("pohunek-sessiond");
     fs::write(&worker, "#!/bin/sh\nexit 0\n").expect("write the fixture worker");
     fs::set_permissions(&worker, fs::Permissions::from_mode(FIXTURE_EXECUTABLE_MODE))
         .expect("make the fixture worker executable");
-    sealed_archive::seal(release);
+    setup_release::seal(release);
 }
 
 /// A sealed archive whose member changed after sealing is refused before its
@@ -391,4 +391,64 @@ fn an_intact_sealed_archive_passes_verification_and_is_planned() {
         "the archive verifies and its daemon plans: {stderr}"
     );
     assert_eq!(tree(env.root()), before, "a refused plan writes nothing");
+}
+
+/// On a host without a service, `--dry-run --json` prints the plan the run
+/// would preview, as one JSON document, and changes nothing. The release is
+/// this build's binaries, signed and sealed like an extracted archive, so the
+/// dry run verifies it and its daemon plans with `--detect`.
+#[test]
+fn a_dry_run_on_a_fresh_host_prints_the_preview_and_changes_nothing() {
+    let env = TestEnv::new().expect("private environment");
+    let release = env.root().join(RELEASE_DIR);
+    setup_release::stage_binaries(&release);
+    setup_release::sign(&release, &pohunek_test_support::catalog::test_key());
+    setup_release::seal(&release);
+    let binary = release.join("pohunek");
+    let before = tree(env.root());
+
+    let output = run_setup(&env, &binary, &["setup", "--dry-run", "--json"]);
+
+    assert!(
+        output.status.success(),
+        "a dry run succeeds: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document = json_document(&output);
+    let preview = &document["ok"];
+    assert_eq!(preview["service"]["action"], "install", "{preview}");
+    assert!(preview["packages"].is_array(), "{preview}");
+    assert!(
+        preview.get("applied").is_none(),
+        "a dry run applies nothing: {preview}"
+    );
+    assert_eq!(tree(env.root()), before, "a dry run writes nothing");
+}
+
+/// `--dry-run` never applies: with `--yes`, or with a setup subcommand, the
+/// command line is refused before anything runs.
+#[test]
+fn a_dry_run_with_yes_or_a_subcommand_is_a_usage_error() {
+    let env = TestEnv::new().expect("private environment");
+    let binary = pohunek_test_support::bin_exe("pohunek");
+    let before = tree(env.root());
+
+    for arguments in [
+        &["setup", "--dry-run", "--yes"][..],
+        &["setup", "--dry-run", "config"][..],
+    ] {
+        let output = run_setup(&env, &binary, arguments);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{arguments:?} is a usage error"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("--dry-run"), "{arguments:?}: {stderr}");
+    }
+    assert_eq!(
+        tree(env.root()),
+        before,
+        "a refused command line writes nothing"
+    );
 }

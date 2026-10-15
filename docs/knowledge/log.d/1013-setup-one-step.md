@@ -33,6 +33,10 @@
   fails the verdict. A config write that fails part way names the files it
   created. A catalog to be recorded on an installed host with no official
   package to install is a note, not an effect.
+- `pohunek setup --dry-run` prints the plan a run would preview and changes
+  nothing; with `--json` its `ok` is that preview object. With `--yes` or a
+  setup subcommand it is a usage error. The refusal without a terminal names
+  `pohunek setup --dry-run --json`.
 - Setup run from an extracted release archive verifies it first with the
   archive's own `packaging/verify-archive`, as `packaging/install-daemon.sh`
   does, and stops before any change on a modified member or a removed
