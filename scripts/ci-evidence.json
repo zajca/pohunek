@@ -59,7 +59,8 @@
       "release rehearsal (evidence, assembly, archive smoke) / Row hermes on aarch64-apple-darwin",
       "release rehearsal (evidence, assembly, archive smoke) / Row pi on aarch64-apple-darwin",
       "release rehearsal (evidence, assembly, archive smoke) / Assemble the rehearsal bundle",
-      "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated)",
+      "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, ubuntu-latest)",
+      "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, macos-15)",
       "release rehearsal (evidence, assembly, archive smoke) / Evidence verdict"
     ],
     "nightly": [
@@ -117,7 +118,8 @@
       "release rehearsal (evidence, assembly, archive smoke) / Row hermes on aarch64-apple-darwin",
       "release rehearsal (evidence, assembly, archive smoke) / Row pi on aarch64-apple-darwin",
       "release rehearsal (evidence, assembly, archive smoke) / Assemble the rehearsal bundle",
-      "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated)",
+      "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, ubuntu-latest)",
+      "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, macos-15)",
       "release rehearsal (evidence, assembly, archive smoke) / Evidence verdict",
       "macOS package install and upgrade (macos-14)",
       "tests (relay DB, PostgreSQL)"

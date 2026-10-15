@@ -18,6 +18,107 @@ WORKFLOW_PATH = ".github/workflows/ci.yml"
 REQUIRED_JOBS = ["required check", "matrix check (linux)"]
 
 
+def static_matrix(block):
+    """The combinations of a job's literal `strategy.matrix`, each a dict in
+    declaration order; None when the job has no matrix, "dynamic" when the
+    matrix is an expression such as `fromJSON(...)`."""
+    head = re.search(r"(?m)^      matrix:(.*)$", block)
+    if head is None:
+        return None
+    if head.group(1).strip():
+        return "dynamic"
+    lists, include, current = {}, [], None
+    for line in block[head.end():].splitlines()[1:]:
+        if line.strip().startswith("#") or not line.strip():
+            continue
+        if not line.startswith("        "):
+            break
+        entry = re.fullmatch(r"( *)(- )?([a-z_]+): *(.*)", line)
+        if entry is None:
+            continue
+        key, value = entry.group(3), entry.group(4).strip()
+        if key == "include" and not entry.group(2):
+            continue
+        if value.startswith("["):
+            lists[key] = [item.strip().strip('"') for item in value.strip("[]").split(",")]
+        elif entry.group(2):
+            current = {key: value.strip('"')}
+            include.append(current)
+        elif current is not None:
+            current[key] = value.strip('"')
+    combos = [{}]
+    for key, values in lists.items():
+        combos = [dict(combo, **{key: value}) for combo in combos for value in values]
+    return include if include and not lists else combos
+
+
+def workflow_jobs(path):
+    """Returns (name, matrix, called_workflow) for each job of a workflow.
+
+    A job without `name:` is shown under its id; `matrix` is what
+    `static_matrix` returns; `called_workflow` is the local reusable workflow
+    the job `uses:`, or None.
+    """
+    job_text = (ROOT / path).read_text().split("jobs:\n", 1)[1]
+    matches = list(re.finditer(r"(?m)^  ([a-z][a-z0-9-]*):\n", job_text))
+    jobs = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(job_text)
+        block = job_text[match.end():end]
+        name = re.search(r"(?m)^    name: (.+)$", block)
+        uses = re.search(r"(?m)^    uses: \./(\.github/workflows/\S+)$", block)
+        jobs.append((
+            name.group(1) if name else match.group(1),
+            static_matrix(block),
+            uses.group(1) if uses else None,
+        ))
+    return jobs
+
+
+def job_name_pattern(name, matrix):
+    """Matches the names Actions shows for a job.
+
+    With a literal matrix each combination gives exact names: `${{ matrix.<key> }}`
+    takes the combination's value, and a name without an expression gets the
+    combination's values appended in parentheses. With a dynamic matrix an
+    expression stands for any value.
+    """
+    if matrix is None or matrix == "dynamic":
+        pattern = ".+?".join(re.escape(part) for part in re.split(r"\$\{\{.*?\}\}", name))
+        if matrix == "dynamic" and "${{" not in name:
+            pattern += r"( \(.+\))?"
+        return re.compile(pattern + r"\Z")
+    names = []
+    for combo in matrix:
+        if "${{" in name:
+            names.append(re.sub(
+                r"\$\{\{ *matrix\.([a-z_]+) *\}\}",
+                lambda key: combo.get(key.group(1), key.group(0)),
+                name,
+            ))
+        else:
+            names.append(f"{name} ({', '.join(combo.values())})")
+    return re.compile("(?:" + "|".join(re.escape(shown) for shown in names) + r")\Z")
+
+
+def names_a_workflow_job(required, workflow_path):
+    """Whether a required job name, `caller` or `caller / called job`, is a job
+    Actions can show for the workflow, looking through a local reusable
+    workflow for the part after ` / `."""
+    caller, _, called = required.partition(" / ")
+    for name, matrix, uses in workflow_jobs(workflow_path):
+        if not job_name_pattern(name, matrix).match(caller):
+            continue
+        if not called:
+            return True
+        if uses and any(
+            job_name_pattern(inner, inner_matrix).match(called)
+            for inner, inner_matrix, _ in workflow_jobs(uses)
+        ):
+            return True
+    return False
+
+
 FAKE_GH = r'''#!/usr/bin/env python3
 import json
 import os
@@ -253,6 +354,27 @@ class CiEvidenceCliTests(unittest.TestCase):
             "continue-on-error: ${{ matrix.runner == 'macos-14' && github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') }}",
             macos_job,
         )
+
+    def test_every_required_job_names_a_job_of_the_workflow_or_its_reusable_workflows(self):
+        config = json.loads(DEFAULT_CONFIG.read_text())
+        workflow = config["workflow_path"]
+        for tier in ("main", "nightly"):
+            for name in config["required_jobs"][tier]:
+                with self.subTest(tier=tier, job=name):
+                    self.assertTrue(names_a_workflow_job(name, workflow))
+        # A required name that a matrix rename left behind, or a matrix value
+        # the workflow does not run, is refused.
+        smoke = "release rehearsal (evidence, assembly, archive smoke) / Archive smoke"
+        self.assertFalse(names_a_workflow_job(f"{smoke} (network-isolated)", workflow))
+        self.assertFalse(names_a_workflow_job(f"{smoke} (network-isolated, macos-14)", workflow))
+        self.assertFalse(names_a_workflow_job(f"{smoke} (network-isolated, ubuntu-latest) extra", workflow))
+        consumer = "release rehearsal (evidence, assembly, archive smoke) / Build the release consumer executable"
+        self.assertFalse(names_a_workflow_job(f"{consumer} (macos-14)", workflow))
+        self.assertFalse(names_a_workflow_job("tests (gpu, fast)", workflow))
+        # Both legs of the archive smoke gate a release in both tiers.
+        for tier in ("main", "nightly"):
+            for leg in ("ubuntu-latest", "macos-15"):
+                self.assertIn(f"{smoke} (network-isolated, {leg})", config["required_jobs"][tier])
 
     def test_real_main_jobs_fixture_satisfies_the_inventory(self):
         fixture = json.loads(
