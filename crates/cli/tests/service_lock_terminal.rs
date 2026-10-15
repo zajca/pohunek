@@ -55,13 +55,19 @@ echo "$second" > "$d/second"
 while [ ! -e "$d/stop" ]; do sleep 0.05; done
 "#;
 
-/// The shell that owns the terminal: it runs the lock in its foreground,
-/// then reports that the lock ended and waits for `end`.
+/// The shell that owns the terminal: it runs the lock in its foreground on
+/// the command `$LOCKED`, then reports that the lock ended and waits for `end`.
 const OUTER: &str = r#"d=$1
-"$POHUNEK" service lock -- sh "$d/inner.sh" "$d"
+"$POHUNEK" service lock -- "$LOCKED" "$d/inner.sh" "$d"
 echo $? > "$d/lock.status"
 while [ ! -e "$d/end" ]; do sleep 0.05; done
 "#;
+
+/// The command the lock runs [`INNER`] with.
+const SHELL: &str = "sh";
+
+/// A command that does not exist, so its `exec` fails.
+const MISSING_COMMAND: &str = "/nonexistent/pohunek-test-missing-command";
 
 /// Waits until `check` holds; the hang guard names the wait if it never does.
 fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
@@ -90,6 +96,41 @@ fn stopped(pid: i32) -> bool {
         })
 }
 
+/// A FIFO that holds the lock process before its own handoff of the terminal
+/// ([`pohunek_cli::service::HANDOFF_HOLD_ENV`]) until it is released.
+struct Hold {
+    path: PathBuf,
+    release: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl Hold {
+    fn new(dir: &Path) -> Self {
+        let path = dir.join("hold");
+        let made = Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo {}", path.display());
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let fifo = path.clone();
+        // Opening the FIFO for writing waits for the lock process to open it
+        // for reading; closing it on release ends the lock process's read.
+        std::thread::spawn(move || {
+            let writer = fs::OpenOptions::new().write(true).open(fifo);
+            let _ = released.recv();
+            drop(writer);
+        });
+        Self {
+            path,
+            release: Some(release),
+        }
+    }
+
+    fn release(&mut self) {
+        self.release.take();
+    }
+}
+
 /// A shell on its own pseudo-terminal running `service lock`.
 struct Session {
     _env: TestEnv,
@@ -97,10 +138,21 @@ struct Session {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn std::io::Write + Send>,
     shell: Box<dyn portable_pty::Child + Send + Sync>,
+    hold: Option<Hold>,
 }
 
 impl Session {
     fn start() -> Self {
+        Self::launch(false, SHELL)
+    }
+
+    /// Starts a session whose lock process waits before its own handoff of
+    /// the terminal until [`Self::release`].
+    fn start_held() -> Self {
+        Self::launch(true, SHELL)
+    }
+
+    fn launch(with_hold: bool, locked: &str) -> Self {
         // `TestEnv` roots are canonical, so no symlinked ancestor (macOS `/var`)
         // is refused.
         let env = TestEnv::new().expect("create the hermetic test environment");
@@ -111,6 +163,7 @@ impl Session {
             .expect("make directory private");
         fs::write(dir.join("inner.sh"), INNER).expect("write inner script");
         fs::write(dir.join("outer.sh"), OUTER).expect("write outer script");
+        let hold = with_hold.then(|| Hold::new(&dir));
 
         let pair = native_pty_system().openpty(SIZE).expect("open a pty");
         let mut command = CommandBuilder::new("sh");
@@ -120,6 +173,10 @@ impl Session {
             command.env(name, value);
         }
         command.env("POHUNEK", pohunek_bin());
+        command.env("LOCKED", locked);
+        if let Some(hold) = &hold {
+            command.env(pohunek_cli::service::HANDOFF_HOLD_ENV, &hold.path);
+        }
         command.cwd(env.cwd());
         let shell = pair.slave.spawn_command(command).expect("start the shell");
         drop(pair.slave);
@@ -136,6 +193,13 @@ impl Session {
             master: pair.master,
             writer,
             shell,
+            hold,
+        }
+    }
+
+    fn release(&mut self) {
+        if let Some(hold) = &mut self.hold {
+            hold.release();
         }
     }
 
@@ -251,5 +315,46 @@ fn ctrl_z_stops_the_job_and_sigcont_resumes_it_with_the_terminal() {
     assert_eq!(line(&session.path("second")), "after");
     session.touch("stop");
     assert_eq!(line(&session.path("lock.status")), "0");
+    assert_eq!(session.foreground(), Some(shell));
+}
+
+/// A command that reads the terminal before the lock process has handed it
+/// over owns the terminal already and reads the line. The lock process is
+/// held between spawning the command and its own handoff, the order a loaded
+/// host can produce. The shell that runs the lock has no job control, so a
+/// job stopped by that read would never be continued.
+#[test]
+fn a_command_reading_before_the_lock_hands_over_owns_the_terminal() {
+    let mut session = Session::start_held();
+    let child = session.pid("child.pid");
+    let lock = session.pid("lock.pid");
+    let shell = i32::try_from(session.shell.process_id().expect("shell pid")).expect("pid");
+    assert_eq!(
+        session.foreground(),
+        Some(child),
+        "the command owns the terminal before the lock process hands it over"
+    );
+    session.type_bytes(b"hello\n");
+    assert_eq!(line(&session.path("first")), "hello");
+
+    session.release();
+    session.touch("phase2");
+    session.type_bytes(b"again\n");
+    assert_eq!(line(&session.path("second")), "again");
+    assert!(!stopped(lock));
+    session.touch("stop");
+    assert_eq!(line(&session.path("lock.status")), "0");
+    assert_eq!(session.foreground(), Some(shell));
+}
+
+/// A command that cannot be executed leaves the terminal to the shell that
+/// runs the lock. The child takes the terminal before its `exec`, so the
+/// lock process takes it back from the child's group, which has no member
+/// left.
+#[test]
+fn a_command_that_cannot_execute_leaves_the_terminal_to_the_shell() {
+    let session = Session::launch(false, MISSING_COMMAND);
+    let shell = i32::try_from(session.shell.process_id().expect("shell pid")).expect("pid");
+    assert_ne!(line(&session.path("lock.status")), "0");
     assert_eq!(session.foreground(), Some(shell));
 }

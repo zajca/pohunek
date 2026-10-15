@@ -372,9 +372,11 @@ impl Signals {
 /// to its group) is forwarded to the child's group, and when this process
 /// runs in the foreground of the terminal on stdin, the terminal's
 /// foreground passes to the child's group for the child's lifetime, as a
-/// shell hands it to a job. Terminal signals such as `Ctrl-C` then reach the
-/// child's group directly and not this process, and the child can still read
-/// from the terminal.
+/// shell hands it to a job: the child takes it before it executes the
+/// command, and this process makes the same handoff after the spawn, so the
+/// command owns the terminal from its first instruction. Terminal signals
+/// such as `Ctrl-C` then reach the child's group directly and not this
+/// process, and the child can read from the terminal at once.
 ///
 /// With the terminal handed over, a stopped child (`Ctrl-Z`, or a read
 /// from the terminal in the background) stops this process too, the way a
@@ -390,12 +392,21 @@ async fn run_locked(
 ) -> Result<ExitStatus, Error> {
     use std::os::unix::process::CommandExt as _;
 
-    let child = std::process::Command::new(program)
+    let terminal = Terminal::owned();
+    let mut command = std::process::Command::new(program);
+    command
         .args(arguments)
         .env(inherited::LOCK_TOKEN_ENV, token.as_str())
-        .process_group(0)
-        .spawn()
-        .map_err(error::io_error("run", program))?;
+        .process_group(0);
+    if let Some(terminal) = &terminal {
+        terminal.prepare(&mut command);
+    }
+    let child = command.spawn().map_err(|source| {
+        if let Some(terminal) = &terminal {
+            terminal.recover();
+        }
+        error::io_error("run", program)(source)
+    })?;
     let pid = i32::try_from(child.id())
         .map(nix::unistd::Pid::from_raw)
         .map_err(|_overflow| {
@@ -406,7 +417,9 @@ async fn run_locked(
     let group = pid;
     let (events, mut changes) = tokio::sync::mpsc::unbounded_channel();
     let waiter = std::thread::spawn(move || watch(pid, &events));
-    let terminal = Foreground::hand_to(group);
+    #[cfg(feature = "test-util")]
+    hold_before_handoff();
+    let terminal = terminal.and_then(|terminal| terminal.hand_to(group));
     let status = loop {
         tokio::select! {
             change = changes.recv() => match change {
@@ -426,6 +439,25 @@ async fn run_locked(
     // `child` is reaped already; dropping it neither waits nor kills.
     drop(child);
     status.map_err(error::io_error("wait for", program))
+}
+
+/// Environment variable naming a FIFO that [`run_locked`] reads to its end
+/// after it spawned the child and before its own handoff of the terminal.
+///
+/// A test holds the lock process there to run the child first, the order a
+/// loaded host can produce.
+#[cfg(feature = "test-util")]
+pub const HANDOFF_HOLD_ENV: &str = "POHUNEK_TEST_SERVICE_LOCK_HANDOFF_HOLD";
+
+/// Blocks until the test releases the FIFO that [`HANDOFF_HOLD_ENV`] names.
+///
+/// Opening the FIFO waits for the test's writer, and the read ends when the
+/// test closes it.
+#[cfg(feature = "test-util")]
+fn hold_before_handoff() {
+    if let Some(path) = std::env::var_os(HANDOFF_HOLD_ENV) {
+        let _ = std::fs::read(path);
+    }
 }
 
 /// A state change of the child `watch` reports.
@@ -471,6 +503,138 @@ fn watch(pid: nix::unistd::Pid, events: &tokio::sync::mpsc::UnboundedSender<Chan
     }
 }
 
+/// The terminal on stdin while its foreground is this process's group.
+#[derive(Debug, Clone, Copy)]
+struct Terminal {
+    /// This process's group.
+    own: nix::unistd::Pid,
+}
+
+impl Terminal {
+    /// Returns the terminal on stdin when this process's group owns it.
+    ///
+    /// Returns `None` when stdin is no terminal or this process runs in its
+    /// background; the child then leaves the foreground alone.
+    fn owned() -> Option<Self> {
+        use std::os::fd::AsRawFd as _;
+
+        let stdin = std::io::stdin();
+        if !nix::unistd::isatty(stdin.as_raw_fd()).unwrap_or(false) {
+            return None;
+        }
+        let own = nix::unistd::getpgrp();
+        (nix::unistd::tcgetpgrp(&stdin).ok()? == own).then_some(Self { own })
+    }
+
+    /// Makes the child of `command` take the terminal for its own group
+    /// before it executes, as the child of a job-control shell does.
+    ///
+    /// A command that reads the terminal at once is then never stopped by
+    /// `SIGTTIN` before the handoff, a stop the shell that runs this process
+    /// would see as the job's. The child takes the terminal only while this
+    /// process's group still owns it.
+    fn prepare(self, command: &mut std::process::Command) {
+        use nix::sys::signal::{SigSet, Signal};
+        use std::os::unix::process::CommandExt as _;
+
+        let own = self.own;
+        let mut ttou = SigSet::empty();
+        ttou.add(Signal::SIGTTOU);
+        #[expect(
+            unsafe_code,
+            reason = "pre_exec is required to take the terminal between fork and exec"
+        )]
+        // SAFETY: the closure makes only async-signal-safe calls on values
+        // built before the fork.
+        unsafe {
+            command.pre_exec(move || {
+                take_terminal(own, ttou);
+                Ok(())
+            });
+        }
+    }
+
+    /// Hands the terminal to the child's `group`, which normally took it
+    /// before it executed.
+    ///
+    /// This process takes the same step in case the child did not, as the
+    /// parent side of a job-control shell does. Returns `None` when neither
+    /// did, because another group took the terminal meanwhile.
+    fn hand_to(self, group: nix::unistd::Pid) -> Option<Foreground> {
+        let terminal = Foreground {
+            own: self.own,
+            child: group,
+        };
+        let current = nix::unistd::tcgetpgrp(std::io::stdin()).ok()?;
+        (current == group || terminal.give()).then_some(terminal)
+    }
+
+    /// Takes the terminal back after a failed spawn.
+    ///
+    /// The child may have taken it before its `exec` failed, and the spawn
+    /// reaps that child, so its group has no member left. The terminal is
+    /// taken back only from a group without members, never from a live one
+    /// that took it meanwhile.
+    fn recover(self) {
+        let stdin = std::io::stdin();
+        let Ok(current) = nix::unistd::tcgetpgrp(&stdin) else {
+            return;
+        };
+        if current != self.own
+            && nix::sys::signal::killpg(current, None) == Err(nix::errno::Errno::ESRCH)
+        {
+            claim_from_background(&stdin, self.own);
+        }
+    }
+}
+
+/// Takes the terminal on stdin for this process's group, in the child
+/// between `fork` and `exec`, while `owner`'s group owns it.
+///
+/// Only async-signal-safe calls run here. The group is created again, which
+/// changes nothing when the standard library created it already. `SIGTTOU`
+/// is blocked for `tcsetpgrp`, which this process calls from the terminal's
+/// background, and the previous mask is restored because the command
+/// inherits it.
+#[expect(
+    unsafe_code,
+    reason = "stdin is borrowed by its descriptor number inside pre_exec"
+)]
+fn take_terminal(owner: nix::unistd::Pid, ttou: nix::sys::signal::SigSet) {
+    use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
+    use nix::unistd::{getpgrp, setpgid, tcgetpgrp, tcsetpgrp, Pid};
+
+    // SAFETY: descriptor 0 stays open for the whole call; the standard
+    // library sets up stdio before pre_exec closures run.
+    let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(libc::STDIN_FILENO) };
+    if tcgetpgrp(stdin) != Ok(owner) || setpgid(Pid::from_raw(0), Pid::from_raw(0)).is_err() {
+        return;
+    }
+    let mut previous = SigSet::empty();
+    if pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&ttou), Some(&mut previous)).is_ok() {
+        let _ = tcsetpgrp(stdin, getpgrp());
+        let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&previous), None);
+    }
+}
+
+/// Gives the terminal on `stdin` to `group` from this process, which runs in
+/// the terminal's background.
+///
+/// Changing the foreground from there raises `SIGTTOU`, which would stop
+/// this process; the signal is blocked on this thread for the call, which
+/// both Linux and macOS honor for `tcsetpgrp`.
+fn claim_from_background(stdin: &std::io::Stdin, group: nix::unistd::Pid) {
+    use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow, Signal};
+
+    let mut ttou = SigSet::empty();
+    ttou.add(Signal::SIGTTOU);
+    let mut previous = SigSet::empty();
+    if pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&ttou), Some(&mut previous)).is_ok() {
+        let _ = nix::unistd::tcsetpgrp(stdin, group);
+        let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&previous), None);
+    }
+}
+
 /// The terminal's foreground, handed to the child's process group.
 ///
 /// Dropping it hands the foreground back to this process's group, when the
@@ -484,25 +648,6 @@ struct Foreground {
 }
 
 impl Foreground {
-    /// Hands the terminal on stdin to `child` when this process owns it.
-    ///
-    /// Returns `None`, changing nothing, when stdin is no terminal or this
-    /// process runs in its background.
-    fn hand_to(child: nix::unistd::Pid) -> Option<Self> {
-        use std::os::fd::AsRawFd as _;
-
-        let stdin = std::io::stdin();
-        if !nix::unistd::isatty(stdin.as_raw_fd()).unwrap_or(false) {
-            return None;
-        }
-        let own = nix::unistd::getpgrp();
-        if nix::unistd::tcgetpgrp(&stdin).ok()? != own {
-            return None;
-        }
-        let terminal = Self { own, child };
-        terminal.give().then_some(terminal)
-    }
-
     /// Gives the foreground to the child's group, which then continues.
     ///
     /// Only this process's group may give it away; returns whether it did.
@@ -513,32 +658,21 @@ impl Foreground {
         {
             return false;
         }
-        // A child that read the terminal before it owned it was stopped by
-        // `SIGTTIN`; it continues now that it may read.
+        // A child that read the terminal while it was continued in the
+        // background was stopped by `SIGTTIN`; it continues now that it may
+        // read.
         let _ = nix::sys::signal::killpg(self.child, nix::sys::signal::Signal::SIGCONT);
         true
     }
 
     /// Takes the foreground back from the child's group, if it has it.
     ///
-    /// This process is in the terminal's background then, and changing the
-    /// foreground from there raises `SIGTTOU`, which would stop it; the
-    /// signal is blocked on this thread for the call, which both Linux and
-    /// macOS honor for `tcsetpgrp`. The foreground is only taken while the
-    /// child's group holds it, never from a shell that took it meanwhile.
+    /// The foreground is only taken while the child's group holds it, never
+    /// from a shell that took it meanwhile.
     fn take_back(&self) {
-        use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow, Signal};
-
         let stdin = std::io::stdin();
-        if nix::unistd::tcgetpgrp(&stdin).ok() != Some(self.child) {
-            return;
-        }
-        let mut ttou = SigSet::empty();
-        ttou.add(Signal::SIGTTOU);
-        let mut previous = SigSet::empty();
-        if pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&ttou), Some(&mut previous)).is_ok() {
-            let _ = nix::unistd::tcsetpgrp(&stdin, self.own);
-            let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&previous), None);
+        if nix::unistd::tcgetpgrp(&stdin).ok() == Some(self.child) {
+            claim_from_background(&stdin, self.own);
         }
     }
 
