@@ -470,8 +470,9 @@ impl Error {
 /// The bus error behind a failed connection, classified as no bus or not.
 #[cfg(target_os = "linux")]
 fn no_bus_source(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    // An address that cannot be parsed is a configuration error, not an absent
+    // bus: it fails closed, so only the socket's absence counts.
     match source.downcast_ref::<zbus::Error>() {
-        Some(zbus::Error::Address(_)) => true,
         Some(zbus::Error::InputOutput(io)) => matches!(
             io.kind(),
             std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused

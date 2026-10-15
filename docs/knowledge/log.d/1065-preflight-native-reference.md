@@ -37,3 +37,7 @@
   unreachable service manager. A bus that refuses the client stays an error. A degraded
   judgement's warning reaches every upgrade, rollback and check output, and a refusal that
   the judgement produced carries it too.
+- A malformed session bus address is a configuration error and fails closed; only an
+  absent socket (not found, or refused) means no service manager is reachable.
+- Every refusal of an upgrade, rollback or check gate that a degraded judgement produced
+  carries that judgement's warning.

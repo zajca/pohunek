@@ -1733,6 +1733,19 @@ mod tests {
         .await
         .expect_err("no bus listens at the socket");
         assert!(error.is_no_bus(), "{error}");
+        // The error text does not carry the socket path: it names only the failure.
+        assert!(
+            !error.to_string().contains(&missing.display().to_string()),
+            "{error}"
+        );
+
+        // A malformed address is a configuration error, not an absent bus, so it
+        // fails closed even though no bus is reachable through it either.
+        let error = read_user_manager_environment(Some("not an address"), timeout)
+            .await
+            .expect_err("the address cannot be parsed");
+        assert!(!error.is_no_bus(), "{error}");
+        assert!(!error.to_string().contains("not an address"), "{error}");
 
         let socket = dir.path().join("hang-up-bus");
         let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind the socket");

@@ -794,6 +794,7 @@ impl<'a> Engine<'a> {
             return Ok((None, None));
         }
         let job = installed_job_path(self.context).await?;
+        let warnings = job_warnings(self.context, &job);
         let gated = preflight::gate_upgrade(
             &*self.preflight,
             self.context,
@@ -804,7 +805,8 @@ impl<'a> Engine<'a> {
             preflight::ReleasePlan::Included,
             self.accept_runtime_loss,
         )
-        .await?;
+        .await
+        .map_err(|error| error.with_warnings(&warnings))?;
         Ok((Some(gated), Some(job)))
     }
 
@@ -1098,7 +1100,8 @@ impl<'a> Engine<'a> {
         // The job is resolved here, after the hook and after a migration's stop,
         // so the value the runtime step gets is the one the new daemon gets.
         let job = job_path(self.context, config, record.launchd_default_path.as_deref()).await?;
-        late.warnings.extend(job_warnings(self.context, &job));
+        let warnings = job_warnings(self.context, &job);
+        late.warnings.extend(warnings.iter().cloned());
         if swap {
             if let Some(dir) = config.daemon_executable().parent() {
                 match preflight::gate_upgrade(
@@ -1116,12 +1119,12 @@ impl<'a> Engine<'a> {
                     Ok(gated) => late.gated = Some(gated),
                     Err(error) => {
                         late.refused = true;
-                        return Err(error);
+                        return Err(error.with_warnings(&warnings));
                     }
                 }
             }
         }
-        self.run_runtimes(record, layout, late, &job.value, &job.variables)
+        self.run_runtimes(record, layout, late, &job.value, &job.variables, &warnings)
             .await?;
         self.checkpoint(Step::Runtimes)?;
         if replaces_daemon(record.step) {
@@ -1243,7 +1246,8 @@ impl<'a> Engine<'a> {
             (hook.0)();
         }
         let job = job_path(self.context, config, record.launchd_default_path.as_deref()).await?;
-        late.warnings.extend(job_warnings(self.context, &job));
+        let warnings = job_warnings(self.context, &job);
+        late.warnings.extend(warnings.iter().cloned());
         if let Some(dir) = config.daemon_executable().parent() {
             match preflight::gate_upgrade(
                 &*self.preflight,
@@ -1262,7 +1266,7 @@ impl<'a> Engine<'a> {
                     late.refused = true;
                     // Nothing stopped or written yet; the record rolls
                     // back without stopping any daemon.
-                    return Err(error);
+                    return Err(error.with_warnings(&warnings));
                 }
             }
         }
@@ -1297,6 +1301,7 @@ impl<'a> Engine<'a> {
         late: &mut LateGate,
         search_path: &str,
         variables: &BTreeMap<String, String>,
+        warnings: &[String],
     ) -> Result<(), Error> {
         if record.step >= Step::Runtimes {
             return Ok(());
@@ -1356,7 +1361,8 @@ impl<'a> Engine<'a> {
                     preflight::ReleasePlan::Omitted,
                     self.accept_runtime_loss,
                 )
-                .await?,
+                .await
+                .map_err(|error| error.with_warnings(warnings))?,
             );
         }
         self.advance(record, Step::Runtimes)
@@ -1627,6 +1633,7 @@ impl<'a> Engine<'a> {
                     detail: "previous version has no valid installation directory".to_owned(),
                 })?;
         let job = journal_job_path(self.context, record).await?;
+        let warnings = job_warnings(self.context, &job);
         let mut gated = rollback::gate(
             rollback::Inputs {
                 preflight: &*self.preflight,
@@ -1642,8 +1649,9 @@ impl<'a> Engine<'a> {
             &job.variables,
             self.accept_runtime_loss,
         )
-        .await?;
-        gated.warnings = job_warnings(self.context, &job);
+        .await
+        .map_err(|error| error.with_warnings(&warnings))?;
+        gated.warnings = warnings;
         Ok(gated)
     }
 

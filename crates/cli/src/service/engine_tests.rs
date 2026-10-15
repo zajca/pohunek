@@ -6217,6 +6217,89 @@ async fn a_refused_check_without_a_bus_shows_the_warning_with_the_refusal() {
     );
 }
 
+/// An upgrade whose gate refuses at-risk sessions on a recorded-`PATH` job with
+/// no bus carries the warning in its refusal, as the check does.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_refused_upgrade_without_a_bus_shows_the_warning_with_the_refusal() {
+    use crate::service::manager_env::EnvironmentFailure;
+
+    let mut harness = Harness::new();
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Managed {
+            login_shell: None,
+            shell_defaulted: false,
+            fallback_directories: vec!["/usr/bin".to_owned()],
+        })
+        .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unreachable(
+            "no session bus".to_owned(),
+        ))));
+    harness.install(V1).await.expect("install");
+    seed_live_session(&harness, SESSION, "w-1");
+    edit_stored_line(&harness, SESSION, |line| {
+        line.as_object_mut().expect("record").remove("runtime");
+    });
+
+    let refused = harness
+        .upgrade(V2)
+        .await
+        .expect_err("the at-risk session refuses the upgrade");
+    assert!(
+        matches!(refused, Error::UpgradeAtRisk { .. }),
+        "{refused:?}"
+    );
+    let text = refused.to_string();
+    assert!(
+        text.contains("judged at the default store locations"),
+        "the refusal carries the warning: {text}"
+    );
+}
+
+/// A rollback refused for at-risk sessions on a recorded-`PATH` job with no bus
+/// carries the warning in its refusal.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_refused_rollback_without_a_bus_shows_the_warning_with_the_refusal() {
+    use crate::service::manager_env::EnvironmentFailure;
+
+    let mut harness = Harness::new();
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Managed {
+            login_shell: None,
+            shell_defaulted: false,
+            fallback_directories: vec!["/usr/bin".to_owned()],
+        })
+        .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unreachable(
+            "no session bus".to_owned(),
+        ))));
+    harness.install(V1).await.expect("install");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after the registration");
+    seed_unadoptable_session(&harness);
+
+    let refused = harness
+        .upgrade(V1)
+        .await
+        .expect_err("the rollback needs consent");
+    assert!(
+        matches!(refused, Error::RollbackAtRisk { .. }),
+        "{refused:?}"
+    );
+    let text = refused.to_string();
+    assert!(
+        text.contains("judged at the default store locations"),
+        "the refusal carries the warning: {text}"
+    );
+}
+
 #[tokio::test]
 async fn check_asks_the_preflight_of_an_upgrade_and_honours_the_flag() {
     let harness = Harness::new();
