@@ -655,6 +655,9 @@ async fn a_late_exit_after_the_stop_gave_up_honours_the_stop_intent() {
     scenario.config.stop_grace = pohunek_session_worker::WorkerConfig::new()
         .terminal_commit_wait_timeout
         + LATE_COMMIT_MARGIN;
+    // A worker rejects a post-kill reap deadline shorter than its grace. The
+    // root here exits on its own, so the deadline never bounds this stop.
+    scenario.config.kill_reap_deadline = scenario.config.stop_grace;
     let registry = scenario.registry();
     let (created, holder) = scenario.start(&registry).await;
     poll_until("the root to exit on its own", || {

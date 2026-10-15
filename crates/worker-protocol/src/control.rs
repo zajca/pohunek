@@ -130,8 +130,9 @@ pub enum ControlTypeError {
     /// An initialization memory or retention limit was zero.
     #[error("initialize limits must all be nonzero")]
     InvalidLimits,
-    /// A stop grace period was zero.
-    #[error("stop grace period must be nonzero")]
+    /// A stop grace period was zero, or the wait for the root's death after
+    /// the forced kill was shorter than the grace.
+    #[error("stop grace period must be nonzero and no longer than the post-kill reap deadline")]
     InvalidStopPolicy,
     /// An input stall bound was zero.
     #[error("input stall bound must be nonzero")]
@@ -365,6 +366,10 @@ impl<'de> Deserialize<'de> for InitializeLimits {
 pub struct StopPolicy {
     /// Grace period between termination and forced kill.
     grace_ms: u64,
+    /// How long after the forced kill the root's death is awaited. A daemon of
+    /// the previous release does not send it; the worker then uses its default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kill_reap_ms: Option<u64>,
 }
 
 impl StopPolicy {
@@ -377,7 +382,31 @@ impl StopPolicy {
         if grace_ms == 0 {
             Err(ControlTypeError::InvalidStopPolicy)
         } else {
-            Ok(Self { grace_ms })
+            Ok(Self {
+                grace_ms,
+                kill_reap_ms: None,
+            })
+        }
+    }
+
+    /// Creates a stop policy that also bounds the wait for the root's death
+    /// after the forced kill.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlTypeError::InvalidStopPolicy`] when `grace_ms` is zero
+    /// or `kill_reap_ms` is shorter than `grace_ms`.
+    pub const fn with_kill_reap(
+        grace_ms: u64,
+        kill_reap_ms: u64,
+    ) -> Result<Self, ControlTypeError> {
+        if grace_ms == 0 || kill_reap_ms < grace_ms {
+            Err(ControlTypeError::InvalidStopPolicy)
+        } else {
+            Ok(Self {
+                grace_ms,
+                kill_reap_ms: Some(kill_reap_ms),
+            })
         }
     }
 
@@ -385,6 +414,13 @@ impl StopPolicy {
     #[must_use]
     pub const fn grace_ms(self) -> u64 {
         self.grace_ms
+    }
+
+    /// Returns how long after the forced kill the root's death is awaited, in
+    /// milliseconds, when the policy carries it.
+    #[must_use]
+    pub const fn kill_reap_ms(self) -> Option<u64> {
+        self.kill_reap_ms
     }
 }
 
@@ -396,10 +432,16 @@ impl<'de> Deserialize<'de> for StopPolicy {
         #[derive(Deserialize)]
         struct WireStopPolicy {
             grace_ms: u64,
+            #[serde(default)]
+            kill_reap_ms: Option<u64>,
         }
 
         let policy = WireStopPolicy::deserialize(deserializer)?;
-        Self::new(policy.grace_ms).map_err(serde::de::Error::custom)
+        match policy.kill_reap_ms {
+            Some(kill_reap_ms) => Self::with_kill_reap(policy.grace_ms, kill_reap_ms),
+            None => Self::new(policy.grace_ms),
+        }
+        .map_err(serde::de::Error::custom)
     }
 }
 

@@ -276,9 +276,13 @@ async fn the_child_leads_the_session_and_receives_resize_signals() {
         .expect("resize the PTY");
     output_until(&pty, "winch-seen").await;
 
-    pty.stop("launch-test", Duration::from_secs(1))
-        .await
-        .expect("stop the shell");
+    pty.stop(
+        "launch-test",
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    )
+    .await
+    .expect("stop the shell");
 }
 
 /// The child inherits only the three PTY descriptors, not worker descriptors

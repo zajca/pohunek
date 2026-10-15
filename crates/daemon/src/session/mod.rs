@@ -346,6 +346,9 @@ pub struct SessionRegistryConfig {
     pub shell_command: ShellCommand,
     /// Grace period after SIGTERM before falling back to a hard kill.
     pub stop_grace: Duration,
+    /// How long after the hard kill a worker waits for the root's death before
+    /// the stop fails; never shorter than [`Self::stop_grace`].
+    pub kill_reap_deadline: Duration,
     /// How long a one-shot attach token may remain pending before redemption.
     pub attach_token_ttl: Duration,
     /// How long a failed attach outcome remains available to `session.detach`.
@@ -512,6 +515,7 @@ impl Default for SessionRegistryConfig {
         Self {
             shell_command: ShellCommand::default(),
             stop_grace: pohunek_service_config::DEFAULT_STOP_GRACE,
+            kill_reap_deadline: pohunek_service_config::DEFAULT_KILL_REAP_DEADLINE,
             attach_token_ttl: DEFAULT_ATTACH_TOKEN_TTL,
             attach_result_ttl: DEFAULT_ATTACH_RESULT_TTL,
             attach_result_capacity: DEFAULT_ATTACH_RESULT_CAPACITY,
