@@ -2558,6 +2558,29 @@ async fn an_upgrade_judges_with_the_allowlisted_launchd_domain_variables_and_no_
     }
 }
 
+/// The debug form of the job's launch facts and of launchd's active state names
+/// the variables and never prints their values.
+#[test]
+fn the_debug_forms_of_the_job_environment_name_the_variables_and_never_their_values() {
+    const SENTINEL: &str = "/sentinel/secret-store-value";
+    let variables = BTreeMap::from([("CLAUDE_CONFIG_DIR".to_owned(), SENTINEL.to_owned())]);
+    let job = JobPath {
+        value: CURRENT_PATH.to_owned(),
+        source: PathSource::Recorded,
+        loaded_default: None,
+        variables,
+    };
+    let active = crate::service::manager_env::ActiveJob {
+        domain: None,
+        loaded_default: None,
+        domain_environment: vec![("CLAUDE_CONFIG_DIR".to_owned(), SENTINEL.to_owned())],
+    };
+    for debug in [format!("{job:?}"), format!("{active:?}")] {
+        assert!(debug.contains("CLAUDE_CONFIG_DIR"), "{debug}");
+        assert!(!debug.contains(SENTINEL), "{debug}");
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_rollback_judges_with_the_manager_path_current_at_rollback() {

@@ -860,6 +860,16 @@ async fn the_manager_variables_reach_the_spawned_daemon_and_their_values_stay_ou
     .expect_err("a daemon that exits without a report fails the gate");
     assert!(!error.to_string().contains(SENTINEL), "{error}");
     assert!(!format!("{error:?}").contains(SENTINEL), "{error:?}");
+
+    // The manager's environment, as the job reads it, shows the variable's name
+    // in its debug form and never its value.
+    let manager = FakeUserManager(Ok(vec![format!("{NAME}={SENTINEL}")]));
+    let environment = user_manager_environment(&manager, &[NAME.to_owned()])
+        .await
+        .expect("the variable is carried");
+    let debug = format!("{environment:?}");
+    assert!(debug.contains(NAME), "{debug}");
+    assert!(!debug.contains(SENTINEL), "{debug}");
 }
 
 #[tokio::test]

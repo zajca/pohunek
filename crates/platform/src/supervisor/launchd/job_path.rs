@@ -66,7 +66,7 @@ const EXCERPT_CHARS: usize = 160;
 /// Both are read whatever the other says: the domain's value is readable whether
 /// or not the job is loaded, and the job's default exists only while it is
 /// loaded. The caller decides their order.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct JobPathSources {
     /// The domain's `PATH`, set with `launchctl setenv`, when the domain has one.
     pub domain: Option<String>,
@@ -76,6 +76,22 @@ pub struct JobPathSources {
     /// Every variable of the domain's `environment`, in launchd's order,
     /// `PATH` included. Empty when the domain sets none.
     pub domain_environment: Vec<(String, String)>,
+}
+
+// The domain's variables are printed by name only: their values may be secrets.
+impl std::fmt::Debug for JobPathSources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self
+            .domain_environment
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        f.debug_struct("JobPathSources")
+            .field("domain", &self.domain)
+            .field("loaded_default", &self.loaded_default)
+            .field("domain_environment", &names)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Reads the `PATH` the job `label` of `gui/<uid>` runs with when its
@@ -518,6 +534,20 @@ mod tests {
                     ..JobPathSources::default()
                 }
             );
+        });
+    }
+
+    #[test]
+    fn the_debug_form_of_the_domain_sources_names_the_variables_and_never_their_values() {
+        runtime().block_on(async {
+            let dir = pohunek_test_support::tempdir().expect("scratch directory");
+            let domain = "gui/501 = {\n\tenvironment = {\n\t\tSECRET_STORE => /sentinel/secret-value\n\t}\n\tservices = {\n\t}\n}\n";
+            let launchctl = fake(dir.path(), Reply::Output(domain), Reply::Status(113), None);
+            let sources = resolve(&launchctl, "gui/501", "job").await.expect("resolved");
+
+            let debug = format!("{sources:?}");
+            assert!(debug.contains("SECRET_STORE"), "the name is shown: {debug}");
+            assert!(!debug.contains("/sentinel/secret-value"), "no value: {debug}");
         });
     }
 

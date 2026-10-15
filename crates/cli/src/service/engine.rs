@@ -2744,7 +2744,7 @@ pub(crate) enum PathSource {
 }
 
 /// The `PATH` a daemon job runs with, byte for byte, and where it came from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct JobPath {
     /// The value the job's processes get.
     pub(crate) value: String,
@@ -2758,6 +2758,18 @@ pub(crate) struct JobPath {
     /// excluded. A preflight judges with them, so they stay out of the logs and
     /// errors: only their names may appear there.
     pub(crate) variables: BTreeMap<String, String>,
+}
+
+// The variables are printed by name only: their values may be secrets.
+impl std::fmt::Debug for JobPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobPath")
+            .field("value", &self.value)
+            .field("source", &self.source)
+            .field("loaded_default", &self.loaded_default)
+            .field("variables", &self.variables.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
 }
 
 /// The `PATH` of the daemon job of `config`, which every preflight and runtime

@@ -60,13 +60,23 @@ impl UserManager for SystemdUserManager {
 }
 
 /// What the systemd user manager gives the daemon job, read once.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UserManagerEnvironment {
     /// The manager's `PATH`, byte for byte, when it sets one. The daemon job
     /// runs with exactly this value.
     pub search_path: Option<String>,
     /// The manager's variables the allowlist selects, `PATH` excluded.
     pub variables: BTreeMap<String, String>,
+}
+
+// Variables are printed by name only: their values may be secrets.
+impl Debug for UserManagerEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserManagerEnvironment")
+            .field("search_path", &self.search_path)
+            .field("variables", &self.variables.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Reads the environment of the systemd user manager through `manager` once,
@@ -146,7 +156,7 @@ pub(crate) fn carry(value: &str) -> Result<String, String> {
 }
 
 /// What launchd reports for the daemon job's `PATH`, from both of its sources.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct ActiveJob {
     /// The domain's `PATH`, set with `launchctl setenv`, when the domain has one.
     pub domain: Option<String>,
@@ -154,6 +164,22 @@ pub struct ActiveJob {
     pub loaded_default: Option<String>,
     /// The domain's `environment` variables, `PATH` included, in launchd's order.
     pub domain_environment: Vec<(String, String)>,
+}
+
+// The domain's variables are printed by name only: their values may be secrets.
+impl Debug for ActiveJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self
+            .domain_environment
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        f.debug_struct("ActiveJob")
+            .field("domain", &self.domain)
+            .field("loaded_default", &self.loaded_default)
+            .field("domain_environment", &names)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Reads launchd's active state of the daemon job.
