@@ -460,19 +460,22 @@ fn check_accepts_a_current_schema_config_without_a_migration() {
             .is_some_and(Value::is_null),
         "{envelope}: a current-schema file needs no migration"
     );
-    // The host has no reachable user manager, and the job records its PATH, so
-    // the check still passes and says which way its verdicts may err.
-    let warnings = envelope
-        .get("ok")
-        .and_then(|report| report.get("warnings"))
-        .and_then(Value::as_array)
-        .expect("the check reports its warnings");
-    assert!(
-        warnings.iter().any(|warning| warning
-            .as_str()
-            .is_some_and(|text| text.contains("judged at the default store locations"))),
-        "{envelope}: an unreachable manager is a visible warning"
-    );
+    // On Linux the child has no reachable user bus, and the job records its
+    // PATH, so the check still passes and says which way its verdicts may err.
+    // A macOS host reads its launchd domain instead, which needs no bus.
+    if cfg!(target_os = "linux") {
+        let warnings = envelope
+            .get("ok")
+            .and_then(|report| report.get("warnings"))
+            .and_then(Value::as_array)
+            .expect("the check reports its warnings");
+        assert!(
+            warnings.iter().any(|warning| warning
+                .as_str()
+                .is_some_and(|text| text.contains("judged at the default store locations"))),
+            "{envelope}: an unreachable manager is a visible warning"
+        );
+    }
 }
 
 #[test]
