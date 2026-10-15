@@ -155,7 +155,8 @@ impl SessionRegistry {
             if entry.snapshot.launch_binding != candidate.pin {
                 continue;
             }
-            entry.pinned = resolution.pinned;
+            let previous = std::mem::replace(&mut entry.pinned, resolution.pinned);
+            rebind_observed_agents(entry, previous.as_ref());
             entry.default_detector_config = resolution.default.clone();
             let current = active_snapshot(entry);
             if current == candidate.active {
@@ -427,6 +428,34 @@ struct AdoptedResolution {
     /// name as its report resolves it. `None` when it does not resolve or is not
     /// of the own runtime.
     active: Option<DetectorConfig>,
+}
+
+/// Moves the observations the replaced pin `previous` matched onto the
+/// session's current pin, so a later transition never applies the replaced
+/// definition's rules. Without a current pin the session's own runtime is no
+/// longer attributed to it, and those observations are dropped. A changed pin
+/// also asks procwatch to observe again.
+fn rebind_observed_agents(entry: &mut SessionEntry, previous: Option<&Arc<RuntimeDefinition>>) {
+    if super::same_pin(entry.pinned.as_ref(), previous) {
+        return;
+    }
+    entry.procwatch_rescan.notify_one();
+    let Some(previous) = previous else {
+        return;
+    };
+    let current = entry.pinned.clone();
+    entry.observed_agents.retain_mut(|observed| {
+        if !Arc::ptr_eq(&observed.definition.0, previous) {
+            return true;
+        }
+        match &current {
+            Some(current) => {
+                observed.definition = super::MatchedDefinition(Arc::clone(current));
+                true
+            }
+            None => false,
+        }
+    });
 }
 
 /// Resolves an adopted session once. Loading the definition verifies the

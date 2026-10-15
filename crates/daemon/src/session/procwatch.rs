@@ -16,9 +16,10 @@ use crate::detect::{identify_definition, DetectorConfig};
 use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessIdentity, StartIdentity};
 
 use super::{
-    agent_kind_label, clear_active_agent, is_terminal, report_is_current, send_detector_config,
-    timestamp_now, ActiveAgentReport, CancellationToken, MatchedDefinition, Notify, ObservedAgent,
-    Ordering, RuntimeWatchIdentity, SessionEntry, SessionId, SessionRegistry,
+    agent_kind_label, clear_active_agent, is_terminal, report_is_current, same_pin,
+    send_detector_config, timestamp_now, ActiveAgentReport, CancellationToken, MatchedDefinition,
+    Notify, ObservedAgent, Ordering, RuntimeWatchIdentity, SessionEntry, SessionId,
+    SessionRegistry,
 };
 
 const PROCWATCH_SOURCE: &str = "pohunek:procwatch";
@@ -44,6 +45,14 @@ impl OwnRuntime {
             || Self::Unserved(entry.info.agent_base.clone()),
             Self::Pinned,
         )
+    }
+
+    /// The pinned definition this rule matches with.
+    fn pinned(&self) -> Option<&Arc<RuntimeDefinition>> {
+        match self {
+            Self::Pinned(definition) => Some(definition),
+            Self::Unserved(_) => None,
+        }
     }
 }
 
@@ -179,16 +188,20 @@ impl SessionRegistry {
         now: Instant,
     ) -> bool {
         let root_pid = root.pid;
-        let observed_refresh = match self.inner.inspector.descendants(root_pid) {
+        // The registry snapshot the scan identifies other runtimes with.
+        let scan_registry = self.inner.profiles.runtimes().registry();
+        let (scan_pin, observed_refresh) = match self.inner.inspector.descendants(root_pid) {
             Ok(facts) => {
                 let own = self.inner.sessions.lock().await.get(id).map(OwnRuntime::of);
-                Some(self.observed_agents_from_facts_for_runtime(
+                let scan_pin = own.as_ref().and_then(OwnRuntime::pinned).cloned();
+                let observed = self.observed_agents_from_facts_for_runtime(
                     id,
                     facts,
                     now,
                     own.as_ref(),
                     Some(&expected.worker_instance_id),
-                ))
+                );
+                (scan_pin, Some(observed))
             }
             Err(err) => {
                 warn!(
@@ -197,7 +210,7 @@ impl SessionRegistry {
                     error = %err,
                     "failed to inspect session process descendants"
                 );
-                None
+                (None, None)
             }
         };
         // Procfs inspection is synchronous. Keep it outside the global session
@@ -239,6 +252,20 @@ impl SessionRegistry {
             if entry.stopping || is_terminal(entry.info.state) {
                 return false;
             }
+            // A package change replaced a definition this scan matched with:
+            // the session's own pin, or the registry other runtimes resolve
+            // through. The next scan observes again.
+            let current_registry = self.inner.profiles.runtimes().registry();
+            let observed_refresh = match observed_refresh {
+                Some(_)
+                    if !same_pin(entry.pinned.as_ref(), scan_pin.as_ref())
+                        || !Arc::ptr_eq(&scan_registry, &current_registry) =>
+                {
+                    entry.procwatch_rescan.notify_one();
+                    None
+                }
+                observed_refresh => observed_refresh,
+            };
 
             let to_spawn = apply_observed_refresh(entry, observed_refresh, &mut exit_watches);
 

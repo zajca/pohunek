@@ -139,6 +139,7 @@ impl Host {
             transaction: None,
             info,
             recovery: None,
+            active_agent_origin: None,
             native_identity_ordering: None,
             runtime: RuntimeRecord {
                 state: RuntimeState::Live,

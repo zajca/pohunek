@@ -44,7 +44,7 @@ pub(crate) fn embedded_manifest_sources() -> [(&'static str, &'static str); 1] {
     [(protocol::RuntimeId::SHELL, GENERIC_SHELL_MANIFEST)]
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DetectorConfig {
     pub detection: DetectionConfig,
     pub manifest: Option<Manifest>,

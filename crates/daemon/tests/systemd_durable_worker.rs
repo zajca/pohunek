@@ -845,6 +845,7 @@ impl Fixture {
                     profile_revision: None,
                     native_launch_unresolved: false,
                 }),
+                active_agent_origin: None,
                 native_identity_ordering: None,
                 runtime: RuntimeRecord {
                     state: RuntimeState::Live,

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use crate::procwatch::ProcessFact;
 use protocol::AgentActivity;
@@ -30,7 +31,19 @@ use parser::{MAX_MATCHERS, MAX_MATCHER_BYTES};
 pub struct Manifest {
     rules: Vec<Rule>,
     process: Option<ProcessMatchers>,
+    /// The source the rules and matchers were compiled from.
+    source: Arc<str>,
 }
+
+/// A manifest compiles deterministically from its source, so two manifests
+/// are equal when their sources are.
+impl PartialEq for Manifest {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+    }
+}
+
+impl Eq for Manifest {}
 
 impl Manifest {
     pub fn parse_str(source: &str) -> Result<Self, ManifestError> {
@@ -59,7 +72,11 @@ impl Manifest {
             .map(|raw_process| compile_process_matchers(raw_process, &mut budget))
             .transpose()?;
 
-        Ok(Self { rules, process })
+        Ok(Self {
+            rules,
+            process,
+            source: Arc::from(source),
+        })
     }
 
     #[must_use]

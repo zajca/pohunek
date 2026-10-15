@@ -38,6 +38,7 @@ use super::{
     SessionRegistry, SessionRuntime, SessionState, StateSource, UnconfirmedCleanup, Worker,
     WorkerError, WorkerMetadataApplyOutcome, WORKER_CONNECT_RETRY,
 };
+use crate::agent::host::RuntimeDefinition;
 use crate::agent::NativeReferenceProvenance;
 use crate::procwatch::ProcessInspector;
 use crate::runtime::lifecycle::{
@@ -45,7 +46,7 @@ use crate::runtime::lifecycle::{
     UnsupportedJournalSchema, IDENTITY_MISMATCH, SUPERVISION_AMBIGUOUS, SUPERVISION_UNAVAILABLE,
 };
 use crate::session::target::open_detector_output;
-use crate::store::{ResumeBinding, SessionWriteOutcome};
+use crate::store::{ActiveAgentOrigin, ResumeBinding, SessionWriteOutcome};
 
 // Rust guideline compliant 2026-10-12
 
@@ -636,7 +637,7 @@ impl SessionRegistry {
             }
         }
 
-        let current_after_store = {
+        let (current_after_store, pinned) = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(id) else {
                 return WorkerMetadataApplyOutcome::Discarded;
@@ -649,7 +650,7 @@ impl SessionRegistry {
             ) {
                 return WorkerMetadataApplyOutcome::Discarded;
             }
-            current
+            (current, entry.pinned.clone())
         };
         if current_after_store != memory_base {
             let durable_before_rebase = candidate.clone();
@@ -667,7 +668,19 @@ impl SessionRegistry {
             memory_base = current_after_store;
         }
 
-        let updated = {
+        let mut pinned = pinned;
+        let mut stale_resolutions = 0;
+        let updated = loop {
+            // A worker-reported agent runs the detector a live report of it
+            // selects. Its profile is read off the sessions lock.
+            let registry = self.inner.profiles.runtimes().registry();
+            let reported_detector_config = projection.active.as_ref().and_then(|active| {
+                self.active_agent_detector_config(&candidate.info, pinned.as_ref(), Some(active))
+            });
+            #[cfg(test)]
+            if projection.privately_reported {
+                self.hold_metadata_apply().await;
+            }
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(id) else {
                 return WorkerMetadataApplyOutcome::Discarded;
@@ -680,6 +693,23 @@ impl SessionRegistry {
                     super::WorkerMetadataRetryCause::Commit,
                 );
             }
+            // A package change replaced a definition the detector resolved
+            // against: applying it would restore the previous detector rules,
+            // so it is resolved again against the current one.
+            if projection.privately_reported
+                && (!super::same_pin(entry.pinned.as_ref(), pinned.as_ref())
+                    || !Arc::ptr_eq(&registry, &self.inner.profiles.runtimes().registry()))
+            {
+                pinned = entry.pinned.clone();
+                drop(sessions);
+                stale_resolutions += 1;
+                if stale_resolutions > super::MAX_STALE_REPORT_RESOLUTIONS {
+                    return WorkerMetadataApplyOutcome::Retryable(
+                        super::WorkerMetadataRetryCause::Commit,
+                    );
+                }
+                continue;
+            }
             let subagent_events = subagents
                 .iter()
                 .filter(|subagent| {
@@ -689,7 +719,18 @@ impl SessionRegistry {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut changed = apply_identity_projection(entry, &candidate, &projection, snapshot);
+            let projected = apply_identity_projection(entry, &candidate, &projection, snapshot);
+            if projected.active {
+                let config = reported_detector_config
+                    .clone()
+                    .unwrap_or_else(|| entry.default_detector_config.clone());
+                // Reconfiguring restarts detection, so an agent whose
+                // configuration already runs keeps its detector state.
+                if entry.detector_config.borrow().config != config {
+                    super::send_detector_config(entry, config);
+                }
+            }
+            let mut changed = projected.any;
             if entry.info.subagents != subagents {
                 entry.info.subagents = subagents;
                 changed = true;
@@ -710,12 +751,12 @@ impl SessionRegistry {
                 preserve_newer_updated_at(&entry.info.updated_at, &mut updated_at);
                 entry.info.updated_at = updated_at;
             }
-            (
+            break (
                 changed,
                 entry.info.clone(),
                 subagent_events,
                 background_changed,
-            )
+            );
         };
         if updated.0 {
             self.persist_resume_binding(id).await;
@@ -914,6 +955,69 @@ impl SessionRegistry {
             (owners, _) => owners,
         };
         self.delete_orphaned_session_tmpdirs(owners).await;
+    }
+
+    /// The detector configuration of a session whose active agent is `active`,
+    /// chosen as a live report or observation chooses it, or `None` when the
+    /// session's default configuration runs.
+    ///
+    /// A reconciled session starts with it, and a worker-reported identity
+    /// switches to it. It reads profile files, so callers resolve it outside
+    /// the sessions lock.
+    fn active_agent_detector_config(
+        &self,
+        info: &protocol::SessionInfo,
+        pinned: Option<&Arc<RuntimeDefinition>>,
+        active: Option<&ActiveAgentReport>,
+    ) -> Option<DetectorConfig> {
+        let (Some(active), Some(active_base)) = (active, info.active_agent_base.as_ref()) else {
+            return None;
+        };
+        let unresolved = |error: &ProtocolError| {
+            tracing::warn!(
+                name: "session.active_agent.detector_unresolved",
+                session_id = %info.id.0,
+                agent = %active.agent,
+                error = %error,
+                "the active agent does not resolve; the session's default detector runs until it reports again"
+            );
+        };
+        let own_runtime = *active_base == info.agent_base;
+        if active.observed {
+            // Without a pin, the session's own runtime is unserved.
+            if own_runtime {
+                return pinned.map(|definition| DetectorConfig::for_definition(definition));
+            }
+            return match self.inner.profiles.runtimes().resolve_ref(active_base) {
+                Ok(definition) => Some(DetectorConfig::for_definition(&definition)),
+                Err(error) => {
+                    unresolved(&error);
+                    None
+                }
+            };
+        }
+        let resolved = match pinned {
+            Some(pinned) => self
+                .inner
+                .profiles
+                .resolve_agent_pinned(&active.agent, pinned),
+            None => self.inner.profiles.resolve_agent(&active.agent),
+        };
+        match resolved {
+            // Without a pin, the session's own runtime is unserved and a
+            // report of it is refused, so the launch default stays.
+            Ok(resolved)
+                if pinned.is_none()
+                    && RuntimeRef::from(resolved.base.clone()) == info.agent_base =>
+            {
+                None
+            }
+            Ok(resolved) => Some(super::detector_config_for_resolved_agent(&resolved)),
+            Err(error) => {
+                unresolved(&error);
+                None
+            }
+        }
     }
 
     /// Classifies the socket evidence startup discovery found for a session,
@@ -1628,11 +1732,7 @@ impl SessionRegistry {
         record.info.state = SessionState::Stopped;
         record.info.state_source = StateSource::Process;
         record.info.activity = None;
-        record.info.active_agent = None;
-        record.info.active_agent_base = None;
-        record.info.active_agent_pid = None;
-        record.info.active_agent_session_id = None;
-        record.info.active_agent_session_path = None;
+        clear_active_identity(&mut record);
         if !self
             .insert_unavailable_record(record, RuntimeState::Terminal, "")
             .await
@@ -3531,7 +3631,7 @@ impl SessionRegistry {
         }
         import_native_reference(&mut record, &snapshot);
         let identity_projection = if root_missing_during_drain || retry_identity {
-            clear_active_identity(&mut record.info);
+            clear_active_identity(&mut record);
             WorkerIdentityProjection::unreported()
         } else {
             match import_worker_identities(&mut record, &snapshot) {
@@ -3564,7 +3664,7 @@ impl SessionRegistry {
         }
         let active_agent = identity_projection
             .active
-            .or_else(|| active_report_from_info(&record.info));
+            .or_else(|| active_report_from_record(&record));
         let detector_output = match open_detector_output(&worker, &id).await {
             Ok(output) => output,
             Err(error) => {
@@ -3662,6 +3762,14 @@ impl SessionRegistry {
             &pin,
             manifest_override,
         );
+        let pinned = self
+            .inner
+            .profiles
+            .runtimes()
+            .pinned_definition(&record.info.agent_base, &pin);
+        let restored_detector_config = self
+            .active_agent_detector_config(&record.info, pinned.as_ref(), active_agent.as_ref())
+            .unwrap_or_else(|| default_detector_config.clone());
         let detector_cancel = CancellationToken::new();
         let procwatch_cancel = CancellationToken::new();
         let runtime_watch_cancel = CancellationToken::new();
@@ -3670,7 +3778,7 @@ impl SessionRegistry {
             watch::channel((record.info.rows, record.info.cols));
         let (detector_config, detector_config_rx) = watch::channel(DetectorConfigUpdate {
             generation: 0,
-            config: default_detector_config.clone(),
+            config: restored_detector_config,
         });
         let (detector_preview, detector_preview_rx) = mpsc::channel(1);
         let (input_ready_tx, input_ready) = watch::channel(false);
@@ -3689,11 +3797,7 @@ impl SessionRegistry {
             detector_preview,
             input_ready,
             default_detector_config,
-            pinned: self
-                .inner
-                .profiles
-                .runtimes()
-                .pinned_definition(&record.info.agent_base, &pin),
+            pinned,
             procwatch_cancel: procwatch_cancel.clone(),
             runtime_watch_cancel: runtime_watch_cancel.clone(),
             procwatch_rescan: Arc::clone(&procwatch_rescan),
@@ -4549,12 +4653,21 @@ fn import_worker_identities(
     Ok(projection)
 }
 
+/// What a worker identity projection changed in a session entry.
+#[derive(Debug, Clone, Copy)]
+struct ProjectedIdentity {
+    /// The native reference or the active identity changed.
+    any: bool,
+    /// The active identity changed: agent, process, references or origin.
+    active: bool,
+}
+
 fn apply_identity_projection(
     entry: &mut SessionEntry,
     candidate: &SessionRecord,
     projection: &WorkerIdentityProjection,
     snapshot: &InspectSnapshot,
-) -> bool {
+) -> ProjectedIdentity {
     let provenance = candidate
         .recovery
         .as_ref()
@@ -4565,13 +4678,17 @@ fn apply_identity_projection(
         || entry.info.native_session_id != candidate.info.native_session_id
         || entry.info.native_session_path != candidate.info.native_session_path;
     let active_changed = projection.privately_reported
-        && (entry.info.active_agent != candidate.info.active_agent
+        && (super::active_agent_origin(entry) != candidate.active_agent_origin
+            || entry.info.active_agent != candidate.info.active_agent
             || entry.info.active_agent_base != candidate.info.active_agent_base
             || entry.info.active_agent_pid != candidate.info.active_agent_pid
             || entry.info.active_agent_session_id != candidate.info.active_agent_session_id
             || entry.info.active_agent_session_path != candidate.info.active_agent_session_path);
     if !native_changed && !active_changed {
-        return false;
+        return ProjectedIdentity {
+            any: false,
+            active: false,
+        };
     }
     entry
         .info
@@ -4610,7 +4727,10 @@ fn apply_identity_projection(
                 .map(|release| release_tombstone(snapshot, release))
         });
     }
-    true
+    ProjectedIdentity {
+        any: true,
+        active: active_changed,
+    }
 }
 
 pub(super) fn worker_metadata_record_is_current(
@@ -4788,14 +4908,21 @@ fn claim_process_facts(
     Ok(())
 }
 
-fn active_report_from_info(info: &protocol::SessionInfo) -> Option<ActiveAgentReport> {
+fn active_report_from_record(record: &SessionRecord) -> Option<ActiveAgentReport> {
+    let info = &record.info;
     let agent = info.active_agent.clone()?;
-    // procwatch records an observed agent under its runtime id, while a reported
-    // agent carries its profile's name. The record keeps no origin, so a restored
-    // agent named like its runtime is treated as observed. The only ambiguous
-    // case is an explicit report of exactly that name while a same-named profile
-    // exists: it runs the pinned definition until the client reports again.
-    let observed = agent == super::agent_kind_label(&info.agent_base);
+    // A record before schema 10 keeps no origin. procwatch records an observed
+    // agent under its own runtime id, while a reported agent carries its
+    // profile's name, so such an agent named like its runtime is treated as
+    // observed.
+    let observed = match record.active_agent_origin {
+        Some(ActiveAgentOrigin::Observed) => true,
+        Some(ActiveAgentOrigin::Reported) => false,
+        None => {
+            let base = info.active_agent_base.as_ref().unwrap_or(&info.agent_base);
+            agent == super::agent_kind_label(base)
+        }
+    };
     Some(ActiveAgentReport {
         source: "persisted".to_owned(),
         agent,
@@ -4808,7 +4935,9 @@ fn active_report_from_info(info: &protocol::SessionInfo) -> Option<ActiveAgentRe
     })
 }
 
-fn clear_active_identity(info: &mut protocol::SessionInfo) {
+fn clear_active_identity(record: &mut SessionRecord) {
+    record.active_agent_origin = None;
+    let info = &mut record.info;
     info.active_agent = None;
     info.active_agent_base = None;
     info.active_agent_pid = None;
@@ -4884,7 +5013,7 @@ fn apply_worker_identities_with(
         let release_matches = record.info.active_agent.as_deref() == Some(&release.provider)
             && record.info.active_agent_pid == Some(release.process.pid);
         if release_matches {
-            clear_active_identity(&mut record.info);
+            clear_active_identity(record);
         }
         return Ok(WorkerIdentityProjection {
             active: None,
@@ -4906,6 +5035,7 @@ fn apply_worker_identities_with(
         }
         None => (None, None),
     };
+    record.active_agent_origin = Some(ActiveAgentOrigin::Reported);
     record.info.active_agent = Some(identity.provider.clone());
     record.info.active_agent_base = Some(agent_base);
     record.info.active_agent_pid = Some(identity.process.pid);
@@ -5800,6 +5930,7 @@ fn import_legacy_manifest(store: &crate::store::Store) -> Result<LegacyManifest,
                 transaction: None,
                 info,
                 recovery,
+                active_agent_origin: None,
                 native_identity_ordering: None,
                 runtime: crate::store::RuntimeRecord {
                     state: runtime_state,
@@ -6626,6 +6757,7 @@ while os.getppid() == parent:
     #[test]
     fn reconciliation_imports_immutable_launch_and_nested_active_identity() {
         let mut record = identity_record();
+        record.active_agent_origin = Some(crate::store::ActiveAgentOrigin::Observed);
         let snapshot = identity_snapshot("native-launch");
 
         let active =
@@ -6649,6 +6781,11 @@ while os.getppid() == parent:
             Some("nested-native")
         );
         assert_eq!(active.active.expect("active report").pid, Some(60));
+        assert_eq!(
+            record.active_agent_origin,
+            Some(crate::store::ActiveAgentOrigin::Reported),
+            "a worker-reported identity is reported, whatever the record held"
+        );
 
         let conflict =
             import_worker_identities(&mut record, &identity_snapshot("different-launch"))
@@ -8154,6 +8291,7 @@ while os.getppid() == parent:
                     previous_worker_instance_id: None,
                     daemon_instance_id: None,
                 }),
+                active_agent_origin: None,
                 native_identity_ordering: Some(NativeIdentityOrdering {
                     worker_instance_id: worker_instance_id.to_string(),
                     pid: child.pid,
@@ -9599,6 +9737,7 @@ while os.getppid() == parent:
             session_id: "s-identity".to_owned(),
             desired_state: DesiredState::Running,
             transaction: None,
+            active_agent_origin: None,
             native_identity_ordering: None,
             info: SessionInfo {
                 id: SessionId("s-identity".to_owned()),

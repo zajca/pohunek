@@ -820,7 +820,7 @@ async fn composite_wait_short_circuits_ended_lost_and_disappeared_runtimes() {
 /// start identity of a process, and one request and response round trip with
 /// the worker socket.
 #[cfg(unix)]
-const WORKER_IDENTITY_HELPERS: &str = r#"import json
+pub(super) const WORKER_IDENTITY_HELPERS: &str = r#"import json
 import os
 import socket
 import sys
@@ -7123,6 +7123,78 @@ async fn transient_identity_validation_failure_retries_the_same_snapshot() {
     let retried = registry.inspect(&created.id).await.expect("inspect retry");
     assert_eq!(retried.active_agent.as_deref(), Some("codex"));
     assert_eq!(retried.subagents.len(), 1);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A worker's hook report of the agent procwatch already observed under the
+/// same name and process makes the agent reported, in memory as in the record.
+#[tokio::test]
+async fn a_worker_report_of_an_observed_agent_makes_it_reported() {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            procwatch_poll: Duration::from_mins(1),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    let root = snapshot.child_process.expect("worker child");
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("live session");
+    entry.active_agent = Some(ActiveAgentReport {
+        source: "pohunek:procwatch".to_owned(),
+        agent: "codex".to_owned(),
+        seq: None,
+        pid: Some(root.pid),
+        start_identity: Some(root.start_identity),
+        reported_at: crate::time::now(),
+        activity_reported: false,
+        observed: true,
+    });
+    entry.info.active_agent = Some("codex".to_owned());
+    entry.info.active_agent_base = Some(RuntimeRef::codex());
+    entry.info.active_agent_pid = Some(root.pid);
+    drop(sessions);
+    let origin = |registry: &SessionRegistry| {
+        let registry = registry.clone();
+        let id = created.id.clone();
+        async move {
+            let sessions = registry.inner.sessions.lock().await;
+            let entry = sessions.get(&id).expect("live session");
+            SessionRegistry::session_record(&id, entry, entry.desired_state, None)
+                .active_agent_origin
+        }
+    };
+    assert_eq!(
+        origin(&registry).await,
+        Some(crate::store::ActiveAgentOrigin::Observed)
+    );
+    snapshot.active_identity = Some(pohunek_worker_protocol::ActiveIdentityClaim {
+        provider: "codex".to_owned(),
+        process: root,
+        sequence: 1,
+        expires_at: native_report_expiry(),
+        reference_kind: None,
+        native_reference: None,
+    });
+
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    assert_eq!(
+        origin(&registry).await,
+        Some(crate::store::ActiveAgentOrigin::Reported),
+        "the hook report makes the observed agent reported"
+    );
     let _ = registry.stop(&created.id).await;
 }
 
