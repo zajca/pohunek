@@ -19,9 +19,9 @@
   deleted stays deleted while the store still holds its tombstone, and a
   generation that ended while the daemon was down is reported. A terminal
   record from a daemon that keyed it by epoch reports the generation it was
-  created in: it covers a replayed terminal state when it was created after
-  that generation started, or when the start is unknown. A session without
-  runtime information keeps the epoch key.
+  created in: it covers a replayed terminal state only when it was created
+  after that generation started. A generation whose start is unknown is
+  reported. A session without runtime information keeps the epoch key.
 - A session that is still blocked after a restart raises no new
   `agent_blocked` record while an unread `agent_blocked` or
   `approval_required` record of the session exists; the store is checked when

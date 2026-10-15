@@ -278,9 +278,11 @@ fn event_subject(event: &Event) -> Option<(SessionId, Option<AgentActivity>)> {
 
 /// Whether a stored terminal record keyed by transition epoch reports the
 /// runtime generation `session` ends. Such a record names no generation, so it
-/// counts when it was created after the generation started, or when that start
-/// is unknown. A session without runtime information keys its terminal records
-/// by epoch and is never bridged.
+/// counts only when it was created after the generation started. A generation
+/// whose start is unknown, such as one a resume prepared before its worker
+/// connected, is not covered: its terminal state may be newer than the record.
+/// A session without runtime information keys its terminal records by epoch
+/// and is never bridged.
 fn epoch_keyed_record_reports_runtime(created_at: OffsetDateTime, session: &SessionInfo) -> bool {
     let Some(runtime) = session.runtime.as_ref() else {
         return false;
@@ -289,7 +291,7 @@ fn epoch_keyed_record_reports_runtime(created_at: OffsetDateTime, session: &Sess
         .started_at
         .as_deref()
         .and_then(|started_at| parse_timestamp(started_at).ok())
-        .is_none_or(|started_at| created_at >= started_at)
+        .is_some_and(|started_at| created_at >= started_at)
 }
 
 #[derive(Debug, Default)]
@@ -1976,6 +1978,33 @@ mod tests {
             records_of(&service, NotificationKind::Error),
             2,
             "each generation's failure is reported: {:#?}",
+            list(&service)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_of_a_generation_with_an_unknown_start_is_reported_beside_an_epoch_keyed_record(
+    ) {
+        let dir = temp_data_dir("epoch-keyed-unknown-start");
+        store_epoch_keyed_error_record(
+            &NotificationService::open(&dir).expect("open notification service"),
+            "2026-07-03T10:05:00Z",
+        );
+
+        // A resume prepared the next generation, and its worker failed before
+        // the daemon recorded when the generation started.
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let mut projector = ProjectorState::default();
+        project_session_update(
+            &mut projector,
+            &service,
+            &session_in_generation("s-1", SessionState::Failed, Some(1), 2),
+        )
+        .await;
+        assert_eq!(
+            records_of(&service, NotificationKind::Error),
+            2,
+            "a record cannot be shown to report a generation of unknown start: {:#?}",
             list(&service)
         );
     }
