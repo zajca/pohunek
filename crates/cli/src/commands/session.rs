@@ -501,7 +501,9 @@ pub(crate) fn parse_meta_pair(input: &str) -> Result<(String, String), String> {
 /// Rejects a key named more than once: metadata travels as a flat map, so a
 /// repeated key would otherwise silently collapse to whichever occurrence is
 /// inserted last, which is a confusing outcome for a caller-visible CLI flag.
-fn parse_meta_pairs(pairs: &[(String, String)]) -> Result<BTreeMap<String, String>, CliError> {
+pub(crate) fn parse_meta_pairs(
+    pairs: &[(String, String)],
+) -> Result<BTreeMap<String, String>, CliError> {
     let mut metadata = BTreeMap::new();
     for (key, value) in pairs {
         if metadata.insert(key.clone(), value.clone()).is_some() {

@@ -261,6 +261,21 @@ enum Commands {
 struct AssistantArgs {
     /// Free-form request for the assistant (joined into one line).
     request: Vec<String>,
+    /// Read the free-form request from stdin instead of `REQUEST` words, so it
+    /// stays out of the process argv. Surrounding whitespace is trimmed and an
+    /// empty request is refused. A remote launch then needs `--yes`, because
+    /// stdin no longer answers the confirmation prompt.
+    #[arg(long, conflicts_with = "request")]
+    request_stdin: bool,
+    /// Override the daemon response deadline of the session creation request.
+    /// A deadline that expires leaves the creation outcome unknown.
+    #[arg(long, value_parser = commands::session::parse_request_timeout_ms)]
+    request_timeout_ms: Option<u32>,
+    /// Session metadata in key=value form (repeatable), written atomically
+    /// with the assistant session. A caller-chosen key finds the session with
+    /// `session list --meta-eq` when a creation outcome is unknown.
+    #[arg(long = "meta", value_name = "key=value", value_parser = commands::session::parse_meta_pair)]
+    meta: Vec<(String, String)>,
     /// Override agent selection with a specific agent name or host profile.
     #[arg(long)]
     agent: Option<String>,
@@ -2755,7 +2770,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             args,
         } => {
             let paths = Paths::resolve()?;
-            let opts = resolve_assistant_options(&global_host, action.as_ref(), intent, args);
+            let opts = resolve_assistant_options(&global_host, action.as_ref(), intent, args)?;
             commands::assistant::run(opts, &paths).await?;
             Ok(ExitCode::SUCCESS)
         }
@@ -2765,12 +2780,21 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
 /// Collapse the assistant CLI surface (default form or intent wrapper) into the
 /// single internal launch model. Wrappers only set the intent; the default form
 /// uses `--intent` (defaulting to `help`).
+/// Resolve the launch options of one `assistant` invocation.
+///
+/// A `--request-stdin` request is read here, before the target is validated
+/// or any daemon is started or dialed, so a refused request touches nothing.
+///
+/// # Errors
+///
+/// Returns [`CliError`] for an empty or invalid stdin request and for a
+/// repeated `--meta` key.
 fn resolve_assistant_options(
     global_host: &str,
     action: Option<&AssistantAction>,
     intent: Option<commands::assistant::Intent>,
     default_args: AssistantArgs,
-) -> commands::assistant::AssistantOptions {
+) -> Result<commands::assistant::AssistantOptions, CliError> {
     use commands::assistant::Intent;
 
     let (intent, args) = match action {
@@ -2781,15 +2805,20 @@ fn resolve_assistant_options(
         None => (intent.unwrap_or(Intent::Help), default_args),
     };
 
-    let request = if args.request.is_empty() {
+    let request = if args.request_stdin {
+        Some(commands::assistant::read_stdin_request()?)
+    } else if args.request.is_empty() {
         None
     } else {
         Some(args.request.join(" "))
     };
 
-    commands::assistant::AssistantOptions {
+    Ok(commands::assistant::AssistantOptions {
         intent,
         request,
+        request_from_stdin: args.request_stdin,
+        request_timeout_ms: args.request_timeout_ms,
+        metadata: commands::session::parse_meta_pairs(&args.meta)?,
         agent: args.agent,
         host: effective_host(global_host, None),
         project: args.project,
@@ -2802,7 +2831,7 @@ fn resolve_assistant_options(
         no_snapshot: args.no_snapshot,
         degraded: args.degraded,
         no_start_daemon: args.no_start_daemon,
-    }
+    })
 }
 
 /// Resolve the effective host for a command.

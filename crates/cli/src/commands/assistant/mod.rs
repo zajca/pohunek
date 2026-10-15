@@ -16,7 +16,9 @@
 
 pub(crate) mod bootstrap;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use pohunek_assistant::launch as core_assistant;
 use pohunek_assistant::{AssistantError, ConnectionOptions, HostConfig};
@@ -65,6 +67,14 @@ impl Intent {
 pub(crate) struct AssistantOptions {
     pub(crate) intent: Intent,
     pub(crate) request: Option<String>,
+    /// The request came from stdin, which then cannot answer the remote
+    /// confirmation prompt.
+    pub(crate) request_from_stdin: bool,
+    /// Explicit response deadline of the `session.new` request; `None` keeps
+    /// the SDK's dedicated initial-input creation budget.
+    pub(crate) request_timeout_ms: Option<u32>,
+    /// Caller metadata written atomically with the session.
+    pub(crate) metadata: BTreeMap<String, String>,
     pub(crate) agent: Option<String>,
     pub(crate) host: String,
     pub(crate) project: Option<String>,
@@ -90,6 +100,27 @@ impl AssistantOptions {
     }
 }
 
+/// Read the `--request-stdin` request: bounded UTF-8 text with surrounding
+/// whitespace trimmed.
+///
+/// # Errors
+///
+/// Returns [`CliError::InvalidStdinInput`] for oversized, non-UTF-8 or
+/// control-character input, and for a request that is empty after trimming.
+pub(crate) fn read_stdin_request() -> Result<String, CliError> {
+    request_from_text(&crate::commands::session::read_stdin_input()?)
+}
+
+fn request_from_text(text: &str) -> Result<String, CliError> {
+    let request = text.trim();
+    if request.is_empty() {
+        return Err(CliError::InvalidStdinInput {
+            detail: "the assistant request is empty".to_owned(),
+        });
+    }
+    Ok(request.to_owned())
+}
+
 /// Assistant metadata emitted under `--json` alongside the session info.
 #[derive(Debug, Serialize)]
 struct AssistantMeta<'a> {
@@ -110,6 +141,11 @@ struct AssistantMeta<'a> {
 /// or the session launch is rejected.
 pub(crate) async fn run(opts: AssistantOptions, paths: &Paths) -> Result<(), CliError> {
     validate_target(&opts)?;
+    // A launch that cannot prompt is refused before any daemon is started or
+    // dialed; `--print-prompt` starts nothing and needs no confirmation.
+    if !opts.print_prompt && matches!(remote_confirmation(&opts), ConfirmDecision::RequireYes) {
+        return Err(CliError::RemoteConfirmationRequired);
+    }
     if opts.degraded {
         return run_degraded(opts, paths).await;
     }
@@ -170,7 +206,7 @@ async fn run_prepared(
     let host = assistant_host_config(&opts, paths);
     let assistant_paths = assistant_paths(paths);
     let params = assistant_params(&opts, auto_started);
-    let prepared = core_assistant::prepare_with_options(
+    let mut prepared = core_assistant::prepare_with_options(
         &host,
         &assistant_paths,
         params,
@@ -185,10 +221,16 @@ async fn run_prepared(
     }
 
     confirm_remote_launch(&opts)?;
-    let launched =
-        core_assistant::start_prepared_with_options(&host, prepared, ConnectionOptions::default())
-            .await
-            .map_err(core_error)?;
+    prepared.session_params.metadata = opts.metadata.clone();
+    let options = ConnectionOptions {
+        request_timeout: opts
+            .request_timeout_ms
+            .map(|timeout_ms| Duration::from_millis(u64::from(timeout_ms))),
+        ..ConnectionOptions::default()
+    };
+    let launched = core_assistant::start_prepared_with_options(&host, prepared, options)
+        .await
+        .map_err(core_error)?;
     if launched.applied_input != Some(true) {
         eprintln!(
             "pohunek: warning: host '{}' did not confirm the assistant opening prompt was \
@@ -249,8 +291,16 @@ fn print_prompt(
     Ok(())
 }
 
+/// The confirmation a launch on `opts.host` needs.
+///
+/// A stdin request leaves no stdin for the prompt, so it takes the machine
+/// path's rule: a remote launch needs `--yes`.
+fn remote_confirmation(opts: &AssistantOptions) -> ConfirmDecision {
+    confirmation_decision(&opts.host, opts.json || opts.request_from_stdin, opts.yes)
+}
+
 fn confirm_remote_launch(opts: &AssistantOptions) -> Result<(), CliError> {
-    match confirmation_decision(&opts.host, opts.json, opts.yes) {
+    match remote_confirmation(opts) {
         ConfirmDecision::Proceed => Ok(()),
         ConfirmDecision::RequireYes => Err(CliError::RemoteConfirmationRequired),
         ConfirmDecision::Prompt => {
@@ -392,6 +442,9 @@ mod tests {
         AssistantOptions {
             intent: Intent::Help,
             request: None,
+            request_from_stdin: false,
+            request_timeout_ms: None,
+            metadata: BTreeMap::new(),
             agent: None,
             host: host.to_owned(),
             project: None,

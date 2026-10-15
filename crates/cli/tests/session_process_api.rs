@@ -47,6 +47,7 @@ enum Scenario {
     OutputRuntimeChanged,
     SlowWait,
     SlowInput,
+    NoReplyToNew,
     WaitTimeout,
     OutputLogSafety,
     RetentionSweepClean,
@@ -688,6 +689,17 @@ fn handle_connection<S>(
     {
         thread::sleep(SLOW_RESPONSE_DELAY);
     }
+    if matches!(scenario, Scenario::NoReplyToNew)
+        && request.method() == protocol::method::SESSION_NEW
+    {
+        // The creation is never answered: the connection is held until the
+        // client hangs up, so only the client's own deadline ends the call.
+        let mut rest = String::new();
+        while reader.read_line(&mut rest).is_ok_and(|read| read > 0) {
+            rest.clear();
+        }
+        return;
+    }
     let response = fixture_response(&request, scenario);
     let mut stream = reader.into_inner();
     let write_result = writeln!(
@@ -715,7 +727,7 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
         .expect("valid error response");
     }
     let ok = match request.method() {
-        protocol::method::SESSION_LIST => session_list(scenario),
+        protocol::method::SESSION_LIST => session_list(request, scenario),
         protocol::method::DAEMON_DOCTOR if matches!(scenario, Scenario::DoctorReport) => json!({
             "report": {
                 "overall": "fail",
@@ -788,10 +800,27 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
             result
         }
         protocol::method::SESSION_INPUT => json!({"accepted": true}),
+        protocol::method::HOST_INSPECT => host_capabilities(),
         protocol::method::SESSION_RETENTION_SWEEP => retention_sweep(scenario),
         method => panic!("unexpected fixture method: {method}"),
     };
     Response::ok(PROTOCOL_VERSION, request.id(), ok).expect("valid success response")
+}
+
+/// Host capabilities that report no runtime, so an explicit `--agent` stays
+/// the daemon's decision and the assistant selects it.
+fn host_capabilities() -> Value {
+    json!({
+        "daemon_version": "fixture",
+        "protocol_version": PROTOCOL_VERSION.get(),
+        "supported_agents": [],
+        "runtimes": [],
+        "git_available": false,
+        "worktree_supported": false,
+        "terminal_read_supported": false,
+        "output_read_supported": false,
+        "session_wait_supported": false
+    })
 }
 
 fn output_response(scenario: Scenario) -> Value {
@@ -892,7 +921,10 @@ fn governance_identifier(prefix: &str) -> String {
     format!("{prefix}{}", "A".repeat(43))
 }
 
-fn session_list(scenario: Scenario) -> Value {
+fn session_list(request: &Request, scenario: Scenario) -> Value {
+    if matches!(scenario, Scenario::NoReplyToNew) {
+        return recorded_creation_list(request);
+    }
     if matches!(scenario, Scenario::Ambiguous) {
         json!([
             session("s-ambiguous-2", Some("ambiguous")),
@@ -905,6 +937,27 @@ fn session_list(scenario: Scenario) -> Value {
             scenario
         )])
     }
+}
+
+/// The caller key an assistant launch of the request-form scenarios carries,
+/// as `--meta launch=req-7f3a`.
+const LAUNCH_KEY: (&str, &str) = ("launch", "req-7f3a");
+
+/// The list of a daemon that recorded the unanswered creation under the
+/// caller's key, filtered with the protocol's own filter semantics.
+fn recorded_creation_list(request: &Request) -> Value {
+    let mut recorded = session(SESSION_ID, None);
+    recorded["metadata"] = json!({LAUNCH_KEY.0: LAUNCH_KEY.1});
+    let recorded: protocol::SessionInfo =
+        serde_json::from_value(recorded).expect("a valid recorded session");
+    let params: protocol::SessionListParams =
+        serde_json::from_value(request.params().clone()).expect("valid list params");
+    let listed = params
+        .filters
+        .iter()
+        .all(|filter| filter.matches(&recorded))
+        .then_some(recorded);
+    serde_json::to_value(listed.into_iter().collect::<Vec<_>>()).expect("serialize the list")
 }
 
 fn session_for_scenario(id: &str, name: Option<&str>, scenario: Scenario) -> Value {
@@ -2487,5 +2540,208 @@ fn notification_retention_prune_requires_an_explicit_mode_on_the_cli() {
     assert_cli_usage_error(
         &["notifications", "retention", "prune"],
         "required arguments were not provided",
+    );
+}
+
+/// The request line of an assistant opening prompt.
+fn assistant_request_line(request: &Request) -> String {
+    request.params()["input"]
+        .as_str()
+        .expect("the opening prompt is the initial input")
+        .lines()
+        .find(|line| line.starts_with("request: "))
+        .expect("the opening prompt names the request")
+        .to_owned()
+}
+
+/// Runs `pohunek` in `home` with `stdin` written to its standard input.
+fn run_piping_stdin(home: &TestHome, args: &[&str], stdin: &str) -> Output {
+    let mut child = home
+        .command()
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn pohunek");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(stdin.as_bytes())
+        .expect("write the request to stdin");
+    child.wait_with_output().expect("wait for pohunek")
+}
+
+/// Assistant flags shared by the request-form scenarios.
+const ASSISTANT_ARGS: [&str; 7] = [
+    "assistant",
+    "--agent",
+    "codex",
+    "--no-snapshot",
+    "--meta",
+    "launch=req-7f3a",
+    "--json",
+];
+
+/// The request words of the request-form scenarios.
+const ASSISTANT_REQUEST: [&str; 4] = ["review", "the", "failing", "test"];
+
+#[test]
+fn an_assistant_request_from_stdin_launches_like_the_positional_form() {
+    let home = TestHome::new();
+    let fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+
+    let positional = home
+        .command()
+        .args(ASSISTANT_ARGS)
+        .args(ASSISTANT_REQUEST)
+        .output()
+        .expect("run pohunek");
+    let stdin_args = [ASSISTANT_ARGS.as_slice(), &["--request-stdin"]].concat();
+    assert!(
+        stdin_args
+            .iter()
+            .all(|arg| !ASSISTANT_REQUEST.contains(arg)),
+        "the stdin form keeps the request out of argv"
+    );
+    let from_stdin = run_piping_stdin(
+        &home,
+        &stdin_args,
+        &format!("\n  {}  \n", ASSISTANT_REQUEST.join(" ")),
+    );
+
+    let created = assert_json_success(&positional);
+    assert_eq!(created["session"]["id"], SESSION_ID, "{created}");
+    assert_eq!(assert_json_success(&from_stdin), created);
+    let creations = fixture
+        .finish()
+        .into_iter()
+        .filter(|request| request.method() == protocol::method::SESSION_NEW)
+        .collect::<Vec<_>>();
+    assert_eq!(creations.len(), 2, "one creation per launch");
+    for creation in &creations {
+        assert_eq!(
+            assistant_request_line(creation),
+            "request: review the failing test"
+        );
+        assert_eq!(creation.params()["metadata"], json!({"launch": "req-7f3a"}));
+    }
+}
+
+#[test]
+fn an_unusable_assistant_stdin_request_is_refused_before_any_daemon_request() {
+    let home = TestHome::new();
+    let fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+    let stdin_args = [ASSISTANT_ARGS.as_slice(), &["--request-stdin"]].concat();
+
+    let empty = assert_json_error(
+        &run_piping_stdin(&home, &stdin_args, " \n\t\n"),
+        "cli_usage",
+    );
+    assert!(
+        empty["err"]["msg"]
+            .as_str()
+            .expect("typed message")
+            .contains("the assistant request is empty"),
+        "{empty}"
+    );
+    assert_json_error(
+        &run_piping_stdin(&home, &stdin_args, "stop\u{7}"),
+        "cli_usage",
+    );
+    let both = run_piping_stdin(
+        &home,
+        &[stdin_args.as_slice(), &["review"]].concat(),
+        "review",
+    );
+    assert_eq!(both.status.code(), Some(2), "{both:?}");
+    // Stdin holds the request, so a remote launch cannot prompt and needs
+    // `--yes` even on the human path.
+    let remote = run_piping_stdin(
+        &home,
+        &[
+            "--host",
+            "fixture-remote",
+            "assistant",
+            "--project",
+            "ui",
+            "--request-stdin",
+        ],
+        "review",
+    );
+    assert_eq!(remote.status.code(), Some(1), "{remote:?}");
+    assert!(
+        utf8(&remote.stderr).contains("--yes"),
+        "{}",
+        utf8(&remote.stderr)
+    );
+
+    assert!(
+        fixture.finish().is_empty(),
+        "a refused request reaches no daemon"
+    );
+}
+
+/// Creation deadline of the unanswered-creation scenario: the fixture never
+/// replies, so any deadline expires, and a short one keeps the scenario fast.
+const UNANSWERED_CREATION_DEADLINE_MS: &str = "50";
+
+/// The caller protocol of "Creation outcome" in `docs/public-api.md`: after an
+/// unknown outcome, look the launch key up and retry only when nothing matches.
+#[test]
+fn an_assistant_launch_with_an_unknown_outcome_is_found_by_its_key_instead_of_retried() {
+    let home = TestHome::new();
+    let fixture = FixtureDaemon::start(&home.socket(), Scenario::NoReplyToNew);
+    let launch = || {
+        run_piping_stdin(
+            &home,
+            &[
+                ASSISTANT_ARGS.as_slice(),
+                &[
+                    "--request-stdin",
+                    "--request-timeout-ms",
+                    UNANSWERED_CREATION_DEADLINE_MS,
+                ],
+            ]
+            .concat(),
+            "review the failing test",
+        )
+    };
+    let lookup = |key: &str| {
+        let output = home
+            .command()
+            .args(["session", "list", "--meta-eq", key, "--json"])
+            .output()
+            .expect("run pohunek");
+        assert_json_success(&output)
+    };
+
+    assert_json_error(&launch(), "request_timeout");
+    // The client may give up before the fixture has read the request.
+    wait_for_method(&fixture, protocol::method::SESSION_NEW);
+    assert_eq!(
+        lookup("launch=another-launch"),
+        json!([]),
+        "the lookup matches the key, not any session"
+    );
+    let found = lookup(&format!("{}={}", LAUNCH_KEY.0, LAUNCH_KEY.1));
+    let found = found.as_array().expect("a session list");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["id"], SESSION_ID);
+    assert_eq!(found[0]["metadata"][LAUNCH_KEY.0], LAUNCH_KEY.1);
+    // The caller retries only when nothing matches. The launch is found, so
+    // no second creation is sent.
+
+    let creations = fixture
+        .finish()
+        .into_iter()
+        .filter(|request| request.method() == protocol::method::SESSION_NEW)
+        .collect::<Vec<_>>();
+    assert_eq!(creations.len(), 1, "one creation: the CLI never resends it");
+    assert_eq!(
+        creations[0].params()["metadata"],
+        json!({LAUNCH_KEY.0: LAUNCH_KEY.1}),
+        "the caller's key travels with the one creation"
     );
 }

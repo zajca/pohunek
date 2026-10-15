@@ -100,7 +100,7 @@ discovered records still print. The `--json` records list peers only.
 | `pohunek setup [--yes \| --dry-run] [--json]` | The one host setup: installs the service from this release, applies the official runtime packages, profile pins and hooks for the runtimes this host has, and writes the missing config files. It previews every change and asks once; `--yes` applies without asking, and without a terminal or with `--json` it needs `--yes`. `--dry-run` prints the plan and changes nothing. It never upgrades an installed service. |
 | `pohunek setup config [--force] [--json]` | Install the default `attach.conf` and prompt templates; existing files are kept unless `--force`. |
 | `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
-| `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot. |
+| `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot; `--request-stdin` reads the request from stdin, `--request-timeout-ms` and `--meta k=v` as on `session new`. |
 | `pohunek agent-skill` | Print the complete bundled agent skill; `--json` wraps the skill text and its `content_sha256` in the process envelope. Fully local — `--host` is accepted and ignored. |
 | `pohunek prompt render / link` | Render provider prompt templates and work-item link metadata (called by external launchers). |
 
@@ -472,6 +472,26 @@ automatic preference order is `pohunek-assistant`, `codex`, `claude`, then
 selected host. Codex, Claude Code and Hermes are served only by their official
 packages: on a host with none of them (and no capable host profile) the
 assistant answers `no_capable_agent`, whose hint names the package install.
+
+Keep a request out of the process list with `--request-stdin`. The CLI reads
+bounded UTF-8 text from stdin and trims surrounding whitespace. An empty
+request fails with `cli_usage` before any daemon is started or dialed. The flag
+cannot be combined with request words, and a remote launch with it needs
+`--yes`, since stdin cannot also answer the confirmation prompt.
+`--request-timeout-ms` and `--meta key=value` work as on `session new`:
+
+```bash
+printf '%s' 'Why does attach fail on my laptop?' \
+  | pohunek assistant --request-stdin --meta launch=7f3a9c --json
+pohunek session list --meta-eq launch=7f3a9c --json   # after request_timeout
+```
+
+A launch sends one `session.new` and never resends it. Only the CLI's own
+refusals before that request prove that nothing was created; after any other
+failure, look up the caller's `--meta` key before launching again. The key name
+is the caller's choice. `session.new` has no idempotency key, so a retry can
+still create a second session, which the same key lists. See "Assistant request
+and creation outcome" in [public-api.md](public-api.md).
 
 ### Hermes Agent and operator plugin
 
