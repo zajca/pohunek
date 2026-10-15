@@ -192,10 +192,11 @@ async fn admit_hook_notification(
             session_id,
             pohunek_worker_protocol::HookAction::Notification,
             &provider,
+            "hook notification",
         )
         .await
         .map(|()| true)
-        .map_err(|_denial| refuse("the session runtime does not admit this hook report"))
+        .map_err(|_refusal| refuse("the session runtime does not admit this hook report"))
 }
 
 /// Enrich producer params with live session context without making a missing
