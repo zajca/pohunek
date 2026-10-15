@@ -145,7 +145,8 @@ upgrade of the release files. It runs in this order:
    The Hermes homes applied are exactly the homes the preview listed. A home
    with the pohunek marker is updated, unless the preview lists it as
    `current`: its plugin already is the selected package's, unmodified and
-   enabled, and the run selects no other Hermes package, so it is kept
+   enabled, the `hermes` is the pinned release, and the run selects no other
+   Hermes package, so it is kept
    without a write. Setup runs the `hermes` executable on the daemon job's
    `PATH`, the one the plan detects Hermes with. A home without the marker
    is a gap: setup
@@ -179,8 +180,9 @@ preview a run shows before it asks, and with `--json` as one document whose
 `preview`. It asks nothing and changes nothing: no service, package, profile,
 hook or config file, and it takes no lock a run would wait for. Like a run's
 plan, it runs the agents' read-only queries: the version probes of the
-release daemon's detection and, for a marked Hermes home, `hermes plugins
-list --json`, which tells whether the plugin is enabled. A plan that
+release daemon's detection and, for a marked Hermes home, `hermes --version`
+and `hermes plugins list --json`, which tell whether it is the pinned Hermes
+release and whether the plugin is enabled. A plan that
 blocks the run, such as an installed service of another version or a release
 archive that fails its verification, is the same error the run returns.
 `--dry-run` with `--yes`, or with a setup subcommand, is a usage error.

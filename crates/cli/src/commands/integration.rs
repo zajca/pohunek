@@ -1045,9 +1045,10 @@ pub(crate) fn hermes_home_plan(
 
 /// Whether the plugin of a marked Hermes home is installed from the selected
 /// package, unmodified and enabled, with a usable policy and no leftover of an
-/// interrupted transaction, as the `hermes` found on `search_path` reports it.
-/// It writes nothing: it runs the read-only `hermes plugins list --json` and
-/// the installed-plugin probe.
+/// interrupted transaction, as the `hermes` found on `search_path` reports it,
+/// and that `hermes` is the pinned release an update would require.
+/// It writes nothing: it runs the read-only `hermes --version` and
+/// `hermes plugins list --json` and the installed-plugin probe.
 ///
 /// Any failure to tell is `false`: the home is then planned as an update,
 /// whose apply reports the failure.
@@ -1058,6 +1059,9 @@ fn hermes_home_is_current(update: &HermesUpdate, plugins: &Path, search_path: &O
     let Ok(mut runner) = HermesRunner::new(&executable) else {
         return false;
     };
+    if runner.verify_version(&update.target).is_err() {
+        return false;
+    }
     let Ok(bundle) = assets::selected_bundle(plugins, &update.policy_path) else {
         return false;
     };

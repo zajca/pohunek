@@ -60,6 +60,8 @@ struct HermesHost {
     search_path: std::ffi::OsString,
     log: PathBuf,
     state: PathBuf,
+    /// The banner the controlled `hermes --version` prints.
+    version: PathBuf,
 }
 
 impl HermesHost {
@@ -80,7 +82,9 @@ impl HermesHost {
         let log = root.join("hermes-calls.log");
         let state = root.join("hermes-plugin-state");
         fs::write(&state, "disabled\n").expect("initial plugin state");
-        let hermes = write_controlled_hermes(&root, target.plugin_root(), &log, &state);
+        let version = root.join("hermes-version");
+        fs::write(&version, format!("{SUPPORTED_HERMES}\n")).expect("version banner");
+        let hermes = write_controlled_hermes(&root, target.plugin_root(), &log, &state, &version);
         let venv_bin = hermes.parent().expect("venv bin").to_path_buf();
 
         let policy_path = policy_path(&state_dir, &target).expect("policy path");
@@ -130,6 +134,7 @@ impl HermesHost {
             search_path: venv_bin.into_os_string(),
             log,
             state,
+            version,
         }
     }
 
@@ -199,7 +204,13 @@ fn install_official_hermes(plugins: &Path) {
 /// Writes a `hermes` below `root` with its contained Python runtime, as a
 /// Hermes installation lays them out. It appends each call's arguments to
 /// `log` and keeps the plugin's enabled state in `state`.
-fn write_controlled_hermes(root: &Path, plugin_root: &Path, log: &Path, state: &Path) -> PathBuf {
+fn write_controlled_hermes(
+    root: &Path,
+    plugin_root: &Path,
+    log: &Path,
+    state: &Path,
+    version: &Path,
+) -> PathBuf {
     let venv_bin = root.join("hermes-install/venv/bin");
     let runtime = root.join("hermes-install/python/bin/python3");
     private_directory(&venv_bin);
@@ -215,7 +226,7 @@ fn write_controlled_hermes(root: &Path, plugin_root: &Path, log: &Path, state: &
         &format!(
             r#"printf '%s\n' "$*" >> '{log}'
 case "$*" in
-  --version) printf '%s\n' '{SUPPORTED_HERMES}' ;;
+  --version) /bin/cat '{version}' ;;
   'plugins list --json')
 if [ ! -d '{plugin_root}' ]; then printf '%s\n' '[]'; exit 0; fi
 IFS= read -r state < '{state}'
@@ -227,6 +238,7 @@ esac"#,
             log = log.display(),
             plugin_root = plugin_root.display(),
             state = state.display(),
+            version = version.display(),
         ),
     )
 }
@@ -307,4 +319,23 @@ fn a_hermes_update_runs_the_hermes_of_the_given_search_path() {
         HERMES_CURRENT,
         "{replanned:?}"
     );
+}
+
+/// A marked home whose plugin is intact and enabled is not current when the
+/// `hermes` on the search path is not the pinned release, so the apply's
+/// update refuses it instead of the plan keeping it.
+#[test]
+fn a_hermes_of_another_build_does_not_leave_a_home_current() {
+    let host = HermesHost::new();
+    let search = host.search_path.as_os_str();
+    assert_eq!(
+        default_home(&hermes_home_plan(&host.env, search, false)).status,
+        HERMES_CURRENT,
+        "the pinned release keeps the home current"
+    );
+    fs::write(&host.version, "Hermes Agent v0.20.0 (2026.9.1)\n").expect("another build");
+
+    let planned = hermes_home_plan(&host.env, search, false);
+
+    assert_eq!(default_home(&planned).status, HERMES_UPDATE, "{planned:?}");
 }
