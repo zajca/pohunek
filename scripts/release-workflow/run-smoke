@@ -78,6 +78,12 @@ for archive in "$bundle"/pohunek-daemon-"$VERSION"-$smoke_target.tar.gz; do
     for runtime in $runtimes; do
         rm -rf -- "${stage:?}/$runtime"
         cp -a -- "$pristine/$runtime" "$stage/$runtime"
+        # macOS runs the consumer as a throwaway local user: the smoke's own
+        # temp copy of the stage must be readable by other users. The
+        # provisioner creates its install root 0700.
+        if [ "$(uname -s)" = Darwin ]; then
+            chmod -R go+rX -- "$stage/$runtime"
+        fi
         "$XTASK" compat verify-stage --runtime "$runtime" --dir "$stage"
     done
     packaging/smoke-archive --archive "$archive" --stage "$stage" --consumer "$consumer_copy" --isolation "$ISOLATION"

@@ -18,6 +18,7 @@ import select
 import selectors
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -37,6 +38,8 @@ BINARIES = ("pohunek", "pohunekd", "pohunek-sessiond")
 MARKER_SLEEP = "2987"
 # Wall-clock timeout for smoke() calls, applied as Python's subprocess timeout.
 SMOKE_TIMEOUT_SECONDS = 600
+# Grace period after SIGTERM before SIGKILL; cleanup (deleting a user) may take time
+SMOKE_KILL_GRACE_SECONDS = 60
 
 STUB_PREAMBLE = """#!/bin/sh
 set -eu
@@ -280,20 +283,41 @@ class _SmokeArchiveFixture:
         ]
         if timeout is not None:
             command = ["timeout", "--signal=TERM", "--kill-after=2s", f"{timeout}s", *command]
+        process = subprocess.Popen(
+            command,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
         try:
-            return subprocess.run(
-                command,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=SMOKE_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise AssertionError(
-                f"smoke-archive did not finish within {SMOKE_TIMEOUT_SECONDS}s: "
-                f"stdout={error.stdout!r} stderr={error.stderr!r}"
-            ) from error
+            stdout, stderr = process.communicate(timeout=SMOKE_TIMEOUT_SECONDS)
+            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired:
+            # First try SIGTERM so the smoke's cleanup trap runs
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                stdout, stderr = process.communicate(timeout=SMOKE_KILL_GRACE_SECONDS)
+                raise AssertionError(
+                    f"smoke-archive did not finish within {SMOKE_TIMEOUT_SECONDS}s; "
+                    f"it exited {process.returncode} after SIGTERM: stdout={stdout!r} stderr={stderr!r}"
+                ) from None
+            except subprocess.TimeoutExpired:
+                # SIGTERM grace period expired, send SIGKILL
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                stdout, stderr = process.communicate()
+                raise AssertionError(
+                    f"smoke-archive did not finish within {SMOKE_TIMEOUT_SECONDS}s "
+                    f"and did not exit {SMOKE_KILL_GRACE_SECONDS}s after SIGTERM; "
+                    f"sent SIGKILL: stdout={stdout!r} stderr={stderr!r}"
+                ) from None
 
     def assert_cleaned_up(self):
         self.assertEqual(list(self.tmpdir.iterdir()), [], "the temp directory was left behind")
@@ -954,6 +978,61 @@ class SmokeArchivePreflightTest(_SmokeArchiveFixture, unittest.TestCase):
         result = self.smoke("--runtime", "pi", node_dir=node_dir)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("node on PATH resolves inside the checkout", result.stderr)
+        self.assert_cleaned_up()
+
+    @needs_isolated_run
+    @unittest.skipUnless(sys.platform.startswith("darwin"), "the throwaway-user preflight is macOS-only")
+    def test_an_unreadable_stage_fails_the_preflight_clearly(self):
+        stage_dir = self.stage / "pi"
+        original_mode = stat.S_IMODE(os.stat(stage_dir).st_mode)
+        self.addCleanup(os.chmod, stage_dir, original_mode)
+        os.chmod(stage_dir, 0o700)
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the throwaway user cannot read the staged upstream", result.stderr)
+        self.assert_cleaned_up()
+
+    @needs_isolated_run
+    @unittest.skipUnless(sys.platform.startswith("darwin"), "the throwaway-user preflight is macOS-only")
+    def test_a_stage_with_a_private_subdirectory_made_readable_runs(self):
+        stage_dir = self.stage / "pi"
+        private_dir = stage_dir / "private"
+        private_dir.mkdir()
+        private_file = private_dir / "data.txt"
+        payload = b"private data\n"
+        private_file.write_bytes(payload)
+        private_file.chmod(0o600)  # no x bits initially
+        os.chmod(private_dir, 0o700)
+
+        # Apply go+rX: walk the whole runtime directory and chmod everything
+        # Mirrors chmod -R go+rX $stage/$runtime
+        for root, dirs, files in os.walk(stage_dir):
+            # chmod the root directory itself
+            root_mode = stat.S_IMODE(os.stat(root).st_mode)
+            os.chmod(root, root_mode | 0o055)
+            # chmod all subdirectories
+            for d in dirs:
+                dir_path = Path(root) / d
+                current_mode = stat.S_IMODE(os.stat(dir_path).st_mode)
+                os.chmod(dir_path, current_mode | 0o055)
+            # chmod all files
+            for f in files:
+                file_path = Path(root) / f
+                current_mode = stat.S_IMODE(os.stat(file_path).st_mode)
+                # Add 0o044, plus 0o011 if file has owner x
+                if current_mode & 0o100:
+                    os.chmod(file_path, current_mode | 0o055)
+                else:
+                    os.chmod(file_path, current_mode | 0o044)
+
+        # Also update stage manifests to include the new file
+        digest = sha256_hex(payload)
+        with (stage_dir / "STAGE.sha256").open("a") as manifest:
+            manifest.write(f"{digest}  private/data.txt\n")
+
+        # Run should succeed
+        result = self.smoke("--runtime", "pi")
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_cleaned_up()
 
 

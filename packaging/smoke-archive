@@ -1028,10 +1028,22 @@ if [ "$chosen" = sandbox ]; then
         chmod 755 "$work/smoke-archive"
         mkdir -p "$work/t"
         /usr/bin/sudo -n /usr/sbin/chown -R "$tuser" "$work/run" "$work/t" "$sock_root" || fail "cannot set permissions for the throwaway user"
-        output=$(/usr/bin/sudo -n -u "$tuser" /bin/sh -c 'for p do [ -r "$p" ] && [ -x "$p" ] || { printf "%s\n" "$p"; exit 1; }; done' sh "$root" "$stage" "$node_dir" "$work/consumer" "$work/smoke-archive" 2>&1) && preflight_status=0 || preflight_status=$?
+        output=$(/usr/bin/sudo -n -u "$tuser" /bin/sh -c 'for p do [ -r "$p" ] && [ -x "$p" ] || { printf "%s\n" "$p"; exit 1; }; done' sh "$root" "$stage" "$node_dir" "$node_bin" "$work/consumer" "$work/smoke-archive" 2>&1) && preflight_status=0 || preflight_status=$?
         if [ "$preflight_status" -ne 0 ]; then
             fail "the throwaway user cannot read and enter: $(printf '%s\n' "$output" | head -n 1)"
         fi
+        # Verify the throwaway user can traverse the entire stage tree for each runtime
+        for rt in $runtimes; do
+            output=$(/usr/bin/sudo -n -u "$tuser" /bin/sh -c '
+                [ -r "$1" ] && [ -x "$1" ] || { printf "stage dir not readable/executable: %s\n" "$1"; exit 1; }
+                [ -r "$2" ] && [ -f "$2" ] || { printf "STAGE.sha256 not readable: %s\n" "$2"; exit 1; }
+                [ -r "$3" ] && [ -f "$3" ] || { printf "STAGE.links not readable: %s\n" "$3"; exit 1; }
+                /usr/bin/find "$1" -print >/dev/null 2>&1 || { printf "find failed in stage: %s\n" "$1"; exit 1; }
+            ' sh "$stage/$rt" "$stage/$rt/STAGE.sha256" "$stage/$rt/STAGE.links" 2>&1) && stage_status=0 || stage_status=$?
+            if [ "$stage_status" -ne 0 ]; then
+                fail "the throwaway user cannot read the staged upstream $stage/$rt: $(printf '%s\n' "$output" | head -n 1); the caller must make the stage readable by other users (scripts/release-workflow/run-smoke does chmod -R go+rX on macOS)"
+            fi
+        done
         [ -S "$host_probe/s" ] || fail "host probe socket is missing"
         [ -S "$host_probe/w" ] || fail "host probe socket is missing"
         if /usr/bin/sudo -n -u "$tuser" /usr/bin/nc -U -w 2 "$host_probe/s" </dev/null >/dev/null 2>&1; then
