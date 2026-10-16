@@ -611,6 +611,71 @@ def gone_or_zombie(pid):
 
 
 @unittest.skipUnless(sys.platform == "linux", "reads /proc and uses process groups")
+class PlanActionTests(ScriptScenario):
+    """`plan` turns a selection into the CI test jobs to start, without nextest."""
+
+    def plan(self, selection):
+        path = self.root / "selection.json"
+        path.write_text(json.dumps({"schema_version": 1, **selection}))
+        result = self.run_script("plan", "--selection", str(path))
+        self.assertEqual(self.nextest_calls(), [])
+        return result
+
+    def assert_plan(self, selection, fast_shards, heavy, relay_db):
+        result = self.plan(selection)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            f"fast_shards={json.dumps(fast_shards)}\nheavy={str(heavy).lower()}\n"
+            f"relay_db={str(relay_db).lower()}\n",
+        )
+
+    def packages(self, *names, script_tests=False):
+        return {
+            "mode": "packages", "script_tests": script_tests,
+            "packages": [{"name": name, "tests": "all"} for name in names],
+        }
+
+    def test_a_full_selection_runs_every_job(self):
+        self.assert_plan({"mode": "full", "script_tests": True},
+                         ["core", "daemon", "relay", "cli"], True, True)
+
+    def test_each_selected_package_starts_the_shard_that_owns_it(self):
+        self.assert_plan(self.packages("pohunek-session-worker", "pohunek-cli"),
+                         ["daemon", "cli"], True, False)
+        self.assert_plan(self.packages("pohunek-protocol"), ["core"], True, False)
+
+    def test_relay_packages_start_only_the_relay_jobs(self):
+        self.assert_plan(self.packages("pohunek-relay-client"), ["relay"], False, True)
+
+    def test_the_script_regressions_start_core_without_a_rust_test(self):
+        self.assert_plan({"mode": "none", "script_tests": True, "packages": []},
+                         ["core"], False, False)
+        self.assert_plan(self.packages("pohunek-cli", script_tests=True),
+                         ["core", "cli"], True, False)
+
+    def test_a_selection_of_nothing_starts_no_test_job(self):
+        self.assert_plan({"mode": "none", "script_tests": False, "packages": []},
+                         [], False, False)
+
+    def test_a_selection_the_plan_cannot_trust_fails(self):
+        for selection in (
+            {"schema_version": 2, "mode": "full"},
+            {"mode": "subset"},
+            {"mode": "packages", "packages": []},
+            {"mode": "none", "packages": [{"name": "pohunek-cli"}]},
+        ):
+            with self.subTest(selection=selection):
+                result = self.plan(selection)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+    def test_selection_is_refused_outside_plan(self):
+        result = self.run_script("check", "--selection", "selection.json")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--selection applies to plan only", result.stderr)
+
+
 class WorkerRunActionTests(ScriptScenario):
     """The real run command owns a private base and reaps leaked workers."""
 

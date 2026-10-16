@@ -17,6 +17,7 @@ import collections
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import signal
@@ -153,6 +154,56 @@ def filters():
         **{name: f"({fast}) and ({owner})" for name, owner in owners.items()},
         "relay-db": f"(not ({fast})) and ({RELAY})",
         "heavy": f"(not ({fast})) and not ({RELAY})",
+    }
+
+
+# The fast shards a pull request can run, and the owners that route a
+# selected package to one of them; every other package belongs to core.
+FAST_SHARDS = ("core", "daemon", "relay", "cli")
+SHARD_OWNERS = {"daemon": DAEMON, "relay": RELAY, "cli": CLI}
+# `selection.json` shape (`cargo xtask affected ci`) that `plan` reads.
+SELECTION_SCHEMA_VERSION = 1
+
+
+def owned_packages(owner):
+    """The package names an owner filter of SHARD_OWNERS lists."""
+    return set(re.findall(r"package\(=([^)]+)\)", owner))
+
+
+def shard_plan(selection):
+    """The CI test jobs a selection runs: the fast shards, heavy and relay-db.
+
+    A fast shard runs when it owns a selected package, and core also runs for
+    the script regressions its job carries. The heavy and relay-db jobs run
+    whenever a package they hold tests of may be selected; which of its tests
+    run is the selection's filterset.
+    """
+    if selection.get("schema_version") != SELECTION_SCHEMA_VERSION:
+        raise ValueError(
+            f"selection schema version {selection.get('schema_version')!r} is not "
+            f"{SELECTION_SCHEMA_VERSION}")
+    mode = selection.get("mode")
+    if mode == "full":
+        return {"fast_shards": list(FAST_SHARDS), "heavy": True, "relay_db": True}
+    if mode not in ("packages", "none"):
+        raise ValueError(f"unknown selection mode {mode!r}")
+    names = {package["name"] for package in selection.get("packages", [])}
+    if (mode == "packages") != bool(names):
+        raise ValueError(f"selection mode {mode} lists {len(names)} packages")
+    owners = {
+        shard: owned_packages(owner) for shard, owner in SHARD_OWNERS.items()
+    }
+    shards = {
+        next((shard for shard, owned in owners.items() if name in owned), "core")
+        for name in names
+    }
+    if selection.get("script_tests") is True:
+        shards.add("core")
+    relay = owners["relay"]
+    return {
+        "fast_shards": [shard for shard in FAST_SHARDS if shard in shards],
+        "heavy": any(name not in relay for name in names),
+        "relay_db": any(name in relay for name in names),
     }
 
 
@@ -505,7 +556,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "action",
-        choices=("run", "check", "filter", "check-macos", *MACOS_RUN_SETS),
+        choices=("run", "check", "filter", "plan", "check-macos", *MACOS_RUN_SETS),
     )
     parser.add_argument("shard", nargs="?", choices=SHARDS)
     parser.add_argument(
@@ -517,7 +568,24 @@ def main():
         help="run and check from this `cargo nextest archive` file instead of building; "
              "extracts into this checkout, whatever path the archive was built at",
     )
+    parser.add_argument(
+        "--selection", type=Path,
+        help="plan only: the selection.json of `cargo xtask affected ci` to plan the CI test jobs of",
+    )
     args = parser.parse_args()
+    if args.action == "plan":
+        if args.selection is None or args.shard is not None or args.archive_file is not None:
+            parser.error("plan takes --selection and nothing else")
+        try:
+            plan = shard_plan(json.loads(args.selection.read_text()))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+            sys.exit(f"test-partitions plan: {args.selection}: {error}")
+        print(f"fast_shards={json.dumps(plan['fast_shards'])}")
+        print(f"heavy={str(plan['heavy']).lower()}")
+        print(f"relay_db={str(plan['relay_db']).lower()}")
+        return
+    if args.selection is not None:
+        parser.error("--selection applies to plan only")
     archive = None
     if args.archive_file is not None:
         try:
