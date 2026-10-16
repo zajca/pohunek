@@ -441,8 +441,15 @@ pub(crate) fn find_binary_runs(
     for (package, package_files) in &by_package {
         let shared = package_constants(package_files);
         for file in package_files {
+            // The file's own items shadow the package's; a name the file
+            // defines with different values resolves nowhere.
             let mut constants = shared.clone();
-            constants.extend(string_constants(file));
+            for (name, values) in string_constant_values(file) {
+                match single(values) {
+                    Some(value) => constants.insert(name, value),
+                    None => constants.remove(&name),
+                };
+            }
             let mut run = |offset: usize, binary: String| {
                 runs.insert((
                     package.name.clone(),
@@ -496,14 +503,27 @@ pub(crate) fn find_binary_runs(
 fn package_constants(files: &[&SourceFile]) -> BTreeMap<String, String> {
     let mut values: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for file in files {
-        for (name, value) in string_constants(file) {
-            values.entry(name).or_default().insert(value);
+        for (name, value) in string_constant_values(file) {
+            values.entry(name).or_default().extend(value);
         }
     }
+    unique_values(values)
+}
+
+/// The value of a name defined with exactly one value.
+fn single(values: BTreeSet<String>) -> Option<String> {
+    if values.len() == 1 {
+        values.into_iter().next()
+    } else {
+        None
+    }
+}
+
+/// The names of `values` with exactly one value, and that value.
+fn unique_values(values: BTreeMap<String, BTreeSet<String>>) -> BTreeMap<String, String> {
     values
         .into_iter()
-        .filter(|(_, values)| values.len() == 1)
-        .filter_map(|(name, values)| values.into_iter().next().map(|value| (name, value)))
+        .filter_map(|(name, values)| single(values).map(|value| (name, value)))
         .collect()
 }
 
@@ -1169,11 +1189,19 @@ fn bound_name(skeleton: &str, anchor: usize, end: usize) -> Option<String> {
     skeleton[after..].starts_with(';').then(|| name.to_owned())
 }
 
-/// `const` and `static` string items of `file`, by name.
+/// `const` and `static` string items of `file` with one value, by name. Items
+/// in different scopes can share a name; a name the file defines with
+/// different values resolves nowhere, so a read through it is judged like an
+/// unknown path.
 fn string_constants(file: &SourceFile) -> BTreeMap<String, String> {
+    unique_values(string_constant_values(file))
+}
+
+/// Every value of each `const` and `static` string item of `file`, by name.
+fn string_constant_values(file: &SourceFile) -> BTreeMap<String, BTreeSet<String>> {
     let views = file.views();
     let skeleton = views.skeleton.as_bytes();
-    let mut constants = BTreeMap::new();
+    let mut values: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for keyword in ["const ", "static "] {
         for (offset, _) in views.skeleton.match_indices(keyword) {
             if offset > 0 && is_ident(skeleton[offset - 1]) {
@@ -1194,14 +1222,14 @@ fn string_constants(file: &SourceFile) -> BTreeMap<String, String> {
             }
             let value_at = skip_whitespace(views.code.as_bytes(), eq + 1);
             if let Some(value) = string_literal_at(&views.code, value_at) {
-                constants.insert(
-                    views.skeleton[name_start..name_end].to_owned(),
-                    value.to_owned(),
-                );
+                values
+                    .entry(views.skeleton[name_start..name_end].to_owned())
+                    .or_default()
+                    .insert(value.to_owned());
             }
         }
     }
-    constants
+    values
 }
 
 /// String literals in the test code of `file`, as `(offset, content)`.

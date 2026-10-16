@@ -976,3 +976,59 @@ fn a_binary_named_by_another_file_s_constant_or_with_a_trailing_comma_is_found()
         );
     }
 }
+
+#[test]
+fn a_constant_named_in_two_scopes_with_different_paths_resolves_nowhere() {
+    let repo = Repo::new();
+    // Each module reads through its own `PATH`; only the second path selects
+    // the daemon, so the first read cannot be taken for it.
+    repo.write(
+        "crates/daemon/tests/reads.rs",
+        "mod guide {\n    const PATH: &str = \"docs/guide.md\";\n    #[test]\n    fn reads() {\n        \
+         drop(std::fs::read(pohunek_test_support::workspace_root().join(PATH)));\n    }\n}\n\
+         mod hooks {\n    const PATH: &str = \"compat/codex/subagent-hooks.json\";\n    #[test]\n    \
+         fn reads() {\n        drop(std::fs::read(pohunek_test_support::workspace_root().join(PATH)));\n    \
+         }\n}\n",
+    );
+    repo.commit("two constants named PATH");
+    let (success, stderr) = guard(&repo);
+    assert!(!success, "{stderr}");
+    for line in [5, 12] {
+        assert!(
+            stderr.contains(&format!(
+                "crates/daemon/tests/reads.rs:{line}: pohunek-daemon reads the repository root"
+            )),
+            "{line}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_binary_constant_named_in_two_scopes_with_different_binaries_is_undecided() {
+    let repo = Repo::new();
+    // Another file's `BIN` names the daemon's own binary; neither it nor the
+    // last module's value may stand for the first module's.
+    repo.write(
+        "crates/daemon/tests/support.rs",
+        "pub const BIN: &str = \"pohunekd\";\n",
+    );
+    repo.write(
+        "crates/daemon/tests/spawns.rs",
+        "mod cli {\n    const BIN: &str = \"pohunek\";\n    #[test]\n    fn spawns() {\n        \
+         drop(pohunek_test_support::bin_exe(BIN));\n    }\n}\n\
+         mod daemon {\n    const BIN: &str = \"pohunekd\";\n    #[test]\n    fn spawns() {\n        \
+         drop(pohunek_test_support::bin_exe(BIN));\n    }\n}\n",
+    );
+    repo.commit("two constants named BIN");
+    let (success, stderr) = guard(&repo);
+    assert!(!success, "{stderr}");
+    for line in [5, 12] {
+        assert!(
+            stderr.contains(&format!(
+                "crates/daemon/tests/spawns.rs:{line}: pohunek-daemon calls `bin_exe(..)` with an \
+                 argument that is neither a literal nor a constant of the package"
+            )),
+            "{line}: {stderr}"
+        );
+    }
+}
