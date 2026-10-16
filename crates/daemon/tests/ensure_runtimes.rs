@@ -23,11 +23,13 @@ use package::ANCHOR_FILE_NAME;
 use pohunek_daemon::lock::InstanceLock;
 use pohunek_paths::{METADATA_STORE_NAME as STORE_NAME, PLUGINS_SUBDIR};
 use pohunek_service_config::runtimes::{
-    CatalogStatus, EnsureReport, PackageStatus, ProfileStatus, UseReason, CODE_DAEMON_RUNNING,
-    CODE_GAP_AGENT_NOT_ON_PATH, CODE_GAP_CONFIG_HOME_MISSING, CODE_GAP_CONFIG_HOME_SYMLINK,
-    CODE_GAP_SERVED_BY_OTHER_PACKAGE, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
-    CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE,
-    DETECT_FLAG, DRY_RUN_FLAG, ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
+    CatalogStatus, EnsureReport, PackageStatus, ProfileAction, ProfileStatus, SelectedPackage,
+    UseReason, CODE_DAEMON_RUNNING, CODE_GAP_AGENT_NOT_ON_PATH, CODE_GAP_CONFIG_HOME_MISSING,
+    CODE_GAP_CONFIG_HOME_SYMLINK, CODE_GAP_SERVED_BY_OTHER_PACKAGE,
+    CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PINNED_TO_NEWER_VERSION,
+    CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_VERSION_UNKNOWN, CODE_PROFILE_NOT_MIGRATABLE,
+    CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE, DETECT_FLAG, DRY_RUN_FLAG,
+    ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
 };
 use pohunek_test_support::bin_exe;
 use pohunek_test_support::env::TestEnv;
@@ -255,7 +257,13 @@ impl Host {
     }
 
     fn profile_text(&self) -> String {
-        fs::read_to_string(self.profile_path()).expect("read the profile")
+        self.profile_text_of(CLAUDE_PROFILE)
+    }
+
+    /// The text of the host profile `name`.
+    fn profile_text_of(&self, name: &str) -> String {
+        let path = self.profiles_dir().join(format!("{name}.toml"));
+        fs::read_to_string(path).expect("read the profile")
     }
 
     /// Runs the step and returns its raw output.
@@ -788,11 +796,15 @@ fn an_unpinned_profile_is_refused_when_a_retained_older_version_is_damaged() {
     host.publish_at(&["claude"], 1);
     host.write_claude_profile();
     let older = host.step(false).packages[0].digest.clone();
+    let pinned_older = host.profile_text();
     let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.3");
     host.publish_archives(2, &[("claude", &bytes, &digest)]);
     let newer = host.step(false);
     assert_eq!(newer.packages[0].status, PackageStatus::Installed);
     assert_eq!(newer.packages[0].digest, digest.as_str());
+    // The release repins the profile to the newer version; the older version is
+    // retained again so the scenario refuses over it.
+    host.write_profile(CLAUDE_PROFILE, &pinned_older);
     host.remove_package_root(&older);
     host.remove_release();
     let second = host.write_profile("second", "base = \"claude\"\n");
@@ -945,10 +957,12 @@ fn a_selected_but_disabled_release_package_is_not_enabled_when_its_bind_would_re
     host.publish_at(&["claude"], 1);
     host.write_profile("other", "base = \"claude\"\n");
     let older = host.step(false).packages[0].digest.clone();
+    let pinned_older = host.profile_text_of("other");
     let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.3");
     host.publish_archives(2, &[("claude", &bytes, &digest)]);
     let newer = host.step(false);
     assert_eq!(newer.packages[0].status, PackageStatus::Installed);
+    host.write_profile("other", &pinned_older);
     host.disable_package(&digest);
     host.remove_package_root(&older);
     let target = host.write_profile("target", "base = \"claude\"\n");
@@ -962,7 +976,10 @@ fn a_selected_but_disabled_release_package_is_not_enabled_when_its_bind_would_re
     for report in [&plan, &applied] {
         assert_eq!(refusal_codes(report), [incompatible.as_str()]);
         assert_eq!(report.refusals[0].subject, "target");
-        assert!(report.profiles.is_empty());
+        assert!(report
+            .profiles
+            .iter()
+            .all(|profile| profile.name != "target"));
     }
     assert_eq!(
         fs::read(host.registry_path()).expect("the registry record"),
@@ -972,6 +989,15 @@ fn a_selected_but_disabled_release_package_is_not_enabled_when_its_bind_would_re
     assert_eq!(fs::read(&target).expect("the unpinned profile"), profile);
 }
 
+/// The status of the profile `name` in `profiles`, which must have an entry.
+fn profile_status(profiles: &[ProfileAction], name: &str) -> ProfileStatus {
+    profiles
+        .iter()
+        .find(|profile| profile.name == name)
+        .unwrap_or_else(|| panic!("the profile {name} has an entry"))
+        .status
+}
+
 /// The state both missing-root scenarios start from: a healthy older version is
 /// retained by the pinned profile `other`, and the newer selected version is
 /// published again from its archive. Returns the older and the newer digest.
@@ -979,10 +1005,14 @@ fn selected_root_missing_state(host: &Host) -> (String, PackageDigest) {
     host.publish_at(&["claude"], 1);
     host.write_profile("other", "base = \"claude\"\n");
     let older = host.step(false).packages[0].digest.clone();
+    let pinned_older = host.profile_text_of("other");
     let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.3");
     host.publish_archives(2, &[("claude", &bytes, &digest)]);
     let newer = host.step(false);
     assert_eq!(newer.packages[0].status, PackageStatus::Installed);
+    // The release repins `other` to the newer version; the older version is
+    // retained again, as the scenarios need it.
+    host.write_profile("other", &pinned_older);
     host.remove_package_root(digest.as_str());
     (older, digest)
 }
@@ -1006,8 +1036,14 @@ fn an_unpinned_profile_binds_when_the_selected_root_is_missing_and_the_older_ver
         .find(|package| package.runtime == "claude")
         .expect("the claude package");
     assert_eq!(claude.status, PackageStatus::Install);
-    assert_eq!(plan.profiles.len(), 1);
-    assert_eq!(plan.profiles[0].status, ProfileStatus::Bind);
+    assert_eq!(
+        profile_status(&plan.profiles, "target"),
+        ProfileStatus::Bind
+    );
+    assert_eq!(
+        profile_status(&plan.profiles, "other"),
+        ProfileStatus::Repin
+    );
 
     let applied = host.step(false);
 
@@ -1018,7 +1054,14 @@ fn an_unpinned_profile_binds_when_the_selected_root_is_missing_and_the_older_ver
         .find(|package| package.runtime == "claude")
         .expect("the claude package");
     assert_eq!(claude.status, PackageStatus::Installed);
-    assert_eq!(applied.profiles[0].status, ProfileStatus::Bound);
+    assert_eq!(
+        profile_status(&applied.profiles, "target"),
+        ProfileStatus::Bound
+    );
+    assert_eq!(
+        profile_status(&applied.profiles, "other"),
+        ProfileStatus::Repinned
+    );
     let repeat = host.step(false);
     assert_eq!(repeat.packages[0].status, PackageStatus::Present);
     assert!(repeat.profiles.is_empty());
@@ -1045,7 +1088,10 @@ fn an_unpinned_profile_is_refused_before_restore_when_both_roots_are_missing() {
     for report in [&plan, &applied] {
         assert_eq!(refusal_codes(report), [incompatible.as_str()]);
         assert_eq!(report.refusals[0].subject, "target");
-        assert!(report.profiles.is_empty());
+        assert!(report
+            .profiles
+            .iter()
+            .all(|profile| profile.name != "target"));
     }
     assert_eq!(
         fs::read(host.registry_path()).expect("the registry record"),
@@ -1688,4 +1734,199 @@ fn detect_without_dry_run_is_a_usage_error_and_changes_nothing() {
     assert!(output.stdout.is_empty());
     assert_eq!(host.profile_text(), profile);
     assert!(!host.plugins_dir().exists());
+}
+
+/// The older and the newer version the repin scenarios publish as the release
+/// package of `claude`.
+const OLDER_VERSION: &str = "1.0.0";
+const NEWER_VERSION: &str = "1.0.1";
+
+/// Publishes the `claude` package at `version` as the release, under a catalog
+/// at `sequence`, and returns its digest.
+fn publish_claude_version(host: &Host, version: &str, sequence: u64) -> PackageDigest {
+    let (bytes, digest) = official_runtimes::variant_archive("claude", version);
+    host.publish_archives(sequence, &[("claude", &bytes, &digest)]);
+    digest
+}
+
+/// A profile pinned to an older official version of the release package is
+/// moved to the release package: the plan reports the repin, the apply reports
+/// it repinned, and the profile file names the release package from then on.
+#[test]
+fn a_profile_pinned_to_an_older_official_version_is_repinned_to_the_release_package() {
+    let host = Host::new();
+    let older = publish_claude_version(&host, OLDER_VERSION, 1);
+    host.write_claude_profile();
+    let bound = host.step(false);
+    assert_eq!(bound.profiles.len(), 1);
+    assert_eq!(bound.profiles[0].status, ProfileStatus::Bound);
+    assert_eq!(bound.packages[0].digest, older.as_str());
+    let newer = publish_claude_version(&host, NEWER_VERSION, 2);
+
+    let plan = host.step(true);
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(plan.packages[0].status, PackageStatus::Install);
+    assert_eq!(plan.profiles.len(), 1);
+    let repin = &plan.profiles[0];
+    assert_eq!(repin.name, CLAUDE_PROFILE);
+    assert_eq!(repin.status, ProfileStatus::Repin);
+    assert_eq!(repin.digest, newer.as_str());
+    assert_eq!(repin.previous_digest.as_deref(), Some(older.as_str()));
+    assert_eq!(repin.previous_version.as_deref(), Some(OLDER_VERSION));
+    assert_eq!(repin.version.as_deref(), Some(NEWER_VERSION));
+    assert!(repin.kept_reason.is_none());
+    assert!(host.profile_text().contains(older.as_str()));
+
+    let applied = host.step(false);
+
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    assert_eq!(applied.packages[0].status, PackageStatus::Installed);
+    assert_eq!(applied.profiles.len(), 1);
+    assert_eq!(applied.profiles[0].status, ProfileStatus::Repinned);
+    assert_eq!(applied.profiles[0].digest, newer.as_str());
+    let text = host.profile_text();
+    assert!(text.contains(newer.as_str()), "{text}");
+    assert!(!text.contains(older.as_str()), "{text}");
+
+    let repeat = host.step(false);
+
+    assert!(
+        repeat.profiles.is_empty(),
+        "a repinned profile has no entry"
+    );
+    assert_eq!(repeat.packages[0].status, PackageStatus::Present);
+}
+
+/// A profile whose `package` key names another package than the one its
+/// digest records is an anomalous pin: the step keeps it, even though the digest
+/// is an older version of the release package.
+#[test]
+fn a_profile_whose_package_key_disagrees_with_its_digest_is_kept() {
+    let host = Host::new();
+    let older = publish_claude_version(&host, OLDER_VERSION, 1);
+    host.write_claude_profile();
+    let bound = host.step(false);
+    assert_eq!(bound.profiles[0].status, ProfileStatus::Bound);
+    let text = host.profile_text();
+    assert!(text.contains("pohunek.runtime.claude"), "{text}");
+    host.write_profile(
+        CLAUDE_PROFILE,
+        &text.replacen("pohunek.runtime.claude", "acme.runtime.other", 1),
+    );
+    let profile = fs::read(host.profile_path()).expect("the kept profile");
+    publish_claude_version(&host, NEWER_VERSION, 2);
+
+    let plan = host.step(true);
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(plan.profiles.len(), 1, "{:?}", plan.profiles);
+    assert_kept(
+        &plan.profiles[0],
+        older.as_str(),
+        CODE_PINNED_TO_OTHER_PACKAGE,
+    );
+    let applied = host.step(false);
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    assert_eq!(
+        fs::read(host.profile_path()).expect("the kept profile"),
+        profile
+    );
+}
+
+/// Asserts that `profile` keeps its pin at `digest` for `reason`, so nothing
+/// rewrites it.
+fn assert_kept(profile: &ProfileAction, digest: &str, reason: &str) {
+    assert_eq!(profile.status, ProfileStatus::Kept, "{profile:?}");
+    assert_eq!(profile.name, CLAUDE_PROFILE);
+    assert_eq!(profile.digest, digest);
+    assert_eq!(profile.kept_reason.as_deref(), Some(reason));
+    assert_eq!(profile.version, None);
+}
+
+/// A profile pinned to a newer official version than the release package is
+/// kept at its pin with its reason. The release package is still installed,
+/// and the newer package the registry selected is named as the one it replaces.
+#[test]
+fn a_profile_pinned_to_a_newer_official_version_is_kept_and_the_replaced_selection_is_named() {
+    let host = Host::new();
+    let newer = publish_claude_version(&host, NEWER_VERSION, 1);
+    host.write_claude_profile();
+    let bound = host.step(false);
+    assert_eq!(bound.profiles[0].status, ProfileStatus::Bound);
+    let older = publish_claude_version(&host, OLDER_VERSION, 2);
+    let profile = fs::read(host.profile_path()).expect("the kept profile");
+    let replaced = SelectedPackage {
+        digest: newer.as_str().to_owned(),
+        version: NEWER_VERSION.to_owned(),
+    };
+
+    let plan = host.step(true);
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(plan.packages[0].status, PackageStatus::Install);
+    assert_eq!(plan.packages[0].digest, older.as_str());
+    assert_eq!(plan.packages[0].replaces_newer, Some(replaced.clone()));
+    assert_eq!(plan.profiles.len(), 1);
+    assert_kept(
+        &plan.profiles[0],
+        newer.as_str(),
+        CODE_PINNED_TO_NEWER_VERSION,
+    );
+    assert_eq!(
+        plan.profiles[0].previous_version.as_deref(),
+        Some(NEWER_VERSION)
+    );
+
+    let applied = host.step(false);
+
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    assert_eq!(applied.packages[0].status, PackageStatus::Installed);
+    assert_eq!(applied.packages[0].digest, older.as_str());
+    assert_eq!(applied.packages[0].replaces_newer, Some(replaced));
+    assert_eq!(applied.profiles.len(), 1);
+    assert_kept(
+        &applied.profiles[0],
+        newer.as_str(),
+        CODE_PINNED_TO_NEWER_VERSION,
+    );
+    assert_eq!(
+        fs::read(host.profile_path()).expect("the kept profile"),
+        profile
+    );
+}
+
+/// A profile pinned to a digest the registry holds no record of is kept, as
+/// its version cannot be compared with the release package.
+#[test]
+fn a_profile_pinned_to_an_unrecorded_digest_is_kept_with_its_version_unknown() {
+    let host = Host::new();
+    publish_claude_version(&host, OLDER_VERSION, 1);
+    let unrecorded = format!("sha256:{}", "0".repeat(64));
+    host.write_profile(
+        CLAUDE_PROFILE,
+        &format!(
+            "base = \"claude\"\npackage = \"pohunek.runtime.claude\"\ndigest = \"{unrecorded}\"\n"
+        ),
+    );
+    let profile = fs::read(host.profile_path()).expect("the kept profile");
+
+    let plan = host.step(true);
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(plan.profiles.len(), 1);
+    assert_kept(&plan.profiles[0], &unrecorded, CODE_PINNED_VERSION_UNKNOWN);
+
+    let applied = host.step(false);
+
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    assert_kept(
+        &applied.profiles[0],
+        &unrecorded,
+        CODE_PINNED_VERSION_UNKNOWN,
+    );
+    assert_eq!(
+        fs::read(host.profile_path()).expect("the kept profile"),
+        profile
+    );
 }

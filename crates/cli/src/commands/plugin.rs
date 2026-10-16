@@ -392,6 +392,38 @@ pub(crate) enum Error {
         found: String,
     },
 
+    /// The update would select an older official version than the selected one.
+    #[error(
+        "updating {package} to {offered} would replace the selected official version {installed}; nothing was changed; to roll back on purpose, {rollback}`pohunek plugin select {package} --digest {digest}`"
+    )]
+    UpdateDowngrade {
+        /// The package id being updated.
+        package: String,
+        /// The selected official version the update would replace.
+        installed: String,
+        /// The older version the archive holds.
+        offered: String,
+        /// Abbreviated digest of the archive, accepted by `--digest`.
+        digest: String,
+        /// The step before the select: empty when the older version is
+        /// installed already, else its install, which leaves it unselected.
+        rollback: &'static str,
+    },
+
+    /// The update would replace a selected official version whose order
+    /// against the offered one cannot be proven, because one is not semantic.
+    #[error(
+        "updating {package} to {offered} cannot be ordered against the selected official version {installed}, because a version is not semantic; nothing was changed; the order cannot be proven"
+    )]
+    UpdateVersionUnordered {
+        /// The package id being updated.
+        package: String,
+        /// The selected official version the update would replace.
+        installed: String,
+        /// The version the archive holds.
+        offered: String,
+    },
+
     /// The agents directory is missing its safety properties or unreadable.
     #[error("the agent profiles directory cannot be used: {detail}")]
     ProfileDirectory {
@@ -419,6 +451,8 @@ impl Error {
             Self::NotInstalled { .. } | Self::NoMatchingVersion { .. } => "package_not_installed",
             Self::Ambiguous { .. } => "plugin_selector_ambiguous",
             Self::UpdateIdMismatch { .. } => "plugin_update_id_mismatch",
+            Self::UpdateDowngrade { .. } => "plugin_update_downgrade",
+            Self::UpdateVersionUnordered { .. } => "plugin_update_version_unordered",
             Self::ProfileDirectory { .. } => "profile_directory_unusable",
             Self::ProfileTarget { .. } => "profile_target_invalid",
         }
@@ -441,6 +475,12 @@ impl Error {
             Self::Ambiguous { .. } => "narrow the selection with --digest or --version",
             Self::UpdateIdMismatch { .. } => {
                 "name the package id the archive declares, or use `pohunek plugin install`"
+            }
+            Self::UpdateDowngrade { .. } => {
+                "list installed versions with `pohunek plugin list`, and keep the selected version unless a rollback is intended"
+            }
+            Self::UpdateVersionUnordered { .. } => {
+                "install the archive with `pohunek plugin install <archive> ...` (another version stays selected), then run `pohunek plugin select <package> --digest <digest>`"
             }
             Self::ProfileDirectory { .. } => {
                 "the agents directory must be owned by you and not group- or world-writable"
@@ -793,6 +833,9 @@ async fn ingest_package(
             .into());
         }
     }
+    if ingest == Ingest::Update {
+        ensure_not_official_downgrade(&installed, &preview.package)?;
+    }
     let another_version_installed = installed
         .packages
         .iter()
@@ -827,6 +870,68 @@ async fn ingest_package(
     }
     print_output(json, &result, || render_install_result(&result, ingest))?;
     Ok(())
+}
+
+/// Refuses an official update whose version is older than the selected
+/// official version of the same package, or whose order cannot be proven.
+///
+/// The daemon accepts any signed catalog at or above its high-water sequence,
+/// so an older official version stays installable; only the update flow
+/// reads the semantic order. An archive counts as official when the catalog
+/// listed it or its digest is already recorded as official, because an
+/// explicit digest carries no catalog origin. Build metadata does not order
+/// versions. Rolling back on purpose is `pohunek plugin select`.
+fn ensure_not_official_downgrade(
+    installed: &PackageListResult,
+    preview: &PackageInfo,
+) -> Result<(), Error> {
+    let recorded_official = installed
+        .packages
+        .iter()
+        .any(|info| info.digest == preview.digest && info.origin == PackageOrigin::Official);
+    if preview.origin != PackageOrigin::Official && !recorded_official {
+        return Ok(());
+    }
+    let Some(selected) = installed.packages.iter().find(|info| {
+        info.selected
+            && info.origin == PackageOrigin::Official
+            && info.package.id == preview.package.id
+    }) else {
+        return Ok(());
+    };
+    // Re-selecting the version already selected is no change, so its order
+    // is not needed even when the version string does not parse.
+    if selected.digest == preview.digest {
+        return Ok(());
+    }
+    let (Ok(offered), Ok(current)) = (
+        semver::Version::parse(preview.package.version.as_str()),
+        semver::Version::parse(selected.package.version.as_str()),
+    ) else {
+        return Err(Error::UpdateVersionUnordered {
+            package: preview.package.id.to_string(),
+            installed: selected.package.version.to_string(),
+            offered: preview.package.version.to_string(),
+        });
+    };
+    if !offered.cmp_precedence(&current).is_lt() {
+        return Ok(());
+    }
+    let recorded = installed
+        .packages
+        .iter()
+        .any(|info| info.digest == preview.digest);
+    Err(Error::UpdateDowngrade {
+        package: preview.package.id.to_string(),
+        installed: selected.package.version.to_string(),
+        offered: preview.package.version.to_string(),
+        digest: short_digest(&preview.digest),
+        rollback: if recorded {
+            "run "
+        } else {
+            "install the archive with `pohunek plugin install` (another version stays selected), then run "
+        },
+    })
 }
 
 /// Makes an already recorded version enabled and selected, as `update`

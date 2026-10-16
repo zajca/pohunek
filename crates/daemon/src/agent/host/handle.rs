@@ -12,18 +12,19 @@
 
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
+use package::registry::PackageSource as RecordSource;
 use package::registry::RegistryError as PackageRegistryError;
 use package::PackageDigest;
 use protocol::{
     BindingProvenance, LaunchBinding, PackageId, PackageIdentity, ProtocolError, RuntimeId,
     RuntimeRef,
 };
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::builtin::BuiltinSource;
 use super::claim::{is_reserved, ServedBy};
 use super::definition::{DefinitionError, LaunchProgram, RuntimeDefinition};
-use super::launch::{adopts, check_pin, LaunchPin};
+use super::launch::{adopts, adopts_newer, check_pin, LaunchPin};
 use super::package::{PackageRejection, PackageSource, PackageStore, RejectedPackage};
 use super::registry::{RegistryError, RuntimeRegistry, RuntimeSource, SourceTrust};
 
@@ -434,6 +435,177 @@ impl RuntimeHost {
             .load_pinned(runtime_id, package_digest, package)
             .map(Arc::new)
             .map_err(|reason| refuse(runtime_id, &reason))
+    }
+
+    /// The newer official package a relaunch of a session frozen with the
+    /// package `pin` may adopt instead of its exact digest, if there is one.
+    ///
+    /// The candidate is what the registry serves for the runtime id now (the
+    /// planned overlay included), and it must pass [`adopts_newer`]. Both
+    /// registry records must come from the official catalog, which is the trust
+    /// decision: the frozen digest is recorded with source `official`, and the
+    /// candidate is either a planned release package or recorded `official`,
+    /// enabled and selected. A package installed by explicit digest or linked
+    /// may declare the same package and runtime id, and never adopts.
+    /// The frozen package must still load, because the candidate is compared
+    /// with it: the same integration handler and hook schema, and the same
+    /// native reference existence check. The candidate's root is verified
+    /// again. Every other case yields `None`, and the session resolves its exact
+    /// digest through [`Self::resolve_pinned`].
+    ///
+    /// Only a relaunch and the recovery judgements call this; a live session is
+    /// observed through its frozen digest. `session list` judges every listed
+    /// session, so the reasons a candidate does not adopt are logged at debug
+    /// level, and the exact-digest resolution reports its own refusal.
+    #[must_use]
+    pub fn newer_adopter(
+        &self,
+        reference: &RuntimeRef,
+        pin: &LaunchPin,
+    ) -> Option<Arc<RuntimeDefinition>> {
+        let store = self.package_store()?;
+        let LaunchBinding {
+            runtime_id,
+            provenance:
+                BindingProvenance::Package {
+                    package: frozen_package,
+                    package_digest: frozen_digest,
+                },
+        } = pin.binding()?
+        else {
+            return None;
+        };
+        if reference.launchable().ok()? != runtime_id {
+            return None;
+        }
+        let candidate = self.resolve_ref(reference).ok()?;
+        if !adopts_newer(pin, &candidate) {
+            return None;
+        }
+        let BindingProvenance::Package {
+            package,
+            package_digest,
+        } = &candidate.binding().provenance
+        else {
+            return None;
+        };
+        let state = store.registry().state().ok()?;
+        let official =
+            |record: &package::registry::PackageRecord| record.source() == RecordSource::Official;
+        if !state.package(frozen_digest).is_some_and(official) {
+            return None;
+        }
+        let planned = self.is_planned(package_digest);
+        let served = planned
+            || (state.package(package_digest).is_some_and(|record| {
+                official(record) && record.enabled() && record.identity() == package
+            }) && state.selected(&package.id) == Some(package_digest));
+        if !served {
+            return None;
+        }
+        let frozen = match store.load_pinned(runtime_id, frozen_digest, frozen_package) {
+            Ok(frozen) => frozen,
+            Err(reason) => {
+                debug!(
+                    runtime = %runtime_id,
+                    reason = %reason,
+                    "the frozen package of a session does not load, so a newer version cannot adopt it"
+                );
+                return None;
+            }
+        };
+        let same_integration = frozen.integration_handler() == candidate.integration_handler()
+            && frozen.hook_schema() == candidate.hook_schema()
+            && frozen.hook_existence() == candidate.hook_existence();
+        if !same_integration {
+            debug!(
+                runtime = %runtime_id,
+                package = %package.id,
+                "a newer package version changes the integration or the native reference check, so it does not adopt sessions of the older version"
+            );
+            return None;
+        }
+        if planned {
+            return Some(candidate);
+        }
+        match store.load_pinned(runtime_id, package_digest, package) {
+            Ok(verified) => Some(Arc::new(verified)),
+            Err(reason) => {
+                debug!(
+                    runtime = %runtime_id,
+                    reason = %reason,
+                    "the selected newer package does not verify, so it does not adopt sessions"
+                );
+                None
+            }
+        }
+    }
+
+    /// Whether a host profile pinned to `digest` of package `package` names a
+    /// strictly newer official version of the official package the session
+    /// binding `frozen` was launched from.
+    ///
+    /// Both registry records must be official and of the same package id. A
+    /// release step repins a profile so; a session that the newer version does
+    /// not adopt keeps relaunching from its frozen digest under that profile.
+    #[must_use]
+    pub fn pins_newer_official(
+        &self,
+        frozen: &LaunchBinding,
+        package: &PackageId,
+        digest: &PackageDigest,
+    ) -> bool {
+        let (
+            Some(store),
+            BindingProvenance::Package {
+                package: frozen_package,
+                package_digest: frozen_digest,
+            },
+        ) = (self.package_store(), &frozen.provenance)
+        else {
+            return false;
+        };
+        let Ok(state) = store.registry().state() else {
+            return false;
+        };
+        let official =
+            |record: &package::registry::PackageRecord| record.source() == RecordSource::Official;
+        let Some(launched) = state
+            .package(frozen_digest)
+            .filter(|record| official(record))
+        else {
+            return false;
+        };
+        // A digest the planned release step installs is an official release
+        // package the plan verified; an installed one must be recorded official.
+        let pinned = match self.planned_identity(digest) {
+            Some(planned) => planned,
+            None => match state.package(digest).filter(|record| official(record)) {
+                Some(record) => record.identity().clone(),
+                None => return false,
+            },
+        };
+        launched.identity() == frozen_package
+            && pinned.id == frozen_package.id
+            && *package == frozen_package.id
+            && super::launch::version_order(&launched.identity().version, &pinned.version)
+                == Some(std::cmp::Ordering::Less)
+    }
+
+    /// The package identity of the planned definition of exactly `digest`, when
+    /// the planned overlay holds it.
+    fn planned_identity(&self, digest: &PackageDigest) -> Option<PackageIdentity> {
+        self.packages
+            .as_ref()?
+            .planned
+            .iter()
+            .find_map(|definition| match &definition.binding().provenance {
+                BindingProvenance::Package {
+                    package,
+                    package_digest,
+                } if package_digest == digest => Some(package.clone()),
+                _ => None,
+            })
     }
 
     /// The planned definition of exactly `digest` under `identity` for

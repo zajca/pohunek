@@ -4247,7 +4247,7 @@ async fn a_profile_pinned_to_another_package_id_is_refused_not_adopted() {
 
 /// The verdict the upgrade preflight gives the stopped session `id` over the
 /// state `fixture` holds, and the refusal code of that verdict.
-fn stopped_preflight_verdict(
+pub(super) fn stopped_preflight_verdict(
     fixture: &Fixture,
     store_path: &Path,
     id: &protocol::SessionId,

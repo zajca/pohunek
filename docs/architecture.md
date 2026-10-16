@@ -1282,7 +1282,23 @@ Trust boundary:
   root verifies (`verify_launchable` in
   `crates/daemon/src/agent/host/handle.rs`). A pinned session or profile
   resolves exactly its digest and never falls back to another package or to
-  `shell`. Recovery steps are in
+  `shell`. There is one exception, for a relaunch only:
+  - the resume or fork of a stopped session pinned to an official package may be
+    adopted by a strictly newer, selected official version of the same package
+    id and runtime id (reserved or not, so Pi too) (`RuntimeHost::newer_adopter`, `recovery_definition` in
+    `crates/daemon/src/session/resume.rs`);
+  - the newer version must keep the integration, the native reference check and
+    the frozen launch contract;
+  - a session launched from a profile is adopted only when that profile pins the
+    newer version;
+  - anything else resolves the exact digest, and a live session is always
+    observed through its own.
+  "Official" is a registry record from a catalog the host's single anchor
+  verified; which root or key authorized it is not recorded
+  ([#1200](https://github.com/zajca/pohunek/issues/1200)). `service upgrade`
+  repins the profiles pinned to an older version of the release's official
+  package. That changes those profiles' revisions, so a relay approval of the
+  previous revision no longer matches. Recovery steps are in
   `docs/knowledge/runbooks/runtime-package-recovery.md`.
 
 ## Overlay Registry and Discovery

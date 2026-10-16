@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::agent::host::{ProfileRevision, RuntimeDefinition};
 use crate::agent::{
-    InputRules, LaunchEnv, LaunchView, NativeReferenceProvenance, ProfileRegistry,
+    InputRules, LaunchEnv, LaunchView, NativeReferenceProvenance, Pin, ProfilePin, ProfileRegistry,
     ReferenceCheckFailure, ReferenceExistence, ResolvedAgent, StoreRoot,
 };
 use crate::detect::Manifest;
@@ -246,7 +246,6 @@ impl SessionRegistry {
     /// capabilities stay the upper bound: a capability is only ever cleared,
     /// never set. Nothing is persisted.
     pub(crate) async fn enrich_native_activity(&self, sessions: &mut [SessionInfo]) {
-        let runtimes = self.inner.profiles.runtimes();
         let candidates = {
             let entries = self.inner.sessions.lock().await;
             sessions
@@ -268,7 +267,7 @@ impl SessionRegistry {
                 lookup_inputs.push(None);
                 continue;
             };
-            let definition = recovery_definition(runtimes, &binding);
+            let definition = recovery_definition(&self.inner.profiles, &binding);
             clear_refused_capabilities(info, &binding, definition.as_ref());
             let definition = definition.ok();
             lookup_inputs.push(
@@ -733,7 +732,7 @@ impl SessionRegistry {
         &self,
         binding: &ResumeBinding,
     ) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
-        recovery_definition(self.inner.profiles.runtimes(), binding)
+        recovery_definition(&self.inner.profiles, binding)
     }
 
     async fn persist_failed_recovery_rollback(&self, id: &SessionId) {
@@ -1433,20 +1432,23 @@ fn resolve_recovery_agent_in(
     profiles: &ProfileRegistry,
     binding: &ResumeBinding,
 ) -> Result<ResolvedAgent, ProtocolError> {
-    match recovery_definition(profiles.runtimes(), binding) {
+    match recovery_definition(profiles, binding) {
         Ok(pinned) => profiles.resolve_agent_pinned(&binding.agent, &pinned),
         Err(_unresolved) => profiles.resolve_agent(&binding.agent),
     }
 }
 
-/// Whether a profile whose revision was frozen over a built-in pin still
-/// matches that revision once the official package adopts the pin.
+/// Whether a profile whose revision was frozen over a pin the definition now
+/// serves by adoption still matches that revision.
 ///
-/// The frozen revision digests the built-in binding the session stored, so
-/// the package that now serves the runtime cannot reproduce it. The match
-/// is accepted only when the definition is the adoption of the pin
-/// ([`host::adopts`]) and honors the frozen launch for this operation, and
-/// the profile's pin keys, if any, name that package.
+/// The frozen revision digests the binding the session stored, so the package
+/// that now serves the runtime cannot reproduce it. The match is accepted only
+/// when the definition is an adoption of the pin and honors the frozen launch
+/// for this operation. For a built-in pin ([`host::adopts`]) the profile's pin
+/// keys, if any, name that package. For an older version of the package
+/// ([`host::adopts_newer`]) the profile pins the newer version, and putting
+/// the frozen pin back reproduces the frozen revision. A session that resolves
+/// its exact frozen digest is matched by [`repinned_profile_matches_in`].
 fn adopted_profile_matches_in(
     profiles: &ProfileRegistry,
     binding: &ResumeBinding,
@@ -1455,9 +1457,12 @@ fn adopted_profile_matches_in(
     frozen: &ProfileRevision,
     fork: bool,
 ) -> Result<bool, ProtocolError> {
-    if !host::adopts(&binding.launch_binding, definition)
-        || recovery_contract(binding, definition, fork).is_err()
-    {
+    let built_in = host::adopts(&binding.launch_binding, definition);
+    let newer = host::adopts_newer(&binding.launch_binding, definition);
+    if !(built_in || newer) {
+        return repinned_profile_matches_in(profiles, binding, name, definition, frozen);
+    }
+    if recovery_contract(binding, definition, fork).is_err() {
         return Ok(false);
     }
     let (
@@ -1476,11 +1481,82 @@ fn adopted_profile_matches_in(
     if binding.program.is_empty() {
         return Ok(false);
     }
-    profiles.frozen_builtin_matches(
+    let launch = (binding.program.as_str(), binding.args.as_slice());
+    if built_in {
+        return profiles.frozen_builtin_matches(
+            name,
+            stored,
+            launch,
+            (&package.id, package_digest),
+            frozen,
+        );
+    }
+    let BindingProvenance::Package {
+        package: frozen_package,
+        package_digest: frozen_digest,
+    } = &stored.provenance
+    else {
+        return Ok(false);
+    };
+    let launched = Pin {
+        package: frozen_package.id.clone(),
+        digest: frozen_digest.clone(),
+    };
+    let served = Pin {
+        package: package.id.clone(),
+        digest: package_digest.clone(),
+    };
+    profiles.frozen_package_matches(name, stored, launch, (&launched, &served), frozen)
+}
+
+/// Whether a profile that a release step repinned still matches the revision
+/// frozen into a session that relaunches from its exact frozen digest.
+///
+/// The step moves a profile to a strictly newer official version of the
+/// official package the session was launched from. When that version does not
+/// adopt the session (another integration, reference check or launch
+/// contract), the session resumes from its frozen digest as it did before the
+/// step. The profile then differs from its frozen revision only in the pin
+/// keys, so it matches when putting the frozen pin back reproduces the frozen
+/// revision. Any other pin, or any other change, does not match.
+fn repinned_profile_matches_in(
+    profiles: &ProfileRegistry,
+    binding: &ResumeBinding,
+    name: &str,
+    definition: &RuntimeDefinition,
+    frozen: &ProfileRevision,
+) -> Result<bool, ProtocolError> {
+    let Some(stored) = binding.launch_binding.binding() else {
+        return Ok(false);
+    };
+    let BindingProvenance::Package {
+        package: frozen_package,
+        package_digest: frozen_digest,
+    } = &stored.provenance
+    else {
+        return Ok(false);
+    };
+    if definition.binding() != stored || binding.program.is_empty() {
+        return Ok(false);
+    }
+    let ProfilePin::Pinned(current) = profiles.profile_pin(name)? else {
+        return Ok(false);
+    };
+    if !profiles
+        .runtimes()
+        .pins_newer_official(stored, &current.package, &current.digest)
+    {
+        return Ok(false);
+    }
+    let launched = Pin {
+        package: frozen_package.id.clone(),
+        digest: frozen_digest.clone(),
+    };
+    profiles.frozen_package_matches(
         name,
         stored,
-        (&binding.program, &binding.args),
-        (&package.id, package_digest),
+        (binding.program.as_str(), binding.args.as_slice()),
+        (&launched, &current),
         frozen,
     )
 }
@@ -1565,8 +1641,16 @@ pub(super) fn binding_program(binding: &ResumeBinding, definition: &RuntimeDefin
 
 /// Resolves the definition a resume of `binding` launches from: the runtime
 /// its launch pin names, which a package serves only when it is the
-/// adoption of an official alias (`host::adopts`) that honors the frozen
+/// adoption of an official alias (`host::adopts`) or of an older version of
+/// the same official package (`host::adopts_newer`) that honors the frozen
 /// launch.
+///
+/// A newer version adopts the session only when it honors everything the
+/// frozen launch supports (resume, and fork when the frozen spec forks), and,
+/// for a session launched from a host profile, only when that profile now pins
+/// the newer version: a profile still pinned to the frozen digest keeps the
+/// session on it. Otherwise the session resolves its exact digest, as it would
+/// without the newer version.
 ///
 /// The stored binding is never changed here, so a refusal leaves the session
 /// resumable once the runtime is served again.
@@ -1581,12 +1665,62 @@ pub(super) fn binding_program(binding: &ResumeBinding, definition: &RuntimeDefin
 /// and `runtime_incompatible` for a pinned package whose root fails
 /// verification.
 pub(super) fn recovery_definition(
-    runtimes: &host::RuntimeHost,
+    profiles: &ProfileRegistry,
     binding: &ResumeBinding,
 ) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
+    let runtimes = profiles.runtimes();
+    if let Some(adopter) = runtimes.newer_adopter(&binding.agent_base, &binding.launch_binding) {
+        if newer_adoption_holds(profiles, binding, &adopter) {
+            return Ok(adopter);
+        }
+    }
     let definition = runtimes.resolve_pinned(&binding.agent_base, &binding.launch_binding)?;
     recovery_contract(binding, &definition, false)?;
     Ok(definition)
+}
+
+/// Whether the newer package version `adopter` may serve `binding`'s relaunch:
+/// it honors the frozen resume, and the frozen fork when there is one, and a
+/// host profile the session was launched from pins `adopter`.
+fn newer_adoption_holds(
+    profiles: &ProfileRegistry,
+    binding: &ResumeBinding,
+    adopter: &RuntimeDefinition,
+) -> bool {
+    let forks = binding
+        .native_launch
+        .as_ref()
+        .is_some_and(NativeSessionLaunch::supports_fork);
+    if recovery_contract(binding, adopter, false).is_err()
+        || (forks && recovery_contract(binding, adopter, true).is_err())
+    {
+        return false;
+    }
+    let BindingProvenance::Package {
+        package,
+        package_digest,
+    } = &adopter.binding().provenance
+    else {
+        return false;
+    };
+    match profiles.profile_pin(&binding.agent) {
+        // A bare runtime session: the agent name is the runtime id and no
+        // profile revision was frozen.
+        Ok(ProfilePin::Absent) => binding.profile_revision.is_none(),
+        Ok(ProfilePin::Pinned(pin)) => pin.package == package.id && &pin.digest == package_digest,
+        Ok(ProfilePin::Unpinned) => false,
+        // The exact-digest resolution and the profile check report the profile
+        // error themselves.
+        Err(error) => {
+            tracing::debug!(
+                session_id = %binding.session_id,
+                agent = %binding.agent,
+                error_code = %error.code,
+                "the session's host profile cannot be read, so a newer package does not adopt it"
+            );
+            false
+        }
+    }
 }
 
 /// Checks that `definition` honors the launch `binding` froze for a resume,

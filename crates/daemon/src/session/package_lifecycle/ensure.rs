@@ -11,22 +11,25 @@
 
 // Rust guideline compliant 2026-10-14
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use package::catalog_state::CatalogState;
-use package::registry::{RegistryState, RetainedDigests};
+use package::registry::{PackageSource, RegistryState, RetainedDigests};
 use package::verify::VerifyError;
 use package::{PackageDigest, VerifiedCatalog, MAX_CATALOG_BYTES};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Gap, IntegrationAction, PackageAction, PackageStatus,
-    ProfileAction, ProfileStatus, Refusal, UseReason, CODE_GAP_AGENT_NOT_ON_PATH,
+    ProfileAction, ProfileStatus, Refusal, SelectedPackage, UseReason, CODE_GAP_AGENT_NOT_ON_PATH,
     CODE_GAP_CONFIG_HOME_MISSING, CODE_GAP_CONFIG_HOME_SYMLINK, CODE_GAP_SERVED_BY_OTHER_PACKAGE,
     CODE_PACKAGE_ARCHIVE_INVALID, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
-    CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE,
-    ENSURE_REPORT_VERSION,
+    CODE_PINNED_TARGET_NOT_OFFICIAL, CODE_PINNED_TO_NEWER_VERSION,
+    CODE_PINNED_TO_NON_OFFICIAL_PACKAGE, CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_TO_SAME_VERSION,
+    CODE_PINNED_VERSION_UNKNOWN, CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE,
+    CODE_SERVICE_CONFIG_UNREADABLE, ENSURE_REPORT_VERSION,
 };
 use pohunek_worker_protocol::BaseEnv;
 use protocol::{
@@ -46,7 +49,7 @@ use super::{
     unix_now, Context, HostTrustAnchor, InstallPlan, Prepared,
 };
 use crate::agent::host::{
-    is_reserved, PackageRejection, PackageStore, RuntimeDefinition, RuntimeHost,
+    is_reserved, version_order, PackageRejection, PackageStore, RuntimeDefinition, RuntimeHost,
 };
 use crate::agent::{apply_pin, parse_head, Pin, ProfileRegistry, ValidatedLaunchProgram};
 use crate::catalog_anchor::CatalogTrust;
@@ -153,6 +156,9 @@ struct Planned {
     digest: PackageDigest,
     definition: RuntimeDefinition,
     action: Action,
+    /// The newer official package the registry selects, which installing and
+    /// selecting this release package replaces.
+    replaces_newer: Option<SelectedPackage>,
 }
 
 /// One host profile over an official runtime that pins no package.
@@ -162,13 +168,32 @@ struct Unpinned {
     text: String,
 }
 
-/// A host profile to pin to the package planned for its base runtime.
+/// One host profile over an official runtime that pins a package.
+struct Pinned {
+    name: String,
+    base: RuntimeId,
+    pin: Pin,
+    text: String,
+}
+
+/// The package pin a repin moves a profile off.
+struct Previous {
+    digest: PackageDigest,
+    version: String,
+}
+
+/// A host profile to pin to the package planned for its base runtime: an
+/// unpinned profile, or a pinned one that moves from an older official version.
 struct Bind {
     name: String,
     base: RuntimeId,
     digest: PackageDigest,
+    /// Version of the planned package.
+    version: String,
     /// The profile text with its package pin, as the apply writes it.
     text: String,
+    /// The pin a repin moves the profile off; `None` for an unpinned profile.
+    previous: Option<Previous>,
 }
 
 /// The official runtimes the host uses, with the reasons, in id order.
@@ -209,6 +234,7 @@ struct OfficialProfile {
 struct Gathered {
     uses: Uses,
     unpinned: Vec<Unpinned>,
+    pinned: Vec<Pinned>,
     /// Every host profile over an official runtime, pinned or not.
     official: Vec<OfficialProfile>,
 }
@@ -457,10 +483,10 @@ impl Computed {
             .iter()
             .map(|plan| package_action(plan, false))
             .collect();
-        report.profiles = binds
-            .iter()
-            .map(|bind| profile_action(bind, ProfileStatus::Bind))
-            .collect();
+        // The kept profiles are already in the report, as the planning found them.
+        report
+            .profiles
+            .extend(binds.iter().map(|bind| profile_action(bind, false)));
         report.finish()
     }
 }
@@ -523,6 +549,7 @@ fn compute(inputs: &EnsureInputs, detect: bool) -> Result<Computed, EnsureError>
     let Gathered {
         mut uses,
         unpinned,
+        pinned,
         official,
     } = gather(inputs, launch, &profiles, &mut report)?;
     let base = launch
@@ -547,6 +574,7 @@ fn compute(inputs: &EnsureInputs, detect: bool) -> Result<Computed, EnsureError>
         &plan,
         &inputs.store_path,
         &unpinned,
+        &pinned,
         &planned,
         &mut report,
     )?;
@@ -574,6 +602,7 @@ fn gather(
 ) -> Result<Gathered, EnsureError> {
     let mut uses = Uses::default();
     let mut unpinned = Vec::new();
+    let mut pinned = Vec::new();
     // Every profile over an official base, pinned or not, with its base.
     let mut official_profiles: Vec<OfficialProfile> = Vec::new();
     for (name, text) in profiles.scanned_texts().map_err(EnsureError::Profiles)? {
@@ -620,12 +649,18 @@ fn gather(
             base: head.base.clone(),
             digest: head.pin().map(|pin| pin.digest),
         });
-        if head.pin().is_none() {
-            unpinned.push(Unpinned {
+        match head.pin() {
+            None => unpinned.push(Unpinned {
                 name,
                 base: head.base,
                 text: source,
-            });
+            }),
+            Some(pin) => pinned.push(Pinned {
+                name,
+                base: head.base,
+                pin,
+                text: source,
+            }),
         }
     }
     let homes = integration_homes(profiles, launch)?;
@@ -648,6 +683,7 @@ fn gather(
     Ok(Gathered {
         uses,
         unpinned,
+        pinned,
         official: official_profiles,
     })
 }
@@ -814,9 +850,7 @@ fn apply(
                 code: "profile_not_bound".to_owned(),
             });
         }
-        report
-            .profiles
-            .push(profile_action(&bind, ProfileStatus::Bound));
+        report.profiles.push(profile_action(&bind, true));
     }
     Ok(())
 }
@@ -1061,6 +1095,7 @@ fn plan_installed(
         digest,
         definition: (*definition).clone(),
         action: Action::Kept,
+        replaces_newer: None,
     })
 }
 
@@ -1147,6 +1182,7 @@ fn plan_runtime(
     let identity = prepared.identity.clone();
     let digest = prepared.digest.clone();
     let definition = prepared.definition.clone();
+    let replaces_newer = replaces_newer(plan, &prepared);
     let action = if matches!(health, Health::Present) {
         Action::Present
     } else {
@@ -1159,6 +1195,7 @@ fn plan_runtime(
         digest,
         definition,
         action,
+        replaces_newer,
     }))
 }
 
@@ -1526,27 +1563,42 @@ fn health_of(plan: &PlanInputs<'_>, digest: &PackageDigest) -> Health {
     }
 }
 
-/// Plans the pins of the unpinned profiles, validating each rewritten profile
-/// against the planned package definition the way a bind does, and running the
-/// coexistence check a bind runs.
+/// Plans the pins of the host profiles over the planned runtimes.
+///
+/// An unpinned profile is bound to its planned package. A profile pinned to an
+/// older official version of that package is repinned to it, and any other
+/// pinned profile is kept and reported with its reason. Each rewritten profile
+/// is validated against the planned definition the way a bind validates it,
+/// and runs the coexistence check a bind runs.
 fn plan_binds(
     profiles: &ProfileRegistry,
     plan: &PlanInputs<'_>,
     store_path: &Path,
     unpinned: &[Unpinned],
+    pinned: &[Pinned],
     planned: &[Planned],
     report: &mut Report,
 ) -> Result<Vec<Bind>, EnsureError> {
-    let targets: Vec<&Unpinned> = unpinned
+    let mut repins = Vec::new();
+    for profile in pinned {
+        match classify_pin(plan, profile, planned) {
+            Pinning::Untouched => {}
+            Pinning::Keep(action) => report.profiles.push(action),
+            Pinning::Repin { entry, previous } => repins.push((profile, entry, previous)),
+        }
+    }
+    let targets: Vec<&str> = unpinned
         .iter()
         .filter(|profile| planned.iter().any(|entry| entry.runtime == profile.base))
+        .map(|profile| profile.name.as_str())
+        .chain(repins.iter().map(|(profile, _, _)| profile.name.as_str()))
         .collect();
     // The apply rewrites the agents directory through the owner-safety check
     // this opens it with, so a directory that fails it is refused here.
     if !targets.is_empty() && profiles.open_for_bind().is_err() {
-        for target in targets {
+        for name in targets {
             report.refuse(
-                &target.name,
+                name,
                 CODE_PROFILE_NOT_MIGRATABLE,
                 "the agent profile directory cannot be opened for a rewrite; fix its owner and \
                  permissions, then run the upgrade again",
@@ -1559,52 +1611,171 @@ fn plan_binds(
         let Some(entry) = planned.iter().find(|entry| entry.runtime == profile.base) else {
             continue;
         };
-        // The reference this profile replaces is not a reference to compare
-        // with, so the set is the one the apply's bind uses.
-        let retained = retained_pins(store_path, profiles, Some(&profile.name))?;
-        if let Some(kind) = bind_coexistence(plan, entry, &retained) {
-            report.refuse(
-                &profile.name,
-                &ProtocolError::from(kind).code,
-                "an installed version of this package is not compatible with a retained version",
-            );
-            continue;
-        }
-        let pin = Pin {
-            package: entry.identity.id.clone(),
-            digest: entry.digest.clone(),
-        };
-        let rewritten = match apply_pin(&profile.text, &pin) {
-            Ok(rewritten) => rewritten,
-            Err(_detail) => {
-                report.refuse(
-                    &profile.name,
-                    CODE_PROFILE_NOT_MIGRATABLE,
-                    "the profile cannot be rewritten with its package pin",
-                );
-                continue;
-            }
-        };
-        if let Err(error) = profiles.validate_candidate(
+        let Some(text) = rewrite_pin(
+            profiles,
+            plan,
+            store_path,
             &profile.name,
-            &rewritten,
-            &Arc::new(entry.definition.clone()),
-        ) {
-            report.refuse(
-                &profile.name,
-                CODE_PROFILE_NOT_MIGRATABLE,
-                &format!("the pinned profile is not accepted: {}", error.code),
-            );
+            &profile.text,
+            entry,
+            report,
+        )?
+        else {
             continue;
-        }
-        binds.push(Bind {
-            name: profile.name.clone(),
-            base: profile.base.clone(),
-            digest: entry.digest.clone(),
-            text: rewritten,
-        });
+        };
+        binds.push(bind_of(&profile.name, entry, text, None));
+    }
+    for (profile, entry, previous) in repins {
+        let Some(text) = rewrite_pin(
+            profiles,
+            plan,
+            store_path,
+            &profile.name,
+            &profile.text,
+            entry,
+            report,
+        )?
+        else {
+            continue;
+        };
+        binds.push(bind_of(&profile.name, entry, text, Some(previous)));
     }
     Ok(binds)
+}
+
+/// The bind of the profile `name` to the planned package `entry`.
+fn bind_of(name: &str, entry: &Planned, text: String, previous: Option<Previous>) -> Bind {
+    Bind {
+        name: name.to_owned(),
+        base: entry.runtime.clone(),
+        digest: entry.digest.clone(),
+        version: entry.identity.version.as_str().to_owned(),
+        text,
+        previous,
+    }
+}
+
+/// What the plan does with a host profile that is pinned to a package.
+enum Pinning<'a> {
+    /// The profile already has the planned package, or no package is planned
+    /// for its base runtime, or the release package is not planned as one to
+    /// move to; it has no entry.
+    Untouched,
+    /// The profile moves to the planned package `entry`, off `previous`.
+    Repin {
+        entry: &'a Planned,
+        previous: Previous,
+    },
+    /// The profile keeps its pin, and the action names the reason.
+    Keep(ProfileAction),
+}
+
+/// Judges a pinned profile against the package planned for its base runtime.
+///
+/// A repin needs the registry record of the profile's digest to be an official
+/// package with the planned package's id, and the planned package to be a
+/// strictly newer official version of it. Every other pin is kept, and the
+/// first failing check is the reason. Nothing here refuses the plan.
+fn classify_pin<'a>(
+    plan: &PlanInputs<'_>,
+    profile: &Pinned,
+    planned: &'a [Planned],
+) -> Pinning<'a> {
+    let Some(entry) = planned.iter().find(|entry| entry.runtime == profile.base) else {
+        return Pinning::Untouched;
+    };
+    // Without a usable release catalog the planned package is the installed one
+    // that already serves the runtime, not a release package to move to.
+    if matches!(entry.action, Action::Kept) || entry.digest == profile.pin.digest {
+        return Pinning::Untouched;
+    }
+    let keep = |reason: &str, previous_version: Option<&str>| {
+        Pinning::Keep(kept_action(profile, previous_version, reason))
+    };
+    let Some(record) = plan
+        .state
+        .and_then(|state| state.package(&profile.pin.digest))
+    else {
+        return keep(CODE_PINNED_VERSION_UNKNOWN, None);
+    };
+    let version = record.identity().version.as_str().to_owned();
+    if record.source() != PackageSource::Official {
+        return keep(CODE_PINNED_TO_NON_OFFICIAL_PACKAGE, Some(&version));
+    }
+    // The profile names its package as well as the digest; a pin whose
+    // package key and digest record disagree is anomalous and kept.
+    if record.identity().id != entry.identity.id || profile.pin.package != entry.identity.id {
+        return keep(CODE_PINNED_TO_OTHER_PACKAGE, Some(&version));
+    }
+    let target_is_official = plan
+        .state
+        .and_then(|state| state.package(&entry.digest))
+        .is_none_or(|target| target.source() == PackageSource::Official);
+    if !target_is_official {
+        return keep(CODE_PINNED_TARGET_NOT_OFFICIAL, Some(&version));
+    }
+    match version_order(&record.identity().version, &entry.identity.version) {
+        Some(Ordering::Less) => Pinning::Repin {
+            entry,
+            previous: Previous {
+                digest: profile.pin.digest.clone(),
+                version,
+            },
+        },
+        Some(Ordering::Greater) => keep(CODE_PINNED_TO_NEWER_VERSION, Some(&version)),
+        Some(Ordering::Equal) => keep(CODE_PINNED_TO_SAME_VERSION, Some(&version)),
+        None => keep(CODE_PINNED_VERSION_UNKNOWN, Some(&version)),
+    }
+}
+
+/// Rewrites the profile `name` with its pin to the planned package `entry`, and
+/// validates it the way a bind does. `None` after a refusal of the plan.
+fn rewrite_pin(
+    profiles: &ProfileRegistry,
+    plan: &PlanInputs<'_>,
+    store_path: &Path,
+    name: &str,
+    text: &str,
+    entry: &Planned,
+    report: &mut Report,
+) -> Result<Option<String>, EnsureError> {
+    // The reference this profile replaces is not a reference to compare
+    // with, so the set is the one the apply's bind uses.
+    let retained = retained_pins(store_path, profiles, Some(name))?;
+    if let Some(kind) = bind_coexistence(plan, entry, &retained) {
+        report.refuse(
+            name,
+            &ProtocolError::from(kind).code,
+            "an installed version of this package is not compatible with a retained version",
+        );
+        return Ok(None);
+    }
+    let pin = Pin {
+        package: entry.identity.id.clone(),
+        digest: entry.digest.clone(),
+    };
+    let rewritten = match apply_pin(text, &pin) {
+        Ok(rewritten) => rewritten,
+        Err(_detail) => {
+            report.refuse(
+                name,
+                CODE_PROFILE_NOT_MIGRATABLE,
+                "the profile cannot be rewritten with its package pin",
+            );
+            return Ok(None);
+        }
+    };
+    if let Err(error) =
+        profiles.validate_candidate(name, &rewritten, &Arc::new(entry.definition.clone()))
+    {
+        report.refuse(
+            name,
+            CODE_PROFILE_NOT_MIGRATABLE,
+            &format!("the pinned profile is not accepted: {}", error.code),
+        );
+        return Ok(None);
+    }
+    Ok(Some(rewritten))
 }
 
 /// The coexistence refusal a bind of `entry` meets, as `ensure_coexists` judges
@@ -1748,13 +1919,44 @@ fn install(
     Ok(())
 }
 
-/// The profile status of one planned or applied pin.
-fn profile_action(bind: &Bind, status: ProfileStatus) -> ProfileAction {
+/// The entry of one planned or applied pin: a bind, or a repin when the profile
+/// moves off a previous pin.
+fn profile_action(bind: &Bind, applied: bool) -> ProfileAction {
+    let status = match (bind.previous.is_some(), applied) {
+        (false, false) => ProfileStatus::Bind,
+        (false, true) => ProfileStatus::Bound,
+        (true, false) => ProfileStatus::Repin,
+        (true, true) => ProfileStatus::Repinned,
+    };
     ProfileAction {
         name: bind.name.clone(),
         base: bind.base.as_str().to_owned(),
         digest: bind.digest.as_str().to_owned(),
         status,
+        previous_digest: bind
+            .previous
+            .as_ref()
+            .map(|previous| previous.digest.as_str().to_owned()),
+        previous_version: bind
+            .previous
+            .as_ref()
+            .map(|previous| previous.version.clone()),
+        version: Some(bind.version.clone()),
+        kept_reason: None,
+    }
+}
+
+/// The entry of a profile that keeps its pin, with the reason it is kept.
+fn kept_action(profile: &Pinned, previous_version: Option<&str>, reason: &str) -> ProfileAction {
+    ProfileAction {
+        name: profile.name.clone(),
+        base: profile.base.as_str().to_owned(),
+        digest: profile.pin.digest.as_str().to_owned(),
+        status: ProfileStatus::Kept,
+        previous_digest: None,
+        previous_version: previous_version.map(str::to_owned),
+        version: None,
+        kept_reason: Some(reason.to_owned()),
     }
 }
 
@@ -1773,7 +1975,29 @@ fn package_action(plan: &Planned, applied: bool) -> PackageAction {
         digest: plan.digest.as_str().to_owned(),
         status,
         reasons: plan.reasons.clone(),
+        replaces_newer: plan.replaces_newer.clone(),
     }
+}
+
+/// The official package the registry selects over `prepared` when that package
+/// is a strictly newer version of the same package. Installing and selecting
+/// `prepared` replaces it.
+fn replaces_newer(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<SelectedPackage> {
+    let state = plan.state?;
+    let selected = state.selected(&prepared.identity.id)?;
+    if selected == &prepared.digest {
+        return None;
+    }
+    let record = state.package(selected)?;
+    if record.source() != PackageSource::Official {
+        return None;
+    }
+    (version_order(&record.identity().version, &prepared.identity.version)
+        == Some(Ordering::Greater))
+    .then(|| SelectedPackage {
+        digest: selected.as_str().to_owned(),
+        version: record.identity().version.as_str().to_owned(),
+    })
 }
 
 /// The base environment the integration status reads the config homes with:

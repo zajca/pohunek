@@ -275,6 +275,11 @@ pub(crate) enum ReleaseAction {
         /// Official runtime id whose package goes into the tree; repeat per runtime.
         #[arg(long = "runtime", value_name = "ID", required = true)]
         runtime: Vec<String>,
+        /// Existing empty directory that also receives a catalog, signed by the
+        /// same key, of each runtime's package at a lower version than any
+        /// release ships.
+        #[arg(long, value_name = "DIR")]
+        downgrade: Option<PathBuf>,
     },
     /// Verify a release bundle directory against its inventory.
     ///
@@ -340,8 +345,13 @@ pub(crate) fn run(action: ReleaseAction, root: &Path) -> Result<(), XtaskError> 
                 summary.files, summary.sequence
             );
         }
-        ReleaseAction::TestRuntime { output, runtime } => {
-            let summary = crate::test_runtime::write(root, &output, &runtime)?;
+        ReleaseAction::TestRuntime {
+            output,
+            runtime,
+            downgrade,
+        } => {
+            let summary =
+                crate::test_runtime::write(root, &output, &runtime, downgrade.as_deref())?;
             println!(
                 "release test-runtime ok: {} runtimes written to {}",
                 summary.runtimes.len(),

@@ -129,7 +129,10 @@ pins. The upgrade installs and pins them in the same run, so a host on an older
 release needs no manual package migration: one `pohunek service upgrade` moves
 its built-in Claude Code and Codex profiles to the packages, adopts its live
 sessions, leaves its stopped sessions resumable (a resume relaunches them from
-the package digest), and reinstalls the hooks. `--accept-runtime-loss` is only
+the package digest), and reinstalls the hooks. A host already on official
+packages gets the release's versions: profiles pinned to an older version of the
+same official package are repinned, and its stopped sessions move to the newer
+version on their next resume or fork, see the update runbook. `--accept-runtime-loss` is only
 for a session the new daemon cannot adopt, after you have reviewed the session
 list; it never overrides a plan the release cannot apply
 (`service_upgrade_runtimes_refused`, before anything is stopped) or a store the
@@ -349,10 +352,18 @@ installed.
 To prepare first, install with `--no-enable` and run
 `pohunek plugin enable <package-id>` when you are ready to switch. `pohunek
 plugin disable` or `pohunek plugin uninstall` leaves `claude`, `codex` or
-`hermes` unserved. The upgrade installs the release's package only for a runtime
-no installed package serves; an installed package keeps serving until you run
-`pohunek plugin update <package> runtime/packages/<runtime>.tar.zst
---catalog runtime/runtime-catalog.json` from the new release's archive. A plain
+`hermes` unserved. The upgrade installs and selects the release's package for
+every official runtime the host uses. It repins the host profiles pinned to an
+older version of that package and lists the pinned profiles it keeps. Outside
+an upgrade, `pohunek plugin update <package> runtime/packages/<runtime>.tar.zst
+--catalog runtime/runtime-catalog.json` installs and selects a newer release's
+version. It refuses a version lower than the selected official one
+(`plugin_update_downgrade`), and a version that cannot be ordered against it
+(`plugin_update_version_unordered`); `pohunek plugin select` rolls back on
+purpose. When
+the selected version is newer than the release's, for example after a
+`plugin update` from a later archive, the upgrade plan says that the upgrade
+re-selects the release's version. Select the newer one again afterwards. A plain
 `install` of another version leaves it installed but unselected.
 The trust model and the package classes are described
 in [the architecture](architecture.md#runtime-packages-and-trust) and the

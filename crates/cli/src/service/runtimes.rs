@@ -21,8 +21,8 @@ use std::time::Duration;
 use pohunek_paths::DAEMON_EXECUTABLE_NAME;
 use pohunek_platform::filesystem::{AdvisoryLock, EntryKind, FsError, TrustedDir};
 use pohunek_service_config::runtimes::{
-    CatalogStatus, EnsureReport, IntegrationAction, PackageStatus, ProfileStatus, DETECT_FLAG,
-    DRY_RUN_FLAG, ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG,
+    CatalogStatus, EnsureReport, IntegrationAction, PackageAction, PackageStatus, ProfileAction,
+    ProfileStatus, DETECT_FLAG, DRY_RUN_FLAG, ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG,
 };
 use tokio::io::AsyncReadExt as _;
 
@@ -302,7 +302,7 @@ pub fn needs_apply(plan: &EnsureReport) -> bool {
         || plan
             .profiles
             .iter()
-            .any(|profile| profile.status == ProfileStatus::Bind)
+            .any(|profile| profile.status.is_pending())
         || plan.catalog == CatalogStatus::Record
 }
 
@@ -339,7 +339,7 @@ pub fn check_applied(dir: &Path, report: &EnsureReport) -> Result<(), Error> {
             report
                 .profiles
                 .iter()
-                .filter(|profile| profile.status == ProfileStatus::Bind)
+                .filter(|profile| profile.status.is_pending())
                 .map(|profile| profile.name.clone()),
         )
         .collect::<Vec<_>>();
@@ -353,6 +353,70 @@ pub fn check_applied(dir: &Path, report: &EnsureReport) -> Result<(), Error> {
         binary: dir.join(DAEMON_EXECUTABLE_NAME),
         detail: format!("the apply left {} undone", undone.join(", ")),
     })
+}
+
+/// The next step a kept profile is shown with, by its reason. The step never
+/// moves a kept profile. A profile pinned to a newer version keeps it on
+/// purpose, and a migrate without a digest would move it to the selected,
+/// older version, so its step points to the package warning that names the
+/// reselection of the newer version.
+fn kept_next_step(profile: &ProfileAction) -> String {
+    match profile.kept_reason.as_deref() {
+        Some(pohunek_service_config::runtimes::CODE_PINNED_TO_NEWER_VERSION) => {
+            "it keeps the newer version; do not migrate it, and select that version again for \
+             fresh launches as the package's warning names"
+                .to_owned()
+        }
+        _ => format!(
+            "to move it, review and run `pohunek plugin profile migrate {} --digest <digest>`",
+            profile.name
+        ),
+    }
+}
+
+/// The detail a profile line carries after its status: the version and digest
+/// a repin moves the profile from and to, or the reason a kept profile keeps
+/// its pin. `None` for a bind, which needs no detail.
+#[must_use]
+pub fn profile_detail(profile: &ProfileAction) -> Option<String> {
+    match profile.status {
+        ProfileStatus::Repin | ProfileStatus::Repinned => Some(format!(
+            "moves from {} ({}) to {} ({})",
+            profile
+                .previous_version
+                .as_deref()
+                .unwrap_or("an unknown version"),
+            profile
+                .previous_digest
+                .as_deref()
+                .unwrap_or("an unknown digest"),
+            profile.version.as_deref().unwrap_or("an unknown version"),
+            profile.digest
+        )),
+        ProfileStatus::Kept => Some(format!(
+            "kept at {} ({}), reason {}; {}",
+            profile
+                .previous_version
+                .as_deref()
+                .unwrap_or("an unknown version"),
+            profile.digest,
+            profile.kept_reason.as_deref().unwrap_or("unknown"),
+            kept_next_step(profile),
+        )),
+        ProfileStatus::Bind | ProfileStatus::Bound => None,
+    }
+}
+
+/// The warning a package carries when the registry selects a newer official
+/// version than the release package the step installs and selects. `None`
+/// when nothing is replaced.
+#[must_use]
+pub fn replaces_newer_warning(package: &PackageAction) -> Option<String> {
+    let newer = package.replaces_newer.as_ref()?;
+    Some(format!(
+        "warning: upgrade re-selects the bundled {} {} over the selected newer {}; select it again with `pohunek plugin select {} --digest {}` afterwards",
+        package.package, package.version, newer.version, package.package, newer.digest
+    ))
 }
 
 /// One state file the step may change, read before the step.
@@ -754,7 +818,10 @@ mod tests {
             .await
             .expect_err("the version is refused"),
         );
-        assert!(detail.contains("expected 1"), "{detail}");
+        assert!(
+            detail.contains(&format!("expected {ENSURE_REPORT_VERSION}")),
+            "{detail}"
+        );
     }
 
     #[tokio::test]

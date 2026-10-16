@@ -597,6 +597,10 @@ the upgrade is not what ends it.
   release is adoptable when the official package that serves its runtime id is
   installed and adopts it, live or stopped (its pin names that package id; the
   package version may differ). Resume and fork then run through the package.
+  A stopped session launched from an official package is
+  `adoptable_by_newer_package` when a strictly newer version of the same
+  package adopts it. The `detail` names both versions. See "Stopped sessions on
+  an older official package version" below.
 - `would lose recovery`: the worker is adopted but the session cannot resume
   natively (`native_recovery_unmappable`, `resume_record_unreadable`,
   `native_recovery_unverified`, `runtime_source_not_served`). A binding that
@@ -738,10 +742,79 @@ The manual migration below remains the fallback for a host that cannot run the
 upgrade's runtime step, for example to move its sessions before an upgrade.
 
 A host whose previous release installed the packages itself (its own `service
-install` pinned its profiles to them) keeps those pins. The plan then reports the
-head's package as `present` when its digest is the one the host serves, and as
-`install` otherwise; no profile is planned, and the sessions and profiles stay on
-their pinned package until `plugin profile migrate` moves a profile.
+install` pinned its profiles to them) gets the release's packages too. The plan
+reports the release's package as `present` when its digest is the one the host
+serves, and as `install` otherwise. A host profile pinned to an older version of
+the same official package is planned as `repin` and pinned to the release's
+package by the apply (`repinned`). Its entry names the previous and the new
+version and digest. A pinned profile the step does not move is listed as
+`kept`, with a reason:
+- `pinned_to_newer_version`: the profile's package is newer than the release's;
+- `pinned_to_non_official_package`: a local or linked package;
+- `pinned_to_other_package`: another package id;
+- `pinned_version_unknown`: the pinned digest is not installed, or its version
+  is not a semantic version;
+- `pinned_to_same_version`: another digest of the release's version;
+- `pinned_target_not_official`: the release's package is recorded as not
+  official on this host.
+
+In `--json`, a `repin` entry carries `previous_digest`, `previous_version` and
+`version`; a `kept` entry carries `kept_reason`, its pinned `digest` and, when
+the registry records it, `previous_version`. A package entry whose selected
+version is newer carries `replaces_newer` with that version's `digest` and
+`version`. The report layout is `report_version` 2.
+
+A kept profile changes nothing and does not refuse the plan. Move it with
+`pohunek plugin profile migrate <name> --digest <digest> --yes` when you want to.
+
+When the selected official package of a runtime is newer than the release's
+package (installed with `plugin update` from a later archive), the plan says
+that the upgrade re-selects the release's lower version. The upgrade still does
+that. Select the newer version again afterwards with `pohunek plugin select
+<package> --digest <digest>`. Profiles pinned to the newer version keep their
+pin.
+
+### Stopped sessions on an older official package version
+
+A stopped session launched from an official package is pinned to that package's
+digest. On resume or fork, a strictly newer version of the same package adopts
+it, so a release that widens a package's supported agent range also reaches
+sessions launched before it. All of these must hold:
+- both versions are official (recorded from the signed catalog) and serve the
+  same runtime id under the same package id. A package installed by explicit
+  digest or linked never adopts a session, even under the official package id;
+- the newer version is selected and enabled, and its root verifies;
+- the older version is still installed, and the newer one declares the same
+  integration handler, hook schema and native reference check;
+- the newer version honors the launch the session froze: the same reference
+  kind, the same assigned reference strategy, and fork support when the frozen
+  launch forks;
+- for a session launched from a host profile, the profile now pins the newer
+  version (the upgrade repins it, see above). A profile still pinned to the
+  older version keeps the session on it.
+
+This covers Pi too. `service upgrade` does not repin Pi profiles, because the
+upgrade's runtime step manages only `claude`, `codex` and `hermes`. After
+`pohunek plugin update pohunek.runtime.pi <archive> --catalog <catalog> --yes`,
+move a Pi profile with `pohunek plugin profile migrate <name> --yes`. Its
+stopped sessions are then adopted on their next resume or fork. A session
+launched as the bare `pi` runtime follows the selected version.
+
+A newer version that fails one of these checks does not break the session.
+When the upgrade repinned its profile to that version, the session still
+resumes from its frozen digest, as before the upgrade. The profile counts as
+unchanged when only its pin moved to a strictly newer official version of the
+same package. The preflight reports the session as `adoptable`.
+
+The relaunch keeps the frozen program and arguments. It probes the agent with
+the newer version's version probe and records the newer digest as the session's
+pin. A lower version never adopts a session, and neither does another digest of
+the same version (the registry holds one digest per version). A live session is
+never adopted: it keeps being observed through the digest it runs.
+
+"Official" means recorded from a catalog that the host's single trust anchor
+verified. The registry does not record which anchor root or key authorized a
+package ([#1200](https://github.com/zajca/pohunek/issues/1200)).
 
 The apply is judged once more. After it, the new release's preflight judges the
 live sessions again, with the same decision as before the apply, because the
@@ -839,11 +912,16 @@ the preflight reports them as `adoptable`:
 4. Run `pohunek service check` with the new release's binaries: the sessions
    launched from the package are `adoptable`.
 
-After the upgrade the package version the previous release installed keeps
-serving the sessions and profiles pinned to it. `pohunek plugin update
-<package> <archive> --catalog <catalog> --yes` with the new release's archive
-installs and selects its version for new launches; a profile moves to it only
-through `plugin profile migrate`. The release upgrade test
+A later `service upgrade` installs the newer release's package. It repins the
+profiles pinned to an older version of it, and stopped sessions move to the
+newer version on their next resume or fork (see "Official runtime packages
+during an upgrade"). Outside an upgrade, `pohunek plugin update <package>
+<archive> --catalog <catalog> --yes` with a newer release's archive installs and
+selects its version for new launches. A profile moves to it only through
+`plugin profile migrate`. `plugin update` refuses a lower version than the
+selected one (`plugin_update_downgrade`) and a version that cannot be ordered
+(`plugin_update_version_unordered`); `plugin select` is the explicit
+rollback. The release upgrade test
 (`scripts/upgrade-test`, `crates/cli/tests/release_upgrade.rs`) runs the one-step
 path for Claude and Codex from the previous release to the build under test.
 

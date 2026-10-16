@@ -343,6 +343,7 @@ fn package(status: PackageStatus) -> PackageAction {
         digest: "de".repeat(32),
         status,
         reasons: vec![UseReason::Profile],
+        replaces_newer: None,
     }
 }
 
@@ -352,6 +353,10 @@ fn profile(status: ProfileStatus) -> ProfileAction {
         base: "claude".to_owned(),
         digest: "de".repeat(32),
         status,
+        previous_digest: None,
+        previous_version: None,
+        version: None,
+        kept_reason: None,
     }
 }
 

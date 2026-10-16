@@ -276,6 +276,11 @@ const RULES: &[Rule] = &[
         Effect::Packages(&["pohunek-daemon"]),
         "Claude Code package descriptor and detection manifest embedded by the daemon's in-crate official package fixture and built into the package its integration tests install",
     ),
+    rule(
+        Pattern::Dir("runtime-packages/pi"),
+        Effect::Packages(&["pohunek-daemon"]),
+        "Pi package descriptor and detection manifest embedded by the daemon's in-crate official package fixture and built into the packages its newer-version adoption scenarios install",
+    ),
     reminding(
         Pattern::Dir("scripts"),
         Effect::Packages(&["pohunek-cli"]),
@@ -1103,7 +1108,10 @@ mod tests {
                 "runtime-packages/claude/runtime.toml",
                 &["pohunek-cli", "pohunek-daemon"],
             ),
-            ("runtime-packages/pi/runtime.toml", &["pohunek-cli"]),
+            (
+                "runtime-packages/pi/runtime.toml",
+                &["pohunek-cli", "pohunek-daemon"],
+            ),
             (
                 "runtime-packages/hermes/runtime.toml",
                 &["pohunek-cli", "pohunek-daemon", "xtask"],

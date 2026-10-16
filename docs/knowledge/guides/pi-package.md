@@ -187,6 +187,15 @@ reserved, so either way of installing serves it.
   `PI_CODING_AGENT_SESSION_DIR` (absolute) in the host profile's `[env]`, or
   set `PI_CODING_AGENT_DIR` to move the whole agent directory; do not pass
   `--session-dir` in profile `args`.
+- A stopped session moves to a newer official Pi package version on resume or
+  fork when three things hold. The newer version keeps the session's native
+  reference check and its `--session-id` assignment. A session launched from a
+  profile also needs the profile to pin the newer version
+  (`pohunek plugin profile migrate <name> --yes`; `service upgrade` does not
+  repin Pi profiles). A session launched as the bare `pi` runtime follows the
+  selected version. The relaunch is then pinned to the newer digest. A
+  version whose check or assignment differs, such as 1.0.2 over a session from
+  1.0.1, keeps the session on its own digest.
 - Pin a profile to the installed digest (`pohunek plugin profile migrate`) so a
   later `plugin update` cannot change an existing profile's package. A profile
   `[env]` may set `PI_OFFLINE`, `PI_SKIP_VERSION_CHECK` and `PI_TELEMETRY`; never
