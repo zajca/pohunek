@@ -355,10 +355,24 @@ pub fn check_applied(dir: &Path, report: &EnsureReport) -> Result<(), Error> {
     })
 }
 
-/// The next step a kept profile is shown with. The step never moves a kept
-/// profile, so the operator moves it with the profile command.
-const KEPT_PROFILE_NEXT_STEP: &str =
-    "to move it to the selected package, review and run `pohunek plugin profile migrate <name>`";
+/// The next step a kept profile is shown with, by its reason. The step never
+/// moves a kept profile. A profile pinned to a newer version keeps it on
+/// purpose, and a migrate without a digest would move it to the selected,
+/// older version, so its step points to the package warning that names the
+/// reselection of the newer version.
+fn kept_next_step(profile: &ProfileAction) -> String {
+    match profile.kept_reason.as_deref() {
+        Some(pohunek_service_config::runtimes::CODE_PINNED_TO_NEWER_VERSION) => {
+            "it keeps the newer version; do not migrate it, and select that version again for \
+             fresh launches as the package's warning names"
+                .to_owned()
+        }
+        _ => format!(
+            "to move it, review and run `pohunek plugin profile migrate {} --digest <digest>`",
+            profile.name
+        ),
+    }
+}
 
 /// The detail a profile line carries after its status: the version and digest
 /// a repin moves the profile from and to, or the reason a kept profile keeps
@@ -380,13 +394,14 @@ pub fn profile_detail(profile: &ProfileAction) -> Option<String> {
             profile.digest
         )),
         ProfileStatus::Kept => Some(format!(
-            "kept at {} ({}), reason {}; {KEPT_PROFILE_NEXT_STEP}",
+            "kept at {} ({}), reason {}; {}",
             profile
                 .previous_version
                 .as_deref()
                 .unwrap_or("an unknown version"),
             profile.digest,
             profile.kept_reason.as_deref().unwrap_or("unknown"),
+            kept_next_step(profile),
         )),
         ProfileStatus::Bind | ProfileStatus::Bound => None,
     }
@@ -399,8 +414,8 @@ pub fn profile_detail(profile: &ProfileAction) -> Option<String> {
 pub fn replaces_newer_warning(package: &PackageAction) -> Option<String> {
     let newer = package.replaces_newer.as_ref()?;
     Some(format!(
-        "warning: upgrade re-selects the bundled {} {} over the selected newer {}; select it again with `pohunek plugin select --digest {}` afterwards",
-        package.package, package.version, newer.version, newer.digest
+        "warning: upgrade re-selects the bundled {} {} over the selected newer {}; select it again with `pohunek plugin select {} --digest {}` afterwards",
+        package.package, package.version, newer.version, package.package, newer.digest
     ))
 }
 
