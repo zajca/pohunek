@@ -541,6 +541,50 @@ impl RuntimeHost {
         }
     }
 
+    /// Whether a host profile pinned to `digest` of package `package` names a
+    /// strictly newer official version of the official package the session
+    /// binding `frozen` was launched from.
+    ///
+    /// Both registry records must be official and of the same package id. A
+    /// release step repins a profile so; a session that the newer version does
+    /// not adopt keeps relaunching from its frozen digest under that profile.
+    #[must_use]
+    pub fn pins_newer_official(
+        &self,
+        frozen: &LaunchBinding,
+        package: &PackageId,
+        digest: &PackageDigest,
+    ) -> bool {
+        let (
+            Some(store),
+            BindingProvenance::Package {
+                package: frozen_package,
+                package_digest: frozen_digest,
+            },
+        ) = (self.package_store(), &frozen.provenance)
+        else {
+            return false;
+        };
+        let Ok(state) = store.registry().state() else {
+            return false;
+        };
+        let official =
+            |record: &package::registry::PackageRecord| record.source() == RecordSource::Official;
+        let (Some(launched), Some(pinned)) = (state.package(frozen_digest), state.package(digest))
+        else {
+            return false;
+        };
+        official(launched)
+            && official(pinned)
+            && launched.identity() == frozen_package
+            && pinned.identity().id == frozen_package.id
+            && *package == frozen_package.id
+            && super::launch::version_order(
+                &launched.identity().version,
+                &pinned.identity().version,
+            ) == Some(std::cmp::Ordering::Less)
+    }
+
     /// The planned definition of exactly `digest` under `identity` for
     /// `runtime_id`, when the planned overlay holds it.
     fn planned_definition(

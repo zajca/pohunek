@@ -1447,7 +1447,8 @@ fn resolve_recovery_agent_in(
 /// for this operation. For a built-in pin ([`host::adopts`]) the profile's pin
 /// keys, if any, name that package. For an older version of the package
 /// ([`host::adopts_newer`]) the profile pins the newer version, and putting
-/// the frozen pin back reproduces the frozen revision.
+/// the frozen pin back reproduces the frozen revision. A session that resolves
+/// its exact frozen digest is matched by [`repinned_profile_matches_in`].
 fn adopted_profile_matches_in(
     profiles: &ProfileRegistry,
     binding: &ResumeBinding,
@@ -1458,7 +1459,10 @@ fn adopted_profile_matches_in(
 ) -> Result<bool, ProtocolError> {
     let built_in = host::adopts(&binding.launch_binding, definition);
     let newer = host::adopts_newer(&binding.launch_binding, definition);
-    if !(built_in || newer) || recovery_contract(binding, definition, fork).is_err() {
+    if !(built_in || newer) {
+        return repinned_profile_matches_in(profiles, binding, name, definition, frozen);
+    }
+    if recovery_contract(binding, definition, fork).is_err() {
         return Ok(false);
     }
     let (
@@ -1503,6 +1507,58 @@ fn adopted_profile_matches_in(
         digest: package_digest.clone(),
     };
     profiles.frozen_package_matches(name, stored, launch, (&launched, &served), frozen)
+}
+
+/// Whether a profile that a release step repinned still matches the revision
+/// frozen into a session that relaunches from its exact frozen digest.
+///
+/// The step moves a profile to a strictly newer official version of the
+/// official package the session was launched from. When that version does not
+/// adopt the session (another integration, reference check or launch
+/// contract), the session resumes from its frozen digest as it did before the
+/// step. The profile then differs from its frozen revision only in the pin
+/// keys, so it matches when putting the frozen pin back reproduces the frozen
+/// revision. Any other pin, or any other change, does not match.
+fn repinned_profile_matches_in(
+    profiles: &ProfileRegistry,
+    binding: &ResumeBinding,
+    name: &str,
+    definition: &RuntimeDefinition,
+    frozen: &ProfileRevision,
+) -> Result<bool, ProtocolError> {
+    let Some(stored) = binding.launch_binding.binding() else {
+        return Ok(false);
+    };
+    let BindingProvenance::Package {
+        package: frozen_package,
+        package_digest: frozen_digest,
+    } = &stored.provenance
+    else {
+        return Ok(false);
+    };
+    if definition.binding() != stored || binding.program.is_empty() {
+        return Ok(false);
+    }
+    let ProfilePin::Pinned(current) = profiles.profile_pin(name)? else {
+        return Ok(false);
+    };
+    if !profiles
+        .runtimes()
+        .pins_newer_official(stored, &current.package, &current.digest)
+    {
+        return Ok(false);
+    }
+    let launched = Pin {
+        package: frozen_package.id.clone(),
+        digest: frozen_digest.clone(),
+    };
+    profiles.frozen_package_matches(
+        name,
+        stored,
+        (binding.program.as_str(), binding.args.as_slice()),
+        (&launched, &current),
+        frozen,
+    )
 }
 
 /// Resolves the host profile `binding` was launched from and checks it against

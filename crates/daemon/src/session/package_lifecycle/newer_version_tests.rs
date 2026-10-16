@@ -200,6 +200,23 @@ struct Stopped {
 /// Installs `launched` at `version`, pins the profile to it, starts a session
 /// whose conversation exists, and stops it.
 async fn stopped_on(tag: &str, kind: &Kind, launched: &Package, version: &str) -> Stopped {
+    stopped_from(tag, kind, launched, Some(version)).await
+}
+
+/// [`stopped_on`] for `launched` installed by its explicit digest, as a local
+/// package that declares the official package id.
+async fn stopped_on_local(tag: &str, kind: &Kind, launched: &Package) -> Stopped {
+    stopped_from(tag, kind, launched, None).await
+}
+
+/// [`stopped_on`], installing `launched` through the catalog at `version`, or
+/// by its explicit digest without one.
+async fn stopped_from(
+    tag: &str,
+    kind: &Kind,
+    launched: &Package,
+    version: Option<&str>,
+) -> Stopped {
     let store_path = temp_store_path(tag);
     let fixture = Fixture::with_anchor_and_store(
         &format!("{tag}-plugins"),
@@ -220,7 +237,17 @@ async fn stopped_on(tag: &str, kind: &Kind, launched: &Package, version: &str) -
             home.display()
         ),
     );
-    install(&fixture, kind, launched, version, 5).await;
+    match version {
+        Some(version) => install(&fixture, kind, launched, version, 5).await,
+        None => {
+            let path = fixture.write_archive(launched);
+            fixture
+                .registry
+                .package_install(explicit(&path, launched, true, true))
+                .await
+                .expect("a local package of the official package id installs");
+        }
+    }
     pin_profile(&fixture.registry, &launched.digest).await;
     let created = fixture
         .registry
@@ -386,27 +413,6 @@ async fn assert_fork_adopted(tag: &str, kind: &Kind) {
         .expect("remove the fork");
 }
 
-/// A newer version of `kind` built by `edit` from the newer descriptor does not
-/// adopt the stopped session: the session stays on its exact digest, which the
-/// profile no longer names.
-async fn assert_never_adopted_by(tag: &str, kind: &Kind, edit: impl FnOnce(String) -> String) {
-    let old = kind.older();
-    let changed = kind.package(kind.new_version, kind.new_below, edit);
-    let session = stopped_on(tag, kind, &old, kind.old_version).await;
-    kind.write_agent(&session.agent, kind.only_new);
-    install(&session.fixture, kind, &changed, kind.new_version, 6).await;
-    pin_profile(&session.fixture.registry, &changed.digest).await;
-
-    let restarted = restart(&session.fixture).await;
-    let refused = restarted
-        .registry
-        .resume_with(&session.id, ProfileChange::Refuse)
-        .await
-        .expect_err("the changed version does not adopt the session");
-    assert_eq!(refused.code, "agent_profile_changed", "{refused:?}");
-    assert_eq!(pinned_digest(&session.store_path, &session.id), old.digest);
-}
-
 #[tokio::test]
 async fn a_newer_package_version_adopts_a_stopped_claude_session_whose_profile_moved_to_it() {
     assert_resume_adopted("newer-adopts-claude", &CLAUDE).await;
@@ -509,30 +515,277 @@ async fn a_lower_selected_version_never_adopts_a_session_of_a_higher_one() {
     assert_eq!(pinned_digest(&session.store_path, &session.id), new.digest);
 }
 
+/// How the newer version of a fail-closed case differs, or how it is installed.
+#[derive(Clone, Copy)]
+enum Newer {
+    /// The descriptor is edited by the function.
+    Edited(fn(String) -> String),
+    /// The newer version is installed and selected, then disabled.
+    Disabled,
+    /// The newer version is installed without being selected.
+    Unselected,
+    /// The newer version is not a semantic version.
+    Unparsable,
+    /// The newer version differs from the launched one in build metadata only,
+    /// which semantic version precedence ignores.
+    Rebuilt,
+}
+
+/// What a resume of the stopped session does once its profile names the newer
+/// version that does not adopt it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Expected {
+    /// It resumes from its frozen digest, as it would without the newer version.
+    Frozen,
+    /// It is refused as a changed profile, and stays on its frozen digest.
+    ProfileChanged,
+}
+
+/// One newer version that never adopts a stopped session.
+struct FailClosed {
+    name: &'static str,
+    kind: &'static Kind,
+    newer: Newer,
+    expected: Expected,
+}
+
+/// A package version every validator accepts that is not a semantic version.
+const UNPARSABLE_VERSION: &str = "1.0.2.1";
+
+fn deeper_reference_search(text: String) -> String {
+    assert!(
+        text.contains("max_depth = 1"),
+        "the descriptor bounds the search"
+    );
+    text.replacen("max_depth = 1", "max_depth = 2", 1)
+}
+
+fn path_reference_kind(text: String) -> String {
+    assert!(
+        text.contains("reference_kind = \"id\""),
+        "Claude resumes by id"
+    );
+    text.replacen("reference_kind = \"id\"", "reference_kind = \"path\"", 1)
+}
+
+fn without_fork(text: String) -> String {
+    let forking =
+        "[fork]\nsupported = true\nargs = [\"--resume\", \"{reference}\", \"--fork-session\"]\n";
+    assert!(text.contains(forking), "Claude forks");
+    text.replacen(forking, "[fork]\nsupported = false\n", 1)
+}
+
+fn other_assignment(text: String) -> String {
+    let assigned = "launch_args = [\"--session-id\", \"{reference}\"]";
+    assert!(text.contains(assigned), "Pi assigns its reference");
+    text.replacen(
+        assigned,
+        "launch_args = [\"--session-uuid\", \"{reference}\"]",
+        1,
+    )
+}
+
+/// Installs the newer version of `case` beside the launched one and returns its
+/// digest, as the step or the owner would have installed it.
+async fn install_newer(fixture: &Fixture, case: &FailClosed) -> PackageDigest {
+    let kind = case.kind;
+    let (package, version, select) = match case.newer {
+        Newer::Edited(edit) => (
+            kind.package(kind.new_version, kind.new_below, edit),
+            kind.new_version.to_owned(),
+            true,
+        ),
+        Newer::Disabled => (kind.newer(), kind.new_version.to_owned(), true),
+        Newer::Unselected => (kind.newer(), kind.new_version.to_owned(), false),
+        Newer::Unparsable => (
+            kind.package(UNPARSABLE_VERSION, kind.new_below, |text| text),
+            UNPARSABLE_VERSION.to_owned(),
+            true,
+        ),
+        Newer::Rebuilt => {
+            let rebuilt = format!("{}+rebuild", kind.old_version);
+            (
+                kind.package(&rebuilt, kind.new_below, |text| text),
+                rebuilt,
+                true,
+            )
+        }
+    };
+    let document = signed_by(
+        &signing_key("root"),
+        catalog(
+            6,
+            vec![entry(&package, &kind.package_id(), kind.runtime, &version)],
+        ),
+    );
+    let mut params = catalog_install(fixture, &package, &document, false);
+    params.select = select;
+    let installed = fixture
+        .registry
+        .package_install(params)
+        .await
+        .unwrap_or_else(|error| panic!("{}: the newer version installs: {error:?}", case.name));
+    assert_eq!(installed.package.selected, select, "{installed:?}");
+    if matches!(case.newer, Newer::Disabled) {
+        fixture
+            .registry
+            .package_set_enabled(protocol::PackageSetEnabledParams {
+                digest: package.digest.clone(),
+                enabled: false,
+            })
+            .await
+            .expect("disable the newer version");
+    }
+    package.digest
+}
+
+/// Each newer version that does not adopt a stopped session leaves it on its
+/// frozen digest, even after its profile was moved to that version, as the
+/// release step moves it. A strictly newer official version of the same
+/// package that only fails the adoption contract resumes the session from the
+/// frozen digest, as before the move; a version that cannot be ordered is a
+/// changed profile.
 #[tokio::test]
-async fn a_newer_version_with_another_reference_check_never_adopts_a_session() {
-    assert_never_adopted_by("newer-other-check", &CLAUDE, |text| {
-        assert!(
-            text.contains("max_depth = 1"),
-            "the descriptor bounds the search"
-        );
-        text.replacen("max_depth = 1", "max_depth = 2", 1)
-    })
-    .await;
+async fn a_newer_version_that_does_not_adopt_keeps_the_session_on_its_frozen_digest() {
+    let cases = [
+        FailClosed {
+            name: "another native reference check",
+            kind: &CLAUDE,
+            newer: Newer::Edited(deeper_reference_search),
+            expected: Expected::Frozen,
+        },
+        FailClosed {
+            name: "another reference kind",
+            kind: &CODEX,
+            newer: Newer::Edited(path_reference_kind),
+            expected: Expected::Frozen,
+        },
+        FailClosed {
+            name: "no fork where the frozen launch forks",
+            kind: &CLAUDE,
+            newer: Newer::Edited(without_fork),
+            expected: Expected::Frozen,
+        },
+        FailClosed {
+            name: "another assigned reference template",
+            kind: &PI,
+            newer: Newer::Edited(other_assignment),
+            expected: Expected::Frozen,
+        },
+        FailClosed {
+            name: "a disabled newer version",
+            kind: &CLAUDE,
+            newer: Newer::Disabled,
+            expected: Expected::Frozen,
+        },
+        FailClosed {
+            name: "an unselected newer version",
+            kind: &CLAUDE,
+            newer: Newer::Unselected,
+            expected: Expected::Frozen,
+        },
+        FailClosed {
+            name: "the launched version with other build metadata",
+            kind: &CLAUDE,
+            newer: Newer::Rebuilt,
+            expected: Expected::ProfileChanged,
+        },
+        FailClosed {
+            name: "a version that is not a semantic version",
+            kind: &CLAUDE,
+            newer: Newer::Unparsable,
+            expected: Expected::ProfileChanged,
+        },
+    ];
+    for (index, case) in cases.iter().enumerate() {
+        let kind = case.kind;
+        let old = kind.older();
+        let session = stopped_on(
+            &format!("newer-fail-closed-{index}"),
+            kind,
+            &old,
+            kind.old_version,
+        )
+        .await;
+        let newer = install_newer(&session.fixture, case).await;
+        pin_profile(&session.fixture.registry, &newer).await;
+
+        let restarted = restart(&session.fixture).await;
+        let verdict = stopped_verdict(&restarted, &session.store_path, &session.id);
+        let resumed = restarted
+            .registry
+            .resume_with(&session.id, ProfileChange::Refuse)
+            .await;
+        match case.expected {
+            Expected::Frozen => {
+                assert_eq!(
+                    verdict,
+                    (Verdict::Adoptable, CODE_ADOPTABLE.to_owned()),
+                    "{}",
+                    case.name
+                );
+                let resumed = resumed.unwrap_or_else(|error| {
+                    panic!(
+                        "{}: the session resumes from its frozen digest: {error:?}",
+                        case.name
+                    )
+                });
+                assert_eq!(
+                    resumed.runtime.as_ref().map(|runtime| runtime.state),
+                    Some(protocol::RuntimeState::Live),
+                    "{}",
+                    case.name
+                );
+                assert_eq!(
+                    pinned_digest(&session.store_path, &session.id),
+                    old.digest,
+                    "{}: the relaunch keeps the frozen digest",
+                    case.name
+                );
+                restarted
+                    .registry
+                    .remove(&session.id)
+                    .await
+                    .expect("remove the resumed session");
+            }
+            Expected::ProfileChanged => {
+                assert_eq!(verdict.1, "agent_profile_changed", "{}", case.name);
+                let refused = resumed.expect_err(case.name);
+                assert_eq!(
+                    refused.code, "agent_profile_changed",
+                    "{}: {refused:?}",
+                    case.name
+                );
+                assert_eq!(
+                    pinned_digest(&session.store_path, &session.id),
+                    old.digest,
+                    "{}: the session keeps its frozen digest",
+                    case.name
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]
-async fn a_newer_version_with_another_assigned_reference_never_adopts_a_session() {
-    assert_never_adopted_by("newer-other-assignment", &PI, |text| {
-        let assigned = "launch_args = [\"--session-id\", \"{reference}\"]";
-        assert!(text.contains(assigned), "Pi assigns its reference");
-        text.replacen(
-            assigned,
-            "launch_args = [\"--session-uuid\", \"{reference}\"]",
-            1,
-        )
-    })
-    .await;
+async fn a_newer_official_version_never_adopts_a_session_of_a_local_package() {
+    let local = PI.older();
+    let session = stopped_on_local("newer-local-launch", &PI, &local).await;
+    let newer = PI.newer();
+    install(&session.fixture, &PI, &newer, PI.new_version, 6).await;
+    pin_profile(&session.fixture.registry, &newer.digest).await;
+
+    let restarted = restart(&session.fixture).await;
+    let refused = restarted
+        .registry
+        .resume_with(&session.id, ProfileChange::Refuse)
+        .await
+        .expect_err("an official version never adopts a local package's session");
+    assert_eq!(refused.code, "agent_profile_changed", "{refused:?}");
+    assert_eq!(
+        pinned_digest(&session.store_path, &session.id),
+        local.digest
+    );
 }
 
 #[tokio::test]

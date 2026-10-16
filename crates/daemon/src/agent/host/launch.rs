@@ -303,15 +303,16 @@ fn same_origin(frozen: &BindingProvenance, current: &BindingProvenance) -> bool 
     }
 }
 
-/// Orders two package versions as semantic versions.
+/// Orders two package versions by semantic version precedence.
 ///
 /// A package version is a validated string, so text order would put `1.0.10`
-/// below `1.0.9`. `None` when either side is not a semantic version; callers
+/// below `1.0.9`. Build metadata does not count, so `1.0.2+a` and `1.0.2+b`
+/// are equal. `None` when either side is not a semantic version; callers
 /// treat that as "not newer" and keep what they have.
 pub(crate) fn version_order(left: &PackageVersion, right: &PackageVersion) -> Option<Ordering> {
     let left = semver::Version::parse(left.as_str()).ok()?;
     let right = semver::Version::parse(right.as_str()).ok()?;
-    Some(left.cmp(&right))
+    Some(left.cmp_precedence(&right))
 }
 
 /// What a launch spawns, which decides what launch validation resolves.
