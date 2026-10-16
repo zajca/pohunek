@@ -158,12 +158,15 @@ jobs:
         run: cargo build --locked -p xtask
 
       # The consumer leaves the job before any upstream code runs in it.
+      # Every upload of this job overwrites its artifact, so that a rerun of
+      # the failed job replaces what the failed attempt uploaded.
       - name: Upload the consumer executable
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-consumer-${{ runner.os }}
           path: ${{ runner.temp }}/consumer/release_consumer
           if-no-files-found: error
+          overwrite: true
 
       - name: Download the daemon archives of the runner
         if: ${{ matrix.rows != '' }}
@@ -230,6 +233,7 @@ jobs:
           name: attestation-${{ matrix.os }}
           path: ${{ runner.temp }}/rows/attestation-*.json
           if-no-files-found: error
+          overwrite: true
 
       # Wall clock and outcome of each consumer run as a one-testcase JUnit
       # report per row. run-row writes it also when the consumer fails, so it
@@ -242,6 +246,7 @@ jobs:
           name: matrix-junit-${{ matrix.os }}
           path: ${{ runner.temp }}/rows/junit-*.xml
           if-no-files-found: warn
+          overwrite: true
 
       # One result line per row, read by the verdict to name a failing row.
       - name: Upload the row results
@@ -251,6 +256,7 @@ jobs:
           name: row-results-${{ matrix.os }}
           path: ${{ runner.temp }}/rows/row-results.jsonl
           if-no-files-found: warn
+          overwrite: true
 
   # Build provenance for every producer artifact, so that the assembler can
   # require it. No checkout and no repository code: only artifacts are

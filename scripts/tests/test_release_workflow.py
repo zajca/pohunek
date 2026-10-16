@@ -850,6 +850,13 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
             self.assertTrue(fnmatch.fnmatchcase(f"attestation-{os_name}", "attestation-*"))
         self.assertIn('(out_dir / f"attestation-{runtime}-{target}.json").unlink(missing_ok=True)', (SCRIPTS / "run-rows").read_text())
 
+    def test_every_upload_of_the_row_job_survives_a_rerun_of_the_job(self):
+        # "Re-run failed jobs" uploads again under the same names.
+        rows = self.evidence_jobs["rows"]
+        uploads = rows.count("uses: actions/upload-artifact@")
+        self.assertEqual(uploads, 4)
+        self.assertEqual(rows.count("          overwrite: true\n"), uploads)
+
     def test_the_consumer_is_uploaded_before_any_upstream_runs(self):
         rows = self.evidence_jobs["rows"]
         upload = rows.index("      - name: Upload the consumer executable\n")
@@ -872,7 +879,18 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
         base = re.search(r'const MACOS_TEMP_ROOT: &str = "([^"]+)";', lib).group(1)
         self.assertIn(f'TEST_ROOT_PREFIX = "{prefix}"', script)
         self.assertIn(f'MACOS_TEMP_ROOT = "{base}"', script)
-        self.assertIn('ROW_ROOT_TEMPLATE = "/tmp/pkrow.XXXXXX"', script)
+        # The row root is the base of the consumer's TestEnv roots. The
+        # deepest socket below it, raw or resolved (/tmp is /private/tmp on
+        # macOS), must fit the budget test-support checks with bytes to spare.
+        template = re.search(r'ROW_ROOT_TEMPLATE = "([^"]+)"', script).group(1)
+        random_bytes = int(re.search(r"const ROOT_RANDOM_BYTES: usize = (\d+);", env).group(1))
+        suffix = re.search(r'const NESTED_SOCKET_SUFFIX: &str =\s*"([^"]+)";', env).group(1)
+        capacity = int(re.search(r"pub const STRICTEST_SOCKET_PATH_CAPACITY: usize = (\d+);", env).group(1))
+        for base in (template, "/private" + template):
+            with self.subTest(base=base):
+                deepest = len(base) + 1 + len(prefix) + random_bytes + len(suffix)
+                self.assertLessEqual(deepest + 1, capacity - 3)
+        self.assertIn('POHUNEK_TEST_TEMP_ROOT="$work"', (SCRIPTS / "run-row").read_text())
         # C2: the keychain is read without -d, which would print secret data.
         self.assertIn('["security", "dump-keychain", login.strip().strip(\'"\')]', script)
         self.assertEqual(script.count('"dump-keychain"'), 1)
