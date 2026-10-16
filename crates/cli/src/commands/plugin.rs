@@ -392,6 +392,24 @@ pub(crate) enum Error {
         found: String,
     },
 
+    /// The update would select an older official version than the selected one.
+    #[error(
+        "updating {package} to {offered} would replace the selected official version {installed}; nothing was changed; to roll back on purpose, {rollback}`pohunek plugin select {package} --digest {digest}`"
+    )]
+    UpdateDowngrade {
+        /// The package id being updated.
+        package: String,
+        /// The selected official version the update would replace.
+        installed: String,
+        /// The older version the archive holds.
+        offered: String,
+        /// Abbreviated digest of the archive, accepted by `--digest`.
+        digest: String,
+        /// The step before the select: empty when the older version is
+        /// installed already, else its install, which leaves it unselected.
+        rollback: &'static str,
+    },
+
     /// The agents directory is missing its safety properties or unreadable.
     #[error("the agent profiles directory cannot be used: {detail}")]
     ProfileDirectory {
@@ -419,6 +437,7 @@ impl Error {
             Self::NotInstalled { .. } | Self::NoMatchingVersion { .. } => "package_not_installed",
             Self::Ambiguous { .. } => "plugin_selector_ambiguous",
             Self::UpdateIdMismatch { .. } => "plugin_update_id_mismatch",
+            Self::UpdateDowngrade { .. } => "plugin_update_downgrade",
             Self::ProfileDirectory { .. } => "profile_directory_unusable",
             Self::ProfileTarget { .. } => "profile_target_invalid",
         }
@@ -441,6 +460,9 @@ impl Error {
             Self::Ambiguous { .. } => "narrow the selection with --digest or --version",
             Self::UpdateIdMismatch { .. } => {
                 "name the package id the archive declares, or use `pohunek plugin install`"
+            }
+            Self::UpdateDowngrade { .. } => {
+                "list installed versions with `pohunek plugin list`, and keep the selected version unless a rollback is intended"
             }
             Self::ProfileDirectory { .. } => {
                 "the agents directory must be owned by you and not group- or world-writable"
@@ -793,6 +815,9 @@ async fn ingest_package(
             .into());
         }
     }
+    if ingest == Ingest::Update {
+        ensure_not_official_downgrade(&installed, &preview.package)?;
+    }
     let another_version_installed = installed
         .packages
         .iter()
@@ -827,6 +852,53 @@ async fn ingest_package(
     }
     print_output(json, &result, || render_install_result(&result, ingest))?;
     Ok(())
+}
+
+/// Refuses an official update whose version is older than the selected
+/// official version of the same package.
+///
+/// The daemon accepts any signed catalog at or above its high-water sequence,
+/// so an older official version stays installable; only the update flow
+/// reads the semantic order. An unparsable version cannot be proven older, so
+/// the update proceeds. Rolling back on purpose is `pohunek plugin select`.
+fn ensure_not_official_downgrade(
+    installed: &PackageListResult,
+    preview: &PackageInfo,
+) -> Result<(), Error> {
+    if preview.origin != PackageOrigin::Official {
+        return Ok(());
+    }
+    let Some(selected) = installed.packages.iter().find(|info| {
+        info.selected
+            && info.origin == PackageOrigin::Official
+            && info.package.id == preview.package.id
+    }) else {
+        return Ok(());
+    };
+    let (Ok(offered), Ok(current)) = (
+        semver::Version::parse(preview.package.version.as_str()),
+        semver::Version::parse(selected.package.version.as_str()),
+    ) else {
+        return Ok(());
+    };
+    if offered >= current {
+        return Ok(());
+    }
+    let recorded = installed
+        .packages
+        .iter()
+        .any(|info| info.digest == preview.digest);
+    Err(Error::UpdateDowngrade {
+        package: preview.package.id.to_string(),
+        installed: selected.package.version.to_string(),
+        offered: preview.package.version.to_string(),
+        digest: short_digest(&preview.digest),
+        rollback: if recorded {
+            "run "
+        } else {
+            "install the archive with `pohunek plugin install` (another version stays selected), then run "
+        },
+    })
 }
 
 /// Makes an already recorded version enabled and selected, as `update`

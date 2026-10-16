@@ -26,6 +26,7 @@ pohunek-relay-protocol.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
+semver = { workspace = true }
 pohunek-hostcheck = { workspace = true }
 pohunek-protocol = { workspace = true }
 pohunek-package = { workspace = true }

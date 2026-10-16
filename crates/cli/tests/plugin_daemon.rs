@@ -612,22 +612,7 @@ async fn install_official(
     package: &str,
     runtime: &str,
 ) -> (i32, Value) {
-    let entry = CatalogEntry {
-        package_id: PackageId::parse(package).expect("package id"),
-        runtime_id: RuntimeId::parse(runtime).expect("runtime id"),
-        version: PackageVersion::parse("1.0.0").expect("package version"),
-        digest: built.digest.clone(),
-        runtime_api: RUNTIME_API,
-        platforms: vec![host_platform()],
-        attestations: attestations_for(&[host_platform()]),
-        core: ANY_CORE.to_owned(),
-    };
-    let catalog = harness.env.root().join("runtime-catalog.json");
-    fs::write(
-        &catalog,
-        signed(key, catalog_of(1, WINDOW_END, vec![entry])),
-    )
-    .expect("write the catalog");
+    let catalog = official_catalog(harness, key, 1, package, runtime, &[("1.0.0", built)]);
     harness
         .json(&[
             "plugin",
@@ -638,6 +623,42 @@ async fn install_official(
             "--yes",
         ])
         .await
+}
+
+/// Writes a catalog signed by `key` at `sequence` that lists each `(version,
+/// archive)` pair as an official `package` serving `runtime`, and returns its
+/// path.
+fn official_catalog(
+    harness: &Harness,
+    key: &ed25519_dalek::SigningKey,
+    sequence: u64,
+    package: &str,
+    runtime: &str,
+    listed: &[(&str, &Built)],
+) -> PathBuf {
+    let entries = listed
+        .iter()
+        .map(|(version, built)| CatalogEntry {
+            package_id: PackageId::parse(package).expect("package id"),
+            runtime_id: RuntimeId::parse(runtime).expect("runtime id"),
+            version: PackageVersion::parse(version).expect("package version"),
+            digest: built.digest.clone(),
+            runtime_api: RUNTIME_API,
+            platforms: vec![host_platform()],
+            attestations: attestations_for(&[host_platform()]),
+            core: ANY_CORE.to_owned(),
+        })
+        .collect();
+    let catalog = harness
+        .env
+        .root()
+        .join(format!("runtime-catalog-{sequence}.json"));
+    fs::write(
+        &catalog,
+        signed(key, catalog_of(sequence, WINDOW_END, entries)),
+    )
+    .expect("write the catalog");
+    catalog
 }
 
 /// Modifies the installed descriptor of `digest`, so the daemon cannot
@@ -941,6 +962,114 @@ async fn update_to_a_recorded_version_enables_and_selects_it() {
         state.package(&old.digest).is_some(),
         "the old version stays"
     );
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn update_refuses_an_older_official_version_and_rollback_is_explicit() {
+    let key = test_key();
+    let anchor = HostTrustAnchor::new(vec![root_of(&key, WINDOW_START, WINDOW_END)], Vec::new())
+        .expect("the test trust anchor");
+    let harness = Harness::start_with_trust(CatalogTrust::Loaded(anchor)).await;
+    let old = harness.archive_of(OFFICIAL_CODEX_ID, "codex", "1.0.0");
+    let new = harness.archive_of(OFFICIAL_CODEX_ID, "codex", "1.0.1");
+    let first = official_catalog(
+        &harness,
+        &key,
+        1,
+        OFFICIAL_CODEX_ID,
+        "codex",
+        &[("1.0.0", &old)],
+    );
+    let (code, installed) = harness
+        .json(&[
+            "plugin",
+            "install",
+            path_str(&old.path),
+            "--catalog",
+            path_str(&first),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{installed}");
+    assert_eq!(
+        installed["ok"]["package"]["origin"], "official",
+        "{installed}"
+    );
+
+    let second = official_catalog(
+        &harness,
+        &key,
+        2,
+        OFFICIAL_CODEX_ID,
+        "codex",
+        &[("1.0.0", &old), ("1.0.1", &new)],
+    );
+    let (code, updated) = harness
+        .json(&[
+            "plugin",
+            "update",
+            OFFICIAL_CODEX_ID,
+            path_str(&new.path),
+            "--catalog",
+            path_str(&second),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{updated}");
+    let id: PackageId = OFFICIAL_CODEX_ID.parse().expect("package id");
+    assert_eq!(harness.registry().selected(&id), Some(&new.digest));
+
+    // The catalog is current and the old archive is already recorded, so only
+    // the version order stands between this update and a silent rollback.
+    let (code, refused) = harness
+        .json(&[
+            "plugin",
+            "update",
+            OFFICIAL_CODEX_ID,
+            path_str(&old.path),
+            "--catalog",
+            path_str(&second),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(
+        refused["err"]["code"], "plugin_update_downgrade",
+        "{refused}"
+    );
+    let message = refused["err"]["msg"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("1.0.0") && message.contains("1.0.1"),
+        "{refused}"
+    );
+    assert!(
+        message.contains(&format!(
+            "pohunek plugin select {OFFICIAL_CODEX_ID} --digest"
+        )),
+        "{refused}"
+    );
+    let state = harness.registry();
+    assert_eq!(state.packages().len(), 2, "no record is added or removed");
+    assert_eq!(
+        state.selected(&id),
+        Some(&new.digest),
+        "1.0.1 stays selected"
+    );
+
+    // The explicit rollback the refusal names still works.
+    let (code, rolled_back) = harness
+        .json(&[
+            "plugin",
+            "select",
+            OFFICIAL_CODEX_ID,
+            "--digest",
+            &old.digest.as_str()[7..19],
+        ])
+        .await;
+    assert_eq!(code, 0, "{rolled_back}");
+    assert_eq!(harness.registry().selected(&id), Some(&old.digest));
 
     harness.stop().await;
 }
