@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Write a pull request's test selection with the selector of its merge base.
+
+A pull request never judges itself: the `xtask` selector that classifies the
+change is built from the merge base of `--base` and `HEAD`, at this checkout's
+path (so the CI build cache matches), and then run against the head tree.
+A change to the selector, its rules or the lockfile therefore takes effect
+only on the pull requests that come after it lands, and a path the base rules
+do not know is unmapped, which selects every test.
+
+`--out DIR` receives what `cargo xtask affected ci` writes there:
+`selection.json`, `outputs.env` (`key=value` lines for `$GITHUB_OUTPUT`) and
+`summary.md`. Whenever no trustworthy selection can be made (no merge base, a
+base selector that does not build, fails, or writes another schema), the
+script writes a full selection instead, naming the cause, and exits 0: a full
+run is always a correct run. `--full CAUSE` writes that selection directly,
+for the events that are not pull requests.
+
+The script exits non-zero only when it cannot write `--out`, or cannot return
+the checkout to `HEAD` after building the base selector; the CI jobs treat a
+failed selection job as a full run too.
+
+The build runs `$CARGO` (default `cargo`). This file is a CI-pipeline script:
+in CI mode a change to it selects every test.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+# Shape of `selection.json` this script and the CI jobs read.
+SCHEMA_VERSION = 1
+MODES = ("full", "packages", "none")
+FLAGS = ("docs_only", "script_tests", "sdk_gates")
+OUTPUT_KEYS = ("mode", *FLAGS, "filterset")
+OUTPUT_FILES = ("selection.json", "outputs.env", "summary.md")
+# A cold build of the selector takes a few minutes; past this the run is full.
+BUILD_TIMEOUT_SECONDS = 1200
+# The selector itself runs in seconds plus two `cargo metadata` calls.
+SELECT_TIMEOUT_SECONDS = 600
+# Lines of a failing command's stderr quoted in the full-run cause.
+STDERR_TAIL_LINES = 5
+
+
+class Unavailable(Exception):
+    """The merge base's selector cannot give a selection; the run is full."""
+
+
+def git(*args, cwd):
+    result = subprocess.run(
+        ["git", *args], cwd=cwd, check=False, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode, ["git", *args], result.stdout, result.stderr
+        )
+    return result.stdout.strip()
+
+
+def tail(text):
+    return " / ".join(text.strip().splitlines()[-STDERR_TAIL_LINES:])
+
+
+def write_full(out, cause, base="", merge_base=""):
+    """Writes a selection that runs every test because of `cause`."""
+    selection = {
+        "schema_version": SCHEMA_VERSION,
+        "base": base,
+        "merge_base": merge_base,
+        "mode": "full",
+        "docs_only": False,
+        "script_tests": True,
+        "sdk_gates": True,
+        "filterset": None,
+        "full_causes": [cause],
+        "packages": [],
+        "files": [],
+    }
+    outputs = "mode=full\ndocs_only=false\nscript_tests=true\nsdk_gates=true\nfilterset=\n"
+    summary = f"### Test selection\n\nMode: **full**. Every test runs because of:\n\n- {cause}\n"
+    out.mkdir(parents=True, exist_ok=True)
+    for name in OUTPUT_FILES:
+        (out / name).unlink(missing_ok=True)
+    (out / "summary.md").write_text(summary)
+    (out / "outputs.env").write_text(outputs)
+    (out / "selection.json").write_text(json.dumps(selection, indent=2) + "\n")
+
+
+def validate(out):
+    """Checks the files a base selector wrote; raises Unavailable otherwise."""
+    try:
+        selection = json.loads((out / "selection.json").read_text())
+        lines = (out / "outputs.env").read_text().splitlines()
+        (out / "summary.md").read_text()
+    except (OSError, ValueError) as error:
+        raise Unavailable(f"the merge base's selector wrote no readable selection: {error}")
+    version = selection.get("schema_version") if isinstance(selection, dict) else None
+    if version != SCHEMA_VERSION:
+        raise Unavailable(
+            f"the merge base's selector wrote schema version {version!r}, not {SCHEMA_VERSION}"
+        )
+    outputs = dict(line.split("=", 1) for line in lines if "=" in line)
+    consistent = (
+        selection.get("mode") in MODES
+        and all(isinstance(selection.get(flag), bool) for flag in FLAGS)
+        and list(outputs) == list(OUTPUT_KEYS)
+        and outputs["mode"] == selection["mode"]
+        and all(outputs[flag] == str(selection[flag]).lower() for flag in FLAGS)
+        and outputs["filterset"] == (selection.get("filterset") or "")
+        and (selection["mode"] != "packages" or bool(outputs["filterset"]))
+    )
+    if not consistent:
+        raise Unavailable("the merge base's selector wrote an inconsistent selection")
+
+
+def build_base_selector(root, merge_base, head, scratch):
+    """Builds xtask at `merge_base` in `root`, returns a copy of the binary,
+    and checks `head` out again, whatever the build did."""
+    cargo = os.environ.get("CARGO", "cargo")
+    git("checkout", "--quiet", "--detach", merge_base, cwd=root)
+    try:
+        try:
+            result = subprocess.run(
+                [cargo, "build", "--locked", "-p", "xtask", "--bin", "xtask"],
+                cwd=root, check=False, capture_output=True, text=True,
+                timeout=BUILD_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            raise Unavailable(
+                f"the merge base's selector did not build within {BUILD_TIMEOUT_SECONDS} s"
+            )
+        except OSError as error:
+            raise Unavailable(f"the merge base's selector could not be built: {error}")
+        built = root / "target" / "debug" / "xtask"
+        if result.returncode != 0 or not built.is_file():
+            raise Unavailable(
+                f"the merge base's selector did not build: {tail(result.stderr)}"
+            )
+        selector = scratch / "xtask"
+        shutil.copy2(built, selector)
+        return selector
+    finally:
+        git("checkout", "--quiet", "--detach", head, cwd=root)
+        if git("rev-parse", "HEAD", cwd=root) != head:
+            raise RuntimeError(f"the checkout did not return to {head}")
+
+
+def select(root, base, out):
+    """Writes the base selector's selection of `HEAD`, or raises Unavailable."""
+    if git("status", "--porcelain", "--untracked-files=no", cwd=root):
+        raise Unavailable("the checkout has uncommitted changes, so the merge base cannot be built")
+    head = git("rev-parse", "HEAD", cwd=root)
+    try:
+        merge_base = git("merge-base", "--end-of-options", base, "HEAD", cwd=root)
+    except subprocess.CalledProcessError as error:
+        raise Unavailable(f"no merge base of {base} and HEAD: {tail(error.stderr)}")
+    with tempfile.TemporaryDirectory(prefix="ci-test-selection-") as scratch:
+        started = time.monotonic()
+        selector = build_base_selector(root, merge_base, head, Path(scratch))
+        built_in = time.monotonic() - started
+        try:
+            result = subprocess.run(
+                [str(selector), "affected", "ci", "--base", base, "--out", str(out)],
+                cwd=root, check=False, capture_output=True, text=True,
+                timeout=SELECT_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            raise Unavailable(
+                f"the merge base's selector did not finish within {SELECT_TIMEOUT_SECONDS} s"
+            )
+    if result.returncode != 0:
+        raise Unavailable(f"the merge base's selector failed: {tail(result.stderr)}")
+    validate(out)
+    with (out / "summary.md").open("a") as summary:
+        summary.write(
+            f"\nSelector built from the merge base `{merge_base}` in {built_in:.0f} s.\n"
+        )
+    return merge_base
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--out", type=Path, required=True)
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--base", help="base revision of the pull request")
+    action.add_argument("--full", metavar="CAUSE", help="write a full selection for CAUSE")
+    args = parser.parse_args()
+    out = args.out.resolve()
+    if args.full is not None:
+        write_full(out, args.full)
+        return
+    root = Path(git("rev-parse", "--show-toplevel", cwd=Path.cwd()))
+    out.mkdir(parents=True, exist_ok=True)
+    for name in OUTPUT_FILES:
+        (out / name).unlink(missing_ok=True)
+    try:
+        merge_base = select(root, args.base, out)
+        print(f"ci-test-selection: selection of the merge base {merge_base}'s selector")
+    except Unavailable as cause:
+        print(f"::warning::every test runs: {cause}")
+        write_full(out, str(cause), base=args.base)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

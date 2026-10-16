@@ -596,6 +596,10 @@ pub(crate) const CI_RULES: &[(Pattern, &str)] = &[
         Pattern::File("scripts/check-rust-toolchain-pin"),
         "toolchain pin check of the CI test jobs",
     ),
+    (
+        Pattern::File("scripts/ci-test-selection"),
+        "builds and runs the merge base's selector for the CI test jobs",
+    ),
 ];
 
 /// Which caller classifies a change.
