@@ -303,7 +303,13 @@ digest = "sha256:<64 lowercase hex digits>"     # the archive digest to launch f
 - With both keys the profile resolves from exactly that digest, never from the
   registry's current selection. `plugin update`, `plugin select` and a newer
   installed version do not change what the profile launches, while a bare
-  runtime name keeps following the selection.
+  runtime name keeps following the selection. `service upgrade` is the one step
+  that moves a pin by itself: it repins a profile pinned to an older version of
+  the release's official package, and leaves every other pin as it is.
+- A stopped session launched from such a profile moves to a strictly newer
+  official version of its package on resume or fork only when the profile pins
+  that version. The upgrade's repin is such a change, and resume does not count
+  it as a profile change.
 - A digest that is not installed is `runtime_not_installed`; a digest that
   belongs to another package or runtime, or whose root fails verification, is
   `runtime_incompatible`.
