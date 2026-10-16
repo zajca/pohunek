@@ -12,12 +12,15 @@
 //! pohunek-protocol      <- pohunek-client (+ registry crate leftpad)
 //!                       <- pohunek-knowledge (dev: pohunek-test-support) <- xtask
 //! pohunek-client        <- pohunek-daemon (dev: pohunek-test-support) <- pohunek-cli
+//!                                                (+ registry crate rightpad)
 //! pohunek-netbird       <- pohunek-relay (dev only) <- pohunek-relay-client
 //! ```
 //!
 //! - a changed member selects itself and every member whose library depends on
 //!   it, transitively; a dev-dependency selects its dependent for one hop only;
 //! - a lockfile change selects the members that resolve the changed crate;
+//! - a change to `pohunek-cli` also selects the daemon test that runs the
+//!   `pohunek` binary, with no Cargo edge from the daemon to the CLI;
 //! - a path of the runtime-edge map selects the tests it names;
 //! - an unmapped path, the CI configuration and the scripts of the CI test
 //!   jobs select every test;
@@ -34,9 +37,11 @@ use std::process::Output;
 use pohunek_test_support::env::TestEnv;
 use serde_json::Value;
 
-/// Registry crate the fixture's `pohunek-client` depends on, in both versions
-/// the vendored directory source holds.
-const LEFTPAD_VERSIONS: [&str; 2] = ["1.0.0", "1.0.1"];
+/// Registry crates of the fixture and the member that depends on each.
+const VENDORED: [(&str, &str); 2] = [("leftpad", "pohunek-client"), ("rightpad", "pohunek-cli")];
+
+/// Versions of each registry crate that the vendored directory source holds.
+const VENDORED_VERSIONS: [&str; 2] = ["1.0.0", "1.0.1"];
 
 /// Package checksum of every vendored crate; a directory source compares it
 /// with the lockfile only, so any 64 hex digits serve.
@@ -106,7 +111,7 @@ impl Repo {
         repo.write(
             "Cargo.toml",
             "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n\n\
-             [workspace.dependencies]\nleftpad = \"1\"\n",
+             [workspace.dependencies]\nleftpad = \"1\"\nrightpad = \"1\"\n",
         );
         let toolchain = std::fs::read_to_string(
             pohunek_test_support::workspace_root().join("rust-toolchain.toml"),
@@ -117,19 +122,22 @@ impl Repo {
             repo.write(&format!("{dir}/Cargo.toml"), &manifest(name, deps, dev));
             repo.write(&format!("{dir}/src/lib.rs"), "pub fn f() {}\n");
         }
-        for version in LEFTPAD_VERSIONS {
-            let dir = format!("vendor/leftpad-{version}");
-            repo.write(
-                &format!("{dir}/Cargo.toml"),
-                &format!(
-                    "[package]\nname = \"leftpad\"\nversion = \"{version}\"\nedition = \"2021\"\n"
-                ),
-            );
-            repo.write(&format!("{dir}/src/lib.rs"), "pub fn pad() {}\n");
-            repo.write(
-                &format!("{dir}/.cargo-checksum.json"),
-                &format!("{{\"files\":{{}},\"package\":\"{VENDORED_CHECKSUM}\"}}"),
-            );
+        repo.write("crates/cli/src/bin/pohunek.rs", "fn main() {}\n");
+        for (krate, _) in VENDORED {
+            for version in VENDORED_VERSIONS {
+                let dir = format!("vendor/{krate}-{version}");
+                repo.write(
+                    &format!("{dir}/Cargo.toml"),
+                    &format!(
+                        "[package]\nname = \"{krate}\"\nversion = \"{version}\"\nedition = \"2021\"\n"
+                    ),
+                );
+                repo.write(&format!("{dir}/src/lib.rs"), "pub fn pad() {}\n");
+                repo.write(
+                    &format!("{dir}/.cargo-checksum.json"),
+                    &format!("{{\"files\":{{}},\"package\":\"{VENDORED_CHECKSUM}\"}}"),
+                );
+            }
         }
         for (path, content) in OTHER_FILES {
             repo.write(path, content);
@@ -152,6 +160,22 @@ impl Repo {
 
     fn read(&self, path: &str) -> String {
         std::fs::read_to_string(self.dir().join(path)).expect("read file")
+    }
+
+    /// Commits a lockfile that resolves registry crate `krate` to 1.0.0
+    /// instead of 1.0.1, with no manifest change.
+    fn downgrade(&self, krate: &str) {
+        let lock = self.read("Cargo.lock");
+        let resolved = format!("name = \"{krate}\"\nversion = \"1.0.1\"");
+        assert!(lock.contains(&resolved), "{lock}");
+        self.write(
+            "Cargo.lock",
+            &lock.replace(
+                &resolved,
+                &format!("name = \"{krate}\"\nversion = \"1.0.0\""),
+            ),
+        );
+        self.commit(&format!("downgrade {krate}"));
     }
 
     /// Appends a line to `path` (creating it), so every call is a change.
@@ -268,8 +292,10 @@ fn manifest(name: &str, deps: &[&str], dev: &[&str]) -> String {
     let mut text = format!(
         "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n"
     );
-    if name == "pohunek-client" {
-        text.push_str("leftpad = { workspace = true }\n");
+    for (krate, consumer) in VENDORED {
+        if name == consumer {
+            let _ = writeln!(text, "{krate} = {{ workspace = true }}");
+        }
     }
     for dep in deps {
         let _ = writeln!(text, "{dep} = {{ path = \"../{}\" }}", dir_of(dep));
@@ -421,13 +447,7 @@ fn a_dev_dependency_selects_its_dependent_for_one_hop_only() {
 #[test]
 fn a_dependency_only_lockfile_change_selects_the_members_resolving_the_crate() {
     let repo = Repo::new();
-    let lock = repo.read("Cargo.lock");
-    assert!(lock.contains("version = \"1.0.1\""), "{lock}");
-    repo.write(
-        "Cargo.lock",
-        &lock.replace("version = \"1.0.1\"", "version = \"1.0.0\""),
-    );
-    repo.commit("downgrade leftpad");
+    repo.downgrade("leftpad");
     let selection = repo.select();
     assert_eq!(selection["mode"], "packages", "{selection:#}");
     let mut expected = whole(&["pohunek-client", "pohunek-daemon", "pohunek-cli"]);
@@ -436,6 +456,60 @@ fn a_dependency_only_lockfile_change_selects_the_members_resolving_the_crate() {
     assert_eq!(packages(&selection), expected);
     let client = reasons(&selection, "pohunek-client").join("; ");
     assert!(client.contains("leftpad@1.0.0"), "{client}");
+}
+
+#[test]
+fn a_lockfile_change_rebuilding_the_cli_selects_the_daemon_test_that_runs_it() {
+    let repo = Repo::new();
+    repo.downgrade("rightpad");
+    let selection = repo.select();
+    assert_eq!(selection["mode"], "packages", "{selection:#}");
+    let mut expected = whole(&["pohunek-cli"]);
+    expected.push((
+        "pohunek-daemon".to_owned(),
+        "binary(=supervised_lifecycle)".to_owned(),
+    ));
+    expected.push(("xtask".to_owned(), "binary(=dependency_policy)".to_owned()));
+    expected.sort();
+    assert_eq!(packages(&selection), expected);
+    assert!(
+        reasons(&selection, "pohunek-daemon")
+            .iter()
+            .any(|reason| reason.starts_with("the `pohunek` binary of pohunek-cli")),
+        "{selection:#}"
+    );
+}
+
+#[test]
+fn a_root_dependency_entry_change_selects_its_inheritors_without_a_resolve_difference() {
+    let repo = Repo::new();
+    let manifest = repo.read("Cargo.toml");
+    // `leftpad` has no default features, so the resolve does not change.
+    repo.write(
+        "Cargo.toml",
+        &manifest.replace(
+            "leftpad = \"1\"",
+            "leftpad = { version = \"1\", default-features = false }",
+        ),
+    );
+    repo.commit("leftpad without default features");
+    let selection = repo.select();
+    assert_eq!(selection["mode"], "packages", "{selection:#}");
+    let selected = packages(&selection);
+    for name in ["pohunek-client", "pohunek-daemon", "pohunek-cli"] {
+        assert!(
+            selected.contains(&(name.to_owned(), "all".to_owned())),
+            "{name}: {selection:#}"
+        );
+    }
+    assert!(
+        !selected.iter().any(|(name, _)| name == "pohunek-relay"),
+        "{selection:#}"
+    );
+    assert_eq!(
+        reasons(&selection, "pohunek-client"),
+        ["dependency diff: root [workspace.dependencies] entry `leftpad` changed"]
+    );
 }
 
 #[test]
@@ -528,6 +602,8 @@ fn a_hostile_file_name_cannot_forge_summary_rows() {
 fn a_failed_selection_exits_non_zero_and_writes_nothing() {
     let repo = Repo::new();
     repo.change(&["crates/relay-client/src/lib.rs"]);
+    // An earlier run's outputs in a reused directory are not left behind.
+    repo.select();
     let out = repo.out_dir();
     let output = repo.xtask(&[
         "ci",
@@ -537,8 +613,9 @@ fn a_failed_selection_exits_non_zero_and_writes_nothing() {
         out.to_str().expect("utf-8"),
     ]);
     assert!(!output.status.success());
-    assert!(!out.join("selection.json").exists());
-    assert!(!out.join("outputs.env").exists());
+    for name in ["selection.json", "outputs.env", "summary.md"] {
+        assert!(!out.join(name).exists(), "{name} is left");
+    }
 }
 
 /// Runs the guard and returns `(success, stderr)`.
@@ -690,7 +767,89 @@ fn a_narrowed_rule_covers_only_the_test_sources_it_names() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("no rule selects the tests in crates/protocol/tests/other.rs"),
+        stderr.contains(
+            "no rule selects the test in crates/protocol/tests/other.rs that makes the read"
+        ),
         "{stderr}"
     );
+}
+
+#[test]
+fn a_cli_change_selects_the_daemon_test_that_runs_the_cli_binary() {
+    let repo = Repo::new();
+    repo.change(&["crates/cli/src/lib.rs"]);
+    let selection = repo.select();
+    assert_eq!(selection["mode"], "packages");
+    assert!(
+        packages(&selection).contains(&(
+            "pohunek-daemon".to_owned(),
+            "binary(=supervised_lifecycle)".to_owned()
+        )),
+        "{selection}"
+    );
+    assert!(
+        reasons(&selection, "pohunek-daemon")
+            .iter()
+            .any(|reason| reason.starts_with("the `pohunek` binary of pohunek-cli")),
+        "{selection}"
+    );
+}
+
+#[test]
+fn the_guard_requires_a_binary_use_for_a_binary_run_outside_cargo_edges() {
+    let repo = Repo::new();
+    let spawn = "#[test]\nfn spawns() {\n    let cli = pohunek_test_support::bin_exe(\"pohunekd\")\n        \
+                 .with_file_name(\"pohunek\");\n    drop(cli);\n}\n";
+    repo.write("crates/daemon/tests/supervised_lifecycle.rs", spawn);
+    repo.commit("declared binary run");
+    let (success, stderr) = guard(&repo);
+    assert!(success, "{stderr}");
+
+    repo.write("crates/daemon/tests/spawns.rs", spawn);
+    repo.commit("undeclared binary run");
+    let (success, stderr) = guard(&repo);
+    assert!(!success, "{stderr}");
+    assert!(
+        stderr.contains(
+            "crates/daemon/tests/spawns.rs:4: pohunek-daemon runs the `pohunek` binary of \
+             pohunek-cli, but a change to pohunek-cli does not select it"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_narrowed_rule_covers_only_the_test_its_filter_selects() {
+    let repo = Repo::new();
+    let reader = |name: &str| {
+        format!(
+            "    #[test]\n    fn {name}() {{\n        drop(std::fs::read(\n            \
+             pohunek_test_support::workspace_root().join(\"crates/xtask/src/affected/mod.rs\"),\n        \
+             ));\n    }}\n"
+        )
+    };
+    let selected = reader("the_allow_list_contains_no_variable_xtask_treats_as_redirecting");
+    repo.write(
+        "crates/daemon/src/git.rs",
+        &format!("#[cfg(test)]\nmod tests {{\n{selected}}}\n"),
+    );
+    repo.commit("the selected reader");
+    let (success, stderr) = guard(&repo);
+    assert!(success, "{stderr}");
+
+    let other = reader("another_reader_of_the_same_path");
+    repo.write(
+        "crates/daemon/src/git.rs",
+        &format!("#[cfg(test)]\nmod tests {{\n{selected}{other}}}\n"),
+    );
+    repo.commit("a reader the filter does not select");
+    let (success, stderr) = guard(&repo);
+    assert!(!success, "{stderr}");
+    assert!(
+        stderr.contains(
+            "crates/daemon/src/git.rs:12: pohunek-daemon reads crates/xtask/src/affected/mod.rs"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("crates/daemon/src/git.rs:6:"), "{stderr}");
 }

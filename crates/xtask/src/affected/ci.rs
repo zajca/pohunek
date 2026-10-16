@@ -14,10 +14,11 @@
 //! - `outputs.env`: `key=value` lines for `$GITHUB_OUTPUT`;
 //! - `summary.md`: the Markdown table for `$GITHUB_STEP_SUMMARY`.
 //!
-//! Every failure (Git, Cargo metadata, writing) exits non-zero, and each file
-//! is renamed into place only once it is complete, so a caller never reads a
-//! narrower selection from a failed run; the CI jobs treat a failed or missing
-//! selection as a full run. A failure of the dependency diff alone is not an
+//! Every failure (Git, Cargo metadata, writing) exits non-zero. The previous
+//! outputs are removed before any write, each file is renamed into place only
+//! once it is complete, `selection.json` comes last, and a failed write removes
+//! the outputs again, so a caller never reads a selection from a failed run;
+//! the CI jobs treat a failed or missing selection as a full run. A failure of the dependency diff alone is not an
 //! error: it selects every test.
 
 // Rust guideline compliant 2026-10-16
@@ -30,12 +31,18 @@ use serde_json::json;
 
 use super::{
     command_output, ensure_git_toplevel, filterset, graph, merge_base, parse_nul_list, plan,
-    printable, resolve, workspace, Mode, Outcome, Plan, Reason, Reminder, GIT,
+    printable, resolve, workspace, Decision, Mode, Outcome, Plan, Reason, Reminder, GIT,
 };
 use crate::XtaskError;
 
 /// Version of the `selection.json` shape; a consumer refuses any other.
 const SCHEMA_VERSION: u32 = 1;
+
+/// The output files; `selection.json` is written last, so it exists only
+/// beside complete companions.
+const SUMMARY: &str = "summary.md";
+const OUTPUTS: &str = "outputs.env";
+const SELECTION: &str = "selection.json";
 
 /// Reasons listed per package in `summary.md`; `selection.json` holds all.
 const SUMMARY_REASONS: usize = 4;
@@ -57,6 +64,11 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
         path: PathBuf::from("."),
         source,
     })?;
+    std::fs::create_dir_all(&options.out).map_err(|source| XtaskError::Io {
+        path: options.out.clone(),
+        source,
+    })?;
+    remove_outputs(&options.out)?;
     let (root, packages) = workspace(&cwd)?;
     ensure_git_toplevel(&root)?;
     let merge_base = merge_base(&root, &options.base)?;
@@ -79,20 +91,23 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
         graph::manifest_diff(&root, &merge_base)
     });
 
-    std::fs::create_dir_all(&options.out).map_err(|source| XtaskError::Io {
-        path: options.out.clone(),
-        source,
-    })?;
     let report = Report::new(&plan, &outcome);
     let selection =
         serde_json::to_string_pretty(&report.json(&options.base, &merge_base, &plan, &outcome))
             .map_err(XtaskError::Json)?;
-    write_atomic(&options.out.join("selection.json"), &(selection + "\n"))?;
-    write_atomic(&options.out.join("outputs.env"), &report.outputs(&outcome))?;
-    write_atomic(
-        &options.out.join("summary.md"),
-        &report.summary(&merge_base, &plan, &outcome),
-    )?;
+    let written = [
+        (SUMMARY, report.summary(&merge_base, &plan, &outcome)),
+        (OUTPUTS, report.outputs(&outcome)),
+        (SELECTION, selection + "\n"),
+    ]
+    .iter()
+    .try_for_each(|(name, text)| write_atomic(&options.out.join(name), text));
+    if written.is_err() {
+        // The write error is the one reported; a removal failing as well
+        // changes nothing about the exit status.
+        let _ = remove_outputs(&options.out);
+    }
+    written?;
     eprintln!(
         "affected ci: mode {}, {} changed files",
         report.mode,
@@ -105,7 +120,7 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
 struct Report {
     /// `full`, `packages` or `none`.
     mode: &'static str,
-    /// No Rust input and no gate but `docs check` is affected.
+    /// Every changed file has no Rust tests and no gate but `docs check`.
     docs_only: bool,
     script_tests: bool,
     sdk_gates: bool,
@@ -118,7 +133,11 @@ impl Report {
             Outcome::Tests(_) => "packages",
             Outcome::Nothing => "none",
         };
-        let docs_only = mode == "none"
+        // A dependency input whose diff selects nothing is still a build input.
+        let docs_only = plan
+            .decisions
+            .iter()
+            .all(|(_, decision)| matches!(decision, Decision::NoRustTests(_)))
             && plan
                 .reminders
                 .iter()
@@ -267,6 +286,20 @@ fn listed(reasons: &[String]) -> String {
 /// span are replaced, so a hostile file name cannot add rows or markup.
 fn cell(text: &str) -> String {
     printable(text).replace('|', "\\|").replace('`', "'")
+}
+
+/// Removes the output files of an earlier run from `out`.
+fn remove_outputs(out: &Path) -> Result<(), XtaskError> {
+    for name in [SELECTION, OUTPUTS, SUMMARY] {
+        let path = out.join(name);
+        match std::fs::remove_file(&path) {
+            Err(source) if source.kind() != std::io::ErrorKind::NotFound => {
+                return Err(XtaskError::Io { path, source });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Writes `text` to `path` through a sibling temporary file and a rename.

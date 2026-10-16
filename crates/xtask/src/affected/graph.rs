@@ -119,6 +119,14 @@ struct NoDepsPackage {
     manifest_path: PathBuf,
     #[serde(default)]
     dependencies: Vec<NoDepsDependency>,
+    #[serde(default)]
+    targets: Vec<NoDepsTarget>,
+}
+
+#[derive(Deserialize)]
+struct NoDepsTarget {
+    name: String,
+    kind: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -166,10 +174,17 @@ pub(crate) fn parse_members(json: &[u8]) -> Result<(PathBuf, Vec<Package>), Xtas
                 Some((name.clone(), kind))
             })
             .collect();
+        let bins = package
+            .targets
+            .iter()
+            .filter(|target| target.kind.iter().any(|kind| kind == "bin"))
+            .map(|target| target.name.clone())
+            .collect();
         members.push(Package {
             name: package.name.clone(),
             dir: crate::relative_path_string(dir)?,
             deps,
+            bins,
         });
     }
     Ok((metadata.workspace_root, members))
@@ -180,8 +195,15 @@ pub(crate) fn parse_members(json: &[u8]) -> Result<(PathBuf, Vec<Package>), Xtas
 pub(crate) enum ManifestDiff {
     /// The change cannot be judged by the resolve; the reason names why.
     Everything(String),
-    /// Members whose own resolved node or library closure changed, with reasons.
-    Members(BTreeMap<String, BTreeSet<Reason>>),
+    /// Members selected by the resolve and by the root dependency table.
+    Members {
+        /// Members whose own resolved node or library closure changed, and
+        /// members whose dev-dependencies inherit a changed root entry.
+        resolved: BTreeMap<String, BTreeSet<Reason>>,
+        /// Members whose libraries inherit a changed root entry; the caller
+        /// closes them over their reverse dependencies.
+        library_seeds: BTreeMap<String, BTreeSet<Reason>>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -196,6 +218,7 @@ struct FullMetadata {
 struct FullPackage {
     id: String,
     name: String,
+    manifest_path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -483,12 +506,130 @@ pub(crate) fn manifest_diff(root: &Path, base: &str) -> Result<ManifestDiff, Xta
         .and_then(|json| parse_graph(&json))
     };
     let base_graph = resolve(base_root)?;
-    let head_graph = resolve(root)?;
+    let head_json = command_output(
+        root,
+        "cargo",
+        &[
+            "metadata",
+            "--format-version",
+            "1",
+            "--all-features",
+            "--locked",
+        ],
+    )?;
+    let head_graph = parse_graph(&head_json)?;
     let changed = changed_nodes(&base_graph, &head_graph);
-    Ok(ManifestDiff::Members(selected_members(
-        &head_graph,
-        &changed,
-    )))
+    let mut resolved = selected_members(&head_graph, &changed);
+
+    // The resolve merges the features of host and target builds, so a root
+    // entry change can alter a build with no difference in it. Every member
+    // that inherits a changed entry is selected instead.
+    let mut library_seeds: BTreeMap<String, BTreeSet<Reason>> = BTreeMap::new();
+    let keys = changed_workspace_dependencies(&before, &after)?;
+    if !keys.is_empty() {
+        let metadata: FullMetadata =
+            serde_json::from_slice(&head_json).map_err(XtaskError::Json)?;
+        for package in metadata
+            .packages
+            .iter()
+            .filter(|package| metadata.workspace_members.contains(&package.id))
+        {
+            let manifest = std::fs::read_to_string(&package.manifest_path).map_err(|source| {
+                XtaskError::Io {
+                    path: package.manifest_path.clone(),
+                    source,
+                }
+            })?;
+            for key in &keys {
+                let reason = || {
+                    Reason::Changed(format!(
+                        "dependency diff: root [workspace.dependencies] entry `{key}` changed"
+                    ))
+                };
+                match inherited_kind(&manifest, key).map_err(|error| {
+                    XtaskError::Usage(format!(
+                        "affected: {} does not parse: {error}",
+                        package.manifest_path.display()
+                    ))
+                })? {
+                    Some(Kind::Library) => {
+                        library_seeds
+                            .entry(package.name.clone())
+                            .or_default()
+                            .insert(reason());
+                    }
+                    Some(Kind::Dev) => {
+                        resolved
+                            .entry(package.name.clone())
+                            .or_default()
+                            .insert(reason());
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    Ok(ManifestDiff::Members {
+        resolved,
+        library_seeds,
+    })
+}
+
+/// Keys of the root `[workspace.dependencies]` table added, removed or changed
+/// between the manifest texts `before` and `after`.
+fn changed_workspace_dependencies(
+    before: &str,
+    after: &str,
+) -> Result<BTreeSet<String>, XtaskError> {
+    let table = |text: &str| -> Result<toml::Table, XtaskError> {
+        let value: toml::Value = toml::from_str(text).map_err(|error| {
+            XtaskError::Usage(format!("affected: root manifest does not parse: {error}"))
+        })?;
+        Ok(value
+            .get(RESOLVED_ROOT_TABLE.0)
+            .and_then(|workspace| workspace.get(RESOLVED_ROOT_TABLE.1))
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default())
+    };
+    let (before, after) = (table(before)?, table(after)?);
+    Ok(before
+        .keys()
+        .chain(after.keys())
+        .filter(|key| before.get(*key) != after.get(*key))
+        .cloned()
+        .collect())
+}
+
+/// How the member manifest `text` inherits the root entry `key` with
+/// `workspace = true`: in a library or build table, only in a dev table, or
+/// not at all. Target-specific tables count like the plain ones.
+fn inherited_kind(text: &str, key: &str) -> Result<Option<Kind>, toml::de::Error> {
+    let manifest: toml::Table = toml::from_str(text)?;
+    let inherits = |tables: &toml::Table, name: &str| {
+        tables
+            .get(name)
+            .and_then(|table| table.get(key))
+            .and_then(|entry| entry.get("workspace"))
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+    };
+    let mut scopes = vec![&manifest];
+    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+        scopes.extend(targets.values().filter_map(toml::Value::as_table));
+    }
+    let any = |names: &[&str]| {
+        scopes
+            .iter()
+            .any(|scope| names.iter().any(|name| inherits(scope, name)))
+    };
+    Ok(if any(&["dependencies", "build-dependencies"]) {
+        Some(Kind::Library)
+    } else if any(&["dev-dependencies"]) {
+        Some(Kind::Dev)
+    } else {
+        None
+    })
 }
 
 /// Exports the tree of revision `base` of the repository at `root`.

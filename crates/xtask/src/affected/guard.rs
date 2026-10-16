@@ -20,15 +20,26 @@
 //! A read path is matched against the tracked files: the files it names and
 //! the files below it. Each of them must select the reader when it changes: it
 //! lies in the reader's directory, or its classification ([`RULES`] through
-//! the closure) selects the reader or names tests of it, or it selects every
-//! test. A use that resolves to the repository root itself (a whole-repository
+//! the closure) selects the reader, or it selects every test. A rule that
+//! names tests of the reader covers the read only when it lists the read's
+//! source and its filter provably selects the test that makes the read: the
+//! guard locates each read in its test binary, module and test function. A use that resolves to the repository root itself (a whole-repository
 //! scan, or the root passed on) is not a path the guard can judge: its file
 //! must be listed in [`SCANS`], whose declared scopes are checked in its place.
+//!
+//! Test code also runs workspace binaries by path. The guard finds each lookup
+//! of one: `bin_exe(..)` or `.with_file_name(..)` with a literal or string
+//! constant that names a workspace binary, `worker_binary()`, and a
+//! `var_os(..)`/`var(..)` read of a variable in [`BINARY_VARIABLES`]. A change
+//! to the binary's package must select the test: through a Cargo edge (the
+//! test's package depends on the binary's), or through an entry in
+//! [`BINARY_USES`] that names the test's source.
 //!
 //! Limits: a path built at run time (`format!`, a field, a value read from a
 //! file) is not found. The runtime guards of the CI test jobs cover those.
 //!
 //! [`RULES`]: super::RULES
+//! [`BINARY_USES`]: super::BINARY_USES
 
 // Rust guideline compliant 2026-10-16
 
@@ -36,8 +47,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, PathBuf};
 
 use super::{
-    classify, command_output, ensure_git_toplevel, graph, is_below, owning_package, parse_nul_list,
-    printable, workspace, Decision, Effect, Mode, Package, Reason, GIT, RULES,
+    binary_owner, classify, command_output, ensure_git_toplevel, graph, is_below, owning_package,
+    parse_nul_list, printable, workspace, BinaryUse, Decision, Effect, Mode, Package, Reason,
+    BINARY_USES, GIT, RULES,
 };
 use crate::test_code::{
     classify as classify_sources, is_ident, read_sources, skip_whitespace, string_literal_at,
@@ -56,6 +68,22 @@ const JOIN: &str = ".join(";
 
 /// Path component that matches any one component.
 const WILDCARD: &str = "*";
+
+/// Calls whose string argument names a binary beside the test's own.
+const BINARY_LOOKUPS: [&str; 2] = ["bin_exe(", ".with_file_name("];
+
+/// Test-support function that returns the session worker, and its binary.
+const WORKER_LOOKUP: (&str, &str) = ("worker_binary", "pohunek-sessiond");
+
+/// Calls that read an environment variable.
+const VARIABLE_READS: [&str; 2] = ["var_os(", "var("];
+
+/// Environment variables through which test code takes a workspace binary.
+pub(crate) const BINARY_VARIABLES: [(&str, &str); 3] = [
+    ("POHUNEK_CLI_BIN", "pohunek"),
+    ("POHUNEK_DAEMON_BIN", "pohunekd"),
+    ("POHUNEK_WORKER_BIN", "pohunek-sessiond"),
+];
 
 /// Test files that use the repository root itself, with the paths they read.
 ///
@@ -194,6 +222,20 @@ pub(crate) struct Read {
     /// Found from an anchor, so it must name a tracked path; a `../` literal
     /// may name anything.
     pub(crate) anchored: bool,
+    pub(crate) location: Location,
+}
+
+/// Where a use sits among the tests nextest runs.
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct Location {
+    /// Integration test binary whose root file or module directory holds it.
+    pub(crate) binary: Option<String>,
+    /// Module path in the package library (or the integration binary) of the
+    /// position, inline modules included; `None` when the file's place in a
+    /// test binary is unknown, such as a `tests/support` module.
+    pub(crate) scope: Option<String>,
+    /// Full nextest name of the test function holding it, if any.
+    pub(crate) test: Option<String>,
 }
 
 /// A read whose path does not select the reading package.
@@ -203,6 +245,16 @@ pub(crate) struct Violation {
     pub(crate) reader: String,
     /// What is wrong: the uncovered file and its decision, or the missing scan.
     pub(crate) problem: String,
+}
+
+/// One lookup of a workspace binary by test code.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct BinaryRun {
+    /// Workspace-relative source file of the lookup.
+    pub(crate) file: String,
+    pub(crate) line: usize,
+    pub(crate) binary: String,
+    pub(crate) location: Location,
 }
 
 /// Options for one `cargo xtask affected guard` invocation.
@@ -224,7 +276,9 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
     let tracked: BTreeSet<String> =
         parse_nul_list(&command_output(&root, GIT, &["ls-files", "-z"])?).collect();
     let sources = read_sources(&root)?;
-    let reads = find_reads(&classify_sources(&sources), &packages);
+    let classified = classify_sources(&sources);
+    let reads = find_reads(&classified, &packages);
+    let runs = find_binary_runs(&classified, &packages);
     if options.list {
         for (reader, read) in &reads {
             println!(
@@ -234,12 +288,25 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
                 shown(&read.path)
             );
         }
+        for (reader, run) in &runs {
+            println!(
+                "{}:{}: {reader} runs the `{}` binary",
+                printable(&run.file),
+                run.line,
+                run.binary
+            );
+        }
     }
     let violations = check(&reads, &packages, &tracked, SCANS, NOT_READS);
-    if violations.is_empty() {
+    let binary_violations = check_binary_runs(&runs, &packages, &tracked, BINARY_USES);
+    for problem in &binary_violations {
+        eprintln!("{problem}");
+    }
+    if violations.is_empty() && binary_violations.is_empty() {
         println!(
-            "affected guard ok: {} repository reads in test code select their readers",
-            reads.len()
+            "affected guard ok: {} repository reads and {} binary runs in test code select their readers",
+            reads.len(),
+            runs.len()
         );
         return Ok(());
     }
@@ -254,11 +321,179 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
         );
     }
     Err(XtaskError::Usage(format!(
-        "affected guard: {} repository reads of test code are not covered; map each \
-         path to its reader in RULES, or declare a root scan in SCANS \
-         (crates/xtask/src/affected/)",
-        violations.len()
+        "affected guard: {} repository reads and {} binary runs of test code are not \
+         covered; map each path to its reader in RULES, declare a root scan in SCANS, \
+         or add the binary run to BINARY_USES (crates/xtask/src/affected/)",
+        violations.len(),
+        binary_violations.len()
     )))
+}
+
+/// Every lookup of a workspace binary in the test code of `files`, with its
+/// package.
+pub(crate) fn find_binary_runs(
+    files: &BTreeMap<String, SourceFile>,
+    packages: &[Package],
+) -> Vec<(String, BinaryRun)> {
+    let mut by_package: BTreeMap<&Package, Vec<&SourceFile>> = BTreeMap::new();
+    for file in files.values() {
+        if let Some(owner) = owning_package(file.path(), packages) {
+            by_package.entry(owner).or_default().push(file);
+        }
+    }
+    let mut runs = BTreeSet::new();
+    for (package, package_files) in &by_package {
+        for file in package_files {
+            for (offset, binary) in binary_lookups(file) {
+                if binary_owner(&binary, packages).is_some() {
+                    runs.insert((
+                        package.name.clone(),
+                        BinaryRun {
+                            file: file.path().to_owned(),
+                            line: file.line_of(offset),
+                            binary,
+                            location: locate(file, &package.dir, package_files, offset),
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    runs.into_iter().collect()
+}
+
+/// The binary lookups in the test code of `file`, as `(offset, binary)`; the
+/// names are not yet checked against the workspace.
+fn binary_lookups(file: &SourceFile) -> Vec<(usize, String)> {
+    let views = file.views();
+    let skeleton = views.skeleton.as_bytes();
+    let constants = string_constants(file);
+    let call_at = |offset: usize, call: &str| {
+        file.in_test_code(offset)
+            && !(offset > 0 && !call.starts_with('.') && is_ident(skeleton[offset - 1]))
+            && !views.skeleton[..offset].trim_end().ends_with("fn")
+    };
+    // The argument of the call whose `(` ends at `open`: a literal or a constant.
+    let argument = |open: usize| -> Option<String> {
+        let at = skip_whitespace(views.code.as_bytes(), open);
+        let (value, end) = if views.code.as_bytes().get(at) == Some(&b'"') && skeleton[at] == b' ' {
+            (
+                string_literal_at(&views.code, at)?.to_owned(),
+                literal_end(&views.skeleton, at),
+            )
+        } else {
+            let end = ident_end(skeleton, at);
+            (constants.get(&views.skeleton[at..end])?.clone(), end)
+        };
+        (skeleton.get(skip_whitespace(skeleton, end)) == Some(&b')')).then_some(value)
+    };
+
+    let mut found = Vec::new();
+    for call in BINARY_LOOKUPS {
+        for (offset, _) in views.skeleton.match_indices(call) {
+            if call_at(offset, call) {
+                if let Some(binary) = argument(offset + call.len()) {
+                    found.push((offset, binary));
+                }
+            }
+        }
+    }
+    for call in VARIABLE_READS {
+        for (offset, _) in views.skeleton.match_indices(call) {
+            if !call_at(offset, call) {
+                continue;
+            }
+            let binary = argument(offset + call.len()).and_then(|variable| {
+                BINARY_VARIABLES
+                    .iter()
+                    .find(|(name, _)| *name == variable)
+                    .map(|(_, binary)| (*binary).to_owned())
+            });
+            if let Some(binary) = binary {
+                found.push((offset, binary));
+            }
+        }
+    }
+    let (function, binary) = WORKER_LOOKUP;
+    for (offset, _) in views.skeleton.match_indices(function) {
+        let open = offset + function.len();
+        let called = views.skeleton[open..].starts_with('(')
+            && skeleton.get(skip_whitespace(skeleton, open + 1)) == Some(&b')');
+        if called
+            && call_at(offset, function)
+            && !(offset > 0 && is_ident(skeleton[offset - 1]))
+            && !is_ident(*skeleton.get(open).unwrap_or(&b' '))
+        {
+            found.push((offset, binary.to_owned()));
+        }
+    }
+    found
+}
+
+/// The binary runs whose binary's package does not select the running test,
+/// and the stale entries of `uses`, as printable lines.
+pub(crate) fn check_binary_runs(
+    runs: &[(String, BinaryRun)],
+    packages: &[Package],
+    tracked: &BTreeSet<String>,
+    uses: &[BinaryUse],
+) -> Vec<String> {
+    let mut problems = BTreeSet::new();
+    let mut matched = BTreeSet::new();
+    for (reader, run) in runs {
+        let Some(owner) = binary_owner(&run.binary, packages) else {
+            continue;
+        };
+        let seeds = BTreeMap::from([(
+            owner.name.clone(),
+            BTreeSet::from([Reason::Changed(String::new())]),
+        )]);
+        if owner.name == *reader || graph::close(&seeds, packages).contains_key(reader) {
+            continue;
+        }
+        let entry = uses.iter().position(|edge| {
+            edge.binary == run.binary
+                && edge.readers.package == reader
+                && edge
+                    .readers
+                    .files
+                    .iter()
+                    .any(|named| run.file == *named || is_below(&run.file, named))
+                && filter_covers(edge.readers.filter, &run.location)
+        });
+        match entry {
+            Some(index) => {
+                matched.insert(index);
+            }
+            None => {
+                problems.insert(format!(
+                    "{}:{}: {reader} runs the `{}` binary of {}, but a change to {} does not \
+                     select it: no Cargo edge and no BINARY_USES entry names {}",
+                    printable(&run.file),
+                    run.line,
+                    run.binary,
+                    owner.name,
+                    owner.name,
+                    printable(&run.file)
+                ));
+            }
+        }
+    }
+    for (index, edge) in uses.iter().enumerate() {
+        let present = edge.readers.files.iter().any(|named| {
+            tracked
+                .iter()
+                .any(|file| file == named || is_below(file, named))
+        });
+        if present && !matched.contains(&index) {
+            problems.insert(format!(
+                "BINARY_USES: the entry for `{}` in {} is stale: no test source it names runs \
+                 the binary outside a Cargo edge",
+                edge.binary, edge.readers.package
+            ));
+        }
+    }
+    problems.into_iter().collect()
 }
 
 /// A read path for display; the empty path is the repository root.
@@ -284,7 +519,7 @@ pub(crate) fn find_reads(
     let mut reads = BTreeSet::new();
     for (package, files) in by_package {
         let (shared, bodies) = package_anchors(&files);
-        for file in files {
+        for file in &files {
             // A file's own wrappers win over a same-named wrapper elsewhere.
             let mut anchors = shared.clone();
             for (name, anchor, _) in wrappers(file, &shared) {
@@ -298,6 +533,7 @@ pub(crate) fn find_reads(
                         line: file.line_of(offset),
                         path,
                         anchored,
+                        location: locate(file, &package.dir, &files, offset),
                     },
                 ));
             }
@@ -792,12 +1028,11 @@ pub(crate) fn check(
             // A path that names no tracked file (an absence check, or an input
             // that moved) must still select the reader once a file is there.
             let absent = (read.anchored && named.peek().is_none() && !path.contains(WILDCARD))
-                .then(|| uncovered(&path, reader, &read.file, packages).map(|why| (&path, why)))
+                .then(|| uncovered(&path, reader, read, packages).map(|why| (&path, why)))
                 .flatten();
             let uncovered = absent.or_else(|| {
-                named.find_map(|file| {
-                    uncovered(file, reader, &read.file, packages).map(|why| (file, why))
-                })
+                named
+                    .find_map(|file| uncovered(file, reader, read, packages).map(|why| (file, why)))
             });
             if let Some((file, why)) = uncovered {
                 violations.insert(Violation {
@@ -821,6 +1056,7 @@ pub(crate) fn check(
                     line: 0,
                     path: (*path).to_owned(),
                     anchored: false,
+                    location: Location::default(),
                 },
                 reader: String::from("NOT_READS"),
                 problem: "the entry is stale: the file no longer has this read".to_owned(),
@@ -835,6 +1071,7 @@ pub(crate) fn check(
                     line: 0,
                     path: String::new(),
                     anchored: false,
+                    location: Location::default(),
                 },
                 reader: String::from("SCANS"),
                 problem: "the entry is stale: the file no longer uses the repository root"
@@ -854,11 +1091,13 @@ fn is_own(path: &str, reader: &str, packages: &[Package]) -> bool {
 }
 
 /// The decision of `file` when its change does not select the test code of
-/// package `reader` in source `source`.
+/// package `reader` that makes `read`.
 ///
-/// A narrowed rule covers the read only when it names `source` among the
-/// sources its filter selects; naming the package is not enough.
-fn uncovered(file: &str, reader: &str, source: &str, packages: &[Package]) -> Option<String> {
+/// A narrowed rule covers the read only when it names the read's source among
+/// the sources its filter selects and its filter selects the test holding the
+/// read; naming the package or the file is not enough.
+fn uncovered(file: &str, reader: &str, read: &Read, packages: &[Package]) -> Option<String> {
+    let source = read.file.as_str();
     if is_own(file, reader, packages) {
         return None;
     }
@@ -877,11 +1116,11 @@ fn uncovered(file: &str, reader: &str, source: &str, packages: &[Package]) -> Op
                 .collect();
             let selected = graph::close(&seeds, packages);
             let narrowed = tests.iter().any(|(package, ..)| package == reader)
-                && names_source(file, reader, source);
+                && narrowed_covers(file, reader, read);
             let covered = selected.contains_key(reader) || narrowed;
             (!covered).then(|| {
                 format!(
-                    "{} (no rule selects the tests in {})",
+                    "{} (no rule selects the test in {} that makes the read)",
                     decision.describe(),
                     printable(source)
                 )
@@ -891,8 +1130,9 @@ fn uncovered(file: &str, reader: &str, source: &str, packages: &[Package]) -> Op
     }
 }
 
-/// Whether a narrowed rule for `file` names `source` as a test source of `reader`.
-fn names_source(file: &str, reader: &str, source: &str) -> bool {
+/// Whether a narrowed rule for `file` names the source of `read` as a test
+/// source of `reader` and selects the test that makes the read.
+fn narrowed_covers(file: &str, reader: &str, read: &Read) -> bool {
     RULES
         .iter()
         .filter(|rule| rule.pattern.matches(file))
@@ -901,6 +1141,210 @@ fn names_source(file: &str, reader: &str, source: &str) -> bool {
             _ => &[],
         })
         .filter(|entry| entry.package == reader)
-        .flat_map(|entry| entry.files)
-        .any(|named| source == *named || is_below(source, named))
+        .any(|entry| {
+            entry
+                .files
+                .iter()
+                .any(|named| read.file == *named || is_below(&read.file, named))
+                && filter_covers(entry.filter, &read.location)
+        })
+}
+
+/// Where the use at `offset` of `file`, in the package at `package_dir`, sits
+/// among the package's tests. `files` are the package's sources, which tell a
+/// `tests/<name>/main.rs` binary's modules apart from a shared module tree.
+fn locate(file: &SourceFile, package_dir: &str, files: &[&SourceFile], offset: usize) -> Location {
+    let relative = if package_dir.is_empty() {
+        file.path()
+    } else {
+        file.path()
+            .strip_prefix(package_dir)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .unwrap_or(file.path())
+    };
+    let module_of = |path: &str| -> String {
+        let path = path.strip_suffix(".rs").unwrap_or(path);
+        let path = path.strip_suffix("/mod").unwrap_or(path);
+        path.replace('/', "::")
+    };
+    let (binary, base) = if let Some(rest) = relative.strip_prefix("tests/") {
+        match rest.split_once('/') {
+            None => (
+                rest.strip_suffix(".rs").map(str::to_owned),
+                Some(String::new()),
+            ),
+            Some((dir, inner)) => {
+                let main = format!("{package_dir}/tests/{dir}/main.rs");
+                if files.iter().any(|candidate| candidate.path() == main) {
+                    let base = if inner == "main.rs" {
+                        String::new()
+                    } else {
+                        module_of(inner)
+                    };
+                    (Some(dir.to_owned()), Some(base))
+                } else {
+                    (None, None)
+                }
+            }
+        }
+    } else if let Some(rest) = relative.strip_prefix("src/") {
+        if rest == "main.rs" || rest.starts_with("bin/") {
+            (None, None)
+        } else if rest == "lib.rs" {
+            (None, Some(String::new()))
+        } else {
+            (None, Some(module_of(rest)))
+        }
+    } else {
+        (None, None)
+    };
+    let scope = base.map(|base| {
+        std::iter::once(base)
+            .chain(file.modules_at(offset))
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("::")
+    });
+    let test = scope.as_ref().and_then(|scope| {
+        file.test_function_at(offset).map(|name| {
+            if scope.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{scope}::{name}")
+            }
+        })
+    });
+    Location {
+        binary,
+        scope,
+        test,
+    }
+}
+
+/// Whether the nextest `filter` provably selects the test at `location`: one
+/// of its `|` alternatives holds for it in every conjunct.
+///
+/// The conjuncts understood are `binary(=name)`, `kind(lib)`, `test(=name)`
+/// and `test(/^prefix/)` with an optional `(a|b)` group in the prefix. A use
+/// outside a test function, in a helper, is selected only by an alternative
+/// that selects every test of its module. Any other form proves nothing.
+fn filter_covers(filter: &str, location: &Location) -> bool {
+    split_top(strip_parens(filter), " | ")
+        .into_iter()
+        .any(|alternative| {
+            split_top(strip_parens(alternative), " and ")
+                .into_iter()
+                .all(|atom| atom_covers(strip_parens(atom), location))
+        })
+}
+
+fn atom_covers(atom: &str, location: &Location) -> bool {
+    if atom == "kind(lib)" {
+        return location.binary.is_none() && location.scope.is_some();
+    }
+    if let Some(name) = atom
+        .strip_prefix("binary(=")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        return location.binary.as_deref() == Some(name);
+    }
+    if let Some(name) = atom
+        .strip_prefix("test(=")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        return location.test.as_deref() == Some(name);
+    }
+    let Some(prefixes) = atom
+        .strip_prefix("test(/^")
+        .and_then(|rest| rest.strip_suffix("/)"))
+        .and_then(regex_prefixes)
+    else {
+        return false;
+    };
+    let scope = location
+        .scope
+        .as_deref()
+        .filter(|scope| !scope.is_empty())
+        .map(|scope| format!("{scope}::"));
+    prefixes.iter().any(|prefix| {
+        scope
+            .as_deref()
+            .is_some_and(|scope| scope.starts_with(prefix.as_str()))
+            || location
+                .test
+                .as_deref()
+                .is_some_and(|test| test.starts_with(prefix.as_str()))
+    })
+}
+
+/// The literal prefixes a `^`-anchored regex body stands for: plain text with
+/// at most one `(a|b|..)` group; `None` for any other regex syntax.
+fn regex_prefixes(body: &str) -> Option<Vec<String>> {
+    let plain = |text: &str| {
+        !text.contains([
+            '.', '*', '+', '?', '[', ']', '(', ')', '|', '\\', '$', '^', '{', '}',
+        ])
+    };
+    let Some((head, rest)) = body.split_once('(') else {
+        return plain(body).then(|| vec![body.to_owned()]);
+    };
+    let (group, tail) = rest.split_once(')')?;
+    if !plain(head) || !plain(tail) {
+        return None;
+    }
+    group
+        .split('|')
+        .map(|choice| plain(choice).then(|| format!("{head}{choice}{tail}")))
+        .collect()
+}
+
+/// `text` without parentheses that enclose all of it.
+fn strip_parens(text: &str) -> &str {
+    let mut text = text.trim();
+    while text.starts_with('(') && text.ends_with(')') && closes_at_end(text) {
+        text = text[1..text.len() - 1].trim();
+    }
+    text
+}
+
+/// Whether the `(` that opens `text` is closed by its last byte.
+fn closes_at_end(text: &str) -> bool {
+    let mut depth = 0_usize;
+    for (index, byte) in text.bytes().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return index == text.len() - 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `text` split at each `separator` outside parentheses and regex slashes.
+fn split_top<'a>(text: &'a str, separator: &str) -> Vec<&'a str> {
+    let bytes = text.as_bytes();
+    let mut parts = Vec::new();
+    let (mut depth, mut in_regex, mut start, mut index) = (0_usize, false, 0, 0);
+    while index < bytes.len() {
+        match bytes[index] {
+            b'/' => in_regex = !in_regex,
+            b'(' if !in_regex => depth += 1,
+            b')' if !in_regex => depth = depth.saturating_sub(1),
+            _ if depth == 0 && !in_regex && text[index..].starts_with(separator) => {
+                parts.push(&text[start..index]);
+                index += separator.len();
+                start = index;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    parts.push(&text[start..]);
+    parts
 }

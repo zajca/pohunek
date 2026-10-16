@@ -69,6 +69,8 @@ pub struct SourceFile {
 #[derive(Debug)]
 struct TestSpan {
     start: usize,
+    /// Offset of the first token after the attributes.
+    header_start: usize,
     end: usize,
     /// Attribute bodies (text between `[` and `]`, comments blanked) of the item.
     attributes: Vec<String>,
@@ -117,6 +119,56 @@ impl SourceFile {
             .filter(|span| span.start <= offset && offset < span.end)
             .flat_map(|span| span.attributes.iter().map(String::as_str))
             .collect()
+    }
+
+    /// Name of the innermost test function (an item with a test attribute such
+    /// as `#[test]` or `#[tokio::test]`) that contains the byte `offset`.
+    #[must_use]
+    pub fn test_function_at(&self, offset: usize) -> Option<&str> {
+        let span = self
+            .test_spans
+            .iter()
+            .filter(|span| span.start <= offset && offset < span.end)
+            .filter(|span| span.attributes.iter().any(|body| is_test_marker(body)))
+            .max_by_key(|span| span.start)?;
+        let skeleton = &self.views.skeleton;
+        let bytes = skeleton.as_bytes();
+        let header = &skeleton[span.header_start..span.end];
+        let keyword = header
+            .match_indices("fn")
+            .map(|(at, _)| span.header_start + at)
+            .find(|&at| {
+                (at == 0 || !is_ident(bytes[at - 1]))
+                    && bytes.get(at + 2).is_some_and(u8::is_ascii_whitespace)
+            })?;
+        let start = skip_whitespace(bytes, keyword + 2);
+        let mut end = start;
+        while bytes.get(end).copied().is_some_and(is_ident) {
+            end += 1;
+        }
+        (end > start).then(|| &skeleton[start..end])
+    }
+
+    /// Names of the inline modules (`mod name { .. }`) that contain the byte
+    /// `offset`, outermost first.
+    #[must_use]
+    pub fn modules_at(&self, offset: usize) -> Vec<String> {
+        let bytes = self.views.skeleton.as_bytes();
+        let mut found = Vec::new();
+        for (at, _) in self.views.skeleton.match_indices("mod") {
+            if at >= offset {
+                break;
+            }
+            if at > 0 && is_ident(bytes[at - 1]) {
+                continue;
+            }
+            if let Some((name, open, b'{')) = module_header(bytes, at) {
+                if open < offset && offset < matching_close(bytes, open) {
+                    found.push(name);
+                }
+            }
+        }
+        found
     }
 
     /// One-based line number of the byte `offset`.
@@ -277,6 +329,7 @@ pub fn classify(files: &BTreeMap<String, String>) -> BTreeMap<String, SourceFile
                 .filter(|item| item.test_only)
                 .map(|item| TestSpan {
                     start: item.start,
+                    header_start: item.header_start,
                     end: item.end,
                     attributes: item.attributes.clone(),
                 })

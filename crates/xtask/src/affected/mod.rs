@@ -25,7 +25,9 @@
 //! The selected packages are closed over their reverse dependencies
 //! ([`graph::close`]) and become an explicit nextest filterset such as
 //! `package(=a) | (package(=b) and (binary(=t)))`, so each package carries the
-//! reason it runs.
+//! reason it runs. A test that runs another package's binary by path with no
+//! Cargo edge between the two ([`BINARY_USES`]) is selected whenever that
+//! package's library is.
 //!
 //! **Selection narrows what runs, never what is built.** CI keeps building the
 //! whole workspace (`cargo nextest archive --workspace --all-features`) and
@@ -44,7 +46,7 @@
 //! The local loop is an inner-loop accelerator. It never replaces the full
 //! gate set.
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-16
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -110,6 +112,8 @@ pub(crate) struct Package {
     pub(crate) dir: String,
     /// Members this package depends on, by name, with the kind of each edge.
     pub(crate) deps: BTreeSet<(String, Kind)>,
+    /// Names of the package's binary targets.
+    pub(crate) bins: BTreeSet<String>,
 }
 
 /// Path shape matched by a classification rule.
@@ -177,6 +181,35 @@ const fn readers(
         filter,
         files,
     }
+}
+
+/// Tests that run another package's binary by path, with no Cargo edge
+/// between the two packages that would select them.
+///
+/// A change that selects the owning package's library rebuilds the binary,
+/// so it selects these tests. [`guard`] finds every binary lookup in test
+/// code and requires a Cargo edge or an entry here.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BinaryUse {
+    /// Name of the binary target, as the test looks it up.
+    pub(crate) binary: &'static str,
+    pub(crate) readers: Readers,
+    pub(crate) why: &'static str,
+}
+
+pub(crate) const BINARY_USES: &[BinaryUse] = &[BinaryUse {
+    binary: "pohunek",
+    readers: readers(
+        "pohunek-daemon",
+        "binary(=supervised_lifecycle)",
+        &["crates/daemon/tests/supervised_lifecycle.rs"],
+    ),
+    why: "the managed-CLI scenario runs the `pohunek` binary beside `pohunekd`",
+}];
+
+/// The workspace package that builds binary `name`.
+pub(crate) fn binary_owner<'a>(name: &str, packages: &'a [Package]) -> Option<&'a Package> {
+    packages.iter().find(|package| package.bins.contains(name))
 }
 
 /// Follow-up check that the Rust tests do not cover.
@@ -794,6 +827,20 @@ fn plan(changed: &BTreeSet<String>, packages: &[Package], mode: Mode) -> Result<
         }
     }
 
+    for edge in BINARY_USES {
+        if binary_owner(edge.binary, packages).is_none()
+            || !packages
+                .iter()
+                .any(|package| package.name == edge.readers.package)
+        {
+            return Err(XtaskError::Usage(format!(
+                "affected binary use of `{}` by `{}` names no workspace binary or package; \
+                 update BINARY_USES in crates/xtask/src/affected/mod.rs",
+                edge.binary, edge.readers.package
+            )));
+        }
+    }
+
     let mut decisions = Vec::with_capacity(changed.len());
     let mut reminders = BTreeSet::new();
     let mut everything = false;
@@ -970,8 +1017,12 @@ fn resolve(
     let mut whole = graph::close(&seeds, packages);
     if plan.dependencies {
         match diff() {
-            Ok(graph::ManifestDiff::Members(members)) => {
-                for (name, reasons) in members {
+            Ok(graph::ManifestDiff::Members {
+                resolved,
+                library_seeds,
+            }) => {
+                let inherited = graph::close(&library_seeds, packages);
+                for (name, reasons) in resolved.into_iter().chain(inherited) {
                     whole.entry(name).or_default().extend(reasons);
                 }
             }
@@ -984,6 +1035,28 @@ fn resolve(
                     printable(&error.to_string())
                 )]);
             }
+        }
+    }
+    // A binary is rebuilt when its package's library is selected; a selection
+    // through a dev-dependency changes only the package's tests.
+    for edge in BINARY_USES {
+        let rebuilt = binary_owner(edge.binary, packages)
+            .and_then(|owner| whole.get(&owner.name).map(|reasons| (owner, reasons)))
+            .filter(|(_, reasons)| {
+                reasons
+                    .iter()
+                    .any(|reason| !matches!(reason, Reason::DevDependsOn(_)))
+            });
+        if let Some((owner, _)) = rebuilt {
+            narrowed
+                .entry(edge.readers.package.to_owned())
+                .or_default()
+                .entry(edge.readers.filter)
+                .or_default()
+                .insert(format!(
+                    "the `{}` binary of {} ({})",
+                    edge.binary, owner.name, edge.why
+                ));
         }
     }
     narrowed.retain(|package, _| !whole.contains_key(package));
@@ -1335,6 +1408,7 @@ mod tests {
             name: name.to_owned(),
             dir: dir.to_owned(),
             deps: BTreeSet::new(),
+            bins: BTreeSet::new(),
         }
     }
 
@@ -1347,7 +1421,10 @@ mod tests {
             package("pohunek-daemon", "crates/daemon"),
             package("pohunek-protocol", "crates/protocol"),
             package("pohunek-client", "crates/client"),
-            package("pohunek-cli", "crates/cli"),
+            Package {
+                bins: BTreeSet::from(["pohunek".to_owned()]),
+                ..package("pohunek-cli", "crates/cli")
+            },
             package("pohunek-netbird", "crates/netbird"),
             package("pohunek-test-support", "crates/test-support"),
             package("xtask", "crates/xtask"),
@@ -1692,7 +1769,10 @@ mod tests {
             "sdk/ts/x.ts -> no Rust tests (Bun workspace; xtask only writes its generated \
              bindings, checked by `cargo xtask ts check`)"
         );
-        assert_eq!(lines[3], "selection: pohunek-cli, xtask (named tests)");
+        assert_eq!(
+            lines[3],
+            "selection: pohunek-cli, pohunek-daemon (named tests), xtask (named tests)"
+        );
         assert_eq!(
             lines[4],
             "  pohunek-cli: crates/cli/src/lib.rs (package directory)"
@@ -1705,7 +1785,8 @@ mod tests {
         );
         assert!(
             lines[6].starts_with(
-                "cargo t -E 'package(=pohunek-cli) | (package(=xtask) and ((binary(=hermetic_scan)"
+                "cargo t -E 'package(=pohunek-cli) | (package(=pohunek-daemon) and \
+                 ((binary(=supervised_lifecycle)))) | (package(=xtask) and ((binary(=hermetic_scan)"
             ),
             "{report}"
         );
@@ -1796,6 +1877,7 @@ mod tests {
                     name,
                     dir,
                     deps: BTreeSet::new(),
+                    bins: BTreeSet::new(),
                 }
             })
             .collect()
@@ -1803,9 +1885,10 @@ mod tests {
 
     #[test]
     fn rules_name_only_real_workspace_packages() {
-        let packages = repo_packages(&pohunek_test_support::workspace_root());
+        let (_, packages) =
+            workspace(&pohunek_test_support::workspace_root()).expect("workspace metadata");
         plan(&BTreeSet::new(), &packages, Mode::Local)
-            .expect("every rule names a workspace package");
+            .expect("every rule and binary use names a workspace package");
     }
 
     /// Resolves `.` and `..` lexically; `None` when the path climbs above the root.
