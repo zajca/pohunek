@@ -50,7 +50,14 @@ RELEASE_CALLER = "evidence"
 CI_CALLER = "release-rehearsal"
 SIGNING_JOB = "assemble"
 SIGNING_SECRET = "CATALOG_SIGNING_KEY_CI"
-FULL_RUN_EVENTS = ("schedule", "push", "workflow_dispatch")
+# The terms that start the CI rehearsal: the nightly tier (schedule and a
+# `nightly` dispatch) and a pull request whose `release_rehearsal` filter
+# matched. Push to main and a `main` dispatch never start it.
+REHEARSAL_RUN_TERMS = (
+    "github.event_name == 'schedule'",
+    "(github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly')",
+    "(github.event_name == 'pull_request' && needs.changes.outputs.release_rehearsal == 'true')",
+)
 REHEARSAL_INPUTS = {
     ".github/workflows/ci.yml",
     ".github/workflows/release.yml",
@@ -631,9 +638,9 @@ class OidcTests(ReleaseWorkflowFiles):
             with self.subTest(job=name):
                 condition = re.search(r"(?m)^    if: (.*)$", block)
                 self.assertIsNotNone(condition)
-                for event in FULL_RUN_EVENTS:
-                    self.assertIn(f"github.event_name == '{event}'", condition.group(1))
-                self.assertIn("needs.changes.outputs.release_rehearsal == 'true'", condition.group(1))
+                for term in REHEARSAL_RUN_TERMS:
+                    self.assertIn(term, condition.group(1))
+                self.assertNotIn("github.event_name == 'push'", condition.group(1))
                 self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", block)
                 self.assertIn("dependabot[bot]", block)
                 self.assertIn("mode: rehearsal", block)
