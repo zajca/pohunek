@@ -169,6 +169,29 @@ CI acceptance (#1224). Manual
 dispatch requires the `main` or `nightly` choice; nightly adds the nightly-only
 checks to main. Schedule and manual runs do not cancel PR or main runs.
 
+On pull requests the Linux test jobs run only the tests the change can
+affect (#1218). The `test selection` job builds `xtask` at the merge base and
+runs its `cargo xtask affected ci` against the head
+(`scripts/ci-test-selection`), so a change to the selector, its rules, or the
+lockfile judges only the pull requests after it lands, and a path the base
+rules do not know selects every test. `scripts/test-partitions plan
+--selection` turns the selection into the fast shards to start and whether
+the heavy and relay DB jobs run. The archive stays the whole workspace; each
+job runs its shard narrowed to the selection (`run <shard> --selection`, which
+is `-E '(<shard>) and (<filterset>)'`) from a sparse checkout that holds only
+the files whose change selects a selected package (`cargo xtask affected
+sparse`), so a test that reads any other path fails instead of passing with
+the test skipped. The heavy job first proves with `check --selection` that the
+planned shards hold every selected test. Every test runs on push, schedule,
+and dispatch runs, and on a pull request that changes `.github/`, a script the
+CI test jobs run, `.cargo/`, `.config/nextest.toml`, `rust-toolchain*`, the
+root `Cargo.toml` outside `[workspace.dependencies]`, or an unmapped path, or
+whose selector fails, times out, or writes another schema. A test job narrows
+or skips only on an explicit output of a successful selection, and the
+`test selection verdict` job fails a run whose test job failed, was
+cancelled, or was skipped without one. The script regressions run in the
+core shard when a script, `.github/`, or a full selection needs them.
+
 Before the final head of a pull request merges, dispatch `ci.yml` once with
 `tier=main` on the branch (`gh workflow run ci.yml --ref <branch> -f tier=main`)
 only when the diff touches a release workflow or release xtask code, the runtime
