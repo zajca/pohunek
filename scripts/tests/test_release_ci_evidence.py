@@ -120,6 +120,17 @@ with events.open("a") as stream:
     endpoint = next(value for value in args if value.startswith("repos/"))
     if endpoint.endswith("/commits"):
         print(json.dumps([{"sha": state["sha"]}]))
+    elif "/git/commits/" in endpoint:
+        sha = endpoint.rsplit("/", 1)[1]
+        tree = subprocess.check_output(
+            [os.environ["REAL_GIT"], "-C", os.environ["RELEASE_REPO"], "rev-parse", sha + "^{tree}"],
+            text=True,
+        ).strip()
+        print(json.dumps({"sha": sha, "tree": {"sha": tree}}))
+    elif endpoint.endswith("/artifacts"):
+        run_id = int(endpoint.split("/")[-2])
+        run = next((run for run in state["runs"] if run["id"] == run_id), {})
+        print(json.dumps([{"artifacts": [{"name": name} for name in run.get("artifacts", [])]}]))
     elif "/actions/workflows/" in endpoint:
         wanted = next((value.split("=", 1)[1] for value in args if value.startswith("event=")), None)
         runs = [run for run in state["runs"] if wanted is None or run["event"] == wanted]
@@ -359,6 +370,55 @@ class ReleaseEvidenceTests(unittest.TestCase):
         self.assertIn(json.loads(self.state.read_text())["sha"], tag_event)
         self.assertLess(decoded.index("gh-dispatch-nightly"), decoded.index(tag_event))
         self.assertLess(decoded.index(tag_event), decoded.index(["git", "push", "push", "origin", "v0.1.1"]))
+
+    def test_the_release_commit_is_never_matched_by_an_earlier_tree(self):
+        # Green dispatch runs of both tiers on the commit before the release,
+        # with their trees recorded: the release commit bumps the version, so
+        # its tree differs and the release takes evidence on its own commit.
+        before = subprocess.check_output(
+            [shutil.which("git"), "-C", str(self.repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        tree = subprocess.check_output(
+            [shutil.which("git"), "-C", str(self.repo), "rev-parse", "HEAD^{tree}"], text=True
+        ).strip()
+        runs = []
+        for index, tier in enumerate(("main", "nightly"), start=1):
+            run_id = 800 + index
+            runs.append({
+                "id": run_id,
+                "run_number": run_id,
+                "run_attempt": 1,
+                "head_sha": before,
+                "head_branch": "main",
+                "path": ".github/workflows/ci.yml@refs/heads/main",
+                "event": "workflow_dispatch",
+                "display_title": f"CI [tier={tier}]",
+                "status": "completed",
+                "conclusion": "success",
+                "html_url": f"https://github.com/example/pohunek/actions/runs/{run_id}",
+                "repository": {"full_name": "example/pohunek"},
+                "head_repository": {"full_name": "example/pohunek"},
+                "artifacts": [f"tested-tree-{tree}"],
+                "tier": tier,
+            })
+        self.state.write_text(json.dumps({"sha": "", "runs": runs}))
+
+        refused = self.run_release("--no-push")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("no main tier run exists", refused.stderr)
+        self.assertFalse(any(event.startswith('["git", "tag"') for event in self.read_events()))
+
+        self.git("reset", "--hard", before)
+        self.state.write_text(json.dumps({"sha": "", "runs": runs}))
+        result = self.run_release()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        candidate = json.loads(self.state.read_text())["sha"]
+        self.assertNotEqual(candidate, before)
+        for tier in ("main", "nightly"):
+            self.assertIn(f"{tier} tier passed for {candidate}: ", result.stdout)
+        self.assertNotIn("by tree", result.stdout)
+        self.assertNotIn("/actions/runs/801", result.stdout)
+        self.assertNotIn("/actions/runs/802", result.stdout)
 
     def test_no_push_refuses_to_tag_without_existing_evidence(self):
         result = self.run_release("--no-push")

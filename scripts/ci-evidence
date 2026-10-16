@@ -1,9 +1,24 @@
 #!/usr/bin/env python3
-"""Require successful exact-commit evidence from the CI execution tiers."""
+"""Require successful CI execution-tier evidence for a commit.
+
+A run is evidence for commit S when its `head_sha` is S, or, for a
+`workflow_dispatch` run of the evidence repository, when it tested the same git
+tree as S: the tree of its own head commit equals tree(S), and the
+`tested-tree-<tree>` artifact the run uploaded names that tree. A run on S
+itself always decides once any run or run attempt of the tier on S has
+completed; a tree match is consulted only while none has.
+
+Trust basis of a tree match: only identities with write access, the owner and
+its agent identities, can start a `workflow_dispatch` run, and the workflow
+definition is part of the tree, so a run of the same tree ran the same jobs on
+the same content whichever branch or commit it was started on. Runs a pull
+request can start, and runs of another repository, never match by tree.
+"""
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
 import secrets
@@ -15,9 +30,14 @@ from typing import Any
 
 
 DEFAULT_CONFIG = Path(__file__).with_name("ci-evidence.json")
+# The checkout this script belongs to; a commit it holds needs no API lookup.
+CHECKOUT = Path(__file__).resolve().parents[1]
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 REF_PATTERN = re.compile(r"^[A-Za-z0-9._/-]+$")
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+# Artifact the `required jobs (paths filter)` job of ci.yml uploads with the tree
+# its run checked out.
+TESTED_TREE_ARTIFACT = re.compile(r"^tested-tree-([0-9a-f]{40})$")
 
 
 class EvidenceError(Exception):
@@ -59,6 +79,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "poll_interval_seconds",
         "required_jobs",
         "required_steps",
+        "tree_match_max_age_days",
     ):
         if field not in config:
             raise EvidenceError(f"config is missing {field}")
@@ -86,7 +107,7 @@ def load_config(path: Path) -> dict[str, Any]:
                 raise EvidenceError(
                     f"config required_steps.{tier} references non-required job {item['job']}"
                 )
-    for field in ("wait_timeout_seconds", "poll_interval_seconds"):
+    for field in ("wait_timeout_seconds", "poll_interval_seconds", "tree_match_max_age_days"):
         if not isinstance(config[field], int) or config[field] <= 0:
             raise EvidenceError(f"config {field} must be a positive integer")
     if not isinstance(config["workflow_path"], str) or not config["workflow_path"].startswith(".github/workflows/"):
@@ -129,6 +150,7 @@ def list_runs(
     *,
     sha: str | None = None,
     event: str | None = None,
+    created_since: datetime.date | None = None,
 ) -> list[dict[str, Any]]:
     arguments = [
         "api",
@@ -142,6 +164,8 @@ def list_runs(
         arguments.extend(("-f", f"head_sha={sha}"))
     if event is not None:
         arguments.extend(("-f", f"event={event}"))
+    if created_since is not None:
+        arguments.extend(("-f", f"created=>={created_since.isoformat()}"))
     arguments.extend(("-f", "per_page=100"))
     pages = read_json(tuple(arguments))
     if not isinstance(pages, list):
@@ -163,6 +187,101 @@ def matching_runs(
         run for run in runs
         if run.get("head_sha") == sha and run_tier(run, workflow_path) == tier
     ]
+
+
+def local_tree(sha: str) -> str | None:
+    """The tree of commit `sha` in this checkout, or None when it lacks the
+    commit. A commit id fixes its tree, so the local object needs no trust in
+    the checkout beyond holding it."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(CHECKOUT), "rev-parse", "--verify", "--quiet", f"{sha}^{{tree}}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None
+    tree = result.stdout.strip()
+    return tree if result.returncode == 0 and SHA_PATTERN.fullmatch(tree) else None
+
+
+def commit_tree(repo: str, sha: str, cache: dict[str, str]) -> str:
+    """The tree of commit `sha`: from this checkout when it holds the commit
+    (an unpushed release candidate), otherwise from the git commits API."""
+    if sha not in cache:
+        if not SHA_PATTERN.fullmatch(sha):
+            raise EvidenceError(f"invalid commit SHA from the Actions API: {sha!r}")
+        tree = local_tree(sha)
+        if tree is None:
+            commit = read_json(("api", "--method", "GET", f"repos/{repo}/git/commits/{sha}"))
+            tree = commit.get("tree", {}).get("sha") if isinstance(commit, dict) else None
+            if not isinstance(tree, str) or not SHA_PATTERN.fullmatch(tree):
+                raise EvidenceError(f"git commits API returned no tree for {sha}")
+        cache[sha] = tree
+    return cache[sha]
+
+
+def recorded_trees(repo: str, run_id: int) -> set[str]:
+    """The trees named by the `tested-tree-<tree>` artifacts of run `run_id`."""
+    pages = read_json(
+        (
+            "api",
+            "--method",
+            "GET",
+            "--paginate",
+            "--slurp",
+            f"repos/{repo}/actions/runs/{run_id}/artifacts",
+            "-f",
+            "per_page=100",
+        )
+    )
+    if not isinstance(pages, list):
+        raise EvidenceError("Actions API returned an invalid artifact list")
+    trees = set()
+    for page in pages:
+        if isinstance(page, dict):
+            values = page.get("artifacts")
+            if not isinstance(values, list):
+                raise EvidenceError("Actions API response has no artifacts list")
+            for artifact in values:
+                match = TESTED_TREE_ARTIFACT.fullmatch(str(artifact.get("name", "")))
+                if match:
+                    trees.add(match.group(1))
+    return trees
+
+
+def tree_runs(
+    repo: str,
+    config: dict[str, Any],
+    tier: str,
+    tree: str,
+    cache: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Completed dispatch runs of `tier` in `repo` whose head commit has `tree`,
+    newest first. Other events never supply evidence by tree."""
+    since = datetime.datetime.now(datetime.timezone.utc).date() - datetime.timedelta(
+        days=config["tree_match_max_age_days"]
+    )
+    runs = [
+        run
+        for run in list_runs(
+            repo, config["workflow_file"], event="workflow_dispatch", created_since=since
+        )
+        if run.get("event") == "workflow_dispatch"
+        and run.get("status") == "completed"
+        and run_tier(run, config["workflow_path"]) == tier
+        and isinstance(run.get("id"), int)
+        and (run.get("repository") or {}).get("full_name") == repo
+        and (run.get("head_repository") or {}).get("full_name") == repo
+        and isinstance(run.get("head_sha"), str)
+    ]
+    matching = [run for run in runs if commit_tree(repo, run["head_sha"], cache) == tree]
+    matching.sort(
+        key=lambda item: (item.get("run_number", 0), item.get("run_attempt", 1)),
+        reverse=True,
+    )
+    return matching
 
 
 def resolve_dispatch_ref(repo: str, ref: str, sha: str) -> None:
@@ -273,12 +392,23 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     config = load_config(args.config)
     runs = list_runs(args.repo, config["workflow_file"], sha=args.sha)
     candidates = matching_runs(runs, args.sha, args.tier, config["workflow_path"])
+    tree_refusal = None
+    # A run in its second or later attempt already completed an earlier one.
+    if not any(
+        run.get("status") == "completed" or run.get("run_attempt", 1) > 1 for run in candidates
+    ):
+        accepted, tree_refusal = tree_evidence(args, config)
+        if accepted is not None:
+            return accepted
     dispatched_ids: set[int] = set()
     dispatch_request_id: str | None = None
     did_dispatch = False
     if not candidates:
         if not args.dispatch_ref:
-            raise EvidenceError(f"no {args.tier} tier run exists for {args.sha}; --dispatch-ref is required")
+            detail = f" ({tree_refusal})" if tree_refusal else ""
+            raise EvidenceError(
+                f"no {args.tier} tier run exists for {args.sha}{detail}; --dispatch-ref is required"
+            )
         previous_dispatches = list_runs(
             args.repo, config["workflow_file"], event="workflow_dispatch"
         )
@@ -289,14 +419,10 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     deadline = time.monotonic() + config["wait_timeout_seconds"]
     run = None
     while time.monotonic() < deadline:
-        if candidates:
-            candidates.sort(
-                key=lambda item: (item.get("run_number", 0), item.get("run_attempt", 1)),
-                reverse=True,
-            )
-            if candidates[0].get("status") == "completed":
-                run = candidates[0]
-                break
+        newest = newest_run(candidates)
+        if newest is not None and newest.get("status") == "completed":
+            run = newest
+            break
         time.sleep(config["poll_interval_seconds"])
         runs = list_runs(args.repo, config["workflow_file"], sha=args.sha)
         if did_dispatch:
@@ -332,22 +458,87 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         raise EvidenceError(f"run {url} has head SHA {run.get('head_sha')}, expected {args.sha}")
     if run.get("status") != "completed":
         raise EvidenceError(f"{args.tier} tier run is still {run.get('status')}: {url}")
-    jobs = get_jobs(args.repo, run["id"])
-    failures = verify_jobs(jobs, config["required_jobs"][args.tier])
-    failures.extend(verify_steps(jobs, config["required_steps"][args.tier]))
-    if run.get("conclusion") != "success":
-        failures.insert(0, f"workflow conclusion is {run.get('conclusion')}")
+    failures = run_failures(args.repo, run, config, args.tier)
     if failures:
         raise EvidenceError(f"{args.tier} tier failed for {args.sha}: {'; '.join(failures)} ({url})")
-    return {
+    return evidence(args, run, config, match="sha")
+
+
+def newest_run(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda item: (item.get("run_number", 0), item.get("run_attempt", 1)),
+    )
+
+
+def run_failures(
+    repo: str, run: dict[str, Any], config: dict[str, Any], tier: str
+) -> list[str]:
+    """Why a completed run is not evidence for `tier`; empty when it is."""
+    jobs = get_jobs(repo, run["id"])
+    failures = verify_jobs(jobs, config["required_jobs"][tier])
+    failures.extend(verify_steps(jobs, config["required_steps"][tier]))
+    if run.get("conclusion") != "success":
+        failures.insert(0, f"workflow conclusion is {run.get('conclusion')}")
+    return failures
+
+
+def tree_evidence(
+    args: argparse.Namespace, config: dict[str, Any]
+) -> tuple[dict[str, Any] | None, str | None]:
+    """The newest dispatch run that tested tree(S) and passes the tier, or why
+    none does. A tree candidate that fails is reported, never accepted, and a
+    lookup that cannot complete is a refusal: the exact-commit path decides."""
+    cache: dict[str, str] = {}
+    try:
+        tree = commit_tree(args.repo, args.sha, cache)
+        runs = tree_runs(args.repo, config, args.tier, tree, cache)
+    except EvidenceError as error:
+        return None, f"tree lookup failed: {error}"
+    refusals = []
+    for run in runs:
+        url = run.get("html_url") or f"run {run['id']}"
+        try:
+            recorded = recorded_trees(args.repo, run["id"])
+            failures = run_failures(args.repo, run, config, args.tier) if recorded == {tree} else []
+        except EvidenceError as error:
+            refusals.append(f"tree match {url} could not be read: {error}")
+            continue
+        if recorded != {tree}:
+            names = ", ".join(sorted(recorded)) or "none"
+            refusals.append(f"tree match {url} recorded tested tree {names}, expected {tree}")
+            continue
+        if failures:
+            refusals.append(f"tree match {url} failed: {'; '.join(failures)}")
+            continue
+        return evidence(args, run, config, match="tree", tree=tree), None
+    return None, "; ".join(refusals) or None
+
+
+def evidence(
+    args: argparse.Namespace,
+    run: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    match: str,
+    tree: str | None = None,
+) -> dict[str, Any]:
+    result = {
         "tier": args.tier,
         "sha": args.sha,
+        "match": match,
+        "run_sha": run.get("head_sha"),
         "event": run.get("event"),
         "run_id": run.get("id"),
         "url": run.get("html_url"),
         "required_jobs": len(config["required_jobs"][args.tier]),
         "required_steps": len(config["required_steps"][args.tier]),
     }
+    if tree is not None:
+        result["tree"] = tree
+    return result
 
 
 def main() -> int:
@@ -367,7 +558,13 @@ def main() -> int:
     if args.json:
         print(json.dumps(result, sort_keys=True))
     else:
-        print(f"ci-evidence: {args.tier} tier passed for {args.sha}: {result['url']}")
+        if result["match"] == "tree":
+            print(
+                f"ci-evidence: {args.tier} tier passed for {args.sha} by tree {result['tree']} "
+                f"(dispatch run on {result['run_sha']}): {result['url']}"
+            )
+        else:
+            print(f"ci-evidence: {args.tier} tier passed for {args.sha}: {result['url']}")
     return 0
 
 
