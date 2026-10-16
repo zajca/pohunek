@@ -36,14 +36,15 @@ use std::time::{Duration, Instant};
 
 use pohunek_service_config::preflight::{
     PreflightReport, SessionVerdict, StoreReport, StoreState, Verdict, CODE_ADOPTABLE,
-    CODE_CREATE_ROLLED_BACK, CODE_EVIDENCE_UNAVAILABLE, CODE_GENERATION_MISSING,
-    CODE_IDENTITY_UNVERIFIED, CODE_INTENT_FINISHED, CODE_JOURNAL_AMBIGUOUS, CODE_JOURNAL_MISSING,
-    CODE_JOURNAL_SCHEMA_UNSUPPORTED, CODE_JOURNAL_UNREADABLE, CODE_NO_SESSION_RECORD,
-    CODE_PROTOCOL_INCOMPATIBLE, CODE_RECORD_UNREADABLE, CODE_RECOVERY_UNMAPPABLE,
-    CODE_RECOVERY_UNVERIFIED, CODE_RESUME_RECORD_UNREADABLE, CODE_RUNTIME_IDENTITY_MISMATCH,
-    CODE_RUNTIME_SOURCE_NOT_SERVED, CODE_STORE_UNUSABLE, CODE_WORKER_CHILD_MISSING,
-    CODE_WORKER_ENDED, CODE_WORKER_MARKER_LEGACY, CODE_WORKER_NOT_ADVANCED,
-    CODE_WORKER_NOT_INITIALIZED, CODE_WORKER_NOT_RUNNING, CODE_WORKER_UNVERIFIABLE, REPORT_VERSION,
+    CODE_ADOPTABLE_BY_NEWER_PACKAGE, CODE_CREATE_ROLLED_BACK, CODE_EVIDENCE_UNAVAILABLE,
+    CODE_GENERATION_MISSING, CODE_IDENTITY_UNVERIFIED, CODE_INTENT_FINISHED,
+    CODE_JOURNAL_AMBIGUOUS, CODE_JOURNAL_MISSING, CODE_JOURNAL_SCHEMA_UNSUPPORTED,
+    CODE_JOURNAL_UNREADABLE, CODE_NO_SESSION_RECORD, CODE_PROTOCOL_INCOMPATIBLE,
+    CODE_RECORD_UNREADABLE, CODE_RECOVERY_UNMAPPABLE, CODE_RECOVERY_UNVERIFIED,
+    CODE_RESUME_RECORD_UNREADABLE, CODE_RUNTIME_IDENTITY_MISMATCH, CODE_RUNTIME_SOURCE_NOT_SERVED,
+    CODE_STORE_UNUSABLE, CODE_WORKER_CHILD_MISSING, CODE_WORKER_ENDED, CODE_WORKER_MARKER_LEGACY,
+    CODE_WORKER_NOT_ADVANCED, CODE_WORKER_NOT_INITIALIZED, CODE_WORKER_NOT_RUNNING,
+    CODE_WORKER_UNVERIFIABLE, REPORT_VERSION,
 };
 use tracing::warn;
 
@@ -57,7 +58,9 @@ use pohunek_service_config::runtimes::{
     CODE_SERVICE_CONFIG_UNREADABLE, ENSURE_REPORT_VERSION,
 };
 use pohunek_worker_protocol::{negotiate, BaseEnv, Version, VersionRange, SUPPORTED_RANGE};
-use protocol::{BindingProvenance, LaunchBinding, PackageDigest, ProtocolError, RuntimeId};
+use protocol::{
+    BindingProvenance, LaunchBinding, PackageDigest, PackageIdentity, ProtocolError, RuntimeId,
+};
 
 use super::{
     import_worker_identities, import_worker_subagents, initial_input_orphaned,
@@ -66,9 +69,9 @@ use super::{
     JournalReject, WorkerJournalScan,
 };
 use crate::agent::host::{
-    adopts, validate_launch_runtime_with_timeout_detailed, BuiltinSource, DefinitionError,
-    DefinitionOrigin, LaunchPin, PackageSource, PackageStore, RuntimeDefinition, RuntimeHost,
-    Spawn,
+    adopts, adopts_newer, validate_launch_runtime_with_timeout_detailed, BuiltinSource,
+    DefinitionError, DefinitionOrigin, LaunchPin, PackageSource, PackageStore, RuntimeDefinition,
+    RuntimeHost, Spawn,
 };
 use crate::agent::{
     parse_head, NativeReferenceProvenance, Pin, ProfileRegistry, ReferenceCheckFailure,
@@ -221,8 +224,7 @@ pub fn run_with(
             )
         }
     };
-    let profiles = ProfileRegistry::with_runtimes(options.profiles_dir.clone(), runtimes.clone())
-        .with_read_only_revision_state_dir(options.host_state_dir.clone());
+    let profiles = judging_profiles(options, &runtimes, &planned_profiles);
     let base_env = match &options.launch {
         Ok(launch) => launch.base().map_err(|error| error.to_string()),
         Err(detail) => Err(detail.clone()),
@@ -286,6 +288,23 @@ pub fn run_with(
         runtimes: runtimes_report,
         profile_warnings,
     }
+}
+
+/// The host profiles a judgement reads: the profile directory over `runtimes`,
+/// with the revision key read only, and the profile texts the release step
+/// writes in place of the files, which are the texts resume reads after it.
+fn judging_profiles(
+    options: &PreflightOptions,
+    runtimes: &RuntimeHost,
+    planned_profiles: &[PlannedProfile],
+) -> ProfileRegistry {
+    ProfileRegistry::with_runtimes(options.profiles_dir.clone(), runtimes.clone())
+        .with_read_only_revision_state_dir(options.host_state_dir.clone())
+        .with_planned_texts(
+            planned_profiles
+                .iter()
+                .map(|profile| (profile.name.clone(), profile.text.clone())),
+        )
 }
 
 /// The host profiles that load with a reduced guarantee on the runtimes the
@@ -748,16 +767,50 @@ fn judge_stopped(
     }
     Some(match recovery_loss(facts, &candidate, judging) {
         Some(loss) => loss,
-        None => judge_reference(&candidate, judging).unwrap_or_else(|| {
-            (
-                Verdict::Adoptable,
-                CODE_ADOPTABLE.to_owned(),
-                "the stored native recovery resumes and forks through the runtime source this \
-                 daemon serves"
-                    .to_owned(),
-            )
-        }),
+        None => judge_reference(&candidate, judging)
+            .unwrap_or_else(|| adoptable_verdict(&candidate, judging)),
     })
+}
+
+/// The verdict of a stopped session whose recovery the new daemon keeps, naming
+/// the package versions when a newer official package version adopts it.
+fn adoptable_verdict(candidate: &SessionRecord, judging: &Judging<'_>) -> Judgement {
+    let adopted = candidate.recovery.as_ref().and_then(|binding| {
+        let definition = recovery_definition(judging.profiles, binding).ok()?;
+        if !adopts_newer(&binding.launch_binding, &definition) {
+            return None;
+        }
+        let frozen = package_identity(binding.launch_binding.binding()?)?;
+        let served = package_identity(definition.binding())?;
+        Some((frozen.clone(), served.clone()))
+    });
+    match adopted {
+        Some((frozen, served)) => (
+            Verdict::Adoptable,
+            CODE_ADOPTABLE_BY_NEWER_PACKAGE.to_owned(),
+            format!(
+                "the stored native recovery resumes and forks through {} {}, which adopts the \
+                 session launched from {}; the session is moved to the newer version on its next \
+                 resume or fork",
+                served.id, served.version, frozen.version
+            ),
+        ),
+        None => (
+            Verdict::Adoptable,
+            CODE_ADOPTABLE.to_owned(),
+            "the stored native recovery resumes and forks through the runtime source this daemon \
+             serves"
+                .to_owned(),
+        ),
+    }
+}
+
+/// The package identity of a package-pinned binding.
+fn package_identity(binding: &LaunchBinding) -> Option<&PackageIdentity> {
+    match &binding.provenance {
+        BindingProvenance::Package { package, .. } => Some(package),
+        BindingProvenance::Builtin { .. } => None,
+    }
 }
 
 /// The v0.34.2 built-in runtimes whose native reference check is compiled in as
@@ -859,6 +912,11 @@ fn reported_check_identity(
     if pinned.is_some() && pinned == package_digest(definition.binding()) {
         return CheckIdentity::Unchanged;
     }
+    // A newer package version adopts a session only with the frozen digest's
+    // native reference check (`RuntimeHost::newer_adopter`).
+    if adopts_newer(&binding.launch_binding, definition) {
+        return CheckIdentity::Unchanged;
+    }
     if !adopts(&binding.launch_binding, definition) {
         return CheckIdentity::Unproven(
             "the recovery runs a built-in runtime that the upgrade does not replace with a \
@@ -919,7 +977,7 @@ fn judge_reference(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<J
     let fork = !capabilities.resume;
     let profile =
         recovery_profile_in(judging.profiles, binding, ProfileChange::Refuse, fork).ok()?;
-    let definition = recovery_definition(judging.runtimes, binding).ok()?;
+    let definition = recovery_definition(judging.profiles, binding).ok()?;
     let base = judging.base_env.as_ref().ok()?;
     let identity = reported_check_identity(binding, &definition, judging);
     let launch = binding_native_launch(binding, &definition);
@@ -1754,7 +1812,7 @@ fn recovery_loss(
                 .to_owned(),
         ));
     }
-    judge_pin(candidate, judging.runtimes).or_else(|| judge_launch(candidate, judging))
+    judge_pin(candidate, judging.profiles).or_else(|| judge_launch(candidate, judging))
 }
 
 /// The launch resume runs before it relaunches a session: the host profile the
@@ -1797,7 +1855,7 @@ fn judge_launch(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judg
         }
     }
     let profile_env = profile_env.unwrap_or_default();
-    let definition = recovery_definition(judging.runtimes, binding).ok()?;
+    let definition = recovery_definition(judging.profiles, binding).ok()?;
     // Resume builds the base environment for every relaunch and validates the
     // frozen executable for every relaunch; only a declared version probe reads
     // the `PATH` the agent launches under.
@@ -1912,13 +1970,13 @@ fn judge_runtime_source(candidate: &SessionRecord, runtimes: &RuntimeHost) -> Op
 /// does not honor is judged the same way ([`recovery_contract`]). A session
 /// without native resume or fork has no recovery to lose. A runtime source no
 /// interaction is served from is judged first, by [`judge_runtime_source`].
-fn judge_pin(candidate: &SessionRecord, runtimes: &RuntimeHost) -> Option<Judgement> {
+fn judge_pin(candidate: &SessionRecord, profiles: &ProfileRegistry) -> Option<Judgement> {
     let binding = candidate.recovery.as_ref()?;
     let capabilities = &candidate.info.capabilities;
     if !capabilities.resume && !capabilities.fork {
         return None;
     }
-    let error = match recovery_definition(runtimes, binding) {
+    let error = match recovery_definition(profiles, binding) {
         Err(error) => error,
         Ok(definition) if capabilities.fork => {
             recovery_contract(binding, &definition, true).err()?

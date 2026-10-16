@@ -41,7 +41,7 @@ const SESSION_BUS_VARIABLE: &str = "DBUS_SESSION_BUS_ADDRESS";
 
 /// Report the fixture daemon prints for a plan it refuses.
 const REFUSED_REPORT: &str = r#"{
-  "report_version": 1,
+  "report_version": 2,
   "daemon_version": "fixture",
   "dry_run": true,
   "packages": [],
@@ -55,7 +55,7 @@ const REFUSED_REPORT: &str = r#"{
 
 /// Report with a version this CLI does not read, so the plan is unusable.
 const UNREADABLE_REPORT: &str = r#"{
-  "report_version": 2,
+  "report_version": 3,
   "daemon_version": "fixture",
   "dry_run": true,
   "packages": [],

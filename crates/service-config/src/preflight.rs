@@ -100,6 +100,10 @@ pub const REPORT_VERSION: u32 = 1;
 
 /// The session is adopted with its native recovery intact.
 pub const CODE_ADOPTABLE: &str = "adoptable";
+/// The stopped session resumes and forks through a newer version of the
+/// official package it was launched from, which adopts it; the detail names
+/// both versions.
+pub const CODE_ADOPTABLE_BY_NEWER_PACKAGE: &str = "adoptable_by_newer_package";
 /// The session record is skipped when the store loads.
 pub const CODE_RECORD_UNREADABLE: &str = "record_unreadable";
 /// A live worker names no session record, and a store line that names no

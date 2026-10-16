@@ -1,7 +1,9 @@
 //! Launch-time use of a [`RuntimeDefinition`]: command construction, the
 //! frozen launch pin and the version-probe validation selected by data.
 
-use protocol::{BindingProvenance, LaunchBinding, ProtocolError};
+use std::cmp::Ordering;
+
+use protocol::{BindingProvenance, LaunchBinding, PackageVersion, ProtocolError};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::claim::is_reserved;
@@ -163,14 +165,55 @@ pub(crate) fn adopts(pin: &LaunchPin, definition: &RuntimeDefinition) -> bool {
         && package.id == built_in.id
 }
 
+/// Whether the official package `definition` adopts a session frozen with the
+/// package `pin` of an older version of the same package.
+///
+/// Both sides are packages of one package id serving the same runtime id, and
+/// the served version is strictly higher than the frozen one. The registry
+/// records one digest per package version, so another digest of an equal
+/// version is an anomaly that never adopts. This is the structural half of the decision;
+/// [`RuntimeHost::newer_adopter`] checks the registry records and the frozen
+/// package before it offers such a definition.
+///
+/// [`RuntimeHost::newer_adopter`]: super::RuntimeHost::newer_adopter
+pub(crate) fn adopts_newer(pin: &LaunchPin, definition: &RuntimeDefinition) -> bool {
+    let LaunchPin::Pinned(frozen) = pin else {
+        return false;
+    };
+    let (
+        BindingProvenance::Package {
+            package: frozen_package,
+            package_digest: frozen_digest,
+        },
+        BindingProvenance::Package {
+            package,
+            package_digest,
+        },
+    ) = (&frozen.provenance, &definition.binding().provenance)
+    else {
+        return false;
+    };
+    frozen.runtime_id == definition.binding().runtime_id
+        && frozen_package.id == package.id
+        && frozen_digest != package_digest
+        && version_order(&frozen_package.version, &package.version) == Some(Ordering::Less)
+}
+
+/// Whether `definition` serves a session frozen with `pin` by adoption: a
+/// built-in pin ([`adopts`]) or an older package version ([`adopts_newer`]).
+fn adopted(pin: &LaunchPin, definition: &RuntimeDefinition) -> bool {
+    adopts(pin, definition) || adopts_newer(pin, definition)
+}
+
 /// Checks that the package an adopted session resumes or forks from honors the
 /// launch the session froze.
 ///
 /// The argv is always the frozen one, so only what the frozen spec relies on is
-/// compared: the reference kind, a hook-reported reference (the built-in's
-/// reference is reported, which an assigned package strategy cannot honor)
-/// and, for a fork, fork support on both sides. A session that is not adopted
-/// is not checked here.
+/// compared: the reference kind and, for a fork, fork support on both sides.
+/// A built-in pin's reference is hook-reported, which an assigned package
+/// strategy cannot honor; an older package version's assigned strategy must be
+/// the one the package serves. A session that is not adopted is not checked
+/// here.
 ///
 /// # Errors
 ///
@@ -182,14 +225,20 @@ pub(crate) fn honors_frozen_launch(
     frozen: Option<&NativeSessionLaunch>,
     fork: bool,
 ) -> Result<(), ProtocolError> {
-    if !adopts(pin, definition) {
+    let same_assignment = |frozen: &NativeSessionLaunch, served: &NativeSessionLaunch| {
+        if adopts(pin, definition) {
+            frozen.assigned().is_none() && served.assigned().is_none()
+        } else {
+            frozen.assigned() == served.assigned()
+        }
+    };
+    if !adopted(pin, definition) {
         return Ok(());
     }
     let honored = match (frozen, definition.native()) {
         (Some(frozen), Some(served)) => {
             frozen.reference_kind() == served.reference_kind()
-                && frozen.assigned().is_none()
-                && served.assigned().is_none()
+                && same_assignment(frozen, served)
                 && (!fork || (frozen.supports_fork() && served.supports_fork()))
         }
         _ => false,
@@ -216,7 +265,7 @@ pub(crate) fn relaunch_launch(
     let package_forks = definition
         .native()
         .is_some_and(NativeSessionLaunch::supports_fork);
-    if adopts(frozen, definition) && !package_forks {
+    if adopted(frozen, definition) && !package_forks {
         launch.without_fork()
     } else {
         launch
@@ -227,7 +276,7 @@ pub(crate) fn relaunch_launch(
 /// session records the package it now launches from, so later resumes resolve
 /// that exact digest; every other session keeps its pin.
 pub(crate) fn relaunch_pin(frozen: &LaunchPin, definition: &RuntimeDefinition) -> LaunchPin {
-    if adopts(frozen, definition) {
+    if adopted(frozen, definition) {
         LaunchPin::of(definition)
     } else {
         frozen.clone()
@@ -252,6 +301,17 @@ fn same_origin(frozen: &BindingProvenance, current: &BindingProvenance) -> bool 
         ) => left == right && left_digest == right_digest,
         _ => false,
     }
+}
+
+/// Orders two package versions as semantic versions.
+///
+/// A package version is a validated string, so text order would put `1.0.10`
+/// below `1.0.9`. `None` when either side is not a semantic version; callers
+/// treat that as "not newer" and keep what they have.
+pub(crate) fn version_order(left: &PackageVersion, right: &PackageVersion) -> Option<Ordering> {
+    let left = semver::Version::parse(left.as_str()).ok()?;
+    let right = semver::Version::parse(right.as_str()).ok()?;
+    Some(left.cmp(&right))
 }
 
 /// What a launch spawns, which decides what launch validation resolves.

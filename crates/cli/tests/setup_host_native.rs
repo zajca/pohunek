@@ -94,7 +94,7 @@ impl ReleasePlanner for ScriptedPlanner {
 /// A planner report that lists `integrations` and nothing else.
 fn report(integrations: &Value) -> EnsureReport {
     serde_json::from_value(json!({
-        "report_version": 1,
+        "report_version": 2,
         "daemon_version": VERSION,
         "dry_run": true,
         "packages": [],
@@ -516,7 +516,7 @@ async fn a_refusal_of_the_install_runtime_step_stops_setup_before_any_change() {
                 fallback_directories: vec!["/usr/bin".to_owned(), "/bin".to_owned()],
             });
     let planner = ScriptedPlanner::new(vec![serde_json::from_value(json!({
-        "report_version": 1,
+        "report_version": 2,
         "daemon_version": VERSION,
         "dry_run": true,
         "packages": [],
@@ -605,7 +605,7 @@ async fn a_host_that_changed_after_the_preview_stops_setup_before_it_applies() {
 /// A planner report with the given packages and profiles and no integrations.
 fn planned(packages: &Value, profiles: &Value) -> EnsureReport {
     serde_json::from_value(json!({
-        "report_version": 1,
+        "report_version": 2,
         "daemon_version": VERSION,
         "dry_run": true,
         "packages": packages,
@@ -815,7 +815,7 @@ fn hermes_marker(home: &Path) -> PathBuf {
 /// A planner report that lists `catalog` as its trust state and no packages.
 fn catalog_report(catalog: &str) -> EnsureReport {
     serde_json::from_value(json!({
-        "report_version": 1,
+        "report_version": 2,
         "daemon_version": VERSION,
         "dry_run": true,
         "packages": [],

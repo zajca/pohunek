@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Version of the report layout; a reader refuses any other value.
-pub const ENSURE_REPORT_VERSION: u32 = 1;
+pub const ENSURE_REPORT_VERSION: u32 = 2;
 
 /// Argument of `pohunekd` that runs the step.
 pub const ENSURE_RUNTIMES_ARG: &str = "ensure-official-runtimes";
@@ -52,6 +52,27 @@ pub const CODE_RUNTIME_PLAN_UNAVAILABLE: &str = "runtime_plan_unavailable";
 /// inherits, and therefore the plan and the version probes, are unknown.
 pub const CODE_SERVICE_CONFIG_UNREADABLE: &str = "service_config_unreadable";
 
+/// A host profile is pinned to a package version that is newer than the
+/// release package. The step keeps the pin, so a downgrade is never applied
+/// to it.
+pub const CODE_PINNED_TO_NEWER_VERSION: &str = "pinned_to_newer_version";
+/// A host profile is pinned to a different package of the same version as the
+/// release package. Such a pin is anomalous, so the step keeps it.
+pub const CODE_PINNED_TO_SAME_VERSION: &str = "pinned_to_same_version";
+/// A host profile is pinned to a package that is not an official one, such as
+/// a local package installed by explicit digest. The step never repins it.
+pub const CODE_PINNED_TO_NON_OFFICIAL_PACKAGE: &str = "pinned_to_non_official_package";
+/// A host profile is pinned to a package with another package id than the
+/// release package of its runtime. The step never repins it.
+pub const CODE_PINNED_TO_OTHER_PACKAGE: &str = "pinned_to_other_package";
+/// A host profile is pinned to a digest the registry has no record of, or to a
+/// version that cannot be ordered against the release package. The step keeps
+/// the pin.
+pub const CODE_PINNED_VERSION_UNKNOWN: &str = "pinned_version_unknown";
+/// The release package of a host profile's runtime is recorded as a package
+/// that is not official, so a repin cannot target it. The step keeps the pin.
+pub const CODE_PINNED_TARGET_NOT_OFFICIAL: &str = "pinned_target_not_official";
+
 /// A runtime's program is not on the search path, so its agent is not
 /// installed for this host.
 pub const CODE_GAP_AGENT_NOT_ON_PATH: &str = "agent_not_on_search_path";
@@ -81,8 +102,9 @@ pub struct EnsureReport {
     /// Whether the package catalog trust state records the release
     /// catalog's sequence and revoked keys.
     pub catalog: CatalogStatus,
-    /// One entry per host profile over an official runtime that pins no
-    /// package.
+    /// One entry per host profile over an official runtime the step binds,
+    /// repins or keeps. A profile already pinned to the release package has no
+    /// entry.
     pub profiles: Vec<ProfileAction>,
     /// The config homes whose daemon-installed integration hooks the
     /// installer reinstalls once the new daemon is ready.
@@ -174,29 +196,81 @@ pub struct PackageAction {
     pub status: PackageStatus,
     /// Why the host uses the runtime.
     pub reasons: Vec<UseReason>,
+    /// Set when the registry selects a newer official version of the package
+    /// than the release package this step installs and selects. The step does
+    /// not keep that selection: it selects the release package, which the
+    /// operator can select again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces_newer: Option<SelectedPackage>,
+}
+
+/// A package the registry selects, named by its digest and version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectedPackage {
+    /// Archive digest of the selected package.
+    pub digest: String,
+    /// Package version of the selected package.
+    pub version: String,
 }
 
 /// The state of one host profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileStatus {
-    /// The plan pins the profile to the package.
+    /// The plan pins a profile that has no pin to the package.
     Bind,
     /// The step pinned the profile to the package.
     Bound,
+    /// The plan moves a profile pinned to an older official version of the
+    /// package to the release package.
+    Repin,
+    /// The step moved the profile to the release package.
+    Repinned,
+    /// The profile keeps its pin, and [`ProfileAction::kept_reason`] says why.
+    Kept,
 }
 
-/// One host profile over an official runtime that pins no package.
+impl ProfileStatus {
+    /// Whether the plan changes the profile's pin, which the step then applies.
+    #[must_use]
+    pub fn is_pending(self) -> bool {
+        matches!(self, Self::Bind | Self::Repin)
+    }
+
+    /// Whether the step has changed the profile's pin.
+    #[must_use]
+    pub fn is_applied(self) -> bool {
+        matches!(self, Self::Bound | Self::Repinned)
+    }
+}
+
+/// One host profile over an official runtime the step binds, repins or keeps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileAction {
     /// Profile name.
     pub name: String,
     /// The runtime id the profile is based on.
     pub base: String,
-    /// The package digest the profile is pinned to.
+    /// The package digest the profile is pinned to after the step: the target
+    /// of a bind or repin, or the digest a kept profile stays pinned to.
     pub digest: String,
     /// What the step does or did.
     pub status: ProfileStatus,
+    /// The digest a repin moves the profile off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_digest: Option<String>,
+    /// The version of the package the profile is pinned to before the step,
+    /// when the registry records it. Set for a repin and for a kept profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_version: Option<String>,
+    /// The version of the package the profile is pinned to by a bind or
+    /// repin. Not set for a kept profile, which keeps its own pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Why a kept profile is left unchanged: one of the `CODE_PINNED_*`
+    /// constants of this module. Set only for a kept profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_reason: Option<String>,
 }
 
 /// Integration hooks the installer reinstalls through the new daemon.

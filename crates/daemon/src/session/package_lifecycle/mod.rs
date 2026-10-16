@@ -1075,6 +1075,8 @@ mod bind_tests;
 #[cfg(test)]
 mod catalog_tests;
 #[cfg(test)]
+mod newer_version_tests;
+#[cfg(test)]
 mod official_alias_tests;
 #[cfg(test)]
 mod selection_tests;

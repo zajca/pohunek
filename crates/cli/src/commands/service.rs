@@ -18,10 +18,13 @@ use pohunek_service_config::preflight::{
     PreflightReport, ProfileWarning, SessionVerdict, StoreState, Verdict, MAX_PROBE_BUDGET_SECS,
     MIN_PROBE_BUDGET_SECS, PROBE_BUDGET,
 };
-use pohunek_service_config::runtimes::{CatalogStatus, EnsureReport, PackageStatus};
+use pohunek_service_config::runtimes::{
+    CatalogStatus, EnsureReport, PackageAction, PackageStatus, ProfileAction,
+};
 
 use crate::commands::render_json;
 use crate::error::CliError;
+use crate::service::runtimes::{profile_detail, replaces_newer_warning};
 use crate::service::{self, report, UninstallOptions};
 
 /// `pohunek service` subcommands.
@@ -278,6 +281,9 @@ fn render_install_runtimes(text: &mut String, runtimes: &EnsureReport) {
             wire_name(&package.status)
         );
     }
+    for package in &runtimes.packages {
+        append_package_warning(text, package);
+    }
     for profile in &runtimes.profiles {
         let _ = writeln!(
             text,
@@ -286,6 +292,23 @@ fn render_install_runtimes(text: &mut String, runtimes: &EnsureReport) {
             profile.base,
             wire_name(&profile.status)
         );
+        append_profile_detail(text, profile);
+    }
+}
+
+/// Appends the warning of a package that replaces a newer selected version,
+/// when there is one.
+fn append_package_warning(text: &mut String, package: &PackageAction) {
+    if let Some(warning) = replaces_newer_warning(package) {
+        let _ = writeln!(text, "{warning}");
+    }
+}
+
+/// Appends the detail of a profile that repins or keeps its pin, when there is
+/// one, on the line below the profile.
+fn append_profile_detail(text: &mut String, profile: &ProfileAction) {
+    if let Some(detail) = profile_detail(profile) {
+        let _ = writeln!(text, "           {detail}");
     }
 }
 
@@ -459,6 +482,7 @@ fn render_plan(text: &mut String, plan: &EnsureReport) {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        append_package_warning(text, package);
     }
     for profile in &plan.profiles {
         let _ = writeln!(
@@ -468,6 +492,7 @@ fn render_plan(text: &mut String, plan: &EnsureReport) {
             profile.base,
             format!("{:?}", profile.status).to_lowercase()
         );
+        append_profile_detail(text, profile);
     }
     for integration in &plan.integrations {
         let profile = integration
@@ -595,6 +620,7 @@ fn render_runtimes(text: &mut String, runtimes: &EnsureReport) {
             package.version,
             format!("{:?}", package.status).to_lowercase()
         );
+        append_package_warning(text, package);
     }
     for profile in &runtimes.profiles {
         let _ = writeln!(
@@ -604,6 +630,7 @@ fn render_runtimes(text: &mut String, runtimes: &EnsureReport) {
             profile.base,
             format!("{:?}", profile.status).to_lowercase()
         );
+        append_profile_detail(text, profile);
     }
 }
 
@@ -881,7 +908,7 @@ mod tests {
         let mut install = install_report(search_path_report("login_shell"));
         install.runtimes = Some(
             serde_json::from_value(serde_json::json!({
-                "report_version": 1,
+                "report_version": 2,
                 "daemon_version": "1.2.3",
                 "dry_run": false,
                 "packages": [{
@@ -1124,8 +1151,7 @@ mod tests {
     fn runtime_plan_preflight() -> PreflightReport {
         use pohunek_service_config::preflight::{StoreReport, REPORT_VERSION};
         use pohunek_service_config::runtimes::{
-            IntegrationAction, PackageAction, ProfileAction, ProfileStatus, UseReason,
-            ENSURE_REPORT_VERSION,
+            IntegrationAction, ProfileStatus, UseReason, ENSURE_REPORT_VERSION,
         };
 
         let session = |id: &str, verdict: Verdict| SessionVerdict {
@@ -1166,12 +1192,17 @@ mod tests {
                     digest: "de".repeat(32),
                     status: PackageStatus::Install,
                     reasons: vec![UseReason::Profile, UseReason::Session],
+                    replaces_newer: None,
                 }],
                 profiles: vec![ProfileAction {
                     name: "work".to_owned(),
                     base: "claude".to_owned(),
                     digest: "de".repeat(32),
                     status: ProfileStatus::Bind,
+                    previous_digest: None,
+                    previous_version: None,
+                    version: Some("1.0.0".to_owned()),
+                    kept_reason: None,
                 }],
                 integrations: vec![IntegrationAction {
                     runtime: "claude".to_owned(),
@@ -1340,6 +1371,7 @@ mod tests {
                 digest: "de".repeat(32),
                 status: PackageStatus::Kept,
                 reasons: vec![pohunek_service_config::runtimes::UseReason::Profile],
+                replaces_newer: None,
             }],
             catalog: CatalogStatus::Unavailable,
             profiles: Vec::new(),

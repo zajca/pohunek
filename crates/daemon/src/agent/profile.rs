@@ -311,6 +311,18 @@ pub(crate) enum DoctorManifestError {
     Invalid,
 }
 
+/// The package pin a host profile carries, as [`ProfileRegistry::profile_pin`]
+/// reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProfilePin {
+    /// No host profile of that name exists.
+    Absent,
+    /// The profile carries no `package` and `digest` keys.
+    Unpinned,
+    /// The profile is pinned to this package digest.
+    Pinned(Pin),
+}
+
 /// Loads + resolves host agent profiles from `<config_dir>/agents`.
 ///
 /// Resolution is on demand (per `session.new`), but the **owner-only security gate**
@@ -330,6 +342,10 @@ pub(crate) struct ProfileRegistry {
     runtimes: RuntimeHost,
     /// Host-local key that turns profile launch inputs into revisions.
     revision_keys: Arc<RevisionKeys>,
+    /// Profile texts a planned release step writes, by profile name. A recovery
+    /// judgement reads them in place of the files, as resume reads the files
+    /// after the step.
+    planned: Arc<HashMap<String, String>>,
 }
 
 impl ProfileRegistry {
@@ -473,6 +489,27 @@ impl ProfileRegistry {
             configured_dir,
             runtimes,
             revision_keys: Arc::default(),
+            planned: Arc::default(),
+        }
+    }
+
+    /// Reads `texts`, the profile files a planned release step rewrites, in
+    /// place of the files on disk when a session's recovery is resolved.
+    #[must_use]
+    pub(crate) fn with_planned_texts(
+        mut self,
+        texts: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.planned = Arc::new(texts.into_iter().collect());
+        self
+    }
+
+    /// The text of the profile `name` at `path`: the planned text when the
+    /// planned release step rewrites it, else the file.
+    fn profile_text(&self, dir: &Path, name: &str, path: &Path) -> Result<String, ProtocolError> {
+        match self.planned.get(name) {
+            Some(text) => Ok(text.clone()),
+            None => read_profile_text(dir, name, path),
         }
     }
 
@@ -543,7 +580,7 @@ impl ProfileRegistry {
             .as_deref()
             .ok_or_else(|| agent_profile_not_found(name))?;
         let path = dir.join(format!("{name}.toml"));
-        let content = read_profile_text(dir, name, &path)?;
+        let content = self.profile_text(dir, name, &path)?;
         let raw: RawProfile = toml::from_str(&content)
             .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
         let pin = parse_package_pin(name, raw.package.as_deref(), raw.digest.as_deref())?;
@@ -565,6 +602,82 @@ impl ProfileRegistry {
             launch.1,
         )?;
         self.revision_keys().matches(&inputs, frozen)
+    }
+
+    /// Whether the profile `name`, read as it is now, has the revision `frozen`
+    /// once its pin is the package pin `launched` it had when the session froze
+    /// the package binding `stored`.
+    ///
+    /// A release step that moves the profile to a newer version of its package
+    /// changes only the pin keys, so the text with `launched` put back, the
+    /// manifest read as a launch reads it, `stored`, `program` and `args` digest
+    /// to the frozen revision exactly when nothing else changed. The profile
+    /// must pin `served`, the package that now serves the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns the profile read errors, `agent_profile_not_found` without a
+    /// profile directory and `agent_profile_revision_unavailable` when the
+    /// revision key cannot be read.
+    pub(crate) fn frozen_package_matches(
+        &self,
+        name: &str,
+        stored: &LaunchBinding,
+        launch: (&str, &[String]),
+        pins: (&Pin, &Pin),
+        frozen: &ProfileRevision,
+    ) -> Result<bool, ProtocolError> {
+        let (launched, served) = pins;
+        let dir = self
+            .dir
+            .as_deref()
+            .ok_or_else(|| agent_profile_not_found(name))?;
+        let path = dir.join(format!("{name}.toml"));
+        let content = self.profile_text(dir, name, &path)?;
+        let raw: RawProfile = toml::from_str(&content)
+            .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
+        let pin = parse_package_pin(name, raw.package.as_deref(), raw.digest.as_deref())?;
+        if !pin.is_some_and(|pin| pin.package == served.package && pin.digest == served.digest) {
+            return Ok(false);
+        }
+        let at_launch =
+            apply_pin(&content, launched).map_err(|detail| invalid_profile(name, &detail))?;
+        let manifest = resolve_manifest(name, dir, raw.manifest.as_deref())?;
+        let binding_json = serde_json::to_vec(stored)
+            .map_err(|err| invalid_profile(name, &format!("launch binding: {err}")))?;
+        let inputs = ProfileInputs::of(
+            &at_launch,
+            manifest.as_ref().map(|source| source.text.as_str()),
+            &binding_json,
+            launch.0,
+            launch.1,
+        )?;
+        self.revision_keys().matches(&inputs, frozen)
+    }
+
+    /// The package pin of the host profile `name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the profile read and parse errors.
+    pub(crate) fn profile_pin(&self, name: &str) -> Result<ProfilePin, ProtocolError> {
+        let Some(dir) = self.dir.as_deref() else {
+            return Ok(ProfilePin::Absent);
+        };
+        let path = dir.join(format!("{name}.toml"));
+        if !self.planned.contains_key(name) && !path.is_file() {
+            return Ok(ProfilePin::Absent);
+        }
+        let content = self.profile_text(dir, name, &path)?;
+        let raw: RawProfile = toml::from_str(&content)
+            .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
+        let pin = parse_package_pin(name, raw.package.as_deref(), raw.digest.as_deref())?;
+        Ok(pin.map_or(ProfilePin::Unpinned, |pin| {
+            ProfilePin::Pinned(Pin {
+                package: pin.package,
+                digest: pin.digest,
+            })
+        }))
     }
 
     /// Resolve an agent name (4-step chain, fail-closed):
@@ -597,6 +710,9 @@ impl ProfileRegistry {
         validate_name("agent", name)?;
         if let Some(dir) = &self.dir {
             let path = dir.join(format!("{name}.toml"));
+            if let Some(text) = self.planned.get(name) {
+                return resolve_profile_text(name, text, dir, &self.runtimes, pinned);
+            }
             if path.is_file() {
                 return load_profile(name, &path, dir, &self.runtimes, pinned);
             }

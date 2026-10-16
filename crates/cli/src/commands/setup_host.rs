@@ -39,8 +39,7 @@ use std::pin::Pin;
 
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Gap, IntegrationAction, PackageAction, PackageStatus,
-    ProfileAction, ProfileStatus, Refusal, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
-    RELEASE_RUNTIME_DIR,
+    ProfileAction, Refusal, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, RELEASE_RUNTIME_DIR,
 };
 use protocol::{
     method, DoctorStatus, IntegrationInstallState, IntegrationRecovery, IntegrationStatusParams,
@@ -62,7 +61,7 @@ use crate::hermes_integration::runner::safe_ancestor;
 use crate::paths::Paths;
 use crate::service::engine::{install_layout, installed_job_search_path, recorded_job_search_path};
 use crate::service::report::IntegrationReinstall;
-use crate::service::runtimes::DaemonRuntimes;
+use crate::service::runtimes::{profile_detail, replaces_newer_warning, DaemonRuntimes};
 use crate::service::{self, Context, VERSION};
 use crate::target::LOCAL_HOST;
 
@@ -138,6 +137,17 @@ const ENGINE_REFUSED_GAPS: [&str; 1] = [CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM];
 
 /// Profile status the install engine leaves a profile in once it pinned it.
 const ENGINE_BOUND: &str = "bound";
+
+/// Profile status the install engine leaves a profile in once it repinned it.
+const ENGINE_REPINNED: &str = "repinned";
+
+/// Whether the install engine pinned the profile `profile`, by a bind or a repin.
+fn engine_pinned(profile: &ProfileAction) -> bool {
+    matches!(
+        wire_name(&profile.status).as_str(),
+        ENGINE_BOUND | ENGINE_REPINNED
+    )
+}
 
 /// Reads the release planner's report for a directory: the release's
 /// `pohunekd ensure-official-runtimes --dry-run --detect`.
@@ -800,8 +810,12 @@ fn engine_changes(runtimes: Option<&EnsureReport>) -> Vec<String> {
         }
     }
     for profile in &report.profiles {
-        if wire_name(&profile.status) == ENGINE_BOUND {
-            changes.push(format!("profile {}: bound", profile.name));
+        if engine_pinned(profile) {
+            changes.push(format!(
+                "profile {}: {}",
+                profile.name,
+                wire_name(&profile.status)
+            ));
         }
     }
     if report.catalog == CatalogStatus::Recorded {
@@ -863,9 +877,10 @@ fn same_profile(left: &ProfileAction, right: &ProfileAction) -> bool {
 /// Whether the install engine reports the profile `shown` pinned.
 fn engine_bound(engine: Option<&EnsureReport>, shown: &ProfileAction) -> bool {
     engine.is_some_and(|report| {
-        report.profiles.iter().any(|profile| {
-            same_profile(profile, shown) && wire_name(&profile.status) == ENGINE_BOUND
-        })
+        report
+            .profiles
+            .iter()
+            .any(|profile| same_profile(profile, shown) && engine_pinned(profile))
     })
 }
 
@@ -892,8 +907,8 @@ fn check_engine_changes_shown(
         let shown = previewed
             .profiles
             .iter()
-            .any(|shown| same_profile(shown, profile) && shown.status == ProfileStatus::Bind);
-        if wire_name(&profile.status) == ENGINE_BOUND && !shown {
+            .any(|shown| same_profile(shown, profile) && shown.status.is_pending());
+        if engine_pinned(profile) && !shown {
             return Err(format!(
                 "the install engine pinned profile {}, which the preview did not show",
                 profile.name
@@ -997,7 +1012,7 @@ fn check_profile_transitions(
             .profiles
             .iter()
             .any(|profile| profile.name == shown.name);
-        if !pending && shown.status == ProfileStatus::Bind && !engine_bound(engine, shown) {
+        if !pending && shown.status.is_pending() && !engine_bound(engine, shown) {
             return Err(format!(
                 "profile {} left the plan after the install, but the install engine did not pin it",
                 shown.name
@@ -1098,7 +1113,7 @@ async fn apply_remaining(
     for profile in remaining
         .profiles
         .iter()
-        .filter(|profile| profile.status == ProfileStatus::Bind)
+        .filter(|profile| profile.status.is_pending())
     {
         let digest = PackageDigest::parse(&profile.digest).map_err(|_malformed| {
             CliError::SetupIncomplete {
@@ -1163,7 +1178,7 @@ async fn verdict(
         .profiles
         .iter()
         .filter(|shown| {
-            shown.status == ProfileStatus::Bind
+            shown.status.is_pending()
                 && after
                     .profiles
                     .iter()
@@ -1502,6 +1517,11 @@ fn render_plan(plan: &HostPlan) -> String {
         );
     }
     let _ = writeln!(out, "profiles:");
+    for package in &preview.packages {
+        if let Some(warning) = replaces_newer_warning(package) {
+            let _ = writeln!(out, "  {warning}");
+        }
+    }
     for profile in &preview.profiles {
         let _ = writeln!(
             out,
@@ -1510,6 +1530,9 @@ fn render_plan(plan: &HostPlan) -> String {
             profile.base,
             wire_name(&profile.status)
         );
+        if let Some(detail) = profile_detail(profile) {
+            let _ = writeln!(out, "    {detail}");
+        }
     }
     let _ = writeln!(out, "hooks:");
     for integration in &preview.integrations {

@@ -38,7 +38,8 @@ use pohunek_service_config::preflight::{
 };
 use pohunek_service_config::runtimes::{
     PackageStatus, ProfileStatus, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
-    CODE_RUNTIME_PLAN_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE, RELEASE_RUNTIME_DIR,
+    CODE_PINNED_VERSION_UNKNOWN, CODE_RUNTIME_PLAN_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE,
+    RELEASE_RUNTIME_DIR,
 };
 #[path = "support/service_file.rs"]
 mod service_file;
@@ -1719,10 +1720,22 @@ fn a_profile_pinned_to_a_planned_digest_is_warned_before_its_package_is_installe
 
     let plan = report.runtimes.as_ref().expect("the release plan");
     assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
-    assert!(
-        plan.profiles.is_empty(),
-        "the plan leaves the pinned profile: {:?}",
+    // The profile on the planned digest has no entry. The unrecorded pin is
+    // kept with its reason, and it resolves nowhere, so it is not warned.
+    let entries: Vec<(&str, ProfileStatus)> = plan
+        .profiles
+        .iter()
+        .map(|profile| (profile.name.as_str(), profile.status))
+        .collect();
+    assert_eq!(
+        entries,
+        [("claude-unplanned", ProfileStatus::Kept)],
+        "{:?}",
         plan.profiles
+    );
+    assert_eq!(
+        plan.profiles[0].kept_reason.as_deref(),
+        Some(CODE_PINNED_VERSION_UNKNOWN)
     );
     let warned: Vec<(&str, &str)> = report
         .profile_warnings

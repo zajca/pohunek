@@ -316,6 +316,33 @@ pub(crate) fn official_package_entries(runtime: &str) -> [package::ArchiveEntry;
     official_entries(official)
 }
 
+/// The `runtime.toml` and `detect.toml` the official package of `runtime`
+/// ships, version probe included.
+///
+/// # Panics
+///
+/// Panics when `runtime` is not an official fixture runtime.
+pub(crate) fn official_package_sources(runtime: &str) -> (&'static str, &'static str) {
+    if runtime == PI_RUNTIME {
+        return (PI_DESCRIPTOR, PI_DETECT);
+    }
+    let official = OFFICIAL_PACKAGES
+        .iter()
+        .find(|official| official.runtime == runtime)
+        .unwrap_or_else(|| panic!("{runtime} is not an official fixture runtime"));
+    (official.descriptor, official.detect)
+}
+
+/// Runtime id of the official Pi package, which the fixture source does not
+/// serve: Pi's id is not reserved, so tests install it as a package.
+const PI_RUNTIME: &str = "pi";
+
+/// The `runtime.toml` of the official Pi package.
+const PI_DESCRIPTOR: &str = include_str!("../../../../../runtime-packages/pi/runtime.toml");
+
+/// The `detect.toml` of the official Pi package.
+const PI_DETECT: &str = include_str!("../../../../../runtime-packages/pi/detect.toml");
+
 /// The package id and version the official descriptor of `runtime` declares,
 /// read from the descriptor itself so tests follow package version bumps.
 ///
@@ -324,11 +351,8 @@ pub(crate) fn official_package_entries(runtime: &str) -> [package::ArchiveEntry;
 /// Panics when `runtime` is not an official fixture runtime or its descriptor
 /// does not declare a string `id` and `version`.
 pub(crate) fn official_package_identity(runtime: &str) -> (String, String) {
-    let official = OFFICIAL_PACKAGES
-        .iter()
-        .find(|official| official.runtime == runtime)
-        .unwrap_or_else(|| panic!("{runtime} is not an official fixture runtime"));
-    let table: toml::Table = toml::from_str(official.descriptor).expect("the descriptor parses");
+    let (descriptor, _detect) = official_package_sources(runtime);
+    let table: toml::Table = toml::from_str(descriptor).expect("the descriptor parses");
     let field = |key: &str| {
         table[key]
             .as_str()
