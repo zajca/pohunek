@@ -386,13 +386,16 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     runs = list_runs(args.repo, config["workflow_file"], sha=args.sha)
     candidates = matching_runs(runs, args.sha, args.tier, config["workflow_path"])
     tree_refusal = None
-    # A run in its second or later attempt already completed an earlier one.
-    if not any(
-        run.get("status") == "completed" or run.get("run_attempt", 1) > 1 for run in candidates
-    ):
+    if not decided_on_commit(candidates):
         accepted, tree_refusal = tree_evidence(args, config)
         if accepted is not None:
-            return accepted
+            # A run on S may have completed while the tree match was read; it
+            # decides then, so the tree match is only accepted if none has.
+            runs = list_runs(args.repo, config["workflow_file"], sha=args.sha)
+            candidates = matching_runs(runs, args.sha, args.tier, config["workflow_path"])
+            if not decided_on_commit(candidates):
+                return accepted
+            tree_refusal = f"a run on {args.sha} completed while the tree match was read"
     dispatched_ids: set[int] = set()
     dispatch_request_id: str | None = None
     did_dispatch = False
@@ -455,6 +458,15 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     if failures:
         raise EvidenceError(f"{args.tier} tier failed for {args.sha}: {'; '.join(failures)} ({url})")
     return evidence(args, run, config, match="sha")
+
+
+def decided_on_commit(candidates: list[dict[str, Any]]) -> bool:
+    """Whether a run of the tier on the commit itself has completed: a
+    completed run, or a run in its second or later attempt, whose earlier
+    attempt completed."""
+    return any(
+        run.get("status") == "completed" or run.get("run_attempt", 1) > 1 for run in candidates
+    )
 
 
 def newest_run(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:

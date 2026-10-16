@@ -638,6 +638,21 @@ class CiEvidenceCliTests(unittest.TestCase):
         self.assertIn("no main tier run exists", result.stderr)
         self.assertIn("tree lookup failed", result.stderr)
 
+    def test_a_run_on_the_commit_that_completes_during_the_tree_match_decides(self):
+        # The run on SHA is still running when the tree match is read and has
+        # failed by the time the match would be accepted.
+        running = run_doc(status="in_progress", conclusion=None)
+        failed = run_doc(conclusion="failure")
+        self.tree_fixture(
+            run_pages=[page([running]), page([failed])],
+            jobs_page=jobs_page(overrides={"required check": "failure"}),
+        )
+        result = self.invoke("main", "--json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("workflow conclusion is failure", result.stderr)
+        self.assertIn("/actions/runs/456", result.stderr)
+
     def test_a_newer_failed_run_of_the_tree_blocks_an_older_passing_one(self):
         newer = dispatch_doc(sha=THIRD_SHA, run_id=790, conclusion="failure")
         self.tree_fixture(
