@@ -59,6 +59,7 @@ use crate::XtaskError;
 pub(crate) mod ci;
 pub(crate) mod graph;
 pub(crate) mod guard;
+pub(crate) mod sparse;
 
 use graph::{Kind, Reason};
 
@@ -102,6 +103,8 @@ enum Action {
     Ci(ci::Options),
     /// Check that every repository path a test reads selects that test.
     Guard(guard::Options),
+    /// Print the sparse-checkout patterns of the tree that runs some packages' tests.
+    Sparse(sparse::Options),
 }
 
 /// Workspace package, its manifest directory and the members it depends on.
@@ -703,6 +706,7 @@ pub(crate) fn run(root: &Path, options: &Options) -> Result<(), XtaskError> {
     match &options.command {
         Some(Action::Ci(ci)) => return ci::run(ci),
         Some(Action::Guard(guard)) => return guard::run(guard),
+        Some(Action::Sparse(sparse)) => return sparse::run(sparse),
         None => {}
     }
     let (workspace_root, packages) = workspace(root)?;
@@ -1052,6 +1056,47 @@ fn is_below(path: &str, dir: &str) -> bool {
 ///
 /// `=` is nextest's exact name matcher. `BTreeMap` iteration keeps the output
 /// deterministic.
+/// The tracked files a sparse working tree keeps for `targets`: every file
+/// whose change would select one of their packages, every file whose change
+/// selects everything or goes through the dependency diff, and nothing that is
+/// [`Decision::NoRustTests`]. A test that reads a file outside this set reads
+/// a path whose change does not select it.
+pub(crate) fn sparse_paths(
+    tracked: &BTreeSet<String>,
+    packages: &[Package],
+    targets: &Targets,
+) -> BTreeSet<String> {
+    let selected: BTreeSet<&str> = targets
+        .whole
+        .keys()
+        .chain(targets.narrowed.keys())
+        .map(String::as_str)
+        .collect();
+    let mut closures: BTreeMap<BTreeSet<String>, bool> = BTreeMap::new();
+    tracked
+        .iter()
+        .filter(|path| match classify(path, packages, Mode::Ci).0 {
+            Decision::NoRustTests(_) => false,
+            Decision::Everything(_) | Decision::Unmapped | Decision::Dependencies(_) => true,
+            Decision::Packages { names, tests, .. } => {
+                tests
+                    .iter()
+                    .any(|(package, ..)| selected.contains(package.as_str()))
+                    || *closures.entry(names).or_insert_with_key(|names| {
+                        let seeds = names
+                            .iter()
+                            .map(|name| (name.clone(), BTreeSet::new()))
+                            .collect();
+                        graph::close(&seeds, packages)
+                            .keys()
+                            .any(|name| selected.contains(name.as_str()))
+                    })
+            }
+        })
+        .cloned()
+        .collect()
+}
+
 pub(crate) fn filterset(targets: &Targets) -> String {
     let whole = targets.whole.keys().map(|name| format!("package(={name})"));
     let narrowed = targets.narrowed.iter().map(|(name, filters)| {
