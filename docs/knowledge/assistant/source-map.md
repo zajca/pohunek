@@ -274,8 +274,14 @@ Release packaging and contributor verification:
 - `scripts/ci-timings` — reproduction of CI timing evidence from `gh` run
   data: per-job wall clock and workflow medians (`runs`, `compare`), per-shard
   nextest JUnit summaries (`junit`), sccache/rust-cache
-  cache-hit extraction (`cache`), and per-job step medians (`steps`).
-  Every counted job's wall clock is also rounded up to a whole minute and
+  cache-hit extraction (`cache`), per-job step medians (`steps`), and
+  per-tier CI timing (`tiers`): pull request, push to main, `tier=main`
+  dispatch, schedule and `tier=nightly` dispatch, each with its completion
+  share (only runs with a verdict count as complete), job counts per
+  complete run, and job queue split by runner platform from the REST jobs'
+  runner labels. Windows take dates or UTC timestamps; `gh` server errors and
+  secondary rate limits are retried, and a fetch that fails part way keeps
+  what it fetched. Every counted job's wall clock is also rounded up to a whole minute and
   summed into runner minutes, carried by `runs`, `steps`, `compare`, and
   every `--json` summary. A fetch accumulates run documents into
   `target/ci-timings/ci-runs.json` (`--cache` writes elsewhere), but a

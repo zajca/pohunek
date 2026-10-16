@@ -3,8 +3,10 @@
 
 Implements the measurement half of issue #127 (epic #115): per-job workflow
 wall clock, JUnit execution times, and sccache/rust-cache cache-hit evidence.
-The `tiers` command separately reports PR, main-branch, and scheduled-run
-end-to-end timing, including queue time and per-job queue/run durations.
+The `tiers` command separately reports end-to-end timing per trigger tier
+(pull request, push to main, `tier=main` dispatch, schedule, `tier=nightly`
+dispatch): completion, per-job queue/run durations, and job counts and job
+queue per runner platform.
 
 Every number printed by this tool comes from one of three sources:
 
@@ -14,6 +16,8 @@ Every number printed by this tool comes from one of three sources:
   their workflow wall clock remains `startedAt` to `updatedAt` for compatibility.
 * `tiers` -- total workflow wall clock from run creation through completion,
   including queue time, plus the queue/execution split and per-job timing.
+  Only runs that reached a verdict count as complete; job counts and job
+  queue are split by runner platform from the REST jobs' runner labels.
 * `junit` -- nextest JUnit XML (`target/nextest/<profile>/junit.xml` or an
   uploaded CI artifact) and the one-testcase reports of the release evidence
   rows (`scripts/release-workflow/run-row`). JUnit has test execution time
@@ -38,11 +42,14 @@ import collections
 import datetime
 import json
 import math
+import os
 from pathlib import Path
 import re
 import statistics
 import subprocess
 import sys
+import tempfile
+import time
 import xml.etree.ElementTree as ElementTree
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,6 +80,25 @@ VIEW_FIELDS = (
 # GitHub bills each job's runner time rounded UP to a whole minute, so
 # every job's wall clock contributes one minute-quantized step.
 RUNNER_MINUTE = 60
+# A `gh` call that fails with a server error or a secondary rate limit is
+# retried this many times in total, waiting `GH_RETRY_DELAY_SECONDS` times the
+# attempt number between tries; `--gh-attempts`/`--gh-retry-delay` override
+# both. A primary rate limit, an auth error or a 4xx fails at once: retrying
+# within seconds cannot fix those.
+GH_ATTEMPTS = 5
+GH_RETRY_DELAY_SECONDS = 5.0
+GH_TRANSIENT = re.compile(r"HTTP 5\d\d\b|secondary rate limit", re.IGNORECASE)
+# Conclusions of a run that reached a verdict. A run GitHub reports as
+# `completed` with an empty conclusion also counts; `cancelled`, `skipped`
+# and the remaining conclusions (`neutral`, `stale`, `action_required`) do not.
+VERDICT_CONCLUSIONS = ("success", "failure", "timed_out", "startup_failure")
+# Trigger tiers of `tiers`, in report order.
+TIERS = ("pr", "main_push", "main_dispatch", "nightly_schedule", "nightly_dispatch")
+# Runner platform of a job, from its REST `labels`: `macos` when any label
+# names macOS, `linux` for any other labelled runner, `unknown` when the
+# labels were never fetched. A job whose fetched labels are empty never got a
+# runner (a matrix job cancelled before expansion) and is not a started job.
+PLATFORMS = ("macos", "linux", "unknown")
 
 
 def parse_timestamp(value):
@@ -127,6 +153,16 @@ def job_seconds(document):
             continue
         durations[job["name"]] = seconds
     return durations
+
+
+def job_platform(job):
+    """A job's runner platform from the REST runner labels stored on it."""
+    if "labels" not in job:
+        return "unknown"
+    labels = [str(label).lower() for label in job.get("labels") or []]
+    if not labels:
+        return None
+    return "macos" if any("macos" in label for label in labels) else "linux"
 
 
 def runner_minutes(jobs):
@@ -191,6 +227,26 @@ def summarize_run(document, with_steps=False):
                     if run_seconds is not None and run_seconds > 0 else None
                 ),
             }
+    started_jobs = []
+    for job in document.get("jobs") or []:
+        if (job.get("conclusion") or "") == "skipped":
+            continue
+        job_started = parse_timestamp(job.get("startedAt"))
+        if job_started is None or job_started.year <= 1:
+            continue
+        platform = job_platform(job)
+        if platform is None:
+            continue
+        queued = parse_timestamp(job.get("createdAt") or job.get("queuedAt"))
+        started_jobs.append({
+            "name": job.get("name"),
+            "platform": platform,
+            "queue_seconds": (
+                (job_started - queued).total_seconds()
+                if queued is not None and queued.year > 1 and job_started >= queued
+                else None
+            ),
+        })
     completed_jobs = [
         (parse_timestamp(job.get("completedAt")), job.get("name"))
         for job in document.get("jobs") or []
@@ -230,6 +286,8 @@ def summarize_run(document, with_steps=False):
         "title": document.get("displayTitle"),
         "jobs": jobs,
         "job_timings": job_timings,
+        # Jobs that started (not skipped), with runner platform and queue.
+        "started_jobs": started_jobs,
         "runner_minutes": runner_minutes(jobs),
     }
     if updated is None:
@@ -242,19 +300,47 @@ def summarize_run(document, with_steps=False):
 
 
 
-def parse_date(value):
-    """Parse a `YYYY-MM-DD` date as a UTC midnight datetime."""
-    return datetime.datetime.strptime(value, "%Y-%m-%d").replace(
-        tzinfo=datetime.timezone.utc
+# A selection window: runs created at `start` or later and before `horizon`.
+# `end` is the inclusive end as written, `text` the window as given.
+Window = collections.namedtuple("Window", ("start", "end", "horizon", "text"))
+# Accepted bound shapes, each with the span its precision covers: an
+# inclusive end of `2026-10-16` covers the whole day, one of
+# `2026-10-16T13:42Z` the whole minute.
+BOUND_FORMATS = (
+    ("%Y-%m-%d", datetime.timedelta(days=1)),
+    ("%Y-%m-%dT%H:%MZ", datetime.timedelta(minutes=1)),
+    ("%Y-%m-%dT%H:%M:%SZ", datetime.timedelta(seconds=1)),
+)
+
+
+def parse_bound(value):
+    """Parse a window bound and the span its precision covers."""
+    for pattern, span in BOUND_FORMATS:
+        try:
+            parsed = datetime.datetime.strptime(value, pattern)
+        except ValueError:
+            continue
+        return parsed.replace(tzinfo=datetime.timezone.utc), span
+    raise ValueError(
+        f"window bound must be YYYY-MM-DD, YYYY-MM-DDTHH:MMZ or "
+        f"YYYY-MM-DDTHH:MM:SSZ (UTC), got {value!r}"
     )
 
 
 def parse_window(value):
-    """Parse an inclusive `START..END` window of `YYYY-MM-DD` dates."""
+    """Parse an inclusive `START..END` window of dates or UTC timestamps.
+
+    The end covers the whole unit it names, so `..2026-10-16` includes every
+    run of that day and `..2026-10-16T13:42Z` one created at 13:42:56.
+    """
     parts = value.split("..")
     if len(parts) != 2:
         raise ValueError(f"window must be START..END, got {value!r}")
-    return parse_date(parts[0]), parse_date(parts[1])
+    start, _ = parse_bound(parts[0])
+    end, span = parse_bound(parts[1])
+    if end + span <= start:
+        raise ValueError(f"window {value!r} ends before it starts")
+    return Window(start, end, end + span, value)
 
 
 def select_attempts(runs, attempts):
@@ -305,8 +391,7 @@ def filter_runs(runs, window=None, event=None, conclusion=None, branch=None,
     for run in select_attempts(runs, attempts):
         when = run["created_at"]
         if window is not None:
-            start, end = window
-            if when is None or not start <= when < end + datetime.timedelta(days=1):
+            if when is None or not window.start <= when < window.horizon:
                 continue
         if event is not None and run.get("event") != event:
             continue
@@ -779,33 +864,111 @@ def render_cache_markdown(records):
     return "\n".join(lines)
 
 
+# How often a transient `gh` failure is retried; `main` sets it from the
+# command line before any fetch.
+RetryPolicy = collections.namedtuple("RetryPolicy", ("attempts", "delay_seconds"))
+GH_RETRY = RetryPolicy(GH_ATTEMPTS, GH_RETRY_DELAY_SECONDS)
+
+
+def is_transient(error):
+    """Whether a failed `gh` call names a server error or a secondary limit."""
+    return bool(GH_TRANSIENT.search(getattr(error, "stderr", None) or ""))
+
+
 def gh_json(arguments):
-    """Run `gh` with `--json` output and decode the result."""
-    result = subprocess.run(
-        ["gh", *arguments],
-        cwd=ROOT,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    return json.loads(result.stdout)
+    """Run `gh` with `--json` output and decode the result.
+
+    A server error or a secondary rate limit is retried with a growing wait,
+    up to `GH_RETRY.attempts` tries in total; each retry is announced on
+    stderr. Any other failure, or the last transient one, is raised.
+    """
+    for attempt in range(1, GH_RETRY.attempts + 1):
+        try:
+            result = subprocess.run(
+                ["gh", *arguments],
+                cwd=ROOT,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except subprocess.CalledProcessError as error:
+            if attempt == GH_RETRY.attempts or not is_transient(error):
+                raise
+            wait = GH_RETRY.delay_seconds * attempt
+            print(
+                f"ci-timings: retrying in {wait:g}s ({attempt}/{GH_RETRY.attempts}): "
+                f"{describe_error(error)}",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
+            continue
+        return json.loads(result.stdout)
+    raise AssertionError("unreachable: the last attempt returns or raises")
 
 
-def job_queue_timestamps(run_id, attempt):
-    """Fetch REST job creation times, absent from `gh run view --json jobs`."""
-    endpoint = (
-        f"repos/{{owner}}/{{repo}}/actions/runs/{run_id}/attempts/{attempt}/jobs"
-        "?per_page=100"
-    )
-    try:
+def rest_jobs(run_id, attempt):
+    """Every REST job object of one run attempt, following the pages.
+
+    `gh run view --json jobs` has neither a job's creation time nor its
+    runner labels; the REST endpoint has both.
+    """
+    jobs = []
+    page = 1
+    while True:
+        endpoint = (
+            f"repos/{{owner}}/{{repo}}/actions/runs/{run_id}/attempts/{attempt}/jobs"
+            f"?per_page=100&page={page}"
+        )
         result = gh_json(["api", endpoint])
-    except subprocess.CalledProcessError:
-        # Queue time is supplementary: keep run and job execution metrics
-        # usable when permissions or an older GitHub API omit this endpoint.
-        return {}
-    jobs = result.get("jobs", []) if isinstance(result, dict) else []
-    return {job.get("id"): job.get("created_at") for job in jobs if job.get("id")}
+        batch = result.get("jobs", []) if isinstance(result, dict) else []
+        jobs.extend(batch)
+        total = result.get("total_count", 0) if isinstance(result, dict) else 0
+        if not batch or len(jobs) >= total:
+            return jobs
+        page += 1
+
+
+def needs_rest_jobs(document):
+    """Whether a run document still lacks a job's creation time or labels."""
+    return any(
+        job.get("databaseId")
+        and ((not job.get("createdAt") and not job.get("queuedAt")) or "labels" not in job)
+        for job in document.get("jobs") or []
+    )
+
+
+def enrich_jobs(document):
+    """Add REST creation times and runner labels to a document's jobs.
+
+    Returns whether the document changed. A failure is reported on stderr
+    with the run it concerns and leaves the document as it was, so that run
+    counts as missing those fields (`unknown` platform) instead of passing
+    for one without queue time or on a Linux runner.
+    """
+    run_id = document["databaseId"]
+    attempt = document.get("attempt", 1) or 1
+    try:
+        by_id = {job.get("id"): job for job in rest_jobs(run_id, attempt) if job.get("id")}
+    except subprocess.CalledProcessError as error:
+        print(
+            f"ci-timings: warning: no REST jobs for run {run_id} attempt {attempt}; "
+            f"its job queue and runner platform stay unknown: {describe_error(error)}",
+            file=sys.stderr,
+        )
+        return False
+    changed = False
+    for job in document.get("jobs") or []:
+        rest = by_id.get(job.get("databaseId"))
+        if rest is None:
+            continue
+        if not job.get("createdAt") and not job.get("queuedAt") and rest.get("created_at"):
+            job["createdAt"] = rest["created_at"]
+            changed = True
+        if "labels" not in job:
+            job["labels"] = list(rest.get("labels") or [])
+            changed = True
+    return changed
 
 
 def read_snapshot(path):
@@ -827,10 +990,25 @@ def document_key(document):
 
 
 def write_snapshot(path, documents):
-    """Write a run snapshot, accumulating runs for offline re-measurement."""
+    """Write a run snapshot, accumulating runs for offline re-measurement.
+
+    The new content goes to a sibling file that then replaces the snapshot,
+    so an interrupted write never leaves a truncated cache behind. Each
+    writer stages under its own unique name: two commands sharing the
+    default cache must not write or rename one another's staging file.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(documents, indent=1, sort_keys=True) + "\n")
+    descriptor, partial = tempfile.mkstemp(
+        dir=path.parent, prefix=path.name + ".", suffix=".partial"
+    )
+    try:
+        with os.fdopen(descriptor, "w") as staged:
+            staged.write(json.dumps(documents, indent=1, sort_keys=True) + "\n")
+        os.replace(partial, path)
+    except BaseException:
+        Path(partial).unlink(missing_ok=True)
+        raise
 
 
 def list_arguments(args, window=None):
@@ -854,8 +1032,10 @@ def list_arguments(args, window=None):
     if args.branch:
         arguments += ["--branch", args.branch]
     if window is not None:
+        # Whole dates: the server-side filter fetches a superset, and
+        # `filter_runs` applies a timestamp window exactly.
         created = (
-            f"{window[0].date().isoformat()}..{window[1].date().isoformat()}"
+            f"{window.start.date().isoformat()}..{window.end.date().isoformat()}"
         )
         arguments += ["--created", created]
     return arguments
@@ -897,36 +1077,31 @@ def list_documents(args, window=None):
         ["run", "list", *list_arguments(args, window), "--json", LIST_FIELDS]
     )
     selected = {}
-    fetched = 0
-    enriched = False
-    for entry in listed:
-        # An unfinished run has no completed job timestamps to measure.
-        if not entry.get("conclusion"):
-            continue
-        run_id = entry["databaseId"]
-        latest = entry.get("attempt", 1) or 1
-        view_command = ["run", "view", str(run_id), "--json", VIEW_FIELDS]
-        for attempt in wanted_attempts(latest, args.attempts):
-            document = by_key.get((run_id, attempt))
-            if document is None:
-                document = gh_json(view_command + ["--attempt", str(attempt)])
-                by_key[document_key(document)] = document
-                fetched += 1
-            if args.command == "tiers":
-                jobs = document.get("jobs") or []
-                if any(job.get("databaseId") and not job.get("createdAt")
-                       and not job.get("queuedAt") for job in jobs):
-                    created_at_by_id = job_queue_timestamps(run_id, attempt)
-                    for job in jobs:
-                        created_at = created_at_by_id.get(job.get("databaseId"))
-                        if created_at:
-                            job["createdAt"] = created_at
-                            enriched = True
-            selected[document_key(document)] = document
-    if fetched or enriched:
-        write_snapshot(
-            cache_path, sorted(by_key.values(), key=document_key)
-        )
+    changed = False
+    try:
+        for entry in listed:
+            # An unfinished run has no completed job timestamps to measure.
+            if not entry.get("conclusion"):
+                continue
+            run_id = entry["databaseId"]
+            latest = entry.get("attempt", 1) or 1
+            view_command = ["run", "view", str(run_id), "--json", VIEW_FIELDS]
+            for attempt in wanted_attempts(latest, args.attempts):
+                document = by_key.get((run_id, attempt))
+                if document is None:
+                    document = gh_json(view_command + ["--attempt", str(attempt)])
+                    by_key[document_key(document)] = document
+                    changed = True
+                if args.command == "tiers" and needs_rest_jobs(document):
+                    changed = enrich_jobs(document) or changed
+                selected[document_key(document)] = document
+    finally:
+        # Also on a failed or interrupted fetch: what was fetched stays in
+        # the snapshot, and the next run resumes from it.
+        if changed:
+            write_snapshot(
+                cache_path, sorted(by_key.values(), key=document_key)
+            )
     return Fetch(list(selected.values()), bool(args.limit) and len(listed) >= args.limit)
 
 
@@ -966,9 +1141,8 @@ def truncation_warning(label, window, limit):
     means the window may hold older runs that never reached the medians --
     a partial sample renders exactly like a complete one.
     """
-    span = f"{window[0].date()}..{window[1].date()}"
     return (
-        f"the {label} window {span} filled --limit {limit}, so it may be "
+        f"the {label} window {window.text} filled --limit {limit}, so it may be "
         "missing older runs; raise --limit until the count stops growing"
     )
 
@@ -1017,12 +1191,19 @@ Reproducing the numbers in docs/design/test-performance-report.md:
   scripts/ci-timings cache --run 35564038269
   scripts/ci-timings tiers --window 2026-09-20..2026-09-21
 
+Measuring a window to the minute (the CI throughput epic #1206):
+
+  scripts/ci-timings tiers --window 2026-10-15T06:39Z..2026-10-16T13:42Z \
+      --limit 500 --json
+
 Fetched run metadata accumulates in target/ci-timings/ci-runs.json. Without
 --input every runs/compare invocation queries `gh` first; pass the snapshot as
 --input to re-measure the same tables with no network calls. A measurement
 covers exactly the runs its own query named, so a fuller cache never widens
 it; --limit applies per window, and a window that fills it is reported as
-possibly truncated.
+possibly truncated. A fetch that fails part way keeps what it fetched in the
+snapshot, so running it again resumes there; `tiers` also stores each job's
+REST creation time and runner labels in it.
 """
 
 
@@ -1059,6 +1240,18 @@ def add_selection_arguments(parser):
         help="keep only first attempts (default) or every rerun attempt",
     )
     parser.add_argument("--json", action="store_true", help="emit JSON output")
+    parser.add_argument(
+        "--gh-attempts",
+        type=int,
+        default=GH_ATTEMPTS,
+        help="tries per `gh` call on a server error or secondary rate limit",
+    )
+    parser.add_argument(
+        "--gh-retry-delay",
+        type=float,
+        default=GH_RETRY_DELAY_SECONDS,
+        help="seconds to wait before a retry, times the attempt number",
+    )
 
 
 def select_runs(runs, args, window=None):
@@ -1083,11 +1276,9 @@ def select_runs(runs, args, window=None):
 
 def runs_in_window(runs, window):
     """The runs whose creation time falls inside an inclusive date window."""
-    start, end = window
-    horizon = end + datetime.timedelta(days=1)
     return [
         run for run in runs
-        if run["created_at"] and start <= run["created_at"] < horizon
+        if run["created_at"] and window.start <= run["created_at"] < window.horizon
     ]
 
 
@@ -1144,9 +1335,8 @@ def empty_window_diagnosis(args, loaded, window):
         # candidate passing every filter means `filter_runs` selected them
         # and nothing asked for a diagnosis. Reaching here means the two have
         # drifted apart, which must fail loudly rather than explain itself.
-        span = f"{window[0].date()}..{window[1].date()}"
         raise RuntimeError(
-            f"ci-timings invariant violated: every candidate in {span} passes "
+            f"ci-timings invariant violated: every candidate in {window.text} passes "
             "every filter, so the selection cannot be empty -- "
             "select_attempts and filter_runs disagree"
         )
@@ -1181,9 +1371,8 @@ def selection_coverage_warning(args, window, loaded, selected):
         return None
     if runs_in_window(selected, window):
         return None
-    span = f"{window[0].date()}..{window[1].date()}"
     return (
-        f"no run matched the requested window {span}: "
+        f"no run matched the requested window {window.text}: "
         f"{empty_window_diagnosis(args, loaded, window).message}"
     )
 
@@ -1215,24 +1404,186 @@ def command_runs(args):
 
 
 def classify_tier(run):
-    """Map CI triggers to the three operator-facing timing tiers."""
+    """Map a CI trigger to its operator-facing timing tier.
+
+    Push runs and `tier=main` dispatches stay apart, as do scheduled runs and
+    `tier=nightly` dispatches: push and schedule follow merges and the clock,
+    while a dispatch is evidence someone asked for on one commit.
+    """
     if run.get("event") == "pull_request":
         return "pr"
     if run.get("event") == "schedule":
-        return "nightly"
+        return "nightly_schedule"
     if run.get("event") == "push" and run.get("branch") == "main":
-        return "main"
+        return "main_push"
     if run.get("event") == "workflow_dispatch":
         title = run.get("title") or ""
         for tier in ("main", "nightly"):
             marker = f"CI [tier={tier}]"
             if title == marker or title.startswith(marker + " "):
-                return tier
+                return f"{tier}_dispatch"
     return None
 
 
+def finished(run):
+    """Whether a run has ended, with or without a verdict."""
+    return bool(run.get("conclusion")) or run.get("status") == "completed"
+
+
+def reached_verdict(run):
+    """Whether a run completed with a verdict (see VERDICT_CONCLUSIONS)."""
+    conclusion = run.get("conclusion") or ""
+    if conclusion:
+        return conclusion in VERDICT_CONCLUSIONS
+    return run.get("status") == "completed"
+
+
+def spread(values):
+    """Median, minimum and maximum of a sample, or Nones when it is empty."""
+    return {
+        "p50": statistics.median(values) if values else None,
+        "min": min(values) if values else None,
+        "max": max(values) if values else None,
+        "samples": len(values),
+    }
+
+
+def queue_by_platform(runs):
+    """Job queue p50/p90/max per runner platform over the jobs of `runs`."""
+    samples = {platform: [] for platform in PLATFORMS}
+    for run in runs:
+        for job in run["started_jobs"]:
+            if job["queue_seconds"] is not None:
+                samples[job["platform"]].append(job["queue_seconds"])
+    return {
+        platform: {
+            "p50": statistics.median(values) if values else None,
+            "p90": percentile(values, 0.90),
+            "max": max(values) if values else None,
+            "samples": len(values),
+        }
+        for platform, values in samples.items()
+    }
+
+
+def tier_summary(runs):
+    """Completion, wall clock, job counts and job queue of one tier.
+
+    Wall clock and the job counts per run come from complete runs only, so a
+    cancelled run's partial job set never reads as a smaller run. The
+    completion share is over finished runs: a run still in progress has not
+    had its chance to complete, and a fetch from `gh` never includes one,
+    so a snapshot measured with `--input` gives the same share. The job queue
+    covers every run: a job of a later-cancelled run waited all the same.
+    """
+    complete = [
+        run for run in runs
+        if reached_verdict(run) and run["total_wall_seconds"] is not None
+    ]
+    queue = [run["queue_seconds"] for run in complete if run["queue_seconds"] is not None]
+    execution = [run["execution_seconds"] for run in complete if run["execution_seconds"] is not None]
+    job_queue = collections.defaultdict(list)
+    job_run = collections.defaultdict(list)
+    job_platforms = collections.defaultdict(collections.Counter)
+    last = collections.Counter()
+    for run in runs:
+        if run in complete and run["last_finishing_job"]:
+            last[run["last_finishing_job"]] += 1
+        for job, timing in run["job_timings"].items():
+            if timing["queue_seconds"] is not None:
+                job_queue[job].append(timing["queue_seconds"])
+            if timing["run_seconds"] is not None:
+                job_run[job].append(timing["run_seconds"])
+        for job in run["started_jobs"]:
+            job_platforms[job["name"]][job["platform"]] += 1
+    ended = [run for run in runs if finished(run)]
+    conclusions = collections.Counter(
+        run.get("conclusion") or run.get("status") or "unknown" for run in runs
+    )
+    return {
+        "runs": len(runs),
+        "complete_runs": len(complete),
+        "finished_runs": len(ended),
+        "completion_share": len(complete) / len(ended) if ended else None,
+        "conclusions": dict(sorted(conclusions.items())),
+        "wall_seconds_p50": statistics.median([r["total_wall_seconds"] for r in complete]) if complete else None,
+        "wall_seconds_p90": percentile([r["total_wall_seconds"] for r in complete], 0.90),
+        "queue_seconds_p50": statistics.median(queue) if queue else None,
+        "queue_seconds_p90": percentile(queue, 0.90),
+        "execution_seconds_p50": statistics.median(execution) if execution else None,
+        "jobs_per_complete_run": spread([len(run["started_jobs"]) for run in complete]),
+        "macos_jobs_per_complete_run": spread([
+            sum(1 for job in run["started_jobs"] if job["platform"] == "macos")
+            for run in complete
+        ]),
+        "job_queue": queue_by_platform(runs),
+        "unknown_platform_jobs": sum(
+            1 for run in runs for job in run["started_jobs"] if job["platform"] == "unknown"
+        ),
+        "last_finishing_job": last.most_common(1)[0][0] if last else None,
+        "last_finishing_jobs": dict(sorted(last.items())),
+        "jobs": {
+            job: {
+                "queue_seconds_p50": statistics.median(job_queue[job]) if job_queue[job] else None,
+                "queue_seconds_p90": percentile(job_queue[job], 0.90),
+                "run_seconds_p50": statistics.median(job_run[job]) if job_run[job] else None,
+                "queue_samples": len(job_queue[job]),
+                "run_samples": len(job_run[job]),
+                "platforms": dict(sorted(job_platforms[job].items())),
+            }
+            for job in sorted(job_queue.keys() | job_run.keys())
+        },
+    }
+
+
+def format_optional(seconds):
+    """`format_seconds`, or `n/a` for a missing value."""
+    return format_seconds(seconds) if seconds is not None else "n/a"
+
+
+def render_spread(values):
+    """`p50 (min-max)` of a job-count spread, or `n/a`."""
+    if values["p50"] is None:
+        return "n/a"
+    return f"{values['p50']:g} ({values['min']}-{values['max']})"
+
+
+def render_tier(name, summary):
+    """The text lines of one tier."""
+    share = summary["completion_share"]
+    unfinished = summary["runs"] - summary["finished_runs"]
+    lines = [
+        f"{name}: {summary['complete_runs']}/{summary['runs']} complete"
+        f"{f' ({share:.0%} of finished)' if share is not None else ''}"
+        f"{f', {unfinished} unfinished' if unfinished else ''}; "
+        f"conclusions {', '.join(f'{key}={value}' for key, value in summary['conclusions'].items()) or 'n/a'}; "
+        f"wall p50/p90 {format_optional(summary['wall_seconds_p50'])}/"
+        f"{format_optional(summary['wall_seconds_p90'])}; "
+        f"queue p50/p90 {format_optional(summary['queue_seconds_p50'])}/"
+        f"{format_optional(summary['queue_seconds_p90'])}; "
+        f"execution p50 {format_optional(summary['execution_seconds_p50'])}; "
+        f"last finishers {', '.join(f'{job}={count}' for job, count in summary['last_finishing_jobs'].items()) or 'n/a'}",
+        f"  jobs per complete run {render_spread(summary['jobs_per_complete_run'])}, "
+        f"macOS {render_spread(summary['macos_jobs_per_complete_run'])}; "
+        + "; ".join(
+            f"{platform} job queue p50/p90 {format_optional(queue['p50'])}/"
+            f"{format_optional(queue['p90'])} ({queue['samples']})"
+            for platform, queue in summary["job_queue"].items()
+            if queue["samples"]
+        ),
+    ]
+    for job, timing in summary["jobs"].items():
+        platforms = "/".join(timing["platforms"]) or "n/a"
+        lines.append(
+            f"  {job} [{platforms}]: queue p50/p90 {format_optional(timing['queue_seconds_p50'])}/"
+            f"{format_optional(timing['queue_seconds_p90'])} ({timing['queue_samples']}), "
+            f"run p50 {format_optional(timing['run_seconds_p50'])} ({timing['run_samples']})"
+        )
+    return lines
+
+
 def command_tiers(args):
-    """Report end-to-end and per-job timing by PR, main, and nightly tier."""
+    """Report end-to-end and per-job timing per trigger tier."""
     window = parse_window(args.window) if args.window else None
     loaded = load_run_summaries(args, window)
     selected = select_runs(loaded.runs, args, window)
@@ -1242,7 +1593,7 @@ def command_tiers(args):
     coverage = selection_coverage_warning(args, window, loaded.runs, selected)
     if coverage:
         warnings.append(coverage)
-    tiers = {name: [] for name in ("pr", "main", "nightly")}
+    tiers = {name: [] for name in TIERS}
     unclassified = 0
     for run in selected:
         tier = classify_tier(run)
@@ -1250,66 +1601,36 @@ def command_tiers(args):
             tiers[tier].append(run)
         else:
             unclassified += 1
-    payload = {}
-    for name, runs in tiers.items():
-        complete = [
-            run for run in runs
-            if ((run["conclusion"] or "") or run["status"] == "completed")
-            and run["total_wall_seconds"] is not None
-        ]
-        queue = [run["queue_seconds"] for run in complete if run["queue_seconds"] is not None]
-        execution = [run["execution_seconds"] for run in complete if run["execution_seconds"] is not None]
-        job_queue = collections.defaultdict(list)
-        job_run = collections.defaultdict(list)
-        last = collections.Counter()
-        for run in runs:
-            if run in complete and run["last_finishing_job"]:
-                last[run["last_finishing_job"]] += 1
-            for job, timing in run["job_timings"].items():
-                if timing["queue_seconds"] is not None:
-                    job_queue[job].append(timing["queue_seconds"])
-                if timing["run_seconds"] is not None:
-                    job_run[job].append(timing["run_seconds"])
-        payload[name] = {
-            "runs": len(runs),
-            "complete_runs": len(complete),
-            "wall_seconds_p50": statistics.median([r["total_wall_seconds"] for r in complete]) if complete else None,
-            "wall_seconds_p90": percentile([r["total_wall_seconds"] for r in complete], 0.90),
-            "queue_seconds_p50": statistics.median(queue) if queue else None,
-            "queue_seconds_p90": percentile(queue, 0.90),
-            "execution_seconds_p50": statistics.median(execution) if execution else None,
-            "last_finishing_job": last.most_common(1)[0][0] if last else None,
-            "last_finishing_jobs": dict(sorted(last.items())),
-            "jobs": {
-                job: {
-                    "queue_seconds_p50": statistics.median(job_queue[job]) if job_queue[job] else None,
-                    "queue_seconds_p90": percentile(job_queue[job], 0.90),
-                    "run_seconds_p50": statistics.median(job_run[job]) if job_run[job] else None,
-                    "queue_samples": len(job_queue[job]),
-                    "run_samples": len(job_run[job]),
-                }
-                for job in sorted(job_queue.keys() | job_run.keys())
-            },
-        }
+    payload = {name: tier_summary(runs) for name, runs in tiers.items()}
+    overall = {"runs": len(selected), "job_queue": queue_by_platform(selected)}
+    unknown = sum(
+        1 for run in selected for job in run["started_jobs"] if job["platform"] == "unknown"
+    )
+    if unknown:
+        warnings.append(
+            f"{unknown} started job(s) carry no runner labels, so their platform is "
+            "unknown and the macOS counts leave them out; fetch the window again "
+            "without --input to add the labels"
+        )
     if args.json:
+        payload["all_runs"] = overall
         payload["unclassified"] = {"runs": unclassified}
+        payload["complete_conclusions"] = list(VERDICT_CONCLUSIONS)
         print(json.dumps(payload, indent=1))
     else:
         for name, summary in payload.items():
-            print(f"{name}: {summary['complete_runs']}/{summary['runs']} complete; "
-                  f"wall p50/p90 {format_seconds(summary['wall_seconds_p50']) if summary['wall_seconds_p50'] is not None else 'n/a'}/"
-                  f"{format_seconds(summary['wall_seconds_p90']) if summary['wall_seconds_p90'] is not None else 'n/a'}; "
-                  f"queue p50/p90 {format_seconds(summary['queue_seconds_p50']) if summary['queue_seconds_p50'] is not None else 'n/a'}/"
-                  f"{format_seconds(summary['queue_seconds_p90']) if summary['queue_seconds_p90'] is not None else 'n/a'}; "
-                  f"execution p50 {format_seconds(summary['execution_seconds_p50']) if summary['execution_seconds_p50'] is not None else 'n/a'}; "
-                  f"last finishers {', '.join(f'{job}={count}' for job, count in summary['last_finishing_jobs'].items()) or 'n/a'}")
-            for job, timing in summary["jobs"].items():
-                queue_text = format_seconds(timing["queue_seconds_p50"]) if timing["queue_seconds_p50"] is not None else "n/a"
-                queue_p90_text = format_seconds(timing["queue_seconds_p90"]) if timing["queue_seconds_p90"] is not None else "n/a"
-                run_text = format_seconds(timing["run_seconds_p50"]) if timing["run_seconds_p50"] is not None else "n/a"
-                print(f"  {job}: queue p50/p90 {queue_text}/{queue_p90_text} ({timing['queue_samples']}), "
-                      f"run p50 {run_text} ({timing['run_samples']})")
+            print("\n".join(render_tier(name, summary)))
+        print(
+            f"all runs: {overall['runs']}; "
+            + "; ".join(
+                f"{platform} job queue p50/p90/max {format_optional(queue['p50'])}/"
+                f"{format_optional(queue['p90'])}/{format_optional(queue['max'])} ({queue['samples']})"
+                for platform, queue in overall["job_queue"].items()
+                if queue["samples"]
+            )
+        )
         print(f"unclassified: {unclassified} run(s)")
+        print(f"complete conclusions: {', '.join(VERDICT_CONCLUSIONS)}, or completed with none")
     for warning in warnings:
         print(f"warning: {warning}", file=sys.stderr)
     return 0
@@ -1592,18 +1913,20 @@ def build_parser():
     runs.add_argument(
         "--window",
         default=None,
-        help="inclusive START..END window of YYYY-MM-DD dates (default: newest runs)",
+        help="inclusive START..END window of YYYY-MM-DD dates or UTC timestamps "
+        "(YYYY-MM-DDTHH:MM[:SS]Z); default: newest runs",
     )
     runs.set_defaults(handler=command_runs)
 
     tiers = subparsers.add_parser(
-        "tiers", help="PR, main push, and scheduled CI timing summaries"
+        "tiers", help="PR, main push/dispatch, and nightly schedule/dispatch CI timing summaries"
     )
     add_selection_arguments(tiers)
     tiers.add_argument(
         "--window",
         default=None,
-        help="inclusive START..END window of YYYY-MM-DD dates (default: newest runs)",
+        help="inclusive START..END window of YYYY-MM-DD dates or UTC timestamps "
+        "(YYYY-MM-DDTHH:MM[:SS]Z); default: newest runs",
     )
     tiers.set_defaults(handler=command_tiers)
 
@@ -1614,7 +1937,8 @@ def build_parser():
     steps.add_argument(
         "--window",
         default=None,
-        help="inclusive START..END window of YYYY-MM-DD dates (default: newest runs)",
+        help="inclusive START..END window of YYYY-MM-DD dates or UTC timestamps "
+        "(YYYY-MM-DDTHH:MM[:SS]Z); default: newest runs",
     )
     steps.add_argument(
         "--job",
@@ -1726,6 +2050,13 @@ def describe_error(error):
 def main(argv=None):
     """Run one measurement mode and return the process exit code."""
     args = build_parser().parse_args(argv)
+    global GH_RETRY
+    if hasattr(args, "gh_attempts"):
+        if args.gh_attempts < 1 or args.gh_retry_delay < 0:
+            print("ci-timings: --gh-attempts must be at least 1 and --gh-retry-delay "
+                  "not negative", file=sys.stderr)
+            return 2
+        GH_RETRY = RetryPolicy(args.gh_attempts, args.gh_retry_delay)
     try:
         return args.handler(args)
     except (
