@@ -187,8 +187,8 @@ open.
 
 ### macOS host and client support — [#94](https://github.com/zajca/pohunek/issues/94) ([milestone](https://github.com/zajca/pohunek/milestone/2), project 4)
 
-Native Apple Silicon hosts, macOS 14.0 minimum target, launchd-owned durable
-workers ([RFC](design/macos-support-rfc.md)); Intel Macs are out of scope.
+Native Apple Silicon hosts, macOS 14.0 minimum target tested on macOS 15
+(#1224), launchd-owned durable workers ([RFC](design/macos-support-rfc.md)); Intel Macs are out of scope.
 **7/12;** the milestone has 6 open and 6 closed issues. Landed: platform
 contracts (#95), runtime paths (#96), process inspection (#97), peer identity
 (#98), portable PTY I/O (#99), external observation and integrations (#101), and

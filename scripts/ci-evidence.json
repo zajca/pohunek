@@ -121,7 +121,6 @@
       "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, ubuntu-latest)",
       "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, macos-15)",
       "release rehearsal (evidence, assembly, archive smoke) / Evidence verdict",
-      "macOS package install and upgrade (macos-14)",
       "tests (relay DB, PostgreSQL)"
     ]
   },
@@ -129,7 +128,7 @@
     "main": [],
     "nightly": [
       {
-        "job": "macOS package install and upgrade (macos-14)",
+        "job": "macOS package install and upgrade (macos-15)",
         "step": "Install, upgrade, and uninstall from the archives"
       },
       {
