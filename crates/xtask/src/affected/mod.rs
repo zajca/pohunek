@@ -1,39 +1,64 @@
-//! `cargo xtask affected`: the fast test loop narrowed to what a change can break.
+//! `cargo xtask affected`: the tests a change can break.
 //!
-//! The changed files are the union of the committed diff against the merge base
-//! (`git diff <base>...HEAD`), the uncommitted staged and unstaged changes, and
-//! the untracked files. Every file is classified independently:
+//! One classification serves two callers. The local fast loop (`cargo ta`)
+//! runs the selected fast tests; `cargo xtask affected ci` ([`ci`]) writes the
+//! selection a pull request's CI test jobs run ([`guard`] checks the rules
+//! against the test sources).
 //!
-//! - a workspace-wide build input (root manifest, lockfile, Cargo or nextest
-//!   configuration, toolchain or lint configuration) selects every test;
+//! Every changed file is classified independently:
+//!
+//! - a workspace-wide build input (Cargo or nextest configuration, toolchain or
+//!   lint configuration) selects every test;
+//! - the lockfile and the manifests go through the dependency diff of
+//!   [`graph`], which selects the members resolving a changed crate, or every
+//!   test for a root manifest change it cannot judge;
 //! - a file inside a package directory selects the package with the longest
 //!   manifest-directory prefix;
 //! - a file that a package embeds or reads in its tests from outside its own
-//!   directory selects that package too ([`RULES`]);
+//!   directory selects that package, or only the named tests of it ([`RULES`]);
 //! - a file on the reviewed allowlist of non-Rust paths selects nothing;
 //! - any other file cannot be proven harmless and selects every test.
 //!
-//! Selected packages become the nextest filterset `rdeps(=a) | rdeps(=b)`, which
-//! also runs every workspace package that depends on them. The command is the
-//! `cargo t` alias from `.cargo/config.toml` plus that filterset, so the profile
-//! and features always match the documented fast loop, and nextest intersects
-//! the filterset with the fast profile's `default-filter`. Filtersets narrow
-//! only the tests that run, not the build; Cargo's incremental build already
-//! recompiles only the changed packages and their dependents.
+//! In CI mode the CI configuration and the scripts that run the test jobs also
+//! select every test ([`CI_RULES`]).
 //!
-//! This is an inner-loop accelerator. It never replaces the full gate set.
+//! The selected packages are closed over their reverse dependencies
+//! ([`graph::close`]) and become an explicit nextest filterset such as
+//! `package(=a) | (package(=b) and (binary(=t)))`, so each package carries the
+//! reason it runs.
+//!
+//! **Selection narrows what runs, never what is built.** CI keeps building the
+//! whole workspace (`cargo nextest archive --workspace --all-features`) and
+//! applies the filterset when it runs the archive. Building only the selected
+//! packages would build them with other dependency features: Cargo unifies
+//! features over the packages selected for a build, and the pinned Cargo 1.99.0
+//! ignores `resolver.feature-unification` without `-Zfeature-unification`. On
+//! 2026-10-16 `cargo tree --all-features` resolved 13 dependency units (clap,
+//! futures-util, nix, ...) with other feature sets for the three relay crates
+//! than for `--workspace`, and 23 units for `pohunek-daemon`, `pohunek-cli`,
+//! `pohunek-session-worker`, `pohunek-paths` and `xtask` (digest, ed25519,
+//! hyper-util, ...). Such a build would test binaries that neither the full run
+//! nor the release build produces, and it would miss the compile cache of the
+//! full build.
+//!
+//! The local loop is an inner-loop accelerator. It never replaces the full
+//! gate set.
 
 // Rust guideline compliant 2026-10-12
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde::Deserialize;
+use crate::XtaskError;
 
-use crate::{relative_path_string, XtaskError};
+pub(crate) mod ci;
+pub(crate) mod graph;
+pub(crate) mod guard;
+
+use graph::{Kind, Reason};
 
 /// Revisions tried in order when `--base` is absent.
 ///
@@ -52,7 +77,10 @@ const SCRIPT_TESTS_COMMAND: &str = "python3 -m unittest discover -s scripts/test
 
 /// Options for one `cargo xtask affected` invocation.
 #[derive(Debug, clap::Args)]
+#[command(args_conflicts_with_subcommands = true)]
 pub(crate) struct Options {
+    #[command(subcommand)]
+    command: Option<Action>,
     /// Revision to diff against through its merge base with HEAD
     /// [default: origin/main, else main; fails when neither exists].
     #[arg(long, value_name = "REF")]
@@ -65,12 +93,23 @@ pub(crate) struct Options {
     nextest_args: Vec<OsString>,
 }
 
-/// Workspace package name and its manifest directory relative to the workspace root.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Package {
-    name: String,
+/// Subcommands of `cargo xtask affected`.
+#[derive(Debug, clap::Subcommand)]
+enum Action {
+    /// Write the test selection of a pull request for its CI jobs.
+    Ci(ci::Options),
+    /// Check that every repository path a test reads selects that test.
+    Guard(guard::Options),
+}
+
+/// Workspace package, its manifest directory and the members it depends on.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct Package {
+    pub(crate) name: String,
     /// `/`-separated, without a trailing slash; empty for a root package.
-    dir: String,
+    pub(crate) dir: String,
+    /// Members this package depends on, by name, with the kind of each edge.
+    pub(crate) deps: BTreeSet<(String, Kind)>,
 }
 
 /// Path shape matched by a classification rule.
@@ -105,6 +144,14 @@ enum Effect {
     Everything,
     /// The path is embedded or read by the tests of these packages.
     Packages(&'static [&'static str]),
+    /// The path is read only by the tests of each package that its nextest
+    /// filter names, as `(package, filter)`.
+    Tests(&'static [(&'static str, &'static str)]),
+    /// Like [`Effect::Tests`], but only for a path that something else maps:
+    /// the rule adds readers and never makes an unmapped path mapped.
+    AlsoTests(&'static [(&'static str, &'static str)]),
+    /// A manifest or lockfile; the dependency diff decides ([`graph`]).
+    Dependencies,
     /// The path provably feeds no Rust test.
     NoRustTests,
 }
@@ -175,8 +222,25 @@ const fn reminding(
 /// path selects every test.
 const RULES: &[Rule] = &[
     // Workspace-wide inputs.
-    rule(Pattern::File("Cargo.toml"), Effect::Everything, "workspace manifest"),
-    rule(Pattern::File("Cargo.lock"), Effect::Everything, "dependency lockfile"),
+    rule(Pattern::File("Cargo.toml"), Effect::Dependencies, "workspace manifest"),
+    rule(Pattern::File("Cargo.lock"), Effect::Dependencies, "dependency lockfile"),
+    rule(
+        Pattern::File("Cargo.toml"),
+        Effect::Tests(&[
+            ("xtask", "binary(=dependency_policy)"),
+            ("xtask", "kind(lib) and test(/^affected::tests::/)"),
+            (
+                "pohunek-test-support",
+                "test(=tests::workspace_root_holds_the_workspace_manifest)",
+            ),
+        ]),
+        "workspace manifest read by xtask's dependency_policy test and the members test of its affected module, and by the workspace root check of pohunek-test-support",
+    ),
+    rule(
+        Pattern::File("Cargo.lock"),
+        Effect::Tests(&[("xtask", "binary(=dependency_policy)")]),
+        "lockfile read by xtask's dependency_policy test",
+    ),
     rule(Pattern::Dir(".cargo"), Effect::Everything, "Cargo configuration and aliases"),
     rule(
         Pattern::File(".config/nextest.toml"),
@@ -252,14 +316,72 @@ const RULES: &[Rule] = &[
         "Pi compatibility lock and captured screens read by pohunek-cli's pi_package and pi_frame_properties tests; lock and npm project read by xtask's upstream staging scenarios",
     ),
     rule(
+        Pattern::Dir("crates"),
+        Effect::AlsoTests(&[(
+            "xtask",
+            "binary(=hermetic_scan) | binary(=no_special_dispatch) | \
+             binary(=test_artifact_lookup_guard) | binary(=timing_ratchet) | \
+             binary(=dependency_policy) | \
+             (binary(=affected_ci) and test(=every_repository_read_of_the_test_code_selects_its_reader)) | \
+             (kind(lib) and test(/^affected::tests::/))",
+        )]),
+        "every crate's sources and manifests, scanned by xtask's repository guards (hermetic_scan, no_special_dispatch, test_artifact_lookup_guard, timing_ratchet, the affected guard and include scan) and resolved by its dependency_policy test",
+    ),
+    rule(
+        Pattern::Dir("runtime-packages"),
+        Effect::Tests(&[(
+            "xtask",
+            "kind(lib) and test(/^(attestation|release_tests|test_runtime|upstream_stage_tests)::/)",
+        )]),
+        "official package sources listed by xtask's matrix check and upstream staging scenarios and built by its release and test-runtime scenarios",
+    ),
+    rule(
+        Pattern::File("scripts/provision-hermes-compat"),
+        Effect::Tests(&[("xtask", "kind(lib) and test(/^upstream_stage_tests::/)")]),
+        "Hermes provisioner whose bytes xtask's upstream staging scenarios read and verify",
+    ),
+    rule(
+        Pattern::File(".github/workflows/ci.yml"),
+        Effect::Tests(&[("xtask", "binary(=affected_ci)")]),
+        "CI workflow whose test-job scripts the affected scenarios require to select every test",
+    ),
+    rule(
+        Pattern::File("crates/xtask/src/affected/mod.rs"),
+        Effect::Tests(&[(
+            "pohunek-daemon",
+            "test(=git::tests::the_allow_list_contains_no_variable_xtask_treats_as_redirecting)",
+        )]),
+        "xtask's list of repository-redirecting Git variables, which the daemon's git environment test compares with its own",
+    ),
+    rule(
+        Pattern::File("docs/public-api.md"),
+        Effect::Tests(&[("pohunek-protocol", "binary(=task_errors)")]),
+        "public API reference whose shared error codes pohunek-protocol's task_errors test checks",
+    ),
+    rule(
+        Pattern::Dir("crates/daemon/src"),
+        Effect::Tests(&[("pohunek-protocol", "binary(=task_errors)")]),
+        "daemon sources whose raised task error codes pohunek-protocol's task_errors test reads",
+    ),
+    rule(
+        Pattern::File("crates/cli/src/hermes_integration/assets/pohunek/_pohunek_reporter.py"),
+        Effect::Packages(&["pohunek-daemon"]),
+        "Hermes reporter plugin that the daemon's worker hook and session scenarios run",
+    ),
+    rule(
+        Pattern::File("compat/pi/compatibility-lock.json"),
+        Effect::Packages(&["pohunek-daemon"]),
+        "Pi compatibility lock whose pinned release the daemon's official runtime fixtures report to the package version probe",
+    ),
+    rule(
         Pattern::Dir("crates/netbird/tests/fixtures"),
         Effect::Packages(&["pohunek-netbird", "pohunek-cli"]),
         "NetBird status recordings embedded by NetBird tests and CLI discovery scenarios",
     ),
     rule(
         Pattern::Dir("runtime-packages"),
-        Effect::Packages(&["pohunek-cli"]),
-        "official runtime package sources built and parsed by pohunek-cli's pi_package, pi_frame_properties, codex_package, claude_package and hermes_package tests, and read by its Hermes plugin suites and the package fixture bundle of its hermes_integration module tests",
+        Effect::Packages(&["pohunek-cli", "pohunek-daemon"]),
+        "official runtime package sources built and parsed by pohunek-cli's pi_package, pi_frame_properties, codex_package, claude_package and hermes_package tests, and read by its Hermes plugin suites and the package fixture bundle of its hermes_integration module tests; each package directory is built into the archives the daemon's official runtime fixtures install",
     ),
     rule(
         Pattern::Dir("runtime-packages/hermes"),
@@ -383,14 +505,51 @@ const RULES: &[Rule] = &[
     rule(Pattern::File("bacon.toml"), Effect::NoRustTests, "optional watcher configuration"),
 ];
 
+/// Rules that apply in CI mode before [`RULES`], each selecting every test.
+///
+/// A pull request's CI run must prove a change to the jobs that select and run
+/// its tests on the full set; locally these paths keep their [`RULES`]
+/// effects. `ci_scripts_of_the_test_jobs_escalate` in [`guard`]'s scenarios
+/// requires every script the test jobs of `.github/workflows/ci.yml` run to be
+/// listed here.
+pub(crate) const CI_RULES: &[(Pattern, &str)] = &[
+    (Pattern::Dir(".github"), "CI configuration"),
+    (
+        Pattern::File("scripts/test-partitions"),
+        "shard partitions and the runner of the CI test jobs",
+    ),
+    (
+        Pattern::File("scripts/junit-flaky-summary"),
+        "flaky-test report of the CI test jobs",
+    ),
+    (
+        Pattern::File("scripts/check-rust-toolchain-pin"),
+        "toolchain pin check of the CI test jobs",
+    ),
+];
+
+/// Which caller classifies a change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Mode {
+    /// The local fast loop.
+    Local,
+    /// A pull request's CI test jobs ([`CI_RULES`] apply).
+    Ci,
+}
+
 /// Why one changed file selects what it selects.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Decision {
     Everything(&'static str),
     Packages {
+        /// Packages whose tests are selected whole.
         names: BTreeSet<String>,
+        /// Tests selected inside other packages, as `(package, filter, why)`.
+        tests: BTreeSet<(String, &'static str, &'static str)>,
+        /// Why `names` are selected.
         why: String,
     },
+    Dependencies(&'static str),
     NoRustTests(&'static str),
     Unmapped,
 }
@@ -399,19 +558,34 @@ impl Decision {
     fn describe(&self) -> String {
         match self {
             Self::Everything(why) => format!("everything ({why})"),
-            Self::Packages { names, why } => {
-                let names: Vec<&str> = names.iter().map(String::as_str).collect();
-                format!("{} ({why})", names.join(", "))
+            Self::Packages { names, tests, why } => {
+                let mut parts = Vec::new();
+                if !names.is_empty() {
+                    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+                    parts.push(format!("{} ({why})", names.join(", ")));
+                }
+                parts.extend(
+                    tests
+                        .iter()
+                        .map(|(package, filter, why)| format!("{package} [{filter}] ({why})")),
+                );
+                parts.join("; ")
             }
+            Self::Dependencies(why) => format!("dependency diff ({why})"),
             Self::NoRustTests(why) => format!("no Rust tests ({why})"),
             Self::Unmapped => {
                 "everything (no package or reviewed rule covers this path)".to_owned()
             }
         }
     }
+
+    /// Whether the decision selects every test on its own.
+    fn is_everything(&self) -> bool {
+        matches!(self, Self::Everything(_) | Self::Unmapped)
+    }
 }
 
-/// Tests selected by the whole change.
+/// Packages selected by the files of a change, before the closure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Selection {
     Nothing,
@@ -423,37 +597,68 @@ enum Selection {
 #[derive(Debug)]
 struct Plan {
     decisions: Vec<(String, Decision)>,
+    /// Packages the files select whole.
     selection: Selection,
+    /// Whether a manifest or the lockfile changed, so the dependency diff runs.
+    dependencies: bool,
     reminders: BTreeSet<Reminder>,
 }
 
-/// Runs, or with `--print` describes, the fast tests affected by the current change.
+/// Tests that a change selects after the closure and the dependency diff.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Targets {
+    /// Packages whose tests all run, with the reasons.
+    pub(crate) whole: BTreeMap<String, BTreeSet<Reason>>,
+    /// Packages of which only the named tests run: filter, then the paths and
+    /// rules that select it.
+    pub(crate) narrowed: BTreeMap<String, BTreeMap<&'static str, BTreeSet<String>>>,
+}
+
+impl Targets {
+    fn is_empty(&self) -> bool {
+        self.whole.is_empty() && self.narrowed.is_empty()
+    }
+}
+
+/// What a change runs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Outcome {
+    /// No Rust test can be affected.
+    Nothing,
+    /// The selected tests.
+    Tests(Targets),
+    /// Every test, with the causes.
+    Everything(Vec<String>),
+}
+
+/// Runs a subcommand, or the fast tests affected by the current change.
 pub(crate) fn run(root: &Path, options: &Options) -> Result<(), XtaskError> {
-    let metadata = command_output(
-        root,
-        "cargo",
-        &[
-            "metadata",
-            "--format-version",
-            "1",
-            "--no-deps",
-            "--offline",
-        ],
-    )?;
-    let (workspace_root, packages) = parse_metadata(&metadata)?;
+    match &options.command {
+        Some(Action::Ci(ci)) => return ci::run(ci),
+        Some(Action::Guard(guard)) => return guard::run(guard),
+        None => {}
+    }
+    let (workspace_root, packages) = workspace(root)?;
     ensure_git_toplevel(&workspace_root)?;
 
     let base = resolve_base(&workspace_root, options.base.as_deref())?;
     let changed = changed_files(&workspace_root, &base)?;
-    let plan = plan(&changed, &packages)?;
-    let args = nextest_args(&plan.selection, &options.nextest_args);
+    let plan = plan(&changed, &packages, Mode::Local)?;
+    let outcome = resolve(&plan, &packages, || {
+        let merge_base = merge_base(&workspace_root, &base)?;
+        graph::manifest_diff(&workspace_root, &merge_base)
+    });
+    let args = nextest_args(&outcome, &options.nextest_args);
 
     if options.print {
-        print!("{}", render_report(&base, &plan, args.as_deref()));
+        print!("{}", render_report(&base, &plan, &outcome, args.as_deref()));
         return Ok(());
     }
 
-    eprint!("{}", render_summary(&base, &plan, args.as_deref()));
+    eprint!(
+        "{}",
+        render_summary(&base, &plan, &outcome, args.as_deref())
+    );
     let Some(args) = args else {
         return Ok(());
     };
@@ -475,51 +680,48 @@ pub(crate) fn run(root: &Path, options: &Options) -> Result<(), XtaskError> {
     }
 }
 
-#[derive(Deserialize)]
-struct Metadata {
-    workspace_root: PathBuf,
-    packages: Vec<MetadataPackage>,
+/// Reads the workspace root and its members from `cargo metadata --no-deps`.
+pub(crate) fn workspace(root: &Path) -> Result<(PathBuf, Vec<Package>), XtaskError> {
+    let metadata = command_output(
+        root,
+        "cargo",
+        &[
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--offline",
+        ],
+    )?;
+    graph::parse_members(&metadata)
 }
 
-#[derive(Deserialize)]
-struct MetadataPackage {
-    name: String,
-    manifest_path: PathBuf,
+/// The merge base of `base` and `HEAD`, as a full commit id.
+pub(crate) fn merge_base(root: &Path, base: &str) -> Result<String, XtaskError> {
+    let output = command_output(root, GIT, &["merge-base", "--end-of-options", base, "HEAD"])?;
+    Ok(String::from_utf8_lossy(&output).trim().to_owned())
 }
 
-/// Parses `cargo metadata --no-deps` into the workspace root and its packages.
-fn parse_metadata(json: &[u8]) -> Result<(PathBuf, Vec<Package>), XtaskError> {
-    let metadata: Metadata = serde_json::from_slice(json).map_err(XtaskError::Json)?;
-    let mut packages = Vec::with_capacity(metadata.packages.len());
-    for package in metadata.packages {
-        let dir = package
-            .manifest_path
-            .parent()
-            .and_then(|dir| dir.strip_prefix(&metadata.workspace_root).ok())
-            .ok_or_else(|| XtaskError::InvalidPath(package.manifest_path.clone()))?;
-        packages.push(Package {
-            name: package.name,
-            dir: relative_path_string(dir)?,
-        });
-    }
-    Ok((metadata.workspace_root, packages))
-}
-
-/// Classifies every changed file and combines the decisions into one selection.
+/// Classifies every changed file and combines the decisions.
 ///
 /// Fails when a rule names a package that is not in the workspace, so a renamed
 /// crate cannot silently drop out of the selection.
-fn plan(changed: &BTreeSet<String>, packages: &[Package]) -> Result<Plan, XtaskError> {
+fn plan(changed: &BTreeSet<String>, packages: &[Package], mode: Mode) -> Result<Plan, XtaskError> {
     for rule in RULES {
-        if let Effect::Packages(names) = rule.effect {
-            for name in names {
-                if !packages.iter().any(|package| package.name == *name) {
-                    return Err(XtaskError::Usage(format!(
-                        "affected rule for {:?} names unknown workspace package `{name}`; \
-                         update RULES in crates/xtask/src/affected.rs",
-                        rule.pattern
-                    )));
-                }
+        let names: Vec<&str> = match rule.effect {
+            Effect::Packages(names) => names.to_vec(),
+            Effect::Tests(tests) | Effect::AlsoTests(tests) => {
+                tests.iter().map(|(package, _)| *package).collect()
+            }
+            _ => Vec::new(),
+        };
+        for name in names {
+            if !packages.iter().any(|package| package.name == name) {
+                return Err(XtaskError::Usage(format!(
+                    "affected rule for {:?} names unknown workspace package `{name}`; \
+                     update RULES in crates/xtask/src/affected/mod.rs",
+                    rule.pattern
+                )));
             }
         }
     }
@@ -527,14 +729,18 @@ fn plan(changed: &BTreeSet<String>, packages: &[Package]) -> Result<Plan, XtaskE
     let mut decisions = Vec::with_capacity(changed.len());
     let mut reminders = BTreeSet::new();
     let mut everything = false;
+    let mut dependencies = false;
     let mut selected = BTreeSet::new();
     for path in changed {
-        let (decision, reminder) = classify(path, packages);
+        let (decision, reminder) = classify(path, packages, mode);
         reminders.extend(reminder);
+        if is_dependency_input(path, packages) {
+            dependencies = true;
+        }
         match &decision {
             Decision::Everything(_) | Decision::Unmapped => everything = true,
             Decision::Packages { names, .. } => selected.extend(names.iter().cloned()),
-            Decision::NoRustTests(_) => {}
+            Decision::Dependencies(_) | Decision::NoRustTests(_) => {}
         }
         decisions.push((path.clone(), decision));
     }
@@ -549,12 +755,29 @@ fn plan(changed: &BTreeSet<String>, packages: &[Package]) -> Result<Plan, XtaskE
     Ok(Plan {
         decisions,
         selection,
+        dependencies,
         reminders,
     })
 }
 
+/// Whether a change to `path` needs the dependency diff: a member manifest,
+/// or a path whose rule is [`Effect::Dependencies`].
+fn is_dependency_input(path: &str, packages: &[Package]) -> bool {
+    let ruled = RULES
+        .iter()
+        .any(|rule| matches!(rule.effect, Effect::Dependencies) && rule.pattern.matches(path));
+    ruled
+        || packages.iter().any(|package| {
+            if package.dir.is_empty() {
+                path == "Cargo.toml"
+            } else {
+                path.strip_prefix(package.dir.as_str()) == Some("/Cargo.toml")
+            }
+        })
+}
+
 /// Classifies one repository-relative, `/`-separated path.
-fn classify(path: &str, packages: &[Package]) -> (Decision, BTreeSet<Reminder>) {
+fn classify(path: &str, packages: &[Package], mode: Mode) -> (Decision, BTreeSet<Reminder>) {
     let matching: Vec<&Rule> = RULES
         .iter()
         .filter(|rule| rule.pattern.matches(path))
@@ -566,28 +789,66 @@ fn classify(path: &str, packages: &[Package]) -> (Decision, BTreeSet<Reminder>) 
         .flat_map(|rule| rule.reminders.iter().copied())
         .collect();
 
+    if mode == Mode::Ci {
+        if let Some((_, why)) = CI_RULES.iter().find(|(pattern, _)| pattern.matches(path)) {
+            return (Decision::Everything(why), reminder);
+        }
+    }
     if let Some(rule) = matching
         .iter()
         .find(|rule| matches!(rule.effect, Effect::Everything))
     {
         return (Decision::Everything(rule.why), reminder);
     }
-
     let mut names = BTreeSet::new();
+    let mut tests = BTreeSet::new();
+    let mut also = BTreeSet::new();
     let mut reasons = Vec::new();
     if let Some(owner) = owning_package(path, packages) {
         names.insert(owner.name.clone());
         reasons.push("package directory");
     }
     for rule in &matching {
-        if let Effect::Packages(embedders) = rule.effect {
-            names.extend(embedders.iter().map(|name| (*name).to_owned()));
-            reasons.push(rule.why);
+        match rule.effect {
+            Effect::Packages(embedders) => {
+                names.extend(embedders.iter().map(|name| (*name).to_owned()));
+                reasons.push(rule.why);
+            }
+            Effect::Tests(readers) => {
+                tests.extend(
+                    readers
+                        .iter()
+                        .map(|(package, filter)| ((*package).to_owned(), *filter, rule.why)),
+                );
+            }
+            Effect::AlsoTests(readers) => {
+                also.extend(
+                    readers
+                        .iter()
+                        .map(|(package, filter)| ((*package).to_owned(), *filter, rule.why)),
+                );
+            }
+            _ => {}
         }
     }
-    if !names.is_empty() {
+    let mapped = !names.is_empty()
+        || !tests.is_empty()
+        || matching
+            .iter()
+            .any(|rule| matches!(rule.effect, Effect::NoRustTests | Effect::Dependencies));
+    if mapped {
+        tests.extend(also);
+    }
+    tests.retain(|(package, ..)| !names.contains(package));
+    if !names.is_empty() || !tests.is_empty() {
         let why = reasons.join("; ");
-        return (Decision::Packages { names, why }, reminder);
+        return (Decision::Packages { names, tests, why }, reminder);
+    }
+    if let Some(rule) = matching
+        .iter()
+        .find(|rule| matches!(rule.effect, Effect::Dependencies))
+    {
+        return (Decision::Dependencies(rule.why), reminder);
     }
 
     match matching
@@ -596,6 +857,73 @@ fn classify(path: &str, packages: &[Package]) -> (Decision, BTreeSet<Reminder>) 
     {
         Some(rule) => (Decision::NoRustTests(rule.why), reminder),
         None => (Decision::Unmapped, reminder),
+    }
+}
+
+/// Turns `plan` into what runs: the closure of its packages, the narrowed
+/// tests, and the members the dependency diff selects.
+///
+/// `diff` runs only when the plan needs it; its failure selects every test.
+fn resolve(
+    plan: &Plan,
+    packages: &[Package],
+    diff: impl FnOnce() -> Result<graph::ManifestDiff, XtaskError>,
+) -> Outcome {
+    let causes: Vec<String> = plan
+        .decisions
+        .iter()
+        .filter(|(_, decision)| decision.is_everything())
+        .map(|(path, decision)| format!("{}: {}", printable(path), decision.describe()))
+        .collect();
+    if plan.selection == Selection::Everything {
+        return Outcome::Everything(causes);
+    }
+
+    let mut seeds: BTreeMap<String, BTreeSet<Reason>> = BTreeMap::new();
+    let mut narrowed: BTreeMap<String, BTreeMap<&'static str, BTreeSet<String>>> = BTreeMap::new();
+    for (path, decision) in &plan.decisions {
+        if let Decision::Packages { names, tests, why } = decision {
+            for name in names {
+                seeds
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(Reason::Changed(format!("{} ({why})", printable(path))));
+            }
+            for (package, filter, test_why) in tests {
+                narrowed
+                    .entry(package.clone())
+                    .or_default()
+                    .entry(*filter)
+                    .or_default()
+                    .insert(format!("{} ({test_why})", printable(path)));
+            }
+        }
+    }
+    let mut whole = graph::close(&seeds, packages);
+    if plan.dependencies {
+        match diff() {
+            Ok(graph::ManifestDiff::Members(members)) => {
+                for (name, reasons) in members {
+                    whole.entry(name).or_default().extend(reasons);
+                }
+            }
+            Ok(graph::ManifestDiff::Everything(why)) => {
+                return Outcome::Everything(vec![format!("dependency diff: {why}")]);
+            }
+            Err(error) => {
+                return Outcome::Everything(vec![format!(
+                    "dependency diff failed: {}",
+                    printable(&error.to_string())
+                )]);
+            }
+        }
+    }
+    narrowed.retain(|package, _| !whole.contains_key(package));
+    let targets = Targets { whole, narrowed };
+    if targets.is_empty() {
+        Outcome::Nothing
+    } else {
+        Outcome::Tests(targets)
     }
 }
 
@@ -613,40 +941,47 @@ fn is_below(path: &str, dir: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Builds the nextest filterset selecting `names` and their reverse dependencies.
+/// Builds the nextest filterset of `targets`.
 ///
-/// `=` is nextest's exact name matcher; the default for `rdeps` is a glob.
-/// `BTreeSet` iteration keeps the output deterministic.
-fn filterset(names: &BTreeSet<String>) -> String {
-    names
-        .iter()
-        .map(|name| format!("rdeps(={name})"))
-        .collect::<Vec<_>>()
-        .join(" | ")
+/// `=` is nextest's exact name matcher. `BTreeMap` iteration keeps the output
+/// deterministic.
+pub(crate) fn filterset(targets: &Targets) -> String {
+    let whole = targets.whole.keys().map(|name| format!("package(={name})"));
+    let narrowed = targets.narrowed.iter().map(|(name, filters)| {
+        let filters: Vec<String> = filters.keys().map(|filter| format!("({filter})")).collect();
+        format!("(package(={name}) and ({}))", filters.join(" | "))
+    });
+    whole.chain(narrowed).collect::<Vec<_>>().join(" | ")
 }
 
 /// Arguments for `cargo`, or `None` when no Rust test is affected.
-fn nextest_args(selection: &Selection, extra: &[OsString]) -> Option<Vec<OsString>> {
+fn nextest_args(outcome: &Outcome, extra: &[OsString]) -> Option<Vec<OsString>> {
     let mut args = vec![OsString::from(FAST_LOOP_ALIAS)];
-    match selection {
-        Selection::Nothing => return None,
-        Selection::Everything => {}
-        Selection::Packages(names) => {
+    match outcome {
+        Outcome::Nothing => return None,
+        Outcome::Everything(_) => {}
+        Outcome::Tests(targets) => {
             args.push(OsString::from("-E"));
-            args.push(OsString::from(filterset(names)));
+            args.push(OsString::from(filterset(targets)));
         }
     }
     args.extend(extra.iter().cloned());
     Some(args)
 }
 
-fn selection_line(selection: &Selection) -> String {
-    match selection {
-        Selection::Nothing => "selection: no Rust tests are affected".to_owned(),
-        Selection::Everything => "selection: everything (fail-safe escalation)".to_owned(),
-        Selection::Packages(names) => {
-            let names: Vec<&str> = names.iter().map(String::as_str).collect();
-            format!("selection: {} plus their dependents", names.join(", "))
+fn outcome_line(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Nothing => "selection: no Rust tests are affected".to_owned(),
+        Outcome::Everything(_) => "selection: everything (fail-safe escalation)".to_owned(),
+        Outcome::Tests(targets) => {
+            let mut parts: Vec<String> = targets.whole.keys().cloned().collect();
+            parts.extend(
+                targets
+                    .narrowed
+                    .keys()
+                    .map(|name| format!("{name} (named tests)")),
+            );
+            format!("selection: {}", parts.join(", "))
         }
     }
 }
@@ -666,7 +1001,7 @@ fn command_line(args: Option<&[OsString]>) -> String {
 }
 
 /// Full `--print` output: base, one reason per file, selection, reminders, command.
-fn render_report(base: &str, plan: &Plan, args: Option<&[OsString]>) -> String {
+fn render_report(base: &str, plan: &Plan, outcome: &Outcome, args: Option<&[OsString]>) -> String {
     let mut out = format!("base: {}\n", printable(base));
     if plan.decisions.is_empty() {
         out.push_str("no changed files\n");
@@ -674,7 +1009,21 @@ fn render_report(base: &str, plan: &Plan, args: Option<&[OsString]>) -> String {
     for (path, decision) in &plan.decisions {
         let _ = writeln!(out, "{} -> {}", printable(path), decision.describe());
     }
-    let _ = writeln!(out, "{}", selection_line(&plan.selection));
+    if let Outcome::Everything(causes) = outcome {
+        for cause in causes
+            .iter()
+            .filter(|cause| cause.starts_with("dependency diff"))
+        {
+            let _ = writeln!(out, "{cause}");
+        }
+    }
+    let _ = writeln!(out, "{}", outcome_line(outcome));
+    if let Outcome::Tests(targets) = outcome {
+        for (name, reasons) in &targets.whole {
+            let reasons: Vec<String> = reasons.iter().map(Reason::describe).collect();
+            let _ = writeln!(out, "  {name}: {}", reasons.join("; "));
+        }
+    }
     for reminder in &plan.reminders {
         let _ = writeln!(out, "reminder: {}", reminder.message());
     }
@@ -683,23 +1032,18 @@ fn render_report(base: &str, plan: &Plan, args: Option<&[OsString]>) -> String {
 }
 
 /// Short summary printed before running: base, escalation causes, selection, reminders.
-fn render_summary(base: &str, plan: &Plan, args: Option<&[OsString]>) -> String {
+fn render_summary(base: &str, plan: &Plan, outcome: &Outcome, args: Option<&[OsString]>) -> String {
     let mut out = format!(
         "affected: base {}, {} changed files\n",
         printable(base),
         plan.decisions.len()
     );
-    for (path, decision) in &plan.decisions {
-        if matches!(decision, Decision::Everything(_) | Decision::Unmapped) {
-            let _ = writeln!(
-                out,
-                "affected: {} -> {}",
-                printable(path),
-                decision.describe()
-            );
+    if let Outcome::Everything(causes) = outcome {
+        for cause in causes {
+            let _ = writeln!(out, "affected: {cause}");
         }
     }
-    let _ = writeln!(out, "affected: {}", selection_line(&plan.selection));
+    let _ = writeln!(out, "affected: {}", outcome_line(outcome));
     for reminder in &plan.reminders {
         let _ = writeln!(out, "affected: reminder: {}", reminder.message());
     }
@@ -922,6 +1266,7 @@ mod tests {
         Package {
             name: name.to_owned(),
             dir: dir.to_owned(),
+            deps: BTreeSet::new(),
         }
     }
 
@@ -936,6 +1281,7 @@ mod tests {
             package("pohunek-client", "crates/client"),
             package("pohunek-cli", "crates/cli"),
             package("pohunek-netbird", "crates/netbird"),
+            package("pohunek-test-support", "crates/test-support"),
             package("xtask", "crates/xtask"),
             package("nested-fixture", "crates/xtask/tests/fixtures/nested"),
         ]
@@ -950,7 +1296,9 @@ mod tests {
     }
 
     fn selection(paths: &[&str]) -> Selection {
-        plan(&changed(paths), &fixture()).expect("plan").selection
+        plan(&changed(paths), &fixture(), Mode::Local)
+            .expect("plan")
+            .selection
     }
 
     #[test]
@@ -980,8 +1328,6 @@ mod tests {
     #[test]
     fn every_workspace_wide_input_escalates_to_everything() {
         for path in [
-            "Cargo.toml",
-            "Cargo.lock",
             ".cargo/config.toml",
             ".config/nextest.toml",
             "rust-toolchain",
@@ -1018,7 +1364,7 @@ mod tests {
             "crates/README.md",
             "compat/other/x.json",
         ] {
-            let plan = plan(&changed(&[path]), &fixture()).expect("plan");
+            let plan = plan(&changed(&[path]), &fixture(), Mode::Local).expect("plan");
             assert_eq!(plan.selection, Selection::Everything, "{path}");
             assert_eq!(plan.decisions[0].1, Decision::Unmapped, "{path}");
         }
@@ -1045,7 +1391,7 @@ mod tests {
         ] {
             assert_eq!(selection(&[path]), Selection::Nothing, "{path}");
         }
-        assert_eq!(nextest_args(&Selection::Nothing, &[]), None);
+        assert_eq!(nextest_args(&Outcome::Nothing, &[]), None);
     }
 
     #[test]
@@ -1120,7 +1466,10 @@ mod tests {
                 "runtime-packages/hermes/operator/cli.py",
                 &["pohunek-cli", "pohunek-daemon", "xtask"],
             ),
-            ("runtime-packages/README.md", &["pohunek-cli"]),
+            (
+                "runtime-packages/README.md",
+                &["pohunek-cli", "pohunek-daemon"],
+            ),
             (
                 "scripts/tests/smoke-hermes-plugin-release.sh",
                 &["pohunek-cli"],
@@ -1150,6 +1499,7 @@ mod tests {
                 "Cargo.lock",
             ]),
             &fixture(),
+            Mode::Local,
         )
         .expect("plan");
         assert_eq!(
@@ -1160,7 +1510,7 @@ mod tests {
                 Reminder::SdkGates
             ])
         );
-        let report = render_report("main", &plan, None);
+        let report = render_report("main", &plan, &Outcome::Nothing, None);
         assert!(report.contains("cargo xtask docs check"), "{report}");
         assert!(report.contains(SCRIPT_TESTS_COMMAND), "{report}");
         assert!(report.contains("cargo xtask ts check"), "{report}");
@@ -1169,7 +1519,7 @@ mod tests {
     #[test]
     fn every_docs_check_input_reminds_the_docs_check() {
         for path in ["docs/runbooks/upgrade.md", "README.md", "LICENSE"] {
-            let plan = plan(&changed(&[path]), &fixture()).expect("plan");
+            let plan = plan(&changed(&[path]), &fixture(), Mode::Local).expect("plan");
             assert_eq!(plan.selection, Selection::Nothing, "{path}");
             assert_eq!(
                 plan.reminders,
@@ -1182,7 +1532,7 @@ mod tests {
     #[test]
     fn a_rule_naming_an_unknown_package_fails() {
         let packages = vec![package("pohunek-cli", "crates/cli")];
-        let error = plan(&changed(&["crates/cli/src/lib.rs"]), &packages)
+        let error = plan(&changed(&["crates/cli/src/lib.rs"]), &packages, Mode::Local)
             .expect_err("rules name packages missing from this workspace");
         assert!(
             error.to_string().contains("unknown workspace package"),
@@ -1190,43 +1540,63 @@ mod tests {
         );
     }
 
+    /// Targets selecting `names` whole, as the closure of a fixture without edges does.
+    fn targets(names: &[&str]) -> Targets {
+        Targets {
+            whole: names
+                .iter()
+                .map(|name| ((*name).to_owned(), BTreeSet::new()))
+                .collect(),
+            narrowed: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn filterset_is_sorted_and_uses_exact_package_matchers() {
-        let selected = BTreeSet::from(["xtask".to_owned(), "pohunek-cli".to_owned()]);
-        assert_eq!(filterset(&selected), "rdeps(=pohunek-cli) | rdeps(=xtask)");
-
-        let from_other_order = selection(&["crates/xtask/src/lib.rs", "crates/cli/src/lib.rs"]);
-        let Selection::Packages(from_other_order) = from_other_order else {
-            panic!("expected a package selection");
-        };
-        assert_eq!(filterset(&from_other_order), filterset(&selected));
+        let mut selected = targets(&["xtask", "pohunek-cli"]);
+        assert_eq!(
+            filterset(&selected),
+            "package(=pohunek-cli) | package(=xtask)"
+        );
+        selected.narrowed.insert(
+            "pohunek-protocol".to_owned(),
+            BTreeMap::from([
+                ("binary(=b)", BTreeSet::new()),
+                ("binary(=a)", BTreeSet::new()),
+            ]),
+        );
+        assert_eq!(
+            filterset(&selected),
+            "package(=pohunek-cli) | package(=xtask) | \
+             (package(=pohunek-protocol) and ((binary(=a)) | (binary(=b))))"
+        );
     }
 
     #[test]
     fn nextest_args_use_the_fast_alias_and_append_passthrough() {
         let extra = [OsString::from("--no-fail-fast")];
         assert_eq!(
-            nextest_args(&Selection::Packages(names(&["pohunek-cli"])), &extra),
+            nextest_args(&Outcome::Tests(targets(&["pohunek-cli"])), &extra),
             Some(vec![
                 OsString::from("t"),
                 OsString::from("-E"),
-                OsString::from("rdeps(=pohunek-cli)"),
+                OsString::from("package(=pohunek-cli)"),
                 OsString::from("--no-fail-fast"),
             ])
         );
         assert_eq!(
-            nextest_args(&Selection::Everything, &extra),
+            nextest_args(&Outcome::Everything(Vec::new()), &extra),
             Some(vec![OsString::from("t"), OsString::from("--no-fail-fast")])
         );
     }
 
     #[test]
     fn printed_command_is_shell_quoted() {
-        let args = nextest_args(&Selection::Packages(names(&["pohunek-cli", "xtask"])), &[])
-            .expect("args");
+        let args =
+            nextest_args(&Outcome::Tests(targets(&["pohunek-cli", "xtask"])), &[]).expect("args");
         assert_eq!(
             command_line(Some(&args)),
-            "cargo t -E 'rdeps(=pohunek-cli) | rdeps(=xtask)'"
+            "cargo t -E 'package(=pohunek-cli) | package(=xtask)'"
         );
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
     }
@@ -1236,33 +1606,54 @@ mod tests {
         let plan = plan(
             &changed(&["crates/cli/src/lib.rs", "sdk/ts/x.ts"]),
             &fixture(),
+            Mode::Local,
         )
         .expect("plan");
-        let args = nextest_args(&plan.selection, &[]);
-        let report = render_report("origin/main", &plan, args.as_deref());
-        assert_eq!(
-            report,
-            "base: origin/main\n\
-             crates/cli/src/lib.rs -> pohunek-cli (package directory)\n\
-             sdk/ts/x.ts -> no Rust tests (Bun workspace; xtask only writes its generated \
-             bindings, checked by `cargo xtask ts check`)\n\
-             selection: pohunek-cli plus their dependents\n\
-             reminder: SDK workspace changed: also run the Bun gates from the repository \
-             root (.agents/instructions/verification.md \"SDK workspace gates\") and \
-             `cargo xtask ts check`\n\
-             cargo t -E 'rdeps(=pohunek-cli)'\n"
+        let outcome = resolve(&plan, &fixture(), || unreachable!("no manifest changed"));
+        let args = nextest_args(&outcome, &[]);
+        let report = render_report("origin/main", &plan, &outcome, args.as_deref());
+        let lines: Vec<&str> = report.lines().collect();
+        assert_eq!(lines[0], "base: origin/main", "{report}");
+        assert!(
+            lines[1]
+                .starts_with("crates/cli/src/lib.rs -> pohunek-cli (package directory); xtask ["),
+            "{report}"
         );
+        assert_eq!(
+            lines[2],
+            "sdk/ts/x.ts -> no Rust tests (Bun workspace; xtask only writes its generated \
+             bindings, checked by `cargo xtask ts check`)"
+        );
+        assert_eq!(lines[3], "selection: pohunek-cli, xtask (named tests)");
+        assert_eq!(
+            lines[4],
+            "  pohunek-cli: crates/cli/src/lib.rs (package directory)"
+        );
+        assert_eq!(
+            lines[5],
+            "reminder: SDK workspace changed: also run the Bun gates from the repository \
+             root (.agents/instructions/verification.md \"SDK workspace gates\") and \
+             `cargo xtask ts check`"
+        );
+        assert!(
+            lines[6].starts_with(
+                "cargo t -E 'package(=pohunek-cli) | (package(=xtask) and ((binary(=hermetic_scan)"
+            ),
+            "{report}"
+        );
+        assert_eq!(lines.len(), 7, "{report}");
     }
 
     #[test]
     fn control_characters_in_paths_and_base_are_escaped() {
         // Unmapped, so the pre-run summary prints it as an escalation cause too.
         let hostile = "a\nforged -> nothing\x1b[2J.rs";
-        let plan = plan(&changed(&[hostile]), &fixture()).expect("plan");
-        let args = nextest_args(&plan.selection, &[]);
+        let plan = plan(&changed(&[hostile]), &fixture(), Mode::Local).expect("plan");
+        let outcome = resolve(&plan, &fixture(), || unreachable!("no manifest changed"));
+        let args = nextest_args(&outcome, &[]);
         for output in [
-            render_report("main\x1b]0;x\x07", &plan, args.as_deref()),
-            render_summary("main\x1b]0;x\x07", &plan, args.as_deref()),
+            render_report("main\x1b]0;x\x07", &plan, &outcome, args.as_deref()),
+            render_summary("main\x1b]0;x\x07", &plan, &outcome, args.as_deref()),
         ] {
             assert!(
                 !output.chars().any(|c| c.is_control() && c != '\n'),
@@ -1296,7 +1687,7 @@ mod tests {
                 {"name": "xtask", "manifest_path": "/repo/crates/xtask/Cargo.toml"}
             ]
         }"#;
-        let (root, packages) = parse_metadata(json).expect("metadata parses");
+        let (root, packages) = graph::parse_members(json).expect("metadata parses");
         assert_eq!(root, Path::new("/repo"));
         assert_eq!(
             packages,
@@ -1308,7 +1699,7 @@ mod tests {
 
         let outside = br#"{"workspace_root": "/repo",
             "packages": [{"name": "x", "manifest_path": "/elsewhere/Cargo.toml"}]}"#;
-        parse_metadata(outside).expect_err("a package outside the workspace is rejected");
+        graph::parse_members(outside).expect_err("a package outside the workspace is rejected");
     }
 
     /// Workspace packages read from the real manifests.
@@ -1333,7 +1724,11 @@ mod tests {
                     .as_str()
                     .expect("package name")
                     .to_owned();
-                Package { name, dir }
+                Package {
+                    name,
+                    dir,
+                    deps: BTreeSet::new(),
+                }
             })
             .collect()
     }
@@ -1341,7 +1736,8 @@ mod tests {
     #[test]
     fn rules_name_only_real_workspace_packages() {
         let packages = repo_packages(&pohunek_test_support::workspace_root());
-        plan(&BTreeSet::new(), &packages).expect("every rule names a workspace package");
+        plan(&BTreeSet::new(), &packages, Mode::Local)
+            .expect("every rule names a workspace package");
     }
 
     /// Resolves `.` and `..` lexically; `None` when the path climbs above the root.
@@ -1399,10 +1795,15 @@ mod tests {
                     if is_below(&target, &package.dir) {
                         continue;
                     }
-                    let selected = match classify(&target, &packages).0 {
+                    let selected = match classify(&target, &packages, Mode::Local).0 {
                         Decision::Everything(_) => true,
-                        Decision::Packages { names, .. } => names.contains(&package.name),
-                        Decision::NoRustTests(_) | Decision::Unmapped => false,
+                        Decision::Packages { names, tests, .. } => {
+                            names.contains(&package.name)
+                                || tests.iter().any(|(name, ..)| *name == package.name)
+                        }
+                        Decision::Dependencies(_)
+                        | Decision::NoRustTests(_)
+                        | Decision::Unmapped => false,
                     };
                     if !selected {
                         uncovered.push(format!("{} -> {target}", relative.display()));
@@ -1412,7 +1813,7 @@ mod tests {
         }
         assert!(
             uncovered.is_empty(),
-            "add these embedded paths to RULES in affected.rs: {uncovered:#?}"
+            "add these embedded paths to RULES in affected/mod.rs: {uncovered:#?}"
         );
     }
 

@@ -435,11 +435,19 @@ fails; `--base` overrides) and adds staged, unstaged, and untracked files.
 Each file selects the package whose directory contains it;
 paths that crates embed or their tests read from outside their own directory
 (`docs/knowledge`, `compat/`, `scripts/`, `packaging/`, the release workflow)
-select those crates. It then runs `cargo t -E 'rdeps(=a) | ...'`, so dependents
-run too and the fast profile's default filter still applies. It fails safe:
-the root `Cargo.toml`, `Cargo.lock`, `.cargo/`, `.config/nextest.toml`,
-`rust-toolchain*`, lint/format configs, and any path no rule covers run
-everything. Only a reviewed allowlist in `crates/xtask/src/affected.rs` (other paths:
+select those crates, or only the named tests of them. The selected packages
+are closed over their reverse dependencies (a dev-dependency counts for one
+hop) and it runs `cargo t -E 'package(=a) | ...'`, so dependents run too and
+the fast profile's default filter still applies. A change to `Cargo.lock` or a
+manifest goes through a `cargo metadata --all-features` diff of the merge base
+and the working tree, which selects the members that resolve a changed crate.
+It fails safe: a root `Cargo.toml` change outside `[workspace.dependencies]`,
+a failed dependency diff, `.cargo/`, `.config/nextest.toml`, `rust-toolchain*`,
+lint/format configs, and any path no rule covers run everything.
+`cargo xtask affected guard` checks that every repository path the test code
+reads through `pohunek_test_support::workspace_root()` or `manifest_dir()`
+selects that test, and `cargo xtask affected ci --base REV --out DIR` writes the
+selection for a pull request's CI jobs. Only a reviewed allowlist in `crates/xtask/src/affected/mod.rs` (other paths:
 `sdk/ts/`, the root Bun workspace files, `docs/`, `.github/`, `.claude/`, `.agents/`, `assets/`, root `*.md`,
 `LICENSE`, `bacon.toml`) selects no Rust tests; when nothing else changed it
 exits 0 without running nextest and names the follow-up checks (`cargo xtask
