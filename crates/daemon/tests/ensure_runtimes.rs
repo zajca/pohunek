@@ -27,9 +27,9 @@ use pohunek_service_config::runtimes::{
     UseReason, CODE_DAEMON_RUNNING, CODE_GAP_AGENT_NOT_ON_PATH, CODE_GAP_CONFIG_HOME_MISSING,
     CODE_GAP_CONFIG_HOME_SYMLINK, CODE_GAP_SERVED_BY_OTHER_PACKAGE,
     CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PINNED_TO_NEWER_VERSION,
-    CODE_PINNED_VERSION_UNKNOWN, CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE,
-    CODE_SERVICE_CONFIG_UNREADABLE, DETECT_FLAG, DRY_RUN_FLAG, ENSURE_REPORT_VERSION,
-    ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
+    CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_VERSION_UNKNOWN, CODE_PROFILE_NOT_MIGRATABLE,
+    CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE, DETECT_FLAG, DRY_RUN_FLAG,
+    ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
 };
 use pohunek_test_support::bin_exe;
 use pohunek_test_support::env::TestEnv;
@@ -1796,6 +1796,42 @@ fn a_profile_pinned_to_an_older_official_version_is_repinned_to_the_release_pack
         "a repinned profile has no entry"
     );
     assert_eq!(repeat.packages[0].status, PackageStatus::Present);
+}
+
+/// A profile whose `package` key names another package than the one its
+/// digest records is an anomalous pin: the step keeps it, even though the digest
+/// is an older version of the release package.
+#[test]
+fn a_profile_whose_package_key_disagrees_with_its_digest_is_kept() {
+    let host = Host::new();
+    let older = publish_claude_version(&host, OLDER_VERSION, 1);
+    host.write_claude_profile();
+    let bound = host.step(false);
+    assert_eq!(bound.profiles[0].status, ProfileStatus::Bound);
+    let text = host.profile_text();
+    assert!(text.contains("pohunek.runtime.claude"), "{text}");
+    host.write_profile(
+        CLAUDE_PROFILE,
+        &text.replacen("pohunek.runtime.claude", "acme.runtime.other", 1),
+    );
+    let profile = fs::read(host.profile_path()).expect("the kept profile");
+    publish_claude_version(&host, NEWER_VERSION, 2);
+
+    let plan = host.step(true);
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(plan.profiles.len(), 1, "{:?}", plan.profiles);
+    assert_kept(
+        &plan.profiles[0],
+        older.as_str(),
+        CODE_PINNED_TO_OTHER_PACKAGE,
+    );
+    let applied = host.step(false);
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    assert_eq!(
+        fs::read(host.profile_path()).expect("the kept profile"),
+        profile
+    );
 }
 
 /// Asserts that `profile` keeps its pin at `digest` for `reason`, so nothing

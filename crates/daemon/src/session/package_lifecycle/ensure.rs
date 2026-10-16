@@ -1702,7 +1702,9 @@ fn classify_pin<'a>(
     if record.source() != PackageSource::Official {
         return keep(CODE_PINNED_TO_NON_OFFICIAL_PACKAGE, Some(&version));
     }
-    if record.identity().id != entry.identity.id {
+    // The profile names its package as well as the digest; a pin whose
+    // package key and digest record disagree is anomalous and kept.
+    if record.identity().id != entry.identity.id || profile.pin.package != entry.identity.id {
         return keep(CODE_PINNED_TO_OTHER_PACKAGE, Some(&version));
     }
     let target_is_official = plan
