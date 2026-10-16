@@ -27,10 +27,16 @@ and direct communication with Linux hosts over a configured overlay.
 The release targets native `aarch64-apple-darwin` artifacts without a Rosetta
 dependency. Intel Macs and `x86_64-apple-darwin` artifacts are outside the
 current release scope; adding them requires a separate accepted scope and native
-acceptance evidence. The proposed minimum is macOS 14.0. CI pins
-`MACOSX_DEPLOYMENT_TARGET=14.0`; this compile-time floor is not a substitute for
-the native minimum-OS acceptance gate in #105. Supported current versions must
-also be named and tested at release time.
+acceptance evidence. The minimum is macOS 14.0: CI pins
+`MACOSX_DEPLOYMENT_TARGET=14.0`, and the archives record and enforce that floor.
+Supported current versions must also be named and tested at release time.
+
+Revision (2026-10-16, #1224, repository owner decision): macOS 14 is a supported
+build target without CI acceptance, and macOS 15 is the tested platform. CI and
+release acceptance run on macOS 15 only; no macOS 14 runner is kept, because
+GitHub retires the hosted `macos-14` image on 2026-11-02. Nothing refuses to
+install or run on macOS 14. The minimum-OS acceptance host that #105 asked for
+is not part of the release gate; the gate accepts the tested macOS 15 platform.
 
 Production services run as the logged-in owner through launchd user agents.
 Closing a terminal or locking the screen does not stop workers. Logout may end

@@ -119,8 +119,8 @@ jobs:
     # budget covers the toolchain, cache restore and a cold build.
     timeout-minutes: 45
     env:
-      # Compile against the oldest supported macOS SDK contract. Runtime
-      # acceptance on macOS 14 remains an explicit release milestone.
+      # Compile against the oldest supported macOS, 14.0. CI tests on macOS 15
+      # only; macOS 14 is a supported build target without CI acceptance.
       MACOSX_DEPLOYMENT_TARGET: "14.0"
       # mold is Linux-only: keep the default linker on macOS runners.
       RUSTFLAGS: -D warnings
@@ -342,18 +342,13 @@ jobs:
   # they carry ad-hoc signatures and `signing adhoc` in the MANIFEST, and
   # `verify-signed --adhoc` checks them.
   macos-package:
-    # macos-15 is the required leg. The nightly macos-14 leg is informational
-    # on pull requests and main pushes, but release evidence requires its real
-    # acceptance result until issue #355 provides an accepted replacement.
-    name: macOS package install and upgrade (${{ matrix.runner }})
+    # macOS 15 is the tested platform. The archives target macOS 14.0, a
+    # supported build target that CI does not run (issue #1224).
+    name: macOS package install and upgrade (macos-15)
     if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || github.event_name == 'push' || (github.event_name == 'pull_request' && needs.changes.outputs.macos_package == 'true') }}
     needs: changes
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-15
     timeout-minutes: 90
-    continue-on-error: ${{ matrix.runner == 'macos-14' && github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') }}
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly')) && '{"runner":["macos-14","macos-15"]}' || '{"runner":["macos-15"]}') }}
     env:
       # mold is Linux-only: keep the default linker on macOS runners.
       RUSTFLAGS: -D warnings
@@ -372,7 +367,7 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: macos-package-${{ matrix.runner }}
+          shared-key: macos-package-macos-15
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build offline documentation

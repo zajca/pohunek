@@ -154,10 +154,12 @@ of the Claude, Codex, Hermes, and Pi packages. A push to
 `main` runs the main tier: platform contracts, the macOS tier packages, the
 `macos-15` package job, Hermes macOS, and SDK macOS, alongside the Linux jobs
 selected on main. PR and main runs cancel superseded runs on the same ref. A
-daily 05:00 UTC nightly run includes the main tier, the required `macos-14`
-package leg, the cold rebuild comparison, and the nightly-only relay database
-suite. The `macos-14` package leg runs only in nightly schedule and `nightly`
-manual dispatch, and must pass for nightly CI evidence. Manual
+daily 05:00 UTC nightly run includes the main tier, the cold rebuild
+comparison in the `macos-15` package job, and the nightly-only relay database
+suite. Nightly CI evidence requires that job's install, upgrade, and uninstall
+step and its cold rebuild step. macOS 15 is the only macOS version CI runs;
+macOS 14 is a supported build target (deployment target 14.0) without CI
+acceptance (#1224). Manual
 dispatch requires the `main` or `nightly` choice; nightly adds the nightly-only
 checks to main. Schedule and manual runs do not cancel PR or main runs.
 

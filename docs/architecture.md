@@ -381,8 +381,9 @@ this contract, and `disable` and `uninstall` remove them
 (`crates/cli/src/workflow/units.rs`).
 
 The shared contract crate compiles and tests natively on Apple Silicon Darwin
-with a macOS 14 deployment target. Intel Macs are outside the current release
-scope. The secure runtime-path and portable filesystem contract also runs
+with a macOS 14 deployment target. macOS 14 is a supported build target without
+CI acceptance; CI and release acceptance run on macOS 15 only (revision of
+2026-10-16, #1224). Intel Macs are outside the current release scope. The secure runtime-path and portable filesystem contract also runs
 natively on APFS, and native process and peer inspection are in place. The
 session worker's PTY I/O is portable: output readiness is one `poll(2)`
 implementation shared by both targets, and the worker's complete test suite,

@@ -244,13 +244,12 @@ class CiEvidenceCliTests(unittest.TestCase):
         self.config.write_text(json.dumps(self.config_data))
 
     def require_nightly_release_evidence(self):
-        self.config_data["required_jobs"]["nightly"].extend((
-            "macOS package install and upgrade (macos-14)",
+        self.config_data["required_jobs"]["nightly"].append(
             "macOS package install and upgrade (macos-15)",
-        ))
+        )
         self.config_data["required_steps"]["nightly"] = [
             {
-                "job": "macOS package install and upgrade (macos-14)",
+                "job": "macOS package install and upgrade (macos-15)",
                 "step": "Install, upgrade, and uninstall from the archives",
             },
             {
@@ -268,26 +267,23 @@ class CiEvidenceCliTests(unittest.TestCase):
         omit_acceptance=False,
         omit_cold=False,
     ):
-        macos14_steps = [] if omit_acceptance else [{
-            "name": "Install, upgrade, and uninstall from the archives",
-            "conclusion": acceptance_conclusion,
-        }]
-        macos15_steps = [] if omit_cold else [{
-            "name": "Rebuild from a cold release directory and compare",
-            "conclusion": cold_conclusion,
-        }]
+        steps = []
+        if not omit_acceptance:
+            steps.append({
+                "name": "Install, upgrade, and uninstall from the archives",
+                "conclusion": acceptance_conclusion,
+            })
+        if not omit_cold:
+            steps.append({
+                "name": "Rebuild from a cold release directory and compare",
+                "conclusion": cold_conclusion,
+            })
         return [
-            {
-                "name": "macOS package install and upgrade (macos-14)",
-                "status": "completed",
-                "conclusion": "success",
-                "steps": macos14_steps,
-            },
             {
                 "name": "macOS package install and upgrade (macos-15)",
                 "status": "completed",
                 "conclusion": "success",
-                "steps": macos15_steps,
+                "steps": steps,
             },
         ]
 
@@ -335,25 +331,28 @@ class CiEvidenceCliTests(unittest.TestCase):
             name = name_match.group(1)
             if name == "tests (${{ matrix.shard }}, fast)":
                 workflow_names.update(f"tests ({shard}, fast)" for shard in ("core", "daemon", "relay", "cli"))
-            elif name == "macOS package install and upgrade (${{ matrix.runner }})":
-                workflow_names.update(
-                    f"macOS package install and upgrade ({runner})"
-                    for runner in ("macos-14", "macos-15")
-                )
             else:
                 workflow_names.add(name)
         for tier in ("main", "nightly"):
             for name in config["required_jobs"][tier]:
                 self.assertIn(name.split(" / ", 1)[0], workflow_names)
-        self.assertNotIn("macOS package install and upgrade (macos-14)", config["required_jobs"]["main"])
-        self.assertIn("macOS package install and upgrade (macos-14)", config["required_jobs"]["nightly"])
+        # macOS 15 is the only package acceptance leg, in both tiers.
+        for tier in ("main", "nightly"):
+            self.assertEqual(
+                [name for name in config["required_jobs"][tier] if name.startswith("macOS package install")],
+                ["macOS package install and upgrade (macos-15)"],
+            )
+        self.assertIn(
+            {
+                "job": "macOS package install and upgrade (macos-15)",
+                "step": "Install, upgrade, and uninstall from the archives",
+            },
+            config["required_steps"]["nightly"],
+        )
         self.assertNotIn("tests (relay DB, PostgreSQL)", config["required_jobs"]["main"])
         self.assertIn("tests (relay DB, PostgreSQL)", config["required_jobs"]["nightly"])
         macos_job = workflow.split("  macos-package:\n", 1)[1].split("\n  test:\n", 1)[0]
-        self.assertIn(
-            "continue-on-error: ${{ matrix.runner == 'macos-14' && github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') }}",
-            macos_job,
-        )
+        self.assertNotIn("continue-on-error", macos_job)
 
     def test_every_required_job_names_a_job_of_the_workflow_or_its_reusable_workflows(self):
         config = json.loads(DEFAULT_CONFIG.read_text())
@@ -366,10 +365,10 @@ class CiEvidenceCliTests(unittest.TestCase):
         # the workflow does not run, is refused.
         smoke = "release rehearsal (evidence, assembly, archive smoke) / Archive smoke"
         self.assertFalse(names_a_workflow_job(f"{smoke} (network-isolated)", workflow))
-        self.assertFalse(names_a_workflow_job(f"{smoke} (network-isolated, macos-14)", workflow))
+        self.assertFalse(names_a_workflow_job(f"{smoke} (network-isolated, macos-13)", workflow))
         self.assertFalse(names_a_workflow_job(f"{smoke} (network-isolated, ubuntu-latest) extra", workflow))
         consumer = "release rehearsal (evidence, assembly, archive smoke) / Build the release consumer executable"
-        self.assertFalse(names_a_workflow_job(f"{consumer} (macos-14)", workflow))
+        self.assertFalse(names_a_workflow_job(f"{consumer} (macos-13)", workflow))
         self.assertFalse(names_a_workflow_job("tests (gpu, fast)", workflow))
         # Both legs of the archive smoke gate a release in both tiers.
         for tier in ("main", "nightly"):
@@ -421,7 +420,7 @@ class CiEvidenceCliTests(unittest.TestCase):
         result = self.invoke("nightly")
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_nightly_requires_green_macos14_acceptance(self):
+    def test_nightly_requires_green_macos15_acceptance(self):
         self.require_nightly_release_evidence()
         self.write_fixture(
             run_pages=[page([run_doc(event="schedule", branch="main")])],
@@ -433,6 +432,18 @@ class CiEvidenceCliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("conclusion=failure", result.stderr)
         self.assertIn("/actions/runs/456", result.stderr)
+        for macos_jobs in (
+            self.nightly_macos_jobs(acceptance_conclusion="skipped"),
+            self.nightly_macos_jobs(omit_acceptance=True),
+        ):
+            with self.subTest(macos_jobs=macos_jobs):
+                self.write_fixture(
+                    run_pages=[page([run_doc(event="schedule", branch="main")])],
+                    jobs_page=jobs_page(extra=macos_jobs),
+                )
+                result = self.invoke("nightly")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Install, upgrade, and uninstall from the archives", result.stderr)
 
     def test_nightly_refuses_missing_skipped_or_failed_cold_rebuild_step(self):
         self.require_nightly_release_evidence()

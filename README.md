@@ -149,9 +149,9 @@ Read these first and follow them, they are the source of truth:
 Rules:
 1. Detect the OS and CPU. Linux x86_64 uses the latest release's
    pohunek-daemon-<version>-x86_64-unknown-linux-gnu.tar.gz (or -musl).
-   macOS 14+ on Apple Silicon uses `brew install zajca/pohunek/pohunek`;
-   tell me that macOS support is not declared final yet. For anything else,
-   stop and tell me.
+   macOS 14 or newer on Apple Silicon (tested on macOS 15) uses
+   `brew install zajca/pohunek/pohunek`; tell me that macOS support is not
+   declared final yet. For anything else, stop and tell me.
 2. Verify every download with its .sha256 file and, when `gh` is available,
    `gh attestation verify <file> --repo zajca/pohunek`. Stop on any mismatch.
 3. Before changing anything, run `pohunek service check --json` (from the
@@ -191,10 +191,10 @@ projects, agent profiles, and remote hosts.
 - **Linux x86_64:** each [release](https://github.com/zajca/pohunek/releases)
   publishes glibc and MUSL CLI and daemon archives. Unpack the daemon archive
   and run `./packaging/install-daemon.sh`.
-- **macOS (Apple Silicon, macOS 14+):** `brew install zajca/pohunek/pohunek`,
-  then `pohunek service install`. The archives are published, but macOS support
-  is declared only after its acceptance gate
-  ([#105](https://github.com/zajca/pohunek/issues/105)) passes.
+- **macOS (Apple Silicon, macOS 14 or newer, tested on macOS 15):**
+  `brew install zajca/pohunek/pohunek`, then `pohunek service install`. The
+  archives are published, but macOS support is declared only after its
+  acceptance gate ([#105](https://github.com/zajca/pohunek/issues/105)) passes.
 - **From source (Rust 1.96+):**
   `cargo build --release --locked --bin pohunek --bin pohunekd --bin pohunek-sessiond`.
 

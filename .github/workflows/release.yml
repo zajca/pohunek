@@ -343,7 +343,8 @@ jobs:
   # archive's provenance comes from the evidence workflow's attest job, not
   # from a signer identity.
   #
-  # Running the archives on macOS 14 itself is a separate acceptance gate.
+  # Release acceptance runs the archives on macOS 15 (the ci.yml macos-package
+  # job); macOS 14 is a supported build target without CI acceptance.
   stage-macos:
     name: Stage ${{ matrix.component }} for aarch64-apple-darwin
     needs: [tier-evidence, gate, docs-gate, sdk-gate, upgrade-test]
