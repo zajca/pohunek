@@ -727,6 +727,7 @@ struct HermesFixture {
     hermes_bin: PathBuf,
     pohunek_bin: PathBuf,
     enable_failure: PathBuf,
+    version_banner: PathBuf,
 }
 
 impl HermesFixture {
@@ -763,12 +764,16 @@ impl HermesFixture {
         let plugin_root = hermes_home.join("plugins/operators/pohunek");
         let state_file = env.root().join("hermes-plugin-state");
         let enable_failure = env.root().join("fail-hermes-enable");
+        let version_banner = env.root().join("hermes-version-banner");
         fs::write(&state_file, "disabled\n").expect("initialize Hermes plugin state");
+        fs::write(&version_banner, "Hermes Agent v0.20.0 (2026.8.3)\n")
+            .expect("initialize the Hermes version banner");
         let hermes_bin = install_bin.join("hermes");
         write_executable(
             &hermes_bin,
             format!(
-                "case \"$*\" in\n--version) printf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3)' ;;\n'plugins list --json') if [ -d '{}' ]; then printf '[{{\"name\":\"pohunek\",\"status\":\"%s\",\"source\":\"user\"}}]\\n' \"$(/bin/cat '{}')\"; else printf '%s\\n' '[]'; fi ;;\n'plugins enable pohunek --no-allow-tool-override') if [ -e '{}' ]; then /bin/rm -f '{}'; exit 90; fi; printf '%s\\n' enabled > '{}' ;;\n'plugins disable pohunek') printf '%s\\n' disabled > '{}' ;;\n*) exit 90 ;;\nesac",
+                "case \"$*\" in\n--version) /bin/cat '{}' ;;\n'plugins list --json') if [ -d '{}' ]; then printf '[{{\"name\":\"pohunek\",\"status\":\"%s\",\"source\":\"user\"}}]\\n' \"$(/bin/cat '{}')\"; else printf '%s\\n' '[]'; fi ;;\n'plugins enable pohunek --no-allow-tool-override') if [ -e '{}' ]; then /bin/rm -f '{}'; exit 90; fi; printf '%s\\n' enabled > '{}' ;;\n'plugins disable pohunek') printf '%s\\n' disabled > '{}' ;;\n*) exit 90 ;;\nesac",
+                version_banner.display(),
                 plugin_root.display(),
                 state_file.display(),
                 enable_failure.display(),
@@ -785,7 +790,14 @@ impl HermesFixture {
             hermes_bin,
             pohunek_bin: bin_exe("pohunek"),
             enable_failure,
+            version_banner,
         }
+    }
+
+    /// Makes `hermes --version` print `banner`.
+    fn set_version_banner(&self, banner: &str) {
+        fs::write(&self.version_banner, format!("{banner}\n"))
+            .expect("write the Hermes version banner");
     }
 
     /// Arguments of one Hermes lifecycle action for the default profile.
@@ -1094,6 +1106,11 @@ async fn assert_source_findings(
             check(&doctor, "asset_current").0,
             "fail",
             "{context}: doctor does not offer an update that cannot succeed: {doctor:#}"
+        );
+        assert_eq!(
+            check(&doctor, "hermes_version").0,
+            "not_run",
+            "{context}: without a package range the version is not judged: {doctor:#}"
         );
         assert_eq!(doctor["doctor"]["ok"], false, "{context}");
     }
@@ -1824,6 +1841,40 @@ async fn a_real_hermes_launch_submits_its_initial_input_once_the_prompt_shows() 
 
     let (code, removed) = harness.json(&["session", "rm", &session_id]).await;
     assert_eq!(code, 0, "remove Hermes session and worker: {removed}");
+    harness.stop().await;
+}
+
+/// The integration's Hermes version gate is the selected package's declared
+/// range, read with the launch gate's grammar: a release in the range with
+/// other build metadata than the locked banner installs and passes doctor, and
+/// the first release above the range is refused with nothing written.
+#[tokio::test]
+async fn the_integration_accepts_the_package_range_not_one_banner() {
+    let key = test_key();
+    let harness = trusted_harness(&key).await;
+    install_official(&harness, &key).await;
+    let hermes = HermesFixture::new(&harness.env);
+    let probe =
+        read_toml(&format!("{PACKAGE_DIR}/runtime.toml"))["runtime"]["version_probe"].clone();
+    let bound = |field: &str| {
+        probe[field]
+            .as_str()
+            .unwrap_or_else(|| panic!("version_probe.{field}"))
+            .to_owned()
+    };
+    let (min, below) = (bound("min"), bound("below"));
+
+    hermes.set_version_banner(&format!("Hermes Agent v{min} (rebuilt) · local 0123abcd"));
+    hermes.install(&harness).await;
+    let doctor = hermes.doctor(&harness).await;
+    assert_eq!(check(&doctor, "hermes_version").0, "pass", "{doctor:#}");
+
+    hermes.set_version_banner(&format!("Hermes Agent v{below} (future)"));
+    hermes
+        .refuses_install_and_update(&harness, "hermes_unsupported_version", "above the range")
+        .await;
+    let doctor = hermes.doctor(&harness).await;
+    assert_eq!(check(&doctor, "hermes_version").0, "fail", "{doctor:#}");
     harness.stop().await;
 }
 
@@ -2837,6 +2888,17 @@ async fn sidecar_violations_in_a_signed_package_fail_install() {
         format!("{init}\nSECOND_POLICY_PATH = {POLICY_TOKEN}\n").into_bytes(),
     );
     cases.push(("an init with the policy token twice", repeated));
+
+    // The daemon accepts other probe arguments, but the integration runs only
+    // the fixed `hermes --version`, so it would check another output.
+    let mut probe_args = package_entries();
+    let descriptor = entry_mut(&mut probe_args, "runtime.toml");
+    let text = String::from_utf8(descriptor.contents.clone()).expect("descriptor UTF-8");
+    assert!(text.contains(r#"args = ["--version"], min"#), "{text}");
+    descriptor.contents = text
+        .replacen(r#"args = ["--version"], min"#, r#"args = ["-V"], min"#, 1)
+        .into_bytes();
+    cases.push(("a version probe with other arguments", probe_args));
 
     let mut published = Vec::new();
     for (index, (name, mut entries)) in cases.into_iter().enumerate() {

@@ -167,12 +167,15 @@ pub(crate) fn diagnose(
         target_safe,
         "select an explicit owner-private Hermes target",
     );
-    if target_safe {
+    // The supported range is the selected package's; without a usable package
+    // the version is not judged and stays not run, while `asset_source`
+    // reports the missing package.
+    if let (true, Ok(bundle)) = (target_safe, source) {
         set_result(
             &mut checks,
             "hermes_version",
-            runner.verify_version(target).is_ok(),
-            "install the pinned supported Hermes release",
+            runner.verify_version(target, &bundle.version_probe).is_ok(),
+            "install a Hermes release the selected Hermes package supports",
         );
     }
 

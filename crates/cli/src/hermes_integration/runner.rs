@@ -27,6 +27,7 @@ use nix::unistd::access;
 #[cfg(target_os = "linux")]
 use nix::unistd::eaccess;
 use nix::unistd::{AccessFlags, Uid};
+use package::version_probe::VersionProbePolicy;
 use serde::{Deserialize, Serialize};
 
 use super::error::Error;
@@ -36,10 +37,6 @@ use crate::process::bounded::{
     spawn_bounded_reader_stdout, wait_for_child,
 };
 
-/// The release prefix required by `compat/hermes/compatibility-lock.json`.
-const PINNED_HERMES_VERSION_LINE: &str = "Hermes Agent v0.20.0 (2026.8.3)";
-/// Hermes appends source-provenance metadata after this delimiter for Git installs.
-const HERMES_VERSION_METADATA_DELIMITER: &str = " · ";
 /// A local lifecycle query must finish promptly and never block the CLI indefinitely.
 ///
 /// Cold-starting the pinned Hermes runtime can exceed ten seconds on shared
@@ -567,20 +564,30 @@ impl HermesRunner {
         })
     }
 
-    /// Verifies the exact Hermes release pinned by the compatibility contract.
+    /// Verifies that `hermes --version` names a release the selected Hermes
+    /// package supports.
+    ///
+    /// `policy` is the package descriptor's `version_probe`; the output is read
+    /// with the grammar the daemon's launch gate applies, so this gate accepts
+    /// exactly the releases a Hermes launch accepts.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::UnsupportedHermes`] when no output line contains the
-    /// pinned release, optionally followed by Hermes's provenance metadata.
-    pub(crate) fn verify_version(&self, target: &ResolvedTarget) -> Result<(), Error> {
+    /// Returns [`Error::UnsupportedHermes`] when the first output line does not
+    /// follow the declared grammar or the release lies outside the declared
+    /// range.
+    pub(crate) fn verify_version(
+        &self,
+        target: &ResolvedTarget,
+        policy: &VersionProbePolicy,
+    ) -> Result<(), Error> {
         let output = self.run(target, FixedCommand::Version)?;
-        let version = std::str::from_utf8(&output.stdout).map_err(|_| Error::UnsupportedHermes)?;
-        if version.lines().any(pinned_version_line_matches) {
-            Ok(())
-        } else {
-            Err(Error::UnsupportedHermes)
-        }
+        // Decoded as the daemon's probe decodes it, so bytes after the first
+        // line never decide the verdict.
+        policy
+            .check_output(&String::from_utf8_lossy(&output.stdout))
+            .map(|_release| ())
+            .map_err(|_refusal| Error::UnsupportedHermes)
     }
 
     /// Reads exactly one valid Pohunek entry from Hermes's JSON plugin list.
@@ -644,10 +651,11 @@ impl HermesRunner {
     pub(crate) fn validate_staged(
         &self,
         target: &ResolvedTarget,
+        version_policy: &VersionProbePolicy,
         staged_plugin: &Path,
         staged_policy: &Path,
     ) -> Result<(), Error> {
-        self.verify_version(target)?;
+        self.verify_version(target, version_policy)?;
         let (staged_plugin, staged_policy) = validate_stage_paths(
             target,
             staged_plugin,
@@ -796,13 +804,6 @@ fn lifecycle_error(error: &bounded::Error) -> Error {
     }
 }
 
-fn pinned_version_line_matches(line: &str) -> bool {
-    line.strip_prefix(PINNED_HERMES_VERSION_LINE)
-        .is_some_and(|suffix| {
-            suffix.is_empty() || suffix.starts_with(HERMES_VERSION_METADATA_DELIMITER)
-        })
-}
-
 /// The exact environment contract for one fixed child process family.
 #[derive(Debug, Clone, Copy)]
 enum ChildEnvironment<'a> {
@@ -862,10 +863,11 @@ impl super::lifecycle::HermesControl for HermesRunner {
     fn validate_staged(
         &mut self,
         target: &ResolvedTarget,
+        version_policy: &VersionProbePolicy,
         staged_root: &Path,
         staged_policy: &Path,
     ) -> Result<(), Error> {
-        HermesRunner::validate_staged(self, target, staged_root, staged_policy)
+        HermesRunner::validate_staged(self, target, version_policy, staged_root, staged_policy)
     }
 
     fn is_enabled(&mut self, target: &ResolvedTarget) -> Result<bool, Error> {
@@ -893,7 +895,7 @@ enum FixedCommand {
 impl FixedCommand {
     fn args(self) -> &'static [&'static str] {
         match self {
-            Self::Version => &["--version"],
+            Self::Version => &super::assets::VERSION_ARGS,
             Self::List => &["plugins", "list", "--json"],
             Self::Enable => &["plugins", "enable", "pohunek", "--no-allow-tool-override"],
             Self::Disable => &["plugins", "disable", "pohunek"],
@@ -1231,6 +1233,11 @@ mod tests {
         SHELL_DESCRIPTORS,
     };
 
+    /// The version policy of the Hermes package directory.
+    fn version_policy() -> VersionProbePolicy {
+        test_package::version_policy().expect("the package version policy")
+    }
+
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
     struct Fixture(PathBuf);
@@ -1501,7 +1508,7 @@ mod tests {
         for (selection, first, second, third) in cases {
             let selected = target(&root.0, selection);
             runner(&root.0, &body)
-                .verify_version(&selected)
+                .verify_version(&selected, &version_policy())
                 .expect("pinned version");
             let parts: Vec<_> = fs::read_to_string(&log)
                 .expect("log")
@@ -1622,36 +1629,35 @@ mod tests {
     }
 
     #[test]
-    fn verifies_the_pinned_version_with_optional_provenance_metadata() {
+    fn verifies_the_package_range_with_optional_provenance_metadata() {
         let root = fixture("version");
         let selected = target(&root.0, TargetSelection::Profile(ProfileName::default()));
-        runner(
-            &root.0,
-            "printf '%s\\n%s\\n' 'metadata' 'Hermes Agent v0.20.0 (2026.8.3)'",
-        )
-        .verify_version(&selected)
-        .expect("supported Hermes version");
-        runner(
-            &root.0,
-            "printf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3) · upstream 7aecab56 · local 3c27eb62'",
-        )
-        .verify_version(&selected)
-        .expect("supported Hermes version with provenance");
+        let policy = test_package::version_policy().expect("the package version policy");
+        let (min, below) = (policy.min(), policy.below());
+        let verify = |line: &str| {
+            runner(&root.0, &format!("printf '%b\\n' '{line}'")).verify_version(&selected, &policy)
+        };
+        verify(&format!("Hermes Agent v{min} (2026.8.3)")).expect("the lowest supported release");
+        verify(&format!(
+            "Hermes Agent v{min} (2026.8.3) · upstream 7aecab56 · local 3c27eb62"
+        ))
+        .expect("a supported release with provenance");
+        verify(&format!("Hermes Agent v{min} (2026.8.3)\\n\\0377"))
+            .expect("bytes after the first line do not decide the verdict");
+        for refused in [
+            format!("Hermes Agent v{below} (2026.8.3)"),
+            format!("Hermes Agent v{min}-unexpected (2026.8.3)"),
+            format!("Hermes Agent v{min}"),
+            format!("metadata\nHermes Agent v{min} (2026.8.3)"),
+        ] {
+            assert_eq!(
+                verify(&refused),
+                Err(Error::UnsupportedHermes),
+                "{refused:?}"
+            );
+        }
         assert_eq!(
-            runner(
-                &root.0,
-                "printf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3)-unexpected'",
-            )
-            .verify_version(&selected),
-            Err(Error::UnsupportedHermes)
-        );
-        assert_eq!(
-            runner(&root.0, "printf '%s\\n' 'Hermes Agent v0.20.1 (2026.8.3)'")
-                .verify_version(&selected),
-            Err(Error::UnsupportedHermes)
-        );
-        assert_eq!(
-            runner(&root.0, "printf '\\377'").verify_version(&selected),
+            runner(&root.0, "printf '\\377'").verify_version(&selected, &policy),
             Err(Error::UnsupportedHermes)
         );
     }
@@ -1758,7 +1764,12 @@ mod tests {
         let stage = stage_fixture("stage-valid");
         stage
             .runner
-            .validate_staged(&stage.target, &stage.plugin, &stage.policy)
+            .validate_staged(
+                &stage.target,
+                &version_policy(),
+                &stage.plugin,
+                &stage.policy,
+            )
             .expect("valid isolated stage");
 
         let extra = stage_fixture("stage-manifest-extra");
@@ -1873,6 +1884,7 @@ mod tests {
         assert_eq!(
             relative.runner.validate_staged(
                 &relative.target,
+                &version_policy(),
                 Path::new("relative"),
                 &relative.policy
             ),
@@ -2000,9 +2012,12 @@ mod tests {
 
     fn assert_stage_error(stage: &StageFixture, expected: Error) {
         assert_eq!(
-            stage
-                .runner
-                .validate_staged(&stage.target, &stage.plugin, &stage.policy),
+            stage.runner.validate_staged(
+                &stage.target,
+                &version_policy(),
+                &stage.plugin,
+                &stage.policy,
+            ),
             Err(expected)
         );
     }
@@ -2068,7 +2083,7 @@ mod tests {
         };
         let started = Instant::now();
         runner
-            .verify_version(&selected)
+            .verify_version(&selected, &version_policy())
             .expect("direct child output");
         assert!(
             started.elapsed() < timeout,
@@ -2120,7 +2135,7 @@ mod tests {
             result.display()
         );
         runner(root, &body)
-            .verify_version(&selected)
+            .verify_version(&selected, &version_policy())
             .expect("fixed version after descriptor checks");
         assert!(high.as_raw_fd() >= high_descriptor_floor());
         assert_eq!(

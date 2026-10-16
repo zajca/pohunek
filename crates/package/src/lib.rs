@@ -31,6 +31,10 @@
 //! - [`directory`] builds the canonical archive of a developer directory, the
 //!   input of `plugin link` and `package build`.
 //!
+//! - [`version_probe`] is the one grammar of a descriptor's `version_probe`
+//!   declaration and of the version output it reads, shared by the daemon's
+//!   launch gate and the CLI's Hermes integration gate.
+//!
 //! Signatures are covered by the signed runtime catalog; the runtime manifest
 //! inside a package is a separate concern. The formats are described in
 //! `docs/knowledge/concepts/runtime-package-archive.md` and
@@ -50,6 +54,7 @@ mod error;
 mod limits;
 mod release;
 mod sign;
+pub mod version_probe;
 
 // Extraction, verification and the registry need descriptor-relative
 // filesystem primitives.

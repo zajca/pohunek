@@ -1165,7 +1165,12 @@ the core hook reporter and refuses to install or update the plugin without the
 package (`hermes_package_not_installed`). Installation uses
 only Hermes's supported plugin commands and places a separate owner-private
 Pohunek policy outside the immutable plugin checksum set. The rendered plugin
-asset stores the exact absolute policy path selected by the installer.
+asset stores the exact absolute policy path selected by the installer. Install,
+update, setup and doctor accept the `hermes` executable only when
+`hermes --version` names a release in the range the selected package's
+`version_probe` declares, read with the grammar the daemon's launch gate uses
+(`crates/package/src/version_probe.rs`), so the CLI never accepts a release a
+Hermes launch refuses.
 
 The policy fixes the verified absolute CLI executable, public protocol range,
 access mode, host allowlist, and bounded tool limits. It is a delegated-tool

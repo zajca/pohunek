@@ -601,7 +601,7 @@ Runtime package archive format:
 - `crates/package/src/layout.rs` — package root names, modes and bounds.
 - `crates/daemon/src/agent/host/package.rs` — package-backed runtime loading and pin resolution.
 - `crates/daemon/src/agent/host/handle.rs` — runtime host snapshot, reload and launch verification.
-- `crates/daemon/src/agent/host/version_probe.rs` — the `semver-v1` and `semver-line-v1` data-driven version probe policy (probe argv, `[min, below)` release range and the `line` output template).
+- `crates/package/src/version_probe.rs` — the `semver-v1` and `semver-line-v1` data-driven version probe policy (probe argv, `[min, below)` release range, the `line` output template and the out-of-range or unparseable refusal), shared by the daemon launch gate and the CLI Hermes integration gate.
 - `crates/daemon/src/session/packages.rs` — reload and retention-checked uninstall.
 - `crates/package/src/hash.rs` — SHA-256 helpers.
 - `crates/package/src/directory.rs` — directory-to-archive builder behind `plugin link` and `cargo xtask package build`.

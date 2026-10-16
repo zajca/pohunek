@@ -21,6 +21,7 @@ use super::policy::{
 };
 use super::runner::HermesRunner;
 use super::target::{TargetContext, TargetSelection};
+use super::test_package;
 use super::test_python;
 use crate::commands::integration::{
     hermes_home_plan, reinstall_previewed_hermes_homes, IntegrationEnv, HERMES_CURRENT,
@@ -351,19 +352,35 @@ async fn an_upgrade_reinstall_runs_the_hermes_of_the_job_path() {
     );
 }
 
-/// A marked home whose plugin is intact and enabled is not current when the
-/// `hermes` on the search path is not the pinned release, so the apply's
-/// update refuses it instead of the plan keeping it.
+/// A marked home whose plugin is intact and enabled stays current under any
+/// build of a release the selected package supports, and is not current when
+/// the `hermes` on the search path is outside the package's range, so the
+/// apply's update refuses it instead of the plan keeping it.
 #[test]
-fn a_hermes_of_another_build_does_not_leave_a_home_current() {
+fn a_hermes_outside_the_package_range_does_not_leave_a_home_current() {
     let host = HermesHost::new();
     let search = host.search_path.as_os_str();
+    let policy = test_package::version_policy().expect("the package version policy");
     assert_eq!(
         default_home(&hermes_home_plan(&host.env, search, false)).status,
         HERMES_CURRENT,
-        "the pinned release keeps the home current"
+        "the locked release keeps the home current"
     );
-    fs::write(&host.version, "Hermes Agent v0.20.0 (2026.9.1)\n").expect("another build");
+    fs::write(
+        &host.version,
+        format!("Hermes Agent v{} (2026.9.1)\n", policy.min()),
+    )
+    .expect("another build");
+    assert_eq!(
+        default_home(&hermes_home_plan(&host.env, search, false)).status,
+        HERMES_CURRENT,
+        "another build of a supported release keeps the home current"
+    );
+    fs::write(
+        &host.version,
+        format!("Hermes Agent v{} (future)\n", policy.below()),
+    )
+    .expect("a release above the range");
 
     let planned = hermes_home_plan(&host.env, search, false);
 
