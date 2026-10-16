@@ -3,7 +3,9 @@
 Each scenario builds a Git repository whose `selector.py` stands in for the
 `xtask` selector: it knows a set of path prefixes (its rules), selects every
 test for any other path, and writes the `affected ci` output files with the
-revision it was built from. A private `cargo` on `$CARGO` builds it by copying
+revision it was built from. Its `affected sparse` prints one pattern per
+tracked file of the named packages' directories, after a comment naming that
+revision. A private `cargo` on `$CARGO` builds it by copying
 `selector.py` of the checked-out tree to `target/debug/xtask`, so the binary
 that runs is the one of whatever revision the script checked out to build.
 """
@@ -40,11 +42,17 @@ SELECTOR = textwrap.dedent(
     KNOWN = {known!r}
     SCHEMA = {schema!r}
     args = sys.argv[1:]
+    git = lambda *a: subprocess.check_output(["git", *a], text=True)
+    if args[:2] == ["affected", "sparse"] and {has_sparse!r}:
+        names = [args[i + 1] for i, a in enumerate(args) if a == "--package"]
+        files = git("ls-files").split()
+        print(f"# {{REVISION}}")
+        print("".join(f"/{{f}}\\n" for f in files if f.split("/")[0] in names), end="")
+        sys.exit(0)
     if args[:2] != ["affected", "ci"] or not {has_ci!r}:
         sys.exit("error: unrecognized subcommand")
     base = args[args.index("--base") + 1]
     out = args[args.index("--out") + 1]
-    git = lambda *a: subprocess.check_output(["git", *a], text=True)
     merge_base = git("merge-base", base, "HEAD").strip()
     files = git("diff", "--name-only", merge_base, "HEAD").split()
     unknown = [f for f in files if not f.startswith(tuple(KNOWN))]
@@ -55,7 +63,7 @@ SELECTOR = textwrap.dedent(
         "schema_version": SCHEMA, "base": base, "merge_base": merge_base, "mode": mode,
         "docs_only": False, "script_tests": mode == "full", "sdk_gates": mode == "full",
         "filterset": filterset, "full_causes": [f"{{f}}: unmapped" for f in unknown],
-        "packages": packages, "files": files, "selector_revision": REVISION,
+        "packages": [{{"name": p}} for p in packages], "files": files, "selector_revision": REVISION,
     }}
     os.makedirs(out, exist_ok=True)
     flags = {{k: str(selection[k]).lower() for k in ("docs_only", "script_tests", "sdk_gates")}}
@@ -70,8 +78,11 @@ SELECTOR = textwrap.dedent(
 )
 
 
-def selector(revision, known, schema=1, has_ci=True):
-    return SELECTOR.format(revision=revision, known=list(known), schema=schema, has_ci=has_ci)
+def selector(revision, known, schema=1, has_ci=True, has_sparse=True):
+    return SELECTOR.format(
+        revision=revision, known=list(known), schema=schema, has_ci=has_ci,
+        has_sparse=has_sparse,
+    )
 
 
 class Repo:
@@ -118,7 +129,7 @@ class Repo:
         self.git("commit", "--quiet", "-m", message)
 
     def run(self, *args):
-        out = self.root / "out"
+        out = self.out = self.root / "out"
         result = subprocess.run(
             [str(SCRIPT), *args, "--out", str(out)], cwd=self.dir, env=self.env,
             check=False, capture_output=True, text=True,
@@ -171,6 +182,39 @@ class CiTestSelectionTests(unittest.TestCase):
         self.assertEqual(outputs["mode"], "packages")
         self.assertEqual(outputs["filterset"], "package(=a) | package(=selector.py)")
         self.assert_head_restored(repo, head)
+
+    def test_the_base_selector_writes_the_sparse_tree_of_a_narrowed_selection(self):
+        repo = self.repo(selector("base", ["a/", "b/", "selector.py"]))
+        repo.commit({"selector.py": selector("head", ["a/", "b/"], has_sparse=False),
+                     "a/x": "changed\n", "b/y": "y\n"}, "change a/")
+        _, outputs, summary = repo.run("--base", "main")
+        self.assertEqual(outputs["mode"], "packages")
+        # The base selector's patterns, of the head tree's files.
+        self.assertEqual(
+            (repo.out / "sparse.txt").read_text(), "# base\n/a/x\n/b/y\n/selector.py\n"
+        )
+        self.assertIn("run from a sparse tree", summary)
+
+    def test_a_base_selector_without_a_sparse_tree_runs_the_selection_from_the_full_tree(self):
+        repo = self.repo(selector("base", ["a/"], has_sparse=False))
+        repo.commit({"a/x": "changed\n"}, "change a/")
+        _, outputs, summary = repo.run("--base", "main")
+        self.assertEqual(outputs["mode"], "packages")
+        self.assertFalse((repo.out / "sparse.txt").exists())
+        self.assertIn("run from the full tree", summary)
+        self.assertIn("::warning::The merge base's selector gave no sparse tree", repo.result.stdout)
+
+    def test_a_full_selection_writes_no_sparse_tree(self):
+        repo = self.repo(selector("base", ["a/"]))
+        repo.commit({"c/z": "z\n"}, "change an unmapped path")
+        (self.root / "out").mkdir()
+        (self.root / "out" / "sparse.txt").write_text("/stale\n")
+        _, outputs, _ = repo.run("--base", "main")
+        self.assertEqual(outputs["mode"], "full")
+        self.assertFalse((repo.out / "sparse.txt").exists())
+        (self.root / "out" / "sparse.txt").write_text("/stale\n")
+        repo.run("--full", "push to main runs every test")
+        self.assertFalse((repo.out / "sparse.txt").exists())
 
     def test_a_base_selector_without_the_ci_command_runs_every_test(self):
         repo = self.repo(selector("base", ["a/"], has_ci=False))

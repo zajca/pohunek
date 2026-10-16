@@ -10,7 +10,11 @@ do not know is unmapped, which selects every test.
 
 `--out DIR` receives what `cargo xtask affected ci` writes there:
 `selection.json`, `outputs.env` (`key=value` lines for `$GITHUB_OUTPUT`) and
-`summary.md`. Whenever no trustworthy selection can be made (no merge base, a
+`summary.md`. For a `packages` selection it also receives `sparse.txt`, the
+`cargo xtask affected sparse` patterns of the selected packages, from the same
+selector; the test jobs run from that sparse tree, so a test reading a path
+whose change does not select it fails. Without the file (a selector that
+cannot compute it) the jobs run from the full tree, as the summary says. Whenever no trustworthy selection can be made (no merge base, a
 base selector that does not build, fails, or writes another schema), the
 script writes a full selection instead, naming the cause, and exits 0: a full
 run is always a correct run. `--full CAUSE` writes that selection directly,
@@ -40,6 +44,7 @@ MODES = ("full", "packages", "none")
 FLAGS = ("docs_only", "script_tests", "sdk_gates")
 OUTPUT_KEYS = ("mode", *FLAGS, "filterset")
 OUTPUT_FILES = ("selection.json", "outputs.env", "summary.md")
+SPARSE_FILE = "sparse.txt"
 # A cold build of the selector takes a few minutes; past this the run is full.
 BUILD_TIMEOUT_SECONDS = 1200
 # The selector itself runs in seconds plus two `cargo metadata` calls.
@@ -85,7 +90,7 @@ def write_full(out, cause, base="", merge_base=""):
     outputs = "mode=full\ndocs_only=false\nscript_tests=true\nsdk_gates=true\nfilterset=\n"
     summary = f"### Test selection\n\nMode: **full**. Every test runs because of:\n\n- {cause}\n"
     out.mkdir(parents=True, exist_ok=True)
-    for name in OUTPUT_FILES:
+    for name in (*OUTPUT_FILES, SPARSE_FILE):
         (out / name).unlink(missing_ok=True)
     (out / "summary.md").write_text(summary)
     (out / "outputs.env").write_text(outputs)
@@ -151,6 +156,31 @@ def build_base_selector(root, merge_base, head, scratch):
             raise RuntimeError(f"the checkout did not return to {head}")
 
 
+def write_sparse(selector, root, out):
+    """Writes `sparse.txt` for a packages selection; returns the summary note,
+    or None when the selection is not narrowed."""
+    selection = json.loads((out / "selection.json").read_text())
+    if selection["mode"] != "packages":
+        return None
+    names = [package["name"] for package in selection["packages"]]
+    command = [str(selector), "affected", "sparse"]
+    for name in names:
+        command.extend(["--package", name])
+    full_tree = "the test jobs run from the full tree"
+    try:
+        result = subprocess.run(
+            command, cwd=root, check=False, capture_output=True, text=True,
+            timeout=SELECT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return f"The sparse tree took longer than {SELECT_TIMEOUT_SECONDS} s: {full_tree}."
+    if result.returncode != 0 or not result.stdout.strip():
+        return f"The merge base's selector gave no sparse tree ({tail(result.stderr)}): {full_tree}."
+    (out / SPARSE_FILE).write_text(result.stdout)
+    count = len(result.stdout.splitlines())
+    return f"The test jobs run from a sparse tree of {count} files."
+
+
 def select(root, base, out):
     """Writes the base selector's selection of `HEAD`, or raises Unavailable."""
     if git("status", "--porcelain", "--untracked-files=no", cwd=root):
@@ -174,13 +204,18 @@ def select(root, base, out):
             raise Unavailable(
                 f"the merge base's selector did not finish within {SELECT_TIMEOUT_SECONDS} s"
             )
-    if result.returncode != 0:
-        raise Unavailable(f"the merge base's selector failed: {tail(result.stderr)}")
-    validate(out)
+        if result.returncode != 0:
+            raise Unavailable(f"the merge base's selector failed: {tail(result.stderr)}")
+        validate(out)
+        sparse = write_sparse(selector, root, out)
+    if sparse is not None and not (out / SPARSE_FILE).is_file():
+        print(f"::warning::{sparse}")
     with (out / "summary.md").open("a") as summary:
         summary.write(
             f"\nSelector built from the merge base `{merge_base}` in {built_in:.0f} s.\n"
         )
+        if sparse is not None:
+            summary.write(f"\n{sparse}\n")
     return merge_base
 
 
@@ -197,7 +232,7 @@ def main():
         return
     root = Path(git("rev-parse", "--show-toplevel", cwd=Path.cwd()))
     out.mkdir(parents=True, exist_ok=True)
-    for name in OUTPUT_FILES:
+    for name in (*OUTPUT_FILES, SPARSE_FILE):
         (out / name).unlink(missing_ok=True)
     try:
         merge_base = select(root, args.base, out)
