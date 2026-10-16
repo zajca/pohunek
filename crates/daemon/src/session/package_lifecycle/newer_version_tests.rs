@@ -237,16 +237,15 @@ async fn stopped_from(
             home.display()
         ),
     );
-    match version {
-        Some(version) => install(&fixture, kind, launched, version, 5).await,
-        None => {
-            let path = fixture.write_archive(launched);
-            fixture
-                .registry
-                .package_install(explicit(&path, launched, true, true))
-                .await
-                .expect("a local package of the official package id installs");
-        }
+    if let Some(version) = version {
+        install(&fixture, kind, launched, version, 5).await;
+    } else {
+        let path = fixture.write_archive(launched);
+        fixture
+            .registry
+            .package_install(explicit(&path, launched, true, true))
+            .await
+            .expect("a local package of the official package id installs");
     }
     pin_profile(&fixture.registry, &launched.digest).await;
     let created = fixture
@@ -519,7 +518,7 @@ async fn a_lower_selected_version_never_adopts_a_session_of_a_higher_one() {
 #[derive(Clone, Copy)]
 enum Newer {
     /// The descriptor is edited by the function.
-    Edited(fn(String) -> String),
+    Edited(fn(&str) -> String),
     /// The newer version is installed and selected, then disabled.
     Disabled,
     /// The newer version is installed without being selected.
@@ -552,7 +551,7 @@ struct FailClosed {
 /// A package version every validator accepts that is not a semantic version.
 const UNPARSABLE_VERSION: &str = "1.0.2.1";
 
-fn deeper_reference_search(text: String) -> String {
+fn deeper_reference_search(text: &str) -> String {
     assert!(
         text.contains("max_depth = 1"),
         "the descriptor bounds the search"
@@ -560,7 +559,7 @@ fn deeper_reference_search(text: String) -> String {
     text.replacen("max_depth = 1", "max_depth = 2", 1)
 }
 
-fn path_reference_kind(text: String) -> String {
+fn path_reference_kind(text: &str) -> String {
     assert!(
         text.contains("reference_kind = \"id\""),
         "Claude resumes by id"
@@ -568,14 +567,14 @@ fn path_reference_kind(text: String) -> String {
     text.replacen("reference_kind = \"id\"", "reference_kind = \"path\"", 1)
 }
 
-fn without_fork(text: String) -> String {
+fn without_fork(text: &str) -> String {
     let forking =
         "[fork]\nsupported = true\nargs = [\"--resume\", \"{reference}\", \"--fork-session\"]\n";
     assert!(text.contains(forking), "Claude forks");
     text.replacen(forking, "[fork]\nsupported = false\n", 1)
 }
 
-fn other_assignment(text: String) -> String {
+fn other_assignment(text: &str) -> String {
     let assigned = "launch_args = [\"--session-id\", \"{reference}\"]";
     assert!(text.contains(assigned), "Pi assigns its reference");
     text.replacen(
@@ -591,7 +590,7 @@ async fn install_newer(fixture: &Fixture, case: &FailClosed) -> PackageDigest {
     let kind = case.kind;
     let (package, version, select) = match case.newer {
         Newer::Edited(edit) => (
-            kind.package(kind.new_version, kind.new_below, edit),
+            kind.package(kind.new_version, kind.new_below, |text| edit(&text)),
             kind.new_version.to_owned(),
             true,
         ),
@@ -698,71 +697,77 @@ async fn a_newer_version_that_does_not_adopt_keeps_the_session_on_its_frozen_dig
         },
     ];
     for (index, case) in cases.iter().enumerate() {
-        let kind = case.kind;
-        let old = kind.older();
-        let session = stopped_on(
-            &format!("newer-fail-closed-{index}"),
-            kind,
-            &old,
-            kind.old_version,
-        )
-        .await;
-        let newer = install_newer(&session.fixture, case).await;
-        pin_profile(&session.fixture.registry, &newer).await;
+        assert_fail_closed(index, case).await;
+    }
+}
 
-        let restarted = restart(&session.fixture).await;
-        let verdict = stopped_verdict(&restarted, &session.store_path, &session.id);
-        let resumed = restarted
-            .registry
-            .resume_with(&session.id, ProfileChange::Refuse)
-            .await;
-        match case.expected {
-            Expected::Frozen => {
-                assert_eq!(
-                    verdict,
-                    (Verdict::Adoptable, CODE_ADOPTABLE.to_owned()),
-                    "{}",
+/// Runs the fail-closed `case` as the `index`th: the profile of a stopped
+/// session moves to the newer version, and the resume does what `case` expects.
+async fn assert_fail_closed(index: usize, case: &FailClosed) {
+    let kind = case.kind;
+    let old = kind.older();
+    let session = stopped_on(
+        &format!("newer-fail-closed-{index}"),
+        kind,
+        &old,
+        kind.old_version,
+    )
+    .await;
+    let newer = install_newer(&session.fixture, case).await;
+    pin_profile(&session.fixture.registry, &newer).await;
+
+    let restarted = restart(&session.fixture).await;
+    let verdict = stopped_verdict(&restarted, &session.store_path, &session.id);
+    let resumed = restarted
+        .registry
+        .resume_with(&session.id, ProfileChange::Refuse)
+        .await;
+    match case.expected {
+        Expected::Frozen => {
+            assert_eq!(
+                verdict,
+                (Verdict::Adoptable, CODE_ADOPTABLE.to_owned()),
+                "{}",
+                case.name
+            );
+            let resumed = resumed.unwrap_or_else(|error| {
+                panic!(
+                    "{}: the session resumes from its frozen digest: {error:?}",
                     case.name
-                );
-                let resumed = resumed.unwrap_or_else(|error| {
-                    panic!(
-                        "{}: the session resumes from its frozen digest: {error:?}",
-                        case.name
-                    )
-                });
-                assert_eq!(
-                    resumed.runtime.as_ref().map(|runtime| runtime.state),
-                    Some(protocol::RuntimeState::Live),
-                    "{}",
-                    case.name
-                );
-                assert_eq!(
-                    pinned_digest(&session.store_path, &session.id),
-                    old.digest,
-                    "{}: the relaunch keeps the frozen digest",
-                    case.name
-                );
-                restarted
-                    .registry
-                    .remove(&session.id)
-                    .await
-                    .expect("remove the resumed session");
-            }
-            Expected::ProfileChanged => {
-                assert_eq!(verdict.1, "agent_profile_changed", "{}", case.name);
-                let refused = resumed.expect_err(case.name);
-                assert_eq!(
-                    refused.code, "agent_profile_changed",
-                    "{}: {refused:?}",
-                    case.name
-                );
-                assert_eq!(
-                    pinned_digest(&session.store_path, &session.id),
-                    old.digest,
-                    "{}: the session keeps its frozen digest",
-                    case.name
-                );
-            }
+                )
+            });
+            assert_eq!(
+                resumed.runtime.as_ref().map(|runtime| runtime.state),
+                Some(protocol::RuntimeState::Live),
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                pinned_digest(&session.store_path, &session.id),
+                old.digest,
+                "{}: the relaunch keeps the frozen digest",
+                case.name
+            );
+            restarted
+                .registry
+                .remove(&session.id)
+                .await
+                .expect("remove the resumed session");
+        }
+        Expected::ProfileChanged => {
+            assert_eq!(verdict.1, "agent_profile_changed", "{}", case.name);
+            let refused = resumed.expect_err(case.name);
+            assert_eq!(
+                refused.code, "agent_profile_changed",
+                "{}: {refused:?}",
+                case.name
+            );
+            assert_eq!(
+                pinned_digest(&session.store_path, &session.id),
+                old.digest,
+                "{}: the session keeps its frozen digest",
+                case.name
+            );
         }
     }
 }
