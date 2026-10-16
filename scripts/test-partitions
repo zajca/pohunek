@@ -6,6 +6,11 @@ every nextest call instead extracts a prebuilt `cargo nextest archive` into
 this checkout's `target/` and lists or runs from it without compiling, which
 is how CI shares one build across the shard jobs.
 
+`--selection` takes the `selection.json` of `cargo xtask affected ci`: `plan`
+prints the CI test jobs it starts, `run` narrows a shard to its selected
+tests (a shard holding none of them passes), and `check` requires the
+planned shards to hold every selected test exactly once.
+
 The macOS lane (`check-macos`, `run-macos`, `run-macos-tier`) takes the same
 archive and checks or runs the macOS package set as nextest selections. Its
 coverage check splits that set into disjoint groups (the PR lane, the tier
@@ -207,6 +212,37 @@ def shard_plan(selection):
     }
 
 
+def load_selection(path):
+    """The validated selection of `path` and its plan; raises ValueError."""
+    try:
+        selection = json.loads(Path(path).read_text())
+        plan = shard_plan(selection)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise ValueError(f"{path}: {error}") from error
+    filterset = selection.get("filterset")
+    if selection["mode"] == "packages" and not (isinstance(filterset, str) and filterset):
+        raise ValueError(f"{path}: a packages selection has no filterset")
+    return selection, plan
+
+
+def selected_expression(expression, selection):
+    """`expression` narrowed to the selection, or None when it selects no test."""
+    if selection["mode"] == "full":
+        return expression
+    if selection["mode"] == "none":
+        return None
+    return f"({expression}) and ({selection['filterset']})"
+
+
+def planned_shards(plan):
+    """The shards whose CI job a plan starts."""
+    return {
+        *plan["fast_shards"],
+        *(["heavy"] if plan["heavy"] else []),
+        *(["relay-db"] if plan["relay_db"] else []),
+    }
+
+
 def selected_tests(document):
     return {
         (binary_id, name)
@@ -216,12 +252,26 @@ def selected_tests(document):
     }
 
 
-def validate_coverage(universe, selections):
+def validate_coverage(universe, selections, planned=None):
+    """Require every test of `universe` to be in exactly one shard.
+
+    With `planned`, the shards a selection's plan starts, the universe is the
+    selection: a shard may be empty, and a test in a shard the plan does not
+    start is missing from the run.
+    """
     if not universe:
         raise ValueError("empty workspace test inventory")
     if set(selections) != set(SHARDS):
         raise ValueError("unexpected shard names")
-    empty = [name for name, tests in selections.items() if not tests]
+    if planned is None:
+        empty = [name for name, tests in selections.items() if not tests]
+    else:
+        empty = []
+        unplanned = sorted(
+            name for name, tests in selections.items() if tests and name not in planned
+        )
+        if unplanned:
+            raise ValueError(f"the plan does not start the shards {unplanned} of selected tests")
     counts = collections.Counter(test for tests in selections.values() for test in tests)
     missing = universe - counts.keys()
     extra = counts.keys() - universe
@@ -570,22 +620,30 @@ def main():
     )
     parser.add_argument(
         "--selection", type=Path,
-        help="plan only: the selection.json of `cargo xtask affected ci` to plan the CI test jobs of",
+        help="plan, run and check: the selection.json of `cargo xtask affected ci`; plan "
+             "prints its CI test jobs, run runs the shard's selected tests, check "
+             "verifies that the planned shards hold every selected test",
     )
     args = parser.parse_args()
     if args.action == "plan":
         if args.selection is None or args.shard is not None or args.archive_file is not None:
             parser.error("plan takes --selection and nothing else")
         try:
-            plan = shard_plan(json.loads(args.selection.read_text()))
-        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
-            sys.exit(f"test-partitions plan: {args.selection}: {error}")
+            _selection, plan = load_selection(args.selection)
+        except ValueError as error:
+            sys.exit(f"test-partitions plan: {error}")
         print(f"fast_shards={json.dumps(plan['fast_shards'])}")
         print(f"heavy={str(plan['heavy']).lower()}")
         print(f"relay_db={str(plan['relay_db']).lower()}")
         return
+    selection = plan = None
     if args.selection is not None:
-        parser.error("--selection applies to plan only")
+        if args.action not in ("run", "check"):
+            parser.error("--selection applies to plan, run and check only")
+        try:
+            selection, plan = load_selection(args.selection)
+        except ValueError as error:
+            sys.exit(f"test-partitions {args.action}: {error}")
     archive = None
     if args.archive_file is not None:
         try:
@@ -608,9 +666,20 @@ def main():
     if args.action == "check":
         if args.shard is not None:
             parser.error("check verifies all shards; do not specify one")
-        universe = inventory(archive=archive)
-        selections = {name: inventory(expressions[name], archive) for name in SHARDS}
-        validate_coverage(universe, selections)
+        if selection is None or selection["mode"] == "full":
+            universe = inventory(archive=archive)
+            selections = {name: inventory(expressions[name], archive) for name in SHARDS}
+            validate_coverage(universe, selections)
+        elif selection["mode"] == "none":
+            print("Coverage OK: the selection runs no Rust test")
+            return
+        else:
+            universe = inventory(selection["filterset"], archive)
+            selections = {
+                name: inventory(selected_expression(expressions[name], selection), archive)
+                for name in SHARDS
+            }
+            validate_coverage(universe, selections, planned_shards(plan))
         for name, tests in selections.items():
             print(f"{name}: {len(tests)} tests")
         print(f"Coverage OK: {len(universe)} tests selected exactly once (including ignored tests)")
@@ -623,9 +692,17 @@ def main():
     # Heavy shards run bounded: heavy spawns real worker/PTY fixtures, and
     # relay-db opens per-test database pools that exhaust the fixture limit.
     profile = {"heavy": "heavy", "relay-db": "relay-db"}.get(args.shard, "ci")
+    expression = expressions[args.shard]
+    if selection is not None:
+        expression = selected_expression(expression, selection)
+        if expression is None:
+            print(f"test-partitions run: the selection runs no Rust test of {args.shard}")
+            return
     # CI uploads each job's report under its shard name. Local fast shard runs
     # share the ci report path; copy it before starting the next run if needed.
-    run_nextest(profile, expressions[args.shard], archive)
+    # A shard may hold none of a narrowed selection's tests.
+    run_nextest(profile, expression, archive,
+                no_tests_pass=selection is not None and selection["mode"] == "packages")
 
 
 def check_macos(archive, scope):
@@ -655,8 +732,10 @@ def check_macos(archive, scope):
     )
 
 
-def run_nextest(profile, expression, archive):
+def run_nextest(profile, expression, archive, no_tests_pass=False):
     """Run `expression` under `profile` and exit with nextest's status.
+
+    `no_tests_pass` lets a run that matches no test succeed.
 
     The profile's previous JUnit report is removed first: nextest writes the
     report only when a run completes, so a report left by an earlier run would
@@ -667,6 +746,8 @@ def run_nextest(profile, expression, archive):
     if report is not None:
         report.unlink(missing_ok=True)
     command = nextest_command("run", profile, archive)
+    if no_tests_pass:
+        command.extend(["--no-tests", "pass"])
     command.extend(["-E", expression])
     sys.exit(run_checked(command))
 
