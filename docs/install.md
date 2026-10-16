@@ -358,7 +358,9 @@ older version of that package and lists the pinned profiles it keeps. Outside
 an upgrade, `pohunek plugin update <package> runtime/packages/<runtime>.tar.zst
 --catalog runtime/runtime-catalog.json` installs and selects a newer release's
 version. It refuses a version lower than the selected official one
-(`plugin_update_downgrade`); `pohunek plugin select` rolls back on purpose. When
+(`plugin_update_downgrade`), and a version that cannot be ordered against it
+(`plugin_update_version_unordered`); `pohunek plugin select` rolls back on
+purpose. When
 the selected version is newer than the release's, for example after a
 `plugin update` from a later archive, the upgrade plan says that the upgrade
 re-selects the release's version. Select the newer one again afterwards. A plain

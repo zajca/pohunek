@@ -17,9 +17,14 @@
   migrate`. A package installed by explicit digest or linked never adopts a
   session. The relaunch records the newer digest. The upgrade preflight reports
   such a session as `adoptable` with code `adoptable_by_newer_package`.
+- A stopped session that the newer version does not adopt still resumes from
+  its frozen digest after the upgrade repinned its profile.
 - `plugin update` refuses an official archive whose version is lower than the
   selected official version (`plugin_update_downgrade`, naming both versions)
-  before anything is written. `plugin select` stays the explicit rollback.
+  before anything is written. It also refuses a version that cannot be ordered
+  (`plugin_update_version_unordered`). An archive counts as official by its
+  catalog, or when the registry records its digest as official. `plugin select`
+  stays the explicit rollback.
 - When the selected official package is newer than the release's, the upgrade
   plan says that the upgrade re-selects the release's version.
 - "Official" means a record from a catalog that the host's single trust anchor

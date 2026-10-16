@@ -800,6 +800,12 @@ move a Pi profile with `pohunek plugin profile migrate <name> --yes`. Its
 stopped sessions are then adopted on their next resume or fork. A session
 launched as the bare `pi` runtime follows the selected version.
 
+A newer version that fails one of these checks does not break the session.
+When the upgrade repinned its profile to that version, the session still
+resumes from its frozen digest, as before the upgrade. The profile counts as
+unchanged when only its pin moved to a strictly newer official version of the
+same package. The preflight reports the session as `adoptable`.
+
 The relaunch keeps the frozen program and arguments. It probes the agent with
 the newer version's version probe and records the newer digest as the session's
 pin. A lower version never adopts a session, and neither does another digest of
@@ -913,7 +919,8 @@ during an upgrade"). Outside an upgrade, `pohunek plugin update <package>
 <archive> --catalog <catalog> --yes` with a newer release's archive installs and
 selects its version for new launches. A profile moves to it only through
 `plugin profile migrate`. `plugin update` refuses a lower version than the
-selected one (`plugin_update_downgrade`); `plugin select` is the explicit
+selected one (`plugin_update_downgrade`) and a version that cannot be ordered
+(`plugin_update_version_unordered`); `plugin select` is the explicit
 rollback. The release upgrade test
 (`scripts/upgrade-test`, `crates/cli/tests/release_upgrade.rs`) runs the one-step
 path for Claude and Codex from the previous release to the build under test.
