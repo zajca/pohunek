@@ -537,7 +537,10 @@ head_xtask=$(printf '%s\n' "$head_executables" | grep -E '/xtask$' | tail -n 1 |
 # flag nor the guard, and the test is told so by the absent variable.
 downgrade_args=()
 downgrade_env=()
-if (cd "$head_dir" && "$head_xtask" release test-runtime --help) | grep -q -- '--downgrade'; then
+# xtask prints the help on stderr and exits non-zero, so the text is captured
+# whole, with its status ignored, before it is searched.
+test_runtime_help=$(cd "$head_dir" && "$head_xtask" release test-runtime --help 2>&1 || true)
+if [[ "$test_runtime_help" == *--downgrade* ]]; then
   mkdir -p "$staging/downgrade"
   downgrade_args=(--downgrade "$staging/downgrade")
   downgrade_env=("POHUNEK_UPGRADE_DOWNGRADE_DIR=$staging/downgrade")

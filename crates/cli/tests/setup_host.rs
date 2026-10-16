@@ -241,7 +241,7 @@ fn an_unreadable_plan_stops_setup_before_any_write() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("its report has version 2"),
+        stderr.contains("its report has version 3"),
         "stderr names the report version: {stderr}"
     );
     assert_eq!(

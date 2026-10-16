@@ -1488,8 +1488,13 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Before) {
         previous_version, head_version,
         "an upgrade to the same version is a no-op and proves nothing"
     );
+    // A head of the previous release's version is stamped with build metadata
+    // (`+upgrade.<commit>`), which orders by its core version.
+    let head_core = head_version
+        .split_once('+')
+        .map_or(head_version.as_str(), |(core, _metadata)| core);
     let head_is_release =
-        release_order(&head_version, RUNTIME_RANGE_RELEASE) != std::cmp::Ordering::Less;
+        release_order(head_core, RUNTIME_RANGE_RELEASE) != std::cmp::Ordering::Less;
     eprintln!(
         "upgrade {previous_version} -> {head_version} (runtime range release: {head_is_release})"
     );
