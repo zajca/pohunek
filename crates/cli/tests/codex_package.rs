@@ -98,7 +98,7 @@ const GOLDEN_MANIFEST_NAME: &str = "codex";
 const PACKAGE_ID: &str = "pohunek.runtime.codex";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.1.0";
+const PACKAGE_VERSION: &str = "1.1.1";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -442,6 +442,19 @@ fn the_supported_range_equals_the_compatibility_lock() {
         !policy.supports(policy.below()),
         "the first release above the range is unsupported"
     );
+    let next_major = policy
+        .min()
+        .to_string()
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u64>().ok())
+        .expect("the minimum's major release")
+        + 1;
+    assert_eq!(
+        policy.below().to_string(),
+        format!("{next_major}.0.0"),
+        "the range runs from the verified minimum to the next major release"
+    );
 }
 
 #[test]
@@ -465,10 +478,15 @@ fn the_version_probe_reads_the_codex_banner_and_nothing_else() {
     );
     assert_eq!(
         supported("codex-cli 0.161.0"),
-        Some(false),
-        "the next minor is outside the range"
+        Some(true),
+        "a later 0.x release is inside the range"
     );
-    assert_eq!(supported("codex-cli 1.0.0"), Some(false));
+    assert_eq!(supported("codex-cli 0.162.1"), Some(true));
+    assert_eq!(
+        supported("codex-cli 1.0.0"),
+        Some(false),
+        "the next major is outside the range"
+    );
 
     for unreadable in [
         "",
@@ -2110,9 +2128,9 @@ async fn the_package_version_probe_refuses_an_unsupported_codex_and_starts_the_s
             ProbeVerdict::OutOfRange("0.159.9"),
         ),
         (
-            "codex-cli 0.161.0".to_owned(),
+            "codex-cli 1.0.0".to_owned(),
             0,
-            ProbeVerdict::OutOfRange("0.161.0"),
+            ProbeVerdict::OutOfRange("1.0.0"),
         ),
         (
             format!("codex-cli {release}-rc.1"),
@@ -2177,20 +2195,24 @@ async fn the_package_version_probe_refuses_an_unsupported_codex_and_starts_the_s
         }
     }
 
-    let banner = format!("codex-cli {release}");
-    let program = write_fake_codex(&root, "fake-supported", &banner);
-    fixture.write_profile("fake-supported", Some(&program));
-    let entry = fixture.inventory_entry("fake-supported").await;
-    assert_eq!(entry["supported"], true, "{entry}");
-    assert_eq!(entry["version"], release, "{entry}");
-    let (code, launched) = fixture.launch("fake-supported", "accepted").await;
-    assert_eq!(code, 0, "{launched}");
-    let id = launched["ok"]["id"]
-        .as_str()
-        .expect("session id")
-        .to_owned();
-    assert_eq!(launched["ok"]["agent_base"], "codex");
-    fixture.stop(&id).await;
+    // The locked release and a later 0.x release, the one a host's Codex
+    // auto-update installed (`codex-cli 0.162.1`), both launch.
+    for (index, version) in [release.as_str(), "0.162.1"].into_iter().enumerate() {
+        let profile = format!("fake-supported-{index}");
+        let program = write_fake_codex(&root, &profile, &format!("codex-cli {version}"));
+        fixture.write_profile(&profile, Some(&program));
+        let entry = fixture.inventory_entry(&profile).await;
+        assert_eq!(entry["supported"], true, "{entry}");
+        assert_eq!(entry["version"], version, "{entry}");
+        let (code, launched) = fixture.launch(&profile, "accepted").await;
+        assert_eq!(code, 0, "{launched}");
+        let id = launched["ok"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_owned();
+        assert_eq!(launched["ok"]["agent_base"], "codex");
+        fixture.stop(&id).await;
+    }
     fixture.finish().await;
 }
 

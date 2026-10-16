@@ -502,7 +502,8 @@ daemon compiles no Hermes in: only the official `pohunek.runtime.hermes`
 package serves `hermes`, so install it from the extracted daemon archive first.
 Without it `session new --agent hermes` fails with `agent_profile_not_found`, whose hint
 names the install. Before launching, inspect the target host: the `hermes`
-runtime must be `available` and report `version=0.20.0` with `supported=true`.
+runtime must be `available` and report `supported=true`: its `version` lies in
+the range the Hermes package declares (`[0.20.0, 1.0.0)`).
 
 ```bash
 pohunek plugin install runtime/packages/hermes.tar.zst --catalog runtime/runtime-catalog.json --yes

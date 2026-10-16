@@ -98,7 +98,7 @@ const GOLDEN_MANIFEST_NAME: &str = "claude";
 const PACKAGE_ID: &str = "pohunek.runtime.claude";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.0.1";
+const PACKAGE_VERSION: &str = "1.0.2";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -738,6 +738,19 @@ fn the_supported_range_equals_the_compatibility_lock() {
         !policy.supports(policy.below()),
         "the first release above the range is unsupported"
     );
+    let next_major = policy
+        .min()
+        .to_string()
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u64>().ok())
+        .expect("the minimum's major release")
+        + 1;
+    assert_eq!(
+        policy.below().to_string(),
+        format!("{next_major}.0.0"),
+        "the range runs from the verified minimum to the next major release"
+    );
 }
 
 #[test]
@@ -760,10 +773,14 @@ fn the_version_probe_reads_the_claude_banner_and_nothing_else() {
     );
     assert_eq!(
         supported("2.2.0 (Claude Code)"),
-        Some(false),
-        "the next minor is outside the range"
+        Some(true),
+        "a later 2.x release is inside the range"
     );
-    assert_eq!(supported("3.0.0 (Claude Code)"), Some(false));
+    assert_eq!(
+        supported("3.0.0 (Claude Code)"),
+        Some(false),
+        "the next major is outside the range"
+    );
     assert_eq!(supported("1.0.0 (Claude Code)"), Some(false));
 
     for unreadable in [
@@ -3555,7 +3572,7 @@ async fn the_package_version_probe_refuses_an_unsupported_claude_and_starts_the_
     let release = locked_release();
     let unsupported = [
         banner_of("2.1.288"),
-        banner_of("2.2.0"),
+        banner_of("3.0.0"),
         format!("{release}-rc.1 (Claude Code)"),
         format!("Claude Code {release}"),
         "unreadable".to_owned(),

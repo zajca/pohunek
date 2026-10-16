@@ -2,7 +2,7 @@
 type: Guide
 id: guide/codex-package
 title: Codex runtime package
-description: The official Codex runtime package source (Codex 0.160.x), the only source of the codex runtime, what it declares and keeps equal to the built-in Codex runtime of release 0.34.2, what was verified against a real Codex, and the gaps found.
+description: The official Codex runtime package source (Codex 0.160.0 and later 0.x releases), the only source of the codex runtime, what it declares and keeps equal to the built-in Codex runtime of release 0.34.2, what was verified against a real Codex, and the gaps found.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
@@ -78,13 +78,15 @@ copies of that descriptor and its detection manifest in
 - Launch: `codex` with the first prompt as a trailing positional argument;
   bracketed paste followed by a separate Enter 150 ms later for later input.
 - Version: `version_probe = { parser = "semver-line-v1", args = ["--version"],
-  min = "0.160.0", below = "0.161.0", line = "codex-cli {version}" }`. `codex
+  min = "0.160.0", below = "1.0.0", line = "codex-cli {version}" }`. `codex
   --version` prints `codex-cli 0.160.0` on standard output; the probe reads only
   that first line, so the `WARNING: proceeding, even though we could not create
   PATH aliases` line Codex writes to standard error when its home is under a
   temporary directory is ignored. A pre-release (`codex-cli 0.161.0-rc.1`) or
-  any other wording is unsupported. The range is one minor release because
-  Codex is `0.x`: a new minor can change the interface.
+  any other wording is unsupported. The range is a lower bound: `min` is the
+  release that was verified and `below` is the next major, because hosts update
+  the Codex CLI independently of pohunek and a refused launch breaks every Codex
+  session. Releases above 0.160.0 are accepted by policy, not verified.
 - Native reference: `strategy = "hook"`; resume is `codex resume <id>`; fork is
   unsupported.
 - Integration: handler `codex-hook-v1` with hook schema `identity-subagent-v1`.
@@ -214,9 +216,12 @@ absence of egress), and the older folder-dialog wording the rule still names.
   package then serves `codex` with official trust, profiles carry its
   `package`/`digest` pin, and a launch runs the package's version probe on the
   executable the profile names. An always-running test drives that probe with
-  throwaway `codex` scripts: the older minor, the next minor, a pre-release, a
-  different banner wording and unreadable output are refused with
-  `agent_runtime_unsupported`, and the supported banner launches. Two more
+  throwaway `codex` scripts: the older minor, the next major, a pre-release, a
+  different banner wording, unreadable output and a failing probe are refused
+  with `agent_runtime_unsupported`, whose message and `pohunek doctor` detail
+  name the parsed release and the supported range, or that the output did not
+  parse; the locked banner and a later 0.x release (`codex-cli 0.162.1`)
+  launch. Two more
   always-running tests start from a host without the package and a fake `codex`
   of the locked release on `PATH`: the bare runtime, its integration and an
   unpinned `base = "codex"` profile are refused with the install hint (and the

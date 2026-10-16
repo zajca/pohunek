@@ -21,12 +21,12 @@ positioning; [architecture.md](architecture.md) is the authoritative design.
   profile over it is `runtime_not_installed`. Per-host **agent profiles**
   define the program, arguments, environment, and input rules for custom
   runtimes (e.g. `claude-otel`).
-- Hermes Agent `0.20.0` is supported only through its local interactive terminal
-  backend. Docker, SSH, browser, desktop, gateway, ACP, and other Hermes
+- Hermes Agent `0.20.0` and later `0.x` releases (verified on `0.20.0`) are
+  supported only through the local interactive terminal backend. Docker, SSH, browser, desktop, gateway, ACP, and other Hermes
   backends are outside Pohunek's PTY ownership model. The selected Hermes
   profile can additionally host the owner-private Pohunek operator plugin:
   bounded typed tools, a generated skill, and best-effort lifecycle hooks.
-- The Pi coding agent `1.0.x` is an optional runtime package
+- The Pi coding agent `1.x` (from `1.0.0`) is an optional runtime package
   (`runtime-packages/pi`) installed with `pohunek plugin install`: launch,
   detection, resume and fork need no daemon release, and the daemon assigns the
   session id Pi stores its conversation under.

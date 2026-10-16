@@ -46,13 +46,13 @@ client fails closed instead of inventing a fallback set.
 
 `host.inspect.runtimes` is the availability and support decision point. Each
 entry has a user-facing `agent`; optional `agent_base` is the `RuntimeRef` of the runtime
-it launches. For Hermes, `version` and `supported` enforce the range its package declares (0.20.0 only):
+it launches. For Hermes, `version` and `supported` enforce the range its package declares (`[0.20.0, 1.0.0)`):
 an unavailable executable omits them, while a detected unparseable or other
 version reports `supported: false`. Launch a runtime only when `available` is true and `supported` is not
 `false`; a present runtime with a version policy (Hermes) always reports
 `supported`, so Hermes launches only on `supported: true`. The daemon re-runs that isolated, bounded version
 probe for bare and profile-based Hermes immediately before `session.new` and
-`session.resume`; an unparseable or non-pinned executable returns
+`session.resume`; an unparseable or out-of-range executable returns
 `agent_runtime_unsupported` before it creates a worker, session, worktree, or
 recovery write. That refusal, and the `pohunek doctor` check of the profile,
 name the parsed release and the supported `[min, below)` for a release outside

@@ -2,7 +2,7 @@
 type: Guide
 id: guide/pi-package
 title: Pi runtime package
-description: Install and operate the official Pi coding agent runtime package (Pi 1.0.x), including what was verified against a real Pi, how detection reads dialogs and selectors, how resume and fork work, where sessions may live, and what fails closed.
+description: Install and operate the official Pi coding agent runtime package (Pi 1.x from 1.0.0, verified on 1.0.2), including what was verified against a real Pi, how detection reads dialogs and selectors, how resume and fork work, where sessions may live, and what fails closed.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
@@ -54,7 +54,8 @@ reserved, so either way of installing serves it.
   such a launch into a narrower terminal is always refused.
 - Version: `pi --version` prints exactly the release on standard output
   (extension noise goes to standard error, which the probe discards). The
-  descriptor accepts `[1.0.0, 1.1.0)`; any other release, or output that is not
+  descriptor accepts `[1.0.0, 2.0.0)`, the verified range's lower bound up to
+  the next major (only 1.0.2 is verified); any other release, or output that is not
   one `MAJOR.MINOR.PATCH` line, refuses the launch with
   `agent_runtime_unsupported`. `host.inspect` shows `version` and `supported`.
   The probe runs under the `PATH` the launch will see (the daemon's forwarded

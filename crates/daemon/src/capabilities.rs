@@ -1093,7 +1093,7 @@ strategy = "none"
     fn profile_over_hermes_base_is_probed_with_the_hermes_parser() {
         let dir = temp_agents_dir();
         let hermes = dir.join("hermes-bin");
-        write_test_executable(&hermes, "#!/bin/sh\necho 'Hermes Agent v0.21.0 (future)'\n");
+        write_test_executable(&hermes, "#!/bin/sh\necho 'Hermes Agent v1.0.0 (future)'\n");
         std::fs::write(
             dir.join("hermes-review.toml"),
             format!(
@@ -1115,7 +1115,7 @@ strategy = "none"
             .find(|runtime| runtime.agent == "hermes-review")
             .expect("profile runtime reported");
         assert_eq!(runtime.agent_base, Some(RuntimeRef::hermes()));
-        assert_eq!(runtime.version.as_deref(), Some("0.21.0"));
+        assert_eq!(runtime.version.as_deref(), Some("1.0.0"));
         assert_eq!(runtime.supported, Some(false));
     }
 
@@ -1134,10 +1134,10 @@ strategy = "none"
         assert_eq!(supported.version.as_deref(), Some("0.20.0"));
         assert_eq!(supported.supported, Some(true));
 
-        write_test_executable(&hermes, "#!/bin/sh\necho 'Hermes Agent v0.21.0 (future)'\n");
+        write_test_executable(&hermes, "#!/bin/sh\necho 'Hermes Agent v1.0.0 (future)'\n");
         let wrong = probe_hermes_for_test(&hermes.display().to_string());
         assert!(wrong.available);
-        assert_eq!(wrong.version.as_deref(), Some("0.21.0"));
+        assert_eq!(wrong.version.as_deref(), Some("1.0.0"));
         assert_eq!(wrong.supported, Some(false));
 
         write_test_executable(&hermes, "#!/bin/sh\necho 'unexpected output'\n");
@@ -1180,12 +1180,21 @@ strategy = "none"
             hermes.canonicalize().expect("canonical Hermes fixture")
         );
 
+        // The range runs up to the next major: a later 0.x release launches.
+        write_test_executable(
+            &hermes,
+            "#!/bin/sh\necho 'Hermes Agent v0.21.0 (2026.9.1)'\n",
+        );
+        validate(&binary)
+            .expect("a later 0.x Hermes release")
+            .expect("Hermes has a validated program");
+
         // An out-of-range release is named with the declared range; output
         // that does not parse is never echoed.
         for (output, expected, forbidden) in [
             (
-                "Hermes Agent v0.21.0 (future)",
-                "reports version 0.21.0, outside its runtime's supported range",
+                "Hermes Agent v1.0.0 (future)",
+                "reports version 1.0.0, outside its runtime's supported range",
                 "(future)",
             ),
             (

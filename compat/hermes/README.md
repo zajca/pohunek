@@ -30,7 +30,8 @@ The official Hermes runtime package lives in `runtime-packages/hermes/`
 (`runtime.toml`, `detect.toml`, `operator.toml`, `operator/`; see
 `docs/knowledge/guides/hermes-package.md`). Its descriptor uses the data-driven
 `semver-line-v1` probe for the locked banner and limits support to
-`[0.20.0, 0.20.1)`, the lock's `supported` range
+`[0.20.0, 1.0.0)`, the lock's `supported` range (the verified release up to
+the next major)
 (`crates/cli/tests/hermes_package.rs` keeps the two equal). The lock remains
 authoritative for the upstream release and source digest.
 `builtin-v0.34/` holds golden copies of the built-in Hermes descriptor and

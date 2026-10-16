@@ -79,7 +79,7 @@ const GOLDEN_MANIFEST: &str = "compat/hermes/builtin-v0.34/detect.toml";
 const PACKAGE_ID: &str = "pohunek.runtime.hermes";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.0.0";
+const PACKAGE_VERSION: &str = "1.0.1";
 
 /// Profile that pins the runtime package in the installation scenario.
 const PROFILE: &str = "hermes-package-test";
@@ -623,9 +623,23 @@ fn assert_supported_range_equals_the_lock(lock: &Value, locked_release: &str) {
         !policy.supports(policy.below()),
         "the first release above the range is unsupported"
     );
+    let next_major = policy
+        .min()
+        .to_string()
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u64>().ok())
+        .expect("the minimum's major release")
+        + 1;
+    assert_eq!(
+        policy.below().to_string(),
+        format!("{next_major}.0.0"),
+        "the range runs from the verified minimum to the next major release"
+    );
 }
 
-/// Checks the exact locked release and the first release outside the range.
+/// Checks the exact locked release, a later 0.x release and the first release
+/// outside the range.
 async fn assert_supported_boundary(
     harness: &Harness,
     digest: &PackageDigest,
@@ -636,9 +650,13 @@ async fn assert_supported_boundary(
     write_profile(harness, digest, &supported_probe);
     inspect_profile_version(harness, locked_release, true).await;
 
-    let unsupported_probe = write_probe(harness, "hermes-next", "Hermes Agent v0.20.1 (future)");
+    let later_probe = write_probe(harness, "hermes-later", "Hermes Agent v0.21.0 (2026.9.1)");
+    write_profile(harness, digest, &later_probe);
+    inspect_profile_version(harness, "0.21.0", true).await;
+
+    let unsupported_probe = write_probe(harness, "hermes-next", "Hermes Agent v1.0.0 (future)");
     write_profile(harness, digest, &unsupported_probe);
-    inspect_profile_version(harness, "0.20.1", false).await;
+    inspect_profile_version(harness, "1.0.0", false).await;
     write_profile(harness, digest, &supported_probe);
     inspect_profile_version(harness, locked_release, true).await;
 }
@@ -1177,6 +1195,9 @@ async fn the_signed_hermes_package_is_selected_and_failed_installs_preserve_it()
             .expect("a [runtime] table");
         assert!(runtime.remove("detect_manifest").is_some());
         assert!(runtime.remove("version_probe").is_some());
+        // The package version moves with every package release; the golden
+        // keeps the built-in descriptor's own.
+        assert!(table.remove("version").is_some());
         table
     };
     let golden_descriptor: toml::Table = golden_body(GOLDEN_DESCRIPTOR, BUILTIN_DESCRIPTOR)
@@ -1987,14 +2008,14 @@ async fn an_unusable_selection_without_an_install_is_a_typed_source_error() {
     let hermes = HermesFixture::new(&harness.env);
 
     let mut alternate = package_entries();
-    set_version(&mut alternate, "1.0.1");
+    set_version(&mut alternate, "1.0.2");
     let (bytes, alternate_digest) = archive_of(&alternate);
-    let archive = write_archive(&harness, "hermes-1.0.1.tar.zst", &bytes);
+    let archive = write_archive(&harness, "hermes-1.0.2.tar.zst", &bytes);
     let catalog = write_catalog(
         &harness,
         &key,
         2,
-        vec![catalog_entry("1.0.1", &alternate_digest)],
+        vec![catalog_entry("1.0.2", &alternate_digest)],
     );
     update_package(&harness, &archive, &catalog, &alternate_digest).await;
     let (code, removed) = harness
@@ -2223,17 +2244,17 @@ async fn update_moves_an_install_to_the_newly_selected_package() {
     assert_eq!(hermes.status(&harness).await["outdated"], false);
 
     let mut second = package_entries();
-    set_version(&mut second, "1.0.1");
+    set_version(&mut second, "1.0.2");
     let mut skill = entry(&second, &format!("operator/{SKILL_PATH}")).to_vec();
     skill.extend_from_slice(b"\n<!-- second package version -->\n");
     replace_operator_file(&mut second, SKILL_PATH, skill.clone());
     let (bytes, second_digest) = archive_of(&second);
-    let archive = write_archive(&harness, "hermes-1.0.1.tar.zst", &bytes);
+    let archive = write_archive(&harness, "hermes-1.0.2.tar.zst", &bytes);
     let catalog = write_catalog(
         &harness,
         &key,
         2,
-        vec![catalog_entry("1.0.1", &second_digest)],
+        vec![catalog_entry("1.0.2", &second_digest)],
     );
     update_package(&harness, &archive, &catalog, &second_digest).await;
     let status = hermes.status(&harness).await;
@@ -2902,7 +2923,8 @@ async fn sidecar_violations_in_a_signed_package_fail_install() {
 
     let mut published = Vec::new();
     for (index, (name, mut entries)) in cases.into_iter().enumerate() {
-        let version = format!("1.0.{}", index + 1);
+        // Above the installed package version, so each case is a new version.
+        let version = format!("1.1.{index}");
         set_version(&mut entries, &version);
         let (bytes, case_digest) = archive_of(&entries);
         let archive = write_archive(&harness, &format!("hermes-{version}.tar.zst"), &bytes);

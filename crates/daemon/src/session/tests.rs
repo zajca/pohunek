@@ -3002,7 +3002,7 @@ async fn failed_launch_rolls_back_the_bound_worktree() {
 async fn incompatible_hermes_profile_fails_before_session_and_worktree_side_effects() {
     for (case, version_output) in [
         ("missing", None),
-        ("wrong", Some("Hermes Agent v0.21.0 (future)")),
+        ("wrong", Some("Hermes Agent v1.0.0 (future)")),
         ("unparseable", Some("unexpected provider output")),
     ] {
         let repo = init_git_repo(&format!("hermes-policy-{case}"));
@@ -13105,10 +13105,7 @@ async fn incompatible_hermes_resume_has_no_runtime_or_store_side_effects() {
     let marker_before = fs::read_to_string(&marker).expect("fresh launch marker");
     let store_before = fs::read(&store_path).expect("durable session store");
 
-    for version_output in [
-        "Hermes Agent v0.21.0 (future)",
-        "unexpected provider output",
-    ] {
+    for version_output in ["Hermes Agent v1.0.0 (future)", "unexpected provider output"] {
         write_hermes_resume_executable(&script, &marker, version_output, None);
         let error = registry
             .resume(&created.id)
@@ -13199,7 +13196,7 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
     };
 
     for (program, version_output) in [
-        (Some(script.clone()), "Hermes Agent v0.21.0 (future)"),
+        (Some(script.clone()), "Hermes Agent v1.0.0 (future)"),
         (Some(script.clone()), "unexpected provider output"),
         (None, "missing"),
     ] {
@@ -13226,8 +13223,8 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
             // The refusal names an out-of-range release with the declared
             // range, and never echoes output that does not parse.
             assert_eq!(error.code, "agent_runtime_unsupported");
-            let expected = if version_output.contains("0.21.0") {
-                "reports version 0.21.0, outside its runtime's supported range"
+            let expected = if version_output.contains("1.0.0") {
+                "reports version 1.0.0, outside its runtime's supported range"
             } else {
                 "does not match its runtime's declared format"
             };

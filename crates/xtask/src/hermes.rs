@@ -34,7 +34,7 @@ const GOLDEN_SCHEMA: u32 = 1;
 /// Updating the upstream pin requires reviewing the complete lock and changing
 /// this digest in the same compatibility-infrastructure change.
 const EXPECTED_LOCK_SHA256: &str =
-    "c670328dd5ed3241a6e5c60fc16c1128a58dd5950dd9d3048600df46c3bb2ed7";
+    "dc4b7cc3e7c450609200f629050ece509b53c56a57ee21cdbedb89fa1385602a";
 /// The pinned source archive digest recorded by the M2 baseline review.
 const EXPECTED_SOURCE_SHA256: &str =
     "1e9319c58a7f5e95808546af1091d58472be7437adc63fae0cbb53316e2711aa";

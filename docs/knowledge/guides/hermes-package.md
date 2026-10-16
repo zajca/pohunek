@@ -2,7 +2,7 @@
 type: Guide
 id: guide/hermes-package
 title: Hermes runtime package
-description: The official Hermes Agent runtime package source (Hermes Agent 0.20.0) with its operator plugin payload, the only source of the hermes runtime, what it declares and keeps equal to the built-in Hermes runtime of release 0.34.2, where releases ship it, and how its tests, CI and the release keep it honest.
+description: The official Hermes Agent runtime package source (Hermes Agent 0.20.0 and later 0.x releases, verified on 0.20.0) with its operator plugin payload, the only source of the hermes runtime, what it declares and keeps equal to the built-in Hermes runtime of release 0.34.2, where releases ship it, and how its tests, CI and the release keep it honest.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
@@ -18,7 +18,7 @@ directory holds exactly what the archive holds:
 
 ```text
 runtime-packages/hermes/
-  runtime.toml    runtime descriptor (package pohunek.runtime.hermes 1.0.0)
+  runtime.toml    runtime descriptor (package pohunek.runtime.hermes 1.0.1)
   detect.toml     detection manifest named by `detect_manifest`
   operator.toml   closed sidecar: every operator payload file and its SHA-256
   operator/       the operator plugin payload the sidecar lists
@@ -139,10 +139,12 @@ tag; the package tests compare the package with them.
   with `session_input_not_ready` and is rolled back; the initial input is not
   written.
 - Version: `version_probe = { parser = "semver-line-v1", args = ["--version"],
-  min = "0.20.0", below = "0.20.1", line = "Hermes Agent v{version}
+  min = "0.20.0", below = "1.0.0", line = "Hermes Agent v{version}
   {annotation}" }`, which accepts the locked banner `Hermes Agent v0.20.0
-  (2026.8.3)`. The range equals the lock's `supported` range; `Hermes Agent
-  v0.20.1` and every other release are unsupported.
+  (2026.8.3)` and every later 0.x release. The range equals the lock's
+  `supported` range; `min` is the verified release and `below` the next major,
+  so later releases are accepted by policy, not verified. `Hermes Agent v1.0.0`
+  and older releases are unsupported.
 - Native reference: `strategy = "hook"`.
 - Integration: handler `hermes-hook-v1` with hook schema `identity-v1`. The
   package names the compiled handler and schema; its lifecycle runs in the CLI
@@ -195,7 +197,8 @@ digest.
   - `the_signed_hermes_package_is_selected_and_failed_installs_preserve_it`:
     descriptor and manifest parity with the v0.34.2 goldens above, the supported
     range equal to `compat/hermes/compatibility-lock.json`, the probe accepting
-    the locked banner and refusing `Hermes Agent v0.20.1 (future)`, and a
+    the locked banner and a later 0.x release and refusing
+    `Hermes Agent v1.0.0 (future)`, and a
     `--sha256` install (`package_runtime_not_claimable`) and a corrupt archive
     whose digest the catalog does not list (`package_untrusted`, refused before
     decoding) that leave the selection unchanged.

@@ -788,7 +788,7 @@ fn an_unpinned_profile_is_refused_when_a_retained_older_version_is_damaged() {
     host.publish_at(&["claude"], 1);
     host.write_claude_profile();
     let older = host.step(false).packages[0].digest.clone();
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.2");
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.3");
     host.publish_archives(2, &[("claude", &bytes, &digest)]);
     let newer = host.step(false);
     assert_eq!(newer.packages[0].status, PackageStatus::Installed);
@@ -825,7 +825,7 @@ fn digest_only_repair_state(host: &Host) -> (String, PackageDigest, PathBuf) {
     let older = host.step(false).packages[0].digest.clone();
     // Nothing references the older version once the profile is unpinned.
     host.write_profile("official", "base = \"claude\"\n");
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.2");
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.3");
     host.publish_archives(2, &[("claude", &bytes, &digest)]);
     let newer = host.step(false);
     assert_eq!(newer.packages[0].status, PackageStatus::Installed);
@@ -945,7 +945,7 @@ fn a_selected_but_disabled_release_package_is_not_enabled_when_its_bind_would_re
     host.publish_at(&["claude"], 1);
     host.write_profile("other", "base = \"claude\"\n");
     let older = host.step(false).packages[0].digest.clone();
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.2");
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.3");
     host.publish_archives(2, &[("claude", &bytes, &digest)]);
     let newer = host.step(false);
     assert_eq!(newer.packages[0].status, PackageStatus::Installed);
@@ -979,7 +979,7 @@ fn selected_root_missing_state(host: &Host) -> (String, PackageDigest) {
     host.publish_at(&["claude"], 1);
     host.write_profile("other", "base = \"claude\"\n");
     let older = host.step(false).packages[0].digest.clone();
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.2");
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.3");
     host.publish_archives(2, &[("claude", &bytes, &digest)]);
     let newer = host.step(false);
     assert_eq!(newer.packages[0].status, PackageStatus::Installed);

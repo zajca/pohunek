@@ -33,7 +33,8 @@ multi-team control plane without replacing either owner path.
 - Daemon owns PTYs; clients attach/detach. Agents run PTY/TUI-first.
 - Codex, Claude Code, and the local interactive Hermes Agent runtime are
   first-class, each served only by its official runtime package from the signed
-  release catalog; only `shell` is built in. Hermes is pinned to version 0.20.0. Its operator plugin
+  release catalog; only `shell` is built in. Hermes is verified on 0.20.0, and its package
+  accepts later 0.x releases. Its operator plugin
   comes from the installed Hermes package and is installed explicitly per
   profile or custom owner-private home; it provides typed tools, generated
   skill, and best-effort lifecycle reporting without reading Hermes
