@@ -494,16 +494,30 @@ class CiTierWorkflowTests(unittest.TestCase):
                         expected,
                         f"{caller} on a pull request with {entry['filter']}={filter_value}",
                     )
-                for event, tier in (("push", ""), ("schedule", ""), ("workflow_dispatch", "main")):
-                    self.assertTrue(
-                        evaluate_condition(
-                            expression,
-                            event=event,
-                            tier=tier,
-                            changes={entry["filter"]: "false"},
-                        ),
-                        f"{caller} on {event} {tier}",
-                    )
+                # The rehearsal is nightly-tier evidence: push to main and a
+                # `main` dispatch never start it, whatever the filter computed
+                # against the previous commit, and the nightly tier always does.
+                for event, tier, expected in (
+                    ("push", "", False),
+                    ("workflow_dispatch", "main", False),
+                    ("schedule", "", True),
+                    ("workflow_dispatch", "nightly", True),
+                ):
+                    for filter_value in ("true", "false"):
+                        self.assertEqual(
+                            evaluate_condition(
+                                expression,
+                                event=event,
+                                tier=tier,
+                                changes={entry["filter"]: filter_value},
+                            ),
+                            expected,
+                            f"{caller} on {event} {tier} with {entry['filter']}={filter_value}",
+                        )
+                fork = condition.group(1).replace(SAME_REPOSITORY_PR, "'fork' == 'same'")
+                self.assertFalse(evaluate_condition(
+                    fork, event="pull_request", changes={entry["filter"]: "true"},
+                ))
 
     def test_main_and_nightly_only_macos_job_has_no_pull_request_branch(self):
         jobs = workflow_jobs()
@@ -573,6 +587,210 @@ class CiTierWorkflowTests(unittest.TestCase):
                     self.assertTrue(evaluate_condition(
                         expression.group(1), event=event, tier=tier, result="skipped",
                     ))
+
+
+# The reusable workflows the release rehearsal runs (issue #1207). Push to main
+# never runs the rehearsal, so a pull request that changes one of their inputs
+# must start it through the `release_rehearsal` filter; an input outside the
+# filter is caught only by the nightly tier.
+REHEARSAL_WORKFLOWS = ("release-build.yml", "release-evidence.yml")
+# Inputs the rehearsal reads that the filter deliberately leaves out, with the
+# reason. Each would start the rehearsal (about 30 jobs, 7-8 on macOS) on most
+# pull requests; a failure only the rehearsal sees in them surfaces in the
+# nightly tier, which runs the rehearsal on every schedule.
+REHEARSAL_FILTER_EXCEPTIONS = {
+    "crates/cli/**": "product crate; pull-request CI builds and tests it",
+    "crates/daemon/**": "product crate; pull-request CI builds and tests it",
+    "crates/session-worker/**": "product crate; pull-request CI builds and tests it",
+    "crates/relay/**": "product crate; pull-request CI builds and tests it",
+    "docs/knowledge/**": (
+        "read by `cargo xtask docs site`; `docs check` runs the same bundle build "
+        "on every pull request, and the site renderer is in crates/xtask, which "
+        "the filter lists"
+    ),
+    "README.md": "copied verbatim into every archive; the guard checks it exists",
+    "LICENSE": "copied verbatim into every archive and SDK tarball; the guard checks it exists",
+    "docs/features.md": "copied verbatim into every archive; the guard checks it exists",
+    "docs/install.md": "copied verbatim into every archive; the guard checks it exists",
+    "docs/cli.md": "copied verbatim into every archive; the guard checks it exists",
+    "docs/sdk.md": "copied verbatim into every archive; the guard checks it exists",
+    "docs/development.md": "copied verbatim into every archive; the guard checks it exists",
+    "sdk/ts/protocol/**": "SDK package source; the SDK workspace job typechecks and lints it on every pull request",
+    "sdk/ts/sdk/**": "SDK package source; the SDK workspace job typechecks and lints it on every pull request",
+    "sdk/ts/testkit/**": "SDK package source; the SDK workspace job typechecks and lints it on every pull request",
+}
+# Inputs a rehearsal command reads that its text does not name, by the
+# command that reads them. `pack-release.ts` packs every SDK workspace package,
+# so its directories are added from the tree.
+REHEARSAL_COMMAND_INPUTS = {
+    "cargo xtask docs site": {"docs/knowledge/**"},
+    "bun install --frozen-lockfile": {"package.json", "bun.lock"},
+    "sdk/ts/scripts/pack-release.ts": {"LICENSE"},
+}
+REHEARSAL_PATH_TOKEN = re.compile(
+    r"(?<![\w./$-])((?:\.github|scripts|packaging|compat|runtime-packages|sdk|crates|docs)"
+    r"/[A-Za-z0-9_.*/-]*[A-Za-z0-9_*])"
+)
+REHEARSAL_TEST_MODULE = re.compile(r"python3 -m unittest(?: -v)? (scripts(?:\.[a-z0-9_]+)+)")
+REHEARSAL_LOCAL_ACTION = re.compile(r"uses: \./(\.github/actions/[a-z0-9-]+)")
+REHEARSAL_CARGO_PACKAGE = re.compile(r"\s-p\s+([A-Za-z0-9_-]+)")
+
+
+def code_lines(text: str) -> list[str]:
+    """Shell or YAML lines with continuations joined and comments dropped."""
+    text = re.sub(r"\\\n\s*", " ", text)
+    return [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+
+
+def release_mode_only(text: str) -> bool:
+    """Whether a job or step header runs only in mode `release` (a tag)."""
+    condition = re.search(r"(?m)^\s*if: \$\{\{ (.+) \}\}$", text)
+    return condition is not None and re.fullmatch(
+        r"inputs\.mode == 'release'(?: && .+)?", condition.group(1)
+    ) is not None
+
+
+def path_references(lines: list[str]) -> set[str]:
+    found = set()
+    for line in lines:
+        found.update(match.group(1) for match in REHEARSAL_PATH_TOKEN.finditer(line))
+        found.update(
+            match.group(1).replace(".", "/") + ".py" for match in REHEARSAL_TEST_MODULE.finditer(line)
+        )
+        found.update(match.group(1) + "/**" for match in REHEARSAL_LOCAL_ACTION.finditer(line))
+    return found
+
+
+def glob_covers(pattern: str, path: str) -> bool:
+    """Whether a paths-filter glob matches every file an input path names.
+
+    An input is a file, or a glob (`dir/**`, `dir/*`) standing for a tree; a
+    glob input is covered only by a `<dir>/**` pattern on it or an ancestor.
+    """
+    if "*" in path:
+        base = path.split("*", 1)[0].rstrip("/")
+        return pattern.endswith("/**") and (base + "/").startswith(pattern[:-2])
+    regex = "".join(
+        ".*" if part == "**" else "[^/]*" if part == "*" else re.escape(part)
+        for part in re.split(r"(\*\*|\*)", pattern)
+    )
+    return re.fullmatch(regex, path) is not None
+
+
+def rehearsal_inputs() -> dict[str, str]:
+    """Every repository path the rehearsal reads, mapped to where it is read.
+
+    The steps of both reusable workflows give the paths they name, the
+    `python3 -m unittest` modules they run, the local actions they use and the
+    crates of the `cargo -p` packages they build; steps and jobs of mode
+    `release` alone are left out. One level down, the scripts those steps run
+    give the paths they name, `stage-archive` its `release_files`, and the
+    compatibility locks the provisioner scripts the rows run.
+    """
+    packages = {
+        tomllib.loads(manifest.read_text())["package"]["name"]: f"crates/{manifest.parent.name}/**"
+        for manifest in (ROOT / "crates").glob("*/Cargo.toml")
+    }
+    inputs: dict[str, str] = {}
+    commands = []
+    for workflow in REHEARSAL_WORKFLOWS:
+        inputs[f".github/workflows/{workflow}"] = workflow
+        for job_name, job in workflow_jobs((ROOT / ".github" / "workflows" / workflow).read_text()).items():
+            header, *steps = re.split(r"(?m)^      - ", job)
+            if release_mode_only(header):
+                continue
+            for step in steps:
+                if release_mode_only(step):
+                    continue
+                lines = code_lines(step)
+                commands.extend(lines)
+                for path in path_references(lines):
+                    inputs.setdefault(path, f"{workflow} job {job_name}")
+                for line in lines:
+                    if "cargo " in line:
+                        for package in REHEARSAL_CARGO_PACKAGE.findall(line):
+                            inputs.setdefault(packages[package], f"{workflow} job {job_name}: cargo -p {package}")
+    for command, paths in REHEARSAL_COMMAND_INPUTS.items():
+        if any(command in line for line in commands):
+            for path in paths:
+                inputs.setdefault(path, command)
+    if any("sdk/ts/scripts/pack-release.ts" in line for line in commands):
+        for manifest in (ROOT / "sdk" / "ts").glob("*/package.json"):
+            inputs.setdefault(f"sdk/ts/{manifest.parent.name}/**", "sdk/ts/scripts/pack-release.ts")
+    for path, origin in sorted(inputs.items()):
+        script = ROOT / path
+        if (
+            "*" in path
+            or not script.is_file()
+            or not path.startswith(("scripts/", "packaging/"))
+            or script.suffix not in ("", ".sh", ".py", ".ts")
+        ):
+            continue
+        text = script.read_text()
+        for reference in path_references(code_lines(text)):
+            inputs.setdefault(reference, f"read by {path}")
+        release_files = re.search(r"(?m)^release_files='([^']*)'$", text)
+        if release_files:
+            for reference in release_files.group(1).split():
+                inputs.setdefault(reference, f"release_files of {path}")
+    if "scripts/release-workflow/run-row" in inputs:
+        for lock in sorted((ROOT / "compat").glob("*/compatibility-lock.json")):
+            provisioner = json.loads(lock.read_text()).get("upstream", {}).get("provisioner")
+            if provisioner:
+                inputs.setdefault(provisioner, f"provisioner of {lock.relative_to(ROOT)}")
+    return inputs
+
+
+class ReleaseRehearsalFilterTests(unittest.TestCase):
+    def test_the_filter_covers_every_rehearsal_input_but_the_named_exceptions(self):
+        patterns = filter_paths("release_rehearsal")
+        inputs = rehearsal_inputs()
+        for path, origin in sorted(inputs.items()):
+            with self.subTest(input=path, origin=origin):
+                covered = any(glob_covers(pattern, path) for pattern in patterns)
+                excepted = any(glob_covers(pattern, path) for pattern in REHEARSAL_FILTER_EXCEPTIONS)
+                self.assertTrue(
+                    covered or excepted,
+                    f"{path} ({origin}) is a rehearsal input outside the release_rehearsal "
+                    "filter: add it to the filter, or name it in REHEARSAL_FILTER_EXCEPTIONS",
+                )
+        for exception, reason in REHEARSAL_FILTER_EXCEPTIONS.items():
+            with self.subTest(exception=exception):
+                self.assertTrue(reason)
+                self.assertFalse(
+                    any(glob_covers(pattern, exception) for pattern in patterns),
+                    f"{exception} is in the filter and needs no exception",
+                )
+                self.assertTrue(
+                    any(glob_covers(exception, path) for path in inputs),
+                    f"{exception} is no longer a rehearsal input",
+                )
+
+    def test_discovery_reaches_the_inputs_read_one_level_down(self):
+        inputs = rehearsal_inputs()
+        for path in (
+            "scripts/provision-hermes-compat",
+            "scripts/smoke-hermes-plugin-release",
+            "scripts/tests/test_smoke_archive.py",
+            "packaging/smoke-archive",
+            "crates/xtask/**",
+            "README.md",
+            "sdk/ts/sdk/**",
+        ):
+            with self.subTest(input=path):
+                self.assertIn(path, inputs)
+        # Steps of mode `release` alone are not rehearsal inputs.
+        self.assertNotIn("scripts/build-hermes-package", inputs)
+
+    def test_every_named_file_input_exists(self):
+        # A deleted or renamed file the rehearsal copies, such as a
+        # `release_files` entry of stage-archive, fails here on the pull
+        # request instead of in the nightly rehearsal.
+        for path, origin in sorted(rehearsal_inputs().items()):
+            if "*" in path:
+                continue
+            with self.subTest(input=path, origin=origin):
+                self.assertTrue((ROOT / path).is_file(), f"{path} ({origin}) does not exist")
 
 
 def load_test_partitions():

@@ -8,7 +8,8 @@ name: CI
 # the `release` paths filter matches (manifests, lockfile, .cargo, toolchain
 # pins, the release/CI workflows, scripts/release, packaging). The release
 # rehearsal (jobs `release-rehearsal-build` and `release-rehearsal`) runs the
-# reusable release workflows with a throwaway key and publishes nothing.
+# reusable release workflows with a throwaway key and publishes nothing; it is
+# part of the nightly tier, not of the main tier.
 on:
   push:
     branches: [main]
@@ -827,11 +828,14 @@ jobs:
               - '.github/actions/setup-sccache/**'
             # Release rehearsal (issue #150): the release workflows, the
             # packaging and assembly tools, the compatibility matrix and locks,
-            # the official packages, the consumer suite, and the crates the
-            # assembler and the signed catalog live in. The rehearsal builds the
-            # Linux release artifacts from this commit, runs every matrix row,
-            # assembles and signs a bundle with a throwaway key and runs the
-            # network-isolated archive smoke on it.
+            # the official packages, the consumer suite, the scripts the rows
+            # and the archive smoke run, the SDK pack inputs, and the crates the
+            # assembler and the signed catalog live in. The product crates,
+            # docs and SDK sources it also reads are left out on purpose; the
+            # guard in scripts/tests/test_ci_tiers.py names them. The rehearsal
+            # builds the Linux release artifacts from this commit, runs every
+            # matrix row, assembles and signs a bundle with a throwaway key and
+            # runs the network-isolated archive smoke on it.
             release_rehearsal:
               - '.github/workflows/ci.yml'
               - '.github/workflows/release.yml'
@@ -847,9 +851,15 @@ jobs:
               - 'runtime-packages/**'
               - 'crates/cli/tests/release_consumer.rs'
               - 'crates/cli/tests/support/**'
+              - 'scripts/provision-hermes-compat'
+              - 'scripts/smoke-hermes-plugin-release'
+              - 'scripts/tests/test_smoke_archive.py'
               - 'sdk/ts/scripts/**'
+              - 'package.json'
+              - 'bun.lock'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - '.cargo/**'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
               - '.github/actions/setup-sccache/**'
@@ -1168,16 +1178,18 @@ jobs:
   # (runtime x target) row runs against the pinned upstream, a bundle is
   # assembled and signed with a throwaway key derived from public values (no
   # secret, no environment, no provenance, nothing published) and the
-  # network-isolated archive smoke runs on it. It runs on schedule, push to
-  # main, manual dispatch, or a pull request that changes a `release_rehearsal`
-  # filter input; never for a fork or Dependabot pull request, whose token
-  # cannot hold the scopes the called workflow declares. The caller grants
-  # `id-token`/`attestations` only because a called workflow cannot hold a scope
-  # its caller lacks; the attest jobs are skipped in this mode.
+  # network-isolated archive smoke runs on it. It runs on schedule, `nightly`
+  # manual dispatch, or a pull request that changes a `release_rehearsal` filter
+  # input. It never runs on push to main or a `main` dispatch: the release gate
+  # takes it from the nightly evidence of the release commit. It never runs for
+  # a fork or Dependabot pull request, whose token cannot hold the scopes the
+  # called workflow declares. The caller grants `id-token`/`attestations` only
+  # because a called workflow cannot hold a scope its caller lacks; the attest
+  # jobs are skipped in this mode.
   release-rehearsal-build:
     name: release rehearsal (build)
     needs: changes
-    if: ${{ (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.release_rehearsal == 'true') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}
+    if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || (github.event_name == 'pull_request' && needs.changes.outputs.release_rehearsal == 'true')) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}
     uses: ./.github/workflows/release-build.yml
     permissions:
       contents: read
@@ -1187,7 +1199,7 @@ jobs:
   release-rehearsal:
     name: release rehearsal (evidence, assembly, archive smoke)
     needs: [changes, release-rehearsal-build]
-    if: ${{ (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.release_rehearsal == 'true') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}
+    if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || (github.event_name == 'pull_request' && needs.changes.outputs.release_rehearsal == 'true')) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}
     uses: ./.github/workflows/release-evidence.yml
     permissions:
       contents: read

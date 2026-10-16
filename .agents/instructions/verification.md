@@ -153,13 +153,15 @@ leg of the release consumer build, and the `aarch64-apple-darwin` release rows
 of the Claude, Codex, Hermes, and Pi packages. A push to
 `main` runs the main tier: platform contracts, the macOS tier packages, the
 `macos-15` package job, Hermes macOS, and SDK macOS, alongside the Linux jobs
-selected on main. PR and main runs cancel superseded runs on the same ref. A
-daily 05:00 UTC nightly run includes the main tier, the cold rebuild
-comparison in the `macos-15` package job, and the nightly-only relay database
-suite. Nightly CI evidence requires that job's install, upgrade, and uninstall
-step and its cold rebuild step. macOS 15 is the only macOS version CI runs;
-macOS 14 is a supported build target (deployment target 14.0) without CI
-acceptance (#1224). Manual
+selected on main. The main tier never runs the release rehearsal (#1207): push
+to `main` and a `tier=main` dispatch skip it whatever their paths filter
+computed. PR and main runs cancel superseded runs on the same ref. A
+daily 05:00 UTC nightly run includes the main tier, the release rehearsal, the
+cold rebuild comparison in the `macos-15` package job, and the nightly-only
+relay database suite. Nightly CI evidence requires that job's install, upgrade,
+and uninstall step and its cold rebuild step. macOS 15 is the only macOS version
+CI runs; macOS 14 is a supported build target (deployment target 14.0) without
+CI acceptance (#1224). Manual
 dispatch requires the `main` or `nightly` choice; nightly adds the nightly-only
 checks to main. Schedule and manual runs do not cancel PR or main runs.
 
@@ -168,9 +170,12 @@ Before the final head of a pull request merges, dispatch `ci.yml` once with
 only when the diff touches a release workflow or release xtask code, the runtime
 packages or packaging, the TypeScript SDK, Cargo dependencies, the protocol
 version window, or what the main and nightly tiers run (their jobs in `ci.yml`,
-`scripts/test-partitions`, `.config/nextest.toml`). Ordinary worker, PTY, hook,
-daemon, and CLI changes need no dispatch: pull-request CI already runs the
-macOS lanes.
+`scripts/test-partitions`, `.config/nextest.toml`). The dispatch does not run
+the release rehearsal: a pull request that changes a `release_rehearsal` input
+already ran it, and a rehearsal-only failure in the product crates, docs or SDK
+sources, which the filter leaves out, surfaces in the nightly tier. Ordinary
+worker, PTY, hook, daemon, and CLI changes need no dispatch: pull-request CI
+already runs the macOS lanes.
 
 The automatic red-main issue reporter remains pending under #477 S3. The S4
 release evidence gate is implemented: `scripts/release` requires successful
@@ -316,6 +321,10 @@ The CI workflow's PR/macOS path ownership and tier conditions are guarded by
 `python3 -m unittest scripts.tests.test_ci_tiers` when changing the workflow.
 The inventory distinguishes PR-triggering inputs from inputs covered by the
 post-merge main tier, so narrowing a filter cannot silently drop coverage.
+Because only the nightly tier runs the release rehearsal after merge, the same
+file guards the `release_rehearsal` filter: every path the rehearsal workflows
+and the scripts they run read must match the filter or be named, with its
+reason, in `REHEARSAL_FILTER_EXCEPTIONS`.
 Manual runs use `workflow_dispatch` input `tier=main|nightly`; the daily
 schedule selects nightly. The main tier is latest-wins on pushes to `main`,
 while PR runs are latest-wins per pull request. S3's automatic red-main issue

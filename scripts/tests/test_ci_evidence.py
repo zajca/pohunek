@@ -370,10 +370,24 @@ class CiEvidenceCliTests(unittest.TestCase):
         consumer = "release rehearsal (evidence, assembly, archive smoke) / Build the release consumer executable"
         self.assertFalse(names_a_workflow_job(f"{consumer} (macos-13)", workflow))
         self.assertFalse(names_a_workflow_job("tests (gpu, fast)", workflow))
-        # Both legs of the archive smoke gate a release in both tiers.
-        for tier in ("main", "nightly"):
-            for leg in ("ubuntu-latest", "macos-15"):
-                self.assertIn(f"{smoke} (network-isolated, {leg})", config["required_jobs"][tier])
+        # The release rehearsal is nightly-tier evidence: both legs of its
+        # archive smoke gate a release through the nightly run, and the main
+        # tier, which never starts the rehearsal, requires none of its jobs.
+        for leg in ("ubuntu-latest", "macos-15"):
+            self.assertIn(f"{smoke} (network-isolated, {leg})", config["required_jobs"]["nightly"])
+        rehearsal = [name for name in config["required_jobs"]["nightly"] if name.startswith("release rehearsal ")]
+        self.assertTrue(rehearsal)
+        self.assertEqual(
+            [name for name in config["required_jobs"]["main"] if name.startswith("release rehearsal ")],
+            [],
+        )
+        # Apart from the rehearsal, the nightly tier differs from main only by
+        # its nightly-only relay database suite.
+        nightly_only = {"tests (relay DB, PostgreSQL)"}
+        self.assertEqual(
+            set(config["required_jobs"]["main"]),
+            set(config["required_jobs"]["nightly"]) - set(rehearsal) - nightly_only,
+        )
 
     def test_real_main_jobs_fixture_satisfies_the_inventory(self):
         fixture = json.loads(

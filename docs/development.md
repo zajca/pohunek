@@ -576,10 +576,13 @@ publish its output or feed it to `release assemble`.
 ### Release rehearsal
 
 `ci.yml` runs the same two reusable workflows with `mode: rehearsal`
-(`release-rehearsal-build`, `release-rehearsal`) on push to main, the weekly
-schedule, manual dispatch, and pull requests that change the release workflows,
-`packaging/**`, `scripts/release-workflow/**`, `crates/xtask/**`, `compat/**`,
-`runtime-packages/**`, the consumer suite or the release workflow tests. It
+(`release-rehearsal-build`, `release-rehearsal`) in the nightly tier (the daily
+schedule and a `tier=nightly` dispatch) and on pull requests that change the
+release workflows, `packaging/**`, `scripts/release-workflow/**`,
+`crates/xtask/**`, `compat/**`, `runtime-packages/**`, the consumer suite, the
+release workflow tests, or another input of its `release_rehearsal` filter.
+Push to main and a `tier=main` dispatch do not run it; the release gate takes
+it from the nightly evidence of the release commit. It
 builds the Linux archives, packages and SDK tarballs from the PR commit, runs
 every matrix row, assembles a bundle and runs the archive smoke. It uses no
 secret and no environment: the daemon archives are staged with a throwaway trust
