@@ -1,0 +1,621 @@
+#!/usr/bin/env python3
+"""Run the compatibility rows of one runner in sequence and guard what each
+row could leave behind for the next.
+
+usage: run-rows          (run from the repository root; everything via env)
+env:   ROWS               space-separated <runtime>:<target> words, run in order
+       ROW_LIMIT_SECONDS  wall-clock limit of one row
+       OUT_DIR            receives the attestation-*.json and junit-*.xml files
+                          of scripts/release-workflow/run-row and the results
+                          file row-results.jsonl
+       VERSION, COMMIT, DAEMON_DIR, PACKAGES_DIR, CONSUMER, XTASK
+                          passed on to run-row unchanged
+
+Every row runs run-row in its own session and process group, with a fresh,
+empty, owner-only root (ROW_ROOT) that this script creates and removes. The
+rows of one runner share the runner's account, so after each row this script
+checks that the row left nothing behind that a later row could see:
+
+- no process whose executable, working directory or environment points into
+  the finished row's root, or on macOS into a test root the row created under
+  /private/tmp (the consumer's TestEnv root, MACOS_TEMP_ROOT of the
+  test-support crate). A survivor is killed and fails the row;
+  only its pid, executable and the matched variable name are reported, never
+  an environment value or a command line;
+- no row root and no new test root left on disk;
+- no unit of the systemd user manager (Linux) or job of the launchd user
+  domain (macOS) added or removed;
+- on macOS, no item added to or removed from the login keychain, compared by
+  class and label from `security dump-keychain` without `-d`, which reads
+  attributes only;
+- the manifest of everything a later row trusts is unchanged: xtask, the
+  consumer, run-row and this script, the downloaded archives, the attestations
+  and reports of earlier rows, the Node, uv and Python installs on PATH, and
+  the checkout (HEAD, status and diff). A mismatch stops the job at once and
+  names the row that ran last.
+
+A failing row never stops the rows after it. Each row's result goes to the
+results file, to an error annotation and to the step summary; the script exits
+non-zero when any row did not pass.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import ctypes.util
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+RUN_ROW = Path(__file__).resolve().with_name("run-row")
+SELF = Path(__file__).resolve()
+RESULTS_FILE = "row-results.jsonl"
+WORD = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+# mktemp template of a row root. Its length is part of the consumer's socket
+# path budget (crates/test-support/src/env.rs), so it stays this short.
+ROW_ROOT_TEMPLATE = "/tmp/pkrow.XXXXXX"
+# Name prefix and macOS base of the consumer's TestEnv root
+# (crates/test-support/src/env.rs ROOT_PREFIX, lib.rs MACOS_TEMP_ROOT).
+TEST_ROOT_PREFIX = "ph-"
+MACOS_TEMP_ROOT = "/private/tmp"
+# Seconds a timed-out row gets between SIGTERM and SIGKILL of its group.
+TERM_GRACE_SECONDS = 10
+# Bound of one guard command (git, systemctl, launchctl, security, ps).
+GUARD_COMMAND_SECONDS = 60
+# Seconds the stderr reader may take to drain once the row is gone.
+DRAIN_SECONDS = 5
+# Tools on PATH whose installs a row runs. Each one present is hashed whole
+# unless it lives in a system prefix, where only its binary is hashed.
+TOOLS = ("node", "uv", "python3")
+SYSTEM_PREFIXES = {Path("/"), Path("/usr"), Path("/usr/local"), Path("/opt/homebrew")}
+ROW_INPUTS = ("VERSION", "COMMIT", "DAEMON_DIR", "PACKAGES_DIR", "CONSUMER", "XTASK")
+
+
+class RowsError(Exception):
+    """A refusal before any row ran, or an integrity mismatch that stops the job."""
+
+
+@dataclass
+class Result:
+    runtime: str
+    target: str
+    status: str = "not-run"
+    seconds: float = 0.0
+    guard_seconds: float = 0.0
+    messages: list[str] = field(default_factory=list)
+
+    def document(self) -> dict:
+        return {
+            "runtime": self.runtime,
+            "target": self.target,
+            "status": self.status,
+            "seconds": round(self.seconds, 3),
+            "guard_seconds": round(self.guard_seconds, 3),
+            "message": "; ".join(self.messages),
+        }
+
+
+# ---- inputs ------------------------------------------------------------------
+
+
+def required(name: str) -> str:
+    value = os.environ.get(name, "")
+    if not value:
+        raise RowsError(f"{name} is required")
+    return value
+
+
+def parse_rows(text: str) -> list[tuple[str, str]]:
+    rows = []
+    for word in text.split():
+        runtime, separator, target = word.partition(":")
+        if not separator or not WORD.match(runtime) or not WORD.match(target):
+            raise RowsError(f"invalid row: {word!r}")
+        rows.append((runtime, target))
+    if not rows:
+        raise RowsError("ROWS names no row")
+    if len(set(rows)) != len(rows):
+        raise RowsError("ROWS names a row twice")
+    return rows
+
+
+# ---- bounded commands --------------------------------------------------------
+
+
+def output_of(arguments: list[str], cwd: Path | None = None) -> str | None:
+    """Standard output of a guard command, or None when it fails or is absent."""
+    try:
+        result = subprocess.run(
+            arguments,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=GUARD_COMMAND_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+# ---- integrity manifest ------------------------------------------------------
+
+
+def hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def describe(path: Path) -> dict[str, str]:
+    """Every entry below `path` (or `path` itself) as name -> content id.
+
+    `__pycache__` directories are left out: the interpreter writes its own
+    bytecode caches into its install when a row's helper programs import a
+    module for the first time.
+    """
+    entries: dict[str, str] = {}
+
+    def record(entry: Path) -> None:
+        if entry.is_symlink():
+            entries[str(entry)] = "link:" + os.readlink(entry)
+        elif entry.is_file():
+            entries[str(entry)] = "file:" + hash_file(entry)
+        elif entry.is_dir():
+            entries[str(entry)] = "dir"
+        elif entry.exists():
+            entries[str(entry)] = "special"
+        else:
+            entries[str(entry)] = "absent"
+
+    record(path)
+    if path.is_dir() and not path.is_symlink():
+        for directory, subdirectories, files in os.walk(path):
+            subdirectories[:] = [name for name in subdirectories if name != "__pycache__"]
+            for name in sorted(subdirectories) + sorted(files):
+                record(Path(directory) / name)
+    return entries
+
+
+def tool_root(name: str) -> Path | None:
+    """The install a tool on PATH belongs to, or None when it is absent."""
+    found = shutil.which(name)
+    if found is None:
+        return None
+    binary = Path(found).resolve()
+    directory = binary.parent
+    root = directory.parent if directory.name == "bin" else directory
+    return binary if root in SYSTEM_PREFIXES else root
+
+
+def checkout_state() -> dict[str, str]:
+    head = output_of(["git", "rev-parse", "HEAD"])
+    status = output_of(["git", "status", "--porcelain=v1", "--untracked-files=all"])
+    diff = output_of(["git", "diff", "HEAD", "--binary"])
+    if head is None or status is None or diff is None:
+        raise RowsError("the checkout state cannot be read with git")
+    return {
+        "checkout:HEAD": head.strip(),
+        "checkout:status": hashlib.sha256(status.encode()).hexdigest(),
+        "checkout:diff": hashlib.sha256(diff.encode()).hexdigest(),
+    }
+
+
+class Manifest:
+    """Content ids of everything a later row trusts."""
+
+    def __init__(self, paths: list[Path]):
+        self.paths = list(paths)
+        self.tools = {name: tool_root(name) for name in TOOLS}
+        self.recorded = self.take()
+
+    def take(self) -> dict[str, str]:
+        entries = checkout_state()
+        for path in self.paths:
+            entries.update(describe(path))
+        for name, root in self.tools.items():
+            if root is None:
+                entries[f"tool:{name}"] = "absent" if shutil.which(name) is None else "appeared"
+            else:
+                entries.update(describe(root))
+        return entries
+
+    def add(self, path: Path) -> None:
+        self.paths.append(path)
+        self.recorded.update(describe(path))
+
+    def changes(self) -> list[str]:
+        now = self.take()
+        changed = sorted(
+            name for name in set(self.recorded) | set(now) if self.recorded.get(name) != now.get(name)
+        )
+        return changed
+
+
+# ---- processes left behind ---------------------------------------------------
+
+
+def under(value: bytes | str, scopes: list[str]) -> bool:
+    text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+    for part in text.split(os.pathsep):
+        for scope in scopes:
+            if part == scope or part.startswith(scope + "/"):
+                return True
+    return False
+
+
+def variable_name(entry: bytes) -> str | None:
+    name, separator, _value = entry.partition(b"=")
+    if not separator or not re.fullmatch(rb"[A-Za-z_][A-Za-z0-9_]*", name):
+        return None
+    return name.decode("ascii")
+
+
+def matched_variable(environment: list[bytes], scopes: list[str]) -> str | None:
+    """Name of the first variable whose value points into a scope."""
+    for entry in environment:
+        name = variable_name(entry)
+        if name is not None and under(entry.partition(b"=")[2], scopes):
+            return name
+    return None
+
+
+@dataclass
+class Survivor:
+    pid: int
+    executable: str
+    key: str
+
+
+def linux_survivors(scopes: list[str]) -> list[Survivor]:
+    found = []
+    own = os.getpid()
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit() or int(entry.name) == own:
+            continue
+        pid = int(entry.name)
+        try:
+            executable = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            executable = ""
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            cwd = ""
+        try:
+            environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        except OSError:
+            environment = []
+        if executable and under(executable, scopes):
+            key = "executable"
+        elif cwd and under(cwd, scopes):
+            key = "cwd"
+        else:
+            key = matched_variable(environment, scopes)
+        if key is not None:
+            found.append(Survivor(pid, executable or "?", key))
+    return found
+
+
+def macos_procargs(libc, pid: int) -> tuple[str, list[bytes]] | None:
+    """Executable path and environment of a process (KERN_PROCARGS2)."""
+    ctl_kern, kern_argmax, kern_procargs2 = 1, 8, 49
+    argmax = ctypes.c_int(0)
+    size = ctypes.c_size_t(ctypes.sizeof(argmax))
+    mib = (ctypes.c_int * 2)(ctl_kern, kern_argmax)
+    if libc.sysctl(mib, 2, ctypes.byref(argmax), ctypes.byref(size), None, 0) != 0:
+        return None
+    buffer = ctypes.create_string_buffer(argmax.value)
+    size = ctypes.c_size_t(argmax.value)
+    mib3 = (ctypes.c_int * 3)(ctl_kern, kern_procargs2, pid)
+    if libc.sysctl(mib3, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        return None
+    raw = buffer.raw[: size.value]
+    if len(raw) < 4:
+        return None
+    argc = int.from_bytes(raw[:4], sys.byteorder)
+    executable, _, rest = raw[4:].partition(b"\0")
+    strings = [part for part in rest.lstrip(b"\0").split(b"\0")]
+    environment = []
+    for part in strings[argc:]:
+        if not part:
+            break
+        environment.append(part)
+    return executable.decode("utf-8", errors="replace"), environment
+
+
+def macos_survivors(scopes: list[str]) -> list[Survivor]:
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    listing = output_of(["ps", "-A", "-o", "pid="])
+    if listing is None:
+        raise RowsError("the process table cannot be listed")
+    found = []
+    own = os.getpid()
+    for word in listing.split():
+        pid = int(word)
+        if pid == own:
+            continue
+        facts = macos_procargs(libc, pid)
+        if facts is None:
+            continue
+        executable, environment = facts
+        if under(executable, scopes):
+            key = "executable"
+        else:
+            key = matched_variable(environment, scopes)
+        if key is not None:
+            found.append(Survivor(pid, executable or "?", key))
+    return found
+
+
+def test_roots() -> set[str]:
+    """The consumer's TestEnv roots under the macOS temp base."""
+    base = Path(MACOS_TEMP_ROOT)
+    if sys.platform != "darwin" or not base.is_dir():
+        return set()
+    return {str(entry) for entry in base.iterdir() if entry.name.startswith(TEST_ROOT_PREFIX)}
+
+
+# ---- account-wide state ------------------------------------------------------
+
+
+def services() -> set[str] | None:
+    """Units of the systemd user manager or jobs of the launchd user domain."""
+    if sys.platform == "darwin":
+        listing = output_of(["launchctl", "list"])
+        if listing is None:
+            return None
+        return {line.split("\t")[-1] for line in listing.splitlines()[1:] if line.strip()}
+    listing = output_of(["systemctl", "--user", "list-units", "--plain", "--no-legend", "--no-pager"])
+    if listing is None:
+        return None
+    return {line.split()[0] for line in listing.splitlines() if line.strip()}
+
+
+KEYCHAIN_LABEL = re.compile(r'^\s+(?:0x00000007 |"labl")<blob>=(.*)$')
+KEYCHAIN_CLASS = re.compile(r"^class: (.*)$")
+
+
+def keychain_items() -> set[str] | None:
+    """Class and label of every login keychain item, attributes only."""
+    if sys.platform != "darwin":
+        return None
+    login = output_of(["security", "login-keychain"])
+    if login is None:
+        return None
+    listing = output_of(["security", "dump-keychain", login.strip().strip('"')])
+    if listing is None:
+        return None
+    items: set[str] = set()
+    item_class, label = None, None
+    for line in listing.splitlines() + ["keychain: end"]:
+        if line.startswith("keychain: "):
+            if item_class is not None:
+                items.add(f"{item_class} {label or '<no label>'}")
+            item_class, label = None, None
+        elif (match := KEYCHAIN_CLASS.match(line)) is not None:
+            item_class = match.group(1)
+        elif (match := KEYCHAIN_LABEL.match(line)) is not None:
+            label = match.group(1)
+    return items
+
+
+def compare(kind: str, before, after) -> list[str]:
+    if before is None and after is None:
+        return []
+    if before is None or after is None:
+        return [f"the {kind} became {'readable' if before is None else 'unreadable'} during the row"]
+    findings = [f"added {kind} entry {name}" for name in sorted(after - before)]
+    findings += [f"removed {kind} entry {name}" for name in sorted(before - after)]
+    return findings
+
+
+# ---- one row -----------------------------------------------------------------
+
+
+def annotate(result: Result) -> None:
+    message = "; ".join(result.messages) or result.status
+    message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::error title=Row {result.runtime} on {result.target}::{message}", flush=True)
+
+
+def forward(stream, last: list[str]) -> None:
+    """Copy the row's stderr to ours and remember its last run-row line."""
+    for raw in iter(stream.readline, b""):
+        sys.stderr.buffer.write(raw)
+        sys.stderr.buffer.flush()
+        line = raw.decode("utf-8", errors="replace").rstrip("\n")
+        if line.startswith("run-row: "):
+            last[:] = [line.removeprefix("run-row: ")]
+
+
+def kill_group(pgid: int, sig: int) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def remove_tree(root: str) -> None:
+    """Removes a row root, including directories a row left without write access."""
+    for directory, _subdirectories, _files in os.walk(root):
+        if not os.path.islink(directory):
+            try:
+                os.chmod(directory, 0o700)
+            except OSError:
+                pass
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def run_one(runtime: str, target: str, limit: float, out_dir: Path) -> Result:
+    result = Result(runtime, target)
+    root = subprocess.run(
+        ["mktemp", "-d", ROW_ROOT_TEMPLATE], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    scopes = sorted({root, os.path.realpath(root)})
+    roots_before = test_roots()
+    services_before = services()
+    keychain_before = keychain_items()
+
+    environment = dict(os.environ, RUNTIME=runtime, TARGET=target, ROW_ROOT=root, OUT_DIR=str(out_dir))
+    started = time.monotonic()
+    process = subprocess.Popen(
+        [str(RUN_ROW)], env=environment, stdin=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True
+    )
+    last: list[str] = []
+    reader = threading.Thread(target=forward, args=(process.stderr, last), daemon=True)
+    reader.start()
+    try:
+        status = process.wait(timeout=limit)
+    except subprocess.TimeoutExpired:
+        kill_group(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=TERM_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            kill_group(process.pid, signal.SIGKILL)
+            process.wait()
+        status = None
+    result.seconds = time.monotonic() - started
+
+    guard_started = time.monotonic()
+    new_roots = test_roots() - roots_before
+    survivors = (macos_survivors if sys.platform == "darwin" else linux_survivors)(scopes + sorted(new_roots))
+    for survivor in survivors:
+        try:
+            os.kill(survivor.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        result.messages.append(
+            f"left process {survivor.pid} ({survivor.executable}) running, matched by {survivor.key}"
+        )
+    kill_group(process.pid, signal.SIGKILL)
+    reader.join(DRAIN_SECONDS)
+
+    if status is None:
+        result.messages.insert(0, f"the row exceeded its limit of {limit:g} s")
+    elif status != 0:
+        result.messages.insert(0, last[0] if last else f"run-row exited with status {status}")
+
+    result.messages += compare("service", services_before, services())
+    result.messages += compare("keychain", keychain_before, keychain_items())
+    remove_tree(root)
+    if os.path.lexists(root):
+        result.messages.append(f"its root {root} could not be removed")
+    for leftover in sorted(test_roots() - roots_before):
+        result.messages.append(f"left the test root {leftover} behind")
+        remove_tree(leftover)
+    result.guard_seconds = time.monotonic() - guard_started
+
+    if status is None:
+        result.status = "timeout"
+    elif result.messages:
+        result.status = "fail"
+    else:
+        result.status = "pass"
+    return result
+
+
+# ---- the runner's rows -------------------------------------------------------
+
+
+def write_results(out_dir: Path, results: list[Result]) -> None:
+    lines = "".join(json.dumps(result.document(), sort_keys=True) + "\n" for result in results)
+    partial = out_dir / (RESULTS_FILE + ".partial")
+    partial.write_text(lines)
+    partial.replace(out_dir / RESULTS_FILE)
+
+
+def write_summary(results: list[Result]) -> None:
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    lines = ["| Row | Result | Row s | Guards s | Message |", "| --- | --- | --- | --- | --- |"]
+    for result in results:
+        message = "; ".join(result.messages).replace("|", "\\|")
+        lines.append(
+            f"| {result.runtime} on {result.target} | {result.status} | {result.seconds:.1f}"
+            f" | {result.guard_seconds:.1f} | {message} |"
+        )
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def row_outputs(out_dir: Path, runtime: str, target: str) -> list[Path]:
+    return [out_dir / f"attestation-{runtime}-{target}.json", out_dir / f"junit-{runtime}-{target}.xml"]
+
+
+def main() -> int:
+    rows = parse_rows(required("ROWS"))
+    limit = float(required("ROW_LIMIT_SECONDS"))
+    if limit <= 0:
+        raise RowsError("ROW_LIMIT_SECONDS must be positive")
+    for name in ROW_INPUTS:
+        required(name)
+    out_dir = Path(required("OUT_DIR"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if any(out_dir.iterdir()):
+        raise RowsError("OUT_DIR is not empty")
+
+    trusted = [
+        Path(os.environ["XTASK"]),
+        Path(os.environ["CONSUMER"]),
+        RUN_ROW,
+        SELF,
+        Path(os.environ["DAEMON_DIR"]),
+        Path(os.environ["PACKAGES_DIR"]),
+    ]
+    manifest = Manifest(trusted)
+    results = [Result(runtime, target) for runtime, target in rows]
+    write_results(out_dir, results)
+    for index, (runtime, target) in enumerate(rows):
+        print(f"::group::Row {runtime} on {target}", flush=True)
+        result = run_one(runtime, target, limit, out_dir)
+        print("::endgroup::", flush=True)
+        checked = time.monotonic()
+        changed = manifest.changes()
+        result.guard_seconds += time.monotonic() - checked
+        if changed:
+            shown = ", ".join(changed[:10]) + (f" and {len(changed) - 10} more" if len(changed) > 10 else "")
+            result.status = "fail"
+            result.messages.append(f"changed what later rows trust: {shown}")
+        if result.status != "pass":
+            # Only a passing row's attestation may leave the job.
+            (out_dir / f"attestation-{runtime}-{target}.json").unlink(missing_ok=True)
+            annotate(result)
+        results[index] = result
+        write_results(out_dir, results)
+        if changed:
+            for skipped in results[index + 1 :]:
+                skipped.messages = [f"not run: the job stopped after the row {runtime} on {target}"]
+            write_results(out_dir, results)
+            write_summary(results)
+            return 1
+        if result.status == "pass":
+            for output in row_outputs(out_dir, runtime, target):
+                if output.exists():
+                    manifest.add(output)
+    write_results(out_dir, results)
+    write_summary(results)
+    return 0 if all(result.status == "pass" for result in results) else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except RowsError as error:
+        print(f"run-rows: {error}", file=sys.stderr)
+        sys.exit(2)

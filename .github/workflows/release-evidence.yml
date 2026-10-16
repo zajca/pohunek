@@ -6,12 +6,15 @@ name: Release evidence
 # exact core binaries of the release, signs the runtime catalog over those
 # digests and checks the final archives offline:
 #
-#   plan              the (runtime x target) rows from compat/matrix.json (jq)
-#   consumer          the release consumer test executable, built once
-#   rows              one job per row: extracts the binaries from the daemon
-#                     ARCHIVE, stages the pinned upstream (npm, or a provisioner
-#                     script with Python and uv), runs the consumer out of
-#                     process and emits attestation-<runtime>-<target>.json
+#   plan              the (runtime x target) rows from compat/matrix.json,
+#                     grouped by runner (jq)
+#   rows              one job per runner: builds the release consumer test
+#                     executable once and uploads it for the smoke, then runs
+#                     the runner's rows in sequence. Each row extracts the
+#                     binaries from the daemon ARCHIVE, stages the pinned
+#                     upstream (npm, or a provisioner script with Python and
+#                     uv), runs the consumer out of process and emits
+#                     attestation-<runtime>-<target>.json
 #   attest            build provenance for every producer artifact (release only)
 #   assemble          verifies provenance with `gh attestation verify`, then
 #                     `cargo xtask release assemble` signs the catalog with the
@@ -27,7 +30,7 @@ name: Release evidence
 #   verdict           fails unless exactly the jobs of the chosen mode succeeded
 #                     (a skipped job would otherwise let a caller proceed)
 #
-# Trust model. `rows`, `consumer`, `assemble*` and `smoke` run repository code
+# Trust model. `rows`, `assemble*` and `smoke` run repository code
 # and hold a read-only token; none of them can create an attestation or write
 # to the repository. `attest` and `attest-bundle` are the only jobs with
 # `id-token: write` and `attestations: write`; they check out nothing, run no
@@ -111,45 +114,24 @@ jobs:
             echo "node=$node"
           } >> "$GITHUB_OUTPUT"
 
-  consumer:
-    name: Build the release consumer executable
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-15]
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-
-      - name: Install Rust toolchain
-        uses: ./.github/actions/setup-rust
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: release-consumer-${{ runner.os }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Build the consumer executable
-        run: scripts/release-workflow/build-consumer "$RUNNER_TEMP/consumer"
-
-      - name: Upload the consumer executable
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: release-consumer-${{ runner.os }}
-          path: ${{ runner.temp }}/consumer/release_consumer
-          if-no-files-found: error
-
+  # One job per runner runs the runner's rows in sequence (run-rows). The
+  # setup is paid once: the toolchain, the consumer and xtask builds, Node,
+  # Python and uv, and the downloads. Rows share the job's account, so each
+  # row gets a fresh, empty, owner-only root for HOME, the XDG directories,
+  # TMPDIR, cwd and its staged upstream (npm and uv caches included), and
+  # run-rows checks after each row that it left no process, no root, no user
+  # service or launchd job and no keychain item behind, and that nothing a
+  # later row trusts changed (xtask, the consumer, the scripts, the archives,
+  # earlier attestations, the Node, uv and Python installs, the checkout). The
+  # daemon under test supervises its workers as direct children, so no row
+  # uses the systemd user manager or the launchd user domain; the model stubs
+  # bind ephemeral loopback ports. Rows run one at a time, and a failing row
+  # never stops the rows after it. See the docstring of run-rows.
   rows:
-    name: Row ${{ matrix.runtime }} on ${{ matrix.target }}
-    needs: [plan, consumer]
+    name: Rows on ${{ matrix.runner }}
+    needs: [plan]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     permissions:
       contents: read
     strategy:
@@ -166,30 +148,42 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: release-row-${{ matrix.target }}
+          shared-key: release-rows-${{ runner.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Download the daemon archive of the target
+      - name: Build the consumer executable
+        run: scripts/release-workflow/build-consumer "$RUNNER_TEMP/consumer"
+
+      - name: Build xtask
+        run: cargo build --locked -p xtask
+
+      # The consumer leaves the job before any upstream code runs in it.
+      - name: Upload the consumer executable
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-consumer-${{ runner.os }}
+          path: ${{ runner.temp }}/consumer/release_consumer
+          if-no-files-found: error
+
+      - name: Download the daemon archives of the runner
+        if: ${{ matrix.rows != '' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: ${{ matrix.daemon_artifact }}
+          pattern: ${{ matrix.daemon_pattern }}
+          merge-multiple: true
           path: ${{ runner.temp }}/daemon
 
       - name: Download the package archives
+        if: ${{ matrix.rows != '' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: package-archives
           path: ${{ runner.temp }}/packages
 
-      - name: Download the consumer executable
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: release-consumer-${{ runner.os }}
-          path: ${{ runner.temp }}/consumer
-
       # The upstream runtimes are Node programs: the version is the highest
       # `upstream.node_min` of their locks, not the runner image default.
       - name: Install Node
+        if: ${{ matrix.rows != '' }}
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ needs.plan.outputs.node }}
@@ -198,53 +192,64 @@ jobs:
       # a repository script that builds a Python environment with uv: the
       # script needs python3 for its helper programs and uv, and the
       # environment runs the pinned CPython the script downloads and verifies,
-      # never this interpreter. No uv cache is kept between runs.
+      # never this interpreter. run-rows runs on this interpreter too. No uv
+      # cache is kept between runs.
       - name: Install Python for provisioned upstreams
+        if: ${{ matrix.rows != '' }}
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
       - name: Install uv for provisioned upstreams
+        if: ${{ matrix.rows != '' }}
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: "0.9.28"
           enable-cache: false
 
-      - name: Build xtask
-        run: cargo build --locked -p xtask
-
-      - name: Run the row and write its attestation
+      - name: Run the rows and write their attestations
+        if: ${{ matrix.rows != '' }}
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
           COMMIT: ${{ inputs.commit }}
-          RUNTIME: ${{ matrix.runtime }}
-          TARGET: ${{ matrix.target }}
+          ROWS: ${{ matrix.rows }}
+          ROW_LIMIT_SECONDS: ${{ matrix.row_limit_seconds }}
           DAEMON_DIR: ${{ runner.temp }}/daemon
           PACKAGES_DIR: ${{ runner.temp }}/packages
           CONSUMER: ${{ runner.temp }}/consumer/release_consumer
-          OUT_DIR: ${{ runner.temp }}/row
+          OUT_DIR: ${{ runner.temp }}/rows
         run: |
           set -euo pipefail
-          XTASK="$PWD/target/debug/xtask" scripts/release-workflow/run-row
+          XTASK="$PWD/target/debug/xtask" scripts/release-workflow/run-rows
 
-      - name: Upload the attestation
+      - name: Upload the attestations
+        if: ${{ matrix.rows != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: attestation-${{ matrix.runtime }}-${{ matrix.target }}
-          path: ${{ runner.temp }}/row/attestation-${{ matrix.runtime }}-${{ matrix.target }}.json
+          name: attestation-${{ matrix.os }}
+          path: ${{ runner.temp }}/rows/attestation-*.json
           if-no-files-found: error
 
-      # Wall clock and outcome of the consumer run as a one-testcase JUnit
-      # report. run-row writes it also when the consumer fails, so it is
-      # uploaded whatever the row's result; a row that stopped before the
+      # Wall clock and outcome of each consumer run as a one-testcase JUnit
+      # report per row. run-row writes it also when the consumer fails, so it
+      # is uploaded whatever the rows' result; a row that stopped before the
       # consumer started has none.
-      - name: Upload the row test report
-        if: always()
+      - name: Upload the row test reports
+        if: ${{ always() && matrix.rows != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: matrix-junit-${{ matrix.runtime }}-${{ matrix.target }}
-          path: ${{ runner.temp }}/row/junit-${{ matrix.runtime }}-${{ matrix.target }}.xml
+          name: matrix-junit-${{ matrix.os }}
+          path: ${{ runner.temp }}/rows/junit-*.xml
+          if-no-files-found: warn
+
+      # One result line per row, read by the verdict to name a failing row.
+      - name: Upload the row results
+        if: ${{ always() && matrix.rows != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: row-results-${{ matrix.os }}
+          path: ${{ runner.temp }}/rows/row-results.jsonl
           if-no-files-found: warn
 
   # Build provenance for every producer artifact, so that the assembler can
@@ -459,7 +464,7 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: release-row
+          shared-key: release-rows-${{ runner.os }}
           save-if: false
 
       - name: Build xtask
@@ -531,7 +536,7 @@ jobs:
   # the smoke uses exactly that one and never runs un-isolated.
   smoke:
     name: Archive smoke (network-isolated, ${{ matrix.os }})
-    needs: [plan, assemble, assemble-rehearsal, consumer]
+    needs: [plan, rows, assemble, assemble-rehearsal]
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (needs.assemble.result == 'success' || needs.assemble-rehearsal.result == 'success') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -556,7 +561,7 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: ${{ runner.os == 'Linux' && 'release-row' || format('release-row-{0}', runner.os) }}
+          shared-key: release-rows-${{ runner.os }}
           save-if: false
 
       - name: Download the release bundle
@@ -632,15 +637,53 @@ jobs:
   # The caller proceeds on this workflow's result. A job skipped by an `if`
   # counts as success to the caller, so this job requires exactly the jobs of
   # the chosen mode to have succeeded and the other mode's jobs to be skipped.
+  # It also names every planned row that did not pass, from the results the
+  # row jobs upload; a planned row without a result (its job failed before
+  # run-rows, timed out or lost its runner) is named as such.
   verdict:
     name: Evidence verdict
     if: ${{ always() }}
-    needs: [plan, consumer, rows, attest, assemble, assemble-rehearsal, attest-bundle, smoke]
+    needs: [plan, rows, attest, assemble, assemble-rehearsal, attest-bundle, smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
     steps:
+      - name: Download the row results
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: row-results-*
+          path: ${{ runner.temp }}/row-results
+
+      - name: Name every row that did not pass
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          PLAN: ${{ needs.plan.outputs.rows }}
+        run: |
+          set -euo pipefail
+          plan="${PLAN:-}"
+          [ -n "$plan" ] || plan='{"include":[]}'
+          mkdir -p "$RUNNER_TEMP/row-results"
+          find "$RUNNER_TEMP/row-results" -type f -name row-results.jsonl -exec cat {} + > "$RUNNER_TEMP/row-results.jsonl"
+          failed="$(jq -rn --argjson plan "$plan" --slurpfile results "$RUNNER_TEMP/row-results.jsonl" '
+            $plan.include[]
+            | .runner as $runner
+            | .rows | split(" ")[] | select(length > 0)
+            | split(":") as [$runtime, $target]
+            | ([$results[] | select(.runtime == $runtime and .target == $target)] | first) as $result
+            | if $result == null then "\($runtime) on \($target): no result from Rows on \($runner)"
+              elif $result.status == "pass" then empty
+              else "\($runtime) on \($target): \($result.status), \($result.message)" end
+          ')"
+          if [ -n "$failed" ]; then
+            while IFS= read -r line; do
+              echo "::error::row $line"
+            done <<< "$failed"
+            exit 1
+          fi
+
       - name: Require the jobs of the mode
+        if: ${{ !cancelled() }}
         shell: bash
         env:
           MODE: ${{ inputs.mode }}
@@ -650,9 +693,9 @@ jobs:
           printf '%s' "$NEEDS" | jq -e --arg mode "$MODE" '
             . as $needs
             | (if $mode == "release" then
-                 {success: ["plan","consumer","rows","attest","assemble","attest-bundle","smoke"], skipped: ["assemble-rehearsal"]}
+                 {success: ["plan","rows","attest","assemble","attest-bundle","smoke"], skipped: ["assemble-rehearsal"]}
                elif $mode == "rehearsal" then
-                 {success: ["plan","consumer","rows","assemble-rehearsal","smoke"], skipped: ["attest","assemble","attest-bundle"]}
+                 {success: ["plan","rows","assemble-rehearsal","smoke"], skipped: ["attest","assemble","attest-bundle"]}
                else error("unknown mode") end) as $want
             | all($want.success[]; . as $n | $needs[$n].result == "success")
               and all($want.skipped[]; . as $n | $needs[$n].result == "skipped")

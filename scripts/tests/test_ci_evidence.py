@@ -416,8 +416,6 @@ class CiEvidenceCliTests(unittest.TestCase):
         self.assertFalse(names_a_workflow_job(f"{smoke} (network-isolated)", workflow))
         self.assertFalse(names_a_workflow_job(f"{smoke} (network-isolated, macos-13)", workflow))
         self.assertFalse(names_a_workflow_job(f"{smoke} (network-isolated, ubuntu-latest) extra", workflow))
-        consumer = "release rehearsal (evidence, assembly, archive smoke) / Build the release consumer executable"
-        self.assertFalse(names_a_workflow_job(f"{consumer} (macos-13)", workflow))
         self.assertFalse(names_a_workflow_job("tests (gpu, fast)", workflow))
         # The release rehearsal is nightly-tier evidence: both legs of its
         # archive smoke gate a release through the nightly run, and the main
@@ -437,6 +435,18 @@ class CiEvidenceCliTests(unittest.TestCase):
             set(config["required_jobs"]["main"]),
             set(config["required_jobs"]["nightly"]) - set(rehearsal) - nightly_only,
         )
+        # The row jobs are named after the runners of the planned row matrix,
+        # which the workflow file cannot show: every runner's job gates the
+        # nightly tier.
+        planned = subprocess.run(
+            [str(ROOT / "scripts/release-workflow/row-matrix"), str(ROOT / "compat/matrix.json")],
+            capture_output=True, text=True, check=True,
+        )
+        runners = [entry["runner"] for entry in json.loads(planned.stdout)["include"]]
+        self.assertTrue(runners)
+        rows = "release rehearsal (evidence, assembly, archive smoke) / Rows on"
+        listed = [name for name in config["required_jobs"]["nightly"] if name.startswith(rows)]
+        self.assertEqual(sorted(listed), sorted(f"{rows} {runner}" for runner in runners))
 
     def test_real_main_jobs_fixture_satisfies_the_inventory(self):
         fixture = json.loads(

@@ -10,13 +10,18 @@ signing are exercised by the release rehearsal job of ci.yml.
 """
 
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 import xml.etree.ElementTree as ElementTree
 
@@ -89,29 +94,51 @@ class RowMatrixTests(unittest.TestCase):
         path.write_text(json.dumps({"schema": 1, "suite_version": 1, "rows": rows}))
         return str(path)
 
-    def test_every_row_becomes_an_entry_with_a_runner(self):
+    def test_the_rows_are_grouped_into_one_entry_per_runner(self):
+        rows = [
+            {"runtime": "alpha", "target": "x86_64-unknown-linux-gnu"},
+            {"runtime": "alpha", "target": "x86_64-unknown-linux-musl"},
+            {"runtime": "alpha", "target": "aarch64-apple-darwin"},
+            {"runtime": "beta", "target": "x86_64-unknown-linux-gnu"},
+        ]
+        result = run("row-matrix", self.matrix(rows))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "include": [
+                    {
+                        "runner": "ubuntu-latest",
+                        "os": "linux",
+                        "daemon_pattern": "build-daemon-*",
+                        "rows": "alpha:x86_64-unknown-linux-gnu alpha:x86_64-unknown-linux-musl beta:x86_64-unknown-linux-gnu",
+                        "row_limit_seconds": 900,
+                        "timeout_minutes": 40 + 3 * 15,
+                    },
+                    {
+                        "runner": "macos-15",
+                        "os": "macos",
+                        "daemon_pattern": "macos-signed-daemon",
+                        "rows": "alpha:aarch64-apple-darwin",
+                        "row_limit_seconds": 900,
+                        "timeout_minutes": 40 + 15,
+                    },
+                ]
+            },
+        )
+
+    def test_targets_restrict_the_rows_and_every_runner_keeps_its_entry(self):
         rows = [
             {"runtime": "alpha", "target": "x86_64-unknown-linux-gnu"},
             {"runtime": "alpha", "target": "x86_64-unknown-linux-musl"},
             {"runtime": "alpha", "target": "aarch64-apple-darwin"},
         ]
-        result = run("row-matrix", self.matrix(rows))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        expected = []
-        for row in rows:
-            if row["target"] == "aarch64-apple-darwin":
-                expected.append(dict(row, runner="macos-15", daemon_artifact="macos-signed-daemon"))
-            else:
-                expected.append(dict(row, runner="ubuntu-latest", daemon_artifact="build-daemon-" + row["target"]))
-        self.assertEqual(json.loads(result.stdout), {"include": expected})
-
-    def test_targets_restrict_the_rows_and_an_empty_selection_fails(self):
-        rows = [
-            {"runtime": "alpha", "target": "x86_64-unknown-linux-gnu"},
-            {"runtime": "alpha", "target": "x86_64-unknown-linux-musl"},
-        ]
         result = run("row-matrix", self.matrix(rows), "x86_64-unknown-linux-musl")
-        self.assertEqual([row["target"] for row in json.loads(result.stdout)["include"]], ["x86_64-unknown-linux-musl"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entries = {entry["runner"]: entry for entry in json.loads(result.stdout)["include"]}
+        self.assertEqual(entries["ubuntu-latest"]["rows"], "alpha:x86_64-unknown-linux-musl")
+        # The macOS job still builds the consumer that the macOS smoke runs.
+        self.assertEqual(entries["macos-15"]["rows"], "")
         self.assertNotEqual(run("row-matrix", self.matrix(rows), "riscv64gc-unknown-linux-gnu").returncode, 0)
 
     def test_a_target_without_a_runner_or_an_unsafe_name_is_refused(self):
@@ -129,7 +156,11 @@ class RowMatrixTests(unittest.TestCase):
     def test_the_repository_matrix_has_a_row_for_every_package_directory(self):
         result = run("row-matrix", "compat/matrix.json")
         self.assertEqual(result.returncode, 0, result.stderr)
-        runtimes = {row["runtime"] for row in json.loads(result.stdout)["include"]}
+        runtimes = {
+            word.split(":")[0]
+            for entry in json.loads(result.stdout)["include"]
+            for word in entry["rows"].split()
+        }
         packages = {path.name for path in (ROOT / "runtime-packages").iterdir() if path.is_dir()}
         self.assertEqual(runtimes, packages)
 
@@ -204,6 +235,10 @@ class RowFixture:
         self.tools = tools
         self.consumer_path = directory / "release_consumer"
         self.out_dir = directory / "row"
+        # The fresh, owner-only root run-rows hands to each row.
+        self.row_root = directory / "root"
+        self.row_root.mkdir()
+        self.row_root.chmod(0o700)
 
     @staticmethod
     def sidecar(archive: Path) -> None:
@@ -229,6 +264,7 @@ class RowFixture:
                 "CONSUMER": str(self.consumer_path),
                 "OUT_DIR": str(self.out_dir),
                 "XTASK": str(self.xtask),
+                "ROW_ROOT": str(self.row_root),
             },
         )
 
@@ -299,6 +335,330 @@ class RunRowTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("package archive checksum mismatch", result.stderr)
         self.assertFalse(self.row.junit.exists())
+
+    def test_a_root_that_is_not_empty_or_not_owner_only_is_refused(self):
+        self.row.consumer(PASSING_CONSUMER)
+        (self.row.row_root / "left-over").write_text("")
+        result = self.row.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ROW_ROOT is not empty", result.stderr)
+        (self.row.row_root / "left-over").unlink()
+        self.row.row_root.chmod(0o755)
+        result = self.row.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ROW_ROOT is not owner-only", result.stderr)
+        self.assertFalse(self.row.attestation.exists())
+
+
+class RowsFixture:
+    """Two rows of one runner (alpha, then beta) through run-rows and run-row.
+
+    The stand-ins are those of RowFixture. The consumer is one shell script for
+    both rows; it learns its row from POHUNEK_CONSUMER_RUNTIME. The checkout is
+    a committed git repository, because run-rows records its state. A stand-in
+    `systemctl` prints the units listed in a file, so a scenario can add a user
+    service the way a row could.
+    """
+
+    RUNTIMES = ("alpha", "beta")
+    TARGET = "x86_64-unknown-linux-gnu"
+    VERSION = "1.0.0"
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.checkout = directory / "checkout"
+        stem = f"pohunek-daemon-{self.VERSION}-{self.TARGET}"
+        self.daemon_dir = directory / "daemon"
+        self.daemon_dir.mkdir()
+        binaries = directory / "binaries" / stem
+        binaries.mkdir(parents=True)
+        for name in ("pohunek", "pohunekd", "pohunek-sessiond"):
+            (binaries / name).write_text("#!/bin/sh\n")
+        archive = self.daemon_dir / f"{stem}.tar.gz"
+        with tarfile.open(archive, "w:gz") as bundle:
+            bundle.add(binaries, arcname=stem)
+        RowFixture.sidecar(archive)
+        self.packages_dir = directory / "packages"
+        self.packages_dir.mkdir()
+        for runtime in self.RUNTIMES:
+            (self.checkout / "runtime-packages" / runtime).mkdir(parents=True)
+            lock = self.checkout / "compat" / runtime / "compatibility-lock.json"
+            lock.parent.mkdir(parents=True)
+            lock.write_text("{}\n")
+            package = self.packages_dir / f"pohunek-runtime-{runtime}-{self.VERSION}.tar.zst"
+            package.write_bytes(runtime.encode())
+            RowFixture.sidecar(package)
+        git = ["git", "-c", "user.name=fixture", "-c", "user.email=fixture@invalid", "-c", "commit.gpgsign=false"]
+        for command in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "fixture"]):
+            subprocess.run([*git, *command], cwd=self.checkout, check=True, capture_output=True)
+
+        # The stand-in xtask and node of RowFixture, in a tools directory of
+        # their own.
+        self.tools = directory / "tools"
+        donor = RowFixture(directory / "donor")
+        shutil.copytree(donor.tools, self.tools)
+        self.xtask = self.tools / "xtask"
+        self.units = directory / "units"
+        self.units.write_text("dbus.socket\n")
+        systemctl = self.tools / "systemctl"
+        systemctl.write_text(f"#!/bin/sh\ncat {self.units}\n")
+        systemctl.chmod(0o755)
+        self.consumer_path = directory / "release_consumer"
+        self.out_dir = directory / "rows"
+        self.log = directory / "log"
+        self.log.mkdir()
+
+    def consumer(self, body: str) -> None:
+        """The consumer stand-in, run under run-row's scrubbed environment."""
+        self.consumer_path.write_text(f"#!/bin/sh\nset -eu\nrow=$POHUNEK_CONSUMER_RUNTIME\n{body}\n")
+
+    def run(self, limit: float = 60) -> subprocess.CompletedProcess:
+        return run(
+            "run-rows",
+            cwd=self.checkout,
+            env={
+                "PATH": f"{self.tools}{os.pathsep}/usr/bin{os.pathsep}/bin",
+                "ROWS": " ".join(f"{runtime}:{self.TARGET}" for runtime in self.RUNTIMES),
+                "ROW_LIMIT_SECONDS": str(limit),
+                "VERSION": self.VERSION,
+                "COMMIT": "0" * 40,
+                "DAEMON_DIR": str(self.daemon_dir),
+                "PACKAGES_DIR": str(self.packages_dir),
+                "CONSUMER": str(self.consumer_path),
+                "OUT_DIR": str(self.out_dir),
+                "XTASK": str(self.xtask),
+                "GITHUB_STEP_SUMMARY": str(self.directory / "summary.md"),
+            },
+        )
+
+    def results(self) -> dict[str, dict]:
+        lines = (self.out_dir / "row-results.jsonl").read_text().splitlines()
+        return {document["runtime"]: document for document in map(json.loads, lines)}
+
+    def attestation(self, runtime: str) -> Path:
+        return self.out_dir / f"attestation-{runtime}-{self.TARGET}.json"
+
+    def recorded(self, runtime: str, name: str) -> str:
+        return (self.log / f"{runtime}.{name}").read_text().strip()
+
+
+# Writes a marker into every private place of the row and records where; beta
+# also reports which of alpha's markers it can still see.
+MARKING_CONSUMER = f"""
+stage=${{PATH%%:*}}
+for place in "$HOME" "$TMPDIR" "$PWD" "$stage"; do
+    printf '%s\\n' "$row" > "$place/marker"
+done
+printf '%s\\n' "$HOME" > "$LOG/$row.home"
+printf '%s\\n' "$TMPDIR" > "$LOG/$row.tmp"
+printf '%s\\n' "$PWD" > "$LOG/$row.cwd"
+printf '%s\\n' "$stage" > "$LOG/$row.stage"
+if [ "$row" = beta ]; then
+    for name in home tmp cwd stage; do
+        seen=$(cat "$LOG/alpha.$name")
+        if [ -e "$seen/marker" ] || [ -e "$seen" ]; then
+            printf '%s\\n' "$seen" >> "$LOG/beta.visible"
+        fi
+    done
+fi
+{PASSING_CONSUMER}
+"""
+
+
+@unittest.skipUnless(sys.platform == "linux", "the scenarios scan /proc, as run-rows does on the Linux runner")
+class RunRowsTests(unittest.TestCase):
+    def setUp(self):
+        self.rows = RowsFixture(Path(self.enterContext(tempfile.TemporaryDirectory())))
+
+    def consumer(self, body: str) -> None:
+        self.rows.consumer(body.replace("$LOG", str(self.rows.log)))
+
+    def test_two_rows_of_one_job_do_not_see_each_others_home_store_or_temp_root(self):
+        self.consumer(MARKING_CONSUMER)
+        result = self.rows.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("home", "tmp", "cwd", "stage"):
+            with self.subTest(place=name):
+                alpha, beta = self.rows.recorded("alpha", name), self.rows.recorded("beta", name)
+                self.assertNotEqual(alpha, beta)
+                self.assertFalse(Path(alpha).exists(), "alpha's root is removed before beta runs")
+                self.assertFalse(Path(beta).exists())
+        roots = {Path(self.rows.recorded(runtime, "home")).parents[0] for runtime in self.rows.RUNTIMES}
+        self.assertEqual(len(roots), 2)
+        self.assertFalse((self.rows.log / "beta.visible").exists(), "beta saw alpha's markers")
+        results = self.rows.results()
+        self.assertEqual({runtime: results[runtime]["status"] for runtime in results}, {"alpha": "pass", "beta": "pass"})
+        for runtime in self.rows.RUNTIMES:
+            self.assertTrue(self.rows.attestation(runtime).is_file())
+            self.assertGreaterEqual(results[runtime]["guard_seconds"], 0)
+        self.assertIn("| alpha on x86_64-unknown-linux-gnu | pass |", (self.rows.directory / "summary.md").read_text())
+
+    def test_a_failing_row_is_named_and_the_next_row_still_runs(self):
+        self.consumer(f'if [ "$row" = alpha ]; then exit 3; fi\n{PASSING_CONSUMER}')
+        result = self.rows.run()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        results = self.rows.results()
+        self.assertEqual(results["alpha"]["status"], "fail")
+        self.assertIn("the consumer run failed for alpha on x86_64-unknown-linux-gnu", results["alpha"]["message"])
+        self.assertEqual(results["beta"]["status"], "pass")
+        self.assertFalse(self.rows.attestation("alpha").exists())
+        self.assertTrue(self.rows.attestation("beta").is_file())
+        self.assertIn("::error title=Row alpha on x86_64-unknown-linux-gnu::the consumer run failed", result.stdout)
+        self.assertTrue((self.rows.out_dir / "junit-alpha-x86_64-unknown-linux-gnu.xml").is_file())
+
+    def test_a_process_left_behind_fails_its_row_without_printing_its_environment(self):
+        # The survivor leaves the row's process group and session, and carries
+        # a secret-looking value in its environment and its command line.
+        self.consumer(
+            'if [ "$row" = alpha ]; then\n'
+            '    PROBE_TOKEN="ghs_envsecretvalue:$HOME" setsid sh -c \'sleep 300; : ghs_argsecretvalue\' '
+            '</dev/null >/dev/null 2>&1 &\n'
+            "fi\n"
+            f"{PASSING_CONSUMER}"
+        )
+        result = self.rows.run()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        results = self.rows.results()
+        self.assertEqual(results["alpha"]["status"], "fail")
+        self.assertRegex(results["alpha"]["message"], r"left process \d+ \(/\S+\) running, matched by \w+")
+        self.assertEqual(results["beta"]["status"], "pass")
+        self.assertFalse(self.rows.attestation("alpha").exists())
+        printed = "\n".join(
+            [
+                result.stdout,
+                result.stderr,
+                (self.rows.out_dir / "row-results.jsonl").read_text(),
+                (self.rows.directory / "summary.md").read_text(),
+            ]
+        )
+        self.assertNotIn("ghs_envsecretvalue", printed)
+        self.assertNotIn("ghs_argsecretvalue", printed)
+        pid = int(re.search(r"left process (\d+)", results["alpha"]["message"]).group(1))
+        self.assertFalse(Path(f"/proc/{pid}").exists() and "sleep" in Path(f"/proc/{pid}/comm").read_text(), "the survivor is killed")
+
+    def test_a_row_that_changes_what_later_rows_trust_stops_the_job(self):
+        self.consumer(f'printf "tampered" >> {self.rows.consumer_path}\n{PASSING_CONSUMER}')
+        result = self.rows.run()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        results = self.rows.results()
+        self.assertEqual(results["alpha"]["status"], "fail")
+        self.assertIn("changed what later rows trust", results["alpha"]["message"])
+        self.assertIn(str(self.rows.consumer_path), results["alpha"]["message"])
+        self.assertEqual(results["beta"]["status"], "not-run")
+        self.assertIn("the job stopped after the row alpha", results["beta"]["message"])
+        self.assertFalse(self.rows.attestation("alpha").exists())
+        self.assertFalse(self.rows.attestation("beta").exists())
+
+    def test_a_row_that_changes_an_earlier_attestation_stops_the_job(self):
+        attestation = self.rows.attestation("alpha")
+        self.consumer(f'if [ "$row" = beta ]; then printf "forged" > {attestation}; fi\n{PASSING_CONSUMER}')
+        result = self.rows.run()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        results = self.rows.results()
+        self.assertEqual(results["alpha"]["status"], "pass")
+        self.assertEqual(results["beta"]["status"], "fail")
+        self.assertIn(str(attestation), results["beta"]["message"])
+
+    def test_a_user_service_left_behind_fails_its_row(self):
+        self.consumer(
+            f'if [ "$row" = alpha ]; then printf "pohunek-left.service\\n" >> {self.rows.units}; fi\n{PASSING_CONSUMER}'
+        )
+        result = self.rows.run()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        results = self.rows.results()
+        self.assertEqual(results["alpha"]["status"], "fail")
+        self.assertIn("added service entry pohunek-left.service", results["alpha"]["message"])
+        self.assertEqual(results["beta"]["status"], "pass")
+
+    def test_a_row_over_its_limit_is_named_and_its_process_group_killed(self):
+        self.consumer(
+            'if [ "$row" = alpha ]; then\n'
+            '    printf "%s\\n" "$$" > "$LOG/alpha.pid"\n'
+            "    sleep 300 &\n"
+            '    printf "%s\\n" "$!" > "$LOG/alpha.child"\n'
+            "    wait\n"
+            "fi\n"
+            f"{PASSING_CONSUMER}"
+        )
+        started = time.monotonic()
+        result = self.rows.run(limit=3)
+        self.assertLess(time.monotonic() - started, 60)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        results = self.rows.results()
+        self.assertEqual(results["alpha"]["status"], "timeout")
+        self.assertIn("the row exceeded its limit of 3 s", results["alpha"]["message"])
+        self.assertEqual(results["beta"]["status"], "pass")
+        for name in ("pid", "child"):
+            pid = self.rows.recorded("alpha", name)
+            with self.subTest(process=name):
+                self.assertFalse(Path(f"/proc/{pid}").exists() and Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z")
+
+    def test_invalid_rows_and_a_used_output_directory_are_refused(self):
+        self.consumer(PASSING_CONSUMER)
+        for rows in ("alpha", "Alpha:x86_64-unknown-linux-gnu", "alpha:x86_64-unknown-linux-gnu alpha:x86_64-unknown-linux-gnu", ""):
+            with self.subTest(rows=rows):
+                result = run(
+                    "run-rows",
+                    cwd=self.rows.checkout,
+                    env={"ROWS": rows, "ROW_LIMIT_SECONDS": "60"},
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("run-rows:", result.stderr)
+        self.rows.out_dir.mkdir()
+        (self.rows.out_dir / "stale").write_text("")
+        result = self.rows.run()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("OUT_DIR is not empty", result.stderr)
+
+
+def load_run_rows():
+    """run-rows as a module, for the guards that differ between the OSes."""
+    loader = importlib.machinery.SourceFileLoader("run_rows", str(SCRIPTS / "run-rows"))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("run_rows", loader))
+    # Its dataclasses resolve their module through sys.modules.
+    sys.modules["run_rows"] = module
+    loader.exec_module(module)
+    return module
+
+
+@unittest.skipUnless(sys.platform in ("linux", "darwin"), "the row runners are Linux and macOS")
+class RunRowsGuardTests(unittest.TestCase):
+    """The account-wide guards on the OS that runs the tests."""
+
+    def setUp(self):
+        self.module = load_run_rows()
+
+    def test_the_survivor_scan_names_a_process_by_its_variable_and_never_its_value(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment = dict(os.environ, PROBE_TOKEN=f"ghs_scansecretvalue:{root}/x")
+        sleeper = subprocess.Popen(["sleep", "60"], env=environment, start_new_session=True)
+        self.addCleanup(sleeper.wait)
+        self.addCleanup(sleeper.kill)
+        scan = self.module.macos_survivors if sys.platform == "darwin" else self.module.linux_survivors
+        found = [survivor for survivor in scan([str(root), os.path.realpath(root)]) if survivor.pid == sleeper.pid]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].key, "PROBE_TOKEN")
+        self.assertIn("sleep", found[0].executable)
+        self.assertNotIn("ghs_scansecretvalue", repr(found))
+        self.assertEqual([survivor for survivor in scan(["/nonexistent-scope"]) if survivor.pid == sleeper.pid], [])
+
+    def test_the_service_and_keychain_listings_are_readable_where_the_runner_has_them(self):
+        services = self.module.services()
+        keychain = self.module.keychain_items()
+        if sys.platform == "darwin":
+            self.assertIsInstance(services, set)
+            self.assertTrue(services)
+            self.assertTrue(keychain is None or all("\n" not in item for item in keychain))
+        else:
+            self.assertIsNone(keychain)
+        self.assertEqual(self.module.services() is None, services is None)
+
+    def test_the_tool_manifest_is_stable_while_nothing_changes(self):
+        manifest = self.module.Manifest([SCRIPTS / "run-row"]) if (ROOT / ".git").exists() else None
+        if manifest is None:
+            self.skipTest("the checkout state needs a git checkout")
+        self.assertEqual(manifest.changes(), [])
+
 
 
 class NodeVersionTests(unittest.TestCase):

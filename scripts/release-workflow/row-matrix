@@ -1,15 +1,29 @@
 #!/bin/sh
-# Print the GitHub Actions matrix of the compatibility rows.
+# Print the GitHub Actions matrix of the compatibility row jobs: one entry per
+# runner, which runs its rows in sequence (scripts/release-workflow/run-rows).
 #
 # usage: row-matrix <compat/matrix.json> [target]...
 #
-# Output: one line `{"include":[{"runtime","target","runner","daemon_artifact"}...]}` with one
-# entry per row of the matrix file, optionally restricted to the listed
-# targets. Runtime ids and targets are validated as plain words, because the
-# workflow puts them into artifact names. A target without a known runner
-# fails; so does an empty selection.
+# Output: one line `{"include":[{"runner","os","daemon_pattern","rows",
+# "row_limit_seconds","timeout_minutes"}...]}` with one entry per runner.
+# `rows` lists the runner's rows as `<runtime>:<target>` words, optionally
+# restricted to the listed targets. Every runner keeps its entry even with no
+# rows, because the job also builds the consumer executable that the archive
+# smoke of its OS runs. Runtime ids and targets are validated as plain words,
+# because the workflow puts them into artifact names and annotations. A target
+# without a known runner fails; so does an empty selection.
+#
+# Time limits. One row may take ROW_LIMIT_MINUTES: the slowest row observed on
+# main (2026-10, 289 row runs) took 158 s, a provisioned upstream on macos-15,
+# and slow macOS runners (#1192) can take several times that. The job's
+# timeout adds SETUP_MINUTES for the toolchain, the consumer and xtask builds
+# and the downloads to the sum of its row limits, so a hung row is reported by
+# run-rows and the verdict instead of a job-level cancel.
 
 set -eu
+
+ROW_LIMIT_MINUTES=15
+SETUP_MINUTES=40
 
 fail() {
     printf 'row-matrix: %s\n' "$*" >&2
@@ -23,20 +37,27 @@ targets=$*
 
 [ -f "$matrix" ] || fail "not a file: $matrix"
 
-jq -ec --arg targets "$targets" '
+jq -ec --arg targets "$targets" --argjson limit "$ROW_LIMIT_MINUTES" --argjson setup "$SETUP_MINUTES" '
     def word: type == "string" and test("^[a-z0-9][a-z0-9_-]*$");
     def runner:
         if test("^x86_64-unknown-linux-(gnu|musl)$") then "ubuntu-latest"
         elif test("^aarch64-apple-darwin$") then "macos-15"
         else error("no runner for target " + .) end;
-    def daemon_artifact:
-        if test("^aarch64-apple-darwin$") then "macos-signed-daemon"
-        else "build-daemon-" + . end;
+    def os_of: if . == "macos-15" then "macos" else "linux" end;
+    def daemon_pattern: if . == "macos-15" then "macos-signed-daemon" else "build-daemon-*" end;
     ($targets | split(" ") | map(select(length > 0))) as $wanted
     | [.rows[]
-        | select(($wanted | length) == 0 or ((.target) as $t | $wanted | index($t)))
-        | if (.runtime | word) and (.target | word) then
-            {runtime, target, runner: (.target | runner), daemon_artifact: (.target | daemon_artifact)}
-          else error("invalid row") end]
-    | if length == 0 then error("no rows selected") else {include: .} end
+        | if (.runtime | word) and (.target | word) then . else error("invalid row") end
+        | {runtime, target, runner: (.target | runner)}
+        | select(($wanted | length) == 0 or ((.target) as $t | $wanted | index($t)))]
+    | if length == 0 then error("no rows selected") else . end
+    | . as $rows
+    | {include: [("ubuntu-latest", "macos-15") as $runner
+        | [$rows[] | select(.runner == $runner) | "\(.runtime):\(.target)"] as $words
+        | {runner: $runner,
+           os: ($runner | os_of),
+           daemon_pattern: ($runner | daemon_pattern),
+           rows: ($words | join(" ")),
+           row_limit_seconds: ($limit * 60),
+           timeout_minutes: ($setup + $limit * ($words | length))}]}
 ' "$matrix" || fail "cannot derive the row matrix from $matrix"

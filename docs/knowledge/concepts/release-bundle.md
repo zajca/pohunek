@@ -158,16 +158,20 @@ Producers upload workflow artifacts only: `build-<component>-<target>`,
 The package job also uploads `package-evidence`, the builder evidence of every
 archive (`cargo xtask package build --evidence-dir`); no release job downloads
 it, so it is never a release input or asset.
-The evidence workflow plans the rows from `compat/matrix.json` with `jq`; every
-row extracts the binaries from the daemon ARCHIVE of its target, stages the pinned
-upstream (with npm, or for a lock whose `upstream.kind` is `provisioner`, such
-as Hermes, with the repository script it names, for which the `rows` and
-`smoke` jobs install Python and uv) and runs the consumer suite, then
-`compat attest` writes
-`attestation-<runtime>-<target>.json`. The row also writes the wall clock and
-outcome of the consumer run as a one-testcase JUnit report
-(`matrix-junit-<runtime>-<target>` artifact, uploaded also when the run fails);
-it is timing evidence only, never a release input. `attest` attests every producer artifact;
+The evidence workflow plans the rows from `compat/matrix.json` with `jq` and
+groups them by runner: one `rows` job per runner builds the consumer suite
+once and runs its rows in sequence (`scripts/release-workflow/run-rows`), each
+in a fresh, owner-only root, with the guards described in that script between
+rows. Every row extracts the binaries from the daemon ARCHIVE of its target,
+stages the pinned upstream (with npm, or for a lock whose `upstream.kind` is
+`provisioner`, such as Hermes, with the repository script it names, for which
+the `rows` and `smoke` jobs install Python and uv) and runs the consumer suite,
+then `compat attest` writes `attestation-<runtime>-<target>.json`; the job
+uploads the attestations of its passing rows as one artifact,
+`attestation-<os>`. The row also writes the wall clock and outcome of the
+consumer run as a one-testcase JUnit report (in the `matrix-junit-<os>`
+artifact, uploaded also when a row fails); it is timing evidence only, never a
+release input. `attest` attests every producer artifact;
 `assemble` verifies every input with `gh attestation verify` (signer workflow
 `release-evidence.yml`, signer and source digest equal to the release commit,
 source ref equal to the tag, GitHub-hosted runners only), collects the flat input
@@ -177,7 +181,8 @@ bundle, `smoke` runs `packaging/smoke-archive` on every Linux daemon archive
 with the isolation strategy a probe step proved available, and on the Apple
 Silicon archive under `sandbox-exec` on macos-15, and `verdict` fails
 unless exactly the jobs of the mode succeeded (a skipped job counts as success
-to a caller). The bundle is the artifact `release-bundle`.
+to a caller). It also names every planned row that did not pass, from the
+`row-results-<os>` artifacts, including a row without a result. The bundle is the artifact `release-bundle`.
 
 `publish` is the only job with `contents: write`. It needs every producer and
 the evidence call, downloads only `release-bundle`, and uses `gh` and coreutils

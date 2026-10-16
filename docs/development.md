@@ -162,8 +162,9 @@ writes `target/nextest/heavy/junit.xml`. The runtime package jobs run their
 minutes) and upload `target/nextest/package/junit.xml` as
 `package-junit-<runtime>`, also when the tests fail. Each release evidence row
 writes the wall clock and outcome of its consumer run as a one-testcase JUnit
-report, uploaded as `matrix-junit-<runtime>-<target>`. `scripts/ci-timings junit`
-reads all of them.
+report, `junit-<runtime>-<target>.xml`; the row job of each runner uploads its
+rows' reports as `matrix-junit-<os>`. `scripts/ci-timings junit` reads all of
+them.
 
 The official runtime package jobs (`pi-package`, `codex-package`,
 `claude-package`, `hermes-package`) take their pull-request selection from
@@ -507,21 +508,33 @@ assembles and publishes the release in one fixed flow:
    evidence goes to the separate `package-evidence` artifact) and the SDK
    tarballs; the macOS jobs build, ad-hoc sign and verify the Apple Silicon
    archives. No macOS job uses secrets or a protected environment.
-2. **Evidence** (`release-evidence.yml`, reusable): one job per
-   (runtime x target) row of `compat/matrix.json` extracts the binaries from the
-   daemon ARCHIVE, stages the pinned upstream (npm, or a provisioner script,
-   for which the job installs Python and uv), runs the out-of-process consumer
-   suite and emits `attestation-<runtime>-<target>.json`, plus
+2. **Evidence** (`release-evidence.yml`, reusable): one job per runner
+   (`Rows on ubuntu-latest`, `Rows on macos-15`) builds the release consumer
+   executable once, uploads it for the smoke, then runs the runner's
+   (runtime x target) rows of `compat/matrix.json` in sequence through
+   `scripts/release-workflow/run-rows`. Each row extracts the binaries from the
+   daemon ARCHIVE, stages the pinned upstream (npm, or a provisioner script, for
+   which the job installs Python and uv), runs the out-of-process consumer suite
+   and emits `attestation-<runtime>-<target>.json`, plus
    `junit-<runtime>-<target>.xml` with the timed consumer run (written also when
-   the consumer fails, uploaded as `matrix-junit-<runtime>-<target>`, never a
-   release input); the download-only
+   the consumer fails, never a release input). The job uploads them as
+   `attestation-<os>` (only rows that passed) and `matrix-junit-<os>`, and one
+   result line per row as `row-results-<os>`. Every row gets a fresh,
+   owner-only root for its `HOME`, XDG directories, `TMPDIR` and staged upstream,
+   and after each row `run-rows` fails the row for a process, root, user
+   service, launchd job or keychain item it left behind, and stops the job when
+   anything a later row trusts changed (xtask, the consumer, the scripts, the
+   archives, earlier attestations, the Node, uv and Python installs, the
+   checkout). A failing row never stops the next one; a row over its limit
+   (`row-matrix`, 15 minutes) has its process group killed. The download-only
    `attest` job creates build provenance for every producer artifact;
    `assemble` (environment `release`) verifies that provenance with `gh
    attestation verify`, then `cargo xtask release assemble` signs the catalog
    with the CI root key and writes the bundle; `attest-bundle` attests the
    bundle; `smoke` runs `packaging/smoke-archive` on every Linux daemon archive
    in a network namespace and on the Apple Silicon archive under `sandbox-exec`
-   on macos-15; `verdict` requires all of them.
+   on macos-15; `verdict` requires all of them and names every planned row that
+   did not pass, or for which no result arrived.
 3. **Publish**: the single job with `contents: write`. It checks out nothing and
    runs no repository or downloaded code. It downloads the `release-bundle`
    artifact, checks it against `release-inventory.sha256` (the only list of
