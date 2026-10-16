@@ -183,8 +183,9 @@ Release packaging and contributor verification:
   gate over the baseline verdicts; fails a changed package whose version is
   not above the released versions, and reports `undecided` for an absent
   catalog.
-- `crates/knowledge/src/log.rs` — knowledge-log fragments under
-  `docs/knowledge/log.d/`: the fragment rules, the entry order, the assembled
+- `crates/knowledge/src/log.rs` — knowledge-log fragments, the files of the
+  log.d directory next to `docs/knowledge/log.md`, which the release fold
+  removes with its last fragment: the fragment rules, the entry order, the assembled
   log the embedded bundle (`crates/knowledge/build.rs`) and `docs build` ship,
   and the release fold.
 - `crates/xtask/src/knowledge_log.rs` — `cargo xtask docs log fold|migrate` and
