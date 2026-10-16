@@ -874,10 +874,34 @@ fn write_release(release: &Path, kind: &Kind, package: &Package, version: &str, 
 
 #[tokio::test]
 async fn the_release_step_repins_the_profile_and_the_preflight_judges_the_adoption_it_enables() {
+    assert_release_step("newer-release-step", CLAUDE.newer(), true).await;
+}
+
+/// The release package does not adopt the session (another native reference
+/// check). The step still repins the profile, and the preflight judges the
+/// session resumable from its frozen digest before the package is installed,
+/// as resume then resumes it.
+#[tokio::test]
+async fn the_release_step_repins_the_profile_of_a_session_its_package_does_not_adopt() {
+    let changed = CLAUDE.package(CLAUDE.new_version, CLAUDE.new_below, |text| {
+        deeper_reference_search(&text)
+    });
+    assert_release_step("newer-release-step-frozen", changed, false).await;
+}
+
+/// The release step plans the release package `new` of Claude for a stopped
+/// session launched from the older version, and its profile is repinned. When
+/// `adopts`, the preflight names the adoption and the resume runs through
+/// `new`; otherwise the preflight and the resume keep the frozen digest.
+async fn assert_release_step(tag: &str, new: Package, adopts: bool) {
     let old = CLAUDE.older();
-    let new = CLAUDE.newer();
-    let session = stopped_on("newer-release-step", &CLAUDE, &old, CLAUDE.old_version).await;
-    CLAUDE.write_agent(&session.agent, CLAUDE.only_new);
+    let session = stopped_on(tag, &CLAUDE, &old, CLAUDE.old_version).await;
+    let agent = if adopts {
+        CLAUDE.only_new
+    } else {
+        CLAUDE.in_both
+    };
+    CLAUDE.write_agent(&session.agent, agent);
     let release = session.fixture.dir.join("release").join("runtime");
     write_release(&release, &CLAUDE, &new, CLAUDE.new_version, 6);
     let trust =
@@ -940,7 +964,14 @@ async fn the_release_step_repins_the_profile_and_the_preflight_judges_the_adopti
         });
     assert_eq!(
         (verdict.verdict, verdict.code.as_str()),
-        (Verdict::Adoptable, CODE_ADOPTABLE_BY_NEWER_PACKAGE),
+        (
+            Verdict::Adoptable,
+            if adopts {
+                CODE_ADOPTABLE_BY_NEWER_PACKAGE
+            } else {
+                CODE_ADOPTABLE
+            }
+        ),
         "{}",
         verdict.detail
     );
@@ -971,8 +1002,9 @@ async fn the_release_step_repins_the_profile_and_the_preflight_judges_the_adopti
         .registry
         .resume_with(&session.id, ProfileChange::Refuse)
         .await
-        .expect("the session resumes through the release package after the step");
-    assert_eq!(pinned_digest(&session.store_path, &session.id), new.digest);
+        .expect("the session resumes after the step");
+    let relaunched = if adopts { &new.digest } else { &old.digest };
+    assert_eq!(&pinned_digest(&session.store_path, &session.id), relaunched);
     restarted
         .registry
         .remove(&session.id)

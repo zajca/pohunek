@@ -570,19 +570,42 @@ impl RuntimeHost {
         };
         let official =
             |record: &package::registry::PackageRecord| record.source() == RecordSource::Official;
-        let (Some(launched), Some(pinned)) = (state.package(frozen_digest), state.package(digest))
+        let Some(launched) = state
+            .package(frozen_digest)
+            .filter(|record| official(record))
         else {
             return false;
         };
-        official(launched)
-            && official(pinned)
-            && launched.identity() == frozen_package
-            && pinned.identity().id == frozen_package.id
+        // A digest the planned release step installs is an official release
+        // package the plan verified; an installed one must be recorded official.
+        let pinned = match self.planned_identity(digest) {
+            Some(planned) => planned,
+            None => match state.package(digest).filter(|record| official(record)) {
+                Some(record) => record.identity().clone(),
+                None => return false,
+            },
+        };
+        launched.identity() == frozen_package
+            && pinned.id == frozen_package.id
             && *package == frozen_package.id
-            && super::launch::version_order(
-                &launched.identity().version,
-                &pinned.identity().version,
-            ) == Some(std::cmp::Ordering::Less)
+            && super::launch::version_order(&launched.identity().version, &pinned.version)
+                == Some(std::cmp::Ordering::Less)
+    }
+
+    /// The package identity of the planned definition of exactly `digest`, when
+    /// the planned overlay holds it.
+    fn planned_identity(&self, digest: &PackageDigest) -> Option<PackageIdentity> {
+        self.packages
+            .as_ref()?
+            .planned
+            .iter()
+            .find_map(|definition| match &definition.binding().provenance {
+                BindingProvenance::Package {
+                    package,
+                    package_digest,
+                } if package_digest == digest => Some(package.clone()),
+                _ => None,
+            })
     }
 
     /// The planned definition of exactly `digest` under `identity` for
