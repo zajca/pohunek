@@ -512,6 +512,86 @@ fn a_root_dependency_entry_change_selects_its_inheritors_without_a_resolve_diffe
     );
 }
 
+/// Writes vendored registry crate `name` at `version` with `manifest_rest`
+/// after its `[package]` table.
+fn vendor(repo: &Repo, name: &str, version: &str, manifest_rest: &str) {
+    let dir = format!("vendor/{name}-{version}");
+    repo.write(
+        &format!("{dir}/Cargo.toml"),
+        &format!(
+            "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n\n{manifest_rest}"
+        ),
+    );
+    repo.write(&format!("{dir}/src/lib.rs"), "pub fn f() {}\n");
+    repo.write(
+        &format!("{dir}/.cargo-checksum.json"),
+        &format!("{{\"files\":{{}},\"package\":\"{VENDORED_CHECKSUM}\"}}"),
+    );
+}
+
+#[test]
+fn a_feature_change_of_one_build_hidden_by_the_merged_resolve_selects_its_consumers() {
+    let repo = Repo::new();
+    // `bar` 1.0.1 enables feature `f` of `foo`. pohunek-test-support builds
+    // `foo` with `f` for the target, so the resolve, which merges host and
+    // target features, lists `foo` with `f` before and after. Only the host
+    // build of `foo`, a build-dependency of pohunek-netbird, gains `f` when the
+    // lockfile moves `bar` (a build-dependency of pohunek-relay-client) to 1.0.1.
+    repo.git(&["checkout", "--quiet", "main"]);
+    vendor(&repo, "foo", "1.0.0", "[features]\nf = []\n");
+    vendor(&repo, "bar", "1.0.0", "[dependencies]\nfoo = \"1\"\n");
+    vendor(
+        &repo,
+        "bar",
+        "1.0.1",
+        "[dependencies]\nfoo = { version = \"1\", features = [\"f\"] }\n",
+    );
+    for (dir, build_dependency) in [("crates/relay-client", "bar"), ("crates/netbird", "foo")] {
+        let manifest = repo.read(&format!("{dir}/Cargo.toml"));
+        repo.write(
+            &format!("{dir}/Cargo.toml"),
+            &format!("{manifest}\n[build-dependencies]\n{build_dependency} = \"1\"\n"),
+        );
+        repo.write(&format!("{dir}/build.rs"), "fn main() {}\n");
+    }
+    let manifest = repo.read("crates/test-support/Cargo.toml");
+    repo.write(
+        "crates/test-support/Cargo.toml",
+        &manifest.replacen(
+            "[dependencies]\n",
+            "[dependencies]\nfoo = { version = \"1\", features = [\"f\"] }\n",
+            1,
+        ),
+    );
+    repo.cargo(&["generate-lockfile", "--offline"]);
+    let lock = repo.read("Cargo.lock");
+    let (old, new) = (
+        "name = \"bar\"\nversion = \"1.0.0\"",
+        "name = \"bar\"\nversion = \"1.0.1\"",
+    );
+    assert!(lock.contains(new), "{lock}");
+    repo.write("Cargo.lock", &lock.replace(new, old));
+    repo.commit("bar 1.0.0 and the foo builds");
+    repo.git(&["checkout", "--quiet", "topic"]);
+    repo.git(&["reset", "--quiet", "--hard", "main"]);
+    repo.write("Cargo.lock", &lock);
+    repo.commit("upgrade bar");
+
+    let selection = repo.select();
+    assert_eq!(selection["mode"], "packages", "{selection:#}");
+    let mut expected = whole(&["pohunek-netbird", "pohunek-relay", "pohunek-relay-client"]);
+    expected.push(("xtask".to_owned(), "binary(=dependency_policy)".to_owned()));
+    expected.sort();
+    assert_eq!(packages(&selection), expected, "{selection:#}");
+    let netbird = reasons(&selection, "pohunek-netbird").join("; ");
+    assert!(
+        netbird.contains(
+            "dependency diff: the build resolves other units: +foo v1.0.0 f, -foo v1.0.0"
+        ),
+        "{netbird}"
+    );
+}
+
 #[test]
 fn a_root_manifest_change_outside_workspace_dependencies_selects_everything() {
     let repo = Repo::new();

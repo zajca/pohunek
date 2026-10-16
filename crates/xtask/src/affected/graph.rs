@@ -14,15 +14,18 @@
 //! workspace-unified resolve the CI test archive is built with
 //! (`cargo nextest archive --workspace --all-features`). A resolved node is
 //! changed when it exists on one side only, or when its features or its
-//! dependency edges differ. A node-level comparison of that resolve is a
-//! superset of what a feature-graph analysis would select, which is the safe
-//! direction. A root manifest change outside `[workspace.dependencies]`
-//! (profiles, patches, lints, workspace package fields, members) cannot be
-//! judged by the resolve and selects every test.
+//! dependency edges differ, for any platform. The resolve merges the features
+//! of a package's host and target builds, so the diff also compares the units
+//! of `cargo tree`, which lists those builds apart for the host platform the
+//! CI tests run on: a member whose build reaches other units is selected. A
+//! root manifest change outside `[workspace.dependencies]` (profiles, patches,
+//! lints, workspace package fields, members) cannot be judged by the resolve
+//! and selects every test.
 
 // Rust guideline compliant 2026-10-16
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -447,6 +450,218 @@ fn selected_members(
     selected
 }
 
+/// The workspace-unified resolve of every platform, with the features the CI
+/// test archive builds with.
+const METADATA_ARGS: &[&str] = &[
+    "metadata",
+    "--format-version",
+    "1",
+    "--all-features",
+    "--locked",
+];
+
+/// `cargo tree` listing of the workspace that [`member_units`] reads: the
+/// features the CI test archive builds with, the host platform, and every
+/// edge kind under its `[build-dependencies]` or `[dev-dependencies]` header.
+const TREE_ARGS: &[&str] = &[
+    "tree",
+    "--workspace",
+    "--all-features",
+    "-e",
+    "normal,build,dev",
+    "--format",
+    "{p} {f}",
+    "--charset",
+    "ascii",
+    "--locked",
+];
+
+/// The dependencies of each unit of a [`TREE_ARGS`] listing, as
+/// `(dev edge, unit)`, and the root unit of each member, by member name.
+struct UnitTree {
+    children: BTreeMap<String, BTreeSet<(bool, String)>>,
+    members: BTreeMap<String, String>,
+}
+
+/// The units the build and the tests of each member reach, by member name,
+/// read from the [`TREE_ARGS`] listing `text` of the workspace at `root`.
+///
+/// A unit's library reaches the units of its normal and build dependencies,
+/// transitively; a member also reaches the libraries of its own
+/// dev-dependencies.
+fn member_units(text: &str, root: &Path) -> Result<BTreeMap<String, BTreeSet<String>>, XtaskError> {
+    let UnitTree { children, members } = parse_tree(text, root)?;
+    let library = |unit: &str, reached: &mut BTreeSet<String>| {
+        let mut stack = vec![unit.to_owned()];
+        while let Some(next) = stack.pop() {
+            if reached.insert(next.clone()) {
+                stack.extend(
+                    children[&next]
+                        .iter()
+                        .filter(|(dev, _)| !dev)
+                        .map(|(_, child)| child.clone()),
+                );
+            }
+        }
+    };
+    Ok(members
+        .into_iter()
+        .map(|(name, unit)| {
+            let mut reached = BTreeSet::new();
+            library(&unit, &mut reached);
+            for (dev, child) in &children[&unit] {
+                if *dev {
+                    library(child, &mut reached);
+                }
+            }
+            (name, reached)
+        })
+        .collect())
+}
+
+/// Parses a [`TREE_ARGS`] listing of the workspace at `root`.
+///
+/// A unit is a package with the features one build compiles it with: one
+/// listing line without its tree prefix, with paths below `root` made
+/// relative. The listing expands a unit once and marks its later occurrences
+/// `(*)`, which take the expanded dependencies. Any line of another shape is
+/// an error.
+fn parse_tree(text: &str, root: &Path) -> Result<UnitTree, XtaskError> {
+    let invalid = |number: usize, line: &str| {
+        XtaskError::Usage(format!(
+            "affected: cargo tree line {} has an unknown shape: {line:?}",
+            number + 1
+        ))
+    };
+    let root_dir = format!("({}/", root.display());
+    let root_itself = format!("({})", root.display());
+    // Dependencies of each expanded unit, as (dev edge, unit).
+    let mut children: BTreeMap<String, BTreeSet<(bool, String)>> = BTreeMap::new();
+    let mut members: BTreeMap<String, String> = BTreeMap::new();
+    // The unit at each depth of the current path, whether its following
+    // dependencies are dev-dependencies, and whether the listing expands it
+    // (a `(*)` unit lists no dependencies).
+    let mut path: Vec<(String, bool, bool)> = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        if line.is_empty() {
+            path.clear();
+            continue;
+        }
+        let mut depth = 0;
+        let mut rest = line;
+        while let Some(next) = rest
+            .strip_prefix("|   ")
+            .or_else(|| rest.strip_prefix("    "))
+        {
+            depth += 1;
+            rest = next;
+        }
+        if let Some(header) = rest.strip_prefix('[') {
+            let dev = match header {
+                "build-dependencies]" => false,
+                "dev-dependencies]" => true,
+                _ => return Err(invalid(number, line)),
+            };
+            if depth + 1 > path.len() || !path[depth].2 {
+                return Err(invalid(number, line));
+            }
+            path.truncate(depth + 1);
+            path[depth].1 = dev;
+            continue;
+        }
+        if let Some(entry) = rest
+            .strip_prefix("|-- ")
+            .or_else(|| rest.strip_prefix("`-- "))
+        {
+            depth += 1;
+            rest = entry;
+        } else if depth > 0 {
+            return Err(invalid(number, line));
+        }
+        if rest.is_empty()
+            || rest.starts_with(' ')
+            || depth > path.len()
+            || (depth == 0 && !path.is_empty())
+        {
+            return Err(invalid(number, line));
+        }
+        let rest = rest.trim_end();
+        let (unit, reference) = match rest.strip_suffix(" (*)") {
+            Some(unit) => (unit.trim_end(), true),
+            None => (rest, false),
+        };
+        let unit = unit.replace(&root_dir, "(").replace(&root_itself, "(.)");
+        if reference && !children.contains_key(&unit) {
+            return Err(invalid(number, line));
+        }
+        path.truncate(depth);
+        if let Some((parent, dev, expanded)) = path.last() {
+            if !expanded {
+                return Err(invalid(number, line));
+            }
+            children
+                .entry(parent.clone())
+                .or_default()
+                .insert((*dev, unit.clone()));
+        } else {
+            let name = unit.split(' ').next().unwrap_or_default().to_owned();
+            members.insert(name, unit.clone());
+        }
+        children.entry(unit.clone()).or_default();
+        path.push((unit, false, !reference));
+    }
+    Ok(UnitTree { children, members })
+}
+
+/// The [`member_units`] of the workspace at `dir`.
+fn tree_units(dir: &Path) -> Result<BTreeMap<String, BTreeSet<String>>, XtaskError> {
+    let text = command_output(dir, "cargo", TREE_ARGS)?;
+    let text = String::from_utf8(text).map_err(|error| {
+        XtaskError::Usage(format!(
+            "affected: cargo tree printed non-UTF-8 output: {error}"
+        ))
+    })?;
+    member_units(&text, dir)
+}
+
+/// Members whose build or tests reach other units in `head` than in `base`,
+/// each with the reason naming a few of the differing units.
+fn unit_changes(
+    base: &BTreeMap<String, BTreeSet<String>>,
+    head: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeMap<String, BTreeSet<Reason>> {
+    let mut selected: BTreeMap<String, BTreeSet<Reason>> = BTreeMap::new();
+    for (name, after) in head {
+        let Some(before) = base.get(name) else {
+            continue;
+        };
+        if before == after {
+            continue;
+        }
+        let mut parts: Vec<String> = after
+            .difference(before)
+            .map(|unit| format!("+{unit}"))
+            .collect();
+        parts.extend(before.difference(after).map(|unit| format!("-{unit}")));
+        let shown = parts.len().min(UNIT_CHANGES_SHOWN);
+        let more = parts.len() - shown;
+        let mut text = parts[..shown].join(", ");
+        if more > 0 {
+            let _ = write!(text, " and {more} more");
+        }
+        selected
+            .entry(name.clone())
+            .or_default()
+            .insert(Reason::Changed(format!(
+                "dependency diff: the build resolves other units: {text}"
+            )));
+    }
+    selected
+}
+
+/// Differing units named in one unit-diff reason.
+const UNIT_CHANGES_SHOWN: usize = 3;
+
 /// Table of the root manifest that the resolve fully reflects.
 const RESOLVED_ROOT_TABLE: (&str, &str) = ("workspace", "dependencies");
 
@@ -491,35 +706,14 @@ pub(crate) fn manifest_diff(root: &Path, base: &str) -> Result<ManifestDiff, Xta
         }
     }
 
-    let resolve = |dir: &Path| {
-        command_output(
-            dir,
-            "cargo",
-            &[
-                "metadata",
-                "--format-version",
-                "1",
-                "--all-features",
-                "--locked",
-            ],
-        )
-        .and_then(|json| parse_graph(&json))
-    };
-    let base_graph = resolve(base_root)?;
-    let head_json = command_output(
-        root,
-        "cargo",
-        &[
-            "metadata",
-            "--format-version",
-            "1",
-            "--all-features",
-            "--locked",
-        ],
-    )?;
+    let base_graph = parse_graph(&command_output(base_root, "cargo", METADATA_ARGS)?)?;
+    let head_json = command_output(root, "cargo", METADATA_ARGS)?;
     let head_graph = parse_graph(&head_json)?;
     let changed = changed_nodes(&base_graph, &head_graph);
     let mut resolved = selected_members(&head_graph, &changed);
+    for (name, reasons) in unit_changes(&tree_units(base_root)?, &tree_units(root)?) {
+        resolved.entry(name).or_default().extend(reasons);
+    }
 
     // The resolve merges the features of host and target builds, so a root
     // entry change can alter a build with no difference in it. Every member

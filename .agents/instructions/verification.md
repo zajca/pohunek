@@ -440,7 +440,9 @@ are closed over their reverse dependencies (a dev-dependency counts for one
 hop) and it runs `cargo t -E 'package(=a) | ...'`, so dependents run too and
 the fast profile's default filter still applies. A change to `Cargo.lock` or a
 manifest goes through a `cargo metadata --all-features` diff of the merge base
-and the working tree, which selects the members that resolve a changed crate.
+and the working tree, which selects the members that resolve a changed crate,
+and a diff of the `cargo tree` units each member builds, which also catches a
+feature change of only the host or only the target build of a package.
 It fails safe: a root `Cargo.toml` change outside `[workspace.dependencies]`,
 a failed dependency diff, `.cargo/`, `.config/nextest.toml`, `rust-toolchain*`,
 lint/format configs, and any path no rule covers run everything.
