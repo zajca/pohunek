@@ -1516,12 +1516,12 @@ fn render_plan(plan: &HostPlan) -> String {
                 .join(", ")
         );
     }
-    let _ = writeln!(out, "profiles:");
     for package in &preview.packages {
         if let Some(warning) = replaces_newer_warning(package) {
             let _ = writeln!(out, "  {warning}");
         }
     }
+    let _ = writeln!(out, "profiles:");
     for profile in &preview.profiles {
         let _ = writeln!(
             out,

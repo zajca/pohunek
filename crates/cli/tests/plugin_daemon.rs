@@ -40,6 +40,11 @@ const RUNTIME: &str = "pi";
 /// through a signed catalog.
 const OFFICIAL_CODEX_ID: &str = "pohunek.runtime.codex";
 
+/// Package id of the fixture archive that serves the official `pi` runtime.
+/// The daemon refuses an explicit digest for `codex`, `claude` and `hermes`
+/// unless a catalog authorizes it, so the digest path uses `pi`.
+const OFFICIAL_PI_ID: &str = "pohunek.runtime.pi";
+
 /// Programs the fixture runtime launches; it only has to exist.
 const PROGRAM: &str = "/bin/sh";
 
@@ -1070,6 +1075,227 @@ async fn update_refuses_an_older_official_version_and_rollback_is_explicit() {
         .await;
     assert_eq!(code, 0, "{rolled_back}");
     assert_eq!(harness.registry().selected(&id), Some(&old.digest));
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn update_by_digest_refuses_an_older_official_archive() {
+    let key = test_key();
+    let anchor = HostTrustAnchor::new(vec![root_of(&key, WINDOW_START, WINDOW_END)], Vec::new())
+        .expect("the test trust anchor");
+    let harness = Harness::start_with_trust(CatalogTrust::Loaded(anchor)).await;
+    let old = harness.archive_of(OFFICIAL_PI_ID, "pi", "1.0.0");
+    let new = harness.archive_of(OFFICIAL_PI_ID, "pi", "1.0.1");
+    let first = official_catalog(&harness, &key, 1, OFFICIAL_PI_ID, "pi", &[("1.0.0", &old)]);
+    let (code, installed) = harness
+        .json(&[
+            "plugin",
+            "install",
+            path_str(&old.path),
+            "--catalog",
+            path_str(&first),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{installed}");
+
+    let second = official_catalog(
+        &harness,
+        &key,
+        2,
+        OFFICIAL_PI_ID,
+        "pi",
+        &[("1.0.0", &old), ("1.0.1", &new)],
+    );
+    let (code, updated) = harness
+        .json(&[
+            "plugin",
+            "update",
+            OFFICIAL_PI_ID,
+            path_str(&new.path),
+            "--catalog",
+            path_str(&second),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{updated}");
+    let id: PackageId = OFFICIAL_PI_ID.parse().expect("package id");
+    assert_eq!(harness.registry().selected(&id), Some(&new.digest));
+
+    // An explicit digest carries no catalog origin, but the archive is the
+    // recorded official 1.0.0, so the same downgrade must be refused.
+    let (code, refused) = harness
+        .json(&[
+            "plugin",
+            "update",
+            OFFICIAL_PI_ID,
+            path_str(&old.path),
+            "--sha256",
+            old.digest.as_str(),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(
+        refused["err"]["code"], "plugin_update_downgrade",
+        "{refused}"
+    );
+    let state = harness.registry();
+    assert_eq!(state.packages().len(), 2, "no record is added or removed");
+    assert_eq!(
+        state.selected(&id),
+        Some(&new.digest),
+        "1.0.1 stays selected"
+    );
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn update_refuses_an_official_version_that_is_not_semver() {
+    let key = test_key();
+    let anchor = HostTrustAnchor::new(vec![root_of(&key, WINDOW_START, WINDOW_END)], Vec::new())
+        .expect("the test trust anchor");
+    let harness = Harness::start_with_trust(CatalogTrust::Loaded(anchor)).await;
+    // `1.0` is a valid package version on the wire but not a semantic one, so
+    // the order against `1.0.1` cannot be proven.
+    let unordered = harness.archive_of(OFFICIAL_CODEX_ID, "codex", "1.0");
+    let new = harness.archive_of(OFFICIAL_CODEX_ID, "codex", "1.0.1");
+    let first = official_catalog(
+        &harness,
+        &key,
+        1,
+        OFFICIAL_CODEX_ID,
+        "codex",
+        &[("1.0", &unordered)],
+    );
+    let (code, installed) = harness
+        .json(&[
+            "plugin",
+            "install",
+            path_str(&unordered.path),
+            "--catalog",
+            path_str(&first),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{installed}");
+
+    let second = official_catalog(
+        &harness,
+        &key,
+        2,
+        OFFICIAL_CODEX_ID,
+        "codex",
+        &[("1.0", &unordered), ("1.0.1", &new)],
+    );
+    let (code, refused) = harness
+        .json(&[
+            "plugin",
+            "update",
+            OFFICIAL_CODEX_ID,
+            path_str(&new.path),
+            "--catalog",
+            path_str(&second),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(
+        refused["err"]["code"], "plugin_update_version_unordered",
+        "{refused}"
+    );
+    let message = refused["err"]["msg"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("1.0") && message.contains("1.0.1"),
+        "{refused}"
+    );
+    let recover = refused["err"]["recover"].as_str().unwrap_or_default();
+    assert!(
+        recover.contains("pohunek plugin install") && recover.contains("pohunek plugin select"),
+        "{refused}"
+    );
+    let id: PackageId = OFFICIAL_CODEX_ID.parse().expect("package id");
+    let state = harness.registry();
+    assert_eq!(state.packages().len(), 1, "no record is added");
+    assert_eq!(
+        state.selected(&id),
+        Some(&unordered.digest),
+        "1.0 stays selected"
+    );
+
+    // Re-selecting the version already selected changes nothing, so its
+    // order is not needed.
+    let (code, unchanged) = harness
+        .json(&[
+            "plugin",
+            "update",
+            OFFICIAL_CODEX_ID,
+            path_str(&unordered.path),
+            "--catalog",
+            path_str(&second),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{unchanged}");
+    assert_eq!(harness.registry().selected(&id), Some(&unordered.digest));
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn update_compares_official_versions_by_precedence_ignoring_build_metadata() {
+    let key = test_key();
+    let anchor = HostTrustAnchor::new(vec![root_of(&key, WINDOW_START, WINDOW_END)], Vec::new())
+        .expect("the test trust anchor");
+    let harness = Harness::start_with_trust(CatalogTrust::Loaded(anchor)).await;
+    let built_b = harness.archive_of(OFFICIAL_CODEX_ID, "codex", "1.0.2+b");
+    let built_a = harness.archive_of(OFFICIAL_CODEX_ID, "codex", "1.0.2+a");
+    let first = official_catalog(
+        &harness,
+        &key,
+        1,
+        OFFICIAL_CODEX_ID,
+        "codex",
+        &[("1.0.2+b", &built_b)],
+    );
+    let (code, installed) = harness
+        .json(&[
+            "plugin",
+            "install",
+            path_str(&built_b.path),
+            "--catalog",
+            path_str(&first),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{installed}");
+
+    // Build metadata does not order versions: the same precedence is an
+    // equal update, which proceeds.
+    let second = official_catalog(
+        &harness,
+        &key,
+        2,
+        OFFICIAL_CODEX_ID,
+        "codex",
+        &[("1.0.2+b", &built_b), ("1.0.2+a", &built_a)],
+    );
+    let (code, updated) = harness
+        .json(&[
+            "plugin",
+            "update",
+            OFFICIAL_CODEX_ID,
+            path_str(&built_a.path),
+            "--catalog",
+            path_str(&second),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{updated}");
+    let id: PackageId = OFFICIAL_CODEX_ID.parse().expect("package id");
+    assert_eq!(harness.registry().selected(&id), Some(&built_a.digest));
 
     harness.stop().await;
 }
