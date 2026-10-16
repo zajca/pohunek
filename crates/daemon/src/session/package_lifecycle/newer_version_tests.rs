@@ -889,6 +889,53 @@ async fn the_release_step_repins_the_profile_of_a_session_its_package_does_not_a
     assert_release_step("newer-release-step-frozen", changed, false).await;
 }
 
+/// The upgrade preflight of `session`'s host with the release step of
+/// `release`, judged over the host profiles and revision key the daemon uses.
+fn release_preflight(
+    session: &Stopped,
+    release: &Path,
+    trust: &crate::catalog_anchor::CatalogTrust,
+) -> pohunek_service_config::preflight::PreflightReport {
+    crate::session::upgrade_preflight::run_with(
+        &crate::session::upgrade_preflight::PreflightInputs {
+            store_path: session.store_path.clone(),
+            worker_state_root: session.fixture.dir.join("no-workers"),
+            plugins_dir: session.fixture.plugins.clone(),
+        },
+        &crate::session::upgrade_preflight::PreflightOptions {
+            probe_budget: pohunek_service_config::preflight::PROBE_BUDGET,
+            entry: std::time::Instant::now(),
+            release: Some(crate::session::upgrade_preflight::ReleaseInputs {
+                release_dir: release.to_path_buf(),
+                catalog_trust: trust.clone(),
+            }),
+            profiles_dir: Some(session.fixture.agents.clone()),
+            host_state_dir: Some(session.fixture.dir.join("state")),
+            launch: Ok(test_launch_environment()),
+        },
+        &HostInspector::new(),
+    )
+}
+
+/// Applies the release step of `release` to `session`'s host.
+fn apply_release_step(
+    session: &Stopped,
+    release: PathBuf,
+    trust: crate::catalog_anchor::CatalogTrust,
+) -> pohunek_service_config::runtimes::EnsureReport {
+    crate::session::ensure_official_runtimes(&crate::session::EnsureInputs {
+        store_path: session.store_path.clone(),
+        plugins_dir: session.fixture.plugins.clone(),
+        profiles_dir: session.fixture.agents.clone(),
+        release_dir: release,
+        catalog_trust: trust,
+        dry_run: false,
+        daemon_version: crate::DAEMON_VERSION.to_owned(),
+        environment: Ok(test_launch_environment()),
+    })
+    .expect("the release step applies")
+}
+
 /// The release step plans the release package `new` of Claude for a stopped
 /// session launched from the older version, and its profile is repinned. When
 /// `adopts`, the preflight names the adoption and the resume runs through
@@ -910,25 +957,7 @@ async fn assert_release_step(tag: &str, new: Package, adopts: bool) {
     // The preflight judges the stopped session over the profile text the step
     // writes, which pins the release package; the file on disk still pins the
     // launched version.
-    let report = crate::session::upgrade_preflight::run_with(
-        &crate::session::upgrade_preflight::PreflightInputs {
-            store_path: session.store_path.clone(),
-            worker_state_root: session.fixture.dir.join("no-workers"),
-            plugins_dir: session.fixture.plugins.clone(),
-        },
-        &crate::session::upgrade_preflight::PreflightOptions {
-            probe_budget: pohunek_service_config::preflight::PROBE_BUDGET,
-            entry: std::time::Instant::now(),
-            release: Some(crate::session::upgrade_preflight::ReleaseInputs {
-                release_dir: release.clone(),
-                catalog_trust: trust.clone(),
-            }),
-            profiles_dir: Some(session.fixture.agents.clone()),
-            host_state_dir: Some(session.fixture.dir.join("state")),
-            launch: Ok(test_launch_environment()),
-        },
-        &HostInspector::new(),
-    );
+    let report = release_preflight(&session, &release, &trust);
     let plan = report.runtimes.as_ref().expect("the release plan");
     assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
     let planned: Vec<_> = plan
@@ -976,17 +1005,7 @@ async fn assert_release_step(tag: &str, new: Package, adopts: bool) {
         verdict.detail
     );
 
-    let applied = crate::session::ensure_official_runtimes(&crate::session::EnsureInputs {
-        store_path: session.store_path.clone(),
-        plugins_dir: session.fixture.plugins.clone(),
-        profiles_dir: session.fixture.agents.clone(),
-        release_dir: release,
-        catalog_trust: trust,
-        dry_run: false,
-        daemon_version: crate::DAEMON_VERSION.to_owned(),
-        environment: Ok(test_launch_environment()),
-    })
-    .expect("the release step applies");
+    let applied = apply_release_step(&session, release, trust);
     assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
     assert_eq!(
         applied
