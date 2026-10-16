@@ -12,9 +12,12 @@
 //! packages beside them. A head whose package is a different digest of a newer
 //! version repins the profiles to the head digest (`repin`, applied `repinned`,
 //! naming the previous digest and version). The same digest keeps the pins, and
-//! the same version with another digest is refused by the registry. From
-//! `RUNTIME_RANGE_RELEASE` on, the newer-version outcome is required, not
-//! tolerated.
+//! the same version with another digest is refused by the registry. A head at
+//! `RUNTIME_RANGE_RELEASE` or later must show the newer-version outcome for a
+//! package that widens the previous one: the previous release predates
+//! `RUNTIME_RANGE_RELEASE`, or the head ships another digest whose range accepts
+//! the previous range's `below` bound. A head that ships the previous release's
+//! own digest must keep the pins and adopt nothing onto a newer package.
 //!
 //! Either way the test installs managed Claude hooks, starts a stopped and a
 //! live session of the Claude profiles, each launched by a fake `claude` that
@@ -129,10 +132,11 @@ const CLAUDE_RUNTIME_ID: &str = "claude";
 const RELEASE_RUNTIME_DIR: &str = "runtime";
 
 /// The first release whose official runtime packages widen the version ranges
-/// (`below`) past the previous ones, so an upgrade to it must repin the
-/// profiles and adopt the stopped session onto the head package. A head build
-/// at or above it must show that outcome; a build below it is an older target
-/// tree and is only checked for consistency.
+/// (`below`) past the previous ones, so an upgrade to it from an older release
+/// must repin the profiles and adopt the stopped session onto the head package.
+/// A build below it is an older target tree and is only checked for
+/// consistency. From it on, `widens` decides per package whether the outcome is
+/// required.
 const RUNTIME_RANGE_RELEASE: &str = "0.35.2";
 
 /// Version the head's xtask gives the downgrade package it writes for the
@@ -729,6 +733,36 @@ fn release_order(left: &str, right: &str) -> std::cmp::Ordering {
             .collect()
     };
     parse(left).cmp(&parse(right))
+}
+
+/// The `major.minor.patch` core of `version`. A head of the previous release's
+/// version is stamped with build metadata (`+upgrade.<commit>`), which orders
+/// by its core version.
+fn core_version(version: &str) -> &str {
+    version
+        .split_once('+')
+        .map_or(version, |(core, _metadata)| core)
+}
+
+/// Whether the head's package `release` must replace the previous release's
+/// package `installed`: the head is `RUNTIME_RANGE_RELEASE` or later
+/// (`head_is_release`), ships another digest, and either the previous release
+/// predates `RUNTIME_RANGE_RELEASE` (`previous_predates_ranges`) or the head's
+/// range accepts the previous range's exclusive `below` bound. The same digest
+/// never widens anything, so the upgrade keeps the pins.
+fn widens(
+    head_is_release: bool,
+    previous_predates_ranges: bool,
+    installed: &Installed,
+    release: &ReleasePackage,
+) -> bool {
+    head_is_release
+        && installed.digest != release.digest
+        && (previous_predates_ranges
+            || release
+                .descriptor
+                .probe
+                .accepts(&installed.descriptor.probe.below))
 }
 
 /// Reads the version and version probe of the descriptor `text` of
@@ -1457,10 +1491,12 @@ struct Upgrade {
     previous_version: String,
     head_version: String,
     /// Whether the head's build is the release that widens the official
-    /// runtime ranges (0.35.2 or later). From it on the upgrade must repin, and
-    /// the test expects the strict outcome instead of tolerating a head whose
-    /// packages equal the previous ones.
+    /// runtime ranges (0.35.2 or later). From it on the downgrade guard is
+    /// required, and `widens` decides which packages must repin.
     head_is_release: bool,
+    /// Whether the previous release predates `RUNTIME_RANGE_RELEASE`, so its
+    /// official packages carry the narrower ranges.
+    previous_predates_ranges: bool,
     /// The live session of the Claude profile; the upgrade adopts it.
     id: String,
     /// The stopped session of the Claude profile; it resumes onto its pin.
@@ -1488,15 +1524,14 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Before) {
         previous_version, head_version,
         "an upgrade to the same version is a no-op and proves nothing"
     );
-    // A head of the previous release's version is stamped with build metadata
-    // (`+upgrade.<commit>`), which orders by its core version.
-    let head_core = head_version
-        .split_once('+')
-        .map_or(head_version.as_str(), |(core, _metadata)| core);
-    let head_is_release =
-        release_order(head_core, RUNTIME_RANGE_RELEASE) != std::cmp::Ordering::Less;
+    let head_is_release = release_order(core_version(&head_version), RUNTIME_RANGE_RELEASE)
+        != std::cmp::Ordering::Less;
+    let previous_predates_ranges =
+        release_order(core_version(&previous_version), RUNTIME_RANGE_RELEASE)
+            == std::cmp::Ordering::Less;
     eprintln!(
-        "upgrade {previous_version} -> {head_version} (runtime range release: {head_is_release})"
+        "upgrade {previous_version} -> {head_version} (runtime range release: {head_is_release}, \
+         previous predates it: {previous_predates_ranges})"
     );
     let release = run.head_dir.join(RELEASE_RUNTIME_DIR);
     assert!(
@@ -1556,6 +1591,7 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Before) {
         packages,
         start,
         head_is_release,
+        previous_predates_ranges,
     };
     let before = Before {
         live: sessions.live,
@@ -1658,6 +1694,19 @@ impl Upgrade {
                 codex
             }),
         }
+    }
+
+    /// Whether the head's package of `package_id` must replace the one the
+    /// previous release installed (see `widens`); never for a built-in start.
+    fn must_widen(&self, package_id: &str) -> bool {
+        self.installed(package_id).is_some_and(|installed| {
+            widens(
+                self.head_is_release,
+                self.previous_predates_ranges,
+                installed,
+                self.release(package_id),
+            )
+        })
     }
 
     /// Whether the upgrade repins the profiles of `package_id`: the head's
@@ -1846,12 +1895,14 @@ impl Upgrade {
             "the previous package accepts its own bound {release}: {previous:?}"
         );
         if !head.accepts(release) {
-            // The head package still carries the previous range, so it refuses
-            // the bound as well. Its agent keeps the lowest accepted line.
+            // The head package carries the previous range (or is the previous
+            // package itself), so it refuses the bound as well. Its agent keeps
+            // the lowest accepted line.
             assert!(
-                !self.head_is_release,
-                "the head is runtime range release {RUNTIME_RANGE_RELEASE} or later, but its \
-                 claude package {} does not accept {release}: {head:?}",
+                !self.must_widen(CLAUDE_PACKAGE_ID),
+                "the previous release {} predates runtime range release {RUNTIME_RANGE_RELEASE}, \
+                 but the head's claude package {} does not accept {release}: {head:?}",
+                self.previous_version,
                 self.packages.claude.digest
             );
             eprintln!(
@@ -1867,24 +1918,38 @@ impl Upgrade {
         write_claude_scripts(&self.run, &line);
     }
 
-    /// Checks the package and profile steps of a plan or an apply, and under
-    /// `RUNTIME_RANGE_RELEASE` that the head repins a package it has a newer
-    /// version of.
+    /// Checks that the head repins every package that must widen the
+    /// previous one (see `widens`), and that a package the head ships with the
+    /// previous digest is the no-op: no repin. The plan, the profile steps and
+    /// the stopped session's `adoptable` verdict follow from `repins`, so the
+    /// callers' checks of those assert the rest of the no-op path.
     fn assert_strict_repins(&self, operation: &str) {
-        if !self.head_is_release {
-            return;
-        }
-        if let Start::Package { .. } = self.start {
-            for package_id in [CLAUDE_PACKAGE_ID, CODEX_PACKAGE_ID] {
+        for package_id in [CLAUDE_PACKAGE_ID, CODEX_PACKAGE_ID] {
+            let Some(installed) = self.installed(package_id) else {
+                continue;
+            };
+            let release = self.release(package_id);
+            if self.must_widen(package_id) {
                 assert!(
                     self.repins(package_id),
-                    "{operation}: the head is {} (runtime range release {RUNTIME_RANGE_RELEASE} or later), \
-                     but {package_id} does not repin: the head {} {}, the previous {}",
+                    "{operation}: the head {} must widen {package_id} of the previous {}, but it \
+                     does not repin: the head {} {}, the previous {} {}",
                     self.head_version,
-                    self.release(package_id).digest,
-                    self.release(package_id).descriptor.version,
-                    self.installed(package_id)
-                        .map_or("?", |installed| installed.descriptor.version.as_str()),
+                    self.previous_version,
+                    release.digest,
+                    release.descriptor.version,
+                    installed.digest,
+                    installed.descriptor.version,
+                );
+            } else if installed.digest == release.digest {
+                assert!(
+                    !self.repins(package_id),
+                    "{operation}: {package_id} repins onto its own digest {}",
+                    release.digest
+                );
+                eprintln!(
+                    "{operation}: the head ships the previous {package_id} {}: the pins are kept",
+                    release.digest
                 );
             }
         }
