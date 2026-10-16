@@ -48,6 +48,7 @@ import re
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ElementTree
 
@@ -992,13 +993,22 @@ def write_snapshot(path, documents):
     """Write a run snapshot, accumulating runs for offline re-measurement.
 
     The new content goes to a sibling file that then replaces the snapshot,
-    so an interrupted write never leaves a truncated cache behind.
+    so an interrupted write never leaves a truncated cache behind. Each
+    writer stages under its own unique name: two commands sharing the
+    default cache must not write or rename one another's staging file.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    partial = path.with_name(path.name + ".partial")
-    partial.write_text(json.dumps(documents, indent=1, sort_keys=True) + "\n")
-    os.replace(partial, path)
+    descriptor, partial = tempfile.mkstemp(
+        dir=path.parent, prefix=path.name + ".", suffix=".partial"
+    )
+    try:
+        with os.fdopen(descriptor, "w") as staged:
+            staged.write(json.dumps(documents, indent=1, sort_keys=True) + "\n")
+        os.replace(partial, path)
+    except BaseException:
+        Path(partial).unlink(missing_ok=True)
+        raise
 
 
 def list_arguments(args, window=None):

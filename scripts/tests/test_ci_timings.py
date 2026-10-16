@@ -1314,6 +1314,25 @@ class FetchTests(unittest.TestCase):
         stored = json.loads(self.cache.read_text())
         self.assertEqual(sorted(item["attempt"] for item in stored), [1, 2])
 
+    def test_fetch_never_touches_another_writers_staging_file(self):
+        # Another command sharing the cache is mid-write: its staging file
+        # sits next to the snapshot. This fetch stages under its own name,
+        # so the other file stays as it was and nothing of ours is left.
+        self.seed_cache([])
+        foreign = self.cache.with_name(self.cache.name + ".partial")
+        foreign.write_text("in flight\n")
+        self.set_listing([{"databaseId": 77, "attempt": 1, "conclusion": "success"}])
+        self.set_views({"77:1": self.view_document(77, attempt=1)})
+        payload = self.run_json("runs", "--window", "2026-09-19..2026-09-21")
+        self.assertEqual([run["id"] for run in payload["runs"]], [77])
+        self.assertEqual(foreign.read_text(), "in flight\n")
+        self.assertEqual(
+            sorted(entry.name for entry in self.cache.parent.iterdir()),
+            sorted([self.cache.name, foreign.name]),
+        )
+        stored = json.loads(self.cache.read_text())
+        self.assertEqual([item["databaseId"] for item in stored], [77])
+
     def test_fetch_reuses_a_cached_document_without_refetching(self):
         # A complete cache serves the query with no `gh run view` call at
         # all, so a re-measurement costs no fetch.
