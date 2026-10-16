@@ -144,16 +144,39 @@ enum Effect {
     Everything,
     /// The path is embedded or read by the tests of these packages.
     Packages(&'static [&'static str]),
-    /// The path is read only by the tests of each package that its nextest
-    /// filter names, as `(package, filter)`.
-    Tests(&'static [(&'static str, &'static str)]),
+    /// The path is read only by the named tests of these packages.
+    Tests(&'static [Readers]),
     /// Like [`Effect::Tests`], but only for a path that something else maps:
     /// the rule adds readers and never makes an unmapped path mapped.
-    AlsoTests(&'static [(&'static str, &'static str)]),
+    AlsoTests(&'static [Readers]),
     /// A manifest or lockfile; the dependency diff decides ([`graph`]).
     Dependencies,
     /// The path provably feeds no Rust test.
     NoRustTests,
+}
+
+/// Tests of one package that read a path, and the sources they live in.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Readers {
+    pub(crate) package: &'static str,
+    /// Nextest filter selecting those tests within the package.
+    pub(crate) filter: &'static str,
+    /// Workspace-relative test sources (files, or directories by prefix) that
+    /// the filter selects; [`guard`] accepts the rule only for a read in one
+    /// of them, so a new reader elsewhere in the package needs its own entry.
+    pub(crate) files: &'static [&'static str],
+}
+
+const fn readers(
+    package: &'static str,
+    filter: &'static str,
+    files: &'static [&'static str],
+) -> Readers {
+    Readers {
+        package,
+        filter,
+        files,
+    }
 }
 
 /// Follow-up check that the Rust tests do not cover.
@@ -227,18 +250,31 @@ const RULES: &[Rule] = &[
     rule(
         Pattern::File("Cargo.toml"),
         Effect::Tests(&[
-            ("xtask", "binary(=dependency_policy)"),
-            ("xtask", "kind(lib) and test(/^affected::tests::/)"),
-            (
+            readers(
+                "xtask",
+                "binary(=dependency_policy)",
+                &["crates/xtask/tests/dependency_policy.rs"],
+            ),
+            readers(
+                "xtask",
+                "kind(lib) and test(/^affected::tests::/)",
+                &["crates/xtask/src/affected/mod.rs"],
+            ),
+            readers(
                 "pohunek-test-support",
                 "test(=tests::workspace_root_holds_the_workspace_manifest)",
+                &["crates/test-support/src/lib.rs"],
             ),
         ]),
         "workspace manifest read by xtask's dependency_policy test and the members test of its affected module, and by the workspace root check of pohunek-test-support",
     ),
     rule(
         Pattern::File("Cargo.lock"),
-        Effect::Tests(&[("xtask", "binary(=dependency_policy)")]),
+        Effect::Tests(&[readers(
+            "xtask",
+            "binary(=dependency_policy)",
+            &["crates/xtask/tests/dependency_policy.rs"],
+        )]),
         "lockfile read by xtask's dependency_policy test",
     ),
     rule(Pattern::Dir(".cargo"), Effect::Everything, "Cargo configuration and aliases"),
@@ -317,50 +353,82 @@ const RULES: &[Rule] = &[
     ),
     rule(
         Pattern::Dir("crates"),
-        Effect::AlsoTests(&[(
+        Effect::AlsoTests(&[readers(
             "xtask",
             "binary(=hermetic_scan) | binary(=no_special_dispatch) | \
              binary(=test_artifact_lookup_guard) | binary(=timing_ratchet) | \
              binary(=dependency_policy) | \
              (binary(=affected_ci) and test(=every_repository_read_of_the_test_code_selects_its_reader)) | \
              (kind(lib) and test(/^affected::tests::/))",
+            &[
+                "crates/xtask/tests/hermetic_scan.rs",
+                "crates/xtask/tests/no_special_dispatch.rs",
+                "crates/xtask/tests/test_artifact_lookup_guard.rs",
+                "crates/xtask/tests/timing_ratchet.rs",
+                "crates/xtask/tests/dependency_policy.rs",
+                "crates/xtask/tests/affected_ci.rs",
+                "crates/xtask/src/affected/mod.rs",
+            ],
         )]),
         "every crate's sources and manifests, scanned by xtask's repository guards (hermetic_scan, no_special_dispatch, test_artifact_lookup_guard, timing_ratchet, the affected guard and include scan) and resolved by its dependency_policy test",
     ),
     rule(
         Pattern::Dir("runtime-packages"),
-        Effect::Tests(&[(
+        Effect::Tests(&[readers(
             "xtask",
             "kind(lib) and test(/^(attestation|release_tests|test_runtime|upstream_stage_tests)::/)",
+            &[
+                "crates/xtask/src/attestation.rs",
+                "crates/xtask/src/release_tests.rs",
+                "crates/xtask/src/test_runtime.rs",
+                "crates/xtask/src/upstream_stage_tests.rs",
+            ],
         )]),
         "official package sources listed by xtask's matrix check and upstream staging scenarios and built by its release and test-runtime scenarios",
     ),
     rule(
         Pattern::File("scripts/provision-hermes-compat"),
-        Effect::Tests(&[("xtask", "kind(lib) and test(/^upstream_stage_tests::/)")]),
+        Effect::Tests(&[readers(
+            "xtask",
+            "kind(lib) and test(/^upstream_stage_tests::/)",
+            &["crates/xtask/src/upstream_stage_tests.rs"],
+        )]),
         "Hermes provisioner whose bytes xtask's upstream staging scenarios read and verify",
     ),
     rule(
         Pattern::File(".github/workflows/ci.yml"),
-        Effect::Tests(&[("xtask", "binary(=affected_ci)")]),
+        Effect::Tests(&[readers(
+            "xtask",
+            "binary(=affected_ci)",
+            &["crates/xtask/tests/affected_ci.rs"],
+        )]),
         "CI workflow whose test-job scripts the affected scenarios require to select every test",
     ),
     rule(
         Pattern::File("crates/xtask/src/affected/mod.rs"),
-        Effect::Tests(&[(
+        Effect::Tests(&[readers(
             "pohunek-daemon",
             "test(=git::tests::the_allow_list_contains_no_variable_xtask_treats_as_redirecting)",
+            &["crates/daemon/src/git.rs"],
         )]),
         "xtask's list of repository-redirecting Git variables, which the daemon's git environment test compares with its own",
     ),
     rule(
         Pattern::File("docs/public-api.md"),
-        Effect::Tests(&[("pohunek-protocol", "binary(=task_errors)")]),
+        Effect::Tests(&[readers(
+            "pohunek-protocol",
+            "binary(=task_errors)",
+            &["crates/protocol/tests/task_errors.rs"],
+        )]),
         "public API reference whose shared error codes pohunek-protocol's task_errors test checks",
     ),
     rule(
         Pattern::Dir("crates/daemon/src"),
-        Effect::Tests(&[("pohunek-protocol", "binary(=task_errors)")]),
+        Effect::Tests(&[readers(
+            "pohunek-protocol",
+            "binary(=task_errors)",
+            &["crates/protocol/tests/task_errors.rs"],
+        )]),
         "daemon sources whose raised task error codes pohunek-protocol's task_errors test reads",
     ),
     rule(
@@ -711,7 +779,7 @@ fn plan(changed: &BTreeSet<String>, packages: &[Package], mode: Mode) -> Result<
         let names: Vec<&str> = match rule.effect {
             Effect::Packages(names) => names.to_vec(),
             Effect::Tests(tests) | Effect::AlsoTests(tests) => {
-                tests.iter().map(|(package, _)| *package).collect()
+                tests.iter().map(|entry| entry.package).collect()
             }
             _ => Vec::new(),
         };
@@ -818,14 +886,14 @@ fn classify(path: &str, packages: &[Package], mode: Mode) -> (Decision, BTreeSet
                 tests.extend(
                     readers
                         .iter()
-                        .map(|(package, filter)| ((*package).to_owned(), *filter, rule.why)),
+                        .map(|entry| (entry.package.to_owned(), entry.filter, rule.why)),
                 );
             }
             Effect::AlsoTests(readers) => {
                 also.extend(
                     readers
                         .iter()
-                        .map(|(package, filter)| ((*package).to_owned(), *filter, rule.why)),
+                        .map(|entry| (entry.package.to_owned(), entry.filter, rule.why)),
                 );
             }
             _ => {}

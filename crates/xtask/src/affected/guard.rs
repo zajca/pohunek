@@ -37,7 +37,7 @@ use std::path::{Component, PathBuf};
 
 use super::{
     classify, command_output, ensure_git_toplevel, graph, is_below, owning_package, parse_nul_list,
-    printable, workspace, Decision, Mode, Package, Reason, GIT,
+    printable, workspace, Decision, Effect, Mode, Package, Reason, GIT, RULES,
 };
 use crate::test_code::{
     classify as classify_sources, is_ident, read_sources, skip_whitespace, string_literal_at,
@@ -792,10 +792,12 @@ pub(crate) fn check(
             // A path that names no tracked file (an absence check, or an input
             // that moved) must still select the reader once a file is there.
             let absent = (read.anchored && named.peek().is_none() && !path.contains(WILDCARD))
-                .then(|| uncovered(&path, reader, packages).map(|why| (&path, why)))
+                .then(|| uncovered(&path, reader, &read.file, packages).map(|why| (&path, why)))
                 .flatten();
             let uncovered = absent.or_else(|| {
-                named.find_map(|file| uncovered(file, reader, packages).map(|why| (file, why)))
+                named.find_map(|file| {
+                    uncovered(file, reader, &read.file, packages).map(|why| (file, why))
+                })
             });
             if let Some((file, why)) = uncovered {
                 violations.insert(Violation {
@@ -851,8 +853,12 @@ fn is_own(path: &str, reader: &str, packages: &[Package]) -> bool {
     })
 }
 
-/// The decision of `file` when its change does not select `reader`.
-fn uncovered(file: &str, reader: &str, packages: &[Package]) -> Option<String> {
+/// The decision of `file` when its change does not select the test code of
+/// package `reader` in source `source`.
+///
+/// A narrowed rule covers the read only when it names `source` among the
+/// sources its filter selects; naming the package is not enough.
+fn uncovered(file: &str, reader: &str, source: &str, packages: &[Package]) -> Option<String> {
     if is_own(file, reader, packages) {
         return None;
     }
@@ -870,10 +876,31 @@ fn uncovered(file: &str, reader: &str, packages: &[Package]) -> Option<String> {
                 })
                 .collect();
             let selected = graph::close(&seeds, packages);
-            let covered = selected.contains_key(reader)
-                || tests.iter().any(|(package, ..)| package == reader);
-            (!covered).then(|| decision.describe())
+            let narrowed = tests.iter().any(|(package, ..)| package == reader)
+                && names_source(file, reader, source);
+            let covered = selected.contains_key(reader) || narrowed;
+            (!covered).then(|| {
+                format!(
+                    "{} (no rule selects the tests in {})",
+                    decision.describe(),
+                    printable(source)
+                )
+            })
         }
         Decision::Dependencies(_) | Decision::NoRustTests(_) => Some(decision.describe()),
     }
+}
+
+/// Whether a narrowed rule for `file` names `source` as a test source of `reader`.
+fn names_source(file: &str, reader: &str, source: &str) -> bool {
+    RULES
+        .iter()
+        .filter(|rule| rule.pattern.matches(file))
+        .flat_map(|rule| match rule.effect {
+            Effect::Tests(entries) | Effect::AlsoTests(entries) => entries,
+            _ => &[],
+        })
+        .filter(|entry| entry.package == reader)
+        .flat_map(|entry| entry.files)
+        .any(|named| source == *named || is_below(source, named))
 }

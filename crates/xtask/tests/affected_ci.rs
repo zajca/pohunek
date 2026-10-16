@@ -665,3 +665,32 @@ fn every_script_the_ci_test_jobs_run_selects_everything() {
         assert_full(&repo.select(), &path);
     }
 }
+
+#[test]
+fn a_narrowed_rule_covers_only_the_test_sources_it_names() {
+    let repo = Repo::new();
+    let read = "#[test]\nfn reads() {\n    drop(std::fs::read(\n        \
+                pohunek_test_support::workspace_root().join(\"docs/public-api.md\"),\n    ));\n}\n";
+    // The rule for docs/public-api.md selects pohunek-protocol's task_errors
+    // binary, so a read there is covered.
+    repo.write("crates/protocol/tests/task_errors.rs", read);
+    repo.commit("named reader");
+    let (success, stderr) = guard(&repo);
+    assert!(success, "{stderr}");
+
+    // Another test binary of the same package is not selected by that rule.
+    repo.write("crates/protocol/tests/other.rs", read);
+    repo.commit("unnamed reader");
+    let (success, stderr) = guard(&repo);
+    assert!(!success, "{stderr}");
+    assert!(
+        stderr.contains(
+            "crates/protocol/tests/other.rs:4: pohunek-protocol reads docs/public-api.md"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("no rule selects the tests in crates/protocol/tests/other.rs"),
+        "{stderr}"
+    );
+}
