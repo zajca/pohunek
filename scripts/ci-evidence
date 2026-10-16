@@ -252,8 +252,8 @@ def recorded_trees(repo: str, run_id: int) -> set[str]:
 
 
 def dispatch_runs(repo: str, config: dict[str, Any], tier: str) -> list[dict[str, Any]]:
-    """Completed dispatch runs of `tier` in `repo` within the tree-match window,
-    newest first. Other events never supply evidence by tree."""
+    """Dispatch runs of `tier` in `repo` within the tree-match window, in any
+    state, newest first. Other events never supply evidence by tree."""
     since = datetime.datetime.now(datetime.timezone.utc).date() - datetime.timedelta(
         days=config["tree_match_max_age_days"]
     )
@@ -263,7 +263,6 @@ def dispatch_runs(repo: str, config: dict[str, Any], tier: str) -> list[dict[str
             repo, config["workflow_file"], event="workflow_dispatch", created_since=since
         )
         if run.get("event") == "workflow_dispatch"
-        and run.get("status") == "completed"
         and run_tier(run, config["workflow_path"]) == tier
         and isinstance(run.get("id"), int)
         and (run.get("repository") or {}).get("full_name") == repo
@@ -495,7 +494,7 @@ def tree_evidence(
 ) -> tuple[dict[str, Any] | None, str | None]:
     """The evidence of the newest dispatch run that tested tree(S), or why
     there is none. Only that run decides, pass or fail, as the newest run on S
-    does on the exact-commit path. A run whose tree cannot be looked up is
+    does on the exact-commit path; while it is still running there is none. A run whose tree cannot be looked up is
     skipped, but when it is newer than the newest match it might be a newer run
     of the same tree, so the match is refused. Every refusal leaves the
     decision to the exact-commit path."""
@@ -520,6 +519,8 @@ def tree_evidence(
                 f"tree match {url} may not be the newest run of tree {tree}: "
                 f"tree lookup failed for newer {'; '.join(unresolved)}"
             )
+        if run.get("status") != "completed":
+            return None, f"the newest run of tree {tree}, {url}, is still {run.get('status')}"
         try:
             recorded = recorded_trees(args.repo, run["id"])
             failures = run_failures(args.repo, run, config, args.tier) if recorded == {tree} else []

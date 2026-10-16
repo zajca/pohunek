@@ -672,6 +672,20 @@ class CiEvidenceCliTests(unittest.TestCase):
             for call in self.calls_json() for arg in call
         ))
 
+    def test_a_newer_run_of_the_tree_that_is_still_running_blocks_an_older_one(self):
+        for attempt in (1, 2):
+            with self.subTest(attempt=attempt):
+                newer = dispatch_doc(sha=THIRD_SHA, run_id=790, status="in_progress", conclusion=None)
+                newer["run_attempt"] = attempt
+                self.tree_fixture(
+                    trees={SHA: TREE, OTHER_SHA: TREE, THIRD_SHA: TREE},
+                    tree_runs=[dispatch_doc(), newer],
+                )
+                result = self.invoke("main")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"the newest run of tree {TREE}", result.stderr)
+                self.assertIn("/actions/runs/790, is still in_progress", result.stderr)
+
     def test_a_failed_lookup_of_an_older_run_does_not_block_the_newest_match(self):
         older = dispatch_doc(sha=THIRD_SHA, run_id=700)
         self.tree_fixture(tree_runs=[older, dispatch_doc()], unknown_commits=[THIRD_SHA])

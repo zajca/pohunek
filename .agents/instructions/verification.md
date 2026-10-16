@@ -187,7 +187,8 @@ tree (#1215): every `ci.yml` run uploads a `tested-tree-<tree>` record from its
 `required jobs (paths filter)` job, and `scripts/ci-evidence` accepts a dispatch
 run whose head commit has the candidate's tree, whose record names that tree,
 and whose required jobs and steps passed, within `tree_match_max_age_days`; the
-newest dispatch run of that tree decides, pass or fail. The candidate's tree comes from the local checkout when it holds the commit (an
+newest dispatch run of that tree decides, pass or fail, and while it is still
+running nothing matches by tree. The candidate's tree comes from the local checkout when it holds the commit (an
 unpushed `--no-push` candidate), otherwise from the git commits API. Once any
 run or run attempt of the tier on the commit itself has completed, the runs on
 the commit decide, so a tree match never hides a failure there; pull-request, push, and
