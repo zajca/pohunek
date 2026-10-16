@@ -21,19 +21,26 @@
 //! the files below it. Each of them must select the reader when it changes: it
 //! lies in the reader's directory, or its classification ([`RULES`] through
 //! the closure) selects the reader, or it selects every test. A rule that
-//! names tests of the reader covers the read only when it lists the read's
-//! source and its filter provably selects the test that makes the read: the
-//! guard locates each read in its test binary, module and test function. A use that resolves to the repository root itself (a whole-repository
+//! names tests of the reader covers the read only when its filter provably
+//! selects the test that makes the read: the guard places each source file
+//! in the module trees of the package's targets (`#[path]` included, see
+//! [`crate::test_code`]) and locates each read in its crate, module and test
+//! function. A read in a helper outside a test function is covered only by a
+//! filter that selects its whole crate or binary. A use that resolves to the repository root itself (a whole-repository
 //! scan, or the root passed on) is not a path the guard can judge: its file
 //! must be listed in [`SCANS`], whose declared scopes are checked in its place.
 //!
 //! Test code also runs workspace binaries by path. The guard finds each lookup
 //! of one: `bin_exe(..)` or `.with_file_name(..)` with a literal or string
 //! constant that names a workspace binary, `worker_binary()`, and a
-//! `var_os(..)`/`var(..)` read of a variable in [`BINARY_VARIABLES`]. A change
-//! to the binary's package must select the test: through a Cargo edge (the
-//! test's package depends on the binary's), or through an entry in
-//! [`BINARY_USES`] that names the test's source.
+//! `var_os(..)`/`var(..)` read of a variable in [`BINARY_VARIABLES`]; a
+//! constant may come from any file of the package. A change to the binary's
+//! package must select the test: through a Cargo edge (the test's package
+//! depends on the binary's), or through an entry in [`BINARY_USES`] whose
+//! filter selects it. A `bin_exe`, `var_os` or `var` call whose argument is
+//! neither a literal nor such a constant may run any binary, so it fails
+//! unless its function is in [`LOOKUP_FUNCTIONS`] with the binaries it may
+//! look up.
 //!
 //! Limits: a path built at run time (`format!`, a field, a value read from a
 //! file) is not found. The runtime guards of the CI test jobs cover those.
@@ -53,7 +60,7 @@ use super::{
 };
 use crate::test_code::{
     classify as classify_sources, is_ident, read_sources, skip_whitespace, string_literal_at,
-    SourceFile,
+    CrateRoot, SourceFile,
 };
 use crate::XtaskError;
 
@@ -71,6 +78,69 @@ const WILDCARD: &str = "*";
 
 /// Calls whose string argument names a binary beside the test's own.
 const BINARY_LOOKUPS: [&str; 2] = ["bin_exe(", ".with_file_name("];
+
+/// A test function whose binary lookups take an argument the guard cannot
+/// resolve. Each declared binary counts as a run of that binary there.
+pub(crate) struct LookupFunction {
+    pub(crate) file: &'static str,
+    pub(crate) function: &'static str,
+    /// The binaries the function may look up.
+    pub(crate) binaries: &'static [&'static str],
+    pub(crate) why: &'static str,
+}
+
+/// The reviewed [`LookupFunction`]s; a stale entry, whose function no longer
+/// has such a lookup, is a violation.
+pub(crate) const LOOKUP_FUNCTIONS: &[LookupFunction] = &[
+    LookupFunction {
+        file: "crates/cli/tests/release_consumer.rs",
+        function: "the_release_binaries_serve_the_runtime_out_of_process",
+        binaries: &["pohunek", "pohunekd", "pohunek-sessiond"],
+        why: "reads the POHUNEK_CONSUMER_* inputs, whose bin directory holds the release binaries",
+    },
+    LookupFunction {
+        file: "crates/cli/tests/release_upgrade.rs",
+        function: "from_env",
+        binaries: &["pohunek", "pohunekd", "pohunek-sessiond"],
+        why: "reads the user-manager variables and the bin directories of the previous and head releases",
+    },
+    LookupFunction {
+        file: "crates/cli/tests/release_upgrade.rs",
+        function: "run",
+        binaries: &[],
+        why: "passes the CHILD_ENV variables (PATH, HOME and the user-manager ones) to the CLI it runs",
+    },
+    LookupFunction {
+        file: "crates/cli/tests/support/native.rs",
+        function: "binary",
+        binaries: &["pohunekd", "pohunek-sessiond"],
+        why: "callers pass POHUNEK_DAEMON_BIN or POHUNEK_WORKER_BIN with the binary beside the CLI",
+    },
+    LookupFunction {
+        file: "crates/cli/tests/support/setup_release.rs",
+        function: "stage_binaries",
+        binaries: &["pohunekd", "pohunek-sessiond"],
+        why: "stages pohunekd and pohunek-sessiond from POHUNEK_DAEMON_BIN and POHUNEK_WORKER_BIN",
+    },
+    LookupFunction {
+        file: "crates/daemon/tests/systemd_durable_worker.rs",
+        function: "required_binary",
+        binaries: &["pohunekd", "pohunek-sessiond"],
+        why: "callers pass POHUNEK_DAEMON_BIN or POHUNEK_WORKER_BIN",
+    },
+    LookupFunction {
+        file: "crates/test-support/src/process_env.rs",
+        function: "var",
+        binaries: &[],
+        why: "reads the probe variables of the process-environment tests",
+    },
+    LookupFunction {
+        file: "crates/xtask/tests/dependency_policy.rs",
+        function: "host_cargo",
+        binaries: &[],
+        why: "passes CARGO_HOME and RUSTUP_HOME on to the fixture's cargo",
+    },
+];
 
 /// Test-support function that returns the session worker, and its binary.
 const WORKER_LOOKUP: (&str, &str) = ("worker_binary", "pohunek-sessiond");
@@ -225,16 +295,20 @@ pub(crate) struct Read {
     pub(crate) location: Location,
 }
 
-/// Where a use sits among the tests nextest runs.
+/// Where a use sits among the tests nextest runs: one site per place of its
+/// file in a crate's module tree; none when no target root reaches the file.
 #[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct Location {
-    /// Integration test binary whose root file or module directory holds it.
-    pub(crate) binary: Option<String>,
-    /// Module path in the package library (or the integration binary) of the
-    /// position, inline modules included; `None` when the file's place in a
-    /// test binary is unknown, such as a `tests/support` module.
-    pub(crate) scope: Option<String>,
-    /// Full nextest name of the test function holding it, if any.
+    pub(crate) sites: Vec<Site>,
+}
+
+/// One place of a use in a test crate.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct Site {
+    pub(crate) root: CrateRoot,
+    /// Module path of the position in the crate, inline modules included.
+    pub(crate) scope: String,
+    /// Full nextest name of the test function holding the use, if any.
     pub(crate) test: Option<String>,
 }
 
@@ -278,7 +352,8 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
     let sources = read_sources(&root)?;
     let classified = classify_sources(&sources);
     let reads = find_reads(&classified, &packages);
-    let runs = find_binary_runs(&classified, &packages);
+    let BinaryLookups { runs, undecided } =
+        find_binary_runs(&classified, &packages, LOOKUP_FUNCTIONS);
     if options.list {
         for (reader, read) in &reads {
             println!(
@@ -298,7 +373,8 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
         }
     }
     let violations = check(&reads, &packages, &tracked, SCANS, NOT_READS);
-    let binary_violations = check_binary_runs(&runs, &packages, &tracked, BINARY_USES);
+    let mut binary_violations = check_binary_runs(&runs, &packages, &tracked, BINARY_USES);
+    binary_violations.extend(check_undecided(&undecided, &tracked, LOOKUP_FUNCTIONS));
     for problem in &binary_violations {
         eprintln!("{problem}");
     }
@@ -329,12 +405,31 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
     )))
 }
 
+/// A binary lookup whose argument the guard cannot resolve.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct UndecidedLookup {
+    pub(crate) file: String,
+    pub(crate) line: usize,
+    /// The call, such as `var_os(`.
+    pub(crate) call: &'static str,
+    /// The function that holds the call, if any.
+    pub(crate) function: Option<String>,
+}
+
+/// The binary lookups of the test code, each with the package that makes it.
+pub(crate) struct BinaryLookups {
+    pub(crate) runs: Vec<(String, BinaryRun)>,
+    pub(crate) undecided: Vec<(String, UndecidedLookup)>,
+}
+
 /// Every lookup of a workspace binary in the test code of `files`, with its
-/// package.
+/// package, and every lookup the guard cannot resolve. A lookup in a function
+/// of `lookup_functions` counts as a run of each binary its entry declares.
 pub(crate) fn find_binary_runs(
     files: &BTreeMap<String, SourceFile>,
     packages: &[Package],
-) -> Vec<(String, BinaryRun)> {
+    lookup_functions: &[LookupFunction],
+) -> BinaryLookups {
     let mut by_package: BTreeMap<&Package, Vec<&SourceFile>> = BTreeMap::new();
     for file in files.values() {
         if let Some(owner) = owning_package(file.path(), packages) {
@@ -342,59 +437,154 @@ pub(crate) fn find_binary_runs(
         }
     }
     let mut runs = BTreeSet::new();
+    let mut undecided = BTreeSet::new();
     for (package, package_files) in &by_package {
+        let shared = package_constants(package_files);
         for file in package_files {
-            for (offset, binary) in binary_lookups(file) {
-                if binary_owner(&binary, packages).is_some() {
-                    runs.insert((
-                        package.name.clone(),
-                        BinaryRun {
-                            file: file.path().to_owned(),
-                            line: file.line_of(offset),
-                            binary,
-                            location: locate(file, &package.dir, package_files, offset),
-                        },
-                    ));
+            let mut constants = shared.clone();
+            constants.extend(string_constants(file));
+            let mut run = |offset: usize, binary: String| {
+                runs.insert((
+                    package.name.clone(),
+                    BinaryRun {
+                        file: file.path().to_owned(),
+                        line: file.line_of(offset),
+                        binary,
+                        location: locate(file, offset),
+                    },
+                ));
+            };
+            for (offset, lookup) in binary_lookups(file, &constants) {
+                match lookup {
+                    Lookup::Binary(binary) => {
+                        if binary_owner(&binary, packages).is_some() {
+                            run(offset, binary);
+                        }
+                    }
+                    Lookup::Undecided(call) => {
+                        let function = enclosing_function(file, offset);
+                        let declared = lookup_functions.iter().find(|entry| {
+                            entry.file == file.path() && Some(entry.function) == function.as_deref()
+                        });
+                        if let Some(entry) = declared {
+                            for binary in entry.binaries {
+                                run(offset, (*binary).to_owned());
+                            }
+                        }
+                        undecided.insert((
+                            package.name.clone(),
+                            UndecidedLookup {
+                                file: file.path().to_owned(),
+                                line: file.line_of(offset),
+                                call,
+                                function,
+                            },
+                        ));
+                    }
                 }
             }
         }
     }
-    runs.into_iter().collect()
+    BinaryLookups {
+        runs: runs.into_iter().collect(),
+        undecided: undecided.into_iter().collect(),
+    }
 }
 
-/// The binary lookups in the test code of `file`, as `(offset, binary)`; the
-/// names are not yet checked against the workspace.
-fn binary_lookups(file: &SourceFile) -> Vec<(usize, String)> {
+/// The string constants that the files of one package define with one value;
+/// a name defined with different values resolves nowhere.
+fn package_constants(files: &[&SourceFile]) -> BTreeMap<String, String> {
+    let mut values: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for file in files {
+        for (name, value) in string_constants(file) {
+            values.entry(name).or_default().insert(value);
+        }
+    }
+    values
+        .into_iter()
+        .filter(|(_, values)| values.len() == 1)
+        .filter_map(|(name, values)| values.into_iter().next().map(|value| (name, value)))
+        .collect()
+}
+
+/// A lookup found in test code.
+enum Lookup {
+    /// A lookup of the named binary.
+    Binary(String),
+    /// A `bin_exe` or variable read whose argument is neither a literal nor a
+    /// constant the package defines.
+    Undecided(&'static str),
+}
+
+/// What a call's single argument is.
+enum Argument {
+    Value(String),
+    Other,
+}
+
+/// The binary lookups in the test code of `file`; the names are not yet
+/// checked against the workspace. `constants` resolve identifier arguments.
+fn binary_lookups(file: &SourceFile, constants: &BTreeMap<String, String>) -> Vec<(usize, Lookup)> {
     let views = file.views();
     let skeleton = views.skeleton.as_bytes();
-    let constants = string_constants(file);
     let call_at = |offset: usize, call: &str| {
         file.in_test_code(offset)
             && !(offset > 0 && !call.starts_with('.') && is_ident(skeleton[offset - 1]))
             && !views.skeleton[..offset].trim_end().ends_with("fn")
     };
-    // The argument of the call whose `(` ends at `open`: a literal or a constant.
-    let argument = |open: usize| -> Option<String> {
+    // The single argument of the call whose `(` ends at `open`: a literal or a
+    // (path-qualified) constant, before an optional trailing comma.
+    let argument = |open: usize| -> Argument {
         let at = skip_whitespace(views.code.as_bytes(), open);
-        let (value, end) = if views.code.as_bytes().get(at) == Some(&b'"') && skeleton[at] == b' ' {
-            (
-                string_literal_at(&views.code, at)?.to_owned(),
-                literal_end(&views.skeleton, at),
-            )
+        let resolved = if views.code.as_bytes().get(at) == Some(&b'"') && skeleton[at] == b' ' {
+            string_literal_at(&views.code, at)
+                .map(|literal| (literal.to_owned(), literal_end(&views.skeleton, at)))
         } else {
-            let end = ident_end(skeleton, at);
-            (constants.get(&views.skeleton[at..end])?.clone(), end)
+            let mut end = at;
+            let mut last = at;
+            loop {
+                let ident = ident_end(skeleton, end);
+                if ident == end {
+                    break;
+                }
+                last = end;
+                end = ident;
+                if !views.skeleton[end..].starts_with("::") {
+                    break;
+                }
+                end += 2;
+            }
+            constants
+                .get(&views.skeleton[last..end])
+                .map(|value| (value.clone(), end))
         };
-        (skeleton.get(skip_whitespace(skeleton, end)) == Some(&b')')).then_some(value)
+        let Some((value, end)) = resolved else {
+            return Argument::Other;
+        };
+        let mut next = skip_whitespace(skeleton, end);
+        if skeleton.get(next) == Some(&b',') {
+            next = skip_whitespace(skeleton, next + 1);
+        }
+        if skeleton.get(next) == Some(&b')') {
+            Argument::Value(value)
+        } else {
+            Argument::Other
+        }
     };
 
     let mut found = Vec::new();
     for call in BINARY_LOOKUPS {
         for (offset, _) in views.skeleton.match_indices(call) {
-            if call_at(offset, call) {
-                if let Some(binary) = argument(offset + call.len()) {
-                    found.push((offset, binary));
+            if !call_at(offset, call) {
+                continue;
+            }
+            match argument(offset + call.len()) {
+                Argument::Value(binary) => found.push((offset, Lookup::Binary(binary))),
+                // A path method takes any file name; only `bin_exe` names a binary.
+                Argument::Other if call == "bin_exe(" => {
+                    found.push((offset, Lookup::Undecided(call)));
                 }
+                Argument::Other => {}
             }
         }
     }
@@ -403,14 +593,15 @@ fn binary_lookups(file: &SourceFile) -> Vec<(usize, String)> {
             if !call_at(offset, call) {
                 continue;
             }
-            let binary = argument(offset + call.len()).and_then(|variable| {
-                BINARY_VARIABLES
-                    .iter()
-                    .find(|(name, _)| *name == variable)
-                    .map(|(_, binary)| (*binary).to_owned())
-            });
-            if let Some(binary) = binary {
-                found.push((offset, binary));
+            match argument(offset + call.len()) {
+                Argument::Value(variable) => {
+                    if let Some((_, binary)) =
+                        BINARY_VARIABLES.iter().find(|(name, _)| *name == variable)
+                    {
+                        found.push((offset, Lookup::Binary((*binary).to_owned())));
+                    }
+                }
+                Argument::Other => found.push((offset, Lookup::Undecided(call))),
             }
         }
     }
@@ -424,10 +615,98 @@ fn binary_lookups(file: &SourceFile) -> Vec<(usize, String)> {
             && !(offset > 0 && is_ident(skeleton[offset - 1]))
             && !is_ident(*skeleton.get(open).unwrap_or(&b' '))
         {
-            found.push((offset, binary.to_owned()));
+            found.push((offset, Lookup::Binary(binary.to_owned())));
         }
     }
     found
+}
+
+/// Name of the innermost function whose body holds `offset`.
+fn enclosing_function(file: &SourceFile, offset: usize) -> Option<String> {
+    let skeleton = &file.views().skeleton;
+    let bytes = skeleton.as_bytes();
+    let mut best: Option<(usize, String)> = None;
+    for (at, _) in skeleton.match_indices("fn") {
+        if at >= offset {
+            break;
+        }
+        if (at > 0 && is_ident(bytes[at - 1]))
+            || !bytes.get(at + 2).is_some_and(u8::is_ascii_whitespace)
+        {
+            continue;
+        }
+        let start = skip_whitespace(bytes, at + 2);
+        let end = ident_end(bytes, start);
+        if end == start {
+            continue;
+        }
+        let mut depth = 0_usize;
+        let mut open = None;
+        for (index, byte) in bytes.iter().enumerate().skip(end) {
+            match byte {
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth = depth.saturating_sub(1),
+                b'{' if depth == 0 => {
+                    open = Some(index);
+                    break;
+                }
+                b';' if depth == 0 => break,
+                _ => {}
+            }
+        }
+        let Some(open) = open else {
+            continue;
+        };
+        if open < offset && offset < block_end(skeleton, open + 1) {
+            best = Some((open, skeleton[start..end].to_owned()));
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
+/// The undecided lookups outside the functions of `lookup_functions`, and the
+/// stale entries of it, as printable lines.
+pub(crate) fn check_undecided(
+    undecided: &[(String, UndecidedLookup)],
+    tracked: &BTreeSet<String>,
+    lookup_functions: &[LookupFunction],
+) -> Vec<String> {
+    let mut problems = BTreeSet::new();
+    let mut matched = BTreeSet::new();
+    for (reader, lookup) in undecided {
+        let entry = lookup_functions.iter().position(|entry| {
+            entry.file == lookup.file && Some(entry.function) == lookup.function.as_deref()
+        });
+        match entry {
+            Some(index) => {
+                matched.insert(index);
+            }
+            None => {
+                problems.insert(format!(
+                    "{}:{}: {reader} calls `{}..)` with an argument that is neither a literal \
+                     nor a constant of the package, so the binary it may run is unknown; \
+                     declare {} in LOOKUP_FUNCTIONS (crates/xtask/src/affected/guard.rs)",
+                    printable(&lookup.file),
+                    lookup.line,
+                    lookup.call,
+                    lookup
+                        .function
+                        .as_deref()
+                        .map_or_else(|| "its function".to_owned(), |name| format!("`{name}`")),
+                ));
+            }
+        }
+    }
+    for (index, entry) in lookup_functions.iter().enumerate() {
+        if tracked.contains(entry.file) && !matched.contains(&index) {
+            problems.insert(format!(
+                "LOOKUP_FUNCTIONS: the entry for `{}` in {} ({}) is stale: it has no \
+                 undecided lookup",
+                entry.function, entry.file, entry.why
+            ));
+        }
+    }
+    problems.into_iter().collect()
 }
 
 /// The binary runs whose binary's package does not select the running test,
@@ -454,11 +733,6 @@ pub(crate) fn check_binary_runs(
         let entry = uses.iter().position(|edge| {
             edge.binary == run.binary
                 && edge.readers.package == reader
-                && edge
-                    .readers
-                    .files
-                    .iter()
-                    .any(|named| run.file == *named || is_below(&run.file, named))
                 && filter_covers(edge.readers.filter, &run.location)
         });
         match entry {
@@ -468,7 +742,7 @@ pub(crate) fn check_binary_runs(
             None => {
                 problems.insert(format!(
                     "{}:{}: {reader} runs the `{}` binary of {}, but a change to {} does not \
-                     select it: no Cargo edge and no BINARY_USES entry names {}",
+                     select it: no Cargo edge and no BINARY_USES entry selects the test in {}",
                     printable(&run.file),
                     run.line,
                     run.binary,
@@ -480,7 +754,7 @@ pub(crate) fn check_binary_runs(
         }
     }
     for (index, edge) in uses.iter().enumerate() {
-        let present = edge.readers.files.iter().any(|named| {
+        let present = edge.sources.iter().any(|named| {
             tracked
                 .iter()
                 .any(|file| file == named || is_below(file, named))
@@ -533,7 +807,7 @@ pub(crate) fn find_reads(
                         line: file.line_of(offset),
                         path,
                         anchored,
-                        location: locate(file, &package.dir, &files, offset),
+                        location: locate(file, offset),
                     },
                 ));
             }
@@ -1130,8 +1404,8 @@ fn uncovered(file: &str, reader: &str, read: &Read, packages: &[Package]) -> Opt
     }
 }
 
-/// Whether a narrowed rule for `file` names the source of `read` as a test
-/// source of `reader` and selects the test that makes the read.
+/// Whether a narrowed rule for `file` selects the test of `reader` that makes
+/// `read`.
 fn narrowed_covers(file: &str, reader: &str, read: &Read) -> bool {
     RULES
         .iter()
@@ -1141,140 +1415,92 @@ fn narrowed_covers(file: &str, reader: &str, read: &Read) -> bool {
             _ => &[],
         })
         .filter(|entry| entry.package == reader)
-        .any(|entry| {
-            entry
-                .files
-                .iter()
-                .any(|named| read.file == *named || is_below(&read.file, named))
-                && filter_covers(entry.filter, &read.location)
-        })
+        .any(|entry| filter_covers(entry.filter, &read.location))
 }
 
-/// Where the use at `offset` of `file`, in the package at `package_dir`, sits
-/// among the package's tests. `files` are the package's sources, which tell a
-/// `tests/<name>/main.rs` binary's modules apart from a shared module tree.
-fn locate(file: &SourceFile, package_dir: &str, files: &[&SourceFile], offset: usize) -> Location {
-    let relative = if package_dir.is_empty() {
-        file.path()
-    } else {
-        file.path()
-            .strip_prefix(package_dir)
-            .and_then(|rest| rest.strip_prefix('/'))
-            .unwrap_or(file.path())
-    };
-    let module_of = |path: &str| -> String {
-        let path = path.strip_suffix(".rs").unwrap_or(path);
-        let path = path.strip_suffix("/mod").unwrap_or(path);
-        path.replace('/', "::")
-    };
-    let (binary, base) = if let Some(rest) = relative.strip_prefix("tests/") {
-        match rest.split_once('/') {
-            None => (
-                rest.strip_suffix(".rs").map(str::to_owned),
-                Some(String::new()),
-            ),
-            Some((dir, inner)) => {
-                let main = format!("{package_dir}/tests/{dir}/main.rs");
-                if files.iter().any(|candidate| candidate.path() == main) {
-                    let base = if inner == "main.rs" {
-                        String::new()
-                    } else {
-                        module_of(inner)
-                    };
-                    (Some(dir.to_owned()), Some(base))
+/// Where the use at `offset` of `file` sits among the tests of its package.
+fn locate(file: &SourceFile, offset: usize) -> Location {
+    let inline = file.modules_at(offset);
+    let function = file.test_function_at(offset);
+    let sites = file
+        .placements()
+        .iter()
+        .map(|placement| {
+            let scope = std::iter::once(placement.module.as_str())
+                .chain(inline.iter().map(String::as_str))
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("::");
+            let test = function.map(|name| {
+                if scope.is_empty() {
+                    name.to_owned()
                 } else {
-                    (None, None)
+                    format!("{scope}::{name}")
                 }
-            }
-        }
-    } else if let Some(rest) = relative.strip_prefix("src/") {
-        if rest == "main.rs" || rest.starts_with("bin/") {
-            (None, None)
-        } else if rest == "lib.rs" {
-            (None, Some(String::new()))
-        } else {
-            (None, Some(module_of(rest)))
-        }
-    } else {
-        (None, None)
-    };
-    let scope = base.map(|base| {
-        std::iter::once(base)
-            .chain(file.modules_at(offset))
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("::")
-    });
-    let test = scope.as_ref().and_then(|scope| {
-        file.test_function_at(offset).map(|name| {
-            if scope.is_empty() {
-                name.to_owned()
-            } else {
-                format!("{scope}::{name}")
+            });
+            Site {
+                root: placement.root.clone(),
+                scope,
+                test,
             }
         })
-    });
-    Location {
-        binary,
-        scope,
-        test,
-    }
+        .collect();
+    Location { sites }
 }
 
-/// Whether the nextest `filter` provably selects the test at `location`: one
-/// of its `|` alternatives holds for it in every conjunct.
+/// Whether the nextest `filter` provably selects the use at `location`: at
+/// every site, one of its `|` alternatives holds in every conjunct.
 ///
-/// The conjuncts understood are `binary(=name)`, `kind(lib)`, `test(=name)`
-/// and `test(/^prefix/)` with an optional `(a|b)` group in the prefix. A use
-/// outside a test function, in a helper, is selected only by an alternative
-/// that selects every test of its module. Any other form proves nothing.
+/// The conjuncts understood are `binary(=name)`, `kind(lib|bin|test)`,
+/// `test(=name)` and `test(/^prefix/)` with an optional `(a|b)` group in the
+/// prefix. A test-name conjunct holds only for a use inside a test function;
+/// a use in a helper is selected only by an alternative that selects its
+/// whole crate or binary, since the guard does not know the helper's callers.
+/// Any other form proves nothing, and a file no target root reaches is never
+/// covered.
 fn filter_covers(filter: &str, location: &Location) -> bool {
-    split_top(strip_parens(filter), " | ")
-        .into_iter()
-        .any(|alternative| {
-            split_top(strip_parens(alternative), " and ")
+    !location.sites.is_empty()
+        && location.sites.iter().all(|site| {
+            split_top(strip_parens(filter), " | ")
                 .into_iter()
-                .all(|atom| atom_covers(strip_parens(atom), location))
+                .any(|alternative| {
+                    split_top(strip_parens(alternative), " and ")
+                        .into_iter()
+                        .all(|atom| atom_covers(strip_parens(atom), site))
+                })
         })
 }
 
-fn atom_covers(atom: &str, location: &Location) -> bool {
-    if atom == "kind(lib)" {
-        return location.binary.is_none() && location.scope.is_some();
+fn atom_covers(atom: &str, site: &Site) -> bool {
+    match atom {
+        "kind(lib)" => return site.root == CrateRoot::Lib,
+        "kind(bin)" => return matches!(site.root, CrateRoot::Bin(_)),
+        "kind(test)" => return matches!(site.root, CrateRoot::Test(_)),
+        _ => {}
     }
     if let Some(name) = atom
         .strip_prefix("binary(=")
         .and_then(|rest| rest.strip_suffix(')'))
     {
-        return location.binary.as_deref() == Some(name);
+        return matches!(&site.root, CrateRoot::Test(binary) | CrateRoot::Bin(binary) if binary == name);
     }
+    let Some(test) = site.test.as_deref() else {
+        return false;
+    };
     if let Some(name) = atom
         .strip_prefix("test(=")
         .and_then(|rest| rest.strip_suffix(')'))
     {
-        return location.test.as_deref() == Some(name);
+        return test == name;
     }
-    let Some(prefixes) = atom
-        .strip_prefix("test(/^")
+    atom.strip_prefix("test(/^")
         .and_then(|rest| rest.strip_suffix("/)"))
         .and_then(regex_prefixes)
-    else {
-        return false;
-    };
-    let scope = location
-        .scope
-        .as_deref()
-        .filter(|scope| !scope.is_empty())
-        .map(|scope| format!("{scope}::"));
-    prefixes.iter().any(|prefix| {
-        scope
-            .as_deref()
-            .is_some_and(|scope| scope.starts_with(prefix.as_str()))
-            || location
-                .test
-                .as_deref()
-                .is_some_and(|test| test.starts_with(prefix.as_str()))
-    })
+        .is_some_and(|prefixes| {
+            prefixes
+                .iter()
+                .any(|prefix| test.starts_with(prefix.as_str()))
+        })
 }
 
 /// The literal prefixes a `^`-anchored regex body stands for: plain text with

@@ -829,6 +829,7 @@ fn a_narrowed_rule_covers_only_the_test_its_filter_selects() {
         )
     };
     let selected = reader("the_allow_list_contains_no_variable_xtask_treats_as_redirecting");
+    repo.write("crates/daemon/src/lib.rs", "pub fn f() {}\nmod git;\n");
     repo.write(
         "crates/daemon/src/git.rs",
         &format!("#[cfg(test)]\nmod tests {{\n{selected}}}\n"),
@@ -852,4 +853,126 @@ fn a_narrowed_rule_covers_only_the_test_its_filter_selects() {
         "{stderr}"
     );
     assert!(!stderr.contains("crates/daemon/src/git.rs:6:"), "{stderr}");
+}
+
+/// The daemon's git test that reads xtask's module, as the body of `name`.
+fn git_reader(name: &str) -> String {
+    format!(
+        "    #[test]\n    fn {name}() {{\n        drop(std::fs::read(\n            \
+         pohunek_test_support::workspace_root().join(\"crates/xtask/src/affected/mod.rs\"),\n        \
+         ));\n    }}\n"
+    )
+}
+
+/// The daemon git test the narrowed rule for xtask's module selects.
+const GIT_TEST: &str = "the_allow_list_contains_no_variable_xtask_treats_as_redirecting";
+
+#[test]
+fn a_helper_read_is_covered_only_by_a_filter_that_selects_its_whole_crate() {
+    let repo = Repo::new();
+    // The rule for runtime-packages selects xtask tests by name prefix
+    // (`release_tests::` among them), which says nothing about who calls a
+    // helper.
+    repo.write(
+        "crates/xtask/src/lib.rs",
+        "pub fn f() {}\nmod release_tests;\n",
+    );
+    let module = |body: &str| format!("#[cfg(test)]\nmod tests {{\n{body}}}\n");
+    let read = "drop(std::fs::read(\n            \
+                pohunek_test_support::workspace_root().join(\"runtime-packages/pi\"),\n        ));";
+    repo.write(
+        "crates/xtask/src/release_tests.rs",
+        &module(&format!(
+            "    #[test]\n    fn reads() {{\n        {read}\n    }}\n"
+        )),
+    );
+    repo.commit("a test read");
+    let (success, stderr) = guard(&repo);
+    assert!(success, "{stderr}");
+
+    repo.write(
+        "crates/xtask/src/release_tests.rs",
+        &module(&format!(
+            "    fn read() {{\n        {read}\n    }}\n    #[test]\n    fn reads() {{\n        read();\n    }}\n"
+        )),
+    );
+    repo.commit("a helper read");
+    let (success, stderr) = guard(&repo);
+    assert!(!success, "{stderr}");
+    assert!(
+        stderr.contains("crates/xtask/src/release_tests.rs:5: xtask reads runtime-packages/pi"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_test_module_is_located_through_its_path_attribute_and_must_be_reachable() {
+    let repo = Repo::new();
+    repo.write(
+        "crates/daemon/src/git.rs",
+        "#[cfg(test)]\n#[path = \"git_tests.rs\"]\nmod tests;\n",
+    );
+    repo.write("crates/daemon/src/git_tests.rs", &git_reader(GIT_TEST));
+    // Not declared by the library: no test of the daemon runs the read.
+    repo.commit("an unreachable test module");
+    let (success, stderr) = guard(&repo);
+    assert!(!success, "{stderr}");
+    assert!(
+        stderr.contains("crates/daemon/src/git_tests.rs:4: pohunek-daemon reads"),
+        "{stderr}"
+    );
+
+    repo.write("crates/daemon/src/lib.rs", "pub fn f() {}\nmod git;\n");
+    repo.commit("declare the module");
+    let (success, stderr) = guard(&repo);
+    assert!(success, "{stderr}");
+}
+
+#[test]
+fn a_binary_lookup_the_guard_cannot_resolve_fails() {
+    let repo = Repo::new();
+    repo.write(
+        "crates/daemon/tests/lookups.rs",
+        "fn binary(name: &str) -> std::ffi::OsString {\n    std::env::var_os(name).expect(\"set\")\n}\n\
+         #[test]\nfn runs() {\n    drop(binary(\"POHUNEK_CLI_BIN\"));\n}\n",
+    );
+    repo.commit("an undecided lookup");
+    let (success, stderr) = guard(&repo);
+    assert!(!success, "{stderr}");
+    assert!(
+        stderr.contains(
+            "crates/daemon/tests/lookups.rs:2: pohunek-daemon calls `var_os(..)` with an \
+             argument that is neither a literal nor a constant of the package"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("declare `binary` in LOOKUP_FUNCTIONS"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_binary_named_by_another_file_s_constant_or_with_a_trailing_comma_is_found() {
+    let repo = Repo::new();
+    repo.write(
+        "crates/daemon/tests/support/mod.rs",
+        "pub const CLI: &str = \"pohunek\";\n",
+    );
+    repo.write(
+        "crates/daemon/tests/spawns.rs",
+        "mod support;\n#[test]\nfn spawns() {\n    let daemon = pohunek_test_support::bin_exe(\"pohunekd\");\n    \
+         drop(daemon.with_file_name(support::CLI));\n    drop(daemon.with_file_name(\"pohunek\",));\n}\n",
+    );
+    repo.commit("binary runs through a constant and a trailing comma");
+    let (success, stderr) = guard(&repo);
+    assert!(!success, "{stderr}");
+    for line in [5, 6] {
+        assert!(
+            stderr.contains(&format!(
+                "crates/daemon/tests/spawns.rs:{line}: pohunek-daemon runs the `pohunek` binary"
+            )),
+            "{line}: {stderr}"
+        );
+    }
 }

@@ -159,28 +159,18 @@ enum Effect {
     NoRustTests,
 }
 
-/// Tests of one package that read a path, and the sources they live in.
+/// Tests of one package that read a path.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Readers {
     pub(crate) package: &'static str,
-    /// Nextest filter selecting those tests within the package.
+    /// Nextest filter selecting those tests within the package; [`guard`]
+    /// accepts the rule for a read only when this filter provably selects the
+    /// test that makes it.
     pub(crate) filter: &'static str,
-    /// Workspace-relative test sources (files, or directories by prefix) that
-    /// the filter selects; [`guard`] accepts the rule only for a read in one
-    /// of them, so a new reader elsewhere in the package needs its own entry.
-    pub(crate) files: &'static [&'static str],
 }
 
-const fn readers(
-    package: &'static str,
-    filter: &'static str,
-    files: &'static [&'static str],
-) -> Readers {
-    Readers {
-        package,
-        filter,
-        files,
-    }
+const fn readers(package: &'static str, filter: &'static str) -> Readers {
+    Readers { package, filter }
 }
 
 /// Tests that run another package's binary by path, with no Cargo edge
@@ -194,16 +184,16 @@ pub(crate) struct BinaryUse {
     /// Name of the binary target, as the test looks it up.
     pub(crate) binary: &'static str,
     pub(crate) readers: Readers,
+    /// Test sources that run the binary; an entry whose sources exist but no
+    /// longer run it is stale.
+    pub(crate) sources: &'static [&'static str],
     pub(crate) why: &'static str,
 }
 
 pub(crate) const BINARY_USES: &[BinaryUse] = &[BinaryUse {
     binary: "pohunek",
-    readers: readers(
-        "pohunek-daemon",
-        "binary(=supervised_lifecycle)",
-        &["crates/daemon/tests/supervised_lifecycle.rs"],
-    ),
+    readers: readers("pohunek-daemon", "binary(=supervised_lifecycle)"),
+    sources: &["crates/daemon/tests/supervised_lifecycle.rs"],
     why: "the managed-CLI scenario runs the `pohunek` binary beside `pohunekd`",
 }];
 
@@ -285,18 +275,15 @@ const RULES: &[Rule] = &[
         Effect::Tests(&[
             readers(
                 "xtask",
-                "binary(=dependency_policy)",
-                &["crates/xtask/tests/dependency_policy.rs"],
+                "binary(=dependency_policy)"
             ),
             readers(
                 "xtask",
-                "kind(lib) and test(/^affected::tests::/)",
-                &["crates/xtask/src/affected/mod.rs"],
+                "kind(lib) and test(/^affected::tests::/)"
             ),
             readers(
                 "pohunek-test-support",
-                "test(=tests::workspace_root_holds_the_workspace_manifest)",
-                &["crates/test-support/src/lib.rs"],
+                "test(=tests::workspace_root_holds_the_workspace_manifest)"
             ),
         ]),
         "workspace manifest read by xtask's dependency_policy test and the members test of its affected module, and by the workspace root check of pohunek-test-support",
@@ -305,8 +292,7 @@ const RULES: &[Rule] = &[
         Pattern::File("Cargo.lock"),
         Effect::Tests(&[readers(
             "xtask",
-            "binary(=dependency_policy)",
-            &["crates/xtask/tests/dependency_policy.rs"],
+            "binary(=dependency_policy)"
         )]),
         "lockfile read by xtask's dependency_policy test",
     ),
@@ -393,15 +379,6 @@ const RULES: &[Rule] = &[
              binary(=dependency_policy) | \
              (binary(=affected_ci) and test(=every_repository_read_of_the_test_code_selects_its_reader)) | \
              (kind(lib) and test(/^affected::tests::/))",
-            &[
-                "crates/xtask/tests/hermetic_scan.rs",
-                "crates/xtask/tests/no_special_dispatch.rs",
-                "crates/xtask/tests/test_artifact_lookup_guard.rs",
-                "crates/xtask/tests/timing_ratchet.rs",
-                "crates/xtask/tests/dependency_policy.rs",
-                "crates/xtask/tests/affected_ci.rs",
-                "crates/xtask/src/affected/mod.rs",
-            ],
         )]),
         "every crate's sources and manifests, scanned by xtask's repository guards (hermetic_scan, no_special_dispatch, test_artifact_lookup_guard, timing_ratchet, the affected guard and include scan) and resolved by its dependency_policy test",
     ),
@@ -409,13 +386,7 @@ const RULES: &[Rule] = &[
         Pattern::Dir("runtime-packages"),
         Effect::Tests(&[readers(
             "xtask",
-            "kind(lib) and test(/^(attestation|release_tests|test_runtime|upstream_stage_tests)::/)",
-            &[
-                "crates/xtask/src/attestation.rs",
-                "crates/xtask/src/release_tests.rs",
-                "crates/xtask/src/test_runtime.rs",
-                "crates/xtask/src/upstream_stage_tests.rs",
-            ],
+            "kind(lib) and test(/^(attestation|release_tests|test_runtime|upstream_stage_tests)::/)"
         )]),
         "official package sources listed by xtask's matrix check and upstream staging scenarios and built by its release and test-runtime scenarios",
     ),
@@ -423,8 +394,7 @@ const RULES: &[Rule] = &[
         Pattern::File("scripts/provision-hermes-compat"),
         Effect::Tests(&[readers(
             "xtask",
-            "kind(lib) and test(/^upstream_stage_tests::/)",
-            &["crates/xtask/src/upstream_stage_tests.rs"],
+            "kind(lib) and test(/^upstream_stage_tests::/)"
         )]),
         "Hermes provisioner whose bytes xtask's upstream staging scenarios read and verify",
     ),
@@ -432,8 +402,7 @@ const RULES: &[Rule] = &[
         Pattern::File(".github/workflows/ci.yml"),
         Effect::Tests(&[readers(
             "xtask",
-            "binary(=affected_ci)",
-            &["crates/xtask/tests/affected_ci.rs"],
+            "binary(=affected_ci)"
         )]),
         "CI workflow whose test-job scripts the affected scenarios require to select every test",
     ),
@@ -441,8 +410,7 @@ const RULES: &[Rule] = &[
         Pattern::File("crates/xtask/src/affected/mod.rs"),
         Effect::Tests(&[readers(
             "pohunek-daemon",
-            "test(=git::tests::the_allow_list_contains_no_variable_xtask_treats_as_redirecting)",
-            &["crates/daemon/src/git.rs"],
+            "test(=git::tests::the_allow_list_contains_no_variable_xtask_treats_as_redirecting)"
         )]),
         "xtask's list of repository-redirecting Git variables, which the daemon's git environment test compares with its own",
     ),
@@ -450,8 +418,7 @@ const RULES: &[Rule] = &[
         Pattern::File("docs/public-api.md"),
         Effect::Tests(&[readers(
             "pohunek-protocol",
-            "binary(=task_errors)",
-            &["crates/protocol/tests/task_errors.rs"],
+            "binary(=task_errors)"
         )]),
         "public API reference whose shared error codes pohunek-protocol's task_errors test checks",
     ),
@@ -459,8 +426,7 @@ const RULES: &[Rule] = &[
         Pattern::Dir("crates/daemon/src"),
         Effect::Tests(&[readers(
             "pohunek-protocol",
-            "binary(=task_errors)",
-            &["crates/protocol/tests/task_errors.rs"],
+            "binary(=task_errors)"
         )]),
         "daemon sources whose raised task error codes pohunek-protocol's task_errors test reads",
     ),
