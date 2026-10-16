@@ -655,6 +655,9 @@ scripts/ci-timings junit --label "tests (core, fast)" --run RUN_ID junit-core.xm
                                   # by hand; --job NAME picks the paired CI job
 scripts/ci-timings cache --run RUN_ID             # rust-cache restores per job, plus sccache
                                   # JSON where a job runs sccache (release.yml)
+scripts/ci-timings tiers --window 2026-10-15T06:39Z..2026-10-16T13:42Z \
+    --limit 500 --json            # per trigger tier: completion, wall clock,
+                                  # jobs and macOS jobs per run, job queue
 ```
 
 Record the local baseline before and after a change to the dev loop, and
