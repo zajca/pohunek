@@ -1058,36 +1058,43 @@ fn a_binary_named_by_another_file_s_constant_or_with_a_trailing_comma_is_found()
 }
 
 #[test]
-fn a_constant_named_in_two_scopes_with_different_paths_resolves_nowhere() {
+fn a_constant_named_in_two_scopes_with_different_paths_reads_each_path() {
     let repo = Repo::new();
-    // Each module reads through its own `PATH`; only the second path selects
-    // the daemon, so the first read cannot be taken for it.
+    // Each module reads through its own `DIR`, one of them several components
+    // deep; a change to either file must select the reader.
+    repo.write("docs/user/guide.md", "guide\n");
+    repo.write("docs/operator/skills/guide.md", "guide\n");
     repo.write(
         "crates/daemon/tests/reads.rs",
-        "mod guide {\n    const PATH: &str = \"docs/guide.md\";\n    #[test]\n    fn reads() {\n        \
-         drop(std::fs::read(pohunek_test_support::workspace_root().join(PATH)));\n    }\n}\n\
-         mod hooks {\n    const PATH: &str = \"compat/codex/subagent-hooks.json\";\n    #[test]\n    \
-         fn reads() {\n        drop(std::fs::read(pohunek_test_support::workspace_root().join(PATH)));\n    \
-         }\n}\n",
+        "mod user {\n    const DIR: &str = \"user\";\n    #[test]\n    fn reads() {\n        \
+         drop(std::fs::read(\n            \
+         pohunek_test_support::workspace_root().join(\"docs\").join(DIR).join(\"guide.md\"),\n        \
+         ));\n    }\n}\n\
+         mod operator {\n    const DIR: &str = \"operator/skills\";\n    #[test]\n    fn reads() {\n        \
+         drop(std::fs::read(\n            \
+         pohunek_test_support::workspace_root().join(\"docs\").join(DIR).join(\"guide.md\"),\n        \
+         ));\n    }\n}\n",
     );
-    repo.commit("two constants named PATH");
+    repo.commit("two constants named DIR");
     let (success, stderr) = guard(&repo);
     assert!(!success, "{stderr}");
-    for line in [5, 12] {
-        assert!(
-            stderr.contains(&format!(
-                "crates/daemon/tests/reads.rs:{line}: pohunek-daemon reads the repository root"
-            )),
-            "{line}: {stderr}"
-        );
+    for line in [6, 15] {
+        for path in ["docs/user/guide.md", "docs/operator/skills/guide.md"] {
+            assert!(
+                stderr.contains(&format!(
+                    "crates/daemon/tests/reads.rs:{line}: pohunek-daemon reads {path}"
+                )),
+                "{line} {path}: {stderr}"
+            );
+        }
     }
 }
 
 #[test]
-fn a_binary_constant_named_in_two_scopes_with_different_binaries_is_undecided() {
+fn a_binary_constant_named_in_two_scopes_with_different_binaries_runs_each_binary() {
     let repo = Repo::new();
-    // Another file's `BIN` names the daemon's own binary; neither it nor the
-    // last module's value may stand for the first module's.
+    // Another file's `BIN` names the daemon's own binary; the file's two
+    // modules name the CLI's and the daemon's, so each lookup may run either.
     repo.write(
         "crates/daemon/tests/support.rs",
         "pub const BIN: &str = \"pohunekd\";\n",
@@ -1097,7 +1104,7 @@ fn a_binary_constant_named_in_two_scopes_with_different_binaries_is_undecided() 
         "mod cli {\n    const BIN: &str = \"pohunek\";\n    #[test]\n    fn spawns() {\n        \
          drop(pohunek_test_support::bin_exe(BIN));\n    }\n}\n\
          mod daemon {\n    const BIN: &str = \"pohunekd\";\n    #[test]\n    fn spawns() {\n        \
-         drop(pohunek_test_support::bin_exe(BIN));\n    }\n}\n",
+         drop(pohunek_test_support::bin_exe(\"pohunekd\").with_file_name(BIN));\n    }\n}\n",
     );
     repo.commit("two constants named BIN");
     let (success, stderr) = guard(&repo);
@@ -1105,10 +1112,222 @@ fn a_binary_constant_named_in_two_scopes_with_different_binaries_is_undecided() 
     for line in [5, 12] {
         assert!(
             stderr.contains(&format!(
-                "crates/daemon/tests/spawns.rs:{line}: pohunek-daemon calls `bin_exe(..)` with an \
-                 argument that is neither a literal nor a constant of the package"
+                "crates/daemon/tests/spawns.rs:{line}: pohunek-daemon runs the `pohunek` binary of \
+                 pohunek-cli, but a change to pohunek-cli does not select it"
             )),
             "{line}: {stderr}"
         );
     }
+}
+
+#[test]
+fn an_imported_constant_resolves_to_the_value_of_its_file() {
+    let repo = Repo::new();
+    // The file's own `BIN` and `DIR` name the daemon's binary and files the
+    // daemon selects; the module that imports them from `support.rs` runs the
+    // CLI and reads the docs.
+    repo.write(
+        "crates/daemon/tests/support.rs",
+        "pub const BIN: &str = \"pohunek\";\npub const DIR: &str = \"docs\";\n",
+    );
+    repo.write(
+        "crates/daemon/tests/spawns.rs",
+        "mod support;\n\
+         mod own {\n    const BIN: &str = \"pohunekd\";\n    const DIR: &str = \"compat/codex\";\n    \
+         #[test]\n    fn spawns() {\n        drop(pohunek_test_support::bin_exe(BIN));\n        \
+         drop(std::fs::read(pohunek_test_support::workspace_root().join(DIR)));\n    }\n}\n\
+         mod imported {\n    use super::support::{BIN, DIR};\n    #[test]\n    fn spawns() {\n        \
+         drop(pohunek_test_support::bin_exe(BIN));\n        \
+         drop(std::fs::read(pohunek_test_support::workspace_root().join(DIR)));\n    }\n}\n",
+    );
+    repo.commit("constants imported from another file");
+    let (success, stderr) = guard(&repo);
+    assert!(!success, "{stderr}");
+    for expected in [
+        "crates/daemon/tests/spawns.rs:15: pohunek-daemon runs the `pohunek` binary of \
+         pohunek-cli, but a change to pohunek-cli does not select it",
+        "crates/daemon/tests/spawns.rs:16: pohunek-daemon reads docs:",
+    ] {
+        assert!(stderr.contains(expected), "{expected}: {stderr}");
+    }
+}
+
+#[test]
+fn a_constant_whose_value_is_not_a_literal_stays_unknown() {
+    let repo = Repo::new();
+    // `support.rs` builds its `DIR` and `BIN` with `concat!`; the file's own
+    // literals of the same names cannot stand for them.
+    repo.write(
+        "crates/daemon/tests/support.rs",
+        "pub const DIR: &str = concat!(\"docs\", \"/guide.md\");\n\
+         pub const BIN: &str = concat!(\"pohu\", \"nek\");\n",
+    );
+    repo.write(
+        "crates/daemon/tests/reads.rs",
+        "mod support;\n\
+         mod own {\n    const DIR: &str = \"crates/daemon/src/lib.rs\";\n    \
+         const BIN: &str = \"pohunekd\";\n}\n\
+         use support::{BIN, DIR};\n#[test]\nfn reads() {\n    \
+         drop(std::fs::read(pohunek_test_support::workspace_root().join(DIR)));\n    \
+         drop(pohunek_test_support::bin_exe(BIN));\n}\n",
+    );
+    repo.commit("constants that are not literals");
+    let (success, stderr) = guard(&repo);
+    assert!(!success, "{stderr}");
+    for expected in [
+        "crates/daemon/tests/reads.rs:9: pohunek-daemon reads the repository root",
+        "crates/daemon/tests/reads.rs:10: pohunek-daemon calls `bin_exe(..)` with an argument",
+    ] {
+        assert!(stderr.contains(expected), "{expected}: {stderr}");
+    }
+}
+
+#[test]
+fn a_wrapper_defined_differently_in_two_files_reads_each_path() {
+    let repo = Repo::new();
+    // Two files define `root()` differently, one through a wrapper of its own;
+    // a third file's call may reach either, so both paths must select the reader.
+    repo.write("docs/user/guide.md", "guide\n");
+    repo.write("docs/operator/skills/guide.md", "guide\n");
+    repo.write(
+        "crates/daemon/tests/user.rs",
+        "pub fn root() -> std::path::PathBuf {\n    \
+         pohunek_test_support::workspace_root().join(\"docs\").join(\"user\")\n}\n",
+    );
+    repo.write(
+        "crates/daemon/tests/operator.rs",
+        "fn docs() -> std::path::PathBuf {\n    pohunek_test_support::workspace_root().join(\"docs\")\n}\n\
+         pub fn root() -> std::path::PathBuf {\n    docs().join(\"operator/skills\")\n}\n",
+    );
+    repo.write(
+        "crates/daemon/tests/reads.rs",
+        "mod user;\n#[test]\nfn reads() {\n    drop(std::fs::read(user::root().join(\"guide.md\")));\n}\n",
+    );
+    repo.commit("two wrappers named root");
+    let (success, stderr) = guard(&repo);
+    assert!(!success, "{stderr}");
+    for path in ["docs/user/guide.md", "docs/operator/skills/guide.md"] {
+        assert!(
+            stderr.contains(&format!(
+                "crates/daemon/tests/reads.rs:4: pohunek-daemon reads {path}"
+            )),
+            "{path}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn wrappers_that_reach_each_other_stand_for_the_paths_of_their_cycle() {
+    let repo = Repo::new();
+    // Each file's `root()` call may reach every file's, so the paths grow
+    // without end; the read covers everything below `docs`, the path the cycle
+    // starts from.
+    repo.write(
+        "crates/daemon/tests/base.rs",
+        "pub fn root() -> std::path::PathBuf {\n    pohunek_test_support::workspace_root().join(\"docs\")\n}\n",
+    );
+    for index in 0..8 {
+        repo.write(
+            &format!("crates/daemon/tests/part{index}.rs"),
+            &format!(
+                "mod base;\npub fn root() -> std::path::PathBuf {{\n    base::root().join(\"part{index}\")\n}}\n"
+            ),
+        );
+    }
+    repo.write(
+        "crates/daemon/tests/reads.rs",
+        "mod base;\n#[test]\nfn reads() {\n    drop(std::fs::read(base::root().join(\"guide.md\")));\n    \
+         drop(std::fs::read(base::root().join(\"../..\").join(\"docs/guide.md\")));\n}\n",
+    );
+    repo.commit("wrappers that reach each other");
+    let (success, stderr) = guard(&repo);
+    assert!(!success, "{stderr}");
+    assert!(
+        stderr.contains("crates/daemon/tests/reads.rs:4: pohunek-daemon reads docs:"),
+        "{stderr}"
+    );
+    // A join that climbs out of `docs` can lead anywhere.
+    assert!(
+        stderr.contains("crates/daemon/tests/reads.rs:5: pohunek-daemon reads the repository root"),
+        "{stderr}"
+    );
+
+    // A definition that climbs can leave `docs`.
+    repo.write(
+        "crates/daemon/tests/up.rs",
+        "mod base;\npub fn root() -> std::path::PathBuf {\n    base::root().join(\"..\")\n}\n",
+    );
+    repo.commit("a wrapper that climbs");
+    let (success, stderr) = guard(&repo);
+    assert!(!success, "{stderr}");
+    assert!(
+        stderr.contains("crates/daemon/tests/reads.rs:4: pohunek-daemon reads the repository root"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn names_that_call_each_other_read_below_every_entry_of_their_cycle() {
+    let repo = Repo::new();
+    // `user()` and `operator()` call each other, so a read through `user()`
+    // may continue below the path either of them starts from.
+    repo.write("docs/user/guide.md", "guide\n");
+    repo.write("docs/operator/skills/guide.md", "guide\n");
+    repo.write(
+        "crates/daemon/tests/user.rs",
+        "pub fn user() -> std::path::PathBuf {\n    pohunek_test_support::workspace_root().join(\"docs/user\")\n}\n\
+         pub fn operator() -> std::path::PathBuf {\n    user().join(\"skills\")\n}\n",
+    );
+    repo.write(
+        "crates/daemon/tests/operator.rs",
+        "pub fn operator() -> std::path::PathBuf {\n    \
+         pohunek_test_support::workspace_root().join(\"docs/operator\")\n}\n\
+         pub fn user() -> std::path::PathBuf {\n    operator().join(\"skills\")\n}\n",
+    );
+    repo.write(
+        "crates/daemon/tests/reads.rs",
+        "mod user;\n#[test]\nfn reads() {\n    drop(std::fs::read(user::user().join(\"guide.md\")));\n}\n",
+    );
+    repo.commit("names that call each other");
+    let (success, stderr) = guard(&repo);
+    assert!(!success, "{stderr}");
+    for path in ["docs/user", "docs/operator"] {
+        assert!(
+            stderr.contains(&format!(
+                "crates/daemon/tests/reads.rs:4: pohunek-daemon reads {path}:"
+            )),
+            "{path}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_read_with_more_paths_than_the_guard_tracks_is_judged_like_the_root() {
+    let repo = Repo::new();
+    // Eight modules give `PART` eight values, so four joins through it make
+    // 4,096 paths: past the guard's bound, the read may be any path.
+    let mut modules = String::new();
+    for index in 0..8 {
+        write!(
+            modules,
+            "mod m{index} {{\n    const PART: &str = \"p{index}\";\n}}\n"
+        )
+        .expect("write to a String");
+    }
+    repo.write(
+        "crates/daemon/tests/reads.rs",
+        &format!(
+            "{modules}const PART: &str = \"p0\";\n#[test]\nfn reads() {{\n    drop(std::fs::read(\n        \
+             pohunek_test_support::workspace_root().join(PART).join(PART).join(PART).join(PART),\n    \
+             ));\n}}\n"
+        ),
+    );
+    repo.commit("a read with thousands of paths");
+    let (success, stderr) = guard(&repo);
+    assert!(!success, "{stderr}");
+    assert!(
+        stderr
+            .contains("crates/daemon/tests/reads.rs:29: pohunek-daemon reads the repository root"),
+        "{stderr}"
+    );
 }

@@ -9,10 +9,12 @@
 //!
 //! - an anchor call followed by a chain of `.join(..)` calls. The anchors are
 //!   `workspace_root()`, `manifest_dir()`, and every argument-less test
-//!   function of the same package whose body is an anchor expression. A string
-//!   literal or a string constant of the file is a path segment; a plain
-//!   variable is the wildcard `*`, one path component; any other argument ends
-//!   the chain, and the resolved prefix is read as a directory;
+//!   function of the same package whose body is an anchor expression, with
+//!   every path its definitions in the package can be. A string literal or a
+//!   string constant of the package is a path segment, and a constant the
+//!   package defines with several values reads each of them; a plain variable
+//!   is the wildcard `*`, one path component; any other argument ends the
+//!   chain, and the resolved prefix is read as a directory;
 //! - a `let` binding of such an expression: each later use of the bound name
 //!   reads the bound path, extended by the `.join(..)` chain that follows it;
 //! - a string literal that starts with `../`, relative to the package directory.
@@ -34,7 +36,8 @@
 //! of one: `bin_exe(..)` or `.with_file_name(..)` with a literal or string
 //! constant that names a workspace binary, `worker_binary()`, and a
 //! `var_os(..)`/`var(..)` read of a variable in [`BINARY_VARIABLES`]; a
-//! constant may come from any file of the package. A change to the binary's
+//! constant may come from any file of the package, and one defined with
+//! several values looks up each of them. A change to the binary's
 //! package must select the test: through a Cargo edge (the test's package
 //! depends on the binary's), or through an entry in [`BINARY_USES`] whose
 //! filter selects it. A `bin_exe`, `var_os` or `var` call whose argument is
@@ -75,6 +78,14 @@ const JOIN: &str = ".join(";
 
 /// Path component that matches any one component.
 const WILDCARD: &str = "*";
+
+/// Last path component of a path that stands for any path below the ones
+/// before it: `.join(..)` does not extend it, and it is read as that directory.
+const ANY_BELOW: &str = "**";
+
+/// Most paths one name or read may stand for. Past it the guard cannot tell
+/// which path is read, and judges the read like the repository root itself.
+const MAX_PATHS: usize = 256;
 
 /// Calls whose string argument names a binary beside the test's own.
 const BINARY_LOOKUPS: [&str; 2] = ["bin_exe(", ".with_file_name("];
@@ -266,18 +277,17 @@ pub(crate) const NOT_READS: &[(&str, &str, &str)] = &[(
 )];
 
 /// What a read path is relative to.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Base {
     Root,
     Package,
 }
 
 /// A function or binding whose value is a repository path.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Anchor {
-    base: Base,
-    /// Segments below the base.
-    prefix: Vec<String>,
+    /// Each path the value can be: its base and the segments below it.
+    paths: BTreeSet<(Base, Vec<String>)>,
 }
 
 /// One repository path read by test code.
@@ -439,17 +449,10 @@ pub(crate) fn find_binary_runs(
     let mut runs = BTreeSet::new();
     let mut undecided = BTreeSet::new();
     for (package, package_files) in &by_package {
-        let shared = package_constants(package_files);
+        // A name may reach an item of another file through a path or a `use`,
+        // so it stands for every value the package gives it.
+        let constants = package_constants(package_files);
         for file in package_files {
-            // The file's own items shadow the package's; a name the file
-            // defines with different values resolves nowhere.
-            let mut constants = shared.clone();
-            for (name, values) in string_constant_values(file) {
-                match single(values) {
-                    Some(value) => constants.insert(name, value),
-                    None => constants.remove(&name),
-                };
-            }
             let mut run = |offset: usize, binary: String| {
                 runs.insert((
                     package.name.clone(),
@@ -498,33 +501,15 @@ pub(crate) fn find_binary_runs(
     }
 }
 
-/// The string constants that the files of one package define with one value;
-/// a name defined with different values resolves nowhere.
-fn package_constants(files: &[&SourceFile]) -> BTreeMap<String, String> {
+/// Every value the files of one package give each string constant name.
+fn package_constants(files: &[&SourceFile]) -> BTreeMap<String, BTreeSet<String>> {
     let mut values: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for file in files {
-        for (name, value) in string_constant_values(file) {
+        for (name, value) in string_constants(file) {
             values.entry(name).or_default().extend(value);
         }
     }
-    unique_values(values)
-}
-
-/// The value of a name defined with exactly one value.
-fn single(values: BTreeSet<String>) -> Option<String> {
-    if values.len() == 1 {
-        values.into_iter().next()
-    } else {
-        None
-    }
-}
-
-/// The names of `values` with exactly one value, and that value.
-fn unique_values(values: BTreeMap<String, BTreeSet<String>>) -> BTreeMap<String, String> {
     values
-        .into_iter()
-        .filter_map(|(name, values)| single(values).map(|value| (name, value)))
-        .collect()
 }
 
 /// A lookup found in test code.
@@ -538,13 +523,68 @@ enum Lookup {
 
 /// What a call's single argument is.
 enum Argument {
-    Value(String),
+    /// A literal, or a constant with each of its values.
+    Values(BTreeSet<String>),
     Other,
 }
 
-/// The binary lookups in the test code of `file`; the names are not yet
-/// checked against the workspace. `constants` resolve identifier arguments.
-fn binary_lookups(file: &SourceFile, constants: &BTreeMap<String, String>) -> Vec<(usize, Lookup)> {
+/// The single argument of the call in `file` whose `(` ends at `open`: a
+/// literal or a (path-qualified) constant, before an optional trailing comma.
+fn call_argument(
+    file: &SourceFile,
+    constants: &BTreeMap<String, BTreeSet<String>>,
+    open: usize,
+) -> Argument {
+    let views = file.views();
+    let skeleton = views.skeleton.as_bytes();
+    let at = skip_whitespace(views.code.as_bytes(), open);
+    let resolved = if views.code.as_bytes().get(at) == Some(&b'"') && skeleton[at] == b' ' {
+        string_literal_at(&views.code, at).map(|literal| {
+            (
+                BTreeSet::from([literal.to_owned()]),
+                literal_end(&views.skeleton, at),
+            )
+        })
+    } else {
+        let mut end = at;
+        let mut last = at;
+        loop {
+            let ident = ident_end(skeleton, end);
+            if ident == end {
+                break;
+            }
+            last = end;
+            end = ident;
+            if !views.skeleton[end..].starts_with("::") {
+                break;
+            }
+            end += 2;
+        }
+        constants
+            .get(&views.skeleton[last..end])
+            .map(|value| (value.clone(), end))
+    };
+    let Some((values, end)) = resolved else {
+        return Argument::Other;
+    };
+    let mut next = skip_whitespace(skeleton, end);
+    if skeleton.get(next) == Some(&b',') {
+        next = skip_whitespace(skeleton, next + 1);
+    }
+    if skeleton.get(next) == Some(&b')') {
+        Argument::Values(values)
+    } else {
+        Argument::Other
+    }
+}
+
+/// The binary lookups in the test code of `file`, one for each value an
+/// argument can have; the names are not yet checked against the workspace.
+/// `constants` resolve identifier arguments.
+fn binary_lookups(
+    file: &SourceFile,
+    constants: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<(usize, Lookup)> {
     let views = file.views();
     let skeleton = views.skeleton.as_bytes();
     let call_at = |offset: usize, call: &str| {
@@ -552,45 +592,7 @@ fn binary_lookups(file: &SourceFile, constants: &BTreeMap<String, String>) -> Ve
             && !(offset > 0 && !call.starts_with('.') && is_ident(skeleton[offset - 1]))
             && !views.skeleton[..offset].trim_end().ends_with("fn")
     };
-    // The single argument of the call whose `(` ends at `open`: a literal or a
-    // (path-qualified) constant, before an optional trailing comma.
-    let argument = |open: usize| -> Argument {
-        let at = skip_whitespace(views.code.as_bytes(), open);
-        let resolved = if views.code.as_bytes().get(at) == Some(&b'"') && skeleton[at] == b' ' {
-            string_literal_at(&views.code, at)
-                .map(|literal| (literal.to_owned(), literal_end(&views.skeleton, at)))
-        } else {
-            let mut end = at;
-            let mut last = at;
-            loop {
-                let ident = ident_end(skeleton, end);
-                if ident == end {
-                    break;
-                }
-                last = end;
-                end = ident;
-                if !views.skeleton[end..].starts_with("::") {
-                    break;
-                }
-                end += 2;
-            }
-            constants
-                .get(&views.skeleton[last..end])
-                .map(|value| (value.clone(), end))
-        };
-        let Some((value, end)) = resolved else {
-            return Argument::Other;
-        };
-        let mut next = skip_whitespace(skeleton, end);
-        if skeleton.get(next) == Some(&b',') {
-            next = skip_whitespace(skeleton, next + 1);
-        }
-        if skeleton.get(next) == Some(&b')') {
-            Argument::Value(value)
-        } else {
-            Argument::Other
-        }
-    };
+    let argument = |open: usize| call_argument(file, constants, open);
 
     let mut found = Vec::new();
     for call in BINARY_LOOKUPS {
@@ -599,7 +601,17 @@ fn binary_lookups(file: &SourceFile, constants: &BTreeMap<String, String>) -> Ve
                 continue;
             }
             match argument(offset + call.len()) {
-                Argument::Value(binary) => found.push((offset, Lookup::Binary(binary))),
+                Argument::Values(binaries) => {
+                    // A constant that is not a literal may name any binary.
+                    if call == "bin_exe(" && binaries.contains(WILDCARD) {
+                        found.push((offset, Lookup::Undecided(call)));
+                    }
+                    found.extend(
+                        binaries
+                            .into_iter()
+                            .map(|binary| (offset, Lookup::Binary(binary))),
+                    );
+                }
                 // A path method takes any file name; only `bin_exe` names a binary.
                 Argument::Other if call == "bin_exe(" => {
                     found.push((offset, Lookup::Undecided(call)));
@@ -614,12 +626,16 @@ fn binary_lookups(file: &SourceFile, constants: &BTreeMap<String, String>) -> Ve
                 continue;
             }
             match argument(offset + call.len()) {
-                Argument::Value(variable) => {
-                    if let Some((_, binary)) =
-                        BINARY_VARIABLES.iter().find(|(name, _)| *name == variable)
-                    {
-                        found.push((offset, Lookup::Binary((*binary).to_owned())));
+                Argument::Values(variables) => {
+                    if variables.contains(WILDCARD) {
+                        found.push((offset, Lookup::Undecided(call)));
                     }
+                    found.extend(
+                        BINARY_VARIABLES
+                            .iter()
+                            .filter(|(name, _)| variables.contains(*name))
+                            .map(|(_, binary)| (offset, Lookup::Binary((*binary).to_owned()))),
+                    );
                 }
                 Argument::Other => found.push((offset, Lookup::Undecided(call))),
             }
@@ -812,14 +828,14 @@ pub(crate) fn find_reads(
     }
     let mut reads = BTreeSet::new();
     for (package, files) in by_package {
-        let (shared, bodies) = package_anchors(&files);
+        // A name may reach an item of another file through a path or a `use`,
+        // so it stands for every value the package gives it.
+        let constants = package_constants(&files);
+        let (anchors, bodies) = package_anchors(&files, &constants);
         for file in &files {
-            // A file's own wrappers win over a same-named wrapper elsewhere.
-            let mut anchors = shared.clone();
-            for (name, anchor, _) in wrappers(file, &shared) {
-                anchors.insert(name, anchor);
-            }
-            for (offset, path, anchored) in reads_in(file, &package.dir, &anchors, &bodies) {
+            for (offset, path, anchored) in
+                reads_in(file, &package.dir, &anchors, &constants, &bodies)
+            {
                 reads.insert((
                     package.name.clone(),
                     Read {
@@ -839,56 +855,152 @@ pub(crate) fn find_reads(
 /// The anchors of one package: [`ANCHORS`] and the wrapper functions of its test code.
 ///
 /// A wrapper is an argument-less function in test code whose body is an anchor
-/// expression; wrappers of wrappers resolve because the search repeats until
-/// it finds nothing new. A name that files of the package define with
-/// different values is left out, so each of those files resolves its own.
+/// expression. A name stands for every path any of its definitions in the
+/// package can be, since a call may reach any of them through a path or a
+/// `use`; the search repeats until no name gains a path, so wrappers of
+/// wrappers resolve.
+///
+/// Names whose definitions call each other form a cycle, whose paths grow
+/// without end. Each of those paths is a path the cycle is entered with,
+/// extended by the segments of its definitions, so every name of the cycle
+/// stands for any path below each of them ([`ANY_BELOW`]). A definition in a
+/// cycle that can climb (`..` or an absolute segment) can lead anywhere, so the
+/// cycle also stands for a root path whose first component is unknown, which
+/// is judged like the root itself.
+///
 /// Also returns the `(file, offset)` of each wrapper's body call, which
 /// defines the wrapper and reads nothing itself.
-fn package_anchors(files: &[&SourceFile]) -> (BTreeMap<String, Anchor>, BTreeSet<(String, usize)>) {
+fn package_anchors(
+    files: &[&SourceFile],
+    constants: &BTreeMap<String, BTreeSet<String>>,
+) -> (BTreeMap<String, Anchor>, BTreeSet<(String, usize)>) {
     let mut anchors: BTreeMap<String, Anchor> = ANCHORS
         .iter()
         .map(|(name, base)| {
             (
                 (*name).to_owned(),
                 Anchor {
-                    base: *base,
-                    prefix: Vec::new(),
+                    paths: BTreeSet::from([(*base, Vec::new())]),
                 },
             )
         })
         .collect();
-    let mut bodies = BTreeSet::new();
-    let mut ambiguous = BTreeSet::new();
+    let definitions: Vec<(&SourceFile, Wrapper)> = files
+        .iter()
+        .flat_map(|file| {
+            wrappers(file, constants)
+                .into_iter()
+                .map(move |w| (*file, w))
+        })
+        .collect();
+    let mut calls: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (_, wrapper) in &definitions {
+        calls
+            .entry(wrapper.name.as_str())
+            .or_default()
+            .insert(wrapper.called.as_str());
+    }
+    let in_cycle = |wrapper: &Wrapper| reaches(&calls, &wrapper.called, &wrapper.name);
+    // Each cycle as its names, and whether one of its definitions can climb.
+    let mut cycles: BTreeMap<BTreeSet<&str>, bool> = BTreeMap::new();
+    for (_, wrapper) in definitions.iter().filter(|(_, wrapper)| in_cycle(wrapper)) {
+        let names: BTreeSet<&str> = calls
+            .keys()
+            .copied()
+            .filter(|name| {
+                reaches(&calls, &wrapper.name, name) && reaches(&calls, name, &wrapper.name)
+            })
+            .collect();
+        *cycles.entry(names).or_default() |= wrapper
+            .segments
+            .iter()
+            .flatten()
+            .any(|segment| climbs(segment));
+    }
     loop {
-        let mut found: BTreeMap<String, Anchor> = BTreeMap::new();
-        for file in files {
-            for (name, anchor, body) in wrappers(file, &anchors) {
-                bodies.insert((file.path().to_owned(), body));
-                if anchors.contains_key(&name) || ambiguous.contains(&name) {
-                    continue;
-                }
-                match found.get(&name) {
-                    Some(other) if other.base != anchor.base || other.prefix != anchor.prefix => {
-                        found.remove(&name);
-                        ambiguous.insert(name);
-                    }
-                    Some(_) => {}
-                    None => {
-                        found.insert(name, anchor);
-                    }
-                }
+        let mut next = anchors.clone();
+        for (_, wrapper) in definitions.iter().filter(|(_, wrapper)| !in_cycle(wrapper)) {
+            if let Some(called) = anchors.get(&wrapper.called) {
+                let anchor = next.entry(wrapper.name.clone()).or_insert_with(|| Anchor {
+                    paths: BTreeSet::new(),
+                });
+                anchor
+                    .paths
+                    .extend(extended(&called.paths, &wrapper.segments));
+                anchor.paths = bounded(std::mem::take(&mut anchor.paths));
             }
         }
-        if found.is_empty() {
-            return (anchors, bodies);
+        for (names, climbs) in &cycles {
+            let mut paths: BTreeSet<(Base, Vec<String>)> = names
+                .iter()
+                .filter_map(|name| next.get(*name))
+                .flat_map(|anchor| anchor.paths.iter().cloned())
+                .map(|(base, mut path)| {
+                    if path.last().map(String::as_str) != Some(ANY_BELOW) {
+                        path.push(ANY_BELOW.to_owned());
+                    }
+                    (base, path)
+                })
+                .collect();
+            if paths.is_empty() {
+                continue;
+            }
+            if *climbs {
+                paths.insert(unknown_path());
+            }
+            let paths = bounded(paths);
+            for name in names {
+                next.insert(
+                    (*name).to_owned(),
+                    Anchor {
+                        paths: paths.clone(),
+                    },
+                );
+            }
         }
-        anchors.extend(found);
+        if next == anchors {
+            break;
+        }
+        anchors = next;
     }
+    let bodies = definitions
+        .iter()
+        .filter(|(_, wrapper)| anchors.contains_key(&wrapper.called))
+        .map(|(file, wrapper)| (file.path().to_owned(), wrapper.body))
+        .collect();
+    (anchors, bodies)
 }
 
-/// Argument-less test functions of `file` whose body is an anchor expression,
-/// with the offset of the body's anchor call.
-fn wrappers(file: &SourceFile, anchors: &BTreeMap<String, Anchor>) -> Vec<(String, Anchor, usize)> {
+/// Whether a chain of calls leads from the function named `from` to `to`.
+fn reaches(calls: &BTreeMap<&str, BTreeSet<&str>>, from: &str, to: &str) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![from];
+    while let Some(name) = pending.pop() {
+        if name == to {
+            return true;
+        }
+        if seen.insert(name) {
+            pending.extend(calls.get(name).into_iter().flatten().copied());
+        }
+    }
+    false
+}
+
+/// One definition of a wrapper.
+struct Wrapper {
+    name: String,
+    /// The function its body calls.
+    called: String,
+    /// The `.join(..)` arguments after the call, each with its values.
+    segments: Vec<BTreeSet<String>>,
+    /// Offset of the body's call.
+    body: usize,
+}
+
+/// Argument-less test functions of `file` whose body is a call of an
+/// argument-less function followed by a `.join(..)` chain; they are wrappers
+/// when the called function is an anchor.
+fn wrappers(file: &SourceFile, constants: &BTreeMap<String, BTreeSet<String>>) -> Vec<Wrapper> {
     let views = file.views();
     let skeleton = views.skeleton.as_bytes();
     let mut found = Vec::new();
@@ -906,24 +1018,20 @@ fn wrappers(file: &SourceFile, anchors: &BTreeMap<String, Anchor>) -> Vec<(Strin
             continue;
         };
         let start = skip_whitespace(skeleton, body + 1);
-        let Some((anchor, call_end)) = anchor_call_at(&views.skeleton, start, anchors) else {
+        let Some((called, call_end)) = call_at(&views.skeleton, start) else {
             continue;
         };
-        let (segments, end) = join_chain(file, &string_constants(file), call_end);
+        let (segments, end) = join_chain(file, constants, call_end);
         let close = skip_whitespace(skeleton, end);
         if !views.skeleton[close..].starts_with('}') {
             continue;
         }
-        let mut prefix = anchor.prefix.clone();
-        prefix.extend(segments);
-        found.push((
-            views.skeleton[name_start..name_end].to_owned(),
-            Anchor {
-                base: anchor.base,
-                prefix,
-            },
-            start,
-        ));
+        found.push(Wrapper {
+            name: views.skeleton[name_start..name_end].to_owned(),
+            called: called.to_owned(),
+            segments,
+            body: start,
+        });
     }
     found
 }
@@ -935,6 +1043,13 @@ fn anchor_call_at<'a>(
     start: usize,
     anchors: &'a BTreeMap<String, Anchor>,
 ) -> Option<(&'a Anchor, usize)> {
+    let (name, end) = call_at(skeleton, start)?;
+    anchors.get(name).map(|anchor| (anchor, end))
+}
+
+/// The name of the argument-less function called at `start` (with an optional
+/// path prefix) and the offset after its `()`.
+fn call_at(skeleton: &str, start: usize) -> Option<(&str, usize)> {
     let bytes = skeleton.as_bytes();
     let mut at = start;
     loop {
@@ -946,7 +1061,6 @@ fn anchor_call_at<'a>(
             at = end + 2;
             continue;
         }
-        let anchor = anchors.get(&skeleton[at..end])?;
         let open = skip_whitespace(bytes, end);
         if !skeleton[open..].starts_with('(') {
             return None;
@@ -954,7 +1068,7 @@ fn anchor_call_at<'a>(
         let close = skip_whitespace(bytes, open + 1);
         return skeleton[close..]
             .starts_with(')')
-            .then_some((anchor, close + 1));
+            .then_some((&skeleton[at..end], close + 1));
     }
 }
 
@@ -973,11 +1087,11 @@ fn reads_in(
     file: &SourceFile,
     package_dir: &str,
     anchors: &BTreeMap<String, Anchor>,
+    constants: &BTreeMap<String, BTreeSet<String>>,
     bodies: &BTreeSet<(String, usize)>,
 ) -> Vec<(usize, String, bool)> {
     let views = file.views();
     let skeleton = views.skeleton.as_bytes();
-    let constants = string_constants(file);
     // (offset, base, segments)
     let mut found: Vec<(usize, Base, Vec<String>)> = Vec::new();
     // (offset, name, anchor)
@@ -1003,19 +1117,11 @@ fn reads_in(
             let Some((anchor, call_end)) = anchor_call_at(&views.skeleton, offset, anchors) else {
                 continue;
             };
-            let (segments, end) = join_chain(file, &constants, call_end);
-            let mut path = anchor.prefix.clone();
-            path.extend(segments);
+            let (segments, end) = join_chain(file, constants, call_end);
+            let paths = extended(&anchor.paths, &segments);
             match bound_name(&views.skeleton, offset, end) {
-                Some(binding) => bindings.push((
-                    offset,
-                    binding,
-                    Anchor {
-                        base: anchor.base,
-                        prefix: path,
-                    },
-                )),
-                None => found.push((offset, anchor.base, path)),
+                Some(binding) => bindings.push((offset, binding, Anchor { paths })),
+                None => found.extend(paths.into_iter().map(|(base, path)| (offset, base, path))),
             }
         }
     }
@@ -1045,16 +1151,21 @@ fn reads_in(
             if views.skeleton[end..].starts_with(".display()") {
                 continue;
             }
-            let (segments, _) = join_chain(file, &constants, end);
-            let mut path = anchor.prefix.clone();
-            path.extend(segments);
-            found.push((at, anchor.base, path));
+            let (segments, _) = join_chain(file, constants, end);
+            found.extend(
+                extended(&anchor.paths, &segments)
+                    .into_iter()
+                    .map(|(base, path)| (at, base, path)),
+            );
         }
     }
 
     let mut reads: Vec<(usize, String, bool)> = found
         .into_iter()
-        .filter_map(|(offset, base, segments)| {
+        .filter_map(|(offset, base, mut segments)| {
+            if segments.last().map(String::as_str) == Some(ANY_BELOW) {
+                segments.pop();
+            }
             let start = match base {
                 // A root path whose first component is unknown can be any
                 // path: it is judged like the root itself.
@@ -1107,17 +1218,78 @@ fn anchor_start(before: &str) -> Option<usize> {
     (start < trimmed.len()).then_some(start)
 }
 
-/// Arguments of the `.join(..)` chain starting at `from`, and the offset after
-/// the last call taken.
+/// Whether joining `segment` can leave the path it extends: a `..` or an
+/// absolute path.
+fn climbs(segment: &str) -> bool {
+    PathBuf::from(segment)
+        .components()
+        .any(|part| matches!(part, Component::ParentDir | Component::RootDir))
+}
+
+/// A root path whose first component is unknown: any path of the repository.
+fn unknown_path() -> (Base, Vec<String>) {
+    (Base::Root, vec![WILDCARD.to_owned(), ANY_BELOW.to_owned()])
+}
+
+/// `paths`, or only [`unknown_path`] when they hold it or exceed [`MAX_PATHS`].
+fn bounded(paths: BTreeSet<(Base, Vec<String>)>) -> BTreeSet<(Base, Vec<String>)> {
+    if paths.len() > MAX_PATHS || paths.contains(&unknown_path()) {
+        BTreeSet::from([unknown_path()])
+    } else {
+        paths
+    }
+}
+
+/// Every path `paths` extended by `segments` can be: one for each choice of a
+/// value per segment, within [`MAX_PATHS`] (see [`bounded`]). A path that ends
+/// in [`ANY_BELOW`] already stands for every extension that stays below it; one
+/// that can climb out of it can lead anywhere.
+fn extended(
+    paths: &BTreeSet<(Base, Vec<String>)>,
+    segments: &[BTreeSet<String>],
+) -> BTreeSet<(Base, Vec<String>)> {
+    segments
+        .iter()
+        .fold(bounded(paths.clone()), |paths, values| {
+            // Checked before the product is built, so it is never allocated.
+            if paths.len().saturating_mul(values.len()) > MAX_PATHS {
+                return BTreeSet::from([unknown_path()]);
+            }
+            paths
+                .iter()
+                .flat_map(|(base, path)| {
+                    if path.last().map(String::as_str) == Some(ANY_BELOW) {
+                        if values.iter().any(|value| climbs(value)) {
+                            return vec![unknown_path()];
+                        }
+                        return vec![(*base, path.clone())];
+                    }
+                    values
+                        .iter()
+                        .map(|value| {
+                            let mut path = path.clone();
+                            path.push(value.clone());
+                            (*base, path)
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+}
+
+/// Arguments of the `.join(..)` chain starting at `from`, each with the values
+/// it can have, and the offset after the last call taken.
 ///
-/// A string literal or a string constant of the file is a segment, and a plain
-/// variable is [`WILDCARD`]; any other argument ends the chain, so the path
-/// read is the prefix resolved so far.
+/// A string literal is a segment, a string constant of the package is each of
+/// its values, and a plain variable is [`WILDCARD`]; any other argument ends
+/// the chain, so the path read is the prefix resolved so far. A variable never
+/// shares a constant's name: CI denies the `non_snake_case` and
+/// `non_upper_case_globals` lints that keep the two apart.
 fn join_chain(
     file: &SourceFile,
-    constants: &BTreeMap<String, String>,
+    constants: &BTreeMap<String, BTreeSet<String>>,
     mut from: usize,
-) -> (Vec<String>, usize) {
+) -> (Vec<BTreeSet<String>>, usize) {
     let views = file.views();
     let skeleton = views.skeleton.as_bytes();
     // Whitespace before an argument is skipped in the code view: the skeleton
@@ -1133,24 +1305,27 @@ fn join_chain(
         if views.skeleton[arg..].starts_with('&') {
             arg = skip_whitespace(code, arg + 1);
         }
-        let (value, end) = if let Some(literal) = string_literal_at(&views.code, arg) {
-            (literal.to_owned(), literal_end(&views.skeleton, arg))
+        let (values, end) = if let Some(literal) = string_literal_at(&views.code, arg) {
+            (
+                BTreeSet::from([literal.to_owned()]),
+                literal_end(&views.skeleton, arg),
+            )
         } else {
             let end = ident_end(skeleton, arg);
             if end == arg {
                 return (segments, from);
             }
-            let value = constants
+            let values = constants
                 .get(&views.skeleton[arg..end])
                 .cloned()
-                .unwrap_or_else(|| WILDCARD.to_owned());
-            (value, end)
+                .unwrap_or_else(|| BTreeSet::from([WILDCARD.to_owned()]));
+            (values, end)
         };
         let close = skip_whitespace(skeleton, end);
         if !views.skeleton[close..].starts_with(')') {
             return (segments, from);
         }
-        segments.push(value);
+        segments.push(values);
         from = close + 1;
     }
 }
@@ -1189,16 +1364,11 @@ fn bound_name(skeleton: &str, anchor: usize, end: usize) -> Option<String> {
     skeleton[after..].starts_with(';').then(|| name.to_owned())
 }
 
-/// `const` and `static` string items of `file` with one value, by name. Items
-/// in different scopes can share a name; a name the file defines with
-/// different values resolves nowhere, so a read through it is judged like an
-/// unknown path.
-fn string_constants(file: &SourceFile) -> BTreeMap<String, String> {
-    unique_values(string_constant_values(file))
-}
-
-/// Every value of each `const` and `static` string item of `file`, by name.
-fn string_constant_values(file: &SourceFile) -> BTreeMap<String, BTreeSet<String>> {
+/// Every value of each `const` and `static` string item of `file`, by name;
+/// items in different scopes can share a name. An item whose value is not a
+/// literal (`concat!(..)`, another constant) has the value [`WILDCARD`], so
+/// a same-named literal elsewhere cannot stand for it.
+fn string_constants(file: &SourceFile) -> BTreeMap<String, BTreeSet<String>> {
     let views = file.views();
     let skeleton = views.skeleton.as_bytes();
     let mut values: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -1221,12 +1391,11 @@ fn string_constant_values(file: &SourceFile) -> BTreeMap<String, BTreeSet<String
                 continue;
             }
             let value_at = skip_whitespace(views.code.as_bytes(), eq + 1);
-            if let Some(value) = string_literal_at(&views.code, value_at) {
-                values
-                    .entry(views.skeleton[name_start..name_end].to_owned())
-                    .or_default()
-                    .insert(value.to_owned());
-            }
+            let value = string_literal_at(&views.code, value_at).unwrap_or(WILDCARD);
+            values
+                .entry(views.skeleton[name_start..name_end].to_owned())
+                .or_default()
+                .insert(value.to_owned());
         }
     }
     values
