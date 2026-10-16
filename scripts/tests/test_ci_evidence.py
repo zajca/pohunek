@@ -14,6 +14,7 @@ SCRIPT = ROOT / "scripts" / "ci-evidence"
 DEFAULT_CONFIG = ROOT / "scripts" / "ci-evidence.json"
 SHA = "a" * 40
 OTHER_SHA = "b" * 40
+THIRD_SHA = "e" * 40
 TREE = "c" * 40
 OTHER_TREE = "d" * 40
 REPO = "example/pohunek"
@@ -636,6 +637,40 @@ class CiEvidenceCliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no main tier run exists", result.stderr)
         self.assertIn("tree lookup failed", result.stderr)
+
+    def test_a_newer_failed_run_of_the_tree_blocks_an_older_passing_one(self):
+        newer = dispatch_doc(sha=THIRD_SHA, run_id=790, conclusion="failure")
+        self.tree_fixture(
+            trees={SHA: TREE, OTHER_SHA: TREE, THIRD_SHA: TREE},
+            tree_runs=[dispatch_doc(), newer],
+            artifacts={"789": [f"tested-tree-{TREE}"], "790": [f"tested-tree-{TREE}"]},
+            jobs_by_run={
+                "789": jobs_page(),
+                "790": jobs_page(overrides={"required check": "failure"}),
+            },
+        )
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tree match https://github.com/example/pohunek/actions/runs/790 failed", result.stderr)
+        self.assertFalse(any(
+            arg.startswith("repos/example/pohunek/actions/runs/789/")
+            for call in self.calls_json() for arg in call
+        ))
+
+    def test_a_failed_lookup_of_an_older_run_does_not_block_the_newest_match(self):
+        older = dispatch_doc(sha=THIRD_SHA, run_id=700)
+        self.tree_fixture(tree_runs=[older, dispatch_doc()], unknown_commits=[THIRD_SHA])
+        result = self.invoke("main", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["run_id"], 789)
+
+    def test_a_failed_lookup_of_a_newer_run_refuses_the_older_match(self):
+        newer = dispatch_doc(sha=THIRD_SHA, run_id=790)
+        self.tree_fixture(tree_runs=[dispatch_doc(), newer], unknown_commits=[THIRD_SHA])
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("may not be the newest run of tree", result.stderr)
+        self.assertIn("/actions/runs/790", result.stderr)
 
     def test_a_tree_match_with_a_skipped_required_job_is_refused(self):
         self.tree_fixture(

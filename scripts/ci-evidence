@@ -251,14 +251,8 @@ def recorded_trees(repo: str, run_id: int) -> set[str]:
     return trees
 
 
-def tree_runs(
-    repo: str,
-    config: dict[str, Any],
-    tier: str,
-    tree: str,
-    cache: dict[str, str],
-) -> list[dict[str, Any]]:
-    """Completed dispatch runs of `tier` in `repo` whose head commit has `tree`,
+def dispatch_runs(repo: str, config: dict[str, Any], tier: str) -> list[dict[str, Any]]:
+    """Completed dispatch runs of `tier` in `repo` within the tree-match window,
     newest first. Other events never supply evidence by tree."""
     since = datetime.datetime.now(datetime.timezone.utc).date() - datetime.timedelta(
         days=config["tree_match_max_age_days"]
@@ -276,12 +270,11 @@ def tree_runs(
         and (run.get("head_repository") or {}).get("full_name") == repo
         and isinstance(run.get("head_sha"), str)
     ]
-    matching = [run for run in runs if commit_tree(repo, run["head_sha"], cache) == tree]
-    matching.sort(
+    runs.sort(
         key=lambda item: (item.get("run_number", 0), item.get("run_attempt", 1)),
         reverse=True,
     )
-    return matching
+    return runs
 
 
 def resolve_dispatch_ref(repo: str, ref: str, sha: str) -> None:
@@ -488,33 +481,47 @@ def run_failures(
 def tree_evidence(
     args: argparse.Namespace, config: dict[str, Any]
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """The newest dispatch run that tested tree(S) and passes the tier, or why
-    none does. A tree candidate that fails is reported, never accepted, and a
-    lookup that cannot complete is a refusal: the exact-commit path decides."""
+    """The evidence of the newest dispatch run that tested tree(S), or why
+    there is none. Only that run decides, pass or fail, as the newest run on S
+    does on the exact-commit path. A run whose tree cannot be looked up is
+    skipped, but when it is newer than the newest match it might be a newer run
+    of the same tree, so the match is refused. Every refusal leaves the
+    decision to the exact-commit path."""
     cache: dict[str, str] = {}
     try:
         tree = commit_tree(args.repo, args.sha, cache)
-        runs = tree_runs(args.repo, config, args.tier, tree, cache)
+        runs = dispatch_runs(args.repo, config, args.tier)
     except EvidenceError as error:
         return None, f"tree lookup failed: {error}"
-    refusals = []
+    unresolved = []
     for run in runs:
         url = run.get("html_url") or f"run {run['id']}"
+        try:
+            run_tree = commit_tree(args.repo, run["head_sha"], cache)
+        except EvidenceError as error:
+            unresolved.append(f"{url}: {error}")
+            continue
+        if run_tree != tree:
+            continue
+        if unresolved:
+            return None, (
+                f"tree match {url} may not be the newest run of tree {tree}: "
+                f"tree lookup failed for newer {'; '.join(unresolved)}"
+            )
         try:
             recorded = recorded_trees(args.repo, run["id"])
             failures = run_failures(args.repo, run, config, args.tier) if recorded == {tree} else []
         except EvidenceError as error:
-            refusals.append(f"tree match {url} could not be read: {error}")
-            continue
+            return None, f"tree match {url} could not be read: {error}"
         if recorded != {tree}:
             names = ", ".join(sorted(recorded)) or "none"
-            refusals.append(f"tree match {url} recorded tested tree {names}, expected {tree}")
-            continue
+            return None, f"tree match {url} recorded tested tree {names}, expected {tree}"
         if failures:
-            refusals.append(f"tree match {url} failed: {'; '.join(failures)}")
-            continue
+            return None, f"tree match {url} failed: {'; '.join(failures)}"
         return evidence(args, run, config, match="tree", tree=tree), None
-    return None, "; ".join(refusals) or None
+    if unresolved:
+        return None, f"tree lookup failed for {'; '.join(unresolved)}"
+    return None, None
 
 
 def evidence(
