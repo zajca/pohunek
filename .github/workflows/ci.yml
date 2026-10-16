@@ -537,6 +537,85 @@ jobs:
   # Compiles every workspace test binary exactly once for the fast shards, the
   # heavy job, and the relay DB job (issue #170). Designated `test-debug`
   # saver; the same `--workspace --all-features` build also warms doctests.
+  # Selects the pull request's tests with the selector of its merge base
+  # (scripts/ci-test-selection); every other event runs every test. A test
+  # job narrows or skips only on an explicit output of a successful run of
+  # this job, so a failed or skipped selection runs everything.
+  test-selection:
+    name: test selection
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
+    outputs:
+      mode: ${{ steps.select.outputs.mode }}
+      docs_only: ${{ steps.select.outputs.docs_only }}
+      script_tests: ${{ steps.select.outputs.script_tests }}
+      sdk_gates: ${{ steps.select.outputs.sdk_gates }}
+      fast_shards: ${{ steps.plan.outputs.fast_shards }}
+      heavy: ${{ steps.plan.outputs.heavy }}
+      relay_db: ${{ steps.plan.outputs.relay_db }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The merge base of the pull request and its base commit needs history.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install mold linker
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/setup-mold
+        with:
+          version: ${{ env.MOLD_VERSION }}
+          sha256: ${{ env.MOLD_SHA256 }}
+
+      - name: Install Rust toolchain
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo build
+        if: github.event_name == 'pull_request'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: xtask
+          save-if: false
+
+      # The event and the base commit reach the script only through the
+      # environment. It writes a full selection naming the cause whenever it
+      # cannot select.
+      - name: Select the tests
+        id: select
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/test-selection"
+          if [ "$EVENT" = pull_request ]; then
+            scripts/ci-test-selection --base "$BASE_SHA" --out "$out"
+          else
+            scripts/ci-test-selection --full "a $EVENT run runs every test" --out "$out"
+          fi
+          cat "$out/outputs.env" >> "$GITHUB_OUTPUT"
+          cat "$out/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Plan the test jobs
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/test-partitions plan --selection "$RUNNER_TEMP/test-selection/selection.json" >> "$GITHUB_OUTPUT"
+
+      - name: Upload test selection
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-selection
+          path: ${{ runner.temp }}/test-selection/
+          retention-days: 1
+          if-no-files-found: error
+
   build-tests:
     name: build tests (nextest archive)
     runs-on: ubuntu-latest
@@ -586,12 +665,14 @@ jobs:
 
   fast-tests:
     name: tests (${{ matrix.shard }}, fast)
-    needs: build-tests
+    needs: [build-tests, test-selection]
+    if: ${{ !cancelled() && needs.build-tests.result == 'success' && (needs.test-selection.result != 'success' || needs.test-selection.outputs.fast_shards != '[]') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        shard: [core, daemon, relay, cli]
+        # The shards a successful selection plans; every shard otherwise.
+        shard: ${{ fromJSON(needs.test-selection.result == 'success' && needs.test-selection.outputs.fast_shards || '["core", "daemon", "relay", "cli"]') }}
     defaults:
       run:
         working-directory: relocated
@@ -610,8 +691,15 @@ jobs:
           name: nextest-archive
           path: ${{ runner.temp }}/nextest-archive
 
+      - name: Download test selection
+        if: needs.test-selection.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: test-selection
+          path: ${{ runner.temp }}/test-selection
+
       - name: Check script regressions
-        if: matrix.shard == 'core'
+        if: matrix.shard == 'core' && (needs.test-selection.result != 'success' || needs.test-selection.outputs.script_tests != 'false')
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
       # Every workflow installs Rust from rust-toolchain.toml or a dated nightly.
@@ -619,9 +707,31 @@ jobs:
         if: matrix.shard == 'core'
         run: scripts/check-rust-toolchain-pin
 
+      # The tests run from a tree holding only the files whose change selects
+      # them, so a read of any other path fails instead of passing with the
+      # test skipped. A run without sparse.txt keeps the full tree.
+      - name: Keep only the selection's files in the tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          sparse="$RUNNER_TEMP/test-selection/sparse.txt"
+          if [ -f "$sparse" ]; then
+            git sparse-checkout set --no-cone --stdin < "$sparse"
+            echo "sparse tree of $(wc -l < "$sparse") files"
+          fi
+
       # No dependency on Clippy, PostgreSQL, PTYs, or the release build.
       - name: Run fast shard
-        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run "${{ matrix.shard }}"
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          selection=()
+          if [ -f "$RUNNER_TEMP/test-selection/selection.json" ]; then
+            selection=(--selection "$RUNNER_TEMP/test-selection/selection.json")
+          fi
+          python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run "$SHARD" "${selection[@]}"
 
       - name: Summarize flaky tests
         if: always()
@@ -917,7 +1027,8 @@ jobs:
 
   integration:
     name: tests (heavy, PTY + Hermes)
-    needs: build-tests
+    needs: [build-tests, test-selection]
+    if: ${{ !cancelled() && needs.build-tests.result == 'success' && (needs.test-selection.result != 'success' || needs.test-selection.outputs.heavy != 'false') }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -956,8 +1067,42 @@ jobs:
       - name: Verify exhaustive disjoint test partitions
         run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" check
 
+      - name: Download test selection
+        if: needs.test-selection.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: test-selection
+          path: ${{ runner.temp }}/test-selection
+
+      # Skipping the shards the plan does not start can drop no selected test.
+      - name: Verify the planned shards hold every selected test
+        if: needs.test-selection.result == 'success'
+        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" check --selection "$RUNNER_TEMP/test-selection/selection.json"
+
+      # The tests run from a tree holding only the files whose change selects
+      # them, so a read of any other path fails instead of passing with the
+      # test skipped. A run without sparse.txt keeps the full tree.
+      - name: Keep only the selection's files in the tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          sparse="$RUNNER_TEMP/test-selection/sparse.txt"
+          if [ -f "$sparse" ]; then
+            git sparse-checkout set --no-cone --stdin < "$sparse"
+            echo "sparse tree of $(wc -l < "$sparse") files"
+          fi
+
       - name: Heavy tests (bounded nextest concurrency)
-        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run heavy
+        shell: bash
+        env:
+          SHARD: heavy
+        run: |
+          set -euo pipefail
+          selection=()
+          if [ -f "$RUNNER_TEMP/test-selection/selection.json" ]; then
+            selection=(--selection "$RUNNER_TEMP/test-selection/selection.json")
+          fi
+          python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run "$SHARD" "${selection[@]}"
 
       - name: Summarize flaky tests
         if: always()
@@ -1085,8 +1230,8 @@ jobs:
   # never start the Postgres service.
   integration-relay:
     name: tests (relay DB, PostgreSQL)
-    needs: [changes, build-tests]
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || needs.changes.outputs.relay == 'true' }}
+    needs: [changes, build-tests, test-selection]
+    if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || needs.changes.outputs.relay == 'true') && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.relay_db != 'false') }}
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -1121,12 +1266,40 @@ jobs:
           name: nextest-archive
           path: ${{ runner.temp }}/nextest-archive
 
+      - name: Download test selection
+        if: needs.test-selection.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: test-selection
+          path: ${{ runner.temp }}/test-selection
+
+      # The tests run from a tree holding only the files whose change selects
+      # them, so a read of any other path fails instead of passing with the
+      # test skipped. A run without sparse.txt keeps the full tree.
+      - name: Keep only the selection's files in the tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          sparse="$RUNNER_TEMP/test-selection/sparse.txt"
+          if [ -f "$sparse" ]; then
+            git sparse-checkout set --no-cone --stdin < "$sparse"
+            echo "sparse tree of $(wc -l < "$sparse") files"
+          fi
+
       - name: Relay database tests (bounded nextest concurrency)
-        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run relay-db
+        shell: bash
         env:
+          SHARD: relay-db
           # Resolved at step level: the `job` context is not available in
           # job-level `env`, where it makes the whole workflow invalid.
           POHUNEK_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/pohunek_test
+        run: |
+          set -euo pipefail
+          selection=()
+          if [ -f "$RUNNER_TEMP/test-selection/selection.json" ]; then
+            selection=(--selection "$RUNNER_TEMP/test-selection/selection.json")
+          fi
+          python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run "$SHARD" "${selection[@]}"
 
       - name: Summarize flaky tests
         if: always()
@@ -1139,6 +1312,25 @@ jobs:
           name: nextest-junit-relay-db
           path: relocated/target/nextest/relay-db/junit.xml
           if-no-files-found: warn
+
+  # A skipped test job counts as passed, so this job fails a run where a test
+  # job failed, was cancelled, or was skipped without an explicit narrowing
+  # of a successful selection. The relay DB job is also gated by its paths
+  # filter, so only its failure or cancellation counts.
+  test-selection-verdict:
+    name: test selection verdict
+    needs: [test-selection, build-tests, fast-tests, integration, integration-relay]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail a test job that failed or was skipped without a selection
+        if: ${{ needs.build-tests.result != 'success' || (needs.fast-tests.result != 'success' && !(needs.fast-tests.result == 'skipped' && needs.test-selection.result == 'success' && needs.test-selection.outputs.fast_shards == '[]')) || (needs.integration.result != 'success' && !(needs.integration.result == 'skipped' && needs.test-selection.result == 'success' && needs.test-selection.outputs.heavy == 'false')) || needs.integration-relay.result == 'failure' || needs.integration-relay.result == 'cancelled' }}
+        shell: bash
+        env:
+          RESULTS: "selection=${{ needs.test-selection.result }} build=${{ needs.build-tests.result }} fast=${{ needs.fast-tests.result }} heavy=${{ needs.integration.result }} relay-db=${{ needs.integration-relay.result }}"
+        run: |
+          echo "::error::test jobs did not run as the selection requires: $RESULTS"
+          exit 1
 
   doctests:
     name: doctests

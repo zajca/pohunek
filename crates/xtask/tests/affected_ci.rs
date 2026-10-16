@@ -775,10 +775,12 @@ fn every_repository_read_of_the_test_code_selects_its_reader() {
 }
 
 /// Jobs of `.github/workflows/ci.yml` whose runs the selection narrows.
-const SELECTED_JOBS: [&str; 4] = [
+const SELECTED_JOBS: [&str; 6] = [
+    "test-selection",
     "build-tests",
     "fast-tests",
     "integration",
+    "integration-relay",
     "systemd-supervision",
 ];
 

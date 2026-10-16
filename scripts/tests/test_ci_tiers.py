@@ -1850,5 +1850,277 @@ class RuntimePackageVersionBumpTests(unittest.TestCase):
         self.assertIn("no published release at or below the workspace version", completed.stdout)
 
 
+TEST_SELECTOR = "test-selection"
+TEST_VERDICT = "test-selection-verdict"
+# Each narrowed test job, the plan output that skips it, and that output's
+# value in a plan that skips it.
+NARROWED_TEST_JOBS = {
+    "fast-tests": ("fast_shards", "[]"),
+    "integration": ("heavy", "false"),
+    "integration-relay": ("relay_db", "false"),
+}
+EVERY_FAST_SHARD = ["core", "daemon", "relay", "cli"]
+
+
+def evaluate_needs_expression(
+    expression: str,
+    *,
+    event: str,
+    cancelled: bool = False,
+    tier: str = "",
+    changes: dict[str, str] | None = None,
+    results: dict[str, str] | None = None,
+    outputs: dict[str, dict[str, str]] | None = None,
+):
+    """Evaluate an expression over `needs.<job>.result` and `.outputs.<name>`.
+
+    Understands `!cancelled()`, `always()`, `fromJSON`, `github.event_name`,
+    `inputs.tier`, `needs.<job>.result` and `needs.<job>.outputs.<name>`,
+    string literals, `==`, `!=`, `!`, `&&`, `||` and parentheses; anything
+    else fails the translation. `&&` and `||` return an operand, as in GitHub
+    Actions, so a value expression evaluates to its value. A missing result or
+    output reads as the empty string, and strings compare ignoring case.
+    """
+    python = expression.replace("!cancelled()", "(not cancelled)")
+    python = python.replace("always()", "(True)")
+    python = python.replace("fromJSON(", "fromjson(")
+    python = python.replace("github.event_name", "event")
+    python = python.replace("inputs.tier", "tier")
+    python = re.sub(r"needs\.changes\.outputs\.([a-z_]+)", r"changes.get('\1', '')", python)
+    python = re.sub(
+        r"needs\.([a-z][a-z0-9-]*)\.outputs\.([a-z_]+)",
+        r"outputs.get('\1', {}).get('\2', '')",
+        python,
+    )
+    python = re.sub(r"needs\.([a-z][a-z0-9-]*)\.result", r"results.get('\1', '')", python)
+    python = python.replace("&&", " and ").replace("||", " or ")
+    python = re.sub(r"!(?!=)", " not ", python)
+    python = re.sub(r"'[^']*'", lambda literal: literal.group(0).lower(), python)
+    leftover = re.sub(
+        r"'[^']*'|\b(?:not|and|or|True|event|tier|cancelled|fromjson|changes\.get|"
+        r"results\.get|outputs\.get|get)\b|==|!=|[(){}.,\s]",
+        "",
+        python,
+    )
+    if leftover:
+        raise AssertionError(f"untranslated expression syntax {leftover!r} in {expression!r}")
+    return eval(python, {"__builtins__": {}}, {
+        "event": event.lower(),
+        "cancelled": cancelled,
+        "tier": tier.lower(),
+        "fromjson": json.loads,
+        "changes": {name: value.lower() for name, value in (changes or {}).items()},
+        "results": {name: value.lower() for name, value in (results or {}).items()},
+        "outputs": {
+            job: {name: value.lower() for name, value in values.items()}
+            for job, values in (outputs or {}).items()
+        },
+    })
+
+
+def job_condition(job: str) -> str:
+    match = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", workflow_jobs()[job])
+    if match is None:
+        raise AssertionError(f"{job} has no condition")
+    return match.group(1)
+
+
+def step_condition(step: str) -> str:
+    match = re.search(r"(?m)^        if: (?:\$\{\{ (.+) \}\}|(.+))$", step)
+    if match is None:
+        raise AssertionError(f"step has no condition: {step!r}")
+    return match.group(1) or match.group(2)
+
+
+class TestSelectionWiringTests(unittest.TestCase):
+    """The Linux test jobs narrow only on an explicit successful selection."""
+
+    def runs(self, job, *, event="pull_request", cancelled=False, build="success",
+             selection="success", plan=None, relay_changed=True):
+        return bool(evaluate_needs_expression(
+            job_condition(job), event=event, cancelled=cancelled,
+            changes={"relay": "true" if relay_changed else "false"},
+            results={"build-tests": build, TEST_SELECTOR: selection},
+            outputs={TEST_SELECTOR: plan or {}},
+        ))
+
+    def test_the_selection_runs_on_every_event_with_the_merge_base_selector(self):
+        job = workflow_jobs()[TEST_SELECTOR]
+        self.assertNotRegex(job, r"(?m)^    if:")
+        self.assertNotRegex(job, r"(?m)^    needs:")
+        self.assertIn("fetch-depth: 0", job)
+        steps = job_steps(job)
+        select = steps["Select the tests"]
+        self.assertIn("          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n", select)
+        script = step_script(select)
+        self.assertIn('scripts/ci-test-selection --base "$BASE_SHA" --out "$out"', script)
+        self.assertIn('scripts/ci-test-selection --full "a $EVENT run runs every test" --out "$out"', script)
+        self.assertIn('cat "$out/outputs.env" >> "$GITHUB_OUTPUT"', script)
+        self.assertIn(
+            'python3 scripts/test-partitions plan --selection "$RUNNER_TEMP/test-selection/selection.json"',
+            step_script(steps["Plan the test jobs"]),
+        )
+        for name, step in steps.items():
+            if "        run: |\n" in step:
+                with self.subTest(step=name):
+                    self.assertNotIn("${{", step_script(step))
+                    self.assertIn("set -euo pipefail", step_script(step))
+        outputs = block(job, "outputs", indent=4)
+        for name in ("mode", "docs_only", "script_tests", "sdk_gates"):
+            self.assertIn(f"      {name}: ${{{{ steps.select.outputs.{name} }}}}\n", outputs)
+        for name in ("fast_shards", "heavy", "relay_db"):
+            self.assertIn(f"      {name}: ${{{{ steps.plan.outputs.{name} }}}}\n", outputs)
+
+    def test_test_jobs_run_unless_a_successful_selection_excludes_them(self):
+        for job, (output, skip) in NARROWED_TEST_JOBS.items():
+            excluded = {output: skip}
+            scenarios = (
+                # (event, cancelled, build, selection, plan, runs)
+                ("push", False, "success", "success", {output: "true"}, True),
+                ("schedule", False, "success", "success", {}, True),
+                ("push", False, "success", "failure", {}, True),
+                ("pull_request", False, "success", "success", {output: "true"}, True),
+                # Only a successful selection narrows, whatever outputs a
+                # failed or cancelled one set.
+                ("pull_request", False, "success", "failure", excluded, True),
+                ("pull_request", False, "success", "cancelled", excluded, True),
+                ("pull_request", False, "success", "skipped", {}, True),
+                # A successful selection without the output runs the job.
+                ("pull_request", False, "success", "success", {}, True),
+                ("pull_request", False, "success", "success", excluded, False),
+                # A failed or skipped build never starts a test job.
+                ("pull_request", False, "failure", "failure", {}, False),
+                ("push", False, "skipped", "success", {}, False),
+                ("pull_request", True, "success", "success", {output: "true"}, False),
+            )
+            for event, cancelled, build, selection, plan, runs in scenarios:
+                if job == "integration-relay" and event == "schedule":
+                    continue
+                with self.subTest(job=job, event=event, cancelled=cancelled, build=build,
+                                  selection=selection, plan=plan):
+                    self.assertEqual(
+                        self.runs(job, event=event, cancelled=cancelled, build=build,
+                                  selection=selection, plan=plan),
+                        runs,
+                    )
+        # The relay DB job keeps its paths filter: a selection only narrows it.
+        self.assertFalse(self.runs("integration-relay", relay_changed=False, plan={"relay_db": "true"}))
+        self.assertTrue(self.runs("integration-relay", event="schedule", relay_changed=False,
+                                  plan={"relay_db": "false"}))
+
+    def test_the_fast_shards_are_the_planned_ones_or_every_shard(self):
+        matrix = block(workflow_jobs()["fast-tests"], "matrix", indent=6)
+        expression = re.search(r"(?m)^        shard: \$\{\{ (.+) \}\}$", matrix)
+        self.assertIsNotNone(expression, matrix)
+        assert expression is not None
+
+        def shards(selection, plan):
+            return evaluate_needs_expression(
+                expression.group(1), event="pull_request",
+                results={TEST_SELECTOR: selection}, outputs={TEST_SELECTOR: plan},
+            )
+
+        self.assertEqual(shards("success", {"fast_shards": '["cli"]'}), ["cli"])
+        self.assertEqual(shards("success", {"fast_shards": '["core", "daemon"]'}), ["core", "daemon"])
+        for selection, plan in (
+            ("failure", {"fast_shards": '["cli"]'}),
+            ("skipped", {}),
+            ("success", {}),
+            ("success", {"fast_shards": ""}),
+        ):
+            with self.subTest(selection=selection, plan=plan):
+                self.assertEqual(shards(selection, plan), EVERY_FAST_SHARD)
+        self.assertEqual(
+            partitions_module().FAST_SHARDS, tuple(EVERY_FAST_SHARD),
+            "the fallback must list every fast shard",
+        )
+
+    def test_the_verdict_fails_a_test_job_skipped_without_an_explicit_narrowing(self):
+        job = workflow_jobs()[TEST_VERDICT]
+        self.assertEqual(job_condition(TEST_VERDICT), "always()")
+        self.assertRegex(
+            job, r"(?m)^    needs: \[test-selection, build-tests, fast-tests, integration, integration-relay\]$"
+        )
+        [step] = job_steps(job).values()
+        condition = step_condition(step)
+
+        def fails(results, plan=None, selection="success"):
+            every = {"build-tests": "success", "fast-tests": "success", "integration": "success",
+                     "integration-relay": "success", TEST_SELECTOR: selection}
+            return bool(evaluate_needs_expression(
+                condition, event="pull_request", results={**every, **results},
+                outputs={TEST_SELECTOR: plan or {}},
+            ))
+
+        self.assertFalse(fails({}))
+        self.assertFalse(fails({"integration-relay": "skipped"}))
+        self.assertFalse(fails({"fast-tests": "skipped"}, {"fast_shards": "[]"}))
+        self.assertFalse(fails({"integration": "skipped"}, {"heavy": "false"}))
+        self.assertFalse(fails({"fast-tests": "skipped", "integration": "skipped",
+                                "integration-relay": "skipped"},
+                               {"fast_shards": "[]", "heavy": "false", "relay_db": "false"}))
+        for results, plan, selection in (
+            ({"build-tests": "failure", "fast-tests": "skipped", "integration": "skipped"}, {}, "success"),
+            ({"build-tests": "cancelled"}, {}, "success"),
+            ({"fast-tests": "failure"}, {}, "success"),
+            ({"fast-tests": "cancelled"}, {"fast_shards": "[]"}, "success"),
+            ({"fast-tests": "skipped"}, {"fast_shards": '["cli"]'}, "success"),
+            ({"fast-tests": "skipped"}, {"fast_shards": "[]"}, "failure"),
+            ({"integration": "skipped"}, {"heavy": "true"}, "success"),
+            ({"integration": "skipped"}, {}, "success"),
+            ({"integration": "skipped"}, {"heavy": "false"}, "skipped"),
+            ({"integration": "failure"}, {"heavy": "false"}, "success"),
+            ({"integration-relay": "failure"}, {}, "success"),
+            ({"integration-relay": "cancelled"}, {}, "success"),
+        ):
+            with self.subTest(results=results, plan=plan, selection=selection):
+                self.assertTrue(fails(results, plan, selection))
+
+    def test_the_selection_jobs_gate_main_and_nightly(self):
+        config = json.loads((ROOT / "scripts" / "ci-evidence.json").read_text())
+        for tier in ("main", "nightly"):
+            for name in ("test selection", "test selection verdict"):
+                with self.subTest(tier=tier, job=name):
+                    self.assertIn(name, config["required_jobs"][tier])
+
+    def test_the_test_jobs_read_the_selection_only_from_a_successful_run(self):
+        for job in NARROWED_TEST_JOBS:
+            steps = job_steps(workflow_jobs()[job])
+            names = list(steps)
+            with self.subTest(job=job):
+                download = steps["Download test selection"]
+                self.assertEqual(step_condition(download), "needs.test-selection.result == 'success'")
+                self.assertIn("          name: test-selection\n", download)
+                run = names[next(i for i, name in enumerate(names)
+                                 if "--selection" in steps[name] and "run \"$SHARD\"" in steps[name])]
+                sparse = names.index("Keep only the selection's files in the tree")
+                # The tree turns sparse after every step that reads the whole
+                # checkout and before the tests run.
+                self.assertLess(names.index("Download test selection"), sparse)
+                self.assertLess(sparse, names.index(run))
+                self.assertIn('git sparse-checkout set --no-cone --stdin < "$sparse"',
+                              step_script(steps[names[sparse]]))
+        heavy = job_steps(workflow_jobs()["integration"])
+        order = list(heavy)
+        self.assertLess(order.index("Verify exhaustive disjoint test partitions"),
+                        order.index("Keep only the selection's files in the tree"))
+        self.assertLess(order.index("Verify the planned shards hold every selected test"),
+                        order.index("Keep only the selection's files in the tree"))
+        script_tests = job_steps(workflow_jobs()["fast-tests"])["Check script regressions"]
+        self.assertEqual(
+            step_condition(script_tests),
+            "matrix.shard == 'core' && (needs.test-selection.result != 'success' "
+            "|| needs.test-selection.outputs.script_tests != 'false')",
+        )
+
+
+def partitions_module():
+    loader = importlib.machinery.SourceFileLoader("partitions_wiring", str(ROOT / "scripts" / "test-partitions"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
 if __name__ == "__main__":
     unittest.main()

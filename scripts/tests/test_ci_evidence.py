@@ -25,7 +25,9 @@ REQUIRED_JOBS = ["required check", "matrix check (linux)"]
 def static_matrix(block):
     """The combinations of a job's literal `strategy.matrix`, each a dict in
     declaration order; None when the job has no matrix, "dynamic" when the
-    matrix is an expression such as `fromJSON(...)`."""
+    matrix is an expression such as `fromJSON(...)`. A key whose expression
+    ends in a literal JSON list fallback (`|| '[...]') }}`) takes that list,
+    the values of the run that selects nothing away."""
     head = re.search(r"(?m)^      matrix:(.*)$", block)
     if head is None:
         return None
@@ -43,7 +45,12 @@ def static_matrix(block):
         key, value = entry.group(3), entry.group(4).strip()
         if key == "include" and not entry.group(2):
             continue
-        if value.startswith("["):
+        if value.startswith("${{"):
+            fallback = re.search(r"\|\| '(\[[^']*\])'\) \}\}\Z", value)
+            if fallback is None:
+                return "dynamic"
+            lists[key] = json.loads(fallback.group(1))
+        elif value.startswith("["):
             lists[key] = [item.strip().strip('"') for item in value.strip("[]").split(",")]
         elif entry.group(2):
             current = {key: value.strip('"')}
