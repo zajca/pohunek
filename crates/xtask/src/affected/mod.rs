@@ -1056,10 +1056,6 @@ fn is_below(path: &str, dir: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Builds the nextest filterset of `targets`.
-///
-/// `=` is nextest's exact name matcher. `BTreeMap` iteration keeps the output
-/// deterministic.
 /// The tracked files a sparse working tree keeps for `targets`: every file
 /// whose change would select one of their packages, every file whose change
 /// selects everything, every dependency input, and nothing else that is
@@ -1108,6 +1104,10 @@ pub(crate) fn sparse_paths(
         .collect()
 }
 
+/// Builds the nextest filterset of `targets`.
+///
+/// `=` is nextest's exact name matcher. `BTreeMap` iteration keeps the output
+/// deterministic.
 pub(crate) fn filterset(targets: &Targets) -> String {
     let whole = targets.whole.keys().map(|name| format!("package(={name})"));
     let narrowed = targets.narrowed.iter().map(|(name, filters)| {

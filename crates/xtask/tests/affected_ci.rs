@@ -1,5 +1,5 @@
-//! Scenarios for `cargo xtask affected ci` and `cargo xtask affected guard`,
-//! driven through the real binary.
+//! Scenarios for `cargo xtask affected ci`, `affected guard` and `affected
+//! sparse`, driven through the real binary.
 //!
 //! Each scenario builds its own Git repository holding a Cargo workspace with
 //! the package names the selection rules name, a vendored registry crate, and
@@ -27,6 +27,8 @@
 //! - prose selects no Rust test and marks the change docs-only;
 //! - a failure exits non-zero and writes no selection;
 //! - the guard fails on a test read of a path that does not select the reader.
+//! - the sparse tree of a package set holds exactly the files whose change
+//!   selects one of the packages, every-test paths and the dependency inputs.
 
 // Rust guideline compliant 2026-10-16
 
@@ -1329,5 +1331,85 @@ fn a_read_with_more_paths_than_the_guard_tracks_is_judged_like_the_root() {
         stderr
             .contains("crates/daemon/tests/reads.rs:29: pohunek-daemon reads the repository root"),
         "{stderr}"
+    );
+}
+
+/// Runs `affected sparse` for `packages` and checks the fixture out with its
+/// patterns, as the CI test jobs do.
+fn sparse_checkout(repo: &Repo, packages: &[&str]) -> Output {
+    let mut args = vec!["sparse"];
+    for package in packages {
+        args.extend(["--package", package]);
+    }
+    let output = repo.xtask(&args);
+    if output.status.success() {
+        let mut child = repo
+            .env
+            .command("git")
+            .args(["sparse-checkout", "set", "--no-cone", "--stdin"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("run git sparse-checkout");
+        std::io::Write::write_all(&mut child.stdin.take().expect("git stdin"), &output.stdout)
+            .expect("write the patterns");
+        assert!(child.wait().expect("wait for git").success());
+    }
+    output
+}
+
+#[test]
+fn a_sparse_tree_holds_exactly_the_files_whose_change_selects_its_packages() {
+    let repo = Repo::new();
+    // An unescaped wildcard character would make a pattern miss its own
+    // file; gitignore syntax escapes a trailing space too.
+    repo.write("crates/relay/data/odd[1]*?.txt", "odd\n");
+    repo.write("crates/relay/data/trailing ", "space\n");
+    repo.commit("hostile file names");
+    let output = sparse_checkout(&repo, &["pohunek-relay"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let present = |path: &str| repo.dir().join(path).is_file();
+    for kept in [
+        "crates/relay/src/lib.rs",
+        "crates/relay/data/odd[1]*?.txt",
+        "crates/relay/data/trailing ",
+        // A change to the dev-dependency selects pohunek-relay.
+        "crates/netbird/src/lib.rs",
+        // Dependency inputs, which nextest also needs.
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates/cli/Cargo.toml",
+        // Selects every test.
+        ".github/workflows/ci.yml",
+    ] {
+        assert!(present(kept), "{kept} is missing from the sparse tree");
+    }
+    for dropped in [
+        // A dependent's change does not select pohunek-relay.
+        "crates/relay-client/src/lib.rs",
+        "crates/cli/src/lib.rs",
+        "docs/guide.md",
+        "README.md",
+    ] {
+        assert!(!present(dropped), "{dropped} is in the sparse tree");
+    }
+}
+
+#[test]
+fn a_sparse_tree_of_an_unknown_package_is_refused() {
+    let repo = Repo::new();
+    let output = sparse_checkout(&repo, &["pohunek-relay", "nope"]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("affected sparse: `nope` is not a workspace package"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
