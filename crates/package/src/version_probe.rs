@@ -1,5 +1,9 @@
 //! Supported-version policy of the data-driven version probe.
 //!
+//! The daemon's launch gate and the CLI's Hermes integration gate read a
+//! runtime's version output through this one grammar, from the `version_probe`
+//! declaration of the runtime package descriptor ([`VersionProbeDeclaration`]).
+//!
 //! A runtime descriptor that names the [`SEMVER_PARSER_ID`] or
 //! [`SEMVER_LINE_PARSER_ID`] parser declares the probe arguments and the
 //! half-open release range `[min, below)` the runtime is supported for, so a
@@ -18,7 +22,7 @@
 
 use std::fmt;
 
-use super::definition::{DefinitionError, MAX_ARG_BYTES};
+use serde::Deserialize;
 
 /// Parser id of the data-driven version probe.
 pub const SEMVER_PARSER_ID: &str = "semver-v1";
@@ -26,6 +30,76 @@ pub const SEMVER_PARSER_ID: &str = "semver-v1";
 /// Parser id of the data-driven version probe whose first output line follows
 /// a declared [`LineTemplate`].
 pub const SEMVER_LINE_PARSER_ID: &str = "semver-line-v1";
+
+/// Maximum size of one probe argument, in bytes.
+///
+/// The same bound the daemon applies to every launch argument; a probe
+/// argument is passed to the runtime program like one.
+pub const MAX_PROBE_ARG_BYTES: usize = 1024;
+
+/// Why a `version_probe` declaration is not a valid policy.
+///
+/// `field` is the descriptor field path, `reason` a static description; neither
+/// reflects descriptor text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{field} {reason}")]
+pub struct VersionProbeError {
+    /// The offending descriptor field, such as `runtime.version_probe.min`.
+    pub field: &'static str,
+    /// Why the field is invalid.
+    pub reason: &'static str,
+}
+
+/// The `[runtime] version_probe` table of a runtime package descriptor.
+///
+/// Presence rules between the parser and the policy fields are the
+/// descriptor validator's concern; [`Self::policy`] only builds the policy the
+/// fields declare.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionProbeDeclaration {
+    /// Parser id, such as [`SEMVER_LINE_PARSER_ID`].
+    pub parser: String,
+    /// Probe argv; the data-driven parsers only.
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+    /// Lowest supported release, inclusive; the data-driven parsers only.
+    #[serde(default)]
+    pub min: Option<String>,
+    /// First unsupported release; the data-driven parsers only.
+    #[serde(default)]
+    pub below: Option<String>,
+    /// Output template; the `semver-line-v1` parser only.
+    #[serde(default)]
+    pub line: Option<String>,
+}
+
+impl VersionProbeDeclaration {
+    /// The declared policy, `None` when the declaration carries no policy
+    /// fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`VersionProbeError`] when `args`, `min` and `below` are not
+    /// declared together, or when [`VersionProbePolicy::new`] or
+    /// [`VersionProbePolicy::with_line_template`] rejects them.
+    pub fn policy(&self) -> Result<Option<VersionProbePolicy>, VersionProbeError> {
+        match (&self.args, &self.min, &self.below) {
+            (None, None, None) if self.line.is_none() => Ok(None),
+            (Some(args), Some(min), Some(below)) => match &self.line {
+                Some(line) => {
+                    VersionProbePolicy::with_line_template(args.clone(), min, below, line)
+                }
+                None => VersionProbePolicy::new(args.clone(), min, below),
+            }
+            .map(Some),
+            _ => Err(VersionProbeError {
+                field: "runtime.version_probe",
+                reason: "args, min and below are declared together",
+            }),
+        }
+    }
+}
 
 /// Maximum number of probe arguments.
 ///
@@ -133,7 +207,7 @@ pub enum LineTemplateError {
 }
 
 impl LineTemplateError {
-    /// A static description for [`DefinitionError::Field`].
+    /// A static description for [`VersionProbeError::reason`].
     #[must_use]
     pub fn reason(self) -> &'static str {
         match self {
@@ -250,6 +324,43 @@ impl LineTemplate {
     }
 }
 
+/// Why a probe's output is not a supported release.
+///
+/// Neither variant carries probe output: an out-of-range refusal holds only the
+/// normalized release and the declared range, so it is safe to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionRefusal {
+    /// The first output line does not follow the declared grammar.
+    Unparseable,
+    /// The output names a release outside the declared `[min, below)`.
+    OutOfRange {
+        /// The release the output names.
+        version: ProbeVersion,
+        /// Lowest supported release, inclusive.
+        min: ProbeVersion,
+        /// First release that is no longer supported.
+        below: ProbeVersion,
+    },
+}
+
+impl fmt::Display for VersionRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unparseable => {
+                f.write_str("the version output does not match the declared format")
+            }
+            Self::OutOfRange {
+                version,
+                min,
+                below,
+            } => write!(
+                f,
+                "version {version} is outside the supported range [{min}, {below})"
+            ),
+        }
+    }
+}
+
 /// How a policy reads the probe output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OutputGrammar {
@@ -274,34 +385,36 @@ impl VersionProbePolicy {
     ///
     /// # Errors
     ///
-    /// Returns a [`DefinitionError::Field`] naming the offending field.
-    pub fn new(args: Vec<String>, min: &str, below: &str) -> Result<Self, DefinitionError> {
+    /// Returns a [`VersionProbeError`] naming the offending field.
+    pub fn new(args: Vec<String>, min: &str, below: &str) -> Result<Self, VersionProbeError> {
         const ARGS: &str = "runtime.version_probe.args";
         if args.is_empty() || args.len() > MAX_PROBE_ARGS {
-            return Err(DefinitionError::Field {
+            return Err(VersionProbeError {
                 field: ARGS,
                 reason: "must hold 1..=4 arguments",
             });
         }
         let valid_token = |arg: &String| {
-            !arg.is_empty() && arg.len() <= MAX_ARG_BYTES && !arg.chars().any(char::is_control)
+            !arg.is_empty()
+                && arg.len() <= MAX_PROBE_ARG_BYTES
+                && !arg.chars().any(char::is_control)
         };
         if !args.iter().all(valid_token) {
-            return Err(DefinitionError::Field {
+            return Err(VersionProbeError {
                 field: ARGS,
                 reason: "must be 1..=1024 bytes without control characters",
             });
         }
-        let min = ProbeVersion::parse(min).ok_or(DefinitionError::Field {
+        let min = ProbeVersion::parse(min).ok_or(VersionProbeError {
             field: "runtime.version_probe.min",
             reason: "must be MAJOR.MINOR.PATCH",
         })?;
-        let below = ProbeVersion::parse(below).ok_or(DefinitionError::Field {
+        let below = ProbeVersion::parse(below).ok_or(VersionProbeError {
             field: "runtime.version_probe.below",
             reason: "must be MAJOR.MINOR.PATCH",
         })?;
         if min >= below {
-            return Err(DefinitionError::Field {
+            return Err(VersionProbeError {
                 field: "runtime.version_probe.below",
                 reason: "must be greater than min",
             });
@@ -319,15 +432,15 @@ impl VersionProbePolicy {
     ///
     /// # Errors
     ///
-    /// Returns a [`DefinitionError::Field`] naming the offending field.
+    /// Returns a [`VersionProbeError`] naming the offending field.
     pub fn with_line_template(
         args: Vec<String>,
         min: &str,
         below: &str,
         line: &str,
-    ) -> Result<Self, DefinitionError> {
+    ) -> Result<Self, VersionProbeError> {
         let mut policy = Self::new(args, min, below)?;
-        let template = LineTemplate::parse(line).map_err(|error| DefinitionError::Field {
+        let template = LineTemplate::parse(line).map_err(|error| VersionProbeError {
             field: "runtime.version_probe.line",
             reason: error.reason(),
         })?;
@@ -370,6 +483,29 @@ impl VersionProbePolicy {
     #[must_use]
     pub fn parse_output(output: &str) -> Option<ProbeVersion> {
         ProbeVersion::parse(output.lines().next()?.trim())
+    }
+
+    /// Classifies probe output: the release when it is supported, otherwise
+    /// why it is not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VersionRefusal::Unparseable`] when the first line does not
+    /// follow this policy's grammar, and [`VersionRefusal::OutOfRange`] when the
+    /// release it carries lies outside `[min, below)`.
+    pub fn check_output(&self, output: &str) -> Result<ProbeVersion, VersionRefusal> {
+        let version = self
+            .read_output(output)
+            .ok_or(VersionRefusal::Unparseable)?;
+        if self.supports(version) {
+            Ok(version)
+        } else {
+            Err(VersionRefusal::OutOfRange {
+                version,
+                min: self.min,
+                below: self.below,
+            })
+        }
     }
 
     /// Reads the release from probe output under this policy's grammar. Only
@@ -451,7 +587,7 @@ mod tests {
             min,
             below,
         ) {
-            Err(DefinitionError::Field { field, .. }) => field,
+            Err(VersionProbeError { field, .. }) => field,
             other => panic!("expected a field error, got {other:?}"),
         };
         assert_eq!(
@@ -649,7 +785,7 @@ mod tests {
                 "2.0.0",
                 line,
             ) {
-                Err(DefinitionError::Field { field, .. }) => {
+                Err(VersionProbeError { field, .. }) => {
                     assert_eq!(field, "runtime.version_probe.line", "{line:?}");
                 }
                 other => panic!("expected a field error for {line:?}, got {other:?}"),

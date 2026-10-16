@@ -828,7 +828,8 @@ the worker's root cause.
 
 The runtime path is real PTY/TUI agent sessions. **Codex, Claude Code, and the
 local interactive Hermes Agent backend are first-class**. Hermes support is
-pinned to version 0.20.0 and deliberately excludes its remote, browser,
+verified on version 0.20.0, accepts later 0.x releases by the package's
+range policy, and deliberately excludes its remote, browser,
 desktop, gateway, ACP, and other non-local backends: Pohunek must own the PTY,
 process, worktree, and diff on the same host.
 
@@ -1155,7 +1156,8 @@ ignored the additive `wait` request from confirming delivery.
 
 ### Hermes operator plugin
 
-The pinned local Hermes Agent `0.20.0` runtime may load a Pohunek-owned plugin
+The local Hermes Agent runtime (verified on `0.20.0`, accepted up to the next
+major release) may load a Pohunek-owned plugin
 from one explicitly selected Hermes profile. This is a CLI/client-side
 integration; the daemon stays provider-neutral and M3 does not increase the
 public protocol version. The plugin assets and the deterministically generated
@@ -1165,7 +1167,12 @@ the core hook reporter and refuses to install or update the plugin without the
 package (`hermes_package_not_installed`). Installation uses
 only Hermes's supported plugin commands and places a separate owner-private
 Pohunek policy outside the immutable plugin checksum set. The rendered plugin
-asset stores the exact absolute policy path selected by the installer.
+asset stores the exact absolute policy path selected by the installer. Install,
+update, setup and doctor accept the `hermes` executable only when
+`hermes --version` names a release in the range the selected package's
+`version_probe` declares, read with the grammar the daemon's launch gate uses
+(`crates/package/src/version_probe.rs`), so the CLI never accepts a release a
+Hermes launch refuses.
 
 The policy fixes the verified absolute CLI executable, public protocol range,
 access mode, host allowlist, and bounded tool limits. It is a delegated-tool
@@ -1719,4 +1726,4 @@ Integration and E2E obligations:
 | Providers | In-tree Linear/GitHub adapters | Deferred, shell-out (`gh`, Linear GraphQL/MCP) in the client surfaces, not the chassis |
 | GUI | libghostty client (MVP5) + spike (MVP0) | Mesh-local browser client shipped (the browser and native desktop clients live in `zajca/pohunek-work`); the HTTPS native relay credential CLI is implemented, while the full team client and UI remain [#86](https://github.com/zajca/pohunek/issues/86) |
 | Attach framing | "separate stream mode" (unspecified) | Separate connection per PTY (specified) |
-| Agents | Codex + Claude Code | Codex + Claude Code + local-terminal Hermes Agent 0.20.0 |
+| Agents | Codex + Claude Code | Codex + Claude Code + local-terminal Hermes Agent 0.20.0 and later 0.x |

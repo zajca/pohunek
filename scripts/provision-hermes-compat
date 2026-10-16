@@ -6,7 +6,7 @@ set -euo pipefail
 readonly SCRIPT_NAME="${0##*/}"
 readonly REQUIRED_ARGUMENTS=1
 readonly LOCK_RELATIVE_PATH="compat/hermes/compatibility-lock.json"
-readonly EXPECTED_LOCK_SHA256="c670328dd5ed3241a6e5c60fc16c1128a58dd5950dd9d3048600df46c3bb2ed7"
+readonly EXPECTED_LOCK_SHA256="dc4b7cc3e7c450609200f629050ece509b53c56a57ee21cdbedb89fa1385602a"
 readonly EXPECTED_ARCHIVE_FORMAT="git archive --format=tar"
 readonly PYTHON_MINIMUM_MINOR=11
 readonly PYTHON_MAXIMUM_MINOR=14

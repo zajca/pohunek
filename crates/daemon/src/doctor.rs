@@ -4,6 +4,7 @@
 //! `hostcheck` crate; this module only selects which checks to run on the host
 //! that owns the agent runtime and assembles them into a [`DoctorReport`].
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use protocol::{
     IntegrationInstallState, QuarantineReason, RuntimeId, MAX_CONTROL_LINE_BYTES,
 };
 
+use crate::agent::host::VersionRefusal;
 use crate::catalog_anchor::{AnchorFault, CatalogTrust};
 use crate::governance::{HostGovernanceDiagnostic, HostGovernanceService};
 use crate::session::ActiveSupervision;
@@ -220,7 +222,10 @@ fn configured_profile_checks(
                 }
             };
             let (status, detail) = match result {
-                Ok(()) if readiness_lost => (DoctorStatus::Warn, PROFILE_WITHOUT_SCREEN_READINESS),
+                Ok(()) if readiness_lost => (
+                    DoctorStatus::Warn,
+                    Cow::Borrowed(PROFILE_WITHOUT_SCREEN_READINESS),
+                ),
                 result => configured_profile_result(result),
             };
             DoctorCheck::new(
@@ -237,8 +242,10 @@ fn configured_profile_checks(
 const PROFILE_WITHOUT_SCREEN_READINESS: &str =
     pohunek_service_config::preflight::PROFILE_WITHOUT_SCREEN_READINESS_DETAIL;
 
-fn configured_profile_result(result: Result<(), RuntimeFailure>) -> (DoctorStatus, &'static str) {
-    match result {
+fn configured_profile_result(
+    result: Result<(), RuntimeFailure>,
+) -> (DoctorStatus, Cow<'static, str>) {
+    let (status, detail) = match result {
         Ok(()) => (
             DoctorStatus::Ok,
             "Configured profile and runtime are ready.",
@@ -259,13 +266,38 @@ fn configured_profile_result(result: Result<(), RuntimeFailure>) -> (DoctorStatu
             DoctorStatus::Fail,
             "The configured executable is missing or not trusted; install it or repair the profile.",
         ),
+        Err(RuntimeFailure::Refused(refusal)) => {
+            return (
+                DoctorStatus::Fail,
+                Cow::Owned(version_refusal_detail("The configured executable", refusal)),
+            );
+        }
         Err(RuntimeFailure::Version) => (
             DoctorStatus::Fail,
-            "The configured executable's version is unsupported; repair the profile or runtime installation.",
+            "The configured executable's version probe failed; repair the profile or runtime installation.",
         ),
         Err(RuntimeFailure::ProbeBudget) => (
             DoctorStatus::Fail,
             "The configured runtime version was not checked because the doctor probe budget was exhausted.",
+        ),
+    };
+    (status, Cow::Borrowed(detail))
+}
+
+/// Doctor detail of a probe whose output names no supported release: the
+/// parsed release and the declared range, or that the output did not parse.
+/// Raw probe output never reaches the detail.
+fn version_refusal_detail(subject: &str, refusal: VersionRefusal) -> String {
+    match refusal {
+        VersionRefusal::OutOfRange {
+            version,
+            min,
+            below,
+        } => format!(
+            "{subject} reports version {version}, outside its runtime's supported range [{min}, {below}); install a release in that range or update the runtime package."
+        ),
+        VersionRefusal::Unparseable => format!(
+            "{subject}'s version output does not match its runtime's declared format; the configured program must print its release in the format its runtime package declares."
         ),
     }
 }
@@ -292,16 +324,24 @@ fn optional_runtime_checks(
         .collect()
 }
 
-fn optional_runtime_result(result: Result<(), RuntimeFailure>) -> (DoctorStatus, &'static str) {
-    match result {
+fn optional_runtime_result(
+    result: Result<(), RuntimeFailure>,
+) -> (DoctorStatus, Cow<'static, str>) {
+    let (status, detail) = match result {
         Ok(()) => (DoctorStatus::Ok, "Optional provider runtime is ready."),
         Err(RuntimeFailure::Executable) => (
             DoctorStatus::Warn,
             "Optional provider executable is missing; install it only if you use this agent.",
         ),
+        Err(RuntimeFailure::Refused(refusal)) => {
+            return (
+                DoctorStatus::Fail,
+                Cow::Owned(version_refusal_detail("The optional provider", refusal)),
+            );
+        }
         Err(RuntimeFailure::Version) => (
             DoctorStatus::Fail,
-            "Optional provider's installed version is unsupported; update the provider.",
+            "Optional provider's version probe failed; repair or reinstall the provider.",
         ),
         Err(RuntimeFailure::PinnedRuntime) => (
             DoctorStatus::Fail,
@@ -319,7 +359,8 @@ fn optional_runtime_result(result: Result<(), RuntimeFailure>) -> (DoctorStatus,
             DoctorStatus::Warn,
             "Optional provider version was not checked because the doctor probe budget was exhausted.",
         ),
-    }
+    };
+    (status, Cow::Borrowed(detail))
 }
 
 /// Add redacted hook-integration readiness using the launch-equivalent homes.
@@ -509,6 +550,9 @@ enum RuntimeFailure {
     Profile,
     PinnedRuntime,
     Executable,
+    /// The probe ran and its output names no supported release.
+    Refused(VersionRefusal),
+    /// The probe failed or its parser is not compiled in.
     Version,
     ProbeBudget,
 }
@@ -550,6 +594,9 @@ fn profile_runtime_check(
     .map_err(|error| match error {
         crate::capabilities::LaunchValidationFailure::Missing => RuntimeFailure::Executable,
         crate::capabilities::LaunchValidationFailure::ProbeTimedOut => RuntimeFailure::ProbeBudget,
+        crate::capabilities::LaunchValidationFailure::Refused(refusal) => {
+            RuntimeFailure::Refused(refusal)
+        }
         crate::capabilities::LaunchValidationFailure::Unsupported => RuntimeFailure::Version,
     })?;
     Ok(())

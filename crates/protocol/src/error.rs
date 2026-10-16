@@ -362,14 +362,56 @@ impl ProtocolError {
     }
 
     /// The canonical rejection for an agent executable that exists but fails
-    /// its runtime's version probe: another release, unparseable output, a
-    /// failing or timed-out probe, or a probe parser this daemon does not
-    /// provide. A program that does not resolve is `agent_binary_missing`.
+    /// its runtime's version probe: a failing or timed-out probe, or a probe
+    /// parser this daemon does not provide. A program that does not resolve is
+    /// `agent_binary_missing`; a release outside the supported range and
+    /// output that does not parse have their own detailed forms of this code
+    /// ([`Self::agent_runtime_version_out_of_range`],
+    /// [`Self::agent_runtime_version_unparseable`]).
     #[must_use]
     pub fn agent_runtime_unsupported() -> Self {
         Self::observation(
             "agent_runtime_unsupported",
             "the selected agent executable did not pass this daemon's version check",
+        )
+    }
+
+    /// `agent_runtime_unsupported` for an executable whose probe reported a
+    /// release outside its runtime's supported `[min, below)`.
+    ///
+    /// The arguments are the normalized releases the probe parsed and the
+    /// runtime declares; raw probe output never reaches the error.
+    #[must_use]
+    pub fn agent_runtime_version_out_of_range(
+        version: &impl std::fmt::Display,
+        min: &impl std::fmt::Display,
+        below: &impl std::fmt::Display,
+    ) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "agent_runtime_unsupported",
+            format!(
+                "the selected agent executable reports version {version}, outside its runtime's supported range [{min}, {below})"
+            ),
+            Some(
+                "install a release in the supported range, or update the runtime package"
+                    .to_owned(),
+            ),
+        )
+    }
+
+    /// `agent_runtime_unsupported` for an executable whose probe succeeded
+    /// but printed no release in the format its runtime declares.
+    #[must_use]
+    pub fn agent_runtime_version_unparseable() -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "agent_runtime_unsupported",
+            "the selected agent executable's version output does not match its runtime's declared format",
+            Some(
+                "the configured program must print its release in the format its runtime package declares"
+                    .to_owned(),
+            ),
         )
     }
 

@@ -1195,15 +1195,16 @@ conflicting, or incompatible runtimes and is never automatic. A removed session
 is gone and cannot be recovered.
 
 Hermes, served only by its official package, uses the same durable worker
-model, but only for the local interactive terminal backend in the supported
-0.20.0 release. Pohunek launches it as
+model, but only for the local interactive terminal backend in the releases its
+package supports (`[0.20.0, 1.0.0)`, verified on 0.20.0). Pohunek launches it as
 `hermes chat`; when a valid native reference is already present, recovery is
 exactly `hermes chat --resume <reference>`. It never continues ambient Hermes
 state and never reads `state.db`. Before either launch, and before material
 side effects, the daemon fails with `agent_binary_missing` when the `hermes`
 program does not resolve to an executable, then requires an isolated, bounded
-version probe to confirm the pinned release and fails with payload-free
-`agent_runtime_unsupported` when the runtime is incompatible. The Hermes operator plugin reports a native
+version probe to confirm a release in the package's supported range and fails with
+`agent_runtime_unsupported` when the runtime is incompatible; the refusal names
+the parsed release and the supported range, never the probe output. The Hermes operator plugin reports a native
 reference through its bounded lifecycle hooks for a managed Hermes session; it
 does not infer or read one from Hermes state. Its resume capability is
 independent from a temporarily unavailable report; fork is always unsupported

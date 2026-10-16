@@ -31,6 +31,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use nix::unistd::Uid;
+use package::version_probe::VersionProbePolicy;
 use pohunek_platform::filesystem::{
     AdvisoryLock, AtomicReplaceError, EntryKind, FsError, MoveOutcome, RemoveOutcome, StageOutcome,
     StagedEntry, StagedMoveError, TrustedDir,
@@ -70,10 +71,12 @@ const TRANSACTION_LOCK_NAME: &str = ".pohunek-lifecycle.lock";
 /// and querying or changing its fixed enabled state. In production the runner
 /// owns this boundary; tests use a controlled in-memory implementation.
 pub(crate) trait HermesControl {
-    /// Validates the staged plugin with Hermes's fixed import/schema contract.
+    /// Validates the staged plugin with Hermes's fixed import/schema contract,
+    /// on a Hermes release `version_policy` supports.
     fn validate_staged(
         &mut self,
         target: &ResolvedTarget,
+        version_policy: &VersionProbePolicy,
         staged_root: &Path,
         staged_policy: &Path,
     ) -> Result<(), Error>;
@@ -310,7 +313,14 @@ fn install_with(
                 )
             })
         })
-        .and_then(|()| control.validate_staged(request.target, &stage_plugin, &stage_policy));
+        .and_then(|()| {
+            control.validate_staged(
+                request.target,
+                &bundle.version_probe,
+                &stage_plugin,
+                &stage_policy,
+            )
+        });
     if let Err(error) = write_result {
         remove_current_stage(&stage_plugin);
         remove_owned_file(&stage_policy);
@@ -1666,6 +1676,7 @@ mod tests {
         fn validate_staged(
             &mut self,
             _: &ResolvedTarget,
+            _: &VersionProbePolicy,
             _: &Path,
             staged_policy: &Path,
         ) -> Result<(), Error> {

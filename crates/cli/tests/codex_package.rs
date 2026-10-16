@@ -98,7 +98,7 @@ const GOLDEN_MANIFEST_NAME: &str = "codex";
 const PACKAGE_ID: &str = "pohunek.runtime.codex";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.1.0";
+const PACKAGE_VERSION: &str = "1.1.1";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -442,6 +442,19 @@ fn the_supported_range_equals_the_compatibility_lock() {
         !policy.supports(policy.below()),
         "the first release above the range is unsupported"
     );
+    let next_major = policy
+        .min()
+        .to_string()
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u64>().ok())
+        .expect("the minimum's major release")
+        + 1;
+    assert_eq!(
+        policy.below().to_string(),
+        format!("{next_major}.0.0"),
+        "the range runs from the verified minimum to the next major release"
+    );
 }
 
 #[test]
@@ -465,10 +478,15 @@ fn the_version_probe_reads_the_codex_banner_and_nothing_else() {
     );
     assert_eq!(
         supported("codex-cli 0.161.0"),
-        Some(false),
-        "the next minor is outside the range"
+        Some(true),
+        "a later 0.x release is inside the range"
     );
-    assert_eq!(supported("codex-cli 1.0.0"), Some(false));
+    assert_eq!(supported("codex-cli 0.162.1"), Some(true));
+    assert_eq!(
+        supported("codex-cli 1.0.0"),
+        Some(false),
+        "the next major is outside the range"
+    );
 
     for unreadable in [
         "",
@@ -2049,33 +2067,83 @@ async fn installing_the_package_by_digest_is_refused_because_codex_is_reserved()
 /// Writes an executable `codex` into a directory of its own below `root` that
 /// answers `--version` with `banner` and otherwise idles, and returns its path.
 fn write_fake_codex(root: &Path, directory: &str, banner: &str) -> PathBuf {
+    write_fake_codex_exiting(root, directory, banner, 0)
+}
+
+/// [`write_fake_codex`] whose `--version` exits with `status`.
+fn write_fake_codex_exiting(root: &Path, directory: &str, banner: &str, status: u8) -> PathBuf {
     let path = root.join(directory).join("codex");
     fs::create_dir_all(root.join(directory)).expect("create the fake codex directory");
     write_executable(
         &path,
-        format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo '{banner}'\n  exit 0\nfi\nexec sleep 600\n"),
+        format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo '{banner}'\n  exit {status}\nfi\nexec sleep 600\n"),
     )
     .expect("write the fake codex");
     path
 }
 
+/// How the version check must classify a fake `codex`.
+#[derive(Debug, Clone, Copy)]
+enum ProbeVerdict {
+    /// The banner names this release, outside the locked supported range.
+    OutOfRange(&'static str),
+    /// The banner is not the declared `codex-cli {version}` line.
+    Unparseable,
+    /// The probe itself fails.
+    Failed,
+}
+
+impl ProbeVerdict {
+    /// The fragments the launch refusal message and the doctor detail must
+    /// hold, from the compatibility lock's supported range.
+    fn expected(self) -> Vec<String> {
+        let lock = read_lock();
+        let range = format!(
+            "[{}, {})",
+            lock["supported"]["min"].as_str().expect("lock min"),
+            lock["supported"]["below"].as_str().expect("lock below")
+        );
+        match self {
+            Self::OutOfRange(version) => vec![format!("reports version {version}"), range],
+            Self::Unparseable => vec!["does not match its runtime's declared format".to_owned()],
+            Self::Failed => vec![],
+        }
+    }
+}
+
 /// The version probe the package declares decides every launch of `codex`, on
-/// the executable the profile names: only the supported release starts.
+/// the executable the profile names: only the supported release starts. A
+/// refused launch and `pohunek doctor` name the parsed release and the
+/// supported range, or that the output did not parse, and never echo the
+/// banner itself.
 #[tokio::test]
 async fn the_package_version_probe_refuses_an_unsupported_codex_and_starts_the_supported_one() {
     let fixture = Fixture::start().await;
     let root = fixture.harness.env.root().to_path_buf();
     let release = locked_release();
     let unsupported = [
-        "codex-cli 0.159.9".to_owned(),
-        "codex-cli 0.161.0".to_owned(),
-        format!("codex-cli {release}-rc.1"),
-        format!("codex {release}"),
-        "unreadable".to_owned(),
+        (
+            "codex-cli 0.159.9".to_owned(),
+            0,
+            ProbeVerdict::OutOfRange("0.159.9"),
+        ),
+        (
+            "codex-cli 1.0.0".to_owned(),
+            0,
+            ProbeVerdict::OutOfRange("1.0.0"),
+        ),
+        (
+            format!("codex-cli {release}-rc.1"),
+            0,
+            ProbeVerdict::Unparseable,
+        ),
+        (format!("codex {release}"), 0, ProbeVerdict::Unparseable),
+        ("unreadable".to_owned(), 0, ProbeVerdict::Unparseable),
+        (format!("codex-cli {release}"), 3, ProbeVerdict::Failed),
     ];
-    for (index, banner) in unsupported.iter().enumerate() {
+    for (index, (banner, status, verdict)) in unsupported.iter().enumerate() {
         let profile = format!("fake-unsupported-{index}");
-        let program = write_fake_codex(&root, &profile, banner);
+        let program = write_fake_codex_exiting(&root, &profile, banner, *status);
         fixture.write_profile(&profile, Some(&program));
 
         let entry = fixture.inventory_entry(&profile).await;
@@ -2086,22 +2154,65 @@ async fn the_package_version_probe_refuses_an_unsupported_codex_and_starts_the_s
             refused["err"]["code"], "agent_runtime_unsupported",
             "{banner:?}: {refused}"
         );
+        let message = refused["err"]["msg"].as_str().expect("refusal message");
+        if matches!(verdict, ProbeVerdict::Failed) {
+            assert_eq!(
+                message, "the selected agent executable did not pass this daemon's version check",
+                "{refused}"
+            );
+        } else {
+            for fragment in verdict.expected() {
+                assert!(message.contains(&fragment), "{fragment:?}: {refused}");
+            }
+            assert!(refused["err"]["recover"].is_string(), "{refused}");
+        }
+        if matches!(verdict, ProbeVerdict::Unparseable) {
+            assert!(!refused.to_string().contains(banner.as_str()), "{refused}");
+        }
     }
 
-    let banner = format!("codex-cli {release}");
-    let program = write_fake_codex(&root, "fake-supported", &banner);
-    fixture.write_profile("fake-supported", Some(&program));
-    let entry = fixture.inventory_entry("fake-supported").await;
-    assert_eq!(entry["supported"], true, "{entry}");
-    assert_eq!(entry["version"], release, "{entry}");
-    let (code, launched) = fixture.launch("fake-supported", "accepted").await;
-    assert_eq!(code, 0, "{launched}");
-    let id = launched["ok"]["id"]
-        .as_str()
-        .expect("session id")
-        .to_owned();
-    assert_eq!(launched["ok"]["agent_base"], "codex");
-    fixture.stop(&id).await;
+    let doctor = fixture.harness.run(&["doctor", "--json"]).await;
+    let doctor: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
+    for (index, (banner, _, verdict)) in unsupported.iter().enumerate() {
+        let name = format!("agent_profile_fake-unsupported-{index}");
+        let check = doctor["ok"]["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .find(|check| check["name"] == name.as_str())
+            .unwrap_or_else(|| panic!("doctor reports {name}: {doctor}"));
+        assert_eq!(check["status"], "fail", "{check}");
+        let detail = check["detail"].as_str().expect("doctor detail");
+        if matches!(verdict, ProbeVerdict::Failed) {
+            assert!(detail.contains("version probe failed"), "{check}");
+        } else {
+            for fragment in verdict.expected() {
+                assert!(detail.contains(&fragment), "{fragment:?}: {check}");
+            }
+        }
+        if matches!(verdict, ProbeVerdict::Unparseable) {
+            assert!(!detail.contains(banner.as_str()), "{check}");
+        }
+    }
+
+    // The locked release and a later 0.x release, the one a host's Codex
+    // auto-update installed (`codex-cli 0.162.1`), both launch.
+    for (index, version) in [release.as_str(), "0.162.1"].into_iter().enumerate() {
+        let profile = format!("fake-supported-{index}");
+        let program = write_fake_codex(&root, &profile, &format!("codex-cli {version}"));
+        fixture.write_profile(&profile, Some(&program));
+        let entry = fixture.inventory_entry(&profile).await;
+        assert_eq!(entry["supported"], true, "{entry}");
+        assert_eq!(entry["version"], version, "{entry}");
+        let (code, launched) = fixture.launch(&profile, "accepted").await;
+        assert_eq!(code, 0, "{launched}");
+        let id = launched["ok"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_owned();
+        assert_eq!(launched["ok"]["agent_base"], "codex");
+        fixture.stop(&id).await;
+    }
     fixture.finish().await;
 }
 

@@ -12,7 +12,7 @@
   },
   "supported": {
     "min": "0.160.0",
-    "below": "0.161.0"
+    "below": "1.0.0"
   },
   "verified_with": "Interactive PTY runs of the pinned release against a loopback Responses-API stub with a fresh CODEX_HOME and no network namespace egress: idle, working (status line and streaming), tool-approval, question and trust-folder screens at widths 20 to 200, terminal-title states, `codex --version` banner and hook-trust records (SessionStart, Stop)"
 }

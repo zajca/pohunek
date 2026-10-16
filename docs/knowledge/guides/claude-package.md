@@ -2,7 +2,7 @@
 type: Guide
 id: guide/claude-package
 title: Claude Code runtime package
-description: The official Claude Code runtime package source (Claude Code 2.1.x from 2.1.289), the only source of the claude runtime, what it declares, how its detection differs from the built-in Claude runtime of release 0.34.2, what was verified against a real Claude Code, and the detection limits that remain.
+description: The official Claude Code runtime package source (Claude Code 2.x from 2.1.289), the only source of the claude runtime, what it declares, how its detection differs from the built-in Claude runtime of release 0.34.2, what was verified against a real Claude Code, and the detection limits that remain.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
@@ -113,13 +113,15 @@ enumerated captured frames may read differently.
   (such as `live_prompt_box`) launches with bracketed-paste readiness instead,
   and `pohunek doctor` warns about it.
 - Version: `version_probe = { parser = "semver-line-v1", args = ["--version"],
-  min = "2.1.289", below = "2.2.0", line = "{version} (Claude Code)" }`.
+  min = "2.1.289", below = "3.0.0", line = "{version} (Claude Code)" }`.
   `claude --version` prints `2.1.289 (Claude Code)` on standard output; any
   other wording, a pre-release or trailing text is unsupported. The lower bound
-  is the one release that was verified; the upper bound is the next minor
-  release, as for the other packages. Claude Code ships patch releases almost
-  daily, so only 2.1.289 was exercised; moving the range is a lock and
-  descriptor change made together after a real-Claude run of the new release.
+  is the one release that was verified; the upper bound is the next major
+  release, as for the other packages, because hosts update Claude Code
+  independently of pohunek. Claude Code ships patch releases almost daily, so
+  only 2.1.289 was exercised; later 2.x releases are accepted by policy, not
+  verified. Moving `min` is a lock and descriptor change made together after a
+  real-Claude run of the new release.
 - Native reference: `strategy = "hook"`; resume is `claude --resume <id>`; fork
   is `claude --resume <id> --fork-session`.
 - Integration: handler `claude-hook-v1` with hook schema
@@ -378,9 +380,10 @@ established by the network namespace, not by Claude's own switches.
   package then serves `claude` with official trust, profiles carry its
   `package`/`digest` pin, and a launch runs the package's version probe on the
   executable the profile names. An always-running test drives that probe with
-  throwaway `claude` scripts: the older release, the next minor, a pre-release,
+  throwaway `claude` scripts: the older release, the next major, a pre-release,
   a different banner wording and unreadable output are refused with
-  `agent_runtime_unsupported`, and the supported banner launches.
+  `agent_runtime_unsupported`, and the supported banner and a later 2.x
+  release launch.
 - Always-running clean-host tests start from a daemon without the package and
   a fake `claude` of the locked release on `PATH`: the bare runtime, its
   integration and an unpinned `base = "claude"` profile are refused with the

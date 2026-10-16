@@ -12,7 +12,7 @@
   },
   "supported": {
     "min": "1.0.0",
-    "below": "1.1.0"
+    "below": "2.0.0"
   },
   "verified_with": "PTY run of the pinned release: session file layout (default store and PI_CODING_AGENT_SESSION_DIR), bracketed paste, idle and working screens, extension dialog, project trust, missing session cwd, login and selector screens, process name, session-id resume, and fork under an assigned session id resumed by that id"
 }

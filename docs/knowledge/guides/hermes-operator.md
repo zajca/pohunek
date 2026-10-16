@@ -22,7 +22,11 @@ build it, attest it on Linux x86_64 (glibc and musl) and Apple Silicon
 (aarch64-apple-darwin), and ship it with the signed catalog entry that
 authorizes the reserved `hermes` runtime id in all daemon archives. The package
 carries the Hermes launch, resume and detection contract (`runtime.toml`,
-`detect.toml`) and supports only the locked 0.20.0 release.
+`detect.toml`) and supports Hermes releases from the locked 0.20.0 up to the
+next major release (`[0.20.0, 1.0.0)`); only 0.20.0 is verified. The integration's
+install, update, setup and doctor read `hermes --version` through the selected
+package's `version_probe`, with the grammar the daemon's launch gate uses, so
+they accept exactly the Hermes releases a launch accepts.
 Its `operator.toml` closes the allowlist for the operator payload in
 `operator/`; the CLI verifies its paths and digests before installation. Pohunek loads the operator plugin and its generated skill
 only from the installed, enabled, and selected official package; the CLI

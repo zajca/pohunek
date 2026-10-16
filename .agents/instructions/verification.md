@@ -681,8 +681,9 @@ The real measurements are not part of any test or gate; run them
 deliberately, one at a time, and keep the emitted `baseline.json` files
 in the issue's evidence.
 
-Hermes M3 supports only the pinned local interactive Hermes Agent `0.20.0`
-runtime and its explicit profile-owned Pohunek operator plugin. The stable
+Hermes M3 supports the local interactive Hermes Agent runtime in the range its
+package declares (`[0.20.0, 1.0.0)`), verified on the pinned `0.20.0`, and its
+explicit profile-owned Pohunek operator plugin. The stable
 model-free compatibility gate (`cargo xtask hermes compatibility
 --bin-dir ABS --package ARCHIVE`, with the binary directory holding `pohunek`,
 `pohunekd`, and `pohunek-sessiond`) exercises the pinned CLI and plugin surface:

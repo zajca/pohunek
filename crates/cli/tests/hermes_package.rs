@@ -79,7 +79,7 @@ const GOLDEN_MANIFEST: &str = "compat/hermes/builtin-v0.34/detect.toml";
 const PACKAGE_ID: &str = "pohunek.runtime.hermes";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.0.0";
+const PACKAGE_VERSION: &str = "1.0.1";
 
 /// Profile that pins the runtime package in the installation scenario.
 const PROFILE: &str = "hermes-package-test";
@@ -623,9 +623,23 @@ fn assert_supported_range_equals_the_lock(lock: &Value, locked_release: &str) {
         !policy.supports(policy.below()),
         "the first release above the range is unsupported"
     );
+    let next_major = policy
+        .min()
+        .to_string()
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u64>().ok())
+        .expect("the minimum's major release")
+        + 1;
+    assert_eq!(
+        policy.below().to_string(),
+        format!("{next_major}.0.0"),
+        "the range runs from the verified minimum to the next major release"
+    );
 }
 
-/// Checks the exact locked release and the first release outside the range.
+/// Checks the exact locked release, a later 0.x release and the first release
+/// outside the range.
 async fn assert_supported_boundary(
     harness: &Harness,
     digest: &PackageDigest,
@@ -636,9 +650,13 @@ async fn assert_supported_boundary(
     write_profile(harness, digest, &supported_probe);
     inspect_profile_version(harness, locked_release, true).await;
 
-    let unsupported_probe = write_probe(harness, "hermes-next", "Hermes Agent v0.20.1 (future)");
+    let later_probe = write_probe(harness, "hermes-later", "Hermes Agent v0.21.0 (2026.9.1)");
+    write_profile(harness, digest, &later_probe);
+    inspect_profile_version(harness, "0.21.0", true).await;
+
+    let unsupported_probe = write_probe(harness, "hermes-next", "Hermes Agent v1.0.0 (future)");
     write_profile(harness, digest, &unsupported_probe);
-    inspect_profile_version(harness, "0.20.1", false).await;
+    inspect_profile_version(harness, "1.0.0", false).await;
     write_profile(harness, digest, &supported_probe);
     inspect_profile_version(harness, locked_release, true).await;
 }
@@ -727,6 +745,7 @@ struct HermesFixture {
     hermes_bin: PathBuf,
     pohunek_bin: PathBuf,
     enable_failure: PathBuf,
+    version_banner: PathBuf,
 }
 
 impl HermesFixture {
@@ -763,12 +782,16 @@ impl HermesFixture {
         let plugin_root = hermes_home.join("plugins/operators/pohunek");
         let state_file = env.root().join("hermes-plugin-state");
         let enable_failure = env.root().join("fail-hermes-enable");
+        let version_banner = env.root().join("hermes-version-banner");
         fs::write(&state_file, "disabled\n").expect("initialize Hermes plugin state");
+        fs::write(&version_banner, "Hermes Agent v0.20.0 (2026.8.3)\n")
+            .expect("initialize the Hermes version banner");
         let hermes_bin = install_bin.join("hermes");
         write_executable(
             &hermes_bin,
             format!(
-                "case \"$*\" in\n--version) printf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3)' ;;\n'plugins list --json') if [ -d '{}' ]; then printf '[{{\"name\":\"pohunek\",\"status\":\"%s\",\"source\":\"user\"}}]\\n' \"$(/bin/cat '{}')\"; else printf '%s\\n' '[]'; fi ;;\n'plugins enable pohunek --no-allow-tool-override') if [ -e '{}' ]; then /bin/rm -f '{}'; exit 90; fi; printf '%s\\n' enabled > '{}' ;;\n'plugins disable pohunek') printf '%s\\n' disabled > '{}' ;;\n*) exit 90 ;;\nesac",
+                "case \"$*\" in\n--version) /bin/cat '{}' ;;\n'plugins list --json') if [ -d '{}' ]; then printf '[{{\"name\":\"pohunek\",\"status\":\"%s\",\"source\":\"user\"}}]\\n' \"$(/bin/cat '{}')\"; else printf '%s\\n' '[]'; fi ;;\n'plugins enable pohunek --no-allow-tool-override') if [ -e '{}' ]; then /bin/rm -f '{}'; exit 90; fi; printf '%s\\n' enabled > '{}' ;;\n'plugins disable pohunek') printf '%s\\n' disabled > '{}' ;;\n*) exit 90 ;;\nesac",
+                version_banner.display(),
                 plugin_root.display(),
                 state_file.display(),
                 enable_failure.display(),
@@ -785,7 +808,14 @@ impl HermesFixture {
             hermes_bin,
             pohunek_bin: bin_exe("pohunek"),
             enable_failure,
+            version_banner,
         }
+    }
+
+    /// Makes `hermes --version` print `banner`.
+    fn set_version_banner(&self, banner: &str) {
+        fs::write(&self.version_banner, format!("{banner}\n"))
+            .expect("write the Hermes version banner");
     }
 
     /// Arguments of one Hermes lifecycle action for the default profile.
@@ -1095,6 +1125,11 @@ async fn assert_source_findings(
             "fail",
             "{context}: doctor does not offer an update that cannot succeed: {doctor:#}"
         );
+        assert_eq!(
+            check(&doctor, "hermes_version").0,
+            "not_run",
+            "{context}: without a package range the version is not judged: {doctor:#}"
+        );
         assert_eq!(doctor["doctor"]["ok"], false, "{context}");
     }
 }
@@ -1160,6 +1195,9 @@ async fn the_signed_hermes_package_is_selected_and_failed_installs_preserve_it()
             .expect("a [runtime] table");
         assert!(runtime.remove("detect_manifest").is_some());
         assert!(runtime.remove("version_probe").is_some());
+        // The package version moves with every package release; the golden
+        // keeps the built-in descriptor's own.
+        assert!(table.remove("version").is_some());
         table
     };
     let golden_descriptor: toml::Table = golden_body(GOLDEN_DESCRIPTOR, BUILTIN_DESCRIPTOR)
@@ -1827,6 +1865,40 @@ async fn a_real_hermes_launch_submits_its_initial_input_once_the_prompt_shows() 
     harness.stop().await;
 }
 
+/// The integration's Hermes version gate is the selected package's declared
+/// range, read with the launch gate's grammar: a release in the range with
+/// other build metadata than the locked banner installs and passes doctor, and
+/// the first release above the range is refused with nothing written.
+#[tokio::test]
+async fn the_integration_accepts_the_package_range_not_one_banner() {
+    let key = test_key();
+    let harness = trusted_harness(&key).await;
+    install_official(&harness, &key).await;
+    let hermes = HermesFixture::new(&harness.env);
+    let probe =
+        read_toml(&format!("{PACKAGE_DIR}/runtime.toml"))["runtime"]["version_probe"].clone();
+    let bound = |field: &str| {
+        probe[field]
+            .as_str()
+            .unwrap_or_else(|| panic!("version_probe.{field}"))
+            .to_owned()
+    };
+    let (min, below) = (bound("min"), bound("below"));
+
+    hermes.set_version_banner(&format!("Hermes Agent v{min} (rebuilt) · local 0123abcd"));
+    hermes.install(&harness).await;
+    let doctor = hermes.doctor(&harness).await;
+    assert_eq!(check(&doctor, "hermes_version").0, "pass", "{doctor:#}");
+
+    hermes.set_version_banner(&format!("Hermes Agent v{below} (future)"));
+    hermes
+        .refuses_install_and_update(&harness, "hermes_unsupported_version", "above the range")
+        .await;
+    let doctor = hermes.doctor(&harness).await;
+    assert_eq!(check(&doctor, "hermes_version").0, "fail", "{doctor:#}");
+    harness.stop().await;
+}
+
 /// A package-backed install writes the package bytes, provenance, and policy binding.
 #[tokio::test]
 async fn package_backed_install_writes_the_selected_package_bytes() {
@@ -1936,14 +2008,14 @@ async fn an_unusable_selection_without_an_install_is_a_typed_source_error() {
     let hermes = HermesFixture::new(&harness.env);
 
     let mut alternate = package_entries();
-    set_version(&mut alternate, "1.0.1");
+    set_version(&mut alternate, "1.0.2");
     let (bytes, alternate_digest) = archive_of(&alternate);
-    let archive = write_archive(&harness, "hermes-1.0.1.tar.zst", &bytes);
+    let archive = write_archive(&harness, "hermes-1.0.2.tar.zst", &bytes);
     let catalog = write_catalog(
         &harness,
         &key,
         2,
-        vec![catalog_entry("1.0.1", &alternate_digest)],
+        vec![catalog_entry("1.0.2", &alternate_digest)],
     );
     update_package(&harness, &archive, &catalog, &alternate_digest).await;
     let (code, removed) = harness
@@ -2172,17 +2244,17 @@ async fn update_moves_an_install_to_the_newly_selected_package() {
     assert_eq!(hermes.status(&harness).await["outdated"], false);
 
     let mut second = package_entries();
-    set_version(&mut second, "1.0.1");
+    set_version(&mut second, "1.0.2");
     let mut skill = entry(&second, &format!("operator/{SKILL_PATH}")).to_vec();
     skill.extend_from_slice(b"\n<!-- second package version -->\n");
     replace_operator_file(&mut second, SKILL_PATH, skill.clone());
     let (bytes, second_digest) = archive_of(&second);
-    let archive = write_archive(&harness, "hermes-1.0.1.tar.zst", &bytes);
+    let archive = write_archive(&harness, "hermes-1.0.2.tar.zst", &bytes);
     let catalog = write_catalog(
         &harness,
         &key,
         2,
-        vec![catalog_entry("1.0.1", &second_digest)],
+        vec![catalog_entry("1.0.2", &second_digest)],
     );
     update_package(&harness, &archive, &catalog, &second_digest).await;
     let status = hermes.status(&harness).await;
@@ -2838,9 +2910,21 @@ async fn sidecar_violations_in_a_signed_package_fail_install() {
     );
     cases.push(("an init with the policy token twice", repeated));
 
+    // The daemon accepts other probe arguments, but the integration runs only
+    // the fixed `hermes --version`, so it would check another output.
+    let mut probe_args = package_entries();
+    let descriptor = entry_mut(&mut probe_args, "runtime.toml");
+    let text = String::from_utf8(descriptor.contents.clone()).expect("descriptor UTF-8");
+    assert!(text.contains(r#"args = ["--version"], min"#), "{text}");
+    descriptor.contents = text
+        .replacen(r#"args = ["--version"], min"#, r#"args = ["-V"], min"#, 1)
+        .into_bytes();
+    cases.push(("a version probe with other arguments", probe_args));
+
     let mut published = Vec::new();
     for (index, (name, mut entries)) in cases.into_iter().enumerate() {
-        let version = format!("1.0.{}", index + 1);
+        // Above the installed package version, so each case is a new version.
+        let version = format!("1.1.{index}");
         set_version(&mut entries, &version);
         let (bytes, case_digest) = archive_of(&entries);
         let archive = write_archive(&harness, &format!("hermes-{version}.tar.zst"), &bytes);

@@ -362,8 +362,9 @@ in [the architecture](architecture.md#runtime-packages-and-trust) and the
 
 Pi (`pi`, the Pi coding agent) is an optional runtime delivered as a runtime
 package, not compiled into the daemon. The package declares launch, native
-resume and fork, input framing, and detection for Pi `1.0.x`; the supported range
-and the verified release are in `compat/pi/compatibility-lock.json`. It needs a
+resume and fork, input framing, and detection for Pi `1.x` from `1.0.0` (verified
+on `1.0.2`); the supported range and the verified release are in
+`compat/pi/compatibility-lock.json`. It needs a
 Pi on the daemon's `PATH` (`npm install --global
 @earendil-works/pi-coding-agent@1.0.2`, Node 22.19 or newer). A release install
 takes the official package from the daemon archive as above; a checkout builds
@@ -406,5 +407,6 @@ pohunek session new --agent pi --name "refactor-parser" --input "Refactor the pa
 - A Pi extension dialog, the project trust prompt and the login steps read as
   `blocked`; the model, session and other selectors are never read as `idle`.
 - A Pi outside the supported range refuses to launch with
-  `agent_runtime_unsupported`; update the package (`pohunek plugin update`) when
-  a new Pi range is verified.
+  `agent_runtime_unsupported`, whose message names the detected release and the
+  range; install a Pi in the range, or update the package (`pohunek plugin
+  update`) when a package with a new range is released.

@@ -23,13 +23,16 @@ use sha2::{Digest, Sha256};
 
 use super::config_home::ConfigHome;
 use super::transcripts::Transcripts;
-use super::version_probe::{VersionProbePolicy, SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID};
 use crate::agent::{
     AssignedReference, ExistenceSpec, InputRules, InputTextPolicy, NativeArgs, NativeLaunchError,
     NativeReferenceError, NativeReferenceStrategy, NativeSessionLaunch, ReferenceExistence,
     SessionRefKind,
 };
 use crate::detect::Manifest;
+use package::version_probe::{
+    VersionProbeDeclaration, VersionProbeError, VersionProbePolicy, SEMVER_LINE_PARSER_ID,
+    SEMVER_PARSER_ID,
+};
 
 /// `schema` value this build accepts in a runtime definition.
 pub const SUPPORTED_SCHEMA: u32 = 1;
@@ -131,6 +134,15 @@ pub enum DefinitionError {
     /// `detect_manifest` names a manifest the source cannot provide.
     #[error("detect_manifest does not name an available detection manifest")]
     UnknownManifest,
+}
+
+impl From<VersionProbeError> for DefinitionError {
+    fn from(error: VersionProbeError) -> Self {
+        Self::Field {
+            field: error.field,
+            reason: error.reason,
+        }
+    }
 }
 
 /// A cross-field rule a runtime definition violates.
@@ -661,7 +673,7 @@ impl RuntimeDefinition {
                 .runtime
                 .version_probe
                 .as_ref()
-                .map(RawVersionProbe::policy)
+                .map(VersionProbeDeclaration::policy)
                 .transpose()?
                 .flatten(),
             integration: raw
@@ -1100,51 +1112,10 @@ struct RawRuntime {
     args: Vec<String>,
     detect_manifest: String,
     #[serde(default)]
-    version_probe: Option<RawVersionProbe>,
+    version_probe: Option<VersionProbeDeclaration>,
     /// Absent means the prompt is delivered as terminal input.
     #[serde(default)]
     prompt_arg: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawVersionProbe {
-    parser: String,
-    /// Probe argv; the data-driven parser only.
-    #[serde(default)]
-    args: Option<Vec<String>>,
-    /// Lowest supported release, inclusive; the data-driven parser only.
-    #[serde(default)]
-    min: Option<String>,
-    /// First unsupported release; the data-driven parser only.
-    #[serde(default)]
-    below: Option<String>,
-    /// Output template; the `semver-line-v1` parser only.
-    #[serde(default)]
-    line: Option<String>,
-}
-
-impl RawVersionProbe {
-    /// The declared policy, `None` when the parser takes none.
-    ///
-    /// Presence is checked against the parser by [`validate_version_probe`];
-    /// here a partial declaration is already malformed.
-    fn policy(&self) -> Result<Option<VersionProbePolicy>, DefinitionError> {
-        match (&self.args, &self.min, &self.below) {
-            (None, None, None) if self.line.is_none() => Ok(None),
-            (Some(args), Some(min), Some(below)) => match &self.line {
-                Some(line) => {
-                    VersionProbePolicy::with_line_template(args.clone(), min, below, line)
-                }
-                None => VersionProbePolicy::new(args.clone(), min, below),
-            }
-            .map(Some),
-            _ => Err(DefinitionError::Field {
-                field: "runtime.version_probe",
-                reason: "args, min and below are declared together",
-            }),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]

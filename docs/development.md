@@ -12,7 +12,7 @@ workspace (rooted at the repository root, spanning `sdk/ts/*`) for the TypeScrip
 | Crate | Role |
 |-------|------|
 | `crates/protocol` | Wire contract: envelopes, methods, events, version negotiation. |
-| `crates/package`| Canonical runtime package archive: deterministic `tar.zst` builder, strict reader, size limits, package digest, and the signed runtime catalog verifier. |
+| `crates/package`| Canonical runtime package archive: deterministic `tar.zst` builder, strict reader, size limits, package digest, and the signed runtime catalog verifier. Also the one grammar of a runtime descriptor's `version_probe` (`version_probe.rs`), shared by the daemon's launch gate and the CLI's Hermes integration gate. |
 | `crates/client` | Rust SDK: typed errors, transports, attach helpers. |
 | `crates/daemon` | `pohunekd`: public control plane, logical session registry, reconciliation, detection, notifications. |
 | `crates/worker-protocol` | Versioned owner-private daemon-to-worker protocol and framing. |

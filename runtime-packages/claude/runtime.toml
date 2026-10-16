@@ -6,7 +6,7 @@
 
 schema = 1
 id = "pohunek.runtime.claude"
-version = "1.0.1"
+version = "1.0.2"
 runtime_api = 1
 
 [runtime]
@@ -17,7 +17,7 @@ args = []
 detect_manifest = "detect.toml"
 prompt_arg = true
 # `claude --version` prints `<release> (Claude Code)` on stdout.
-version_probe = { parser = "semver-line-v1", args = ["--version"], min = "2.1.289", below = "2.2.0", line = "{version} (Claude Code)" }
+version_probe = { parser = "semver-line-v1", args = ["--version"], min = "2.1.289", below = "3.0.0", line = "{version} (Claude Code)" }
 
 # Claude's Ink TUI takes the pasted text and the submit key as separate
 # writes; a submit delay the daemon is configured with for this runtime

@@ -3204,7 +3204,7 @@ async fn an_own_runtime_report_naming_a_profile_keeps_its_manifest_override_thro
         &adopted.registry,
         RuntimeId::CLAUDE,
         &claude_next_version_without_fork(),
-        "1.0.2",
+        "1.0.3",
         6,
     )
     .await;
@@ -3240,7 +3240,7 @@ fn claude_next_version_without_fork() -> Package {
         "the descriptor declares its version"
     );
     entries[0].contents = descriptor
-        .replacen(&release, "version = \"1.0.2\"", 1)
+        .replacen(&release, "version = \"1.0.3\"", 1)
         .replace(forking, "[fork]\nsupported = false\n")
         .into_bytes();
     Package::from_entries(&entries)
@@ -3479,7 +3479,7 @@ async fn install_unselected_next_claude(fixture: &Fixture) {
         &key,
         catalog(
             6,
-            vec![entry(&next, &package_id, RuntimeId::CLAUDE, "1.0.2")],
+            vec![entry(&next, &package_id, RuntimeId::CLAUDE, "1.0.3")],
         ),
     );
     let mut install = catalog_install(fixture, &next, &document, false);
@@ -4115,7 +4115,7 @@ async fn an_explicit_report_of_a_differently_named_profile_keeps_its_override_th
         &adopted.registry,
         RuntimeId::CLAUDE,
         &claude_next_version_without_fork(),
-        "1.0.2",
+        "1.0.3",
         6,
     )
     .await;

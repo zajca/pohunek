@@ -9,6 +9,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use package::version_probe::VersionProbePolicy;
+
 use super::assets::{self, Bundle, PACKAGE_ID};
 use super::error::Error;
 
@@ -42,5 +44,18 @@ pub(crate) fn bundle(policy_path: &Path) -> Result<Bundle, Error> {
         manifest_sha256: assets::checksum(&manifest),
         package_id: PACKAGE_ID.to_owned(),
         package_digest: FIXTURE_DIGEST.to_owned(),
+        version_probe: version_policy()?,
     })
+}
+
+/// The version policy the package directory's descriptor declares.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when the descriptor cannot be read, and
+/// [`Error::InvalidAsset`] when it declares no valid policy.
+pub(crate) fn version_policy() -> Result<VersionProbePolicy, Error> {
+    assets::version_policy(&fs::read(
+        package_dir().join(assets::RUNTIME_DESCRIPTOR_PATH),
+    )?)
 }

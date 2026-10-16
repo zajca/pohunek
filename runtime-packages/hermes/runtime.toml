@@ -2,7 +2,7 @@
 
 schema = 1
 id = "pohunek.runtime.hermes"
-version = "1.0.0"
+version = "1.0.1"
 runtime_api = 1
 
 [runtime]
@@ -11,7 +11,7 @@ name = "Hermes Agent"
 program = "hermes"
 args = ["chat"]
 detect_manifest = "detect.toml"
-version_probe = { parser = "semver-line-v1", args = ["--version"], min = "0.20.0", below = "0.20.1", line = "Hermes Agent v{version} {annotation}" }
+version_probe = { parser = "semver-line-v1", args = ["--version"], min = "0.20.0", below = "1.0.0", line = "Hermes Agent v{version} {annotation}" }
 
 [input]
 bracketed_paste = true

@@ -91,7 +91,8 @@ pub(crate) enum Error {
     /// Hermes returned an unsupported fixed plugin lifecycle state.
     #[error("Hermes plugin state is invalid")]
     InvalidHermesState,
-    /// The installed Hermes version is not supported by this lifecycle.
+    /// The installed Hermes release lies outside the range the selected Hermes
+    /// package declares, or its version output does not parse.
     #[error("Hermes version is unsupported")]
     UnsupportedHermes,
     /// A caller must acknowledge a destructive managed-file removal.
@@ -157,7 +158,9 @@ impl Error {
             Self::InvalidHermesState => {
                 "repair the fixed Pohunek plugin registration before retrying"
             }
-            Self::UnsupportedHermes => "use the pinned supported Hermes version",
+            Self::UnsupportedHermes => {
+                "use a Hermes release the selected Hermes package supports"
+            }
             Self::ConfirmationRequired => {
                 "repeat the action with explicit modification confirmation"
             }

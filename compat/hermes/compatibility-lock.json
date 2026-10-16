@@ -21,7 +21,7 @@
   },
   "supported": {
     "min": "0.20.0",
-    "below": "0.20.1"
+    "below": "1.0.0"
   },
   "verified_with": "Model-free runs of the pinned release provisioned from its verified source archive, with an isolated HOME and HERMES_HOME and no provider credential: the version banner, the CLI, profile and plugin command shapes, plugin list, enable and disable in a named profile, plugin tool, hook and skill registration, pohunek integration install, status, doctor and uninstall, and PTY goldens of the nine classic-display states against the repository-owned loopback model mock; the alternate-screen TUI state is recorded as unsupported",
   "launch": {

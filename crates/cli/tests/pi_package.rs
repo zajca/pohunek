@@ -113,7 +113,7 @@ fn the_descriptor_declares_the_verified_pi_launch_contract() {
     match &definition.binding().provenance {
         BindingProvenance::Package { package, .. } => {
             assert_eq!(package.id.as_str(), PACKAGE_ID);
-            assert_eq!(package.version.as_str(), "1.0.2");
+            assert_eq!(package.version.as_str(), "1.0.3");
         }
         other @ BindingProvenance::Builtin { .. } => {
             panic!("a package-served runtime, got {other:?}")
@@ -189,6 +189,25 @@ fn the_supported_range_equals_the_compatibility_lock() {
     assert!(
         !policy.supports(policy.below()),
         "the first release above the range is unsupported"
+    );
+    let next_major = policy
+        .min()
+        .to_string()
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u64>().ok())
+        .expect("the minimum's major release")
+        + 1;
+    assert_eq!(
+        policy.below().to_string(),
+        format!("{next_major}.0.0"),
+        "the range runs from the verified minimum to the next major release"
+    );
+    assert!(
+        policy.supports(
+            pohunek_daemon::agent::host::ProbeVersion::parse("1.1.0").expect("a release")
+        ),
+        "a later 1.x release lies in the supported range"
     );
 }
 

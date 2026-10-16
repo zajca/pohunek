@@ -16,6 +16,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use package::registry::{PackageSource, Registry, RegistryError};
+use package::version_probe::{
+    VersionProbeDeclaration, VersionProbePolicy, SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID,
+};
 use package::Limits;
 use protocol::PackageId;
 use serde::de::{Error as _, MapAccess, Visitor};
@@ -112,6 +115,60 @@ pub(crate) struct Bundle {
     pub(crate) package_id: String,
     /// Package archive digest as lowercase hex, without the `sha256:` prefix.
     pub(crate) package_digest: String,
+    /// The supported Hermes releases and version grammar the package's
+    /// descriptor declares, the range the daemon's launch gate applies too.
+    pub(crate) version_probe: VersionProbePolicy,
+}
+
+/// The arguments of the fixed `hermes --version` query.
+///
+/// The integration runs only fixed Hermes commands, so it accepts a package
+/// only when its `version_probe` declares exactly these arguments; the daemon
+/// then probes the release the integration checks.
+pub(crate) const VERSION_ARGS: [&str; 1] = ["--version"];
+
+/// Path of the runtime descriptor inside a runtime package.
+pub(crate) const RUNTIME_DESCRIPTOR_PATH: &str = "runtime.toml";
+
+/// The part of a runtime descriptor the version gate reads.
+#[derive(Deserialize)]
+struct Descriptor {
+    runtime: DescriptorRuntime,
+}
+
+/// The `[runtime]` table of [`Descriptor`]; other fields are the daemon's.
+#[derive(Deserialize)]
+struct DescriptorRuntime {
+    version_probe: Option<VersionProbeDeclaration>,
+}
+
+/// Reads the data-driven version policy a Hermes runtime descriptor declares.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidAsset`] when the descriptor is not TOML, declares
+/// no data-driven `version_probe`, declares an invalid one, or declares probe
+/// arguments other than [`VERSION_ARGS`].
+pub(crate) fn version_policy(descriptor: &[u8]) -> Result<VersionProbePolicy, Error> {
+    let text = std::str::from_utf8(descriptor).map_err(|_| Error::InvalidAsset)?;
+    let descriptor: Descriptor = toml::from_str(text).map_err(|_| Error::InvalidAsset)?;
+    let declaration = descriptor
+        .runtime
+        .version_probe
+        .ok_or(Error::InvalidAsset)?;
+    let policy = declaration
+        .policy()
+        .map_err(|_| Error::InvalidAsset)?
+        .ok_or(Error::InvalidAsset)?;
+    let grammar_matches = match declaration.parser.as_str() {
+        SEMVER_LINE_PARSER_ID => policy.has_line_template(),
+        SEMVER_PARSER_ID => !policy.has_line_template(),
+        _ => false,
+    };
+    let fixed_args = policy.args().iter().map(String::as_str).eq(VERSION_ARGS);
+    (grammar_matches && fixed_args)
+        .then_some(policy)
+        .ok_or(Error::InvalidAsset)
 }
 
 /// Selects and snapshots the enabled, selected official Hermes package.
@@ -157,6 +214,11 @@ pub(crate) fn selected_bundle(registry_path: &Path, policy_path: &Path) -> Resul
     let source = verified
         .read_file("operator.toml")
         .map_err(|_| Error::InvalidAsset)?;
+    let version_probe = version_policy(
+        &verified
+            .read_file(RUNTIME_DESCRIPTOR_PATH)
+            .map_err(|_| Error::InvalidAsset)?,
+    )?;
     let mut payload = BTreeMap::new();
     let mut operator_paths = BTreeSet::new();
     for file in verified.files() {
@@ -187,6 +249,7 @@ pub(crate) fn selected_bundle(registry_path: &Path, policy_path: &Path) -> Resul
             .to_string()
             .trim_start_matches("sha256:")
             .to_owned(),
+        version_probe,
     })
 }
 

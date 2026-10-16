@@ -54,6 +54,7 @@ libc = { workspace = true }
 nix = { workspace = true, features = ["process", "signal", "term"] }
 tracing = { workspace = true }
 time = { workspace = true }
+toml = { workspace = true }
 toml_edit = { workspace = true }
 # Run identifiers of workflow plugin runs (`pohunek workflow run`).
 ulid = { workspace = true }
@@ -78,8 +79,6 @@ pohunek-daemon = { path = "../daemon" }
 netbird = { workspace = true }
 # `plugin_catalog_install.rs` signs catalogs with a key generated in the test.
 ed25519-dalek = { workspace = true }
-# `codex_package.rs` compares the package files with the built-in Codex files as data.
-toml = { workspace = true }
 # `release_upgrade.rs` reads the previous release's archive, whose frame the
 # current encoder does not reproduce, without the strict canonical reader.
 ruzstd = { workspace = true }

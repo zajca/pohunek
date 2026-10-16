@@ -19,8 +19,11 @@ mod package;
 mod registry;
 mod source;
 mod transcripts;
-mod version_probe;
 
+pub use ::package::version_probe::{
+    LineTemplate, LineTemplateError, ProbeVersion, VersionProbePolicy, VersionRefusal,
+    MAX_PROBE_ARGS, SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID,
+};
 pub use builtin::BuiltinSource;
 pub use claim::{decide_claim, is_reserved, Authority, ClaimRefusal, ServedBy};
 pub use config_home::{ConfigHome, HomeError};
@@ -52,10 +55,6 @@ pub(crate) use source::{ProfileInputs, RevisionKeys};
 pub use transcripts::{
     TranscriptParser, Transcripts, JSONL_HEAD_V1_PARSER_ID, MAX_TRANSCRIPT_DIR_BYTES,
     MAX_TRANSCRIPT_DIR_COMPONENTS,
-};
-pub use version_probe::{
-    LineTemplate, LineTemplateError, ProbeVersion, VersionProbePolicy, MAX_PROBE_ARGS,
-    SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID,
 };
 
 #[cfg(test)]
