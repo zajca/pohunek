@@ -108,6 +108,27 @@ pub(crate) fn package_entry(
 /// higher one refuses the catalog. The document is verified against the anchor
 /// before it is returned, so a catalog the daemon would refuse is never used.
 pub(crate) fn sign(entries: &[CatalogEntry], release: &CoreRelease) -> Result<Trust, XtaskError> {
+    let mut signed = sign_each(&[entries], release)?;
+    Ok(Trust {
+        anchor: signed.anchor,
+        catalog: signed.catalogs.remove(0),
+    })
+}
+
+/// An anchor and the catalogs it verifies, both as the bytes written to disk.
+#[derive(Debug)]
+pub(crate) struct SignedSet {
+    pub(crate) anchor: Vec<u8>,
+    pub(crate) catalogs: Vec<Vec<u8>>,
+}
+
+/// Signs one catalog per entry list of `catalogs`, all for `release` and with
+/// one fresh random key, and returns them in order with the anchor trusting
+/// that key. See [`sign`].
+pub(crate) fn sign_each(
+    catalogs: &[&[CatalogEntry]],
+    release: &CoreRelease,
+) -> Result<SignedSet, XtaskError> {
     let now = unix_now()?;
     let expires_at = now.saturating_add(CATALOG_LIFETIME_SECONDS);
     let key = random_key()?;
@@ -118,31 +139,35 @@ pub(crate) fn sign(entries: &[CatalogEntry], release: &CoreRelease) -> Result<Tr
         .to_bytes()
         .map_err(XtaskError::Anchor)?;
     let placeholder = placeholder_digest()?;
-    let catalog = Catalog {
-        schema_version: CATALOG_SCHEMA_VERSION,
-        sequence: release.sequence,
-        expires_at,
-        release: Release {
-            version: release.version.clone(),
-            commit: PLACEHOLDER_COMMIT.to_owned(),
-            binary_sets: machine_platforms()
-                .into_iter()
-                .map(|target| BinarySet {
-                    target,
-                    digest: placeholder.clone(),
-                })
-                .collect(),
-        },
-        revoked_key_ids: Vec::new(),
-        revoked_digests: Vec::new(),
-        entries: entries.to_vec(),
-    };
-    let envelope = sign_catalog(catalog, &key).map_err(XtaskError::Catalog)?;
-    let document = catalog_document_bytes(&envelope).map_err(XtaskError::Catalog)?;
-    verify_bytes(&document, &anchor, None, now)?;
-    Ok(Trust {
+    let mut documents = Vec::with_capacity(catalogs.len());
+    for entries in catalogs {
+        let catalog = Catalog {
+            schema_version: CATALOG_SCHEMA_VERSION,
+            sequence: release.sequence,
+            expires_at,
+            release: Release {
+                version: release.version.clone(),
+                commit: PLACEHOLDER_COMMIT.to_owned(),
+                binary_sets: machine_platforms()
+                    .into_iter()
+                    .map(|target| BinarySet {
+                        target,
+                        digest: placeholder.clone(),
+                    })
+                    .collect(),
+            },
+            revoked_key_ids: Vec::new(),
+            revoked_digests: Vec::new(),
+            entries: entries.to_vec(),
+        };
+        let envelope = sign_catalog(catalog, &key).map_err(XtaskError::Catalog)?;
+        let document = catalog_document_bytes(&envelope).map_err(XtaskError::Catalog)?;
+        verify_bytes(&document, &anchor, None, now)?;
+        documents.push(document);
+    }
+    Ok(SignedSet {
         anchor,
-        catalog: document,
+        catalogs: documents,
     })
 }
 

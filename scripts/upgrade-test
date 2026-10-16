@@ -531,10 +531,26 @@ done
 # reads that checkout's runtime-packages/.
 head_xtask=$(printf '%s\n' "$head_executables" | grep -E '/xtask$' | tail -n 1 || true)
 [ -x "$head_xtask" ] || fail "cargo did not build xtask in $head_dir"
+# A head whose xtask writes a downgrade catalog (signed by the same throwaway
+# key, at the same sequence, listing lower package versions) also gets the
+# test's `plugin update` downgrade check; an older head tree has neither the
+# flag nor the guard, and the test is told so by the absent variable.
+downgrade_args=()
+downgrade_env=()
+if (cd "$head_dir" && "$head_xtask" release test-runtime --help) | grep -q -- '--downgrade'; then
+  mkdir -p "$staging/downgrade"
+  downgrade_args=(--downgrade "$staging/downgrade")
+  downgrade_env=("POHUNEK_UPGRADE_DOWNGRADE_DIR=$staging/downgrade")
+else
+  info "the head's xtask writes no downgrade catalog; the downgrade check is not run"
+fi
 (cd "$head_dir" && "$head_xtask" release test-runtime --output "$staging/head" \
-  --runtime claude --runtime codex) || fail "cannot write the test runtime tree"
+  --runtime claude --runtime codex "${downgrade_args[@]}") || fail "cannot write the test runtime tree"
 [ -f "$staging/head/runtime-catalog-anchor.json" ] && [ -f "$staging/head/runtime/runtime-catalog.json" ] ||
   fail "the test runtime tree is incomplete"
+if [ "${#downgrade_args[@]}" -gt 0 ]; then
+  [ -f "$staging/downgrade/runtime-catalog.json" ] || fail "the downgrade catalog is missing"
+fi
 restore_manifests
 [ "$("$staging/head/pohunek" --version)" = "pohunek $head_version" ] ||
   fail "the head pohunek does not report $head_version"
@@ -590,6 +606,7 @@ as_user \
   "POHUNEK_PREVIOUS_BIN_DIR=$staging/previous" \
   "POHUNEK_HEAD_BIN_DIR=$staging/head" \
   "POHUNEK_UPGRADE_ARTIFACTS_DIR=$out_dir" \
+  "${downgrade_env[@]}" \
   "$staging/release_upgrade" --ignored --exact "$TEST_NAME" --nocapture --test-threads 1 || status=$?
 
 if [ "$status" -ne 0 ]; then

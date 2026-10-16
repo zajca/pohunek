@@ -9,16 +9,27 @@
 //! profile pinned) the upgrade installs the head's packages and pins every host
 //! profile to them. On its own official packages (the previous release's
 //! `service install` installed and pinned them) the upgrade installs the head's
-//! packages beside them and leaves the pins as they are. Either way the test
-//! installs managed Claude hooks, starts a stopped and a live session of the
-//! Claude profiles, each launched by a fake `claude` that runs the hook scripts
-//! the release wrote, and runs one `pohunek service upgrade` of this build
-//! without `--accept-runtime-loss`. The assertions follow the live session across
-//! the daemon swap, through the previous release's own client, and the stopped
-//! session through a plain `resume` onto the package digest its profile names.
-//! New sessions from the Claude and Codex profiles then launch through the
-//! packages.
-//! Codex profiles then launch through the packages.
+//! packages beside them. A head whose package is a different digest of a newer
+//! version repins the profiles to the head digest (`repin`, applied `repinned`,
+//! naming the previous digest and version). The same digest keeps the pins, and
+//! the same version with another digest is refused by the registry. From
+//! `RUNTIME_RANGE_RELEASE` on, the newer-version outcome is required, not
+//! tolerated.
+//!
+//! Either way the test installs managed Claude hooks, starts a stopped and a
+//! live session of the Claude profiles, each launched by a fake `claude` that
+//! runs the hook scripts the release wrote, and runs one `pohunek service
+//! upgrade` of this build without `--accept-runtime-loss`. Before the upgrade,
+//! a package start rewrites the fake `claude` to answer the previous package's
+//! exclusive `below` bound when the head's package accepts it. The previous
+//! package then refuses the agent the stopped session would resume with, so
+//! only the adoption onto the head package resumes it. The preflight judges the
+//! stopped session `adoptable_by_newer_package` and the live session
+//! `adoptable`. The assertions follow the live session across the daemon swap,
+//! through the previous release's own client, and the stopped session through a
+//! plain `resume` onto the package digest its profile names. New sessions from
+//! the Claude and Codex profiles then launch through the packages. The head's
+//! downgrade guard then refuses an older archive through `plugin update`.
 //!
 //! The fake agents are scripts whose interpreter is a copy of the shell called
 //! `fake-claude-sh` or `fake-codex-sh`. The worker designates the agent process
@@ -46,6 +57,15 @@
 //! - `POHUNEK_UPGRADE_ARTIFACTS_DIR`: writable directory receiving the
 //!   previous release's store, journals, `service.toml`, and `--json` outputs.
 //!
+//! One input is optional:
+//! - `POHUNEK_UPGRADE_DOWNGRADE_DIR`: the directory `pohunek release
+//!   test-runtime --downgrade` wrote beside the head's runtime tree, with a
+//!   `runtime-catalog.json` and `packages/claude.tar.zst` at a lower version
+//!   under the head's signing key and sequence. It is absent when the head's
+//!   xtask predates `--downgrade`, which is why it is not required. When it is
+//!   set, the test runs the downgrade guard. For a head at
+//!   `RUNTIME_RANGE_RELEASE` or later it must be set, and its absence fails.
+//!
 //! The head's archives may be of a different package format than the previous
 //! release reads, so the test takes each digest from the raw bytes and each
 //! descriptor from a plain zstd and tar decode, and never hands an archive to
@@ -68,6 +88,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use package::archive_digest;
+use pohunek_service_config::preflight::{CODE_ADOPTABLE, CODE_ADOPTABLE_BY_NEWER_PACKAGE};
 use pohunek_test_support::wait::poll_until;
 use serde_json::Value;
 
@@ -106,6 +127,17 @@ const CLAUDE_RUNTIME_ID: &str = "claude";
 /// The release directory the head's package archives and catalog live in,
 /// beside the head's binaries.
 const RELEASE_RUNTIME_DIR: &str = "runtime";
+
+/// The first release whose official runtime packages widen the version ranges
+/// (`below`) past the previous ones, so an upgrade to it must repin the
+/// profiles and adopt the stopped session onto the head package. A head build
+/// at or above it must show that outcome; a build below it is an older target
+/// tree and is only checked for consistency.
+const RUNTIME_RANGE_RELEASE: &str = "0.35.2";
+
+/// Version the head's xtask gives the downgrade package it writes for the
+/// downgrade guard (`DOWNGRADE_VERSION` in `crates/xtask/src/test_runtime.rs`).
+const DOWNGRADE_VERSION: &str = "0.0.1";
 
 /// The Claude package archive, relative to the release's `runtime/`.
 const CLAUDE_PACKAGE_ARCHIVE: &str = "packages/claude.tar.zst";
@@ -377,6 +409,9 @@ struct Run {
     previous_dir: PathBuf,
     head_dir: PathBuf,
     artifacts: PathBuf,
+    /// The head's downgrade catalog and archives, when the head's xtask wrote
+    /// them; `None` skips the downgrade guard.
+    downgrade: Option<PathBuf>,
 }
 
 impl Run {
@@ -398,11 +433,22 @@ impl Run {
             assert!(path.is_absolute(), "{name} must be an absolute path");
             path
         };
+        // Optional: `scripts/upgrade-test` sets it only when the head's xtask
+        // has `--downgrade`. A head older than that writes no downgrade catalog.
+        let downgrade = std::env::var_os("POHUNEK_UPGRADE_DOWNGRADE_DIR").map(|value| {
+            let dir = PathBuf::from(value);
+            assert!(
+                dir.is_absolute(),
+                "POHUNEK_UPGRADE_DOWNGRADE_DIR must be absolute"
+            );
+            dir
+        });
         Self {
             home: path("HOME"),
             previous_dir: path("POHUNEK_PREVIOUS_BIN_DIR"),
             head_dir: path("POHUNEK_HEAD_BIN_DIR"),
             artifacts: path("POHUNEK_UPGRADE_ARTIFACTS_DIR"),
+            downgrade,
         }
     }
 
@@ -630,45 +676,75 @@ fn worker_version(status: &Value, id: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// An official package of this build's release, read from its archive so the
-/// test knows the digest the upgrade must install and the version line its
-/// fake agent must answer.
-struct ReleasePackage {
-    /// Digest of the archive bytes, `sha256:<hex>`.
-    digest: String,
-    /// What `--version` prints for the lowest release the package's version
-    /// probe accepts.
-    version_line: String,
+/// The version probe a package descriptor declares: the release range
+/// `[min, below)` it accepts and the `--version` line template it parses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VersionProbe {
+    min: String,
+    below: String,
+    line: String,
 }
 
-impl ReleasePackage {
-    /// Reads the package `archive` of the head's `runtime/` directory. The
-    /// digest is taken from the raw bytes, and the descriptor from a plain zstd
-    /// and tar decode; the archive is never handed to the strict reader.
-    fn read(runtime_dir: &Path, archive: &str, package_id: &str) -> Self {
-        let archive = runtime_dir.join(archive);
-        let bytes = fs::read(&archive)
-            .unwrap_or_else(|error| panic!("read {}: {error}", archive.display()));
-        let digest = archive_digest(&bytes).expect("the archive digest");
-        let contents = tar_member(&zstd_decode(&bytes), PACKAGE_DESCRIPTOR)
-            .unwrap_or_else(|| panic!("{} has no {PACKAGE_DESCRIPTOR}", archive.display()));
-        let text = std::str::from_utf8(&contents).expect("the descriptor is UTF-8");
-        Self {
-            digest: digest.as_str().to_owned(),
-            version_line: version_line_of(text, package_id),
-        }
+impl VersionProbe {
+    /// The `--version` line of release `version`, filled into the template.
+    fn line_of_release(&self, version: &str) -> String {
+        assert_eq!(
+            self.line.matches(VERSION_PLACEHOLDER).count(),
+            1,
+            "the version line template names the release once: {}",
+            self.line
+        );
+        self.line.replace(VERSION_PLACEHOLDER, version)
+    }
+
+    /// The line the fake agent answers when it is the lowest accepted release.
+    fn lowest_line(&self) -> String {
+        self.line_of_release(&self.min)
+    }
+
+    /// Whether the probe accepts release `version`: `min <= version < below`.
+    fn accepts(&self, version: &str) -> bool {
+        release_order(&self.min, version) != std::cmp::Ordering::Greater
+            && release_order(version, &self.below) == std::cmp::Ordering::Less
     }
 }
 
-/// The version line the version probe of the descriptor `text` of `package_id`
-/// accepts: its lowest release filled into the `line` template.
-fn version_line_of(text: &str, package_id: &str) -> String {
+/// The version and version probe of a package descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Descriptor {
+    version: String,
+    probe: VersionProbe,
+}
+
+/// Orders two releases of the form `major.minor.patch`, the form the package
+/// descriptors and the binaries' `--version` use. The daemon orders package
+/// versions by semver; the test needs only this plain numeric order.
+fn release_order(left: &str, right: &str) -> std::cmp::Ordering {
+    let parse = |text: &str| -> Vec<u64> {
+        text.split('.')
+            .map(|part| {
+                part.parse()
+                    .unwrap_or_else(|_| panic!("{text} is not a major.minor.patch release"))
+            })
+            .collect()
+    };
+    parse(left).cmp(&parse(right))
+}
+
+/// Reads the version and version probe of the descriptor `text` of
+/// `package_id`.
+fn descriptor_of(text: &str, package_id: &str) -> Descriptor {
     let descriptor: toml::Table = toml::from_str(text).expect("the descriptor is TOML");
     assert_eq!(
         descriptor.get("id").and_then(toml::Value::as_str),
         Some(package_id),
         "the descriptor is not {package_id}"
     );
+    let version = descriptor
+        .get("version")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_else(|| panic!("{package_id} declares no version"))
+        .to_owned();
     let probe = descriptor
         .get("runtime")
         .and_then(|runtime| runtime.get("version_probe"))
@@ -685,18 +761,61 @@ fn version_line_of(text: &str, package_id: &str) -> String {
         VERSION_LINE_PARSER,
         "the fake agents answer only a line-template version probe"
     );
-    let line = field("line");
-    assert_eq!(
-        line.matches(VERSION_PLACEHOLDER).count(),
-        1,
-        "the version line template names the release once: {line}"
-    );
-    line.replace(VERSION_PLACEHOLDER, field("min"))
+    Descriptor {
+        version,
+        probe: VersionProbe {
+            min: field("min").to_owned(),
+            below: field("below").to_owned(),
+            line: field("line").to_owned(),
+        },
+    }
 }
 
-/// The version line the package `digest` of `package_id` answers, read from the
-/// descriptor the previous release installed in its own package store.
-fn installed_version_line(run: &Run, digest: &str, package_id: &str) -> String {
+/// An official package of this build's release, read from its archive so the
+/// test knows the digest the upgrade must install and the version probe its
+/// fake agent must answer.
+struct ReleasePackage {
+    /// Digest of the archive bytes, `sha256:<hex>`.
+    digest: String,
+    descriptor: Descriptor,
+}
+
+impl ReleasePackage {
+    /// Reads the package `archive` of the head's `runtime/` directory. The
+    /// digest is taken from the raw bytes, and the descriptor from a plain zstd
+    /// and tar decode; the archive is never handed to the strict reader.
+    fn read(runtime_dir: &Path, archive: &str, package_id: &str) -> Self {
+        let archive = runtime_dir.join(archive);
+        let bytes = fs::read(&archive)
+            .unwrap_or_else(|error| panic!("read {}: {error}", archive.display()));
+        let digest = archive_digest(&bytes).expect("the archive digest");
+        let contents = tar_member(&zstd_decode(&bytes), PACKAGE_DESCRIPTOR)
+            .unwrap_or_else(|| panic!("{} has no {PACKAGE_DESCRIPTOR}", archive.display()));
+        let text = std::str::from_utf8(&contents).expect("the descriptor is UTF-8");
+        Self {
+            digest: digest.as_str().to_owned(),
+            descriptor: descriptor_of(text, package_id),
+        }
+    }
+
+    /// What `--version` prints for the lowest release this package accepts.
+    fn version_line(&self) -> String {
+        self.descriptor.probe.lowest_line()
+    }
+}
+
+/// An official package the previous release installed, read from its own
+/// package store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Installed {
+    /// Archive digest, `sha256:<hex>`.
+    digest: String,
+    descriptor: Descriptor,
+}
+
+/// The descriptor of the package `digest` of `package_id`, read from the
+/// package store the previous release installed it into.
+fn installed_descriptor(run: &Run, digest: &str, package_id: &str) -> Descriptor {
     let hex = digest
         .strip_prefix("sha256:")
         .unwrap_or_else(|| panic!("{digest} is not a sha256 digest"));
@@ -708,7 +827,7 @@ fn installed_version_line(run: &Run, digest: &str, package_id: &str) -> String {
         .join(PACKAGE_DESCRIPTOR);
     let text = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-    version_line_of(&text, package_id)
+    descriptor_of(&text, package_id)
 }
 
 /// Decodes one zstd frame, of whichever encoder wrote it.
@@ -784,9 +903,13 @@ fn write_agent_script(path: &Path, source: &str, interpreter: &Path, version_lin
         "the version line cannot be quoted for the shell: {version_line}"
     );
     let text = format!("{interpreter_line}\nFAKE_AGENT_VERSION_LINE='{version_line}'\n{body}");
-    fs::write(path, text).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .unwrap_or_else(|error| panic!("chmod {}: {error}", path.display()));
+    // The script is replaced by a rename: a shell running the old text reads
+    // its script by offset, so an in-place rewrite would feed it the new text.
+    let staged = path.with_extension("next");
+    fs::write(&staged, text).unwrap_or_else(|error| panic!("write {}: {error}", staged.display()));
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|error| panic!("chmod {}: {error}", staged.display()));
+    fs::rename(&staged, path).unwrap_or_else(|error| panic!("replace {}: {error}", path.display()));
 }
 
 /// Copies `shell` to `name` in the agent directory, as an owner-only
@@ -806,11 +929,10 @@ fn write_profile(run: &Run, name: &str, text: &str) {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod the profile");
 }
 
-/// Writes the fake agents' scripts. Each answers `--version` with its version
-/// line, which the probe of the package it runs under accepts.
-fn write_agent_scripts(run: &Run, claude_line: &str, codex_line: &str) {
+/// Writes the fake Claude agents' scripts, which answer `--version` with
+/// `claude_line`.
+fn write_claude_scripts(run: &Run, claude_line: &str) {
     let claude_interpreter = run.agent_dir().join(CLAUDE_INTERPRETER);
-    let codex_interpreter = run.agent_dir().join(CODEX_INTERPRETER);
     write_agent_script(
         &run.agent_dir().join(FAKE_CLAUDE_SCRIPT),
         FAKE_AGENT,
@@ -823,6 +945,13 @@ fn write_agent_scripts(run: &Run, claude_line: &str, codex_line: &str) {
         &claude_interpreter,
         claude_line,
     );
+}
+
+/// Writes the fake agents' scripts. Each answers `--version` with its version
+/// line, which the probe of the package it runs under accepts.
+fn write_agent_scripts(run: &Run, claude_line: &str, codex_line: &str) {
+    let codex_interpreter = run.agent_dir().join(CODEX_INTERPRETER);
+    write_claude_scripts(run, claude_line);
     write_agent_script(
         &run.agent_dir().join(FAKE_CODEX_SCRIPT),
         FAKE_CODEX_AGENT,
@@ -1040,14 +1169,17 @@ fn assert_store_pin(
 }
 
 /// The adoption preflight in a `service check` or `service upgrade` payload
-/// was run by this build's daemon and judges the live session `live` and the
-/// stopped session `stopped` adoptable, and no session at risk.
+/// was run by this build's daemon. It judges the live session `live` adoptable
+/// with code `adoptable`, and the stopped session `stopped` adoptable with code
+/// `stopped_code`, which is `adoptable_by_newer_package` when the stopped session
+/// resumes onto a newer package. No session is at risk.
 /// The daemon version rules out the previous daemon's rollback verdict, which
 /// the same field carries for a rollback.
 fn assert_preflight_adoptable(
     payload: &Value,
     live: &str,
     stopped: &str,
+    stopped_code: &str,
     head_version: &str,
     operation: &str,
 ) {
@@ -1056,16 +1188,30 @@ fn assert_preflight_adoptable(
         Some(&Value::from(head_version)),
         "{operation}: the preflight was not run by this build's daemon: {payload}"
     );
-    for (list, id) in [("sessions", live), ("stopped_sessions", stopped)] {
+    eprintln!(
+        "{operation} preflight verdicts: live {live} adoptable, stopped {stopped} {stopped_code}"
+    );
+    for (list, id, code) in [
+        ("sessions", live, CODE_ADOPTABLE),
+        ("stopped_sessions", stopped, stopped_code),
+    ] {
         let sessions = payload
             .pointer(&format!("/preflight/{list}"))
             .and_then(Value::as_array)
             .unwrap_or_else(|| panic!("{operation} carries no preflight {list}: {payload}"));
-        assert!(
-            sessions
-                .iter()
-                .any(|session| session["session_id"] == id && session["verdict"] == "adoptable"),
-            "{operation}: the preflight does not judge {id} adoptable in {list}: {payload}"
+        let session = sessions
+            .iter()
+            .find(|session| session["session_id"] == id)
+            .unwrap_or_else(|| {
+                panic!("{operation}: the preflight does not judge {id} in {list}: {payload}")
+            });
+        assert_eq!(
+            session["verdict"], "adoptable",
+            "{operation}: {id} in {list} is not adoptable: {session}"
+        );
+        assert_eq!(
+            session["code"], code,
+            "{operation}: {id} in {list} carries the wrong code: {session}"
         );
         assert!(
             sessions
@@ -1078,12 +1224,11 @@ fn assert_preflight_adoptable(
 
 /// Checks one official runtime step, a plan or an applied report: no refusal,
 /// exactly one package entry per `(runtime, digest, status)`, and exactly the
-/// profile entries of `profiles`, each in `profile_status`.
+/// profile entries of `profiles`, each as `(name, status)`.
 fn assert_runtime_step(
     step: &Value,
     packages: &[(&str, &str, &str)],
-    profile_status: &str,
-    profiles: &[&str],
+    profiles: &[(&str, &str)],
     operation: &str,
 ) {
     assert_eq!(
@@ -1109,18 +1254,19 @@ fn assert_runtime_step(
         packages.len(),
         "{operation}: unexpected package steps: {step}"
     );
-    for name in profiles {
+    for (name, status) in profiles {
         let action = list("profiles")
             .iter()
             .find(|action| action["name"] == *name)
             .unwrap_or_else(|| panic!("{operation}: no profile step for {name}: {step}"));
-        assert_eq!(action["status"], profile_status, "{operation}: {action}");
+        assert_eq!(action["status"], *status, "{operation}: {action}");
     }
     assert_eq!(
         list("profiles").len(),
         profiles.len(),
         "{operation}: unexpected profile steps: {step}"
     );
+    eprintln!("{operation} runtime step: {step}");
 }
 
 /// Creates a session of `profile` through `cli` and returns its id.
@@ -1225,14 +1371,18 @@ enum Start {
     /// packages and pins every profile to them.
     Builtin,
     /// The previous release's own packages, which its `service install`
-    /// installed and pinned the profiles to, with their archive digests. The
-    /// upgrade installs the head's packages beside them and keeps the pins.
-    Package { claude: String, codex: String },
+    /// installed and pinned the profiles to. The upgrade installs the head's
+    /// packages beside them. A newer head version repins the profiles to the
+    /// head's digest; the same digest keeps the pins.
+    Package {
+        claude: Box<Installed>,
+        codex: Box<Installed>,
+    },
 }
 
 /// Reads the start state from the previous release's profile listing. Every
 /// test profile must agree: all pinned to a package, or none pinned.
-fn read_start(previous: &Cli) -> Start {
+fn read_start(run: &Run, previous: &Cli) -> Start {
     let listed = previous.json(&["plugin", "profile", "list", "--json"]);
     let profiles = listed["profiles"]
         .as_array()
@@ -1269,13 +1419,20 @@ fn read_start(previous: &Cli) -> Start {
         claude,
         "the Claude profiles pin different packages: {listed}"
     );
+    let codex = digest(CODEX_PROFILE);
     Start::Package {
-        claude,
-        codex: digest(CODEX_PROFILE),
+        claude: Box::new(Installed {
+            descriptor: installed_descriptor(run, &claude, CLAUDE_PACKAGE_ID),
+            digest: claude,
+        }),
+        codex: Box::new(Installed {
+            descriptor: installed_descriptor(run, &codex, CODEX_PACKAGE_ID),
+            digest: codex,
+        }),
     }
 }
 
-/// The pin a session launched on `start` carries for `package_id` before the
+/// The digest a session launched on `start` carries for `package_id` before the
 /// upgrade.
 fn start_pin<'a>(start: &'a Start, package_id: &'static str) -> Pin<'a> {
     match start {
@@ -1283,9 +1440,9 @@ fn start_pin<'a>(start: &'a Start, package_id: &'static str) -> Pin<'a> {
         Start::Package { claude, codex } => Pin::Package {
             package_id,
             digest: if package_id == CLAUDE_PACKAGE_ID {
-                claude
+                &claude.digest
             } else {
-                codex
+                &codex.digest
             },
         },
     }
@@ -1299,6 +1456,11 @@ struct Upgrade {
     head: Cli,
     previous_version: String,
     head_version: String,
+    /// Whether the head's build is the release that widens the official
+    /// runtime ranges (0.35.2 or later). From it on the upgrade must repin, and
+    /// the test expects the strict outcome instead of tolerating a head whose
+    /// packages equal the previous ones.
+    head_is_release: bool,
     /// The live session of the Claude profile; the upgrade adopts it.
     id: String,
     /// The stopped session of the Claude profile; it resumes onto its pin.
@@ -1326,7 +1488,11 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Before) {
         previous_version, head_version,
         "an upgrade to the same version is a no-op and proves nothing"
     );
-    eprintln!("upgrade {previous_version} -> {head_version}");
+    let head_is_release =
+        release_order(&head_version, RUNTIME_RANGE_RELEASE) != std::cmp::Ordering::Less;
+    eprintln!(
+        "upgrade {previous_version} -> {head_version} (runtime range release: {head_is_release})"
+    );
     let release = run.head_dir.join(RELEASE_RUNTIME_DIR);
     assert!(
         release.join(RUNTIME_CATALOG).is_file(),
@@ -1340,15 +1506,15 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Before) {
     eprintln!(
         "head packages: claude {} answers `{}`, codex {} answers `{}`",
         packages.claude.digest,
-        packages.claude.version_line,
+        packages.claude.version_line(),
         packages.codex.digest,
-        packages.codex.version_line
+        packages.codex.version_line()
     );
     // The profiles exist before the install, so an install that pins them does.
     prepare_agent(
         &run,
-        &packages.claude.version_line,
-        &packages.codex.version_line,
+        &packages.claude.version_line(),
+        &packages.codex.version_line(),
     );
     let from = run.previous_dir.display().to_string();
     previous.json(&["service", "install", "--from", &from, "--json"]);
@@ -1361,14 +1527,14 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Before) {
             installed.display()
         );
     }
-    let start = read_start(&previous);
+    let start = read_start(&run, &previous);
     if let Start::Package { claude, codex } = &start {
         // The previous release's probe answers the version line of the package
         // it installed, which may differ from the head's.
         write_agent_scripts(
             &run,
-            &installed_version_line(&run, claude, CLAUDE_PACKAGE_ID),
-            &installed_version_line(&run, codex, CODEX_PACKAGE_ID),
+            &claude.descriptor.probe.lowest_line(),
+            &codex.descriptor.probe.lowest_line(),
         );
     }
     eprintln!("previous release starts on {start:?}");
@@ -1384,6 +1550,7 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Before) {
         stopped_id: sessions.stopped_id,
         packages,
         start,
+        head_is_release,
     };
     let before = Before {
         live: sessions.live,
@@ -1466,25 +1633,47 @@ fn remove_probe(dir: &Path) {
 }
 
 impl Upgrade {
-    /// The digest the test profiles name after the upgrade: the head's package
-    /// for a built-in start (the upgrade pins them), the previous release's for
-    /// a package start (its pins stay).
-    fn profile_digest(&self, package_id: &str) -> &str {
+    /// The official package of `package_id` this build's release ships.
+    fn release(&self, package_id: &str) -> &ReleasePackage {
+        if package_id == CLAUDE_PACKAGE_ID {
+            &self.packages.claude
+        } else {
+            &self.packages.codex
+        }
+    }
+
+    /// The package of `package_id` the previous release installed, `None` for a
+    /// built-in start.
+    fn installed(&self, package_id: &str) -> Option<&Installed> {
         match &self.start {
-            Start::Builtin => {
-                if package_id == CLAUDE_PACKAGE_ID {
-                    &self.packages.claude.digest
-                } else {
-                    &self.packages.codex.digest
-                }
-            }
-            Start::Package { claude, codex } => {
-                if package_id == CLAUDE_PACKAGE_ID {
-                    claude
-                } else {
-                    codex
-                }
-            }
+            Start::Builtin => None,
+            Start::Package { claude, codex } => Some(if package_id == CLAUDE_PACKAGE_ID {
+                claude
+            } else {
+                codex
+            }),
+        }
+    }
+
+    /// Whether the upgrade repins the profiles of `package_id`: the head's
+    /// package is a different digest of a strictly newer version than the one
+    /// the previous release installed.
+    fn repins(&self, package_id: &str) -> bool {
+        self.installed(package_id).is_some_and(|installed| {
+            let release = self.release(package_id);
+            installed.digest != release.digest
+                && release_order(&release.descriptor.version, &installed.descriptor.version)
+                    == std::cmp::Ordering::Greater
+        })
+    }
+
+    /// The digest the test profiles name after the upgrade: the head's package
+    /// for a built-in start (the upgrade pins them) and for a repinned package;
+    /// the installed package's digest otherwise.
+    fn profile_digest(&self, package_id: &str) -> &str {
+        match self.installed(package_id) {
+            Some(installed) if !self.repins(package_id) => &installed.digest,
+            _ => &self.release(package_id).digest,
         }
     }
 
@@ -1515,18 +1704,99 @@ impl Upgrade {
         ]
     }
 
+    /// The profile steps of a plan (`applied` false) or of an apply (`applied`
+    /// true), as `(profile name, status)`. A built-in start binds every profile.
+    /// A package start repins the profiles of a repinned package and has no
+    /// entry for the others: their pins already name the release digest, or the
+    /// step keeps them.
+    fn profile_steps(&self, applied: bool) -> Vec<(&'static str, &'static str)> {
+        self.pinned_profiles()
+            .iter()
+            .filter_map(|&(name, package_id, _)| {
+                let status = match &self.start {
+                    Start::Builtin => {
+                        if applied {
+                            "bound"
+                        } else {
+                            "bind"
+                        }
+                    }
+                    Start::Package { .. } if self.repins(package_id) => {
+                        if applied {
+                            "repinned"
+                        } else {
+                            "repin"
+                        }
+                    }
+                    Start::Package { .. } => return None,
+                };
+                Some((name, status))
+            })
+            .collect()
+    }
+
+    /// The verdict code the stopped Claude session carries after the upgrade:
+    /// the adoption of a newer package when the Claude profiles are repinned,
+    /// which R2 resumes the session through; plain `adoptable` otherwise.
+    fn stopped_code(&self) -> &'static str {
+        if self.repins(CLAUDE_PACKAGE_ID) {
+            CODE_ADOPTABLE_BY_NEWER_PACKAGE
+        } else {
+            CODE_ADOPTABLE
+        }
+    }
+
+    /// Checks that each repinned profile of `step` moves from the installed
+    /// package to the head's, with the previous digest and version named.
+    fn assert_repins_named(&self, step: &Value, operation: &str) {
+        for (name, package_id, _) in self.pinned_profiles() {
+            if !self.repins(package_id) {
+                continue;
+            }
+            let installed = self
+                .installed(package_id)
+                .expect("a repin has an installed package");
+            let release = self.release(package_id);
+            let action = step["profiles"]
+                .as_array()
+                .and_then(|actions| actions.iter().find(|action| action["name"] == name))
+                .unwrap_or_else(|| panic!("{operation}: no profile step for {name}: {step}"));
+            assert_eq!(
+                action["previous_digest"],
+                installed.digest.as_str(),
+                "{operation}: {name} does not name the previous digest: {action}"
+            );
+            assert_eq!(
+                action["previous_version"],
+                installed.descriptor.version.as_str(),
+                "{operation}: {name} does not name the previous version: {action}"
+            );
+            assert_eq!(
+                action["digest"],
+                release.digest.as_str(),
+                "{operation}: {name} is not repinned to the head digest: {action}"
+            );
+            assert_eq!(
+                action["version"],
+                release.descriptor.version.as_str(),
+                "{operation}: {name} is not repinned to the head version: {action}"
+            );
+            eprintln!("{operation}: profile {name}: {action}");
+        }
+    }
+
     /// The plan status of the head's package for `runtime`: `present` where the
     /// host already serves the head's digest, `install` otherwise.
     fn planned_status(&self, runtime: &str, head_digest: &str) -> &'static str {
-        let installed = match &self.start {
-            Start::Builtin => None,
-            Start::Package { claude, codex } => Some(if runtime == CLAUDE_RUNTIME_ID {
-                claude
-            } else {
-                codex
-            }),
+        let package_id = if runtime == CLAUDE_RUNTIME_ID {
+            CLAUDE_PACKAGE_ID
+        } else {
+            CODEX_PACKAGE_ID
         };
-        if installed.map(String::as_str) == Some(head_digest) {
+        let installed = self
+            .installed(package_id)
+            .map(|installed| installed.digest.as_str());
+        if installed == Some(head_digest) {
             "present"
         } else {
             "install"
@@ -1549,6 +1819,148 @@ impl Upgrade {
                 self.planned_status(CODEX_RUNTIME_ID, codex),
             ),
         ]
+    }
+
+    /// Makes the fake Claude agents answer a release the previous package's
+    /// version probe refuses and the head's accepts: the previous `below` bound,
+    /// which is exclusive. The stopped session then cannot resume on its
+    /// previous pin, so only the adoption onto the head package can resume it.
+    /// The rewrite happens before the upgrade, so the previous package's probe
+    /// never sees the new line before it is refused. A built-in start has no
+    /// previous package range, so its agents keep their line.
+    fn point_claude_agent_at_newer_range(&self) {
+        let Start::Package { claude, .. } = &self.start else {
+            eprintln!("the built-in start has no previous package range; the agent keeps its line");
+            return;
+        };
+        let previous = &claude.descriptor.probe;
+        let head = &self.packages.claude.descriptor.probe;
+        let release = previous.below.as_str();
+        assert!(
+            !previous.accepts(release),
+            "the previous package accepts its own bound {release}: {previous:?}"
+        );
+        if !head.accepts(release) {
+            // The head package still carries the previous range, so it refuses
+            // the bound as well. Its agent keeps the lowest accepted line.
+            assert!(
+                !self.head_is_release,
+                "the head is runtime range release {RUNTIME_RANGE_RELEASE} or later, but its \
+                 claude package {} does not accept {release}: {head:?}",
+                self.packages.claude.digest
+            );
+            eprintln!(
+                "the head claude range {head:?} does not accept {release}: the agent keeps its line"
+            );
+            return;
+        }
+        let line = head.line_of_release(release);
+        eprintln!(
+            "the fake claude agents now answer `{line}`: refused by the previous range {previous:?}, \
+             accepted by the head range {head:?}"
+        );
+        write_claude_scripts(&self.run, &line);
+    }
+
+    /// Checks the package and profile steps of a plan or an apply, and under
+    /// `RUNTIME_RANGE_RELEASE` that the head repins a package it has a newer
+    /// version of.
+    fn assert_strict_repins(&self, operation: &str) {
+        if !self.head_is_release {
+            return;
+        }
+        if let Start::Package { .. } = self.start {
+            for package_id in [CLAUDE_PACKAGE_ID, CODEX_PACKAGE_ID] {
+                assert!(
+                    self.repins(package_id),
+                    "{operation}: the head is {} (runtime range release {RUNTIME_RANGE_RELEASE} or later), \
+                     but {package_id} does not repin: the head {} {}, the previous {}",
+                    self.head_version,
+                    self.release(package_id).digest,
+                    self.release(package_id).descriptor.version,
+                    self.installed(package_id)
+                        .map_or("?", |installed| installed.descriptor.version.as_str()),
+                );
+            }
+        }
+    }
+
+    /// The downgrade guard: `plugin update` of the Claude package to the older
+    /// archive in `dir` is refused with `plugin_update_downgrade` and writes
+    /// nothing. The head's Claude digest stays the selected one, and neither the
+    /// offered archive nor the downgrade version is installed.
+    fn assert_downgrade_guard(&self) {
+        let Some(dir) = self.run.downgrade.as_ref() else {
+            assert!(
+                !self.head_is_release,
+                "the head is {} (runtime range release {RUNTIME_RANGE_RELEASE} or later), but \
+                 POHUNEK_UPGRADE_DOWNGRADE_DIR is unset: the downgrade guard cannot run",
+                self.head_version
+            );
+            eprintln!(
+                "the downgrade guard is not checked: POHUNEK_UPGRADE_DOWNGRADE_DIR is unset, \
+                 so the head's xtask writes no downgrade catalog"
+            );
+            return;
+        };
+        let archive = dir.join(CLAUDE_PACKAGE_ARCHIVE);
+        let catalog = dir.join(RUNTIME_CATALOG);
+        let bytes = fs::read(&archive)
+            .unwrap_or_else(|error| panic!("read {}: {error}", archive.display()));
+        let offered = archive_digest(&bytes).expect("the downgrade archive digest");
+        let archive = archive.display().to_string();
+        let catalog = catalog.display().to_string();
+        let output = self.head.run(&[
+            "plugin",
+            "update",
+            CLAUDE_PACKAGE_ID,
+            &archive,
+            "--catalog",
+            &catalog,
+            "--yes",
+            "--json",
+        ]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        eprintln!("plugin update of the downgrade archive: {stdout}");
+        assert!(
+            !output.status.success(),
+            "the downgrade archive was accepted: {stdout}"
+        );
+        let document: Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|error| panic!("the downgrade refusal is not JSON: {error}: {stdout}"));
+        assert_eq!(
+            document["err"]["code"], "plugin_update_downgrade",
+            "the downgrade archive is not refused as a downgrade: {document}"
+        );
+
+        let listed = self.head.json(&["plugin", "list", "--json"]);
+        eprintln!("plugin list after the refused downgrade: {listed}");
+        let packages = listed["packages"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the package listing carries no packages: {listed}"));
+        let claude: Vec<&Value> = packages
+            .iter()
+            .filter(|package| package["package"]["id"] == CLAUDE_PACKAGE_ID)
+            .collect();
+        let head_digest = self.packages.claude.digest.as_str();
+        assert!(
+            claude.iter().any(|package| package["digest"] == head_digest
+                && package["selected"] == true),
+            "the head Claude digest {head_digest} is not the selected one after the refusal: {listed}"
+        );
+        assert!(
+            !claude
+                .iter()
+                .any(|package| package["digest"] == offered.as_str()),
+            "the refused downgrade archive {} was installed: {listed}",
+            offered.as_str()
+        );
+        assert!(
+            !claude
+                .iter()
+                .any(|package| package["package"]["version"] == DOWNGRADE_VERSION),
+            "a {DOWNGRADE_VERSION} Claude record exists after the refused downgrade: {listed}"
+        );
     }
 
     /// The head links a package directory, so the head daemon builds an
@@ -1615,30 +2027,32 @@ impl Upgrade {
     /// The operator path: this build's CLI checks, then upgrades in one step
     /// without accepting runtime loss. The check and the upgrade both judge the
     /// sessions adoptable and plan the head's packages. A built-in start
-    /// installs them and binds every profile; a package start installs the
-    /// head's packages beside the previous ones and binds nothing.
+    /// installs them and binds every profile. A package start installs the
+    /// head's packages beside the previous ones: a newer head version repins
+    /// the profiles to the head digest, and the same digest keeps the pins.
     fn upgrade(&self) {
         let (live, stopped, head_version) = (&self.id, &self.stopped_id, &self.head_version);
         let planned = self.planned_packages();
-        let plan_profiles: Vec<&str> = match self.start {
-            Start::Builtin => self
-                .pinned_profiles()
-                .iter()
-                .map(|(name, _, _)| *name)
-                .collect(),
-            Start::Package { .. } => Vec::new(),
-        };
+        let stopped_code = self.stopped_code();
 
         let check = self.head.json(&["service", "check", "--json"]);
         eprintln!("service check: {check}");
-        assert_preflight_adoptable(&check, live, stopped, head_version, "service check");
+        assert_preflight_adoptable(
+            &check,
+            live,
+            stopped,
+            stopped_code,
+            head_version,
+            "service check",
+        );
         assert_runtime_step(
             &check["preflight"]["runtimes"],
             &planned,
-            "bind",
-            &plan_profiles,
+            &self.profile_steps(false),
             "service check",
         );
+        self.assert_repins_named(&check["preflight"]["runtimes"], "service check");
+        self.assert_strict_repins("service check");
 
         let from = self.run.head_dir.display().to_string();
         let report = self
@@ -1649,7 +2063,14 @@ impl Upgrade {
         // After an apply the upgrade's preflight is the judgement against the
         // installed packages, which carries no plan; `service check` above
         // carries the plan and `runtimes` below the applied step.
-        assert_preflight_adoptable(&report, live, stopped, head_version, "service upgrade");
+        assert_preflight_adoptable(
+            &report,
+            live,
+            stopped,
+            stopped_code,
+            head_version,
+            "service upgrade",
+        );
         let applied: Vec<(&str, &str, &str)> = planned
             .iter()
             .map(|(runtime, digest, status)| {
@@ -1664,10 +2085,11 @@ impl Upgrade {
         assert_runtime_step(
             &report["runtimes"],
             &applied,
-            "bound",
-            &plan_profiles,
+            &self.profile_steps(true),
             "service upgrade",
         );
+        self.assert_repins_named(&report["runtimes"], "service upgrade");
+        self.assert_strict_repins("service upgrade");
         assert_claude_hooks_reinstalled(&report);
         self.assert_profile_files_pinned();
         // The upgrade does not relaunch a session, so the stopped session keeps
@@ -1963,7 +2385,9 @@ fn previous_release_session_survives_the_upgrade_to_head() {
     let head = Cli::new("head", &run.head_dir, &run.artifacts);
     let (upgrade, before) = start_on_previous(run, previous, head);
     upgrade.capture_previous_goldens();
+    upgrade.point_claude_agent_at_newer_range();
     upgrade.upgrade();
+    upgrade.assert_downgrade_guard();
     let after = upgrade.assert_adopted(&before.live, before.daemon);
     upgrade.assert_session_works();
     upgrade.assert_head_links_a_package_of_its_format();
