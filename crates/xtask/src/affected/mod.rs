@@ -1058,7 +1058,7 @@ fn is_below(path: &str, dir: &str) -> bool {
 /// deterministic.
 /// The tracked files a sparse working tree keeps for `targets`: every file
 /// whose change would select one of their packages, every file whose change
-/// selects everything or goes through the dependency diff, and nothing that is
+/// selects everything, every dependency input, and nothing else that is
 /// [`Decision::NoRustTests`]. A test that reads a file outside this set reads
 /// a path whose change does not select it.
 pub(crate) fn sparse_paths(
@@ -1075,23 +1075,30 @@ pub(crate) fn sparse_paths(
     let mut closures: BTreeMap<BTreeSet<String>, bool> = BTreeMap::new();
     tracked
         .iter()
-        .filter(|path| match classify(path, packages, Mode::Ci).0 {
-            Decision::NoRustTests(_) => false,
-            Decision::Everything(_) | Decision::Unmapped | Decision::Dependencies(_) => true,
-            Decision::Packages { names, tests, .. } => {
-                tests
-                    .iter()
-                    .any(|(package, ..)| selected.contains(package.as_str()))
-                    || *closures.entry(names).or_insert_with_key(|names| {
-                        let seeds = names
+        // A dependency input can select any package through the dependency
+        // diff, and nextest needs the workspace manifests.
+        .filter(|path| {
+            is_dependency_input(path, packages)
+                || match classify(path, packages, Mode::Ci).0 {
+                    Decision::NoRustTests(_) => false,
+                    Decision::Everything(_) | Decision::Unmapped | Decision::Dependencies(_) => {
+                        true
+                    }
+                    Decision::Packages { names, tests, .. } => {
+                        tests
                             .iter()
-                            .map(|name| (name.clone(), BTreeSet::new()))
-                            .collect();
-                        graph::close(&seeds, packages)
-                            .keys()
-                            .any(|name| selected.contains(name.as_str()))
-                    })
-            }
+                            .any(|(package, ..)| selected.contains(package.as_str()))
+                            || *closures.entry(names).or_insert_with_key(|names| {
+                                let seeds = names
+                                    .iter()
+                                    .map(|name| (name.clone(), BTreeSet::new()))
+                                    .collect();
+                                graph::close(&seeds, packages)
+                                    .keys()
+                                    .any(|name| selected.contains(name.as_str()))
+                            })
+                    }
+                }
         })
         .cloned()
         .collect()
