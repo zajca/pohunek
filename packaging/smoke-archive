@@ -490,6 +490,18 @@ inner_main() {
         mkdir -p "$work/t" "$run/home" "$run/cwd" "$run/config" "$run/data" "$run/state" "$run/cache"
 
         if [ "$isolation" = sandbox ]; then
+            # A fresh macOS user's first python3 start is slow enough to outlast
+            # the agents' 10 s hook timeout, and the agent's first hook is what
+            # reports its identity. The interpreter the hooks resolve, through
+            # the consumer's PATH, is therefore started once before the consumer.
+            warm_start=$(/usr/bin/perl -MTime::HiRes=time -e 'printf "%.3f", time')
+            warm_exit=0
+            env -i PATH="$stage/$rt/bin:$node_dir:/usr/bin:/bin" HOME="$run/home" TMPDIR="$work/t" LANG=C.UTF-8 \
+                python3 -I -c 'import ctypes' >/dev/null 2>&1 || warm_exit=$?
+            warm_end=$(/usr/bin/perl -MTime::HiRes=time -e 'printf "%.3f", time')
+            /usr/bin/perl -e 'printf "smoke-archive: python3 warm-up for %s took %.3fs (exit %s)\n", $ARGV[0], $ARGV[2] - $ARGV[1], $ARGV[3]' \
+                "$rt" "$warm_start" "$warm_end" "$warm_exit"
+            [ "$warm_exit" -eq 0 ] || fail "python3 warm-up for $rt failed (exit $warm_exit); the agents' hooks need python3"
             # On macOS, run the consumer in a new session to detect stray processes.
             pidfile="$work/run/.stray_$rt.pid"
             consumer_exit=0
