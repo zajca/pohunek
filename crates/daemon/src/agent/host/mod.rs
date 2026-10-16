@@ -54,8 +54,8 @@ pub use transcripts::{
     MAX_TRANSCRIPT_DIR_COMPONENTS,
 };
 pub use version_probe::{
-    LineTemplate, LineTemplateError, ProbeVersion, VersionProbePolicy, MAX_PROBE_ARGS,
-    SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID,
+    LineTemplate, LineTemplateError, ProbeVersion, VersionProbePolicy, VersionRefusal,
+    MAX_PROBE_ARGS, SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID,
 };
 
 #[cfg(test)]

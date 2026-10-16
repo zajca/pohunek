@@ -54,7 +54,11 @@ version reports `supported: false`. Launch a runtime only when `available` is tr
 probe for bare and profile-based Hermes immediately before `session.new` and
 `session.resume`; an unparseable or non-pinned executable returns
 `agent_runtime_unsupported` before it creates a worker, session, worktree, or
-recovery write. A program that does not resolve to an executable, for Hermes
+recovery write. That refusal, and the `pohunek doctor` check of the profile,
+name the parsed release and the supported `[min, below)` for a release outside
+the range, or say that the output does not match the runtime's declared format;
+neither repeats the probe output. A failing or timed-out probe keeps the generic
+message. A program that does not resolve to an executable, for Hermes
 or any other runtime but a bare host shell, returns `agent_binary_missing` at the
 same point, before any probe runs; that refusal names only the program's file
 name. The probe clears ambient user state except the launch `PATH` and uses

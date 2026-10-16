@@ -21,7 +21,7 @@ use protocol::{
 use tracing::debug;
 
 use crate::agent::host::{
-    LaunchProgram, RuntimeDefinition, RuntimeRegistry, Spawn, VersionProbePolicy,
+    LaunchProgram, RuntimeDefinition, RuntimeRegistry, Spawn, VersionProbePolicy, VersionRefusal,
     RESERVED_RUNTIME_IDS, SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID,
 };
 use crate::agent::{which_executable, ProfileRegistry, ValidatedLaunchProgram};
@@ -69,27 +69,12 @@ impl<'a> VersionProbe<'a> {
         launch_path: Option<&OsStr>,
         timeout: Duration,
     ) -> Option<String> {
-        self.detect_version_with_outcome(path, launch_path, timeout)
-            .ok()
-    }
-
-    /// Runs the probe while retaining timeout separately from other failures.
-    fn detect_version_with_outcome(
-        self,
-        path: &Path,
-        launch_path: Option<&OsStr>,
-        timeout: Duration,
-    ) -> Result<String, ProbeOutcome> {
         let policy = self.0;
-        let outcome =
-            spawn_and_collect_probe(path, policy, launch_path, timeout, &[], &Instant::now)
-                .unwrap_or(ProbeOutcome::Unavailable);
-        match outcome {
+        match spawn_and_collect_probe(path, policy, launch_path, timeout, &[], &Instant::now)? {
             ProbeOutcome::Output(output) => policy
                 .read_output(&output)
-                .map(|version| version.to_string())
-                .ok_or(ProbeOutcome::Failed),
-            failure => Err(failure),
+                .map(|version| version.to_string()),
+            ProbeOutcome::Failed | ProbeOutcome::TimedOut | ProbeOutcome::Unavailable => None,
         }
     }
 
@@ -408,10 +393,25 @@ pub(crate) fn validate_definition_launch_with_timeout(
             LaunchValidationFailure::Missing => {
                 ProtocolError::agent_binary_missing(reported_program(definition, spawn))
             }
+            LaunchValidationFailure::Refused(refusal) => unsupported_version_error(refusal),
             LaunchValidationFailure::Unsupported | LaunchValidationFailure::ProbeTimedOut => {
                 ProtocolError::agent_runtime_unsupported()
             }
         })
+}
+
+/// The `agent_runtime_unsupported` refusal for probe output that ran to
+/// completion: it names the parsed release and the supported range, or that
+/// the output did not parse, and never the output itself.
+pub(crate) fn unsupported_version_error(refusal: VersionRefusal) -> ProtocolError {
+    match refusal {
+        VersionRefusal::Unparseable => ProtocolError::agent_runtime_version_unparseable(),
+        VersionRefusal::OutOfRange {
+            version,
+            min,
+            below,
+        } => ProtocolError::agent_runtime_version_out_of_range(&version, &min, &below),
+    }
 }
 
 /// The program name a missing-executable refusal reports: the file name of
@@ -430,8 +430,12 @@ fn reported_program<'a>(definition: &'a RuntimeDefinition, spawn: Spawn<'a>) -> 
 pub(crate) enum LaunchValidationFailure {
     /// The program does not resolve to an executable; no probe ran.
     Missing,
-    /// The probe rejected an executable that exists, or the definition names
-    /// a parser this daemon does not provide.
+    /// The probe exited successfully, and its output names no supported
+    /// release.
+    Refused(VersionRefusal),
+    /// The probe failed (a non-zero exit, its full deadline, or a setup
+    /// failure), or the definition names a parser this daemon does not
+    /// provide.
     Unsupported,
     /// The probe outran a budget shorter than [`VERSION_PROBE_TIMEOUT`].
     ProbeTimedOut,
@@ -473,19 +477,26 @@ pub(crate) fn validate_definition_launch_with_timeout_detailed(
     let Some(probe) = VersionProbe::for_definition(definition) else {
         return Err(LaunchValidationFailure::Unsupported);
     };
-    let version = probe
-        .detect_version_with_outcome(program.as_path(), launch_path, timeout)
-        .map_err(|outcome| match outcome {
-            ProbeOutcome::TimedOut if shortened_budget => LaunchValidationFailure::ProbeTimedOut,
-            ProbeOutcome::Failed | ProbeOutcome::Unavailable | ProbeOutcome::Output(_) => {
-                LaunchValidationFailure::Unsupported
-            }
-            ProbeOutcome::TimedOut => LaunchValidationFailure::Unsupported,
-        })?;
-    probe
-        .accepts(&version)
-        .then_some(Some(program))
-        .ok_or(LaunchValidationFailure::Unsupported)
+    let policy = probe.0;
+    let outcome = spawn_and_collect_probe(
+        program.as_path(),
+        policy,
+        launch_path,
+        timeout,
+        &[],
+        &Instant::now,
+    )
+    .unwrap_or(ProbeOutcome::Unavailable);
+    match outcome {
+        ProbeOutcome::Output(output) => policy
+            .check_output(&output)
+            .map(|_version| Some(program))
+            .map_err(LaunchValidationFailure::Refused),
+        ProbeOutcome::TimedOut if shortened_budget => Err(LaunchValidationFailure::ProbeTimedOut),
+        ProbeOutcome::TimedOut | ProbeOutcome::Failed | ProbeOutcome::Unavailable => {
+            Err(LaunchValidationFailure::Unsupported)
+        }
+    }
 }
 
 /// How a version probe ended.
@@ -1169,15 +1180,27 @@ strategy = "none"
             hermes.canonicalize().expect("canonical Hermes fixture")
         );
 
-        for (output, forbidden) in [
-            ("Hermes Agent v0.21.0 (future)", "0.21.0"),
-            ("unexpected output", "unexpected output"),
+        // An out-of-range release is named with the declared range; output
+        // that does not parse is never echoed.
+        for (output, expected, forbidden) in [
+            (
+                "Hermes Agent v0.21.0 (future)",
+                "reports version 0.21.0, outside its runtime's supported range",
+                "(future)",
+            ),
+            (
+                "unexpected output",
+                "does not match its runtime's declared format",
+                "unexpected output",
+            ),
         ] {
             write_test_executable(&hermes, &format!("#!/bin/sh\necho '{output}'\n"));
             let error = validate(&binary).expect_err("incompatible Hermes runtime");
             assert_eq!(error.code, "agent_runtime_unsupported");
-            assert!(!error.msg.contains(forbidden));
+            assert!(error.msg.contains(expected), "{error:?}");
+            assert!(!error.msg.contains(forbidden), "{error:?}");
             assert!(!error.msg.contains(&binary));
+            assert!(error.recover.is_some(), "{error:?}");
         }
 
         let missing = dir.join("missing").display().to_string();
@@ -1580,7 +1603,15 @@ strategy = "none"
             )
             .expect_err("a release outside the range is refused");
             assert_eq!(error.code, "agent_runtime_unsupported");
-            assert!(!error.msg.contains(output) || output.is_empty());
+            match version {
+                Some(version) => assert!(
+                    error
+                        .msg
+                        .contains(&format!("reports version {version}, outside")),
+                    "{error:?}"
+                ),
+                None => assert!(!error.msg.contains(output) || output.is_empty()),
+            }
         }
 
         write_test_executable(&tool, "#!/bin/sh\necho 1.0.2\nexit 3\n");

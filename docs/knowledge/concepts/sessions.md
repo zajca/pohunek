@@ -1202,8 +1202,9 @@ exactly `hermes chat --resume <reference>`. It never continues ambient Hermes
 state and never reads `state.db`. Before either launch, and before material
 side effects, the daemon fails with `agent_binary_missing` when the `hermes`
 program does not resolve to an executable, then requires an isolated, bounded
-version probe to confirm the pinned release and fails with payload-free
-`agent_runtime_unsupported` when the runtime is incompatible. The Hermes operator plugin reports a native
+version probe to confirm the pinned release and fails with
+`agent_runtime_unsupported` when the runtime is incompatible; the refusal names
+the parsed release and the supported range, never the probe output. The Hermes operator plugin reports a native
 reference through its bounded lifecycle hooks for a managed Hermes session; it
 does not infer or read one from Hermes state. Its resume capability is
 independent from a temporarily unavailable report; fork is always unsupported

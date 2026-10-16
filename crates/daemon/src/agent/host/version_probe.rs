@@ -250,6 +250,43 @@ impl LineTemplate {
     }
 }
 
+/// Why a probe's output is not a supported release.
+///
+/// Neither variant carries probe output: an out-of-range refusal holds only the
+/// normalized release and the declared range, so it is safe to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionRefusal {
+    /// The first output line does not follow the declared grammar.
+    Unparseable,
+    /// The output names a release outside the declared `[min, below)`.
+    OutOfRange {
+        /// The release the output names.
+        version: ProbeVersion,
+        /// Lowest supported release, inclusive.
+        min: ProbeVersion,
+        /// First release that is no longer supported.
+        below: ProbeVersion,
+    },
+}
+
+impl fmt::Display for VersionRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unparseable => {
+                f.write_str("the version output does not match the declared format")
+            }
+            Self::OutOfRange {
+                version,
+                min,
+                below,
+            } => write!(
+                f,
+                "version {version} is outside the supported range [{min}, {below})"
+            ),
+        }
+    }
+}
+
 /// How a policy reads the probe output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OutputGrammar {
@@ -370,6 +407,29 @@ impl VersionProbePolicy {
     #[must_use]
     pub fn parse_output(output: &str) -> Option<ProbeVersion> {
         ProbeVersion::parse(output.lines().next()?.trim())
+    }
+
+    /// Classifies probe output: the release when it is supported, otherwise
+    /// why it is not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VersionRefusal::Unparseable`] when the first line does not
+    /// follow this policy's grammar, and [`VersionRefusal::OutOfRange`] when the
+    /// release it carries lies outside `[min, below)`.
+    pub fn check_output(&self, output: &str) -> Result<ProbeVersion, VersionRefusal> {
+        let version = self
+            .read_output(output)
+            .ok_or(VersionRefusal::Unparseable)?;
+        if self.supports(version) {
+            Ok(version)
+        } else {
+            Err(VersionRefusal::OutOfRange {
+                version,
+                min: self.min,
+                below: self.below,
+            })
+        }
     }
 
     /// Reads the release from probe output under this policy's grammar. Only

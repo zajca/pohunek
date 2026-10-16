@@ -13223,12 +13223,17 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
             assert!(!error.msg.contains(&dir.display().to_string()), "{error:?}");
             assert!(error.recover.is_some(), "{error:?}");
         } else {
+            // The refusal names an out-of-range release with the declared
+            // range, and never echoes output that does not parse.
             assert_eq!(error.code, "agent_runtime_unsupported");
-            assert_eq!(
-                error.msg,
-                "the selected agent executable did not pass this daemon's version check"
-            );
-            assert!(error.recover.is_none());
+            let expected = if version_output.contains("0.21.0") {
+                "reports version 0.21.0, outside its runtime's supported range"
+            } else {
+                "does not match its runtime's declared format"
+            };
+            assert!(error.msg.contains(expected), "{error:?}");
+            assert!(!error.msg.contains("provider output"), "{error:?}");
+            assert!(error.recover.is_some(), "{error:?}");
         }
         assert_eq!(fs::read(&store_path).expect("store sentinel"), sentinel);
         assert!(!marker.exists(), "resume process must not be launched");
