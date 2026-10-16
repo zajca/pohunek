@@ -48,6 +48,12 @@ const WAIT_SLICE_MS: &str = "8000";
 /// Number of trailing log bytes printed when a run fails.
 const LOG_TAIL_BYTES: usize = 4096;
 
+/// Most hook lines of one agent transcript printed when a run fails.
+const HOOK_LINES_MAX: usize = 20;
+
+/// Longest hook line printed, in bytes.
+const HOOK_LINE_MAX_BYTES: usize = 2048;
+
 /// A running daemon, its environment and the CLI used against it.
 pub(crate) struct Host {
     pub(crate) env: TestEnv,
@@ -344,7 +350,39 @@ fn dump_runtime_logs(root: &Path) {
         };
         eprintln!("--- {}", path.display());
         eprintln!("{}", tail(&bytes, LOG_TAIL_BYTES));
+        dump_hook_lines(&path, &bytes);
     }
+}
+
+/// Prints the hook entries of an agent transcript, wherever they sit in it.
+///
+/// The tail above can miss a session's first hook, and a hook the agent killed
+/// at its timeout leaves no pohunek trace, so the transcript is the only record.
+fn dump_hook_lines(path: &Path, bytes: &[u8]) {
+    let in_transcripts = path.components().any(|part| part.as_os_str() == "projects");
+    if !in_transcripts {
+        return;
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text.lines().filter(|line| line.contains("hook")).collect();
+    let omitted = lines.len().saturating_sub(HOOK_LINES_MAX);
+    eprintln!(
+        "hook lines of {}: {} shown, {omitted} later omitted",
+        path.display(),
+        lines.len() - omitted
+    );
+    for line in lines.iter().take(HOOK_LINES_MAX) {
+        eprintln!("{}", truncate_at_char(line, HOOK_LINE_MAX_BYTES));
+    }
+}
+
+/// `line` cut to at most `max` bytes on a character boundary.
+fn truncate_at_char(line: &str, max: usize) -> &str {
+    let mut end = line.len().min(max);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    &line[..end]
 }
 
 /// Recursively collects up to 30 log file paths, depth ≤ 8, skipping symlinks.
