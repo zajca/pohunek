@@ -36,11 +36,13 @@ on:
 run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_id != '' && format('CI [tier={0}] [dispatch={1}]', inputs.tier, inputs.dispatch_id) || (github.event_name == 'workflow_dispatch' && format('CI [tier={0}]', inputs.tier)) || ' ' }}
 
 
-# Cancel superseded PR and main runs on the same ref. Each scheduled or manual
-# run gets its own group, so neither cancels those latest-wins streams.
+# A new PR push cancels the PR's run in progress (latest wins). Pushes to main
+# drain (#1209): the running main run completes, and GitHub keeps only the
+# newest push pending behind it, replacing an older pending one. Each scheduled
+# or manual run gets its own group, so it neither cancels nor waits for those.
 concurrency:
   group: ci-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.event_name == 'push' && 'main' || github.run_id }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

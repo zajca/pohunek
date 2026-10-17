@@ -357,13 +357,28 @@ class CiTierWorkflowTests(unittest.TestCase):
         self.assertRegex(tier, r"(?m)^\s+- main$")
         self.assertRegex(tier, r"(?m)^\s+- nightly$")
 
-    def test_superseded_pr_and_main_runs_cancel_without_cross_tier_cancellation(self):
+    def test_superseded_pr_runs_cancel_and_main_runs_drain_without_cross_tier_cancellation(self):
         concurrency = block(CI, "concurrency", indent=0)
-        self.assertIn("github.ref", concurrency)
-        self.assertIn("github.event_name == 'pull_request'", concurrency)
-        self.assertIn("github.event_name == 'push'", concurrency)
-        self.assertIn("github.run_id", concurrency)
-        self.assertIn("cancel-in-progress: true", concurrency)
+        group = re.search(r"(?m)^  group: (.+)$", concurrency)
+        self.assertIsNotNone(group)
+        self.assertEqual(
+            group.group(1),
+            "ci-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' "
+            "|| github.event_name == 'push' && 'main' || github.run_id }}",
+        )
+        cancel = re.search(r"(?m)^  cancel-in-progress: \$\{\{ github\.event_name == '([a-z_]+)' \}\}$", concurrency)
+        self.assertIsNotNone(cancel, "cancel-in-progress must depend on the event alone")
+        # (event, cancels a run in progress): a PR push replaces the PR's run;
+        # a push to main waits for the running main run to complete. Schedule
+        # and dispatch runs are alone in a run_id group, so nothing cancels them.
+        for event, cancels in (
+            ("pull_request", True),
+            ("push", False),
+            ("schedule", False),
+            ("workflow_dispatch", False),
+        ):
+            with self.subTest(event=event):
+                self.assertEqual(cancel.group(1) == event, cancels)
 
     def test_macos_package_runs_on_macos_15_and_nightly_adds_cold_rebuild_and_relay_suite(self):
         jobs = workflow_jobs()
