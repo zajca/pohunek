@@ -74,10 +74,16 @@ jobs:
           version="$(scripts/release-workflow/version "$MODE" "$REF_NAME")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+  # One job per target. Each component keeps its own `cargo build`
+  # invocation, so feature unification across components cannot change its
+  # bytes, while the components of a target share the compiled dependencies.
+  # A component is staged and archived right after its build, before the
+  # next one builds: the daemon build relinks `pohunek` in the same target
+  # dir with the features of all three of its packages.
   binaries:
-    name: Build ${{ matrix.component }} for ${{ matrix.target }}
+    name: Build ${{ matrix.target }} (${{ matrix.components }})
     needs: [meta]
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     permissions:
@@ -88,40 +94,24 @@ jobs:
         include:
           # Dynamically linked glibc build (primary target).
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            component: cli
-            archive_prefix: pohunek-cli
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            component: daemon
-            archive_prefix: pohunek-daemon
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            component: relay
-            archive_prefix: pohunek-relay
+            components: cli daemon relay
           # Fully static musl CLI and daemon builds: self-contained binaries
           # that run on x86_64 Linux regardless of the host glibc version.
           - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
-            component: cli
-            archive_prefix: pohunek-cli
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
-            component: daemon
-            archive_prefix: pohunek-daemon
+            components: cli daemon
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
       - name: Install Python for Hermes release verification
-        if: ${{ inputs.mode == 'release' && matrix.component == 'daemon' }}
+        if: ${{ inputs.mode == 'release' && contains(matrix.components, 'daemon') }}
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
       - name: Install uv for Hermes release verification
-        if: ${{ inputs.mode == 'release' && matrix.component == 'daemon' }}
+        if: ${{ inputs.mode == 'release' && contains(matrix.components, 'daemon') }}
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: "0.9.28"
@@ -136,9 +126,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Every leg links host binaries (build scripts, `cargo xtask docs site`)
+      # Every job links host binaries (build scripts, `cargo xtask docs site`)
       # with the job-level mold RUSTFLAGS; only the musl target link itself
-      # drops mold, in the "Build release binaries" step.
+      # drops mold, in the "Build and package each component" step.
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
 
@@ -153,46 +143,13 @@ jobs:
         with:
           shared-key: ci-
 
-      - name: Build release binaries
-        shell: bash
-        env:
-          # musl targets link statically via the musl toolchain wrapper, which
-          # does not accept GNU ld replacement flags: keep mold GNU-only.
-          RUSTFLAGS: ${{ endsWith(matrix.target, '-musl') && '-D warnings' || '-D warnings -C link-arg=-fuse-ld=mold' }}
-          TARGET: ${{ matrix.target }}
-          COMPONENT: ${{ matrix.component }}
-        run: |
-          set -euo pipefail
-          build_args=(--release --locked --target "$TARGET")
-          case "$COMPONENT" in
-            cli)
-              cargo build "${build_args[@]}" -p pohunek-cli --bin pohunek
-              ;;
-            daemon)
-              cargo build "${build_args[@]}" \
-                -p pohunek-cli \
-                -p pohunek-daemon \
-                -p pohunek-session-worker \
-                --bin pohunek \
-                --bin pohunekd \
-                --bin pohunek-sessiond
-              ;;
-            relay)
-              cargo build "${build_args[@]}" -p pohunek-relay --bin pohunek-relayd
-              ;;
-            *)
-              echo "::error::unsupported release component: $COMPONENT"
-              exit 1
-              ;;
-          esac
-
       - name: Build docs artifacts
         run: cargo xtask docs site
 
       # The throwaway anchor replaces the production one in this ephemeral
-      # checkout only; stage-archive copies it into the daemon archive.
+      # checkout only; stage-archive copies it into the daemon archive alone.
       - name: Install the rehearsal trust anchor
-        if: ${{ inputs.mode == 'rehearsal' && matrix.component == 'daemon' }}
+        if: ${{ inputs.mode == 'rehearsal' && contains(matrix.components, 'daemon') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -201,33 +158,56 @@ jobs:
             "$RUNNER_TEMP/rehearsal-trust" "$GITHUB_RUN_ID" "$GITHUB_SHA"
           cp "$RUNNER_TEMP/rehearsal-trust/anchor.json" packaging/runtime-catalog-anchor.json
 
-      - name: Package
-        id: package
+      - name: Build and package each component
         shell: bash
         env:
+          # musl targets link statically via the musl toolchain wrapper, which
+          # does not accept GNU ld replacement flags: keep mold GNU-only.
+          RUSTFLAGS: ${{ endsWith(matrix.target, '-musl') && '-D warnings' || '-D warnings -C link-arg=-fuse-ld=mold' }}
           VERSION: ${{ needs.meta.outputs.version }}
           TARGET: ${{ matrix.target }}
-          COMPONENT: ${{ matrix.component }}
-          ARCHIVE_PREFIX: ${{ matrix.archive_prefix }}
+          COMPONENTS: ${{ matrix.components }}
         run: |
           set -euo pipefail
           # Archives are stamped with the commit time, so rebuilding the same
           # commit yields the same archive bytes.
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           export SOURCE_DATE_EPOCH
-          name="$(packaging/stage-archive "$COMPONENT" "$VERSION" "$TARGET" \
-            "target/$TARGET/release" target/pohunek-docs dist)"
-          if [ "$name" != "$ARCHIVE_PREFIX-$VERSION-$TARGET" ]; then
-            echo "::error::staged archive $name does not match the matrix archive prefix"
-            exit 1
-          fi
-          sh packaging/write-manifest "dist/$name" "$COMPONENT" "$VERSION" "$TARGET" none
-          sh packaging/archive dist "$name" dist
-          echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
-          echo "checksum=dist/$name.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          build_args=(--release --locked --target "$TARGET")
+          for component in $COMPONENTS; do
+            case "$component" in
+              cli)
+                cargo build "${build_args[@]}" -p pohunek-cli --bin pohunek
+                ;;
+              daemon)
+                cargo build "${build_args[@]}" \
+                  -p pohunek-cli \
+                  -p pohunek-daemon \
+                  -p pohunek-session-worker \
+                  --bin pohunek \
+                  --bin pohunekd \
+                  --bin pohunek-sessiond
+                ;;
+              relay)
+                cargo build "${build_args[@]}" -p pohunek-relay --bin pohunek-relayd
+                ;;
+              *)
+                echo "::error::unsupported release component: $component"
+                exit 1
+                ;;
+            esac
+            name="$(packaging/stage-archive "$component" "$VERSION" "$TARGET" \
+              "target/$TARGET/release" target/pohunek-docs dist)"
+            if [ "$name" != "pohunek-$component-$VERSION-$TARGET" ]; then
+              echo "::error::staged archive $name does not match the component $component"
+              exit 1
+            fi
+            sh packaging/write-manifest "dist/$name" "$component" "$VERSION" "$TARGET" none
+            sh packaging/archive dist "$name" dist
+          done
 
       - name: Provision locked Hermes runtime
-        if: ${{ inputs.mode == 'release' && matrix.component == 'daemon' }}
+        if: ${{ inputs.mode == 'release' && contains(matrix.components, 'daemon') }}
         id: hermes
         shell: bash
         run: |
@@ -243,20 +223,17 @@ jobs:
       # anchor only the smoke's private prefix trusts; the archive's
       # production anchor is untouched.
       - name: Verify packaged daemon against pinned Hermes
-        if: ${{ inputs.mode == 'release' && matrix.component == 'daemon' }}
+        if: ${{ inputs.mode == 'release' && contains(matrix.components, 'daemon') }}
         shell: bash
         env:
-          ARCHIVE: ${{ steps.package.outputs.archive }}
           HERMES_BIN: ${{ steps.hermes.outputs.bin }}
-          ARCHIVE_PREFIX: ${{ matrix.archive_prefix }}
-          TARGET: ${{ matrix.target }}
-          VERSION: ${{ needs.meta.outputs.version }}
+          ARCHIVE_NAME: pohunek-daemon-${{ needs.meta.outputs.version }}-${{ matrix.target }}
         run: |
           set -euo pipefail
           extract_dir="$(mktemp -d)"
           trap 'rm -rf "$extract_dir"' EXIT
-          tar -xzf "$ARCHIVE" -C "$extract_dir"
-          release_root="$(realpath "$extract_dir/$ARCHIVE_PREFIX-$VERSION-$TARGET")"
+          tar -xzf "dist/$ARCHIVE_NAME.tar.gz" -C "$extract_dir"
+          release_root="$(realpath "$extract_dir/$ARCHIVE_NAME")"
           packaged_smoke="$release_root/packaging/smoke-hermes-plugin-release"
           for binary in pohunek pohunekd pohunek-sessiond; do
             test -x "$release_root/$binary"
@@ -277,21 +254,48 @@ jobs:
             "$package_dir/trust/runtime-catalog-anchor.json" \
             "$HERMES_BIN"
 
-      # Only the archive and its checksum leave this job.
-      - name: Upload release archive
+      # Only the archives and their checksums leave this job, one artifact per
+      # component. A rerun of the job replaces the uploads of its failed
+      # attempt instead of failing on a name the attempt already used.
+      - name: Upload the cli archive
+        if: ${{ contains(matrix.components, 'cli') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: build-${{ matrix.component }}-${{ matrix.target }}
+          name: build-cli-${{ matrix.target }}
           path: |
-            ${{ steps.package.outputs.archive }}
-            ${{ steps.package.outputs.checksum }}
+            dist/pohunek-cli-${{ needs.meta.outputs.version }}-${{ matrix.target }}.tar.gz
+            dist/pohunek-cli-${{ needs.meta.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
+          overwrite: true
+
+      - name: Upload the daemon archive
+        if: ${{ contains(matrix.components, 'daemon') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-daemon-${{ matrix.target }}
+          path: |
+            dist/pohunek-daemon-${{ needs.meta.outputs.version }}-${{ matrix.target }}.tar.gz
+            dist/pohunek-daemon-${{ needs.meta.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Upload the relay archive
+        if: ${{ contains(matrix.components, 'relay') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-relay-${{ matrix.target }}
+          path: |
+            dist/pohunek-relay-${{ needs.meta.outputs.version }}-${{ matrix.target }}.tar.gz
+            dist/pohunek-relay-${{ needs.meta.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          overwrite: true
 
   # One job for all official packages: every runtime-packages/<runtime>/
   # directory is verified (two builds compared) and archived. Adding a runtime
-  # directory adds its archive here without a workflow edit.
+  # directory adds its archive here without a workflow edit. The same job then
+  # packs the TypeScript SDK tarballs.
   packages:
-    name: Build the runtime package archives
+    name: Build the runtime package archives and the SDK tarballs
     needs: [meta]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -323,12 +327,15 @@ jobs:
           XTASK="$PWD/target/debug/xtask" scripts/release-workflow/build-packages \
             "$VERSION" "$RUNNER_TEMP/package-archives" "$RUNNER_TEMP/package-evidence"
 
+      # A rerun of the job, for example after a failed SDK pack, replaces the
+      # uploads of its failed attempt.
       - name: Upload the package archives
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: package-archives
           path: ${{ runner.temp }}/package-archives
           if-no-files-found: error
+          overwrite: true
 
       # The builder evidence (manifest, provenance input, compatibility vector)
       # is a workflow artifact only: no release job downloads it, so it never
@@ -339,21 +346,13 @@ jobs:
           name: package-evidence
           path: ${{ runner.temp }}/package-evidence
           if-no-files-found: error
+          overwrite: true
 
-  # The SDK tarballs are built with a read-only token and no persisted git
-  # credentials, because packing installs and runs npm dependencies. The
-  # policy requires them in every bundle, so a rehearsal packs them too.
-  sdk:
-    name: Pack TypeScript SDK release assets
-    needs: [meta]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-
+      # The SDK tarballs are built with a read-only token and no persisted git
+      # credentials, because packing installs and runs npm dependencies. That
+      # code runs only after the package archives and their evidence have left
+      # the job. The policy requires the tarballs in every bundle, so a
+      # rehearsal packs them too.
       - name: Install Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
@@ -387,28 +386,28 @@ jobs:
           name: sdk-release-assets
           path: sdk-dist
           if-no-files-found: error
+          overwrite: true
 
   # Rehearsal-only macOS archives for CI (issue #929): native aarch64-apple-darwin
   # builds with a throwaway trust anchor. This job runs on macos-15 and produces
   # the macos-signed-<component> archives that the evidence workflow expects from
   # a rehearsal. In release mode, release.yml's stage-macos and package-macos jobs
-  # build and sign the production archives instead; a rehearsal has no need for
-  # that three-job split since it publishes nothing and runs in a single ephemeral
-  # runner environment.
+  # build and sign the production archives instead, one job per component; a
+  # rehearsal publishes nothing, so both of its components share one runner.
+  # Each component is built by the same `packaging/macos/build-release
+  # <component>` invocation as in stage-macos, and is staged and signed before
+  # the next one builds: the daemon build relinks `pohunek` in the same target
+  # dir.
   rehearsal-macos:
-    name: Build and sign ${{ matrix.component }} for aarch64-apple-darwin (rehearsal)
+    name: Build and sign cli and daemon for aarch64-apple-darwin (rehearsal)
     if: ${{ inputs.mode == 'rehearsal' }}
     needs: [meta]
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
     env:
       RUSTFLAGS: -D warnings
-    strategy:
-      fail-fast: false
-      matrix:
-        component: [cli, daemon]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -424,14 +423,15 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: release-macos-${{ matrix.component }}
+          shared-key: release-macos-rehearsal
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build offline documentation
         run: cargo xtask docs site
 
+      # Only the daemon archive carries the anchor; the cli staging never
+      # reads it.
       - name: Install the rehearsal trust anchor
-        if: ${{ matrix.component == 'daemon' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -440,19 +440,22 @@ jobs:
             "$RUNNER_TEMP/rehearsal-trust" "$GITHUB_RUN_ID" "$GITHUB_SHA"
           cp "$RUNNER_TEMP/rehearsal-trust/anchor.json" packaging/runtime-catalog-anchor.json
 
-      - name: Build release binaries
-        id: build
+      - name: Build cli release binaries
+        id: build-cli
         shell: bash
+        env:
+          COMPONENT: cli
         run: |
           set -euo pipefail
-          bindir="$(packaging/macos/build-release "${{ matrix.component }}")"
+          bindir="$(packaging/macos/build-release "$COMPONENT")"
           echo "bindir=$bindir" >> "$GITHUB_OUTPUT"
 
-      - name: Stage and package the archive
+      - name: Stage and package the cli archive
         shell: bash
         env:
           VERSION: ${{ needs.meta.outputs.version }}
-          COMPONENT: ${{ matrix.component }}
+          COMPONENT: cli
+          BINDIR: ${{ steps.build-cli.outputs.bindir }}
         run: |
           set -euo pipefail
           # Archives are stamped with the commit time, so rebuilding the same
@@ -461,16 +464,57 @@ jobs:
           export SOURCE_DATE_EPOCH
           mkdir -p dist
           packaging/macos/package --stage-release "$COMPONENT" "$VERSION" \
-            "${{ steps.build.outputs.bindir }}" target/pohunek-docs dist
+            "$BINDIR" target/pohunek-docs dist
           # Ad-hoc sign, verify, and archive; runs no program from the tree.
           archive="$(packaging/macos/package --adhoc-release "$COMPONENT" "$VERSION" \
             "dist/pohunek-$COMPONENT-$VERSION-aarch64-apple-darwin")"
-          mkdir -p "$RUNNER_TEMP/signed-upload"
-          cp "$archive" "$archive.sha256" "$RUNNER_TEMP/signed-upload/"
+          mkdir -p "$RUNNER_TEMP/signed-upload/$COMPONENT"
+          cp "$archive" "$archive.sha256" "$RUNNER_TEMP/signed-upload/$COMPONENT/"
 
-      - name: Upload the signed archive
+      - name: Build daemon release binaries
+        id: build-daemon
+        shell: bash
+        env:
+          COMPONENT: daemon
+        run: |
+          set -euo pipefail
+          bindir="$(packaging/macos/build-release "$COMPONENT")"
+          echo "bindir=$bindir" >> "$GITHUB_OUTPUT"
+
+      - name: Stage and package the daemon archive
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          COMPONENT: daemon
+          BINDIR: ${{ steps.build-daemon.outputs.bindir }}
+        run: |
+          set -euo pipefail
+          # Archives are stamped with the commit time, so rebuilding the same
+          # commit yields the same archive bytes.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          mkdir -p dist
+          packaging/macos/package --stage-release "$COMPONENT" "$VERSION" \
+            "$BINDIR" target/pohunek-docs dist
+          # Ad-hoc sign, verify, and archive; runs no program from the tree.
+          archive="$(packaging/macos/package --adhoc-release "$COMPONENT" "$VERSION" \
+            "dist/pohunek-$COMPONENT-$VERSION-aarch64-apple-darwin")"
+          mkdir -p "$RUNNER_TEMP/signed-upload/$COMPONENT"
+          cp "$archive" "$archive.sha256" "$RUNNER_TEMP/signed-upload/$COMPONENT/"
+
+      # A rerun of the job replaces the uploads of its failed attempt.
+      - name: Upload the signed cli archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: macos-signed-${{ matrix.component }}
-          path: ${{ runner.temp }}/signed-upload
+          name: macos-signed-cli
+          path: ${{ runner.temp }}/signed-upload/cli
           if-no-files-found: error
+          overwrite: true
+
+      - name: Upload the signed daemon archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-signed-daemon
+          path: ${{ runner.temp }}/signed-upload/daemon
+          if-no-files-found: error
+          overwrite: true

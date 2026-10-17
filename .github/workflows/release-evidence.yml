@@ -125,8 +125,9 @@ jobs:
   # earlier attestations, the Node, uv and Python installs, the checkout). The
   # daemon under test supervises its workers as direct children, so no row
   # uses the systemd user manager or the launchd user domain; the model stubs
-  # bind ephemeral loopback ports. Rows run one at a time, and a failing row
-  # never stops the rows after it. See the docstring of run-rows.
+  # bind ephemeral loopback ports. Rows run one at a time. A failing row stops
+  # the rows after it only when it changed the account or what they trust, or
+  # the guards could not check it. See the docstring of run-rows.
   rows:
     name: Rows on ${{ matrix.runner }}
     needs: [plan]

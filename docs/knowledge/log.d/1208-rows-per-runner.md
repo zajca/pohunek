@@ -8,9 +8,10 @@
   same workflow.
 - Each row runs in a fresh, owner-only root. After each row `run-rows` fails it
   for a process, root, user service, launchd job or keychain item it left
-  behind, and stops the job when anything a later row trusts changed. A failing
-  row never stops the next one, and a row over its 15-minute limit has its
-  process group killed.
+  behind. It stops the job when the row changed the account or anything a later
+  row trusts, or when the guards could not check it; any other failing row does
+  not stop the next one. A row over its 15-minute limit has its process group
+  killed.
 - The attestation and JUnit file names and the `attestation-*` pattern are
   unchanged. The artifacts are per runner: `attestation-<os>`,
   `matrix-junit-<os>` and the new `row-results-<os>`, from which the evidence

@@ -144,7 +144,7 @@ by `scripts/tests/test_release_workflow.py`.
 | File | Role |
 | --- | --- |
 | `release.yml` | Tag trigger, the quality gate, the macOS jobs, two calls and the single `publish` job. |
-| `release-build.yml` | Reusable producers: Linux archives, one job over `runtime-packages/*`, SDK tarballs. |
+| `release-build.yml` | Reusable producers: Linux archives in one job per target, one job over `runtime-packages/*` that then packs the SDK tarballs, and in a rehearsal one macOS job for both components. |
 | `release-evidence.yml` | Reusable evidence: rows, provenance, assembly and signing, bundle provenance, archive smoke, verdict. |
 
 `ci.yml` calls the two reusable files with `mode: rehearsal` (jobs

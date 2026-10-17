@@ -501,13 +501,17 @@ dispatch CI or push either ref. The Release workflow
 assembles and publishes the release in one fixed flow:
 
 1. **Producers** upload workflow artifacts only: `release-build.yml` (reusable)
-   builds the glibc and MUSL x86_64 CLI and daemon archives, the glibc relay
-   archive, the official runtime package archives (every `runtime-packages/*`
-   directory: `package verify`, then `package build`, named
-   `pohunek-runtime-<runtime>-<version>.tar.zst` with a `.sha256`; the builder
-   evidence goes to the separate `package-evidence` artifact) and the SDK
-   tarballs; the macOS jobs build, ad-hoc sign and verify the Apple Silicon
-   archives. No macOS job uses secrets or a protected environment.
+   builds the glibc and MUSL x86_64 CLI and daemon archives and the glibc relay
+   archive in one job per target, each component with its own `cargo build`
+   and archived before the next one builds (artifacts
+   `build-<component>-<target>`). One job builds the official runtime package
+   archives (every `runtime-packages/*` directory: `package verify`, then
+   `package build`, named `pohunek-runtime-<runtime>-<version>.tar.zst` with a
+   `.sha256`; the builder evidence goes to the separate `package-evidence`
+   artifact), uploads them, and then packs the SDK tarballs. The macOS jobs
+   build, ad-hoc sign and verify the Apple Silicon archives; a rehearsal builds
+   both macOS components in one job. No macOS job uses secrets or a protected
+   environment.
 2. **Evidence** (`release-evidence.yml`, reusable): one job per runner
    (`Rows on ubuntu-latest`, `Rows on macos-15`) builds the release consumer
    executable once, uploads it for the smoke, then runs the runner's
@@ -525,7 +529,8 @@ assembles and publishes the release in one fixed flow:
    service, launchd job or keychain item it left behind, and stops the job when
    anything a later row trusts changed (xtask, the consumer, the scripts, the
    archives, earlier attestations, the Node, uv and Python installs, the
-   checkout). A failing row never stops the next one; a row over its limit
+   checkout). A failing row stops the job only when it changed the account
+   or what later rows trust, or the guards could not check it; a row over its limit
    (`row-matrix`, 15 minutes) has its process group killed. The download-only
    `attest` job creates build provenance for every producer artifact;
    `assemble` (environment `release`) verifies that provenance with `gh
@@ -620,8 +625,8 @@ package job write copies the lock's `upstream` object whole, whatever its kind
 Nothing in `release.yml`, `release-build.yml` or `release-evidence.yml` names a
 runtime: the package job, the row matrix and the smoke derive them from those
 directories and files. A new target needs a runner
-mapping in `scripts/release-workflow/row-matrix`, a build leg in
-`release-build.yml` and the policy entries in `packaging/release-policy.json`.
+mapping in `scripts/release-workflow/row-matrix`, a matrix entry (target and
+components) in the `binaries` job of `release-build.yml` and the policy entries in `packaging/release-policy.json`.
 The per-pull-request package job in `ci.yml` needs the runtime in the
 `package-selection` loop, the selector outputs `<runtime>` and
 `<runtime>_baseline_digest`, a "Match the release baseline" step after its

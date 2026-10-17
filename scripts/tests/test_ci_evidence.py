@@ -424,6 +424,8 @@ class CiEvidenceCliTests(unittest.TestCase):
             self.assertIn(f"{smoke} (network-isolated, {leg})", config["required_jobs"]["nightly"])
         rehearsal = [name for name in config["required_jobs"]["nightly"] if name.startswith("release rehearsal ")]
         self.assertTrue(rehearsal)
+        # A rehearsal runs at most 12 runner jobs (#1208).
+        self.assertLessEqual(len(rehearsal), 12)
         self.assertEqual(
             [name for name in config["required_jobs"]["main"] if name.startswith("release rehearsal ")],
             [],
