@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn the_allow_list_contains_no_variable_xtask_treats_as_redirecting() {
-        let xtask = pohunek_test_support::workspace_root().join("crates/xtask/src/affected.rs");
+        let xtask = pohunek_test_support::workspace_root().join("crates/xtask/src/affected/mod.rs");
         let source = std::fs::read_to_string(xtask).expect("read the xtask affected module");
         let theirs = literal_list(&source, "const REPOSITORY_REDIRECTING_VARS")
             .expect("xtask declares REPOSITORY_REDIRECTING_VARS");

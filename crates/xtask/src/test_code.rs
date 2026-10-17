@@ -63,12 +63,34 @@ pub struct SourceFile {
     whole_file: bool,
     test_spans: Vec<TestSpan>,
     line_starts: Vec<usize>,
+    placements: Vec<Placement>,
+}
+
+/// The crate a target root file starts.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CrateRoot {
+    /// `src/lib.rs`.
+    Lib,
+    /// `src/main.rs` (an empty name) or `src/bin/<name>`.
+    Bin(String),
+    /// The integration test `tests/<name>`.
+    Test(String),
+}
+
+/// One place of a file in a crate's module tree.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Placement {
+    pub root: CrateRoot,
+    /// Module path of the file in that crate; empty for the root file.
+    pub module: String,
 }
 
 /// A test-only item (cfg-gated or test-attribute-decorated) of a file.
 #[derive(Debug)]
 struct TestSpan {
     start: usize,
+    /// Offset of the first token after the attributes.
+    header_start: usize,
     end: usize,
     /// Attribute bodies (text between `[` and `]`, comments blanked) of the item.
     attributes: Vec<String>,
@@ -117,6 +139,64 @@ impl SourceFile {
             .filter(|span| span.start <= offset && offset < span.end)
             .flat_map(|span| span.attributes.iter().map(String::as_str))
             .collect()
+    }
+
+    /// Name of the innermost test function (an item with a test attribute such
+    /// as `#[test]` or `#[tokio::test]`) that contains the byte `offset`.
+    #[must_use]
+    pub fn test_function_at(&self, offset: usize) -> Option<&str> {
+        let span = self
+            .test_spans
+            .iter()
+            .filter(|span| span.start <= offset && offset < span.end)
+            .filter(|span| span.attributes.iter().any(|body| is_test_marker(body)))
+            .max_by_key(|span| span.start)?;
+        let skeleton = &self.views.skeleton;
+        let bytes = skeleton.as_bytes();
+        let header = &skeleton[span.header_start..span.end];
+        let keyword = header
+            .match_indices("fn")
+            .map(|(at, _)| span.header_start + at)
+            .find(|&at| {
+                (at == 0 || !is_ident(bytes[at - 1]))
+                    && bytes.get(at + 2).is_some_and(u8::is_ascii_whitespace)
+            })?;
+        let start = skip_whitespace(bytes, keyword + 2);
+        let mut end = start;
+        while bytes.get(end).copied().is_some_and(is_ident) {
+            end += 1;
+        }
+        (end > start).then(|| &skeleton[start..end])
+    }
+
+    /// Names of the inline modules (`mod name { .. }`) that contain the byte
+    /// `offset`, outermost first.
+    #[must_use]
+    pub fn modules_at(&self, offset: usize) -> Vec<String> {
+        let bytes = self.views.skeleton.as_bytes();
+        let mut found = Vec::new();
+        for (at, _) in self.views.skeleton.match_indices("mod") {
+            if at >= offset {
+                break;
+            }
+            if at > 0 && is_ident(bytes[at - 1]) {
+                continue;
+            }
+            if let Some((name, open, b'{')) = module_header(bytes, at) {
+                if open < offset && offset < matching_close(bytes, open) {
+                    found.push(name);
+                }
+            }
+        }
+        found
+    }
+
+    /// Every place of the file in a crate's module tree, found from the target
+    /// root files through `mod` declarations (`#[path]` included). Empty when
+    /// no root reaches the file.
+    #[must_use]
+    pub fn placements(&self) -> &[Placement] {
+        &self.placements
     }
 
     /// One-based line number of the byte `offset`.
@@ -266,6 +346,7 @@ pub fn classify(files: &BTreeMap<String, String>) -> BTreeMap<String, SourceFile
             break;
         }
     }
+    let placements = module_tree(files, &parsed, &forced);
     files
         .iter()
         .zip(parsed)
@@ -277,6 +358,7 @@ pub fn classify(files: &BTreeMap<String, String>) -> BTreeMap<String, SourceFile
                 .filter(|item| item.test_only)
                 .map(|item| TestSpan {
                     start: item.start,
+                    header_start: item.header_start,
                     end: item.end,
                     attributes: item.attributes.clone(),
                 })
@@ -290,6 +372,7 @@ pub fn classify(files: &BTreeMap<String, String>) -> BTreeMap<String, SourceFile
                 whole_file,
                 test_spans,
                 line_starts,
+                placements: placements.get(path.as_str()).cloned().unwrap_or_default(),
             };
             (path.clone(), source)
         })
@@ -722,6 +805,90 @@ fn external_modules(
             in_test_code: in_test(position),
         })
         .collect()
+}
+
+/// Deepest module nesting the module tree follows.
+const MAX_MODULE_DEPTH: usize = 64;
+
+/// The crate a target root file at `path` starts, by Cargo's target layout.
+fn crate_root(path: &str) -> Option<CrateRoot> {
+    if path.ends_with("/src/lib.rs") {
+        return Some(CrateRoot::Lib);
+    }
+    if path.ends_with("/src/main.rs") {
+        return Some(CrateRoot::Bin(String::new()));
+    }
+    let target = |dir: &str| {
+        let (_, rest) = path.rsplit_once(dir)?;
+        match rest.split('/').collect::<Vec<_>>()[..] {
+            [file] => file.strip_suffix(".rs").map(str::to_owned),
+            [name, "main.rs"] => Some(name.to_owned()),
+            _ => None,
+        }
+    };
+    target("/src/bin/")
+        .map(CrateRoot::Bin)
+        .or_else(|| target("/tests/").map(CrateRoot::Test))
+}
+
+/// The placements of every file reached from a target root through `mod`
+/// declarations, test-only ones included.
+fn module_tree<'a>(
+    files: &'a BTreeMap<String, String>,
+    parsed: &BTreeMap<&str, Parsed>,
+    forced: &BTreeSet<&str>,
+) -> BTreeMap<&'a str, Vec<Placement>> {
+    let mut placements: BTreeMap<&str, Vec<Placement>> = BTreeMap::new();
+    let mut queue: Vec<(&str, Placement)> = files
+        .keys()
+        .filter_map(|path| {
+            crate_root(path).map(|root| {
+                (
+                    path.as_str(),
+                    Placement {
+                        root,
+                        module: String::new(),
+                    },
+                )
+            })
+        })
+        .collect();
+    while let Some((path, placement)) = queue.pop() {
+        let entry = placements.entry(path).or_default();
+        // A `#[path]` cycle would nest the same files without end.
+        if entry.contains(&placement) || placement.module.split("::").count() > MAX_MODULE_DEPTH {
+            continue;
+        }
+        entry.push(placement.clone());
+        let Some(file) = parsed.get(path) else {
+            continue;
+        };
+        let whole_file = file.whole_file(forced.contains(path));
+        for module in external_modules(&file.views, &file.items, whole_file) {
+            let found = module_candidates(path, &module)
+                .into_iter()
+                .find_map(|candidate| files.get_key_value(&candidate).map(|(k, _)| k.as_str()));
+            if let Some(found) = found {
+                let child = std::iter::once(placement.module.as_str())
+                    .chain(module.inline_chain.iter().map(String::as_str))
+                    .chain(std::iter::once(module.name.as_str()))
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                queue.push((
+                    found,
+                    Placement {
+                        root: placement.root.clone(),
+                        module: child,
+                    },
+                ));
+            }
+        }
+    }
+    for list in placements.values_mut() {
+        list.sort();
+    }
+    placements
 }
 
 /// Joins `parts` with `/` and resolves `.` and `..` components.

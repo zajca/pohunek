@@ -170,10 +170,15 @@ Release packaging and contributor verification:
 - `.cargo/config.toml` — `cargo t`/`cargo ti` select fast unit and integration
   tests; `cargo tw` keeps the full suite; `cargo ta` runs `cargo xtask
   affected`. Fast loops do not replace full gates.
-- `crates/xtask/src/affected.rs` — `cargo xtask affected`: maps changed,
-  staged, unstaged, and untracked files to workspace packages and runs
-  `cargo t` with an `rdeps` filterset; workspace-wide and unmapped paths run
-  everything, and only a reviewed non-Rust allowlist selects no tests.
+- `crates/xtask/src/affected/` — `cargo xtask affected`: maps changed,
+  staged, unstaged, and untracked files to workspace packages, closes them over
+  their reverse dependencies (a dev-dependency for one hop), and runs `cargo t`
+  with an explicit `package(=..)` filterset; a manifest or lockfile change goes
+  through a `cargo metadata` diff of both revisions, workspace-wide and unmapped
+  paths run everything, and only a reviewed non-Rust allowlist selects no
+  tests. `affected ci` writes the same selection for a pull request's CI jobs,
+  and `affected guard` checks that every repository path a test reads selects
+  that test.
 - `crates/xtask/src/package_affected.rs` — `cargo xtask package affected`: maps
   changed files to the official runtime packages a change selects; a core
   change, an embedded file, or an unknown path selects every package. The
