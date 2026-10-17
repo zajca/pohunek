@@ -12,12 +12,14 @@ do not know is unmapped, which selects every test.
 `selection.json`, `outputs.env` (`key=value` lines for `$GITHUB_OUTPUT`) and
 `summary.md`. For a `packages` selection it also receives `sparse.txt`, the
 `cargo xtask affected sparse` patterns of the selected packages, from the same
-selector; the test jobs run from that sparse tree, so a test reading a path
-whose change does not select it fails. Without the file (a selector that
-cannot compute it) the jobs run from the full tree, as the summary says. Whenever no trustworthy selection can be made (no merge base, a
-base selector that does not build, fails, or writes another schema), the
-script writes a full selection instead, naming the cause, and exits 0: a full
-run is always a correct run. `--full CAUSE` writes that selection directly,
+selector. With the `TEST_SELECTION_SPARSE` switch of `ci.yml` on, the test jobs
+run from that sparse tree, so a test reading a path whose change does not
+select it fails. Without the file (a selector that cannot compute it) the jobs
+run from the full tree, as the summary says. Whenever no trustworthy selection
+can be made (no merge base, a merge base that cannot be checked out, a base
+selector that does not build, fails, or writes another schema), the script
+writes a full selection instead, naming the cause, and exits 0: a full run is
+always a correct run. `--full CAUSE` writes that selection directly,
 for the events that are not pull requests.
 
 The script exits non-zero only when it cannot write `--out`, or cannot return
@@ -55,6 +57,10 @@ STDERR_TAIL_LINES = 5
 
 class Unavailable(Exception):
     """The merge base's selector cannot give a selection; the run is full."""
+
+
+class CheckoutLost(Exception):
+    """The checkout could not return to `HEAD`, so no job may test it."""
 
 
 def git(*args, cwd):
@@ -128,8 +134,13 @@ def build_base_selector(root, merge_base, head, scratch):
     """Builds xtask at `merge_base` in `root`, returns a copy of the binary,
     and checks `head` out again, whatever the build did."""
     cargo = os.environ.get("CARGO", "cargo")
-    git("checkout", "--quiet", "--detach", merge_base, cwd=root)
     try:
+        try:
+            git("checkout", "--quiet", "--detach", merge_base, cwd=root)
+        except subprocess.CalledProcessError as error:
+            raise Unavailable(
+                f"the merge base {merge_base} could not be checked out: {tail(error.stderr)}"
+            )
         try:
             result = subprocess.run(
                 [cargo, "build", "--locked", "-p", "xtask", "--bin", "xtask"],
@@ -151,9 +162,13 @@ def build_base_selector(root, merge_base, head, scratch):
         shutil.copy2(built, selector)
         return selector
     finally:
-        git("checkout", "--quiet", "--detach", head, cwd=root)
-        if git("rev-parse", "HEAD", cwd=root) != head:
-            raise RuntimeError(f"the checkout did not return to {head}")
+        try:
+            git("checkout", "--quiet", "--detach", head, cwd=root)
+            restored = git("rev-parse", "HEAD", cwd=root) == head
+        except subprocess.CalledProcessError as error:
+            raise CheckoutLost(f"the checkout did not return to {head}: {tail(error.stderr)}")
+        if not restored:
+            raise CheckoutLost(f"the checkout did not return to {head}")
 
 
 def write_sparse(selector, root, out):
@@ -240,6 +255,9 @@ def main():
     except Unavailable as cause:
         print(f"::warning::every test runs: {cause}")
         write_full(out, str(cause), base=args.base)
+    except CheckoutLost as error:
+        print(f"::error::ci-test-selection: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

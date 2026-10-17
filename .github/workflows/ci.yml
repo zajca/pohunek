@@ -54,6 +54,10 @@ env:
   # artifacts before persisting anyway, so producing them only wastes time.
   # Kept explicit (issue #124) so every job benefits even before restore.
   CARGO_INCREMENTAL: "0"
+  # G2 of #1218: a narrowed pull request runs its tests from a sparse tree
+  # holding only the files whose change selects them. Off until a G3 seeding
+  # run shows every package's tests green from its own sparse tree.
+  TEST_SELECTION_SPARSE: "false"
   # Test binaries (issue #170): job `build-tests` compiles the workspace test
   # binaries once (`cargo nextest archive --workspace --all-features`) and
   # uploads the archive. The test jobs (fast shards, heavy, relay DB) download
@@ -550,6 +554,7 @@ jobs:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     outputs:
       mode: ${{ steps.select.outputs.mode }}
+      narrowed: ${{ steps.narrow.outputs.narrowed }}
       docs_only: ${{ steps.select.outputs.docs_only }}
       script_tests: ${{ steps.select.outputs.script_tests }}
       sdk_gates: ${{ steps.select.outputs.sdk_gates }}
@@ -559,8 +564,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # The merge base of the pull request and its base commit needs history.
-          fetch-depth: 0
+          # The merge base of a pull request and its base commit needs history;
+          # every other event runs every test from this commit alone.
+          fetch-depth: ${{ github.event_name != 'pull_request' && 1 || 0 }}
           persist-credentials: false
 
       - name: Install mold linker
@@ -600,6 +606,52 @@ jobs:
           fi
           cat "$out/outputs.env" >> "$GITHUB_OUTPUT"
           cat "$out/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      # The selection and the plan are written by scripts of the head tree.
+      # They may narrow the run only when the test pipeline, every file that
+      # decides or runs the CI test jobs, equals its merge-base copy: then the
+      # head scripts are the merge base's. This step alone writes `narrowed`,
+      # and every job that skips or narrows tests requires it.
+      # Trust bound: a pull request runs its own ci.yml, so one that rewrites
+      # it can remove any check, as in any design. Such a change is in the
+      # pipeline (`.github/`), so its run never narrows, and its protection is
+      # the review of workflow changes.
+      - name: Decide whether the selection narrows the run
+        id: narrow
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MODE: ${{ steps.select.outputs.mode }}
+        run: |
+          set -euo pipefail
+          # The CI_RULES paths of `cargo xtask affected` and the files
+          # scripts/test-partitions reads.
+          pipeline=(
+            .github
+            .config/nextest.toml
+            scripts/ci-test-selection
+            scripts/test-partitions
+            scripts/junit-flaky-summary
+            scripts/check-rust-toolchain-pin
+          )
+          narrowed=false
+          if [ "$EVENT" != pull_request ]; then
+            reason="a $EVENT run runs every test"
+          elif ! base=$(git merge-base "$BASE_SHA" HEAD); then
+            reason="the pull request has no merge base with $BASE_SHA"
+          elif ! changed=$(git diff --no-renames --name-only "$base" HEAD -- "${pipeline[@]}"); then
+            reason="the test pipeline cannot be compared with the merge base"
+          elif [ -n "$changed" ]; then
+            reason="the pull request changes the test pipeline: $(echo "$changed" | head -n 5 | paste -sd ' ')"
+          elif [ "$MODE" != packages ] && [ "$MODE" != none ]; then
+            reason="the selection is $MODE"
+          else
+            narrowed=true
+            reason="the test pipeline equals the merge base's"
+          fi
+          echo "narrowed=$narrowed" >> "$GITHUB_OUTPUT"
+          echo "Narrowed: $narrowed ($reason)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Plan the test jobs
         id: plan
@@ -666,13 +718,13 @@ jobs:
   fast-tests:
     name: tests (${{ matrix.shard }}, fast)
     needs: [build-tests, test-selection]
-    if: ${{ !cancelled() && needs.build-tests.result == 'success' && (needs.test-selection.result != 'success' || needs.test-selection.outputs.fast_shards != '[]') }}
+    if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.fast_shards != '[]') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # The shards a successful selection plans; every shard otherwise.
-        shard: ${{ fromJSON(needs.test-selection.result == 'success' && needs.test-selection.outputs.fast_shards || '["core", "daemon", "relay", "cli"]') }}
+        # The shards a narrowed selection plans; every shard otherwise.
+        shard: ${{ fromJSON(github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.fast_shards || '["core", "daemon", "relay", "cli"]') }}
     defaults:
       run:
         working-directory: relocated
@@ -692,14 +744,14 @@ jobs:
           path: ${{ runner.temp }}/nextest-archive
 
       - name: Download test selection
-        if: needs.test-selection.result == 'success'
+        if: github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true'
         uses: actions/download-artifact@v4
         with:
           name: test-selection
           path: ${{ runner.temp }}/test-selection
 
       - name: Check script regressions
-        if: matrix.shard == 'core' && (needs.test-selection.result != 'success' || needs.test-selection.outputs.script_tests != 'false')
+        if: matrix.shard == 'core' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.script_tests != 'false')
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
       # Every workflow installs Rust from rust-toolchain.toml or a dated nightly.
@@ -711,6 +763,7 @@ jobs:
       # them, so a read of any other path fails instead of passing with the
       # test skipped. A run without sparse.txt keeps the full tree.
       - name: Keep only the selection's files in the tree
+        if: env.TEST_SELECTION_SPARSE == 'true' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -725,10 +778,11 @@ jobs:
         shell: bash
         env:
           SHARD: ${{ matrix.shard }}
+          NARROWED: ${{ github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}
         run: |
           set -euo pipefail
           selection=()
-          if [ -f "$RUNNER_TEMP/test-selection/selection.json" ]; then
+          if [ "$NARROWED" = true ]; then
             selection=(--selection "$RUNNER_TEMP/test-selection/selection.json")
           fi
           python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run "$SHARD" "${selection[@]}"
@@ -1028,7 +1082,7 @@ jobs:
   integration:
     name: tests (heavy, PTY + Hermes)
     needs: [build-tests, test-selection]
-    if: ${{ !cancelled() && needs.build-tests.result == 'success' && (needs.test-selection.result != 'success' || needs.test-selection.outputs.heavy != 'false') }}
+    if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.heavy != 'false') }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -1068,21 +1122,17 @@ jobs:
         run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" check
 
       - name: Download test selection
-        if: needs.test-selection.result == 'success'
+        if: github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true'
         uses: actions/download-artifact@v4
         with:
           name: test-selection
           path: ${{ runner.temp }}/test-selection
 
-      # Skipping the shards the plan does not start can drop no selected test.
-      - name: Verify the planned shards hold every selected test
-        if: needs.test-selection.result == 'success'
-        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" check --selection "$RUNNER_TEMP/test-selection/selection.json"
-
       # The tests run from a tree holding only the files whose change selects
       # them, so a read of any other path fails instead of passing with the
       # test skipped. A run without sparse.txt keeps the full tree.
       - name: Keep only the selection's files in the tree
+        if: env.TEST_SELECTION_SPARSE == 'true' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -1096,10 +1146,11 @@ jobs:
         shell: bash
         env:
           SHARD: heavy
+          NARROWED: ${{ github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}
         run: |
           set -euo pipefail
           selection=()
-          if [ -f "$RUNNER_TEMP/test-selection/selection.json" ]; then
+          if [ "$NARROWED" = true ]; then
             selection=(--selection "$RUNNER_TEMP/test-selection/selection.json")
           fi
           python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run "$SHARD" "${selection[@]}"
@@ -1231,7 +1282,7 @@ jobs:
   integration-relay:
     name: tests (relay DB, PostgreSQL)
     needs: [changes, build-tests, test-selection]
-    if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || needs.changes.outputs.relay == 'true') && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.relay_db != 'false') }}
+    if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || needs.changes.outputs.relay == 'true') && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.relay_db != 'false') }}
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -1267,7 +1318,7 @@ jobs:
           path: ${{ runner.temp }}/nextest-archive
 
       - name: Download test selection
-        if: needs.test-selection.result == 'success'
+        if: github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true'
         uses: actions/download-artifact@v4
         with:
           name: test-selection
@@ -1277,6 +1328,7 @@ jobs:
       # them, so a read of any other path fails instead of passing with the
       # test skipped. A run without sparse.txt keeps the full tree.
       - name: Keep only the selection's files in the tree
+        if: env.TEST_SELECTION_SPARSE == 'true' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -1293,10 +1345,11 @@ jobs:
           # Resolved at step level: the `job` context is not available in
           # job-level `env`, where it makes the whole workflow invalid.
           POHUNEK_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/pohunek_test
+          NARROWED: ${{ github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}
         run: |
           set -euo pipefail
           selection=()
-          if [ -f "$RUNNER_TEMP/test-selection/selection.json" ]; then
+          if [ "$NARROWED" = true ]; then
             selection=(--selection "$RUNNER_TEMP/test-selection/selection.json")
           fi
           python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run "$SHARD" "${selection[@]}"
@@ -1313,21 +1366,56 @@ jobs:
           path: relocated/target/nextest/relay-db/junit.xml
           if-no-files-found: warn
 
+  # Skipping the shards a narrowed plan does not start can drop no selected
+  # test: every selected test must lie in a planned shard. It runs on every
+  # narrowed selection, whichever test jobs that selection starts.
+  test-selection-check:
+    name: test selection check
+    needs: [build-tests, test-selection]
+    if: ${{ !cancelled() && needs.build-tests.result == 'success' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: relocated
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: relocated
+
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-nextest
+
+      - name: Download test archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest-archive
+
+      - name: Download test selection
+        uses: actions/download-artifact@v4
+        with:
+          name: test-selection
+          path: ${{ runner.temp }}/test-selection
+
+      - name: Verify the planned shards hold every selected test
+        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" check --selection "$RUNNER_TEMP/test-selection/selection.json"
+
   # A skipped test job counts as passed, so this job fails a run where a test
-  # job failed, was cancelled, or was skipped without an explicit narrowing
-  # of a successful selection. The relay DB job is also gated by its paths
-  # filter, so only its failure or cancellation counts.
+  # job failed, was cancelled, or was skipped without a narrowed selection of
+  # a pull request that plans nothing for it. The relay DB job is also gated
+  # by its paths filter, so only its failure or cancellation counts.
   test-selection-verdict:
     name: test selection verdict
-    needs: [test-selection, build-tests, fast-tests, integration, integration-relay]
+    needs: [test-selection, build-tests, test-selection-check, fast-tests, integration, integration-relay]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
-      - name: Fail a test job that failed or was skipped without a selection
-        if: ${{ needs.build-tests.result != 'success' || (needs.fast-tests.result != 'success' && !(needs.fast-tests.result == 'skipped' && needs.test-selection.result == 'success' && needs.test-selection.outputs.fast_shards == '[]')) || (needs.integration.result != 'success' && !(needs.integration.result == 'skipped' && needs.test-selection.result == 'success' && needs.test-selection.outputs.heavy == 'false')) || needs.integration-relay.result == 'failure' || needs.integration-relay.result == 'cancelled' }}
+      - name: Fail a test job that failed or was skipped without a narrowed selection
+        if: ${{ needs.build-tests.result != 'success' || (needs.fast-tests.result != 'success' && !(needs.fast-tests.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.fast_shards == '[]')) || (needs.integration.result != 'success' && !(needs.integration.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.heavy == 'false')) || needs.integration-relay.result == 'failure' || needs.integration-relay.result == 'cancelled' || needs.test-selection-check.result == 'failure' || needs.test-selection-check.result == 'cancelled' || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection-check.result != 'success') }}
         shell: bash
         env:
-          RESULTS: "selection=${{ needs.test-selection.result }} build=${{ needs.build-tests.result }} fast=${{ needs.fast-tests.result }} heavy=${{ needs.integration.result }} relay-db=${{ needs.integration-relay.result }}"
+          RESULTS: "selection=${{ needs.test-selection.result }} narrowed=${{ needs.test-selection.outputs.narrowed }} mode=${{ needs.test-selection.outputs.mode }} build=${{ needs.build-tests.result }} check=${{ needs.test-selection-check.result }} fast=${{ needs.fast-tests.result }} heavy=${{ needs.integration.result }} relay-db=${{ needs.integration-relay.result }}"
         run: |
           echo "::error::test jobs did not run as the selection requires: $RESULTS"
           exit 1

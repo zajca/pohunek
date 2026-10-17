@@ -14,11 +14,28 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "ci-test-selection"
+
+# Runs the script's own code with module constants overridden, so a timeout
+# scenario does not wait for the production limits.
+DRIVER = textwrap.dedent(
+    """\
+    import importlib.machinery, importlib.util, json, sys
+    path, overrides = sys.argv[1], json.loads(sys.argv[2])
+    loader = importlib.machinery.SourceFileLoader("ci_test_selection", path)
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    for name, value in overrides.items():
+        setattr(module, name, value)
+    sys.argv = [path, *sys.argv[3:]]
+    sys.exit(module.main())
+    """
+)
 
 FAKE_CARGO = textwrap.dedent(
     """\
@@ -37,7 +54,7 @@ FAKE_CARGO = textwrap.dedent(
 SELECTOR = textwrap.dedent(
     """\
     #!/usr/bin/env python3
-    import json, os, subprocess, sys
+    import json, os, subprocess, sys, time
     REVISION = {revision!r}
     KNOWN = {known!r}
     SCHEMA = {schema!r}
@@ -51,6 +68,7 @@ SELECTOR = textwrap.dedent(
         sys.exit(0)
     if args[:2] != ["affected", "ci"] or not {has_ci!r}:
         sys.exit("error: unrecognized subcommand")
+    time.sleep({ci_delay!r})
     base = args[args.index("--base") + 1]
     out = args[args.index("--out") + 1]
     merge_base = git("merge-base", base, "HEAD").strip()
@@ -74,14 +92,30 @@ SELECTOR = textwrap.dedent(
         f.write(f"### Test selection\\n\\nMode: **{{mode}}**\\n")
     with open(os.path.join(out, "selection.json"), "w") as f:
         json.dump(selection, f)
+    if {outputs_env!r} is not None:
+        with open(os.path.join(out, "outputs.env"), "w") as f:
+            f.write({outputs_env!r})
     """
 )
 
+# Built at a merge base whose untracked output blocks the checkout back to HEAD:
+# the build leaves `b/y`, which HEAD tracks and the merge base does not.
+UNTRACKED_OUTPUT_CARGO = FAKE_CARGO + (
+    "os.makedirs('b', exist_ok=True)\n"
+    "open('b/y', 'w').write('left behind\\n')\n"
+)
 
-def selector(revision, known, schema=1, has_ci=True, has_sparse=True):
+# The build sleeps past any timeout a scenario sets.
+SLOW_CARGO = FAKE_CARGO.replace("import os, shutil, sys\n", "import os, shutil, sys, time\ntime.sleep(3)\n", 1)
+
+
+def selector(revision, known, schema=1, has_ci=True, has_sparse=True, ci_delay=0,
+             outputs_env=None):
+    """A base selector; `ci_delay` seconds pass before `affected ci` answers and
+    `outputs_env`, when set, replaces the `outputs.env` it writes."""
     return SELECTOR.format(
         revision=revision, known=list(known), schema=schema, has_ci=has_ci,
-        has_sparse=has_sparse,
+        has_sparse=has_sparse, ci_delay=ci_delay, outputs_env=outputs_env,
     )
 
 
@@ -128,13 +162,23 @@ class Repo:
         self.git("add", "--all")
         self.git("commit", "--quiet", "-m", message)
 
-    def run(self, *args):
+    def invoke(self, *args, constants=None):
+        """Runs the script, or with `constants` the script's code with those
+        module constants overridden; the result is kept in `self.result`."""
         out = self.out = self.root / "out"
-        result = subprocess.run(
-            [str(SCRIPT), *args, "--out", str(out)], cwd=self.dir, env=self.env,
-            check=False, capture_output=True, text=True,
+        if constants is None:
+            command = [str(SCRIPT), *args, "--out", str(out)]
+        else:
+            command = [sys.executable, "-c", DRIVER, str(SCRIPT), json.dumps(constants),
+                       *args, "--out", str(out)]
+        self.result = subprocess.run(
+            command, cwd=self.dir, env=self.env, check=False, capture_output=True, text=True,
         )
-        self.result = result
+        return self.result
+
+    def run(self, *args, constants=None):
+        result = self.invoke(*args, constants=constants)
+        out = self.out
         assert result.returncode == 0, result.stderr + result.stdout
         selection = json.loads((out / "selection.json").read_text())
         outputs = dict(
@@ -252,6 +296,107 @@ class CiTestSelectionTests(unittest.TestCase):
         selection, outputs, _ = repo.run("--base", "unrelated")
         self.assertEqual(outputs["mode"], "full")
         self.assertIn("no merge base of unrelated and HEAD", selection["full_causes"][0])
+
+    def assert_every_test_runs_because(self, repo, cause):
+        self.assertEqual(repo.result.returncode, 0, repo.result.stderr)
+        selection = json.loads((repo.out / "selection.json").read_text())
+        self.assertEqual(selection["mode"], "full")
+        self.assertEqual(selection["full_causes"], [cause])
+        self.assertIn(f"::warning::every test runs: {cause}", repo.result.stdout)
+
+    def inconsistent_outputs_repo(self, outputs_env):
+        repo = self.repo(selector("base", ["a/"], outputs_env=outputs_env))
+        repo.commit({"a/x": "changed\n"}, "change a/")
+        return repo
+
+    def test_a_base_selector_whose_mode_disagrees_with_its_selection_runs_every_test(self):
+        repo = self.inconsistent_outputs_repo(
+            "mode=none\ndocs_only=false\nscript_tests=false\nsdk_gates=false\nfilterset=package(=a)\n"
+        )
+        repo.invoke("--base", "main")
+        self.assert_every_test_runs_because(
+            repo, "the merge base's selector wrote an inconsistent selection"
+        )
+
+    def test_a_base_selector_whose_flag_disagrees_with_its_selection_runs_every_test(self):
+        repo = self.inconsistent_outputs_repo(
+            "mode=packages\ndocs_only=false\nscript_tests=true\nsdk_gates=false\nfilterset=package(=a)\n"
+        )
+        repo.invoke("--base", "main")
+        self.assert_every_test_runs_because(
+            repo, "the merge base's selector wrote an inconsistent selection"
+        )
+
+    def test_a_base_selector_with_a_malformed_outputs_line_runs_every_test(self):
+        # A line without `=` is no key, so the keys no longer match the schema.
+        repo = self.inconsistent_outputs_repo(
+            "mode=packages\ndocs_only=false\nscript_tests=false\nsdk_gates=false\nfilterset\n"
+        )
+        repo.invoke("--base", "main")
+        self.assert_every_test_runs_because(
+            repo, "the merge base's selector wrote an inconsistent selection"
+        )
+
+    def test_a_base_selector_that_builds_too_slowly_runs_every_test(self):
+        repo = self.repo(selector("base", ["a/"]))
+        repo.commit({"a/x": "changed\n"}, "change a/")
+        head = repo.git("rev-parse", "HEAD")
+        slow = self.root / "bin" / "cargo"
+        slow.write_text(SLOW_CARGO)
+        repo.run("--base", "main", constants={"BUILD_TIMEOUT_SECONDS": 1})
+        self.assert_every_test_runs_because(
+            repo, "the merge base's selector did not build within 1 s"
+        )
+        self.assert_head_restored(repo, head)
+
+    def test_a_base_selector_that_selects_too_slowly_runs_every_test(self):
+        repo = self.repo(selector("base", ["a/"], ci_delay=3))
+        repo.commit({"a/x": "changed\n"}, "change a/")
+        head = repo.git("rev-parse", "HEAD")
+        repo.run("--base", "main", constants={"SELECT_TIMEOUT_SECONDS": 1})
+        self.assert_every_test_runs_because(
+            repo, "the merge base's selector did not finish within 1 s"
+        )
+        self.assert_head_restored(repo, head)
+
+    def test_a_dirty_checkout_runs_every_test_without_building_the_base(self):
+        repo = self.repo(selector("base", ["a/"]))
+        repo.commit({"a/y": "y\n"}, "add a/y")
+        # Tracked in both commits, so the base checkout would carry it along.
+        (repo.dir / "a" / "x").write_text("uncommitted\n")
+        repo.invoke("--base", "main")
+        self.assert_every_test_runs_because(
+            repo, "the checkout has uncommitted changes, so the merge base cannot be built"
+        )
+        self.assertEqual((repo.dir / "a" / "x").read_text(), "uncommitted\n")
+        self.assertFalse((repo.dir / "target").exists())
+
+    def test_a_checkout_that_cannot_return_to_head_fails_and_leaves_no_selection(self):
+        repo = self.repo(selector("base", ["a/", "selector.py"]))
+        repo.commit({"b/y": "y\n"}, "add b/y")
+        (self.root / "bin" / "cargo").write_text(UNTRACKED_OUTPUT_CARGO)
+        stale = self.root / "out"
+        stale.mkdir()
+        (stale / "selection.json").write_text("{}\n")
+        result = repo.invoke("--base", "main")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("::error::ci-test-selection: the checkout did not return to", result.stderr)
+        for name in ("selection.json", "outputs.env", "summary.md", "sparse.txt"):
+            self.assertFalse((repo.out / name).exists(), name)
+
+    def test_a_merge_base_that_cannot_be_checked_out_runs_every_test(self):
+        repo = self.repo(selector("base", ["a/", "selector.py"]))
+        repo.commit({"a/x": None}, "remove a/x")
+        head = repo.git("rev-parse", "HEAD")
+        # An untracked file where the merge base tracks one blocks its checkout.
+        (repo.dir / "a" / "x").write_text("untracked\n")
+        selection, _, summary = repo.run("--base", "main")
+        self.assertEqual(selection["mode"], "full")
+        [cause] = selection["full_causes"]
+        self.assertIn("could not be checked out", cause)
+        self.assertIn("could not be checked out", summary)
+        self.assert_head_restored(repo, head)
+        self.assertEqual((repo.dir / "a" / "x").read_text(), "untracked\n")
 
     def test_a_full_selection_names_its_cause_in_every_output(self):
         repo = self.repo(selector("base", ["a/"]))

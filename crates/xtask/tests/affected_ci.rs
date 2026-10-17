@@ -1368,6 +1368,9 @@ fn a_sparse_tree_holds_exactly_the_files_whose_change_selects_its_packages() {
     // file; gitignore syntax escapes a trailing space too.
     repo.write("crates/relay/data/odd[1]*?.txt", "odd\n");
     repo.write("crates/relay/data/trailing ", "space\n");
+    // Workspace-wide inputs of the test jobs, which every package's tree needs.
+    repo.write(".config/nextest.toml", "[profile.default]\n");
+    repo.write("scripts/junit-flaky-summary", "#!/bin/sh\n");
     repo.commit("hostile file names");
     let output = sparse_checkout(&repo, &["pohunek-relay"]);
     assert!(
@@ -1388,6 +1391,10 @@ fn a_sparse_tree_holds_exactly_the_files_whose_change_selects_its_packages() {
         "crates/cli/Cargo.toml",
         // Selects every test.
         ".github/workflows/ci.yml",
+        // Read by the test jobs, so kept whichever package is selected.
+        ".config/nextest.toml",
+        "scripts/test-partitions",
+        "scripts/junit-flaky-summary",
     ] {
         assert!(present(kept), "{kept} is missing from the sparse tree");
     }

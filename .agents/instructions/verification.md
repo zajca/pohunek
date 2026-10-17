@@ -178,19 +178,31 @@ rules do not know selects every test. `scripts/test-partitions plan
 --selection` turns the selection into the fast shards to start and whether
 the heavy and relay DB jobs run. The archive stays the whole workspace; each
 job runs its shard narrowed to the selection (`run <shard> --selection`, which
-is `-E '(<shard>) and (<filterset>)'`) from a sparse checkout that holds only
-the files whose change selects a selected package (`cargo xtask affected
-sparse`), so a test that reads any other path fails instead of passing with
-the test skipped. The heavy job first proves with `check --selection` that the
-planned shards hold every selected test. Every test runs on push, schedule,
-and dispatch runs, and on a pull request that changes `.github/`, a script the
-CI test jobs run, `.cargo/`, `.config/nextest.toml`, `rust-toolchain*`, the
-root `Cargo.toml` outside `[workspace.dependencies]`, or an unmapped path, or
-whose selector fails, times out, or writes another schema. A test job narrows
-or skips only on an explicit output of a successful selection, and the
-`test selection verdict` job fails a run whose test job failed, was
-cancelled, or was skipped without one. The script regressions run in the
-core shard when a script, `.github/`, or a full selection needs them.
+is `-E '(<shard>) and (<filterset>)'`), and the `test selection check` job
+proves with `check --selection` that the planned shards hold every selected
+test.
+
+A selection narrows the run only when it is `narrowed`: the run is a pull
+request, its selection is `packages` or `none`, and the test pipeline equals
+its merge-base copy. The pipeline is `.github/`, `.config/nextest.toml` and
+the scripts that decide or run the CI test jobs (`ci-test-selection`,
+`test-partitions`, `junit-flaky-summary`, `check-rust-toolchain-pin`), so the
+head scripts that narrow a run are the merge base's. A step of `ci.yml`
+decides it, never a script's output. Every test runs on push, schedule, and
+dispatch runs, and on a pull request that changes the pipeline, `.cargo/`,
+`rust-toolchain*`, the root `Cargo.toml` outside `[workspace.dependencies]`,
+or an unmapped path, or whose selector fails, times out, or writes another
+schema. A pull request that rewrites `ci.yml` can remove any check, as in any
+design; it changes the pipeline, so it runs every test, and the review of
+workflow changes protects it. A test job narrows or skips only on a narrowed
+selection, and the `test selection verdict` job fails a run whose test job or
+selection check failed, was cancelled, or was skipped without one. The script
+regressions run in the core shard unless a narrowed selection needs none.
+
+G2, running the tests from a sparse checkout that holds only the files whose
+change selects a selected package (`cargo xtask affected sparse`), is wired
+behind the `TEST_SELECTION_SPARSE` switch of `ci.yml` and is off until a G3
+seeding run shows every package's tests green from its own sparse tree.
 
 Before the final head of a pull request merges, dispatch `ci.yml` once with
 `tier=main` on the branch (`gh workflow run ci.yml --ref <branch> -f tier=main`)
