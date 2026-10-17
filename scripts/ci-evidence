@@ -13,6 +13,11 @@ its agent identities, can start a `workflow_dispatch` run, and the workflow
 definition is part of the tree, so a run of the same tree ran the same jobs on
 the same content whichever branch or commit it was started on. Runs a pull
 request can start, and runs of another repository, never match by tree.
+
+The required jobs and steps come from `scripts/ci-evidence.json` in the tree of
+S itself, not from the checkout that runs this script: from the local
+repository when it holds S, otherwise from the contents API. A tree that has no
+readable config refuses the evidence. `--config` names a file to use instead.
 """
 
 from __future__ import annotations
@@ -29,9 +34,10 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_CONFIG = Path(__file__).with_name("ci-evidence.json")
 # The checkout this script belongs to; a commit it holds needs no API lookup.
 CHECKOUT = Path(__file__).resolve().parents[1]
+# Where the config lives in every tree of the repository.
+CONFIG_IN_TREE = "scripts/ci-evidence.json"
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 REF_PATTERN = re.compile(r"^[A-Za-z0-9._/-]+$")
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -65,11 +71,56 @@ def read_json(arguments: tuple[str, ...]) -> Any:
         raise EvidenceError("gh returned invalid JSON") from error
 
 
-def load_config(path: Path) -> dict[str, Any]:
+def local_commit_file(sha: str, path: str) -> str | None:
+    """The file `path` in the tree of commit `sha`, from this checkout, or None
+    when the checkout lacks the commit. A commit it holds without the file is
+    a refusal."""
     try:
-        config = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as error:
-        raise EvidenceError(f"cannot read config {path}: {error}") from error
+        present = subprocess.run(
+            ["git", "-C", str(CHECKOUT), "cat-file", "-e", f"{sha}^{{commit}}"],
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None
+    if present.returncode != 0:
+        return None
+    result = subprocess.run(
+        ["git", "-C", str(CHECKOUT), "show", f"{sha}:{path}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise EvidenceError(f"commit {sha} has no {path}")
+    return result.stdout
+
+
+def config_of_commit(repo: str, sha: str) -> tuple[str, str]:
+    """The text of the config in the tree of `sha` and where it was read."""
+    source = f"{sha}:{CONFIG_IN_TREE}"
+    text = local_commit_file(sha, CONFIG_IN_TREE)
+    if text is not None:
+        return text, source
+    try:
+        text = gh(
+            "api",
+            "--method",
+            "GET",
+            "-H",
+            "Accept: application/vnd.github.raw+json",
+            f"repos/{repo}/contents/{CONFIG_IN_TREE}?ref={sha}",
+        )
+    except EvidenceError as error:
+        raise EvidenceError(f"cannot read the config {source}: {error}") from error
+    return text, source
+
+
+def load_config(text: str, source: str) -> dict[str, Any]:
+    try:
+        config = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise EvidenceError(f"cannot read config {source}: {error}") from error
     if not isinstance(config, dict):
         raise EvidenceError("config must be a JSON object")
     for field in (
@@ -381,7 +432,14 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         raise EvidenceError("--repo must be in owner/name form")
     if not SHA_PATTERN.fullmatch(args.sha):
         raise EvidenceError("--sha must be a full 40-character lowercase commit SHA")
-    config = load_config(args.config)
+    if args.config is None:
+        config = load_config(*config_of_commit(args.repo, args.sha))
+    else:
+        try:
+            text = args.config.read_text()
+        except OSError as error:
+            raise EvidenceError(f"cannot read config {args.config}: {error}") from error
+        config = load_config(text, str(args.config))
     runs = list_runs(args.repo, config["workflow_file"], sha=args.sha)
     candidates = matching_runs(runs, args.sha, args.tier, config["workflow_path"])
     tree_refusal = None
@@ -567,7 +625,11 @@ def main() -> int:
     parser.add_argument("--sha", required=True, help="exact candidate commit SHA")
     parser.add_argument("--tier", choices=("main", "nightly"), required=True)
     parser.add_argument("--dispatch-ref", help="branch or tag to dispatch if tier evidence is missing")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help=f"config file to use instead of {CONFIG_IN_TREE} in the tree of --sha",
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     try:

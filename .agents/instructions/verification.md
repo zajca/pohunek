@@ -275,7 +275,12 @@ unpushed `--no-push` candidate), otherwise from the git commits API. Once any
 run or run attempt of the tier on the commit itself has completed, the runs on
 the commit decide, so a tree match never hides a failure there; pull-request, push, and
 schedule runs never match by tree. The report names the run and whether it
-matched by `sha` or by `tree`.
+matched by `sha` or by `tree`. The required jobs and steps come from
+`scripts/ci-evidence.json` in the candidate commit's own tree, read from the
+local checkout when it holds the commit and otherwise from the contents API,
+never from the checkout that runs the script (#1243); a commit whose config
+cannot be read refuses the evidence, and `--config` names a file to use
+instead.
 
 SDK workspace gates (one Bun workspace root at the repository root spans `sdk/ts/*`):
 
