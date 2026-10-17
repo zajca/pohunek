@@ -58,6 +58,9 @@ env:
   # holding only the files whose change selects them. Off until a G3 seeding
   # run shows every package's tests green from its own sparse tree.
   TEST_SELECTION_SPARSE: "false"
+  # A Python script never imports from its own directory or the working
+  # directory, so a file a pull request adds there cannot shadow a module.
+  PYTHONSAFEPATH: "1"
   # Test binaries (issue #170): job `build-tests` compiles the workspace test
   # binaries once (`cargo nextest archive --workspace --all-features`) and
   # uploads the archive. The test jobs (fast shards, heavy, relay DB) download
@@ -626,14 +629,12 @@ jobs:
         run: |
           set -euo pipefail
           # The CI_RULES paths of `cargo xtask affected` and the files
-          # scripts/test-partitions reads.
+          # scripts/test-partitions reads. All of scripts/: a file added next
+          # to a script can shadow a module it imports.
           pipeline=(
             .github
             .config/nextest.toml
-            scripts/ci-test-selection
-            scripts/test-partitions
-            scripts/junit-flaky-summary
-            scripts/check-rust-toolchain-pin
+            scripts
           )
           narrowed=false
           if [ "$EVENT" != pull_request ]; then

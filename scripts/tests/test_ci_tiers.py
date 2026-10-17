@@ -2068,6 +2068,7 @@ class TestSelectionWiringTests(unittest.TestCase):
             ({"change": ".github/workflows/ci.yml"}, "changes the test pipeline: .github/workflows/ci.yml"),
             ({"change": ".config/nextest.toml"}, "changes the test pipeline: .config/nextest.toml"),
             ({"change": "scripts/ci-test-selection"}, "changes the test pipeline: scripts/ci-test-selection"),
+            ({"change": "scripts/json.py"}, "changes the test pipeline: scripts/json.py"),
             ({"base": "0" * 40}, "has no merge base"),
         ):
             with self.subTest(**kwargs):
@@ -2083,7 +2084,17 @@ class TestSelectionWiringTests(unittest.TestCase):
         self.assertIsNotNone(listed, script)
         assert listed is not None
         pipeline = set(listed.group(1).split())
-        self.assertLessEqual({".github", ".config/nextest.toml", *ci_rules_paths()}, pipeline)
+        # A module next to a script shadows the one it imports, so the whole
+        # directory is the pipeline, and no script imports from its own one.
+        self.assertIn("scripts", pipeline)
+        self.assertEqual(workflow_env("PYTHONSAFEPATH"), '"1"')
+
+        def covered(path):
+            return any(path == entry or path.startswith(f"{entry}/") for entry in pipeline)
+
+        for path in (".github", ".config/nextest.toml", *ci_rules_paths()):
+            with self.subTest(rule=path):
+                self.assertTrue(covered(path), path)
         jobs = workflow_jobs()
         for job in (TEST_SELECTOR, TEST_CHECK, TEST_VERDICT, *NARROWED_TEST_JOBS):
             for name, step in job_steps(jobs[job]).items():
@@ -2092,13 +2103,13 @@ class TestSelectionWiringTests(unittest.TestCase):
                     if used == "tests":
                         continue
                     with self.subTest(job=job, step=name, script=used):
-                        self.assertIn(f"scripts/{used}", pipeline)
+                        self.assertTrue(covered(f"scripts/{used}"), used)
         # Every file scripts/test-partitions reads from the tree.
         partitions = (ROOT / "scripts" / "test-partitions").read_text()
         for read in re.findall(r'ROOT / "([^"]+)"', partitions):
             if read != "target":
                 with self.subTest(read=read):
-                    self.assertIn(read, pipeline)
+                    self.assertTrue(covered(read), read)
 
     def test_test_jobs_run_unless_a_narrowed_selection_excludes_them(self):
         for job, (output, skip) in NARROWED_TEST_JOBS.items():

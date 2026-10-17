@@ -185,9 +185,9 @@ test.
 A selection narrows the run only when it is `narrowed`: the run is a pull
 request, its selection is `packages` or `none`, and the test pipeline equals
 its merge-base copy. The pipeline is `.github/`, `.config/nextest.toml` and
-the scripts that decide or run the CI test jobs (`ci-test-selection`,
-`test-partitions`, `junit-flaky-summary`, `check-rust-toolchain-pin`), so the
-head scripts that narrow a run are the merge base's. A step of `ci.yml`
+all of `scripts/`, so the head scripts that narrow a run, and every module
+next to them, are the merge base's; `PYTHONSAFEPATH=1` keeps a script from
+importing a file from its own directory either way. A step of `ci.yml`
 decides it, never a script's output. Every test runs on push, schedule, and
 dispatch runs, and on a pull request that changes the pipeline, `.cargo/`,
 `rust-toolchain*`, the root `Cargo.toml` outside `[workspace.dependencies]`,

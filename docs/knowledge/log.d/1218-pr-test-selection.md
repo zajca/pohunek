@@ -5,7 +5,7 @@
   (`cargo xtask affected ci`), and the fast shards, the heavy job, and the
   relay DB job run their shard narrowed to the selected packages. A run
   narrows only when the test pipeline (`.github/`, `.config/nextest.toml`,
-  and the scripts that decide or run the test jobs) equals the merge base's.
+  and `scripts/`) equals the merge base's.
   Pushes to `main`, the nightly run, dispatch runs, and any change to the
   pipeline or an unmapped path still run every test. The
   `test selection check` job proves that the planned shards hold every
