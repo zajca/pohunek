@@ -29,7 +29,8 @@ checks that the row left nothing behind that a later row could see:
   agents), so a launchd job does not count when it is a named transient
   Spotlight worker, or when it was added and its program lives on the sealed
   system volume (/System), which a row cannot write; the results name such
-  jobs;
+  jobs, and the job log names every added job with its program path alone,
+  looked up in the process's, the login session's and the user's domain;
 - no item added to or removed from the login keychain, wherever `security`
   answers (macOS), compared as
   a multiset of class, label, service, account and server from
@@ -545,17 +546,18 @@ def test_roots() -> set[str]:
 
 
 # launchd jobs the system starts and retires on its own while a row runs: the
-# Spotlight metadata workers, one label per worker instance (observed on
-# macos-15 runners, every row). Nothing else is left out of the comparison.
+# Spotlight metadata workers of the shared and the application kind, one label
+# per worker instance (observed on macos-15 runners). They are left out of the
+# comparison on both sides of a row.
 LAUNCHD_TRANSIENT = re.compile(
-    r"^com\.apple\.mdworker\.shared\.[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$"
+    r"^com\.apple\.mdworker\.(?:shared|application)\."
+    r"[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$"
 )
 
 
 def launchd_jobs(listing: str) -> set[str]:
-    """Labels of a `launchctl list` table, without the transient system jobs."""
-    labels = {line.split("\t")[-1] for line in listing.splitlines()[1:] if line.strip()}
-    return {label for label in labels if not LAUNCHD_TRANSIENT.match(label)}
+    """Labels of a `launchctl list` table."""
+    return {line.split("\t")[-1] for line in listing.splitlines()[1:] if line.strip()}
 
 
 def systemd_units() -> set[str] | None:
@@ -572,34 +574,59 @@ LAUNCHD_PROGRAM = re.compile(r"^\s*program = (\S.*)$")
 LAUNCHD_ARGUMENTS = re.compile(r"^\s*arguments = \{\s*$")
 
 
-def launchd_program(label: str) -> str | None:
-    """The program of a job in this process's launchd domain, or None when
-    launchctl cannot describe it."""
-    description = output_of(["launchctl", "print", f"pid/{os.getpid()}/{label}"])
-    if description is None:
-        return None
-    lines = description.splitlines()
-    for line in lines:
-        if (match := LAUNCHD_PROGRAM.match(line)) is not None:
-            return match.group(1).strip()
-    for index, line in enumerate(lines[:-1]):
-        if LAUNCHD_ARGUMENTS.match(line):
-            return lines[index + 1].strip()
+def launchd_domains() -> list[str]:
+    """The domains a job listed by `launchctl list` can be in: this process's
+    own, then the login session's and the user's, which it inherits."""
+    return [f"pid/{os.getpid()}", f"gui/{os.getuid()}", f"user/{os.getuid()}"]
+
+
+def launchd_program(label: str) -> tuple[str, str] | None:
+    """The first domain that describes the job and the job's program there, or
+    None when no domain describes a program for it."""
+    for domain in launchd_domains():
+        description = output_of(["launchctl", "print", f"{domain}/{label}"])
+        if description is None:
+            continue
+        lines = description.splitlines()
+        for line in lines:
+            if (match := LAUNCHD_PROGRAM.match(line)) is not None:
+                return domain, match.group(1).strip()
+        for index, line in enumerate(lines[:-1]):
+            if LAUNCHD_ARGUMENTS.match(line):
+                return domain, lines[index + 1].strip()
     return None
 
 
-def system_launchd_jobs(labels: set[str]) -> set[str]:
-    """The jobs among `labels` whose program lives on the sealed system volume,
-    which the runner's user cannot write. A job launchctl cannot describe is
-    not among them. A job a row submits with a /System program and arguments of
-    its own would pass, but that is deliberate evasion, outside the threat
-    model above."""
-    found = set()
-    for label in labels:
-        program = launchd_program(label)
-        if program is not None and program.startswith("/System/") and os.path.normpath(program) == program:
-            found.add(label)
-    return found
+def on_system_volume(program: str) -> bool:
+    return program.startswith("/System/") and os.path.normpath(program) == program
+
+
+def describe_launchd_job(label: str, found: tuple[str, str] | None) -> str:
+    """The job log's line for an added job: its label and its program path,
+    never any other field of `launchctl print`."""
+    if found is None:
+        return f"run-rows: added launchd job {label}: not described"
+    domain, program = found
+    if not program.startswith("/"):
+        return f"run-rows: added launchd job {label}: a program that is not an absolute path, in {domain}"
+    return f"run-rows: added launchd job {label}: {program}, in {domain}"
+
+
+def left_out_launchd_jobs(before: set[str], after: set[str]) -> tuple[set[str], set[str]]:
+    """The transient jobs on either side, and the added jobs whose program lives
+    on the sealed system volume, which the runner's user cannot write. Every
+    added job goes to the job log with its program. A job no domain describes
+    is not a system job. A job a row submits with a /System program and
+    arguments of its own would pass, but that is deliberate evasion, outside
+    the threat model above."""
+    transient = {label for label in before | after if LAUNCHD_TRANSIENT.match(label)}
+    system = set()
+    for label in sorted(after - before):
+        found = launchd_program(label)
+        print(describe_launchd_job(label, found), file=sys.stderr, flush=True)
+        if found is not None and on_system_volume(found[1]):
+            system.add(label)
+    return transient, system
 
 
 def launchd_labels() -> set[str] | None:
@@ -801,8 +828,9 @@ def run_one(runtime: str, target: str, limit: float, out_dir: Path) -> Result:
 
         state_after = account_state()
         if state_before["launchd job"] is not None and state_after["launchd job"] is not None:
-            system_jobs = system_launchd_jobs(state_after["launchd job"] - state_before["launchd job"])
-            state_after["launchd job"] = state_after["launchd job"] - system_jobs
+            transient, system_jobs = left_out_launchd_jobs(state_before["launchd job"], state_after["launchd job"])
+            state_before["launchd job"] = state_before["launchd job"] - transient
+            state_after["launchd job"] = state_after["launchd job"] - transient - system_jobs
             result.system_jobs = sorted(system_jobs)
         for kind in ACCOUNT_GUARDS:
             changes = compare(kind, state_before[kind], state_after[kind])
