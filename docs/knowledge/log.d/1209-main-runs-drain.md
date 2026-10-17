@@ -2,8 +2,9 @@
 
 - The `ci.yml` concurrency group for pushes to `main` no longer cancels the
   run in progress. Each started main run completes, and GitHub keeps only the
-  newest push pending behind it, replacing an older pending push. `main` gets a
-  verdict at most one merge behind its tip.
+  newest push pending behind it, replacing an older pending push. Merges that
+  land during one main run are tested together by the next run, on the newest
+  of them.
 - A new push to a pull request still cancels that PR's run in progress.
   Schedule and dispatch runs keep their own groups.
 - This revises #477 decision 4 ("a newer merge cancels the post-merge run in

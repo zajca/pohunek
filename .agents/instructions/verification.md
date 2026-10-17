@@ -157,8 +157,9 @@ selected on main. The main tier never runs the release rehearsal (#1207): push
 to `main` and a `tier=main` dispatch skip it whatever their paths filter
 computed. A new PR push cancels that PR's run in progress. Pushes to `main`
 drain instead (#1209): the running main run always completes, and only the
-newest push waits behind it, so `main` gets a verdict at most one merge behind
-its tip without merge pauses. A
+newest push waits behind it. Merges that land during a run share the next run,
+which tests the newest of them, so `main` gets a verdict without merge pauses;
+a merge that a later push replaced while pending gets no run of its own. A
 daily 05:00 UTC nightly run includes the main tier, the release rehearsal, the
 cold rebuild comparison in the `macos-15` package job, and the nightly-only
 relay database suite. Nightly CI evidence requires that job's install, upgrade,
