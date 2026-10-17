@@ -86,6 +86,12 @@ fail loudly instead of passing on a shape the fixture agrees with anyway.
 A test selection's filterset ($PARTITIONS_FILTERSET) narrows a shard as
 `(shard) and (filterset)`; on its own it lists the whole selection. Either
 way only the fixture tests marked `selected` match.
+
+A run of `(shard) and (package(=NAME))`, as `audit-sparse` composes it, runs
+that package's non-ignored fixture tests of the shard in the working tree
+and writes the profile's JUnit report. A test with `reads` fails when that
+file is absent, and a test with `binary_dir` is not run at all when that
+directory is absent, as nextest skips the binary of a package it cannot find.
 """
 
 import json
@@ -139,6 +145,47 @@ def macos_member(kind, scope, test):
     if kind == "tier":
         return test.get("set") == "tier"
     return kind in test.get("buckets", [])
+
+
+def package_of(binary_id):
+    """The package of a fixture binary id `<package>-<hash>`."""
+    return binary_id.rsplit("-", 1)[0]
+
+
+def audit_run(argv, expression):
+    """Runs an `audit-sparse` package run; returns its exit status, 0 when it
+    passes, or None when `expression` is not one."""
+    marker = ") and (package(="
+    if not expression.startswith("(") or marker not in expression or not expression.endswith("))"):
+        return None
+    shard_expression, package = expression[1:-2].rsplit(marker, 1)
+    if not package.replace("-", "").replace("_", "").isalnum():
+        return None
+    try:
+        shard = shard_of(shard_expression, os.environ["PARTITIONS_FAST"])
+    except SystemExit:
+        return None
+    profile = argv[argv.index("--profile") + 1]
+    fixture = json.loads(Path(os.environ["PARTITIONS_FIXTURE"]).read_text())
+    cases, failed = [], False
+    for entry in fixture["binaries"]:
+        if package_of(entry["id"]) != package:
+            continue
+        for name, test in entry["tests"].items():
+            if shard not in test["matches"] or test.get("ignored", False):
+                continue
+            if "binary_dir" in test and not Path(test["binary_dir"]).is_dir():
+                continue
+            missing = "reads" in test and not Path(test["reads"]).is_file()
+            failed = failed or missing
+            failure = '<failure message="file not found"/>' if missing else ""
+            cases.append(f'<testcase classname="{entry["id"]}" name="{name}">{failure}</testcase>')
+    report = Path("target") / "nextest" / profile / "junit.xml"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(
+        f'<testsuites><testsuite name="{package}">{"".join(cases)}</testsuite></testsuites>'
+    )
+    return 100 if failed else 0
 
 
 def main():
@@ -221,6 +268,9 @@ def main():
                 record["stat"] = Path(f"/proc/{worker.pid}/stat").read_text()
             temporary.write_text(json.dumps(record))
             os.replace(temporary, pid_record)
+        expression = argv[argv.index("-E") + 1] if "-E" in argv else ""
+        if audited := audit_run(argv, expression):
+            raise SystemExit(audited)
         if status := os.environ.get("PARTITIONS_FAKE_RUN_STATUS"):
             raise SystemExit(int(status))
         if os.environ.get("PARTITIONS_HOLD_RUN"):
@@ -249,6 +299,7 @@ def main():
         print(json.dumps({"rust-suites": suites}))
         return
     fast = os.environ["PARTITIONS_FAST"]
+    run_ignored = argv[argv.index("--run-ignored") + 1] if "--run-ignored" in argv else "default"
     filterset = os.environ.get("PARTITIONS_FILTERSET")
     narrowed = False
     if expression is not None and filterset:
@@ -262,7 +313,10 @@ def main():
     for entry in fixture["binaries"]:
         cases = {}
         for name, test in entry["tests"].items():
-            if narrowed and not test.get("selected", False):
+            ignored = bool(test.get("ignored", False))
+            if run_ignored != "all" and (run_ignored == "only") != ignored:
+                status = "mismatch"
+            elif narrowed and not test.get("selected", False):
                 status = "mismatch"
             elif selected is None:
                 status = "matches" if test.get("listed", True) else "mismatch"
@@ -274,7 +328,7 @@ def main():
                 "ignored": bool(test.get("ignored", False)),
                 "filter-match": {"status": status},
             }
-        suites[entry["id"]] = {"testcases": cases}
+        suites[entry["id"]] = {"package-name": package_of(entry["id"]), "testcases": cases}
     print(json.dumps({"rust-suites": suites}))
 
 
@@ -1375,6 +1429,186 @@ class MacosLaneTests(ScriptScenario):
         result = self.run_script("run-macos", "core", "--archive-file", str(self.archive))
         self.assertEqual(result.returncode, 2)
         self.assertIn("takes no shard", result.stderr)
+        self.assertEqual(self.nextest_calls(), [])
+
+
+FAKE_SELECTOR = """#!/usr/bin/env python3
+import json, os, sys
+trees = json.load(open(os.environ["PARTITIONS_SPARSE_TREES"]))
+package = sys.argv[sys.argv.index("--package") + 1]
+if package not in trees:
+    sys.exit("selector: unknown package " + package)
+for path in trees[package]:
+    print("/" + path)
+"""
+
+
+class AuditSparseTests(ScriptScenario):
+    """`audit-sparse` (G3 of #1218) runs each package from its own sparse tree.
+
+    The fixture checkout is a real git repository, so `git sparse-checkout`
+    really removes the files outside a package's tree. The selector is a fake
+    `xtask` printing each package's tree from a fixture, and the fake nextest
+    runs a fixture test against the files present in the working tree.
+    """
+
+    TRACKED = (
+        ".config/nextest.toml",
+        "crates/daemon/src/lib.rs",
+        "crates/relay/src/lib.rs",
+        "crates/cli/src/lib.rs",
+        "crates/knowledge/src/lib.rs",
+        "docs/guide.md",
+    )
+
+    def setUp(self):
+        super().setUp()
+        for path in self.TRACKED[1:]:
+            target = self.root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(path)
+        (self.root / ".gitignore").write_text("/bin/\n/target/\n/*.json\n/*.jsonl\n/reports/\n/archive.tar.zst\n/selector\n")
+        # A commit starts `git maintenance run --auto --detach`, which can still be
+        # writing into .git while the fixture repository is removed. The fixture
+        # commit must not depend on the user's signing setup.
+        for command in (
+            ["init", "-q"],
+            ["config", "maintenance.auto", "false"],
+            ["config", "gc.auto", "0"],
+            ["config", "commit.gpgsign", "false"],
+            ["add", ".gitignore", "scripts", *self.TRACKED],
+            ["-c", "user.name=fixture", "-c", "user.email=fixture@invalid",
+             "commit", "-q", "-m", "fixture"],
+        ):
+            subprocess.run(["git", *command], cwd=self.root, check=True)
+        self.archive = self.root / "archive.tar.zst"
+        self.archive.write_bytes(b"fixture archive")
+        self.selector = self.root / "selector"
+        self.selector.write_text(FAKE_SELECTOR)
+        self.selector.chmod(0o755)
+        self.trees = self.root / "trees.json"
+        own = lambda name: [".config/nextest.toml", "scripts/test-partitions", f"crates/{name}/src/lib.rs"]
+        self.trees.write_text(json.dumps({
+            "pohunek-daemon": own("daemon"),
+            "pohunek-relay": own("relay"),
+            "pohunek-cli": own("cli"),
+            "pohunek-knowledge": own("knowledge"),
+        }))
+        self.reports = self.root / "reports"
+
+    def audit(self, binaries, extra_env=None):
+        self.set_inventory(binaries)
+        return self.run_script(
+            "--archive-file", str(self.archive), "audit-sparse",
+            "--selector", str(self.selector), "--report-dir", str(self.reports),
+            extra_env={"PARTITIONS_SPARSE_TREES": str(self.trees), **(extra_env or {})},
+        )
+
+    def assert_full_tree(self):
+        for path in self.TRACKED:
+            self.assertTrue((self.root / path).is_file(), f"{path} is missing after the audit")
+
+    def runs(self):
+        return [call["argv"] for call in self.nextest_calls() if call["argv"][1] == "run"]
+
+    def test_every_package_passing_from_its_own_tree_passes_the_audit(self):
+        result = self.audit(nextest_inventory())
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("7 of 7 package runs passed, each with exactly the tests of the full tree", result.stdout)
+        self.assertIn("| pohunek-daemon | heavy | 3 | 1 / 1 | 0 | passed |", result.stdout)
+        self.assertIn("| pohunek-relay | relay-db | 3 | 1 / 1 | 0 | passed |", result.stdout)
+        self.assertEqual(
+            (self.reports / "summary.md").read_text().splitlines()[0],
+            result.stdout.splitlines()[0],
+        )
+        self.assertTrue((self.reports / "pohunek-knowledge.heavy.xml").is_file())
+        self.assert_full_tree()
+
+    def test_each_shard_runs_under_its_own_profile(self):
+        result = self.audit(nextest_inventory())
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        profiles = {}
+        for argv in self.runs():
+            expression = argv[argv.index("-E") + 1]
+            package = expression.rsplit("package(=", 1)[1].rstrip(")")
+            profiles.setdefault(package, set()).add(argv[argv.index("--profile") + 1])
+        self.assertEqual(profiles["pohunek-daemon"], {"ci", "heavy"})
+        self.assertEqual(profiles["pohunek-relay"], {"ci", "relay-db"})
+        self.assertEqual(profiles["pohunek-cli"], {"ci"})
+
+    def test_a_test_reading_a_file_outside_its_tree_fails_the_audit(self):
+        binaries = nextest_inventory()
+        binaries[3]["tests"]["bundle::materialize"]["reads"] = "docs/guide.md"
+
+        result = self.audit(binaries)
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("| pohunek-knowledge | core | 3 | 1 / 1 | 100 | failed |", result.stdout)
+        self.assertIn("6 of 7 package runs passed", result.stdout)
+        self.assert_full_tree()
+
+    def test_a_test_the_sparse_tree_skips_fails_the_audit_although_nextest_passes(self):
+        binaries = nextest_inventory()
+        binaries[0]["tests"]["store::migrate"]["binary_dir"] = "docs"
+
+        result = self.audit(binaries)
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("| pohunek-daemon | daemon | 3 | 0 / 1 | 0 | count mismatch |", result.stdout)
+        self.assert_full_tree()
+
+    def test_the_expected_counts_leave_out_ignored_tests(self):
+        result = self.audit(nextest_inventory())
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lists = [call["argv"] for call in self.nextest_calls() if call["argv"][1] == "list"]
+        self.assertTrue(lists)
+        for argv in lists:
+            self.assertEqual(argv[argv.index("--run-ignored") + 1], "default")
+
+    def test_a_selector_without_a_tree_fails_before_any_run(self):
+        trees = json.loads(self.trees.read_text())
+        del trees["pohunek-cli"]
+        self.trees.write_text(json.dumps(trees))
+
+        result = self.audit(nextest_inventory())
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the selector gave no sparse tree for pohunek-cli", result.stderr)
+        self.assertEqual(self.runs(), [])
+        self.assert_full_tree()
+
+    def test_a_failing_run_still_returns_the_full_tree(self):
+        result = self.audit(nextest_inventory(), extra_env={"PARTITIONS_FAKE_RUN_STATUS": "3"})
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assert_full_tree()
+
+    def test_a_checkout_left_sparse_refuses_the_audit_before_any_test_runs(self):
+        trees = json.loads(self.trees.read_text())
+        subprocess.run(["git", "sparse-checkout", "set", "--no-cone", "--stdin"], cwd=self.root,
+                       input="\n".join("/" + path for path in trees["pohunek-cli"]), text=True,
+                       check=True)
+
+        result = self.audit(nextest_inventory())
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the checkout is sparse", result.stderr)
+        self.assertEqual(self.nextest_calls(), [])
+
+    def test_audit_sparse_needs_its_archive_selector_and_report_dir(self):
+        self.set_inventory(nextest_inventory())
+        for arguments in (
+            ("audit-sparse", "--selector", str(self.selector), "--report-dir", str(self.reports)),
+            ("--archive-file", str(self.archive), "audit-sparse", "--report-dir", str(self.reports)),
+            ("--archive-file", str(self.archive), "audit-sparse", "--selector", str(self.selector)),
+            ("--archive-file", str(self.archive), "run", "core", "--selector", str(self.selector)),
+        ):
+            with self.subTest(arguments=arguments):
+                result = self.run_script(*arguments)
+                self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(self.nextest_calls(), [])
 
 

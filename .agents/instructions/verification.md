@@ -62,7 +62,10 @@ report of every `ci.yml` test job with `scripts/test-duplicates` and fails on
 a test that two jobs of the same OS ran, unless `scripts/test-duplicates.json`
 allows it with a reason. A new JUnit artifact must be named there with its OS
 and matched by the job's download pattern, or the check fails. The release
-rehearsal's reports come from a called workflow and are not read. Under that profile the tests of xtask's `hermes::tests`
+rehearsal's reports come from a called workflow and are not read. The G3 audit's
+reports are separate evidence: it deliberately repeats the shards in sparse
+trees, so its `test-selection-audit` artifact is excluded from this duplicate
+check. Under that profile the tests of xtask's `hermes::tests`
 run one at a time (test group `hermes-pty`), because its PTY scenarios take
 turns on an in-process mutex that a process per test cannot share.
 The real-systemd suites (`crates/platform/tests/systemd.rs`,
@@ -244,8 +247,16 @@ was skipped by anything but that path.
 
 G2, running the tests from a sparse checkout that holds only the files whose
 change selects a selected package (`cargo xtask affected sparse`), is wired
-behind the `TEST_SELECTION_SPARSE` switch of `ci.yml` and is off until a G3
-seeding run shows every package's tests green from its own sparse tree.
+behind the `TEST_SELECTION_SPARSE` switch of `ci.yml`. It stays off until three
+consecutive nightly runs of G3 on `main` are green.
+
+G3, the `test selection audit (G3)` job of the nightly tier, runs
+`scripts/test-partitions audit-sparse`. For each package it runs that
+package's tests from the archive in the package's own sparse tree, and fails
+when a run fails or runs fewer tests than the full tree lists for the package.
+A red G3 means a test reads a path that its package's selector does not cover.
+Fix it by adding the path to the package's `RULES` entry, never by relaxing
+the test.
 
 Before the final head of a pull request merges, dispatch `ci.yml` once with
 `tier=main` on the branch (`gh workflow run ci.yml --ref <branch> -f tier=main`)
@@ -546,6 +557,7 @@ python3 scripts/test-partitions --archive-file A check-macos   # 13-package macO
 python3 scripts/test-partitions --archive-file A check-macos --scope lane  # PR lane archive: its 9 packages only
 python3 scripts/test-partitions --archive-file A run-macos     # PR macOS lane: 9 packages, profile macos
 python3 scripts/test-partitions --archive-file A run-macos-tier  # main/nightly macOS tier: client, netbird, package, xtask
+python3 scripts/test-partitions --archive-file A audit-sparse --selector target/debug/xtask --report-dir R  # nightly G3: each package from its own sparse tree
 ```
 
 `cargo ta` (`cargo xtask affected [--base REF] [--print] [-- NEXTEST_ARGS]`)

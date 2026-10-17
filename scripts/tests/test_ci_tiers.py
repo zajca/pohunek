@@ -2881,7 +2881,97 @@ class ArchiveToolchainTests(unittest.TestCase):
             with self.subTest(job=name):
                 self.assertTrue(setup, f"{name} runs archive tests without setup-rust")
                 self.assertLess(min(setup), min(runs))
-        self.assertTrue({"fast-tests", "integration", "integration-relay"} <= set(checked), checked)
+        self.assertTrue({"fast-tests", "integration", "integration-relay",
+                         "test-selection-audit"} <= set(checked), checked)
+
+
+AUDIT_JOB = "test-selection-audit"
+
+
+class SelectionAuditTests(unittest.TestCase):
+    """The G3 audit of #1218 runs each package from its own sparse tree nightly."""
+
+    def test_the_audit_is_one_sequential_job_without_issue_creation(self):
+        job = workflow_jobs()[AUDIT_JOB]
+        self.assertNotIn("    strategy:\n", job)
+        self.assertNotRegex(job, r"(?m)^    uses:")
+        self.assertNotRegex(job, r"issues:\s*write|gh\s+issue\s+create|github-script")
+
+    def test_audit_reports_stay_outside_the_same_os_duplicate_check(self):
+        # G3 deliberately reruns the ordinary shards in a different checkout.
+        # Its reports are audit evidence, not a second owner of those tests.
+        job = workflow_jobs()[AUDIT_JOB]
+        self.assertIn("          name: test-selection-audit\n", job)
+        check = workflow_jobs()["test-duplicates"]
+        self.assertNotIn(AUDIT_JOB, job_needs(check))
+        pattern = re.search(r"(?m)^          pattern: '\{([^}']+)\}'$", check)
+        self.assertIsNotNone(pattern)
+        self.assertFalse(any(fnmatch.fnmatchcase("test-selection-audit", glob)
+                             for glob in pattern.group(1).split(",")))
+
+    def runs(self, *, event, tier="", cancelled=False, build="success"):
+        return bool(evaluate_needs_expression(
+            job_condition(AUDIT_JOB), event=event, tier=tier, cancelled=cancelled,
+            results={"build-tests": build},
+        ))
+
+    def test_the_audit_runs_on_the_nightly_tier_after_a_built_archive(self):
+        self.assertEqual(job_needs(workflow_jobs()[AUDIT_JOB]), ["build-tests"])
+        self.assertTrue(self.runs(event="schedule"))
+        self.assertTrue(self.runs(event="workflow_dispatch", tier="nightly"))
+        for kwargs in (
+            {"event": "pull_request"}, {"event": "push"},
+            {"event": "workflow_dispatch", "tier": "main"},
+            {"event": "schedule", "build": "failure"},
+            {"event": "schedule", "build": "skipped"},
+            {"event": "schedule", "cancelled": True},
+        ):
+            with self.subTest(**kwargs):
+                self.assertFalse(self.runs(**kwargs))
+
+    def test_the_audit_gates_the_nightly_evidence_only(self):
+        config = json.loads((ROOT / "scripts" / "ci-evidence.json").read_text())
+        name = "test selection audit (G3)"
+        self.assertIn(f"    name: {name}\n", workflow_jobs()[AUDIT_JOB])
+        self.assertIn(name, config["required_jobs"]["nightly"])
+        self.assertNotIn(name, config["required_jobs"]["main"])
+
+    def test_the_audit_runs_the_relay_database_tests_against_the_relay_service(self):
+        jobs = workflow_jobs()
+        self.assertEqual(block(jobs[AUDIT_JOB], "services", 4),
+                         block(jobs["integration-relay"], "services", 4))
+        run = job_steps(jobs[AUDIT_JOB])["Run every package from its own sparse tree"]
+        self.assertIn(
+            "POHUNEK_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:"
+            "${{ job.services.postgres.ports['5432'] }}/pohunek_test", run)
+
+    def test_the_audit_runs_the_archive_with_the_selector_of_its_tree(self):
+        steps = job_steps(workflow_jobs()[AUDIT_JOB])
+        names = list(steps)
+        build = steps["Build the selector"]
+        self.assertIn("cargo build --locked -p xtask --bin xtask", step_script(build))
+        self.assertIn('cp target/debug/xtask "$RUNNER_TEMP/xtask"', step_script(build))
+        self.assertIn("          name: nextest-archive\n", steps["Download test archive"])
+        run = steps["Run every package from its own sparse tree"]
+        self.assertIn(
+            'python3 scripts/test-partitions --archive-file '
+            '"$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" audit-sparse '
+            '--selector "$RUNNER_TEMP/xtask" --report-dir "$RUNNER_TEMP/test-selection-audit"',
+            step_script(run))
+        # The selector leaves target/ before the archive extracts into it.
+        self.assertLess(names.index("Build the selector"), names.index("Download test archive"))
+        self.assertLess(names.index("Download test archive"),
+                        names.index("Run every package from its own sparse tree"))
+        for name in ("Summarize the audit", "Upload the audit reports"):
+            with self.subTest(step=name):
+                self.assertEqual(step_condition(steps[name]), "always()")
+                self.assertGreater(names.index(name),
+                                   names.index("Run every package from its own sparse tree"))
+
+    def test_the_audit_does_not_wait_for_the_pull_request_sparse_trees(self):
+        # G3 is the evidence that turns G2 on, so it runs while G2 is off.
+        self.assertNotIn("TEST_SELECTION_SPARSE", workflow_jobs()[AUDIT_JOB])
+        self.assertNotIn("test-selection", job_needs(workflow_jobs()[AUDIT_JOB]))
 
 
 def partitions_module():
