@@ -716,17 +716,17 @@ class SigningTests(ReleaseWorkflowFiles):
         self.assertIn("rehearsal %s %s", script)
         self.assertIn('[ "${GITHUB_REF_TYPE:-}" != tag ]', script)
         build = self.build_jobs["binaries"]
-        self.assertIn("inputs.mode == 'rehearsal' && matrix.component == 'daemon'", build)
+        self.assertIn("inputs.mode == 'rehearsal' && contains(matrix.components, 'daemon')", build)
         rehearsal_macos = self.build_jobs["rehearsal-macos"]
         self.assertIn("    if: ${{ inputs.mode == 'rehearsal' }}\n", rehearsal_macos)
         self.assertIn("runs-on: macos-15\n", rehearsal_macos)
         self.assertIn("permissions:\n      contents: read\n", rehearsal_macos)
-        self.assertIn("matrix:\n        component: [cli, daemon]\n", rehearsal_macos)
+        self.assertNotIn("matrix", rehearsal_macos)
         self.assertIn("test \"$(uname -m)\" = \"arm64\"", rehearsal_macos)
-        self.assertIn("    if: ${{ matrix.component == 'daemon' }}\n", rehearsal_macos)
         self.assertIn("scripts/release-workflow/rehearsal-trust", rehearsal_macos)
         self.assertIn("packaging/macos/package --adhoc-release", rehearsal_macos)
-        self.assertIn("name: macos-signed-${{ matrix.component }}", rehearsal_macos)
+        for component in ("cli", "daemon"):
+            self.assertIn(f"name: macos-signed-{component}\n", rehearsal_macos)
         self.assertIn("mkdir -p dist", rehearsal_macos)
         self.assertNotIn("rehearsal-trust", self.release)
 
@@ -974,22 +974,78 @@ class AssetNameTests(ReleaseWorkflowFiles):
         super().setUpClass()
         cls.policy = json.loads(POLICY.read_text())
 
-    def matrix_entries(self, block: str) -> set[tuple[str, str, str]]:
+    def matrix_entries(self, block: str) -> set[tuple[str, str]]:
         entries = set()
         for entry in re.split(r"^\s+- target: ", block, flags=re.M)[1:]:
             target = entry.split("\n", 1)[0].strip()
-            component = re.search(r"^\s+component: (\S+)$", entry, re.M).group(1)
-            prefix = re.search(r"^\s+archive_prefix: (\S+)$", entry, re.M).group(1)
-            entries.add((component, target, prefix))
+            components = re.search(r"^\s+components: (.+)$", entry, re.M).group(1).split()
+            entries.update((component, target) for component in components)
         return entries
 
     def test_the_linux_matrix_equals_the_policy_archives(self):
-        linux = {
-            (slot["component"], slot["target"], f"pohunek-{slot['component']}")
-            for slot in self.policy["archives"]
-            if "-linux-" in slot["target"]
-        }
-        self.assertEqual(self.matrix_entries(self.build_jobs["binaries"]), linux)
+        linux = {(slot["component"], slot["target"]) for slot in self.policy["archives"] if "-linux-" in slot["target"]}
+        binaries = self.build_jobs["binaries"]
+        self.assertEqual(self.matrix_entries(binaries), linux)
+        # One upload per component, under the name the evidence workflow reads.
+        for component in {component for component, _target in linux}:
+            with self.subTest(component=component):
+                upload = binaries.split(f"- name: Upload the {component} archive\n", 1)[1].split("\n\n", 1)[0]
+                self.assertIn(f"if: ${{{{ contains(matrix.components, '{component}') }}}}", upload)
+                self.assertIn(f"name: build-{component}-${{{{ matrix.target }}}}\n", upload)
+                self.assertIn(f"dist/pohunek-{component}-${{{{ needs.meta.outputs.version }}}}-${{{{ matrix.target }}}}.tar.gz\n", upload)
+                self.assertIn("overwrite: true", upload)
+
+    def test_every_upload_of_the_release_build_survives_a_rerun_of_its_job(self):
+        # A job that fails after an upload is rerun with the same artifact
+        # names, which upload-artifact v4 refuses unless it may overwrite.
+        for name, block in self.build_jobs.items():
+            with self.subTest(job=name):
+                uploads = block.split("uses: actions/upload-artifact@")[1:]
+                for upload in uploads:
+                    self.assertIn("overwrite: true", upload.split("\n\n", 1)[0])
+
+    def test_each_linux_component_is_packaged_before_the_next_one_builds(self):
+        # The daemon build relinks `pohunek` in the shared target dir, so the
+        # cli archive must be staged from the cli build alone.
+        step = self.build_jobs["binaries"].split("- name: Build and package each component\n", 1)[1].split("\n\n", 1)[0]
+        self.assertEqual(step.count("for component in $COMPONENTS; do"), 1)
+        body = step.split("for component in $COMPONENTS; do", 1)[1].split("\n          done\n", 1)[0]
+        self.assertLess(body.index("cargo build"), body.index("packaging/stage-archive"))
+        self.assertLess(body.index("packaging/stage-archive"), body.index("sh packaging/archive"))
+        self.assertIn('if [ "$name" != "pohunek-$component-$VERSION-$TARGET" ]; then', body)
+
+    def test_the_rehearsal_builds_each_macos_component_as_stage_macos_does(self):
+        darwin = [slot["component"] for slot in self.policy["archives"] if slot["target"].endswith("-apple-darwin")]
+        stage = self.release_jobs["stage-macos"]
+        rehearsal = self.build_jobs["rehearsal-macos"]
+        release_build = stage.split("- name: Build release binaries\n", 1)[1].split("\n\n", 1)[0]
+        release_run = release_build.split("run: |\n", 1)[1]
+        self.assertIn('packaging/macos/build-release "${{ matrix.component }}"', release_run)
+        # Both jobs build with the same environment, and nothing in the
+        # rehearsal job changes the target dir, the flags or the lock flag.
+        self.assertIn("    env:\n      RUSTFLAGS: -D warnings\n", stage)
+        self.assertIn("    env:\n      RUSTFLAGS: -D warnings\n", rehearsal)
+        self.assertNotRegex(rehearsal, r"CARGO_TARGET_DIR|CARGO_LOCKED_FLAG|CARGO_ENCODED_RUSTFLAGS")
+        self.assertEqual(rehearsal.count("RUSTFLAGS"), 1)
+        positions = []
+        for component in sorted(darwin):
+            with self.subTest(component=component):
+                build = rehearsal.split(f"- name: Build {component} release binaries\n", 1)[1].split("\n\n", 1)[0]
+                self.assertIn(f"env:\n          COMPONENT: {component}\n", build)
+                run = build.split("run: |\n", 1)[1]
+                self.assertEqual(run, release_run.replace('"${{ matrix.component }}"', '"$COMPONENT"'))
+                self.assertEqual(rehearsal.count("packaging/macos/build-release"), len(darwin))
+                positions.append(
+                    (
+                        rehearsal.index(f"- name: Build {component} release binaries\n"),
+                        rehearsal.index(f"- name: Stage and package the {component} archive\n"),
+                    )
+                )
+        # Each component is staged before the next one builds.
+        for (_build, staged), (next_build, _next_staged) in zip(positions, positions[1:]):
+            self.assertLess(staged, next_build)
+        for build, staged in positions:
+            self.assertLess(build, staged)
 
     def test_the_macos_jobs_equal_the_policy_archives(self):
         darwin = {slot["component"] for slot in self.policy["archives"] if slot["target"].endswith("-apple-darwin")}
@@ -1006,7 +1062,14 @@ class AssetNameTests(ReleaseWorkflowFiles):
         pack = (ROOT / "sdk" / "ts" / "scripts" / "pack-release.ts").read_text()
         directories = re.search(r"PACKAGE_DIRECTORIES = \[([^\]]*)\]", pack).group(1)
         self.assertEqual(set(re.findall(r'"([a-z]+)"', directories)), set(self.policy["sdk_packages"]))
-        self.assertIn("name: sdk-release-assets", self.build_jobs["sdk"])
+        packages = self.build_jobs["packages"]
+        self.assertIn("name: sdk-release-assets", packages)
+        self.assertNotIn("sdk", self.build_jobs)
+        # npm dependency code runs only after the package archives and their
+        # evidence have left the job.
+        install = packages.index("bun install --frozen-lockfile")
+        for upload in ("name: package-archives\n", "name: package-evidence\n"):
+            self.assertLess(packages.index(upload), install, upload)
 
     def test_package_and_attestation_names_match_the_assembler(self):
         policy_source = (ROOT / "crates" / "xtask" / "src" / "release_policy.rs").read_text()
