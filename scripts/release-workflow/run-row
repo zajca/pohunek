@@ -12,6 +12,9 @@
 #        OUT_DIR      directory that receives attestation-<runtime>-<target>.json
 #                     and junit-<runtime>-<target>.xml
 #        XTASK        path of the built xtask binary
+#        ROW_ROOT     an empty, owner-only directory for the row's files; the
+#                     caller (scripts/release-workflow/run-rows) creates it,
+#                     removes it afterwards and checks what the row left behind
 #
 # The binaries under test are extracted from the daemon ARCHIVE of the target,
 # never rebuilt: the attestation binds exactly the bytes that will be bundled.
@@ -84,7 +87,7 @@ need() {
     eval "value=\${$1:-}"
     [ -n "$value" ] || fail "$1 is required"
 }
-for name in VERSION COMMIT RUNTIME TARGET DAEMON_DIR PACKAGES_DIR CONSUMER OUT_DIR XTASK; do
+for name in VERSION COMMIT RUNTIME TARGET DAEMON_DIR PACKAGES_DIR CONSUMER OUT_DIR XTASK ROW_ROOT; do
     need "$name"
 done
 case $RUNTIME in *[!a-z0-9_-]*) fail "invalid runtime id" ;; esac
@@ -105,18 +108,25 @@ package=$PACKAGES_DIR/pohunek-runtime-$RUNTIME-$VERSION.tar.zst
 (cd "$DAEMON_DIR" && sha256_check "$stem.tar.gz.sha256") || fail "daemon archive checksum mismatch"
 (cd "$PACKAGES_DIR" && sha256_check "pohunek-runtime-$RUNTIME-$VERSION.tar.zst.sha256") || fail "package archive checksum mismatch"
 
-# A short root keeps the suite's socket paths inside the AF_UNIX limit.
-work=$(mktemp -d /tmp/pkrow.XXXXXX)
-trap 'rm -rf -- "$work"' EXIT
+# The root's short path keeps the suite's socket paths inside the AF_UNIX
+# limit; run-rows creates it with mktemp -d /tmp/pk.XXXX. The consumer's
+# TestEnv roots are created in it (POHUNEK_TEST_TEMP_ROOT), so whatever they
+# leave behind is found and removed with the row's root.
+work=$ROW_ROOT
+case $work in /*) ;; *) fail "ROW_ROOT must be absolute" ;; esac
+[ -d "$work" ] && [ ! -L "$work" ] || fail "ROW_ROOT is not a directory"
+[ -n "$(find "$work" -prune -user "$(id -u)" -perm 0700)" ] || fail "ROW_ROOT is not owner-only"
+[ -z "$(ls -A -- "$work")" ] || fail "ROW_ROOT is not empty"
 mkdir -p "$work/extract" "$work/stage" "$work/cwd" "$work/home" "$work/t" "$OUT_DIR"
 
-tar -xzf "$archive" -C "$work/extract" --no-same-owner
+tar -xzf "$archive" -C "$work/extract" --no-same-owner || fail "the daemon archive cannot be extracted (status $?)"
 bin_dir=$work/extract/$stem
 for binary in pohunek pohunekd pohunek-sessiond; do
     [ -f "$bin_dir/$binary" ] && [ ! -L "$bin_dir/$binary" ] || fail "the archive lacks $binary"
 done
 
-"$XTASK" compat stage-upstream --runtime "$RUNTIME" --out "$work/stage"
+"$XTASK" compat stage-upstream --runtime "$RUNTIME" --out "$work/stage" \
+    || fail "staging the upstream of $RUNTIME failed (status $?)"
 node_bin=$(command -v node) || fail "node is required on PATH"
 node_dir=$(cd "$(dirname -- "$node_bin")" && pwd -P)
 
@@ -135,6 +145,7 @@ status=0
         XDG_STATE_HOME="$work/home/.local/state" \
         XDG_CACHE_HOME="$work/home/.cache" \
         TMPDIR="$work/t" \
+        POHUNEK_TEST_TEMP_ROOT="$work" \
         LANG=C.UTF-8 \
         POHUNEK_CONSUMER_BIN_DIR="$bin_dir" \
         POHUNEK_CONSUMER_RUNTIME="$RUNTIME" \
@@ -162,4 +173,5 @@ write_junit "$elapsed"
     --matrix compat/matrix.json \
     --commit "$COMMIT" \
     --target "$TARGET" \
-    --output "$OUT_DIR/attestation-$RUNTIME-$TARGET.json"
+    --output "$OUT_DIR/attestation-$RUNTIME-$TARGET.json" \
+    || fail "compat attest failed for $RUNTIME on $TARGET (status $?)"

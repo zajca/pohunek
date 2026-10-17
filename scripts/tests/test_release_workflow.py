@@ -758,11 +758,11 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
     def test_the_jobs_run_in_the_documented_order(self):
         needs = {name: needs_of(block) for name, block in self.evidence_jobs.items()}
         self.assertEqual(needs["plan"], [])
-        self.assertEqual(needs["rows"], ["plan", "consumer"])
+        self.assertEqual(needs["rows"], ["plan"])
         self.assertEqual(needs["attest"], ["rows"])
         self.assertEqual(needs["assemble"], ["rows", "attest"])
         self.assertEqual(needs["assemble-rehearsal"], ["rows"])
-        self.assertEqual(needs["smoke"], ["plan", "assemble", "assemble-rehearsal", "consumer"])
+        self.assertEqual(needs["smoke"], ["plan", "rows", "assemble", "assemble-rehearsal"])
 
     def test_the_verdict_requires_every_other_job_of_the_mode(self):
         verdict = self.evidence_jobs["verdict"]
@@ -770,9 +770,20 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
             sorted(needs_of(verdict)), sorted(name for name in self.evidence_jobs if name != "verdict")
         )
         self.assertIn("    if: ${{ always() }}\n", verdict)
-        for name in ("plan", "consumer", "rows", "attest", "assemble", "assemble-rehearsal", "attest-bundle", "smoke"):
+        for name in ("plan", "rows", "attest", "assemble", "assemble-rehearsal", "attest-bundle", "smoke"):
             self.assertIn(f'"{name}"', verdict)
         self.assertIn('"skipped"', verdict)
+
+    def test_the_verdict_names_every_planned_row_that_did_not_pass(self):
+        verdict = self.evidence_jobs["verdict"]
+        self.assertIn("          pattern: row-results-*\n", verdict)
+        self.assertIn("          PLAN: ${{ needs.plan.outputs.rows }}\n", verdict)
+        self.assertIn('no result from Rows on', verdict)
+        self.assertIn('elif $result.status == "pass" then empty', verdict)
+        self.assertIn("    permissions: {}\n", verdict)
+        # Both checks run whatever the download did; neither replaces the other.
+        self.assertEqual(verdict.count("        if: ${{ !cancelled() }}\n"), 2)
+        self.assertLess(verdict.index("Name every row that did not pass"), verdict.index("Require the jobs of the mode"))
 
     def test_the_release_never_consults_a_baseline_or_a_selection(self):
         # The tag builds, tests and attests every official package from its
@@ -787,7 +798,10 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
     def test_rows_are_data_driven_and_run_the_archive_binaries(self):
         rows = self.evidence_jobs["rows"]
         self.assertIn("matrix: ${{ fromJSON(needs.plan.outputs.rows) }}", rows)
-        self.assertIn("name: ${{ matrix.daemon_artifact }}", rows)
+        self.assertIn("pattern: ${{ matrix.daemon_pattern }}", rows)
+        self.assertIn("    timeout-minutes: ${{ matrix.timeout_minutes }}\n", rows)
+        self.assertIn("ROW_LIMIT_SECONDS: ${{ matrix.row_limit_seconds }}", rows)
+        self.assertIn('XTASK="$PWD/target/debug/xtask" scripts/release-workflow/run-rows', rows)
         for runtime in ("pi", "codex", "claude"):
             self.assertNotRegex(self.evidence + self.build, rf"\b{runtime}\b(?!-)", runtime)
         script = (SCRIPTS / "run-row").read_text()
@@ -796,32 +810,98 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
         self.assertIn("compat stage-upstream", script)
         self.assertNotIn("cargo build", script)
 
-    def test_rows_upload_their_junit_report_whatever_the_result(self):
+    def step(self, block: str, name: str) -> str:
+        start = block.index(f"      - name: {name}\n")
+        end = block.find("\n      - ", start)
+        return block[start:] if end < 0 else block[start : end + 1]
+
+    def test_rows_upload_their_reports_and_results_whatever_the_result(self):
         rows = self.evidence_jobs["rows"]
-        start = rows.index("      - name: Upload the row test report\n")
-        self.assertLess(rows.index("      - name: Run the row and write its attestation\n"), start)
-        end = rows.find("\n      - ", start)
-        upload = rows[start:] if end < 0 else rows[start : end + 1]
-        self.assertIn("        if: always()\n", upload)
-        self.assertIn("uses: actions/upload-artifact@", upload)
-        self.assertIn("          name: matrix-junit-${{ matrix.runtime }}-${{ matrix.target }}\n", upload)
-        self.assertIn("          OUT_DIR: ${{ runner.temp }}/row\n", rows)
-        self.assertIn(
-            "          path: ${{ runner.temp }}/row/junit-${{ matrix.runtime }}-${{ matrix.target }}.xml\n",
-            upload,
-        )
+        run_step = rows.index("      - name: Run the rows and write their attestations\n")
+        self.assertIn("          OUT_DIR: ${{ runner.temp }}/rows\n", rows)
+        for name, artifact, path in (
+            ("Upload the row test reports", "matrix-junit-${{ matrix.os }}", "junit-*.xml"),
+            ("Upload the row results", "row-results-${{ matrix.os }}", "row-results.jsonl"),
+        ):
+            with self.subTest(step=name):
+                upload = self.step(rows, name)
+                self.assertLess(run_step, rows.index(upload))
+                self.assertIn("        if: ${{ always() && matrix.rows != '' }}\n", upload)
+                self.assertIn("uses: actions/upload-artifact@", upload)
+                self.assertIn(f"          name: {artifact}\n", upload)
+                self.assertIn(f"          path: ${{{{ runner.temp }}}}/rows/{path}\n", upload)
         self.assertIn("junit=$OUT_DIR/junit-$RUNTIME-$TARGET.xml", (SCRIPTS / "run-row").read_text())
-        # The report is no release input: no download pattern may pick it up.
+        # Reports and results are no release input: no release download
+        # pattern may pick them up.
         for pattern in re.findall(r"(?m)^\s+pattern: (\S+)$", self.release + self.build + self.evidence + self.ci):
             with self.subTest(pattern=pattern):
-                self.assertFalse(fnmatch.fnmatchcase("matrix-junit-runtime-target", pattern))
+                self.assertFalse(fnmatch.fnmatchcase("matrix-junit-linux", pattern))
+                if pattern != "row-results-*":
+                    self.assertFalse(fnmatch.fnmatchcase("row-results-linux", pattern))
+
+    def test_rows_upload_only_passing_attestations_under_the_attestation_pattern(self):
+        rows = self.evidence_jobs["rows"]
+        upload = self.step(rows, "Upload the attestations")
+        self.assertIn("        if: ${{ matrix.rows != '' }}\n", upload)
+        self.assertIn("          name: attestation-${{ matrix.os }}\n", upload)
+        self.assertIn("          path: ${{ runner.temp }}/rows/attestation-*.json\n", upload)
+        self.assertIn("          if-no-files-found: error\n", upload)
+        for os_name in ("linux", "macos"):
+            self.assertTrue(fnmatch.fnmatchcase(f"attestation-{os_name}", "attestation-*"))
+        self.assertIn('(out_dir / f"attestation-{runtime}-{target}.json").unlink(missing_ok=True)', (SCRIPTS / "run-rows").read_text())
+
+    def test_every_upload_of_the_row_job_survives_a_rerun_of_the_job(self):
+        # "Re-run failed jobs" uploads again under the same names.
+        rows = self.evidence_jobs["rows"]
+        uploads = rows.count("uses: actions/upload-artifact@")
+        self.assertEqual(uploads, 4)
+        self.assertEqual(rows.count("          overwrite: true\n"), uploads)
+
+    def test_the_consumer_is_uploaded_before_any_upstream_runs(self):
+        rows = self.evidence_jobs["rows"]
+        upload = rows.index("      - name: Upload the consumer executable\n")
+        self.assertLess(rows.index("      - name: Build the consumer executable\n"), upload)
+        for later in (
+            "      - name: Download the daemon archives of the runner\n",
+            "      - name: Install Node\n",
+            "      - name: Run the rows and write their attestations\n",
+        ):
+            with self.subTest(step=later):
+                self.assertLess(upload, rows.index(later))
+        self.assertIn("          name: release-consumer-${{ runner.os }}\n", self.step(rows, "Upload the consumer executable"))
+        self.assertNotIn("matrix.rows", self.step(rows, "Upload the consumer executable"))
+
+    def test_the_row_guards_name_their_scopes_like_the_test_support_crate(self):
+        script = (SCRIPTS / "run-rows").read_text()
+        env = (ROOT / "crates" / "test-support" / "src" / "env.rs").read_text()
+        lib = (ROOT / "crates" / "test-support" / "src" / "lib.rs").read_text()
+        prefix = re.search(r'const ROOT_PREFIX: &str = "([^"]+)";', env).group(1)
+        base = re.search(r'const MACOS_TEMP_ROOT: &str = "([^"]+)";', lib).group(1)
+        self.assertIn(f'TEST_ROOT_PREFIX = "{prefix}"', script)
+        self.assertIn(f'MACOS_TEMP_ROOT = "{base}"', script)
+        # The row root is the base of the consumer's TestEnv roots. The
+        # deepest socket below it, raw or resolved (/tmp is /private/tmp on
+        # macOS), must fit the budget test-support checks with bytes to spare.
+        template = re.search(r'ROW_ROOT_TEMPLATE = "([^"]+)"', script).group(1)
+        random_bytes = int(re.search(r"const ROOT_RANDOM_BYTES: usize = (\d+);", env).group(1))
+        suffix = re.search(r'const NESTED_SOCKET_SUFFIX: &str =\s*"([^"]+)";', env).group(1)
+        capacity = int(re.search(r"pub const STRICTEST_SOCKET_PATH_CAPACITY: usize = (\d+);", env).group(1))
+        for base in (template, "/private" + template):
+            with self.subTest(base=base):
+                deepest = len(base) + 1 + len(prefix) + random_bytes + len(suffix)
+                self.assertLessEqual(deepest + 1, capacity - 3)
+        self.assertIn('POHUNEK_TEST_TEMP_ROOT="$work"', (SCRIPTS / "run-row").read_text())
+        # C2: the keychain is read without -d, which would print secret data.
+        self.assertIn('["security", "dump-keychain", login.strip().strip(\'"\')]', script)
+        self.assertEqual(script.count('"dump-keychain"'), 1)
+        self.assertNotRegex(script, r'"dump-keychain"[^\]]*"-d"')
 
     def test_rows_and_smoke_run_on_the_node_the_locks_require(self):
-        for name in ("rows", "smoke"):
+        for name, script in (("rows", "run-rows"), ("smoke", "run-smoke")):
             block = self.evidence_jobs[name]
             with self.subTest(job=name):
                 self.assertIn("node-version: ${{ needs.plan.outputs.node }}", block)
-                self.assertLess(block.index("actions/setup-node@"), block.index("      - name: Build xtask"))
+                self.assertLess(block.index("actions/setup-node@"), block.index(f"scripts/release-workflow/{script}"))
         self.assertIn("scripts/release-workflow/node-version compat/matrix.json", self.evidence_jobs["plan"])
 
     def test_the_smoke_probes_isolation_before_running(self):

@@ -203,7 +203,7 @@ MACOS_CALLED_JOBS = {
     },
     "release-rehearsal": {
         "workflow": "release-evidence.yml",
-        "jobs": {"consumer", "rows"},
+        "jobs": {"rows"},
         "filter": "release_rehearsal",
     },
 }
