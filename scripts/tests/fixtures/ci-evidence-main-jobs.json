@@ -1,6 +1,16 @@
 {
   "jobs": [
     {
+      "name": "test selection",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "test selection verdict",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
       "name": "build tests (nextest archive)",
       "status": "completed",
       "conclusion": "success"

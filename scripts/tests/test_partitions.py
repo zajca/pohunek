@@ -82,6 +82,10 @@ recognizes which shard a selection denotes, judged from the markers the
 script's composition leaves in the expression itself, so a future edit that
 breaks the composition makes the fake report the wrong shard and the check
 fail loudly instead of passing on a shape the fixture agrees with anyway.
+
+A test selection's filterset ($PARTITIONS_FILTERSET) narrows a shard as
+`(shard) and (filterset)`; on its own it lists the whole selection. Either
+way only the fixture tests marked `selected` match.
 """
 
 import json
@@ -245,12 +249,22 @@ def main():
         print(json.dumps({"rust-suites": suites}))
         return
     fast = os.environ["PARTITIONS_FAST"]
-    selected = None if "-E" not in argv else shard_of(argv[argv.index("-E") + 1], fast)
+    filterset = os.environ.get("PARTITIONS_FILTERSET")
+    narrowed = False
+    if expression is not None and filterset:
+        suffix = f") and ({filterset})"
+        if expression == filterset:
+            expression, narrowed = None, True
+        elif expression.startswith("(") and expression.endswith(suffix):
+            expression, narrowed = expression[1:-len(suffix)], True
+    selected = None if expression is None else shard_of(expression, fast)
     suites = {}
     for entry in fixture["binaries"]:
         cases = {}
         for name, test in entry["tests"].items():
-            if selected is None:
+            if narrowed and not test.get("selected", False):
+                status = "mismatch"
+            elif selected is None:
                 status = "matches" if test.get("listed", True) else "mismatch"
             elif selected in test["matches"]:
                 status = "matches"
@@ -354,6 +368,7 @@ class ScriptScenario(unittest.TestCase):
             "PARTITIONS_FAKE_RUN_STATUS",
             "PARTITIONS_HOLD_RUN",
             "PARTITIONS_LOCKED_TREE",
+            "PARTITIONS_FILTERSET",
         ):
             environment.pop(name, None)
         environment.update(extra_env or {})
@@ -611,6 +626,162 @@ def gone_or_zombie(pid):
 
 
 @unittest.skipUnless(sys.platform == "linux", "reads /proc and uses process groups")
+class PlanActionTests(ScriptScenario):
+    """`plan` turns a selection into the CI test jobs to start, without nextest."""
+
+    def plan(self, selection):
+        path = self.root / "selection.json"
+        path.write_text(json.dumps({"schema_version": 1, **selection}))
+        result = self.run_script("plan", "--selection", str(path))
+        self.assertEqual(self.nextest_calls(), [])
+        return result
+
+    def assert_plan(self, selection, fast_shards, heavy, relay_db):
+        result = self.plan(selection)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            f"fast_shards={json.dumps(fast_shards)}\nheavy={str(heavy).lower()}\n"
+            f"relay_db={str(relay_db).lower()}\n",
+        )
+
+    def packages(self, *names, script_tests=False):
+        return {
+            "mode": "packages", "script_tests": script_tests,
+            "filterset": " | ".join(f"package(={name})" for name in names),
+            "packages": [{"name": name, "tests": "all"} for name in names],
+        }
+
+    def test_a_full_selection_runs_every_job(self):
+        self.assert_plan({"mode": "full", "script_tests": True},
+                         ["core", "daemon", "relay", "cli"], True, True)
+
+    def test_each_selected_package_starts_the_shard_that_owns_it(self):
+        self.assert_plan(self.packages("pohunek-session-worker", "pohunek-cli"),
+                         ["daemon", "cli"], True, False)
+        self.assert_plan(self.packages("pohunek-protocol"), ["core"], True, False)
+
+    def test_relay_packages_start_only_the_relay_jobs(self):
+        self.assert_plan(self.packages("pohunek-relay-client"), ["relay"], False, True)
+
+    def test_the_script_regressions_start_core_without_a_rust_test(self):
+        self.assert_plan({"mode": "none", "script_tests": True, "packages": []},
+                         ["core"], False, False)
+        self.assert_plan(self.packages("pohunek-cli", script_tests=True),
+                         ["core", "cli"], True, False)
+
+    def test_a_selection_of_nothing_starts_no_test_job(self):
+        self.assert_plan({"mode": "none", "script_tests": False, "packages": []},
+                         [], False, False)
+
+    def test_a_selection_the_plan_cannot_trust_fails(self):
+        for selection in (
+            {"schema_version": 2, "mode": "full"},
+            {"mode": "subset"},
+            {"mode": "packages", "packages": []},
+            {"mode": "packages", "filterset": "", "packages": [{"name": "pohunek-cli"}]},
+            {"mode": "none", "packages": [{"name": "pohunek-cli"}]},
+        ):
+            with self.subTest(selection=selection):
+                result = self.plan(selection)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+    def test_selection_is_refused_outside_plan_run_and_check(self):
+        result = self.run_script("filter", "core", "--selection", "selection.json")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--selection applies to plan, run and check only", result.stderr)
+
+
+class SelectionActionTests(ScriptScenario):
+    """`run` and `check` with `--selection` narrow the shards to a selection."""
+
+    FILTERSET = "package(=pohunek-daemon) | (package(=pohunek-knowledge) and (binary(=bundle)))"
+
+    def write_selection(self, mode, names=(), filterset=FILTERSET):
+        path = self.root / "selection.json"
+        path.write_text(json.dumps({
+            "schema_version": 1, "mode": mode, "script_tests": False,
+            "filterset": filterset if mode == "packages" else None,
+            "packages": [{"name": name, "tests": "all"} for name in names],
+        }))
+        return str(path)
+
+    def run_calls(self):
+        return [call["argv"] for call in self.nextest_calls() if call["argv"][1] == "run"]
+
+    def selected_inventory(self, selected):
+        """The fixture inventory with the tests of `selected` marked selected."""
+        binaries = nextest_inventory()
+        for entry in binaries:
+            for name, test in entry["tests"].items():
+                test["selected"] = (entry["id"], name) in selected
+        return binaries
+
+    def test_a_shard_runs_only_the_selected_tests_and_passes_when_it_has_none(self):
+        selection = self.write_selection("packages", ["pohunek-daemon", "pohunek-knowledge"])
+        result = self.run_script("run", "heavy", "--selection", selection)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [argv] = self.run_calls()
+        heavy = shard_expressions(self.config_fast_filter())["heavy"]
+        self.assertEqual(argv[argv.index("-E") + 1], f"({heavy}) and ({self.FILTERSET})")
+        self.assertEqual(argv[argv.index("--no-tests") + 1], "pass")
+        self.assertEqual(argv[argv.index("--profile") + 1], "heavy")
+
+    def test_a_full_selection_runs_the_whole_shard(self):
+        result = self.run_script("run", "core", "--selection", self.write_selection("full"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [argv] = self.run_calls()
+        core = shard_expressions(self.config_fast_filter())["core"]
+        self.assertEqual(argv[argv.index("-E") + 1], core)
+        self.assertNotIn("--no-tests", argv)
+
+    def test_a_selection_of_no_rust_test_runs_nothing(self):
+        result = self.run_script("run", "core", "--selection", self.write_selection("none"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.nextest_calls(), [])
+        self.assertIn("the selection runs no Rust test of core", result.stdout)
+
+    def test_check_accepts_a_plan_whose_shards_hold_every_selected_test(self):
+        self.set_inventory(self.selected_inventory({
+            ("pohunek-daemon-111111", "store::migrate"),
+            ("pohunek-daemon-111111", "reconcile::worker_leak"),
+            ("pohunek-knowledge-444444", "bundle::materialize"),
+        }))
+        selection = self.write_selection("packages", ["pohunek-daemon", "pohunek-knowledge"])
+        result = self.run_script(
+            "check", "--selection", selection,
+            extra_env={"PARTITIONS_FILTERSET": self.FILTERSET},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("daemon: 1 tests", result.stdout)
+        self.assertIn("relay: 0 tests", result.stdout)
+        self.assertIn("Coverage OK: 3 tests selected exactly once", result.stdout)
+
+    def test_check_fails_a_selected_test_in_a_shard_the_plan_does_not_start(self):
+        # A pohunek-relay selection starts relay and relay-db, never heavy.
+        self.set_inventory(self.selected_inventory({
+            ("pohunek-relay-222222", "acl::owner_allow"),
+            ("pohunek-knowledge-444444", "source_map::drift"),
+        }))
+        selection = self.write_selection("packages", ["pohunek-relay"])
+        result = self.run_script(
+            "check", "--selection", selection,
+            extra_env={"PARTITIONS_FILTERSET": self.FILTERSET},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the plan does not start the shards ['heavy']", result.stderr)
+
+    def test_a_selection_without_its_filterset_is_refused(self):
+        selection = self.write_selection("packages", ["pohunek-daemon"], filterset="")
+        for action in (("run", "core"), ("check",)):
+            with self.subTest(action=action):
+                result = self.run_script(*action, "--selection", selection)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("a packages selection has no filterset", result.stderr)
+        self.assertEqual(self.nextest_calls(), [])
+
+
 class WorkerRunActionTests(ScriptScenario):
     """The real run command owns a private base and reaps leaked workers."""
 

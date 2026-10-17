@@ -169,6 +169,41 @@ CI acceptance (#1224). Manual
 dispatch requires the `main` or `nightly` choice; nightly adds the nightly-only
 checks to main. Schedule and manual runs do not cancel PR or main runs.
 
+On pull requests the Linux test jobs run only the tests the change can
+affect (#1218). The `test selection` job builds `xtask` at the merge base and
+runs its `cargo xtask affected ci` against the head
+(`scripts/ci-test-selection`), so a change to the selector, its rules, or the
+lockfile judges only the pull requests after it lands, and a path the base
+rules do not know selects every test. `scripts/test-partitions plan
+--selection` turns the selection into the fast shards to start and whether
+the heavy and relay DB jobs run. The archive stays the whole workspace; each
+job runs its shard narrowed to the selection (`run <shard> --selection`, which
+is `-E '(<shard>) and (<filterset>)'`), and the `test selection check` job
+proves with `check --selection` that the planned shards hold every selected
+test.
+
+A selection narrows the run only when it is `narrowed`: the run is a pull
+request, its selection is `packages` or `none`, and the test pipeline equals
+its merge-base copy. The pipeline is `.github/`, `.config/nextest.toml` and
+all of `scripts/`, so the head scripts that narrow a run, and every module
+next to them, are the merge base's; `PYTHONSAFEPATH=1` keeps a script from
+importing a file from its own directory either way. A step of `ci.yml`
+decides it, never a script's output. Every test runs on push, schedule, and
+dispatch runs, and on a pull request that changes the pipeline, `.cargo/`,
+`rust-toolchain*`, the root `Cargo.toml` outside `[workspace.dependencies]`,
+or an unmapped path, or whose selector fails, times out, or writes another
+schema. A pull request that rewrites `ci.yml` can remove any check, as in any
+design; it changes the pipeline, so it runs every test, and the review of
+workflow changes protects it. A test job narrows or skips only on a narrowed
+selection, and the `test selection verdict` job fails a run whose test job or
+selection check failed, was cancelled, or was skipped without one. The script
+regressions run in the core shard unless a narrowed selection needs none.
+
+G2, running the tests from a sparse checkout that holds only the files whose
+change selects a selected package (`cargo xtask affected sparse`), is wired
+behind the `TEST_SELECTION_SPARSE` switch of `ci.yml` and is off until a G3
+seeding run shows every package's tests green from its own sparse tree.
+
 Before the final head of a pull request merges, dispatch `ci.yml` once with
 `tier=main` on the branch (`gh workflow run ci.yml --ref <branch> -f tier=main`)
 only when the diff touches a release workflow or release xtask code, the runtime

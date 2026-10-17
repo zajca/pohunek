@@ -1850,5 +1850,501 @@ class RuntimePackageVersionBumpTests(unittest.TestCase):
         self.assertIn("no published release at or below the workspace version", completed.stdout)
 
 
+TEST_SELECTOR = "test-selection"
+TEST_CHECK = "test-selection-check"
+TEST_VERDICT = "test-selection-verdict"
+# Each narrowed test job, the plan output that skips it, and that output's
+# value in a plan that skips it.
+NARROWED_TEST_JOBS = {
+    "fast-tests": ("fast_shards", "[]"),
+    "integration": ("heavy", "false"),
+    "integration-relay": ("relay_db", "false"),
+}
+EVERY_FAST_SHARD = ["core", "daemon", "relay", "cli"]
+# The condition under which a job may read the selection and narrow on it.
+NARROWED = (
+    "github.event_name == 'pull_request' && needs.test-selection.result == 'success' "
+    "&& needs.test-selection.outputs.narrowed == 'true'"
+)
+# A plan output set by a narrowed selection.
+NARROWED_PLAN = {"narrowed": "true", "mode": "packages"}
+
+
+def evaluate_needs_expression(
+    expression: str,
+    *,
+    event: str,
+    cancelled: bool = False,
+    tier: str = "",
+    changes: dict[str, str] | None = None,
+    results: dict[str, str] | None = None,
+    outputs: dict[str, dict[str, str]] | None = None,
+    env: dict[str, str] | None = None,
+    matrix: dict[str, str] | None = None,
+):
+    """Evaluate an expression over `needs.<job>.result` and `.outputs.<name>`.
+
+    Understands `!cancelled()`, `always()`, `fromJSON`, `github.event_name`,
+    `inputs.tier`, `env.<NAME>`, `matrix.<name>`, `needs.<job>.result` and
+    `needs.<job>.outputs.<name>`, string and integer literals, `==`, `!=`, `!`,
+    `&&`, `||` and parentheses; anything else fails the translation. `&&` and
+    `||` return an operand, as in GitHub Actions, so a value expression
+    evaluates to its value. A missing result or output reads as the empty
+    string, and strings compare ignoring case.
+    """
+    python = expression.replace("!cancelled()", "(not cancelled)")
+    python = python.replace("always()", "(True)")
+    python = python.replace("fromJSON(", "fromjson(")
+    python = python.replace("github.event_name", "event")
+    python = python.replace("inputs.tier", "tier")
+    python = re.sub(r"\benv\.([A-Z_]+)", r"envs.get('\1', '')", python)
+    python = re.sub(r"\bmatrix\.([a-z_]+)", r"matrix.get('\1', '')", python)
+    python = re.sub(r"needs\.changes\.outputs\.([a-z_]+)", r"changes.get('\1', '')", python)
+    python = re.sub(
+        r"needs\.([a-z][a-z0-9-]*)\.outputs\.([a-z_]+)",
+        r"outputs.get('\1', {}).get('\2', '')",
+        python,
+    )
+    python = re.sub(r"needs\.([a-z][a-z0-9-]*)\.result", r"results.get('\1', '')", python)
+    python = python.replace("&&", " and ").replace("||", " or ")
+    python = re.sub(r"!(?!=)", " not ", python)
+    python = re.sub(r"'[^']*'", lambda literal: literal.group(0).lower(), python)
+    leftover = re.sub(
+        r"'[^']*'|\b(?:not|and|or|True|event|tier|cancelled|fromjson|changes\.get|"
+        r"results\.get|outputs\.get|envs\.get|matrix\.get|get|\d+)\b|==|!=|[(){}.,\s]",
+        "",
+        python,
+    )
+    if leftover:
+        raise AssertionError(f"untranslated expression syntax {leftover!r} in {expression!r}")
+    return eval(python, {"__builtins__": {}}, {
+        "event": event.lower(),
+        "cancelled": cancelled,
+        "tier": tier.lower(),
+        "fromjson": json.loads,
+        # Literals are lowered with the rest of the expression, keys included.
+        "envs": {name.lower(): value.lower() for name, value in (env or {}).items()},
+        "matrix": {name.lower(): value.lower() for name, value in (matrix or {}).items()},
+        "changes": {name: value.lower() for name, value in (changes or {}).items()},
+        "results": {name: value.lower() for name, value in (results or {}).items()},
+        "outputs": {
+            job: {name: value.lower() for name, value in values.items()}
+            for job, values in (outputs or {}).items()
+        },
+    })
+
+
+def job_condition(job: str) -> str:
+    match = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", workflow_jobs()[job])
+    if match is None:
+        raise AssertionError(f"{job} has no condition")
+    return match.group(1)
+
+
+def step_condition(step: str) -> str:
+    match = re.search(r"(?m)^        if: (?:\$\{\{ (.+) \}\}|(.+))$", step)
+    if match is None:
+        raise AssertionError(f"step has no condition: {step!r}")
+    return match.group(1) or match.group(2)
+
+
+def step_env_expression(step: str, name: str) -> str:
+    """The `${{ }}` expression a step sets environment variable `name` to."""
+    match = re.search(rf"(?m)^          {name}: \$\{{\{{ (.+) \}}\}}$", step)
+    if match is None:
+        raise AssertionError(f"step has no {name} expression: {step!r}")
+    return match.group(1)
+
+
+def ci_rules_paths() -> list[str]:
+    """The paths of `CI_RULES` in `cargo xtask affected`."""
+    source = (ROOT / "crates" / "xtask" / "src" / "affected" / "mod.rs").read_text()
+    rules = source.split("pub(crate) const CI_RULES", 1)[1].split("];", 1)[0]
+    return re.findall(r'Pattern::(?:Dir|File)\("([^"]+)"\)', rules)
+
+
+class TestSelectionWiringTests(unittest.TestCase):
+    """The Linux test jobs narrow only on a narrowed selection of a pull request."""
+
+    def runs(self, job, *, event="pull_request", cancelled=False, build="success",
+             selection="success", plan=None, relay_changed=True):
+        return bool(evaluate_needs_expression(
+            job_condition(job), event=event, cancelled=cancelled,
+            changes={"relay": "true" if relay_changed else "false"},
+            results={"build-tests": build, TEST_SELECTOR: selection},
+            outputs={TEST_SELECTOR: plan or {}},
+        ))
+
+    def test_the_selection_runs_on_every_event_with_the_merge_base_selector(self):
+        job = workflow_jobs()[TEST_SELECTOR]
+        self.assertNotRegex(job, r"(?m)^    if:")
+        self.assertNotRegex(job, r"(?m)^    needs:")
+        depth = re.search(r"(?m)^          fetch-depth: \$\{\{ (.+) \}\}$", job)
+        self.assertIsNotNone(depth, job)
+        assert depth is not None
+        # History for a pull request's merge base; one commit otherwise.
+        for event, expected in (("pull_request", 0), ("push", 1), ("schedule", 1),
+                                ("workflow_dispatch", 1)):
+            with self.subTest(event=event):
+                self.assertEqual(evaluate_needs_expression(depth.group(1), event=event), expected)
+        steps = job_steps(job)
+        select = steps["Select the tests"]
+        self.assertIn("          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n", select)
+        script = step_script(select)
+        self.assertIn('scripts/ci-test-selection --base "$BASE_SHA" --out "$out"', script)
+        self.assertIn('scripts/ci-test-selection --full "a $EVENT run runs every test" --out "$out"', script)
+        self.assertIn('cat "$out/outputs.env" >> "$GITHUB_OUTPUT"', script)
+        self.assertIn(
+            'python3 scripts/test-partitions plan --selection "$RUNNER_TEMP/test-selection/selection.json"',
+            step_script(steps["Plan the test jobs"]),
+        )
+        names = list(steps)
+        self.assertLess(names.index("Select the tests"),
+                        names.index("Decide whether the selection narrows the run"))
+        for name, step in steps.items():
+            if "        run: |\n" in step:
+                with self.subTest(step=name):
+                    self.assertNotIn("${{", step_script(step))
+                    self.assertIn("set -euo pipefail", step_script(step))
+        outputs = block(job, "outputs", indent=4)
+        for name in ("mode", "docs_only", "script_tests", "sdk_gates"):
+            self.assertIn(f"      {name}: ${{{{ steps.select.outputs.{name} }}}}\n", outputs)
+        for name in ("fast_shards", "heavy", "relay_db"):
+            self.assertIn(f"      {name}: ${{{{ steps.plan.outputs.{name} }}}}\n", outputs)
+        # Only the ci.yml step writes `narrowed`; no head script sets it.
+        self.assertIn("      narrowed: ${{ steps.narrow.outputs.narrowed }}\n", outputs)
+
+    def narrow(self, *, event="pull_request", mode="packages", change=None, base=None):
+        """Run the narrowing step in a repository whose head adds `change`."""
+        script = step_script(
+            job_steps(workflow_jobs()[TEST_SELECTOR])["Decide whether the selection narrows the run"]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            env = {
+                **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
+                "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
+            }
+
+            def git(*args):
+                return subprocess.run(["git", *args], cwd=repo, env=env, check=True,
+                                      capture_output=True, text=True).stdout.strip()
+
+            git("init", "--quiet", "--initial-branch=main")
+            for path in ("crates/daemon/src/lib.rs", "scripts/test-partitions", ".github/workflows/ci.yml",
+                         ".config/nextest.toml"):
+                (repo / path).parent.mkdir(parents=True, exist_ok=True)
+                (repo / path).write_text("base\n")
+            git("add", "-A")
+            git("commit", "--quiet", "-m", "base")
+            base_sha = git("rev-parse", "HEAD")
+            for path in [change or "crates/daemon/src/lib.rs"]:
+                (repo / path).parent.mkdir(parents=True, exist_ok=True)
+                (repo / path).write_text("head\n")
+            git("add", "-A")
+            git("commit", "--quiet", "-m", "head")
+            output = Path(directory) / "output"
+            summary = Path(directory) / "summary"
+            completed = subprocess.run(
+                ["bash", "-c", script], cwd=repo, capture_output=True, text=True,
+                env={**env, "EVENT": event, "BASE_SHA": base or base_sha, "MODE": mode,
+                     "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary)},
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return output.read_text(), summary.read_text()
+
+    def test_a_selection_narrows_only_when_the_test_pipeline_equals_the_merge_base(self):
+        self.assertEqual(self.narrow()[0], "narrowed=true\n")
+        self.assertEqual(self.narrow(mode="none")[0], "narrowed=true\n")
+        for kwargs, reason in (
+            ({"event": "push"}, "a push run runs every test"),
+            ({"mode": "full"}, "the selection is full"),
+            ({"mode": ""}, "the selection is "),
+            ({"change": "scripts/test-partitions"}, "changes the test pipeline: scripts/test-partitions"),
+            ({"change": ".github/workflows/ci.yml"}, "changes the test pipeline: .github/workflows/ci.yml"),
+            ({"change": ".config/nextest.toml"}, "changes the test pipeline: .config/nextest.toml"),
+            ({"change": "scripts/ci-test-selection"}, "changes the test pipeline: scripts/ci-test-selection"),
+            ({"change": "scripts/json.py"}, "changes the test pipeline: scripts/json.py"),
+            ({"base": "0" * 40}, "has no merge base"),
+        ):
+            with self.subTest(**kwargs):
+                output, summary = self.narrow(**kwargs)
+                self.assertEqual(output, "narrowed=false\n")
+                self.assertIn(reason, summary)
+
+    def test_the_test_pipeline_holds_every_script_the_test_jobs_run(self):
+        script = step_script(
+            job_steps(workflow_jobs()[TEST_SELECTOR])["Decide whether the selection narrows the run"]
+        )
+        listed = re.search(r"pipeline=\(\n(.*?)\n\)", script, re.S)
+        self.assertIsNotNone(listed, script)
+        assert listed is not None
+        pipeline = set(listed.group(1).split())
+        # A module next to a script shadows the one it imports, so the whole
+        # directory is the pipeline, and no script imports from its own one.
+        self.assertIn("scripts", pipeline)
+        self.assertEqual(workflow_env("PYTHONSAFEPATH"), '"1"')
+
+        def covered(path):
+            return any(path == entry or path.startswith(f"{entry}/") for entry in pipeline)
+
+        for path in (".github", ".config/nextest.toml", *ci_rules_paths()):
+            with self.subTest(rule=path):
+                self.assertTrue(covered(path), path)
+        jobs = workflow_jobs()
+        for job in (TEST_SELECTOR, TEST_CHECK, TEST_VERDICT, *NARROWED_TEST_JOBS):
+            for name, step in job_steps(jobs[job]).items():
+                text = step_script(step) if "        run: |\n" in step else step
+                for used in re.findall(r"\bscripts/([a-z0-9-]+)\b", text):
+                    if used == "tests":
+                        continue
+                    with self.subTest(job=job, step=name, script=used):
+                        self.assertTrue(covered(f"scripts/{used}"), used)
+        # Every file scripts/test-partitions reads from the tree.
+        partitions = (ROOT / "scripts" / "test-partitions").read_text()
+        for read in re.findall(r'ROOT / "([^"]+)"', partitions):
+            if read != "target":
+                with self.subTest(read=read):
+                    self.assertTrue(covered(read), read)
+
+    def test_test_jobs_run_unless_a_narrowed_selection_excludes_them(self):
+        for job, (output, skip) in NARROWED_TEST_JOBS.items():
+            excluded = {output: skip, **NARROWED_PLAN}
+            scenarios = (
+                # (event, cancelled, build, selection, plan, runs)
+                ("push", False, "success", "success", {output: "true"}, True),
+                ("schedule", False, "success", "success", {}, True),
+                ("push", False, "success", "failure", {}, True),
+                ("pull_request", False, "success", "success", {output: "true", **NARROWED_PLAN}, True),
+                # Only a pull request's narrowed selection narrows: a push or
+                # a scheduled run with the same outputs runs the job.
+                ("push", False, "success", "success", excluded, True),
+                ("schedule", False, "success", "success", excluded, True),
+                # A selection that is not narrowed runs the job, whatever it plans.
+                ("pull_request", False, "success", "success", {output: skip}, True),
+                ("pull_request", False, "success", "success", {output: skip, "narrowed": "false"}, True),
+                # Only a successful selection narrows, whatever outputs a
+                # failed or cancelled one set.
+                ("pull_request", False, "success", "failure", excluded, True),
+                ("pull_request", False, "success", "cancelled", excluded, True),
+                ("pull_request", False, "success", "skipped", {}, True),
+                # A narrowed selection without the output runs the job.
+                ("pull_request", False, "success", "success", NARROWED_PLAN, True),
+                ("pull_request", False, "success", "success", excluded, False),
+                # A failed or skipped build never starts a test job.
+                ("pull_request", False, "failure", "failure", {}, False),
+                ("push", False, "skipped", "success", {}, False),
+                ("pull_request", True, "success", "success", {output: "true"}, False),
+            )
+            for event, cancelled, build, selection, plan, runs in scenarios:
+                if job == "integration-relay" and event == "schedule":
+                    continue
+                with self.subTest(job=job, event=event, cancelled=cancelled, build=build,
+                                  selection=selection, plan=plan):
+                    self.assertEqual(
+                        self.runs(job, event=event, cancelled=cancelled, build=build,
+                                  selection=selection, plan=plan),
+                        runs,
+                    )
+        # The relay DB job keeps its paths filter: a selection only narrows it.
+        self.assertFalse(self.runs("integration-relay", relay_changed=False,
+                                   plan={"relay_db": "true", **NARROWED_PLAN}))
+        self.assertTrue(self.runs("integration-relay", event="schedule", relay_changed=False,
+                                  plan={"relay_db": "false", **NARROWED_PLAN}))
+
+    def test_the_fast_shards_are_the_planned_ones_or_every_shard(self):
+        matrix = block(workflow_jobs()["fast-tests"], "matrix", indent=6)
+        expression = re.search(r"(?m)^        shard: \$\{\{ (.+) \}\}$", matrix)
+        self.assertIsNotNone(expression, matrix)
+        assert expression is not None
+
+        def shards(selection, plan, event="pull_request"):
+            return evaluate_needs_expression(
+                expression.group(1), event=event,
+                results={TEST_SELECTOR: selection}, outputs={TEST_SELECTOR: plan},
+            )
+
+        self.assertEqual(shards("success", {"fast_shards": '["cli"]', **NARROWED_PLAN}), ["cli"])
+        self.assertEqual(shards("success", {"fast_shards": '["core", "daemon"]', **NARROWED_PLAN}),
+                         ["core", "daemon"])
+        for selection, plan, event in (
+            ("failure", {"fast_shards": '["cli"]', **NARROWED_PLAN}, "pull_request"),
+            ("skipped", {}, "pull_request"),
+            ("success", {}, "pull_request"),
+            ("success", {"fast_shards": "", **NARROWED_PLAN}, "pull_request"),
+            ("success", {"fast_shards": '["cli"]'}, "pull_request"),
+            ("success", {"fast_shards": '["cli"]', "narrowed": "false"}, "pull_request"),
+            ("success", {"fast_shards": '["cli"]', **NARROWED_PLAN}, "push"),
+        ):
+            with self.subTest(selection=selection, plan=plan, event=event):
+                self.assertEqual(shards(selection, plan, event), EVERY_FAST_SHARD)
+        self.assertEqual(
+            partitions_module().FAST_SHARDS, tuple(EVERY_FAST_SHARD),
+            "the fallback must list every fast shard",
+        )
+
+    def test_the_selection_check_runs_on_every_narrowed_selection(self):
+        job = workflow_jobs()[TEST_CHECK]
+        self.assertRegex(job, r"(?m)^    needs: \[build-tests, test-selection\]$")
+        self.assertIn(
+            'check --selection "$RUNNER_TEMP/test-selection/selection.json"',
+            job_steps(job)["Verify the planned shards hold every selected test"],
+        )
+        for event, build, selection, plan, runs in (
+            ("pull_request", "success", "success", NARROWED_PLAN, True),
+            # Whatever test jobs the selection starts.
+            ("pull_request", "success", "success",
+             {"fast_shards": "[]", "heavy": "false", "relay_db": "false", **NARROWED_PLAN}, True),
+            ("pull_request", "success", "success", {"narrowed": "false"}, False),
+            ("pull_request", "success", "failure", NARROWED_PLAN, False),
+            ("push", "success", "success", NARROWED_PLAN, False),
+            ("pull_request", "failure", "success", NARROWED_PLAN, False),
+        ):
+            with self.subTest(event=event, build=build, selection=selection, plan=plan):
+                self.assertEqual(self.runs(TEST_CHECK, event=event, build=build,
+                                           selection=selection, plan=plan), runs)
+
+    def test_the_verdict_fails_a_test_job_skipped_without_a_narrowed_selection(self):
+        job = workflow_jobs()[TEST_VERDICT]
+        self.assertEqual(job_condition(TEST_VERDICT), "always()")
+        self.assertRegex(
+            job,
+            r"(?m)^    needs: \[test-selection, build-tests, test-selection-check, fast-tests, "
+            r"integration, integration-relay\]$",
+        )
+        [step] = job_steps(job).values()
+        condition = step_condition(step)
+
+        def fails(results, plan=None, selection="success", event="pull_request", narrowed=True):
+            every = {"build-tests": "success", "fast-tests": "success", "integration": "success",
+                     "integration-relay": "success", TEST_SELECTOR: selection,
+                     TEST_CHECK: "success" if narrowed else "skipped"}
+            outputs = {**(NARROWED_PLAN if narrowed else {}), **(plan or {})}
+            return bool(evaluate_needs_expression(
+                condition, event=event, results={**every, **results},
+                outputs={TEST_SELECTOR: outputs},
+            ))
+
+        self.assertFalse(fails({}))
+        self.assertFalse(fails({}, narrowed=False))
+        self.assertFalse(fails({}, event="push", narrowed=False))
+        self.assertFalse(fails({"integration-relay": "skipped"}))
+        self.assertFalse(fails({"fast-tests": "skipped"}, {"fast_shards": "[]"}))
+        self.assertFalse(fails({"integration": "skipped"}, {"heavy": "false"}))
+        self.assertFalse(fails({"fast-tests": "skipped", "integration": "skipped",
+                                "integration-relay": "skipped"},
+                               {"fast_shards": "[]", "heavy": "false", "relay_db": "false"}))
+        for results, plan, selection, event, narrowed in (
+            ({"build-tests": "failure", "fast-tests": "skipped", "integration": "skipped"}, {},
+             "success", "pull_request", True),
+            ({"build-tests": "cancelled"}, {}, "success", "pull_request", True),
+            ({"fast-tests": "failure"}, {}, "success", "pull_request", True),
+            ({"fast-tests": "cancelled"}, {"fast_shards": "[]"}, "success", "pull_request", True),
+            ({"fast-tests": "skipped"}, {"fast_shards": '["cli"]'}, "success", "pull_request", True),
+            ({"fast-tests": "skipped"}, {"fast_shards": "[]"}, "failure", "pull_request", True),
+            # A skip is excused only for a narrowed selection of a pull request.
+            ({"fast-tests": "skipped"}, {"fast_shards": "[]"}, "success", "pull_request", False),
+            ({"fast-tests": "skipped"}, {"fast_shards": "[]"}, "success", "push", True),
+            ({"fast-tests": "skipped"}, {"fast_shards": "[]", "mode": "full"}, "success",
+             "pull_request", True),
+            ({"integration": "skipped"}, {"heavy": "false", "mode": "full"}, "success",
+             "pull_request", True),
+            ({"integration": "skipped"}, {"heavy": "false"}, "success", "schedule", True),
+            ({"integration": "skipped"}, {"heavy": "false"}, "success", "pull_request", False),
+            ({"integration": "skipped"}, {"heavy": "true"}, "success", "pull_request", True),
+            ({"integration": "skipped"}, {}, "success", "pull_request", True),
+            ({"integration": "skipped"}, {"heavy": "false"}, "skipped", "pull_request", True),
+            ({"integration": "failure"}, {"heavy": "false"}, "success", "pull_request", True),
+            ({"integration-relay": "failure"}, {}, "success", "pull_request", True),
+            ({"integration-relay": "cancelled"}, {}, "success", "pull_request", True),
+            # The selection check must pass on every narrowed selection.
+            ({TEST_CHECK: "skipped"}, {}, "success", "pull_request", True),
+            ({TEST_CHECK: "failure"}, {}, "success", "pull_request", True),
+            ({TEST_CHECK: "failure"}, {}, "success", "pull_request", False),
+            ({TEST_CHECK: "cancelled"}, {}, "success", "push", False),
+        ):
+            with self.subTest(results=results, plan=plan, selection=selection, event=event,
+                              narrowed=narrowed):
+                self.assertTrue(fails(results, plan, selection, event, narrowed))
+
+    def test_the_selection_jobs_gate_main_and_nightly(self):
+        config = json.loads((ROOT / "scripts" / "ci-evidence.json").read_text())
+        for tier in ("main", "nightly"):
+            for name in ("test selection", "test selection verdict"):
+                with self.subTest(tier=tier, job=name):
+                    self.assertIn(name, config["required_jobs"][tier])
+
+    def test_the_test_jobs_read_the_selection_only_when_it_narrows(self):
+        self.assertIn('\n  TEST_SELECTION_SPARSE: "false"\n', CI.split("jobs:\n", 1)[0])
+        for job in NARROWED_TEST_JOBS:
+            steps = job_steps(workflow_jobs()[job])
+            names = list(steps)
+            with self.subTest(job=job):
+                download = steps["Download test selection"]
+                self.assertEqual(step_condition(download), NARROWED)
+                self.assertIn("          name: test-selection\n", download)
+                run = names[next(i for i, name in enumerate(names)
+                                 if "--selection" in steps[name] and "run \"$SHARD\"" in steps[name])]
+                # The run step passes the selection only when it narrows.
+                self.assertEqual(step_env_expression(steps[run], "NARROWED"), NARROWED)
+                self.assertIn('if [ "$NARROWED" = true ]; then', step_script(steps[run]))
+                sparse_name = "Keep only the selection's files in the tree"
+                sparse = names.index(sparse_name)
+                # The tree turns sparse after every step that reads the whole
+                # checkout and before the tests run.
+                self.assertLess(names.index("Download test selection"), sparse)
+                self.assertLess(sparse, names.index(run))
+                self.assertIn('git sparse-checkout set --no-cone --stdin < "$sparse"',
+                              step_script(steps[sparse_name]))
+                # G2 runs only behind its switch, and only on a narrowed run.
+                for switch, plan, event, expected in (
+                    ("false", NARROWED_PLAN, "pull_request", False),
+                    ("true", NARROWED_PLAN, "pull_request", True),
+                    ("true", {"narrowed": "false"}, "pull_request", False),
+                    ("true", NARROWED_PLAN, "push", False),
+                ):
+                    self.assertEqual(
+                        bool(evaluate_needs_expression(
+                            step_condition(steps[sparse_name]), event=event,
+                            results={TEST_SELECTOR: "success"}, outputs={TEST_SELECTOR: plan},
+                            env={"TEST_SELECTION_SPARSE": switch},
+                        )),
+                        expected,
+                        (switch, plan, event),
+                    )
+        heavy = job_steps(workflow_jobs()["integration"])
+        order = list(heavy)
+        self.assertLess(order.index("Verify exhaustive disjoint test partitions"),
+                        order.index("Keep only the selection's files in the tree"))
+        script_tests = step_condition(job_steps(workflow_jobs()["fast-tests"])["Check script regressions"])
+        for shard, event, plan, runs in (
+            ("core", "pull_request", {"script_tests": "false", **NARROWED_PLAN}, False),
+            ("core", "pull_request", {"script_tests": "true", **NARROWED_PLAN}, True),
+            # Only a narrowed selection skips them: the scripts the test jobs
+            # run are tested whenever the pipeline changed.
+            ("core", "pull_request", {"script_tests": "false"}, True),
+            ("core", "pull_request", {"script_tests": "false", "narrowed": "false"}, True),
+            ("core", "push", {"script_tests": "false", **NARROWED_PLAN}, True),
+            ("cli", "pull_request", {"script_tests": "true", **NARROWED_PLAN}, False),
+        ):
+            with self.subTest(shard=shard, event=event, plan=plan):
+                self.assertEqual(bool(evaluate_needs_expression(
+                    script_tests, event=event, results={TEST_SELECTOR: "success"},
+                    outputs={TEST_SELECTOR: plan}, matrix={"shard": shard},
+                )), runs)
+
+
+def partitions_module():
+    loader = importlib.machinery.SourceFileLoader("partitions_wiring", str(ROOT / "scripts" / "test-partitions"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
 if __name__ == "__main__":
     unittest.main()
