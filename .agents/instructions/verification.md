@@ -155,7 +155,11 @@ of the Claude, Codex, Hermes, and Pi packages. A push to
 `macos-15` package job, Hermes macOS, and SDK macOS, alongside the Linux jobs
 selected on main. The main tier never runs the release rehearsal (#1207): push
 to `main` and a `tier=main` dispatch skip it whatever their paths filter
-computed. PR and main runs cancel superseded runs on the same ref. A
+computed. A new PR push cancels that PR's run in progress. Pushes to `main`
+drain instead (#1209): the running main run always completes, and only the
+newest push waits behind it. Merges that land during a run share the next run,
+which tests the newest of them, so `main` gets a verdict without merge pauses;
+a merge that a later push replaced while pending gets no run of its own. A
 daily 05:00 UTC nightly run includes the main tier, the release rehearsal, the
 cold rebuild comparison in the `macos-15` package job, and the nightly-only
 relay database suite. Nightly CI evidence requires that job's install, upgrade,
@@ -338,8 +342,9 @@ file guards the `release_rehearsal` filter: every path the rehearsal workflows
 and the scripts they run read must match the filter or be named, with its
 reason, in `REHEARSAL_FILTER_EXCEPTIONS`.
 Manual runs use `workflow_dispatch` input `tier=main|nightly`; the daily
-schedule selects nightly. The main tier is latest-wins on pushes to `main`,
-while PR runs are latest-wins per pull request. S3's automatic red-main issue
+schedule selects nightly. Pushes to `main` drain: each started main run
+completes, and a newer push replaces only the pending one. PR runs are
+latest-wins per pull request. S3's automatic red-main issue
 reporter remains pending. The S4 release evidence gate is enforced by
 `scripts/release`, which accepts only successful main and nightly evidence for
 the candidate commit (a run on it, or a dispatch run of the same tree, as

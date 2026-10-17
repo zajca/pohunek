@@ -103,12 +103,15 @@ PR. Move anything else to the next milestone with a one-line reason.
 - On the release clock, fire the dispatch in parallel with PR CI and cancel
   the other on a real failure. A docs-only delta after a green dispatch keeps
   that dispatch as evidence (verify the delta with `git diff --name-only`).
-- Two `main` checkpoints a day; a red checkpoint is top priority.
+- Merge without pausing for a `main` run: pushes to `main` drain, so every
+  started main run completes and reports a verdict (#1209). A red `main` run
+  is top priority.
 
 ## CI and GitHub hygiene
 
 - Cancel superseded runs on the critical path's runners when their failures
-  are already known.
+  are already known. Never cancel a `main` run only because a newer merge
+  landed: the drain depends on each started main run completing.
 - A transient registry stall (an optional npm platform package skipped, a
   pinned sha mismatch right after a stalled `npm ci`) may be rerun with
   `gh run rerun --failed` at most twice; anything else stops for a diagnosis.
