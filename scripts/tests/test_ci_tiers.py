@@ -2806,6 +2806,36 @@ class LaneSelectionTests(unittest.TestCase):
                 self.assertTrue(fails(**args))
 
 
+    def test_the_verdict_fails_a_hermes_job_that_did_not_pass_what_the_lane_left_to_it(self):
+        job = workflow_jobs()[TEST_VERDICT]
+        self.assertLessEqual({"changes", "macos-release-build", "hermes-compatibility-macos"},
+                             set(job_needs(job)))
+        condition = step_condition(job_steps(job)[
+            "Fail a Hermes macOS job that did not pass the tests the lane left to it"])
+        lane = job_steps(workflow_jobs()[LANE_JOB])["Run macOS lane tests"]
+        skip = re.search(r"(?m)^          SKIP_OWNED_BY: \$\{\{ \((.+)\) && 'hermes-macos' \|\| '' \}\}$", lane)
+        self.assertIsNotNone(skip)
+        # The step judges the Hermes job under exactly the lane's skip condition.
+        self.assertIn(f"({skip.group(1)}) && ", condition)
+
+        def fails(hermes, event="pull_request", hermes_macos="true"):
+            return bool(evaluate_needs_expression(
+                condition, event=event, changes={"hermes_macos": hermes_macos},
+                results={"hermes-compatibility-macos": hermes},
+            ))
+
+        self.assertFalse(fails("success"))
+        self.assertFalse(fails("success", event="push"))
+        # Without Hermes changes the lane runs `hermes_package` itself.
+        for result in ("skipped", "failure"):
+            with self.subTest(result=result):
+                self.assertFalse(fails(result, hermes_macos="false"))
+        for result in ("failure", "cancelled", "skipped"):
+            for event in ("pull_request", "push", "schedule", "workflow_dispatch"):
+                with self.subTest(result=result, event=event):
+                    self.assertTrue(fails(result, event=event))
+
+
 def partitions_module():
     loader = importlib.machinery.SourceFileLoader("partitions_wiring", str(ROOT / "scripts" / "test-partitions"))
     spec = importlib.util.spec_from_loader(loader.name, loader)

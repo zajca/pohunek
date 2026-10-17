@@ -8,6 +8,8 @@
   macOS job runs in the same run: always on `main` and nightly, and on a pull
   request when its `hermes_macos` filter matches. The Hermes job runs that
   binary with the ignored real-Hermes tests.
+  Under that condition the `test selection verdict` fails a run whose Hermes
+  macOS job did not pass.
 - `scripts/test-partitions run-macos|run-macos-tier --skip-owned-by
   hermes-macos` implements both, from one `OWNED_ELSEWHERE` selection.
 - A new `test duplicates (same OS)` job in the main and nightly tiers runs

@@ -1518,7 +1518,7 @@ jobs:
   # macOS lane by its paths filter or a narrowed selection without lane tests.
   test-selection-verdict:
     name: test selection verdict
-    needs: [changes, test-selection, build-tests, test-selection-check, fast-tests, integration, integration-relay, test, darwin-check, doctests, build-bins, sdk, audit, shear, platform-contracts]
+    needs: [changes, test-selection, build-tests, test-selection-check, fast-tests, integration, integration-relay, test, darwin-check, doctests, build-bins, sdk, audit, shear, platform-contracts, macos-release-build, hermes-compatibility-macos]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
@@ -1545,6 +1545,16 @@ jobs:
           RESULTS: "lane=${{ needs.platform-contracts.result }} changes=${{ needs.changes.result }} macos=${{ needs.changes.outputs.macos }} selection=${{ needs.test-selection.result }} narrowed=${{ needs.test-selection.outputs.narrowed }} lane_plan=${{ needs.test-selection.outputs.lane }}"
         run: |
           echo "::error::the macOS lane did not run as the selection requires: $RESULTS"
+          exit 1
+      # Under the lane's `SKIP_OWNED_BY` condition the lane leaves the
+      # `hermes_package` tests to the Hermes macOS job, so that job must pass.
+      - name: Fail a Hermes macOS job that did not pass the tests the lane left to it
+        if: ${{ (github.event_name != 'pull_request' || needs.changes.outputs.hermes_macos == 'true') && needs.hermes-compatibility-macos.result != 'success' }}
+        shell: bash
+        env:
+          RESULTS: "hermes-macos=${{ needs.hermes-compatibility-macos.result }} macos-release-build=${{ needs.macos-release-build.result }} hermes_macos=${{ needs.changes.outputs.hermes_macos }}"
+        run: |
+          echo "::error::the Hermes macOS job did not pass the hermes_package tests the macOS lane left to it: $RESULTS"
           exit 1
 
   # Skipped on the docs-only path of a pull request (#1218): a narrowed
