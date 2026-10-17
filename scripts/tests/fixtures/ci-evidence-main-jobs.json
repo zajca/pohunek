@@ -101,6 +101,11 @@
       "conclusion": "skipped"
     },
     {
+      "name": "macOS release daemon build (macos-15)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
       "name": "macOS package install and upgrade (macos-15)",
       "status": "completed",
       "conclusion": "success"

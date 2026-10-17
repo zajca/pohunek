@@ -50,7 +50,8 @@ the full set. It never runs on a pull request: only pushes, the daily schedule,
 and `main` or `nightly` dispatches start it.
 The Hermes macOS job (`hermes-compatibility-macos`) runs the xtask Hermes
 harness tests and the real-Hermes `hermes_package` scenario with `cargo nextest
-run --profile macos`. Under that profile the tests of xtask's `hermes::tests`
+run --profile macos`, and packages the daemon archive it checks from the
+binaries of `macos-release-build`. Under that profile the tests of xtask's `hermes::tests`
 run one at a time (test group `hermes-pty`), because its PTY scenarios take
 turns on an in-process mutex that a process per test cannot share.
 The real-systemd suites (`crates/platform/tests/systemd.rs`,
@@ -123,13 +124,19 @@ and its home afterwards. When the target has the previous release's version the
 script builds it with a `+upgrade.<commit>` version suffix (`Cargo.toml` and
 `Cargo.lock` are restored). Never run the `release_upgrade` test directly in
 your own account.
-The `macOS package install and upgrade
-(arm64)` CI job builds the daemon archive twice with `packaging/macos/build-release`
-and `packaging/macos/package --development` (the archives must be
-byte-identical and pass `packaging/macos/audit-macho`), then installs,
-upgrades with live sessions, refuses corrupt archives, and uninstalls from the
-extracted archives against real launchd
-(`scripts/acceptance/macos-package-install`). Intel Macs are outside the
+The `macOS release daemon build (macos-15)` CI job (`macos-release-build`)
+builds the release daemon binaries with `packaging/macos/build-release` once per
+run and uploads them; it runs whenever the package job or the Hermes macOS job
+runs, and neither of them compiles those binaries (#1210). The `macOS package
+install and upgrade (macos-15)` CI job packages version A of the daemon archive
+from them and builds version B, a bumped version of the same tree, itself. Both
+archives take the release path (`packaging/macos/package --stage-release`, then
+`--adhoc-release`), pass `packaging/macos/audit-macho`, and are checked with
+`verify-signed --adhoc`. In the nightly tier the job also rebuilds version A
+from a cold release directory and requires the builder's binaries and the same
+archive byte for byte. It then installs, upgrades with live sessions, refuses
+corrupt archives, and uninstalls from the extracted archives against real
+launchd (`scripts/acceptance/macos-package-install`). Intel Macs are outside the
 current release scope. This gate does not mean complete macOS host support;
 delivery scope, order, and status are tracked by the
 [`Complete macOS support` milestone](https://github.com/zajca/pohunek/milestone/2),
@@ -145,14 +152,16 @@ macOS job runs only for its narrow input filter, never because the runtime
 package selection picked Hermes; and the SDK macOS job runs for its own narrow
 input filter. The Linux `hermes-package` job follows the package selection like
 the other runtime package jobs. A change to
-`.github/workflows/ci.yml` selects all four pull-request macOS jobs. The
+`.github/workflows/ci.yml` selects all four pull-request macOS jobs, and the
+release daemon build runs with the package or Hermes macOS job. The
 release rehearsal, which a pull request starts through its `release_rehearsal`
 filter, adds macOS jobs from the workflows it calls: the signed
 `aarch64-apple-darwin` CLI and daemon builds (`rehearsal-macos`), the macOS
 leg of the release consumer build, and the `aarch64-apple-darwin` release rows
 of the Claude, Codex, Hermes, and Pi packages. A push to
 `main` runs the main tier: platform contracts, the macOS tier packages, the
-`macos-15` package job, Hermes macOS, and SDK macOS, alongside the Linux jobs
+macOS release daemon build, the `macos-15` package job, Hermes macOS, and SDK
+macOS, alongside the Linux jobs
 selected on main. The main tier never runs the release rehearsal (#1207): push
 to `main` and a `tier=main` dispatch skip it whatever their paths filter
 computed. A new PR push cancels that PR's run in progress. Pushes to `main`
