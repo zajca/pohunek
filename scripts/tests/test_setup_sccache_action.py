@@ -36,7 +36,7 @@ RELEASE_URL_PREFIX = "https://github.com/mozilla/sccache/releases/download/"
 # Flags that only make sense against the real HTTPS release CDN.
 TLS_FLAGS_WITH_VALUE = {"--proto"}
 TLS_FLAGS = {"--tlsv1.2"}
-# Upper bound for one script run; with a delay of 0 curl uses its own short backoff.
+# Upper bound for one script run.
 SCRIPT_TIMEOUT_SECONDS = 60
 # How often the server loop re-checks its stop flag while waiting for a client.
 ACCEPT_POLL_SECONDS = 0.05
@@ -299,7 +299,6 @@ def seed_env(sandbox: Sandbox, server, sha256: str, **extra: str) -> dict[str, s
         SCCACHE_VERSION=SCCACHE_VERSION,
         SCCACHE_SHA256=sha256,
         DOWNLOAD_RETRIES=action_env("DOWNLOAD_RETRIES"),
-        DOWNLOAD_RETRY_DELAY_SECONDS="0",
         TEST_SERVER_PORT=str(server.port),
     )
     env.update(TRANSFER_LIMITS_FOR_TESTS)
@@ -336,11 +335,15 @@ class SetupSccacheActionTests(unittest.TestCase):
 
     def test_persistent_download_failure_falls_back_without_a_marker(self):
         body = sccache_archive()
-        # The overall limit is raised so that the retry count, not the time
-        # budget, decides how many attempts are made.
+        # Two retries keep curl's backoff at 1 + 2 s, and the overall limit is
+        # raised so that the retry count, not the time budget, decides how many
+        # attempts are made.
         with ReleaseServer(body, resets=10**6) as server:
             result, outputs, binary, marker, _ = self.seed(
-                server, hashlib.sha256(body).hexdigest(), DOWNLOAD_RETRY_MAX_TIME_SECONDS="60"
+                server,
+                hashlib.sha256(body).hexdigest(),
+                DOWNLOAD_RETRIES="2",
+                DOWNLOAD_RETRY_MAX_TIME_SECONDS="30",
             )
             connections = server.connections
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -350,7 +353,7 @@ class SetupSccacheActionTests(unittest.TestCase):
         self.assertFalse(binary.exists())
         self.assertFalse(marker.exists())
         # One attempt plus the bounded retries, never more.
-        self.assertEqual(connections, int(action_env("DOWNLOAD_RETRIES")) + 1)
+        self.assertEqual(connections, 3)
 
     def test_checksum_mismatch_falls_back_before_extraction(self):
         body = sccache_archive()

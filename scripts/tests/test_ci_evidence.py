@@ -178,6 +178,14 @@ elif "/actions/workflows/" in endpoint:
     fixture[query_key] = index + 1
     fixture_path.write_text(json.dumps(fixture))
     print(json.dumps([page]))
+elif "/contents/" in endpoint:
+    # The config in the tree of the ref, served raw as the contents API does.
+    ref = endpoint.split("?ref=", 1)[1]
+    configs = fixture.get("tree_configs", {})
+    if ref not in configs:
+        print("gh: Not Found (HTTP 404)", file=sys.stderr)
+        raise SystemExit(1)
+    print(json.dumps(configs[ref]))
 elif "/git/commits/" in endpoint:
     sha = endpoint.rsplit("/", 1)[1]
     if sha in fixture.get("unknown_commits", []):
@@ -345,22 +353,98 @@ class CiEvidenceCliTests(unittest.TestCase):
         base.update(values)
         self.fixture.write_text(json.dumps(base))
 
-    def invoke(self, tier="main", *extra, config=None, sha=SHA):
+    def invoke(self, tier="main", *extra, config=None, sha=SHA, script=SCRIPT, tree_config=False):
         env = os.environ.copy()
         env.update({
             "PATH": f"{self.bin_dir}{os.pathsep}{env['PATH']}",
             "GH_FIXTURE": str(self.fixture),
             "GH_CALLS": str(self.calls),
         })
+        # tree_config leaves --config out, so the script reads the config of
+        # the commit it checks.
+        config_arguments = [] if tree_config else ["--config", str(config or self.config)]
         return subprocess.run(
-            [str(SCRIPT), "--repo", "example/pohunek", "--sha", sha,
-             "--tier", tier, "--config", str(config or self.config), *extra],
+            [str(script), "--repo", "example/pohunek", "--sha", sha,
+             "--tier", tier, *config_arguments, *extra],
             capture_output=True,
             text=True,
             check=False,
             cwd=self.directory,
             env=env,
         )
+
+    def checkout(self, committed: dict, working: dict) -> tuple[Path, str]:
+        """A checkout holding this script and one commit whose config is
+        `committed`, with `working` as the uncommitted config of its work
+        tree. Returns the script's path and the commit."""
+        repository = self.directory / "checkout"
+        (repository / "scripts").mkdir(parents=True)
+        script = repository / "scripts" / "ci-evidence"
+        script.write_bytes(SCRIPT.read_bytes())
+        script.chmod(0o755)
+        config = repository / "scripts" / "ci-evidence.json"
+        config.write_text(json.dumps(committed))
+        git = ["git", "-C", str(repository), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+               "-c", "commit.gpgsign=false", "-c", "maintenance.auto=false",
+               "-c", "gc.auto=0"]
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        for command in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "config"]):
+            subprocess.run([*git, *command], check=True, capture_output=True, env=env)
+        sha = subprocess.run(
+            [*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True, env=env
+        ).stdout.strip()
+        config.write_text(json.dumps(working))
+        return script, sha
+
+    def config_with(self, *extra_jobs: str) -> dict:
+        config = json.loads(json.dumps(self.config_data))
+        config["required_jobs"]["main"] += list(extra_jobs)
+        return config
+
+    def test_the_target_commits_config_decides_when_the_checkout_requires_more(self):
+        # The checkout's config adds a job that the commit's runs never had;
+        # the commit's own config does not require it, so its runs pass.
+        script, sha = self.checkout(self.config_data, self.config_with("job only the checkout requires"))
+        self.write_fixture(resolved_ref=sha, run_pages=[page([run_doc(sha=sha)])])
+        result = self.invoke(script=script, sha=sha, tree_config=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"main tier passed for {sha}", result.stdout)
+
+    def test_the_target_commits_config_decides_when_the_checkout_requires_less(self):
+        # The commit's config requires a job its runs lack; the checkout's
+        # config omits it, and would accept the runs.
+        script, sha = self.checkout(self.config_with("job the commit requires"), self.config_data)
+        self.write_fixture(resolved_ref=sha, run_pages=[page([run_doc(sha=sha)])])
+        result = self.invoke(script=script, sha=sha, tree_config=True)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("missing required job: job the commit requires", result.stderr)
+
+    def test_a_commit_the_checkout_lacks_takes_its_config_from_the_contents_api(self):
+        # SHA is not in the checkout; the API serves its config, which requires
+        # a job the run lacks, while the checkout's own config would not.
+        script, _ = self.checkout(self.config_data, self.config_data)
+        self.write_fixture(
+            run_pages=[page([run_doc()])],
+            tree_configs={SHA: self.config_with("job the commit requires")},
+        )
+        result = self.invoke(script=script, tree_config=True)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("missing required job: job the commit requires", result.stderr)
+        contents = [call for call in self.calls_json() if any("/contents/" in arg for arg in call)]
+        self.assertEqual(len(contents), 1)
+        self.assertIn(f"repos/example/pohunek/contents/scripts/ci-evidence.json?ref={SHA}", contents[0])
+
+        self.write_fixture(run_pages=[page([run_doc()])], tree_configs={SHA: self.config_data})
+        result = self.invoke(script=script, tree_config=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_commit_without_a_readable_config_refuses_the_evidence(self):
+        script, _ = self.checkout(self.config_data, self.config_data)
+        # The API has no config for the commit, though its runs would pass.
+        self.write_fixture(run_pages=[page([run_doc()])], tree_configs={})
+        result = self.invoke(script=script, tree_config=True)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(f"cannot read the config {SHA}:scripts/ci-evidence.json", result.stderr)
 
     def calls_json(self):
         return [json.loads(line) for line in self.calls.read_text().splitlines()]
