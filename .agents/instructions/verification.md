@@ -334,7 +334,7 @@ installs the locked release from npm and runs them; locally:
 ```bash
 cargo xtask package build runtime-packages/pi --output ABS/pi.tar.zst
 POHUNEK_PI_E2E=1 POHUNEK_PI_PACKAGE_ARCHIVE=ABS/pi.tar.zst \
-  cargo test -p pohunek-cli --test pi_package -- --include-ignored --test-threads 1
+  cargo test -p pohunek-cli --test all -- --include-ignored --test-threads 1 pi_package::
 ```
 
 Moving the supported Pi range means changing the descriptor's `min`/`below`
@@ -351,8 +351,8 @@ tests install the built archive through a signed catalog with a throwaway key
 and trust anchor, so the real-Codex tests launch through the installed package
 and its version probe; the fixture kills every process it started, also when a
 test fails. Run them with
-`POHUNEK_CODEX_E2E=1 cargo test -p pohunek-cli --test codex_package --
---include-ignored --test-threads 1`; the `codex-package` CI job installs the
+`POHUNEK_CODEX_E2E=1 cargo test -p pohunek-cli --test all --
+--include-ignored --test-threads 1 codex_package::`; the `codex-package` CI job installs the
 locked release from npm. Never point a manual run at the operator's real Codex home.
 
 The TypeScript SDK is released as three npm-pack tarballs
@@ -452,6 +452,18 @@ ignored `regenerate_timing_baseline` test). Paused-time tests exempt only
 tokio timers (and `.elapsed()` when the file uses `tokio::time::Instant`
 alone); `thread::sleep` and `Timer::after` stay counted. An unavoidable real-time wait
 carries `// timing-allowed: #<issue> <reason>` on or directly above its line.
+
+Test binary layout: the integration tests of `pohunek-cli` are modules of one
+test binary, `all` (`crates/cli/tests/all.rs`, `autotests = false`), so the
+dependency graph links once for the crate (#1228). A new test file there gets a
+`#[path] mod` line in `all.rs`; its tests are named `<file>::<test>` and a run
+selects them with `--test all -E 'test(/^<file>::/)'` (nextest) or `--test all
+-- <file>::` (cargo test). `release_consumer.rs` and `release_upgrade.rs` stay
+test targets of their own, because other workflows build and run those binaries
+directly. A test that re-runs its own binary builds the libtest filter with
+`pohunek_test_support::exact_test_filter(module_path!(), "<test>")`, which is
+right in both layouts; `crates/xtask/tests/exact_filter_guard.rs` refuses a
+literal `--exact` in integration test code.
 
 Flaky tests: `.config/nextest.toml` sets `flaky-result = "fail"` in
 `profile.default`, so every profile inherits it. Only `heavy` and `relay-db`

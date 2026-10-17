@@ -247,8 +247,8 @@ absence of egress), and the older folder-dialog wording the rule still names.
   the package manifest as well), and the approval prompt. The hook trust comes
   from `pohunek integration install --agent codex --profile …`, which resolves
   the profile's `CODEX_HOME` so the real home is never touched. Run them with
-  `POHUNEK_CODEX_E2E=1 cargo test -p pohunek-cli --test codex_package --
-  --include-ignored --test-threads 1`; without the variable and a `codex` on
+  `POHUNEK_CODEX_E2E=1 cargo test -p pohunek-cli --test all --
+  --include-ignored --test-threads 1 codex_package::`; without the variable and a `codex` on
   `PATH` they fail by name instead of skipping.
 - The `codex-package` CI job installs exactly the locked release from npm
   (`@openai/codex@0.160.0`), builds the archive with `cargo xtask package build`

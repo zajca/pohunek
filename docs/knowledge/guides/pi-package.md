@@ -216,8 +216,8 @@ reserved, so either way of installing serves it.
   in `PI_CODING_AGENT_SESSION_DIR` resumes, and a `sessionDir` setting or the
   `--session-dir` flag refuses the launch. A loopback chat-completions stub
   stands in for the model, so no provider, credential or network is involved.
-  Run them with `POHUNEK_PI_E2E=1 cargo test -p pohunek-cli --test pi_package --
-  --ignored`; the variable and a `pi` on `PATH` are required, otherwise the run
+  Run them with `POHUNEK_PI_E2E=1 cargo test -p pohunek-cli --test all --
+  --ignored pi_package::`; the variable and a `pi` on `PATH` are required, otherwise the run
   fails by name instead of skipping.
 - The `pi-package` CI job installs exactly the locked release from npm, builds
   the archive with `cargo xtask package build`, and runs that file.

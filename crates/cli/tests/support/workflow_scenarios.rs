@@ -25,10 +25,10 @@ use pohunek_platform::supervisor::{PluginUnitKey, PluginUnitKind, ServiceState};
 use pohunek_test_support::wait::{poll_until, wait_until};
 use serde_json::Value;
 
-use crate::workflow_units::native::{
+use super::workflow_units::native::{
     self, manager_variable, set_manager_variable, unset_manager_variable,
 };
-use crate::workflow_units::{
+use super::workflow_units::{
     assert_alternating, describe, variable_names, wait_gone, Managed, Plugin, UnitEnv,
     DIRECT_KNOBS, KNOBS, SUPERVISED_ENVIRONMENT, TICK_OUTPUT,
 };

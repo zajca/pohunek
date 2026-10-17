@@ -14,12 +14,12 @@ use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::wait::poll_until;
 use serde_json::Value;
 
-use crate::native_reference_diagnostics::NativeReferenceDiagnostics;
-use crate::release_bounded::{run as run_bounded, PROBE_TIMEOUT};
-use crate::release_catalog::PackageFacts;
-use crate::release_drivers::{write_profile, Driver, Integration, Prepared, Stub};
-use crate::release_host::Host;
-use crate::release_layout::Layout;
+use super::native_reference_diagnostics::NativeReferenceDiagnostics;
+use super::release_bounded::{run as run_bounded, PROBE_TIMEOUT};
+use super::release_catalog::PackageFacts;
+use super::release_drivers::{write_profile, Driver, Integration, Prepared, Stub};
+use super::release_host::Host;
+use super::release_layout::Layout;
 
 /// Profile every session of the suite launches through.
 const PROFILE: &str = "consumer";

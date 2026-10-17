@@ -1341,19 +1341,19 @@ jobs:
 
       - name: pohunek service transactions
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p pohunek-cli --test service_systemd -- --ignored --test-threads 1
+        run: cargo test --locked -p pohunek-cli --test all -- --ignored --test-threads 1 'service_systemd::'
 
       # Issue #1013: bare `pohunek setup` against the user manager, including
       # the fresh-host run from a signed release.
       - name: pohunek setup on a host
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p pohunek-cli --test setup_host_native -- --ignored --test-threads 1
+        run: cargo test --locked -p pohunek-cli --test all -- --ignored --test-threads 1 'setup_host_native::'
 
       # The `pohunek setup` binary runs that plan a fresh host read the PATH
       # the systemd user manager gives the daemon job.
       - name: pohunek setup binary on a fresh host
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p pohunek-cli --test setup_host -- --ignored --test-threads 1
+        run: cargo test --locked -p pohunek-cli --test all -- --ignored --test-threads 1 'setup_host::'
 
       - name: Supervised worker lifecycle
         if: ${{ !cancelled() }}
@@ -1361,18 +1361,18 @@ jobs:
 
       - name: pohunek service upgrade with live workers
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p pohunek-cli --test service_upgrade -- --ignored --test-threads 1
+        run: cargo test --locked -p pohunek-cli --test all -- --ignored --test-threads 1 'service_upgrade::'
 
       # Issue #326: workflow plugin jobs and services as persistent user units
       # running the `pohunek workflow __exec` trampoline.
       - name: Workflow plugin units
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p pohunek-cli --test workflow_systemd -- --ignored --test-threads 1
+        run: cargo test --locked -p pohunek-cli --test all -- --ignored --test-threads 1 'workflow_systemd::'
 
       # Issue #148: the reaction dispatcher unit and its event delivery.
       - name: Workflow event reactions
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p pohunek-cli --test workflow_reactions -- --ignored --test-threads 1
+        run: cargo test --locked -p pohunek-cli --test all -- --ignored --test-threads 1 'workflow_reactions::'
 
   # Issue #525: a session started on the previous release survives
   # `pohunek service upgrade` to this build. The job is the reusable
@@ -1936,7 +1936,7 @@ jobs:
           POHUNEK_PYTHON_BIN: ${{ steps.hermes.outputs.python }}
         run: |
           rm -f target/nextest/package/junit.xml
-          cargo nextest run --locked --profile package -p pohunek-cli --test hermes_package --run-ignored all --test-threads 1
+          cargo nextest run --locked --profile package -p pohunek-cli --test all -E 'test(/^hermes_package::/)' --run-ignored all --test-threads 1
 
       # The session test wrote into the stage it used; the release consumer
       # runs on another fresh restore of the untouched copy at the same
@@ -2427,7 +2427,7 @@ jobs:
       - name: Drive the real Pi through the installed package
         run: |
           rm -f target/nextest/package/junit.xml
-          cargo nextest run --locked --profile package -p pohunek-cli --test pi_package --run-ignored all --test-threads 1
+          cargo nextest run --locked --profile package -p pohunek-cli --test all -E 'test(/^pi_package::/)' --run-ignored all --test-threads 1
 
       - name: Summarize flaky tests
         if: always()
@@ -2560,7 +2560,7 @@ jobs:
       - name: Drive the real Codex
         run: |
           rm -f target/nextest/package/junit.xml
-          cargo nextest run --locked --profile package -p pohunek-cli --test codex_package --run-ignored all --test-threads 1
+          cargo nextest run --locked --profile package -p pohunek-cli --test all -E 'test(/^codex_package::/)' --run-ignored all --test-threads 1
 
       - name: Summarize flaky tests
         if: always()
@@ -2706,7 +2706,7 @@ jobs:
       - name: Drive the real Claude Code
         run: |
           rm -f target/nextest/package/junit.xml
-          cargo nextest run --locked --profile package -p pohunek-cli --test claude_package --run-ignored all --test-threads 1
+          cargo nextest run --locked --profile package -p pohunek-cli --test all -E 'test(/^claude_package::/)' --run-ignored all --test-threads 1
 
       - name: Summarize flaky tests
         if: always()
@@ -2999,7 +2999,7 @@ jobs:
           set -uo pipefail
           mkdir -p "$RUNNER_TEMP/hermes-junit"
           rm -f target/nextest/macos/junit.xml || exit 1
-          cargo nextest run --locked --profile macos -p pohunek-cli --test hermes_package --run-ignored all --test-threads 1
+          cargo nextest run --locked --profile macos -p pohunek-cli --test all -E 'test(/^hermes_package::/)' --run-ignored all --test-threads 1
           status=$?
           cp target/nextest/macos/junit.xml "$RUNNER_TEMP/hermes-junit/package.xml" || status=1
           exit "$status"

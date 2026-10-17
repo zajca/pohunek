@@ -38,8 +38,8 @@ hermes-pty = { max-threads = 1 }
 filter = '''
 (package(=pohunek-daemon) and binary(=forced_close_stop))
 or (package(=pohunek-session-worker) and test(=server::tests::escaped_pty_holder_ends_with_the_exit_and_the_exact_final_output_offset))
-or (package(=pohunek-cli) and binary(=claude_package) and test(=a_session_removal_ignores_an_unreadable_process_of_the_test_host))
-or (package(=pohunek-cli) and binary(=claude_package) and test(=the_child_guard_terminates_a_non_dumpable_helper_when_the_test_unwinds))
+or (package(=pohunek-cli) and binary(=all) and test(=claude_package::a_session_removal_ignores_an_unreadable_process_of_the_test_host))
+or (package(=pohunek-cli) and binary(=all) and test(=claude_package::the_child_guard_terminates_a_non_dumpable_helper_when_the_test_unwinds))
 '''
 test-group = 'unreadable-holders'
 
@@ -82,7 +82,7 @@ not (
   or (package(=pohunek-relay) and
     (kind(test) or test(/^(admission::|auth::service::|auth::parent_integrity_tests::|authorization::admin_tests::|lifecycle::|runtime::|server::credential_router_tests::|operator::)/)))
   or (package(=pohunek-cli) and
-    (test(/^hermes_integration::/) or binary(/^hermes_/) or binary(=session_process_api) or binary(=plugin_catalog_install) or binary(=doctor_worker_compat) or binary(=session_background) or binary(=session_background_work)))
+    (test(/^hermes_integration::/) or (binary(=all) and test(/^hermes_/)) or (binary(=all) and test(/^session_process_api::/)) or (binary(=all) and test(/^plugin_catalog_install::/)) or (binary(=all) and test(/^doctor_worker_compat::/)) or (binary(=all) and test(/^session_background::/)) or (binary(=all) and test(/^session_background_work::/))))
   or (package(=pohunek-client) and binary(=netbird_cancellation))
   or (package(=pohunek-platform) and
     test(/^(shell_env::test_support::tests::|filesystem::tests::a_dropped_lock_is_free_while_|test_spawn::)/))
@@ -191,8 +191,8 @@ filter = '''
 (package(=pohunek-platform) and binary(=launchd))
 or (package(=pohunek-daemon) and binary(=supervised_lifecycle))
 or (package(=pohunek-cli) and (
-  binary(=service_launchd) or binary(=service_upgrade) or binary(=setup_host_native)
-  or binary(=workflow_launchd) or binary(=workflow_store)))
+  (binary(=all) and test(/^service_launchd::/)) or (binary(=all) and test(/^service_upgrade::/)) or (binary(=all) and test(/^setup_host_native::/))
+  or (binary(=all) and test(/^workflow_launchd::/)) or (binary(=all) and test(/^workflow_store::/))))
 '''
 test-group = 'launchd-gui'
 

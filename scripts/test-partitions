@@ -104,7 +104,7 @@ MACOS_BUCKETS = {
         ("xtask", "pohunek-cli"),
         " or ".join((
             "(package(=xtask) and test(/(^|::)(survey_hermetic_violations|regenerate_allow_list|regenerate_timing_baseline)$/))",
-            "(package(=pohunek-cli) and binary(=claude_package) and test(/^capture_the_real_claude_/))",
+            "(package(=pohunek-cli) and binary(=all) and test(/^claude_package::capture_the_real_claude_/))",
         )),
     ),
     # Real-upstream tests of the runtime packages. The Linux package jobs run
@@ -112,9 +112,8 @@ MACOS_BUCKETS = {
     # `hermes_package` with `--include-ignored`.
     "owned-elsewhere": Bucket(
         ("pohunek-cli",),
-        "package(=pohunek-cli) and (binary(=claude_package) or binary(=codex_package) "
-        "or binary(=pi_package) or binary(=hermes_package)) "
-        "and not test(/^capture_the_real_claude_/)",
+        "package(=pohunek-cli) and binary(=all) and test(/^(claude|codex|pi|hermes)_package::/) "
+        "and not test(/^claude_package::capture_the_real_claude_/)",
     ),
 }
 # Tests another macOS job runs in the same workflow run, by job, as the exact
