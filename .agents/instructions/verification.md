@@ -51,7 +51,18 @@ and `main` or `nightly` dispatches start it.
 The Hermes macOS job (`hermes-compatibility-macos`) runs the xtask Hermes
 harness tests and the real-Hermes `hermes_package` scenario with `cargo nextest
 run --profile macos`, and packages the daemon archive it checks from the
-binaries of `macos-release-build`. Under that profile the tests of xtask's `hermes::tests`
+binaries of `macos-release-build`. Each test runs at most once per OS in a CI
+run (#1226): `run-macos-tier` always passes `--skip-owned-by hermes-macos`,
+because the Hermes macOS job runs in every run that starts the tier, and the
+lane passes it under the Hermes macOS job's own condition, so neither repeats
+what that job runs. Whenever the lane leaves those tests out, the `test
+selection verdict` fails a run whose Hermes macOS job did not pass. The `test
+duplicates (same OS)` job of the main and nightly tiers reads the JUnit
+report of every `ci.yml` test job with `scripts/test-duplicates` and fails on
+a test that two jobs of the same OS ran, unless `scripts/test-duplicates.json`
+allows it with a reason. A new JUnit artifact must be named there with its OS
+and matched by the job's download pattern, or the check fails. The release
+rehearsal's reports come from a called workflow and are not read. Under that profile the tests of xtask's `hermes::tests`
 run one at a time (test group `hermes-pty`), because its PTY scenarios take
 turns on an in-process mutex that a process per test cannot share.
 The real-systemd suites (`crates/platform/tests/systemd.rs`,

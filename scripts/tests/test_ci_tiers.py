@@ -1,6 +1,7 @@
 """Contract checks for the PR, main, and nightly CI tiers."""
 
 from pathlib import Path
+import fnmatch
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -968,7 +969,7 @@ class MacosLanePackageSetTests(unittest.TestCase):
             "doctests are the only cargo test of the lane",
         )
         self.assertIn("check-macos --scope lane", lane)
-        self.assertRegex(lane, r"scripts/test-partitions .* run-macos\n")
+        self.assertRegex(lane, r"scripts/test-partitions .* run-macos[ \n]")
 
     def test_tier_archive_holds_every_macos_package_and_runs_only_the_tier(self):
         tier = workflow_jobs()["macos-tier"]
@@ -1041,6 +1042,141 @@ class MacosLanePackageSetTests(unittest.TestCase):
             self.partitions.MACOS_SCOPES["all"][1],
             self.partitions.MACOS_SET,
         )
+
+
+# Every event and tier a ci.yml run can have, crossed with the two filters
+# that decide whether the macOS lane and the Hermes macOS job run on a PR.
+MACOS_RUN_SCENARIOS = [
+    {"event": event, "tier": tier, "changes": {"macos": macos, "hermes_macos": hermes}}
+    for event, tier in (
+        ("pull_request", ""), ("push", ""), ("schedule", ""),
+        ("workflow_dispatch", "main"), ("workflow_dispatch", "nightly"),
+    )
+    for macos in ("true", "false")
+    for hermes in ("true", "false")
+]
+# The lane also reads the test selection: a narrowed one may leave it out.
+MACOS_RUN_SELECTIONS = [
+    ("success", {"narrowed": "true", "lane": "true"}),
+    ("success", {"narrowed": "true", "lane": "false"}),
+    ("success", {"narrowed": "false"}),
+    ("failure", {}),
+]
+
+
+class SameOsDuplicateTests(unittest.TestCase):
+    """No test runs twice on macOS in one run, and the main tier checks every OS (#1226)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.partitions = load_test_partitions()
+        cls.jobs = workflow_jobs()
+        cls.hermes = job_condition("hermes-compatibility-macos")
+
+    @staticmethod
+    def holds(expression, scenario, selection):
+        result, outputs = selection
+        return bool(evaluate_needs_expression(
+            expression, **scenario,
+            results={TEST_SELECTOR: result}, outputs={TEST_SELECTOR: outputs},
+        ))
+
+    def test_the_hermes_macos_selection_is_what_the_hermes_job_runs(self):
+        steps = job_steps(self.jobs["hermes-compatibility-macos"])
+        self.assertIn("-p xtask --lib -E 'test(hermes)'\n", steps["Test Hermes harness natively"])
+        self.assertIn(
+            "-p pohunek-cli --test hermes_package --run-ignored all --test-threads 1\n",
+            steps["Drive a real pinned Hermes session through the package"],
+        )
+        self.assertEqual(
+            self.partitions.OWNED_ELSEWHERE["hermes-macos"],
+            "(package(=xtask) and kind(lib) and test(hermes)) or "
+            "(package(=pohunek-cli) and binary(=hermes_package))",
+        )
+
+    def test_the_tier_leaves_out_the_harness_and_runs_only_alongside_the_hermes_job(self):
+        tier = self.jobs["macos-tier"]
+        step = job_steps(tier)["Run macOS tier tests"]
+        self.assertIn("run-macos-tier --skip-owned-by hermes-macos\n", step)
+        condition = job_condition("macos-tier")
+        for scenario in MACOS_RUN_SCENARIOS:
+            for selection in MACOS_RUN_SELECTIONS:
+                with self.subTest(**scenario, selection=selection):
+                    if self.holds(condition, scenario, selection):
+                        self.assertTrue(
+                            self.holds(self.hermes, scenario, selection),
+                            "the tier leaves the harness out only where the Hermes job runs it",
+                        )
+
+    def test_the_lane_leaves_out_hermes_package_exactly_when_the_hermes_job_runs(self):
+        lane = self.jobs["platform-contracts"]
+        step = job_steps(lane)["Run macOS lane tests"]
+        skip = re.search(r"(?m)^          SKIP_OWNED_BY: \$\{\{ (.+) \}\}$", step)
+        self.assertIsNotNone(skip)
+        # Both the narrowed and the whole lane command pass the option.
+        self.assertEqual(step.count("scripts/test-partitions "), 2)
+        self.assertEqual(step.count(' ${SKIP_OWNED_BY:+--skip-owned-by "$SKIP_OWNED_BY"}\n'), 2)
+        self.assertIn("&& 'hermes-macos' || ''", skip.group(1))
+        lane_condition = job_condition("platform-contracts")
+        ran = 0
+        for scenario in MACOS_RUN_SCENARIOS:
+            for selection in MACOS_RUN_SELECTIONS:
+                if not self.holds(lane_condition, scenario, selection):
+                    continue
+                ran += 1
+                with self.subTest(**scenario, selection=selection):
+                    self.assertEqual(
+                        self.holds(skip.group(1), scenario, selection),
+                        self.holds(self.hermes, scenario, selection),
+                    )
+        self.assertGreater(ran, 0)
+
+    def test_the_duplicate_check_reads_every_junit_artifact_after_its_jobs(self):
+        uploads = {}
+        for name, job in self.jobs.items():
+            for artifact in re.findall(r"(?m)^          name: (.*junit.*)$", job):
+                uploads.setdefault(name, []).append(artifact)
+        # The fast-tests matrix names one artifact per shard; a full run starts all.
+        shards = json.loads(re.search(r"\|\| '(\[[^']+\])'\)", self.jobs["fast-tests"]).group(1))
+        artifacts = set()
+        for names in uploads.values():
+            for artifact in names:
+                if "${{ matrix.shard }}" in artifact:
+                    artifacts.update(artifact.replace("${{ matrix.shard }}", shard) for shard in shards)
+                else:
+                    artifacts.add(artifact)
+        config = json.loads((ROOT / "scripts" / "test-duplicates.json").read_text())
+        self.assertEqual(set(config["artifacts"]), artifacts)
+        check = self.jobs["test-duplicates"]
+        needs = set(re.findall(r"(?m)^      - ([a-z0-9-]+)$", block(check, "needs", indent=4)))
+        self.assertEqual(needs, set(uploads))
+        pattern = re.search(r"(?m)^          pattern: '\{([^}']+)\}'$", check)
+        self.assertIsNotNone(pattern, check)
+        globs = pattern.group(1).split(",")
+        for artifact in artifacts:
+            with self.subTest(artifact=artifact):
+                self.assertTrue(any(fnmatch.fnmatchcase(artifact, glob) for glob in globs))
+        # A called workflow's reports are not this job's to wait for or name.
+        called = set(re.findall(r"(?m)^    uses: \./\.github/workflows/([a-z0-9-]+\.yml)$", CI))
+        self.assertIn("release-evidence.yml", called)
+        foreign = set()
+        for workflow in called:
+            text = (ROOT / ".github" / "workflows" / workflow).read_text()
+            for artifact in re.findall(r"(?m)^\s+name: (.*junit.*)$", text):
+                foreign.update(re.sub(r"\$\{\{[^}]*\}\}", value, artifact) for value in ("linux", "macos"))
+        self.assertIn("matrix-junit-macos", foreign)
+        for artifact in foreign:
+            with self.subTest(foreign=artifact):
+                self.assertFalse(any(fnmatch.fnmatchcase(artifact, glob) for glob in globs))
+        self.assertIn('python3 scripts/test-duplicates "$RUNNER_TEMP/junit"\n', check)
+        condition = job_condition("test-duplicates")
+        for event, tier, runs in (
+            ("pull_request", "", False), ("push", "", True), ("schedule", "", True),
+            ("workflow_dispatch", "main", True), ("workflow_dispatch", "nightly", True),
+        ):
+            with self.subTest(event=event, tier=tier):
+                self.assertEqual(evaluate_condition(condition, event=event, tier=tier), runs)
+                self.assertFalse(evaluate_condition(condition, event=event, tier=tier, cancelled=True))
 
 
 class HermesTestInterpreterActionTests(unittest.TestCase):
@@ -2686,6 +2822,36 @@ class LaneSelectionTests(unittest.TestCase):
         ):
             with self.subTest(**args):
                 self.assertTrue(fails(**args))
+
+
+    def test_the_verdict_fails_a_hermes_job_that_did_not_pass_what_the_lane_left_to_it(self):
+        job = workflow_jobs()[TEST_VERDICT]
+        self.assertLessEqual({"changes", "macos-release-build", "hermes-compatibility-macos"},
+                             set(job_needs(job)))
+        condition = step_condition(job_steps(job)[
+            "Fail a Hermes macOS job that did not pass the tests the lane left to it"])
+        lane = job_steps(workflow_jobs()[LANE_JOB])["Run macOS lane tests"]
+        skip = re.search(r"(?m)^          SKIP_OWNED_BY: \$\{\{ \((.+)\) && 'hermes-macos' \|\| '' \}\}$", lane)
+        self.assertIsNotNone(skip)
+        # The step judges the Hermes job under exactly the lane's skip condition.
+        self.assertIn(f"({skip.group(1)}) && ", condition)
+
+        def fails(hermes, event="pull_request", hermes_macos="true"):
+            return bool(evaluate_needs_expression(
+                condition, event=event, changes={"hermes_macos": hermes_macos},
+                results={"hermes-compatibility-macos": hermes},
+            ))
+
+        self.assertFalse(fails("success"))
+        self.assertFalse(fails("success", event="push"))
+        # Without Hermes changes the lane runs `hermes_package` itself.
+        for result in ("skipped", "failure"):
+            with self.subTest(result=result):
+                self.assertFalse(fails(result, hermes_macos="false"))
+        for result in ("failure", "cancelled", "skipped"):
+            for event in ("pull_request", "push", "schedule", "workflow_dispatch"):
+                with self.subTest(result=result, event=event):
+                    self.assertTrue(fails(result, event=event))
 
 
 def partitions_module():

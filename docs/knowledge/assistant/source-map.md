@@ -303,6 +303,12 @@ Release packaging and contributor verification:
   Markdown table in `$GITHUB_STEP_SUMMARY` (or stdout with `--stdout`); a
   missing or unreadable report is written into the summary. CI runs it with
   `if: always()` after the fast, heavy, and relay-db nextest steps.
+- `scripts/test-duplicates` — reads one CI run's downloaded JUnit artifacts and
+  fails on a test that two jobs of the same OS ran, unless
+  `scripts/test-duplicates.json` allows it with a reason; that file also names
+  each artifact's OS, and an unnamed artifact fails the check. The `test
+  duplicates (same OS)` job runs it in the main and nightly tiers (#1226).
+- `scripts/tests/test_test_duplicates.py` — scenarios for that check.
 - `scripts/tests/test_junit_flaky_summary.py` — regression checks for that
   summary against real nextest JUnit captures in
   `scripts/tests/fixtures/nextest-junit/`.

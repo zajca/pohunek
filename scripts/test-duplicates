@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Fail when a CI run executed one test more than once on the same OS.
+
+Reads the nextest JUnit reports of one workflow run: one directory per
+downloaded artifact (as `actions/download-artifact` writes them), each holding
+`*.xml` reports. A test is the pair (binary id, test name). It is a duplicate
+when reports from two different sources of the same OS executed it; a skipped
+test case did not execute.
+
+`scripts/test-duplicates.json` names the OS of every JUnit artifact and lists
+the duplicates that are allowed, each with its reason. An artifact the config
+does not name fails the check, so a new test job is classified before it is
+counted. An allowed duplicate that this run did not execute is reported but
+does not fail: a job skipped or failed early uploads no report.
+
+The Markdown table is appended to `$GITHUB_STEP_SUMMARY` when it is set.
+Exit status: 0 when every duplicate is allowed, 1 when one is not, 2 on a
+usage or input error.
+"""
+
+import argparse
+import collections
+import json
+import os
+from pathlib import Path
+import sys
+import xml.etree.ElementTree as ElementTree
+
+SUMMARY_ENV = "GITHUB_STEP_SUMMARY"
+DEFAULT_CONFIG = Path(__file__).resolve().with_name("test-duplicates.json")
+OPERATING_SYSTEMS = ("linux", "macos")
+
+
+class InputError(Exception):
+    """A report directory, report or config this check cannot use."""
+
+
+def load_config(path):
+    """The validated config: artifact OS map and the allowed duplicates."""
+    try:
+        config = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise InputError(f"{path}: {error}") from error
+    artifacts = config.get("artifacts")
+    if not isinstance(artifacts, dict) or not artifacts:
+        raise InputError(f"{path}: `artifacts` must map artifact names to an OS")
+    for name, os_name in artifacts.items():
+        if os_name not in OPERATING_SYSTEMS:
+            raise InputError(f"{path}: artifact {name} has OS {os_name!r}, not one of {OPERATING_SYSTEMS}")
+    allowed = config.get("allowed")
+    if not isinstance(allowed, list):
+        raise InputError(f"{path}: `allowed` must be a list")
+    for entry in allowed:
+        binaries, sources, reason = entry.get("binaries"), entry.get("sources"), entry.get("reason")
+        if not (isinstance(binaries, list) and binaries and all(isinstance(b, str) and b for b in binaries)):
+            raise InputError(f"{path}: allowed entry {entry} needs a non-empty `binaries` list")
+        if not (isinstance(sources, list) and len(sources) >= 2 and len(set(sources)) == len(sources)):
+            raise InputError(f"{path}: allowed entry {entry} needs at least two distinct `sources`")
+        if not (isinstance(reason, str) and reason.strip()):
+            raise InputError(f"{path}: allowed entry {entry} needs a `reason`")
+        for source in sources:
+            if source.split("/", 1)[0] not in artifacts:
+                raise InputError(f"{path}: allowed entry {entry} names unknown source {source}")
+    return config
+
+
+def read_reports(root, artifacts):
+    """Executed tests per (OS, test): the set of sources that ran each."""
+    root = Path(root)
+    directories = sorted(path for path in root.iterdir() if path.is_dir()) if root.is_dir() else []
+    if not directories:
+        raise InputError(f"{root}: no artifact directories")
+    executed = collections.defaultdict(set)
+    seconds = collections.defaultdict(dict)
+    for directory in directories:
+        if directory.name not in artifacts:
+            raise InputError(
+                f"artifact {directory.name} is not in the config; add it to `artifacts` with its OS"
+            )
+        os_name = artifacts[directory.name]
+        reports = sorted(directory.glob("*.xml"))
+        if not reports:
+            raise InputError(f"artifact {directory.name} holds no JUnit report")
+        for report in reports:
+            # `junit.xml` is the artifact's only run; any other report is a
+            # separate run inside the artifact, named by its file.
+            source = directory.name if report.stem == "junit" else f"{directory.name}/{report.stem}"
+            try:
+                document = ElementTree.parse(report).getroot()
+            except ElementTree.ParseError as error:
+                raise InputError(f"{report}: {error}") from error
+            for suite in document.iter("testsuite"):
+                for case in suite.iter("testcase"):
+                    if case.find("skipped") is not None:
+                        continue
+                    binary = case.get("classname") or suite.get("name") or "?"
+                    key = (os_name, binary, case.get("name") or "?")
+                    executed[key].add(source)
+                    seconds[key][source] = float(case.get("time") or 0)
+    return executed, seconds
+
+
+def find_duplicates(executed, seconds, allowed):
+    """Group same-OS duplicates by (OS, binary, sources) and mark each allowed or not."""
+    groups = collections.defaultdict(lambda: {"cases": 0, "extra_seconds": 0.0})
+    for (os_name, binary, _name), sources in executed.items():
+        if len(sources) < 2:
+            continue
+        group = groups[(os_name, binary, tuple(sorted(sources)))]
+        group["cases"] += 1
+        times = sorted(seconds[(os_name, binary, _name)].values())
+        group["extra_seconds"] += sum(times[:-1])
+    rows = []
+    used = set()
+    for (os_name, binary, sources), group in sorted(groups.items()):
+        match = next(
+            (index for index, entry in enumerate(allowed)
+             if binary in entry["binaries"] and set(entry["sources"]) == set(sources)),
+            None,
+        )
+        if match is not None:
+            used.add(match)
+        rows.append({
+            "os": os_name, "binary": binary, "sources": list(sources),
+            "cases": group["cases"], "extra_seconds": round(group["extra_seconds"], 1),
+            "allowed": match is not None,
+            "reason": allowed[match]["reason"] if match is not None else None,
+        })
+    unused = [entry for index, entry in enumerate(allowed) if index not in used]
+    return rows, unused
+
+
+def render(rows, unused):
+    """The Markdown summary of the duplicates and the unused allowed entries."""
+    lines = ["## Same-OS test duplicates", ""]
+    if rows:
+        lines += ["| OS | Binary | Sources | Cases | Extra s | Allowed |", "|---|---|---|---|---|---|"]
+        for row in rows:
+            verdict = f"yes: {row['reason']}" if row["allowed"] else "**no**"
+            lines.append(
+                f"| {row['os']} | `{row['binary']}` | {' + '.join(row['sources'])} | "
+                f"{row['cases']} | {row['extra_seconds']} | {verdict} |"
+            )
+    else:
+        lines.append("No test ran twice on the same OS.")
+    if unused:
+        lines += ["", "Allowed duplicates this run did not execute (a job may have been skipped):", ""]
+        lines += [f"- `{', '.join(entry['binaries'])}` in {' + '.join(entry['sources'])}" for entry in unused]
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("reports", type=Path, help="directory holding one directory per JUnit artifact")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--json", action="store_true", help="print the duplicate groups as JSON")
+    args = parser.parse_args()
+    try:
+        config = load_config(args.config)
+        executed, seconds = read_reports(args.reports, config["artifacts"])
+    except InputError as error:
+        print(f"test-duplicates: {error}", file=sys.stderr)
+        return 2
+    rows, unused = find_duplicates(executed, seconds, config["allowed"])
+    summary = render(rows, unused)
+    if args.json:
+        print(json.dumps({"duplicates": rows, "unused_allowed": unused}, indent=1))
+    else:
+        print(summary, end="")
+    if os.environ.get(SUMMARY_ENV):
+        with open(os.environ[SUMMARY_ENV], "a", encoding="utf-8") as handle:
+            handle.write(summary)
+    unallowed = [row for row in rows if not row["allowed"]]
+    for row in unallowed:
+        print(
+            f"test-duplicates: {row['cases']} test(s) of {row['binary']} ran on {row['os']} in "
+            f"{' and '.join(row['sources'])}; leave them out of one job or add an allowed entry "
+            f"with its reason to {args.config.name}",
+            file=sys.stderr,
+        )
+    return 1 if unallowed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

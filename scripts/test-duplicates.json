@@ -1,0 +1,39 @@
+{
+  "artifacts": {
+    "macos-lane-junit": "macos",
+    "macos-tier-junit": "macos",
+    "hermes-macos-junit": "macos",
+    "nextest-junit-core": "linux",
+    "nextest-junit-daemon": "linux",
+    "nextest-junit-relay": "linux",
+    "nextest-junit-cli": "linux",
+    "nextest-junit-heavy": "linux",
+    "nextest-junit-relay-db": "linux",
+    "package-junit-pi": "linux",
+    "package-junit-claude": "linux",
+    "package-junit-codex": "linux",
+    "package-junit-hermes": "linux"
+  },
+  "allowed": [
+    {
+      "binaries": ["pohunek-cli::pi_package"],
+      "sources": ["nextest-junit-cli", "package-junit-pi"],
+      "reason": "the package job exports POHUNEK_PI_PACKAGE_ARCHIVE, which switches the fixture from the in-process archive to the supplied one; the shard keeps the in-process path until the per-test audit of #1226 settles it"
+    },
+    {
+      "binaries": ["pohunek-cli::claude_package"],
+      "sources": ["nextest-junit-cli", "package-junit-claude"],
+      "reason": "the package job runs the binary under its real-runtime environment; the shard's run of the non-ignored tests stays until the per-test audit of #1226 settles it"
+    },
+    {
+      "binaries": ["pohunek-cli::codex_package"],
+      "sources": ["nextest-junit-cli", "package-junit-codex"],
+      "reason": "the package job runs the binary under its real-runtime environment; the shard's run of the non-ignored tests stays until the per-test audit of #1226 settles it"
+    },
+    {
+      "binaries": ["pohunek-cli::hermes_package"],
+      "sources": ["nextest-junit-heavy", "package-junit-hermes"],
+      "reason": "the package job runs the binary under its real-runtime environment; the shard's run of the non-ignored tests stays until the per-test audit of #1226 settles it"
+    }
+  ]
+}
