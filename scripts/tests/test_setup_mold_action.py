@@ -33,7 +33,7 @@ RELEASE_URL_PREFIX = "https://github.com/rui314/mold/releases/download/"
 # Flags that only make sense against the real HTTPS release CDN.
 TLS_FLAGS_WITH_VALUE = {"--proto"}
 TLS_FLAGS = {"--tlsv1.2"}
-# Upper bound for one script run; with a delay of 0 curl uses its own short backoff.
+# Upper bound for one script run.
 SCRIPT_TIMEOUT_SECONDS = 60
 # How often the server loop re-checks its stop flag while waiting for a client.
 ACCEPT_POLL_SECONDS = 0.05
@@ -51,6 +51,11 @@ TRANSFER_LIMITS_FOR_TESTS = {
 STALL_RUN_BOUND_SECONDS = 20
 # Content-Length the stalling server declares; it never sends that many bytes.
 STALL_DECLARED_LENGTH = 1048576
+# Retries the backoff scenario allows, so curl waits 1 + 2 + 4 s between them.
+BACKOFF_RETRIES = "3"
+# The wait curl announces before each retry once --silent is dropped; the
+# wording differs between curl versions.
+RETRY_ANNOUNCEMENT = re.compile(r"(?:Will retry|Retrying) in (\d+) seconds?")
 
 
 def action_run_script() -> str:
@@ -131,6 +136,42 @@ class ReleaseServer:
                 connection.sendall(head + self.body)
 
 
+class GatewayTimeoutServer:
+    """Answers every request with 504, as the release CDN does in an outage."""
+
+    def __init__(self):
+        self.connections = 0
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen()
+        self.listener.settimeout(ACCEPT_POLL_SECONDS)
+        self.stopped = threading.Event()
+        self.port = self.listener.getsockname()[1]
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stopped.set()
+        self.thread.join(timeout=SCRIPT_TIMEOUT_SECONDS)
+        self.listener.close()
+
+    def _serve(self):
+        while not self.stopped.is_set():
+            try:
+                connection, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            self.connections += 1
+            with connection:
+                connection.recv(65536)
+                connection.sendall(b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+
+
 class StallingServer:
     """Accepts every connection and then stalls it.
 
@@ -209,6 +250,8 @@ for arg in args:
         skip = True
     elif arg in {flags!r}:
         pass
+    elif arg == "--silent" and os.environ.get("TEST_CURL_ANNOUNCES_RETRIES"):
+        pass
     elif arg.startswith({prefix!r}):
         out.append("http://127.0.0.1:" + os.environ["TEST_SERVER_PORT"] + "/" + arg[len({prefix!r}):])
     else:
@@ -218,7 +261,7 @@ os.execv({curl!r}, [{curl!r}] + out)
 
 
 class SetupMoldActionTests(unittest.TestCase):
-    def run_action(self, server, sha256: str):
+    def run_action(self, server, sha256: str, **overrides: str):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             shims = tmp / "shims"
@@ -249,9 +292,9 @@ class SetupMoldActionTests(unittest.TestCase):
                 "MOLD_VERSION": MOLD_VERSION,
                 "MOLD_SHA256": sha256,
                 "DOWNLOAD_RETRIES": action_env("DOWNLOAD_RETRIES"),
-                "DOWNLOAD_RETRY_DELAY_SECONDS": "0",
                 "TEST_SERVER_PORT": str(server.port),
                 **TRANSFER_LIMITS_FOR_TESTS,
+                **overrides,
             }
             result = subprocess.run(
                 ["bash", "-c", action_run_script()],
@@ -304,6 +347,26 @@ class SetupMoldActionTests(unittest.TestCase):
                 self.assertIn(f'"${name}"', script)
         for flag in ("--connect-timeout", "--speed-limit", "--speed-time", "--max-time", "--retry-max-time"):
             self.assertIn(flag, script)
+
+    def test_a_gateway_timeout_is_retried_on_a_doubling_schedule(self):
+        body = mold_archive()
+        with GatewayTimeoutServer() as server:
+            result, installed, _ = self.run_action(
+                server,
+                hashlib.sha256(body).hexdigest(),
+                DOWNLOAD_RETRIES=BACKOFF_RETRIES,
+                DOWNLOAD_RETRY_MAX_TIME_SECONDS="30",
+                TEST_CURL_ANNOUNCES_RETRIES="1",
+            )
+            connections = server.connections
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("::error::setup-mold: download of", result.stderr)
+        self.assertFalse(installed)
+        self.assertEqual(connections, int(BACKOFF_RETRIES) + 1)
+        # curl announces each wait it schedules: its own backoff doubles them,
+        # a fixed delay repeats one value.
+        waits = [int(seconds) for seconds in RETRY_ANNOUNCEMENT.findall(result.stderr)]
+        self.assertEqual(waits, [1, 2, 4], result.stderr)
 
     def test_hash_mismatch_fails_before_extraction(self):
         body = mold_archive()

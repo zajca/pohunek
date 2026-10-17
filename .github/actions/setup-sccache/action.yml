@@ -28,8 +28,10 @@ runs:
         # reset (curl exit 35 or 56) that plain `--retry` treats as permanent.
         # Retries are bounded: when the last attempt fails the job falls back
         # to building without sccache. The sha256 check below guards the bytes.
-        DOWNLOAD_RETRIES: "5"
-        DOWNLOAD_RETRY_DELAY_SECONDS: "2"
+        # Without --retry-delay curl backs off exponentially (1, 2, 4 ... s),
+        # so 6 retries wait 63 s in all and ride out a short server outage;
+        # a fixed delay would spend every retry in a few seconds.
+        DOWNLOAD_RETRIES: "6"
         # Transfer limits. --retry only counts attempts that return, so a server
         # that accepts and then stalls would hang the job without these. The
         # asset is about 9.7 MB: 1 KiB/s sustained for 30 s is a stall, and 120 s
@@ -81,7 +83,6 @@ runs:
         mkdir -p "$dest"
         if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
           --retry "$DOWNLOAD_RETRIES" --retry-all-errors \
-          --retry-delay "$DOWNLOAD_RETRY_DELAY_SECONDS" \
           --retry-max-time "$DOWNLOAD_RETRY_MAX_TIME_SECONDS" \
           --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT_SECONDS" \
           --speed-limit "$DOWNLOAD_STALL_BYTES_PER_SECOND" \
