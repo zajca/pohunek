@@ -176,8 +176,10 @@ fn spawn_concurrent_bootstrap_children(
     let children = (0..2)
         .map(|_child_index| {
             env.command(std::env::current_exe().expect("test executable"))
-                .arg("--exact")
-                .arg("concurrent_first_start_waits_for_the_locked_bootstrap_then_converges")
+                .args(pohunek_test_support::exact_test_filter(
+                    module_path!(),
+                    "concurrent_first_start_waits_for_the_locked_bootstrap_then_converges",
+                ))
                 .env(CHILD_STATE_DIR_ENV, temp.path())
                 .env(CHILD_ATTEMPT_SOCKET_ENV, attempt_socket)
                 .env(CHILD_PERMIT_SOCKET_ENV, permit_socket)

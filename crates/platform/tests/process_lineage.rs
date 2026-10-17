@@ -49,7 +49,8 @@ const FIXTURE_LIFETIME_SECONDS: &str = "600";
 ///
 /// `publish NAME VALUE` writes `VALUE` to `$DIR/NAME` atomically, so a reader
 /// either sees the whole value or no file. `$1` is the holding image and `$2`
-/// the scenario directory.
+/// the scenario directory. `$HOLD_FILTER` and `$ORPHAN_FILTER`, set after it,
+/// are the libtest arguments that select [`hold`] and [`orphan`].
 const SCRIPT_PRELUDE: &str = r#"IMAGE=$1
 DIR=$2
 publish() { printf '%s\n' "$2" > "$DIR/$1.tmp" && /bin/mv "$DIR/$1.tmp" "$DIR/$1"; }
@@ -80,7 +81,7 @@ exec /bin/sleep 600
 /// reason given on [`CREATOR_A`].
 const CREATOR_B: &str = r#"/bin/sleep 600 &
 sleeper=$!
-"$IMAGE" --exact hold --ignored &
+"$IMAGE" $HOLD_FILTER --ignored &
 holder=$!
 publish b.pids "$sleeper $holder"
 exec /bin/sleep 600
@@ -100,7 +101,7 @@ wait
 
 /// The creator `m` of the orphaning shape: starts the orphaning fixture, which
 /// runs this test binary until its creator is gone.
-const ORPHANING_CREATOR: &str = r#""$IMAGE" --exact orphan --ignored &
+const ORPHANING_CREATOR: &str = r#""$IMAGE" $ORPHAN_FILTER --ignored &
 publish orphan.pids "$!"
 wait
 "#;
@@ -236,9 +237,11 @@ impl Scenario {
     }
 
     fn write_script(&self, name: &str, body: &str) {
+        let hold = pohunek_test_support::exact_test_filter(module_path!(), "hold").join(" ");
+        let orphan = pohunek_test_support::exact_test_filter(module_path!(), "orphan").join(" ");
         pohunek_test_support::fs::write_file(
             self.dir().join(name),
-            format!("{SCRIPT_PRELUDE}{body}"),
+            format!("{SCRIPT_PRELUDE}HOLD_FILTER='{hold}'\nORPHAN_FILTER='{orphan}'\n{body}"),
         )
         .expect("write the fixture script");
     }

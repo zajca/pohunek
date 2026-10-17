@@ -5491,7 +5491,11 @@ async fn a_wide_read_only_tmpdir_is_deleted_under_a_low_descriptor_limit() {
     const TEST_NAME: &str = "a_wide_read_only_tmpdir_is_deleted_under_a_low_descriptor_limit";
     if std::env::var_os(WIDE_TMPDIR_CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args(["--exact", TEST_NAME, "--nocapture"])
+            .args(pohunek_test_support::exact_test_filter(
+                module_path!(),
+                TEST_NAME,
+            ))
+            .arg("--nocapture")
             .env(WIDE_TMPDIR_CHILD, "1")
             .output()
             .expect("run the re-executed child");

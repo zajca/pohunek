@@ -462,9 +462,11 @@ fn adopted_transactions_under_one_holder_run_one_at_a_time() {
     let second = host.root.join("second");
     fs::create_dir(&first).expect("first");
     fs::create_dir(&second).expect("second");
+    let [exact, probe_test] =
+        pohunek_test_support::exact_test_filter(module_path!(), "adopted_transaction_probe");
     let run = |dir: &Path| {
         format!(
-            "{PROBE_DIR_ENV}='{}' '{}' --exact adopted_transaction_probe --quiet >/dev/null",
+            "{PROBE_DIR_ENV}='{}' '{}' {exact} {probe_test} --quiet >/dev/null",
             dir.display(),
             probe.display()
         )

@@ -593,11 +593,11 @@ fn extraction_holds_descriptors_bounded_by_depth_not_directory_count() {
 
     if std::env::var_os(FD_LIMIT_CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
+            .args(pohunek_test_support::exact_test_filter(
+                module_path!(),
                 "extraction_holds_descriptors_bounded_by_depth_not_directory_count",
-                "--nocapture",
-            ])
+            ))
+            .arg("--nocapture")
             .env(FD_LIMIT_CHILD, "1")
             .output()
             .unwrap();

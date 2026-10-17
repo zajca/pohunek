@@ -176,12 +176,11 @@ fn a_degraded_preparation_creates_the_runtime_directories_owner_private() {
     let output = std::process::Command::new("/bin/sh")
         .args(["-c", "umask 022; exec \"$0\" \"$@\""])
         .arg(std::env::current_exe().expect("test executable"))
-        .args([
-            "--exact",
+        .args(pohunek_test_support::exact_test_filter(
+            module_path!(),
             "degraded_preparation_under_a_permissive_umask_child",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        ))
+        .args(["--nocapture", "--test-threads=1"])
         .env(UMASK_CHILD_VAR, "1")
         .output()
         .expect("run the child under the permissive umask");

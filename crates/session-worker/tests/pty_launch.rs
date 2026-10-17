@@ -123,7 +123,11 @@ async fn output_until(pty: &PtyOwner, needle: &str) -> String {
 fn run_in_child(test_name: &str, marker: &str, body: impl FnOnce()) {
     if std::env::var_os(LIMIT_CHILD_FLAG).is_none() {
         let output = ProcessCommand::new(std::env::current_exe().expect("test binary"))
-            .args(["--exact", test_name, "--nocapture"])
+            .args(pohunek_test_support::exact_test_filter(
+                module_path!(),
+                test_name,
+            ))
+            .arg("--nocapture")
             .env(LIMIT_CHILD_FLAG, "1")
             .output()
             .expect("run the re-executed child");
