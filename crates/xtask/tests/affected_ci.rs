@@ -24,7 +24,8 @@
 //! - a path of the runtime-edge map selects the tests it names;
 //! - an unmapped path, the CI configuration and the scripts of the CI test
 //!   jobs select every test;
-//! - prose selects no Rust test and marks the change docs-only;
+//! - prose selects no Rust test and marks the change docs-only, as does an
+//!   empty change;
 //! - a failure exits non-zero and writes no selection;
 //! - the guard fails on a test read of a path that does not select the reader.
 //! - the sparse tree of a package set holds exactly the files whose change
@@ -664,6 +665,18 @@ fn a_docs_only_change_selects_no_rust_test() {
     assert_eq!(selection["docs_only"], true);
     assert!(selection["filterset"].is_null());
     assert_eq!(all_packages(&selection), Vec::<(String, String)>::new());
+}
+
+/// A head whose tree equals its merge base changes nothing a run could test,
+/// so it takes the docs-only path.
+#[test]
+fn an_empty_change_is_docs_only() {
+    let repo = Repo::new();
+    repo.git(&["commit", "--quiet", "--allow-empty", "-m", "empty"]);
+    let selection = repo.select();
+    assert_eq!(selection["mode"], "none");
+    assert_eq!(selection["docs_only"], true);
+    assert_eq!(selection["files"], serde_json::json!([]));
 }
 
 #[test]

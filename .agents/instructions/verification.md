@@ -199,6 +199,19 @@ selection, and the `test selection verdict` job fails a run whose test job or
 selection check failed, was cancelled, or was skipped without one. The script
 regressions run in the core shard unless a narrowed selection needs none.
 
+A narrowed selection whose every changed file has no Rust tests and no gate
+but `docs check` (`docs_only`, mode `none`; for example `docs/` outside the
+mapped `docs/knowledge/` and `docs/public-api.md`, root `*.md`, `.agents/`,
+`.claude/` or `assets/`) takes the docs-only path. It skips `fmt + clippy`,
+`darwin-check`, `doctests`, `build bins`, `SDK workspace`, `cargo-audit` and
+`cargo-shear`; push, schedule and dispatch runs still run them. No such file
+reaches a build: the `every_escaping_include_is_covered` test of `xtask`
+requires every `include_str!` or `include_bytes!` path outside its package
+to select that package. `build tests` and `real systemd supervision` do not
+wait for the selection, so they also run on the docs-only path, and the
+verdict fails a run where one of the skipped jobs failed, was cancelled, or
+was skipped by anything but that path.
+
 G2, running the tests from a sparse checkout that holds only the files whose
 change selects a selected package (`cargo xtask affected sparse`), is wired
 behind the `TEST_SELECTION_SPARSE` switch of `ci.yml` and is off until a G3

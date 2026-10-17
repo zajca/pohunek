@@ -465,8 +465,13 @@ jobs:
           PKG_ACCEPT_UPGRADE_ARCHIVE: ${{ steps.package-b.outputs.archive }}
         run: scripts/acceptance/macos-package-install
 
+  # Skipped on the docs-only path of a pull request (#1218): a narrowed
+  # selection whose every changed file has no Rust tests and no gate but
+  # `docs check`. Any other outcome of the selection runs it.
   test:
     name: fmt + clippy
+    needs: test-selection
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
@@ -510,8 +515,13 @@ jobs:
   # `zig cc`, which carries the macOS libc headers. Runs on every event, like
   # `fmt + clippy`: one cheap job whose failure is the signal, with no paths
   # filter that could hide a macOS-only break.
+  # Skipped on the docs-only path of a pull request (#1218): a narrowed
+  # selection whose every changed file has no Rust tests and no gate but
+  # `docs check`. Any other outcome of the selection runs it.
   darwin-check:
     name: macOS lint from Linux (aarch64-apple-darwin clippy)
+    needs: test-selection
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
     runs-on: ubuntu-latest
     env:
       # No mold link argument: the lint links nothing, and with an explicit
@@ -541,9 +551,6 @@ jobs:
       - name: Clippy for aarch64-apple-darwin
         run: scripts/darwin-check
 
-  # Compiles every workspace test binary exactly once for the fast shards, the
-  # heavy job, and the relay DB job (issue #170). Designated `test-debug`
-  # saver; the same `--workspace --all-features` build also warms doctests.
   # Selects the pull request's tests with the selector of its merge base
   # (scripts/ci-test-selection); every other event runs every test. A test
   # job narrows or skips only on an explicit output of a successful run of
@@ -669,6 +676,9 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # Compiles every workspace test binary exactly once for the fast shards, the
+  # heavy job, and the relay DB job (issue #170). Designated `test-debug`
+  # saver; the same `--workspace --all-features` build also warms doctests.
   build-tests:
     name: build tests (nextest archive)
     runs-on: ubuntu-latest
@@ -1405,10 +1415,11 @@ jobs:
   # A skipped test job counts as passed, so this job fails a run where a test
   # job failed, was cancelled, or was skipped without a narrowed selection of
   # a pull request that plans nothing for it. The relay DB job is also gated
-  # by its paths filter, so only its failure or cancellation counts.
+  # by its paths filter, so only its failure or cancellation counts. The gate
+  # jobs of the docs-only path must succeed or be skipped by that path.
   test-selection-verdict:
     name: test selection verdict
-    needs: [test-selection, build-tests, test-selection-check, fast-tests, integration, integration-relay]
+    needs: [test-selection, build-tests, test-selection-check, fast-tests, integration, integration-relay, test, darwin-check, doctests, build-bins, sdk, audit, shear]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
@@ -1420,9 +1431,22 @@ jobs:
         run: |
           echo "::error::test jobs did not run as the selection requires: $RESULTS"
           exit 1
+      - name: Fail a gate job that failed or was skipped without the docs-only path
+        if: ${{ (needs.test.result != 'success' && !(needs.test.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.darwin-check.result != 'success' && !(needs.darwin-check.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.doctests.result != 'success' && !(needs.doctests.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.build-bins.result != 'success' && !(needs.build-bins.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.sdk.result != 'success' && !(needs.sdk.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.audit.result != 'success' && !(needs.audit.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.shear.result != 'success' && !(needs.shear.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) }}
+        shell: bash
+        env:
+          RESULTS: "selection=${{ needs.test-selection.result }} narrowed=${{ needs.test-selection.outputs.narrowed }} mode=${{ needs.test-selection.outputs.mode }} docs_only=${{ needs.test-selection.outputs.docs_only }} test=${{ needs.test.result }} darwin-check=${{ needs.darwin-check.result }} doctests=${{ needs.doctests.result }} build-bins=${{ needs.build-bins.result }} sdk=${{ needs.sdk.result }} audit=${{ needs.audit.result }} shear=${{ needs.shear.result }}"
+        run: |
+          echo "::error::gate jobs did not run as the selection requires: $RESULTS"
+          exit 1
 
+  # Skipped on the docs-only path of a pull request (#1218): a narrowed
+  # selection whose every changed file has no Rust tests and no gate but
+  # `docs check`. Any other outcome of the selection runs it.
   doctests:
     name: doctests
+    needs: test-selection
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
@@ -2857,8 +2881,13 @@ jobs:
 
   # Build the three runnable binaries exactly once. The SDK e2e job reuses
   # this artifact instead of rebuilding Rust (issue #122).
+  # Skipped on the docs-only path of a pull request (#1218): a narrowed
+  # selection whose every changed file has no Rust tests and no gate but
+  # `docs check`. Any other outcome of the selection runs it.
   build-bins:
     name: build bins (pohunekd + pohunek-sessiond + pohunek)
+    needs: test-selection
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
@@ -2918,10 +2947,14 @@ jobs:
           path: target/hermes-e2e
           if-no-files-found: error
 
+  # Skipped on the docs-only path of a pull request (#1218): a narrowed
+  # selection whose every changed file has no Rust tests and no gate but
+  # `docs check`. Any other outcome of the selection runs it.
   sdk:
     name: SDK workspace
     runs-on: ubuntu-latest
-    needs: build-bins
+    needs: [build-bins, test-selection]
+    if: ${{ !cancelled() && needs.build-bins.result == 'success' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -3084,8 +3117,13 @@ jobs:
   # feature matrix, and unused dependencies. Kept off the critical `test` job so
   # an advisory in a transitive crate stays visible without masking a real
   # failure.
+  # Skipped on the docs-only path of a pull request (#1218): a narrowed
+  # selection whose every changed file has no Rust tests and no gate but
+  # `docs check`. Any other outcome of the selection runs it.
   audit:
     name: cargo-audit (RustSec advisories)
+    needs: test-selection
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -3223,8 +3261,13 @@ jobs:
   # transitively anyway, both of which cargo-udeps misses (issue #173). A false
   # positive is suppressed per crate with
   # `[package.metadata.cargo-shear] ignored = ["<crate>"]` plus a reason comment.
+  # Skipped on the docs-only path of a pull request (#1218): a narrowed
+  # selection whose every changed file has no Rust tests and no gate but
+  # `docs check`. Any other outcome of the selection runs it.
   shear:
     name: cargo-shear (unused dependencies)
+    needs: test-selection
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
