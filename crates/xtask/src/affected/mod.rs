@@ -602,6 +602,47 @@ pub(crate) const CI_RULES: &[(Pattern, &str)] = &[
     ),
 ];
 
+/// Platform-neutral data that the macOS lane selection of a pull request
+/// leaves out (#1225).
+///
+/// A change to `pattern` cannot behave differently on macOS: the data reaches
+/// Rust tests as `owner`'s embedded data or through its [`RULES`] readers,
+/// and every dependent of `owner` is a reviewed `reader`. The Linux selection
+/// still closes over all of them. A perturbed copy of the data (#1225) failed
+/// only `owner`'s own tests. `lane_neutral_readers_are_every_dependent`
+/// requires `readers` to name every workspace member that depends on `owner`.
+pub(crate) struct LaneNeutral {
+    pub(crate) pattern: Pattern,
+    pub(crate) owner: &'static str,
+    pub(crate) readers: &'static [(&'static str, &'static str)],
+    pub(crate) why: &'static str,
+}
+
+/// The paths of [`LaneNeutral`].
+pub(crate) const LANE_NEUTRAL: &[LaneNeutral] = &[LaneNeutral {
+    pattern: Pattern::Dir("docs/knowledge"),
+    owner: "pohunek-knowledge",
+    readers: &[
+        (
+            "pohunek-assistant",
+            "materializes the embedded bundle and hashes it for the launch id",
+        ),
+        (
+            "pohunek-daemon",
+            "materializes the embedded bundle for `assistant.materialize`",
+        ),
+        (
+            "pohunek-cli",
+            "reaches the bundle through pohunek-assistant",
+        ),
+        (
+            "xtask",
+            "depends on the bundle through the daemon and the CLI",
+        ),
+    ],
+    why: "knowledge bundle data, embedded by pohunek-knowledge's build script",
+}];
+
 /// Which caller classifies a change.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Mode {
@@ -1988,6 +2029,37 @@ mod tests {
             uncovered.is_empty(),
             "add these embedded paths to RULES in affected/mod.rs: {uncovered:#?}"
         );
+    }
+
+    /// The macOS lane leaves a [`LANE_NEUTRAL`] path out only while a review
+    /// names every package that can read its data: a new dependent of the
+    /// owner fails here until it is listed with the reason it reads the data.
+    #[test]
+    fn lane_neutral_readers_are_every_dependent() {
+        let (_, packages) =
+            workspace(&pohunek_test_support::workspace_root()).expect("workspace members");
+        for data in LANE_NEUTRAL {
+            assert!(
+                packages.iter().any(|package| package.name == data.owner),
+                "{:?}: owner {} is not a workspace member",
+                data.pattern,
+                data.owner
+            );
+            let seeds = BTreeMap::from([(data.owner.to_owned(), BTreeSet::new())]);
+            let mut dependents: BTreeSet<String> =
+                graph::close(&seeds, &packages).into_keys().collect();
+            dependents.remove(data.owner);
+            let readers: BTreeSet<String> = data
+                .readers
+                .iter()
+                .map(|(name, _)| (*name).to_owned())
+                .collect();
+            assert_eq!(
+                readers, dependents,
+                "{:?}: LANE_NEUTRAL readers must be exactly the dependents of {}",
+                data.pattern, data.owner
+            );
+        }
     }
 
     /// Runs git in the environment's private working directory with a scrubbed

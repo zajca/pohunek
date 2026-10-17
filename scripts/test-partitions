@@ -9,7 +9,9 @@ is how CI shares one build across the shard jobs.
 `--selection` takes the `selection.json` of `cargo xtask affected ci`: `plan`
 prints the CI test jobs it starts, `run` narrows a shard to its selected
 tests (a shard holding none of them passes), and `check` requires the
-planned shards to hold every selected test exactly once.
+planned shards to hold every selected test exactly once. `run-macos` narrows
+the macOS lane to the selection's `lane` part; a selection without one, or a
+full selection, runs the whole lane.
 
 The macOS lane (`check-macos`, `run-macos`, `run-macos-tier`) takes the same
 archive and checks or runs the macOS package set as nextest selections. Its
@@ -189,7 +191,7 @@ def shard_plan(selection):
             f"{SELECTION_SCHEMA_VERSION}")
     mode = selection.get("mode")
     if mode == "full":
-        return {"fast_shards": list(FAST_SHARDS), "heavy": True, "relay_db": True}
+        return {"fast_shards": list(FAST_SHARDS), "heavy": True, "relay_db": True, "lane": True}
     if mode not in ("packages", "none"):
         raise ValueError(f"unknown selection mode {mode!r}")
     names = {package["name"] for package in selection.get("packages", [])}
@@ -209,7 +211,37 @@ def shard_plan(selection):
         "fast_shards": [shard for shard in FAST_SHARDS if shard in shards],
         "heavy": any(name not in relay for name in names),
         "relay_db": any(name in relay for name in names),
+        "lane": lane_selection(selection)["mode"] != "none",
     }
+
+
+def lane_selection(selection):
+    """The macOS lane part of a selection, as `{"mode", "filterset"}`.
+
+    The lane leaves out the paths whose readers all run on Linux, so its part
+    may select less than the Linux shards. A selection without a lane part,
+    from a selector that predates it, or a full selection runs the whole lane.
+    A lane part that selects no lane package runs nothing.
+    """
+    lane = selection.get("lane")
+    if selection.get("mode") == "full" or lane is None:
+        return {"mode": "full", "filterset": None}
+    if not isinstance(lane, dict):
+        raise ValueError("the lane part of the selection is not an object")
+    mode = lane.get("mode")
+    if mode == "full":
+        return {"mode": "full", "filterset": None}
+    if mode not in ("packages", "none"):
+        raise ValueError(f"unknown lane mode {mode!r}")
+    names = {package["name"] for package in lane.get("packages", [])}
+    filterset = lane.get("filterset")
+    if mode == "packages" and not (names and isinstance(filterset, str) and filterset):
+        raise ValueError("a packages lane part has no packages or no filterset")
+    if mode == "none" and (names or filterset is not None):
+        raise ValueError("a none lane part lists packages or a filterset")
+    if mode == "none" or not names & set(LANE_PACKAGES):
+        return {"mode": "none", "filterset": None}
+    return {"mode": "packages", "filterset": filterset}
 
 
 def load_selection(path):
@@ -620,9 +652,10 @@ def main():
     )
     parser.add_argument(
         "--selection", type=Path,
-        help="plan, run and check: the selection.json of `cargo xtask affected ci`; plan "
-             "prints its CI test jobs, run runs the shard's selected tests, check "
-             "verifies that the planned shards hold every selected test",
+        help="plan, run, check and run-macos: the selection.json of `cargo xtask "
+             "affected ci`; plan prints its CI test jobs, run runs the shard's selected "
+             "tests, check verifies that the planned shards hold every selected test, "
+             "run-macos runs the lane's selected tests",
     )
     args = parser.parse_args()
     if args.action == "plan":
@@ -635,11 +668,12 @@ def main():
         print(f"fast_shards={json.dumps(plan['fast_shards'])}")
         print(f"heavy={str(plan['heavy']).lower()}")
         print(f"relay_db={str(plan['relay_db']).lower()}")
+        print(f"lane={str(plan['lane']).lower()}")
         return
     selection = plan = None
     if args.selection is not None:
-        if args.action not in ("run", "check"):
-            parser.error("--selection applies to plan, run and check only")
+        if args.action not in ("run", "check", "run-macos"):
+            parser.error("--selection applies to plan, run, check and run-macos only")
         try:
             selection, plan = load_selection(args.selection)
         except ValueError as error:
@@ -661,7 +695,17 @@ def main():
             return
         if args.scope is not None:
             parser.error("--scope applies to check-macos only")
-        run_nextest("macos", MACOS_RUN_SETS[args.action], archive)
+        expression = MACOS_RUN_SETS[args.action]
+        if selection is not None:
+            lane = lane_selection(selection)
+            if lane["mode"] == "none":
+                print("test-partitions run-macos: the selection runs no test of the macOS lane")
+                return
+            if lane["mode"] == "packages":
+                expression = f"({expression}) and ({lane['filterset']})"
+        # A narrowed lane may hold none of a selected package's filtered tests.
+        run_nextest("macos", expression, archive,
+                    no_tests_pass=selection is not None and expression != MACOS_RUN_SETS[args.action])
     expressions = filters()
     if args.action == "check":
         if args.shard is not None:

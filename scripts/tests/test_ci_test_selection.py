@@ -90,6 +90,8 @@ SELECTOR = textwrap.dedent(
                 + f"filterset={{filterset or ''}}\\n")
     with open(os.path.join(out, "summary.md"), "w") as f:
         f.write(f"### Test selection\\n\\nMode: **{{mode}}**\\n")
+    if {lane!r} is not None:
+        selection["lane"] = {lane!r}
     with open(os.path.join(out, "selection.json"), "w") as f:
         json.dump(selection, f)
     if {outputs_env!r} is not None:
@@ -110,12 +112,13 @@ SLOW_CARGO = FAKE_CARGO.replace("import os, shutil, sys\n", "import os, shutil, 
 
 
 def selector(revision, known, schema=1, has_ci=True, has_sparse=True, ci_delay=0,
-             outputs_env=None):
-    """A base selector; `ci_delay` seconds pass before `affected ci` answers and
-    `outputs_env`, when set, replaces the `outputs.env` it writes."""
+             outputs_env=None, lane=None):
+    """A base selector; `ci_delay` seconds pass before `affected ci` answers,
+    `outputs_env`, when set, replaces the `outputs.env` it writes, and `lane`,
+    when set, is the macOS lane part of its selection."""
     return SELECTOR.format(
         revision=revision, known=list(known), schema=schema, has_ci=has_ci,
-        has_sparse=has_sparse, ci_delay=ci_delay, outputs_env=outputs_env,
+        has_sparse=has_sparse, ci_delay=ci_delay, outputs_env=outputs_env, lane=lane,
     )
 
 
@@ -308,6 +311,44 @@ class CiTestSelectionTests(unittest.TestCase):
         repo = self.repo(selector("base", ["a/"], outputs_env=outputs_env))
         repo.commit({"a/x": "changed\n"}, "change a/")
         return repo
+
+    def test_the_lane_part_of_the_base_selector_reaches_the_lane_job(self):
+        for lane in (
+            {"mode": "none", "filterset": None, "full_causes": [], "packages": []},
+            {"mode": "packages", "filterset": "package(=a)", "full_causes": [],
+             "packages": [{"name": "a"}]},
+            {"mode": "full", "filterset": None, "full_causes": ["x"], "packages": []},
+        ):
+            with self.subTest(lane=lane["mode"]):
+                self.tearDown()
+                self.setUp()
+                repo = self.repo(selector("base", ["a/"], lane=lane))
+                repo.commit({"a/x": "changed\n"}, "change a/")
+                selection, outputs, _ = repo.run("--base", "main")
+                self.assertEqual(outputs["mode"], "packages")
+                self.assertEqual(selection["lane"], lane)
+
+    def test_a_malformed_lane_part_runs_every_test(self):
+        for lane in (
+            "none",
+            {"mode": "subset", "filterset": None, "packages": []},
+            {"mode": "packages", "filterset": None, "packages": [{"name": "a"}]},
+            {"mode": "packages", "filterset": "package(=a)", "packages": []},
+            {"mode": "none", "filterset": "package(=a)", "packages": []},
+            {"mode": "none", "filterset": None, "packages": [{"name": "a"}]},
+            {"mode": "none", "filterset": None, "packages": "a"},
+        ):
+            with self.subTest(lane=lane):
+                self.tearDown()
+                self.setUp()
+                repo = self.repo(selector("base", ["a/"], lane=lane))
+                repo.commit({"a/x": "changed\n"}, "change a/")
+                repo.invoke("--base", "main")
+                self.assert_every_test_runs_because(
+                    repo, "the merge base's selector wrote an inconsistent selection"
+                )
+                selection = json.loads((repo.out / "selection.json").read_text())
+                self.assertEqual(selection["lane"]["mode"], "full")
 
     def test_a_base_selector_whose_mode_disagrees_with_its_selection_runs_every_test(self):
         repo = self.inconsistent_outputs_repo(

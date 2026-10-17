@@ -54,14 +54,14 @@ MACOS_PATH_OWNERSHIP = {
             ".github/actions/hermes-test-python/**",
             "crates/relay-client/**",
             "crates/relay-protocol/**",
-            "docs/knowledge/**",
             "Cargo.lock",
             ".cargo/**",
             ".github/workflows/ci.yml",
             "rust-toolchain.toml",
             ".github/actions/setup-rust/**",
         },
-        "main": set(),
+        # Platform-neutral data whose readers all run on Linux (#1225).
+        "main": {"docs/knowledge/**"},
     },
     "macos-package": {
         "filter": "macos_package",
@@ -294,6 +294,24 @@ PACKAGE_JOBS = {
 }
 PACKAGE_SELECTOR = "package-selection"
 PACKAGE_SELECT_COMMAND = 'cargo xtask package affected --base "$BASE_SHA" --json'
+
+
+def evaluate_job_condition(
+    expression: str,
+    *,
+    event: str,
+    tier: str = "",
+    changes: dict[str, str] | None = None,
+    result: str = "",
+    outputs: dict[str, str] | None = None,
+) -> bool:
+    """`evaluate_condition` for a job that may also wait on other jobs: the
+    package selection gives `result` and `outputs`, and every other job of
+    `needs` has no result, as when the selection has not narrowed anything."""
+    return bool(evaluate_needs_expression(
+        expression, event=event, tier=tier, changes=changes,
+        results={PACKAGE_SELECTOR: result}, outputs={PACKAGE_SELECTOR: outputs or {}},
+    ))
 
 
 def evaluate_condition(
@@ -583,17 +601,17 @@ class CiTierWorkflowTests(unittest.TestCase):
             other_filters[ownership["filter"]] = "false"
             for result, outputs in selections:
                 with self.subTest(job=name, selection=result, outputs=outputs):
-                    self.assertTrue(evaluate_condition(
+                    self.assertTrue(evaluate_job_condition(
                         expression.group(1), event="pull_request",
                         changes={ownership["filter"]: "true"}, result=result, outputs=outputs,
                     ))
-                    self.assertFalse(evaluate_condition(
+                    self.assertFalse(evaluate_job_condition(
                         expression.group(1), event="pull_request",
                         changes=other_filters, result=result, outputs=outputs,
                     ))
             for event, tier in (("push", ""), ("schedule", ""), ("workflow_dispatch", "main"), ("workflow_dispatch", "nightly")):
                 with self.subTest(job=name, event=event, tier=tier):
-                    self.assertTrue(evaluate_condition(
+                    self.assertTrue(evaluate_job_condition(
                         expression.group(1), event=event, tier=tier, result="skipped",
                     ))
         # A job without a pull-request branch never starts on a pull request,
@@ -605,13 +623,13 @@ class CiTierWorkflowTests(unittest.TestCase):
                 for value in ("true", "false"):
                     changes = {filter_name: value for filter_name in filter_names()}
                     with self.subTest(job=name, selection=result, outputs=outputs, filters=value):
-                        self.assertFalse(evaluate_condition(
+                        self.assertFalse(evaluate_job_condition(
                             expression.group(1), event="pull_request",
                             changes=changes, result=result, outputs=outputs,
                         ))
             for event, tier in (("push", ""), ("schedule", ""), ("workflow_dispatch", "main"), ("workflow_dispatch", "nightly")):
                 with self.subTest(job=name, event=event, tier=tier):
-                    self.assertTrue(evaluate_condition(
+                    self.assertTrue(evaluate_job_condition(
                         expression.group(1), event=event, tier=tier, result="skipped",
                     ))
 
@@ -2543,6 +2561,126 @@ class DocsOnlyPathTests(unittest.TestCase):
                     waiting.add(name)
                     grown = True
         self.assertEqual(waiting - verdict, set())
+
+
+LANE_JOB = "platform-contracts"
+
+
+class LaneSelectionTests(unittest.TestCase):
+    """A narrowed selection without lane tests skips the macOS lane (#1225)."""
+
+    def runs(self, *, event="pull_request", tier="", cancelled=False, macos="true",
+             selection="success", plan=None):
+        return bool(evaluate_needs_expression(
+            job_condition(LANE_JOB), event=event, tier=tier, cancelled=cancelled,
+            changes={"macos": macos}, results={TEST_SELECTOR: selection},
+            outputs={TEST_SELECTOR: {"narrowed": "true", "lane": "false"} if plan is None else plan},
+        ))
+
+    def test_the_lane_waits_for_the_selection_and_its_paths_filter(self):
+        self.assertEqual(set(job_needs(workflow_jobs()[LANE_JOB])), {"changes", TEST_SELECTOR})
+
+    def test_a_narrowed_selection_without_lane_tests_skips_the_lane(self):
+        self.assertFalse(self.runs())
+        self.assertFalse(self.runs(macos="false", plan={"narrowed": "true", "lane": "true"}))
+        self.assertFalse(self.runs(cancelled=True, plan={}))
+        for kwargs in (
+            {"plan": {"narrowed": "true", "lane": "true"}},
+            # A selector without the lane output, or any selection that is
+            # not a narrowed one, runs the whole lane.
+            {"plan": {"narrowed": "true"}},
+            {"plan": {"narrowed": "false", "lane": "false"}},
+            {"selection": "failure"}, {"selection": "cancelled"}, {"selection": "skipped"},
+        ):
+            with self.subTest(**kwargs):
+                self.assertTrue(self.runs(**kwargs))
+
+    def test_every_tier_run_starts_the_lane_whatever_the_selection(self):
+        for event, tier in (("push", ""), ("schedule", ""), ("workflow_dispatch", "main"),
+                            ("workflow_dispatch", "nightly")):
+            for selection in ("success", "failure", "skipped"):
+                with self.subTest(event=event, tier=tier, selection=selection):
+                    self.assertTrue(self.runs(event=event, tier=tier, macos="",
+                                              selection=selection))
+
+    def test_the_lane_tests_read_the_selection_only_when_it_narrows(self):
+        steps = job_steps(workflow_jobs()[LANE_JOB])
+        self.assertEqual(
+            step_condition(steps["Download test selection"]), f"!cancelled() && {NARROWED}"
+        )
+        run = steps["Run macOS lane tests"]
+        self.assertEqual(step_env_expression(run, "NARROWED"), NARROWED)
+        script = step_script(run)
+        self.assertIn('if [ "$NARROWED" = true ]; then', script)
+        self.assertIn('run-macos --selection "$RUNNER_TEMP/test-selection/selection.json"', script)
+        # The lint and the doctests stay whole.
+        for name in ("Lint macOS lane packages", "Run macOS lane doctests"):
+            with self.subTest(step=name):
+                self.assertNotIn("selection", steps[name])
+
+    def test_the_knowledge_bundle_does_not_start_the_lane(self):
+        self.assertNotIn("docs/knowledge/**", filter_paths("macos"))
+
+    def test_every_lane_trigger_outside_the_crates_runs_the_whole_lane(self):
+        # A non-test step of the lane (the contributor path, the APFS checks)
+        # reads these inputs, so a change to one must never skip the lane:
+        # each is in the test pipeline, which keeps a run from narrowing, or
+        # selects every lane test in `cargo xtask affected ci`.
+        script = step_script(
+            job_steps(workflow_jobs()[TEST_SELECTOR])["Decide whether the selection narrows the run"]
+        )
+        pipeline = set(re.search(r"pipeline=\(\n(.*?)\n\)", script, re.S).group(1).split())
+        # Dependency inputs and the Everything rules of `cargo xtask affected`.
+        full_lane = {"Cargo.toml", "Cargo.lock", ".cargo/**", "rust-toolchain.toml"}
+        for path in filter_paths("macos"):
+            if path.startswith("crates/"):
+                continue
+            stem = path.removesuffix("/**")
+            with self.subTest(path=path):
+                self.assertTrue(
+                    path in full_lane
+                    or any(stem == entry or stem.startswith(f"{entry}/") for entry in pipeline),
+                    path,
+                )
+
+    def test_the_plan_writes_the_lane_output(self):
+        self.assertIn("      lane: ${{ steps.plan.outputs.lane }}\n", workflow_jobs()[TEST_SELECTOR])
+
+    def test_the_verdict_fails_a_lane_skipped_without_a_reason(self):
+        job = workflow_jobs()[TEST_VERDICT]
+        self.assertLessEqual({"changes", LANE_JOB}, set(job_needs(job)))
+        condition = step_condition(
+            job_steps(job)["Fail a macOS lane that failed or was skipped without a reason"]
+        )
+
+        def fails(lane, event="pull_request", macos="true", changes="success",
+                  selection="success", plan=None):
+            return bool(evaluate_needs_expression(
+                condition, event=event, changes={"macos": macos},
+                results={LANE_JOB: lane, "changes": changes, TEST_SELECTOR: selection},
+                outputs={TEST_SELECTOR: {"narrowed": "true", "lane": "false"}
+                         if plan is None else plan},
+            ))
+
+        self.assertFalse(fails("success"))
+        self.assertFalse(fails("success", event="push"))
+        self.assertFalse(fails("skipped"))
+        self.assertFalse(fails("skipped", macos="false", plan={}))
+        self.assertFalse(fails("skipped", changes="failure", plan={}))
+        for args in (
+            {"lane": "failure"}, {"lane": "cancelled"},
+            {"lane": "skipped", "event": "push"}, {"lane": "skipped", "event": "schedule"},
+            {"lane": "skipped", "event": "workflow_dispatch"},
+            # The paths filter excuses a skip on a pull request only.
+            {"lane": "skipped", "event": "push", "macos": "false", "plan": {}},
+            {"lane": "skipped", "event": "schedule", "changes": "failure", "plan": {}},
+            {"lane": "skipped", "plan": {"narrowed": "true", "lane": "true"}},
+            {"lane": "skipped", "plan": {"narrowed": "true"}},
+            {"lane": "skipped", "plan": {"narrowed": "false", "lane": "false"}},
+            {"lane": "skipped", "selection": "failure"},
+        ):
+            with self.subTest(**args):
+                self.assertTrue(fails(**args))
 
 
 def partitions_module():

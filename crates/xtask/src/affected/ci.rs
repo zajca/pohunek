@@ -10,7 +10,8 @@
 //! The command writes three files into `--out`:
 //!
 //! - `selection.json`: the mode, the nextest filterset, every selected package
-//!   with its reasons, and every changed file with its decision;
+//!   with its reasons, every changed file with its decision, and the `lane`
+//!   part that the macOS lane runs;
 //! - `outputs.env`: `key=value` lines for `$GITHUB_OUTPUT`;
 //! - `summary.md`: the Markdown table for `$GITHUB_STEP_SUMMARY`.
 //!
@@ -20,6 +21,10 @@
 //! the outputs again, so a caller never reads a selection from a failed run;
 //! the CI jobs treat a failed or missing selection as a full run. A failure of the dependency diff alone is not an
 //! error: it selects every test.
+//!
+//! The `lane` part classifies the changed files without the [`LANE_NEUTRAL`]
+//! paths, whose readers all run on Linux. Its dependency diff would cover the
+//! host platform only, so any dependency input makes the lane part full.
 
 // Rust guideline compliant 2026-10-16
 
@@ -31,7 +36,8 @@ use serde_json::json;
 
 use super::{
     command_output, ensure_git_toplevel, filterset, graph, merge_base, parse_nul_list, plan,
-    printable, resolve, workspace, Decision, Mode, Outcome, Plan, Reason, Reminder, GIT,
+    printable, resolve, workspace, Decision, Mode, Outcome, Package, Plan, Reason, Reminder, GIT,
+    LANE_NEUTRAL,
 };
 use crate::XtaskError;
 
@@ -90,13 +96,17 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
     let outcome = resolve(&plan, &packages, || {
         graph::manifest_diff(&root, &merge_base)
     });
+    let lane = lane_outcome(&changed, &packages)?;
 
     let report = Report::new(&plan, &outcome);
-    let selection =
-        serde_json::to_string_pretty(&report.json(&options.base, &merge_base, &plan, &outcome))
-            .map_err(XtaskError::Json)?;
+    let mut summary = report.summary(&merge_base, &plan, &outcome);
+    summary.push_str(&lane_summary(&lane));
+    let mut json = report.json(&options.base, &merge_base, &plan, &outcome);
+    json["lane"] = lane_json(&lane);
+    json["lane"]["left_out"] = left_out(&changed);
+    let selection = serde_json::to_string_pretty(&json).map_err(XtaskError::Json)?;
     let written = [
-        (SUMMARY, report.summary(&merge_base, &plan, &outcome)),
+        (SUMMARY, summary),
         (OUTPUTS, report.outputs(&outcome)),
         (SELECTION, selection + "\n"),
     ]
@@ -114,6 +124,94 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
         changed.len()
     );
     Ok(())
+}
+
+/// What the macOS lane runs: the changed files without the [`LANE_NEUTRAL`]
+/// paths, classified like the Linux selection, and every lane test on any
+/// dependency input.
+fn lane_outcome(changed: &BTreeSet<String>, packages: &[Package]) -> Result<Outcome, XtaskError> {
+    let kept: BTreeSet<String> = changed
+        .iter()
+        .filter(|path| !LANE_NEUTRAL.iter().any(|data| data.pattern.matches(path)))
+        .cloned()
+        .collect();
+    let lane = plan(&kept, packages, Mode::Ci)?;
+    if lane.dependencies {
+        return Ok(Outcome::Everything(vec![
+            "a dependency input changed, and the dependency diff covers the host platform only"
+                .to_owned(),
+        ]));
+    }
+    Ok(resolve(&lane, packages, || {
+        Err(XtaskError::Usage(
+            "the lane selection has no dependency input".to_owned(),
+        ))
+    }))
+}
+
+/// The changed [`LANE_NEUTRAL`] paths the lane part leaves out, each with
+/// its data and the packages that read it on Linux.
+fn left_out(changed: &BTreeSet<String>) -> serde_json::Value {
+    let entries: Vec<serde_json::Value> = changed
+        .iter()
+        .filter_map(|path| {
+            let data = LANE_NEUTRAL
+                .iter()
+                .find(|data| data.pattern.matches(path))?;
+            let readers: Vec<&str> = std::iter::once(data.owner)
+                .chain(data.readers.iter().map(|(name, _)| *name))
+                .collect();
+            Some(json!({"path": path, "why": data.why, "linux_readers": readers}))
+        })
+        .collect();
+    serde_json::Value::Array(entries)
+}
+
+/// The `lane` object of `selection.json`.
+fn lane_json(outcome: &Outcome) -> serde_json::Value {
+    match outcome {
+        Outcome::Everything(causes) => {
+            json!({"mode": "full", "filterset": null, "full_causes": causes, "packages": []})
+        }
+        Outcome::Nothing => {
+            json!({"mode": "none", "filterset": null, "full_causes": [], "packages": []})
+        }
+        Outcome::Tests(targets) => {
+            let names: BTreeSet<&String> = targets
+                .whole
+                .keys()
+                .chain(targets.narrowed.keys())
+                .collect();
+            let packages: Vec<serde_json::Value> = names
+                .into_iter()
+                .map(|name| json!({"name": name}))
+                .collect();
+            json!({
+                "mode": "packages",
+                "filterset": filterset(targets),
+                "full_causes": [],
+                "packages": packages,
+            })
+        }
+    }
+}
+
+/// One line of `summary.md` naming what the macOS lane runs.
+fn lane_summary(outcome: &Outcome) -> String {
+    let what = match outcome {
+        Outcome::Everything(_) => "every lane test".to_owned(),
+        Outcome::Nothing => "no test".to_owned(),
+        Outcome::Tests(targets) => {
+            let names: BTreeSet<&String> = targets
+                .whole
+                .keys()
+                .chain(targets.narrowed.keys())
+                .collect();
+            let names: Vec<String> = names.into_iter().map(|name| cell(name)).collect();
+            format!("the selected tests of {}", names.join(", "))
+        }
+    };
+    format!("\nmacOS lane: {what} (paths whose readers all run on Linux are left out).\n")
 }
 
 /// The mode and the flags the CI jobs branch on.

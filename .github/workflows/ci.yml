@@ -121,9 +121,10 @@ jobs:
   platform-contracts:
     name: platform contracts (arm64)
     # macOS runners are costly (issue #125): run in the main/nightly tiers or
-    # on a PR when platform inputs change via the paths filter.
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.macos == 'true') }}
-    needs: changes
+    # on a PR when platform inputs change via the paths filter. A narrowed
+    # selection whose lane part selects no lane package skips it (#1225).
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.macos == 'true' && (needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.lane != 'false'))) }}
+    needs: [changes, test-selection]
     runs-on: macos-15
     # The lane's test phase takes about 450 s on macos-15; the rest of the
     # budget covers the toolchain, cache restore and a cold build.
@@ -214,9 +215,27 @@ jobs:
       # Binding::revalidate must reject), and the real gui/<uid> launchd suites.
       # Those paths run only on a native runner.
       # Independent of the check: the tests still run when the partition check fails.
+      - name: Download test selection
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: test-selection
+          path: ${{ runner.temp }}/test-selection
+
+      # A narrowed selection runs the lane tests of its lane part; the lint
+      # and the doctests stay whole.
       - name: Run macOS lane tests
         if: ${{ !cancelled() }}
-        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/macos-lane.tar.zst" run-macos
+        shell: bash
+        env:
+          NARROWED: ${{ github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}
+        run: |
+          set -euo pipefail
+          if [ "$NARROWED" = true ]; then
+            python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/macos-lane.tar.zst" run-macos --selection "$RUNNER_TEMP/test-selection/selection.json"
+          else
+            python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/macos-lane.tar.zst" run-macos
+          fi
 
       # nextest runs no doctests, so the lane packages' doc examples run here,
       # natively, where their Darwin code paths are compiled.
@@ -644,6 +663,7 @@ jobs:
       fast_shards: ${{ steps.plan.outputs.fast_shards }}
       heavy: ${{ steps.plan.outputs.heavy }}
       relay_db: ${{ steps.plan.outputs.relay_db }}
+      lane: ${{ steps.plan.outputs.lane }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1002,7 +1022,6 @@ jobs:
               - '.github/actions/hermes-test-python/**'
               - 'crates/relay-client/**'
               - 'crates/relay-protocol/**'
-              - 'docs/knowledge/**'
               - 'Cargo.lock'
               - '.cargo/**'
               - '.github/workflows/ci.yml'
@@ -1489,10 +1508,11 @@ jobs:
   # job failed, was cancelled, or was skipped without a narrowed selection of
   # a pull request that plans nothing for it. The relay DB job is also gated
   # by its paths filter, so only its failure or cancellation counts. The gate
-  # jobs of the docs-only path must succeed or be skipped by that path.
+  # jobs of the docs-only path must succeed or be skipped by that path, and the
+  # macOS lane by its paths filter or a narrowed selection without lane tests.
   test-selection-verdict:
     name: test selection verdict
-    needs: [test-selection, build-tests, test-selection-check, fast-tests, integration, integration-relay, test, darwin-check, doctests, build-bins, sdk, audit, shear]
+    needs: [changes, test-selection, build-tests, test-selection-check, fast-tests, integration, integration-relay, test, darwin-check, doctests, build-bins, sdk, audit, shear, platform-contracts]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
@@ -1511,6 +1531,14 @@ jobs:
           RESULTS: "selection=${{ needs.test-selection.result }} narrowed=${{ needs.test-selection.outputs.narrowed }} mode=${{ needs.test-selection.outputs.mode }} docs_only=${{ needs.test-selection.outputs.docs_only }} test=${{ needs.test.result }} darwin-check=${{ needs.darwin-check.result }} doctests=${{ needs.doctests.result }} build-bins=${{ needs.build-bins.result }} sdk=${{ needs.sdk.result }} audit=${{ needs.audit.result }} shear=${{ needs.shear.result }}"
         run: |
           echo "::error::gate jobs did not run as the selection requires: $RESULTS"
+          exit 1
+      - name: Fail a macOS lane that failed or was skipped without a reason
+        if: ${{ needs.platform-contracts.result == 'failure' || needs.platform-contracts.result == 'cancelled' || (needs.platform-contracts.result == 'skipped' && !(github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.macos != 'true' || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.lane == 'false')))) }}
+        shell: bash
+        env:
+          RESULTS: "lane=${{ needs.platform-contracts.result }} changes=${{ needs.changes.result }} macos=${{ needs.changes.outputs.macos }} selection=${{ needs.test-selection.result }} narrowed=${{ needs.test-selection.outputs.narrowed }} lane_plan=${{ needs.test-selection.outputs.lane }}"
+        run: |
+          echo "::error::the macOS lane did not run as the selection requires: $RESULTS"
           exit 1
 
   # Skipped on the docs-only path of a pull request (#1218): a narrowed

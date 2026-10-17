@@ -26,6 +26,8 @@
 //!   jobs select every test;
 //! - prose selects no Rust test and marks the change docs-only, as does an
 //!   empty change;
+//! - the macOS lane part leaves the knowledge bundle out, which the Linux
+//!   selection still closes over, and runs in full on a dependency input;
 //! - a failure exits non-zero and writes no selection;
 //! - the guard fails on a test read of a path that does not select the reader.
 //! - the sparse tree of a package set holds exactly the files whose change
@@ -677,6 +679,91 @@ fn an_empty_change_is_docs_only() {
     assert_eq!(selection["mode"], "none");
     assert_eq!(selection["docs_only"], true);
     assert_eq!(selection["files"], serde_json::json!([]));
+}
+
+/// The lane packages of `selection` (its `lane` part), sorted.
+fn lane_packages(selection: &Value) -> Vec<String> {
+    let mut names: Vec<String> = selection["lane"]["packages"]
+        .as_array()
+        .expect("lane packages array")
+        .iter()
+        .map(|package| package["name"].as_str().expect("name").to_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_knowledge_change_selects_its_dependents_but_no_lane_test() {
+    let repo = Repo::new();
+    repo.change(&["docs/knowledge/log.d/1225-fragment.md"]);
+    let selection = repo.select();
+    assert_eq!(selection["mode"], "packages", "{selection:#}");
+    let linux: Vec<String> = all_packages(&selection)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert!(linux.contains(&"pohunek-knowledge".to_owned()), "{linux:?}");
+    assert!(linux.contains(&"xtask".to_owned()), "{linux:?}");
+    assert_eq!(selection["lane"]["mode"], "none", "{selection:#}");
+    assert!(selection["lane"]["filterset"].is_null());
+    assert_eq!(lane_packages(&selection), Vec::<String>::new());
+    let summary = std::fs::read_to_string(repo.out_dir().join("summary.md")).expect("summary");
+    assert!(summary.contains("macOS lane: no test"), "{summary}");
+    let left_out = &selection["lane"]["left_out"][0];
+    assert_eq!(left_out["path"], "docs/knowledge/log.d/1225-fragment.md");
+    let readers = left_out["linux_readers"].to_string();
+    assert!(readers.contains("pohunek-knowledge"), "{readers}");
+}
+
+#[test]
+fn a_knowledge_change_beside_a_code_change_runs_only_the_code_in_the_lane() {
+    let repo = Repo::new();
+    repo.change(&["docs/knowledge/concepts/x.md", "crates/daemon/src/lib.rs"]);
+    let selection = repo.select();
+    let linux: Vec<String> = all_packages(&selection)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert!(linux.contains(&"pohunek-knowledge".to_owned()), "{linux:?}");
+    assert_eq!(selection["lane"]["mode"], "packages", "{selection:#}");
+    // The lane part is what the code change alone selects.
+    let code = Repo::new();
+    code.change(&["crates/daemon/src/lib.rs"]);
+    let alone = code.select();
+    assert_eq!(
+        selection["lane"]["filterset"], alone["filterset"],
+        "{selection:#}"
+    );
+    let names: Vec<String> = all_packages(&alone)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    assert_eq!(lane_packages(&selection), names);
+    assert!(!lane_packages(&selection).contains(&"pohunek-knowledge".to_owned()));
+}
+
+#[test]
+fn a_dependency_input_runs_the_whole_lane() {
+    let repo = Repo::new();
+    repo.downgrade("leftpad");
+    let selection = repo.select();
+    assert_eq!(selection["mode"], "packages", "{selection:#}");
+    assert_eq!(selection["lane"]["mode"], "full", "{selection:#}");
+    assert!(selection["lane"]["filterset"].is_null());
+    let causes = selection["lane"]["full_causes"].to_string();
+    assert!(causes.contains("covers the host platform only"), "{causes}");
+}
+
+#[test]
+fn a_change_selecting_every_test_runs_the_whole_lane() {
+    let repo = Repo::new();
+    repo.change(&[".github/workflows/ci.yml"]);
+    let selection = repo.select();
+    assert_eq!(selection["mode"], "full");
+    assert_eq!(selection["lane"]["mode"], "full", "{selection:#}");
 }
 
 #[test]

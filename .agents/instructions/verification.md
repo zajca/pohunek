@@ -146,7 +146,17 @@ constraints and rationale, not live delivery state.
 
 CI uses three execution tiers (issue #477). Pull requests always run the
 required Linux checks. On PRs, macOS platform contracts run when their input
-filter matches; the package job runs on `macos-15` only for packaging,
+filter matches, and the lane tests follow the `lane` part of the test
+selection (#1225): it classifies the change without `docs/knowledge/`, the
+platform-neutral bundle whose every reader also runs on Linux, and selects
+every lane test on any dependency input, because the dependency diff covers
+the host platform only. A narrowed selection whose lane part holds no lane
+package skips the job, and `run-macos --selection` runs only the selected lane
+tests; the lane's lint and doctests stay whole. The bundle is not in the lane
+filter, so the mandatory `log.d` fragment alone starts no macOS job. Every
+lane trigger outside the crates is in the test pipeline or selects every lane
+test, so the job's non-test steps run whenever their inputs change. The
+package job runs on `macos-15` only for packaging,
 install-acceptance, launchd-service, or relevant workflow inputs; the Hermes
 macOS job runs only for its narrow input filter, never because the runtime
 package selection picked Hermes; and the SDK macOS job runs for its own narrow
