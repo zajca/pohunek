@@ -1,6 +1,7 @@
 """Contract checks for the PR, main, and nightly CI tiers."""
 
 from pathlib import Path
+import fnmatch
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -1149,7 +1150,24 @@ class SameOsDuplicateTests(unittest.TestCase):
         check = self.jobs["test-duplicates"]
         needs = set(re.findall(r"(?m)^      - ([a-z0-9-]+)$", block(check, "needs", indent=4)))
         self.assertEqual(needs, set(uploads))
-        self.assertIn("pattern: '*junit*'", check)
+        pattern = re.search(r"(?m)^          pattern: '\{([^}']+)\}'$", check)
+        self.assertIsNotNone(pattern, check)
+        globs = pattern.group(1).split(",")
+        for artifact in artifacts:
+            with self.subTest(artifact=artifact):
+                self.assertTrue(any(fnmatch.fnmatchcase(artifact, glob) for glob in globs))
+        # A called workflow's reports are not this job's to wait for or name.
+        called = set(re.findall(r"(?m)^    uses: \./\.github/workflows/([a-z0-9-]+\.yml)$", CI))
+        self.assertIn("release-evidence.yml", called)
+        foreign = set()
+        for workflow in called:
+            text = (ROOT / ".github" / "workflows" / workflow).read_text()
+            for artifact in re.findall(r"(?m)^\s+name: (.*junit.*)$", text):
+                foreign.update(re.sub(r"\$\{\{[^}]*\}\}", value, artifact) for value in ("linux", "macos"))
+        self.assertIn("matrix-junit-macos", foreign)
+        for artifact in foreign:
+            with self.subTest(foreign=artifact):
+                self.assertFalse(any(fnmatch.fnmatchcase(artifact, glob) for glob in globs))
         self.assertIn('python3 scripts/test-duplicates "$RUNNER_TEMP/junit"\n', check)
         condition = job_condition("test-duplicates")
         for event, tier, runs in (

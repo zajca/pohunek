@@ -13,7 +13,8 @@
 - `scripts/test-partitions run-macos|run-macos-tier --skip-owned-by
   hermes-macos` implements both, from one `OWNED_ELSEWHERE` selection.
 - A new `test duplicates (same OS)` job in the main and nightly tiers runs
-  `scripts/test-duplicates` over every JUnit report of the run. It fails on an
+  `scripts/test-duplicates` over every JUnit report of `ci.yml`'s own test
+  jobs; the release rehearsal's reports are not read. It fails on an
   unlisted same-OS duplicate. The four Linux runtime-package duplicates are
   listed in `scripts/test-duplicates.json` until their per-test environment
   audit is done.

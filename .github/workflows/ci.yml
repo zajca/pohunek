@@ -3043,10 +3043,12 @@ jobs:
         with:
           sparse-checkout: scripts
 
+      # Only this workflow's test jobs: the release rehearsal's reusable
+      # workflow uploads its own JUnit reports, which this job does not wait for.
       - name: Download the run's JUnit reports
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: '*junit*'
+          pattern: '{nextest-junit-*,package-junit-*,macos-lane-junit,macos-tier-junit,hermes-macos-junit}'
           path: ${{ runner.temp }}/junit
 
       - name: Check for same-OS duplicates
