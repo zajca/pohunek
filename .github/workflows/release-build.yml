@@ -397,13 +397,14 @@ jobs:
   # Each component is built by the same `packaging/macos/build-release
   # <component>` invocation as in stage-macos, and is staged and signed before
   # the next one builds: the daemon build relinks `pohunek` in the same target
-  # dir.
+  # dir. The timeout covers both components on a cold cache with room for a slow
+  # runner, because a rehearsal that times out fails the release gate.
   rehearsal-macos:
     name: Build and sign cli and daemon for aarch64-apple-darwin (rehearsal)
     if: ${{ inputs.mode == 'rehearsal' }}
     needs: [meta]
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
       contents: read
     env:
