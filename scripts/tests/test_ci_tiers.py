@@ -1868,6 +1868,10 @@ NARROWED = (
 )
 # A plan output set by a narrowed selection.
 NARROWED_PLAN = {"narrowed": "true", "mode": "packages"}
+# The jobs the docs-only path of a pull request skips, and the outputs of a
+# selection that takes it.
+DOCS_ONLY_JOBS = ("test", "darwin-check", "doctests", "build-bins", "sdk", "audit", "shear")
+DOCS_ONLY_PLAN = {"narrowed": "true", "mode": "none", "docs_only": "true"}
 
 
 def evaluate_needs_expression(
@@ -1932,6 +1936,14 @@ def evaluate_needs_expression(
             for job, values in (outputs or {}).items()
         },
     })
+
+
+def job_needs(job: str) -> list[str]:
+    """The `needs` of a job body, as a list."""
+    match = re.search(r"(?m)^    needs: (?:\[(.*)\]|(\S+))$", job)
+    if match is None:
+        return []
+    return [name.strip() for name in (match.group(1) or match.group(2)).split(",")]
 
 
 def job_condition(job: str) -> str:
@@ -2211,13 +2223,12 @@ class TestSelectionWiringTests(unittest.TestCase):
     def test_the_verdict_fails_a_test_job_skipped_without_a_narrowed_selection(self):
         job = workflow_jobs()[TEST_VERDICT]
         self.assertEqual(job_condition(TEST_VERDICT), "always()")
-        self.assertRegex(
-            job,
-            r"(?m)^    needs: \[test-selection, build-tests, test-selection-check, fast-tests, "
-            r"integration, integration-relay\]$",
+        self.assertLessEqual(
+            {TEST_SELECTOR, "build-tests", TEST_CHECK, *NARROWED_TEST_JOBS}, set(job_needs(job))
         )
-        [step] = job_steps(job).values()
-        condition = step_condition(step)
+        condition = step_condition(
+            job_steps(job)["Fail a test job that failed or was skipped without a narrowed selection"]
+        )
 
         def fails(results, plan=None, selection="success", event="pull_request", narrowed=True):
             every = {"build-tests": "success", "fast-tests": "success", "integration": "success",
@@ -2336,6 +2347,102 @@ class TestSelectionWiringTests(unittest.TestCase):
                     script_tests, event=event, results={TEST_SELECTOR: "success"},
                     outputs={TEST_SELECTOR: plan}, matrix={"shard": shard},
                 )), runs)
+
+
+class DocsOnlyPathTests(unittest.TestCase):
+    """A pull request whose every change is prose skips the build and lint gates."""
+
+    def runs(self, job, *, event="pull_request", cancelled=False, selection="success",
+             plan=None, bins="success"):
+        return bool(evaluate_needs_expression(
+            job_condition(job), event=event, cancelled=cancelled,
+            results={TEST_SELECTOR: selection, "build-bins": bins},
+            outputs={TEST_SELECTOR: DOCS_ONLY_PLAN if plan is None else plan},
+        ))
+
+    def test_the_gate_jobs_run_unless_the_selection_takes_the_docs_only_path(self):
+        for job in DOCS_ONLY_JOBS:
+            with self.subTest(job=job):
+                self.assertIn(TEST_SELECTOR, job_needs(workflow_jobs()[job]))
+                self.assertFalse(self.runs(job))
+                self.assertFalse(self.runs(job, cancelled=True, plan={}))
+                for kwargs in (
+                    {"event": "push"}, {"event": "schedule"}, {"event": "workflow_dispatch"},
+                    # A failed, cancelled or skipped selection runs every gate.
+                    {"selection": "failure"}, {"selection": "cancelled"},
+                    {"selection": "skipped"},
+                    {"plan": {**DOCS_ONLY_PLAN, "narrowed": "false"}},
+                    {"plan": {**DOCS_ONLY_PLAN, "mode": "packages"}},
+                    {"plan": {**DOCS_ONLY_PLAN, "mode": "full"}},
+                    {"plan": {**DOCS_ONLY_PLAN, "docs_only": "false"}},
+                    {"plan": {}},
+                ):
+                    with self.subTest(**kwargs):
+                        self.assertTrue(self.runs(job, **kwargs))
+
+    def test_the_sdk_job_runs_only_on_built_binaries(self):
+        self.assertIn("build-bins", job_needs(workflow_jobs()["sdk"]))
+        for bins in ("failure", "cancelled", "skipped"):
+            with self.subTest(bins=bins):
+                self.assertFalse(self.runs("sdk", plan={}, bins=bins))
+        self.assertTrue(self.runs("sdk", plan={}))
+
+    def test_the_build_of_the_tests_and_systemd_do_not_wait_for_the_selection(self):
+        # Q5 of #1218: wall clock on Rust pull requests beats runner time on
+        # docs-only ones.
+        for job in ("build-tests", "systemd-supervision"):
+            with self.subTest(job=job):
+                self.assertNotIn(TEST_SELECTOR, job_needs(workflow_jobs()[job]))
+
+    def test_the_verdict_fails_a_gate_job_skipped_without_the_docs_only_path(self):
+        job = workflow_jobs()[TEST_VERDICT]
+        condition = step_condition(
+            job_steps(job)["Fail a gate job that failed or was skipped without the docs-only path"]
+        )
+
+        def fails(results, plan=None, selection="success", event="pull_request"):
+            every = {name: "success" for name in DOCS_ONLY_JOBS}
+            return bool(evaluate_needs_expression(
+                condition, event=event,
+                results={**every, TEST_SELECTOR: selection, **results},
+                outputs={TEST_SELECTOR: DOCS_ONLY_PLAN if plan is None else plan},
+            ))
+
+        skipped = {name: "skipped" for name in DOCS_ONLY_JOBS}
+        self.assertFalse(fails({}))
+        self.assertFalse(fails({}, plan={}, event="push"))
+        self.assertFalse(fails(skipped))
+        for name in DOCS_ONLY_JOBS:
+            for results, plan, selection, event in (
+                ({name: "failure"}, None, "success", "pull_request"),
+                ({name: "cancelled"}, None, "success", "pull_request"),
+                ({name: "skipped"}, None, "success", "push"),
+                ({name: "skipped"}, None, "failure", "pull_request"),
+                ({name: "skipped"}, None, "skipped", "pull_request"),
+                ({name: "skipped"}, {**DOCS_ONLY_PLAN, "narrowed": "false"}, "success",
+                 "pull_request"),
+                ({name: "skipped"}, {**DOCS_ONLY_PLAN, "mode": "packages"}, "success",
+                 "pull_request"),
+                ({name: "skipped"}, {**DOCS_ONLY_PLAN, "docs_only": "false"}, "success",
+                 "pull_request"),
+                ({name: "skipped"}, {}, "success", "pull_request"),
+            ):
+                with self.subTest(job=name, results=results, plan=plan, selection=selection,
+                                  event=event):
+                    self.assertTrue(fails(results, plan, selection, event))
+
+    def test_the_verdict_judges_every_job_that_waits_for_the_selection(self):
+        jobs = workflow_jobs()
+        verdict = set(job_needs(jobs[TEST_VERDICT]))
+        waiting = {TEST_SELECTOR}
+        grown = True
+        while grown:
+            grown = False
+            for name, body in jobs.items():
+                if name not in waiting and name != TEST_VERDICT and waiting & set(job_needs(body)):
+                    waiting.add(name)
+                    grown = True
+        self.assertEqual(waiting - verdict, set())
 
 
 def partitions_module():
