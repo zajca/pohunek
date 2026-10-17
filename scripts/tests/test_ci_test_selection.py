@@ -142,6 +142,11 @@ class Repo:
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
             "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
+            # A commit starts `git maintenance run --auto --detach`, which can still be
+            # writing into .git while the fixture repository is removed.
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "maintenance.auto", "GIT_CONFIG_VALUE_0": "false",
+            "GIT_CONFIG_KEY_1": "gc.auto", "GIT_CONFIG_VALUE_1": "0",
         }
         self.git("init", "--quiet", "--initial-branch=main")
         (self.dir / ".gitignore").write_text("target/\n")

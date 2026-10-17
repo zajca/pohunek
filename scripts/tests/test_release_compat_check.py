@@ -47,6 +47,13 @@ class ReleaseCompatCheckTest(unittest.TestCase):
         for role in ("AUTHOR", "COMMITTER"):
             self.env[f"GIT_{role}_NAME"] = "test"
             self.env[f"GIT_{role}_EMAIL"] = "test@example.invalid"
+        # A commit starts `git maintenance run --auto --detach`, which can still be
+        # writing into .git while the fixture repository is removed.
+        self.env.update({
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "maintenance.auto", "GIT_CONFIG_VALUE_0": "false",
+            "GIT_CONFIG_KEY_1": "gc.auto", "GIT_CONFIG_VALUE_1": "0",
+        })
         self.git("init", "-q", "-b", "main")
         self.git("add", "-A")
         self.commit("initial")

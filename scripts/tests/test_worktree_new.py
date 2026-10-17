@@ -423,9 +423,15 @@ class WorktreeCliFixture:
             "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
             "GIT_COMMITTER_NAME": "fixture",
             "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
-            "GIT_CONFIG_COUNT": "1",
+            # A commit starts `git maintenance run --auto --detach`, which can still be
+            # writing into .git while the fixture repository is removed.
+            "GIT_CONFIG_COUNT": "3",
             "GIT_CONFIG_KEY_0": "commit.gpgsign",
             "GIT_CONFIG_VALUE_0": "false",
+            "GIT_CONFIG_KEY_1": "maintenance.auto",
+            "GIT_CONFIG_VALUE_1": "false",
+            "GIT_CONFIG_KEY_2": "gc.auto",
+            "GIT_CONFIG_VALUE_2": "0",
         })
         self.git("init", "-q", "-b", "main")
         (self.repo / "README.md").write_text("fixture\n")
@@ -1610,7 +1616,10 @@ class LockfileCommitTimeRealGitTests(unittest.TestCase):
         env = dict(os.environ, GIT_COMMITTER_DATE=f"{when} +0000",
                    GIT_AUTHOR_DATE=f"{when} +0000",
                    GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+        # A commit starts `git maintenance run --auto --detach`, which can still be
+        # writing into .git while the fixture repository is removed.
         command = ["git", "-c", "commit.gpgsign=false",
+                   "-c", "maintenance.auto=false", "-c", "gc.auto=0",
                    "-c", "user.name=Test", "-c", "user.email=test@example.com",
                    *args]
         return subprocess.run(command, cwd=repo, env=env, check=True,

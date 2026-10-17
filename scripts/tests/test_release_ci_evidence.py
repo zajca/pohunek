@@ -177,6 +177,10 @@ class ReleaseEvidenceTests(unittest.TestCase):
         self.git("config", "user.email", "release-test@example.invalid")
         self.git("config", "commit.gpgsign", "false")
         self.git("config", "tag.gpgsign", "false")
+        # A commit starts `git maintenance run --auto --detach`, which can still be
+        # writing into .git while the fixture repository is removed.
+        self.git("config", "maintenance.auto", "false")
+        self.git("config", "gc.auto", "0")
         self.git("add", "Cargo.toml", "Cargo.lock", "scripts", "bin")
         self.git("commit", "-m", "Initial state")
         self.git("remote", "add", "origin", "https://github.com/example/pohunek.git")
