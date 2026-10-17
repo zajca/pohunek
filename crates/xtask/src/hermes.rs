@@ -1512,26 +1512,12 @@ fn refresh_with(
     require_explicit_binary(hermes_bin)?;
     let lock = check_cli(repo, hermes_bin, limits)?;
 
-    let isolation = Isolation::new("pohunek-hermes-goldens-")?;
-    let mock = Mock::start().map_err(|error| fail(error.to_string()))?;
-    let mock_base_url = mock.base_url();
-    write_refresh_config(&isolation, &mock_base_url)?;
-    let diagnostic_paths = sensitive_paths(repo, hermes_bin, &isolation, &mock_base_url);
-    let scenarios = classic_scenarios(limits);
+    let session = RefreshSession::start(repo, hermes_bin, limits)?;
     let mut captures = Vec::new();
     let mut resume_reference = None;
 
-    for scenario in &scenarios {
-        let capture = run_mocked_pty(
-            hermes_bin,
-            scenario,
-            &isolation,
-            &mock,
-            &diagnostic_paths,
-            limits,
-        )?;
-        validate_classic_capture(scenario.id, &capture)
-            .map_err(|error| with_pty_diagnostic(&error, &capture.bytes, &diagnostic_paths))?;
+    for scenario in &classic_scenarios(limits) {
+        let capture = session.classic(scenario)?;
         if scenario.id == "completion" {
             resume_reference = extract_session_reference(&capture.bytes);
         }
@@ -1550,14 +1536,7 @@ fn refresh_with(
             Action::Write(EXIT_COMMAND),
         ],
     };
-    let resume_capture = run_mocked_pty(
-        hermes_bin,
-        &resume,
-        &isolation,
-        &mock,
-        &diagnostic_paths,
-        limits,
-    )?;
+    let resume_capture = session.run(&resume)?;
     validate_resume_capture(&resume_capture, &resume.args[2])?;
     captures.push((
         resume.id,
@@ -1566,48 +1545,95 @@ fn refresh_with(
         resume_capture,
     ));
 
-    let tui = tui_scenario(limits);
-    let tui_capture = run_mocked_pty(
-        hermes_bin,
-        &tui,
-        &isolation,
-        &mock,
-        &diagnostic_paths,
-        limits,
-    );
-    match tui_capture {
-        Ok(capture) if has_alternate_screen(&capture.bytes) => {
-            if !capture.killed
-                && capture
-                    .exit_code
-                    .is_some_and(|code| code != 0 && code != 130)
-            {
-                return Err(fail(
-                    "Hermes alternate-screen TUI crashed after entering alternate-screen mode",
-                ));
-            }
-            captures.push((tui.id, tui.mode, GoldenStatus::Captured, capture));
-        }
-        Ok(capture) if recognized_tui_unavailable(&capture.bytes) => {
-            captures.push((tui.id, tui.mode, GoldenStatus::Unsupported, capture));
-        }
-        Ok(_capture) => {
-            return Err(fail(
-                "Hermes alternate-screen TUI produced neither alternate-screen evidence nor a recognized local-unavailable diagnosis",
-            ));
-        }
-        Err(error) => return Err(error),
-    }
+    captures.push(session.tui()?);
 
     write_goldens(
         repo,
         &lock,
         hermes_bin,
-        &isolation,
-        &mock_base_url,
+        &session.isolation,
+        &session.mock_base_url,
         captures,
         limits,
     )
+}
+
+/// What the PTY scenarios of one refresh share: the isolated Hermes home, the
+/// local mock model endpoint, and the paths redacted from PTY diagnostics.
+struct RefreshSession<'a> {
+    hermes_bin: &'a Path,
+    limits: Limits,
+    // Declared before the isolation, so the endpoint stops before the
+    // isolated root is removed.
+    mock: Mock,
+    mock_base_url: String,
+    isolation: Isolation,
+    diagnostic_paths: Vec<(String, &'static str)>,
+}
+
+impl<'a> RefreshSession<'a> {
+    fn start(repo: &Path, hermes_bin: &'a Path, limits: Limits) -> Result<Self, XtaskError> {
+        let isolation = Isolation::new("pohunek-hermes-goldens-")?;
+        let mock = Mock::start().map_err(|error| fail(error.to_string()))?;
+        let mock_base_url = mock.base_url();
+        write_refresh_config(&isolation, &mock_base_url)?;
+        let diagnostic_paths = sensitive_paths(repo, hermes_bin, &isolation, &mock_base_url);
+        Ok(Self {
+            hermes_bin,
+            limits,
+            mock,
+            mock_base_url,
+            isolation,
+            diagnostic_paths,
+        })
+    }
+
+    fn run(&self, scenario: &Scenario) -> Result<PtyCapture, XtaskError> {
+        run_mocked_pty(
+            self.hermes_bin,
+            scenario,
+            &self.isolation,
+            &self.mock,
+            &self.diagnostic_paths,
+            self.limits,
+        )
+    }
+
+    /// Runs one classic scenario and validates its capture.
+    fn classic(&self, scenario: &Scenario) -> Result<PtyCapture, XtaskError> {
+        let capture = self.run(scenario)?;
+        validate_classic_capture(scenario.id, &capture)
+            .map_err(|error| with_pty_diagnostic(&error, &capture.bytes, &self.diagnostic_paths))?;
+        Ok(capture)
+    }
+
+    /// Runs the alternate-screen TUI scenario. A recognized local reason the
+    /// TUI cannot start is recorded as unsupported; any other failure, or a
+    /// crash after entering the alternate screen, fails the refresh.
+    fn tui(&self) -> Result<(&'static str, &'static str, GoldenStatus, PtyCapture), XtaskError> {
+        let tui = tui_scenario(self.limits);
+        match self.run(&tui) {
+            Ok(capture) if has_alternate_screen(&capture.bytes) => {
+                if !capture.killed
+                    && capture
+                        .exit_code
+                        .is_some_and(|code| code != 0 && code != 130)
+                {
+                    return Err(fail(
+                        "Hermes alternate-screen TUI crashed after entering alternate-screen mode",
+                    ));
+                }
+                Ok((tui.id, tui.mode, GoldenStatus::Captured, capture))
+            }
+            Ok(capture) if recognized_tui_unavailable(&capture.bytes) => {
+                Ok((tui.id, tui.mode, GoldenStatus::Unsupported, capture))
+            }
+            Ok(_capture) => Err(fail(
+                "Hermes alternate-screen TUI produced neither alternate-screen evidence nor a recognized local-unavailable diagnosis",
+            )),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 fn write_refresh_config(isolation: &Isolation, base_url: &str) -> Result<(), XtaskError> {
@@ -4313,10 +4339,62 @@ mod tests {
         hermes_bin: &Path,
         limits: Limits,
     ) -> Result<super::RefreshSummary, super::XtaskError> {
+        in_turn(hermes_bin, || super::refresh_with(repo, hermes_bin, limits))
+    }
+
+    /// Runs the named classic scenarios of a refresh, in refresh order, in one
+    /// refresh session, and validates each capture as the refresh does.
+    ///
+    /// A fixture change that concerns some scenarios is checked on those
+    /// alone; the full refresh runs ten PTY sessions, and its wiring is covered
+    /// by the tests that call `refresh_with`.
+    fn classic_scenarios_with(
+        repo: &Path,
+        hermes_bin: &Path,
+        limits: Limits,
+        ids: &[&str],
+    ) -> Result<(), super::XtaskError> {
+        let scenarios = classic_scenarios(limits);
+        for id in ids {
+            assert!(
+                scenarios.iter().any(|scenario| scenario.id == *id),
+                "unknown classic scenario {id}"
+            );
+        }
+        in_turn(hermes_bin, || {
+            let session = super::RefreshSession::start(repo, hermes_bin, limits)?;
+            for scenario in scenarios
+                .iter()
+                .filter(|scenario| ids.contains(&scenario.id))
+            {
+                session.classic(scenario)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Runs the alternate-screen TUI step of a refresh alone and returns the
+    /// status it records.
+    fn tui_step_with(
+        repo: &Path,
+        hermes_bin: &Path,
+        limits: Limits,
+    ) -> Result<GoldenStatus, super::XtaskError> {
+        in_turn(hermes_bin, || {
+            let session = super::RefreshSession::start(repo, hermes_bin, limits)?;
+            session.tui().map(|(_, _, status, _)| status)
+        })
+    }
+
+    /// Runs `scenarios` while holding the PTY scenario turn.
+    fn in_turn<T>(
+        hermes_bin: &Path,
+        scenarios: impl FnOnce() -> Result<T, super::XtaskError>,
+    ) -> Result<T, super::XtaskError> {
         let _turn = PTY_SCENARIOS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result = super::refresh_with(repo, hermes_bin, limits);
+        let result = scenarios();
         if result.is_err() {
             // The fake Hermes logs its loop events next to itself; showing them
             // names whether a stuck run ever read the exit command.
@@ -6285,8 +6363,9 @@ PY
     fn compatibility_rejects_rehashed_model_golden_with_metadata_only_panel_claim() {
         let repo = fixture_repo();
         let binary = fake_hermes(repo.path(), "0.20.0");
-        refresh_with(repo.path(), &binary, fast_limits()).expect("controlled refresh succeeds");
 
+        // `fixture_repo` holds the committed goldens, whose short-input
+        // capture carries derived panel evidence.
         let golden_path = repo.path().join(GOLDEN_ROOT).join("short-input.txt");
         let original = fs::read_to_string(&golden_path).expect("read captured golden");
         let (header, body) = original
@@ -6299,7 +6378,7 @@ PY
         write_file(&golden_path, &forged).expect("write forged captured golden");
 
         let manifest_path = repo.path().join(GOLDEN_ROOT).join(GOLDEN_MANIFEST);
-        let mut manifest = load_golden_manifest(repo.path()).expect("load refreshed manifest");
+        let mut manifest = load_golden_manifest(repo.path()).expect("load committed manifest");
         let pending = &mut manifest.records[0];
         pending.status = GoldenStatus::Pending;
         pending.file = None;
@@ -6335,8 +6414,9 @@ PY
             "echo 'prompt echoed only'",
         );
 
-        let error = refresh_with(repo.path(), &binary, expiring_limits())
-            .expect_err("prompt echo cannot satisfy response evidence");
+        let error =
+            classic_scenarios_with(repo.path(), &binary, expiring_limits(), &["short-input"])
+                .expect_err("prompt echo cannot satisfy response evidence");
 
         assert!(
             error.to_string().contains("assistant-panel evidence"),
@@ -6351,8 +6431,9 @@ PY
         let binary = fake_hermes(repo.path(), "0.20.0");
         rewrite_script(&binary, "split_paste=0", "split_paste=1");
 
-        let error = refresh_with(repo.path(), &binary, fast_limits())
-            .expect_err("embedded newlines submitted as separate turns must fail");
+        let error =
+            classic_scenarios_with(repo.path(), &binary, fast_limits(), &["multiline-input"])
+                .expect_err("embedded newlines submitted as separate turns must fail");
 
         assert!(
             error.to_string().contains("required semantic evidence"),
@@ -6367,7 +6448,7 @@ PY
         let binary = fake_hermes(repo.path(), "0.20.0");
         rewrite_script(&binary, "wrap_approval=0", "wrap_approval=1");
 
-        refresh_with(repo.path(), &binary, fast_limits())
+        classic_scenarios_with(repo.path(), &binary, fast_limits(), &["approval-blocked"])
             .expect("one approval preview wrapped at the fixed PTY width remains one turn");
     }
 
@@ -6617,9 +6698,9 @@ PY
             &front_invocation("tui"),
             "    echo 'node not found \u{2014} install Node.js to use the TUI.'\n    exit 1",
         );
-        let summary = refresh_with(repo.path(), &unavailable, fast_limits())
+        let status = tui_step_with(repo.path(), &unavailable, fast_limits())
             .expect("recognized local TUI unavailability is recorded");
-        assert_eq!(summary.unsupported, 1);
+        assert_eq!(status, GoldenStatus::Unsupported);
     }
 
     /// A TUI that fails for any other reason is rejected at the TUI step,
@@ -6634,7 +6715,7 @@ PY
             &front_invocation("tui"),
             "    echo 'authentication failed'\n    exit 1",
         );
-        let error = refresh_with(repo.path(), &crash, fast_limits())
+        let error = tui_step_with(repo.path(), &crash, fast_limits())
             .expect_err("auth failure cannot be recorded as unsupported");
         assert!(
             error
@@ -6656,7 +6737,7 @@ PY
             "TUI_INTERRUPT_STATUS = 0\n",
             "TUI_INTERRUPT_STATUS = 2\n",
         );
-        let error = refresh_with(repo.path(), &alt_crash, fast_limits())
+        let error = tui_step_with(repo.path(), &alt_crash, fast_limits())
             .expect_err("alternate-screen entry does not hide a subsequent crash");
         assert_eq!(
             error.to_string(),
@@ -6935,8 +7016,21 @@ PY
             },
         );
 
-        refresh_with(repo.path(), &binary, fast_limits())
-            .expect("a fixture stalled for 1.5 s stays within the PTY budgets");
+        // The exit stall fires on the first `/exit` (prompt-ready), the mock
+        // stall on the first model request (short-input).
+        classic_scenarios_with(
+            repo.path(),
+            &binary,
+            fast_limits(),
+            &["prompt-ready", "short-input"],
+        )
+        .expect("a fixture stalled for 1.5 s stays within the PTY budgets");
+        for stall in ["exit", "mock"] {
+            assert!(
+                repo.path().join(format!("stalled-{stall}")).exists(),
+                "the {stall} stall did not fire"
+            );
+        }
     }
 
     #[test]
@@ -6989,8 +7083,14 @@ PY
         let repo = fixture_repo();
         let binary = split_command_line_fake_hermes(repo.path());
 
-        refresh_with(repo.path(), &binary, fast_limits())
-            .expect("the interrupt is sent after the terminal command line is complete");
+        // The scenarios that interrupt a running command.
+        classic_scenarios_with(
+            repo.path(),
+            &binary,
+            fast_limits(),
+            &["working", "interruption"],
+        )
+        .expect("the interrupt is sent after the terminal command line is complete");
     }
 
     #[test]
@@ -7005,8 +7105,14 @@ PY
             &format!("printf '%s' '{bottom}'\n  sleep {RACE_WINDOW_HOLD}\n  printf '\\n'"),
         );
 
-        refresh_with(repo.path(), &binary, fast_limits())
-            .expect("the exit is sent after the assistant panel border is complete");
+        // The scenarios that exit right after an assistant panel.
+        classic_scenarios_with(
+            repo.path(),
+            &binary,
+            fast_limits(),
+            &["short-input", "multiline-input", "completion"],
+        )
+        .expect("the exit is sent after the assistant panel border is complete");
     }
 
     /// Rewrites the fake Hermes so that it acknowledges Ctrl-C and then stays
@@ -7036,8 +7142,14 @@ PY
         let repo = fixture_repo();
         let binary = busy_after_interrupt_fake_hermes(repo.path());
 
-        refresh_with(repo.path(), &binary, fast_limits())
-            .expect("the exit command is typed once the idle prompt is back");
+        // The scenarios that exit after an interrupt.
+        classic_scenarios_with(
+            repo.path(),
+            &binary,
+            fast_limits(),
+            &["working", "approval-blocked", "interruption"],
+        )
+        .expect("the exit command is typed once the idle prompt is back");
     }
 
     #[test]
