@@ -1254,6 +1254,31 @@ class MacosLaneTests(ScriptScenario):
             self.assertNotIn(f"package(={package})", expression)
         self.assertFalse(calls[0]["stale_report_exists"])
 
+    def test_skip_owned_by_leaves_the_hermes_macos_tests_out_of_both_macos_runs(self):
+        owned = partitions.OWNED_ELSEWHERE["hermes-macos"]
+        for action, package_set in (("run-macos", partitions.LANE_SET), ("run-macos-tier", partitions.TIER_SET)):
+            with self.subTest(action=action):
+                self.calls_log.write_text("")
+                result = self.run_script(
+                    action, "--archive-file", str(self.archive), "--skip-owned-by", "hermes-macos",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = self.nextest_calls()
+                self.assertEqual(len(calls), 1)
+                argv = calls[0]["argv"]
+                self.assertEqual(argv[argv.index("-E") + 1], f"({package_set}) and not ({owned})")
+
+    def test_skip_owned_by_is_refused_outside_the_macos_runs(self):
+        for arguments in (("run", "core"), ("check",), ("check-macos", "--archive-file", str(self.archive))):
+            with self.subTest(arguments=arguments):
+                result = self.run_script(*arguments, "--skip-owned-by", "hermes-macos")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("--skip-owned-by applies to run-macos and run-macos-tier only", result.stderr)
+        result = self.run_script("run-macos", "--archive-file", str(self.archive), "--skip-owned-by", "linux-job")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("invalid choice", result.stderr)
+        self.assertEqual(self.nextest_calls(), [])
+
     def test_a_tier_test_that_the_lane_selects_is_reported_as_an_overlap(self):
         fixture_test(self.binaries, "pohunek-netbird", "netbird_tests::lane_probe")["lane_too"] = True
         self.set_macos_inventory(self.binaries)
@@ -1297,6 +1322,21 @@ class MacosLaneTests(ScriptScenario):
         [call] = self.nextest_calls()
         argv = call["argv"]
         self.assertEqual(argv[argv.index("-E") + 1], f"({partitions.LANE_SET}) and ({filterset})")
+        self.assertEqual(argv[argv.index("--no-tests") + 1], "pass")
+
+    def test_a_narrowed_lane_still_leaves_out_what_the_hermes_job_runs(self):
+        filterset = "package(=pohunek-cli)"
+        lane = {"mode": "packages", "filterset": filterset, "packages": [{"name": "pohunek-cli"}]}
+        result = self.run_script("run-macos", "--archive-file", str(self.archive),
+                                 "--selection", self.lane_selection(lane),
+                                 "--skip-owned-by", "hermes-macos")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [call] = self.nextest_calls()
+        argv = call["argv"]
+        owned = partitions.OWNED_ELSEWHERE["hermes-macos"]
+        self.assertEqual(argv[argv.index("-E") + 1],
+                         f"(({partitions.LANE_SET}) and not ({owned})) and ({filterset})")
+        # A selection of only `hermes_package` leaves the narrowed lane empty.
         self.assertEqual(argv[argv.index("--no-tests") + 1], "pass")
 
     def test_run_macos_runs_nothing_for_a_lane_part_without_lane_packages(self):

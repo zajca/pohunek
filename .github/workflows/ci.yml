@@ -223,18 +223,22 @@ jobs:
           path: ${{ runner.temp }}/test-selection
 
       # A narrowed selection runs the lane tests of its lane part; the lint
-      # and the doctests stay whole.
+      # and the doctests stay whole. `SKIP_OWNED_BY` repeats the
+      # `hermes-compatibility-macos` condition: when that job runs, it runs the
+      # `hermes_package` binary with the ignored real-Hermes tests, so the lane
+      # leaves the binary out (#1226).
       - name: Run macOS lane tests
         if: ${{ !cancelled() }}
         shell: bash
         env:
           NARROWED: ${{ github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}
+          SKIP_OWNED_BY: ${{ (github.event_name != 'pull_request' || needs.changes.outputs.hermes_macos == 'true') && 'hermes-macos' || '' }}
         run: |
           set -euo pipefail
           if [ "$NARROWED" = true ]; then
-            python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/macos-lane.tar.zst" run-macos --selection "$RUNNER_TEMP/test-selection/selection.json"
+            python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/macos-lane.tar.zst" run-macos --selection "$RUNNER_TEMP/test-selection/selection.json" ${SKIP_OWNED_BY:+--skip-owned-by "$SKIP_OWNED_BY"}
           else
-            python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/macos-lane.tar.zst" run-macos
+            python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/macos-lane.tar.zst" run-macos ${SKIP_OWNED_BY:+--skip-owned-by "$SKIP_OWNED_BY"}
           fi
 
       # nextest runs no doctests, so the lane packages' doc examples run here,
@@ -346,9 +350,11 @@ jobs:
       - name: Check macOS partition
         run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/macos-all.tar.zst" check-macos --scope all
 
+      # The Hermes macOS job runs in every workflow run that starts this job and
+      # runs the xtask Hermes harness tests itself, so they are left out here (#1226).
       - name: Run macOS tier tests
         if: ${{ !cancelled() }}
-        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/macos-all.tar.zst" run-macos-tier
+        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/macos-all.tar.zst" run-macos-tier --skip-owned-by hermes-macos
 
       - name: Summarize flaky tests
         if: always()
@@ -3001,6 +3007,40 @@ jobs:
             ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
             ${{ hashFiles('crates/xtask/src/upstream_stage.rs') }}-
             ${{ hashFiles('.github/workflows/ci.yml') }}
+
+  # Each test runs at most once per OS in a run (#1226): this job reads every
+  # JUnit report of the run and fails on a test two jobs of the same OS ran,
+  # unless scripts/test-duplicates.json allows it with a reason. It runs in the
+  # main and nightly tiers, where every test job runs.
+  test-duplicates:
+    name: test duplicates (same OS)
+    needs:
+      - platform-contracts
+      - macos-tier
+      - fast-tests
+      - integration
+      - integration-relay
+      - hermes-package
+      - pi-package
+      - codex-package
+      - claude-package
+      - hermes-compatibility-macos
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+
+      - name: Download the run's JUnit reports
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: '*junit*'
+          path: ${{ runner.temp }}/junit
+
+      - name: Check for same-OS duplicates
+        run: python3 scripts/test-duplicates "$RUNNER_TEMP/junit"
 
   # Build the three runnable binaries exactly once. The SDK e2e job reuses
   # this artifact instead of rebuilding Rust (issue #122).

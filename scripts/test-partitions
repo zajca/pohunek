@@ -17,6 +17,9 @@ The macOS lane (`check-macos`, `run-macos`, `run-macos-tier`) takes the same
 archive and checks or runs the macOS package set as nextest selections. Its
 coverage check splits that set into disjoint groups (the PR lane, the tier
 job, and buckets), so a macOS test cannot be dropped without the check failing.
+`--skip-owned-by JOB` leaves out of a macOS run the tests that job runs in the
+same workflow run (`OWNED_ELSEWHERE`); the caller passes it only under that
+job's own condition.
 """
 
 import argparse
@@ -112,6 +115,19 @@ MACOS_BUCKETS = {
         "package(=pohunek-cli) and (binary(=claude_package) or binary(=codex_package) "
         "or binary(=pi_package) or binary(=hermes_package)) "
         "and not test(/^capture_the_real_claude_/)",
+    ),
+}
+# Tests another macOS job runs in the same workflow run, by job, as the exact
+# selection that job passes to nextest. `run-macos` and `run-macos-tier` leave
+# them out with `--skip-owned-by`, so no test runs twice on macOS in one run.
+# `hermes-macos` is `pinned Hermes compatibility (macOS arm64, model-free)`:
+# its harness step runs `-p xtask --lib -E 'test(hermes)'` and its package step
+# `-p pohunek-cli --test hermes_package --run-ignored all`, a superset of the
+# lane's run of that binary.
+OWNED_ELSEWHERE = {
+    "hermes-macos": (
+        "(package(=xtask) and kind(lib) and test(hermes)) or "
+        "(package(=pohunek-cli) and binary(=hermes_package))"
     ),
 }
 # The scope of a check: its packages and the nextest selection of them.
@@ -651,6 +667,11 @@ def main():
              "extracts into this checkout, whatever path the archive was built at",
     )
     parser.add_argument(
+        "--skip-owned-by", choices=tuple(OWNED_ELSEWHERE),
+        help="run-macos and run-macos-tier only: leave out the tests this job runs "
+             "in the same workflow run",
+    )
+    parser.add_argument(
         "--selection", type=Path,
         help="plan, run, check and run-macos: the selection.json of `cargo xtask "
              "affected ci`; plan prints its CI test jobs, run runs the shard's selected "
@@ -658,6 +679,8 @@ def main():
              "run-macos runs the lane's selected tests",
     )
     args = parser.parse_args()
+    if args.skip_owned_by is not None and args.action not in MACOS_RUN_SETS:
+        parser.error("--skip-owned-by applies to run-macos and run-macos-tier only")
     if args.action == "plan":
         if args.selection is None or args.shard is not None or args.archive_file is not None:
             parser.error("plan takes --selection and nothing else")
@@ -695,7 +718,8 @@ def main():
             return
         if args.scope is not None:
             parser.error("--scope applies to check-macos only")
-        expression = MACOS_RUN_SETS[args.action]
+        whole = macos_run_expression(args.action, args.skip_owned_by)
+        expression = whole
         if selection is not None:
             lane = lane_selection(selection)
             if lane["mode"] == "none":
@@ -705,7 +729,7 @@ def main():
                 expression = f"({expression}) and ({lane['filterset']})"
         # A narrowed lane may hold none of a selected package's filtered tests.
         run_nextest("macos", expression, archive,
-                    no_tests_pass=selection is not None and expression != MACOS_RUN_SETS[args.action])
+                    no_tests_pass=selection is not None and expression != whole)
     expressions = filters()
     if args.action == "check":
         if args.shard is not None:
@@ -774,6 +798,14 @@ def check_macos(archive, scope):
         f"macOS coverage OK: {len(universe)} tests selected exactly once "
         "(including ignored tests)"
     )
+
+
+def macos_run_expression(action, skip_owned_by=None):
+    """The nextest selection of macOS run `action`, without `skip_owned_by`'s tests."""
+    expression = MACOS_RUN_SETS[action]
+    if skip_owned_by is None:
+        return expression
+    return f"({expression}) and not ({OWNED_ELSEWHERE[skip_owned_by]})"
 
 
 def run_nextest(profile, expression, archive, no_tests_pass=False):
