@@ -179,9 +179,21 @@ already runs the macOS lanes.
 
 The automatic red-main issue reporter remains pending under #477 S3. The S4
 release evidence gate is implemented: `scripts/release` requires successful
-main and nightly CI evidence for the exact release commit before tagging. The
+main and nightly CI evidence for the release commit before tagging. The
 script dispatches those tiers when it pushes the candidate; `--no-push` checks
-existing evidence only.
+existing evidence only. Evidence is a run on the commit itself, or a
+`workflow_dispatch` run of `ci.yml` in this repository that tested the same git
+tree (#1215): every `ci.yml` run uploads a `tested-tree-<tree>` record from its
+`required jobs (paths filter)` job, and `scripts/ci-evidence` accepts a dispatch
+run whose head commit has the candidate's tree, whose record names that tree,
+and whose required jobs and steps passed, within `tree_match_max_age_days`; the
+newest dispatch run of that tree decides, pass or fail, and while it is still
+running nothing matches by tree. The candidate's tree comes from the local checkout when it holds the commit (an
+unpushed `--no-push` candidate), otherwise from the git commits API. Once any
+run or run attempt of the tier on the commit itself has completed, the runs on
+the commit decide, so a tree match never hides a failure there; pull-request, push, and
+schedule runs never match by tree. The report names the run and whether it
+matched by `sha` or by `tree`.
 
 SDK workspace gates (one Bun workspace root at the repository root spans `sdk/ts/*`):
 
@@ -330,7 +342,8 @@ schedule selects nightly. The main tier is latest-wins on pushes to `main`,
 while PR runs are latest-wins per pull request. S3's automatic red-main issue
 reporter remains pending. The S4 release evidence gate is enforced by
 `scripts/release`, which accepts only successful main and nightly evidence for
-the exact candidate commit; `--no-push` requires those runs to exist already.
+the candidate commit (a run on it, or a dispatch run of the same tree, as
+described above); `--no-push` requires those runs to exist already.
 
 Doctests and the release build: the `doctests` job runs on
 every pull request. The release build (`release-build` job) runs on push to

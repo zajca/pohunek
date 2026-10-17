@@ -64,10 +64,13 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    `docs/knowledge/log.md` and removes them (`cargo xtask docs log fold`), bumps
    `version` in `[workspace.package]` in `Cargo.toml`, refreshes `Cargo.lock`,
    commits all of it as `Release vX.Y.Z`, and requires successful main and
-   nightly CI evidence for that exact commit before creating an annotated tag
-   `vX.Y.Z`. By default it pushes the release branch before waiting for evidence
-   and pushes the tag after verification. With `--no-push`, it checks only
-   already-existing exact-commit evidence and leaves the commit and tag local;
+   nightly CI evidence for that commit before creating an annotated tag
+   `vX.Y.Z`. Evidence is a run on the commit itself or a `workflow_dispatch`
+   run that tested the same git tree; `scripts/ci-evidence` prints which run
+   matched and whether by `sha` or by `tree`. By default it pushes the release
+   branch before waiting for evidence and pushes the tag after verification.
+   With `--no-push`, it checks only already-existing evidence and leaves the
+   commit and tag local;
    it does not dispatch CI or push either ref. After local tagging, the script
    reminds you to push the release branch and tag manually. If the evidence
    check fails or times out, resolve the CI issue and rerun with the same

@@ -2,7 +2,8 @@
 
 # Cut a new release: bump the workspace version, refresh the lockfile, file the
 # knowledge-log fragments under the release heading, commit, push the candidate
-# to main, require exact-commit CI evidence, then tag it.
+# to main, require CI evidence for that commit (a run on it, or a dispatch run
+# of the same tree; see scripts/ci-evidence), then tag it.
 # Pushing the tag triggers .github/workflows/release.yml,
 # which builds the binaries, runs the compatibility rows, signs the runtime
 # catalog and publishes the GitHub Release as a draft that becomes visible only
@@ -16,7 +17,7 @@
 #
 # Options:
 #   --dry-run    Show what would happen without changing anything.
-#   --no-push    Commit and tag locally only when exact-commit CI evidence exists.
+#   --no-push    Commit and tag locally only when CI evidence for the commit exists.
 #   --notes FILE Release-notes file with one line naming each schema or protocol
 #                constant that changed since the previous tag (required when
 #                any changed; see the compatibility check below).
@@ -245,7 +246,7 @@ trap pohunek_restore_release_edits EXIT
 
 if [ "$dry_run" = true ]; then
   pohunek_fold_knowledge_log --dry-run
-  pohunek_info "dry run: would bump $manifest to $next, refresh Cargo.lock, fold the knowledge-log fragments, commit, push the candidate, verify exact-commit main and nightly CI evidence, then tag $tag$( [ "$push" = true ] && printf ' and push the tag' )"
+  pohunek_info "dry run: would bump $manifest to $next, refresh Cargo.lock, fold the knowledge-log fragments, commit, push the candidate, verify main and nightly CI evidence for the candidate (by commit or by tree), then tag $tag$( [ "$push" = true ] && printf ' and push the tag' )"
   exit 0
 fi
 
@@ -321,7 +322,7 @@ if [ "$push" = true ]; then
   pohunek_info "waiting for nightly-tier evidence on $candidate_sha"
   python3 "$script_dir/ci-evidence" --repo "$ci_repo" --sha "$candidate_sha" --tier nightly --dispatch-ref "$release_branch"
 else
-  pohunek_info "checking existing exact-commit CI evidence for $candidate_sha"
+  pohunek_info "checking existing CI evidence (by commit or by tree) for $candidate_sha"
   python3 "$script_dir/ci-evidence" --repo "$ci_repo" --sha "$candidate_sha" --tier main
   python3 "$script_dir/ci-evidence" --repo "$ci_repo" --sha "$candidate_sha" --tier nightly
 fi

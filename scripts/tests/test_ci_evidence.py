@@ -14,6 +14,10 @@ SCRIPT = ROOT / "scripts" / "ci-evidence"
 DEFAULT_CONFIG = ROOT / "scripts" / "ci-evidence.json"
 SHA = "a" * 40
 OTHER_SHA = "b" * 40
+THIRD_SHA = "e" * 40
+TREE = "c" * 40
+OTHER_TREE = "d" * 40
+REPO = "example/pohunek"
 WORKFLOW_PATH = ".github/workflows/ci.yml"
 REQUIRED_JOBS = ["required check", "matrix check (linux)"]
 
@@ -143,7 +147,11 @@ if args[0] != "api":
     raise SystemExit("unexpected gh invocation: " + repr(args))
 
 endpoint = next((arg for arg in args[1:] if arg.startswith("repos/")), "")
-if "/actions/workflows/" in endpoint:
+if "/actions/workflows/" in endpoint and any(arg.startswith("created=") for arg in args):
+    # The tree lookup lists recent dispatch runs; it has its own fixture so the
+    # dispatch flow's query sequence is unaffected.
+    print(json.dumps([{"workflow_runs": fixture.get("tree_runs", [])}]))
+elif "/actions/workflows/" in endpoint:
     if "event=workflow_dispatch" in args:
         sequence = fixture.get("dispatch_pages", [])
         index = fixture.get("dispatch_queries", 0)
@@ -163,10 +171,22 @@ if "/actions/workflows/" in endpoint:
     fixture[query_key] = index + 1
     fixture_path.write_text(json.dumps(fixture))
     print(json.dumps([page]))
+elif "/git/commits/" in endpoint:
+    sha = endpoint.rsplit("/", 1)[1]
+    if sha in fixture.get("unknown_commits", []):
+        print("gh: Not Found (HTTP 404)", file=sys.stderr)
+        raise SystemExit(1)
+    print(json.dumps({"sha": sha, "tree": {"sha": fixture.get("trees", {}).get(sha, "f" * 40)}}))
 elif "/commits" in endpoint:
     print(json.dumps([{"sha": fixture.get("resolved_ref")}]))
+elif endpoint.endswith("/artifacts"):
+    run_id = endpoint.split("/")[-2]
+    names = fixture.get("artifacts", {}).get(run_id, [])
+    print(json.dumps([{"artifacts": [{"name": name} for name in names]}]))
 elif "/actions/runs/" in endpoint:
-    print(json.dumps([fixture.get("jobs_page", {"jobs": []})]))
+    run_id = endpoint.split("/")[-2]
+    page = fixture.get("jobs_by_run", {}).get(run_id, fixture.get("jobs_page", {"jobs": []}))
+    print(json.dumps([page]))
 else:
     raise SystemExit("unexpected Actions API endpoint: " + repr(endpoint))
 '''
@@ -182,8 +202,10 @@ def run_doc(
     status="completed",
     conclusion="success",
     run_id=456,
+    repo=None,
+    head_repo=None,
 ):
-    return {
+    document = {
         "id": run_id,
         "run_number": run_id,
         "run_attempt": 1,
@@ -196,6 +218,25 @@ def run_doc(
         "conclusion": conclusion,
         "html_url": f"https://github.com/example/pohunek/actions/runs/{run_id}",
     }
+    if repo is not None:
+        document["repository"] = {"full_name": repo}
+        document["head_repository"] = {"full_name": head_repo or repo}
+    return document
+
+
+def dispatch_doc(*, sha=OTHER_SHA, tier="main", run_id=789, head_repo=REPO, **values):
+    """A completed dispatch run of `tier` on `sha` in the evidence repository."""
+    return run_doc(
+        sha=sha,
+        event="workflow_dispatch",
+        branch="zajca/feature",
+        title=f"CI [tier={tier}]",
+        path=f"{WORKFLOW_PATH}@refs/heads/zajca/feature",
+        run_id=run_id,
+        repo=REPO,
+        head_repo=head_repo,
+        **values,
+    )
 
 
 def page(runs):
@@ -235,6 +276,7 @@ class CiEvidenceCliTests(unittest.TestCase):
             "workflow_file": "ci.yml",
             "wait_timeout_seconds": 3,
             "poll_interval_seconds": 1,
+            "tree_match_max_age_days": 14,
             "required_jobs": {"main": list(REQUIRED_JOBS), "nightly": list(REQUIRED_JOBS)},
             "required_steps": {"main": [], "nightly": []},
         }
@@ -296,7 +338,7 @@ class CiEvidenceCliTests(unittest.TestCase):
         base.update(values)
         self.fixture.write_text(json.dumps(base))
 
-    def invoke(self, tier="main", *extra, config=None):
+    def invoke(self, tier="main", *extra, config=None, sha=SHA):
         env = os.environ.copy()
         env.update({
             "PATH": f"{self.bin_dir}{os.pathsep}{env['PATH']}",
@@ -304,7 +346,7 @@ class CiEvidenceCliTests(unittest.TestCase):
             "GH_CALLS": str(self.calls),
         })
         return subprocess.run(
-            [str(SCRIPT), "--repo", "example/pohunek", "--sha", SHA,
+            [str(SCRIPT), "--repo", "example/pohunek", "--sha", sha,
              "--tier", tier, "--config", str(config or self.config), *extra],
             capture_output=True,
             text=True,
@@ -475,6 +517,257 @@ class CiEvidenceCliTests(unittest.TestCase):
                 result = self.invoke("nightly")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("required step", result.stderr)
+
+    def tree_fixture(self, **values):
+        """A fixture where SHA and OTHER_SHA have the same tree, and dispatch
+        run 789 on OTHER_SHA recorded that tree with every required job green."""
+        base = {
+            "trees": {SHA: TREE, OTHER_SHA: TREE},
+            "tree_runs": [dispatch_doc()],
+            "artifacts": {"789": [f"tested-tree-{TREE}"]},
+            "jobs_by_run": {"789": jobs_page()},
+        }
+        base.update(values)
+        self.write_fixture(**base)
+
+    def test_a_run_on_the_commit_matches_by_sha(self):
+        self.write_fixture(run_pages=[page([run_doc()])], jobs_page=jobs_page())
+        result = self.invoke("main", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["match"], "sha")
+        self.assertEqual(report["run_sha"], SHA)
+        self.assertNotIn("tree", report)
+        # A completed run on the commit decides without a tree lookup.
+        self.assertFalse(any("/git/commits/" in " ".join(call) for call in self.calls_json()))
+
+    def test_a_dispatch_run_on_another_branch_with_the_same_tree_matches_by_tree(self):
+        # The intended case (#1215 D4): a tier dispatch on a pull request's
+        # up-to-date head, a commit on another branch, is evidence for the
+        # merge commit of the same tree.
+        self.tree_fixture()
+        result = self.invoke("main", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["match"], "tree")
+        self.assertEqual(report["tree"], TREE)
+        self.assertEqual(report["run_sha"], OTHER_SHA)
+        self.assertEqual(report["run_id"], 789)
+        text = self.invoke("main")
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn(f"by tree {TREE} (dispatch run on {OTHER_SHA})", text.stdout)
+        self.assertIn("/actions/runs/789", text.stdout)
+        # The lookup is bounded by tree_match_max_age_days.
+        listing = next(
+            call for call in self.calls_json()
+            if any(arg.startswith("created=") for arg in call)
+        )
+        self.assertIn("event=workflow_dispatch", listing)
+        since = next(arg for arg in listing if arg.startswith("created="))
+        self.assertRegex(since, r"^created=>=\d{4}-\d{2}-\d{2}$")
+
+    def test_a_tree_match_does_not_wait_for_a_running_push_on_the_commit(self):
+        running = run_doc(status="in_progress", conclusion=None)
+        self.tree_fixture(run_pages=[page([running])])
+        result = self.invoke("main", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["match"], "tree")
+
+    def test_a_tree_match_never_hides_a_failed_run_on_the_commit(self):
+        failed = run_doc(conclusion="failure")
+        self.tree_fixture(
+            run_pages=[page([failed])],
+            jobs_page=jobs_page(overrides={"required check": "failure"}),
+        )
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("workflow conclusion is failure", result.stderr)
+        self.assertIn("/actions/runs/456", result.stderr)
+
+    def test_a_tree_match_never_hides_a_failed_run_behind_a_running_rerun(self):
+        failed = run_doc(conclusion="failure")
+        rerun = run_doc(status="in_progress", conclusion=None, run_id=457)
+        self.tree_fixture(
+            run_pages=[page([failed, rerun])],
+            jobs_page=jobs_page(overrides={"required check": "failure"}),
+        )
+        result = self.invoke("main", "--json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("timed out", result.stderr)
+        self.assertFalse(any(
+            arg.startswith("repos/example/pohunek/actions/runs/789/")
+            for call in self.calls_json() for arg in call
+        ))
+
+    def test_a_tree_match_never_hides_a_failed_attempt_of_a_rerun(self):
+        # A re-run shows only its newest attempt; the failed first attempt is
+        # implied by run_attempt.
+        rerun = run_doc(status="in_progress", conclusion=None)
+        rerun["run_attempt"] = 2
+        self.tree_fixture(run_pages=[page([rerun])])
+        result = self.invoke("main", "--json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("timed out", result.stderr)
+
+    def test_the_tree_of_an_unpushed_local_commit_is_read_from_the_checkout(self):
+        head = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        tree = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD^{tree}"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.tree_fixture(
+            trees={OTHER_SHA: tree},
+            unknown_commits=[head],
+            artifacts={"789": [f"tested-tree-{tree}"]},
+        )
+        result = self.invoke("main", "--json", sha=head)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual((report["match"], report["tree"]), ("tree", tree))
+        self.assertFalse(any(f"/git/commits/{head}" in arg for call in self.calls_json() for arg in call))
+
+    def test_a_failed_tree_lookup_leaves_the_decision_to_the_commit(self):
+        self.tree_fixture(unknown_commits=[SHA])
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no main tier run exists", result.stderr)
+        self.assertIn("tree lookup failed", result.stderr)
+
+    def test_a_run_on_the_commit_that_completes_during_the_tree_match_decides(self):
+        # The run on SHA is still running when the tree match is read and has
+        # failed by the time the match would be accepted.
+        running = run_doc(status="in_progress", conclusion=None)
+        failed = run_doc(conclusion="failure")
+        self.tree_fixture(
+            run_pages=[page([running]), page([failed])],
+            jobs_page=jobs_page(overrides={"required check": "failure"}),
+        )
+        result = self.invoke("main", "--json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("workflow conclusion is failure", result.stderr)
+        self.assertIn("/actions/runs/456", result.stderr)
+
+    def test_a_newer_failed_run_of_the_tree_blocks_an_older_passing_one(self):
+        newer = dispatch_doc(sha=THIRD_SHA, run_id=790, conclusion="failure")
+        self.tree_fixture(
+            trees={SHA: TREE, OTHER_SHA: TREE, THIRD_SHA: TREE},
+            tree_runs=[dispatch_doc(), newer],
+            artifacts={"789": [f"tested-tree-{TREE}"], "790": [f"tested-tree-{TREE}"]},
+            jobs_by_run={
+                "789": jobs_page(),
+                "790": jobs_page(overrides={"required check": "failure"}),
+            },
+        )
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tree match https://github.com/example/pohunek/actions/runs/790 failed", result.stderr)
+        self.assertFalse(any(
+            arg.startswith("repos/example/pohunek/actions/runs/789/")
+            for call in self.calls_json() for arg in call
+        ))
+
+    def test_a_newer_run_of_the_tree_that_is_still_running_blocks_an_older_one(self):
+        for attempt in (1, 2):
+            with self.subTest(attempt=attempt):
+                newer = dispatch_doc(sha=THIRD_SHA, run_id=790, status="in_progress", conclusion=None)
+                newer["run_attempt"] = attempt
+                self.tree_fixture(
+                    trees={SHA: TREE, OTHER_SHA: TREE, THIRD_SHA: TREE},
+                    tree_runs=[dispatch_doc(), newer],
+                )
+                result = self.invoke("main")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"the newest run of tree {TREE}", result.stderr)
+                self.assertIn("/actions/runs/790, is still in_progress", result.stderr)
+
+    def test_a_failed_lookup_of_an_older_run_does_not_block_the_newest_match(self):
+        older = dispatch_doc(sha=THIRD_SHA, run_id=700)
+        self.tree_fixture(tree_runs=[older, dispatch_doc()], unknown_commits=[THIRD_SHA])
+        result = self.invoke("main", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["run_id"], 789)
+
+    def test_a_failed_lookup_of_a_newer_run_refuses_the_older_match(self):
+        newer = dispatch_doc(sha=THIRD_SHA, run_id=790)
+        self.tree_fixture(tree_runs=[dispatch_doc(), newer], unknown_commits=[THIRD_SHA])
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("may not be the newest run of tree", result.stderr)
+        self.assertIn("/actions/runs/790", result.stderr)
+
+    def test_a_tree_match_with_a_skipped_required_job_is_refused(self):
+        self.tree_fixture(
+            jobs_by_run={"789": jobs_page(overrides={"matrix check (linux)": "skipped"})},
+        )
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no main tier run exists", result.stderr)
+        self.assertIn("tree match https://github.com/example/pohunek/actions/runs/789 failed", result.stderr)
+        self.assertIn("required job matrix check (linux): skipped", result.stderr)
+
+    def test_a_tree_match_from_a_fork_head_is_refused(self):
+        self.tree_fixture(tree_runs=[dispatch_doc(head_repo="someone/pohunek")])
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no main tier run exists", result.stderr)
+        # The fork-head run is dropped before its record or jobs are read.
+        self.assertFalse(any(
+            arg.startswith("repos/example/pohunek/actions/runs/789/")
+            for call in self.calls_json() for arg in call
+        ))
+
+    def test_only_dispatch_runs_match_by_tree(self):
+        for event, branch in (("pull_request", "zajca/feature"), ("push", "main"), ("schedule", "main")):
+            with self.subTest(event=event):
+                other = run_doc(
+                    sha=OTHER_SHA, event=event, branch=branch, run_id=789, repo=REPO,
+                )
+                self.tree_fixture(tree_runs=[other])
+                result = self.invoke("main")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("no main tier run exists", result.stderr)
+
+    def test_a_tree_match_without_its_recorded_tree_is_refused(self):
+        for names, shown in (([], "none"), ([f"tested-tree-{OTHER_TREE}"], OTHER_TREE)):
+            with self.subTest(names=names):
+                self.tree_fixture(artifacts={"789": names})
+                result = self.invoke("main")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"recorded tested tree {shown}, expected {TREE}", result.stderr)
+
+    def test_a_dispatch_run_of_another_tree_does_not_match(self):
+        self.tree_fixture(trees={SHA: TREE, OTHER_SHA: OTHER_TREE})
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no main tier run exists", result.stderr)
+        self.assertNotIn("tree match", result.stderr)
+
+    def test_a_tree_match_counts_only_for_its_own_tier(self):
+        self.tree_fixture(tree_runs=[dispatch_doc(tier="nightly")])
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no main tier run exists", result.stderr)
+
+    def test_the_tree_lookup_window_stays_within_the_record_retention(self):
+        config = json.loads(DEFAULT_CONFIG.read_text())
+        workflow = (ROOT / config["workflow_path"]).read_text()
+        upload = workflow.split("      - name: Upload the tested-tree record\n", 1)[1].split("\n      - ", 1)[0]
+        self.assertIn("name: tested-tree-${{ steps.tree.outputs.tree }}", upload)
+        retention = int(re.search(r"retention-days: (\d+)", upload).group(1))
+        self.assertLess(config["tree_match_max_age_days"], retention)
+        record = workflow.split("  changes:\n", 1)[1]
+        self.assertTrue(record.startswith("    name: required jobs (paths filter)\n"))
+        self.assertLess(
+            record.index("- name: Record the tested tree"),
+            record.index("dorny/paths-filter"),
+        )
+        self.assertIn("git rev-parse 'HEAD^{tree}'", record)
 
     def test_existing_in_progress_run_is_waited_on_until_it_completes(self):
         running = run_doc(status="in_progress", conclusion=None)
