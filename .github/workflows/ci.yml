@@ -860,6 +860,12 @@ jobs:
           name: test-selection
           path: ${{ runner.temp }}/test-selection
 
+      # A test that runs cargo, such as `cargo metadata` in xtask's affected
+      # tests, finds the pinned toolchain installed. Otherwise rustup installs
+      # it mid-test, and concurrent installs race on ~/.rustup/downloads.
+      - name: Install Rust toolchain
+        uses: ./relocated/.github/actions/setup-rust
+
       - name: Check script regressions
         if: matrix.shard == 'core' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.script_tests != 'false')
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
@@ -1425,6 +1431,12 @@ jobs:
         with:
           name: nextest-archive
           path: ${{ runner.temp }}/nextest-archive
+
+      # A test that runs cargo, such as `cargo metadata` in xtask's affected
+      # tests, finds the pinned toolchain installed. Otherwise rustup installs
+      # it mid-test, and concurrent installs race on ~/.rustup/downloads.
+      - name: Install Rust toolchain
+        uses: ./relocated/.github/actions/setup-rust
 
       - name: Download test selection
         if: github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true'
