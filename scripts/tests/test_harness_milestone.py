@@ -102,6 +102,10 @@ class HarnessMilestoneCase(unittest.TestCase):
         self._git("config", "user.email", "test@example.invalid")
         self._git("config", "user.name", "Test")
         self._git("config", "commit.gpgsign", "false")
+        # A commit starts `git maintenance run --auto --detach`, which can still be
+        # writing into .git while the fixture repository is removed.
+        self._git("config", "maintenance.auto", "false")
+        self._git("config", "gc.auto", "0")
         self.worktrees = self.base / "pohunek-worktrees"
         self._write_config(json.dumps(DEFAULT_CONFIG))
         self.default_task_path = (
@@ -430,6 +434,10 @@ class HarnessMilestoneCase(unittest.TestCase):
         subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@e.invalid"], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(repo), "config", "commit.gpgsign", "false"], check=True, capture_output=True)
+        # A commit starts `git maintenance run --auto --detach`, which can still be
+        # writing into .git while the fixture repository is removed.
+        for key, value in (("maintenance.auto", "false"), ("gc.auto", "0")):
+            subprocess.run(["git", "-C", str(repo), "config", key, value], check=True, capture_output=True)
         (repo / ".github").mkdir()
         (repo / ".github" / "agent-workflow.json").write_text(json.dumps(DEFAULT_CONFIG))
         task = repo / ".lh-harness" / "workflows" / "milestone-build.md"

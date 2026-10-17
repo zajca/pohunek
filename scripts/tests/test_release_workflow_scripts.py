@@ -394,7 +394,10 @@ class RowsFixture:
             package = self.packages_dir / f"pohunek-runtime-{runtime}-{self.VERSION}.tar.zst"
             package.write_bytes(runtime.encode())
             RowFixture.sidecar(package)
-        git = ["git", "-c", "user.name=fixture", "-c", "user.email=fixture@invalid", "-c", "commit.gpgsign=false"]
+        # A commit starts `git maintenance run --auto --detach`, which can still be
+        # writing into .git while the fixture repository is removed.
+        git = ["git", "-c", "user.name=fixture", "-c", "user.email=fixture@invalid", "-c", "commit.gpgsign=false",
+               "-c", "maintenance.auto=false", "-c", "gc.auto=0"]
         for command in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "fixture"]):
             subprocess.run([*git, *command], cwd=self.checkout, check=True, capture_output=True)
 
