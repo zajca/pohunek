@@ -855,53 +855,82 @@ class RunRowsTests(unittest.TestCase):
 
     def test_only_the_named_transient_launchd_jobs_are_left_out(self):
         listing = self.rows.directory / "launchd.txt"
-        worker = "com.apple.mdworker.shared.{}000000-0600-0000-0000-000000000000"
-        listing.write_text(f"PID\tStatus\tLabel\n-\t0\t{worker.format('0A')}\n456\t0\tcom.example.base\n")
+        uuid = "{}000000-0600-0000-0000-000000000000"
+        shared = "com.apple.mdworker.shared." + uuid
+        application = "com.apple.mdworker.application." + uuid
+        listing.write_text(
+            f"PID\tStatus\tLabel\n-\t0\t{shared.format('0A')}\n-\t0\t{application.format('01')}\n"
+            "456\t0\tcom.example.base\n"
+        )
         launchctl = self.rows.tools / "launchctl"
         launchctl.write_text(f'#!/bin/sh\n[ "$1" = list ] || exit 1\ncat {listing}\n')
         launchctl.chmod(0o755)
-        # alpha only sees one Spotlight worker replaced by another; beta also
-        # leaves a job behind and one that merely resembles a worker.
+        # alpha only sees a Spotlight worker of each kind retire and another
+        # start; beta also leaves a job behind, one that merely resembles a
+        # worker and a worker of a kind no pattern names.
         self.consumer(
-            f'if [ "$row" = alpha ]; then printf "PID\\tStatus\\tLabel\\n-\\t0\\t{worker.format("0B")}\\n456\\t0\\tcom.example.base\\n" > {listing}; fi\n'
-            f'if [ "$row" = beta ]; then printf "1\\t0\\tdev.pohunek.left\\n2\\t0\\t{worker.format("0C")}.extra\\n" >> {listing}; fi\n'
+            f'if [ "$row" = alpha ]; then printf "PID\\tStatus\\tLabel\\n-\\t0\\t{shared.format("0B")}\\n'
+            f'7\\t0\\t{application.format("02")}\\n456\\t0\\tcom.example.base\\n" > {listing}; fi\n'
+            f'if [ "$row" = beta ]; then printf "1\\t0\\tdev.pohunek.left\\n2\\t0\\t{shared.format("0C")}.extra\\n'
+            f'3\\t0\\tcom.apple.mdworker.isolation.{uuid.format("0D")}\\n" >> {listing}; fi\n'
             f"{PASSING_CONSUMER}"
         )
         result = self.rows.run()
         self.assertEqual(result.returncode, 1, result.stderr)
         results = self.rows.results()
-        self.assertEqual(results["alpha"]["status"], "pass")
+        self.assertEqual(results["alpha"]["status"], "pass", results["alpha"]["message"])
         self.assertIn("launchd job", results["alpha"]["guards"])
         self.assertEqual(
             results["beta"]["message"],
-            f"added launchd job entry {worker.format('0C')}.extra; added launchd job entry dev.pohunek.left",
+            f"added launchd job entry com.apple.mdworker.isolation.{uuid.format('0D')};"
+            f" added launchd job entry {shared.format('0C')}.extra;"
+            " added launchd job entry dev.pohunek.left",
         )
+        # Every added job reaches the job log, a worker that is left out too.
+        self.assertIn(f"run-rows: added launchd job {application.format('02')}: not described", result.stderr)
+        self.assertIn("run-rows: added launchd job dev.pohunek.left: not described", result.stderr)
 
     def test_a_job_added_from_the_system_volume_is_left_out_and_named(self):
         listing = self.rows.directory / "launchd.txt"
         listing.write_text("PID\tStatus\tLabel\n456\t0\tcom.example.base\n")
         descriptions = self.rows.directory / "launchd"
-        descriptions.mkdir()
-        # `launchctl print` output of each job: a program line, an arguments
-        # block only, a program outside /System, and one that leaves /System.
-        for label, body in (
-            ("com.apple.BKAgentService", "\tprogram = /System/Library/PrivateFrameworks/BookKit.framework/BKAgentService\n"),
-            ("com.apple.podcasts.PodcastContentService", "\targuments = {\n\t\t/System/Applications/Podcasts.app/PodcastContentService\n\t}\n"),
-            ("com.apple.lookalike", "\tprogram = /Users/runner/lookalike\n"),
-            ("com.apple.escape", "\tprogram = /System/../private/tmp/escape\n"),
+        uid = os.getuid()
+        # `launchctl print` output of each job, in the one domain that has it:
+        # a program line with an environment and further arguments, an
+        # arguments block only, a program outside /System, one that leaves
+        # /System and one that is not a path.
+        for domain, label, body in (
+            (
+                f"gui/{uid}",
+                "com.apple.BKAgentService",
+                "\tenvironment = {\n\t\tPROBE_VARIABLE => probe-value\n\t}\n"
+                "\tprogram = /System/Library/PrivateFrameworks/BookKit.framework/BKAgentService\n"
+                "\targuments = {\n\t\t/System/Library/PrivateFrameworks/BookKit.framework/BKAgentService\n"
+                "\t\tprobe-argument\n\t}\n",
+            ),
+            (
+                f"user/{uid}",
+                "com.apple.podcasts.PodcastContentService",
+                "\targuments = {\n\t\t/System/Applications/Podcasts.app/PodcastContentService\n\t}\n",
+            ),
+            (f"gui/{uid}", "com.apple.lookalike", "\tprogram = /Users/runner/lookalike\n"),
+            (f"gui/{uid}", "com.apple.escape", "\tprogram = /System/../private/tmp/escape\n"),
+            (f"user/{uid}", "com.apple.relative", "\tprogram = System/relative\n"),
         ):
-            (descriptions / label).write_text(f"pid/1/{label} = {{\n\tactive count = 0\n{body}}}\n")
+            (descriptions / domain).mkdir(parents=True, exist_ok=True)
+            (descriptions / domain / label).write_text(f"{domain}/{label} = {{\n\tactive count = 0\n{body}}}\n")
         launchctl = self.rows.tools / "launchctl"
         launchctl.write_text(
             "#!/bin/sh\n"
-            f'case $1 in list) cat {listing} ;; print) cat "{descriptions}/${{2##*/}}" ;; *) exit 1 ;; esac\n'
+            f'case $1 in list) cat {listing} ;; print) cat "{descriptions}/$2" 2>/dev/null ;; *) exit 1 ;; esac\n'
         )
         launchctl.chmod(0o755)
         # alpha's run loads two system agents; beta's loads a lookalike, one
-        # whose path leaves /System, and one launchctl cannot describe.
+        # whose path leaves /System, one that is not a path and one launchctl
+        # cannot describe.
         self.consumer(
             f'if [ "$row" = alpha ]; then printf "1\\t0\\tcom.apple.BKAgentService\\n-\\t0\\tcom.apple.podcasts.PodcastContentService\\n" >> {listing}; fi\n'
-            f'if [ "$row" = beta ]; then printf "2\\t0\\tcom.apple.lookalike\\n3\\t0\\tcom.apple.escape\\n4\\t0\\tdev.pohunek.left\\n" >> {listing}; fi\n'
+            f'if [ "$row" = beta ]; then printf "2\\t0\\tcom.apple.lookalike\\n3\\t0\\tcom.apple.escape\\n4\\t0\\tdev.pohunek.left\\n5\\t0\\tcom.apple.relative\\n" >> {listing}; fi\n'
             f"{PASSING_CONSUMER}"
         )
         result = self.rows.run()
@@ -916,8 +945,23 @@ class RunRowsTests(unittest.TestCase):
         self.assertEqual(
             results["beta"]["message"],
             "added launchd job entry com.apple.escape; added launchd job entry com.apple.lookalike;"
-            " added launchd job entry dev.pohunek.left",
+            " added launchd job entry com.apple.relative; added launchd job entry dev.pohunek.left",
         )
+        for line in (
+            "com.apple.BKAgentService: /System/Library/PrivateFrameworks/BookKit.framework/BKAgentService,"
+            f" in gui/{uid}",
+            f"com.apple.podcasts.PodcastContentService: /System/Applications/Podcasts.app/PodcastContentService,"
+            f" in user/{uid}",
+            f"com.apple.lookalike: /Users/runner/lookalike, in gui/{uid}",
+            f"com.apple.relative: a program that is not an absolute path, in user/{uid}",
+            "dev.pohunek.left: not described",
+        ):
+            self.assertIn(f"run-rows: added launchd job {line}\n", result.stderr)
+        # Only the label and the program path leave `launchctl print`.
+        printed = result.stdout + result.stderr + (self.rows.out_dir / "row-results.jsonl").read_text()
+        printed += (self.rows.directory / "summary.md").read_text()
+        for value in ("PROBE_VARIABLE", "probe-value", "probe-argument", "System/relative"):
+            self.assertNotIn(value, printed)
 
     def test_a_shadow_command_that_cannot_be_read_stops_the_job_without_blocking(self):
         for kind, create in (
