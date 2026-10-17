@@ -62,6 +62,11 @@ const HOLDER_LIFETIME: std::time::Duration = std::time::Duration::from_secs(300)
 /// Pause between the holder's checks of its barrier.
 const HOLDER_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
+/// The daemon's supervision sweep grace in these scenarios. The lost-runtime
+/// sweep waits one grace for unreadable markers to settle before it reports
+/// the cleanup unconfirmed; the subprocess default is 5 s.
+const SWEEP_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// Text shared by the worker's sweep events of a force-closed runtime.
 const SWEEP_EVENTS: &str = "of a force-closed runtime";
 
@@ -276,11 +281,11 @@ impl Scenario {
         let mut config = self.config.clone();
         config.worker_runtime_root = Some(worker_environment.runtime_home.join("pohunek/workers"));
         config.worker_state_root = Some(worker_environment.state_home.join("pohunek/workers"));
-        config.supervision = Some(
-            worker_environment
-                .supervision(worker_binary())
-                .with_environment_source(EnvironmentSource::fixed(self.env.environment().clone())),
-        );
+        let mut supervision = worker_environment
+            .supervision(worker_binary())
+            .with_environment_source(EnvironmentSource::fixed(self.env.environment().clone()));
+        supervision.sweep_grace = SWEEP_GRACE;
+        config.supervision = Some(supervision);
         SessionRegistry::new_with_launcher_and_inspector(
             config,
             launcher,
@@ -646,6 +651,10 @@ fn persist_stop_intent(store: &Path) {
 /// A root that exits on its own just before the stop request is still a
 /// stopped session when the worker's terminal commit lands only after the stop
 /// gave up waiting for it: the durable stop intent decides the outcome.
+///
+/// It runs for about three stop graces (about 42 s). The grace must outlast
+/// the worker's 10 s terminal-commit wait, which the real `pohunek-sessiond`
+/// fixes and no configuration it reads can shorten.
 #[tokio::test]
 async fn a_late_exit_after_the_stop_gave_up_honours_the_stop_intent() {
     if !pohunek_test_support::process_env::in_own_process() {
@@ -714,6 +723,10 @@ async fn a_late_exit_after_the_stop_gave_up_honours_the_stop_intent() {
 /// worker still answering with an exited runtime that it never acknowledged.
 /// The restarted daemon imports that runtime as a stopped session with its
 /// exit and the forced close, although the worker saw a natural exit.
+///
+/// It runs for about 32 s: without a stop, the worker force-closes the held
+/// output only after its 30 s post-exit drain, which the real
+/// `pohunek-sessiond` fixes and no configuration it reads can shorten.
 #[tokio::test]
 async fn an_exited_worker_still_answering_after_a_restart_honours_the_stop_intent() {
     if !pohunek_test_support::process_env::in_own_process() {
