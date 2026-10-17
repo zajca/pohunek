@@ -210,7 +210,7 @@ fn detector_for(definition: &RuntimeDefinition, now: Instant, columns: u16) -> D
                 stable_visible_refresh: Duration::from_millis(800),
                 startup_grace: Duration::ZERO,
             },
-            manifest: Some(definition.manifest().as_ref().clone()),
+            manifest: Some(Arc::clone(definition.manifest())),
             input_readiness: definition.input_readiness(),
         },
     )

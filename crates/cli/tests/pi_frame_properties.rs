@@ -14,6 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pohunek_daemon::detect::{
@@ -38,7 +39,7 @@ fn detect_toml() -> String {
 
 /// The manifest with all rules, and with each frame rule alone.
 struct Manifests {
-    full: Manifest,
+    full: Arc<Manifest>,
     dialog: Manifest,
     working: Manifest,
     idle: Manifest,
@@ -60,7 +61,7 @@ fn manifests() -> Manifests {
         Manifest::parse_str(&format!("{}[[rules]]{rule}", parts[0])).expect("single-rule manifest")
     };
     Manifests {
-        full: Manifest::parse_str(&text).expect("the manifest parses"),
+        full: Arc::new(Manifest::parse_str(&text).expect("the manifest parses")),
         dialog: only("dialog_rule"),
         working: only("working_rule"),
         idle: only("idle_editor_rule"),
@@ -350,7 +351,7 @@ fn generated_screens() -> Vec<Screen> {
     screens
 }
 
-fn detector(manifest: &Manifest, columns: u16) -> Detector {
+fn detector(manifest: &Arc<Manifest>, columns: u16) -> Detector {
     let now = Instant::now();
     Detector::new(
         ROWS,
@@ -365,13 +366,13 @@ fn detector(manifest: &Manifest, columns: u16) -> Detector {
                 stable_visible_refresh: Duration::from_millis(800),
                 startup_grace: Duration::ZERO,
             },
-            manifest: Some(manifest.clone()),
+            manifest: Some(Arc::clone(manifest)),
         },
     )
 }
 
 /// What a [`Detector`] publishes from the screen evidence of `lines`.
-fn detected(manifest: &Manifest, lines: &[String], columns: usize) -> Option<AgentActivity> {
+fn detected(manifest: &Arc<Manifest>, lines: &[String], columns: usize) -> Option<AgentActivity> {
     let mut bytes = b"\x1b[2J\x1b[H".to_vec();
     bytes.extend_from_slice(lines.join("\r\n").as_bytes());
     let now = Instant::now();

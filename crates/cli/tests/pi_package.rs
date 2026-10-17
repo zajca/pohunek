@@ -13,6 +13,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use std::time::{Duration, Instant};
 
@@ -626,7 +627,7 @@ fn detector_with_columns(definition: &RuntimeDefinition, now: Instant, columns: 
                 stable_visible_refresh: Duration::from_millis(800),
                 startup_grace: Duration::ZERO,
             },
-            manifest: Some((**definition.manifest()).clone()),
+            manifest: Some(Arc::clone(definition.manifest())),
         },
     )
 }
