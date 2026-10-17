@@ -2854,6 +2854,36 @@ class LaneSelectionTests(unittest.TestCase):
                     self.assertTrue(fails(result, event=event))
 
 
+# A step that runs tests from the nextest archive: a test-partitions action
+# that starts nextest's runner, not one that only lists tests.
+ARCHIVE_RUN = re.compile(r"scripts/test-partitions [^\n]*--archive-file [^\n]*\b(?:run|run-macos|run-macos-tier|audit-sparse)\b")
+
+
+class ArchiveToolchainTests(unittest.TestCase):
+    """Archive test jobs install the pinned toolchain before any test runs (#1256).
+
+    A test that runs cargo would otherwise make rustup install the pinned
+    toolchain mid-test, and concurrent installs race on ~/.rustup/downloads.
+    """
+
+    def test_every_job_running_archive_tests_installs_the_toolchain_first(self):
+        checked = []
+        for name, job in workflow_jobs().items():
+            if "    steps:\n" not in job:
+                continue
+            steps = re.split(r"(?m)^(?=      - )", job.split("    steps:\n", 1)[1])
+            runs = [index for index, step in enumerate(steps) if ARCHIVE_RUN.search(step)]
+            if not runs:
+                continue
+            checked.append(name)
+            setup = [index for index, step in enumerate(steps)
+                     if re.search(r"(?m)^        uses: \./(?:relocated/)?\.github/actions/setup-rust$", step)]
+            with self.subTest(job=name):
+                self.assertTrue(setup, f"{name} runs archive tests without setup-rust")
+                self.assertLess(min(setup), min(runs))
+        self.assertTrue({"fast-tests", "integration", "integration-relay"} <= set(checked), checked)
+
+
 def partitions_module():
     loader = importlib.machinery.SourceFileLoader("partitions_wiring", str(ROOT / "scripts" / "test-partitions"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
