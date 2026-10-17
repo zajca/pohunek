@@ -343,8 +343,64 @@ jobs:
           path: target/nextest/macos/junit.xml
           if-no-files-found: warn
 
-  # Native Apple Silicon packaging (issue #104): the daemon archive is built
-  # twice from the same commit and must come out byte-identical, its Mach-O
+  # The version-A release daemon for aarch64-apple-darwin, built once per run
+  # (issue #1210). `macos-package` and `hermes-compatibility-macos` download
+  # it instead of compiling it on their own macOS runners; it runs whenever
+  # either of them does.
+  macos-release-build:
+    name: macOS release daemon build (macos-15)
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || github.event_name == 'push' || (github.event_name == 'pull_request' && (needs.changes.outputs.macos_package == 'true' || needs.changes.outputs.hermes_macos == 'true')) }}
+    needs: changes
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      # mold is Linux-only: keep the default linker on macOS runners.
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify native runner architecture
+        shell: bash
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: macos-release-build-macos-15
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # build-release maps the checkout, cargo home and sysroot paths to fixed
+      # names, so the binaries do not depend on which runner built them. The
+      # tar keeps their executable mode, which an artifact upload drops.
+      - name: Build the daemon component
+        shell: bash
+        run: |
+          set -euo pipefail
+          bindir="$(packaging/macos/build-release daemon)"
+          tar -C "$bindir" -cf "$RUNNER_TEMP/macos-release-daemon.tar" pohunek pohunekd pohunek-sessiond
+          {
+            echo "Runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            echo '```'
+            (cd "$bindir" && shasum -a 256 pohunek pohunekd pohunek-sessiond)
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the daemon binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-release-daemon
+          path: ${{ runner.temp }}/macos-release-daemon.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  # Native Apple Silicon packaging (issue #104): the daemon archive is packaged
+  # from the binaries of `macos-release-build`, and the nightly tier rebuilds
+  # them cold here and requires byte-identical binaries and archive. Its Mach-O
   # files are audited, and the extracted archives are installed, upgraded, and
   # uninstalled against real launchd with live sessions
   # (scripts/acceptance/macos-package-install). Archives built here take the
@@ -356,7 +412,7 @@ jobs:
     # supported build target that CI does not run (issue #1224).
     name: macOS package install and upgrade (macos-15)
     if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || github.event_name == 'push' || (github.event_name == 'pull_request' && needs.changes.outputs.macos_package == 'true') }}
-    needs: changes
+    needs: [changes, macos-release-build]
     runs-on: macos-15
     timeout-minutes: 90
     env:
@@ -383,12 +439,26 @@ jobs:
       - name: Build offline documentation
         run: cargo xtask docs site
 
-      - name: Build the daemon component
+      # The version-A binaries come from `macos-release-build`; this job does
+      # not compile them.
+      - name: Download the daemon binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: macos-release-daemon
+          path: ${{ runner.temp }}/macos-release-daemon-download
+
+      - name: Unpack the daemon binaries
         id: build
         shell: bash
         run: |
           set -euo pipefail
-          bindir="$(packaging/macos/build-release daemon)"
+          bindir="$RUNNER_TEMP/macos-release-daemon"
+          rm -rf "$bindir"
+          mkdir -p "$bindir"
+          tar -C "$bindir" -xf "$RUNNER_TEMP/macos-release-daemon-download/macos-release-daemon.tar"
+          for binary in pohunek pohunekd pohunek-sessiond; do
+            test -x "$bindir/$binary"
+          done
           echo "bindir=$bindir" >> "$GITHUB_OUTPUT"
 
       - name: Package version A
@@ -405,15 +475,18 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
-      # The same commit rebuilt from a cold release directory at the same path
-      # must produce the same binaries and the same archive. Cargo mixes the
-      # RUSTFLAGS text (which carries the checkout path for path remapping)
-      # into every crate's metadata hash, so the path itself stays fixed.
+      # The same commit rebuilt here from a cold release directory, at the same
+      # checkout path as on the builder's runner, must produce the builder's
+      # binaries and the same archive. Cargo mixes the RUSTFLAGS text (which
+      # carries the checkout path for path remapping) into every crate's
+      # metadata hash, so the path itself stays fixed.
       - name: Rebuild from a cold release directory and compare
         if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') }}
         shell: bash
         run: |
           set -euo pipefail
+          # The builder's job summary names its runner image, for a mismatch.
+          echo "Runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
           first="$RUNNER_TEMP/first-binaries"
           mkdir -p "$first" "$RUNNER_TEMP/dist-repro"
           for binary in pohunek pohunekd pohunek-sessiond; do
@@ -2602,15 +2675,15 @@ jobs:
     # core inputs are covered by the main and nightly tiers. The Linux
     # `hermes-package` job follows the runtime package selection instead.
     if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.hermes_macos == 'true') }}
-    needs: changes
+    needs: [changes, macos-release-build]
     runs-on: macos-15
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
       # mold is Linux-only: keep the default linker on macOS runners.
       RUSTFLAGS: -D warnings
-    # The release daemon-archive build and the debug build of the CLI
-    # integration tests for the real Hermes session each take a large share of
-    # a cold run.
+    # The debug build of the CLI integration tests for the real Hermes session
+    # takes a large share of a cold run; the release daemon comes from
+    # `macos-release-build`.
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -2737,17 +2810,39 @@ jobs:
       - name: Build offline documentation
         run: cargo xtask docs site
 
-      # The packaged archive is built with the release scripts and extracted
-      # outside the checkout, so the gate and the smoke can only use what the
-      # published macOS daemon archive contains: the binaries and the packaged
-      # smoke script.
-      - name: Build, package, and extract the daemon archive outside the source tree
+      # The version-A binaries come from `macos-release-build`; this job does
+      # not compile them.
+      - name: Download the daemon binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: macos-release-daemon
+          path: ${{ runner.temp }}/macos-release-daemon-download
+
+      - name: Unpack the daemon binaries
+        id: binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          bindir="$RUNNER_TEMP/macos-release-daemon"
+          rm -rf "$bindir"
+          mkdir -p "$bindir"
+          tar -C "$bindir" -xf "$RUNNER_TEMP/macos-release-daemon-download/macos-release-daemon.tar"
+          for binary in pohunek pohunekd pohunek-sessiond; do
+            test -x "$bindir/$binary"
+          done
+          echo "bindir=$bindir" >> "$GITHUB_OUTPUT"
+
+      # The archive is packaged with the release scripts and extracted outside
+      # the checkout, so the gate and the smoke can only use what the published
+      # macOS daemon archive contains: the binaries and the packaged smoke
+      # script.
+      - name: Package and extract the daemon archive outside the source tree
         id: packaged
         shell: /bin/bash {0}
         run: |
           set -euo pipefail
           version="$(awk -F'"' '/^\[workspace\.package\]/ { in_pkg = 1; next } /^\[/ { in_pkg = 0 } in_pkg && /^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)"
-          bindir="$(packaging/macos/build-release daemon)"
+          bindir="${{ steps.binaries.outputs.bindir }}"
           dist="$RUNNER_TEMP/dist-daemon"
           rm -rf "$dist"
           mkdir -p "$dist"

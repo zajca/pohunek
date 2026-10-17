@@ -185,6 +185,15 @@ MACOS_PATH_OWNERSHIP = {
 # macOS jobs that never run on a pull request, whatever their paths filter
 # matches: the main and nightly tiers run them unconditionally.
 MACOS_TIER_JOBS = {"macos-tier"}
+# macOS jobs that build for other macOS jobs of the run, by the jobs that
+# download what they build (issue #1210). Each runs exactly when one of its
+# consumers does, so it adds no macOS slot to a run that has none of them.
+MACOS_BUILDER_JOBS = {
+    "macos-release-build": {"macos-package", "hermes-compatibility-macos"},
+}
+# The artifact `macos-release-build` uploads: the version-A release daemon
+# binaries, tarred so they keep their executable mode.
+MACOS_RELEASE_ARTIFACT = "macos-release-daemon"
 # The guard that keeps fork and Dependabot pull requests out of the release
 # rehearsal: their token cannot hold the scopes the called workflow declares.
 SAME_REPOSITORY_PR = (
@@ -424,7 +433,10 @@ class CiTierWorkflowTests(unittest.TestCase):
             if re.search(r"(?m)^    runs-on:.*macos", definition)
             or re.search(r"(?m)^    runs-on: \$\{\{ matrix\.runner \}\}", definition)
         }
-        self.assertEqual(discovered_macos_jobs, set(MACOS_PATH_OWNERSHIP) | MACOS_TIER_JOBS)
+        self.assertEqual(
+            discovered_macos_jobs,
+            set(MACOS_PATH_OWNERSHIP) | MACOS_TIER_JOBS | set(MACOS_BUILDER_JOBS),
+        )
 
         for name, ownership in MACOS_PATH_OWNERSHIP.items():
             with self.subTest(job=name):
@@ -603,6 +615,94 @@ class CiTierWorkflowTests(unittest.TestCase):
                         expression.group(1), event=event, tier=tier, result="skipped",
                     ))
 
+
+    def test_a_macos_builder_runs_exactly_when_one_of_its_consumers_runs(self):
+        jobs = workflow_jobs()
+        filters = sorted({MACOS_PATH_OWNERSHIP[consumer]["filter"]
+                          for consumers in MACOS_BUILDER_JOBS.values()
+                          for consumer in consumers})
+        events = (
+            ("pull_request", ""), ("push", ""), ("schedule", ""),
+            ("workflow_dispatch", "main"), ("workflow_dispatch", "nightly"),
+        )
+        for builder, consumers in MACOS_BUILDER_JOBS.items():
+            condition = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", jobs[builder])
+            self.assertIsNotNone(condition, f"{builder} has no explicit tier condition")
+            assert condition is not None
+            consumer_conditions = {}
+            for consumer in consumers:
+                match = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", jobs[consumer])
+                assert match is not None
+                consumer_conditions[consumer] = match.group(1)
+            for event, tier in events:
+                for values in range(2 ** len(filters)):
+                    changes = {
+                        name: "true" if values >> index & 1 else "false"
+                        for index, name in enumerate(filters)
+                    }
+                    with self.subTest(builder=builder, event=event, tier=tier, changes=changes):
+                        expected = any(
+                            evaluate_condition(expression, event=event, tier=tier, changes=changes)
+                            for expression in consumer_conditions.values()
+                        )
+                        self.assertEqual(
+                            evaluate_condition(condition.group(1), event=event, tier=tier, changes=changes),
+                            expected,
+                        )
+
+    def test_consumers_of_the_macos_release_build_download_it_and_never_build_version_a(self):
+        jobs = workflow_jobs()
+        builder = jobs["macos-release-build"]
+        self.assertRegex(builder, r"(?m)^    needs: changes$")
+        build = job_steps(builder)["Build the daemon component"]
+        self.assertIn('bindir="$(packaging/macos/build-release daemon)"', step_script(build))
+        self.assertNotIn("CARGO_LOCKED_FLAG", step_script(build))
+        upload = job_steps(builder)["Upload the daemon binaries"]
+        self.assertIn("uses: actions/upload-artifact@", upload)
+        self.assertIn(f"name: {MACOS_RELEASE_ARTIFACT}\n", upload)
+
+        for consumer in MACOS_BUILDER_JOBS["macos-release-build"]:
+            with self.subTest(job=consumer):
+                definition = jobs[consumer]
+                self.assertRegex(definition, r"(?m)^    needs: \[changes, macos-release-build\]$")
+                steps = job_steps(definition)
+                download = steps["Download the daemon binaries"]
+                self.assertIn("uses: actions/download-artifact@", download)
+                self.assertIn(f"name: {MACOS_RELEASE_ARTIFACT}\n", download)
+                names = list(steps)
+                building = {
+                    name for name, step in steps.items()
+                    if "packaging/macos/build-release" in step
+                }
+                # Version B is a different version of the tree, and the
+                # nightly cold rebuild must compile to compare; nothing else
+                # in a consumer compiles the release daemon.
+                allowed = {
+                    "macos-package": {
+                        "Rebuild from a cold release directory and compare",
+                        "Build and package version B",
+                    },
+                    "hermes-compatibility-macos": set(),
+                }[consumer]
+                self.assertEqual(building, allowed)
+                packaged = [
+                    name for name, step in steps.items()
+                    if re.search(r"packaging/macos/package --(?:development|stage-release)", step)
+                ]
+                self.assertTrue(packaged)
+                # Packaging version A reads the downloaded binaries.
+                first_package = names.index(packaged[0])
+                self.assertLess(names.index("Download the daemon binaries"), first_package)
+
+        package_steps = job_steps(jobs["macos-package"])
+        cold = package_steps["Rebuild from a cold release directory and compare"]
+        self.assertIn("inputs.tier == 'nightly'", cold)
+        self.assertNotIn("inputs.tier == 'main'", cold)
+        self.assertNotIn("github.event_name == 'push'", cold)
+        self.assertIn('cp "${{ steps.build.outputs.bindir }}/$binary" "$first/"', step_script(cold))
+        self.assertIn("id: build\n", package_steps["Unpack the daemon binaries"])
+        version_b = step_script(package_steps["Build and package version B"])
+        self.assertIn('CARGO_LOCKED_FLAG="" packaging/macos/build-release daemon', version_b)
 
 # The reusable workflows the release rehearsal runs (issue #1207). Push to main
 # never runs the rehearsal, so a pull request that changes one of their inputs
