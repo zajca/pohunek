@@ -92,6 +92,7 @@ def write_full(out, cause, base="", merge_base=""):
         "full_causes": [cause],
         "packages": [],
         "files": [],
+        "lane": {"mode": "full", "filterset": None, "full_causes": [cause], "packages": []},
     }
     outputs = "mode=full\ndocs_only=false\nscript_tests=true\nsdk_gates=true\nfilterset=\n"
     summary = f"### Test selection\n\nMode: **full**. Every test runs because of:\n\n- {cause}\n"
@@ -126,8 +127,33 @@ def validate(out):
         and outputs["filterset"] == (selection.get("filterset") or "")
         and (selection["mode"] != "packages" or bool(outputs["filterset"]))
     )
-    if not consistent:
+    if not consistent or not lane_consistent(selection):
         raise Unavailable("the merge base's selector wrote an inconsistent selection")
+
+
+def lane_consistent(selection):
+    """Whether the optional macOS lane part has the shape the lane job reads.
+
+    A selector that predates the lane part writes none; the lane then runs in
+    full. The lane part may select more than the selection: a dependency
+    change that the host's dependency diff finds empty runs the whole lane.
+    """
+    lane = selection.get("lane")
+    if lane is None:
+        return True
+    if not isinstance(lane, dict) or lane.get("mode") not in MODES:
+        return False
+    packages = lane.get("packages")
+    if not isinstance(packages, list) or not all(
+        isinstance(package, dict) and isinstance(package.get("name"), str) for package in packages
+    ):
+        return False
+    filterset = lane.get("filterset")
+    if lane["mode"] == "packages":
+        shaped = bool(packages) and isinstance(filterset, str) and bool(filterset)
+    else:
+        shaped = not packages and filterset is None
+    return shaped
 
 
 def build_base_selector(root, merge_base, head, scratch):

@@ -636,13 +636,13 @@ class PlanActionTests(ScriptScenario):
         self.assertEqual(self.nextest_calls(), [])
         return result
 
-    def assert_plan(self, selection, fast_shards, heavy, relay_db):
+    def assert_plan(self, selection, fast_shards, heavy, relay_db, lane=True):
         result = self.plan(selection)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout,
             f"fast_shards={json.dumps(fast_shards)}\nheavy={str(heavy).lower()}\n"
-            f"relay_db={str(relay_db).lower()}\n",
+            f"relay_db={str(relay_db).lower()}\nlane={str(lane).lower()}\n",
         )
 
     def packages(self, *names, script_tests=False):
@@ -674,6 +674,45 @@ class PlanActionTests(ScriptScenario):
         self.assert_plan({"mode": "none", "script_tests": False, "packages": []},
                          [], False, False)
 
+    def lane(self, mode, *names):
+        return {
+            "mode": mode,
+            "filterset": " | ".join(f"package(={name})" for name in names) or None,
+            "packages": [{"name": name} for name in names],
+        }
+
+    def test_the_lane_runs_unless_its_part_selects_no_lane_package(self):
+        cli = self.packages("pohunek-cli")
+        # A selector without the lane part runs the whole lane.
+        self.assert_plan(cli, ["cli"], True, False, lane=True)
+        self.assert_plan({"mode": "none", "script_tests": False, "packages": []},
+                         [], False, False, lane=True)
+        self.assert_plan({**cli, "lane": self.lane("packages", "pohunek-cli")},
+                         ["cli"], True, False, lane=True)
+        self.assert_plan({**cli, "lane": self.lane("full")}, ["cli"], True, False, lane=True)
+        self.assert_plan({**cli, "lane": self.lane("none")}, ["cli"], True, False, lane=False)
+        knowledge = self.packages("pohunek-knowledge", "xtask")
+        self.assert_plan({**knowledge, "lane": self.lane("packages", "xtask")},
+                         ["core"], True, False, lane=False)
+        # A full selection runs the whole lane whatever its lane part says.
+        self.assert_plan({"mode": "full", "script_tests": True, "lane": self.lane("none")},
+                         ["core", "daemon", "relay", "cli"], True, True, lane=True)
+
+    def test_a_lane_part_the_plan_cannot_trust_fails(self):
+        cli = self.packages("pohunek-cli")
+        for lane in (
+            "none",
+            {"mode": "subset", "packages": []},
+            {"mode": "packages", "filterset": None, "packages": [{"name": "pohunek-cli"}]},
+            {"mode": "packages", "filterset": "package(=pohunek-cli)", "packages": []},
+            {"mode": "none", "filterset": "package(=pohunek-cli)", "packages": []},
+            {"mode": "none", "filterset": None, "packages": [{"name": "pohunek-cli"}]},
+        ):
+            with self.subTest(lane=lane):
+                result = self.plan({**cli, "lane": lane})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
     def test_a_selection_the_plan_cannot_trust_fails(self):
         for selection in (
             {"schema_version": 2, "mode": "full"},
@@ -690,7 +729,11 @@ class PlanActionTests(ScriptScenario):
     def test_selection_is_refused_outside_plan_run_and_check(self):
         result = self.run_script("filter", "core", "--selection", "selection.json")
         self.assertEqual(result.returncode, 2)
-        self.assertIn("--selection applies to plan, run and check only", result.stderr)
+        self.assertIn("--selection applies to plan, run, check and run-macos only", result.stderr)
+        result = self.run_script("run-macos-tier", "--archive-file", "a.tar.zst",
+                                 "--selection", "selection.json")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--selection applies to plan, run, check and run-macos only", result.stderr)
 
 
 class SelectionActionTests(ScriptScenario):
@@ -1228,6 +1271,53 @@ class MacosLaneTests(ScriptScenario):
         self.assertEqual(result.returncode, 1)
         self.assertIn("macOS partition coverage failed", result.stderr)
         self.assertIn("missing=[('pohunek-client', 'new_real_probe')]", result.stderr)
+
+    def lane_selection(self, lane):
+        path = self.root / "selection.json"
+        selection = {
+            "schema_version": 1, "mode": "packages", "script_tests": False,
+            "filterset": "package(=pohunek-cli) | package(=pohunek-knowledge)",
+            "packages": [{"name": "pohunek-cli", "tests": "all"},
+                         {"name": "pohunek-knowledge", "tests": "all"}],
+        }
+        if lane is not None:
+            selection["lane"] = lane
+        path.write_text(json.dumps(selection))
+        return str(path)
+
+    def run_macos(self, lane):
+        return self.run_script("run-macos", "--archive-file", str(self.archive),
+                               "--selection", self.lane_selection(lane))
+
+    def test_run_macos_narrows_the_lane_to_its_selected_packages(self):
+        filterset = "package(=pohunek-cli)"
+        result = self.run_macos(
+            {"mode": "packages", "filterset": filterset, "packages": [{"name": "pohunek-cli"}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [call] = self.nextest_calls()
+        argv = call["argv"]
+        self.assertEqual(argv[argv.index("-E") + 1], f"({partitions.LANE_SET}) and ({filterset})")
+        self.assertEqual(argv[argv.index("--no-tests") + 1], "pass")
+
+    def test_run_macos_runs_nothing_for_a_lane_part_without_lane_packages(self):
+        for lane in ({"mode": "none", "filterset": None, "packages": []},
+                     {"mode": "packages", "filterset": "package(=xtask)",
+                      "packages": [{"name": "xtask"}]}):
+            with self.subTest(lane=lane):
+                result = self.run_macos(lane)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("runs no test of the macOS lane", result.stdout)
+                self.assertEqual(self.nextest_calls(), [])
+
+    def test_run_macos_runs_the_whole_lane_without_a_narrowing_lane_part(self):
+        for lane in (None, {"mode": "full", "filterset": None, "packages": []}):
+            with self.subTest(lane=lane):
+                result = self.run_macos(lane)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                [call] = self.nextest_calls()[-1:]
+                argv = call["argv"]
+                self.assertEqual(argv[argv.index("-E") + 1], partitions.LANE_SET)
+                self.assertNotIn("--no-tests", argv)
 
     def test_run_macos_status_is_the_runner_status(self):
         result = self.run_script(
