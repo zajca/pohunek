@@ -20,6 +20,9 @@ pub use assistant::{
 pub use index::{bundle_index, BundleIndexError, ConceptMeta};
 #[doc(inline)]
 pub use materializer::{gc, materialize};
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+pub use materializer::{materialize_with_observer, Event};
 #[doc(inline)]
 pub use schema::{
     Citation, Concept, ConceptType, Deprecation, Intent, SourceKind, CONCEPT_SCHEMA_VERSION,

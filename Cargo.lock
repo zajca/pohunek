@@ -2961,6 +2961,7 @@ name = "pohunek-knowledge"
 version = "0.35.2"
 dependencies = [
  "include_dir",
+ "pohunek-platform",
  "pohunek-protocol",
  "pohunek-test-support",
  "serde",

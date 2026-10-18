@@ -22,6 +22,20 @@ the snapshot file, and the [source map](../assistant/source-map.md); it does not
 inline the whole corpus. That keeps prompt size bounded and lets the same
 Markdown serve humans and agents.
 
+Materialization publishes the bundle only after its files and directories have
+been synchronized, then synchronizes the cache directory after the atomic rename.
+A synchronization error fails the operation; retrying completes the publication
+before it reports success. An interrupted, incomplete version is moved aside
+inside the private cache and rebuilt. Symbolic links and unsafe ownership or
+permissions are refused rather than followed or repaired outside that cache.
+
+The daemon and local assistant serialize publication and cache cleanup with the
+same materialization lock. Cleanup preserves active temporary extractions and
+collects abandoned ones after their ownership lock is released. Legacy temporary
+directories without an ownership lock are retained for at least a day before
+cleanup under the shared lock; a live legacy owner is retained conservatively.
+Cleanup is best effort and does not turn a successful publication into a failure.
+
 The planned assistant command surface uses one implementation with intent
 filters: setup, project, update, debug, and help. Intent changes the initial
 table of contents and first-step steering, but the concepts and safety model are
