@@ -12541,6 +12541,26 @@ handler = "codex-hook-v1"
         /// is checked and signalled only by the identity captured at start.
         struct Marked(u32, crate::procwatch::ProcessIdentity);
 
+        /// Builds a holder with exactly its requested ownership markers.
+        fn marker_command(program: &str, markers: &[(&str, &str)]) -> std::process::Command {
+            // Match the platform OwnershipMarkers allowlist; ordinary environment,
+            // including PATH, locale and TMPDIR, remains inherited.
+            const OWNERSHIP_KEYS: &[&str] = &[
+                "POHUNEK_DAEMON_ID",
+                "POHUNEK_SESSION_ID",
+                "POHUNEK_WORKER_ID",
+                "POHUNEK_WORKER_INSTANCE_ID",
+            ];
+            let mut command = std::process::Command::new(program);
+            for key in OWNERSHIP_KEYS {
+                if !markers.iter().any(|(supplied, _)| supplied == key) {
+                    command.env_remove(key);
+                }
+            }
+            command.envs(markers.iter().copied());
+            command
+        }
+
         impl Marked {
             fn spawn(directory: &Path, worker_instance_id: &str) -> Self {
                 Self::spawn_with(
@@ -12551,7 +12571,7 @@ handler = "codex-hook-v1"
 
             /// Like [`Self::spawn`] with exactly the given environment markers.
             fn spawn_with(directory: &Path, markers: &[(&str, &str)]) -> Self {
-                let output = std::process::Command::new("/bin/sh")
+                let output = marker_command("/bin/sh", markers)
                     .args([
                         "-c",
                         &format!(
@@ -12560,7 +12580,6 @@ handler = "codex-hook-v1"
                         ),
                     ])
                     .current_dir(directory)
-                    .envs(markers.iter().copied())
                     .output()
                     .expect("spawn marked process");
                 let pid = String::from_utf8(output.stdout)
@@ -12774,22 +12793,24 @@ generation "$1"
             std::fs::write(&chain, FORKING_HOLDER).expect("write the forking holder");
             // The holder is reparented away from the test process, so the exit
             // of every generation is observable without reaping.
-            let launched = std::process::Command::new("/bin/sh")
-                .args([
-                    "-c",
-                    &format!(
-                        "trap '' HUP; /bin/bash '{chain}' {LAST_PASS_GENERATIONS} '{barrier}' \
+            let launched = marker_command(
+                "/bin/sh",
+                &[("POHUNEK_WORKER_INSTANCE_ID", "runtime-s-324")],
+            )
+            .args([
+                "-c",
+                &format!(
+                    "trap '' HUP; /bin/bash '{chain}' {LAST_PASS_GENERATIONS} '{barrier}' \
                          '{generations}' '{fifo}' </dev/null >/dev/null 2>&1 &",
-                        chain = chain.display(),
-                        barrier = barrier.display(),
-                        generations = generations.display(),
-                        fifo = fifo.display(),
-                    ),
-                ])
-                .current_dir(&fixture.root)
-                .env("POHUNEK_WORKER_INSTANCE_ID", "runtime-s-324")
-                .status()
-                .expect("launch the forking holder");
+                    chain = chain.display(),
+                    barrier = barrier.display(),
+                    generations = generations.display(),
+                    fifo = fifo.display(),
+                ),
+            ])
+            .current_dir(&fixture.root)
+            .status()
+            .expect("launch the forking holder");
             assert!(launched.success(), "the forking holder launches");
             let first = super::wait_for_pid_file(
                 &generations.join(format!("ready-{LAST_PASS_GENERATIONS}")),
@@ -13026,23 +13047,36 @@ generation "$1"
         #[tokio::test]
         async fn crash_next_to_a_descendant_without_an_instance_marker_keeps_the_cleanup_unconfirmed(
         ) {
+            if !pohunek_test_support::process_env::in_own_process() {
+                return;
+            }
             let fixture = fixture(Arc::new(RetryInspector::default()));
-            let legacy = Marked::spawn_with(
-                &fixture.root,
-                &[
-                    ("POHUNEK_SESSION_ID", "s-310"),
-                    ("POHUNEK_WORKER_ID", "worker-s-310"),
-                    ("POHUNEK_RUNTIME_ID", "runtime-s-310"),
-                ],
-            );
-            let other_session = Marked::spawn_with(
-                &fixture.root,
-                &[
-                    ("POHUNEK_SESSION_ID", "s-310-other"),
-                    ("POHUNEK_WORKER_ID", "worker-s-310-other"),
-                    ("POHUNEK_RUNTIME_ID", "runtime-s-310"),
-                ],
-            );
+            let (legacy, other_session, marked) = {
+                let mut ambient = pohunek_test_support::process_env::ProcessEnv::lock();
+                ambient
+                    .set("POHUNEK_DAEMON_ID", "ambient-daemon")
+                    .set("POHUNEK_SESSION_ID", "ambient-session")
+                    .set("POHUNEK_WORKER_ID", "ambient-worker")
+                    .set("POHUNEK_WORKER_INSTANCE_ID", "ambient-instance");
+                let legacy = Marked::spawn_with(
+                    &fixture.root,
+                    &[
+                        ("POHUNEK_SESSION_ID", "s-310"),
+                        ("POHUNEK_WORKER_ID", "worker-s-310"),
+                        ("POHUNEK_RUNTIME_ID", "runtime-s-310"),
+                    ],
+                );
+                let other_session = Marked::spawn_with(
+                    &fixture.root,
+                    &[
+                        ("POHUNEK_SESSION_ID", "s-310-other"),
+                        ("POHUNEK_WORKER_ID", "worker-s-310-other"),
+                        ("POHUNEK_RUNTIME_ID", "runtime-s-310"),
+                    ],
+                );
+                let marked = Marked::spawn(&fixture.root, "explicit-instance");
+                (legacy, other_session, marked)
+            };
             persist_record(&fixture.root, "s-310", Some("runtime-s-310"));
             write_live_journal(
                 &fixture.root,
@@ -13072,6 +13106,31 @@ generation "$1"
             assert!(
                 other_session.alive(),
                 "a process of another session is never signalled"
+            );
+            let inspector = HostInspector::new();
+            for (process, session, worker) in [
+                (&legacy, "s-310", "worker-s-310"),
+                (&other_session, "s-310-other", "worker-s-310-other"),
+            ] {
+                assert_eq!(
+                    inspector
+                        .ownership_markers(process.0)
+                        .expect("legacy markers"),
+                    crate::procwatch::OwnershipMarkers {
+                        session_id: Some(session.to_owned()),
+                        worker_id: Some(worker.to_owned()),
+                        ..Default::default()
+                    }
+                );
+            }
+            assert_eq!(
+                inspector
+                    .ownership_markers(marked.0)
+                    .expect("explicit markers"),
+                crate::procwatch::OwnershipMarkers {
+                    worker_instance_id: Some("explicit-instance".to_owned()),
+                    ..Default::default()
+                }
             );
         }
 
