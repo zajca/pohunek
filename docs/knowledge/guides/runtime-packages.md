@@ -331,6 +331,10 @@ after the host's startup grace ends for a silent agent
   progress never counts). This is as strict as `screen_idle` — full grace, and
   `session_input_not_ready` plus a rollback when the deadline passes without
   that evidence — but a title-reporting runtime such as Codex can satisfy it.
+  After a visible blocker, cached idle evidence stays ineligible across
+  clears and redraws. Only a fresh winning screen or title idle signal after
+  the blocker disappears releases the prompt; receiving the same title value
+  again counts as fresh, while ticks and OSC progress do not.
   Declare it when the agent enables bracketed paste while a screen other than
   its editable prompt holds it, so a popup or a stale title cannot release the
   prompt either.

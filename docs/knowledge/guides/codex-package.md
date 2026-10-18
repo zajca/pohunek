@@ -153,8 +153,11 @@ classifies every one of them through the package manifest.
   package declares `ready = "manifest_idle"`. Its `startup_update_prompt` rule
   reads the popup as a visible blocker from the top sixteen non-empty screen lines, above the
   title's idle rule, so a prompt is refused (nothing written, the session
-  rolled back) while the popup holds, and delivered once the popup is gone
-  and the idle title shows. The rule is verified against captures at 80, 100
+  rolled back) while the popup holds. After observing the blocker, cached
+  idle evidence cannot release input during a clear or partial redraw. A
+  fresh idle title received after the popup disappears can release it, even
+  if the value repeats; title arrival is ordered against screen updates
+  within each PTY chunk. The rule is verified against captures at 80, 100
   and 160 columns (`compat/codex/screens/update-popup/`); a title left over
   from before the popup is only ever synthetic — the measured popup set no
   title. Initial-input readiness for other startup dialogs (sign-in, folder

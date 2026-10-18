@@ -23,6 +23,17 @@
   title region keeps the strict readiness instead of downgrading to
   `bracketed_paste`, so the input is refused rather than released by a signal
   the runtime did not declare.
+- A `manifest_idle` wait stays latched closed once a visible blocker is
+  sighted: only idle evidence that arrives after that sighting releases the
+  prompt. OSC title arrivals are ordered against screen updates inside each
+  PTY chunk, so a title received before a clear cannot be mistaken for a
+  later ready signal. Sighting the blocker again (a partial repaint that
+  keeps it on screen, or a full-context observation before new bytes after a
+  reconfigure or resize) raises the barrier anew, so a fresh title received
+  while the blocker holds cannot arm future readiness. A repeated reception
+  of the same idle title counts as a fresh arrival for readiness only; the
+  activity classification keeps its title-change semantics, and an eligible
+  fresh screen idle rule releases the same way.
 - This changes the `pohunek.runtime.codex` package digest; after release,
   service upgrade repins host profiles from the old digest to the released
   package digest.
