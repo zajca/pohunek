@@ -1934,7 +1934,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_compaction_preserves_epoch_bridge_and_refuses_unreadable_sources() {
+    async fn terminal_compaction_preserves_epoch_bridge() {
         let dir = temp_data_dir("terminal-compaction-epoch");
         let service = NotificationService::open(&dir).expect("open service");
         let store = terminal_source_store(&dir);
@@ -1948,29 +1948,6 @@ mod tests {
         persist_terminal_source(&store, &session);
         store_epoch_keyed_error_record(&service, "2026-07-03T10:05:00Z");
         delete_visible_terminals(&service);
-        let path = dir.join(pohunek_paths::METADATA_STORE_NAME);
-        let metadata = std::fs::read(&path).expect("read durable metadata");
-        let log = std::fs::read(service.store_path()).expect("read original notification log");
-        std::fs::write(&path, b"{not-json}\n").expect("corrupt scratch metadata");
-        let mut policy = service.policy();
-        policy.retention.compaction_min_actions = 1;
-        service.set_policy(policy).expect("set threshold");
-        assert!(
-            service
-                .prune_retention(&protocol::NotificationRetentionParams {
-                    dry_run: false,
-                    status: None,
-                    before: None,
-                    limit: None,
-                })
-                .is_err(),
-            "unreadable source snapshot must not erase tombstones"
-        );
-        assert_eq!(
-            std::fs::read(service.store_path()).expect("unchanged notification log"),
-            log
-        );
-        std::fs::write(&path, metadata).expect("restore metadata");
         compact_deleted_terminals(&service);
         drop(service);
         let service = NotificationService::open(&dir).expect("reopen compacted epoch record");
@@ -1980,6 +1957,91 @@ mod tests {
             list(&service).is_empty(),
             "legacy epoch key still reports this generation"
         );
+    }
+
+    async fn compact_with_incomplete_sources(tag: &str, tail: &str) {
+        let dir = temp_data_dir(tag);
+        let service = NotificationService::open(&dir).expect("open service");
+        let store = terminal_source_store(&dir);
+        let current = session_in_generation("s-1", SessionState::Failed, Some(1), 2);
+        persist_terminal_source(&store, &current);
+        for generation in 1..=2 {
+            let mut projector = ProjectorState::default();
+            project_session_update(
+                &mut projector,
+                &service,
+                &session_in_generation("s-1", SessionState::Failed, Some(1), generation),
+            )
+            .await;
+            delete_visible_terminals(&service);
+        }
+        let path = dir.join(pohunek_paths::METADATA_STORE_NAME);
+        let metadata = std::fs::read(&path).expect("source snapshot");
+        let mut incomplete = metadata.clone();
+        incomplete.extend_from_slice(tail.as_bytes());
+        std::fs::write(&path, incomplete).expect("append rejected source data");
+        let before = std::fs::read_to_string(service.store_path()).expect("original log");
+        let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+        let _subscriber = logs.install();
+        compact_deleted_terminals(&service);
+        let compacted = std::fs::read_to_string(service.store_path()).expect("compacted log");
+        assert!(
+            compacted.len() < before.len(),
+            "history still compacts with incomplete sources"
+        );
+        assert_eq!(
+            compacted.lines().count(),
+            2,
+            "keep every terminal tombstone, not only current generation"
+        );
+        assert!(compacted.contains("projector:s-1:error:g1"));
+        assert!(compacted.contains("projector:s-1:error:g2"));
+        compact_deleted_terminals(&service);
+        assert_eq!(
+            logs.text()
+                .lines()
+                .filter(|line| line.contains("WARN"))
+                .count(),
+            1,
+            "warn once rather than once per maintenance sweep: {}",
+            logs.text()
+        );
+        drop(service);
+        let service = NotificationService::open(&dir).expect("reopen conservative compacted log");
+        let mut projector = ProjectorState::default();
+        project_session_update(&mut projector, &service, &current).await;
+        assert!(
+            list(&service).is_empty(),
+            "current terminal stays deleted after replay"
+        );
+        std::fs::write(&path, metadata).expect("repair source metadata");
+        compact_deleted_terminals(&service);
+        let repaired =
+            std::fs::read_to_string(service.store_path()).expect("bounded log after repair");
+        assert_eq!(
+            repaired.lines().count(),
+            1,
+            "complete sources restore the generation bound"
+        );
+        assert!(!repaired.contains("projector:s-1:error:g1"));
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_all_terminal_tombstones_with_rejected_metadata() {
+        compact_with_incomplete_sources(
+            "terminal-rejected-source",
+            &format!(
+                "{{\"kind\":\"future_kind\",\"schema_version\":{}}}\n",
+                crate::store::STORE_SCHEMA_VERSION
+            ),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_all_terminal_tombstones_with_torn_metadata_tail() {
+        // No newline or closing brace: a registry write stopped mid-record.
+        compact_with_incomplete_sources("terminal-torn-source", "{\"kind\":\"session\"").await;
     }
 
     /// Stores the projector's `agent_blocked` record of session `s-1` from a

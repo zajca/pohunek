@@ -2584,8 +2584,11 @@ also keep bounded, invisible replay evidence: at most one deleted snapshot per
 terminal kind (`error`, `session_finished`) for each durable session's current
 runtime generation. This prevents restart replay from recreating an owner-deleted
 terminal notification. The next eligible compaction removes that evidence after
-the source session is removed or advances generation; an unreadable session store
-refuses compaction instead of treating the sources as absent.
+the source session is removed or advances generation. If session metadata is
+unreadable, rejected, or has a torn final record, compaction keeps every terminal
+tombstone rather than guessing which sources are absent, while still compacting
+other action history. It logs this condition once per store instance; the normal
+per-generation bound resumes once the metadata can be read completely.
 
 Policy is enforced daemon-side for all notification producers. If a producer
 creates a disabled kind, `notification.create` returns

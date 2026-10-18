@@ -928,22 +928,30 @@ impl Store {
         Ok(self.read_all()?.3)
     }
 
-    /// Load one complete source snapshot before notification evidence is discarded.
+    /// Read notification sources without treating rejected records as absence.
     ///
-    /// Unlike ordinary recovery, compaction cannot treat a rejected record as
-    /// an absent session: it might be the only authority for a deleted key.
-    pub(crate) fn load_sessions_strict(&self) -> io::Result<Vec<SessionRecord>> {
+    /// `None` marks an incomplete snapshot, including a torn final line. Read
+    /// it once and do not log each rejected line: the compactor warns once and
+    /// preserves all terminal evidence while still removing action history.
+    pub(crate) fn load_notification_sources(&self) -> io::Result<Option<Vec<SessionRecord>>> {
         let Some(content) = self.read_content()? else {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         };
-        let ((_, _, _, sessions), rejected) = partition_lines(self.checked_lines(&content)?);
-        if !rejected.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "cannot compact notification evidence with rejected metadata records",
-            ));
+        let mut sessions = Vec::new();
+        for line in self.checked_lines(&content)? {
+            let schema::ParsedLine::Record { value, .. } = line else {
+                return Ok(None);
+            };
+            match serde_json::from_value::<Record>(value) {
+                Ok(Record::Session(record)) if record_agents_are_persistable(&record) => {
+                    sessions.push(*record);
+                }
+                Ok(Record::Resume(binding)) if kind_is_persistable(&binding.agent_base) => {}
+                Ok(Record::Worktree(_) | Record::Project(_)) => {}
+                _ => return Ok(None),
+            }
         }
-        Ok(sessions)
+        Ok(Some(sessions))
     }
 
     /// The lines the loaders skip because no record kind accepts them. A

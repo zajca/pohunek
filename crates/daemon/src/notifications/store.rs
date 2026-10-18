@@ -69,6 +69,7 @@ struct StoreState {
     file: File,
     records: BTreeMap<String, NotificationRecord>,
     action_count: usize,
+    source_warning_logged: bool,
 }
 
 #[derive(Debug)]
@@ -138,6 +139,7 @@ impl NotificationStore {
                 file,
                 records: replayed.records,
                 action_count: replayed.action_count,
+                source_warning_logged: false,
             }),
         })
     }
@@ -219,43 +221,7 @@ impl NotificationStore {
             return Ok(false);
         }
 
-        // Read after acquiring notification state: an earlier session snapshot
-        // could erase a tombstone created after that source advanced generation.
-        // Unknown metadata is never evidence that all source sessions vanished.
-        let deleted_terminal: Vec<_> = state
-            .records
-            .values()
-            .filter(|record| super::projector::is_terminal_tombstone(record))
-            .collect();
-        let sources = if deleted_terminal.is_empty() {
-            Vec::new()
-        } else {
-            self.sources
-                .load_sessions_strict()
-                .map_err(|source| NotificationError::io(self.sources.path(), source))?
-        };
-        let sources: BTreeMap<_, _> = sources
-            .into_iter()
-            .filter(|source| source.desired_state != crate::store::DesiredState::Removed)
-            .map(|source| (source.session_id, source.info))
-            .collect();
-        let mut terminal: BTreeMap<_, &NotificationRecord> = BTreeMap::new();
-        for record in deleted_terminal {
-            let Some(session) = record.session_id.as_ref().and_then(|id| sources.get(&id.0)) else {
-                continue;
-            };
-            if !super::projector::terminal_tombstone_matches(record, session) {
-                continue;
-            }
-            let key = (session.id.0.clone(), record.kind.as_str());
-            let newer = terminal.get(&key).is_none_or(|existing| {
-                (&record.created_at, &record.id.0) > (&existing.created_at, &existing.id.0)
-            });
-            if newer {
-                terminal.insert(key, record);
-            }
-        }
-        retained_records.extend(terminal.values().map(|record| (*record).clone()));
+        retained_records.extend(self.terminal_tombstones(&mut state));
         if state.action_count <= retained_records.len() {
             return Ok(false);
         }
@@ -298,6 +264,55 @@ impl NotificationStore {
             .and_then(|directory| directory.sync_all())
             .map_err(|source| NotificationError::io(&self.dir, source))?;
         Ok(true)
+    }
+
+    /// Select replay evidence while holding the notification-state lock.
+    fn terminal_tombstones(&self, state: &mut StoreState) -> Vec<NotificationRecord> {
+        let deleted: Vec<_> = state
+            .records
+            .values()
+            .filter(|record| super::projector::is_terminal_tombstone(record))
+            .collect();
+        if deleted.is_empty() {
+            return Vec::new();
+        }
+        // Reading before the notification lock could erase a newer generation's
+        // tombstone. Rejected metadata is uncertainty, never proof of absence.
+        let snapshot = self.sources.load_notification_sources();
+        let Some(sources) = snapshot.as_ref().ok().and_then(Option::as_ref) else {
+            if !state.source_warning_logged {
+                warn!(file.path = %self.sources.path().display(), error = ?snapshot.as_ref().err(),
+                    "notification compaction retained all terminal tombstones because source metadata is incomplete");
+                state.source_warning_logged = true;
+            }
+            return deleted.into_iter().cloned().collect();
+        };
+        let sources: BTreeMap<_, _> = sources
+            .iter()
+            .filter(|source| source.desired_state != crate::store::DesiredState::Removed)
+            .map(|source| (source.session_id.as_str(), &source.info))
+            .collect();
+        let mut terminal: BTreeMap<_, &NotificationRecord> = BTreeMap::new();
+        for record in deleted {
+            let Some(session) = record
+                .session_id
+                .as_ref()
+                .and_then(|id| sources.get(id.0.as_str()))
+            else {
+                continue;
+            };
+            if !super::projector::terminal_tombstone_matches(record, session) {
+                continue;
+            }
+            let key = (session.id.0.as_str(), record.kind.as_str());
+            let newer = terminal.get(&key).is_none_or(|existing| {
+                (&record.created_at, &record.id.0) > (&existing.created_at, &existing.id.0)
+            });
+            if newer {
+                terminal.insert(key, record);
+            }
+        }
+        terminal.into_values().cloned().collect()
     }
 
     /// Create a record or return/update a deduped visible record atomically.
