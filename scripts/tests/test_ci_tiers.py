@@ -1085,13 +1085,13 @@ class SameOsDuplicateTests(unittest.TestCase):
         steps = job_steps(self.jobs["hermes-compatibility-macos"])
         self.assertIn("-p xtask --lib -E 'test(hermes)'\n", steps["Test Hermes harness natively"])
         self.assertIn(
-            "-p pohunek-cli --test hermes_package --run-ignored all --test-threads 1\n",
+            "-p pohunek-cli --test all -E 'test(/^hermes_package::/)' --run-ignored all --test-threads 1\n",
             steps["Drive a real pinned Hermes session through the package"],
         )
         self.assertEqual(
             self.partitions.OWNED_ELSEWHERE["hermes-macos"],
             "(package(=xtask) and kind(lib) and test(hermes)) or "
-            "(package(=pohunek-cli) and binary(=hermes_package))",
+            "(package(=pohunek-cli) and binary(=all) and test(/^hermes_package::/))",
         )
 
     def test_the_tier_leaves_out_the_harness_and_runs_only_alongside_the_hermes_job(self):

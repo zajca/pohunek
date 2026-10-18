@@ -225,8 +225,8 @@ jobs:
       # A narrowed selection runs the lane tests of its lane part; the lint
       # and the doctests stay whole. `SKIP_OWNED_BY` repeats the
       # `hermes-compatibility-macos` condition: when that job runs, it runs the
-      # `hermes_package` binary with the ignored real-Hermes tests, so the lane
-      # leaves the binary out (#1226).
+      # `hermes_package` module with the ignored real-Hermes tests, so the lane
+      # leaves that module out (#1226).
       - name: Run macOS lane tests
         if: ${{ !cancelled() }}
         shell: bash

@@ -121,12 +121,12 @@ MACOS_BUCKETS = {
 # them out with `--skip-owned-by`, so no test runs twice on macOS in one run.
 # `hermes-macos` is `pinned Hermes compatibility (macOS arm64, model-free)`:
 # its harness step runs `-p xtask --lib -E 'test(hermes)'` and its package step
-# `-p pohunek-cli --test hermes_package --run-ignored all`, a superset of the
-# lane's run of that binary.
+# `-p pohunek-cli --test all -E 'test(/^hermes_package::/)' --run-ignored all`,
+# a superset of the lane's run of that module.
 OWNED_ELSEWHERE = {
     "hermes-macos": (
         "(package(=xtask) and kind(lib) and test(hermes)) or "
-        "(package(=pohunek-cli) and binary(=hermes_package))"
+        "(package(=pohunek-cli) and binary(=all) and test(/^hermes_package::/))"
     ),
 }
 # The scope of a check: its packages and the nextest selection of them.
