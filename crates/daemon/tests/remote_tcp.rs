@@ -1234,6 +1234,10 @@ async fn daemon_doctor_bounds_oversized_profile_home_inspection() {
         .find(|check| check["name"] == "agent_profiles")
         .expect("oversized profile scan failure");
     assert_eq!(profiles["status"], "fail");
+    assert_eq!(
+        profiles["detail"],
+        "the configured agents directory has too many entries to inspect"
+    );
     assert!(
         checks.len() < 64,
         "doctor response was not bounded: {} checks",
@@ -1247,6 +1251,129 @@ async fn daemon_doctor_bounds_oversized_profile_home_inspection() {
             .as_str()
             .is_some_and(|name| name.starts_with("agent_integration_codex_profile_"))
     }));
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "One RPC scenario compares profile results below, at, and above the directory-entry bound."
+)]
+async fn daemon_doctor_counts_non_profile_entries_at_profile_scan_boundary() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const PROFILE_SCAN_LIMIT: usize = 4096;
+
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let root = pohunek_test_support::tempdir().expect("create profile boundary fixture root");
+    let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
+    process_env.set("PATH", root.path());
+    let agents = root.path().join("agents");
+    std::fs::create_dir(&agents).expect("create agents directory");
+    std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o700))
+        .expect("make agents directory private");
+    std::fs::write(
+        agents.join("healthy.toml"),
+        "base = \"shell\"\nprogram = \"/bin/sh\"\n",
+    )
+    .expect("write healthy profile");
+    std::fs::write(agents.join("malformed.toml"), "base = [\n").expect("write malformed profile");
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents.clone()),
+        ..shell_config()
+    };
+    let (_addr, socket, shutdown, handle) =
+        spawn_dual_servers("doctor-profile-boundary", "0.0.0", config).await;
+    let mut client = connect_unix(&socket).await;
+    let mut reports = Vec::new();
+    let mut previous_count = 2;
+    for entry_count in [2, PROFILE_SCAN_LIMIT, PROFILE_SCAN_LIMIT + 1] {
+        // Every directory entry counts toward the bound, including non-profile files.
+        for index in previous_count..entry_count {
+            std::fs::write(agents.join(format!("ignored-{index:04}.txt")), "")
+                .expect("write non-profile entry");
+        }
+        previous_count = entry_count;
+        let payload = ok_payload(
+            exchange(
+                &mut client,
+                &Request::make(
+                    &format!("doctor-profile-boundary-{entry_count}"),
+                    method::DAEMON_DOCTOR,
+                    Value::Null,
+                ),
+            )
+            .await,
+        );
+        let mut checks = payload["report"]["checks"]
+            .as_array()
+            .expect("doctor checks array")
+            .clone();
+        checks.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+        reports.push(checks);
+    }
+    assert_eq!(
+        reports[0], reports[1],
+        "non-profile entries preserve checks at the limit"
+    );
+    let profiles: Vec<_> = reports[1]
+        .iter()
+        .filter(|check| {
+            check["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("agent_profile_"))
+        })
+        .collect();
+    assert_eq!(profiles.len(), 2);
+    for (profile, name, status, detail) in [
+        (profiles[0], "healthy", "ok", "Configured profile and runtime are ready."),
+        (profiles[1], "malformed", "fail", "The profile is malformed or cannot be resolved securely; repair its file or permissions."),
+    ] {
+        assert_eq!(profile["name"], format!("agent_profile_{name}"));
+        assert_eq!(profile["status"], status);
+        assert_eq!(profile["detail"], detail);
+    }
+    assert!(!reports[1]
+        .iter()
+        .any(|check| check["name"] == "agent_profiles"));
+    let overflow = reports[2]
+        .iter()
+        .find(|check| check["name"] == "agent_profiles")
+        .expect("limit plus one reports overflow");
+    assert_eq!(overflow["status"], "fail");
+    assert_eq!(
+        overflow["detail"],
+        "the configured agents directory has too many entries to inspect"
+    );
+    assert!(reports[2].len() < 64, "overflow response stays bounded");
+    assert!(!reports[2].iter().any(|check| {
+        check["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("agent_profile_"))
+    }));
+    for check in &reports[2] {
+        match check["name"].as_str().expect("check name") {
+            "agent_profiles" => {}
+            "agent_manifest_overrides" => {
+                assert_eq!(check["status"], "fail");
+                assert_eq!(
+                    check["detail"],
+                    "configured agent profiles cannot be inspected"
+                );
+            }
+            _ => assert!(
+                reports[1].contains(check),
+                "overflow preserves generic checks: {check}"
+            ),
+        }
+    }
+    assert!(reports[2]
+        .iter()
+        .any(|check| check["name"] == "agent_manifest_overrides"));
 
     let _ = shutdown.send(());
     let _ = handle.await;
