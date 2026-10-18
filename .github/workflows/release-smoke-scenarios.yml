@@ -1,0 +1,45 @@
+name: Release smoke scenarios
+
+# Reusable synthetic-archive smoke scenarios (issue #1259, D1/D2). It runs the
+# scenario suite `scripts/tests/test_smoke_archive` on macos-15: every scenario
+# builds a tiny synthetic daemon archive with the real packaging scripts and a
+# stub consumer, so the job reads only this checkout and waits for no producer
+# artifact, no bundle and no other job. `POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN`
+# makes the scenarios that reach the isolated run fail closed instead of
+# skipping: the throwaway-user path needs passwordless sudo, which only the
+# macOS runner has (on Linux the suite runs in `ci.yml`'s script checks).
+#
+# Callers. `ci.yml` calls it as `release-rehearsal-scenarios` next to the
+# rehearsal build, so the scenarios start as soon as the paths filter matched
+# instead of after the producer build and the bundle assembly. In a release the
+# scenarios are part of the evidence: `release-evidence.yml` calls this workflow
+# in mode `release`, and a rehearsal caller must pass its own scenario job's
+# result to `release-evidence.yml` as `scenarios_result`, which its verdict
+# requires to be `success`. Nothing is published; the workflow holds no secret.
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  smoke-scenarios:
+    name: Archive smoke scenarios (network-isolated, macos-15)
+    runs-on: macos-15
+    # The suite's median is about five minutes; the step budget below covers a
+    # slow runner, and the job budget covers the checkout.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Run the archive smoke scenarios on macOS
+        timeout-minutes: 20
+        shell: bash
+        env:
+          POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN: "1"
+        run: |
+          set -euo pipefail
+          python3 -m unittest -v scripts.tests.test_smoke_archive

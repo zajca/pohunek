@@ -727,6 +727,7 @@ Signed runtime catalog:
 - `packaging/smoke-archive` — the network-isolated archive smoke (with `scripts/tests/test_smoke_archive.py`).
 - `.github/workflows/release-build.yml` — reusable producer workflow: archives, package archives and SDK tarballs as workflow artifacts.
 - `.github/workflows/release-evidence.yml` — reusable workflow: compatibility rows, provenance, catalog signing, bundle assembly and the archive smoke.
+- `.github/workflows/release-smoke-scenarios.yml` — reusable macOS synthetic-archive scenarios, started before the rehearsal build and required by the evidence verdict.
 - `scripts/release-workflow/` — the helper scripts the release workflows call.
 - `crates/xtask/src/upstream_stage.rs` — `cargo xtask compat stage-upstream|verify-stage`: npm or provisioner staging of the pinned upstream runtimes, selected by the lock's `upstream.kind`, and the stage verifier.
 - `compat/pi/npm/package-lock.json` — the pinned npm dependency tree of the Pi upstream (with the codex and claude counterparts under `compat/`).

@@ -506,10 +506,15 @@ class CiEvidenceCliTests(unittest.TestCase):
         # tier, which never starts the rehearsal, requires none of its jobs.
         for leg in ("ubuntu-latest", "macos-15"):
             self.assertIn(f"{smoke} (network-isolated, {leg})", config["required_jobs"]["nightly"])
+        self.assertIn(
+            "release rehearsal (archive smoke scenarios) / Archive smoke scenarios (network-isolated, macos-15)",
+            config["required_jobs"]["nightly"],
+        )
         rehearsal = [name for name in config["required_jobs"]["nightly"] if name.startswith("release rehearsal ")]
         self.assertTrue(rehearsal)
-        # A rehearsal runs at most 12 runner jobs (#1208).
-        self.assertLessEqual(len(rehearsal), 12)
+        # A rehearsal runs at most 13 runner jobs (#1208; #1259 split the macOS
+        # archive smoke into the parallel scenario job).
+        self.assertLessEqual(len(rehearsal), 13)
         self.assertEqual(
             [name for name in config["required_jobs"]["main"] if name.startswith("release rehearsal ")],
             [],

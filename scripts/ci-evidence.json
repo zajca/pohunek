@@ -84,6 +84,7 @@
       "release rehearsal (evidence, assembly, archive smoke) / Rows on ubuntu-latest",
       "release rehearsal (evidence, assembly, archive smoke) / Rows on macos-15",
       "release rehearsal (evidence, assembly, archive smoke) / Assemble the rehearsal bundle",
+      "release rehearsal (archive smoke scenarios) / Archive smoke scenarios (network-isolated, macos-15)",
       "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, ubuntu-latest)",
       "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated, macos-15)",
       "release rehearsal (evidence, assembly, archive smoke) / Evidence verdict",

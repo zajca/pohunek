@@ -7,9 +7,11 @@ name: CI
 # main, the daily schedule, and manual dispatch, and on pull requests only when
 # the `release` paths filter matches (manifests, lockfile, .cargo, toolchain
 # pins, the release/CI workflows, scripts/release, packaging). The release
-# rehearsal (jobs `release-rehearsal-build` and `release-rehearsal`) runs the
-# reusable release workflows with a throwaway key and publishes nothing; it is
-# part of the nightly tier, not of the main tier.
+# rehearsal (jobs `release-rehearsal-build`, `release-rehearsal-scenarios` and
+# `release-rehearsal`) runs the reusable release workflows with a throwaway key
+# and publishes nothing; it is part of the nightly tier, not of the main tier.
+# The rehearsal's synthetic-archive smoke scenarios (#1259) are their own job
+# that needs only this checkout, so they start in parallel with the build.
 on:
   push:
     branches: [main]
@@ -1145,6 +1147,7 @@ jobs:
               - '.github/workflows/release.yml'
               - '.github/workflows/release-build.yml'
               - '.github/workflows/release-evidence.yml'
+              - '.github/workflows/release-smoke-scenarios.yml'
               - 'packaging/**'
               - 'scripts/release-workflow/**'
               - 'scripts/tests/test_release_workflow.py'
@@ -1753,10 +1756,24 @@ jobs:
     with:
       mode: rehearsal
 
+  # The rehearsal's synthetic-archive smoke scenarios (issue #1259, D1/D2).
+  # The scenarios read only this checkout, so the job waits for `changes`
+  # alone: it starts in parallel with the rehearsal build and before the
+  # bundle assembly, instead of after both. Its result is required by the
+  # rehearsal verdict through `scenarios_result` on the evidence call below;
+  # a failure, cancellation or skip fails the run's evidence.
+  release-rehearsal-scenarios:
+    name: release rehearsal (archive smoke scenarios)
+    needs: [changes]
+    if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || (github.event_name == 'pull_request' && needs.changes.outputs.release_rehearsal == 'true')) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}
+    uses: ./.github/workflows/release-smoke-scenarios.yml
+    permissions:
+      contents: read
+
   release-rehearsal:
     name: release rehearsal (evidence, assembly, archive smoke)
-    needs: [changes, release-rehearsal-build]
-    if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || (github.event_name == 'pull_request' && needs.changes.outputs.release_rehearsal == 'true')) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}
+    needs: [changes, release-rehearsal-build, release-rehearsal-scenarios]
+    if: ${{ !cancelled() && needs.release-rehearsal-build.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || (github.event_name == 'pull_request' && needs.changes.outputs.release_rehearsal == 'true')) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}
     uses: ./.github/workflows/release-evidence.yml
     permissions:
       contents: read
@@ -1767,6 +1784,10 @@ jobs:
       commit: ${{ github.sha }}
       mode: rehearsal
       targets: x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-apple-darwin
+      # The scenarios ran in this run, not in the called workflow (which runs
+      # them in a release only). The verdict refuses a rehearsal whose external
+      # scenario result is not `success`.
+      scenarios_result: ${{ needs.release-rehearsal-scenarios.result }}
 
   # TS-binding drift is gated by paths filter (issue #125); it only runs on
   # schedule, push to main, manual dispatch (always a full run), or when the

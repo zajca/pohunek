@@ -216,6 +216,11 @@ MACOS_CALLED_JOBS = {
         "jobs": {"rows"},
         "filter": "release_rehearsal",
     },
+    "release-rehearsal-scenarios": {
+        "workflow": "release-smoke-scenarios.yml",
+        "jobs": {"smoke-scenarios"},
+        "filter": "release_rehearsal",
+    },
 }
 
 
@@ -333,7 +338,10 @@ def evaluate_condition(
     anything else fails the translation. A missing output reads as the empty
     string and string comparison ignores case, as in GitHub Actions.
     """
-    python = expression.replace("!cancelled()", "(not cancelled)")
+    # Tier selection assumes the rehearsal producer has succeeded; lifecycle
+    # outcomes are exercised separately through evaluate_needs_expression.
+    python = expression.replace("needs.release-rehearsal-build.result", "'success'")
+    python = python.replace("!cancelled()", "(not cancelled)")
     python = python.replace("github.event_name", "event")
     python = python.replace("inputs.tier", "tier")
     python = python.replace(f"needs.{PACKAGE_SELECTOR}.result", "result")
@@ -368,6 +376,26 @@ def evaluate_package_condition(expression: str, event: str, cancelled: bool, res
 
 
 class CiTierWorkflowTests(unittest.TestCase):
+    def test_rehearsal_evidence_requires_build_success_and_stops_on_cancel(self):
+        condition = job_condition("release-rehearsal")
+        self.assertNotIn("always()", condition)
+        self.assertIn("!cancelled()", condition)
+        self.assertIn("needs.release-rehearsal-build.result == 'success'", condition)
+        condition = condition.replace(SAME_REPOSITORY_PR, "'same' == 'same'")
+        for build in ("success", "failure", "cancelled", "skipped"):
+            for cancelled in (False, True):
+                for scenarios in ("success", "failure", "cancelled", "skipped"):
+                    with self.subTest(build=build, cancelled=cancelled, scenarios=scenarios):
+                        self.assertEqual(
+                            bool(evaluate_needs_expression(
+                                condition, event="workflow_dispatch", tier="nightly",
+                                cancelled=cancelled,
+                                results={"release-rehearsal-build": build,
+                                         "release-rehearsal-scenarios": scenarios},
+                            )),
+                            build == "success" and not cancelled,
+                        )
+
     def test_every_paths_filter_reacts_to_a_toolchain_change(self):
         for name in filter_names():
             with self.subTest(filter=name):
@@ -726,8 +754,9 @@ class CiTierWorkflowTests(unittest.TestCase):
 # The reusable workflows the release rehearsal runs (issue #1207). Push to main
 # never runs the rehearsal, so a pull request that changes one of their inputs
 # must start it through the `release_rehearsal` filter; an input outside the
-# filter is caught only by the nightly tier.
-REHEARSAL_WORKFLOWS = ("release-build.yml", "release-evidence.yml")
+# filter is caught only by the nightly tier. The scenario workflow is called
+# from ci.yml itself and, in a release, from release-evidence.yml (#1259).
+REHEARSAL_WORKFLOWS = ("release-build.yml", "release-evidence.yml", "release-smoke-scenarios.yml")
 # Inputs the rehearsal reads that the filter deliberately leaves out, with the
 # reason. Each would start the rehearsal (about 30 jobs, 7-8 on macOS) on most
 # pull requests; a failure only the rehearsal sees in them surfaces in the

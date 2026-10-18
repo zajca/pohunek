@@ -23,12 +23,17 @@ name: Release evidence
 #                     values and a throwaway anchor, no secret (rehearsal only)
 #   attest-bundle     build provenance for every file of the final bundle
 #                     (release only)
+#   smoke-scenarios   the synthetic-archive scenario suite on macos-15, as a
+#                     call of release-smoke-scenarios.yml (release only; a
+#                     rehearsal runs it from ci.yml, which must pass the job's
+#                     result as `scenarios_result` for the verdict)
 #   smoke             stages the upstreams, then runs packaging/smoke-archive
 #                     on every Linux daemon archive in a network namespace and
 #                     the Apple Silicon daemon archive on macos-15 under
 #                     sandbox-exec after verify-signed --adhoc
 #   verdict           fails unless exactly the jobs of the chosen mode succeeded
-#                     (a skipped job would otherwise let a caller proceed)
+#                     (a skipped job would otherwise let a caller proceed),
+#                     plus the caller's `scenarios_result` in a rehearsal
 #
 # Trust model. `rows`, `assemble*` and `smoke` run repository code
 # and hold a read-only token; none of them can create an attestation or write
@@ -59,6 +64,11 @@ on:
         required: true
       targets:
         description: Optional space-separated targets to keep (rehearsal); empty means all
+        type: string
+        required: false
+        default: ""
+      scenarios_result:
+        description: Result of the caller's archive-scenario job; a rehearsal requires "success" (issue #1259)
         type: string
         required: false
         default: ""
@@ -535,12 +545,27 @@ jobs:
           subject-path: |
             ${{ runner.temp }}/bundle/*
 
+  # The synthetic-archive smoke scenarios as their own job (issue #1259, D1).
+  # A release runs them here, from the shared reusable workflow. A rehearsal
+  # runs them from ci.yml instead — before the producer build and the bundle —
+  # and passes the result as `scenarios_result`, which the verdict requires to
+  # be `success`; so this job stays skipped in a rehearsal without weakening
+  # the evidence.
+  smoke-scenarios:
+    name: Archive smoke scenarios (network-isolated, macos-15)
+    if: ${{ inputs.mode == 'release' }}
+    uses: ./.github/workflows/release-smoke-scenarios.yml
+    permissions:
+      contents: read
+
   # The network-isolated archive smoke on the final bundle: every Linux daemon
   # archive installs every official package offline and runs the consumer
   # against the staged, hash-verified upstream. The Apple Silicon daemon
   # archive also runs on macos-15 under sandbox-exec after verify-signed
   # --adhoc. The first step proves which isolation strategy the runner allows;
-  # the smoke uses exactly that one and never runs un-isolated.
+  # the smoke uses exactly that one and never runs un-isolated. The
+  # synthetic-archive scenarios of the macOS leg run in `smoke-scenarios`
+  # above (in a rehearsal, in ci.yml).
   smoke:
     name: Archive smoke (network-isolated, ${{ matrix.os }})
     needs: [plan, rows, assemble, assemble-rehearsal]
@@ -606,18 +631,6 @@ jobs:
           version: "0.9.28"
           enable-cache: false
 
-      # The smoke scenarios of the throwaway-user path need passwordless sudo,
-      # which only the macOS runner has; on Linux they run in ci.yml.
-      - name: Run the archive smoke scenarios on macOS
-        if: runner.os == 'macOS'
-        timeout-minutes: 20
-        shell: bash
-        env:
-          POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN: "1"
-        run: |
-          set -euo pipefail
-          python3 -m unittest -v scripts.tests.test_smoke_archive
-
       - name: Build xtask
         run: cargo build --locked -p xtask
 
@@ -650,7 +663,7 @@ jobs:
   verdict:
     name: Evidence verdict
     if: ${{ always() }}
-    needs: [plan, rows, attest, assemble, assemble-rehearsal, attest-bundle, smoke]
+    needs: [plan, rows, attest, assemble, assemble-rehearsal, attest-bundle, smoke, smoke-scenarios]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
@@ -689,21 +702,30 @@ jobs:
             exit 1
           fi
 
+      # The caller proceeds on this workflow's result, and a job skipped by an
+      # `if` counts as success to the caller, so this step requires exactly the
+      # jobs of the chosen mode to have succeeded and the other mode's jobs to
+      # be skipped. In a rehearsal the archive scenarios (#1259) ran in the
+      # caller, not here: its `scenarios_result` input must then be `success`,
+      # so a failure, cancellation, skip or a caller that never ran them fails
+      # the verdict.
       - name: Require the jobs of the mode
         if: ${{ !cancelled() }}
         shell: bash
         env:
           MODE: ${{ inputs.mode }}
+          SCENARIOS: ${{ inputs.scenarios_result }}
           NEEDS: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
-          printf '%s' "$NEEDS" | jq -e --arg mode "$MODE" '
+          printf '%s' "$NEEDS" | jq -e --arg mode "$MODE" --arg scenarios "$SCENARIOS" '
             . as $needs
             | (if $mode == "release" then
-                 {success: ["plan","rows","attest","assemble","attest-bundle","smoke"], skipped: ["assemble-rehearsal"]}
+                 {success: ["plan","rows","attest","assemble","attest-bundle","smoke","smoke-scenarios"], skipped: ["assemble-rehearsal"]}
                elif $mode == "rehearsal" then
-                 {success: ["plan","rows","assemble-rehearsal","smoke"], skipped: ["attest","assemble","attest-bundle"]}
+                 {success: ["plan","rows","assemble-rehearsal","smoke"], skipped: ["attest","assemble","attest-bundle","smoke-scenarios"]}
                else error("unknown mode") end) as $want
             | all($want.success[]; . as $n | $needs[$n].result == "success")
               and all($want.skipped[]; . as $n | $needs[$n].result == "skipped")
-          ' >/dev/null || { echo "::error::the evidence jobs of mode $MODE did not all succeed"; exit 1; }
+              and (if $mode == "rehearsal" then $scenarios == "success" else true end)
+          ' >/dev/null || { echo "::error::the evidence jobs of mode $MODE did not all succeed (external archive-scenario result: ${SCENARIOS:-<none>})"; exit 1; }
