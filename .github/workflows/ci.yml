@@ -1773,7 +1773,7 @@ jobs:
   release-rehearsal:
     name: release rehearsal (evidence, assembly, archive smoke)
     needs: [changes, release-rehearsal-build, release-rehearsal-scenarios]
-    if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || (github.event_name == 'pull_request' && needs.changes.outputs.release_rehearsal == 'true')) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}
+    if: ${{ !cancelled() && needs.release-rehearsal-build.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || (github.event_name == 'pull_request' && needs.changes.outputs.release_rehearsal == 'true')) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}
     uses: ./.github/workflows/release-evidence.yml
     permissions:
       contents: read

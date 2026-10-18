@@ -332,13 +332,15 @@ def evaluate_condition(
 ) -> bool:
     """Evaluate a job's `if:` in Python for the operators it may use.
 
-    Only `always()`, `!cancelled()`, `github.event_name`, `inputs.tier`, the `changes`
+    Only `!cancelled()`, `github.event_name`, `inputs.tier`, the `changes`
     job's `outputs.<name>`, the selector's `result` and `outputs.<name>`,
     string literals, `==`, `!=`, `&&`, `||` and parentheses are understood;
     anything else fails the translation. A missing output reads as the empty
     string and string comparison ignores case, as in GitHub Actions.
     """
-    python = expression.replace("always()", "('always' == 'always')")
+    # Tier selection assumes the rehearsal producer has succeeded; lifecycle
+    # outcomes are exercised separately through evaluate_needs_expression.
+    python = expression.replace("needs.release-rehearsal-build.result", "'success'")
     python = python.replace("!cancelled()", "(not cancelled)")
     python = python.replace("github.event_name", "event")
     python = python.replace("inputs.tier", "tier")
@@ -374,6 +376,26 @@ def evaluate_package_condition(expression: str, event: str, cancelled: bool, res
 
 
 class CiTierWorkflowTests(unittest.TestCase):
+    def test_rehearsal_evidence_requires_build_success_and_stops_on_cancel(self):
+        condition = job_condition("release-rehearsal")
+        self.assertNotIn("always()", condition)
+        self.assertIn("!cancelled()", condition)
+        self.assertIn("needs.release-rehearsal-build.result == 'success'", condition)
+        condition = condition.replace(SAME_REPOSITORY_PR, "'same' == 'same'")
+        for build in ("success", "failure", "cancelled", "skipped"):
+            for cancelled in (False, True):
+                for scenarios in ("success", "failure", "cancelled", "skipped"):
+                    with self.subTest(build=build, cancelled=cancelled, scenarios=scenarios):
+                        self.assertEqual(
+                            bool(evaluate_needs_expression(
+                                condition, event="workflow_dispatch", tier="nightly",
+                                cancelled=cancelled,
+                                results={"release-rehearsal-build": build,
+                                         "release-rehearsal-scenarios": scenarios},
+                            )),
+                            build == "success" and not cancelled,
+                        )
+
     def test_every_paths_filter_reacts_to_a_toolchain_change(self):
         for name in filter_names():
             with self.subTest(filter=name):

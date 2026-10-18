@@ -667,9 +667,13 @@ class OidcTests(ReleaseWorkflowFiles):
         self.assertEqual(needs_of(evidence), ["changes", "release-rehearsal-build", "release-rehearsal-scenarios"])
         self.assertIn("needs.release-rehearsal-build.outputs.version", evidence)
         self.assertIn("scenarios_result: ${{ needs.release-rehearsal-scenarios.result }}", evidence)
-        # Override GitHub's implicit success() so failed/cancelled/skipped
-        # scenarios reach the evidence verdict rather than skipping it.
-        self.assertIn("    if: ${{ always() && ", evidence)
+        # Scenario failure must reach the verdict, but missing producer
+        # artifacts and a cancelled run must never start evidence jobs.
+        self.assertIn(
+            "    if: ${{ !cancelled() && needs.release-rehearsal-build.result == 'success' && ",
+            evidence,
+        )
+        self.assertNotIn("always()", evidence)
         self.assertNotRegex(self.ci, r"(?m)^  pull_request_target:")
 
     def test_the_ci_scenario_caller_starts_before_the_build_and_the_bundle(self):
