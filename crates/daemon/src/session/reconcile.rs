@@ -3820,6 +3820,7 @@ impl SessionRegistry {
             last_agent_report: active_agent,
             last_native_report: record.native_identity_ordering.clone(),
             observed_agents: Vec::<ObservedAgent>::new(),
+            process_lineage: HashMap::new(),
             cwd_observed_at: crate::time::now(),
             initial_input_owner: initial_input_owner(&record),
         };
@@ -4073,6 +4074,7 @@ impl SessionRegistry {
             last_agent_report: None,
             last_native_report: record.native_identity_ordering.clone(),
             observed_agents: Vec::new(),
+            process_lineage: HashMap::new(),
             cwd_observed_at: crate::time::now(),
             initial_input_owner: initial_input_owner(&record),
         };

@@ -1,6 +1,6 @@
 //! Launch-target resolution (project / in-place / worktree) and PTY registration.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use pohunek_worker_protocol::{
     read_frame, DaemonId, Dimensions, FrameKind, Initialize, InitializeLimits, InputPolicy,
@@ -945,6 +945,7 @@ impl SessionRegistry {
             last_agent_report: None,
             last_native_report: carried_native_report.as_deref().cloned(),
             observed_agents: Vec::new(),
+            process_lineage: HashMap::new(),
             cwd_observed_at: crate::time::now(),
             initial_input_owner: initial_input_pending
                 .then(|| self.daemon_instance_id().to_owned()),

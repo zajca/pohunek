@@ -334,7 +334,12 @@ now treats active nested-agent state as an evidence tripod: process facts from
 procwatch are authoritative for start/stop, hooks are the fast path for rich
 claims and clean release, and PTY output remains an activity signal rather than
 lifecycle authority. `SessionStart` hooks report the nested agent's PID when the
-provider exposes it as the hook parent, so procwatch can bind the claim exactly.
+provider exposes it as the hook parent. Procwatch preserves that reported PID
+and active native reference when the live process is a descendant of an observed
+agent of the same runtime in this session. The reporter does not have to match
+the agent's process matcher itself. A dead or reused reporter PID, a sibling
+outside that agent's tree, a different runtime, or a process belonging to another
+session cannot keep the claim.
 Claude `SessionEnd` sends an explicit release for prompt clean-exit clearing;
 Codex has no installed session-end release because its `Stop` event is
 turn-level, so procwatch remains the release backstop. Hook claims must be
@@ -694,7 +699,9 @@ reconnect or native recovery.
 Foreground reconciliation selects the recognized process-group leader first;
 when the leader is an unidentified wrapper, it selects a recognized member of
 the same foreground PGID. It never selects a nested agent by kind from another
-process group. Replacing an active agent clears stale native identity metadata
+process group. A same-runtime foreground ancestor verifies a live reported
+descendant without replacing its reported identity. Replacing an active agent
+clears stale native identity metadata
 and switches the detector configuration with the new agent. An active agent
 that a managed hook reports through the session's worker switches it the same
 way once the daemon projects the worker's journal, and its release restores the

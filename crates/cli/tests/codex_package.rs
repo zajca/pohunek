@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -2832,6 +2833,10 @@ async fn assert_private_hook_diagnostics(fixture: &Fixture, id: &str, pid: u64, 
 /// loopback stub.
 #[tokio::test]
 #[ignore = "needs a real `codex` on PATH; run with POHUNEK_CODEX_E2E=1 and --ignored"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one real-agent lifecycle proves the descendant claim across a completed Working rescan and resume"
+)]
 async fn a_real_codex_reports_hooks_from_a_descendant_of_the_launched_process_and_resume_has_its_reference(
 ) {
     require_real_codex();
@@ -2894,6 +2899,76 @@ async fn a_real_codex_reports_hooks_from_a_descendant_of_the_launched_process_an
     );
 
     assert_private_hook_diagnostics(&fixture, &id, reporter_pid, &reference).await;
+    fixture.wait_activity(&id, "idle").await;
+    let requests_before_working = fixture.stub.started();
+    let replies_before_working = fixture.stub.finished();
+
+    let (code, sent) = fixture
+        .harness
+        .json(&[
+            "session",
+            "input",
+            &id,
+            &format!("{} {PROMPT}", responses_stub::HOLD_MARKER),
+        ])
+        .await;
+    assert_eq!(code, 0, "{sent}");
+    fixture.wait_activity(&id, "working").await;
+    wait_until("the second model response is held", || async {
+        (fixture.stub.started() > requests_before_working
+            && fixture.stub.finished() == replies_before_working
+            && !fixture
+                .stub
+                .bodies_containing(responses_stub::HOLD_MARKER)
+                .is_empty())
+        .then_some(())
+    })
+    .await;
+
+    // Rename the real kernel cwd only after Working. Procwatch publishes its
+    // cwd after reconciling identity, so observing the new path is a completed
+    // rescan barrier. Recreate the old path for the CLI fixture's own commands.
+    // The held response prevents a later turn-end hook masking replacement.
+    let cwd = fixture.harness.env.cwd();
+    let rescanned_cwd = fixture.harness.env.root().join("work-after-working");
+    fs::rename(cwd, &rescanned_cwd).expect("rename the live process cwd");
+    fs::DirBuilder::new()
+        .mode(plugin_harness::PRIVATE_MODE)
+        .create(cwd)
+        .expect("restore the private CLI command cwd");
+    let after_rescan = wait_until("procwatch reconciled the Working turn", || async {
+        let (code, inspected) = fixture.harness.json(&["session", "inspect", &id]).await;
+        assert_eq!(code, 0, "{inspected}");
+        (inspected["ok"]["cwd"] == path_str(&rescanned_cwd)
+            && inspected["ok"]["cwd_source"] == "procwatch")
+            .then(|| inspected["ok"].clone())
+    })
+    .await;
+    assert_eq!(
+        after_rescan["active_agent_pid"], reporter_pid,
+        "{after_rescan}"
+    );
+    assert_eq!(
+        after_rescan["active_agent_session_id"], reference,
+        "{after_rescan}"
+    );
+    assert_eq!(
+        after_rescan["native_session_id"], reference,
+        "{after_rescan}"
+    );
+    eprintln!("the reported descendant survived a completed Working rescan");
+    fs::remove_dir(cwd).expect("remove the empty CLI cwd placeholder");
+    fs::rename(&rescanned_cwd, cwd).expect("restore the agent's original cwd");
+    wait_until("procwatch restored the original cwd", || async {
+        let (code, inspected) = fixture.harness.json(&["session", "inspect", &id]).await;
+        assert_eq!(code, 0, "{inspected}");
+        (inspected["ok"]["cwd"] == path_str(cwd) && inspected["ok"]["cwd_source"] == "procwatch")
+            .then_some(())
+    })
+    .await;
+    fixture.stub.open_gate();
+    fixture.wait_activity(&id, "idle").await;
+    eprintln!("the held Working turn completed after restoring the cwd");
 
     fixture.stop(&id).await;
     let (code, resumed) = fixture.harness.json(&["session", "resume", &id]).await;

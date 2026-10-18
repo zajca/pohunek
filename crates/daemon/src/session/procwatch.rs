@@ -25,6 +25,18 @@ use super::{
 const PROCWATCH_SOURCE: &str = "pohunek:procwatch";
 type ObservedIdentity = (Pid, u64);
 
+/// Live process ancestry from the same identity-bracketed scan as the agents.
+#[derive(Debug, Clone)]
+pub(super) struct ProcessLineage {
+    identity: ProcessIdentity,
+    parent: Pid,
+}
+
+struct ObservedRefresh {
+    agents: HashMap<Pid, ObservedAgent>,
+    lineage: HashMap<Pid, ProcessLineage>,
+}
+
 /// How process recognition treats a session's own runtime.
 #[derive(Debug, Clone)]
 pub(super) enum OwnRuntime {
@@ -150,6 +162,7 @@ impl SessionRegistry {
                 return;
             }
             entry.observed_agents.clear();
+            entry.process_lineage.clear();
             entry.foreground_process_group = None;
             entry
                 .active_agent
@@ -194,6 +207,38 @@ impl SessionRegistry {
             Ok(facts) => {
                 let own = self.inner.sessions.lock().await.get(id).map(OwnRuntime::of);
                 let scan_pin = own.as_ref().and_then(OwnRuntime::pinned).cloned();
+                let mut lineage: HashMap<_, _> = facts
+                    .iter()
+                    .filter(|fact| {
+                        !self.is_foreign_owned_agent(
+                            id,
+                            fact.pid,
+                            Some(&expected.worker_instance_id),
+                        ) && self
+                            .inner
+                            .inspector
+                            .is_running(fact.identity())
+                            .unwrap_or(false)
+                    })
+                    .map(|fact| {
+                        (
+                            fact.pid,
+                            ProcessLineage {
+                                identity: fact.identity(),
+                                parent: fact.ppid,
+                            },
+                        )
+                    })
+                    .collect();
+                // The launch root is excluded from descendants, but the enclosing
+                // liveness bracket proves its identity for direct-agent claims.
+                lineage.insert(
+                    root.pid,
+                    ProcessLineage {
+                        identity: root,
+                        parent: root.pid,
+                    },
+                );
                 let observed = self.observed_agents_from_facts_for_runtime(
                     id,
                     facts,
@@ -201,7 +246,13 @@ impl SessionRegistry {
                     own.as_ref(),
                     Some(&expected.worker_instance_id),
                 );
-                (scan_pin, Some(observed))
+                (
+                    scan_pin,
+                    Some(ObservedRefresh {
+                        agents: observed,
+                        lineage,
+                    }),
+                )
             }
             Err(err) => {
                 warn!(
@@ -235,7 +286,7 @@ impl SessionRegistry {
         let mut exit_watches = match observed_refresh.as_ref() {
             Some(observed) => {
                 let existing = self.existing_observed_identities(id).await;
-                self.open_exit_watches(id, observed.values(), &existing)
+                self.open_exit_watches(id, observed.agents.values(), &existing)
             }
             None => HashMap::new(),
         };
@@ -607,7 +658,7 @@ impl SessionRegistry {
             let observed = choose_observed_agent(entry)?;
             return self.auto_report_observed_agent(entry, &observed, now);
         };
-        let Some(active_base) = entry.info.active_agent_base.as_ref() else {
+        let Some(active_base) = entry.info.active_agent_base.clone() else {
             return Some(clear_active_agent(
                 entry,
                 self.procwatch_tombstone_for(&active, now),
@@ -621,10 +672,24 @@ impl SessionRegistry {
                 // liveness and clears `active_agent` when that process exits.
                 return None;
             }
-            if observed_process_matches(entry, pid, active.start_identity, active_base) {
+            if let Some(observed) = entry
+                .observed_agents
+                .iter()
+                .find(|observed| {
+                    observed.agent_base == active_base
+                        && matching_report_identity(entry, observed, pid).is_some_and(|identity| {
+                            active.start_identity.is_none_or(|start| start == identity)
+                        })
+                })
+                .cloned()
+            {
+                bind_matching_observed_identity(entry, &observed);
                 return None;
             }
-            if let Some(observed) = first_observed_agent_for_base(entry, active_base) {
+            if self.bind_launch_descendant(entry) {
+                return None;
+            }
+            if let Some(observed) = first_observed_agent_for_base(entry, &active_base) {
                 return self.auto_report_observed_agent(entry, &observed, now);
             }
             if let Some(observed) = choose_observed_agent(entry) {
@@ -636,7 +701,7 @@ impl SessionRegistry {
             ));
         }
 
-        if let Some(observed) = single_observed_for_base(entry, active_base) {
+        if let Some(observed) = single_observed_for_base(entry, &active_base) {
             if let Some(active) = entry.active_agent.as_mut() {
                 active.pid = Some(observed.pid);
                 active.start_identity = Some(observed.start_identity);
@@ -767,6 +832,9 @@ impl SessionRegistry {
         }
 
         if foreground_group == root_pid {
+            if self.bind_launch_descendant(entry) {
+                return ForegroundDecision::Preserve;
+            }
             let Some(active) = entry.active_agent.clone() else {
                 return ForegroundDecision::Preserve;
             };
@@ -792,12 +860,37 @@ impl SessionRegistry {
                 });
         let unbound_is_current =
             unbound_claim_is_current(&active, now, self.inner.config.active_agent_claim_ttl);
-        if active_is_live || unbound_is_current {
+        if active_is_live || unbound_is_current || self.bind_launch_descendant(entry) {
             ForegroundDecision::Preserve
         } else {
             let _ = clear_active_agent(entry, self.procwatch_tombstone_for(&active, now));
             ForegroundDecision::Updated
         }
+    }
+
+    fn bind_launch_descendant(&self, entry: &mut SessionEntry) -> bool {
+        if !self.launch_root_is_agent(&entry.info.agent_base)
+            || entry.info.active_agent_base.as_ref() != Some(&entry.info.agent_base)
+        {
+            return false;
+        }
+        let Some(pid) = entry
+            .active_agent
+            .as_ref()
+            .filter(|active| !active.observed)
+            .and_then(|active| active.pid)
+        else {
+            return false;
+        };
+        let Some(root) = entry.process_lineage.get(&entry.info.pid) else {
+            return false;
+        };
+        let Some(start) =
+            matching_lineage_identity(entry, root.identity, &entry.info.agent_base, pid)
+        else {
+            return false;
+        };
+        bind_report_start_identity(entry, start)
     }
 
     fn next_procwatch_seq(&self) -> u64 {
@@ -818,12 +911,17 @@ fn unbound_claim_is_current(
 
 fn apply_observed_refresh(
     entry: &mut SessionEntry,
-    observed_refresh: Option<HashMap<Pid, ObservedAgent>>,
+    observed_refresh: Option<ObservedRefresh>,
     exit_watches: &mut HashMap<ObservedIdentity, ExitWatch>,
 ) -> Vec<(ObservedIdentity, ExitWatch, CancellationToken)> {
-    let Some(observed) = observed_refresh else {
+    let Some(ObservedRefresh {
+        agents: observed,
+        lineage,
+    }) = observed_refresh
+    else {
         return Vec::new();
     };
+    entry.process_lineage = lineage;
     let observed_pids = observed.keys().copied().collect::<HashSet<_>>();
     entry
         .observed_agents
@@ -897,13 +995,24 @@ fn bind_matching_observed_identity(entry: &mut SessionEntry, observed: &Observed
     let Some(active) = entry.active_agent.as_ref() else {
         return false;
     };
-    if active.pid != Some(observed.pid)
-        || entry.info.active_agent_base.as_ref() != Some(&observed.agent_base)
-    {
+    if entry.info.active_agent_base.as_ref() != Some(&observed.agent_base) {
         return false;
     }
-    if let Some(start_identity) = active.start_identity {
-        return start_identity == observed.start_identity;
+    let Some(start_identity) = active
+        .pid
+        .and_then(|pid| matching_report_identity(entry, observed, pid))
+    else {
+        return false;
+    };
+    bind_report_start_identity(entry, start_identity)
+}
+
+fn bind_report_start_identity(entry: &mut SessionEntry, start_identity: u64) -> bool {
+    let Some(active) = entry.active_agent.as_ref() else {
+        return false;
+    };
+    if let Some(claimed_start) = active.start_identity {
+        return claimed_start == start_identity;
     }
 
     let claim = (
@@ -916,11 +1025,11 @@ fn bind_matching_observed_identity(entry: &mut SessionEntry, observed: &Observed
         .active_agent
         .as_mut()
         .expect("active report was checked above")
-        .start_identity = Some(observed.start_identity);
+        .start_identity = Some(start_identity);
     if let Some(last) = entry.last_agent_report.as_mut() {
         let last_claim = (last.source.clone(), last.agent.clone(), last.seq, last.pid);
         if last.start_identity.is_none() && last_claim == claim {
-            last.start_identity = Some(observed.start_identity);
+            last.start_identity = Some(start_identity);
         }
     }
     true
@@ -977,6 +1086,61 @@ fn single_observed_for_base(
     matching.next().is_none().then(|| first.clone())
 }
 
+/// Verifies the reporter against an observed ancestor without changing its identity.
+fn matching_report_identity(
+    entry: &SessionEntry,
+    observed: &ObservedAgent,
+    pid: Pid,
+) -> Option<u64> {
+    if pid == observed.pid {
+        return Some(observed.start_identity);
+    }
+    // Only a hook claim can outrank process observation through ancestry.
+    // Observed agents must still follow the selected foreground process.
+    if entry
+        .active_agent
+        .as_ref()
+        .is_none_or(|active| active.observed)
+    {
+        return None;
+    }
+    matching_lineage_identity(
+        entry,
+        ProcessIdentity {
+            pid: observed.pid,
+            start_identity: StartIdentity::new(observed.start_identity),
+        },
+        &observed.agent_base,
+        pid,
+    )
+}
+
+fn matching_lineage_identity(
+    entry: &SessionEntry,
+    ancestor: ProcessIdentity,
+    base: &RuntimeRef,
+    pid: Pid,
+) -> Option<u64> {
+    let reporter = entry.process_lineage.get(&pid)?;
+    let mut process = reporter;
+    // A malformed or cyclic process table must never create an ancestry proof.
+    for _ in 0..entry.process_lineage.len() {
+        if process.identity == ancestor {
+            return Some(reporter.identity.start_identity.get());
+        }
+        // Do not carry a runtime's claim through a different recognized runtime.
+        if entry
+            .observed_agents
+            .iter()
+            .any(|agent| agent.pid == process.identity.pid && &agent.agent_base != base)
+        {
+            return None;
+        }
+        process = entry.process_lineage.get(&process.parent)?;
+    }
+    None
+}
+
 fn observed_process_matches(
     entry: &SessionEntry,
     pid: Pid,
@@ -984,9 +1148,9 @@ fn observed_process_matches(
     agent_base: &RuntimeRef,
 ) -> bool {
     entry.observed_agents.iter().any(|observed| {
-        observed.pid == pid
-            && &observed.agent_base == agent_base
-            && start_identity.is_none_or(|identity| observed.start_identity == identity)
+        &observed.agent_base == agent_base
+            && matching_report_identity(entry, observed, pid)
+                .is_some_and(|identity| start_identity.is_none_or(|start| start == identity))
     })
 }
 

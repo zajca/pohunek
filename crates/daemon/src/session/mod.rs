@@ -812,6 +812,7 @@ struct SessionEntry {
     last_agent_report: Option<ActiveAgentReport>,
     last_native_report: Option<NativeIdentityReport>,
     observed_agents: Vec<ObservedAgent>,
+    process_lineage: HashMap<Pid, procwatch::ProcessLineage>,
     /// When the evidence that set `info.cwd` was observed. Older cwd evidence
     /// never replaces it, so a scan that read a process before a newer OSC 7
     /// hint landed cannot move the session back.
@@ -1204,6 +1205,7 @@ fn exit_transition(
     candidate.info.active_agent_session_id = None;
     candidate.info.active_agent_session_path = None;
     candidate.observed_agents.clear();
+    candidate.process_lineage.clear();
     candidate.info.exit_code = exit.exit_code;
     if observed.output_forced_closed {
         note_output_force_closed(&mut candidate.info);
