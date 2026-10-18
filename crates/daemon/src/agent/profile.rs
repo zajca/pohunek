@@ -373,7 +373,8 @@ impl ProfileRegistry {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(_error) => return Err("the configured agents directory cannot be listed"),
         };
-        let mut profiles = Vec::new();
+        // Reject oversized directories before resolving profiles whose results would be discarded.
+        let mut paths = Vec::new();
         let mut scanned = 0_usize;
         for entry in entries {
             scanned += 1;
@@ -382,7 +383,10 @@ impl ProfileRegistry {
             }
             let entry =
                 entry.map_err(|_error| "the configured agents directory cannot be listed")?;
-            let path = entry.path();
+            paths.push(entry.path());
+        }
+        let mut profiles = Vec::new();
+        for path in paths {
             if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
                 continue;
             }
