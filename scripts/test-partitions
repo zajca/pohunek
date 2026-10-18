@@ -13,6 +13,11 @@ planned shards to hold every selected test exactly once. `run-macos` narrows
 the macOS lane to the selection's `lane` part; a selection without one, or a
 full selection, runs the whole lane.
 
+`audit-sparse` is the nightly G3 audit of #1218: it runs each package's tests
+from the archive in a sparse tree holding only the files whose change selects
+that package, and fails unless every run passes with exactly the tests the
+full tree lists for it.
+
 The macOS lane (`check-macos`, `run-macos`, `run-macos-tier`) takes the same
 archive and checks or runs the macOS package set as nextest selections. Its
 coverage check splits that set into disjoint groups (the PR lane, the tier
@@ -35,6 +40,7 @@ import string
 import subprocess
 import sys
 import tomllib
+import xml.etree.ElementTree
 
 ROOT = Path(__file__).resolve().parents[1]
 # Package ownership partitions the fast set. The complement catches new crates
@@ -281,6 +287,15 @@ def selected_expression(expression, selection):
     return f"({expression}) and ({selection['filterset']})"
 
 
+def shard_profile(shard):
+    """The nextest profile a shard runs under.
+
+    Heavy shards run bounded: heavy spawns real worker/PTY fixtures, and
+    relay-db opens per-test database pools that exhaust the fixture limit.
+    """
+    return {"heavy": "heavy", "relay-db": "relay-db"}.get(shard, "ci")
+
+
 def planned_shards(plan):
     """The shards whose CI job a plan starts."""
     return {
@@ -438,13 +453,18 @@ def nextest_command(subcommand, profile, archive):
     ]
 
 
-def inventory(expression=None, archive=None, run_ignored="all", profile="ci"):
+def list_document(expression=None, archive=None, run_ignored="all", profile="ci"):
+    """nextest's JSON test list of `expression`."""
     command = nextest_command("list", profile, archive)
     command.extend(["--run-ignored", run_ignored, "--message-format", "json"])
     if expression is not None:
         command.extend(["-E", expression])
     result = subprocess.run(command, cwd=ROOT, check=True, stdout=subprocess.PIPE)
-    return selected_tests(json.loads(result.stdout))
+    return json.loads(result.stdout)
+
+
+def inventory(expression=None, archive=None, run_ignored="all", profile="ci"):
+    return selected_tests(list_document(expression, archive, run_ignored, profile))
 
 
 class Process:
@@ -653,7 +673,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "action",
-        choices=("run", "check", "filter", "plan", "check-macos", *MACOS_RUN_SETS),
+        choices=("run", "check", "filter", "plan", "check-macos", "audit-sparse",
+                 *MACOS_RUN_SETS),
     )
     parser.add_argument("shard", nargs="?", choices=SHARDS)
     parser.add_argument(
@@ -677,9 +698,19 @@ def main():
              "tests, check verifies that the planned shards hold every selected test, "
              "run-macos runs the lane's selected tests",
     )
+    parser.add_argument(
+        "--selector", type=Path,
+        help="audit-sparse only: the xtask binary whose `affected sparse` gives each package's tree",
+    )
+    parser.add_argument(
+        "--report-dir", type=Path,
+        help="audit-sparse only: receives summary.md and each run's JUnit report",
+    )
     args = parser.parse_args()
     if args.skip_owned_by is not None and args.action not in MACOS_RUN_SETS:
         parser.error("--skip-owned-by applies to run-macos and run-macos-tier only")
+    if args.action != "audit-sparse" and (args.selector is not None or args.report_dir is not None):
+        parser.error("--selector and --report-dir apply to audit-sparse only")
     if args.action == "plan":
         if args.selection is None or args.shard is not None or args.archive_file is not None:
             parser.error("plan takes --selection and nothing else")
@@ -707,6 +738,16 @@ def main():
         except ValueError as error:
             parser.error(str(error))
         archive = Archive(args.archive_file.resolve())
+    if args.action == "audit-sparse":
+        if archive is None or args.selector is None or args.report_dir is None:
+            parser.error("audit-sparse needs --archive-file, --selector and --report-dir")
+        if args.shard is not None or args.scope is not None:
+            parser.error("audit-sparse takes no shard and no scope")
+        try:
+            audit_sparse(archive, args.selector.resolve(), args.report_dir.resolve())
+        except (ValueError, subprocess.CalledProcessError) as error:
+            sys.exit(f"test-partitions audit-sparse: {error}")
+        return
     if args.action == "check-macos" or args.action in MACOS_RUN_SETS:
         if archive is None:
             parser.error(f"{args.action} needs --archive-file: the macOS lane never builds")
@@ -756,9 +797,7 @@ def main():
     if args.action == "filter":
         print(expressions[args.shard])
         return
-    # Heavy shards run bounded: heavy spawns real worker/PTY fixtures, and
-    # relay-db opens per-test database pools that exhaust the fixture limit.
-    profile = {"heavy": "heavy", "relay-db": "relay-db"}.get(args.shard, "ci")
+    profile = shard_profile(args.shard)
     expression = expressions[args.shard]
     if selection is not None:
         expression = selected_expression(expression, selection)
@@ -805,6 +844,120 @@ def macos_run_expression(action, skip_owned_by=None):
     if skip_owned_by is None:
         return expression
     return f"({expression}) and not ({OWNED_ELSEWHERE[skip_owned_by]})"
+
+
+def package_counts(document):
+    """The number of matching tests of each package in a nextest list."""
+    counts = collections.Counter()
+    for suite in document["rust-suites"].values():
+        matching = sum(
+            1 for test in suite["testcases"].values()
+            if test["filter-match"]["status"] == "matches"
+        )
+        if matching:
+            counts[suite["package-name"]] += matching
+    return counts
+
+
+def junit_cases(report):
+    """The number of test cases in the JUnit report `report`, or None without one."""
+    try:
+        return sum(1 for _ in xml.etree.ElementTree.parse(report).iter("testcase"))
+    except (OSError, xml.etree.ElementTree.ParseError):
+        return None
+
+
+def sparse_patterns(selector, package):
+    """The sparse-checkout patterns of `package`'s tree; raises ValueError."""
+    result = subprocess.run(
+        [str(selector), "affected", "sparse", "--package", package],
+        cwd=ROOT, check=False, capture_output=True, text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise ValueError(
+            f"the selector gave no sparse tree for {package}: {result.stderr.strip()[-500:]}"
+        )
+    return result.stdout
+
+
+def audit_sparse(archive, selector, report_dir):
+    """Run each package's tests from its own sparse tree (G3 of #1218); exit 1
+    unless every run passes and runs exactly the tests the full tree lists.
+
+    The expected counts come from the full tree, before any file is removed: a
+    filterset run skips the binaries of a package whose directory is absent,
+    so a count read from the sparse tree could pass a lost test. Each shard's
+    tests of a package run under that shard's profile, as in their CI job.
+    The checkout returns to the full tree whatever happens, and a run that
+    finds it already sparse, from a run that was killed, refuses to start: its
+    expected counts would come from a partial tree.
+    """
+    sparse = subprocess.run(
+        ["git", "config", "--bool", "core.sparseCheckout"],
+        cwd=ROOT, check=False, capture_output=True, text=True,
+    ).stdout.strip()
+    if sparse == "true":
+        raise ValueError(
+            "the checkout is sparse; run `git sparse-checkout disable` to restore the full tree first"
+        )
+    with (ROOT / ".config/nextest.toml").open("rb") as config:
+        nextest_config = tomllib.load(config)
+    expressions = filters()
+    expected = {}
+    for shard in SHARDS:
+        listed = list_document(expressions[shard], archive, "default", shard_profile(shard))
+        for package, count in package_counts(listed).items():
+            expected[(package, shard)] = count
+    if not expected:
+        raise ValueError("empty workspace test inventory")
+    packages = sorted({package for package, _shard in expected})
+    patterns = {package: sparse_patterns(selector, package) for package in packages}
+    report_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    try:
+        for package in packages:
+            subprocess.run(
+                ["git", "sparse-checkout", "set", "--no-cone", "--stdin"],
+                cwd=ROOT, input=patterns[package], text=True, check=True,
+            )
+            for shard in SHARDS:
+                want = expected.get((package, shard))
+                if not want:
+                    continue
+                profile = shard_profile(shard)
+                report = junit_report(nextest_config, profile, ROOT)
+                if report is None:
+                    raise ValueError(f"nextest profile {profile} writes no JUnit report")
+                report.unlink(missing_ok=True)
+                command = nextest_command("run", profile, archive)
+                command.extend(["-E", f"({expressions[shard]}) and (package(={package}))"])
+                status = run_checked(command)
+                ran = junit_cases(report)
+                if ran is not None:
+                    shutil.copyfile(report, report_dir / f"{package}.{shard}.xml")
+                passed = status == 0 and ran == want
+                rows.append((package, shard, len(patterns[package].splitlines()),
+                             want, ran, status, passed))
+    finally:
+        subprocess.run(["git", "sparse-checkout", "disable"], cwd=ROOT, check=True)
+    lines = [
+        "| Package | Shard | Kept files | Ran / expected | Exit | Result |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for package, shard, kept, want, ran, status, passed in rows:
+        result = "passed" if passed else ("failed" if status else "count mismatch")
+        ran_text = "no report" if ran is None else ran
+        lines.append(f"| {package} | {shard} | {kept} | {ran_text} / {want} | {status} | {result} |")
+    failed = [row for row in rows if not row[-1]]
+    verdict = (
+        f"G3 sparse audit: {len(rows) - len(failed)} of {len(rows)} package runs passed"
+        f"{'' if failed else ', each with exactly the tests of the full tree'}"
+    )
+    summary = "\n".join([verdict, "", *lines, ""])
+    (report_dir / "summary.md").write_text(summary)
+    print(summary)
+    if failed:
+        sys.exit(1)
 
 
 def run_nextest(profile, expression, archive, no_tests_pass=False):

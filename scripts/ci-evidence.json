@@ -55,6 +55,7 @@
       "tests (heavy, PTY + Hermes)",
       "test selection",
       "test selection verdict",
+      "test selection audit (G3)",
       "required jobs (paths filter)",
       "real systemd supervision",
       "upgrade from the previous release / upgrade from the previous release",

@@ -55,8 +55,8 @@ env:
   # Kept explicit (issue #124) so every job benefits even before restore.
   CARGO_INCREMENTAL: "0"
   # G2 of #1218: a narrowed pull request runs its tests from a sparse tree
-  # holding only the files whose change selects them. Off until a G3 seeding
-  # run shows every package's tests green from its own sparse tree.
+  # holding only the files whose change selects them. Off until three
+  # consecutive nightly G3 runs on main pass, plus the local preflight.
   TEST_SELECTION_SPARSE: "false"
   # A Python script never imports from its own directory or the working
   # directory, so a file a pull request adds there cannot shadow a module.
@@ -1485,6 +1485,104 @@ jobs:
         with:
           name: nextest-junit-relay-db
           path: relocated/target/nextest/relay-db/junit.xml
+          if-no-files-found: warn
+
+  # G3 of #1218: each package's tests run from a tree holding only the files
+  # whose change selects that package, so a test that reads a path outside
+  # its selector's map fails here every night instead of passing a narrowed
+  # pull request with the path absent from its selection.
+  test-selection-audit:
+    name: test selection audit (G3)
+    needs: [build-tests]
+    if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly')) }}
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
+    services:
+      postgres:
+        # Docker Official Image from Google's cache, pinned to its OCI index.
+        image: mirror.gcr.io/library/postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+        env:
+          POSTGRES_DB: pohunek_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U postgres -d pohunek_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-nextest
+
+      - name: Install mold linker
+        uses: ./.github/actions/setup-mold
+        with:
+          version: ${{ env.MOLD_VERSION }}
+          sha256: ${{ env.MOLD_SHA256 }}
+
+      # The selector is built here. xtask::dependency_policy, one of the
+      # audited tests, also needs Clippy and the locked crates in the registry.
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: xtask
+          save-if: false
+
+      - name: Fetch locked dependency sources
+        run: cargo fetch --locked
+
+      # The copy keeps the selector out of target/, where the archive extracts.
+      - name: Build the selector
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked -p xtask --bin xtask
+          cp target/debug/xtask "$RUNNER_TEMP/xtask"
+
+      - name: Download test archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest-archive
+
+      - name: Run every package from its own sparse tree
+        shell: bash
+        env:
+          # Resolved at step level: the `job` context is not available in
+          # job-level `env`, where it makes the whole workflow invalid.
+          POHUNEK_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/pohunek_test
+        run: |
+          set -euo pipefail
+          python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" audit-sparse --selector "$RUNNER_TEMP/xtask" --report-dir "$RUNNER_TEMP/test-selection-audit"
+
+      - name: Summarize the audit
+        if: always()
+        shell: bash
+        run: |
+          summary="$RUNNER_TEMP/test-selection-audit/summary.md"
+          if [ -f "$summary" ]; then
+            cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload the audit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-selection-audit
+          path: ${{ runner.temp }}/test-selection-audit/
           if-no-files-found: warn
 
   # Skipping the shards a narrowed plan does not start can drop no selected
