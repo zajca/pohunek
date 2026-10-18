@@ -28,7 +28,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{event, Level};
 
-// Rust guideline compliant 2026-09-28
+// Rust guideline compliant 2026-10-18
 
 /// XDG bases whose application directory the subprocess supervisor prepares.
 ///
@@ -50,6 +50,14 @@ const PREPARED_XDG_BASES: [&str; 5] = [
 /// bytes are read and counted but dropped, so the worker never blocks on a
 /// full pipe.
 const MAX_WORKER_STDERR_BYTES: usize = 8 * 1024;
+
+/// First descriptor whose inheritance across `exec` is forbidden.
+///
+/// 0 through 2 are the worker's stdio (a null stdin and stdout, and the
+/// captured stderr pipe); every descriptor at or above this number is marked
+/// close-on-exec in the child before `exec`, so the worker inherits nothing
+/// else the daemon process happens to hold.
+const FIRST_INHERITED_DESCRIPTOR: libc::c_int = 3;
 
 /// How long [`SubprocessWorkerLauncher`]'s exit report waits for the capture
 /// of an exited worker's stderr to finish.
@@ -78,7 +86,11 @@ struct SupervisedChild {
 ///
 /// It spawns exactly the definition's executable and arguments with a cleared
 /// environment plus the definition's bootstrap variables, in a fresh process
-/// group. Each worker's stderr is captured, bounded to its first 8 KiB, and
+/// group. A pre-exec hook marks every descriptor at or above 3 close-on-exec,
+/// so the worker inherits only its three standard descriptors across `exec`;
+/// the sweep bound is read from `RLIMIT_NOFILE` in the parent, and a spawn
+/// failure is reported when no bounded sweep is possible. Each worker's stderr
+/// is captured, bounded to its first 8 KiB, and
 /// logged as a `worker.stderr.captured`
 /// event once the pipe closes; stdout is discarded. Dropping the launcher
 /// kills its workers, but dropping a daemon server or registry does not
@@ -188,7 +200,11 @@ impl Supervisor for SubprocessWorkerLauncher {
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
-            std::os::unix::process::CommandExt::process_group(command.as_std_mut(), 0);
+            let std_command = command.as_std_mut();
+            std::os::unix::process::CommandExt::process_group(std_command, 0);
+            // The bound is read before the fork; the hook must not read the
+            // limits after it.
+            install_worker_sweep(std_command, worker_sweep_bound()?);
             let mut child = command
                 .spawn()
                 .map_err(|source| operation("spawn", source))?;
@@ -291,6 +307,196 @@ impl Supervisor for SubprocessWorkerLauncher {
             }
             Ok(job_exit(status))
         })
+    }
+}
+
+/// Returns the exclusive bound of the worker's pre-exec descriptor sweep, read
+/// in the parent before the fork.
+///
+/// The sweep runs inside the child, which must not list the descriptor table or
+/// read the limits after the fork, so both the soft `RLIMIT_NOFILE` and the
+/// highest open descriptor are captured here. Linux marks the whole table
+/// when `close_range` succeeds; other paths use this finite exclusive bound.
+///
+/// # Errors
+///
+/// Fails the spawn when the soft limit is unlimited or exceeds the `c_int`
+/// range of the sweep: without a finite bound no bounded sweep can promise the
+/// isolation, and skipping it would hand the daemon's descriptors to the worker.
+fn worker_sweep_bound() -> Result<libc::c_int, WorkerLaunchError> {
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile)
+        .current
+        .ok_or_else(|| {
+            operation(
+                "descriptor_sweep_bound",
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the soft descriptor limit is unlimited; worker spawn needs a bounded sweep",
+                ),
+            )
+        })?;
+    let limit = libc::c_int::try_from(limit)
+        .map_err(|source| operation("descriptor_sweep_bound", source))?;
+    let highest = highest_worker_descriptor()
+        .map_err(|source| operation("descriptor_sweep_bound", source))?;
+    let open_end = highest.checked_add(1).ok_or_else(|| {
+        operation(
+            "descriptor_sweep_bound",
+            std::io::Error::from_raw_os_error(libc::EOVERFLOW),
+        )
+    })?;
+    // New opens stay below the soft limit; enumeration covers FDs retained above a lowered limit.
+    Ok(limit.max(open_end))
+}
+
+/// Lists the parent's open table before fork; any incomplete listing fails spawn.
+#[cfg(not(target_os = "macos"))]
+fn highest_worker_descriptor() -> std::io::Result<libc::c_int> {
+    #[cfg(target_os = "linux")]
+    let directory = "/proc/self/fd";
+    #[cfg(not(target_os = "linux"))]
+    let directory = "/dev/fd";
+    let mut highest = FIRST_INHERITED_DESCRIPTOR - 1;
+    for entry in std::fs::read_dir(directory)? {
+        let name = entry?.file_name();
+        let descriptor = name
+            .to_str()
+            .and_then(|name| name.parse::<libc::c_int>().ok())
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        highest = highest.max(descriptor);
+    }
+    Ok(highest)
+}
+
+/// Enumerates the parent's complete Darwin descriptor table before fork.
+#[cfg(target_os = "macos")]
+#[expect(
+    unsafe_code,
+    reason = "proc_pidinfo queries the current process descriptor table"
+)]
+fn highest_worker_descriptor() -> std::io::Result<libc::c_int> {
+    // Space beyond the size probe absorbs ordinary concurrent opens; a full buffer is retried.
+    const LIST_SLACK: usize = 16;
+    let overflow = || std::io::Error::from_raw_os_error(libc::EOVERFLOW);
+    let bytes_read = |result| match usize::try_from(result) {
+        Ok(bytes) if bytes > 0 => Ok(bytes),
+        _ => Err(std::io::Error::last_os_error()),
+    };
+    let pid = libc::c_int::try_from(std::process::id()).map_err(|_source| overflow())?;
+    let entry_size = std::mem::size_of::<libc::proc_fdinfo>();
+    // SAFETY: a null, zero-length buffer requests only the required size.
+    let required =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    let mut capacity = bytes_read(required)? / entry_size + LIST_SLACK;
+    loop {
+        let mut entries = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0
+            };
+            capacity
+        ];
+        let size = capacity.checked_mul(entry_size).ok_or_else(overflow)?;
+        let buffer_size = libc::c_int::try_from(size).map_err(|_source| overflow())?;
+        // SAFETY: entries owns buffer_size aligned, writable bytes for the duration of this call.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                entries.as_mut_ptr().cast(),
+                buffer_size,
+            )
+        };
+        let written = bytes_read(written)?;
+        if written < size {
+            return Ok(entries[..written / entry_size]
+                .iter()
+                .map(|entry| entry.proc_fd)
+                .max()
+                .unwrap_or(FIRST_INHERITED_DESCRIPTOR - 1));
+        }
+        capacity = capacity.checked_mul(2).ok_or_else(overflow)?;
+    }
+}
+
+/// Marks every inherited descriptor from [`FIRST_INHERITED_DESCRIPTOR`] up
+/// close-on-exec, in the child before `exec`.
+///
+/// Marking rather than closing is required: std's exec-status pipe is a
+/// close-on-exec descriptor above 2 that the child writes an `exec` failure
+/// into, and std's child aborts when that write fails. The exec'd worker sees
+/// the same descriptors either way. Linux marks the whole table in one
+/// `close_range` call with `CLOSE_RANGE_CLOEXEC`; kernels without that support
+/// (`ENOSYS`, or `EINVAL` from the pre-5.11 flag handling) and every other Unix
+/// target run the bounded fallback below the parent-side bound. Free
+/// descriptor holes report `EBADF` there, which is expected and ignored.
+///
+/// # Errors
+///
+/// Returns the errno of an unexpected call failure: anything other than
+/// missing `close_range` support or a descriptor hole.
+#[expect(
+    unsafe_code,
+    reason = "close_range and fcntl are libc calls with no safe wrapper"
+)]
+fn mark_worker_descriptors_cloexec(sweep_bound: libc::c_int) -> std::io::Result<()> {
+    use std::io::Error as IoError;
+
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `syscall` with `SYS_close_range` takes integer arguments and
+        // only updates the descriptor table.
+        let marked = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                FIRST_INHERITED_DESCRIPTOR as libc::c_uint,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        if marked == 0 {
+            return Ok(());
+        }
+        let error = IoError::last_os_error();
+        // A kernel either lacks the syscall (`ENOSYS`) or predates the
+        // `CLOSE_RANGE_CLOEXEC` flag (`EINVAL`): both fall through to the
+        // bounded sweep, which marks the same descriptors one by one.
+        if !matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
+            return Err(error);
+        }
+    }
+    for descriptor in FIRST_INHERITED_DESCRIPTOR..sweep_bound {
+        // SAFETY: `fcntl` with `F_SETFD` is async-signal-safe; only the
+        // descriptor table of this fork child is touched.
+        let marked = unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) };
+        if marked == -1 {
+            let error = IoError::last_os_error();
+            if error.raw_os_error() != Some(libc::EBADF) {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Registers the child-side descriptor sweep that runs between fork and `exec`.
+///
+/// A sweep failure is returned by the forked child to std, which reports it
+/// through the exec-status pipe as a failed spawn; no program runs.
+#[expect(
+    unsafe_code,
+    reason = "pre_exec is an unsafe API; the registered closure only calls async-signal-safe libc functions"
+)]
+fn install_worker_sweep(process: &mut std::process::Command, sweep_bound: libc::c_int) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: the closure captures one `c_int`, and calls only
+    // `mark_worker_descriptors_cloexec`, which takes no locks or allocations and
+    // uses only descriptor syscalls and their thread-local errno result.
+    // That is the requirement after fork in a multithreaded process.
+    unsafe {
+        process.pre_exec(move || mark_worker_descriptors_cloexec(sweep_bound));
     }
 }
 

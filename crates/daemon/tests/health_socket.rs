@@ -1408,6 +1408,53 @@ async fn stop_real_daemon(
         .expect("wait for real daemon")
 }
 
+/// Opens a file-backed descriptor that lacks close-on-exec, inside `root`.
+///
+/// The regression is the boundary a real worker keeps: this sentinel exists so
+/// the boundary has something to fail on. The test and the real daemon inherit
+/// it by construction; without the launcher's isolation the worker would too.
+///
+/// Returns the file, whose drop closes the descriptor at the end of the test,
+/// and the path every executor's descriptor link would name while it is open.
+#[cfg(target_os = "linux")]
+fn inheritable_fd_sentinel(root: &Path) -> (std::fs::File, PathBuf) {
+    use rustix::io::{fcntl_getfd, fcntl_setfd, FdFlags};
+
+    // Above the daemon's lowered soft limit, so the fallback must enumerate existing FDs.
+    const SENTINEL_DESCRIPTOR_MIN: i32 = 512;
+    let path = root.join("fd-sentinel");
+    let original = std::fs::File::create(&path).expect("create the sentinel file");
+    let file = std::fs::File::from(
+        rustix::io::fcntl_dupfd_cloexec(&original, SENTINEL_DESCRIPTOR_MIN)
+            .expect("duplicate sentinel above the daemon soft limit"),
+    );
+    fcntl_setfd(&file, FdFlags::empty()).expect("clear close-on-exec on the sentinel");
+    assert!(
+        fcntl_getfd(&file)
+            .expect("read the sentinel flags")
+            .is_empty(),
+        "the sentinel must lack close-on-exec for the regression to be meaningful"
+    );
+    (file, path)
+}
+
+/// Reads the link target of every descriptor the live process `pid` holds.
+///
+/// Ignores descriptors closed during the scan; other inspection errors fail
+/// the scenario instead of claiming the sentinel is absent.
+#[cfg(target_os = "linux")]
+fn descriptor_link_targets(pid: u32) -> std::io::Result<Vec<PathBuf>> {
+    let mut targets = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fd"))? {
+        match std::fs::read_link(entry?.path()) {
+            Ok(target) => targets.push(target),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(targets)
+}
+
 #[test]
 fn daemon_startup_rejects_missing_config_home_and_home() {
     let env = TestEnv::new().expect("create isolated daemon environment");
@@ -1450,8 +1497,16 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
     let root = root_dir.path().to_path_buf();
     // Declared after `root_dir` and before the daemon child: the daemon is
     // killed first, then any worker still below the root is reaped, then the
-    // root is removed.
-    let _workers = WorkerGuard::watch(&root);
+    // root is removed. The guard reports its survivors while the regression
+    // below needs the real worker's identity, and owns the teardown itself.
+    let workers = WorkerGuard::watch(&root);
+    // On Linux the worker's descriptor table is the regression's boundary. The
+    // sentinel file backs a deliberately inheritable descriptor held by this
+    // test for the whole run: without the launcher's isolation the real daemon
+    // inherits it, and without the sentinel the worker-side assertion below
+    // could pass vacuously.
+    #[cfg(target_os = "linux")]
+    let (sentinel, sentinel_path) = inheritable_fd_sentinel(&root);
     let runtime_home = root.join("r");
     let data_home = root.join("d");
     let state_home = root.join("s");
@@ -1474,8 +1529,8 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
     assert_mode(&state_home, 0o755);
 
     let daemon_env = TestEnv::new().expect("create the daemon child environment");
-    let mut child = daemon_env
-        .tokio_command(bin_exe("pohunekd"))
+    let mut command = daemon_env.tokio_command(bin_exe("pohunekd"));
+    command
         .env("XDG_RUNTIME_DIR", &runtime_home)
         .env("XDG_DATA_HOME", &data_home)
         .env("XDG_STATE_HOME", &state_home)
@@ -1490,11 +1545,57 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn real daemon");
+        .kill_on_drop(true);
+    #[cfg(target_os = "linux")]
+    {
+        // Keep ample runtime headroom while retaining the already-open FD above this limit.
+        const DAEMON_SOFT_DESCRIPTOR_LIMIT: u64 = 256;
+        let hard = rustix::process::getrlimit(rustix::process::Resource::Nofile).maximum;
+        #[expect(
+            unsafe_code,
+            reason = "pre_exec lowers the child limit without touching the test process"
+        )]
+        // SAFETY: the closure captures only scalar limits and calls the async-signal-safe setrlimit.
+        unsafe {
+            command.pre_exec(move || {
+                rustix::process::setrlimit(
+                    rustix::process::Resource::Nofile,
+                    rustix::process::Rlimit {
+                        current: Some(DAEMON_SOFT_DESCRIPTOR_LIMIT),
+                        maximum: hard,
+                    },
+                )
+                .map_err(std::io::Error::from)
+            });
+        }
+    }
+    let mut child = command.spawn().expect("spawn real daemon");
     let socket = runtime_home.join(APP_DIR).join("daemon.sock");
     let mut client = wait_for_daemon_socket(&mut child, &socket).await;
+
+    // Non-vacuity of the boundary below: the sentinel is still clear and
+    // deliberately inherited by both the test process and the real daemon, so
+    // only the launcher's isolation can keep it out of the worker.
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            rustix::io::fcntl_getfd(&sentinel)
+                .expect("read the sentinel flags")
+                .is_empty(),
+            "the sentinel must lack close-on-exec for the regression to be meaningful"
+        );
+        for (process, pid) in [
+            ("the test process", std::process::id()),
+            ("the real daemon", child.id().expect("running daemon pid")),
+        ] {
+            let targets = descriptor_link_targets(pid)
+                .unwrap_or_else(|error| panic!("read the descriptor table of {process}: {error}"));
+            assert!(
+                targets.iter().any(|target| target == &sentinel_path),
+                "{process} must hold the deliberately inheritable sentinel descriptor: {targets:?}"
+            );
+        }
+    }
     let response = tokio::time::timeout(
         DAEMON_CONTROL_REQUEST_TIMEOUT,
         exchange(
@@ -1586,6 +1687,44 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
         "listed session retains its real worker runtime"
     );
 
+    // The boundary of #302: the real worker's post-exec descriptor table holds
+    // no link to the sentinel file. The worker's process is not hard-coded; it
+    // is the survivor the guard lists while the session still runs, and the
+    // guard retains its teardown role below.
+    #[cfg(target_os = "linux")]
+    {
+        let worker_pid = wait_until(
+            "the real worker to be listed below the guarded root",
+            || {
+                let survivor = workers
+                    .survivors()
+                    .into_iter()
+                    .next()
+                    .map(|worker| worker.pid);
+                std::future::ready(survivor)
+            },
+        )
+        .await;
+        let inspector = HostInspector::new();
+        let worker_identity = inspector
+            .identity(worker_pid)
+            .expect("inspect the real worker")
+            .expect("the real worker is live before descriptor inspection");
+        let worker_targets = descriptor_link_targets(worker_pid)
+            .expect("read the real worker's descriptor table while it runs");
+        assert!(
+            !worker_targets.iter().any(|target| target == &sentinel_path),
+            "the real worker inherited a descriptor above 2: {worker_targets:?}"
+        );
+        assert_eq!(
+            inspector
+                .identity(worker_pid)
+                .expect("reinspect the real worker"),
+            Some(worker_identity),
+            "the same real worker remains live after descriptor inspection"
+        );
+    };
+
     let stop_request = Request::make(
         "startup-private-state-session-stop",
         method::SESSION_STOP,
@@ -1636,6 +1775,7 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
     ] {
         assert_mode(&host_state.join(name), 0o600);
     }
+    drop(workers);
 }
 
 #[tokio::test]
