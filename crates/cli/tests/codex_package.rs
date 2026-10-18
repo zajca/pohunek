@@ -2489,7 +2489,10 @@ async fn a_conforming_wrapper_profile_launches_and_resumes_with_its_fixed_argume
     }
 
     // The probe ran each wrapper with only the package's probe arguments,
-    // and the launch kept the profile's fixed arguments.
+    // and the launch kept the profile's fixed arguments. A returned launch is
+    // not log readiness: the wrapper logs its argv only when the worker runs
+    // it, which can trail the launch command, so wait for the exact launch
+    // line and treat a missing or partially written log as pending.
     for (directory, launch_line) in [
         (
             "dispatch-wrapper",
@@ -2497,7 +2500,11 @@ async fn a_conforming_wrapper_profile_launches_and_resumes_with_its_fixed_argume
         ),
         ("bridge-wrapper", bridge_agent.display().to_string()),
     ] {
-        let log = fs::read_to_string(wrapper_argv_log(&root, directory)).expect("the wrapper log");
+        let log = wait_until("the wrapper's launch argv entry", || async {
+            let log = fs::read_to_string(wrapper_argv_log(&root, directory)).ok()?;
+            log.lines().any(|line| *line == launch_line).then_some(log)
+        })
+        .await;
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(
             lines.first(),
@@ -2534,13 +2541,21 @@ async fn a_conforming_wrapper_profile_launches_and_resumes_with_its_fixed_argume
         fixture.stop(&id).await;
         let (code, resumed) = fixture.harness.json(&["session", "resume", &id]).await;
         assert_eq!(code, 0, "{resumed}");
-        let log = fs::read_to_string(wrapper_argv_log(&root, directory)).expect("the wrapper log");
         // The dispatch wrapper sees the fixed arguments ahead of the resume
-        // arguments; the bridge sees the agent path ahead of them.
+        // arguments; the bridge sees the agent path ahead of them. A returned
+        // resume and the reported reference are not log readiness: the wrapper
+        // and the agent log their argv only when the worker runs them, which
+        // can trail the resume command, so wait for the exact resume lines and
+        // treat a missing or partially written log as pending.
         let resumed_line = match directory {
             "dispatch-wrapper" => format!("exec {} {agent} resume {reference}", cwd.display()),
             _ => format!("{agent} resume {reference}"),
         };
+        let log = wait_until("the wrapper's resume argv entry", || async {
+            let log = fs::read_to_string(wrapper_argv_log(&root, directory)).ok()?;
+            log.lines().any(|line| *line == resumed_line).then_some(log)
+        })
+        .await;
         assert!(
             log.lines().any(|line| line == resumed_line),
             "the resume kept the fixed arguments and the reference: {log}"
@@ -2549,12 +2564,16 @@ async fn a_conforming_wrapper_profile_launches_and_resumes_with_its_fixed_argume
             "dispatch-wrapper" => "dispatch-agent",
             _ => "bridge-agent",
         };
-        let agent_log = fs::read_to_string(root.join(format!("agent-{agent_directory}.log")))
-            .expect("the agent log");
+        let agent_resumed_line = format!("resume {reference}");
+        let agent_log = wait_until("the agent's resume argv entry", || async {
+            let log = fs::read_to_string(root.join(format!("agent-{agent_directory}.log"))).ok()?;
+            log.lines()
+                .any(|line| *line == agent_resumed_line)
+                .then_some(log)
+        })
+        .await;
         assert!(
-            agent_log
-                .lines()
-                .any(|line| line == format!("resume {reference}")),
+            agent_log.lines().any(|line| line == agent_resumed_line),
             "the wrapper dispatched the resume to the agent: {agent_log}"
         );
         fixture.stop(&id).await;
