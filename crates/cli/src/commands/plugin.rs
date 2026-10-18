@@ -7,13 +7,14 @@
 //! the package in a dry run, the CLI prints what it declares, and nothing
 //! changes until the owner repeats the command with `--yes`.
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-18
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::time::Duration;
 
 use clap::{Args, Subcommand, ValueHint};
 use protocol::{
@@ -46,6 +47,9 @@ const DIGEST_HEX_CHARS: usize = 64;
 /// of packages one host holds are not a practical concern, and an ambiguous
 /// prefix is reported rather than guessed.
 const DIGEST_PREFIX_HEX_CHARS: usize = 12;
+
+/// Archive validation can exceed 5 s on a loaded host; keep each response bounded.
+const INSTALL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `pohunek plugin` subcommands.
 #[derive(Debug, Subcommand)]
@@ -665,7 +669,7 @@ async fn run_install(args: &InstallArgs) -> Result<(), CliError> {
     let ingest = Ingest::Install {
         enable: !args.no_enable,
     };
-    let mut client = connect().await?;
+    let mut client = connect_ingest().await?;
     ingest_package(&mut client, &source, ingest, None, args.yes, args.json).await
 }
 
@@ -688,7 +692,7 @@ async fn run_update(args: &UpdateArgs) -> Result<(), CliError> {
         path: canonical_path(&args.archive, "file", Path::is_file)?,
         trust: trust(&args.trust)?,
     };
-    let mut client = connect().await?;
+    let mut client = connect_ingest().await?;
     ingest_package(
         &mut client,
         &source,
@@ -738,6 +742,12 @@ async fn run_uninstall(args: &UninstallArgs) -> Result<(), CliError> {
 async fn connect() -> Result<Client, CliError> {
     let paths = Paths::resolve()?;
     Client::connect(LOCAL_HOST, &paths).await
+}
+
+/// Connects archive install/update commands with their longer response budget.
+async fn connect_ingest() -> Result<Client, CliError> {
+    let paths = Paths::resolve()?;
+    Client::connect_with_request_timeout(LOCAL_HOST, &paths, INSTALL_RESPONSE_TIMEOUT).await
 }
 
 pub(super) async fn list(client: &mut Client) -> Result<PackageListResult, CliError> {
