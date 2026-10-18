@@ -28,8 +28,8 @@ use nix::unistd::Pid;
 use package::directory::build_directory_archive;
 use package::{read_archive, CatalogEntry, Limits, PackageDigest};
 use pohunek_daemon::agent::host::{
-    definition_from_archive, DefinitionError, DefinitionOrigin, HandlerId, LaunchProgram,
-    ProbeVersion, RuntimeDefinition, TranscriptParser,
+    definition_from_archive, DefinitionError, DefinitionOrigin, HandlerId, InputReadiness,
+    LaunchProgram, ProbeVersion, RuntimeDefinition, TranscriptParser,
 };
 use pohunek_daemon::agent::{NativeReferenceStrategy, SessionRef};
 use pohunek_daemon::catalog_anchor::CatalogTrust;
@@ -100,7 +100,7 @@ const GOLDEN_MANIFEST_NAME: &str = "codex";
 const PACKAGE_ID: &str = "pohunek.runtime.codex";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.1.1";
+const PACKAGE_VERSION: &str = "1.2.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -308,6 +308,11 @@ fn the_package_descriptor_preserves_every_builtin_codex_fact() {
     );
     assert_eq!(package.prompt_arg(), golden.prompt_arg());
     assert_eq!(package.native(), golden.native());
+    // The readiness is the one behavioral difference: the package opts into
+    // the strict manifest-idle readiness (#1114), which the built-in
+    // descriptor does not declare.
+    assert_eq!(package.input_readiness(), InputReadiness::ManifestIdle);
+    assert_eq!(golden.input_readiness(), InputReadiness::BracketedPaste);
     assert_eq!(
         package.native_reference_strategy(),
         golden.native_reference_strategy()
@@ -367,11 +372,31 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
         assert!(package.contains_key(section), "[{section}] is declared");
     }
     package.remove("transcripts");
+    // `ready` is the one key the package declares that v0.34.2 does not: the
+    // built-in descriptor relied on the bracketed-paste enable signal. The
+    // package opts into manifest-idle readiness so the startup update popup
+    // cannot take the initial prompt (#1114).
+    let input = package
+        .get_mut("input")
+        .and_then(toml::Value::as_table_mut)
+        .expect("an [input] table");
+    assert_eq!(
+        input.remove("ready").as_ref().and_then(toml::Value::as_str),
+        Some("manifest_idle"),
+        "the package waits for the manifest's idle evidence"
+    );
     let golden_text = golden_body(GOLDEN_DESCRIPTOR, BUILTIN_DESCRIPTOR);
     let golden: toml::Table = golden_text.parse().expect("the golden is TOML");
     assert!(
         !golden.contains_key("transcripts"),
         "v0.34.2 declares no transcript tree"
+    );
+    assert!(
+        golden
+            .get("input")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|input| !input.contains_key("ready")),
+        "v0.34.2 declares no input readiness"
     );
     assert_eq!(package, strip(golden, GOLDEN_PACKAGE_VERSION));
 }
@@ -380,9 +405,13 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
 /// dialog of Codex 0.160, which the built-in never matched.
 const FOLDER_TRUST_RULE: &str = "folder_trust_prompt";
 
+/// Rule the package adds to the golden built-in manifest: the startup update
+/// popup of Codex 0.160, which the built-in never matched.
+const UPDATE_POPUP_RULE: &str = "startup_update_prompt";
+
 /// The manifest file is the golden built-in manifest of release v0.34.2 plus
-/// [`FOLDER_TRUST_RULE`]: same process matchers, and every built-in rule in
-/// the same order with the same fields.
+/// [`FOLDER_TRUST_RULE`] and [`UPDATE_POPUP_RULE`]: same process matchers, and
+/// every built-in rule in the same order with the same fields.
 #[test]
 fn the_package_manifest_file_is_the_builtin_manifest_file_plus_the_folder_trust_rule() {
     let package = read_toml(&format!("{PACKAGE_DIR}/detect.toml"));
@@ -393,7 +422,12 @@ fn the_package_manifest_file_is_the_builtin_manifest_file_plus_the_folder_trust_
         .get_mut("rules")
         .and_then(toml::Value::as_array_mut)
         .expect("rules")
-        .retain(|rule| rule["id"].as_str() != Some(FOLDER_TRUST_RULE));
+        .retain(|rule| {
+            !matches!(
+                rule["id"].as_str(),
+                Some(FOLDER_TRUST_RULE | UPDATE_POPUP_RULE)
+            )
+        });
     assert_eq!(builtin_rules, golden);
     let ids: Vec<&str> = package["rules"]
         .as_array()
@@ -408,6 +442,7 @@ fn the_package_manifest_file_is_the_builtin_manifest_file_plus_the_folder_trust_
             "osc_title_working",
             "workspace_trust_prompt",
             FOLDER_TRUST_RULE,
+            UPDATE_POPUP_RULE,
             "live_strong_blocker",
             "weak_blocker",
             "osc_title_idle",
@@ -947,6 +982,89 @@ fn the_folder_trust_rule_needs_the_dialog_heading_at_the_top_of_the_screen() {
     let mut buried = vec![String::from("line"); 17];
     buried.extend(dialog(&folder_trust));
     assert_eq!(screen_activity(&definition, &buried, 80), None);
+}
+
+/// Captures of the startup update popup, copied from the independent real-PTY
+/// recordings behind #1114: `popup_w<columns>.txt` at 80, 100 and 160 columns.
+/// The real popup set no terminal title, so the stale title this rule must
+/// survive is only ever synthetic.
+const POPUP_CAPTURES_DIR: &str = "compat/codex/screens/update-popup";
+
+/// Columns the popup was captured at, widest to narrowest.
+const POPUP_CAPTURE_COLUMNS: [u16; 3] = [160, 100, 80];
+
+/// The popup rule reads the measured update popup as blocked from the screen
+/// at every captured width, and a synthetic stale idle title under the popup
+/// changes nothing: the screen blocker outranks the title's idle rule. The
+/// grid is as tall as the capturing terminal's visible rows, so feeding the
+/// measured rows cannot scroll the top of the screen away.
+#[test]
+fn the_startup_update_prompt_rule_blocks_the_measured_popup_and_outranks_a_stale_title() {
+    let definition = installed_definition();
+    let config = DetectorConfig {
+        input_readiness: InputReadiness::default(),
+        detection: DetectionConfig {
+            recheck_after: Duration::from_millis(100),
+            confirmations: 1,
+            cap: Duration::from_millis(700),
+            stable_visible_refresh: Duration::from_millis(800),
+            startup_grace: Duration::ZERO,
+        },
+        manifest: Some(Arc::clone(definition.manifest())),
+    };
+    for columns in POPUP_CAPTURE_COLUMNS {
+        let capture = fs::read_to_string(
+            workspace_root()
+                .join(POPUP_CAPTURES_DIR)
+                .join(format!("popup_w{columns}.txt")),
+        )
+        .unwrap_or_else(|error| panic!("read the {columns}-column popup capture: {error}"));
+        let rows: Vec<String> = capture.lines().map(str::to_owned).collect();
+        let feed = |title: Option<&str>| {
+            let mut detector = Detector::new(
+                u16::try_from(rows.len()).expect("capture rows"),
+                columns,
+                Instant::now(),
+                config.clone(),
+            );
+            detector.feed(Instant::now(), &frame_bytes(title, &rows))
+        };
+        assert_eq!(
+            feed(None)
+                .iter()
+                .rfind(|transition| transition.source == StateSource::Screen)
+                .map(|transition| (transition.activity, transition.source)),
+            Some((AgentActivity::Blocked, StateSource::Screen)),
+            "{columns} columns: the popup is blocked from the screen"
+        );
+        assert_eq!(
+            feed(Some("work"))
+                .iter()
+                .rfind(|transition| transition.source != StateSource::Process)
+                .map(|transition| (transition.activity, transition.source)),
+            Some((AgentActivity::Blocked, StateSource::Screen)),
+            "{columns} columns: the popup outranks a stale idle title"
+        );
+    }
+
+    let quoted = ["1. Update now", "2. Skip", "3. Skip until next version"];
+    assert_eq!(
+        screen_activity(&definition, &dialog(&quoted), 80),
+        None,
+        "the choices without the heading are not the popup"
+    );
+    let mut buried = vec![String::from("line"); 17];
+    buried.extend(dialog(&[
+        "Update available · 0.160.0 → 0.162.1",
+        "› 1. Update now",
+        "2. Skip",
+        "3. Skip until next version",
+    ]));
+    assert_eq!(
+        screen_activity(&definition, &buried, 80),
+        None,
+        "the dialog below the first sixteen non-empty lines is not the popup"
+    );
 }
 
 #[test]

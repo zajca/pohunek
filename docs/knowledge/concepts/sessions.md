@@ -212,9 +212,13 @@ input. An older client that does not send that option keeps a 500 ms silent
 startup bound so its five-second response deadline remains usable.
 
 A runtime whose descriptor declares `[input] ready = "screen_idle"` (Claude
-Code, Pi and Hermes) is ready only when its rendered prompt shows. This applies
+Code, Pi and Hermes) is ready only when its rendered prompt shows. Codex
+declares the equally strict `ready = "manifest_idle"`: the detection
+manifest's winning evidence must be idle from the screen or the terminal
+title, so its startup update popup or a stale title cannot release the prompt
+either. This applies
 to initial input written into the terminal; a launch without a host profile of
-a runtime that takes its first prompt as an argument (Claude, Pi) passes it on
+a runtime that takes its first prompt as an argument (Claude, Pi, Codex) passes it on
 the command line and does not wait. Claude
 enables bracketed paste before its prompt box accepts input and drops earlier
 pastes, Pi enables it before it draws any screen, and Hermes discards input

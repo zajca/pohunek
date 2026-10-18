@@ -326,6 +326,14 @@ after the host's startup grace ends for a silent agent
   detection manifest counts. Declare it when the agent enables bracketed paste
   before its input accepts a paste, or discards input queued during its start,
   so the enable signal or the grace would release the input too early.
+- `ready = "manifest_idle"`: the manifest's current winning evidence must be
+  idle, from a screen region or the terminal title (idle read from OSC
+  progress never counts). This is as strict as `screen_idle` — full grace, and
+  `session_input_not_ready` plus a rollback when the deadline passes without
+  that evidence — but a title-reporting runtime such as Codex can satisfy it.
+  Declare it when the agent enables bracketed paste while a screen other than
+  its editable prompt holds it, so a popup or a stale title cannot release the
+  prompt either.
 
 The official packages declare:
 
@@ -338,7 +346,8 @@ the longer of it and the host's `input.initial_startup_grace_ms` (in
 machine but cannot shorten it below what the runtime declares. The grace is an
 upper bound, not a delay: the input is written as soon as readiness shows, and
 the full wait passes only when it never does. A client without that option
-keeps the host's grace (`screen_idle`) or the 500 ms silent-reader bound.
+keeps the host's grace (`screen_idle` and `manifest_idle`) or the 500 ms
+silent-reader bound.
 
 The official packages declare:
 
@@ -347,23 +356,28 @@ The official packages declare:
 | Claude | `screen_idle` | absent (host grace) | `live_prompt_box`: Claude drops pastes sent before its prompt box renders |
 | Pi | `screen_idle` | absent (host grace) | `idle_editor_rule`: Pi enables bracketed paste before it draws any screen |
 | Hermes | `screen_idle` | 30000 | `idle_prompt` or `tui_idle_status`: Hermes discards queued terminal input during its start, and its first start after install compiles its Python modules first |
-| Codex | absent (`bracketed_paste`) | absent (host grace) | Codex reports idle only in its terminal title, which `screen_idle` does not count (#1114) |
+| Codex | `manifest_idle` | absent (host grace) | `osc_title_idle`: Codex enables bracketed paste before its prompt reads input, and its startup update popup would take a prompt released early (#1114) |
 
-A `screen_idle` session whose screen shows no readiness by the end of that wait
-fails `session.new` with `session_input_not_ready`, nothing is written, and the
-session is rolled back. A `screen_idle` runtime gets the host's whole grace even
-from a client without `extended_input_ready_wait`. The `[input]` table is parsed
-strictly: a daemon of release 0.34.x rejects a descriptor that carries `ready`
-or `startup_grace_ms`, so a package with either key needs a daemon that knows
-it.
+A `screen_idle` or `manifest_idle` session whose screen and title show no
+readiness by the end of that wait fails `session.new` with
+`session_input_not_ready`, nothing is written, and the session is rolled back.
+A strict-readiness runtime gets the host's whole grace even from a client
+without `extended_input_ready_wait`. The `[input]` table is parsed strictly: a
+daemon of release 0.34.x rejects a descriptor that carries `ready` or
+`startup_grace_ms`, so a package with either key needs a daemon that knows it.
 
-Readiness is `screen_idle` only while the effective detection manifest has an
-idle rule on a screen region (for example `live_prompt_box`). A host profile
-over a `screen_idle` base whose override manifest has no such rule, such as
+A runtime definition declaring `screen_idle` requires a screen idle rule
+(for example `live_prompt_box`); `manifest_idle` requires an idle rule on the
+screen or terminal title (for example Codex's `osc_title_idle`). Profile
+overrides follow different policies: a host profile over a
+`screen_idle` base whose override manifest has no such rule, such as
 `rules = []` or only working and blocked rules, loads, and its sessions use
-`bracketed_paste` readiness. `pohunek doctor` reports that profile as a warning
-(`agent_profile_<name>`); adding an idle rule on a screen region to the
-override restores screen readiness.
+`bracketed_paste` readiness; `pohunek doctor` reports that profile as a
+warning (`agent_profile_<name>`), and adding an idle rule on a screen region
+to the override restores screen readiness. A `manifest_idle` base never
+downgrades this way: an override manifest without an eligible idle rule keeps
+the strict readiness, so the input is refused instead of released by a signal
+the runtime did not declare.
 
 ## Versioning official packages
 

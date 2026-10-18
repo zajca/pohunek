@@ -136,6 +136,29 @@ impl Manifest {
         })
     }
 
+    /// Whether an idle rule can satisfy manifest-based input readiness.
+    ///
+    /// `manifest_idle` accepts screen text and terminal titles. OSC progress
+    /// stays ineligible, so a progress report alone cannot release a prompt.
+    #[must_use]
+    pub fn has_manifest_idle_rule(&self) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.activity == AgentActivity::Idle
+                && matches!(
+                    rule.region,
+                    ManifestRegion::OscTitle
+                        | ManifestRegion::WholeRecent
+                        | ManifestRegion::BottomLines(_)
+                        | ManifestRegion::BottomNonEmptyLines(_)
+                        | ManifestRegion::TopNonEmptyLines(_)
+                        | ManifestRegion::LastNonEmptyAbovePromptBox
+                        | ManifestRegion::AfterLastPromptMarker
+                        | ManifestRegion::PromptBoxBody
+                        | ManifestRegion::AfterLastHorizontalRule
+                )
+        })
+    }
+
     /// Returns process matchers when this manifest declares `[process]`.
     #[must_use]
     pub fn process_matchers(&self) -> Option<&ProcessMatchers> {

@@ -302,16 +302,23 @@ impl Detector {
     /// Whether terminal output identifies an editable agent input reader.
     #[must_use]
     pub fn input_ready(&self) -> bool {
-        let screen_idle = || {
+        // Manifest-based readiness uses the winning evidence from the full
+        // current context: a visible blocker (such as a startup update popup)
+        // outranks a stale idle title, and no evidence at all — the gap before
+        // the agent's first title — is never readiness.
+        let idle_from_manifest = || {
             self.manifest_evidence(ContextFreshness::all())
-                .is_some_and(|evidence| {
-                    evidence.activity == AgentActivity::Idle
-                        && evidence.source == StateSource::Screen
-                })
+                .filter(|evidence| evidence.activity == AgentActivity::Idle)
+                .map(|evidence| evidence.source)
         };
+        let screen_idle =
+            || idle_from_manifest().is_some_and(|source| source == StateSource::Screen);
         match self.input_readiness {
             InputReadiness::BracketedPaste => self.screen.bracketed_paste() || screen_idle(),
             InputReadiness::ScreenIdle => screen_idle(),
+            InputReadiness::ManifestIdle => idle_from_manifest().is_some_and(|source| {
+                matches!(source, StateSource::Screen | StateSource::OscTitle)
+            }),
         }
     }
 

@@ -78,7 +78,9 @@ early when the agent signals an editable prompt or enables bracketed paste; it
 only delays silent startups. For
 a runtime that declares `ready = "screen_idle"` (Claude, Pi, Hermes) only the
 rendered prompt ends it, and a session still unready at the end of the grace fails
-with `session_input_not_ready`.
+with `session_input_not_ready`; Codex declares the equally strict
+`ready = "manifest_idle"`, where the manifest's winning idle evidence from the
+screen or the terminal title ends it.
 The write stall bound restarts after every byte the PTY accepts, so it bounds a
 stalled reader, not a long input. A write that exceeds it fails with
 `session_input_stalled`, possibly after part of the input was written; a

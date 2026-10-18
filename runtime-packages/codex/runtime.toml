@@ -6,7 +6,7 @@
 
 schema = 1
 id = "pohunek.runtime.codex"
-version = "1.1.1"
+version = "1.2.0"
 runtime_api = 1
 
 [runtime]
@@ -21,11 +21,17 @@ prompt_arg = true
 version_probe = { parser = "semver-line-v1", args = ["--version"], min = "0.160.0", below = "1.0.0", line = "codex-cli {version}" }
 
 # Codex enables bracketed paste in its terminal UI; the submit key is a
-# separate Enter written after the paste.
+# separate Enter written after the paste. `ready = "manifest_idle"` holds the
+# initial prompt until the manifest's winning evidence is idle from the
+# terminal title or the screen: Codex enables bracketed paste long before its
+# prompt reads input, and its startup update popup would take a prompt
+# released by the paste signal (or by a stale idle title) into its choices
+# (#1114).
 [input]
 bracketed_paste = true
 submit_delay_ms = 150
 text_policy = "unrestricted"
+ready = "manifest_idle"
 
 [resume]
 supported = true

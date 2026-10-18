@@ -15,6 +15,9 @@
 #   screen.
 # - folder_trust_prompt: the folder trust dialog Codex 0.160 shows for a
 #   working directory with a project-local .codex/config.toml.
+# - startup_update_prompt: the update popup Codex 0.160 draws over the screen
+#   at startup when a newer release is available; its capture lives in
+#   compat/codex/screens/update-popup/.
 # - live_strong_blocker and weak_blocker: confirmation prompts on screen.
 
 [process]
@@ -68,6 +71,29 @@ all = [
   { line_regex = ['(?i)^\s*trust this folder\?'] },
   { line_regex = ['(?i)^\s*(?:›|❯)?\s*1\.\s*trust and continue\s*$'] },
   { line_regex = ['(?i)^\s*(?:›|❯)?\s*2\.\s*back to agent command\b'] },
+]
+
+# The startup update popup covers the whole screen while Codex checks for a
+# newer release at startup (measured at 80, 100 and 160 columns; captures in
+# compat/codex/screens/update-popup/). The popup sets no terminal title, and a
+# title set before it — or after it — stays idle-looking, so this screen rule
+# must outrank the title's idle evidence: the prompt a `manifest_idle` runtime
+# writes is only released when the winning evidence is idle, and this blocker
+# wins while the popup holds. Requiring the heading and all three choices
+# keeps transcript prose that merely discusses an update from reading as the
+# popup; the `(runs npm install ...)` suffix of the first choice may wrap at
+# narrow widths, so only its head is matched.
+[[rules]]
+id = "startup_update_prompt"
+state = "blocked"
+priority = 1000
+region = "top_non_empty_lines(16)"
+visible_blocker = true
+all = [
+  { line_regex = ['(?i)^\s*update available\b'] },
+  { line_regex = ['(?i)^\s*(?:›|❯)?\s*1\.\s*update now\b'] },
+  { line_regex = ['(?i)^\s*(?:›|❯)?\s*2\.\s*skip\s*$'] },
+  { line_regex = ['(?i)^\s*(?:›|❯)?\s*3\.\s*skip until next version\s*$'] },
 ]
 
 [[rules]]

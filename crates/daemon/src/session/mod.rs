@@ -3108,15 +3108,17 @@ impl SessionRegistry {
     ///
     /// For a [`InputReadiness::BracketedPaste`] session an unobserved
     /// readiness is not an error: the prompt is written once the wait ends,
-    /// because a silent agent may still read it. For a [`InputReadiness::ScreenIdle`]
-    /// session the wait gets the full configured grace, since its readiness
-    /// has no silent-reader fallback, and only observed readiness releases the
+    /// because a silent agent may still read it. For a strict readiness
+    /// ([`InputReadiness::ScreenIdle`] or [`InputReadiness::ManifestIdle`])
+    /// the wait gets the full configured grace, since its readiness has no
+    /// silent-reader fallback, and only observed readiness releases the
     /// prompt.
     ///
     /// # Errors
     ///
-    /// Returns `session_input_not_ready` for a `ScreenIdle` session whose wait
-    /// ended by the deadline or by daemon shutdown rather than by readiness.
+    /// Returns `session_input_not_ready` for a strict-readiness session whose
+    /// wait ended by the deadline or by daemon shutdown rather than by
+    /// readiness.
     async fn await_initial_input_readiness(
         &self,
         session_id: &SessionId,
@@ -3136,7 +3138,10 @@ impl SessionRegistry {
                     .and_then(|definition| definition.startup_grace()),
             )
         };
-        let strict = readiness == InputReadiness::ScreenIdle;
+        let strict = matches!(
+            readiness,
+            InputReadiness::ScreenIdle | InputReadiness::ManifestIdle
+        );
         let configured = self.inner.config.initial_input_startup_grace;
         // Only a client that opted into the extended wait has a response budget
         // for a runtime's longer declared grace.

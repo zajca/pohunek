@@ -316,6 +316,13 @@ pub enum InputReadiness {
     /// Without that evidence by the grace deadline, the launch fails and
     /// nothing is written.
     ScreenIdle,
+    /// The winning manifest rule reports idle from screen text or title.
+    ///
+    /// Bracketed paste and startup grace never qualify. A visible blocker
+    /// takes precedence over an idle title; without eligible evidence the
+    /// launch fails and writes nothing. Profile overrides keep this strict
+    /// policy even when they contain no eligible idle rule.
+    ManifestIdle,
 }
 
 impl InputReadiness {
@@ -325,7 +332,10 @@ impl InputReadiness {
     /// region; without one it could never be observed, so the session gets
     /// `BracketedPaste`, the readiness of a runtime that declares none. A host
     /// profile's override manifest is the case this covers: a runtime's own
-    /// manifest is checked by [`RuntimeDefinition::new`].
+    /// manifest is checked by [`RuntimeDefinition::new`]. `ManifestIdle` never
+    /// downgrades: an override manifest without an eligible idle rule keeps
+    /// the strict readiness, so a prompt is refused rather than released by a
+    /// weaker signal the runtime did not declare.
     #[must_use]
     pub fn for_manifest(self, manifest: &Manifest) -> Self {
         match self {
@@ -407,8 +417,9 @@ impl RuntimeDefinition {
     ///
     /// Returns a [`DefinitionError`] for an empty or oversized label, program
     /// or argument, a control character in any of them, too many arguments, or
-    /// a `ScreenIdle` readiness whose manifest has no idle rule on a screen
-    /// region, since the readiness would then never be observed.
+    /// a `ScreenIdle` or `ManifestIdle` readiness whose manifest has no idle
+    /// rule on a region that readiness reads, since it would then never be
+    /// observed.
     pub fn new(parts: DefinitionParts) -> Result<Self, DefinitionError> {
         let DefinitionParts {
             runtime_id,
@@ -428,12 +439,7 @@ impl RuntimeDefinition {
         } = parts;
         validate_version_probe(version_probe_parser.as_ref(), version_probe_policy.as_ref())?;
         validate_identity_invariants(&runtime_id, &origin, &program)?;
-        if input_readiness == InputReadiness::ScreenIdle && !manifest.has_screen_idle_rule() {
-            return Err(DefinitionError::Field {
-                field: "input.ready",
-                reason: "screen_idle requires a manifest idle rule on a screen region",
-            });
-        }
+        validate_input_readiness(input_readiness, &manifest)?;
         validate_integration(integration.as_ref(), &origin)?;
         validate_label(&display_name, "runtime.name")?;
         validate_token(program.as_str(), "runtime.program")?;
@@ -874,6 +880,31 @@ fn validate_integration(
     Ok(())
 }
 
+/// Rejects a declared readiness the manifest can never report: `screen_idle`
+/// needs an idle rule on a screen region, `manifest_idle` one on a screen or
+/// title region. Without it the readiness would never be observed and every
+/// strict create would time out.
+fn validate_input_readiness(
+    readiness: InputReadiness,
+    manifest: &Manifest,
+) -> Result<(), DefinitionError> {
+    match readiness {
+        InputReadiness::ScreenIdle if !manifest.has_screen_idle_rule() => {
+            Err(DefinitionError::Field {
+                field: "input.ready",
+                reason: "screen_idle requires a manifest idle rule on a screen region",
+            })
+        }
+        InputReadiness::ManifestIdle if !manifest.has_manifest_idle_rule() => {
+            Err(DefinitionError::Field {
+                field: "input.ready",
+                reason: "manifest_idle requires a manifest idle rule on a screen or title region",
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 /// A parser that takes a supported-version policy requires one whose output
 /// grammar it reads, and every other parser must not carry one.
 fn validate_version_probe(
@@ -1142,6 +1173,7 @@ enum RawInputReadiness {
     #[default]
     BracketedPaste,
     ScreenIdle,
+    ManifestIdle,
 }
 
 impl RawInputReadiness {
@@ -1149,6 +1181,7 @@ impl RawInputReadiness {
         match self {
             Self::BracketedPaste => InputReadiness::BracketedPaste,
             Self::ScreenIdle => InputReadiness::ScreenIdle,
+            Self::ManifestIdle => InputReadiness::ManifestIdle,
         }
     }
 }
