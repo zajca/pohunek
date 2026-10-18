@@ -257,7 +257,11 @@ fn spawn_lock_holder(root: &Path, state: &Path) -> LockHolder {
     let env = TestEnv::new().expect("create the lock holder environment");
     let child = env
         .command(std::env::current_exe().expect("test executable"))
-        .args(["--exact", "lock_holder_process", "--nocapture"])
+        .args(pohunek_test_support::exact_test_filter(
+            module_path!(),
+            "lock_holder_process",
+        ))
+        .arg("--nocapture")
         .env("POHUNEK_HOST_LOCK_HELPER_STATE", state)
         .env("POHUNEK_HOST_LOCK_HELPER_READY", &ready)
         .env("POHUNEK_HOST_LOCK_HELPER_RELEASE", &release)

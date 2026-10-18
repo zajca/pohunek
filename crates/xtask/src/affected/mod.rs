@@ -379,11 +379,11 @@ const RULES: &[Rule] = &[
             "xtask",
             "binary(=hermetic_scan) | binary(=no_special_dispatch) | \
              binary(=test_artifact_lookup_guard) | binary(=timing_ratchet) | \
-             binary(=dependency_policy) | \
+             binary(=exact_filter_guard) | binary(=dependency_policy) | \
              (binary(=affected_ci) and test(=every_repository_read_of_the_test_code_selects_its_reader)) | \
              (kind(lib) and test(/^affected::tests::/))",
         )]),
-        "every crate's sources and manifests, scanned by xtask's repository guards (hermetic_scan, no_special_dispatch, test_artifact_lookup_guard, timing_ratchet, the affected guard and include scan) and resolved by its dependency_policy test",
+        "every crate's sources and manifests, scanned by xtask's repository guards (hermetic_scan, no_special_dispatch, test_artifact_lookup_guard, timing_ratchet, exact_filter_guard, the affected guard and include scan) and resolved by its dependency_policy test",
     ),
     rule(
         Pattern::Dir("runtime-packages"),

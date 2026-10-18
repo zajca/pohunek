@@ -17,10 +17,10 @@ use std::path::{Path, PathBuf};
 
 use pohunek_test_support::env::TestEnv;
 
-use crate::hermes_provider::{self, Exchanges, HermesProvider};
-use crate::messages_stub::{self, MessagesStub};
-use crate::model_stub::{self, ModelStub};
-use crate::responses_stub::{self, ResponsesStub};
+use super::hermes_provider::{self, Exchanges, HermesProvider};
+use super::messages_stub::{self, MessagesStub};
+use super::model_stub::{self, ModelStub};
+use super::responses_stub::{self, ResponsesStub};
 
 /// Mode of a profile file and of the profile directory.
 const PROFILE_MODE: u32 = 0o600;

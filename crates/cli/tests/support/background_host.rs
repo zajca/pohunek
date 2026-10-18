@@ -3,7 +3,7 @@
 //!
 //! The daemon serves `claude` from the official Claude package, its only
 //! source, which is installed into the daemon's plugin root before the daemon
-//! starts (`crate::official_runtimes`, the daemon tests' catalog fixture); the
+//! starts (`super::official_runtimes`, the daemon tests' catalog fixture); the
 //! agent profile is pinned to it and the fake agent answers its version probe.
 //!
 //! The fake agent is the PTY child of its session. It runs the installed
@@ -89,7 +89,7 @@ done
 fn fake_agent() -> String {
     format!(
         "#!/bin/sh\n{}{FAKE_AGENT}",
-        crate::official_runtimes::sh_version_answer("claude")
+        super::official_runtimes::sh_version_answer("claude")
     )
 }
 
@@ -106,7 +106,7 @@ fn install_official_packages(env: &TestEnv) {
         .enable_all()
         .build()
         .expect("a runtime for the package install")
-        .block_on(crate::official_runtimes::OfficialCatalog::new().preinstall(&plugins, &scratch));
+        .block_on(super::official_runtimes::OfficialCatalog::new().preinstall(&plugins, &scratch));
 }
 
 /// A running daemon with its hermetic environment, the CLI and the captured
@@ -147,7 +147,7 @@ impl Host {
              CLAUDE_CONFIG_DIR = \"{}\"\nFAKE_AGENT_HOOKS = \"{}\"\n\
              FAKE_AGENT_INPUTS = \"{}\"\nPATH = \"{path}\"\n\n\
              [input_rules]\nbracketed_paste = false\n",
-            crate::official_runtimes::profile_pin("claude"),
+            super::official_runtimes::profile_pin("claude"),
             agent.display(),
             claude_home.display(),
             claude_home.join(HOOKS_DIR).display(),

@@ -240,7 +240,8 @@ digest.
   it after `session stop`. Run it with the provisioned stage's executable:
   `POHUNEK_HERMES_E2E=1 POHUNEK_HERMES_BIN=<abs>/venv/bin/hermes
   POHUNEK_PYTHON_BIN=<abs>/venv/bin/python cargo nextest run --profile package
-  -p pohunek-cli --test hermes_package --run-ignored all --test-threads 1`.
+  -p pohunek-cli --test all -E 'test(/^hermes_package::/)' --run-ignored all
+  --test-threads 1`.
   Without the variables it fails by name instead of skipping.
 - `cargo xtask hermes compatibility --bin-dir ABS --package ARCHIVE` is the
   model-free gate of the pinned release: it installs this archive through a

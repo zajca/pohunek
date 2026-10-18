@@ -16,24 +16,24 @@
   },
   "allowed": [
     {
-      "binaries": ["pohunek-cli::pi_package"],
+      "binaries": ["pohunek-cli::all"],
       "sources": ["nextest-junit-cli", "package-junit-pi"],
-      "reason": "the package job exports POHUNEK_PI_PACKAGE_ARCHIVE, which switches the fixture from the in-process archive to the supplied one; the shard keeps the in-process path until the per-test audit of #1226 settles it"
+      "reason": "the package job exports POHUNEK_PI_PACKAGE_ARCHIVE, which switches the pi_package module of all from the in-process archive to the supplied one; the cli shard keeps the in-process path until the per-test audit of #1226 settles it"
     },
     {
-      "binaries": ["pohunek-cli::claude_package"],
+      "binaries": ["pohunek-cli::all"],
       "sources": ["nextest-junit-cli", "package-junit-claude"],
-      "reason": "the package job runs the binary under its real-runtime environment; the shard's run of the non-ignored tests stays until the per-test audit of #1226 settles it"
+      "reason": "the package job runs the claude_package module of all under its real-runtime environment; the cli shard's run of the module's non-ignored tests stays until the per-test audit of #1226 settles it"
     },
     {
-      "binaries": ["pohunek-cli::codex_package"],
+      "binaries": ["pohunek-cli::all"],
       "sources": ["nextest-junit-cli", "package-junit-codex"],
-      "reason": "the package job runs the binary under its real-runtime environment; the shard's run of the non-ignored tests stays until the per-test audit of #1226 settles it"
+      "reason": "the package job runs the codex_package module of all under its real-runtime environment; the cli shard's run of the module's non-ignored tests stays until the per-test audit of #1226 settles it"
     },
     {
-      "binaries": ["pohunek-cli::hermes_package"],
+      "binaries": ["pohunek-cli::all"],
       "sources": ["nextest-junit-heavy", "package-junit-hermes"],
-      "reason": "the package job runs the binary under its real-runtime environment; the shard's run of the non-ignored tests stays until the per-test audit of #1226 settles it"
+      "reason": "the package job runs the hermes_package module of all under its real-runtime environment; the heavy shard's run of the module's non-ignored tests stays until the per-test audit of #1226 settles it"
     }
   ]
 }

@@ -12,8 +12,8 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use crate::release_env::BINARIES;
-use crate::release_layout::Layout;
+use super::release_env::BINARIES;
+use super::release_layout::Layout;
 
 /// Schema version of the report document.
 pub(crate) const REPORT_SCHEMA: u64 = 1;

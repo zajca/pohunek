@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "pohunek CLI: controls the host daemon over the local control protocol."
+# The integration tests are listed below, so no file under tests/ becomes a
+# test binary of its own by accident.
+autotests = false
 
 [[bin]]
 name = "pohunek"
@@ -64,6 +67,18 @@ pohunek-logging = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+[[test]]
+name = "release_consumer"
+path = "tests/release_consumer.rs"
+
+[[test]]
+name = "release_upgrade"
+path = "tests/release_upgrade.rs"
 
 [dev-dependencies]
 # Enables `test-util` for this package's own integration tests.

@@ -345,6 +345,32 @@ pub fn bin_exe(name: &str) -> PathBuf {
     }
 }
 
+/// Returns the libtest arguments that select exactly one test of this binary.
+///
+/// For a test that re-runs its own test executable to select test `leaf`
+/// of the module the caller is in: pass `module_path!()` as `module_path`.
+/// libtest names a test by its path below the crate root, so the first segment
+/// of `module_path` (the test crate itself) is dropped. The result is right
+/// both when a test file is its own test binary and when it is a module of a
+/// larger one; a bare `--exact <leaf>` matches nothing in the second case.
+///
+/// # Examples
+///
+/// ```
+/// let filter = pohunek_test_support::exact_test_filter("all::service_lock", "probe");
+/// assert_eq!(filter, ["--exact", "service_lock::probe"]);
+/// let filter = pohunek_test_support::exact_test_filter("service_lock", "probe");
+/// assert_eq!(filter, ["--exact", "probe"]);
+/// ```
+#[must_use]
+pub fn exact_test_filter(module_path: &str, leaf: &str) -> [String; 2] {
+    let name = match module_path.split_once("::") {
+        Some((_crate_root, modules)) => format!("{modules}::{leaf}"),
+        None => leaf.to_owned(),
+    };
+    ["--exact".to_owned(), name]
+}
+
 /// Returns the path of the `pohunek-sessiond` session worker binary.
 ///
 /// `POHUNEK_WORKER_BIN`, when set, is returned unchanged. Otherwise the worker

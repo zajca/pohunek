@@ -32,7 +32,7 @@ use pohunek_test_support::workers::WorkerGuard;
 use pohunek_test_support::{bin_exe, worker_binary};
 use serde_json::Value;
 
-use crate::workflow_units::{native, Managed, Plugin, KNOBS};
+use self::workflow_units::{native, Managed, Plugin, KNOBS};
 use pohunek_platform::supervisor::{PluginUnitKey, PluginUnitKind};
 
 /// Plugin id of every scenario.

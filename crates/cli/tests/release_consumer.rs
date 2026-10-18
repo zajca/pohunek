@@ -611,12 +611,11 @@ check = "none"
         command
             .args(["-c", "umask 0002; exec \"$0\" \"$@\""])
             .arg(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                "guards::layout_under_umask_0002_child",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args(pohunek_test_support::exact_test_filter(
+                module_path!(),
+                "layout_under_umask_0002_child",
+            ))
+            .args(["--nocapture", "--test-threads=1"])
             .env(UMASK_CHILD_VAR, "1");
         assert_child_succeeds(command, "the child under umask 0002");
     }
@@ -718,12 +717,11 @@ check = "none"
         let mut command =
             std::process::Command::new(std::env::current_exe().expect("test executable"));
         command
-            .args([
-                "--exact",
-                "guards::relative_input_child",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args(pohunek_test_support::exact_test_filter(
+                module_path!(),
+                "relative_input_child",
+            ))
+            .args(["--nocapture", "--test-threads=1"])
             .current_dir(fixture.path())
             .env(RELATIVE_CHILD_VAR, "1");
         assert_child_succeeds(command, "the relative-path child");

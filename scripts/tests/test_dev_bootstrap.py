@@ -1430,16 +1430,16 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         if IS_LINUX:
             self.assertEqual(
                 [check["command"] for check in focused],
-                [build, "POHUNEK_SYSTEMD_E2E=1 cargo test <suite> -- --ignored --test-threads 1"],
+                [build, "POHUNEK_SYSTEMD_E2E=1 cargo test <suite> --ignored --test-threads 1"],
             )
             # The note names each suite the way `real systemd supervision`
             # selects it.
-            for suite in ("-p pohunek-platform --test systemd",
-                          "-p pohunek-daemon --test systemd_durable_worker",
-                          "-p pohunek-cli --test service_systemd",
-                          "-p pohunek-daemon --test supervised_lifecycle",
-                          "-p pohunek-cli --test service_upgrade",
-                          "-p pohunek-cli --test workflow_systemd"):
+            for suite in ("-p pohunek-platform --test systemd --",
+                          "-p pohunek-daemon --test systemd_durable_worker --",
+                          "-p pohunek-cli --test all -- service_systemd::",
+                          "-p pohunek-daemon --test supervised_lifecycle --",
+                          "-p pohunek-cli --test all -- service_upgrade::",
+                          "-p pohunek-cli --test all -- workflow_systemd::"):
                 self.assertIn(f"`{suite}`", focused[1]["note"])
             # The other OS's suites are reported once, as the ci-only row.
             self.assertEqual(

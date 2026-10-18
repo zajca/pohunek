@@ -330,11 +330,12 @@ fn worker_id(generation: &str) -> ServiceId {
 }
 
 fn fixture_spec(root: &Path, mode: &str) -> JobSpec {
+    let exact = pohunek_test_support::exact_test_filter(module_path!(), "fixture_entry");
     JobSpec {
         executable: std::env::current_exe().expect("test executable"),
         arguments: vec![
-            "fixture_entry".to_owned(),
-            "--exact".to_owned(),
+            exact[0].clone(),
+            exact[1].clone(),
             "--ignored".to_owned(),
             "--test-threads=1".to_owned(),
             format!("{FIXTURE_MARKER}{mode}"),

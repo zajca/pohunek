@@ -20,8 +20,8 @@ use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::wait::poll_until;
 use serde_json::Value;
 
-use crate::release_bounded::{run as run_bounded, CLI_TIMEOUT};
-use crate::release_layout::Layout;
+use super::release_bounded::{run as run_bounded, CLI_TIMEOUT};
+use super::release_layout::Layout;
 
 /// Shell the daemon hands to terminal sessions; the sessions of this suite
 /// launch agents directly, so it only has to exist.

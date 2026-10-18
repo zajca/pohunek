@@ -275,6 +275,11 @@ pub(crate) const SCANS: &[(&str, &[&str], &str)] = &[
         "scan of every crate's Rust sources",
     ),
     (
+        "crates/xtask/tests/exact_filter_guard.rs",
+        &["crates"],
+        "scan of every crate's Rust sources for literal --exact test filters",
+    ),
+    (
         "crates/xtask/tests/timing_ratchet.rs",
         &["crates"],
         "scan of every crate's Rust sources against the timing baseline",

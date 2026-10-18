@@ -204,8 +204,10 @@ impl Scenario {
                 // The holder ignores hangup and termination, so only
                 // `SIGKILL` ends it; fd 3 keeps the PTY slave open in it while
                 // libtest's own output goes to /dev/null.
+                let [exact, holder_test] =
+                    pohunek_test_support::exact_test_filter(module_path!(), HOLDER_TEST);
                 let launch = format!(
-                    "(trap '' TERM; exec setsid '{image}' --exact {HOLDER_TEST} --ignored {HOLDER_MARKER} {mode} '{barrier}' '{ready}' 3>&1 </dev/null >/dev/null 2>&1) &",
+                    "(trap '' TERM; exec setsid '{image}' {exact} {holder_test} --ignored {HOLDER_MARKER} {mode} '{barrier}' '{ready}' 3>&1 </dev/null >/dev/null 2>&1) &",
                     image = image.display(),
                     barrier = barrier.display(),
                     ready = ready.display(),

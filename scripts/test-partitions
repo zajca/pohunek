@@ -104,7 +104,7 @@ MACOS_BUCKETS = {
         ("xtask", "pohunek-cli"),
         " or ".join((
             "(package(=xtask) and test(/(^|::)(survey_hermetic_violations|regenerate_allow_list|regenerate_timing_baseline)$/))",
-            "(package(=pohunek-cli) and binary(=claude_package) and test(/^capture_the_real_claude_/))",
+            "(package(=pohunek-cli) and binary(=all) and test(/^claude_package::capture_the_real_claude_/))",
         )),
     ),
     # Real-upstream tests of the runtime packages. The Linux package jobs run
@@ -112,9 +112,8 @@ MACOS_BUCKETS = {
     # `hermes_package` with `--include-ignored`.
     "owned-elsewhere": Bucket(
         ("pohunek-cli",),
-        "package(=pohunek-cli) and (binary(=claude_package) or binary(=codex_package) "
-        "or binary(=pi_package) or binary(=hermes_package)) "
-        "and not test(/^capture_the_real_claude_/)",
+        "package(=pohunek-cli) and binary(=all) and test(/^(claude|codex|pi|hermes)_package::/) "
+        "and not test(/^claude_package::capture_the_real_claude_/)",
     ),
 }
 # Tests another macOS job runs in the same workflow run, by job, as the exact
@@ -122,12 +121,12 @@ MACOS_BUCKETS = {
 # them out with `--skip-owned-by`, so no test runs twice on macOS in one run.
 # `hermes-macos` is `pinned Hermes compatibility (macOS arm64, model-free)`:
 # its harness step runs `-p xtask --lib -E 'test(hermes)'` and its package step
-# `-p pohunek-cli --test hermes_package --run-ignored all`, a superset of the
-# lane's run of that binary.
+# `-p pohunek-cli --test all -E 'test(/^hermes_package::/)' --run-ignored all`,
+# a superset of the lane's run of that module.
 OWNED_ELSEWHERE = {
     "hermes-macos": (
         "(package(=xtask) and kind(lib) and test(hermes)) or "
-        "(package(=pohunek-cli) and binary(=hermes_package))"
+        "(package(=pohunek-cli) and binary(=all) and test(/^hermes_package::/))"
     ),
 }
 # The scope of a check: its packages and the nextest selection of them.

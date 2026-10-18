@@ -19,12 +19,11 @@ fn materializing_into_a_fresh_cache_creates_its_directories_owner_private() {
             &format!("umask {PERMISSIVE_UMASK}; exec \"$0\" \"$@\""),
         ])
         .arg(std::env::current_exe().expect("test executable"))
-        .args([
-            "--exact",
+        .args(pohunek_test_support::exact_test_filter(
+            module_path!(),
             "materialize_under_a_permissive_umask_child",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        ))
+        .args(["--nocapture", "--test-threads=1"])
         .env(UMASK_CHILD_VAR, "1")
         .output()
         .expect("run the child under the permissive umask");

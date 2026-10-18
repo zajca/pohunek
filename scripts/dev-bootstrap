@@ -257,7 +257,7 @@ RELAY_DB_VARIABLE = "POHUNEK_RELAY_TEST_DATABASE_URL"
 CHILD_ENV_EXCLUDED = (RELAY_DB_VARIABLE,)
 # The real-systemd suites are `#[ignore]`d and opt in per command.
 SYSTEMD_SUITE_COMMAND = (
-    "POHUNEK_SYSTEMD_E2E=1 cargo test <suite> -- --ignored --test-threads 1"
+    "POHUNEK_SYSTEMD_E2E=1 cargo test <suite> --ignored --test-threads 1"
 )
 # `systemctl --user is-system-running` states the real-systemd CI job
 # accepts: `degraded` only means some unrelated user unit failed.
@@ -273,8 +273,7 @@ def word_list(items):
 
 
 # The real-systemd suites, `(package, test file)` in the order the CI job
-# `real systemd supervision` runs them, each as
-# `cargo test -p <package> --test <file stem>`.
+# `real systemd supervision` runs them, each selected by `suite_selector`.
 SYSTEMD_SUITE_FILES = (
     ("pohunek-platform", "crates/platform/tests/systemd.rs"),
     ("pohunek-daemon", "crates/daemon/tests/systemd_durable_worker.rs"),
@@ -287,9 +286,23 @@ SYSTEMD_SUITE_FILES = (
     ("pohunek-cli", "crates/cli/tests/workflow_reactions.rs"),
 )
 SYSTEMD_SUITES = word_list(file for _, file in SYSTEMD_SUITE_FILES)
+# Packages whose integration test files are modules of one `all` test binary.
+ONE_TEST_BINARY_PACKAGES = ("pohunek-cli",)
+
+
+def suite_selector(package, file):
+    """The `<suite>` of `cargo test` that selects the tests of one test file, up
+    to and including the `--` before libtest's arguments: the file's own test
+    binary, or the `all` binary filtered to the file's module."""
+    stem = Path(file).stem
+    if package in ONE_TEST_BINARY_PACKAGES:
+        return f"-p {package} --test all -- {stem}::"
+    return f"-p {package} --test {stem} --"
+
+
 # The `<suite>` of each real-systemd suite, as the CI job selects it.
 SYSTEMD_SUITE_SELECTORS = word_list(
-    f"`-p {package} --test {Path(file).stem}`" for package, file in SYSTEMD_SUITE_FILES
+    f"`{suite_selector(package, file)}`" for package, file in SYSTEMD_SUITE_FILES
 )
 # The packages whose tests drive the real launchd `gui/<uid>` domain, with
 # those test files. The CI job `platform contracts (arm64)` runs them from its

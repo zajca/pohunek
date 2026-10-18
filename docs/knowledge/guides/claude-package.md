@@ -451,8 +451,8 @@ established by the network namespace, not by Claude's own switches.
   `claude` binary first on `PATH`; the pid namespace keeps host processes out of
   the daemon's runtime-release scan.
 - Refreshing the screens: `POHUNEK_CLAUDE_E2E=1 POHUNEK_CLAUDE_CAPTURE_DIR=<abs
-  dir> cargo test -p pohunek-cli --test claude_package -- --ignored
-  capture_the_real_claude` records the first-run screens (needs egress) and the
+  dir> cargo test -p pohunek-cli --test all -- --ignored
+  claude_package::capture_the_real_claude` records the first-run screens (needs egress) and the
   seeded screens (run it without egress); without the directory variable the
   capture tests do nothing.
 - The `claude-package` CI job installs exactly the locked release from npm
