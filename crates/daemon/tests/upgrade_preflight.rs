@@ -521,6 +521,55 @@ async fn an_unreadable_resume_line_loses_recovery_only_when_the_record_depends_o
     );
 }
 
+#[tokio::test]
+async fn stopped_intents_keep_unreadable_resume_dependencies_blocking() {
+    for (state, desired) in [
+        ("conflict", "stopped"),
+        ("lost", "stopped"),
+        ("lost", "running"),
+    ] {
+        let host = Host::serving().await;
+        let mut dependent = pending_intent_line("s-1", "w-fixture", desired);
+        dependent["runtime"]["state"] = json!(state);
+        host.write_store(&[dependent, broken_resume_line()]);
+        let before = host.snapshot();
+
+        let report = host.report();
+
+        let code = if desired == "stopped" {
+            CODE_RESUME_RECORD_UNREADABLE
+        } else {
+            CODE_RECORD_UNREADABLE
+        };
+        assert_eq!(
+            stopped_verdict_of(&report, "s-1"),
+            (&Verdict::WouldLoseRecovery, code),
+            "a skipped projection is not proof that no recovery existed: {report:?}"
+        );
+        assert_eq!(report.at_risk().count(), 1, "{report:?}");
+        assert_eq!(host.snapshot(), before, "preflight is read-only");
+    }
+
+    // An independent embedded binding survives a skipped projection; removal
+    // retains no recovery and therefore has no dependency on that projection.
+    for (desired, embedded) in [("stopped", true), ("removed", true), ("removed", false)] {
+        let host = Host::serving().await;
+        let mut independent = served_session_line("s-1", "w-fixture");
+        independent["desired_state"] = json!(desired);
+        independent["runtime"]["state"] = json!("conflict");
+        if !embedded {
+            independent["recovery"] = Value::Null;
+        }
+        host.write_store(&[independent, broken_resume_line()]);
+        let before = host.snapshot();
+
+        let report = host.report();
+
+        assert_eq!(report.at_risk().count(), 0, "{report:?}");
+        assert_eq!(host.snapshot(), before, "preflight is read-only");
+    }
+}
+
 #[test]
 fn a_record_without_its_kind_still_names_its_live_worker() {
     let host = Host::new();
@@ -925,6 +974,50 @@ fn requested_stop_and_removal_are_nonblocking_with_dead_or_live_owned_workers() 
     }
     assert_eq!(report.at_risk().count(), 0, "{report:?}");
     assert!(report.stopped_sessions.is_empty(), "{report:?}");
+    assert_eq!(host.snapshot(), before, "preflight is read-only");
+}
+
+#[test]
+fn live_stop_and_removal_intents_still_require_a_compatible_worker_protocol() {
+    let host = Host::new();
+    let cases = [
+        ("s-1", "w-live-stop", "stopped", "live"),
+        ("s-2", "w-live-remove", "removed", "live"),
+        ("s-3", "w-dead-stop", "stopped", "dead"),
+        ("s-4", "w-dead-remove", "removed", "dead"),
+        ("s-5", "w-final-stop", "stopped", "terminal"),
+        ("s-6", "w-final-remove", "removed", "terminal"),
+    ];
+    host.write_store(
+        &cases.map(|(session, worker, desired, _)| pending_intent_line(session, worker, desired)),
+    );
+    for (session, worker, _, state) in cases {
+        let mut incompatible = journal(session, worker);
+        incompatible["protocol_minimum"] = json!(1);
+        incompatible["protocol_maximum"] = json!(2);
+        if state == "dead" {
+            incompatible["worker_pid"] = json!(i32::MAX);
+        } else if state == "terminal" {
+            incompatible["phase"] = json!("terminal");
+        }
+        host.write_journal(session, worker, &incompatible);
+    }
+    let before = host.snapshot();
+
+    let report = host.report();
+
+    for (session, _, _, state) in cases {
+        let expected = if state == "live" {
+            (&Verdict::WouldNotBeAdopted, CODE_PROTOCOL_INCOMPATIBLE)
+        } else {
+            (
+                &Verdict::Adoptable,
+                pohunek_service_config::preflight::CODE_INTENT_FINISHED,
+            )
+        };
+        assert_eq!(verdict_of(&report, session), expected, "{report:?}");
+    }
+    assert_eq!(report.at_risk().count(), 2, "{report:?}");
     assert_eq!(host.snapshot(), before, "preflight is read-only");
 }
 

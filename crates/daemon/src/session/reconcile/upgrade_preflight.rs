@@ -772,6 +772,12 @@ fn judge_stopped(
     if record.desired_state == DesiredState::Stopped {
         project_stopped_reference(&mut candidate, journals, judging.runtimes);
     }
+    if candidate.desired_state == DesiredState::Stopped
+        && candidate.recovery.is_none()
+        && (facts.resume_unreadable || facts.recovery != RecoveryOutcome::Preserved)
+    {
+        return recovery_loss(facts, &candidate, judging);
+    }
     candidate.recovery.as_ref()?;
     let capabilities = &candidate.info.capabilities;
     if !capabilities.resume && !capabilities.fork {
@@ -1676,6 +1682,9 @@ fn judge_intent(
         };
     }
     if let Some(judgement) = judge_marker(journal) {
+        return judgement;
+    }
+    if let Some(judgement) = judge_protocol(journal) {
         return judgement;
     }
     let mut candidate = record.clone();
