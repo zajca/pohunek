@@ -465,7 +465,9 @@ because the suite refuses a `TMPDIR` that makes its socket paths too long.
 Scenarios: `python3 -m unittest scripts.tests.test_smoke_archive` (synthetic
 archive and stub consumers; the `sudo` scenario is skipped where `sudo -n` is
 unavailable; on macOS the scenarios that need the isolated run are skipped
-without passwordless sudo, and the macos-15 `smoke` job runs them with
+without passwordless sudo, and the rehearsal's macOS scenario job
+(`release-smoke-scenarios.yml`, called by `ci.yml` before the rehearsal build,
+so it never waits for the bundle) runs them with
 `POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN=1`, so they cannot skip there).
 
 ## Conventions that matter here
@@ -538,7 +540,10 @@ assembles and publishes the release in one fixed flow:
    with the CI root key and writes the bundle; `attest-bundle` attests the
    bundle; `smoke` runs `packaging/smoke-archive` on every Linux daemon archive
    in a network namespace and on the Apple Silicon archive under `sandbox-exec`
-   on macos-15; `verdict` requires all of them and names every planned row that
+   on macos-15; `smoke-scenarios` calls `release-smoke-scenarios.yml` for the
+   synthetic-archive scenario suite on macos-15 (a release only: a rehearsal
+   runs that workflow from `ci.yml` and passes the result to the evidence verdict); and
+   `verdict` requires all of them and names every planned row that
    did not pass, or for which no result arrived.
 3. **Publish**: the single job with `contents: write`. It checks out nothing and
    runs no repository or downloaded code. It downloads the `release-bundle`
@@ -593,8 +598,9 @@ publish its output or feed it to `release assemble`.
 
 ### Release rehearsal
 
-`ci.yml` runs the same two reusable workflows with `mode: rehearsal`
-(`release-rehearsal-build`, `release-rehearsal`) in the nightly tier (the daily
+`ci.yml` calls the build and evidence workflows with `mode: rehearsal`
+(`release-rehearsal-build`, `release-rehearsal`) and starts the separate
+`release-rehearsal-scenarios` call alongside the build in the nightly tier (the daily
 schedule and a `tier=nightly` dispatch) and on pull requests that change the
 release workflows, `packaging/**`, `scripts/release-workflow/**`,
 `crates/xtask/**`, `compat/**`, `runtime-packages/**`, the consumer suite, the

@@ -1,11 +1,13 @@
 """Structural checks on the release workflows: one writer, no repository code in it.
 
-The release is built by three workflow files: release.yml (the tag trigger,
+The release is built by four workflow files: release.yml (the tag trigger,
 the gate, the macOS jobs, and the single `publish` job), release-build.yml
-(reusable producers) and release-evidence.yml (reusable evidence, assembly and
-smoke). The checks pin the security model (issue #150, D2):
+(reusable producers), release-evidence.yml (reusable evidence, assembly and
+smoke) and release-smoke-scenarios.yml (the synthetic-archive smoke scenarios,
+which ci.yml starts before the rehearsal build and release-evidence.yml calls
+in a release; issue #1259). The checks pin the security model (issue #150, D2):
 
-- exactly one job in the three files holds `contents: write`, the job `publish`,
+- exactly one job in the four files holds `contents: write`, the job `publish`,
   and it needs every producer and the evidence workflow;
 - `publish` and the two jobs holding the OIDC scopes (`attest`,
   `attest-bundle`) are compared against exact allowlists of actions, of
@@ -25,8 +27,10 @@ quoted keys, flow mappings, anchors, aliases, merge keys) is reported.
 
 import fnmatch
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -34,6 +38,7 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 RELEASE = WORKFLOWS / "release.yml"
 BUILD = WORKFLOWS / "release-build.yml"
 EVIDENCE = WORKFLOWS / "release-evidence.yml"
+SCENARIOS = WORKFLOWS / "release-smoke-scenarios.yml"
 CI = WORKFLOWS / "ci.yml"
 POLICY = ROOT / "packaging" / "release-policy.json"
 SCRIPTS = ROOT / "scripts" / "release-workflow"
@@ -63,6 +68,7 @@ REHEARSAL_INPUTS = {
     ".github/workflows/release.yml",
     ".github/workflows/release-build.yml",
     ".github/workflows/release-evidence.yml",
+    ".github/workflows/release-smoke-scenarios.yml",
     "packaging/**",
     "scripts/release-workflow/**",
     "scripts/tests/test_release_workflow.py",
@@ -491,11 +497,18 @@ class ReleaseWorkflowFiles(unittest.TestCase):
         cls.release = RELEASE.read_text()
         cls.build = BUILD.read_text()
         cls.evidence = EVIDENCE.read_text()
+        cls.scenarios = SCENARIOS.read_text()
         cls.ci = CI.read_text()
         cls.release_jobs = jobs(cls.release)
         cls.build_jobs = jobs(cls.build)
         cls.evidence_jobs = jobs(cls.evidence)
-        cls.texts = {"release.yml": cls.release, "release-build.yml": cls.build, "release-evidence.yml": cls.evidence}
+        cls.scenario_jobs = jobs(cls.scenarios)
+        cls.texts = {
+            "release.yml": cls.release,
+            "release-build.yml": cls.build,
+            "release-evidence.yml": cls.evidence,
+            "release-smoke-scenarios.yml": cls.scenarios,
+        }
 
 
 class WriterTests(ReleaseWorkflowFiles):
@@ -629,6 +642,7 @@ class OidcTests(ReleaseWorkflowFiles):
             workflow_violations(self.evidence, writer=None, oidc=set(OIDC_JOBS)), []
         )
         self.assertEqual(workflow_violations(self.build, writer=None, oidc=set()), [])
+        self.assertEqual(workflow_violations(self.scenarios, writer=None, oidc=set()), [])
 
     def test_the_ci_caller_runs_in_rehearsal_mode_and_never_for_forks(self):
         ci_jobs = jobs(self.ci)
@@ -648,9 +662,40 @@ class OidcTests(ReleaseWorkflowFiles):
                 self.assertNotIn("environment", block)
         self.assertIn("uses: ./.github/workflows/release-build.yml", build)
         self.assertIn("uses: ./.github/workflows/release-evidence.yml", evidence)
-        self.assertEqual(needs_of(evidence), ["changes", "release-rehearsal-build"])
+        # The evidence caller also waits for the scenario job, so that its
+        # result can travel into the verdict as `scenarios_result`.
+        self.assertEqual(needs_of(evidence), ["changes", "release-rehearsal-build", "release-rehearsal-scenarios"])
         self.assertIn("needs.release-rehearsal-build.outputs.version", evidence)
+        self.assertIn("scenarios_result: ${{ needs.release-rehearsal-scenarios.result }}", evidence)
+        # Override GitHub's implicit success() so failed/cancelled/skipped
+        # scenarios reach the evidence verdict rather than skipping it.
+        self.assertIn("    if: ${{ always() && ", evidence)
         self.assertNotRegex(self.ci, r"(?m)^  pull_request_target:")
+
+    def test_the_ci_scenario_caller_starts_before_the_build_and_the_bundle(self):
+        # D2 of #1259: the synthetic-archive scenarios read only the checkout,
+        # so their caller waits for the paths filter alone — never for the
+        # rehearsal build, the evidence workflow, or any producer job.
+        ci_jobs = jobs(self.ci)
+        caller = ci_jobs["release-rehearsal-scenarios"]
+        self.assertEqual(needs_of(caller), ["changes"])
+        self.assertIn("uses: ./.github/workflows/release-smoke-scenarios.yml", caller)
+        self.assertNotIn("release-rehearsal-build", caller)
+        self.assertNotIn("release-rehearsal:", caller)
+        self.assertNotIn("secrets", caller)
+        self.assertNotIn("environment", caller)
+        condition = re.search(r"(?m)^    if: (.*)$", caller)
+        self.assertIsNotNone(condition)
+        for term in REHEARSAL_RUN_TERMS:
+            self.assertIn(term, condition.group(1))
+        self.assertNotIn("github.event_name == 'push'", condition.group(1))
+        self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", caller)
+        self.assertIn("dependabot[bot]", caller)
+        # The scenarios workflow runs the suite on macOS and holds no secret.
+        scenarios = self.scenario_jobs["smoke-scenarios"]
+        self.assertIn("    runs-on: macos-15\n", scenarios)
+        self.assertNotIn("secrets", self.scenarios)
+        self.assertNotIn("cargo", self.scenarios)
 
     def test_ci_rehearsal_filter_covers_its_inputs(self):
         self.assertEqual(REHEARSAL_INPUTS - filter_paths(self.ci, "release_rehearsal"), set())
@@ -744,10 +789,14 @@ class SigningTests(ReleaseWorkflowFiles):
 
 class EvidenceWorkflowTests(ReleaseWorkflowFiles):
     def test_the_workflows_are_reusable_and_nothing_else(self):
-        for text, inputs in ((self.evidence, ["version", "commit", "mode", "targets"]), (self.build, ["mode", "version"])):
+        for text, inputs in (
+            (self.evidence, ["version", "commit", "mode", "targets", "scenarios_result"]),
+            (self.build, ["mode", "version"]),
+            (self.scenarios, []),
+        ):
             on_block = text.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
             self.assertEqual(re.findall(r"(?m)^  ([a-z_]+):$", on_block), ["workflow_call"])
-            self.assertEqual(re.findall(r"(?m)^      ([a-z]+):\n        description:", on_block), inputs)
+            self.assertEqual(re.findall(r"(?m)^      ([a-z_]+):\n        description:", on_block), inputs)
 
     def test_every_job_declares_its_permissions(self):
         for file, text in self.texts.items():
@@ -763,6 +812,9 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
         self.assertEqual(needs["assemble"], ["rows", "attest"])
         self.assertEqual(needs["assemble-rehearsal"], ["rows"])
         self.assertEqual(needs["smoke"], ["plan", "rows", "assemble", "assemble-rehearsal"])
+        # The scenarios read no artifact of the build, the bundle or the rows,
+        # so they start as soon as the workflow does (issue #1259, D2).
+        self.assertEqual(needs["smoke-scenarios"], [])
 
     def test_the_verdict_requires_every_other_job_of_the_mode(self):
         verdict = self.evidence_jobs["verdict"]
@@ -770,7 +822,7 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
             sorted(needs_of(verdict)), sorted(name for name in self.evidence_jobs if name != "verdict")
         )
         self.assertIn("    if: ${{ always() }}\n", verdict)
-        for name in ("plan", "rows", "attest", "assemble", "assemble-rehearsal", "attest-bundle", "smoke"):
+        for name in ("plan", "rows", "attest", "assemble", "assemble-rehearsal", "attest-bundle", "smoke", "smoke-scenarios"):
             self.assertIn(f'"{name}"', verdict)
         self.assertIn('"skipped"', verdict)
 
@@ -926,19 +978,70 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
         self.assertIn("SMOKE_TARGET: ${{ matrix.smoke_target }}", smoke)
 
     def test_smoke_runs_archive_scenarios_on_macos(self):
-        smoke = self.evidence_jobs["smoke"]
-        self.assertIn("python3 -m unittest -v scripts.tests.test_smoke_archive", smoke)
-        self.assertIn("if: runner.os == 'macOS'", smoke)
-        self.assertIn("POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN: \"1\"", smoke)
-        self.assertLess(
-            smoke.index("python3 -m unittest -v scripts.tests.test_smoke_archive"),
-            smoke.index("scripts/release-workflow/run-smoke"),
+        # D1/D2 of #1259: the synthetic-archive scenarios are their own job in
+        # their own reusable workflow, parallel to the real-archive smoke and
+        # independent of the bundle. The scenario job still runs the isolated
+        # scenarios fail-closed, and the bundle smoke no longer runs them.
+        scenarios = self.scenario_jobs["smoke-scenarios"]
+        self.assertIn("    runs-on: macos-15\n", scenarios)
+        self.assertIn("python3 -m unittest -v scripts.tests.test_smoke_archive", scenarios)
+        self.assertIn('POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN: "1"', scenarios)
+        scenario_step = scenarios.split("      - name: Run the archive smoke scenarios on macOS\n", 1)[1]
+        self.assertIn("timeout-minutes: 20", scenario_step)
+        self.assertNotIn("test_smoke_archive", self.evidence_jobs["smoke"])
+        # A release runs the scenarios from this workflow; a rehearsal runs
+        # them in ci.yml, which passes the result for the verdict to require.
+        caller = self.evidence_jobs["smoke-scenarios"]
+        self.assertIn("    if: ${{ inputs.mode == 'release' }}\n", caller)
+        self.assertIn("uses: ./.github/workflows/release-smoke-scenarios.yml", caller)
+        self.assertIn('SCENARIOS: ${{ inputs.scenarios_result }}', self.evidence_jobs["verdict"])
+
+    def verdict_mode_script(self):
+        for script in run_scripts(self.evidence_jobs["verdict"]):
+            if any("jq -e --arg mode" in line for line in script):
+                return "\n".join(script)
+        self.fail("the verdict has no jobs-of-the-mode check")
+
+    def run_verdict_mode_script(self, results, mode, scenarios=""):
+        needs = json.dumps({name: {"result": result} for name, result in results.items()})
+        return subprocess.run(
+            ["bash", "-c", self.verdict_mode_script()],
+            env={**os.environ, "NEEDS": needs, "MODE": mode, "SCENARIOS": scenarios},
+            capture_output=True,
+            text=True,
         )
-        # Verify timeout-minutes: 20 is set for the macOS smoke step
-        smoke_step_start = smoke.index("Run the archive smoke scenarios on macOS")
-        smoke_step_end = smoke.index("python3 -m unittest -v scripts.tests.test_smoke_archive")
-        smoke_step = smoke[smoke_step_start:smoke_step_end]
-        self.assertIn("timeout-minutes: 20", smoke_step)
+
+    def test_the_verdict_fails_a_phase_that_failed_cancelled_or_was_skipped(self):
+        success = {name: "success" for name in ("plan", "rows", "assemble-rehearsal", "smoke")}
+        skipped = {name: "skipped" for name in ("attest", "assemble", "attest-bundle", "smoke-scenarios")}
+        passing_rehearsal = {**success, **skipped}
+        with self.subTest(case="a passing rehearsal"):
+            self.assertEqual(self.run_verdict_mode_script(passing_rehearsal, "rehearsal", "success").returncode, 0)
+        # Any result other than success of a required phase fails, whatever
+        # the phase: the scenarios and the bundle smoke are both required.
+        for result in ("failure", "cancelled", "skipped"):
+            for phase in ("rows", "smoke"):
+                with self.subTest(case=f"rehearsal {phase} {result}"):
+                    verdict = self.run_verdict_mode_script({**passing_rehearsal, phase: result}, "rehearsal", "success")
+                    self.assertNotEqual(verdict.returncode, 0, verdict.stdout)
+        # The external scenario result is required in a rehearsal: a caller
+        # that skipped, cancelled or failed it, or never passed it, fails.
+        for scenarios in ("failure", "cancelled", "skipped", ""):
+            with self.subTest(case=f"external scenarios {scenarios or 'unset'}"):
+                verdict = self.run_verdict_mode_script(passing_rehearsal, "rehearsal", scenarios)
+                self.assertNotEqual(verdict.returncode, 0, verdict.stdout)
+
+    def test_the_verdict_fails_a_release_phase_that_did_not_pass(self):
+        release_success = {name: "success" for name in ("plan", "rows", "attest", "assemble", "attest-bundle", "smoke", "smoke-scenarios")}
+        release_success["assemble-rehearsal"] = "skipped"
+        with self.subTest(case="a passing release"):
+            self.assertEqual(self.run_verdict_mode_script(release_success, "release").returncode, 0)
+        # In a release the scenarios run here, so a skipped scenario job fails
+        # the verdict even though the caller passed no external result.
+        for result in ("failure", "cancelled", "skipped"):
+            with self.subTest(case=f"release smoke-scenarios {result}"):
+                verdict = self.run_verdict_mode_script({**release_success, "smoke-scenarios": result}, "release")
+                self.assertNotEqual(verdict.returncode, 0, verdict.stdout)
 
     def test_the_consumer_test_name_matches_the_smoke(self):
         pattern = r"consumer_test=(\S+)"

@@ -138,18 +138,20 @@ stage validation. The procedure and its limits are in
 
 ## Release workflows
 
-Three workflow files build and publish a release; the structure below is pinned
+Four workflow files build and publish a release; the structure below is pinned
 by `scripts/tests/test_release_workflow.py`.
 
 | File | Role |
 | --- | --- |
 | `release.yml` | Tag trigger, the quality gate, the macOS jobs, two calls and the single `publish` job. |
 | `release-build.yml` | Reusable producers: Linux archives in one job per target, one job over `runtime-packages/*` that then packs the SDK tarballs, and in a rehearsal one macOS job for both components. |
-| `release-evidence.yml` | Reusable evidence: rows, provenance, assembly and signing, bundle provenance, archive smoke, verdict. |
+| `release-evidence.yml` | Reusable evidence: rows, provenance, assembly and signing, bundle provenance, the archive smoke and the archive-scenario call, verdict. |
+| `release-smoke-scenarios.yml` | Reusable synthetic-archive scenario suite on macos-15: `ci.yml` calls it before the rehearsal build, `release-evidence.yml` calls it in a release. |
 
-`ci.yml` calls the two reusable files with `mode: rehearsal` (jobs
-`release-rehearsal-build`, `release-rehearsal`); `release.yml` calls them with
-`mode: release`.
+`ci.yml` calls the build and evidence workflows with `mode: rehearsal` (jobs
+`release-rehearsal-build` and `release-rehearsal`) and starts the separate
+`release-rehearsal-scenarios` call alongside the build. `release.yml` calls the
+build and evidence workflows with `mode: release`; evidence calls the scenarios.
 
 ### Flow
 

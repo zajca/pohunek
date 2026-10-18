@@ -216,6 +216,11 @@ MACOS_CALLED_JOBS = {
         "jobs": {"rows"},
         "filter": "release_rehearsal",
     },
+    "release-rehearsal-scenarios": {
+        "workflow": "release-smoke-scenarios.yml",
+        "jobs": {"smoke-scenarios"},
+        "filter": "release_rehearsal",
+    },
 }
 
 
@@ -327,13 +332,14 @@ def evaluate_condition(
 ) -> bool:
     """Evaluate a job's `if:` in Python for the operators it may use.
 
-    Only `!cancelled()`, `github.event_name`, `inputs.tier`, the `changes`
+    Only `always()`, `!cancelled()`, `github.event_name`, `inputs.tier`, the `changes`
     job's `outputs.<name>`, the selector's `result` and `outputs.<name>`,
     string literals, `==`, `!=`, `&&`, `||` and parentheses are understood;
     anything else fails the translation. A missing output reads as the empty
     string and string comparison ignores case, as in GitHub Actions.
     """
-    python = expression.replace("!cancelled()", "(not cancelled)")
+    python = expression.replace("always()", "('always' == 'always')")
+    python = python.replace("!cancelled()", "(not cancelled)")
     python = python.replace("github.event_name", "event")
     python = python.replace("inputs.tier", "tier")
     python = python.replace(f"needs.{PACKAGE_SELECTOR}.result", "result")
@@ -726,8 +732,9 @@ class CiTierWorkflowTests(unittest.TestCase):
 # The reusable workflows the release rehearsal runs (issue #1207). Push to main
 # never runs the rehearsal, so a pull request that changes one of their inputs
 # must start it through the `release_rehearsal` filter; an input outside the
-# filter is caught only by the nightly tier.
-REHEARSAL_WORKFLOWS = ("release-build.yml", "release-evidence.yml")
+# filter is caught only by the nightly tier. The scenario workflow is called
+# from ci.yml itself and, in a release, from release-evidence.yml (#1259).
+REHEARSAL_WORKFLOWS = ("release-build.yml", "release-evidence.yml", "release-smoke-scenarios.yml")
 # Inputs the rehearsal reads that the filter deliberately leaves out, with the
 # reason. Each would start the rehearsal (about 30 jobs, 7-8 on macOS) on most
 # pull requests; a failure only the rehearsal sees in them surfaces in the
