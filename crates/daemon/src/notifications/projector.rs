@@ -264,6 +264,41 @@ fn is_terminal_kind(kind: NotificationKind) -> bool {
     )
 }
 
+/// Whether a deleted record can carry terminal replay evidence.
+pub(super) fn is_terminal_tombstone(record: &protocol::NotificationRecord) -> bool {
+    record.status == protocol::NotificationStatus::Deleted
+        && record.source.provider == PROJECTOR_PROVIDER
+        && is_terminal_kind(record.kind)
+        && record.session_id.is_some()
+        && record.source_id.is_some()
+}
+
+/// Whether this deleted terminal record still reports the durable runtime.
+pub(super) fn terminal_tombstone_matches(
+    record: &protocol::NotificationRecord,
+    session: &SessionInfo,
+) -> bool {
+    if !is_terminal_tombstone(record) {
+        return false;
+    }
+    let prefix = projector_source_id_prefix(&session.id, record.kind);
+    let Some(key) = record
+        .source_id
+        .as_deref()
+        .and_then(|id| id.strip_prefix(&prefix))
+        .and_then(parse_transition_key)
+    else {
+        return false;
+    };
+    match key {
+        TransitionKey::Generation(generation) => {
+            session_runtime_generation(session) == Some(generation)
+        }
+        TransitionKey::Epoch(_) => parse_timestamp(&record.created_at)
+            .is_ok_and(|created_at| epoch_keyed_record_reports_runtime(created_at, session)),
+    }
+}
+
 /// The session an event the projector derives notifications from names, with
 /// the agent activity the projector reads from it.
 fn event_subject(event: &Event) -> Option<(SessionId, Option<AgentActivity>)> {
@@ -1699,6 +1734,314 @@ mod tests {
             "a replayed terminal state does not bring back a deleted record: {:#?}",
             list(&service)
         );
+    }
+
+    fn terminal_source_store(dir: &std::path::Path) -> crate::store::Store {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Metadata authority requires the same owner-private root as production.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .expect("private source root");
+        crate::store::Store::new(dir.join(pohunek_paths::METADATA_STORE_NAME))
+    }
+
+    fn persist_terminal_source(store: &crate::store::Store, info: &SessionInfo) {
+        let record = crate::store::SessionRecord {
+            schema_version: crate::store::STORE_SCHEMA_VERSION,
+            session_id: info.id.0.clone(),
+            desired_state: crate::store::DesiredState::Stopped,
+            transaction: None,
+            info: info.clone(),
+            recovery: None,
+            native_identity_ordering: None,
+            runtime: crate::store::RuntimeRecord {
+                state: protocol::RuntimeState::Terminal,
+                worker_id: None,
+                worker_instance_id: None,
+                service_id: None,
+                generation: info
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| runtime.runtime_generation.to_string()),
+                executable: None,
+                reason: None,
+            },
+            active_agent_origin: None,
+        };
+        assert_eq!(
+            store
+                .record_session(&record)
+                .expect("persist terminal source"),
+            crate::store::SessionWriteOutcome::Applied,
+        );
+    }
+
+    fn compact_deleted_terminals(service: &NotificationService) {
+        let mut policy = service.policy();
+        policy.retention.compaction_min_actions = 1;
+        service
+            .set_policy(policy)
+            .expect("set compaction threshold");
+        service
+            .prune_retention(&protocol::NotificationRetentionParams {
+                dry_run: false,
+                status: None,
+                before: None,
+                limit: None,
+            })
+            .expect("compact deleted notifications");
+    }
+
+    fn delete_visible_terminals(service: &NotificationService) {
+        for record in list(service) {
+            service
+                .delete(NotificationDeleteParams { id: record.id })
+                .expect("delete terminal");
+        }
+    }
+
+    #[tokio::test]
+    async fn deleted_terminal_generations_survive_compaction_and_replay() {
+        let dir = temp_data_dir("terminal-compaction-replay");
+        let service = NotificationService::open(&dir).expect("open notification service");
+        enable_session_finished(&service);
+        let store = terminal_source_store(&dir);
+        let sessions = [
+            session_in_generation("s-1", SessionState::Failed, Some(1), 1),
+            session_in_generation("s-2", SessionState::Done, Some(0), 1),
+        ];
+        let mut projector = ProjectorState::default();
+        for session in &sessions {
+            persist_terminal_source(&store, session);
+            project_session_update(&mut projector, &service, session).await;
+        }
+        assert_eq!(list(&service).len(), 2);
+        // Generic source dedupe permits recreation after deletion. Multiple
+        // deleted snapshots of that same terminal source must still compact to one.
+        let error = list(&service)
+            .into_iter()
+            .find(|record| record.kind == NotificationKind::Error)
+            .expect("error record");
+        service
+            .delete(NotificationDeleteParams { id: error.id })
+            .expect("delete first error");
+        service
+            .create(NotificationCreateParams {
+                source: error.source,
+                kind: error.kind,
+                severity: error.severity,
+                title: error.title,
+                body: error.body,
+                metadata: error.metadata,
+                session_id: error.session_id,
+                agent_kind: error.agent_kind,
+                source_id: error.source_id,
+                dedupe_key: error.dedupe_key,
+                project_id: error.project_id,
+            })
+            .expect("recreate same deleted source");
+        delete_visible_terminals(&service);
+        compact_deleted_terminals(&service);
+        assert_eq!(
+            std::fs::read_to_string(service.store_path())
+                .expect("compacted log")
+                .lines()
+                .count(),
+            2
+        );
+        drop(service);
+        let service = NotificationService::open(&dir).expect("reopen compacted service");
+        let mut events = service.subscribe();
+        let mut projector = ProjectorState::default();
+        for session in &sessions {
+            project_session_update(&mut projector, &service, session).await;
+        }
+        assert!(
+            list(&service).is_empty(),
+            "compaction must not resurrect deleted terminals"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "replay emits no notification event"
+        );
+        assert!(!service
+            .inner
+            .store
+            .compact_if_needed(1)
+            .expect("repeat compaction"));
+    }
+
+    #[tokio::test]
+    async fn terminal_tombstones_are_bounded_by_current_durable_sources() {
+        let dir = temp_data_dir("terminal-compaction-bound");
+        let service = NotificationService::open(&dir).expect("open service");
+        enable_session_finished(&service);
+        let store = terminal_source_store(&dir);
+        let mut projector = ProjectorState::default();
+        let remaining = session_in_generation("s-2", SessionState::Done, Some(0), 1);
+        persist_terminal_source(&store, &remaining);
+        project_session_update(&mut projector, &service, &remaining).await;
+        for generation in 1..=4 {
+            let failed = session_in_generation("s-1", SessionState::Failed, Some(1), generation);
+            persist_terminal_source(&store, &failed);
+            // A fresh projector also exercises durable generation seeding.
+            let mut projector = ProjectorState::default();
+            project_session_update(&mut projector, &service, &failed).await;
+            assert_eq!(records_of(&service, NotificationKind::Error), 1);
+            delete_visible_terminals(&service);
+            compact_deleted_terminals(&service);
+            let log = std::fs::read_to_string(service.store_path()).expect("read compacted log");
+            assert_eq!(
+                log.lines().count(),
+                2,
+                "historical generations do not accumulate"
+            );
+            assert!(log.contains(&format!("projector:s-1:error:g{generation}")));
+            assert!(log.contains("projector:s-2:session_finished:g1"));
+        }
+        store.remove_session("s-1").expect("remove source session");
+        compact_deleted_terminals(&service);
+        let log = std::fs::read_to_string(service.store_path()).expect("read bounded log");
+        assert!(
+            !log.contains("projector:s-1:"),
+            "removed source tombstone is physically gone"
+        );
+        assert_eq!(log.lines().count(), 1);
+        drop(service);
+        let service = NotificationService::open(&dir).expect("reopen after source removal");
+        let mut events = service.subscribe();
+        let mut projector = ProjectorState::default();
+        for source in store.load_sessions().expect("remaining durable sources") {
+            project_session_update(&mut projector, &service, &source.info).await;
+        }
+        assert!(
+            list(&service).is_empty(),
+            "remaining source stays deleted after restart"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "removed source cannot resurrect on durable replay"
+        );
+        store
+            .remove_session("s-2")
+            .expect("remove remaining source");
+        compact_deleted_terminals(&service);
+        assert_eq!(
+            std::fs::metadata(service.store_path())
+                .expect("log metadata")
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_compaction_preserves_epoch_bridge() {
+        let dir = temp_data_dir("terminal-compaction-epoch");
+        let service = NotificationService::open(&dir).expect("open service");
+        let store = terminal_source_store(&dir);
+        let session = session_started_in_generation(
+            "s-1",
+            SessionState::Failed,
+            Some(1),
+            1,
+            Some("2026-07-03T10:00:00Z"),
+        );
+        persist_terminal_source(&store, &session);
+        store_epoch_keyed_error_record(&service, "2026-07-03T10:05:00Z");
+        delete_visible_terminals(&service);
+        compact_deleted_terminals(&service);
+        drop(service);
+        let service = NotificationService::open(&dir).expect("reopen compacted epoch record");
+        let mut projector = ProjectorState::default();
+        project_session_update(&mut projector, &service, &session).await;
+        assert!(
+            list(&service).is_empty(),
+            "legacy epoch key still reports this generation"
+        );
+    }
+
+    async fn compact_with_incomplete_sources(tag: &str, tail: &str) {
+        let dir = temp_data_dir(tag);
+        let service = NotificationService::open(&dir).expect("open service");
+        let store = terminal_source_store(&dir);
+        let current = session_in_generation("s-1", SessionState::Failed, Some(1), 2);
+        persist_terminal_source(&store, &current);
+        for generation in 1..=2 {
+            let mut projector = ProjectorState::default();
+            project_session_update(
+                &mut projector,
+                &service,
+                &session_in_generation("s-1", SessionState::Failed, Some(1), generation),
+            )
+            .await;
+            delete_visible_terminals(&service);
+        }
+        let path = dir.join(pohunek_paths::METADATA_STORE_NAME);
+        let metadata = std::fs::read(&path).expect("source snapshot");
+        let mut incomplete = metadata.clone();
+        incomplete.extend_from_slice(tail.as_bytes());
+        std::fs::write(&path, incomplete).expect("append rejected source data");
+        let before = std::fs::read_to_string(service.store_path()).expect("original log");
+        let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+        let _subscriber = logs.install();
+        compact_deleted_terminals(&service);
+        let compacted = std::fs::read_to_string(service.store_path()).expect("compacted log");
+        assert!(
+            compacted.len() < before.len(),
+            "history still compacts with incomplete sources"
+        );
+        assert_eq!(
+            compacted.lines().count(),
+            2,
+            "keep every terminal tombstone, not only current generation"
+        );
+        assert!(compacted.contains("projector:s-1:error:g1"));
+        assert!(compacted.contains("projector:s-1:error:g2"));
+        compact_deleted_terminals(&service);
+        assert_eq!(
+            logs.text()
+                .lines()
+                .filter(|line| line.contains("WARN"))
+                .count(),
+            1,
+            "warn once rather than once per maintenance sweep: {}",
+            logs.text()
+        );
+        drop(service);
+        let service = NotificationService::open(&dir).expect("reopen conservative compacted log");
+        let mut projector = ProjectorState::default();
+        project_session_update(&mut projector, &service, &current).await;
+        assert!(
+            list(&service).is_empty(),
+            "current terminal stays deleted after replay"
+        );
+        std::fs::write(&path, metadata).expect("repair source metadata");
+        compact_deleted_terminals(&service);
+        let repaired =
+            std::fs::read_to_string(service.store_path()).expect("bounded log after repair");
+        assert_eq!(
+            repaired.lines().count(),
+            1,
+            "complete sources restore the generation bound"
+        );
+        assert!(!repaired.contains("projector:s-1:error:g1"));
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_all_terminal_tombstones_with_rejected_metadata() {
+        compact_with_incomplete_sources(
+            "terminal-rejected-source",
+            &format!(
+                "{{\"kind\":\"future_kind\",\"schema_version\":{}}}\n",
+                crate::store::STORE_SCHEMA_VERSION
+            ),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_all_terminal_tombstones_with_torn_metadata_tail() {
+        // No newline or closing brace: a registry write stopped mid-record.
+        compact_with_incomplete_sources("terminal-torn-source", "{\"kind\":\"session\"").await;
     }
 
     /// Stores the projector's `agent_blocked` record of session `s-1` from a

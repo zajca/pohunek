@@ -60,6 +60,7 @@ const TOLERATE_TRAILING_EOF_ACTION: bool = true;
 pub(crate) struct NotificationStore {
     dir: PathBuf,
     path: PathBuf,
+    sources: crate::store::Store,
     state: Mutex<StoreState>,
 }
 
@@ -68,6 +69,7 @@ struct StoreState {
     file: File,
     records: BTreeMap<String, NotificationRecord>,
     action_count: usize,
+    source_warning_logged: bool,
 }
 
 #[derive(Debug)]
@@ -132,10 +134,12 @@ impl NotificationStore {
         Ok(Self {
             dir,
             path,
+            sources: crate::store::Store::new(data_dir.join(pohunek_paths::METADATA_STORE_NAME)),
             state: Mutex::new(StoreState {
                 file,
                 records: replayed.records,
                 action_count: replayed.action_count,
+                source_warning_logged: false,
             }),
         })
     }
@@ -187,7 +191,7 @@ impl NotificationStore {
         state.records.values().cloned().collect()
     }
 
-    /// Physically rewrite the action log to its current visible records.
+    /// Rewrite current records and bounded deleted terminal evidence atomically.
     ///
     /// Compaction is skipped below `minimum_actions` and when it would not
     /// remove an update or tombstone. The replacement file is fully flushed and
@@ -207,13 +211,18 @@ impl NotificationStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let visible_records: Vec<NotificationRecord> = state
+        let mut retained_records: Vec<NotificationRecord> = state
             .records
             .values()
             .filter(|record| record.status != NotificationStatus::Deleted)
             .cloned()
             .collect();
-        if state.action_count < minimum_actions || state.action_count <= visible_records.len() {
+        if state.action_count < minimum_actions || state.action_count <= retained_records.len() {
+            return Ok(false);
+        }
+
+        retained_records.extend(self.terminal_tombstones(&mut state));
+        if state.action_count <= retained_records.len() {
             return Ok(false);
         }
 
@@ -221,7 +230,7 @@ impl NotificationStore {
         let mut replacement = owner_private_write_options()
             .open(&temp_path)
             .map_err(|source| NotificationError::io(&temp_path, source))?;
-        for record in &visible_records {
+        for record in &retained_records {
             let mut line = serde_json::to_string(&StoreAction::Created {
                 record: record.clone(),
             })
@@ -246,14 +255,64 @@ impl NotificationStore {
             .map_err(|source| NotificationError::io(&self.path, source))?;
 
         state.file = replacement;
-        state
-            .records
-            .retain(|_, record| record.status != NotificationStatus::Deleted);
-        state.action_count = visible_records.len();
+        state.action_count = retained_records.len();
+        state.records = retained_records
+            .into_iter()
+            .map(|record| (record.id.0.clone(), record))
+            .collect();
         File::open(&self.dir)
             .and_then(|directory| directory.sync_all())
             .map_err(|source| NotificationError::io(&self.dir, source))?;
         Ok(true)
+    }
+
+    /// Select replay evidence while holding the notification-state lock.
+    fn terminal_tombstones(&self, state: &mut StoreState) -> Vec<NotificationRecord> {
+        let deleted: Vec<_> = state
+            .records
+            .values()
+            .filter(|record| super::projector::is_terminal_tombstone(record))
+            .collect();
+        if deleted.is_empty() {
+            return Vec::new();
+        }
+        // Reading before the notification lock could erase a newer generation's
+        // tombstone. Rejected metadata is uncertainty, never proof of absence.
+        let snapshot = self.sources.load_notification_sources();
+        let Some(sources) = snapshot.as_ref().ok().and_then(Option::as_ref) else {
+            if !state.source_warning_logged {
+                warn!(file.path = %self.sources.path().display(), error = ?snapshot.as_ref().err(),
+                    "notification compaction retained all terminal tombstones because source metadata is incomplete");
+                state.source_warning_logged = true;
+            }
+            return deleted.into_iter().cloned().collect();
+        };
+        let sources: BTreeMap<_, _> = sources
+            .iter()
+            .filter(|source| source.desired_state != crate::store::DesiredState::Removed)
+            .map(|source| (source.session_id.as_str(), &source.info))
+            .collect();
+        let mut terminal: BTreeMap<_, &NotificationRecord> = BTreeMap::new();
+        for record in deleted {
+            let Some(session) = record
+                .session_id
+                .as_ref()
+                .and_then(|id| sources.get(id.0.as_str()))
+            else {
+                continue;
+            };
+            if !super::projector::terminal_tombstone_matches(record, session) {
+                continue;
+            }
+            let key = (session.id.0.as_str(), record.kind.as_str());
+            let newer = terminal.get(&key).is_none_or(|existing| {
+                (&record.created_at, &record.id.0) > (&existing.created_at, &existing.id.0)
+            });
+            if newer {
+                terminal.insert(key, record);
+            }
+        }
+        terminal.into_values().cloned().collect()
     }
 
     /// Create a record or return/update a deduped visible record atomically.

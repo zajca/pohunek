@@ -928,6 +928,32 @@ impl Store {
         Ok(self.read_all()?.3)
     }
 
+    /// Read notification sources without treating rejected records as absence.
+    ///
+    /// `None` marks an incomplete snapshot, including a torn final line. Read
+    /// it once and do not log each rejected line: the compactor warns once and
+    /// preserves all terminal evidence while still removing action history.
+    pub(crate) fn load_notification_sources(&self) -> io::Result<Option<Vec<SessionRecord>>> {
+        let Some(content) = self.read_content()? else {
+            return Ok(Some(Vec::new()));
+        };
+        let mut sessions = Vec::new();
+        for line in self.checked_lines(&content)? {
+            let schema::ParsedLine::Record { value, .. } = line else {
+                return Ok(None);
+            };
+            match serde_json::from_value::<Record>(value) {
+                Ok(Record::Session(record)) if record_agents_are_persistable(&record) => {
+                    sessions.push(*record);
+                }
+                Ok(Record::Resume(binding)) if kind_is_persistable(&binding.agent_base) => {}
+                Ok(Record::Worktree(_) | Record::Project(_)) => {}
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(sessions))
+    }
+
     /// The lines the loaders skip because no record kind accepts them. A
     /// missing file yields an empty list.
     pub(crate) fn load_rejected(&self) -> io::Result<Vec<RejectedLine>> {

@@ -2579,7 +2579,16 @@ acknowledged error, and archived records use their respective TTLs. Unread or
 read action-required and error records are never deleted automatically. After
 eligible records receive normal deletion events, the store atomically rewrites
 the action log to one current action per non-deleted record once the configured
-action threshold is reached.
+action threshold is reached. Deleted daemon-projected terminal notifications
+also keep bounded, invisible replay evidence: at most one deleted snapshot per
+terminal kind (`error`, `session_finished`) for each durable session's current
+runtime generation. This prevents restart replay from recreating an owner-deleted
+terminal notification. The next eligible compaction removes that evidence after
+the source session is removed or advances generation. If session metadata is
+unreadable, rejected, or has a torn final record, compaction keeps every terminal
+tombstone rather than guessing which sources are absent, while still compacting
+other action history. It logs this condition once per store instance; the normal
+per-generation bound resumes once the metadata can be read completely.
 
 Policy is enforced daemon-side for all notification producers. If a producer
 creates a disabled kind, `notification.create` returns
