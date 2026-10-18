@@ -201,24 +201,39 @@ impl SessionRegistry {
         now: Instant,
     ) -> bool {
         let root_pid = root.pid;
+        // Failed probes preserve existing claims without supplying identity evidence.
+        let mut inconclusive: Vec<Pid> = Vec::new();
         // The registry snapshot the scan identifies other runtimes with.
         let scan_registry = self.inner.profiles.runtimes().registry();
         let (scan_pin, observed_refresh) = match self.inner.inspector.descendants(root_pid) {
             Ok(facts) => {
                 let own = self.inner.sessions.lock().await.get(id).map(OwnRuntime::of);
                 let scan_pin = own.as_ref().and_then(OwnRuntime::pinned).cloned();
+                // Only verified live identities may establish ancestry or bind claims.
                 let mut lineage: HashMap<_, _> = facts
                     .iter()
                     .filter(|fact| {
-                        !self.is_foreign_owned_agent(
+                        if self.is_foreign_owned_agent(
                             id,
                             fact.pid,
                             Some(&expected.worker_instance_id),
-                        ) && self
-                            .inner
-                            .inspector
-                            .is_running(fact.identity())
-                            .unwrap_or(false)
+                        ) {
+                            return false;
+                        }
+                        match self.inner.inspector.is_running(fact.identity()) {
+                            Ok(running) => running,
+                            Err(err) => {
+                                debug!(
+                                    session_id = %id.0,
+                                    root_pid,
+                                    pid = fact.pid,
+                                    error = %err,
+                                    "descendant identity read inconclusive"
+                                );
+                                inconclusive.push(fact.pid);
+                                false
+                            }
+                        }
                     })
                     .map(|fact| {
                         (
@@ -230,6 +245,22 @@ impl SessionRegistry {
                         )
                     })
                     .collect();
+                // A failed ancestor probe also leaves its descendants' ancestry
+                // unproven. Preserve their claims without binding through that gap.
+                loop {
+                    let previous = inconclusive.len();
+                    lineage.retain(|pid, process| {
+                        if inconclusive.contains(&process.parent) {
+                            inconclusive.push(*pid);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if previous == inconclusive.len() {
+                        break;
+                    }
+                }
                 // The launch root is excluded from descendants, but the enclosing
                 // liveness bracket proves its identity for direct-agent claims.
                 lineage.insert(
@@ -321,9 +352,17 @@ impl SessionRegistry {
             let to_spawn = apply_observed_refresh(entry, observed_refresh, &mut exit_watches);
 
             let foreground_changed = apply_foreground_probe(entry, foreground_probe);
-            let decision = self.reconcile_foreground_agent(entry, root_pid, now, foreground_probe);
+            let decision = self.reconcile_foreground_agent(
+                entry,
+                root_pid,
+                now,
+                foreground_probe,
+                &inconclusive,
+            );
             let updated = match decision {
-                ForegroundDecision::Fallback => self.reconcile_active_agent(entry, now),
+                ForegroundDecision::Fallback => {
+                    self.reconcile_active_agent(entry, now, &inconclusive)
+                }
                 ForegroundDecision::Preserve => None,
                 ForegroundDecision::Updated => Some(entry.info.clone()),
             };
@@ -448,9 +487,10 @@ impl SessionRegistry {
                 entry.info.pid,
                 crate::time::now(),
                 ForegroundProbe::Observed(entry.foreground_process_group),
+                &[],
             ) {
                 ForegroundDecision::Fallback => {
-                    self.reconcile_active_agent(entry, crate::time::now())
+                    self.reconcile_active_agent(entry, crate::time::now(), &[])
                 }
                 ForegroundDecision::Preserve => None,
                 ForegroundDecision::Updated => Some(entry.info.clone()),
@@ -653,10 +693,14 @@ impl SessionRegistry {
         &self,
         entry: &mut SessionEntry,
         now: Instant,
+        inconclusive: &[Pid],
     ) -> Option<SessionInfo> {
         let Some(active) = entry.active_agent.clone() else {
-            let observed = choose_observed_agent(entry)?;
-            return self.auto_report_observed_agent(entry, &observed, now);
+            match choose_observed_agent(entry) {
+                Some(observed) if inconclusive.contains(&observed.pid) => return None,
+                Some(observed) => return self.auto_report_observed_agent(entry, &observed, now),
+                None => return None,
+            }
         };
         let Some(active_base) = entry.info.active_agent_base.clone() else {
             return Some(clear_active_agent(
@@ -670,6 +714,9 @@ impl SessionRegistry {
                 // SAFETY/why: descendant scans intentionally exclude the PTY-root
                 // process. While the session is running, `record_exit` owns root
                 // liveness and clears `active_agent` when that process exits.
+                return None;
+            }
+            if inconclusive.contains(&pid) {
                 return None;
             }
             if let Some(observed) = entry
@@ -690,9 +737,15 @@ impl SessionRegistry {
                 return None;
             }
             if let Some(observed) = first_observed_agent_for_base(entry, &active_base) {
+                if inconclusive.contains(&observed.pid) {
+                    return None;
+                }
                 return self.auto_report_observed_agent(entry, &observed, now);
             }
             if let Some(observed) = choose_observed_agent(entry) {
+                if inconclusive.contains(&observed.pid) {
+                    return None;
+                }
                 return self.auto_report_observed_agent(entry, &observed, now);
             }
             return Some(clear_active_agent(
@@ -702,6 +755,9 @@ impl SessionRegistry {
         }
 
         if let Some(observed) = single_observed_for_base(entry, &active_base) {
+            if inconclusive.contains(&observed.pid) {
+                return None;
+            }
             if let Some(active) = entry.active_agent.as_mut() {
                 active.pid = Some(observed.pid);
                 active.start_identity = Some(observed.start_identity);
@@ -790,6 +846,7 @@ impl SessionRegistry {
         root_pid: Pid,
         now: Instant,
         probe: ForegroundProbe,
+        inconclusive: &[Pid],
     ) -> ForegroundDecision {
         let ForegroundProbe::Observed(Some(foreground_group)) = probe else {
             return match probe {
@@ -800,6 +857,15 @@ impl SessionRegistry {
                 }
             };
         };
+
+        if entry
+            .active_agent
+            .as_ref()
+            .and_then(|active| active.pid)
+            .is_some_and(|pid| inconclusive.contains(&pid))
+        {
+            return ForegroundDecision::Preserve;
+        }
 
         if foreground_group == root_pid {
             let active_is_launch_root = entry.active_agent.as_ref().is_some_and(|active| {
@@ -813,6 +879,9 @@ impl SessionRegistry {
         }
 
         if let Some(observed) = choose_foreground_observed(entry, foreground_group) {
+            if inconclusive.contains(&observed.pid) {
+                return ForegroundDecision::Preserve;
+            }
             if bind_matching_observed_identity(entry, &observed) {
                 return ForegroundDecision::Preserve;
             }
@@ -848,16 +917,22 @@ impl SessionRegistry {
         let Some(active) = entry.active_agent.clone() else {
             return ForegroundDecision::Preserve;
         };
+        // Bind the reporter's own verified identity before preserving it, so
+        // cwd follows the reporter and PID reuse cannot inherit its native metadata.
+        let observed = entry.info.active_agent_base.as_ref().and_then(|base| {
+            entry
+                .observed_agents
+                .iter()
+                .find(|observed| {
+                    &observed.agent_base == base
+                        && active.pid.is_some_and(|pid| {
+                            matching_report_identity(entry, observed, pid).is_some()
+                        })
+                })
+                .cloned()
+        });
         let active_is_live = active.pid == Some(entry.info.pid)
-            || entry
-                .info
-                .active_agent_base
-                .as_ref()
-                .is_some_and(|active_base| {
-                    active.pid.is_some_and(|pid| {
-                        observed_process_matches(entry, pid, active.start_identity, active_base)
-                    })
-                });
+            || observed.is_some_and(|observed| bind_matching_observed_identity(entry, &observed));
         let unbound_is_current =
             unbound_claim_is_current(&active, now, self.inner.config.active_agent_claim_ttl);
         if active_is_live || unbound_is_current || self.bind_launch_descendant(entry) {
@@ -1139,19 +1214,6 @@ fn matching_lineage_identity(
         process = entry.process_lineage.get(&process.parent)?;
     }
     None
-}
-
-fn observed_process_matches(
-    entry: &SessionEntry,
-    pid: Pid,
-    start_identity: Option<u64>,
-    agent_base: &RuntimeRef,
-) -> bool {
-    entry.observed_agents.iter().any(|observed| {
-        &observed.agent_base == agent_base
-            && matching_report_identity(entry, observed, pid)
-                .is_some_and(|identity| start_identity.is_none_or(|start| start == identity))
-    })
 }
 
 #[cfg(test)]

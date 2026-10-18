@@ -1927,6 +1927,14 @@ impl MockInspector {
             .insert(pid, kind);
     }
 
+    fn clear_identity_error(&self, pid: Pid) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .identity_errors
+            .remove(&pid);
+    }
+
     fn set_ownership_markers(&self, pid: Pid, markers: OwnershipMarkers) {
         self.inner
             .lock()
@@ -10258,6 +10266,377 @@ async fn descendant_reporter_different_runtime_releases_the_claim() {
 #[tokio::test]
 async fn descendant_reporter_foreign_session_releases_the_claim() {
     descendant_claim_replacement("reporter-foreign-session").await;
+}
+
+/// Invariant: claim reconciliation never acts on a descendant identity read
+/// it could not complete. A failed `is_running` read is inconclusive: it
+/// binds no start identity, drives no release and no replacement, and a
+/// reported claim keeps its pid, agent, native session id and any
+/// already-bound start identity across such scans; a scan that can read the
+/// reporter binds its verified identity, a scan after that keeps the bound
+/// identity through an inconclusive read, and a scan that proves death
+/// releases and replaces the claim (#1107).
+#[expect(
+    clippy::too_many_lines,
+    reason = "one claim walks the inconclusive, binding, bound-preserved and released phases"
+)]
+async fn descendant_inconclusive_claim(foreground: Option<Pid>, unreadable: Pid) {
+    let (registry, inspector, created) = mock_procwatch_registry("descendant-inconclusive").await;
+    let wrapper = codex_fact(DESCENDANT_WRAPPER_PID, created.pid);
+    let reporter = ProcessFact {
+        comm: "wrapper-helper".to_owned(),
+        cmdline: vec!["/usr/bin/wrapper-helper".to_owned()],
+        ..codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID)
+    };
+    inspector.set_descendants(created.pid, vec![wrapper, reporter.clone()]);
+    inspector.set_foreground_group(created.pid, foreground);
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: CODEX_HOOK_AGENT.to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+            pid: Some(DESCENDANT_REPORTER_PID),
+            agent_session_id: Some(DESCENDANT_NATIVE_SESSION_ID.to_owned()),
+            agent_session_path: None,
+        })
+        .await;
+    assert!(report.recorded);
+
+    // The reporter's identity read fails inside the same scan bracket: the
+    // claim survives untouched, but the failed read must not bind anything.
+    inspector.fail_identity_with(unreadable, std::io::ErrorKind::Other);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let preserved = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect inconclusive");
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = &sessions[&created.id];
+        assert_eq!(
+            super::active_agent_origin(entry),
+            Some(crate::store::ActiveAgentOrigin::Reported),
+            "the identity origin must remain reported"
+        );
+        assert_eq!(
+            entry
+                .active_agent
+                .as_ref()
+                .expect("surviving claim")
+                .start_identity,
+            None,
+            "an inconclusive read must not bind a start identity"
+        );
+    };
+    assert_eq!(
+        preserved.active_agent.as_deref(),
+        Some(CODEX_HOOK_AGENT),
+        "an inconclusive read must not release the claim"
+    );
+    assert_eq!(
+        preserved.active_agent_pid,
+        Some(DESCENDANT_REPORTER_PID),
+        "an inconclusive read must not replace the reported pid"
+    );
+    assert_eq!(
+        preserved.active_agent_session_id.as_deref(),
+        Some(DESCENDANT_NATIVE_SESSION_ID),
+        "an inconclusive read must not drop the reported native session id"
+    );
+    assert_eq!(
+        preserved.state_source,
+        StateSource::Report,
+        "an inconclusive read must not change the Report origin"
+    );
+
+    // A scan that reads the reporter binds its verified start identity and
+    // keeps the reported claim and metadata.
+    inspector.clear_identity_error(unreadable);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let bound = registry.inspect(&created.id).await.expect("inspect bound");
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = &sessions[&created.id];
+        assert_eq!(
+            super::active_agent_origin(entry),
+            Some(crate::store::ActiveAgentOrigin::Reported),
+            "binding keeps the reported origin"
+        );
+        assert_eq!(
+            entry
+                .active_agent
+                .as_ref()
+                .expect("bound claim")
+                .start_identity,
+            Some(reporter.start_identity.get()),
+            "a verified scan binds the reported pid's start identity"
+        );
+    };
+    assert_eq!(bound.active_agent.as_deref(), Some(CODEX_HOOK_AGENT));
+    assert_eq!(bound.active_agent_pid, Some(DESCENDANT_REPORTER_PID));
+    assert_eq!(
+        bound.active_agent_session_id.as_deref(),
+        Some(DESCENDANT_NATIVE_SESSION_ID)
+    );
+
+    // A later inconclusive read must not unbind the verified identity.
+    inspector.fail_identity_with(unreadable, std::io::ErrorKind::Other);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let still_bound = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect bound again");
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = &sessions[&created.id];
+        assert_eq!(
+            super::active_agent_origin(entry),
+            Some(crate::store::ActiveAgentOrigin::Reported),
+            "the identity origin must remain reported"
+        );
+        assert_eq!(
+            entry
+                .active_agent
+                .as_ref()
+                .expect("surviving bound claim")
+                .start_identity,
+            Some(reporter.start_identity.get()),
+            "an inconclusive read must not unbind a verified start identity"
+        );
+    };
+    assert_eq!(
+        still_bound.active_agent.as_deref(),
+        Some(CODEX_HOOK_AGENT),
+        "an inconclusive read must not release a bound claim"
+    );
+    assert_eq!(still_bound.active_agent_pid, Some(DESCENDANT_REPORTER_PID));
+    assert_eq!(
+        still_bound.active_agent_session_id.as_deref(),
+        Some(DESCENDANT_NATIVE_SESSION_ID)
+    );
+
+    // A confirmed death still acts: the claim releases and the observed
+    // wrapper of the same runtime replaces it.
+    inspector.clear_identity_error(unreadable);
+    inspector.set_not_running(reporter.identity());
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let replaced = registry.inspect(&created.id).await.expect("inspect death");
+    assert_eq!(
+        replaced.active_agent_pid,
+        if foreground == Some(DESCENDANT_REPORTER_PID) {
+            None
+        } else {
+            Some(DESCENDANT_WRAPPER_PID)
+        },
+        "a confirmed death must still release or replace the claim"
+    );
+    assert_eq!(replaced.active_agent_session_id, None);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn descendant_reporter_inconclusive_identity_scan_keeps_the_claim() {
+    for foreground in [
+        None,
+        Some(DESCENDANT_WRAPPER_PID),
+        Some(DESCENDANT_REPORTER_PID),
+    ] {
+        for unreadable in [DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID] {
+            descendant_inconclusive_claim(foreground, unreadable).await;
+        }
+    }
+}
+
+/// A reported pid no scan of the session verifies must never be bound: with
+/// an unknown foreground group the registry holds neither an observed agent
+/// nor a verified lineage entry for the reporter, so the claim releases
+/// instead of standing in for an observed ancestor or surviving on state
+/// captured before the reporter left the process tree (#1107).
+#[tokio::test]
+async fn procwatch_unknown_foreground_never_binds_an_unverified_reporter() {
+    /// Pid of the claimed reporter that no scan of the session observes.
+    const UNVERIFIED_CLAIM_PID: Pid = 999;
+    let (registry, inspector, created) =
+        mock_procwatch_registry("unknown-foreground-unverified").await;
+    let wrapper = codex_fact(DESCENDANT_WRAPPER_PID, created.pid);
+    inspector.set_descendants(created.pid, vec![wrapper.clone()]);
+    // A foreground group no observed agent carries: neither the root's nor
+    // the wrapper's group, and no claim pid to select a report from.
+    inspector.set_foreground_group(created.pid, Some(UNVERIFIED_CLAIM_PID + 10));
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: CODEX_HOOK_AGENT.to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+            pid: Some(UNVERIFIED_CLAIM_PID),
+            agent_session_id: Some("unverified-native".to_owned()),
+            agent_session_path: None,
+        })
+        .await;
+    assert!(report.recorded);
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let released = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect unverified claim");
+    assert_eq!(
+        released.active_agent, None,
+        "no scan verified the reported pid; the claim must release"
+    );
+    assert_eq!(released.active_agent_pid, None);
+    assert_eq!(
+        released.active_agent_session_id, None,
+        "the unverified claim must not keep its native metadata"
+    );
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = &sessions[&created.id];
+        assert_eq!(
+            super::active_agent_origin(entry),
+            None,
+            "an unverified claim must not bind any identity"
+        );
+        assert!(
+            !entry
+                .observed_agents
+                .iter()
+                .any(|observed| observed.pid == UNVERIFIED_CLAIM_PID),
+            "no process was observed at the unverified pid"
+        );
+        assert!(
+            entry
+                .observed_agents
+                .iter()
+                .any(|observed| observed.pid == DESCENDANT_WRAPPER_PID),
+            "the observed wrapper stays observed for a later verified claim"
+        );
+        assert_eq!(
+            entry.observed_agents.len(),
+            1,
+            "no observed agent may stand in for the unverified reported pid"
+        );
+    };
+    let _ = registry.stop(&created.id).await;
+}
+
+/// An unknown foreground process group must not select a claim it cannot
+/// observe, but a scan that verifies the reported pid in the session's
+/// lineage must bind that pid's own observed start identity (never an
+/// observed ancestor's): the cwd focus follows the reported process, and a
+/// later reuse of the pid under the same ancestor releases the claim and its
+/// native metadata instead of accepting the old metadata (#1107).
+#[tokio::test]
+async fn procwatch_unknown_foreground_binds_the_reported_start_identity() {
+    let (registry, inspector, created) = mock_procwatch_registry("unknown-foreground-bind").await;
+    let root_cwd = temp_dir("unknown-foreground-root");
+    let reporter_cwd = temp_dir("unknown-foreground-reporter");
+    let wrapper = codex_fact(DESCENDANT_WRAPPER_PID, created.pid);
+    let mut reporter = ProcessFact {
+        comm: "wrapper-helper".to_owned(),
+        cmdline: vec!["/usr/bin/wrapper-helper".to_owned()],
+        pgid: DESCENDANT_REPORTER_PID,
+        ..codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID)
+    };
+    inspector.set_descendants(created.pid, vec![wrapper.clone(), reporter.clone()]);
+    inspector.set_cwd(created.pid, root_cwd.clone());
+    inspector.set_cwd(DESCENDANT_REPORTER_PID, reporter_cwd.clone());
+    // The reporter's own process group is foreground, and the registry has
+    // not observed the reporter as an agent: the foreground cannot select it.
+    inspector.set_foreground_group(created.pid, Some(DESCENDANT_REPORTER_PID));
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: CODEX_HOOK_AGENT.to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+            pid: Some(DESCENDANT_REPORTER_PID),
+            agent_session_id: Some(DESCENDANT_NATIVE_SESSION_ID.to_owned()),
+            agent_session_path: None,
+        })
+        .await;
+    assert!(report.recorded);
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let bound = registry.inspect(&created.id).await.expect("inspect bound");
+    assert_eq!(
+        bound.active_agent_pid,
+        Some(DESCENDANT_REPORTER_PID),
+        "a verified lineage keeps the reported claim under an unknown foreground"
+    );
+    assert_eq!(
+        bound.active_agent_session_id.as_deref(),
+        Some(DESCENDANT_NATIVE_SESSION_ID),
+        "binding the observed start identity must keep the native metadata"
+    );
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        let claim = sessions[&created.id]
+            .active_agent
+            .as_ref()
+            .expect("active claim");
+        assert_eq!(
+            claim.start_identity,
+            Some(reporter.start_identity.get()),
+            "the claim must carry the reported pid's observed start identity, not an ancestor's"
+        );
+    };
+    assert_eq!(
+        bound.cwd, reporter_cwd,
+        "the cwd focus must follow the reported process, not the root"
+    );
+
+    // The reporter dies and its pid is reused by another process under the
+    // same ancestor. With the bound identity the reuse releases the claim;
+    // the previously reported native metadata must not survive it.
+    reporter.start_identity = StartIdentity::new(reporter.start_identity.get() + 1);
+    inspector.set_descendants(created.pid, vec![wrapper, reporter]);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let released = registry.inspect(&created.id).await.expect("inspect reuse");
+    assert_eq!(
+        released.active_agent_pid, None,
+        "a pid reuse under the same ancestor must release the claim"
+    );
+    assert_eq!(
+        released.active_agent, None,
+        "a pid reuse under the same ancestor must not keep the agent"
+    );
+    assert_eq!(
+        released.active_agent_session_id, None,
+        "old native metadata must not survive the pid reuse"
+    );
+    let _ = registry.stop(&created.id).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
