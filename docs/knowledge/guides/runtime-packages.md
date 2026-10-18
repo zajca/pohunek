@@ -234,6 +234,17 @@ socket. A remote `--host` is rejected before anything runs (code
 connections too. Installing a package extends what the owner's account may
 launch on that machine, so it is never a remote operation.
 
+## Response budget
+
+`install` and `update` wait up to 30 s for one daemon response, where the other
+commands use the SDK's 5 s default: validating and unpacking a whole archive
+can take longer than 5 s on a slow host or for a large archive. The budget is
+the CLI's own tolerance for a slower install, not a daemon install deadline —
+the daemon applies no per-install wall-clock deadline of its own. A command
+that hits the budget fails with `request_timeout` while the daemon may still
+have installed or updated server-side, so check `pohunek plugin list` before
+repeating the command; the CLI never retries an install on its own.
+
 ## Trust model
 
 - `--sha256 <digest>` authorizes a third-party archive by the digest the owner

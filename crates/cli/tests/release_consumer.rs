@@ -49,6 +49,8 @@ mod release_layout;
 mod release_report;
 #[path = "support/release_scenario.rs"]
 mod release_scenario;
+#[path = "support/response_relay.rs"]
+mod response_relay;
 #[path = "support/responses_stub.rs"]
 mod responses_stub;
 
@@ -166,6 +168,7 @@ mod guards {
     use std::os::unix::fs::{symlink, PermissionsExt as _};
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
+    use std::time::Duration;
 
     use package::{build_archive, ArchiveEntry, Limits, ANCHOR_FILE_NAME};
     use pohunek_test_support::env::TestEnv;
@@ -190,6 +193,7 @@ mod guards {
         history_restored, install_official, install_with_catalog, locate_smoke_upstream,
         locate_upstream, probe_upstream, probe_upstream_within,
     };
+    use super::response_relay::ResponseRelay;
 
     /// Longest a child test process may run: the child's own waits end at the
     /// 120 s hang guard of `pohunek_test_support::wait`.
@@ -328,6 +332,9 @@ check = "none"
     /// archive authorized by a throwaway catalog.
     struct Guarded {
         host: Host,
+        /// The throwaway root the daemon's anchor trusts; second catalogs of
+        /// the fixture must be signed by its key.
+        root: ThrowawayRoot,
         catalog: PathBuf,
         archive: PathBuf,
         facts: PackageFacts,
@@ -350,9 +357,26 @@ check = "none"
         let host = Host::start(env, layout, None);
         Guarded {
             host,
+            root,
             catalog,
             archive,
             facts,
+        }
+    }
+
+    impl Guarded {
+        /// Writes the synthetic archive of `version`, reads its facts, and
+        /// signs a catalog for it with the root the daemon's anchor trusts.
+        fn version(&self, version: &str) -> (PathBuf, PackageFacts, PathBuf) {
+            let archive = write_package(self.host.env.root(), version);
+            let facts = read_package(&archive).expect("read the synthetic package");
+            let catalog = self.host.env.root().join(format!("catalog-{version}.json"));
+            fs::write(
+                &catalog,
+                self.root.catalog(&facts, &self.host.layout.version),
+            )
+            .expect("write the catalog");
+            (archive, facts, catalog)
         }
     }
 
@@ -1059,6 +1083,128 @@ check = "none"
         pohunek_test_support::wait::poll_until("the leaked child to be killed", || {
             (!fake_sleep_alive()).then_some(())
         });
+    }
+
+    // ---- delayed daemon responses -----------------------------------------
+
+    /// Control socket of the guarded daemon below the runtime directory, the
+    /// path `release_host` starts the daemon on.
+    const DAEMON_SOCKET: &str = "pohunek/daemon.sock";
+
+    /// How long the relay holds each real `package.install` response: above
+    /// the SDK's 5 s default response budget that `install` and `update` used
+    /// before #1205, below the 30 s install response budget, and far below the
+    /// 90 s CLI process bound, so only the budget under test decides whether
+    /// the command survives the delay.
+    const INSTALL_RESPONSE_DELAY: Duration = Duration::from_secs(6);
+
+    /// Asserts that `holds` are the two held install responses of one command
+    /// (preview and consented commit), each held for the full delay.
+    fn assert_two_delayed_responses(holds: &[std::time::Duration]) {
+        assert_eq!(holds.len(), 2, "the relay held both install responses");
+        assert!(
+            holds.iter().all(|hold| *hold >= INSTALL_RESPONSE_DELAY),
+            "every held response waited the full delay: {holds:?}"
+        );
+    }
+
+    #[test]
+    fn a_delayed_install_response_still_installs_within_the_response_budget() {
+        let guarded = guarded();
+        let host = &guarded.host;
+        // A completed RPC crosses the daemon's socket-publication and
+        // identity-check boundary before the relay replaces its pathname.
+        host.ok(&["health"]);
+        let relay = ResponseRelay::install(
+            &host.env.runtime_dir().join(DAEMON_SOCKET),
+            "package.install",
+            INSTALL_RESPONSE_DELAY,
+        )
+        .expect("install the delayed-response relay");
+
+        let (code, installed) = install_with_catalog(host, &guarded.archive, &guarded.catalog);
+        assert_eq!(code, 0, "delayed install failed: {installed}");
+        assert_eq!(installed["ok"]["status"], "installed", "{installed}");
+        assert_eq!(
+            installed["ok"]["package"]["origin"], "official",
+            "{installed}"
+        );
+        assert_eq!(
+            installed["ok"]["package"]["digest"],
+            guarded.facts.digest.as_str(),
+            "{installed}"
+        );
+        assert_two_delayed_responses(&relay.holds());
+
+        // The registry reads through the relay: commands the budget does not
+        // change keep their undelayed responses.
+        let listed = host.ok(&["plugin", "list"]);
+        let packages = listed["packages"].as_array().expect("packages");
+        assert_eq!(packages.len(), 1, "{listed}");
+        assert_eq!(
+            packages[0]["package"]["id"],
+            guarded.facts.package_id.as_str(),
+            "{listed}"
+        );
+        assert_eq!(
+            packages[0]["digest"],
+            guarded.facts.digest.as_str(),
+            "{listed}"
+        );
+        assert_eq!(packages[0]["enabled"], true, "{listed}");
+        assert_eq!(packages[0]["selected"], true, "{listed}");
+    }
+
+    #[test]
+    fn a_delayed_update_response_still_updates_within_the_response_budget() {
+        let guarded = guarded();
+        let host = &guarded.host;
+        // The update requires its package id installed; install 1.0.0 before
+        // the relay delays anything.
+        install_official(host, &guarded.archive, &guarded.catalog, &guarded.facts);
+        let (archive, facts, catalog) = guarded.version("1.1.0");
+        // A completed RPC crosses the daemon's socket-publication and
+        // identity-check boundary before the relay replaces its pathname.
+        host.ok(&["health"]);
+        let relay = ResponseRelay::install(
+            &host.env.runtime_dir().join(DAEMON_SOCKET),
+            "package.install",
+            INSTALL_RESPONSE_DELAY,
+        )
+        .expect("install the delayed-response relay");
+
+        let (code, updated) = host.json(&[
+            "plugin",
+            "update",
+            facts.package_id.as_str(),
+            archive.to_str().expect("utf-8 archive path"),
+            "--catalog",
+            catalog.to_str().expect("utf-8 catalog path"),
+            "--yes",
+        ]);
+        assert_eq!(code, 0, "delayed update failed: {updated}");
+        assert_eq!(
+            updated["ok"]["package"]["package"]["version"], "1.1.0",
+            "{updated}"
+        );
+        assert_eq!(updated["ok"]["package"]["selected"], true, "{updated}");
+        assert_eq!(
+            updated["ok"]["package"]["digest"],
+            facts.digest.as_str(),
+            "{updated}"
+        );
+        assert_two_delayed_responses(&relay.holds());
+
+        // The new version is the one selected version of the id.
+        let listed = host.ok(&["plugin", "list"]);
+        let selected: Vec<&serde_json::Value> = listed["packages"]
+            .as_array()
+            .expect("packages")
+            .iter()
+            .filter(|package| package["selected"] == true)
+            .collect();
+        assert_eq!(selected.len(), 1, "{listed}");
+        assert_eq!(selected[0]["package"]["version"], "1.1.0", "{listed}");
     }
 
     // ---- drivers ---------------------------------------------------------
