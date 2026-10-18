@@ -828,6 +828,43 @@ fn the_guard_fails_on_a_test_read_of_a_path_that_does_not_select_the_reader() {
 }
 
 #[test]
+fn the_guard_refuses_lane_neutral_reads_only_in_macos_lane_packages() {
+    let repo = Repo::new();
+    repo.write(
+        "crates/cli/Cargo.toml",
+        &manifest("pohunek-cli", &["pohunek-daemon", "pohunek-knowledge"], &[]),
+    );
+    repo.write("docs/knowledge/guide.md", "knowledge fixture\n");
+    repo.commit("knowledge input");
+    let (success, stderr) = guard(&repo);
+    assert!(success, "{stderr}");
+
+    for path in ["docs/knowledge/guide.md", "docs/knowledge"] {
+        let source = format!(
+            "#[test]\nfn reads() {{\n    drop(std::fs::read(\n        \
+             pohunek_test_support::workspace_root().join({path:?}),\n    ));\n}}\n"
+        );
+        repo.write("crates/cli/tests/reads.rs", &source);
+        repo.commit("planted lane read");
+        let (success, stderr) = guard(&repo);
+        assert!(!success, "{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "crates/cli/tests/reads.rs:4: pohunek-cli reads {path}:"
+            )),
+            "{stderr}"
+        );
+        assert!(stderr.contains("the macOS lane omits changes"), "{stderr}");
+
+        repo.git(&["rm", "crates/cli/tests/reads.rs"]);
+        repo.write("crates/xtask/tests/reads.rs", &source);
+        repo.commit("non-lane read");
+        let (success, stderr) = guard(&repo);
+        assert!(success, "{stderr}");
+    }
+}
+
+#[test]
 fn the_guard_accepts_a_mapped_read_and_refuses_an_undeclared_root_scan() {
     let repo = Repo::new();
     repo.write(

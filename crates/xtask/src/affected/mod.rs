@@ -2036,6 +2036,27 @@ mod tests {
     /// owner fails here until it is listed with the reason it reads the data.
     #[test]
     fn lane_neutral_readers_are_every_dependent() {
+        let partitions = std::fs::read_to_string(
+            pohunek_test_support::workspace_root().join("scripts/test-partitions"),
+        )
+        .expect("read the macOS lane partition");
+        let lane = partitions
+            .split_once("LANE_PACKAGES = (")
+            .expect("lane package tuple")
+            .1
+            .split_once(')')
+            .expect("end of lane package tuple")
+            .0;
+        let lane_packages: BTreeSet<&str> = lane
+            .split('"')
+            .enumerate()
+            .filter_map(|(index, part)| (index % 2 == 1).then_some(part))
+            .collect();
+        assert_eq!(
+            lane_packages,
+            guard::LANE_PACKAGES.iter().copied().collect(),
+            "the read guard must cover exactly the macOS lane packages"
+        );
         let (_, packages) =
             workspace(&pohunek_test_support::workspace_root()).expect("workspace members");
         for data in LANE_NEUTRAL {
