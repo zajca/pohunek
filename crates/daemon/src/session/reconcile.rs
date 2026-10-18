@@ -19207,7 +19207,7 @@ generation "$1"
                 damage_store: |_| {},
                 journal_bytes: None,
                 reports_identity: false,
-                preflight_adoptable: false,
+                preflight_adoptable: true,
                 reconcile_live: false,
             },
             Differential {
@@ -19218,7 +19218,7 @@ generation "$1"
                 damage_store: |_| {},
                 journal_bytes: None,
                 reports_identity: false,
-                preflight_adoptable: false,
+                preflight_adoptable: true,
                 reconcile_live: false,
             },
             Differential {
@@ -19624,11 +19624,11 @@ generation "$1"
             Box::pin(registry.reconcile_workers())
                 .await
                 .expect("reconcile");
-            let runtime = registry
+            let reconciled = registry
                 .inspect(&SessionId(session_id.to_owned()))
                 .await
-                .ok()
-                .and_then(|info| info.runtime);
+                .ok();
+            let runtime = reconciled.as_ref().and_then(|info| info.runtime.clone());
             let live = runtime
                 .as_ref()
                 .is_some_and(|runtime| runtime.state == RuntimeState::Live);
@@ -19657,17 +19657,65 @@ generation "$1"
                 "{} ({form}): preflight {:?}",
                 case.name, report.sessions
             );
-            assert!(
-                !adoptable || live,
-                "{} ({form}): the preflight must not call adoptable what reconciliation does not adopt",
-                case.name
-            );
-            assert!(
-                live || report.at_risk().count() > 0,
-                "{} ({form}): a session reconciliation does not adopt must be listed at risk: {:?}",
-                case.name,
-                report
-            );
+            if record.desired_state == DesiredState::Running {
+                assert!(
+                    !adoptable || live,
+                    "{} ({form}): the preflight must not call adoptable what reconciliation does not adopt",
+                    case.name
+                );
+                assert!(
+                    live || report.at_risk().count() > 0,
+                    "{} ({form}): a session reconciliation does not adopt must be listed at risk: {:?}",
+                    case.name,
+                    report
+                );
+            } else {
+                // Finishing the owner's intent is expected, so adoptable here
+                // means the requested stop or removal remains safe to finish.
+                let intent = report
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == session_id)
+                    .expect("the requested intent is judged");
+                assert_eq!(
+                    intent.code,
+                    pohunek_service_config::preflight::CODE_INTENT_FINISHED
+                );
+                assert!(!live, "{} ({form}): the requested runtime ends", case.name);
+                match record.desired_state {
+                    DesiredState::Stopped => {
+                        let stopped = reconciled
+                            .as_ref()
+                            .expect("the stopped session is retained");
+                        assert_eq!(
+                            stopped.state,
+                            SessionState::Stopped,
+                            "{} ({form})",
+                            case.name
+                        );
+                        assert_eq!(
+                            runtime.as_ref().map(|runtime| runtime.state),
+                            Some(RuntimeState::Terminal),
+                            "{} ({form})",
+                            case.name
+                        );
+                    }
+                    DesiredState::Removed => assert!(
+                        reconciled.is_none(),
+                        "{} ({form}): removal finishes",
+                        case.name
+                    ),
+                    DesiredState::Running => {
+                        unreachable!("running records use adoption assertions")
+                    }
+                }
+                assert_eq!(
+                    report.at_risk().count(),
+                    0,
+                    "{} ({form}): {report:?}",
+                    case.name
+                );
+            }
         }
     }
 

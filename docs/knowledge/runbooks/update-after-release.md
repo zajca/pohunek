@@ -662,9 +662,10 @@ A live worker journal with no store record and no such unreadable line is
 listed under `unmanaged_workers`: the running daemon does not manage that
 worker either, so the upgrade leaves it as it is and does not refuse.
 
-When any session is not adoptable, the command exits non-zero with
-`service_upgrade_sessions_at_risk` and lists each session with its code and
-detail. Let those sessions finish (or end them) and rerun, or pass
+When a live or stopped session is at risk, the command exits non-zero with
+`service_upgrade_sessions_at_risk`. Upgrade and rollback refusals count live
+and stopped at-risk sessions separately and label each listed session with its
+kind, verdict, code and detail. Let those sessions finish (or end them) and rerun, or pass
 `--accept-runtime-loss` after reviewing the list. With the flag the upgrade
 proceeds, and the `--json` report carries the full `preflight` object and
 `accepted_runtime_loss: true`. A preflight that cannot run at all (missing or
@@ -693,6 +694,14 @@ by the same rules and listed under stopped sessions (`stopped_sessions` in the
 `--json` report, and a `stopped` section in the text output). A stopped session
 that would lose its resume or fork is at risk and needs `--accept-runtime-loss`
 like a live one.
+
+An owner-requested stop or removal is not a runtime-adoption loss, even when
+the runtime is still alive: the new daemon finishes the existing intent. The
+preflight remains read-only and does not relax process-identity, unreadable
+evidence or foreign-process checks. A stop still retains native recovery, so
+its resume or fork is judged separately and can remain at risk. A removal
+keeps no recovery to preserve. Finishing the intent itself is reported with
+the non-blocking `adoptable` verdict and `stop_or_removal_intent_pending` code.
 
 When the preflight budget (20 seconds by default) runs out before a stopped
 session's native reference is checked, the session is `would_lose_recovery` with

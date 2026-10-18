@@ -2581,10 +2581,16 @@ async fn a_stopped_session_at_risk_needs_the_flag_like_a_live_one() {
         .upgrade(&harness.staged(V2), V2)
         .await
         .expect_err("the stopped session would lose its recovery");
-    let Error::UpgradeAtRisk { sessions, .. } = &error else {
+    let Error::UpgradeAtRisk {
+        sessions,
+        stopped_sessions,
+        ..
+    } = &error
+    else {
         panic!("{error:?}");
     };
-    assert_eq!(sessions, std::slice::from_ref(&stopped));
+    assert!(sessions.is_empty());
+    assert_eq!(stopped_sessions, std::slice::from_ref(&stopped));
     assert!(harness.pending().is_none(), "no transaction was journaled");
     harness.assert_installed(V1);
 
@@ -6261,6 +6267,11 @@ async fn an_upgrade_refuses_live_sessions_whose_records_cannot_be_migrated_and_t
         "{message}"
     );
     assert!(!message.contains(THIRD_SESSION), "{message}");
+    assert!(
+        message.contains("2 live session(s), 0 stopped session(s)"),
+        "{message}"
+    );
+    assert!(message.contains(&format!("live {SESSION}:")), "{message}");
     assert_eq!(error.code(), "service_upgrade_sessions_at_risk");
     harness.assert_installed(V1);
     assert_eq!(
@@ -6861,6 +6872,51 @@ async fn no_gate_refusal_before_the_swap_restarts_the_daemon() {
         assert_daemon_untouched(&harness, replaces);
         harness.assert_installed(V1);
     }
+}
+
+#[tokio::test]
+async fn rollback_refusal_distinguishes_live_and_stopped_session_risks() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after replacement");
+    seed_unadoptable_session(&harness);
+    let stopped = SessionVerdict {
+        session_id: OTHER_SESSION.to_owned(),
+        name: None,
+        verdict: Verdict::WouldLoseRecovery,
+        code: "native_recovery_unmappable".to_owned(),
+        detail: "the stopped session's recovery cannot be mapped".to_owned(),
+    };
+    let error = harness
+        .engine()
+        .with_adoption_preflight(Box::new(ScriptedPreflight {
+            stopped: vec![stopped],
+            ..ScriptedPreflight::default()
+        }))
+        .upgrade(&harness.staged(V1), V1)
+        .await
+        .expect_err("both groups need explicit consent");
+    assert_eq!(error.code(), "service_rollback_sessions_at_risk");
+    let message = error.to_string();
+    assert!(
+        message.contains("1 live session(s), 1 stopped session(s)"),
+        "{message}"
+    );
+    assert!(message.contains(&format!("live {SESSION}:")), "{message}");
+    assert!(
+        message.contains(&format!("stopped {OTHER_SESSION}:")),
+        "{message}"
+    );
+    assert_eq!(
+        harness.pending().expect("record kept").step,
+        Step::Registered
+    );
+    assert_eq!(harness.fake.daemon_version().as_deref(), Some(V2));
 }
 
 #[tokio::test]

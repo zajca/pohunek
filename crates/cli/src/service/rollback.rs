@@ -94,9 +94,14 @@ pub(super) async fn gate(
             code,
             detail,
         },
-        Error::UpgradeAtRisk { sessions, warnings } => Error::RollbackAtRisk {
+        Error::UpgradeAtRisk {
+            sessions,
+            stopped_sessions,
+            warnings,
+        } => Error::RollbackAtRisk {
             version: previous.to_owned(),
             sessions,
+            stopped_sessions,
             warnings,
         },
         other => Error::RollbackPreflightFailed {

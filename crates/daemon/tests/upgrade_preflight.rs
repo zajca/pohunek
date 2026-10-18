@@ -863,6 +863,225 @@ async fn the_binary_prints_the_report_without_creating_or_changing_anything() {
     );
 }
 
+/// An owner intent can remain on disk after the runtime has already gone.
+fn pending_intent_line(session: &str, worker: &str, desired: &str) -> Value {
+    let mut line: Value = serde_json::from_str(
+        include_str!("../src/store/fixtures/schema-9/metadata.jsonl")
+            .lines()
+            .next()
+            .expect("session fixture"),
+    )
+    .expect("schema 9 session fixture");
+    line["session_id"] = json!(session);
+    line["info"]["id"] = json!(session);
+    line["runtime"]["worker_id"] = json!(worker);
+    line["runtime"]["runtime_id"] = json!("r-fixture");
+    line["runtime"]["generation"] = json!(GENERATION);
+    line["runtime"]["service_id"] = json!(format!("{session}.{GENERATION}"));
+    line["runtime"]["executable"] = json!(WORKER_EXECUTABLE);
+    line["info"]["runtime"]["worker_id"] = json!(worker);
+    line["info"]["runtime"]["worker_instance_id"] = json!("r-fixture");
+    line["info"]["runtime"]["state"] = json!("conflict");
+    line["desired_state"] = json!(desired);
+    line["info"]["state"] = json!("stopped");
+    line["info"]["pid"] = json!(i32::MAX);
+    line["runtime"]["state"] = json!("conflict");
+    line["recovery"] = Value::Null;
+    line
+}
+
+#[test]
+fn requested_stop_and_removal_are_nonblocking_with_dead_or_live_owned_workers() {
+    let host = Host::new();
+    let cases = [
+        ("s-1", "w-dead-stop", "stopped"),
+        ("s-2", "w-live-stop", "stopped"),
+        ("s-3", "w-dead-remove", "removed"),
+        ("s-4", "w-live-remove", "removed"),
+    ];
+    host.write_store(
+        &cases.map(|(session, worker, desired)| pending_intent_line(session, worker, desired)),
+    );
+    for (session, worker, _) in cases {
+        if worker.contains("live") {
+            host.write_journal(session, worker, &journal(session, worker));
+        }
+    }
+    let before = host.snapshot();
+
+    let report = host.report();
+    assert!(!report.store_refused(), "{report:?}");
+
+    assert_eq!(report.sessions.len(), cases.len(), "{report:?}");
+    for (session, _, _) in cases {
+        assert_eq!(
+            verdict_of(&report, session),
+            (
+                &Verdict::Adoptable,
+                pohunek_service_config::preflight::CODE_INTENT_FINISHED
+            ),
+            "{report:?}"
+        );
+    }
+    assert_eq!(report.at_risk().count(), 0, "{report:?}");
+    assert!(report.stopped_sessions.is_empty(), "{report:?}");
+    assert_eq!(host.snapshot(), before, "preflight is read-only");
+}
+
+#[test]
+fn a_requested_stop_still_reports_retained_native_recovery_loss() {
+    let host = Host::new();
+    let mut stop = session_line("s-1", "w-stop");
+    stop["desired_state"] = json!("stopped");
+    stop["runtime"]["state"] = json!("conflict");
+    let mut removal = session_line("s-2", "w-remove");
+    removal["desired_state"] = json!("removed");
+    removal["runtime"]["state"] = json!("conflict");
+    host.write_store(&[stop, removal]);
+    let before = host.snapshot();
+
+    let report = host.report();
+    assert!(!report.store_refused(), "{report:?}");
+
+    assert_eq!(verdict_of(&report, "s-1").0, &Verdict::Adoptable);
+    assert_eq!(verdict_of(&report, "s-2").0, &Verdict::Adoptable);
+    assert_eq!(report.stopped_sessions.len(), 1, "{report:?}");
+    assert_eq!(
+        stopped_verdict_of(&report, "s-1"),
+        (&Verdict::WouldLoseRecovery, CODE_RUNTIME_SOURCE_NOT_SERVED),
+        "{report:?}"
+    );
+    assert_eq!(report.at_risk().count(), 1, "{report:?}");
+    assert_eq!(host.snapshot(), before, "preflight is read-only");
+}
+
+#[test]
+fn requested_intents_do_not_hide_unreadable_or_conflicting_worker_identity() {
+    let host = Host::new();
+    let mut invalid_generation = pending_intent_line("s-5", "w-invalid-generation", "stopped");
+    invalid_generation["runtime"]["service_id"] = json!("invalid-service-id");
+    host.write_store(&[
+        pending_intent_line("s-1", "w-unreadable", "stopped"),
+        pending_intent_line("s-2", "w-conflict", "removed"),
+        pending_intent_line("s-3", "w-legacy", "stopped"),
+        pending_intent_line("s-4", "w-foreign-process", "stopped"),
+        invalid_generation,
+    ]);
+    host.write_journal_bytes("s-1", "w-unreadable", b"not json");
+    let mut foreign = journal("s-2", "w-conflict");
+    foreign["runtime_id"] = json!("r-foreign");
+    host.write_journal("s-2", "w-conflict", &foreign);
+    let mut legacy = journal("s-3", "w-legacy");
+    legacy["version"] = json!(LEGACY_MARKER_RELEASE);
+    host.write_journal("s-3", "w-legacy", &legacy);
+    let mut foreign_process = journal("s-4", "w-foreign-process");
+    with_active_identity(&mut foreign_process, "claude");
+    foreign_process["active_identity"]["process"]["pid"] = json!(i32::MAX);
+    host.write_journal("s-4", "w-foreign-process", &foreign_process);
+    let before = host.snapshot();
+
+    let report = host.report();
+    assert!(!report.store_refused(), "{report:?}");
+
+    assert_eq!(
+        verdict_of(&report, "s-1"),
+        (
+            &Verdict::WouldNotBeAdopted,
+            pohunek_service_config::preflight::CODE_JOURNAL_UNREADABLE
+        ),
+        "{report:?}"
+    );
+    assert_eq!(
+        verdict_of(&report, "s-2"),
+        (&Verdict::WouldNotBeAdopted, CODE_RUNTIME_IDENTITY_MISMATCH),
+        "{report:?}"
+    );
+    assert_eq!(
+        verdict_of(&report, "s-3"),
+        (
+            &Verdict::WouldNotBeAdopted,
+            pohunek_service_config::preflight::CODE_WORKER_MARKER_LEGACY
+        ),
+        "{report:?}"
+    );
+    assert_eq!(
+        verdict_of(&report, "s-4"),
+        (
+            &Verdict::WouldNotBeAdopted,
+            "active_identity_process_invalid"
+        ),
+        "{report:?}"
+    );
+    assert_eq!(
+        verdict_of(&report, "s-5"),
+        (&Verdict::WouldNotBeAdopted, CODE_RUNTIME_IDENTITY_MISMATCH),
+        "{report:?}"
+    );
+    assert_eq!(report.at_risk().count(), 5, "{report:?}");
+    assert_eq!(host.snapshot(), before, "preflight is read-only");
+}
+
+#[tokio::test]
+async fn requested_stops_judge_the_native_reference_retained_from_the_worker_journal() {
+    let host = Host::serving().await;
+    let transcripts = host.env.home().join(".claude/projects/work");
+    fs::create_dir_all(&transcripts).expect("transcript directory");
+    fs::write(transcripts.join("native-current.jsonl"), b"{}\n")
+        .expect("the current conversation exists");
+    let cases = [
+        ("s-1", "w-live", "live", false),
+        ("s-2", "w-final", "terminal", false),
+        ("s-3", "w-legacy-live", "live", true),
+        ("s-4", "w-legacy-final", "terminal", true),
+    ];
+    let lines = cases.map(|(session, worker, _, _)| {
+        let mut line = built_in_line("claude", session, worker);
+        line["desired_state"] = json!("stopped");
+        line
+    });
+    host.write_store(&lines);
+    for (session, worker, phase, legacy) in cases {
+        let mut current = journal(session, worker);
+        current["phase"] = json!(phase);
+        current["launch_identity"] = json!({
+            "provider": "claude",
+            "process": current["child"].clone(),
+            "reference_kind": "id",
+            "native_reference": "native-fixture-2",
+        });
+        current["native_reference_claim"] = json!({
+            "provider": "claude",
+            "process": current["child"].clone(),
+            "sequence": 1,
+            "reference_kind": "id",
+            "native_reference": "native-current",
+        });
+        if legacy {
+            current
+                .as_object_mut()
+                .expect("journal object")
+                .remove("native_reference_claim");
+            with_active_identity(&mut current, "claude");
+            current["active_identity"]["native_reference"] = json!("native-current");
+        }
+        host.write_journal(session, worker, &current);
+    }
+    let before = host.snapshot();
+
+    let report = host.report();
+
+    assert!(!report.store_refused(), "{report:?}");
+    for (session, _, _, _) in cases {
+        assert_eq!(
+            stopped_verdict_of(&report, session).0,
+            &Verdict::Adoptable,
+            "the retained journal reference exists, unlike the stale stored one: {report:?}"
+        );
+    }
+    assert_eq!(report.at_risk().count(), 0, "{report:?}");
+    assert_eq!(host.snapshot(), before, "preflight is read-only");
+}
+
 #[test]
 fn a_session_whose_runtime_the_record_already_lost_is_judged_only_as_a_stopped_session() {
     let host = Host::new();
