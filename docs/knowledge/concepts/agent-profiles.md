@@ -73,6 +73,82 @@ behavior to it, with only `PATH` inherited so interpreter scripts resolve (the P
 package uses this). Keep legacy custom profiles usable when `agent_base` is absent,
 but treat a present unknown base as display-only.
 
+### Wrapper programs and version probes
+
+A profile's `program` is also the executable the daemon probes before a new
+launch or a resume. The probe supplies only the runtime package's probe
+arguments, such as `--version`: it does not prepend the profile's fixed `args`.
+It uses private HOME, XDG, temporary and working directories; only the effective
+launch `PATH` is inherited, not the profile's other environment values. The
+wrapper must answer that invocation in the underlying agent's declared format,
+without loading user configuration, requiring credentials or contacting a service.
+Forward the real agent's output rather than printing a made-up supported version.
+The probe's deadline and output limits still apply.
+
+An unparseable answer and a failed probe include conditional wrapper recovery
+guidance in the launch refusal and doctor detail. A parsed release outside the
+supported range instead names the release and range. All retain
+`agent_runtime_unsupported`; none echoes raw probe output. A wrapper that handles
+ordinary launch arguments but cannot answer the version-only invocation is refused.
+
+A bare `program = "/usr/bin/direnv"` with `args = ["exec", ...]` does not meet
+this contract: its probe is `direnv --version`, which reports direnv's release.
+Use an owner-controlled executable wrapper. For example, save this POSIX shell
+wrapper as `/home/owner/bin/codex-direnv` and make it executable:
+
+```sh
+#!/bin/sh
+set -eu
+agent=/usr/bin/codex
+if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
+    exec "$agent" --version
+fi
+exec /usr/bin/direnv "$@"
+```
+
+The profile keeps the dispatch arguments for ordinary launches and resumes:
+
+```toml
+# Keep the profile's existing base, package and digest binding.
+program = "/home/owner/bin/codex-direnv"
+args = ["exec", "/srv/project", "/usr/bin/codex"]
+```
+
+Replace the example paths with the host's actual paths. The wrapper's `agent`
+and the executable in the profile's `args` must identify the same agent, so the
+version being checked is the one being launched. The version branch deliberately
+bypasses direnv: the probe does not have the project's ordinary environment.
+
+A Python forwarding bridge has the same requirement. Save this executable script
+as `/home/owner/bin/claude-bridge`, with absolute paths suitable for the host:
+
+```python
+#!/usr/bin/python3
+import os
+import sys
+
+AGENT = "/usr/bin/claude"
+if sys.argv[1:] == ["--version"]:
+    os.execv(AGENT, [AGENT, "--version"])
+if len(sys.argv) < 2 or sys.argv[1] != AGENT:
+    raise SystemExit("expected the configured agent as the first argument")
+os.execv(AGENT, [AGENT, *sys.argv[2:]])
+```
+
+Its profile supplies the normal forwarding argument:
+
+```toml
+# Keep the profile's existing base, package and digest binding.
+program = "/home/owner/bin/claude-bridge"
+args = ["/usr/bin/claude"]
+```
+
+The version-only branch works without the profile's fixed target argument. During
+launch and resume, the bridge preserves the arguments that follow that target,
+including the runtime's resume arguments. These examples handle the official
+Codex and Claude packages' `--version` probe; a custom runtime's wrapper must
+handle the probe arguments that its own package declares.
+
 Hermes profiles use `base = "hermes"`. Their program and fixed arguments may
 wrap the local terminal command, but they cannot enable fork semantics. The
 package's bare launch is exactly `hermes chat`; a valid native reference resumes

@@ -372,7 +372,7 @@ impl ProtocolError {
     pub fn agent_runtime_unsupported() -> Self {
         Self::observation(
             "agent_runtime_unsupported",
-            "the selected agent executable did not pass this daemon's version check",
+            "the selected agent executable did not pass this daemon's version check; if the configured program is a wrapper, it must answer the runtime package's version-probe arguments without the profile's fixed arguments",
         )
     }
 
@@ -409,7 +409,7 @@ impl ProtocolError {
             "agent_runtime_unsupported",
             "the selected agent executable's version output does not match its runtime's declared format",
             Some(
-                "the configured program must print its release in the format its runtime package declares"
+                "the configured program must print its release in the format its runtime package declares; if the configured program is a wrapper, it must answer the runtime package's version-probe arguments without the profile's fixed arguments"
                     .to_owned(),
             ),
         )

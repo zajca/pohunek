@@ -38,6 +38,8 @@ use pohunek_daemon::detect::{
 };
 use pohunek_daemon::procwatch::{ProcessFact, StartIdentity};
 use pohunek_daemon::session::HostTrustAnchor;
+#[cfg(target_os = "linux")]
+use pohunek_test_support::fs::copy_shell_image;
 use pohunek_test_support::fs::write_executable;
 use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::wait::{poll_until, wait_until};
@@ -1388,13 +1390,28 @@ impl Fixture {
     /// Writes the profile `name`, pinned to the installed package and to the
     /// fixture's Codex home. `program` replaces the runtime's `codex`.
     fn write_profile(&self, name: &str, program: Option<&Path>) {
+        self.write_profile_with_args(name, program, &[]);
+    }
+
+    /// [`Self::write_profile`] with the profile's fixed launch arguments.
+    fn write_profile_with_args(&self, name: &str, program: Option<&Path>, args: &[String]) {
         let program = program.map_or_else(String::new, |program| {
             format!("program = \"{}\"\n", path_str(program))
         });
+        let args = if args.is_empty() {
+            String::new()
+        } else {
+            let list = args
+                .iter()
+                .map(|argument| format!("\"{argument}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("args = [{list}]\n")
+        };
         self.harness.profile(
             name,
             &format!(
-                "base = \"codex\"\npackage = \"{PACKAGE_ID}\"\ndigest = \"{digest}\"\n{program}\n[env]\nCODEX_HOME = \"{home}\"\n",
+                "base = \"codex\"\npackage = \"{PACKAGE_ID}\"\ndigest = \"{digest}\"\n{program}{args}\n[env]\nCODEX_HOME = \"{home}\"\n",
                 digest = self.digest.as_str(),
                 home = path_str(&self.codex_home),
             ),
@@ -2156,10 +2173,13 @@ async fn the_package_version_probe_refuses_an_unsupported_codex_and_starts_the_s
         );
         let message = refused["err"]["msg"].as_str().expect("refusal message");
         if matches!(verdict, ProbeVerdict::Failed) {
-            assert_eq!(
-                message, "the selected agent executable did not pass this daemon's version check",
+            assert!(
+                message.starts_with(
+                    "the selected agent executable did not pass this daemon's version check"
+                ),
                 "{refused}"
             );
+            assert!(refused["err"]["recover"].is_null(), "{refused}");
         } else {
             for fragment in verdict.expected() {
                 assert!(message.contains(&fragment), "{fragment:?}: {refused}");
@@ -2213,6 +2233,594 @@ async fn the_package_version_probe_refuses_an_unsupported_codex_and_starts_the_s
         assert_eq!(launched["ok"]["agent_base"], "codex");
         fixture.stop(&id).await;
     }
+    fixture.finish().await;
+}
+
+/// The recovery guidance a refused wrapper profile must carry (issue #1196):
+/// the probe runs the program with only the package's probe arguments, so a
+/// wrapper `program` must answer them itself, without the profile's fixed
+/// arguments. Launch refusals and doctor details for unparseable and failed
+/// probes carry it; raw probe output never appears.
+#[cfg(target_os = "linux")]
+fn assert_wrapper_guidance(text: &str, context: &str) {
+    for fragment in [
+        "wrapper",
+        "version-probe arguments",
+        "profile's fixed arguments",
+    ] {
+        assert!(
+            text.contains(fragment),
+            "{context} must tell the operator {fragment:?}: {text:?}"
+        );
+    }
+}
+
+/// Where the wrapper script named `directory` logs its invocations, one
+/// space-joined argv per line.
+#[cfg(target_os = "linux")]
+fn wrapper_argv_log(root: &Path, directory: &str) -> PathBuf {
+    root.join(format!("wrapper-{directory}.log"))
+}
+
+/// Writes the fake Codex a wrapper delegates to: a script whose interpreter
+/// is a copy of `/bin/sh` named for the provider (the worker admits the
+/// process as the launch process of a hook claim by its executable name),
+/// which logs its argv, answers `--version` with `banner`, reports
+/// `reference` through the real hook endpoint of its worker when launched,
+/// and then idles.
+#[cfg(target_os = "linux")]
+fn write_wrapper_agent(root: &Path, directory: &str, banner: &str, reference: &str) -> PathBuf {
+    let interpreter = root.join("fake-codex-sh");
+    if !interpreter.exists() {
+        copy_shell_image("/bin/sh", &interpreter)
+            .expect("copy the shell image for the fake agent interpreter");
+    }
+    let reporter = write_identity_reporter(root);
+    let path = root.join(directory).join("codex");
+    fs::create_dir_all(path.parent().expect("the fake agent directory"))
+        .expect("create the fake agent directory");
+    write_executable(
+        &path,
+        format!(
+            "#!{interpreter}\nprintf '%s\\n' \"$*\" >> '{agent_log}'\nif [ \"$1\" = \"--version\" ]; then\n  echo '{banner}'\n  exit 0\nfi\npython3 '{reporter}' '{reference}' '{report_log}'\nwhile :; do sleep 600; done\n",
+            interpreter = path_str(&interpreter),
+            agent_log = root.join(format!("agent-{directory}.log")).display(),
+            reporter = reporter.display(),
+            report_log = root.join("hook-report.log").display(),
+        ),
+    )
+    .expect("write the fake agent a wrapper delegates to");
+    path
+}
+
+/// Writes the Python script a fake agent runs to report a native reference
+/// through the real hook endpoint of its worker: the claim names the parent
+/// process (the launch process) and the reference, exactly as a provider
+/// hook does, and appends the worker's reply to `hook-report.log`.
+#[cfg(target_os = "linux")]
+fn write_identity_reporter(root: &Path) -> PathBuf {
+    let path = root.join("identity-reporter.py");
+    fs::write(
+        &path,
+        r#"
+import json, os, socket, sys, time
+from datetime import datetime, timedelta, timezone
+
+pid = os.getppid()
+with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+    start_identity = int(handle.read().rsplit(")", 1)[1].split()[19])
+request = {
+    "type": "identity_report",
+    "runtime_id": os.environ["POHUNEK_WORKER_INSTANCE_ID"],
+    "provider": "codex",
+    "pid": pid,
+    "start_identity": start_identity,
+    "sequence": time.clock_gettime_ns(time.CLOCK_MONOTONIC),
+    "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=30))
+    .isoformat()
+    .replace("+00:00", "Z"),
+    "reference_kind": "id",
+    "native_reference": sys.argv[1],
+}
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.connect(os.environ["POHUNEK_WORKER_SOCKET_PATH"])
+client.sendall((json.dumps(request) + "\n").encode())
+received = b""
+while b"\n" not in received:
+    chunk = client.recv(4096)
+    if not chunk:
+        raise RuntimeError(f"worker closed the socket before a full response line: {received!r}")
+    received += chunk
+client.close()
+reply = json.loads(received.split(b"\n", 1)[0])
+with open(sys.argv[2], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(reply) + "\n")
+"#,
+    )
+    .expect("write the identity reporter");
+    path
+}
+
+/// Writes a direnv-style dispatch wrapper for the agent `target`: with the
+/// profile's fixed arguments `exec <dir> <target>` it dispatches the agent
+/// the way `direnv exec` would. `answers_the_probe` selects the conforming
+/// version branch; `false` writes the wrapper that answers the package's
+/// probe with its own version instead, which the daemon cannot parse.
+#[cfg(target_os = "linux")]
+fn write_direnv_wrapper(
+    root: &Path,
+    directory: &str,
+    target: &Path,
+    answers_the_probe: bool,
+) -> PathBuf {
+    let version_branch = if answers_the_probe {
+        format!("exec '{target}' --version", target = target.display())
+    } else {
+        "echo '2.38.2'\n  exit 0".to_owned()
+    };
+    let log = wrapper_argv_log(root, directory);
+    let path = root.join(directory).join("wrapper");
+    fs::create_dir_all(path.parent().expect("the wrapper directory"))
+        .expect("create the wrapper directory");
+    write_executable(
+        &path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nif [ \"$1\" = \"--version\" ]; then\n  {version_branch}\nfi\nif [ \"$1\" = \"exec\" ] && [ \"$3\" = '{target}' ]; then\n  shift 3\n  exec '{target}' \"$@\"\nfi\necho 'unexpected dispatch arguments' >&2\nexit 64\n",
+            log = log.display(),
+            target = target.display(),
+        ),
+    )
+    .expect("write the direnv-style wrapper");
+    path
+}
+
+/// Writes a forwarding bridge for the agent `target`: with the profile's
+/// fixed argument `<target>` it forwards every further argument to the
+/// agent. `answers_the_probe` selects the conforming version branch;
+/// `false` writes the bridge that treats the probe argument as the agent
+/// path and fails the probe.
+#[cfg(target_os = "linux")]
+fn write_bridge_wrapper(
+    root: &Path,
+    directory: &str,
+    target: &Path,
+    answers_the_probe: bool,
+) -> PathBuf {
+    let version_branch = if answers_the_probe {
+        format!(
+            "if [ \"$1\" = \"--version\" ]; then\n  exec '{target}' --version\nfi\n",
+            target = target.display()
+        )
+    } else {
+        String::new()
+    };
+    let log = wrapper_argv_log(root, directory);
+    let path = root.join(directory).join("wrapper");
+    fs::create_dir_all(path.parent().expect("the wrapper directory"))
+        .expect("create the wrapper directory");
+    write_executable(
+        &path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n{version_branch}target=$1\nshift\nexec \"$target\" \"$@\"\n",
+            log = log.display(),
+        ),
+    )
+    .expect("write the forwarding bridge");
+    path
+}
+
+/// A wrapper profile (a `program` whose fixed arguments name the agent it
+/// wraps) launches and resumes when the wrapper answers the package's
+/// version probe itself: the probe runs the program with only the package's
+/// probe arguments — never the fixed arguments or the profile environment —
+/// the launch and the resume keep the fixed arguments, and the native
+/// reference arrives through the real worker hook handshake.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one integration scenario asserts the wrapper probe contract at the launch boundary"
+)]
+async fn a_conforming_wrapper_profile_launches_and_resumes_with_its_fixed_arguments() {
+    let fixture = Fixture::start().await;
+    let root = fixture.harness.env.root().to_path_buf();
+    let cwd = fixture.harness.env.cwd().to_path_buf();
+    let release = locked_release();
+
+    let dispatch_agent = write_wrapper_agent(
+        &root,
+        "dispatch-agent",
+        &format!("codex-cli {release}"),
+        "wrapper-conversation-0",
+    );
+    let dispatch_wrapper = write_direnv_wrapper(&root, "dispatch-wrapper", &dispatch_agent, true);
+    let bridge_agent = write_wrapper_agent(
+        &root,
+        "bridge-agent",
+        &format!("codex-cli {release}"),
+        "wrapper-conversation-1",
+    );
+    let bridge_wrapper = write_bridge_wrapper(&root, "bridge-wrapper", &bridge_agent, true);
+    fixture.write_profile_with_args(
+        "wrapper-dispatch-ok",
+        Some(&dispatch_wrapper),
+        &[
+            "exec".to_owned(),
+            cwd.display().to_string(),
+            dispatch_agent.display().to_string(),
+        ],
+    );
+    fixture.write_profile_with_args(
+        "wrapper-bridge-ok",
+        Some(&bridge_wrapper),
+        &[bridge_agent.display().to_string()],
+    );
+
+    // The inventory probes the wrappers and reports the agent release.
+    for profile in ["wrapper-dispatch-ok", "wrapper-bridge-ok"] {
+        let entry = fixture.inventory_entry(profile).await;
+        assert_eq!(entry["supported"], true, "{entry}");
+        assert_eq!(entry["version"], release, "{entry}");
+    }
+
+    // Both wrappers launch.
+    let mut sessions = Vec::new();
+    for (profile, directory, agent, reference) in [
+        (
+            "wrapper-dispatch-ok",
+            "dispatch-wrapper",
+            &dispatch_agent,
+            "wrapper-conversation-0",
+        ),
+        (
+            "wrapper-bridge-ok",
+            "bridge-wrapper",
+            &bridge_agent,
+            "wrapper-conversation-1",
+        ),
+    ] {
+        let (code, launched) = fixture.launch(profile, "wrapper").await;
+        assert_eq!(code, 0, "{launched}");
+        let id = launched["ok"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_owned();
+        sessions.push((directory, agent.display().to_string(), reference, id));
+    }
+
+    // The probe ran each wrapper with only the package's probe arguments,
+    // and the launch kept the profile's fixed arguments. A returned launch is
+    // not log readiness: the wrapper logs its argv only when the worker runs
+    // it, which can trail the launch command, so wait for the exact launch
+    // line and treat a missing or partially written log as pending.
+    for (directory, launch_line) in [
+        (
+            "dispatch-wrapper",
+            format!("exec {} {}", cwd.display(), dispatch_agent.display()),
+        ),
+        ("bridge-wrapper", bridge_agent.display().to_string()),
+    ] {
+        let log = wait_until("the wrapper's launch argv entry", || async {
+            let log = fs::read_to_string(wrapper_argv_log(&root, directory)).ok()?;
+            log.lines().any(|line| *line == launch_line).then_some(log)
+        })
+        .await;
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            lines.first(),
+            Some(&"--version"),
+            "the probe passes only the package's probe arguments: {log}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains("--version") || *line == "--version"),
+            "no probe invocation carries the fixed arguments: {log}"
+        );
+        assert!(
+            lines.iter().any(|line| *line == launch_line),
+            "the launch kept the profile's fixed arguments: {log}"
+        );
+    }
+
+    // The hook handshake reported each conversation, and the resume keeps
+    // the fixed arguments and the reference intact.
+    for (directory, agent, reference, id) in sessions {
+        let reported = wait_until("the hook-reported native reference", || async {
+            let (code, inspected) = fixture.harness.json(&["session", "inspect", &id]).await;
+            assert_eq!(code, 0, "{inspected}");
+            inspected["ok"]["native_session_id"]
+                .is_string()
+                .then(|| inspected["ok"].clone())
+        })
+        .await;
+        assert_eq!(
+            reported["native_session_id"], reference,
+            "the wrapper's agent reported the conversation: {reported}"
+        );
+        fixture.stop(&id).await;
+        let (code, resumed) = fixture.harness.json(&["session", "resume", &id]).await;
+        assert_eq!(code, 0, "{resumed}");
+        // The dispatch wrapper sees the fixed arguments ahead of the resume
+        // arguments; the bridge sees the agent path ahead of them. A returned
+        // resume and the reported reference are not log readiness: the wrapper
+        // and the agent log their argv only when the worker runs them, which
+        // can trail the resume command, so wait for the exact resume lines and
+        // treat a missing or partially written log as pending.
+        let resumed_line = match directory {
+            "dispatch-wrapper" => format!("exec {} {agent} resume {reference}", cwd.display()),
+            _ => format!("{agent} resume {reference}"),
+        };
+        let log = wait_until("the wrapper's resume argv entry", || async {
+            let log = fs::read_to_string(wrapper_argv_log(&root, directory)).ok()?;
+            log.lines().any(|line| *line == resumed_line).then_some(log)
+        })
+        .await;
+        assert!(
+            log.lines().any(|line| line == resumed_line),
+            "the resume kept the fixed arguments and the reference: {log}"
+        );
+        let agent_directory = match directory {
+            "dispatch-wrapper" => "dispatch-agent",
+            _ => "bridge-agent",
+        };
+        let agent_resumed_line = format!("resume {reference}");
+        let agent_log = wait_until("the agent's resume argv entry", || async {
+            let log = fs::read_to_string(root.join(format!("agent-{agent_directory}.log"))).ok()?;
+            log.lines()
+                .any(|line| *line == agent_resumed_line)
+                .then_some(log)
+        })
+        .await;
+        assert!(
+            agent_log.lines().any(|line| line == agent_resumed_line),
+            "the wrapper dispatched the resume to the agent: {agent_log}"
+        );
+        fixture.stop(&id).await;
+    }
+
+    // Doctor probes the wrappers through the same package and reports the
+    // profiles ready.
+    let doctor = fixture.harness.run(&["doctor", "--json"]).await;
+    let doctor: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
+    for name in [
+        "agent_profile_wrapper-dispatch-ok",
+        "agent_profile_wrapper-bridge-ok",
+    ] {
+        let check = doctor["ok"]["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .find(|check| check["name"] == name)
+            .unwrap_or_else(|| panic!("doctor reports {name}: {doctor}"));
+        assert_eq!(check["status"], "ok", "{check}");
+    }
+    fixture.finish().await;
+}
+
+/// A wrapper profile whose program cannot answer the package's version probe
+/// is refused at `session new` and at `session resume`, and `pohunek doctor`
+/// fails its check, each naming the wrapper requirement in its recovery
+/// guidance — the probe runs the program with only the package's probe
+/// arguments, without the profile's fixed arguments — and never echoing the
+/// raw output. A release outside the supported range stays a distinct
+/// refusal without the wrapper guidance.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one integration scenario asserts the refusals, the doctor details and the resume refusals of the wrapper probe contract"
+)]
+async fn a_wrapper_that_cannot_answer_the_version_probe_is_refused_with_wrapper_guidance() {
+    let fixture = Fixture::start().await;
+    let root = fixture.harness.env.root().to_path_buf();
+    let cwd = fixture.harness.env.cwd().to_path_buf();
+    let release = locked_release();
+
+    let target = write_fake_codex(&root, "wrapper-target", &format!("codex-cli {release}"));
+    let ahead = write_fake_codex(&root, "wrapper-ahead", "codex-cli 1.0.0");
+    let banner = write_direnv_wrapper(&root, "banner", &target, false);
+    let failing = write_bridge_wrapper(&root, "failing", &target, false);
+    let ranging = write_direnv_wrapper(&root, "ranging", &ahead, true);
+    fixture.write_profile_with_args(
+        "wrapper-dispatch-banner",
+        Some(&banner),
+        &[
+            "exec".to_owned(),
+            cwd.display().to_string(),
+            target.display().to_string(),
+        ],
+    );
+    fixture.write_profile_with_args(
+        "wrapper-bridge-nonzero",
+        Some(&failing),
+        &[target.display().to_string()],
+    );
+    fixture.write_profile_with_args(
+        "wrapper-dispatch-range",
+        Some(&ranging),
+        &[
+            "exec".to_owned(),
+            cwd.display().to_string(),
+            ahead.display().to_string(),
+        ],
+    );
+
+    for (profile, verdict) in [
+        ("wrapper-dispatch-banner", ProbeVerdict::Unparseable),
+        ("wrapper-bridge-nonzero", ProbeVerdict::Failed),
+        ("wrapper-dispatch-range", ProbeVerdict::OutOfRange("1.0.0")),
+    ] {
+        let entry = fixture.inventory_entry(profile).await;
+        assert_eq!(entry["supported"], false, "{entry}");
+        let (code, refused) = fixture.launch(profile, "refused").await;
+        assert_eq!(code, 1, "{refused}");
+        assert_eq!(
+            refused["err"]["code"], "agent_runtime_unsupported",
+            "{refused}"
+        );
+        let message = refused["err"]["msg"].as_str().expect("refusal message");
+        for fragment in verdict.expected() {
+            assert!(message.contains(&fragment), "{fragment:?}: {refused}");
+        }
+        let recover = refused["err"]["recover"].as_str().unwrap_or("");
+        match verdict {
+            ProbeVerdict::OutOfRange(_) => assert!(
+                !recover.contains("wrapper"),
+                "out of range keeps its own guidance: {refused}"
+            ),
+            ProbeVerdict::Unparseable => assert_wrapper_guidance(recover, "the launch refusal"),
+            ProbeVerdict::Failed => {
+                assert!(refused["err"]["recover"].is_null(), "{refused}");
+                assert_wrapper_guidance(message, "the failed launch refusal");
+            }
+        }
+        if matches!(verdict, ProbeVerdict::Unparseable) {
+            assert!(!refused.to_string().contains("2.38.2"), "{refused}");
+        }
+    }
+
+    let doctor = fixture.harness.run(&["doctor", "--json"]).await;
+    let doctor: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
+    for (name, verdict) in [
+        (
+            "agent_profile_wrapper-dispatch-banner",
+            ProbeVerdict::Unparseable,
+        ),
+        ("agent_profile_wrapper-bridge-nonzero", ProbeVerdict::Failed),
+        (
+            "agent_profile_wrapper-dispatch-range",
+            ProbeVerdict::OutOfRange("1.0.0"),
+        ),
+    ] {
+        let check = doctor["ok"]["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .find(|check| check["name"] == name)
+            .unwrap_or_else(|| panic!("doctor reports {name}: {doctor}"));
+        assert_eq!(check["status"], "fail", "{check}");
+        let detail = check["detail"].as_str().expect("doctor detail");
+        for fragment in verdict.expected() {
+            assert!(detail.contains(&fragment), "{fragment:?}: {check}");
+        }
+        match verdict {
+            ProbeVerdict::OutOfRange(_) => assert!(
+                !detail.contains("wrapper"),
+                "out of range keeps its own detail: {check}"
+            ),
+            _ => assert_wrapper_guidance(detail, "the doctor detail"),
+        }
+        if matches!(verdict, ProbeVerdict::Unparseable) {
+            assert!(!detail.contains("2.38.2"), "{check}");
+        }
+    }
+
+    // A conforming wrapper launches and holds a native reference; once only
+    // the wrapper's probe behavior changes, resume refuses with the same
+    // guidance.
+    let resume_agent = write_wrapper_agent(
+        &root,
+        "resume-agent",
+        &format!("codex-cli {release}"),
+        "wrapper-conversation-2",
+    );
+    let resume_wrapper = write_direnv_wrapper(&root, "resume-wrapper", &resume_agent, true);
+    fixture.write_profile_with_args(
+        "wrapper-dispatch-resume",
+        Some(&resume_wrapper),
+        &[
+            "exec".to_owned(),
+            cwd.display().to_string(),
+            resume_agent.display().to_string(),
+        ],
+    );
+    let (code, launched) = fixture.launch("wrapper-dispatch-resume", "resumable").await;
+    assert_eq!(code, 0, "{launched}");
+    let id = launched["ok"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let reported = wait_until("the hook-reported native reference", || async {
+        let (code, inspected) = fixture.harness.json(&["session", "inspect", &id]).await;
+        assert_eq!(code, 0, "{inspected}");
+        inspected["ok"]["native_session_id"]
+            .is_string()
+            .then(|| inspected["ok"].clone())
+    })
+    .await;
+    assert_eq!(
+        reported["native_session_id"], "wrapper-conversation-2",
+        "{reported}"
+    );
+    fixture.stop(&id).await;
+    write_direnv_wrapper(&root, "resume-wrapper", &resume_agent, false);
+    let (code, refused) = fixture.harness.json(&["session", "resume", &id]).await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(
+        refused["err"]["code"], "agent_runtime_unsupported",
+        "{refused}"
+    );
+    assert!(
+        refused["err"]["msg"]
+            .as_str()
+            .expect("refusal message")
+            .contains("does not match its runtime's declared format"),
+        "{refused}"
+    );
+    assert_wrapper_guidance(
+        refused["err"]["recover"].as_str().unwrap_or(""),
+        "the resume refusal",
+    );
+    assert!(!refused.to_string().contains("2.38.2"), "{refused}");
+
+    // The same for a forwarding bridge whose probe fails.
+    let bridge_agent = write_wrapper_agent(
+        &root,
+        "resume-bridge-agent",
+        &format!("codex-cli {release}"),
+        "wrapper-conversation-3",
+    );
+    let bridge_wrapper = write_bridge_wrapper(&root, "resume-bridge", &bridge_agent, true);
+    fixture.write_profile_with_args(
+        "wrapper-bridge-resume",
+        Some(&bridge_wrapper),
+        &[bridge_agent.display().to_string()],
+    );
+    let (code, launched) = fixture.launch("wrapper-bridge-resume", "bridged").await;
+    assert_eq!(code, 0, "{launched}");
+    let id = launched["ok"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let reported = wait_until("the hook-reported native reference", || async {
+        let (code, inspected) = fixture.harness.json(&["session", "inspect", &id]).await;
+        assert_eq!(code, 0, "{inspected}");
+        inspected["ok"]["native_session_id"]
+            .is_string()
+            .then(|| inspected["ok"].clone())
+    })
+    .await;
+    assert_eq!(
+        reported["native_session_id"], "wrapper-conversation-3",
+        "{reported}"
+    );
+    fixture.stop(&id).await;
+    write_bridge_wrapper(&root, "resume-bridge", &bridge_agent, false);
+    let (code, refused) = fixture.harness.json(&["session", "resume", &id]).await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(
+        refused["err"]["code"], "agent_runtime_unsupported",
+        "{refused}"
+    );
+    let message = refused["err"]["msg"].as_str().expect("refusal message");
+    assert!(
+        message
+            .starts_with("the selected agent executable did not pass this daemon's version check"),
+        "{refused}"
+    );
+    assert!(refused["err"]["recover"].is_null(), "{refused}");
+    assert_wrapper_guidance(message, "the failed resume refusal");
     fixture.finish().await;
 }
 
