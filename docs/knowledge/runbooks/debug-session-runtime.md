@@ -232,6 +232,8 @@ The `reason` codes:
   `worker_timeout` (no answer within the 0.5 s socket timeout),
   `worker_closed` (no usable answer line; `detail` an errno, `empty` or
   `malformed`);
+  A hook timeout means no answer arrived within the deadline, not that the
+  claim was rejected, since the worker may still apply it.
 - `worker_refused`: the worker answered without `ok: true`; match it with the
   `worker.identity.rejected` or `worker.subagent.claim.refused` line of the
   same moment in the worker log;

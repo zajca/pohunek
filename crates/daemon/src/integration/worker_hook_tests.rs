@@ -709,8 +709,9 @@ mod subagent_sequences {
         /// the worker's snapshot there.
         ///
         /// A checkpoint's marker is written only after the hooks before it have
-        /// run to completion, and each hook returns only once the worker has
-        /// answered its claim, so every earlier claim is decided by then.
+        /// run to completion. Hook completion alone does not prove that the
+        /// worker answered: a hook can time out while its claim is still being
+        /// committed. Callers inspect the journaled state separately.
         async fn pass_barrier(&mut self) -> InspectSnapshot {
             let marker = self.root.join(format!("barrier-{}", self.passed));
             Box::pin(wait_until("the agent reaches the checkpoint", || async {
@@ -4634,12 +4635,11 @@ for claim in plan:
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         use std::path::{Path, PathBuf};
 
-        use pohunek_worker_protocol::SubagentPhase;
         use serde_json::{json, Value};
 
         use super::{
-            claude_rows, quoted, recorded, replay, state_asset, stop_tasks, Row, Rows, Step,
-            CLAUDE, CODEX, OTHER_INPUT_BOUND, SESSION_ID,
+            quoted, recorded, replay, state_asset, stop_tasks, Rows, Step, CLAUDE, CODEX,
+            OTHER_INPUT_BOUND, SESSION_ID,
         };
 
         /// Hook action of a subagent start, named as the line's `action`.
@@ -5046,10 +5046,111 @@ for claim in plan:
             assert_no_leak(&trace, &canaries);
         }
 
-        /// Test item 2: claims the worker acknowledges write no line. Claude
-        /// and Codex subagent starts and stops and a valid main `Stop`
-        /// snapshot run first; one failure exit after them leaves the only
-        /// line.
+        /// Runs real hooks against a bound peer and verifies every explicit ACK.
+        ///
+        /// The peer has no durability work; row application belongs to the real
+        /// worker replay scenarios, not this transport-to-trace assertion.
+        async fn assert_acknowledged_hooks(
+            root: &Path,
+            steps: Vec<Step>,
+            expected: &[(&str, &str, Option<&str>)],
+        ) {
+            let socket = root.join("ack.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).expect("bind ACK peer");
+            let mut peer = tokio::task::JoinSet::new();
+            let request_count = expected.len();
+            peer.spawn(async move {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+                let mut requests = Vec::new();
+                for _ in 0..request_count {
+                    let (stream, _) = listener.accept().await.expect("accept hook");
+                    let (read, mut write) = stream.into_split();
+                    let mut line = String::new();
+                    BufReader::new(read)
+                        .read_line(&mut line)
+                        .await
+                        .expect("read hook request");
+                    requests.push(serde_json::from_str::<Value>(&line).expect("JSON request"));
+                    write
+                        .write_all(b"{\"ok\":true}\n")
+                        .await
+                        .expect("send explicit ACK");
+                }
+                requests
+            });
+            let commands = steps
+                .into_iter()
+                .map(|step| match step {
+                    Step::Command(command) => command,
+                    _ => panic!("traced steps are shell commands"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let output = pohunek_test_support::wait::guard(
+                "acknowledged hooks to finish",
+                tokio::process::Command::new("/bin/sh")
+                    .args(["-c", &commands])
+                    .current_dir(root)
+                    .env_clear()
+                    .env("PATH", crate::integration::tests::inherited_path())
+                    .env("TMPDIR", root)
+                    .env("POHUNEK_ENV", "1")
+                    .env("POHUNEK_SESSION_ID", SESSION_ID)
+                    .env(
+                        "POHUNEK_PROTOCOL_VERSION",
+                        protocol::PROTOCOL_VERSION.get().to_string(),
+                    )
+                    .env("POHUNEK_WORKER_SOCKET_PATH", &socket)
+                    .env("POHUNEK_WORKER_INSTANCE_ID", "runtime-trace-ack")
+                    .env(
+                        "POHUNEK_HOOK_TRACE_PATH",
+                        super::super::hook_trace_path(root),
+                    )
+                    .env(
+                        "POHUNEK_HOOK_TRACE_MAX_BYTES",
+                        pohunek_logging::config::HOOK_TRACE_MAX_FILE_BYTES.to_string(),
+                    )
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("run hook sequence");
+            assert!(output.status.success());
+            assert!(output.stdout.is_empty() && output.stderr.is_empty());
+            let requests = pohunek_test_support::wait::guard("all hook ACKs", peer.join_next())
+                .await
+                .expect("peer task exists")
+                .expect("peer task succeeds");
+            assert_eq!(requests.len(), expected.len());
+            for (request, (provider, kind, id)) in requests.iter().zip(expected.iter().copied()) {
+                assert_eq!(request["provider"], provider);
+                assert_eq!(request["type"], kind);
+                assert_eq!(request["runtime_id"], "runtime-trace-ack");
+                assert!(request["pid"].as_u64().is_some_and(|pid| pid > 1));
+                assert!(request["start_identity"]
+                    .as_u64()
+                    .is_some_and(|start| start > 0));
+                assert!(request["sequence"]
+                    .as_u64()
+                    .is_some_and(|sequence| sequence > 0));
+                if let Some(id) = id {
+                    assert_eq!(request["subagent_id"], id);
+                } else {
+                    assert_eq!(request["tasks"], json!([]));
+                }
+                if kind == "subagent_stop" {
+                    assert_eq!(request["outcome"], "completed");
+                }
+            }
+        }
+
+        /// Test item 2: received acknowledgements write no trace line.
+        ///
+        /// A protocol peer explicitly acknowledges the five real hook requests.
+        /// This tests transport and tracing without requiring a durable worker
+        /// commit to complete within the production hook deadline. Real-worker
+        /// replay scenarios separately verify admission and journaled rows.
         #[tokio::test(flavor = "multi_thread")]
         async fn acknowledged_claims_write_no_trace_line() {
             let root = crate::test_support::scoped_dir("ph-trace-success-");
@@ -5113,12 +5214,18 @@ for claim in plan:
                 ),
                 traced(&root, "control", "", &claude, SUBAGENT_START, NOT_JSON),
             ];
-            let mut completed = claude_rows(&[Row {
-                agent_id: started.agent_id.clone(),
-                lifecycle: SubagentPhase::Completed,
-            }]);
-            completed.insert((CODEX.to_owned(), codex_id), SubagentPhase::Completed);
-            replay(&root, steps, &completed).await.finish().await;
+            assert_acknowledged_hooks(
+                &root,
+                steps,
+                &[
+                    (CLAUDE, "subagent_start", Some(started.agent_id.as_str())),
+                    (CLAUDE, "subagent_stop", Some(started.agent_id.as_str())),
+                    (CODEX, "subagent_start", Some(codex_id.as_str())),
+                    (CODEX, "subagent_stop", Some(codex_id.as_str())),
+                    (CLAUDE, "subagent_snapshot", None),
+                ],
+            )
+            .await;
 
             for name in [
                 "claude-start",
