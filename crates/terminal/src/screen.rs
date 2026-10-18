@@ -16,6 +16,8 @@ pub struct ScreenRegion {
 
 pub struct ScreenTracker {
     parser: vt100::Parser,
+    /// VT and UTF-8 state retained across feeds for character observations.
+    draw_parser: vte::Parser,
 }
 
 impl std::fmt::Debug for ScreenTracker {
@@ -31,11 +33,21 @@ impl ScreenTracker {
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
             parser: vt100::Parser::new(rows, cols, SCROLLBACK_LINES),
+            draw_parser: vte::Parser::new(),
         }
     }
 
-    pub fn feed(&mut self, bytes: &[u8]) {
+    /// Feeds PTY bytes and reports whether characters were drawn.
+    ///
+    /// A second instance of the same VT state machine used by `vt100` observes
+    /// print callbacks, including identical redraws that a final text diff
+    /// misses. Both parsers retain partial UTF-8 and escape sequences across
+    /// feeds; OSC payloads, cursor movement and other controls do not print.
+    pub fn feed(&mut self, bytes: &[u8]) -> bool {
+        let mut observation = DrawObservation::default();
+        self.draw_parser.advance(&mut observation, bytes);
         self.parser.process(bytes);
+        observation.drew_chars
     }
 
     /// Whether the parsed terminal has bracketed paste enabled.
@@ -57,6 +69,7 @@ impl ScreenTracker {
     pub fn reset(&mut self) {
         let (rows, cols) = self.parser.screen().size();
         self.parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+        self.draw_parser = vte::Parser::new();
     }
 
     #[must_use]
@@ -286,6 +299,23 @@ impl ScreenTracker {
             }
         }
         None
+    }
+}
+
+/// Print callbacks for one feed; parser state lives in `ScreenTracker`.
+#[derive(Default)]
+struct DrawObservation {
+    drew_chars: bool,
+}
+
+impl vte::Perform for DrawObservation {
+    fn print(&mut self, character: char) {
+        // Match vt100's print callback: replacement and C1 characters are
+        // ignored rather than written to cells. The shared vte parser already
+        // excludes C0 controls, escape payloads and incomplete UTF-8.
+        if character != '\u{fffd}' && !('\u{80}'..'\u{a0}').contains(&character) {
+            self.drew_chars = true;
+        }
     }
 }
 

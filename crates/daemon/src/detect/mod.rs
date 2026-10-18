@@ -234,8 +234,8 @@ pub struct Detector {
     needs_visible_recheck: bool,
     /// Monotonic sequence of evidence arrivals that the strict `manifest_idle`
     /// latch judges freshness with: every received OSC title (even one that
-    /// repeats its value) and every visible-screen text change gets a fresh
-    /// point. The debounced classification keeps its own
+    /// repeats its value) and every screen text change or character redraw
+    /// gets a fresh point. The debounced classification keeps its own
     /// value-changed `ContextFreshness` flags, so activity semantics are
     /// unchanged.
     strict_seq: u64,
@@ -322,12 +322,15 @@ impl Detector {
         transitions
     }
 
-    /// Feeds one screen segment and stamps its sequence point; a segment
-    /// whose visible text did not change does not bump the screen's freshness.
+    /// Feeds a segment and stamps text changes or character redraws.
+    ///
+    /// A clear followed by an identical repaint is fresh screen evidence even
+    /// when the segment's final text equals its initial text. Control-only
+    /// output does not refresh the cached screen's arrival sequence.
     fn feed_screen_segment(&mut self, bytes: &[u8]) {
         let recent_before = self.screen.recent_text();
-        self.screen.feed(bytes);
-        if self.screen.recent_text() != recent_before {
+        let drew_chars = self.screen.feed(bytes);
+        if self.screen.recent_text() != recent_before || drew_chars {
             self.strict_seq += 1;
             self.screen_seq = self.strict_seq;
         }

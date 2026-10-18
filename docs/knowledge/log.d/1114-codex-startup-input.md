@@ -34,6 +34,14 @@
   of the same idle title counts as a fresh arrival for readiness only; the
   activity classification keeps its title-change semantics, and an eligible
   fresh screen idle rule releases the same way.
+- Screen freshness includes identical character redraws, observed with the
+  same `vte` state machine as the terminal grid. A clear and identical composer
+  repaint count as fresh screen evidence whether received together or split
+  into PTY chunks. Control-only output, incomplete UTF-8 and characters ignored
+  by `vt100` cannot refresh stale screen evidence. The blocker barrier still
+  rejects screen output received while a title blocker holds. Screen text
+  changes and character redraws affect strict input freshness; the debounced
+  activity classifier retains its existing final-text-change semantics.
 - This changes the `pohunek.runtime.codex` package digest; after release,
   service upgrade repins host profiles from the old digest to the released
   package digest.

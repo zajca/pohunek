@@ -1412,34 +1412,117 @@ fn manifest_idle_releases_on_fresh_screen_idle_evidence() {
     );
 }
 
-#[test]
-fn manifest_idle_rejects_screen_evidence_received_while_a_title_blocker_holds() {
-    let definition = installed_definition();
+/// The shipped Codex manifest extended with a fresh-screen idle rule and a
+/// title blocker: the pairing the strict-latch screen regressions drive.
+fn screen_idle_manifest_with_title_blocker() -> String {
     let mut source = manifest_with_screen_idle_rule();
     source.push_str(
         "\n[[rules]]\nid = \"title_blocker\"\nstate = \"blocked\"\npriority = 2000\n\
          region = \"osc_title\"\nvisible_blocker = true\ncontains = [\"Action Required\"]\n",
     );
+    source
+}
+
+/// A probe whose title blocker is armed while the composer is drawn under it
+/// and whose blocker title was then cleared: the composer sits on screen,
+/// unchanged by any later output, and no redraw arrived after the clearing.
+fn title_blocker_probe(config: DetectorConfig, columns: u16) -> LatchProbe {
+    let (mut probe, _) = latched_popup_probe(config, columns);
+    probe.feed(&title_chunk("Action Required"));
+    let mut held = clear_composer_chunk(&composer_rows());
+    held.extend(title_chunk(""));
+    probe.feed(&held);
+    probe
+}
+
+#[test]
+fn manifest_idle_rejects_screen_evidence_received_while_a_title_blocker_holds() {
+    let definition = installed_definition();
     let mut config = manifest_idle_probe_config(&definition);
     config.manifest = Some(Arc::new(
-        Manifest::parse_str(&source).expect("title blocker manifest"),
+        Manifest::parse_str(&screen_idle_manifest_with_title_blocker())
+            .expect("title blocker manifest"),
     ));
-    let (mut probe, _) = latched_popup_probe(config, DEFAULT_COLUMNS);
-    probe.feed(&title_chunk("Action Required"));
-    let mut composer_then_clear_title = clear_composer_chunk(&composer_rows());
-    composer_then_clear_title.extend(title_chunk(""));
-    probe.feed(&composer_then_clear_title);
+    let probe = title_blocker_probe(config, DEFAULT_COLUMNS);
     probe.assert_ready(
         false,
         "screen evidence before the title blocker clears is stale",
     );
-    let mut fresh_rows = composer_rows();
-    fresh_rows[0].push_str(" refreshed");
-    probe.feed(&clear_composer_chunk(&fresh_rows));
-    probe.assert_ready(
-        true,
-        "new screen evidence after the title blocker clears releases",
-    );
+}
+
+#[test]
+fn manifest_idle_identical_redraw_releases_under_every_chunking() {
+    let definition = installed_definition();
+    let mut config = manifest_idle_probe_config(&definition);
+    config.manifest = Some(Arc::new(
+        Manifest::parse_str(&screen_idle_manifest_with_title_blocker())
+            .expect("title blocker manifest"),
+    ));
+    let redraw = clear_composer_chunk(&composer_rows());
+    let (clear, repaint) = redraw.split_at(clear_chunk().len());
+    for columns in POPUP_CAPTURE_COLUMNS {
+        // Coalesced: the clear and the identical redraw arrive together, so
+        // the segment's final text is the text it started from. The redraw
+        // has still drawn after the blocker cleared and must be fresh.
+        let mut probe = title_blocker_probe(config.clone(), columns);
+        probe.assert_ready(
+            false,
+            "after clearing the blocker title, before any redraw, stays latched",
+        );
+        probe.feed(&redraw);
+        probe.assert_ready(
+            true,
+            "the coalesced identical redraw counts as fresh screen evidence",
+        );
+
+        // Split: the same bytes split between the clear and the redraw.
+        let mut probe = title_blocker_probe(config.clone(), columns);
+        probe.feed(clear);
+        probe.assert_ready(
+            false,
+            "after the clear but before the repaint still stays latched",
+        );
+        probe.feed(repaint);
+        probe.assert_ready(true, "the split identical redraw releases the same way");
+    }
+}
+
+#[test]
+fn manifest_idle_control_output_does_not_refresh_a_stale_composer() {
+    let definition = installed_definition();
+    let mut config = manifest_idle_probe_config(&definition);
+    config.manifest = Some(Arc::new(
+        Manifest::parse_str(&screen_idle_manifest_with_title_blocker())
+            .expect("title blocker manifest"),
+    ));
+    let controls: &[(&str, &[u8])] = &[
+        ("incomplete UTF-8", b"\xe2"),
+        ("ignored C1 character", b"\xc2\x80"),
+        ("replacement character", "\u{fffd}".as_bytes()),
+        ("cursor and style", b"\x1b[H\x1b[0m\x1b[?25h"),
+        ("OSC progress", b"\x1b]9;4;0;0\x07"),
+        (
+            "DCS payload including BEL",
+            b"\x1bPq\x07not screen text\x1b\\",
+        ),
+        ("split OSC prefix", b"\x1b]52;c;not screen text"),
+    ];
+    for columns in POPUP_CAPTURE_COLUMNS {
+        for &(name, bytes) in controls {
+            for fragmented in [false, true] {
+                let mut probe = title_blocker_probe(config.clone(), columns);
+                if fragmented {
+                    for byte in bytes {
+                        probe.feed(std::slice::from_ref(byte));
+                        probe.assert_ready(false, name);
+                    }
+                } else {
+                    probe.feed(bytes);
+                    probe.assert_ready(false, name);
+                }
+            }
+        }
+    }
 }
 
 #[test]
