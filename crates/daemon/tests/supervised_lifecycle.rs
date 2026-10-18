@@ -76,8 +76,9 @@ const SETTLED: Duration = Duration::from_secs(4);
 /// graceful absence window provably holds output to deliver.
 const ABSENT_COUNTERS: u64 = 2;
 
-/// Rounds of the repeated lifecycle scenario.
-const CYCLE_ROUNDS: usize = 5;
+/// Four rounds cover two graceful restarts and two kills while repeating
+/// every stop, remove, recovery, and final convergence assertion.
+const CYCLE_ROUNDS: usize = 4;
 
 /// Script of a stand-in job that keeps running until it is retired.
 ///
@@ -88,9 +89,10 @@ const RUNNING_JOB: &str = "sleep 600 & wait";
 /// Script of a stand-in job that has already ended.
 const ENDED_JOB: &str = "exit 3";
 
-/// Worker initialization deadline of the stale-job test; well inside the
-/// suite's wait bound, and long enough for a real worker to journal.
-const STALE_JOB_INITIALIZE: Duration = Duration::from_secs(5);
+/// Test-only stale-job initialization bound, not the product default.
+/// Three seconds leaves time to observe the ended job before retirement
+/// while keeping the bound well inside the suite's wait limit.
+const STALE_JOB_INITIALIZE: Duration = Duration::from_secs(3);
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(
@@ -558,8 +560,8 @@ async fn stale_refused_socket_without_job_recovers_but_silent_job_stays_conflict
 )]
 async fn late_worker_is_retired_and_every_path_converges_to_one_generation() {
     let settings = Settings {
-        worker_connect: Duration::from_secs(2),
-        worker_initialize: Duration::from_secs(8),
+        worker_connect: Duration::from_secs(1),
+        worker_initialize: Duration::from_secs(6),
         ..Settings::default()
     };
     let fixture = Installation::new(settings).await;
@@ -569,26 +571,32 @@ async fn late_worker_is_retired_and_every_path_converges_to_one_generation() {
     // Registration succeeds, readiness never comes: the job is watched until
     // the worker's initialization deadline has elapsed, the create fails, and
     // exactly the late generation is retired.
-    let pending = spawn_create(&fixture, "late").await;
+    let late_pending = spawn_create(&fixture, "late").await;
     let late = new_job(&fixture, &[]).await;
     let late_seen = Instant::now();
-    let failure = pending
-        .await
-        .expect("create task")
-        .expect_err("a worker that never becomes ready fails the create");
-    eprintln!("late create failed with {failure:?}");
-    assert_watched_until_initialize(late_seen, settings.worker_initialize, "late");
-    wait_converged(&fixture, "late", &[]).await;
+    // Observe this request independently even while the second registration
+    // is being discovered, so that delay cannot hide an early failure.
+    let late_watch = tokio::spawn(async move {
+        let failure = late_pending
+            .await
+            .expect("create task")
+            .expect_err("a worker that never becomes ready fails the create");
+        eprintln!("late create failed with {failure:?}");
+        assert_watched_until_initialize(late_seen, settings.worker_initialize, "late");
+    });
 
-    // The client abandons its request after registration: the daemon still
-    // owns the outcome, keeps watching until the initialization deadline, and
-    // retires the late generation.
-    let pending = spawn_create(&fixture, "cancelled").await;
-    let cancelled = new_job(&fixture, &[]).await;
+    // Overlap the held registrations, retaining each generation's own first
+    // observation. The client abandons this request after registration, but
+    // the daemon must still watch until initialization expires and retire it.
+    let cancelled_pending = spawn_create(&fixture, "cancelled").await;
+    let cancelled = new_job(&fixture, std::slice::from_ref(&late)).await;
     let cancelled_seen = Instant::now();
-    pending.abort();
+    cancelled_pending.abort();
     let cancelled_id = pohunek_platform::supervisor::ServiceId::parse(cancelled.clone())
         .expect("valid service ID");
+
+    // Check this deadline before joining the independent late watcher: a
+    // wait for the other generation could hide a premature retirement.
     explained("retirement of the cancelled generation", || async {
         if fixture.job_absent(&cancelled_id).await {
             Ok(())
@@ -598,6 +606,8 @@ async fn late_worker_is_retired_and_every_path_converges_to_one_generation() {
     })
     .await;
     assert_watched_until_initialize(cancelled_seen, settings.worker_initialize, "cancelled");
+    late_watch.await.expect("late generation deadline watcher");
+    wait_converged(&fixture, "late", &[]).await;
     wait_converged(&fixture, "cancelled", &[]).await;
 
     // The daemon restarts while a registration is pending: the abandoned

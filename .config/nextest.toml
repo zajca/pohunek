@@ -162,8 +162,8 @@ test-threads = 5
 # that happens every time from one that happens sometimes, for diagnosis.
 retries = { backoff = "fixed", count = 2, delay = "1s" }
 
-# The deadline tests of this binary (worker connect 2 s, worker initialize
-# 8 s, stale-job initialize 5 s) expect the host to answer within their
+# The deadline tests of this binary (worker connect 1 s, worker initialize
+# 6 s, stale-job initialize 3 s) expect the host to answer within their
 # bound, so no other test may share the CPU while one runs.
 [[profile.macos.overrides]]
 filter = 'package(=pohunek-daemon) and binary(=supervised_lifecycle)'
