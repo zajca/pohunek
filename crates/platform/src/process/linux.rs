@@ -1,6 +1,6 @@
 //! Linux `/proc` and pidfd process inspection.
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-18
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
@@ -38,6 +38,14 @@ const STAT_STATE_FIELD: usize = 3;
 const STAT_TPGID_FIELD: usize = 8;
 /// `/proc/<pid>/stat` process start-time field number (`starttime`).
 const STAT_STARTTIME_FIELD: usize = 22;
+/// `/proc/<pid>/stat` environment-region start field number (`env_start`).
+///
+/// The bounds name the region `/proc/<pid>/environ` reads from. Both fields
+/// exist since Linux 3.5 (2012), and the inspector already requires a newer
+/// kernel for pidfds, so every host this runs on reports them.
+const STAT_ENV_START_FIELD: usize = 50;
+/// `/proc/<pid>/stat` environment-region end field number (`env_end`).
+const STAT_ENV_END_FIELD: usize = 51;
 /// Upper bound on consecutive `/proc/<pid>/stat` reads while the kernel reports
 /// placeholder fields (`ppid` 0 with `pgrp` -1) for a task being forked or torn
 /// down. The window closes within microseconds, so a few reads settle it; a
@@ -198,7 +206,7 @@ impl ProcessInspector for LinuxInspector {
     }
 
     fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, Error> {
-        ownership_markers(pid).map_err(|source| process_error("read_ownership_markers", source))
+        ownership_markers(pid)
     }
 
     fn foreground_process_group(&self, root_pid: Pid) -> Result<Option<Pid>, Error> {
@@ -419,17 +427,111 @@ fn cgroup_path_matches(actual: &str, expected: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+/// Stable operation label of the ownership-marker read.
+const OWNERSHIP_MARKERS_OPERATION: &str = "read_ownership_markers";
+
 /// Reads the allowlisted ownership markers from `/proc/<pid>/environ`.
 ///
 /// `environ` holds the environment the process was `execve`d with, which is
 /// exactly where a pohunek daemon's PTY markers live — they are injected before
-/// exec and inherited by every child.
-fn ownership_markers(pid: Pid) -> io::Result<OwnershipMarkers> {
-    match fs::read(proc_path(pid).join("environ")) {
-        Ok(bytes) => Ok(parse_ownership_markers(&bytes)),
-        Err(err) if is_process_race(&err) => Ok(OwnershipMarkers::default()),
-        Err(err) => Err(err),
+/// exec and inherited by every child. A zero-byte read is ambiguous — the
+/// kernel also reports end-of-file for a task without a memory map, and while
+/// a freshly exec'd image has not published its environment region yet — so
+/// the `/proc/<pid>/stat` region bounds decide it (see
+/// [`ownership_markers_from`]).
+fn ownership_markers(pid: Pid) -> Result<OwnershipMarkers, Error> {
+    ownership_markers_from(
+        || fs::read(proc_path(pid).join("environ")),
+        || fs::read_to_string(proc_path(pid).join("stat")),
+        OWNERSHIP_MARKERS_OPERATION,
+    )
+}
+
+/// Upper bound on rereads of `/proc/<pid>/environ` after a settled nonempty
+/// environment region contradicts an empty read.
+///
+/// The contradiction means the image finished installing its environment
+/// between the two observations, so one reread usually recovers the markers;
+/// a second covers a process that re-executed into the window again. The
+/// reads never wait, so the bound only caps the work before failing closed.
+const ENVIRON_REREADS: usize = 2;
+
+/// Resolves one marker answer from raw `environ` and `stat` observations.
+///
+/// The `read_environ` observation yields the raw NUL-separated environment;
+/// `read_stat` yields raw `/proc/<pid>/stat` text. A nonempty environment
+/// parses directly. An empty one is
+/// ambiguous, because the kernel reports end-of-file both for a task without a
+/// memory map and while a freshly exec'd image has not published its
+/// environment region, so the stat sample decides:
+///
+/// - an ended or vanished task has nothing left to reap and reads as unmarked;
+/// - a live task with a published zero-length region (`env_start` equals
+///   `env_end`, both nonzero) genuinely has no environment and reads as
+///   unmarked;
+/// - every other live task is [`Error::Unobservable`] — the region is not
+///   published yet, the region is reversed or half-published, or a published
+///   nonempty region contradicts the empty read. The contradiction means the
+///   image finished installing its markers between the two observations, so
+///   the environment is reread a bounded number of times first; exhaustion
+///   stays unobservable rather than reporting an unreadable environment as
+///   unmarked.
+fn ownership_markers_from(
+    mut read_environ: impl FnMut() -> io::Result<Vec<u8>>,
+    mut read_stat: impl FnMut() -> io::Result<String>,
+    operation: &'static str,
+) -> Result<OwnershipMarkers, Error> {
+    match read_environ() {
+        Ok(bytes) if !bytes.is_empty() => return Ok(parse_ownership_markers(&bytes)),
+        // A task that vanished before the read has nothing left to reap,
+        // which reads as unmarked exactly like the race it replaced.
+        Ok(_) => {}
+        Err(source) if is_process_race(&source) => return Ok(OwnershipMarkers::default()),
+        Err(source) => return Err(process_error(operation, source)),
     }
+    let stat = match read_stat() {
+        Ok(stat) => stat,
+        // The task vanished after the empty read: unmarked, as above.
+        Err(source) if is_process_race(&source) => return Ok(OwnershipMarkers::default()),
+        Err(source) => return Err(process_error(operation, source)),
+    };
+    let state: char =
+        parse_stat_field(&stat, STAT_STATE_FIELD).ok_or(Error::InvalidData { operation })?;
+    if matches!(state, 'Z' | 'X' | 'x') {
+        // An ended task loses its memory map, so its environment reads as
+        // empty for the same reason a vanished one does.
+        return Ok(OwnershipMarkers::default());
+    }
+    let env_start: u64 =
+        parse_stat_field(&stat, STAT_ENV_START_FIELD).ok_or(Error::InvalidData { operation })?;
+    let env_end: u64 =
+        parse_stat_field(&stat, STAT_ENV_END_FIELD).ok_or(Error::InvalidData { operation })?;
+    if env_start == env_end {
+        // A published zero-length region records an empty environment.
+        if env_start != 0 {
+            return Ok(OwnershipMarkers::default());
+        }
+        // The region is not published yet: the task may still be inside the
+        // exec that is about to install its markers.
+        return Err(Error::Unobservable { operation });
+    }
+    if env_start > env_end || env_start == 0 || env_end == 0 {
+        // The kernel never reports a reversed or half-published region, so
+        // the observation is ambiguous and fails closed.
+        return Err(Error::Unobservable { operation });
+    }
+    // A published nonempty region contradicts the empty read: the image
+    // finished installing its environment between the two observations. The
+    // markers are usually readable by now.
+    for _ in 0..ENVIRON_REREADS {
+        match read_environ() {
+            Ok(bytes) if !bytes.is_empty() => return Ok(parse_ownership_markers(&bytes)),
+            Err(source) if is_process_race(&source) => return Ok(OwnershipMarkers::default()),
+            Err(source) => return Err(process_error(operation, source)),
+            Ok(_) => {}
+        }
+    }
+    Err(Error::Unobservable { operation })
 }
 
 /// Extracts the allowlisted markers from NUL-separated `KEY=VALUE` entries.
@@ -1245,5 +1347,449 @@ POHUNEK_WORKER_INSTANCE_IDX=r-2\0HOME=/home/u\0";
                 operation: "read_boot_identity"
             }
         ));
+    }
+    /// Regression scenarios for the exec-window ambiguity of an empty
+    /// `/proc/<pid>/environ` read (#1176).
+    ///
+    /// The production marker reader decides each empty read from controlled
+    /// raw procfs observations, and the actual sweep selection
+    /// (`survey_runtime`) classifies what it answers, so the scenarios never
+    /// mock a marker answer or an error.
+    mod exec_window {
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        use super::*;
+
+        use crate::process::{
+            survey_runtime, SkipReason, Skipped, SweepError, SweepRequest, SweepSurvey,
+        };
+
+        /// Worker instance ID the scenarios sweep for.
+        const SCENARIO_RUNTIME: &str = "runtime-1176";
+
+        /// Start identity shared by the scenario processes and their stat
+        /// fixtures (`starttime`).
+        const SCENARIO_START: u64 = 987_654;
+
+        /// A published environment region observed by the scenarios, shaped
+        /// after a real process's stat read on a 2026 kernel.
+        const PUBLISHED_ENV_START: u64 = 140_731_459_362_880;
+        const PUBLISHED_ENV_END: u64 = 140_731_459_366_893;
+
+        /// Scripted outcome of one raw `/proc/<pid>/environ` read.
+        #[derive(Debug, Clone)]
+        enum EnvironSample {
+            /// The read succeeded with these raw NUL-separated entries.
+            Bytes(Vec<u8>),
+            /// The read failed with `ENOENT` because the task is gone.
+            Vanished,
+        }
+
+        /// Scripted outcome of one raw `/proc/<pid>/stat` read.
+        #[derive(Debug, Clone)]
+        enum StatSample {
+            /// The read succeeded with this raw stat line.
+            Text(String),
+            /// The read failed with `ENOENT` because the task is gone.
+            Vanished,
+        }
+
+        /// Scripted raw procfs observations and read counts, per process id.
+        ///
+        /// Each observation sequence repeats its last entry once exhausted, so
+        /// a reader that settles a stat or rereads an environment within its
+        /// bounds keeps observing the scripted state.
+        #[derive(Debug, Default)]
+        struct Scripts {
+            environ: HashMap<Pid, VecDeque<EnvironSample>>,
+            stat: HashMap<Pid, VecDeque<StatSample>>,
+            environ_reads: HashMap<Pid, usize>,
+            stat_reads: HashMap<Pid, usize>,
+        }
+
+        impl Scripts {
+            fn read_environ(&mut self, pid: Pid) -> io::Result<Vec<u8>> {
+                *self.environ_reads.entry(pid).or_default() += 1;
+                let sample = repeated(
+                    self.environ
+                        .get_mut(&pid)
+                        .expect("every process scripts an environ observation"),
+                );
+                match sample {
+                    EnvironSample::Bytes(bytes) => Ok(bytes),
+                    EnvironSample::Vanished => Err(io::Error::from(io::ErrorKind::NotFound)),
+                }
+            }
+
+            fn read_stat(&mut self, pid: Pid) -> io::Result<String> {
+                *self.stat_reads.entry(pid).or_default() += 1;
+                let sample = repeated(
+                    self.stat
+                        .get_mut(&pid)
+                        .expect("every process scripts a stat observation"),
+                );
+                match sample {
+                    StatSample::Text(text) => Ok(text),
+                    StatSample::Vanished => Err(io::Error::from(io::ErrorKind::NotFound)),
+                }
+            }
+        }
+
+        /// Returns the next observation, repeating the last one in the end.
+        fn repeated<T: Clone>(samples: &mut VecDeque<T>) -> T {
+            if samples.len() > 1 {
+                samples.pop_front().expect("nonempty observation sequence")
+            } else {
+                samples
+                    .front()
+                    .expect("nonempty observation sequence")
+                    .clone()
+            }
+        }
+
+        /// Inspector whose raw procfs observations are scripted.
+        ///
+        /// Marker answers are never scripted: [`ownership_markers_from`], the
+        /// production reader, produces them from the scripted observations,
+        /// and the scenarios run them through the actual sweep selection, so
+        /// the regression covers the reader and the sweep together.
+        #[derive(Debug, Default)]
+        struct ObservedInspector {
+            facts: Vec<ProcessFact>,
+            scripts: Mutex<Scripts>,
+        }
+
+        impl ObservedInspector {
+            fn with_process(
+                mut self,
+                pid: Pid,
+                start: u64,
+                environ: Vec<EnvironSample>,
+                stat_samples: Vec<StatSample>,
+            ) -> Self {
+                self.facts.push(ProcessFact {
+                    pid,
+                    pgid: pid,
+                    ppid: 1,
+                    start_identity: StartIdentity::new(start),
+                    comm: "agent".to_owned(),
+                    cmdline: Vec::new(),
+                });
+                let scripts = self.scripts.get_mut().expect("scripts are not poisoned");
+                scripts.environ.insert(pid, environ.into());
+                scripts.stat.insert(pid, stat_samples.into());
+                self
+            }
+        }
+
+        impl ProcessInspector for ObservedInspector {
+            fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, Error> {
+                Ok(self
+                    .facts
+                    .iter()
+                    .find(|fact| fact.pid == pid)
+                    .map(ProcessFact::identity))
+            }
+
+            fn is_running(&self, identity: ProcessIdentity) -> Result<bool, Error> {
+                // Every scenario process is live as long as it is scripted;
+                // an ended control is decided by the reader before liveness
+                // matters anywhere in the sweep.
+                Ok(self.facts.iter().any(|fact| fact.identity() == identity))
+            }
+
+            fn parent_pid(&self, _pid: Pid) -> Result<Option<Pid>, Error> {
+                Ok(None)
+            }
+
+            fn process(&self, _pid: Pid) -> Result<Option<ProcessFact>, Error> {
+                Ok(None)
+            }
+
+            fn same_user_processes(&self) -> Result<Vec<ProcessFact>, Error> {
+                Ok(self.facts.clone())
+            }
+
+            fn descendants(&self, _root: Pid) -> Result<Vec<ProcessFact>, Error> {
+                Ok(Vec::new())
+            }
+
+            fn cwd(&self, _pid: Pid) -> Result<PathBuf, Error> {
+                Err(Error::Unavailable {
+                    operation: "scripted_cwd",
+                })
+            }
+
+            fn executable(&self, _pid: Pid) -> Result<Option<PathBuf>, Error> {
+                Ok(None)
+            }
+
+            fn exit_watch(&self, _identity: ProcessIdentity) -> Result<ExitWatch, Error> {
+                Err(Error::Unavailable {
+                    operation: "scripted_exit_watch",
+                })
+            }
+
+            fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, Error> {
+                ownership_markers_from(
+                    || {
+                        self.scripts
+                            .lock()
+                            .expect("scripts are not poisoned")
+                            .read_environ(pid)
+                    },
+                    || {
+                        self.scripts
+                            .lock()
+                            .expect("scripts are not poisoned")
+                            .read_stat(pid)
+                    },
+                    OWNERSHIP_MARKERS_OPERATION,
+                )
+            }
+
+            fn foreground_process_group(&self, _root_pid: Pid) -> Result<Option<Pid>, Error> {
+                Ok(None)
+            }
+        }
+
+        /// Builds a settled `/proc/<pid>/stat` line for a scenario process:
+        /// fields 3–22 mirror the existing fixtures, and the appended tail
+        /// carries the kernel padding plus the environment-region bounds.
+        fn observed_stat(state: char, env_start: u64, env_end: u64) -> StatSample {
+            let padding = "0 ".repeat(STAT_ENV_START_FIELD - STAT_STARTTIME_FIELD - 1);
+            StatSample::Text(format!(
+                "987 (agent) {state} 1 987 999 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {SCENARIO_START} {padding}{env_start} {env_end}"
+            ))
+        }
+
+        fn empty_environ() -> EnvironSample {
+            EnvironSample::Bytes(Vec::new())
+        }
+
+        fn marked_environ(worker_instance_id: &str) -> EnvironSample {
+            EnvironSample::Bytes(
+                format!("POHUNEK_WORKER_INSTANCE_ID={worker_instance_id}\0").into_bytes(),
+            )
+        }
+
+        fn scenario_identity(pid: Pid) -> ProcessIdentity {
+            ProcessIdentity {
+                pid,
+                start_identity: StartIdentity::new(SCENARIO_START),
+            }
+        }
+
+        /// Runs the actual sweep selection over a scripted scenario table.
+        ///
+        /// The grace and poll intervals only have to validate; the survey
+        /// signals nothing.
+        fn run_survey(inspector: &ObservedInspector) -> Result<SweepSurvey, SweepError> {
+            let request = SweepRequest::new(
+                SCENARIO_RUNTIME,
+                rustix::process::geteuid().as_raw(),
+                Duration::from_millis(50),
+                Duration::from_millis(5),
+            )
+            .expect("valid request");
+            survey_runtime(inspector, &request)
+        }
+
+        #[test]
+        fn exec_window_empty_environ_with_an_unpublished_region_is_skipped_unreadable() {
+            let unpublished = 999_920;
+            let inspector = ObservedInspector::default().with_process(
+                unpublished,
+                SCENARIO_START,
+                vec![empty_environ()],
+                vec![observed_stat('S', 0, 0)],
+            );
+
+            let survey = run_survey(&inspector).expect("survey");
+
+            // The empty read must not read as an unmarked process: the task
+            // may still be inside the exec that installs its markers.
+            assert_eq!(
+                survey.skipped,
+                vec![Skipped {
+                    identity: scenario_identity(unpublished),
+                    reason: SkipReason::MarkersUnreadable,
+                }]
+            );
+            assert!(survey.attributed.is_empty());
+        }
+
+        #[test]
+        fn exec_window_empty_environ_contradicting_a_settled_region_rereads_within_the_bound() {
+            let contradicting = 999_921;
+            let inspector = ObservedInspector::default().with_process(
+                contradicting,
+                SCENARIO_START,
+                vec![empty_environ()],
+                vec![observed_stat('S', PUBLISHED_ENV_START, PUBLISHED_ENV_END)],
+            );
+
+            let survey = run_survey(&inspector).expect("survey");
+
+            // The contradiction means the image finished installing its
+            // environment between the two observations; the bounded rereads
+            // still leave the task unobservable, so the cleanup stays
+            // unconfirmed instead of foreign.
+            assert_eq!(
+                survey.skipped,
+                vec![Skipped {
+                    identity: scenario_identity(contradicting),
+                    reason: SkipReason::MarkersUnreadable,
+                }]
+            );
+            assert!(survey.attributed.is_empty());
+            // The rereads are bounded even though every one stays empty: one
+            // initial read plus the reread bound.
+            let scripts = inspector.scripts.lock().expect("scripts are not poisoned");
+            assert_eq!(scripts.environ_reads[&contradicting], 1 + ENVIRON_REREADS);
+            assert_eq!(scripts.stat_reads[&contradicting], 1);
+        }
+
+        #[test]
+        fn exec_window_markers_recovered_by_a_reread_are_attributed() {
+            let recovered = 999_922;
+            let inspector = ObservedInspector::default().with_process(
+                recovered,
+                SCENARIO_START,
+                vec![
+                    empty_environ(),
+                    empty_environ(),
+                    marked_environ(SCENARIO_RUNTIME),
+                ],
+                vec![observed_stat('S', PUBLISHED_ENV_START, PUBLISHED_ENV_END)],
+            );
+
+            let survey = run_survey(&inspector).expect("survey");
+
+            assert_eq!(survey.attributed, vec![scenario_identity(recovered)]);
+            assert!(survey.skipped.is_empty());
+        }
+
+        #[test]
+        fn a_live_process_with_a_genuinely_empty_environment_is_foreign() {
+            let genuinely_empty = 999_923;
+            let inspector = ObservedInspector::default().with_process(
+                genuinely_empty,
+                SCENARIO_START,
+                vec![empty_environ()],
+                vec![observed_stat('S', PUBLISHED_ENV_START, PUBLISHED_ENV_START)],
+            );
+
+            let survey = run_survey(&inspector).expect("survey");
+
+            // A published zero-length region records an empty environment,
+            // which is exactly unmarked, and the sweep leaves it out
+            // silently.
+            assert!(survey.attributed.is_empty());
+            assert!(survey.skipped.is_empty());
+        }
+
+        #[test]
+        fn ended_and_vanished_tasks_with_empty_environ_reads_stay_foreign() {
+            let ended = 999_924;
+            let vanished = 999_925;
+            let inspector = ObservedInspector::default()
+                .with_process(
+                    ended,
+                    SCENARIO_START,
+                    vec![empty_environ()],
+                    vec![observed_stat('Z', 0, 0)],
+                )
+                .with_process(
+                    vanished,
+                    SCENARIO_START,
+                    vec![EnvironSample::Vanished],
+                    vec![StatSample::Vanished],
+                )
+                .with_process(
+                    999_930,
+                    SCENARIO_START,
+                    vec![empty_environ()],
+                    vec![StatSample::Vanished],
+                );
+
+            let survey = run_survey(&inspector).expect("survey");
+
+            assert!(survey.attributed.is_empty());
+            assert!(survey.skipped.is_empty());
+        }
+
+        #[test]
+        fn reversed_and_half_published_environment_regions_fail_closed() {
+            let reversed = 999_926;
+            let startless = 999_927;
+            let endless = 999_928;
+            let inspector = ObservedInspector::default()
+                .with_process(
+                    reversed,
+                    SCENARIO_START,
+                    vec![empty_environ()],
+                    vec![observed_stat('S', PUBLISHED_ENV_END, PUBLISHED_ENV_START)],
+                )
+                .with_process(
+                    startless,
+                    SCENARIO_START,
+                    vec![empty_environ()],
+                    vec![observed_stat('S', 0, PUBLISHED_ENV_END)],
+                )
+                .with_process(
+                    endless,
+                    SCENARIO_START,
+                    vec![empty_environ()],
+                    vec![observed_stat('S', PUBLISHED_ENV_START, 0)],
+                );
+
+            let survey = run_survey(&inspector).expect("survey");
+
+            // The kernel never reports these regions, and none of them may
+            // read as an unmarked process.
+            assert!(survey.attributed.is_empty());
+            assert_eq!(
+                survey.skipped,
+                vec![
+                    Skipped {
+                        identity: scenario_identity(reversed),
+                        reason: SkipReason::MarkersUnreadable,
+                    },
+                    Skipped {
+                        identity: scenario_identity(startless),
+                        reason: SkipReason::MarkersUnreadable,
+                    },
+                    Skipped {
+                        identity: scenario_identity(endless),
+                        reason: SkipReason::MarkersUnreadable,
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn a_malformed_stat_of_an_empty_environ_aborts_the_survey() {
+            let malformed = 999_929;
+            let inspector = ObservedInspector::default().with_process(
+                malformed,
+                SCENARIO_START,
+                vec![empty_environ()],
+                vec![StatSample::Text("123 (truncated) S 7".to_owned())],
+            );
+
+            let error = run_survey(&inspector).expect_err("malformed stat must fail closed");
+
+            assert!(matches!(
+                error,
+                SweepError::Inspection {
+                    source: Error::InvalidData {
+                        operation: OWNERSHIP_MARKERS_OPERATION,
+                    },
+                    ..
+                }
+            ));
+        }
     }
 }
