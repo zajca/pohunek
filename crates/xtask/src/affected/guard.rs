@@ -58,14 +58,28 @@ use std::path::{Component, PathBuf};
 
 use super::{
     binary_owner, classify, command_output, ensure_git_toplevel, graph, is_below, owning_package,
-    parse_nul_list, printable, workspace, BinaryUse, Decision, Effect, Mode, Package, Reason,
-    BINARY_USES, GIT, RULES,
+    parse_nul_list, printable, workspace, BinaryUse, Decision, Effect, Mode, Package, Pattern,
+    Reason, BINARY_USES, GIT, LANE_NEUTRAL, RULES,
 };
 use crate::test_code::{
     classify as classify_sources, is_ident, read_sources, skip_whitespace, string_literal_at,
     CrateRoot, SourceFile,
 };
 use crate::XtaskError;
+
+/// Native macOS lane packages; the structural lane-neutral test checks this
+/// list against `scripts/test-partitions`, which owns the lane partition.
+pub(crate) const LANE_PACKAGES: &[&str] = &[
+    "pohunek-platform",
+    "pohunek-paths",
+    "pohunek-worker-protocol",
+    "pohunek-session-worker",
+    "pohunek-service-config",
+    "pohunek-test-support",
+    "pohunek-daemon",
+    "pohunek-cli",
+    "pohunek-hostcheck",
+];
 
 /// Test-support functions that return a repository directory, and what they return.
 const ANCHORS: [(&str, Base); 2] = [
@@ -190,8 +204,8 @@ pub(crate) const SCANS: &[(&str, &[&str], &str)] = &[
     ),
     (
         "crates/xtask/src/affected/mod.rs",
-        &["Cargo.toml", "crates"],
-        "member manifests and the Rust sources of every crate, scanned by the include check",
+        &["Cargo.toml", "crates", "scripts/test-partitions"],
+        "member manifests and Rust sources scanned by the include check, and the macOS lane partition",
     ),
     (
         "crates/xtask/src/agent_skill.rs",
@@ -1492,6 +1506,18 @@ pub(crate) fn check(
             vec![read.path.clone()]
         };
         for path in paths {
+            if lane_uncovered(&path, reader, tracked) {
+                violations.insert(Violation {
+                    read: Read {
+                        path: path.clone(),
+                        ..read.clone()
+                    },
+                    reader: reader.clone(),
+                    problem: "the macOS lane omits changes to this LANE_NEUTRAL path; \
+                              direct runtime reads by lane package tests are not covered"
+                        .to_owned(),
+                });
+            }
             let mut named = tracked
                 .iter()
                 .filter(|file| matches(&path, file))
@@ -1551,6 +1577,18 @@ pub(crate) fn check(
         }
     }
     violations.into_iter().collect()
+}
+
+/// Whether a direct read reaches data omitted from the reader's macOS lane.
+fn lane_uncovered(path: &str, reader: &str, tracked: &BTreeSet<String>) -> bool {
+    LANE_PACKAGES.contains(&reader)
+        && LANE_NEUTRAL.iter().any(|data| {
+            data.pattern.matches(path)
+                || matches!(data.pattern, Pattern::Dir(dir) if path == dir)
+                || tracked
+                    .iter()
+                    .any(|file| matches(path, file) && data.pattern.matches(file))
+        })
 }
 
 /// Whether `path` lies in the directory of package `reader`.
