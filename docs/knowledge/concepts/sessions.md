@@ -763,8 +763,15 @@ environment cannot be read (a non-dumpable or setgid program, or one caught
 between images) and that started after the worker could belong to the runtime:
 the worker re-reads the process table for up to the stop grace, and if such a
 process is still there it is never signalled and the cleanup stays unconfirmed.
-Linux has no fork-lineage proof, so a long-lived foreign process of that kind
-also keeps the cleanup open. A process that scrubs its environment carries no
+On Linux, a zero-byte environment read is not enough to establish that a
+process is unmarked: the process may be inside `execve`. The reader checks the
+published environment range, accepts an empty environment only when both bounds
+are equal and nonzero, and retries a contradictory nonempty range a bounded
+number of times. Unpublished or persistently contradictory reads remain
+unobservable. Kernel threads, identified by the kernel's `PF_KTHREAD` flag,
+cannot carry runtime markers and remain unmarked even with zero bounds.
+Linux has no fork-lineage proof, so a long-lived foreign process
+of that kind also keeps the cleanup open. A process that scrubs its environment carries no
 marker and cannot be found. If the root's exit cannot be observed, nothing is
 invented and the stop fails; if the runtime's processes cannot be proven gone,
 the runtime is faulted instead of ended, the stop fails with
