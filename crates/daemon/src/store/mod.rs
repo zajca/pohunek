@@ -928,6 +928,24 @@ impl Store {
         Ok(self.read_all()?.3)
     }
 
+    /// Load one complete source snapshot before notification evidence is discarded.
+    ///
+    /// Unlike ordinary recovery, compaction cannot treat a rejected record as
+    /// an absent session: it might be the only authority for a deleted key.
+    pub(crate) fn load_sessions_strict(&self) -> io::Result<Vec<SessionRecord>> {
+        let Some(content) = self.read_content()? else {
+            return Ok(Vec::new());
+        };
+        let ((_, _, _, sessions), rejected) = partition_lines(self.checked_lines(&content)?);
+        if !rejected.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot compact notification evidence with rejected metadata records",
+            ));
+        }
+        Ok(sessions)
+    }
+
     /// The lines the loaders skip because no record kind accepts them. A
     /// missing file yields an empty list.
     pub(crate) fn load_rejected(&self) -> io::Result<Vec<RejectedLine>> {
