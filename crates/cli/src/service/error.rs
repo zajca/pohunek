@@ -429,11 +429,13 @@ pub enum Error {
     },
 
     /// The new daemon would not adopt, or would adopt without native
-    /// recovery, live sessions of the running daemon.
-    #[error("{}", at_risk_summary("upgrade", sessions, warnings))]
+    /// recovery, live or stopped sessions of the installed state.
+    #[error("{}", at_risk_summary("upgrade", sessions, stopped_sessions, warnings))]
     UpgradeAtRisk {
-        /// The sessions the preflight judged at risk, ordered by id.
+        /// Live sessions the preflight judged at risk, ordered by id.
         sessions: Vec<SessionVerdict>,
+        /// Stopped sessions whose retained native recovery is at risk.
+        stopped_sessions: Vec<SessionVerdict>,
         /// Warnings of the judgement, so a refusal explains a degraded verdict.
         warnings: Vec<String>,
     },
@@ -533,13 +535,15 @@ pub enum Error {
         detail: String,
     },
 
-    /// The previous daemon may lose live runtime or recovery on rollback.
-    #[error("{}", at_risk_summary(&format!("rollback to {version}"), sessions, warnings))]
+    /// The previous daemon may lose live runtime or retained native recovery.
+    #[error("{}", at_risk_summary(&format!("rollback to {version}"), sessions, stopped_sessions, warnings))]
     RollbackAtRisk {
         /// Version that would be restored.
         version: String,
-        /// Sessions requiring explicit acceptance.
+        /// Live sessions requiring explicit acceptance.
         sessions: Vec<SessionVerdict>,
+        /// Stopped sessions whose retained native recovery is at risk.
+        stopped_sessions: Vec<SessionVerdict>,
         /// Warnings of the judgement, so a refusal explains a degraded verdict.
         warnings: Vec<String>,
     },
@@ -780,7 +784,7 @@ impl Error {
                 Some("inspect the listed sessions with `pohunek session list` and retry")
             }
             Self::UpgradeAtRisk { .. } => Some(
-                "end or save the listed sessions first, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery",
+                "preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery",
             ),
             Self::UpgradeStoreUnusable { .. } => Some(
                 "--accept-runtime-loss does not apply: install a pohunek release that reads this store, or restore the store's .pre-schema-<n> backup",
@@ -810,7 +814,7 @@ impl Error {
                 "--accept-runtime-loss cannot make the previous daemon read this store; restore its .pre-schema-<n> backup or keep the newer release installed",
             ),
             Self::RollbackAtRisk { .. } => Some(
-                "end the listed sessions, or rerun the upgrade with --accept-runtime-loss to accept their loss during rollback",
+                "preserve the required runtime or native recovery for the listed sessions, or rerun the upgrade with --accept-runtime-loss to accept their loss during rollback",
             ),
             Self::RollbackPreflightFailed { .. } => Some(
                 "keep the transaction and restore the previous daemon only after its store and runtime compatibility can be proven",
@@ -883,12 +887,22 @@ fn refusals_summary(refusals: &[Refusal]) -> String {
         .join("; ")
 }
 
-fn at_risk_summary(action: &str, sessions: &[SessionVerdict], warnings: &[String]) -> String {
+fn at_risk_summary(
+    action: &str,
+    sessions: &[SessionVerdict],
+    stopped_sessions: &[SessionVerdict],
+    warnings: &[String],
+) -> String {
     let mut text = format!(
-        "{action} refused: {} live session(s) have unverified runtime or recovery",
-        sessions.len()
+        "{action} refused: {} live session(s), {} stopped session(s) have unverified runtime or recovery",
+        sessions.len(),
+        stopped_sessions.len()
     );
-    for session in sessions {
+    for (kind, session) in sessions
+        .iter()
+        .map(|session| ("live", session))
+        .chain(stopped_sessions.iter().map(|session| ("stopped", session)))
+    {
         let name = session
             .name
             .as_deref()
@@ -896,7 +910,7 @@ fn at_risk_summary(action: &str, sessions: &[SessionVerdict], warnings: &[String
             .unwrap_or_default();
         let _ = write!(
             text,
-            "\n  {}{name}: {} [{}] {}",
+            "\n  {kind} {}{name}: {} [{}] {}",
             session.session_id, session.verdict, session.code, session.detail
         );
     }

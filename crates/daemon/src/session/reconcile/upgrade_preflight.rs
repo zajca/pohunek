@@ -63,10 +63,10 @@ use protocol::{
 };
 
 use super::{
-    import_worker_identities, import_worker_subagents, initial_input_orphaned,
-    merge_persisted_recovery, recovery_not_advanced, runtime_identity_conflict,
-    scan_worker_journals, validate_identity_claims, IdentityClaims, JournalEvidence, JournalPhase,
-    JournalReject, WorkerJournalScan,
+    import_terminal_native_reference, import_worker_identities, import_worker_subagents,
+    initial_input_orphaned, merge_persisted_recovery, recovery_not_advanced, reported_hook_schema,
+    runtime_identity_conflict, scan_worker_journals, validate_identity_claims, IdentityClaims,
+    JournalEvidence, JournalPhase, JournalReject, WorkerJournalScan,
 };
 use crate::agent::host::{
     adopts, adopts_newer, validate_launch_runtime_with_timeout_detailed, BuiltinSource,
@@ -252,7 +252,7 @@ pub fn run_with(
         Ok(dry) => {
             let (sessions, unmanaged) =
                 judge_sessions(&dry, journals.as_ref(), inspector, &judging);
-            let mut stopped = judge_stopped_sessions(&dry, &judging);
+            let mut stopped = judge_stopped_sessions(&dry, journals.as_ref().ok(), &judging);
             judge_rejected_records(&dry, &sessions, &mut stopped);
             (store_report(inputs, &dry), sessions, unmanaged, stopped)
         }
@@ -687,7 +687,11 @@ fn facts_of<'a>(
 /// A stopped session has no worker to adopt, so only its recovery is judged:
 /// resume and fork must still resolve through the runtime source the new
 /// daemon serves, under the same rules as a live session's recovery.
-fn judge_stopped_sessions(dry: &DryRun, judging: &Judging<'_>) -> Vec<SessionVerdict> {
+fn judge_stopped_sessions(
+    dry: &DryRun,
+    journals: Option<&HashMap<String, WorkerJournalScan>>,
+    judging: &Judging<'_>,
+) -> Vec<SessionVerdict> {
     let bindings: HashMap<&str, &ResumeBinding> = dry
         .resume
         .iter()
@@ -705,14 +709,21 @@ fn judge_stopped_sessions(dry: &DryRun, judging: &Judging<'_>) -> Vec<SessionVer
     let mut verdicts = Vec::new();
     for record in &dry.sessions {
         let stopped = record.info.external != Some(true)
-            && (!record.info.may_own_runtime() || runtime_ended(record));
+            && (record.desired_state == DesiredState::Stopped
+                || !record.info.may_own_runtime()
+                || runtime_ended(record));
         // Reconciliation finishes a removal intent instead of resuming the
         // session, so its recovery is not one an upgrade must keep.
         if !stopped || record.desired_state == DesiredState::Removed {
             continue;
         }
         let facts = facts_of(dry, record, &bindings, &unreadable_resume, anonymous_resume);
-        let Some((verdict, code, detail)) = judge_stopped(record, &facts, judging) else {
+        let Some((verdict, code, detail)) = judge_stopped(
+            record,
+            &facts,
+            journals.and_then(|journals| journals.get(&record.session_id)),
+            judging,
+        ) else {
             continue;
         };
         verdicts.push(SessionVerdict {
@@ -736,6 +747,7 @@ fn judge_stopped_sessions(dry: &DryRun, judging: &Judging<'_>) -> Vec<SessionVer
 fn judge_stopped(
     record: &SessionRecord,
     facts: &Facts<'_>,
+    journals: Option<&WorkerJournalScan>,
     judging: &Judging<'_>,
 ) -> Option<Judgement> {
     let mut candidate = record.clone();
@@ -755,6 +767,17 @@ fn judge_stopped(
             candidate = record.clone();
         }
     }
+    // A replayed stop imports the worker's final native reference before it
+    // retains recovery. Judge that same reference rather than stale metadata.
+    if record.desired_state == DesiredState::Stopped {
+        project_stopped_reference(&mut candidate, journals, judging.runtimes);
+    }
+    if candidate.desired_state == DesiredState::Stopped
+        && candidate.recovery.is_none()
+        && (facts.resume_unreadable || facts.recovery != RecoveryOutcome::Preserved)
+    {
+        return recovery_loss(facts, &candidate, judging);
+    }
     candidate.recovery.as_ref()?;
     let capabilities = &candidate.info.capabilities;
     if !capabilities.resume && !capabilities.fork {
@@ -770,6 +793,61 @@ fn judge_stopped(
         None => judge_reference(&candidate, judging)
             .unwrap_or_else(|| adoptable_verdict(&candidate, judging)),
     })
+}
+
+/// Projects only the reference a bound worker retains on stop. Invalid or
+/// ambiguous evidence is refused separately by the runtime intent judgement;
+/// it must never replace the stored recovery reference here.
+fn project_stopped_reference(
+    record: &mut SessionRecord,
+    scan: Option<&WorkerJournalScan>,
+    runtimes: &RuntimeHost,
+) {
+    let Some(scan) = scan else {
+        return;
+    };
+    if !scan.rejected.is_empty() {
+        return;
+    }
+    let Ok(Some(generation)) = Generation::from_record(&record.session_id, &record.runtime) else {
+        return;
+    };
+    let scoped = scan.scoped_to(Some(&generation));
+    let [journal] = scoped.evidence.as_slice() else {
+        return;
+    };
+    if runtime_identity_conflict(
+        record,
+        &journal.worker_id,
+        journal.worker_instance_id.as_deref(),
+    ) {
+        return;
+    }
+    let Ok(mut snapshot) = journal.snapshot() else {
+        return;
+    };
+    if snapshot.hook_schema.is_none() {
+        match record_hook_schema(record, runtimes) {
+            HookSchemaLookup::Schema(schema) => snapshot.hook_schema = Some(schema.id.to_owned()),
+            HookSchemaLookup::NoIntegration => {}
+            HookSchemaLookup::Unresolved(_) => return,
+        }
+    }
+    import_terminal_native_reference(
+        record,
+        &snapshot,
+        reported_hook_schema(snapshot.hook_schema.as_deref()),
+    );
+}
+
+/// Resolves the schema startup supplies to a worker that journaled none.
+fn record_hook_schema(record: &SessionRecord, runtimes: &RuntimeHost) -> HookSchemaLookup {
+    let pin = record
+        .recovery
+        .as_ref()
+        .map(|binding| binding.launch_binding.clone())
+        .unwrap_or_default();
+    runtime_hook_schema(runtimes, &record.info.agent_base, &pin)
 }
 
 /// The verdict of a stopped session whose recovery the new daemon keeps, naming
@@ -1459,11 +1537,7 @@ fn judge(
     }
     // A stop or removal the owner asked for is finished at startup, not adopted.
     if record.desired_state != DesiredState::Running {
-        return not_adopted(
-            CODE_INTENT_FINISHED,
-            "the record carries a stop or removal intent the new daemon finishes instead of \
-             adopting the runtime",
-        );
+        return judge_intent(record, scan, inspector, judging);
     }
     let mut candidate = record.clone();
     if let Some(binding) = facts.binding.cloned() {
@@ -1537,6 +1611,84 @@ fn judge(
         _ => {}
     }
     judge_adoption(facts, journal, &mut candidate, inspector, judging)
+}
+
+/// Finishing an owner intent is expected, but never authorizes a foreign or
+/// unprovable process. Missing or ended workers need no adoption; a live one
+/// still needs the identity evidence reconciliation uses before stopping it.
+fn judge_intent(
+    record: &SessionRecord,
+    scan: Result<Option<&WorkerJournalScan>, &str>,
+    inspector: &dyn ProcessInspector,
+    judging: &Judging<'_>,
+) -> Judgement {
+    let finished = || {
+        (
+            Verdict::Adoptable,
+            CODE_INTENT_FINISHED.to_owned(),
+            "the owner requested a stop or removal, which startup finishes instead of adopting \
+             the runtime; any retained native recovery is judged separately"
+                .to_owned(),
+        )
+    };
+    let generation = match Generation::from_record(&record.session_id, &record.runtime) {
+        Ok(generation) => generation,
+        Err(error) => return not_adopted(IDENTITY_MISMATCH, error.msg),
+    };
+    let scan = match scan {
+        Ok(Some(scan)) => scan,
+        Ok(None) => return finished(),
+        Err(detail) => return not_adopted(CODE_JOURNAL_UNREADABLE, detail),
+    };
+    if let Some((file, reject)) = scan.rejected.first() {
+        let (code, detail) = reject_reason(file, reject);
+        return not_adopted(code, detail);
+    }
+    let Some(generation) = generation else {
+        return not_adopted(
+            CODE_GENERATION_MISSING,
+            "the requested stop or removal has journal evidence but no bound generation",
+        );
+    };
+    let scoped = scan.scoped_to(Some(&generation));
+    let journal = match scoped.evidence.as_slice() {
+        [] => return finished(),
+        [journal] => journal,
+        _ => {
+            return not_adopted(
+                CODE_JOURNAL_AMBIGUOUS,
+                "several worker journals name the record's generation",
+            );
+        }
+    };
+    if runtime_identity_conflict(
+        record,
+        &journal.worker_id,
+        journal.worker_instance_id.as_deref(),
+    ) {
+        return not_adopted(
+            CODE_RUNTIME_IDENTITY_MISMATCH,
+            "the worker journal contradicts the runtime the stop or removal intent binds",
+        );
+    }
+    if is_final(journal) {
+        return finished();
+    }
+    if let Some(judgement) = judge_process(journal, inspector) {
+        return if judgement.1 == CODE_WORKER_NOT_RUNNING {
+            finished()
+        } else {
+            judgement
+        };
+    }
+    if let Some(judgement) = judge_marker(journal) {
+        return judgement;
+    }
+    if let Some(judgement) = judge_protocol(journal) {
+        return judgement;
+    }
+    let mut candidate = record.clone();
+    judge_identity(journal, &mut candidate, inspector, judging.runtimes).unwrap_or_else(finished)
 }
 
 /// The live-worker evidence after the record's identity and generation are
@@ -1711,12 +1863,7 @@ fn judge_identity(
     if snapshot.hook_schema.is_none()
         && (snapshot.active_identity.is_some() || snapshot.active_identity_release.is_some())
     {
-        let pin = candidate
-            .recovery
-            .as_ref()
-            .map(|binding| binding.launch_binding.clone())
-            .unwrap_or_default();
-        match runtime_hook_schema(runtimes, &candidate.info.agent_base, &pin) {
+        match record_hook_schema(candidate, runtimes) {
             HookSchemaLookup::Schema(schema) => snapshot.hook_schema = Some(schema.id.to_owned()),
             HookSchemaLookup::NoIntegration => {}
             HookSchemaLookup::Unresolved(error) => {

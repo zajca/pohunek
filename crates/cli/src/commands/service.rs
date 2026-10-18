@@ -58,18 +58,19 @@ pub(crate) enum Action {
         /// this `pohunek`].
         #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
         from: Option<PathBuf>,
-        /// Upgrade even if live sessions would lose their runtime or native
+        /// Upgrade even if live or stopped sessions would lose runtime or native
         /// recovery.
         ///
-        /// The new daemon's adoption preflight lists every live session it
-        /// would not adopt or would adopt without native recovery, and the
-        /// upgrade refuses them without this flag. It never overrides a
-        /// metadata store the new daemon cannot start with.
+        /// The new daemon's adoption preflight lists live sessions it would not
+        /// adopt or would adopt without native recovery, and stopped sessions
+        /// whose native recovery would be lost. The upgrade refuses either
+        /// group without this flag. It never overrides a metadata store the new
+        /// daemon cannot start with.
         #[arg(long)]
         accept_runtime_loss: bool,
-        /// Probe budget, in seconds, of the preflight that judges the live
-        /// sessions: the version probes and native reference checks run within
-        /// it. The default is 20; the installer's deadline grows with it.
+        /// Probe budget, in seconds, of the preflight that judges live and
+        /// stopped sessions: version probes and native reference checks run
+        /// within it. The default is 20; the installer's deadline grows with it.
         #[arg(
             long,
             value_name = "SECONDS",
@@ -120,13 +121,13 @@ pub(crate) enum Action {
         /// `$HOME/.local`]; an upgrade keeps the installed prefix.
         #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
         prefix: Option<PathBuf>,
-        /// Pass the check although live sessions would lose their runtime or
+        /// Pass the check although live or stopped sessions would lose runtime or
         /// native recovery, as `service upgrade --accept-runtime-loss` would.
         #[arg(long)]
         accept_runtime_loss: bool,
-        /// Probe budget, in seconds, of the preflight that judges the live
-        /// sessions: the version probes and native reference checks run within
-        /// it. The default is 20; the installer's deadline grows with it.
+        /// Probe budget, in seconds, of the preflight that judges live and
+        /// stopped sessions: version probes and native reference checks run
+        /// within it. The default is 20; the installer's deadline grows with it.
         #[arg(
             long,
             value_name = "SECONDS",
@@ -355,7 +356,7 @@ fn render_search_path(text: &mut String, report: &report::SearchPathReport) {
 }
 
 /// Appends what the adoption preflight found: the store dry run, and every
-/// live session with its verdict, reason code and evidence.
+/// live or stopped session with its verdict, reason code and evidence.
 fn render_preflight(text: &mut String, preflight: &PreflightReport, accepted_runtime_loss: bool) {
     let store = &preflight.store;
     match (store.state, store.schema_from) {

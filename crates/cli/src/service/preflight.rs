@@ -262,8 +262,19 @@ pub fn decide(report: PreflightReport, accept_runtime_loss: bool) -> Result<Gate
             detail: report.store.error.unwrap_or_default(),
         });
     }
-    let at_risk: Vec<SessionVerdict> = report.at_risk().cloned().collect();
-    if at_risk.is_empty() {
+    let sessions: Vec<SessionVerdict> = report
+        .sessions
+        .iter()
+        .filter(|session| session.verdict.at_risk())
+        .cloned()
+        .collect();
+    let stopped_sessions: Vec<SessionVerdict> = report
+        .stopped_sessions
+        .iter()
+        .filter(|session| session.verdict.at_risk())
+        .cloned()
+        .collect();
+    if sessions.is_empty() && stopped_sessions.is_empty() {
         return Ok(Gated {
             report,
             accepted: false,
@@ -278,7 +289,8 @@ pub fn decide(report: PreflightReport, accept_runtime_loss: bool) -> Result<Gate
         })
     } else {
         Err(Error::UpgradeAtRisk {
-            sessions: at_risk,
+            sessions,
+            stopped_sessions,
             warnings: Vec::new(),
         })
     }

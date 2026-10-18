@@ -42,6 +42,41 @@ use protocol::{
     SessionRuntime, SessionState, StateSource,
 };
 
+#[test]
+fn service_upgrade_and_check_help_name_stopped_session_recovery_risks() {
+    let home = pohunek_test_support::tempdir_with_prefix("phk-help-").expect("isolated help home");
+    for action in ["upgrade", "check"] {
+        let output = std::process::Command::new(pohunek_test_support::bin_exe("pohunek"))
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin:/bin")
+            .args(["service", action, "--help"])
+            .output()
+            .expect("run service help");
+        assert!(output.status.success(), "{action}: {output:?}");
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8 help");
+        let text = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+        let (_, options) = text
+            .split_once("--accept-runtime-loss")
+            .expect("loss flag help");
+        let (loss_help, _) = options
+            .split_once("--preflight-budget")
+            .expect("next option");
+        assert!(
+            loss_help.contains("live or stopped sessions"),
+            "{action}: {loss_help}"
+        );
+        if action == "upgrade" {
+            assert!(
+                loss_help.contains(
+                    "It never overrides a metadata store the new daemon cannot start with"
+                ),
+                "{text}"
+            );
+        }
+    }
+}
+
 /// A worker generation token of the valid grammar.
 const GENERATION: &str = "abcd2345";
 /// Session of the tests.
@@ -528,10 +563,26 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
     )
     .await
     .expect_err("a stopped session at risk needs the flag");
-    let Error::UpgradeAtRisk { sessions, .. } = &error else {
+    let Error::UpgradeAtRisk {
+        sessions,
+        stopped_sessions,
+        ..
+    } = &error
+    else {
         panic!("{error:?}");
     };
-    assert_eq!(sessions, std::slice::from_ref(&stopped));
+    assert!(sessions.is_empty());
+    assert_eq!(stopped_sessions, std::slice::from_ref(&stopped));
+    let message = error.to_string();
+    assert!(
+        message.contains("0 live session(s), 1 stopped session(s)"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("stopped {}:", stopped.session_id)),
+        "{message}"
+    );
+    assert_eq!(error.code(), "service_upgrade_sessions_at_risk");
 
     let gated = gate_upgrade(
         &DaemonPreflight,
