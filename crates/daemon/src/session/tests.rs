@@ -14477,6 +14477,85 @@ async fn session_diff_registry_end_to_end_reflects_worktree_changes_against_the_
     assert!(result.diff.contains("+changed in the worktree"));
 }
 
+#[tokio::test]
+async fn session_diff_rejects_incomplete_git_output_from_a_pipe_holding_textconv() {
+    use std::os::unix::fs::PermissionsExt;
+    let (registry, repo) = project_registry("diff-held-output");
+    let info = registry
+        .create(SessionNewParams {
+            repo: Some(repo.clone()),
+            branch: Some("feat/held-output".to_owned()),
+            ..params()
+        })
+        .await
+        .expect("create worktree session");
+    let worktree = info.worktree_path.as_ref().expect("worktree");
+    let python = crate::agent::trusted_program("python3").expect("test Python");
+    let converter = repo.join("converter.py");
+    let ended = repo.join("converter-ended");
+    std::fs::write(&converter, format!(
+        "#!{}\nimport os,time,pathlib,sys\nif os.fork()==0:\n    os.dup2(os.open(os.devnull,os.O_WRONLY),1)\n    time.sleep(1)\n    with open({:?},'a') as f: f.write('done\\n')\n    os._exit(0)\nsys.stdout.write(pathlib.Path(sys.argv[1]).read_text())\n",
+        python.display(), ended.to_str().expect("test path")
+    )).expect("write textconv");
+    std::fs::set_permissions(&converter, std::fs::Permissions::from_mode(0o755))
+        .expect("executable textconv");
+    git_in(
+        &repo,
+        &[
+            "config",
+            "diff.held.textconv",
+            converter.to_str().expect("converter path"),
+        ],
+    );
+    std::fs::write(worktree.join(".gitattributes"), "README.md diff=held\n").expect("attributes");
+    std::fs::write(worktree.join("README.md"), "changed\n").expect("change tracked file");
+    let result = registry.diff(&info.id, None).await;
+    // Both short-lived descendants finish even if an assertion fails; no signals.
+    pohunek_test_support::wait::poll_until("both converters exit naturally", || {
+        std::fs::read_to_string(&ended)
+            .ok()
+            .filter(|text| text.lines().count() == 2)
+    });
+    let error = result.expect_err("a held git pipe is not a complete diff");
+    assert_eq!(error.code, "session_diff_failed");
+    assert!(error.msg.contains("git output incomplete"), "{error:?}");
+    assert!(error.msg.contains("post-exit drain deadline reached: true"));
+}
+
+#[tokio::test]
+async fn session_diff_rejects_git_output_over_the_capture_cap() {
+    let (registry, repo) = project_registry("diff-output-cap");
+    let info = registry
+        .create(SessionNewParams {
+            repo: Some(repo),
+            branch: Some("feat/output-cap".to_owned()),
+            ..params()
+        })
+        .await
+        .expect("create worktree session");
+    std::fs::write(
+        info.worktree_path
+            .as_ref()
+            .expect("worktree")
+            .join("huge.txt"),
+        vec![b'x'; 9 * 1024 * 1024],
+    )
+    .expect("oversized diff file");
+    let error = registry
+        .diff(&info.id, None)
+        .await
+        .expect_err("capture overflow must not produce a partial successful diff");
+    assert_eq!(error.code, "session_diff_failed");
+    assert!(error.msg.contains("output cap exceeded: true"));
+    let response = protocol::Response::err(protocol::PROTOCOL_VERSION, "diff-cap", error)
+        .expect("error response");
+    let serialized = serde_json::to_string(&response).expect("serialize error");
+    assert!(
+        serialized.len() < MAX_CONTROL_LINE_BYTES,
+        "overflow error must fit the public response frame"
+    );
+}
+
 // --- retention sweep (end to end) -----------------------------------------
 
 /// A registry whose sessions exit immediately, with the metadata store and

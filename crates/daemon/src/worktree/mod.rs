@@ -50,6 +50,7 @@ use tracing::{debug, info, warn};
 use crate::store::{Store, StoreMutation, WorktreeBinding, WorktreeStatus};
 use crate::time::now_rfc3339;
 
+mod git_output;
 mod stderr_drain;
 mod stderr_tail;
 
@@ -1636,7 +1637,12 @@ fn run_admin_command_within(
 ) -> Result<(), String> {
     let lock = admin_lock(repo)?;
     let guard = lock_within(&lock, lock_timeout)?;
-    let output = run_output_bounded_then(cmd, GIT_COMMAND_TIMEOUT, move || drop(guard))?;
+    let output = run_output_bounded_then(
+        cmd,
+        GIT_COMMAND_TIMEOUT,
+        OutputPolicy::StatusOnly,
+        move || drop(guard),
+    )?;
     if output.status.success() {
         return Ok(());
     }
@@ -2341,98 +2347,44 @@ fn run_command(cmd: Command) -> Result<String, String> {
 /// Run a command to completion, killing it when `timeout` elapses.
 ///
 /// Returns `Ok(Output)` for any completed process regardless of exit status
-/// (including a non-zero one) — only a spawn failure, a wait failure, or a
-/// timeout is `Err`. Callers branch on `Output::status` for command-specific
+/// (including a non-zero one). Spawn/wait/read failures, the command timeout,
+/// an expired post-exit drain deadline, or capture overflow return `Err`.
+/// Callers branch on `Output::status` for command-specific
 /// success/failure semantics (e.g. `session::diff`'s `git diff --no-index`,
 /// which uses exit code 1 to mean "files differ", not "failed").
 pub(crate) fn run_output_bounded(cmd: Command, timeout: Duration) -> Result<Output, String> {
-    run_output_bounded_then(cmd, timeout, || {})
+    run_output_bounded_then(cmd, timeout, OutputPolicy::Complete, || {})
 }
 
-/// [`run_output_bounded`] that calls `after_exit` as soon as the process has
-/// exited (or been killed on timeout, or its wait failed), before the output
-/// streams are joined. `after_exit` is dropped uncalled when spawning fails.
-///
-// TODO: unbounded output join, see #556
+/// Whether a caller can act on the exit status without complete output.
+#[derive(Clone, Copy)]
+enum OutputPolicy {
+    Complete,
+    StatusOnly,
+}
+
+/// Release the admin lock on reap, before draining inherited output pipes.
 fn run_output_bounded_then(
-    mut cmd: Command,
+    cmd: Command,
     timeout: Duration,
+    policy: OutputPolicy,
     after_exit: impl FnOnce(),
 ) -> Result<Output, String> {
-    configure_process_group(&mut cmd);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|err| format!("failed to run git: {err}"))?;
-    let stdout = child.stdout.take().expect("stdout was piped before spawn");
-    let stderr = child.stderr.take().expect("stderr was piped before spawn");
-    let stdout_reader = thread::spawn(move || read_pipe(stdout));
-    let stderr_reader = thread::spawn(move || read_pipe(stderr));
-
-    let outcome = wait_child_with_timeout(&mut child, timeout);
-    after_exit();
-    let status = match outcome {
-        GitOutcome::Exited(status) => status,
-        GitOutcome::TimedOut => {
-            return Err(format!("git command timed out after {timeout:?}"));
+    let captured = git_output::capture(cmd, timeout, after_exit)?;
+    if captured.deadline_hit || captured.cap_exceeded {
+        if matches!(policy, OutputPolicy::Complete) {
+            return Err(format!(
+                "git output incomplete (post-exit drain deadline reached: {}, output cap exceeded: {})",
+                captured.deadline_hit, captured.cap_exceeded
+            ));
         }
-        GitOutcome::WaitError(err) => {
-            return Err(format!("failed to wait for git: {err}"));
-        }
-    };
-
-    let stdout = join_pipe_reader(stdout_reader, "stdout")?;
-    let stderr = join_pipe_reader(stderr_reader, "stderr")?;
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-enum GitOutcome {
-    Exited(ExitStatus),
-    TimedOut,
-    WaitError(io::Error),
-}
-
-fn wait_child_with_timeout(child: &mut Child, timeout: Duration) -> GitOutcome {
-    let deadline = Instant::now() + timeout;
-    let mut poll = GIT_COMMAND_POLL_START;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return GitOutcome::Exited(status),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    terminate_process_group(child);
-                    return GitOutcome::TimedOut;
-                }
-                thread::sleep(poll);
-                poll = (poll * 2).min(GIT_COMMAND_POLL_INTERVAL);
-            }
-            Err(err) => return GitOutcome::WaitError(err),
-        }
+        warn!(
+            deadline_hit = captured.deadline_hit,
+            cap_exceeded = captured.cap_exceeded,
+            "git output incomplete; proceeding with the exit status and partial diagnostics"
+        );
     }
-}
-
-fn read_pipe(mut pipe: impl io::Read) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    pipe.read_to_end(&mut buf)?;
-    Ok(buf)
-}
-
-fn join_pipe_reader(
-    reader: thread::JoinHandle<io::Result<Vec<u8>>>,
-    stream_name: &str,
-) -> Result<Vec<u8>, String> {
-    let result = match reader.join() {
-        Ok(result) => result,
-        Err(payload) => {
-            drop(payload);
-            return Err(format!("git {stream_name} reader panicked"));
-        }
-    };
-    result.map_err(|err| format!("failed to read git {stream_name}: {err}"))
+    Ok(captured.output)
 }
 
 /// Run `git -C <repo> <args>` capturing trimmed stdout on success.

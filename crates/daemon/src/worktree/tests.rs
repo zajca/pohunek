@@ -826,13 +826,12 @@ fn repository_lock_is_released_when_git_exits_even_if_a_hook_descendant_holds_th
             started.exists().then_some(())
         });
 
-        // The first call keeps joining output while its descendant lives, yet
-        // git has exited, so the lock must be free for the second add.
+        // Git has exited, so the lock must be free before the bounded drain ends.
         add(&second_path, "feat/second", TEST_LOCK_WAIT)
             .expect("second add proceeds while the first call is still joining output");
-        assert!(
-            !first.is_finished(),
-            "the first call is still blocked on the descendant's output"
+        pohunek_test_support::wait::poll_until(
+            "bounded completion before descendant release",
+            || first.is_finished().then_some(()),
         );
 
         fs::write(&release, "go\n").expect("release the descendant");
@@ -843,6 +842,115 @@ fn repository_lock_is_released_when_git_exits_even_if_a_hook_descendant_holds_th
     });
     assert!(is_valid_worktree(&first_path));
     assert!(is_valid_worktree(&second_path));
+}
+
+#[test]
+fn a_bind_finishes_while_a_same_group_git_grandchild_holds_output() {
+    bind_with_pipe_holding_grandchild(false, false);
+}
+
+#[test]
+fn a_bind_finishes_while_a_setsid_git_grandchild_holds_output() {
+    bind_with_pipe_holding_grandchild(true, false);
+}
+
+#[test]
+fn a_failing_bind_reports_partial_stderr_while_a_git_grandchild_holds_output() {
+    bind_with_pipe_holding_grandchild(false, true);
+}
+
+fn bind_with_pipe_holding_grandchild(detached: bool, fails: bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = init_repo("bounded-native-hook");
+    let state = unique_dir("bounded-native-hook-state");
+    let started = state.join("started");
+    let release = state.join("release");
+    let ended = state.join("ended");
+    let python = crate::agent::trusted_program("python3").expect("test Python");
+    let hook = repo.join(".git/hooks/post-checkout");
+    fs::write(&hook, format!(
+        "#!{}\nimport os,time,pathlib\ns=pathlib.Path({:?})\nif (s/'started').exists(): os._exit(0)\nif os.fork()==0:\n{}    (s/'started').write_text('ready')\n    os.write(1,b'partial stdout\\n')\n    os.write(2,b'partial stderr\\n')\n    while not (s/'release').exists(): time.sleep(0.01)\n    try: os.write(1,b'late output')\n    except BrokenPipeError: (s/'ended').write_text('closed')\n    else: (s/'ended').write_text('open')\n    os._exit(0)\nos._exit({})\n",
+        python.display(), state.to_str().expect("test state path"),
+        if detached { "    os.setsid()\n" } else { "" },
+        if fails { 7 } else { 0 },
+    )).expect("write native hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("executable hook");
+    let manager = manager("bounded-native-hook");
+    let req = request("first", &repo, "feat/first");
+    let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+    std::thread::scope(|scope| {
+        // Release on failure before joining, so the unfixed runner fails rather than hangs.
+        let _release = ReleaseOnDrop(release.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let manager = &manager;
+        let req = &req;
+        let logs = &logs;
+        let first = scope.spawn(move || {
+            let _subscriber = logs.install();
+            let _ = tx.send(manager.bind(req));
+        });
+        pohunek_test_support::wait::poll_until("native hook grandchild ready", || {
+            started.exists().then_some(())
+        });
+        let lock = admin_lock(&repo).expect("repository lock");
+        drop(lock_within(&lock, TEST_LOCK_WAIT).expect("git exit releases lock before drain"));
+        manager
+            .bind(&request("second", &repo, "feat/second"))
+            .expect("second bind proceeds");
+        let result = rx.recv_timeout(Duration::from_secs(3));
+        assert!(
+            result.is_ok(),
+            "bind must finish before the pipe holder is released: {result:?}"
+        );
+        let result = result.expect("bounded result");
+        if fails {
+            let error = result.expect_err("native hook exit 7 fails the bind");
+            assert_eq!(error.code, "worktree_add_failed");
+            assert!(error.msg.contains("partial stderr"), "{error:?}");
+        } else {
+            result.expect("status-only worktree add succeeds");
+        }
+        assert!(!ended.exists(), "no post-reap signal ended the grandchild");
+        fs::write(&release, "go").expect("release grandchild");
+        first.join().expect("bind thread");
+        pohunek_test_support::wait::poll_until("grandchild exits naturally", || {
+            ended.exists().then_some(())
+        });
+        assert_eq!(fs::read_to_string(&ended).expect("pipe result"), "closed");
+    });
+    assert_eq!(
+        logs.text()
+            .matches("git output incomplete; proceeding")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn an_oversized_failing_native_hook_keeps_bounded_partial_diagnostics() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = init_repo("native-hook-cap");
+    let python = crate::agent::trusted_program("python3").expect("test Python");
+    let hook = repo.join(".git/hooks/post-checkout");
+    fs::write(&hook, format!("#!{}\nimport sys\nsys.stderr.write('diagnostic marker\\n'+'x'*(9*1024*1024))\nsys.exit(7)\n", python.display())).expect("write hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("executable hook");
+    let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+    let _subscriber = logs.install();
+    let error = manager("native-hook-cap")
+        .bind(&request("first", &repo, "feat/first"))
+        .expect_err("native hook fails");
+    assert!(error.msg.contains("diagnostic marker"));
+    assert!(
+        error.msg.len() < 8 * 1024 * 1024 + 1024,
+        "retained diagnostics are capped"
+    );
+    assert_eq!(
+        logs.text()
+            .matches("git output incomplete; proceeding")
+            .count(),
+        1
+    );
 }
 
 #[test]
