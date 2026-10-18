@@ -274,7 +274,7 @@ fn configured_profile_result(
         }
         Err(RuntimeFailure::Version) => (
             DoctorStatus::Fail,
-            "The configured executable's version probe failed; repair the profile or runtime installation.",
+            "The configured executable's version probe failed; repair the profile or runtime installation. If the configured program is a wrapper, it must answer the runtime package's version-probe arguments without the profile's fixed arguments.",
         ),
         Err(RuntimeFailure::ProbeBudget) => (
             DoctorStatus::Fail,
@@ -297,7 +297,7 @@ fn version_refusal_detail(subject: &str, refusal: VersionRefusal) -> String {
             "{subject} reports version {version}, outside its runtime's supported range [{min}, {below}); install a release in that range or update the runtime package."
         ),
         VersionRefusal::Unparseable => format!(
-            "{subject}'s version output does not match its runtime's declared format; the configured program must print its release in the format its runtime package declares."
+            "{subject}'s version output does not match its runtime's declared format; the configured program must print its release in the format its runtime package declares. If the configured program is a wrapper, it must answer the runtime package's version-probe arguments without the profile's fixed arguments."
         ),
     }
 }
@@ -341,7 +341,7 @@ fn optional_runtime_result(
         }
         Err(RuntimeFailure::Version) => (
             DoctorStatus::Fail,
-            "Optional provider's version probe failed; repair or reinstall the provider.",
+            "Optional provider's version probe failed; repair or reinstall the provider. If the configured program is a wrapper, it must answer the runtime package's version-probe arguments without the profile's fixed arguments.",
         ),
         Err(RuntimeFailure::PinnedRuntime) => (
             DoctorStatus::Fail,
