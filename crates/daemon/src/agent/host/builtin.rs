@@ -73,7 +73,7 @@ impl BuiltinSource {
             input_rules: InputRules::unrestricted(false, Duration::ZERO),
             input_readiness: InputReadiness::BracketedPaste,
             submit_delay_configurable: false,
-            manifest: Arc::new(detect::generic_shell_manifest().clone()),
+            manifest: Arc::clone(detect::shared_generic_shell_manifest()),
             native: None,
             prompt_arg: false,
             version_probe_parser: None,

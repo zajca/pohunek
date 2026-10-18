@@ -290,6 +290,7 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use protocol::{AgentActivity, DetectionRegionKind, SessionNewParams, StateSource};
@@ -319,7 +320,7 @@ mod tests {
         let initial = DetectorConfig {
             input_readiness: crate::agent::host::InputReadiness::default(),
             detection: DetectionConfig::default(),
-            manifest: Some(
+            manifest: Some(Arc::new(
                 Manifest::parse_str(
                     r#"
                     [[rules]]
@@ -331,12 +332,12 @@ mod tests {
                     "#,
                 )
                 .expect("initial manifest parses"),
-            ),
+            )),
         };
         let updated = DetectorConfig {
             input_readiness: crate::agent::host::InputReadiness::default(),
             detection: DetectionConfig::default(),
-            manifest: Some(
+            manifest: Some(Arc::new(
                 Manifest::parse_str(
                     r#"
                     [[rules]]
@@ -348,7 +349,7 @@ mod tests {
                     "#,
                 )
                 .expect("updated manifest parses"),
-            ),
+            )),
         };
         let (config_tx, mut config_rx) = tokio::sync::watch::channel(DetectorConfigUpdate {
             generation: 0,
@@ -441,7 +442,7 @@ mod tests {
                 stable_visible_refresh: TEST_STABLE_VISIBLE_REFRESH,
                 startup_grace: Duration::ZERO,
             },
-            manifest: Some(
+            manifest: Some(Arc::new(
                 Manifest::parse_str(
                     r#"
                     [[rules]]
@@ -453,7 +454,7 @@ mod tests {
                     "#,
                 )
                 .expect("manifest parses"),
-            ),
+            )),
         };
         let (output_tx, output_rx) = broadcast::channel(8);
         let (_resize_tx, resize_rx) = watch::channel((24, 80));

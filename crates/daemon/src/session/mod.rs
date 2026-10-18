@@ -6908,7 +6908,7 @@ fn detector_config_for_resolved_agent(resolved: &ResolvedAgent) -> DetectorConfi
         .and_then(|profile| profile.manifest.clone())
     {
         Some(manifest) => DetectorConfig {
-            manifest: Some(manifest),
+            manifest: Some(Arc::new(manifest)),
             input_readiness: resolved.input_readiness(),
             ..DetectorConfig::default()
         },

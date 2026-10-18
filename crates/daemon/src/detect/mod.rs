@@ -5,7 +5,7 @@
 //! machine. Session code can own a detector without coupling the pipeline to
 //! async runtime concerns.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use protocol::{AgentActivity, DetectionRegionPreview, ProtocolError, RuntimeRef, StateSource};
@@ -47,7 +47,14 @@ pub(crate) fn embedded_manifest_sources() -> [(&'static str, &'static str); 1] {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DetectorConfig {
     pub detection: DetectionConfig,
-    pub manifest: Option<Manifest>,
+    /// The screen manifest, shared read-only by every detector of a runtime.
+    ///
+    /// Sharing keeps the compiled rules and their lazy-DFA caches warm across
+    /// detectors: a cloned `regex::Regex` starts with an empty cache pool and
+    /// rebuilds its DFA states on its first screens. `Regex` is `Send + Sync`
+    /// and its cache pool hands each concurrent search its own cache, so
+    /// sessions on different threads can match through one manifest at once.
+    pub manifest: Option<Arc<Manifest>>,
     /// Which evidence makes the detector report editable input as ready.
     pub input_readiness: InputReadiness,
 }
@@ -58,7 +65,7 @@ impl DetectorConfig {
     pub fn generic_shell() -> Self {
         Self {
             detection: DetectionConfig::default(),
-            manifest: Some(generic_shell_manifest().clone()),
+            manifest: Some(Arc::clone(shared_generic_shell_manifest())),
             input_readiness: InputReadiness::default(),
         }
     }
@@ -91,7 +98,7 @@ impl DetectorConfig {
                 detection: DetectionConfig::default(),
                 input_readiness: readiness_of(host.definition_for_pin(base, pin))
                     .for_manifest(&manifest),
-                manifest: Some(manifest),
+                manifest: Some(Arc::new(manifest)),
             },
             None => host.definition_for_pin(base, pin).map_or_else(
                 |_unresolved| Self::generic_shell(),
@@ -112,7 +119,7 @@ impl DetectorConfig {
         match (override_manifest, definition) {
             (Some(manifest), definition) => Self {
                 detection: DetectionConfig::default(),
-                manifest: Some(manifest),
+                manifest: Some(Arc::new(manifest)),
                 input_readiness: definition
                     .map_or_else(InputReadiness::default, RuntimeDefinition::input_readiness),
             },
@@ -127,7 +134,7 @@ impl DetectorConfig {
     pub fn for_definition(definition: &RuntimeDefinition) -> Self {
         Self {
             detection: DetectionConfig::default(),
-            manifest: Some((**definition.manifest()).clone()),
+            manifest: Some(Arc::clone(definition.manifest())),
             input_readiness: definition.input_readiness(),
         }
     }
@@ -147,7 +154,7 @@ impl DetectorConfig {
             Some(manifest) => Self {
                 detection: DetectionConfig::default(),
                 input_readiness: readiness_of(host.resolve_ref(base)).for_manifest(&manifest),
-                manifest: Some(manifest),
+                manifest: Some(Arc::new(manifest)),
             },
             None => Self::for_agent(host, base),
         }
@@ -165,14 +172,22 @@ fn readiness_of(
     )
 }
 
-/// Parses the embedded generic shell manifest.
+/// The parsed embedded generic shell manifest.
+#[must_use]
+pub fn generic_shell_manifest() -> &'static Manifest {
+    shared_generic_shell_manifest()
+}
+
+/// Parses the embedded generic shell manifest once; every shell detector shares it.
 ///
 /// The manifest is a shipped, trusted, unit-tested constant, so a parse failure
 /// is a programming error rather than a recoverable condition.
-pub fn generic_shell_manifest() -> &'static Manifest {
-    static MANIFEST: OnceLock<Manifest> = OnceLock::new();
+pub(crate) fn shared_generic_shell_manifest() -> &'static Arc<Manifest> {
+    static MANIFEST: OnceLock<Arc<Manifest>> = OnceLock::new();
     MANIFEST.get_or_init(|| {
-        Manifest::parse_str(GENERIC_SHELL_MANIFEST).expect("generic shell manifest must parse")
+        Arc::new(
+            Manifest::parse_str(GENERIC_SHELL_MANIFEST).expect("generic shell manifest must parse"),
+        )
     })
 }
 
@@ -210,7 +225,7 @@ pub struct Detector {
     osc: OscParser,
     screen: ScreenTracker,
     state: StateMachine,
-    manifest: Option<Manifest>,
+    manifest: Option<Arc<Manifest>>,
     input_readiness: InputReadiness,
     latest_title: Option<String>,
     latest_progress: Option<String>,
@@ -657,7 +672,7 @@ mod tests {
                 stable_visible_refresh: Duration::from_millis(800),
                 startup_grace: Duration::ZERO,
             },
-            manifest: Some(super::generic_shell_manifest().clone()),
+            manifest: Some(Arc::clone(super::shared_generic_shell_manifest())),
         }
     }
 
@@ -671,7 +686,7 @@ mod tests {
                 stable_visible_refresh: Duration::from_millis(800),
                 startup_grace: Duration::ZERO,
             },
-            manifest: Some(super::generic_shell_manifest().clone()),
+            manifest: Some(Arc::clone(super::shared_generic_shell_manifest())),
         }
     }
 
@@ -681,6 +696,10 @@ mod tests {
 
     fn manifest(source: &str) -> Manifest {
         Manifest::parse_str(source).expect("manifest should parse")
+    }
+
+    fn shared_manifest(source: &str) -> Arc<Manifest> {
+        Arc::new(manifest(source))
     }
 
     fn fact(process_id: Pid, comm: &str, cmdline: &[&str]) -> ProcessFact {
@@ -891,7 +910,7 @@ mod tests {
     fn manifest_osc_title_rule_emits_osc_title_source() {
         let started_at = instant();
         let mut detector_config = config();
-        detector_config.manifest = Some(manifest(
+        detector_config.manifest = Some(shared_manifest(
             r#"
             [[rules]]
             id = "title-blocked"
@@ -913,7 +932,7 @@ mod tests {
     fn manifest_bottom_lines_11_region_can_match() {
         let started_at = instant();
         let mut detector_config = config();
-        detector_config.manifest = Some(manifest(
+        detector_config.manifest = Some(shared_manifest(
             r#"
             [[rules]]
             id = "bottom-11"
@@ -938,7 +957,7 @@ mod tests {
     fn after_last_horizontal_rule_region_matches_text_below_the_rule() {
         let started_at = instant();
         let mut detector_config = config();
-        detector_config.manifest = Some(manifest(
+        detector_config.manifest = Some(shared_manifest(
             r#"
             [[rules]]
             id = "below-rule-blocked"
@@ -963,7 +982,7 @@ mod tests {
     fn top_non_empty_lines_region_matches_joined_head_content() {
         let started_at = instant();
         let mut detector_config = config();
-        detector_config.manifest = Some(manifest(
+        detector_config.manifest = Some(shared_manifest(
             r#"
             [[rules]]
             id = "top-trust-blocked"
@@ -988,7 +1007,7 @@ mod tests {
     fn top_non_empty_lines_region_matches_cjk_wide_glyph_content() {
         let started_at = instant();
         let mut detector_config = config();
-        detector_config.manifest = Some(manifest(
+        detector_config.manifest = Some(shared_manifest(
             r#"
             [[rules]]
             id = "top-trust-cjk-blocked"
@@ -1013,7 +1032,7 @@ mod tests {
     fn last_non_empty_above_prompt_box_region_matches_status_line() {
         let started_at = instant();
         let mut detector_config = config();
-        detector_config.manifest = Some(manifest(
+        detector_config.manifest = Some(shared_manifest(
             r#"
             [[rules]]
             id = "above-prompt-blocked"
@@ -1038,7 +1057,7 @@ mod tests {
     fn last_non_empty_above_prompt_box_region_matches_cjk_wide_glyph_content() {
         let started_at = instant();
         let mut detector_config = config();
-        detector_config.manifest = Some(manifest(
+        detector_config.manifest = Some(shared_manifest(
             r#"
             [[rules]]
             id = "above-prompt-cjk-blocked"
@@ -1063,7 +1082,7 @@ mod tests {
     fn region_previews_render_new_regions_with_canonical_names() {
         let started_at = instant();
         let mut detector_config = config();
-        detector_config.manifest = Some(manifest(
+        detector_config.manifest = Some(shared_manifest(
             r#"
             [[rules]]
             id = "top"
@@ -1098,7 +1117,7 @@ mod tests {
     fn after_last_prompt_marker_region_matches_text_below_the_marker() {
         let started_at = instant();
         let mut detector_config = config();
-        detector_config.manifest = Some(manifest(
+        detector_config.manifest = Some(shared_manifest(
             r#"
             [[rules]]
             id = "below-marker-blocked"
@@ -1123,7 +1142,7 @@ mod tests {
     fn missing_osc_title_region_is_absent_from_manifest_context() {
         let started_at = instant();
         let mut detector_config = config();
-        detector_config.manifest = Some(manifest(
+        detector_config.manifest = Some(shared_manifest(
             r#"
             [[rules]]
             id = "missing-title"
@@ -1146,7 +1165,7 @@ mod tests {
     fn stale_manifest_context_does_not_suppress_process_fallback() {
         let started_at = instant();
         let mut detector_config = config();
-        detector_config.manifest = Some(manifest(
+        detector_config.manifest = Some(shared_manifest(
             r#"
             [[rules]]
             id = "visible-blocked"
@@ -1172,7 +1191,7 @@ mod tests {
     fn tick_reconfirms_static_manifest_evidence_for_default_debounce() {
         let started_at = instant();
         let mut detector_config = debounce_config();
-        detector_config.manifest = Some(manifest(
+        detector_config.manifest = Some(shared_manifest(
             r#"
             [[rules]]
             id = "visible-blocked"
@@ -1198,7 +1217,7 @@ mod tests {
     fn tick_prioritizes_manifest_evidence_over_generic_osc_to_confirm_debounce() {
         let started_at = instant();
         let mut detector_config = debounce_config();
-        detector_config.manifest = Some(manifest(
+        detector_config.manifest = Some(shared_manifest(
             r#"
             [[rules]]
             id = "screen-blocked"
@@ -1280,7 +1299,7 @@ mod tests {
     fn resync_after_lag_clears_visible_screen_so_stale_text_no_longer_matches() {
         let started_at = instant();
         let mut detector_config = config();
-        detector_config.manifest = Some(manifest(
+        detector_config.manifest = Some(shared_manifest(
             r#"
             [[rules]]
             id = "visible-blocked"
@@ -1335,7 +1354,7 @@ mod tests {
     fn tick_delegates_stable_visible_refresh() {
         let started_at = instant();
         let mut detector_config = config();
-        detector_config.manifest = Some(manifest(
+        detector_config.manifest = Some(shared_manifest(
             r#"
             [[rules]]
             id = "visible-working"
@@ -1361,7 +1380,7 @@ mod tests {
     fn resize_changes_screen_dimensions_used_by_manifest_context() {
         let started_at = instant();
         let mut detector_config = config();
-        detector_config.manifest = Some(manifest(
+        detector_config.manifest = Some(shared_manifest(
             r#"
             [[rules]]
             id = "two-line-context"
@@ -1616,7 +1635,7 @@ mod tests {
         );
 
         let mut detector_config = config();
-        detector_config.manifest = Some(manifest(
+        detector_config.manifest = Some(shared_manifest(
             r#"
             [[rules]]
             id = "nested-screen"

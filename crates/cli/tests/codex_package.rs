@@ -514,7 +514,7 @@ fn frame_bytes(title: Option<&str>, rows: &[String]) -> Vec<u8> {
     bytes
 }
 
-fn detector_for(manifest: &Manifest, now: Instant, columns: u16) -> Detector {
+fn detector_for(manifest: &Arc<Manifest>, now: Instant, columns: u16) -> Detector {
     Detector::new(
         24,
         columns,
@@ -528,7 +528,7 @@ fn detector_for(manifest: &Manifest, now: Instant, columns: u16) -> Detector {
                 stable_visible_refresh: Duration::from_millis(800),
                 startup_grace: Duration::ZERO,
             },
-            manifest: Some(manifest.clone()),
+            manifest: Some(Arc::clone(manifest)),
         },
     )
 }
