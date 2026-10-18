@@ -3329,6 +3329,9 @@ where
                 timed_out: false,
             });
         }
+        // Competing wakes finish this one-shot stream, after rechecking the
+        // page for an output wake. Its reader is then dropped, so cancelling
+        // raw read_frame never resumes a partially consumed frame.
         tokio::select! {
             () = output.wait_for_observation(page.runtime_end_offset, shutdown) => {
                 if shutdown.is_cancelled() {
