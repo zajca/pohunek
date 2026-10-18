@@ -33,6 +33,13 @@ const STAT_PGRP_FIELD: usize = 5;
 const STAT_PPID_FIELD: usize = 4;
 /// `/proc/<pid>/stat` process-state field number.
 const STAT_STATE_FIELD: usize = 3;
+/// `/proc/<pid>/stat` task-flags field number (`flags`).
+const STAT_FLAGS_FIELD: usize = 9;
+/// Linux `PF_KTHREAD`: a kernel thread cannot carry a userspace environment.
+///
+/// These tasks also have zero environment bounds, but unlike a userspace task
+/// between exec images they can never inherit a worker's ownership markers.
+const PF_KTHREAD: u32 = 0x0020_0000;
 /// `/proc/<pid>/stat` controlling-terminal foreground group field number
 /// (`tpgid`). The value is signed; `-1` means no controlling terminal.
 const STAT_TPGID_FIELD: usize = 8;
@@ -466,6 +473,7 @@ const ENVIRON_REREADS: usize = 2;
 /// environment region, so the stat sample decides:
 ///
 /// - an ended or vanished task has nothing left to reap and reads as unmarked;
+/// - a kernel thread (`PF_KTHREAD`) has no userspace markers and reads as unmarked;
 /// - a live task with a published zero-length region (`env_start` equals
 ///   `env_end`, both nonzero) genuinely has no environment and reads as
 ///   unmarked;
@@ -500,6 +508,11 @@ fn ownership_markers_from(
     if matches!(state, 'Z' | 'X' | 'x') {
         // An ended task loses its memory map, so its environment reads as
         // empty for the same reason a vanished one does.
+        return Ok(OwnershipMarkers::default());
+    }
+    let flags: u32 =
+        parse_stat_field(&stat, STAT_FLAGS_FIELD).ok_or(Error::InvalidData { operation })?;
+    if flags & PF_KTHREAD != 0 {
         return Ok(OwnershipMarkers::default());
     }
     let env_start: u64 =
@@ -1558,9 +1571,18 @@ POHUNEK_WORKER_INSTANCE_IDX=r-2\0HOME=/home/u\0";
         /// fields 3–22 mirror the existing fixtures, and the appended tail
         /// carries the kernel padding plus the environment-region bounds.
         fn observed_stat(state: char, env_start: u64, env_end: u64) -> StatSample {
+            observed_stat_flags(state, env_start, env_end, 0)
+        }
+
+        fn observed_stat_flags(
+            state: char,
+            env_start: u64,
+            env_end: u64,
+            flags: u32,
+        ) -> StatSample {
             let padding = "0 ".repeat(STAT_ENV_START_FIELD - STAT_STARTTIME_FIELD - 1);
             StatSample::Text(format!(
-                "987 (agent) {state} 1 987 999 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {SCENARIO_START} {padding}{env_start} {env_end}"
+                "987 (agent) {state} 1 987 999 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 {SCENARIO_START} {padding}{env_start} {env_end}"
             ))
         }
 
@@ -1594,6 +1616,34 @@ POHUNEK_WORKER_INSTANCE_IDX=r-2\0HOME=/home/u\0";
             )
             .expect("valid request");
             survey_runtime(inspector, &request)
+        }
+
+        #[test]
+        fn a_kernel_thread_newer_than_the_worker_does_not_block_cleanup() {
+            let kernel_thread = 999_931;
+            let inspector = ObservedInspector::default().with_process(
+                kernel_thread,
+                SCENARIO_START,
+                vec![empty_environ()],
+                // PF_KTHREAD from Linux's task flags, plus an unrelated flag.
+                vec![observed_stat_flags('I', 0, 0, 0x0020_0000 | 0x0000_0040)],
+            );
+            let request = SweepRequest::new(
+                SCENARIO_RUNTIME,
+                rustix::process::geteuid().as_raw(),
+                Duration::from_millis(50),
+                Duration::from_millis(5),
+            )
+            .expect("valid request")
+            .with_worker_start_identity(Some(StartIdentity::new(SCENARIO_START - 1)));
+
+            // UID 0 enumerates these same-user tasks too. A kernel thread
+            // cannot carry runtime markers, even if it started after the worker.
+            let survey = survey_runtime(&inspector, &request).expect("survey");
+            assert!(
+                survey.is_empty(),
+                "kernel thread must not block cleanup: {survey:?}"
+            );
         }
 
         #[test]

@@ -9,7 +9,9 @@
   cleanup could therefore be confirmed while the child survived.
 - An empty environ read is now decided by the `/proc/<pid>/stat`
   environment-region bounds (fields 50 and 51, `env_start`/`env_end`): an
-  ended or vanished task reads as unmarked as before, a published zero-length
+  ended or vanished task reads as unmarked as before. Kernel threads are
+  positively identified by `PF_KTHREAD` in stat field 9 and remain unmarked,
+  so a newer kernel thread cannot block cleanup when running as UID 0. A published zero-length
   region on a live task is a genuinely empty environment and reads as
   unmarked, and every other live task — an unpublished region, a reversed or
   half-published one, or a published nonempty region that contradicts the
