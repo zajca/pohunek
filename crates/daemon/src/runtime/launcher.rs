@@ -28,7 +28,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{event, Level};
 
-// Rust guideline compliant 2026-10-18
+// Rust guideline compliant 2026-10-19
 
 /// XDG bases whose application directory the subprocess supervisor prepares.
 ///
@@ -320,23 +320,16 @@ impl Supervisor for SubprocessWorkerLauncher {
 ///
 /// # Errors
 ///
-/// Fails the spawn when the soft limit is unlimited or exceeds the `c_int`
-/// range of the sweep: without a finite bound no bounded sweep can promise the
-/// isolation, and skipping it would hand the daemon's descriptors to the worker.
+/// Fails the spawn when neither the soft limit nor the platform descriptor
+/// maximum provides a finite bound, or the bound exceeds the sweep's `c_int`
+/// range. Skipping the sweep would leak daemon descriptors to the worker.
 fn worker_sweep_bound() -> Result<libc::c_int, WorkerLaunchError> {
-    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile)
-        .current
-        .ok_or_else(|| {
-            operation(
-                "descriptor_sweep_bound",
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "the soft descriptor limit is unlimited; worker spawn needs a bounded sweep",
-                ),
-            )
-        })?;
-    let limit = libc::c_int::try_from(limit)
-        .map_err(|source| operation("descriptor_sweep_bound", source))?;
+    let limit = match rustix::process::getrlimit(rustix::process::Resource::Nofile).current {
+        Some(limit) => libc::c_int::try_from(limit)
+            .map_err(|source| operation("descriptor_sweep_bound", source))?,
+        None => platform_descriptor_bound()
+            .map_err(|source| operation("descriptor_sweep_bound", source))?,
+    };
     let highest = highest_worker_descriptor()
         .map_err(|source| operation("descriptor_sweep_bound", source))?;
     let open_end = highest.checked_add(1).ok_or_else(|| {
@@ -345,8 +338,28 @@ fn worker_sweep_bound() -> Result<libc::c_int, WorkerLaunchError> {
             std::io::Error::from_raw_os_error(libc::EOVERFLOW),
         )
     })?;
-    // New opens stay below the soft limit; enumeration covers FDs retained above a lowered limit.
+    // New opens stay below the soft/platform bound; enumeration covers FDs above a lowered limit.
     Ok(limit.max(open_end))
+}
+
+/// Reads the finite platform maximum when the soft descriptor limit is unlimited.
+#[expect(
+    unsafe_code,
+    reason = "getdtablesize queries the process descriptor limit"
+)]
+fn platform_descriptor_bound() -> std::io::Result<libc::c_int> {
+    // Darwin clamps the unlimited rlimit to kern.maxfilesperproc here. Query
+    // before fork so the child still only performs async-signal-safe FD calls.
+    // SAFETY: getdtablesize takes no pointers and only reads process/kernel limits.
+    let bound = unsafe { libc::getdtablesize() };
+    if bound > FIRST_INHERITED_DESCRIPTOR {
+        Ok(bound)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "no finite platform descriptor limit is available for the worker sweep",
+        ))
+    }
 }
 
 /// Lists the parent's open table before fork; any incomplete listing fails spawn.

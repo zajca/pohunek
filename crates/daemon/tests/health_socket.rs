@@ -1478,11 +1478,67 @@ fn daemon_startup_rejects_missing_config_home_and_home() {
 }
 
 #[tokio::test]
+async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home() {
+    daemon_startup_with_descriptor_limit(false).await;
+}
+
+#[tokio::test]
+async fn daemon_launches_a_real_worker_with_an_unlimited_soft_descriptor_limit() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let env = TestEnv::new().expect("create isolated limit probe environment");
+    let mut probe = env.command("/usr/bin/true");
+    configure_descriptor_limit(&mut probe, true);
+    match probe.status() {
+        Ok(status) => assert!(
+            status.success(),
+            "unlimited descriptor limit probe succeeds"
+        ),
+        #[cfg(target_os = "linux")]
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EPERM | libc::EINVAL)) => {
+            eprintln!("unsupported: Linux refuses an unlimited RLIMIT_NOFILE: {error}");
+            return;
+        }
+        Err(error) => panic!("set unlimited descriptor limit in the child: {error}"),
+    }
+    daemon_startup_with_descriptor_limit(true).await;
+}
+
+fn configure_descriptor_limit(command: &mut std::process::Command, unlimited: bool) {
+    use std::os::unix::process::CommandExt;
+
+    // Keep ample runtime headroom while retaining the already-open sentinel above this limit.
+    const DAEMON_SOFT_DESCRIPTOR_LIMIT: u64 = 256;
+    let limit = if unlimited {
+        rustix::process::Rlimit {
+            current: None,
+            maximum: None,
+        }
+    } else {
+        rustix::process::Rlimit {
+            current: Some(DAEMON_SOFT_DESCRIPTOR_LIMIT),
+            maximum: rustix::process::getrlimit(rustix::process::Resource::Nofile).maximum,
+        }
+    };
+    #[expect(
+        unsafe_code,
+        reason = "pre_exec changes the child limit without touching the test process"
+    )]
+    // SAFETY: the closure captures only scalar limits and calls async-signal-safe setrlimit.
+    unsafe {
+        command.pre_exec(move || {
+            rustix::process::setrlimit(rustix::process::Resource::Nofile, limit)
+                .map_err(std::io::Error::from)
+        });
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "This real-daemon regression keeps bounded startup, worker lifecycle, permission, and cleanup assertions in one auditable sequence."
 )]
-async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home() {
+async fn daemon_startup_with_descriptor_limit(unlimited: bool) {
     use std::os::unix::fs::PermissionsExt;
 
     if !pohunek_test_support::process_env::in_own_process() {
@@ -1546,28 +1602,8 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    #[cfg(target_os = "linux")]
-    {
-        // Keep ample runtime headroom while retaining the already-open FD above this limit.
-        const DAEMON_SOFT_DESCRIPTOR_LIMIT: u64 = 256;
-        let hard = rustix::process::getrlimit(rustix::process::Resource::Nofile).maximum;
-        #[expect(
-            unsafe_code,
-            reason = "pre_exec lowers the child limit without touching the test process"
-        )]
-        // SAFETY: the closure captures only scalar limits and calls the async-signal-safe setrlimit.
-        unsafe {
-            command.pre_exec(move || {
-                rustix::process::setrlimit(
-                    rustix::process::Resource::Nofile,
-                    rustix::process::Rlimit {
-                        current: Some(DAEMON_SOFT_DESCRIPTOR_LIMIT),
-                        maximum: hard,
-                    },
-                )
-                .map_err(std::io::Error::from)
-            });
-        }
+    if unlimited || cfg!(target_os = "linux") {
+        configure_descriptor_limit(command.as_std_mut(), unlimited);
     }
     let mut child = command.spawn().expect("spawn real daemon");
     let socket = runtime_home.join(APP_DIR).join("daemon.sock");
