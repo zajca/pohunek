@@ -10493,37 +10493,78 @@ async fn descendant_reporter_foreign_session_releases_the_claim() {
     descendant_claim_replacement("reporter-foreign-session").await;
 }
 
-/// A reported claim on a process that is itself an observed agent is decided
-/// by the exact-match rules: a foreground switch to its observed ancestor
-/// replaces it.
+/// A reported claim on a process that is itself an observed agent keeps its
+/// claim when the foreground selects the observed same-runtime agent above it
+/// (a wrapper in front of the reporter), and is replaced when the foreground
+/// moves to an observed agent it does not descend from.
 #[tokio::test]
-async fn foreground_switch_replaces_a_claim_on_an_observed_descendant_agent() {
-    let (registry, inspector, created) = mock_procwatch_registry("observed-claim-switch").await;
-    inspector.set_descendants(
-        created.pid,
-        vec![
-            codex_fact(DESCENDANT_WRAPPER_PID, created.pid),
-            codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID),
-        ],
-    );
-    inspector.set_foreground_group(created.pid, Some(DESCENDANT_REPORTER_PID));
-    report_descendant_claim(&registry, &created).await;
-    registry
-        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
-        .await;
-    inspector.set_foreground_group(created.pid, Some(DESCENDANT_WRAPPER_PID));
-    registry
-        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
-        .await;
-    assert_descendant_claim_replaced(
-        &registry,
-        &created.id,
-        DESCENDANT_WRAPPER_PID,
-        RuntimeRef::codex(),
-        "observed claim, foreground on its ancestor",
-    )
-    .await;
-    let _ = registry.stop(&created.id).await;
+async fn observed_reporter_claim_follows_the_foreground_ancestry() {
+    for (case, foreground, kept) in [
+        ("ancestor", DESCENDANT_WRAPPER_PID, true),
+        ("non-ancestor", DESCENDANT_OTHER_AGENT_PID, false),
+    ] {
+        let (registry, inspector, created) = mock_procwatch_registry(case).await;
+        inspector.set_descendants(
+            created.pid,
+            vec![
+                codex_fact(DESCENDANT_WRAPPER_PID, created.pid),
+                codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID),
+                codex_fact(DESCENDANT_OTHER_AGENT_PID, created.pid),
+            ],
+        );
+        inspector.set_foreground_group(created.pid, Some(DESCENDANT_REPORTER_PID));
+        report_descendant_claim(&registry, &created).await;
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        inspector.set_foreground_group(created.pid, Some(foreground));
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        if kept {
+            assert_descendant_claim_kept(&registry, &created.id, case).await;
+        } else {
+            assert_descendant_claim_replaced(
+                &registry,
+                &created.id,
+                foreground,
+                RuntimeRef::codex(),
+                case,
+            )
+            .await;
+        }
+        let _ = registry.stop(&created.id).await;
+    }
+}
+
+/// A reported claim on an observed agent directly below the launch root keeps
+/// its claim with the foreground on the root when the root is an agent of the
+/// claim's runtime, and is cleared when the root is a shell.
+#[tokio::test]
+async fn observed_reporter_below_the_launch_root_follows_the_root_kind() {
+    for agent_root in [true, false] {
+        let (registry, inspector, created) = if agent_root {
+            mock_direct_codex_registry("observed-below-agent-root").await
+        } else {
+            mock_procwatch_registry("observed-below-shell-root").await
+        };
+        inspector.set_descendants(
+            created.pid,
+            vec![codex_fact(DESCENDANT_REPORTER_PID, created.pid)],
+        );
+        inspector.set_foreground_group(created.pid, Some(created.pid));
+        report_descendant_claim(&registry, &created).await;
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        if agent_root {
+            assert_descendant_claim_kept(&registry, &created.id, "agent launch root").await;
+        } else {
+            let cleared = registry.inspect(&created.id).await.expect("inspect");
+            assert_eq!(cleared.active_agent_pid, None, "shell launch root");
+        }
+        let _ = registry.stop(&created.id).await;
+    }
 }
 
 /// A foreground switch to an agent the reporter does not descend from is the

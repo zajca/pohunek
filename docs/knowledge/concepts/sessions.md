@@ -335,7 +335,9 @@ claims and clean release, and PTY output remains an activity signal rather than
 lifecycle authority. `SessionStart` hooks report the nested agent's PID when the
 provider exposes it as the hook parent, so procwatch can bind the claim exactly.
 A reporter that is not an observed agent itself, such as the Codex binary below
-the `node codex.js` wrapper, keeps its claim while a scan proves it: the process
+the `node codex.js` wrapper, or that is an observed agent below the agent the
+foreground selects or below an agent launch root, keeps its claim while a scan
+proves it: the process
 runs now, still has the claim's start identity, is not owned by another session,
 and descends from an observed agent of the same runtime, or from the launch root
 of an agent session, without an agent of another runtime in between. The proof

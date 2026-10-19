@@ -964,15 +964,6 @@ impl SessionRegistry {
         else {
             return false;
         };
-        // A reporter that is an observed agent itself is decided by the
-        // exact-match rules alone.
-        if entry
-            .observed_agents
-            .iter()
-            .any(|observed| observed.pid == reporter.pid)
-        {
-            return false;
-        }
         if active
             .start_identity
             .is_some_and(|start| start != reporter.start_identity.get())
