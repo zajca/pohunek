@@ -25,6 +25,47 @@ use super::{
 const PROCWATCH_SOURCE: &str = "pohunek:procwatch";
 type ObservedIdentity = (Pid, u64);
 
+/// Process ancestry of one successful scan, used to verify a hook-reported
+/// claim whose process is not itself an observed agent.
+///
+/// The evidence is local to the scan that collected it. It only ever proves a
+/// claim (a running reporter below an anchor); a scan without it, an exit
+/// callback included, decides exactly as without the descendant rule.
+struct ScanLineage {
+    /// The launch root, which the descendant listing excludes.
+    root: ProcessIdentity,
+    /// Identity and parent of the root and of every listed descendant.
+    processes: HashMap<Pid, LineageEntry>,
+    /// The reporter of the session's reported claim, when this scan read it
+    /// running after collecting the facts and it is not owned by another
+    /// session.
+    reporter: Option<ProcessIdentity>,
+    /// Processes between the reporter and the root that another session or
+    /// worker owns. Such an agent is never observed, yet a claim cannot pass
+    /// through it.
+    foreign: HashSet<Pid>,
+}
+
+struct LineageEntry {
+    identity: ProcessIdentity,
+    parent: Pid,
+}
+
+/// The agent a verified reporter has to descend from.
+enum ReporterAnchor {
+    /// Exactly this observed agent: the foreground selected it.
+    Observed(ObservedAgent),
+    /// The launch root, when it is an agent of the claim's runtime.
+    LaunchRoot,
+    /// The launch root or any observed agent of the claim's runtime.
+    Any,
+}
+
+struct ObservedRefresh {
+    agents: HashMap<Pid, ObservedAgent>,
+    lineage: Option<ScanLineage>,
+}
+
 /// How process recognition treats a session's own runtime.
 #[derive(Debug, Clone)]
 pub(super) enum OwnRuntime {
@@ -190,18 +231,32 @@ impl SessionRegistry {
         let root_pid = root.pid;
         // The registry snapshot the scan identifies other runtimes with.
         let scan_registry = self.inner.profiles.runtimes().registry();
+        // The claim a scan may prove is the one current before it collects: a
+        // claim admitted during or after collection gets no proof from it.
+        let claimed_reporter = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .and_then(reported_descendant_pid);
         let (scan_pin, observed_refresh) = match self.inner.inspector.descendants(root_pid) {
             Ok(facts) => {
                 let own = self.inner.sessions.lock().await.get(id).map(OwnRuntime::of);
                 let scan_pin = own.as_ref().and_then(OwnRuntime::pinned).cloned();
-                let observed = self.observed_agents_from_facts_for_runtime(
+                // Probes stay outside the session mutex, after the facts they
+                // verify were collected.
+                let lineage = claimed_reporter.map(|pid| {
+                    self.scan_lineage(id, &expected.worker_instance_id, root, &facts, pid)
+                });
+                let agents = self.observed_agents_from_facts_for_runtime(
                     id,
                     facts,
                     now,
                     own.as_ref(),
                     Some(&expected.worker_instance_id),
                 );
-                (scan_pin, Some(observed))
+                (scan_pin, Some(ObservedRefresh { agents, lineage }))
             }
             Err(err) => {
                 warn!(
@@ -235,7 +290,7 @@ impl SessionRegistry {
         let mut exit_watches = match observed_refresh.as_ref() {
             Some(observed) => {
                 let existing = self.existing_observed_identities(id).await;
-                self.open_exit_watches(id, observed.values(), &existing)
+                self.open_exit_watches(id, observed.agents.values(), &existing)
             }
             None => HashMap::new(),
         };
@@ -267,12 +322,24 @@ impl SessionRegistry {
                 observed_refresh => observed_refresh,
             };
 
-            let to_spawn = apply_observed_refresh(entry, observed_refresh, &mut exit_watches);
+            let (agents, lineage) = match observed_refresh {
+                Some(ObservedRefresh { agents, lineage }) => (Some(agents), lineage),
+                None => (None, None),
+            };
+            let to_spawn = apply_observed_refresh(entry, agents, &mut exit_watches);
 
             let foreground_changed = apply_foreground_probe(entry, foreground_probe);
-            let decision = self.reconcile_foreground_agent(entry, root_pid, now, foreground_probe);
+            let decision = self.reconcile_foreground_agent(
+                entry,
+                root_pid,
+                now,
+                foreground_probe,
+                lineage.as_ref(),
+            );
             let updated = match decision {
-                ForegroundDecision::Fallback => self.reconcile_active_agent(entry, now),
+                ForegroundDecision::Fallback => {
+                    self.reconcile_active_agent(entry, now, lineage.as_ref())
+                }
                 ForegroundDecision::Preserve => None,
                 ForegroundDecision::Updated => Some(entry.info.clone()),
             };
@@ -397,9 +464,10 @@ impl SessionRegistry {
                 entry.info.pid,
                 crate::time::now(),
                 ForegroundProbe::Observed(entry.foreground_process_group),
+                None,
             ) {
                 ForegroundDecision::Fallback => {
-                    self.reconcile_active_agent(entry, crate::time::now())
+                    self.reconcile_active_agent(entry, crate::time::now(), None)
                 }
                 ForegroundDecision::Preserve => None,
                 ForegroundDecision::Updated => Some(entry.info.clone()),
@@ -602,12 +670,13 @@ impl SessionRegistry {
         &self,
         entry: &mut SessionEntry,
         now: Instant,
+        lineage: Option<&ScanLineage>,
     ) -> Option<SessionInfo> {
         let Some(active) = entry.active_agent.clone() else {
             let observed = choose_observed_agent(entry)?;
             return self.auto_report_observed_agent(entry, &observed, now);
         };
-        let Some(active_base) = entry.info.active_agent_base.as_ref() else {
+        let Some(active_base) = entry.info.active_agent_base.clone() else {
             return Some(clear_active_agent(
                 entry,
                 self.procwatch_tombstone_for(&active, now),
@@ -621,10 +690,13 @@ impl SessionRegistry {
                 // liveness and clears `active_agent` when that process exits.
                 return None;
             }
-            if observed_process_matches(entry, pid, active.start_identity, active_base) {
+            if observed_process_matches(entry, pid, active.start_identity, &active_base) {
                 return None;
             }
-            if let Some(observed) = first_observed_agent_for_base(entry, active_base) {
+            if self.preserve_descendant_reporter(entry, lineage, &ReporterAnchor::Any) {
+                return None;
+            }
+            if let Some(observed) = first_observed_agent_for_base(entry, &active_base) {
                 return self.auto_report_observed_agent(entry, &observed, now);
             }
             if let Some(observed) = choose_observed_agent(entry) {
@@ -636,7 +708,7 @@ impl SessionRegistry {
             ));
         }
 
-        if let Some(observed) = single_observed_for_base(entry, active_base) {
+        if let Some(observed) = single_observed_for_base(entry, &active_base) {
             if let Some(active) = entry.active_agent.as_mut() {
                 active.pid = Some(observed.pid);
                 active.start_identity = Some(observed.start_identity);
@@ -725,6 +797,7 @@ impl SessionRegistry {
         root_pid: Pid,
         now: Instant,
         probe: ForegroundProbe,
+        lineage: Option<&ScanLineage>,
     ) -> ForegroundDecision {
         let ForegroundProbe::Observed(Some(foreground_group)) = probe else {
             return match probe {
@@ -751,6 +824,13 @@ impl SessionRegistry {
             if bind_matching_observed_identity(entry, &observed) {
                 return ForegroundDecision::Preserve;
             }
+            if self.preserve_descendant_reporter(
+                entry,
+                lineage,
+                &ReporterAnchor::Observed(observed.clone()),
+            ) {
+                return ForegroundDecision::Preserve;
+            }
             let agent = agent_kind_label(&observed.agent_base).to_owned();
             let report = ActiveAgentReport {
                 source: PROCWATCH_SOURCE.to_owned(),
@@ -767,6 +847,9 @@ impl SessionRegistry {
         }
 
         if foreground_group == root_pid {
+            if self.preserve_descendant_reporter(entry, lineage, &ReporterAnchor::LaunchRoot) {
+                return ForegroundDecision::Preserve;
+            }
             let Some(active) = entry.active_agent.clone() else {
                 return ForegroundDecision::Preserve;
             };
@@ -792,12 +875,165 @@ impl SessionRegistry {
                 });
         let unbound_is_current =
             unbound_claim_is_current(&active, now, self.inner.config.active_agent_claim_ttl);
-        if active_is_live || unbound_is_current {
+        if active_is_live
+            || unbound_is_current
+            || self.preserve_descendant_reporter(entry, lineage, &ReporterAnchor::Any)
+        {
             ForegroundDecision::Preserve
         } else {
             let _ = clear_active_agent(entry, self.procwatch_tombstone_for(&active, now));
             ForegroundDecision::Updated
         }
+    }
+
+    /// Reads the ancestry of `facts` and, for the reporter `pid` of the
+    /// session's reported claim, whether it runs now.
+    fn scan_lineage(
+        &self,
+        id: &SessionId,
+        worker_instance_id: &str,
+        root: ProcessIdentity,
+        facts: &[ProcessFact],
+        pid: Pid,
+    ) -> ScanLineage {
+        let mut processes: HashMap<Pid, LineageEntry> = facts
+            .iter()
+            .map(|fact| {
+                (
+                    fact.pid,
+                    LineageEntry {
+                        identity: fact.identity(),
+                        parent: fact.ppid,
+                    },
+                )
+            })
+            .collect();
+        processes.insert(
+            root.pid,
+            LineageEntry {
+                identity: root,
+                parent: root.pid,
+            },
+        );
+        let reporter = facts
+            .iter()
+            .find(|fact| fact.pid == pid)
+            .map(ProcessFact::identity)
+            .filter(|identity| {
+                if self.is_foreign_owned_agent(id, pid, Some(worker_instance_id)) {
+                    return false;
+                }
+                match self.inner.inspector.is_running(*identity) {
+                    Ok(running) => running,
+                    Err(err) => {
+                        debug!(
+                            session_id = %id.0,
+                            pid,
+                            error = %err,
+                            "reported agent liveness read failed; the claim gets no scan proof"
+                        );
+                        false
+                    }
+                }
+            });
+        let mut foreign = HashSet::new();
+        if reporter.is_some() {
+            let mut current = processes.get(&pid).map(|entry| entry.parent);
+            // Bounded like the ancestry walk: a cyclic table ends the loop.
+            for _ in 0..processes.len() {
+                let Some(ancestor) = current.filter(|ancestor| *ancestor != root.pid) else {
+                    break;
+                };
+                if self.is_foreign_owned_agent(id, ancestor, Some(worker_instance_id)) {
+                    foreign.insert(ancestor);
+                }
+                current = processes.get(&ancestor).map(|entry| entry.parent);
+            }
+        }
+        ScanLineage {
+            root,
+            processes,
+            reporter,
+            foreign,
+        }
+    }
+
+    /// Keeps a hook-reported claim whose process is not an observed agent when
+    /// this scan proves it: the reporter runs, still has the claim's start
+    /// identity, and descends from `anchor` through processes of this scan
+    /// without passing an agent of another runtime. Binds the reporter's own
+    /// start identity to the claim. Any other case returns `false` and leaves
+    /// the decision to the caller.
+    fn preserve_descendant_reporter(
+        &self,
+        entry: &mut SessionEntry,
+        lineage: Option<&ScanLineage>,
+        anchor: &ReporterAnchor,
+    ) -> bool {
+        let Some(lineage) = lineage else {
+            return false;
+        };
+        let Some(reporter) = lineage.reporter else {
+            return false;
+        };
+        let Some(active) = entry
+            .active_agent
+            .as_ref()
+            .filter(|active| !active.observed && active.pid == Some(reporter.pid))
+        else {
+            return false;
+        };
+        if active
+            .start_identity
+            .is_some_and(|start| start != reporter.start_identity.get())
+        {
+            return false;
+        }
+        let Some(base) = entry.info.active_agent_base.clone() else {
+            return false;
+        };
+        let launch_root = (self.launch_root_is_agent(&entry.info.agent_base)
+            && entry.info.agent_base == base)
+            .then_some(lineage.root);
+        let is_anchor = |identity: ProcessIdentity| match anchor {
+            ReporterAnchor::Observed(observed) => {
+                observed.agent_base == base
+                    && identity.pid == observed.pid
+                    && identity.start_identity.get() == observed.start_identity
+            }
+            ReporterAnchor::LaunchRoot => launch_root == Some(identity),
+            ReporterAnchor::Any => {
+                launch_root == Some(identity)
+                    || entry.observed_agents.iter().any(|observed| {
+                        observed.agent_base == base
+                            && identity.pid == observed.pid
+                            && identity.start_identity.get() == observed.start_identity
+                    })
+            }
+        };
+        let mut process = lineage.processes.get(&reporter.pid);
+        // A malformed or cyclic process table never proves ancestry.
+        for _ in 0..lineage.processes.len() {
+            let Some(current) = process else {
+                return false;
+            };
+            if lineage.foreign.contains(&current.identity.pid) {
+                return false;
+            }
+            if is_anchor(current.identity) {
+                return bind_report_start_identity(entry, reporter.start_identity.get());
+            }
+            // A claim is not carried through a different recognized runtime.
+            if entry
+                .observed_agents
+                .iter()
+                .any(|observed| observed.pid == current.identity.pid && observed.agent_base != base)
+            {
+                return false;
+            }
+            process = lineage.processes.get(&current.parent);
+        }
+        false
     }
 
     fn next_procwatch_seq(&self) -> u64 {
@@ -893,6 +1129,17 @@ fn choose_foreground_observed(
         })
 }
 
+/// The pid of the session's hook-reported claim when it names a process below
+/// the launch root.
+fn reported_descendant_pid(entry: &SessionEntry) -> Option<Pid> {
+    entry
+        .active_agent
+        .as_ref()
+        .filter(|active| !active.observed)
+        .and_then(|active| active.pid)
+        .filter(|pid| *pid != entry.info.pid)
+}
+
 fn bind_matching_observed_identity(entry: &mut SessionEntry, observed: &ObservedAgent) -> bool {
     let Some(active) = entry.active_agent.as_ref() else {
         return false;
@@ -902,8 +1149,16 @@ fn bind_matching_observed_identity(entry: &mut SessionEntry, observed: &Observed
     {
         return false;
     }
-    if let Some(start_identity) = active.start_identity {
-        return start_identity == observed.start_identity;
+    bind_report_start_identity(entry, observed.start_identity)
+}
+
+/// Binds `start_identity` to the active claim, or confirms the one it carries.
+fn bind_report_start_identity(entry: &mut SessionEntry, start_identity: u64) -> bool {
+    let Some(active) = entry.active_agent.as_ref() else {
+        return false;
+    };
+    if let Some(claimed_start) = active.start_identity {
+        return claimed_start == start_identity;
     }
 
     let claim = (
@@ -916,11 +1171,11 @@ fn bind_matching_observed_identity(entry: &mut SessionEntry, observed: &Observed
         .active_agent
         .as_mut()
         .expect("active report was checked above")
-        .start_identity = Some(observed.start_identity);
+        .start_identity = Some(start_identity);
     if let Some(last) = entry.last_agent_report.as_mut() {
         let last_claim = (last.source.clone(), last.agent.clone(), last.seq, last.pid);
         if last.start_identity.is_none() && last_claim == claim {
-            last.start_identity = Some(observed.start_identity);
+            last.start_identity = Some(start_identity);
         }
     }
     true

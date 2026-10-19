@@ -9846,12 +9846,20 @@ async fn stale_procwatch_retirement_cannot_clear_replacement_runtime() {
 async fn mock_direct_codex_registry(
     tag: &str,
 ) -> (SessionRegistry, Arc<MockInspector>, SessionInfo) {
+    mock_direct_registry(tag, "codex").await
+}
+
+/// A registry whose sessions launch an agent of runtime `base` directly.
+async fn mock_direct_registry(
+    tag: &str,
+    base: &str,
+) -> (SessionRegistry, Arc<MockInspector>, SessionInfo) {
     let inspector = Arc::new(MockInspector::default());
     let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
     let agents_dir = temp_agents_dir_with(
         tag,
-        "direct-codex",
-        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+        "direct-agent",
+        &format!("base = \"{base}\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n"),
     );
     let registry = SessionRegistry::new_with_inspector(
         SessionRegistryConfig {
@@ -9867,7 +9875,7 @@ async fn mock_direct_codex_registry(
     let created = registry
         .create(SessionNewParams {
             name: Some(tag.to_owned()),
-            agent: "direct-codex".to_owned(),
+            agent: "direct-agent".to_owned(),
             ..params()
         })
         .await
@@ -9967,6 +9975,931 @@ async fn direct_agent_without_hook_does_not_auto_report_root() {
         assert_eq!(inspected.active_agent_pid, None);
     }
 
+    let _ = registry.stop(&created.id).await;
+}
+
+/// Pid of the observed Codex wrapper a descendant reporter claims from.
+const DESCENDANT_WRAPPER_PID: Pid = 520;
+/// Pid of the hook reporter, an unmatched child of the Codex wrapper.
+const DESCENDANT_REPORTER_PID: Pid = 521;
+/// Pid of an observed agent that is not the reporter's ancestor.
+const DESCENDANT_OTHER_AGENT_PID: Pid = 530;
+/// Native session id the descendant reporter binds to its hook claim.
+const DESCENDANT_NATIVE_SESSION_ID: &str = "descendant-native";
+/// Native session path the descendant reporter binds to its hook claim.
+const DESCENDANT_NATIVE_SESSION_PATH: &str = "/work/descendant-native.jsonl";
+
+/// An unmatched helper process below `parent`, the way a hook child runs
+/// below its agent: no runtime's process matchers recognize it.
+fn descendant_reporter_fact(parent: Pid, pgid: Pid) -> ProcessFact {
+    ProcessFact {
+        comm: "wrapper-helper".to_owned(),
+        cmdline: vec!["/usr/bin/wrapper-helper".to_owned()],
+        pgid,
+        ..codex_fact(DESCENDANT_REPORTER_PID, parent)
+    }
+}
+
+/// Admits the Codex hook claim of the descendant reporter.
+async fn report_descendant_claim(registry: &SessionRegistry, created: &SessionInfo) {
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: CODEX_HOOK_AGENT.to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+            pid: Some(DESCENDANT_REPORTER_PID),
+            agent_session_id: Some(DESCENDANT_NATIVE_SESSION_ID.to_owned()),
+            agent_session_path: Some(DESCENDANT_NATIVE_SESSION_PATH.to_owned()),
+        })
+        .await;
+    assert!(report.recorded);
+}
+
+/// Admits the descendant reporter's claim directly, without the report path's
+/// request for a rescan, so only the scans a test runs observe it.
+async fn admit_descendant_claim_unannounced(registry: &SessionRegistry, id: &SessionId) {
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(id).expect("live session entry");
+    let report = ActiveAgentReport {
+        source: CODEX_HOOK_SOURCE.to_owned(),
+        agent: CODEX_HOOK_AGENT.to_owned(),
+        seq: Some(DIRECT_AGENT_REPORT_SEQ),
+        pid: Some(DESCENDANT_REPORTER_PID),
+        start_identity: None,
+        reported_at: Instant::now(),
+        activity_reported: false,
+        observed: false,
+    };
+    entry.active_agent = Some(report.clone());
+    entry.last_agent_report = Some(report);
+    entry.info.active_agent = Some(CODEX_HOOK_AGENT.to_owned());
+    entry.info.active_agent_base = Some(RuntimeRef::codex());
+    entry.info.active_agent_pid = Some(DESCENDANT_REPORTER_PID);
+    entry.info.active_agent_session_id = Some(DESCENDANT_NATIVE_SESSION_ID.to_owned());
+    entry.info.active_agent_session_path = Some(DESCENDANT_NATIVE_SESSION_PATH.to_owned());
+}
+
+/// The reporter keeps the claim: its pid, runtime, native reference and
+/// `Report` origin are those of the hook report.
+async fn assert_descendant_claim_kept(registry: &SessionRegistry, id: &SessionId, context: &str) {
+    let inspected = registry
+        .inspect(id)
+        .await
+        .expect("inspect descendant claim");
+    assert_eq!(
+        inspected.active_agent.as_deref(),
+        Some(CODEX_HOOK_AGENT),
+        "{context}: the reported agent"
+    );
+    assert_eq!(
+        inspected.active_agent_base,
+        Some(RuntimeRef::codex()),
+        "{context}: the reported runtime"
+    );
+    assert_eq!(
+        inspected.active_agent_pid,
+        Some(DESCENDANT_REPORTER_PID),
+        "{context}: the reported pid"
+    );
+    assert_eq!(
+        inspected.active_agent_session_id.as_deref(),
+        Some(DESCENDANT_NATIVE_SESSION_ID),
+        "{context}: the reported native session id"
+    );
+    assert_eq!(
+        inspected.state_source,
+        StateSource::Report,
+        "{context}: the Report origin"
+    );
+    let sessions = registry.inner.sessions.lock().await;
+    assert_eq!(
+        super::active_agent_origin(&sessions[id]),
+        Some(crate::store::ActiveAgentOrigin::Reported),
+        "{context}: the identity origin"
+    );
+}
+
+/// The reported claim is gone and procwatch's own observation of `pid` stands
+/// in for it, without the reported native reference.
+async fn assert_descendant_claim_replaced(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    pid: Pid,
+    base: RuntimeRef,
+    context: &str,
+) {
+    let replaced = registry.inspect(id).await.expect("inspect replaced claim");
+    assert_eq!(replaced.active_agent_pid, Some(pid), "{context}");
+    assert_eq!(replaced.active_agent_base, Some(base), "{context}");
+    assert_eq!(replaced.active_agent_session_id, None, "{context}");
+    assert_eq!(replaced.active_agent_session_path, None, "{context}");
+    let sessions = registry.inner.sessions.lock().await;
+    assert_eq!(
+        super::active_agent_origin(&sessions[id]),
+        Some(crate::store::ActiveAgentOrigin::Observed),
+        "{context}"
+    );
+}
+
+/// The hook-reported claim of an unmatched reporter that is a child of an
+/// observed Codex wrapper of the same runtime survives fallback rescans (no
+/// foreground group observed): the active agent keeps the reported pid, its
+/// `Report` origin and the reported native session id (#1107 D1).
+#[tokio::test]
+async fn descendant_reporter_hook_claim_survives_fallback_rescans() {
+    let (registry, inspector, created) = mock_procwatch_registry("descendant-fallback").await;
+    inspector.set_descendants(
+        created.pid,
+        vec![
+            codex_fact(DESCENDANT_WRAPPER_PID, created.pid),
+            descendant_reporter_fact(DESCENDANT_WRAPPER_PID, DESCENDANT_REPORTER_PID),
+        ],
+    );
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        let observed = &sessions[&created.id].observed_agents;
+        assert_eq!(observed.len(), 1, "only the wrapper is an observed agent");
+        assert_eq!(observed[0].pid, DESCENDANT_WRAPPER_PID);
+    };
+    report_descendant_claim(&registry, &created).await;
+
+    for _ in 0..DIRECT_AGENT_RESCAN_COUNT {
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        assert_descendant_claim_kept(&registry, &created.id, "fallback rescan").await;
+    }
+    let _ = registry.stop(&created.id).await;
+}
+
+/// The same claim survives a rescan in which the foreground process group
+/// selects the wrapper: the wrapper replaces neither the reporter, its native
+/// session id nor its `Report` origin (#1107 D1).
+#[tokio::test]
+async fn descendant_reporter_hook_claim_survives_foreground_wrapper_selection() {
+    let (registry, inspector, created) = mock_procwatch_registry("descendant-foreground").await;
+    inspector.set_descendants(
+        created.pid,
+        vec![
+            codex_fact(DESCENDANT_WRAPPER_PID, created.pid),
+            descendant_reporter_fact(DESCENDANT_WRAPPER_PID, DESCENDANT_WRAPPER_PID),
+        ],
+    );
+    inspector.set_foreground_group(created.pid, Some(DESCENDANT_WRAPPER_PID));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    report_descendant_claim(&registry, &created).await;
+
+    for _ in 0..DIRECT_AGENT_RESCAN_COUNT {
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        assert_descendant_claim_kept(&registry, &created.id, "foreground wrapper selection").await;
+    }
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A reporter below a session whose launch process is the agent keeps its
+/// claim until it exits, with the foreground on the launch root or unknown
+/// (#1107 D1).
+#[tokio::test]
+async fn descendant_reporter_below_launch_agent_survives_until_exit() {
+    for foreground in [false, true] {
+        let (registry, inspector, created) = mock_direct_codex_registry("launch-descendant").await;
+        inspector.set_foreground_group(created.pid, foreground.then_some(created.pid));
+        inspector.set_descendants(
+            created.pid,
+            vec![descendant_reporter_fact(created.pid, created.pid)],
+        );
+        report_descendant_claim(&registry, &created).await;
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        assert_descendant_claim_kept(
+            &registry,
+            &created.id,
+            &format!("launch agent, foreground={foreground}"),
+        )
+        .await;
+
+        inspector.set_descendants(created.pid, Vec::new());
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let exited = registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect exited reporter");
+        assert_eq!(exited.active_agent_pid, None, "foreground={foreground}");
+        assert_eq!(
+            exited.active_agent_session_id, None,
+            "foreground={foreground}"
+        );
+        registry
+            .stop(&created.id)
+            .await
+            .expect("stop direct-agent fixture");
+    }
+}
+
+/// An unknown foreground group does not select the claim, but a scan that
+/// verifies the reported pid below an observed agent binds that pid's own
+/// start identity, never its ancestor's: the cwd focus follows the reporter,
+/// and a later reuse of the pid releases the claim with its native metadata
+/// (#1107).
+#[tokio::test]
+async fn procwatch_unknown_foreground_binds_the_reported_start_identity() {
+    let (registry, inspector, created) = mock_procwatch_registry("unknown-foreground-bind").await;
+    let root_cwd = temp_dir("unknown-foreground-root");
+    let reporter_cwd = temp_dir("unknown-foreground-reporter");
+    let wrapper = codex_fact(DESCENDANT_WRAPPER_PID, created.pid);
+    let mut reporter = descendant_reporter_fact(DESCENDANT_WRAPPER_PID, DESCENDANT_REPORTER_PID);
+    inspector.set_descendants(created.pid, vec![wrapper.clone(), reporter.clone()]);
+    inspector.set_cwd(created.pid, root_cwd);
+    inspector.set_cwd(DESCENDANT_REPORTER_PID, reporter_cwd.clone());
+    // The reporter's own process group is foreground and no observed agent
+    // carries it, so the foreground cannot select the claim.
+    inspector.set_foreground_group(created.pid, Some(DESCENDANT_REPORTER_PID));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    report_descendant_claim(&registry, &created).await;
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    assert_descendant_claim_kept(&registry, &created.id, "unknown foreground").await;
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        let claim = sessions[&created.id]
+            .active_agent
+            .as_ref()
+            .expect("active claim");
+        assert_eq!(
+            claim.start_identity,
+            Some(reporter.start_identity.get()),
+            "the claim carries the reporter's own start identity, not an ancestor's"
+        );
+    };
+    assert_eq!(
+        registry.inspect(&created.id).await.expect("inspect").cwd,
+        reporter_cwd,
+        "the cwd focus follows the reported process, not the root"
+    );
+
+    reporter.start_identity = StartIdentity::new(reporter.start_identity.get() + 1);
+    inspector.set_descendants(created.pid, vec![wrapper, reporter]);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let released = registry.inspect(&created.id).await.expect("inspect reuse");
+    assert_eq!(
+        released.active_agent_pid, None,
+        "pid reuse releases the claim"
+    );
+    assert_eq!(released.active_agent, None);
+    assert_eq!(
+        released.active_agent_session_id, None,
+        "native metadata does not survive the pid reuse"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A reported pid no scan verifies is never bound: the claim releases instead
+/// of standing in for an observed agent.
+#[tokio::test]
+async fn procwatch_unknown_foreground_never_binds_an_unverified_reporter() {
+    /// Pid of the claimed reporter that no scan of the session observes.
+    const UNVERIFIED_CLAIM_PID: Pid = 999;
+    let (registry, inspector, created) =
+        mock_procwatch_registry("unknown-foreground-unverified").await;
+    inspector.set_descendants(
+        created.pid,
+        vec![codex_fact(DESCENDANT_WRAPPER_PID, created.pid)],
+    );
+    // A group no observed agent carries: neither the root's nor the wrapper's.
+    inspector.set_foreground_group(created.pid, Some(UNVERIFIED_CLAIM_PID + 10));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: CODEX_HOOK_AGENT.to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+            pid: Some(UNVERIFIED_CLAIM_PID),
+            agent_session_id: Some("unverified-native".to_owned()),
+            agent_session_path: None,
+        })
+        .await;
+    assert!(report.recorded);
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let released = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect unverified claim");
+    assert_eq!(released.active_agent, None);
+    assert_eq!(released.active_agent_pid, None);
+    assert_eq!(released.active_agent_session_id, None);
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = &sessions[&created.id];
+        assert_eq!(super::active_agent_origin(entry), None);
+        assert_eq!(
+            entry
+                .observed_agents
+                .iter()
+                .map(|observed| observed.pid)
+                .collect::<Vec<_>>(),
+            vec![DESCENDANT_WRAPPER_PID],
+            "the wrapper stays observed and nothing stands in for the claim"
+        );
+    };
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn foreground_moves_from_observed_child_to_same_runtime_wrapper() {
+    let (registry, inspector, created) = mock_procwatch_registry("observed-child-focus").await;
+    inspector.set_descendants(
+        created.pid,
+        vec![
+            codex_fact(DESCENDANT_WRAPPER_PID, created.pid),
+            codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID),
+        ],
+    );
+    inspector.set_foreground_group(created.pid, Some(DESCENDANT_REPORTER_PID));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let child = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect observed child");
+    assert_eq!(child.active_agent_pid, Some(DESCENDANT_REPORTER_PID));
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        assert_eq!(
+            super::active_agent_origin(&sessions[&created.id]),
+            Some(crate::store::ActiveAgentOrigin::Observed)
+        );
+    };
+    inspector.set_foreground_group(created.pid, Some(DESCENDANT_WRAPPER_PID));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let wrapper = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect foreground wrapper");
+    assert_eq!(
+        wrapper.active_agent_pid,
+        Some(DESCENDANT_WRAPPER_PID),
+        "only reported claims retain a descendant across foreground selection"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// Registry, inspector and session of a descendant claim whose process tree is
+/// the Codex wrapper above the reporter, with the foreground on `foreground`.
+async fn descendant_claim_fixture(
+    case: &str,
+    foreground: bool,
+) -> (SessionRegistry, Arc<MockInspector>, SessionInfo) {
+    let (registry, inspector, created) = mock_procwatch_registry(case).await;
+    inspector.set_descendants(
+        created.pid,
+        vec![
+            codex_fact(DESCENDANT_WRAPPER_PID, created.pid),
+            descendant_reporter_fact(DESCENDANT_WRAPPER_PID, DESCENDANT_WRAPPER_PID),
+        ],
+    );
+    inspector.set_foreground_group(created.pid, foreground.then_some(DESCENDANT_WRAPPER_PID));
+    report_descendant_claim(&registry, &created).await;
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    (registry, inspector, created)
+}
+
+/// Moves the process tree of a descendant claim through one invalidating
+/// transition and returns the runtime of the agent that replaces the claim.
+fn invalidate_descendant_claim(case: &str, inspector: &MockInspector, root: Pid) -> RuntimeRef {
+    let wrapper = codex_fact(DESCENDANT_WRAPPER_PID, root);
+    let mut reporter = descendant_reporter_fact(DESCENDANT_WRAPPER_PID, DESCENDANT_WRAPPER_PID);
+    match case {
+        "reporter-death" => inspector.set_descendants(root, vec![wrapper]),
+        "reporter-zombie" => inspector.set_not_running(reporter.identity()),
+        "reporter-pid-reuse" => {
+            reporter.start_identity = StartIdentity::new(reporter.start_identity.get() + 1);
+            inspector.set_descendants(root, vec![wrapper, reporter]);
+        }
+        "reporter-sibling" => {
+            reporter.ppid = root;
+            inspector.set_descendants(root, vec![wrapper, reporter]);
+        }
+        "reporter-different-runtime" => {
+            inspector.set_descendants(
+                root,
+                vec![claude_fact(DESCENDANT_WRAPPER_PID, root), reporter],
+            );
+            return RuntimeRef::claude();
+        }
+        "reporter-below-other-runtime" => {
+            // The wrapper is an ancestor, but an agent of another runtime sits
+            // between it and the reporter.
+            reporter.ppid = DESCENDANT_OTHER_AGENT_PID;
+            inspector.set_descendants(
+                root,
+                vec![
+                    wrapper,
+                    claude_fact(DESCENDANT_OTHER_AGENT_PID, DESCENDANT_WRAPPER_PID),
+                    reporter,
+                ],
+            );
+        }
+        "reporter-below-foreign-agent" => {
+            // The agent between the wrapper and the unmarked reporter belongs
+            // to another session, so the session never observes it.
+            reporter.ppid = DESCENDANT_OTHER_AGENT_PID;
+            inspector.set_descendants(
+                root,
+                vec![
+                    wrapper,
+                    claude_fact(DESCENDANT_OTHER_AGENT_PID, DESCENDANT_WRAPPER_PID),
+                    reporter,
+                ],
+            );
+            inspector.set_ownership_markers(
+                DESCENDANT_OTHER_AGENT_PID,
+                OwnershipMarkers {
+                    session_id: Some("another-session".to_owned()),
+                    ..OwnershipMarkers::default()
+                },
+            );
+        }
+        "reporter-foreign-session" => inspector.set_ownership_markers(
+            DESCENDANT_REPORTER_PID,
+            OwnershipMarkers {
+                session_id: Some("another-session".to_owned()),
+                ..OwnershipMarkers::default()
+            },
+        ),
+        _ => unreachable!("known process-tree transition"),
+    }
+    RuntimeRef::codex()
+}
+
+/// Death, zombie, pid reuse, a sibling outside the tree, a different runtime
+/// and a foreign session each end the claim: the observed wrapper replaces it,
+/// with the foreground on the wrapper or unknown.
+async fn descendant_claim_replacement(case: &str) {
+    for foreground in [false, true] {
+        let (registry, inspector, created) = descendant_claim_fixture(case, foreground).await;
+        let expected_runtime = invalidate_descendant_claim(case, &inspector, created.pid);
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        assert_descendant_claim_replaced(
+            &registry,
+            &created.id,
+            DESCENDANT_WRAPPER_PID,
+            expected_runtime,
+            &format!("{case}, foreground={foreground}"),
+        )
+        .await;
+        registry
+            .stop(&created.id)
+            .await
+            .expect("stop fixture session");
+    }
+}
+
+#[tokio::test]
+async fn descendant_reporter_death_releases_the_claim() {
+    descendant_claim_replacement("reporter-death").await;
+}
+
+#[tokio::test]
+async fn descendant_reporter_zombie_releases_the_claim() {
+    descendant_claim_replacement("reporter-zombie").await;
+}
+
+#[tokio::test]
+async fn descendant_reporter_pid_reuse_releases_the_claim() {
+    descendant_claim_replacement("reporter-pid-reuse").await;
+}
+
+#[tokio::test]
+async fn descendant_reporter_sibling_outside_the_tree_releases_the_claim() {
+    descendant_claim_replacement("reporter-sibling").await;
+}
+
+#[tokio::test]
+async fn descendant_reporter_different_runtime_releases_the_claim() {
+    descendant_claim_replacement("reporter-different-runtime").await;
+}
+
+#[tokio::test]
+async fn descendant_reporter_below_another_runtime_releases_the_claim() {
+    descendant_claim_replacement("reporter-below-other-runtime").await;
+}
+
+#[tokio::test]
+async fn descendant_reporter_below_a_foreign_owned_agent_releases_the_claim() {
+    descendant_claim_replacement("reporter-below-foreign-agent").await;
+}
+
+#[tokio::test]
+async fn descendant_reporter_foreign_session_releases_the_claim() {
+    descendant_claim_replacement("reporter-foreign-session").await;
+}
+
+/// A reported claim on a process that is itself an observed agent keeps its
+/// claim when the foreground selects the observed same-runtime agent above it
+/// (a wrapper in front of the reporter), and is replaced when the foreground
+/// moves to an observed agent it does not descend from.
+#[tokio::test]
+async fn observed_reporter_claim_follows_the_foreground_ancestry() {
+    for (case, foreground, kept) in [
+        ("ancestor", DESCENDANT_WRAPPER_PID, true),
+        ("non-ancestor", DESCENDANT_OTHER_AGENT_PID, false),
+    ] {
+        let (registry, inspector, created) = mock_procwatch_registry(case).await;
+        inspector.set_descendants(
+            created.pid,
+            vec![
+                codex_fact(DESCENDANT_WRAPPER_PID, created.pid),
+                codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID),
+                codex_fact(DESCENDANT_OTHER_AGENT_PID, created.pid),
+            ],
+        );
+        inspector.set_foreground_group(created.pid, Some(DESCENDANT_REPORTER_PID));
+        report_descendant_claim(&registry, &created).await;
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        inspector.set_foreground_group(created.pid, Some(foreground));
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        if kept {
+            assert_descendant_claim_kept(&registry, &created.id, case).await;
+        } else {
+            assert_descendant_claim_replaced(
+                &registry,
+                &created.id,
+                foreground,
+                RuntimeRef::codex(),
+                case,
+            )
+            .await;
+        }
+        let _ = registry.stop(&created.id).await;
+    }
+}
+
+/// A reported claim on an observed agent directly below the launch root keeps
+/// its claim with the foreground on the root when the root is an agent of the
+/// claim's runtime, and is cleared when the root is a shell.
+#[tokio::test]
+async fn observed_reporter_below_the_launch_root_follows_the_root_kind() {
+    for agent_root in [true, false] {
+        let (registry, inspector, created) = if agent_root {
+            mock_direct_codex_registry("observed-below-agent-root").await
+        } else {
+            mock_procwatch_registry("observed-below-shell-root").await
+        };
+        inspector.set_descendants(
+            created.pid,
+            vec![codex_fact(DESCENDANT_REPORTER_PID, created.pid)],
+        );
+        inspector.set_foreground_group(created.pid, Some(created.pid));
+        report_descendant_claim(&registry, &created).await;
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        if agent_root {
+            assert_descendant_claim_kept(&registry, &created.id, "agent launch root").await;
+        } else {
+            let cleared = registry.inspect(&created.id).await.expect("inspect");
+            assert_eq!(cleared.active_agent_pid, None, "shell launch root");
+        }
+        let _ = registry.stop(&created.id).await;
+    }
+}
+
+/// The launch root anchors an observed reporter only as an agent of the
+/// claim's own runtime with no other runtime's agent in between.
+#[tokio::test]
+async fn launch_root_anchors_an_observed_reporter_only_within_its_runtime() {
+    // A claude launch root does not anchor a codex claim.
+    let (registry, inspector, created) = mock_direct_registry("root-other-runtime", "claude").await;
+    inspector.set_descendants(
+        created.pid,
+        vec![codex_fact(DESCENDANT_REPORTER_PID, created.pid)],
+    );
+    inspector.set_foreground_group(created.pid, Some(created.pid));
+    report_descendant_claim(&registry, &created).await;
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let other_runtime_root = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(other_runtime_root.active_agent_pid, None, "claude root");
+    let _ = registry.stop(&created.id).await;
+
+    // A codex launch root does not anchor a claim below a claude agent.
+    let (registry, inspector, created) = mock_direct_registry("root-agent-between", "codex").await;
+    inspector.set_descendants(
+        created.pid,
+        vec![
+            claude_fact(DESCENDANT_OTHER_AGENT_PID, created.pid),
+            codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_OTHER_AGENT_PID),
+        ],
+    );
+    inspector.set_foreground_group(created.pid, Some(created.pid));
+    report_descendant_claim(&registry, &created).await;
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let between = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(between.active_agent_pid, None, "other runtime in between");
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A foreground switch to an agent the reporter does not descend from is the
+/// user changing agents: that agent replaces the claim.
+#[tokio::test]
+async fn foreground_switch_to_another_agent_replaces_a_descendant_claim() {
+    for (case, other, runtime) in [
+        (
+            "other-runtime",
+            claude_fact(DESCENDANT_OTHER_AGENT_PID, 0),
+            RuntimeRef::claude(),
+        ),
+        (
+            "other-same-runtime",
+            codex_fact(DESCENDANT_OTHER_AGENT_PID, 0),
+            RuntimeRef::codex(),
+        ),
+    ] {
+        let (registry, inspector, created) = mock_procwatch_registry(case).await;
+        let other = ProcessFact {
+            ppid: created.pid,
+            ..other
+        };
+        inspector.set_descendants(
+            created.pid,
+            vec![
+                codex_fact(DESCENDANT_WRAPPER_PID, created.pid),
+                descendant_reporter_fact(DESCENDANT_WRAPPER_PID, DESCENDANT_WRAPPER_PID),
+                other,
+            ],
+        );
+        inspector.set_foreground_group(created.pid, Some(DESCENDANT_WRAPPER_PID));
+        report_descendant_claim(&registry, &created).await;
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+
+        inspector.set_foreground_group(created.pid, Some(DESCENDANT_OTHER_AGENT_PID));
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        assert_descendant_claim_replaced(
+            &registry,
+            &created.id,
+            DESCENDANT_OTHER_AGENT_PID,
+            runtime,
+            case,
+        )
+        .await;
+        let _ = registry.stop(&created.id).await;
+    }
+}
+
+/// A foreground that returns to the shell root clears a claim anchored to an
+/// observed wrapper: only an agent launch root anchors a claim there.
+#[tokio::test]
+async fn foreground_return_to_the_shell_root_clears_a_descendant_claim() {
+    let (registry, inspector, created) = descendant_claim_fixture("shell-return", true).await;
+    inspector.set_foreground_group(created.pid, Some(created.pid));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let cleared = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(cleared.active_agent, None);
+    assert_eq!(cleared.active_agent_pid, None);
+    assert_eq!(cleared.active_agent_session_id, None);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A reporter whose own liveness probe fails has no proof: the claim follows
+/// the replacement a scan makes without it.
+#[tokio::test]
+async fn descendant_reporter_probe_error_falls_through_to_replacement() {
+    let (registry, inspector, created) =
+        descendant_claim_fixture("descendant-probe-error", false).await;
+    inspector.fail_identity_with(DESCENDANT_REPORTER_PID, std::io::ErrorKind::Interrupted);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    assert_descendant_claim_replaced(
+        &registry,
+        &created.id,
+        DESCENDANT_WRAPPER_PID,
+        RuntimeRef::codex(),
+        "own probe error",
+    )
+    .await;
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A scan whose collection fails supplies no proof: the replacement happens
+/// against the observed agents of the last successful scan.
+#[tokio::test]
+async fn descendant_reporter_failed_collection_falls_through_to_replacement() {
+    let (registry, inspector, created) =
+        descendant_claim_fixture("descendant-failed-collection", false).await;
+    inspector.fail_descendants_with(std::io::ErrorKind::Interrupted);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    assert_descendant_claim_replaced(
+        &registry,
+        &created.id,
+        DESCENDANT_WRAPPER_PID,
+        RuntimeRef::codex(),
+        "failed collection",
+    )
+    .await;
+    let _ = registry.stop(&created.id).await;
+}
+
+/// The exit of an unrelated observed agent reconciles the claim without scan
+/// evidence, so the wrapper replaces it as it does without the descendant
+/// rule.
+#[tokio::test]
+async fn unrelated_exit_callback_reconciles_a_descendant_claim_without_scan_proof() {
+    let (registry, inspector, created) = mock_procwatch_registry("descendant-exit-callback").await;
+    let wrapper = codex_fact(DESCENDANT_WRAPPER_PID, created.pid);
+    let reporter = descendant_reporter_fact(DESCENDANT_WRAPPER_PID, DESCENDANT_WRAPPER_PID);
+    inspector.set_descendants(
+        created.pid,
+        vec![
+            wrapper.clone(),
+            reporter.clone(),
+            claude_fact(DESCENDANT_OTHER_AGENT_PID, created.pid),
+        ],
+    );
+    admit_descendant_claim_unannounced(&registry, &created.id).await;
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+
+    inspector.set_descendants(created.pid, vec![wrapper, reporter]);
+    inspector.fire_exit(DESCENDANT_OTHER_AGENT_PID);
+    wait_until("the exit callback removed the exited agent", || async {
+        let sessions = registry.inner.sessions.lock().await;
+        let observed = &sessions[&created.id].observed_agents;
+        (!observed
+            .iter()
+            .any(|agent| agent.pid == DESCENDANT_OTHER_AGENT_PID))
+        .then_some(())
+    })
+    .await;
+    assert_descendant_claim_replaced(
+        &registry,
+        &created.id,
+        DESCENDANT_WRAPPER_PID,
+        RuntimeRef::codex(),
+        "unrelated exit callback",
+    )
+    .await;
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A scan collected before a claim was admitted and applied after it carries
+/// no proof for that claim: the wrapper replaces it as it does without the
+/// descendant rule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_admission_scan_does_not_preserve_a_descendant_claim() {
+    let (registry, inspector, created) = mock_procwatch_registry("descendant-pre-admission").await;
+    inspector.set_descendants(
+        created.pid,
+        vec![
+            codex_fact(DESCENDANT_WRAPPER_PID, created.pid),
+            descendant_reporter_fact(DESCENDANT_WRAPPER_PID, DESCENDANT_WRAPPER_PID),
+        ],
+    );
+    // Only this test's scan may take the foreground block: stop the session's
+    // own procwatch loop.
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        sessions[&created.id].procwatch_cancel.cancel();
+    };
+    let block = inspector.block_foreground();
+    let _release_guard = ForegroundReleaseGuard(Arc::clone(&block));
+    let scan_registry = registry.clone();
+    let scan_id = created.id.clone();
+    let root_pid = created.pid;
+    let runtime = tokio::runtime::Handle::current();
+    // The probe blocks synchronously after the descendants were collected;
+    // keep it off Tokio's worker pool.
+    let scan = std::thread::spawn(move || {
+        runtime.block_on(scan_registry.rescan_procwatch_at(&scan_id, root_pid, Instant::now()));
+    });
+    tokio::time::timeout(HANG_GUARD, async {
+        while !block.entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the scan collected its descendants");
+
+    // Admit the claim between collection and application.
+    admit_descendant_claim_unannounced(&registry, &created.id).await;
+    block.release();
+    scan.join().expect("pre-admission scan thread");
+
+    assert_descendant_claim_replaced(
+        &registry,
+        &created.id,
+        DESCENDANT_WRAPPER_PID,
+        RuntimeRef::codex(),
+        "pre-admission scan",
+    )
+    .await;
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A descendant claim the worker journal projects survives a successful scan
+/// the way a hook-reported one does: the projection carries the reporter's
+/// start identity and the scan verifies it against the wrapper above it.
+#[tokio::test]
+async fn journal_projected_descendant_claim_survives_a_successful_scan() {
+    let (registry, inspector, created) = mock_procwatch_registry("descendant-journal").await;
+    let reporter = descendant_reporter_fact(DESCENDANT_WRAPPER_PID, DESCENDANT_WRAPPER_PID);
+    inspector.set_descendants(
+        created.pid,
+        vec![
+            codex_fact(DESCENDANT_WRAPPER_PID, created.pid),
+            reporter.clone(),
+        ],
+    );
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    snapshot.active_identity = Some(pohunek_worker_protocol::ActiveIdentityClaim {
+        provider: "codex".to_owned(),
+        process: pohunek_worker_protocol::ProcessIdentity {
+            pid: reporter.pid,
+            start_identity: reporter.start_identity.get(),
+        },
+        sequence: 1,
+        expires_at: native_report_expiry(),
+        reference_kind: None,
+        native_reference: None,
+        agent: None,
+        origin: None,
+        reported_session: None,
+    });
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    let projected = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(projected.active_agent_pid, Some(DESCENDANT_REPORTER_PID));
+
+    for _ in 0..DIRECT_AGENT_RESCAN_COUNT {
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let scanned = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(
+            scanned.active_agent_pid,
+            Some(DESCENDANT_REPORTER_PID),
+            "the journal-projected reporter survives the scan"
+        );
+        assert_eq!(scanned.active_agent_base, Some(RuntimeRef::codex()));
+        let sessions = registry.inner.sessions.lock().await;
+        assert_eq!(
+            super::active_agent_origin(&sessions[&created.id]),
+            Some(crate::store::ActiveAgentOrigin::Reported)
+        );
+    }
     let _ = registry.stop(&created.id).await;
 }
 
