@@ -58,7 +58,7 @@ pub use output::{
 #[doc(inline)]
 pub use pohunek_terminal::TerminalSnapshot;
 #[doc(inline)]
-pub use pty::{Command, EnvBase, Exit, ProcessIdentity, PtyError, PtyOwner};
+pub use pty::{Command, Exit, ProcessIdentity, PtyError, PtyOwner};
 #[doc(inline)]
 pub use server::{run, Server, ServerArgs};
 #[doc(inline)]

@@ -59,9 +59,9 @@ use crate::launch::{self, LaunchClaimStatus};
 use crate::notification;
 use crate::output::OutputCompletion;
 use crate::{
-    Command, ControllerLease, EnvBase, Exit, InputFragment, InputPlan, Journal, LeaseError,
-    LeaseOwner, OutputChunk, OutputEvent, OutputSubscriber, ProcessIdentity, PtyError, PtyOwner,
-    WorkerConfig, WorkerError,
+    Command, ControllerLease, Exit, InputFragment, InputPlan, Journal, LeaseError, LeaseOwner,
+    OutputChunk, OutputEvent, OutputSubscriber, ProcessIdentity, PtyError, PtyOwner, WorkerConfig,
+    WorkerError,
 };
 
 /// How long an idle leased control connection may go unverified.
@@ -1269,10 +1269,7 @@ async fn initialize_request(
     {
         return Err(identity_mismatch());
     }
-    let selected = connection.selected_version.ok_or_else(identity_mismatch)?;
-    initialize
-        .check_version(selected)
-        .map_err(|error| control_error(ControlCode::InvalidRequest, error, false))?;
+    connection.selected_version.ok_or_else(identity_mismatch)?;
     let hook_schema = resolve_hook_schema(&initialize)?;
 
     {
@@ -1331,9 +1328,7 @@ async fn initialize_request(
         history_bytes,
         subscriber_bytes,
         input_dedup_entries: dedup_entries,
-        input_stall: initialize
-            .input_policy
-            .map(|policy| Duration::from_millis(policy.stall_ms())),
+        input_stall: Some(Duration::from_millis(initialize.input_policy.stall_ms())),
         stop_grace,
         kill_reap_deadline,
         terminal_retention: retention,
@@ -1350,7 +1345,6 @@ async fn initialize_request(
         hook_schema,
         initialize.public_protocol_version,
         &initialize.dimensions,
-        selected,
     )
     .await?;
     shared.initialized_tx.send_replace(true);
@@ -1393,10 +1387,6 @@ fn freeze_launch_rule(
 /// The child can report its identity as soon as it runs, and a hook claim is
 /// admitted only in `Running`. Holding the lock across the spawn makes every
 /// claim wait for the commit instead of racing it and being refused.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each parameter is a distinct field committed with the runtime"
-)]
 async fn spawn_running(
     shared: &Shared,
     command: Command,
@@ -1405,12 +1395,10 @@ async fn spawn_running(
     hook_schema: Option<&'static HookSchema>,
     public_protocol_version: u32,
     dimensions: &Dimensions,
-    version: Version,
 ) -> Result<(PtyOwner, WireProcessIdentity), ControlError> {
     let (pty, child_process, committed) = {
         let mut state = shared.state.lock().await;
-        let pty =
-            spawn_pty(command, config).map_err(|error| launch_control_error(error, version))?;
+        let pty = spawn_pty(command, config).map_err(launch_control_error)?;
         let child_process = wire_identity(pty.identity())?;
         state.phase = WireRuntimePhase::Running;
         state.stop_grace = config.stop_grace;
@@ -1468,17 +1456,10 @@ fn spawn_pty(command: Command, config: &WorkerConfig) -> Result<PtyOwner, PtyErr
 }
 
 /// Maps a PTY spawn failure to the code the negotiated peer can decode.
-fn launch_control_error(error: PtyError, version: Version) -> ControlError {
+fn launch_control_error(error: PtyError) -> ControlError {
     match error {
         missing @ PtyError::CwdMissing => {
-            // A v6 peer cannot decode `LaunchCwdMissing`, so it receives the same
-            // refusal as a runtime fault with the identical sanitized message.
-            let code = if version >= protocol::LAUNCH_CWD_CHECK_VERSION {
-                ControlCode::LaunchCwdMissing
-            } else {
-                ControlCode::RuntimeFault
-            };
-            control_error(code, missing, false)
+            control_error(ControlCode::LaunchCwdMissing, missing, false)
         }
         other => control_error(ControlCode::RuntimeFault, other, false),
     }
@@ -1721,7 +1702,6 @@ async fn write_request(
     plan: protocol::InputPlan,
 ) -> Result<ResponseKind, ControlError> {
     let pty = scoped_pty(shared, connection, scope).await?;
-    let version = connection.selected_version.ok_or_else(identity_mismatch)?;
     let byte_len = u64::try_from(plan.byte_len()).unwrap_or(u64::MAX);
     let (write_id, fragments) = plan.into_parts();
     let producer_id = connection
@@ -1749,7 +1729,7 @@ async fn write_request(
         }
         ControlInputId::Legacy => pty.input().execute_legacy(&producer_id, local).await,
     }
-    .map_err(|error| input_control_error(error, version))?;
+    .map_err(input_control_error)?;
     Ok(ResponseKind::WriteCompleted {
         acknowledgement: WriteAck {
             write_id,
@@ -3003,7 +2983,7 @@ where
                         version,
                         stream_id,
                         worker_instance_id,
-                        input_control_error(error, version),
+                        input_control_error(error),
                     ).await;
                 }
                 write_data_frame(
@@ -6744,29 +6724,22 @@ fn validate_lease(
 
 /// Builds the PTY child command from a validated `Initialize`.
 ///
-/// From protocol version six the child environment starts empty and is layered
-/// as base environment, worker `TERM`, profile environment, then the worker's
-/// authoritative `POHUNEK_*` identity. A version-five `Initialize` has no base
-/// environment, so the child inherits the worker's sanitized environment
-/// instead. Service-manager variables are removed from the result either way.
+/// The child environment starts empty and is layered as base environment,
+/// worker `TERM`, profile environment, then the worker's authoritative
+/// `POHUNEK_*` identity. Service-manager variables are removed from the result.
 fn command_from_initialize(
     shared: &Shared,
     initialize: &Initialize,
     worker_instance_id: &WorkerInstanceId,
 ) -> Command {
     let mut environment = BTreeMap::new();
-    let base = match &initialize.base_environment {
-        Some(base_environment) => {
-            environment.extend(
-                base_environment
-                    .iter()
-                    .map(|(name, value)| (name.to_owned(), value.to_owned())),
-            );
-            environment.insert("TERM".to_owned(), CHILD_TERM.to_owned());
-            EnvBase::Empty
-        }
-        None => EnvBase::Inherited,
-    };
+    environment.extend(
+        initialize
+            .base_environment
+            .iter()
+            .map(|(name, value)| (name.to_owned(), value.to_owned())),
+    );
+    environment.insert("TERM".to_owned(), CHILD_TERM.to_owned());
     environment.extend(
         initialize
             .environment
@@ -6838,7 +6811,6 @@ fn command_from_initialize(
     Command {
         program: initialize.executable.to_string_lossy().into_owned(),
         args: initialize.arguments.clone(),
-        base,
         env: environment.into_iter().collect(),
         cwd: initialize.cwd.clone(),
         cols: initialize.dimensions.columns(),
@@ -6968,7 +6940,7 @@ fn lease_control_error(error: LeaseError) -> ControlError {
     }
 }
 
-fn input_control_error(error: crate::InputError, version: Version) -> ControlError {
+fn input_control_error(error: crate::InputError) -> ControlError {
     match error {
         crate::InputError::Conflict { .. } => control_error_message(
             ControlCode::InvalidRequest,
@@ -6981,14 +6953,7 @@ fn input_control_error(error: crate::InputError, version: Version) -> ControlErr
             false,
         ),
         stalled @ crate::InputError::Stalled { .. } => {
-            // A v6 peer cannot decode `InputStalled`, so it receives the same
-            // stall as a runtime fault with the identical sanitized message.
-            let code = if version >= protocol::INPUT_STALL_VERSION {
-                ControlCode::InputStalled
-            } else {
-                ControlCode::RuntimeFault
-            };
-            control_error(code, stalled, false)
+            control_error(ControlCode::InputStalled, stalled, false)
         }
         other => control_error(ControlCode::RuntimeFault, other, true),
     }
@@ -7719,7 +7684,6 @@ mod tests {
             crate::Command {
                 program: "/bin/sh".into(),
                 args: vec!["-c".into(), "read -r line".into()],
-                base: crate::EnvBase::Empty,
                 env: crate::test_support::child_env(),
                 cwd: root.clone(),
                 cols: 80,
@@ -8241,7 +8205,7 @@ mod tests {
             .await
             .expect("bind worker");
         let mut initialize =
-            environment_initialize(Some(base_environment(&[("PATH", "/usr/bin:/bin")])), &[]);
+            environment_initialize(base_environment(&[("PATH", "/usr/bin:/bin")]), &[]);
         initialize.executable = std::path::PathBuf::from("/bin/sh");
         initialize.arguments = vec!["-c".to_owned(), "read -r line".to_owned()];
         initialize.hook_schema = Some("identity-subagent-v1".to_owned());
@@ -8287,7 +8251,7 @@ mod tests {
             .await
             .expect("bind worker");
         let mut unknown =
-            environment_initialize(Some(base_environment(&[("PATH", "/usr/bin:/bin")])), &[]);
+            environment_initialize(base_environment(&[("PATH", "/usr/bin:/bin")]), &[]);
         unknown.hook_schema = Some("identity-v9".to_owned());
         let (connection, lease_id) = controller_connection(&server);
 
@@ -8317,7 +8281,7 @@ mod tests {
             .await
             .expect("bind worker");
         let mut initialize =
-            environment_initialize(Some(base_environment(&[("PATH", "/usr/bin:/bin")])), &[]);
+            environment_initialize(base_environment(&[("PATH", "/usr/bin:/bin")]), &[]);
         initialize.executable = std::path::PathBuf::from("/bin/sh");
         initialize.arguments = vec!["-c".to_owned(), "read -r line".to_owned()];
         initialize.stop_policy =
@@ -8654,7 +8618,6 @@ mod tests {
                     release.to_string_lossy().into_owned(),
                     barrier.path().to_string_lossy().into_owned(),
                 ],
-                base: crate::EnvBase::Empty,
                 env: crate::test_support::child_env(),
                 cwd: barrier.path().to_path_buf(),
                 cols: 80,
@@ -8746,7 +8709,6 @@ mod tests {
                     )
                     .to_owned(),
                 ],
-                base: crate::EnvBase::Empty,
                 env: crate::test_support::child_env(),
                 cwd: directory.path().to_path_buf(),
                 cols: 80,
@@ -8842,7 +8804,6 @@ mod tests {
                     directory.path().to_string_lossy().into_owned(),
                     ready.to_string_lossy().into_owned(),
                 ],
-                base: crate::EnvBase::Empty,
                 env: crate::test_support::child_env(),
                 cwd: directory.path().to_path_buf(),
                 cols: 80,
@@ -8925,7 +8886,6 @@ mod tests {
                     directory.path().to_string_lossy().into_owned(),
                     ready.to_string_lossy().into_owned(),
                 ],
-                base: crate::EnvBase::Empty,
                 env: crate::test_support::child_env(),
                 cwd: directory.path().to_path_buf(),
                 cols: 80,
@@ -10203,7 +10163,7 @@ mod tests {
     }
 
     fn environment_initialize(
-        base_environment: Option<protocol::BaseEnv>,
+        base_environment: protocol::BaseEnv,
         profile: &[(&str, &str)],
     ) -> protocol::Initialize {
         protocol::Initialize {
@@ -10236,7 +10196,7 @@ mod tests {
             hook_protocol_version: Version::new(1).expect("hook version"),
             public_protocol_version: 7,
             hook_schema: None,
-            input_policy: Some(protocol::InputPolicy::new(500).expect("input policy")),
+            input_policy: protocol::InputPolicy::new(500).expect("input policy"),
         }
     }
 
@@ -10256,7 +10216,7 @@ mod tests {
         let server = environment_fixture(directory.path(), "abcd2345")
             .await
             .expect("bind worker");
-        let initialize = environment_initialize(Some(base_environment(&[])), &[("TERM", "screen")]);
+        let initialize = environment_initialize(base_environment(&[]), &[("TERM", "screen")]);
         let worker_instance_id = WorkerInstanceId::new("runtime-environment").expect("runtime id");
 
         let command =
@@ -10265,37 +10225,6 @@ mod tests {
         assert!(command
             .env
             .contains(&("TERM".to_owned(), "screen".to_owned())));
-    }
-
-    #[tokio::test]
-    async fn version_five_child_inherits_without_service_manager_variables() {
-        let directory = pohunek_test_support::tempdir().expect("fixture directory");
-        let server = environment_fixture(directory.path(), "abcd2345")
-            .await
-            .expect("bind worker");
-        let initialize = environment_initialize(
-            None,
-            &[
-                ("PROFILE_TOKEN", "profile-secret"),
-                ("NOTIFY_SOCKET", "/run/profile-notify"),
-                ("POHUNEK_BOOTSTRAP_TOKEN", "token"),
-            ],
-        );
-        let worker_instance_id = WorkerInstanceId::new("runtime-environment").expect("runtime id");
-
-        let command =
-            super::command_from_initialize(&server.shared, &initialize, &worker_instance_id);
-
-        assert_eq!(command.base, crate::EnvBase::Inherited);
-        let names = command
-            .env
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>();
-        assert!(names.contains(&"PROFILE_TOKEN"));
-        assert!(!names.contains(&"TERM"));
-        assert!(!names.contains(&"NOTIFY_SOCKET"));
-        assert!(!names.contains(&"POHUNEK_BOOTSTRAP_TOKEN"));
     }
 
     #[tokio::test]
@@ -10357,7 +10286,7 @@ mod tests {
             .expect("bind worker");
         let marker = directory.path().join("child-started");
         let mut initialize = environment_initialize(
-            Some(base_environment(&[("PATH", "/usr/bin:/bin")])),
+            base_environment(&[("PATH", "/usr/bin:/bin")]),
             &[("CHILD_MARKER", marker.to_str().expect("UTF-8 marker path"))],
         );
         initialize.executable = std::path::PathBuf::from("/bin/sh");

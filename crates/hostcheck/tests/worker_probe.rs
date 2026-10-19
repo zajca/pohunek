@@ -19,7 +19,7 @@ fn executable(root: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 fn valid_info() -> &'static str {
-    "printf '%s' '{\"schema_version\":1,\"binary\":\"pohunek-sessiond\",\"version\":\"1.2.3\",\"journal_schema_version\":4,\"worker_protocol\":{\"minimum\":5,\"maximum\":6}}'"
+    "printf '%s' '{\"schema_version\":1,\"binary\":\"pohunek-sessiond\",\"version\":\"1.2.3\",\"journal_schema_version\":4,\"worker_protocol\":{\"minimum\":7,\"maximum\":8}}'"
 }
 
 #[test]
@@ -41,8 +41,8 @@ fn accepts_a_valid_worker_response() {
     );
     assert_eq!(result.version, "1.2.3");
     assert_eq!(result.journal_schema_version, EXPECTED_SCHEMA);
-    assert_eq!(result.protocol_minimum, 5);
-    assert_eq!(result.protocol_maximum, 6);
+    assert_eq!(result.protocol_minimum, 7);
+    assert_eq!(result.protocol_maximum, 8);
 }
 
 #[test]
@@ -52,7 +52,7 @@ fn rejects_malformed_and_wrong_identity_responses() {
     let wrong_identity = executable(
         root.path(),
         "identity",
-        "printf '%s' '{\"schema_version\":1,\"binary\":\"other\",\"version\":\"1\",\"journal_schema_version\":4,\"worker_protocol\":{\"minimum\":5,\"maximum\":6}}'",
+        "printf '%s' '{\"schema_version\":1,\"binary\":\"other\",\"version\":\"1\",\"journal_schema_version\":4,\"worker_protocol\":{\"minimum\":7,\"maximum\":8}}'",
     );
 
     assert!(matches!(
@@ -160,12 +160,12 @@ fn accepts_a_previously_readable_journal_schema_and_rejects_unknown_probe_schema
     let previous_journal = executable(
         root.path(),
         "previous-journal",
-        "printf '%s' '{\"schema_version\":1,\"binary\":\"pohunek-sessiond\",\"version\":\"1\",\"journal_schema_version\":3,\"worker_protocol\":{\"minimum\":5,\"maximum\":6}}'",
+        "printf '%s' '{\"schema_version\":1,\"binary\":\"pohunek-sessiond\",\"version\":\"1\",\"journal_schema_version\":3,\"worker_protocol\":{\"minimum\":7,\"maximum\":8}}'",
     );
     let unknown_probe_schema = executable(
         root.path(),
         "unknown-probe-schema",
-        "printf '%s' '{\"schema_version\":2,\"binary\":\"pohunek-sessiond\",\"version\":\"1\",\"journal_schema_version\":4,\"worker_protocol\":{\"minimum\":5,\"maximum\":6}}'",
+        "printf '%s' '{\"schema_version\":2,\"binary\":\"pohunek-sessiond\",\"version\":\"1\",\"journal_schema_version\":4,\"worker_protocol\":{\"minimum\":7,\"maximum\":8}}'",
     );
 
     let result = probe_worker(

@@ -9,8 +9,7 @@ use std::path::PathBuf;
 /// directories. Both directories exist on Linux and macOS.
 pub(crate) const CHILD_PATH: &str = "/usr/bin:/bin";
 
-/// Returns the complete environment of a PTY child started with
-/// [`crate::EnvBase::Empty`].
+/// Returns the complete environment of a PTY child.
 ///
 /// Nothing from the test process leaks into the child: only the pinned
 /// `PATH` and a `SHELL` naming the POSIX shell the fixtures run under.

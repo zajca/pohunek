@@ -705,10 +705,11 @@ impl Fixture {
             cwd: self.root.clone(),
             dimensions: Dimensions::new(80, 24).expect("dimensions"),
             environment: SecretEnv::new(BTreeMap::new()).expect("environment"),
-            base_environment: Some(
-                BaseEnv::from_allowlist(DEFAULT_ENVIRONMENT_ALLOWLIST, std::env::vars_os())
-                    .expect("base environment"),
-            ),
+            base_environment: BaseEnv::from_allowlist(
+                DEFAULT_ENVIRONMENT_ALLOWLIST,
+                std::env::vars_os(),
+            )
+            .expect("base environment"),
             limits: InitializeLimits::new(
                 if session_id == self.isolation_session_id {
                     128
@@ -721,7 +722,7 @@ impl Fixture {
             )
             .expect("limits"),
             stop_policy: StopPolicy::new(250).expect("stop policy"),
-            input_policy: Some(InputPolicy::new(3000).expect("input policy")),
+            input_policy: InputPolicy::new(3000).expect("input policy"),
             hook_protocol_version: Version::new(1).expect("hook protocol version"),
             public_protocol_version: PROTOCOL_VERSION.get(),
             hook_schema: None,

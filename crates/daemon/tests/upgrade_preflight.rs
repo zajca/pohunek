@@ -625,7 +625,7 @@ fn a_migrated_store_over_the_durable_read_limit_is_refused() {
 
 #[test]
 fn journal_evidence_failures_each_name_their_reason() {
-    let cases: [(&str, Mutation, &str); 7] = [
+    let cases: [(&str, Mutation, &str); 8] = [
         (
             "an unsupported journal schema",
             |journal| journal["schema_version"] = json!(3),
@@ -652,6 +652,14 @@ fn journal_evidence_failures_each_name_their_reason() {
             |journal| {
                 journal["protocol_minimum"] = json!(1);
                 journal["protocol_maximum"] = json!(2);
+            },
+            CODE_PROTOCOL_INCOMPATIBLE,
+        ),
+        (
+            "a worker pinned to the protocol just below the window",
+            |journal| {
+                journal["protocol_minimum"] = json!(6);
+                journal["protocol_maximum"] = json!(6);
             },
             CODE_PROTOCOL_INCOMPATIBLE,
         ),

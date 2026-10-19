@@ -638,7 +638,7 @@ pub(crate) mod tests {
             pid,
             start_identity.to_owned(),
             "boot".to_owned(),
-            (5, 6),
+            (7, 8),
             "2026-09-24T00:00:00Z".to_owned(),
         );
         // A live worker owns a PTY child, which its journal records.

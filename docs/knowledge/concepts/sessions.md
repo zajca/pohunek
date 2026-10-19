@@ -155,10 +155,9 @@ Every `session.input` write, waited or not, and the initial input of
 its terminal and the PTY accepts no byte for that long, the write fails with
 `session_input_stalled` and the rest of that input is not written; the part
 already accepted may have reached the agent, so inspect the session before
-resending. For `session.new` the failed delivery rolls the new session back. A
-worker started by a daemon older than worker protocol 7 keeps unbounded writes. Input typed or
-pasted through an attached terminal is not bounded and waits like a real
-terminal; while it waits, a `session.input` to the same session fails with
+resending. For `session.new` the failed delivery rolls the new session back. Input typed or pasted
+through an attached terminal is not bounded and waits like a real terminal;
+while it waits, a `session.input` to the same session fails with
 `session_input_stalled` after the stall bound instead of queueing behind it.
 
 `pohunek session diff <target> [--base <ref>] [--json]` prints a unified diff
