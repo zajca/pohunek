@@ -28,16 +28,30 @@ impl OscParser {
     }
 
     pub fn advance(&mut self, bytes: &[u8]) -> Vec<OscEvidence> {
+        self.advance_with_offsets(bytes)
+            .into_iter()
+            .map(|(item, _end)| item)
+            .collect()
+    }
+
+    /// Returns completed OSC events with exclusive byte offsets.
+    ///
+    /// Parsing matches [`Self::advance`]. Each offset includes the terminator
+    /// and is relative to `bytes`, even when an OSC spans multiple feeds.
+    /// Callers can apply screen prefixes before processing each event.
+    pub fn advance_with_offsets(&mut self, bytes: &[u8]) -> Vec<(OscEvidence, usize)> {
         let mut evidence = Vec::new();
 
-        for &byte in bytes {
+        for (offset, &byte) in bytes.iter().enumerate() {
             match self.state {
                 State::Ground => self.advance_ground(byte),
                 State::Escape => self.advance_escape(byte),
                 State::OscCommand => self.advance_osc_command(byte),
                 State::OscCommandEscape => self.advance_osc_command_escape(byte),
-                State::OscPayload => self.advance_osc_payload(byte, &mut evidence),
-                State::OscPayloadEscape => self.advance_osc_payload_escape(byte, &mut evidence),
+                State::OscPayload => self.advance_osc_payload(byte, offset, &mut evidence),
+                State::OscPayloadEscape => {
+                    self.advance_osc_payload_escape(byte, offset, &mut evidence);
+                }
                 State::OscDiscard => self.advance_osc_discard(byte),
                 State::OscDiscardEscape => self.advance_osc_discard_escape(byte),
             }
@@ -101,17 +115,27 @@ impl OscParser {
         }
     }
 
-    fn advance_osc_payload(&mut self, byte: u8, evidence: &mut Vec<OscEvidence>) {
+    fn advance_osc_payload(
+        &mut self,
+        byte: u8,
+        offset: usize,
+        evidence: &mut Vec<(OscEvidence, usize)>,
+    ) {
         match byte {
-            BEL => self.finish_osc(evidence),
+            BEL => self.finish_osc(offset, evidence),
             ESC => self.state = State::OscPayloadEscape,
             _ => self.push_payload_byte(byte),
         }
     }
 
-    fn advance_osc_payload_escape(&mut self, byte: u8, evidence: &mut Vec<OscEvidence>) {
+    fn advance_osc_payload_escape(
+        &mut self,
+        byte: u8,
+        offset: usize,
+        evidence: &mut Vec<(OscEvidence, usize)>,
+    ) {
         match byte {
-            b'\\' => self.finish_osc(evidence),
+            b'\\' => self.finish_osc(offset, evidence),
             b']' => self.start_osc(),
             ESC => {
                 self.reset();
@@ -172,7 +196,7 @@ impl OscParser {
         matches!(self.command.as_slice(), b"0" | b"2" | b"7" | b"9")
     }
 
-    fn finish_osc(&mut self, evidence: &mut Vec<OscEvidence>) {
+    fn finish_osc(&mut self, offset: usize, evidence: &mut Vec<(OscEvidence, usize)>) {
         let item = match self.command.as_slice() {
             b"0" | b"2" => Some(OscEvidence::Title(self.payload_string())),
             b"7" => self.cwd_payload().map(OscEvidence::Cwd),
@@ -181,7 +205,7 @@ impl OscParser {
         };
 
         if let Some(item) = item {
-            evidence.push(item);
+            evidence.push((item, offset + 1));
         }
 
         self.reset();

@@ -109,6 +109,8 @@ calcifer-macos-acl = "0.1"
 # RFC3339 timestamps for session metadata (milestone 3). Formatting only.
 time = { version = "0.3", features = ["formatting"] }
 vt100 = "0.16.2"
+# Use the same VT state machine as vt100 for screen redraw observations.
+vte = "0.15"
 unicode-width = "0.2"
 portable-pty = "0.9"
 tempfile = "3"

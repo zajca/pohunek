@@ -77,6 +77,12 @@ copies of that descriptor and its detection manifest in
 
 - Launch: `codex` with the first prompt as a trailing positional argument;
   bracketed paste followed by a separate Enter 150 ms later for later input.
+- Readiness: `ready = "manifest_idle"`. Codex enables bracketed paste long
+  before its composer reads input, and its startup update popup (#1114) would
+  take a prompt released by the paste signal or by a stale idle title, so the
+  initial prompt waits for the manifest's winning evidence to be idle from the
+  terminal title or the screen. See
+  [runtime packages](runtime-packages.md#declaring-input-readiness).
 - Version: `version_probe = { parser = "semver-line-v1", args = ["--version"],
   min = "0.160.0", below = "1.0.0", line = "codex-cli {version}" }`. `codex
   --version` prints `codex-cli 0.160.0` on standard output; the probe reads only
@@ -102,7 +108,8 @@ copies of that descriptor and its detection manifest in
   non-blank title means `idle`, read from the absence of a spinner and of
   `Action Required` rather than from a title of its own. Screen rules cover
   prompts that block the turn: the first-run workspace trust dialog at the top
-  of the screen, the confirmation lines Codex prints after its last prompt
+  of the screen, the startup update popup (`startup_update_prompt`, below),
+  the confirmation lines Codex prints after its last prompt
   marker (`press enter to confirm or esc to cancel`, `enter to submit answer`,
   `enter to submit all`, `allow command?`) and the weaker `[y/n]`-style prompts
   anywhere in the recent screen.
@@ -134,6 +141,28 @@ classifies every one of them through the package manifest.
 
 ## Gaps found
 
+- **The startup update popup holds the screen at startup.** When Codex 0.160.0
+  finds a newer release at startup, it draws `Update available · <old> →
+  <new>`, the release-notes line, `› 1. Update now (runs npm install -g
+  @openai/codex)`, `2. Skip` and `3. Skip until next version` over the whole
+  screen, roughly a second after the provisional composer appeared. The popup
+  sets no terminal title. Because Codex enables bracketed paste long before,
+  `bracketed_paste` readiness released the initial prompt into the popup,
+  where the paste is ignored and the separate Enter can select the
+  highlighted update action while the composer never sees the prompt. The
+  package declares `ready = "manifest_idle"`. Its `startup_update_prompt` rule
+  reads the popup as a visible blocker from the top sixteen non-empty screen lines, above the
+  title's idle rule, so a prompt is refused (nothing written, the session
+  rolled back) while the popup holds. After observing the blocker, cached
+  idle evidence cannot release input during a clear or partial redraw. A
+  fresh idle title received after the popup disappears can release it, even
+  if the value repeats; title arrival is ordered against screen updates
+  within each PTY chunk. The rule is verified against captures at 80, 100
+  and 160 columns (`compat/codex/screens/update-popup/`); a title left over
+  from before the popup is only ever synthetic — the measured popup set no
+  title. Initial-input readiness for other startup dialogs (sign-in, folder
+  trust, settings prompts) has not been validated here and is tracked
+  separately in [#1267](https://github.com/zajca/pohunek/issues/1267).
 - **The folder dialog is blocked from 30 columns.** Codex 0.160.0 shows `Trust
   this folder? Codex can read, edit, and run files here…` with `1. Trust and
   continue` and `2. Back to Agent Command Center`. It appears when the working
@@ -200,8 +229,10 @@ absence of egress), and the older folder-dialog wording the rule still names.
   built-in Codex goldens in `compat/codex/builtin-v0.34/` (as parsed
   definitions, as TOML data, and by feeding both manifests every captured frame,
   title and synthetic dialog). Those comparisons leave out the package's
-  `folder_trust_prompt` rule and the folder dialog frames only it reads; a
-  separate test reads every captured folder dialog frame with the package
+  `folder_trust_prompt` and `startup_update_prompt` rules and the folder dialog
+  frames and popup captures only they read; separate tests read every captured
+  folder dialog frame, and every popup capture with and without a synthetic
+  stale idle title, with the package
   manifest. It requires the
   supported range to equal `compat/codex/compatibility-lock.json`, reads the
   version banner, runs the title, screen and process rules, and asserts the

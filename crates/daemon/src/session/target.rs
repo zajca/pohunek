@@ -868,6 +868,10 @@ impl SessionRegistry {
         });
         let (detector_preview, detector_preview_rx) = mpsc::channel(1);
         let (input_ready_tx, input_ready) = watch::channel(false);
+        let initial_input_done = CancellationToken::new();
+        if !initial_input_pending {
+            initial_input_done.cancel();
+        }
         let root_pid = started.root_process.pid;
 
         let now = timestamp_now();
@@ -926,6 +930,7 @@ impl SessionRegistry {
             detector_config,
             detector_preview,
             input_ready,
+            initial_input_done: initial_input_done.clone(),
             default_detector_config,
             pinned,
             procwatch_cancel: procwatch_cancel.clone(),
@@ -988,6 +993,7 @@ impl SessionRegistry {
             config: detector_config_rx,
             preview: detector_preview_rx,
             input_ready: input_ready_tx,
+            initial_input_done,
         });
         self.spawn_procwatch(
             id.clone(),

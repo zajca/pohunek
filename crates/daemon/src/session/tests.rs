@@ -17085,6 +17085,71 @@ fn undelivered_create(daemon: &RestartableDaemon) -> crate::store::SessionRecord
     record.clone()
 }
 
+/// Session creation owns ordered observation only until its readiness outcome,
+/// including refusal; sessions without initial input never arm it.
+#[tokio::test]
+async fn initial_input_observation_ends_at_every_wait_outcome() {
+    for outcome in ["ready", "timeout", "shutdown"] {
+        let daemon = RestartableDaemon::new(&format!("wt-observe-{outcome}"));
+        let (registry, _supervisor) = scripted_registry(SessionRegistryConfig {
+            initial_input_startup_grace: Duration::ZERO,
+            ..daemon.config.clone()
+        });
+        let create_gate = hold_initial_input(&registry);
+        let outcome_gate = hold_initial_input_outcome(&registry);
+        let creating = tokio::spawn({
+            let registry = registry.clone();
+            let params = SessionNewParams {
+                input: Some("go".to_owned()),
+                ..daemon.params(&format!("feat/observe-{outcome}"))
+            };
+            async move { registry.create(params).await }
+        });
+        create_gate.entered.notified().await;
+        let (readiness_tx, readiness_rx) = tokio::sync::watch::channel(outcome == "ready");
+        let done = {
+            let mut sessions = registry.inner.sessions.lock().await;
+            let entry = sessions.values_mut().next().expect("committed session");
+            entry.input_ready = readiness_rx;
+            entry.default_detector_config.input_readiness =
+                crate::agent::host::InputReadiness::ManifestIdle;
+            entry.initial_input_done.clone()
+        };
+        assert!(
+            !done.is_cancelled(),
+            "{outcome}: initial input is pending before the wait"
+        );
+        if outcome == "shutdown" {
+            registry.begin_daemon_shutdown();
+        }
+        create_gate.release.notify_one();
+        outcome_gate.entered.notified().await;
+        assert!(
+            done.is_cancelled(),
+            "{outcome}: observation stops before delivery or rollback"
+        );
+        outcome_gate.release.notify_one();
+        let result = creating.await.expect("create task joins");
+        assert_eq!(result.is_ok(), outcome == "ready", "{outcome}: {result:?}");
+        drop(readiness_tx);
+    }
+    let daemon = RestartableDaemon::new("wt-no-observation");
+    let (registry, _supervisor) = scripted_registry(daemon.config.clone());
+    let created = registry
+        .create(daemon.params("feat/no-observation"))
+        .await
+        .expect("create without input");
+    let sessions = registry.inner.sessions.lock().await;
+    assert!(
+        sessions
+            .get(&created.id)
+            .expect("created entry")
+            .initial_input_done
+            .is_cancelled(),
+        "no initial input never arms observation"
+    );
+}
+
 /// A `ScreenIdle` create whose wait ends by daemon shutdown is refused even
 /// when its readiness turns true after that outcome was decided.
 #[tokio::test]

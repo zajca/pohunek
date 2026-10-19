@@ -26,7 +26,7 @@ pub use manifest::{
 pub use osc::{OscEvidence, OscParser};
 // The VT screen model lives in `pohunek-terminal` so the daemon and CLI share
 // one implementation instead of drifting copies.
-pub use pohunek_terminal::{ScreenRegion, ScreenTracker};
+pub use pohunek_terminal::{ScreenObservation, ScreenRegion, ScreenTracker};
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
@@ -227,11 +227,28 @@ pub struct Detector {
     state: StateMachine,
     manifest: Option<Arc<Manifest>>,
     input_readiness: InputReadiness,
+    initial_input_pending: bool,
     latest_title: Option<String>,
     latest_progress: Option<String>,
     latest_cwd_hint: Option<String>,
     process_activity: ProcessActivityScanner,
     needs_visible_recheck: bool,
+    /// Monotonic sequence of evidence arrivals that the strict `manifest_idle`
+    /// latch judges freshness with: every received OSC title (even one that
+    /// repeats its value) and every screen text change or character redraw
+    /// gets a fresh point. The debounced classification keeps its own
+    /// value-changed `ContextFreshness` flags, so activity semantics are
+    /// unchanged.
+    strict_seq: u64,
+    title_seq: u64,
+    screen_seq: u64,
+    /// Sequence point of the most recent visible-blocker sighting under
+    /// `manifest_idle` readiness (0 = none seen). Once a blocker is seen,
+    /// only idle evidence from a source that arrived *after* the latest
+    /// sighting can release the input: a cached idle title from before the
+    /// blocker — or a title received while the blocker still held — never
+    /// does.
+    idle_barrier: u64,
 }
 
 impl Detector {
@@ -243,36 +260,69 @@ impl Detector {
             state: StateMachine::new(started_at, config.detection),
             manifest: config.manifest,
             input_readiness: config.input_readiness,
+            initial_input_pending: true,
             latest_title: None,
             latest_progress: None,
             latest_cwd_hint: None,
             process_activity: ProcessActivityScanner::default(),
             needs_visible_recheck: false,
+            strict_seq: 0,
+            title_seq: 0,
+            screen_seq: 0,
+            idle_barrier: 0,
         }
     }
 
+    /// Stops ordered startup observation once the initial-input wait resolves.
+    ///
+    /// Reconfiguration never re-arms a completed wait.
+    pub fn finish_initial_input(&mut self) {
+        self.initial_input_pending = false;
+        self.screen.finish_observation();
+    }
+
     pub fn feed(&mut self, now: Instant, bytes: &[u8]) -> Vec<ActivityTransition> {
+        // A reconfigure or resize may expose a blocker before the next
+        // output clears it. Observe that context before consuming new bytes.
+        self.sight_full_context();
+
         let has_process_activity = self.process_activity.observe(bytes);
         let recent_before = self.screen.recent_text();
-        let osc_items = self.osc.advance(bytes);
-        self.screen.feed(bytes);
-        let screen_changed = self.screen.recent_text() != recent_before;
+        let osc_events = self.osc.advance_with_offsets(bytes);
 
-        let osc_changes = self.collect_osc_evidence(osc_items);
-        let mut evidence = Vec::new();
-        self.collect_manifest_evidence(
-            &mut evidence,
-            ContextFreshness {
-                screen: screen_changed,
-                osc_title: osc_changes.title,
-                osc_progress: osc_changes.progress,
-            },
-        );
-        let has_structured_evidence = !evidence.is_empty();
+        // The screen is fed segment by segment, split at each completed OSC
+        // event: every event is stamped against the screen as it looked where
+        // that event's bytes ended, never against the chunk's final screen —
+        // a title followed by a clear in one chunk arrived while the blocker
+        // still held.
+        let mut osc_changes = OscChanges::default();
+        let mut consumed = 0;
+        for (item, end) in osc_events {
+            self.feed_screen_segment(&bytes[consumed..end]);
+            if self.apply_osc_event(item, &mut osc_changes) {
+                self.sight_full_context();
+            }
+            consumed = end;
+        }
+        self.feed_screen_segment(&bytes[consumed..]);
+
+        // Overall screen change keeps the debounced classification's
+        // value-changed freshness semantics, unchanged for activity.
+        let screen_changed = self.screen.recent_text() != recent_before;
+        let freshness = ContextFreshness {
+            screen: screen_changed,
+            osc_title: osc_changes.title,
+            osc_progress: osc_changes.progress,
+        };
+        let hit = self.manifest_evidence(freshness);
+        let has_structured_evidence = hit.is_some();
 
         let mut transitions = Vec::new();
-        for item in evidence {
-            push_transition(&mut transitions, self.state.observe_evidence(now, item));
+        if let Some(hit) = hit {
+            push_transition(
+                &mut transitions,
+                self.state.observe_evidence(now, hit.evidence),
+            );
         }
 
         if has_process_activity && !has_structured_evidence {
@@ -282,6 +332,94 @@ impl Detector {
         transitions
     }
 
+    /// Feeds a segment and stamps text changes or character redraws.
+    ///
+    /// A clear followed by an identical repaint is fresh screen evidence even
+    /// when the segment's final text equals its initial text. Control-only
+    /// output does not refresh the cached screen's arrival sequence.
+    ///
+    /// Under strict `manifest_idle` readiness the segment is fed observed
+    /// instead: pending text changes are sighted before cursor movement, erasure
+    /// or potential character wrapping can hide them. Formatting does not
+    /// split printable runs into repeated grid observations. A complete
+    /// blocker is recorded before its clear, and the final grid is observed
+    /// even when the final byte is itself a control action.
+    fn feed_screen_segment(&mut self, bytes: &[u8]) {
+        if !self.initial_input_pending {
+            self.screen.feed(bytes);
+            return;
+        }
+        if self.input_readiness == InputReadiness::ManifestIdle {
+            self.feed_screen_segment_observed(bytes);
+            return;
+        }
+        let recent_before = self.screen.recent_text();
+        let drew_chars = self.screen.feed(bytes);
+        if self.screen.recent_text() != recent_before || drew_chars {
+            self.strict_seq += 1;
+            self.screen_seq = self.strict_seq;
+        }
+        // Screen evidence received while a title blocker still holds must
+        // not become fresh merely because the following OSC clears it.
+        self.sight_full_context();
+    }
+
+    /// Feeds one pending-startup segment through [`ScreenTracker::feed_observed`].
+    ///
+    /// The observer borrows the detector's sequence counters and OSC context
+    /// field by field, so the screen tracker can be fed while the observer
+    /// keeps mutating the counters.
+    fn feed_screen_segment_observed(&mut self, bytes: &[u8]) {
+        let Detector {
+            screen,
+            strict_seq,
+            screen_seq,
+            idle_barrier,
+            manifest,
+            latest_title,
+            latest_progress,
+            ..
+        } = self;
+        let mut observer = ReadinessObserver {
+            manifest: manifest.as_deref(),
+            latest_title: latest_title.as_deref(),
+            latest_progress: latest_progress.as_deref(),
+            title_arrival: self.title_seq,
+            strict_seq: &mut *strict_seq,
+            screen_seq: &mut *screen_seq,
+            idle_barrier: &mut *idle_barrier,
+            baseline: screen.recent_text(),
+        };
+        screen.feed_observed(bytes, &mut |screen: &ScreenTracker, observed| {
+            observer.observe(screen, observed);
+        });
+    }
+
+    /// Applies one completed OSC event in stream order and stamps its arrival
+    /// sequence point. A repeated identical value still counts as a fresh
+    /// arrival; the value-changed flags continue to drive the debounced
+    /// classification. Returns whether the event is latch-relevant evidence.
+    fn apply_osc_event(&mut self, item: OscEvidence, changes: &mut OscChanges) -> bool {
+        match item {
+            OscEvidence::Title(title) => {
+                changes.title |= self.latest_title.as_deref() != Some(title.as_str());
+                self.latest_title = Some(title);
+                self.strict_seq += 1;
+                self.title_seq = self.strict_seq;
+                true
+            }
+            OscEvidence::Progress(progress) => {
+                changes.progress |= self.latest_progress.as_deref() != Some(progress.as_str());
+                self.latest_progress = Some(progress);
+                true
+            }
+            OscEvidence::Cwd(path) => {
+                self.latest_cwd_hint = Some(path);
+                false
+            }
+        }
+    }
+
     pub fn tick(&mut self, now: Instant) -> Vec<ActivityTransition> {
         let mut transitions = Vec::new();
 
@@ -289,9 +427,13 @@ impl Detector {
         // debounced idle/blocked states and refreshes stable visible states. A
         // runtime reconfigure asks for one full visible-context recheck so cached
         // screen/OSC context can publish under the newly active manifest.
-        if let Some(item) = self.manifest_evidence(ContextFreshness::all()) {
-            if item.activity != AgentActivity::Working || self.needs_visible_recheck {
-                push_transition(&mut transitions, self.state.observe_evidence(now, item));
+        if let Some(hit) = self.manifest_evidence(ContextFreshness::all()) {
+            self.sight_visible_blocker(&hit);
+            if hit.evidence.activity != AgentActivity::Working || self.needs_visible_recheck {
+                push_transition(
+                    &mut transitions,
+                    self.state.observe_evidence(now, hit.evidence),
+                );
             }
         }
         self.needs_visible_recheck = false;
@@ -302,21 +444,35 @@ impl Detector {
     /// Whether terminal output identifies an editable agent input reader.
     #[must_use]
     pub fn input_ready(&self) -> bool {
-        let screen_idle = || {
+        // Manifest-based readiness uses the winning evidence from the full
+        // current context: a visible blocker (such as a startup update popup)
+        // outranks a stale idle title, and no evidence at all — the gap before
+        // the agent's first title — is never readiness. A `manifest_idle`
+        // session additionally requires the winning idle evidence to be
+        // newer than the most recent visible-blocker sighting, so a screen
+        // clear alone, or the idle title cached from before the blocker, can
+        // never release the latched prompt.
+        let idle_hit = || {
             self.manifest_evidence(ContextFreshness::all())
-                .is_some_and(|evidence| {
-                    evidence.activity == AgentActivity::Idle
-                        && evidence.source == StateSource::Screen
-                })
+                .filter(|hit| hit.evidence.activity == AgentActivity::Idle)
         };
+        let screen_idle =
+            || idle_hit().is_some_and(|hit| hit.evidence.source == StateSource::Screen);
         match self.input_readiness {
             InputReadiness::BracketedPaste => self.screen.bracketed_paste() || screen_idle(),
             InputReadiness::ScreenIdle => screen_idle(),
+            InputReadiness::ManifestIdle => idle_hit().is_some_and(|hit| {
+                matches!(
+                    hit.evidence.source,
+                    StateSource::Screen | StateSource::OscTitle
+                ) && hit.arrival > self.idle_barrier
+            }),
         }
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.screen.resize(rows, cols);
+        self.sight_full_context();
     }
 
     /// Switches detector tuning and manifest without clearing terminal context.
@@ -327,6 +483,7 @@ impl Detector {
         self.process_activity.reset();
         self.state.clear_pending();
         self.needs_visible_recheck = true;
+        self.sight_full_context();
     }
 
     /// Recovers detector state after dropped PTY output.
@@ -345,6 +502,11 @@ impl Detector {
         self.latest_cwd_hint = None;
         self.screen.reset();
         self.needs_visible_recheck = false;
+        // The context these sequence points name is gone; only fresh arrivals
+        // from here on count. The strict latch itself stays armed so its
+        // blocker invariant survives the resync.
+        self.title_seq = 0;
+        self.screen_seq = 0;
     }
 
     #[must_use]
@@ -362,35 +524,28 @@ impl Detector {
         self.latest_cwd_hint.take()
     }
 
-    fn collect_osc_evidence(&mut self, osc_items: Vec<OscEvidence>) -> OscChanges {
-        let mut changes = OscChanges::default();
-
-        for item in osc_items {
-            match item {
-                OscEvidence::Title(title) => {
-                    changes.title |= self.latest_title.as_deref() != Some(title.as_str());
-                    self.latest_title = Some(title);
-                }
-                OscEvidence::Progress(progress) => {
-                    changes.progress |= self.latest_progress.as_deref() != Some(progress.as_str());
-                    self.latest_progress = Some(progress);
-                }
-                OscEvidence::Cwd(path) => {
-                    self.latest_cwd_hint = Some(path);
-                }
-            }
+    /// Records only the full-context winner for strict input readiness.
+    fn sight_full_context(&mut self) {
+        if !self.initial_input_pending || self.input_readiness != InputReadiness::ManifestIdle {
+            return;
         }
-
-        changes
+        if let Some(hit) = self.manifest_evidence(ContextFreshness::all()) {
+            self.sight_visible_blocker(&hit);
+        }
     }
 
-    fn collect_manifest_evidence(
-        &self,
-        evidence: &mut Vec<ActivityEvidence>,
-        freshness: ContextFreshness,
-    ) {
-        if let Some(item) = self.manifest_evidence(freshness) {
-            evidence.push(item);
+    /// Records a visible blocker sighting: from now on, idle evidence must be
+    /// newer than this sighting to release a `manifest_idle` input. A later
+    /// sighting (a redrawn popup, a blocker that outlives other evidence)
+    /// replaces the barrier, so a fresh title or screen update received while
+    /// the blocker still holds cannot arm future readiness.
+    fn sight_visible_blocker(&mut self, hit: &ManifestEvidenceHit) {
+        if self.initial_input_pending
+            && self.input_readiness == InputReadiness::ManifestIdle
+            && hit.evidence.activity == AgentActivity::Blocked
+            && hit.visible_blocker
+        {
+            self.idle_barrier = self.strict_seq;
         }
     }
 
@@ -413,79 +568,28 @@ impl Detector {
             .collect()
     }
 
-    fn manifest_evidence(&self, freshness: ContextFreshness) -> Option<ActivityEvidence> {
-        let manifest = self.manifest.as_ref()?;
-        let matched = manifest.match_context(&self.match_context(manifest, freshness))?;
-        let source = manifest_source(&matched.region);
-        if matched.activity == AgentActivity::Blocked
-            && matched.visible_blocker
-            && !is_visible_manifest_source(source)
-        {
-            return None;
-        }
-
-        Some(ActivityEvidence {
-            activity: matched.activity,
-            source,
+    fn manifest_evidence(&self, freshness: ContextFreshness) -> Option<ManifestEvidenceHit> {
+        self.manifest.as_ref().and_then(|manifest| {
+            manifest_hit(
+                manifest,
+                &self.screen,
+                self.latest_title.as_deref(),
+                self.latest_progress.as_deref(),
+                self.title_seq,
+                self.screen_seq,
+                freshness,
+            )
         })
     }
 
     fn match_context(&self, manifest: &Manifest, freshness: ContextFreshness) -> MatchContext {
-        let mut context = MatchContext::default();
-
-        for region in manifest.required_regions() {
-            if !freshness.includes(&region) {
-                continue;
-            }
-
-            context = match region {
-                ManifestRegion::OscTitle => {
-                    if let Some(title) = &self.latest_title {
-                        context.with_region_text(ManifestRegion::OscTitle, title.clone())
-                    } else {
-                        context
-                    }
-                }
-                ManifestRegion::OscProgress => {
-                    if let Some(progress) = &self.latest_progress {
-                        context.with_region_text(ManifestRegion::OscProgress, progress.clone())
-                    } else {
-                        context
-                    }
-                }
-                ManifestRegion::WholeRecent => {
-                    context.with_region_text(ManifestRegion::WholeRecent, self.screen.recent_text())
-                }
-                ManifestRegion::BottomLines(count) => context.with_region_text(
-                    ManifestRegion::BottomLines(count),
-                    region_text(&self.screen.bottom_lines(count)),
-                ),
-                ManifestRegion::BottomNonEmptyLines(count) => context.with_region_text(
-                    ManifestRegion::BottomNonEmptyLines(count),
-                    region_text(&self.screen.bottom_non_empty_lines(count)),
-                ),
-                ManifestRegion::TopNonEmptyLines(count) => context.with_region_text(
-                    ManifestRegion::TopNonEmptyLines(count),
-                    region_text(&self.screen.top_non_empty_lines(count)),
-                ),
-                ManifestRegion::LastNonEmptyAbovePromptBox => context.with_region_text(
-                    ManifestRegion::LastNonEmptyAbovePromptBox,
-                    self.screen.last_non_empty_above_prompt_box(),
-                ),
-                ManifestRegion::AfterLastPromptMarker => context.with_region_text(
-                    ManifestRegion::AfterLastPromptMarker,
-                    self.screen.after_last_prompt_marker(),
-                ),
-                ManifestRegion::PromptBoxBody => context
-                    .with_region_text(ManifestRegion::PromptBoxBody, self.screen.prompt_box_body()),
-                ManifestRegion::AfterLastHorizontalRule => context.with_region_text(
-                    ManifestRegion::AfterLastHorizontalRule,
-                    self.screen.after_last_horizontal_rule(),
-                ),
-            };
-        }
-
-        context
+        match_context_for(
+            manifest,
+            &self.screen,
+            self.latest_title.as_deref(),
+            self.latest_progress.as_deref(),
+            freshness,
+        )
     }
 }
 
@@ -493,6 +597,184 @@ impl Detector {
 struct OscChanges {
     title: bool,
     progress: bool,
+}
+
+/// Builds the manifest match context over explicit context pieces.
+///
+/// A pure, shared counterpart of [`Detector::match_context`]: the observed
+/// feed's observer borrows the detector field by field (the screen is being
+/// fed through the same borrow set), so both the whole-detector path and the
+/// observer must build one context the same way.
+fn match_context_for(
+    manifest: &Manifest,
+    screen: &ScreenTracker,
+    latest_title: Option<&str>,
+    latest_progress: Option<&str>,
+    freshness: ContextFreshness,
+) -> MatchContext {
+    let mut context = MatchContext::default();
+
+    for region in manifest.required_regions() {
+        if !freshness.includes(&region) {
+            continue;
+        }
+
+        context = match region {
+            ManifestRegion::OscTitle => {
+                if let Some(title) = latest_title {
+                    context.with_region_text(ManifestRegion::OscTitle, title.to_owned())
+                } else {
+                    context
+                }
+            }
+            ManifestRegion::OscProgress => {
+                if let Some(progress) = latest_progress {
+                    context.with_region_text(ManifestRegion::OscProgress, progress.to_owned())
+                } else {
+                    context
+                }
+            }
+            ManifestRegion::WholeRecent => {
+                context.with_region_text(ManifestRegion::WholeRecent, screen.recent_text())
+            }
+            ManifestRegion::BottomLines(count) => context.with_region_text(
+                ManifestRegion::BottomLines(count),
+                region_text(&screen.bottom_lines(count)),
+            ),
+            ManifestRegion::BottomNonEmptyLines(count) => context.with_region_text(
+                ManifestRegion::BottomNonEmptyLines(count),
+                region_text(&screen.bottom_non_empty_lines(count)),
+            ),
+            ManifestRegion::TopNonEmptyLines(count) => context.with_region_text(
+                ManifestRegion::TopNonEmptyLines(count),
+                region_text(&screen.top_non_empty_lines(count)),
+            ),
+            ManifestRegion::LastNonEmptyAbovePromptBox => context.with_region_text(
+                ManifestRegion::LastNonEmptyAbovePromptBox,
+                screen.last_non_empty_above_prompt_box(),
+            ),
+            ManifestRegion::AfterLastPromptMarker => context.with_region_text(
+                ManifestRegion::AfterLastPromptMarker,
+                screen.after_last_prompt_marker(),
+            ),
+            ManifestRegion::PromptBoxBody => {
+                context.with_region_text(ManifestRegion::PromptBoxBody, screen.prompt_box_body())
+            }
+            ManifestRegion::AfterLastHorizontalRule => context.with_region_text(
+                ManifestRegion::AfterLastHorizontalRule,
+                screen.after_last_horizontal_rule(),
+            ),
+        };
+    }
+
+    context
+}
+
+/// The winning manifest evidence over explicit context pieces: the pure,
+/// shared counterpart of [`Detector::manifest_evidence`], for the same
+/// borrow-split reason as [`match_context_for`].
+fn manifest_hit(
+    manifest: &Manifest,
+    screen: &ScreenTracker,
+    latest_title: Option<&str>,
+    latest_progress: Option<&str>,
+    title_arrival: u64,
+    screen_arrival: u64,
+    freshness: ContextFreshness,
+) -> Option<ManifestEvidenceHit> {
+    let context = match_context_for(manifest, screen, latest_title, latest_progress, freshness);
+    let matched = manifest.match_context(&context)?;
+    let source = manifest_source(&matched.region);
+    if matched.activity == AgentActivity::Blocked
+        && matched.visible_blocker
+        && !is_visible_manifest_source(source)
+    {
+        return None;
+    }
+
+    // Arrival sequence for eligible idle sources; other sources cannot
+    // release strict initial input.
+    let arrival = match source {
+        StateSource::OscTitle => title_arrival,
+        StateSource::Screen => screen_arrival,
+        StateSource::OscProgress | StateSource::Process | StateSource::Report => 0,
+    };
+
+    Some(ManifestEvidenceHit {
+        evidence: ActivityEvidence {
+            activity: matched.activity,
+            source,
+        },
+        visible_blocker: matched.visible_blocker,
+        arrival,
+    })
+}
+
+/// Observer behind one observed screen segment under strict `manifest_idle`
+/// readiness.
+///
+/// It stamps screen freshness into the detector's own sequence counters and
+/// re-arms the idle barrier when the full context at an observation names a
+/// visible blocker — the same barrier the whole-detector path keeps — using
+/// only disjoint borrows so the screen can be fed while it writes.
+struct ReadinessObserver<'sight> {
+    manifest: Option<&'sight Manifest>,
+    latest_title: Option<&'sight str>,
+    latest_progress: Option<&'sight str>,
+    title_arrival: u64,
+    strict_seq: &'sight mut u64,
+    screen_seq: &'sight mut u64,
+    idle_barrier: &'sight mut u64,
+    baseline: String,
+}
+
+impl ReadinessObserver<'_> {
+    /// Observes the grid at one control-action boundary (or the segment
+    /// tail): freshness comes from the text the boundary sees or a redraw
+    /// since the previous observation, and the barrier re-arms on a visible
+    /// blocker.
+    fn observe(&mut self, screen: &ScreenTracker, observed: ScreenObservation) {
+        let text = screen.recent_text();
+        let changed = text != self.baseline || observed.drew_chars;
+        self.baseline = text;
+        // OSC changes are sighted by the outer pipeline. An unchanged grid
+        // cannot introduce a blocker between those ordered OSC arrivals.
+        if !changed {
+            return;
+        }
+        *self.strict_seq += 1;
+        *self.screen_seq = *self.strict_seq;
+
+        let hit = self.manifest.and_then(|manifest| {
+            manifest_hit(
+                manifest,
+                screen,
+                self.latest_title,
+                self.latest_progress,
+                self.title_arrival,
+                *self.screen_seq,
+                ContextFreshness::all(),
+            )
+        });
+        if hit.is_some_and(|hit| {
+            hit.evidence.activity == AgentActivity::Blocked && hit.visible_blocker
+        }) {
+            *self.idle_barrier = *self.strict_seq;
+        }
+    }
+}
+
+/// A manifest match with the strict-latch inputs `input_ready` and the feed
+/// path need: the winning evidence, whether it names a visible blocker, and
+/// the arrival sequence of the winning source.
+#[derive(Debug, Clone, Copy)]
+struct ManifestEvidenceHit {
+    evidence: ActivityEvidence,
+    visible_blocker: bool,
+    /// Sequence point of the winning source's most recent real arrival: the
+    /// title's receipt for `osc_title`, the last screen text change for the
+    /// screen regions.
+    arrival: u64,
 }
 
 #[derive(Debug, Clone, Copy)]

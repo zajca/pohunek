@@ -3198,6 +3198,7 @@ dependencies = [
  "serde",
  "unicode-width",
  "vt100",
+ "vte",
 ]
 
 [[package]]

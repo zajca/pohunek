@@ -7,6 +7,8 @@
 
 // Rust guideline compliant 2026-06-26
 
+use unicode_width::UnicodeWidthChar;
+
 const SCROLLBACK_LINES: usize = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +18,8 @@ pub struct ScreenRegion {
 
 pub struct ScreenTracker {
     parser: vt100::Parser,
+    /// VT and UTF-8 state retained across feeds for character observations.
+    draw_parser: Option<vte::Parser>,
 }
 
 impl std::fmt::Debug for ScreenTracker {
@@ -31,11 +35,84 @@ impl ScreenTracker {
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
             parser: vt100::Parser::new(rows, cols, SCROLLBACK_LINES),
+            draw_parser: Some(vte::Parser::new()),
         }
     }
 
-    pub fn feed(&mut self, bytes: &[u8]) {
+    /// Feeds PTY bytes and reports positive-width character prints.
+    ///
+    /// A second instance of the same VT state machine used by `vt100` observes
+    /// print callbacks, including identical redraws that a final text diff
+    /// misses. Both parsers retain partial UTF-8 and escape sequences across
+    /// feeds; OSC payloads, cursor movement and other controls do not print.
+    pub fn feed(&mut self, bytes: &[u8]) -> bool {
+        let mut observation = DrawObservation::default();
+        if let Some(parser) = &mut self.draw_parser {
+            parser.advance(&mut observation, bytes);
+        }
         self.parser.process(bytes);
+        observation.drew_chars
+    }
+
+    /// Feeds bytes with observations before controls and possible wrapping.
+    ///
+    /// The observer sees pending text changes before controls or wrapping can
+    /// erase them, and any remaining changes after all bytes. Formatting-only
+    /// output does not scrape the grid.
+    /// Positive-width print observations accompany each rendered prefix.
+    /// Parser state survives split UTF-8 and escape sequences. Ordinary text
+    /// is batched: the observer never runs for each printable character.
+    pub fn feed_observed<F>(&mut self, bytes: &[u8], observe: &mut F)
+    where
+        F: FnMut(&ScreenTracker, ScreenObservation),
+    {
+        if self.draw_parser.is_none() {
+            self.parser.process(bytes);
+            return;
+        }
+        let mut applied = 0;
+        let mut printed = false;
+        let mut dirty = false;
+        let columns = usize::from(self.parser.screen().size().1);
+        let mut column = usize::from(self.parser.screen().cursor_position().1);
+        for index in 0..bytes.len() {
+            let mut event = ObservedFeed::default();
+            if let Some(parser) = &mut self.draw_parser {
+                parser.advance(&mut event, &bytes[index..=index]);
+            }
+            let may_wrap = event.width.is_some_and(|width| column + width > columns);
+            if event.completed_action || may_wrap {
+                // Exclude this action's final byte: the grid must still show
+                // the prefix the action is about to change or scroll away.
+                self.parser.process(&bytes[applied..index]);
+                if dirty && (event.observe_before || may_wrap) {
+                    observe(self, ScreenObservation::new(printed));
+                    printed = false;
+                    dirty = false;
+                }
+                self.parser.process(&bytes[index..=index]);
+                applied = index + 1;
+                column = usize::from(self.parser.screen().cursor_position().1);
+            } else if let Some(width) = event.width {
+                column += width;
+            }
+            printed |= event.width.is_some();
+            dirty |= event.changes_text;
+        }
+        self.parser.process(&bytes[applied..]);
+        // Include a final erase or scroll, but never scrape an unchanged grid
+        // merely because a chunk contains cursor moves or SGR controls.
+        if dirty {
+            observe(self, ScreenObservation::new(printed));
+        }
+    }
+
+    /// Permanently ends character and ordered screen observations.
+    ///
+    /// Grid updates continue through `feed` or `feed_observed`; neither reports
+    /// redraws or calls the observer after this, even after a reset.
+    pub fn finish_observation(&mut self) {
+        self.draw_parser = None;
     }
 
     /// Whether the parsed terminal has bracketed paste enabled.
@@ -57,6 +134,7 @@ impl ScreenTracker {
     pub fn reset(&mut self) {
         let (rows, cols) = self.parser.screen().size();
         self.parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+        self.draw_parser = self.draw_parser.as_ref().map(|_| vte::Parser::new());
     }
 
     #[must_use]
@@ -286,6 +364,106 @@ impl ScreenTracker {
             }
         }
         None
+    }
+}
+
+/// Character print observations accompanying a rendered terminal prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenObservation {
+    /// Positive-width print callbacks since the previous observation.
+    /// Zero-width changes are detected through the rendered text instead.
+    pub drew_chars: bool,
+}
+
+impl ScreenObservation {
+    fn new(drew_chars: bool) -> Self {
+        Self { drew_chars }
+    }
+}
+
+/// Print callbacks for one feed; parser state lives in `ScreenTracker`.
+#[derive(Default)]
+struct DrawObservation {
+    drew_chars: bool,
+}
+
+impl vte::Perform for DrawObservation {
+    fn print(&mut self, character: char) {
+        if grid_print_width(character).is_some() {
+            self.drew_chars = true;
+        }
+    }
+}
+
+/// Returns the width of a conservatively eligible character redraw.
+///
+/// `vt100` ignores replacement/C1 characters and can discard combining marks
+/// at the cursor origin. Positive-width callbacks count even for an identical
+/// repaint; actual zero-width cell changes remain covered by the text diff.
+fn grid_print_width(character: char) -> Option<usize> {
+    if character == '\u{fffd}' || ('\u{80}'..'\u{a0}').contains(&character) {
+        return None;
+    }
+    character.width().filter(|width| *width > 0)
+}
+
+/// Print and completed-control-action callbacks for
+/// [`ScreenTracker::feed_observed`]; parser state lives in `ScreenTracker`.
+#[derive(Default)]
+struct ObservedFeed {
+    completed_action: bool,
+    observe_before: bool,
+    changes_text: bool,
+    width: Option<usize>,
+}
+
+impl vte::Perform for ObservedFeed {
+    fn print(&mut self, character: char) {
+        self.changes_text = true;
+        if let Some(width) = grid_print_width(character) {
+            self.width = Some(width);
+        }
+    }
+
+    fn execute(&mut self, byte: u8) {
+        self.completed_action = true;
+        self.observe_before = matches!(byte, 0x08..=0x0d);
+        self.changes_text = matches!(byte, 0x0a..=0x0c);
+    }
+
+    fn csi_dispatch(
+        &mut self,
+        params: &vte::Params,
+        _intermediates: &[u8],
+        _ignore: bool,
+        action: char,
+    ) {
+        self.completed_action = true;
+        self.observe_before = action != 'm';
+        // Mode changes affect visible text only when switching buffers.
+        self.changes_text = match action {
+            'h' | 'l' => params
+                .iter()
+                .any(|part| part.iter().any(|value| matches!(value, 47 | 1047 | 1049))),
+            'm' | 'A'..='H' | 'f' | 'd' | 's' | 'u' | 'n' | 'c' | 'r' => false,
+            _ => true,
+        };
+    }
+
+    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, action: u8) {
+        self.completed_action = true;
+        self.observe_before = true;
+        self.changes_text = matches!(action, b'D' | b'E' | b'M' | b'c');
+    }
+
+    fn osc_dispatch(&mut self, _params: &[&[u8]], _wide_osc: bool) {
+        self.completed_action = true;
+    }
+
+    fn unhook(&mut self) {
+        self.completed_action = true;
+        self.observe_before = true;
+        self.changes_text = true;
     }
 }
 

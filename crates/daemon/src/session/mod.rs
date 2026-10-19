@@ -781,6 +781,8 @@ struct SessionEntry {
     detector_config: watch::Sender<DetectorConfigUpdate>,
     detector_preview: mpsc::Sender<DetectionPreviewRequest>,
     input_ready: watch::Receiver<bool>,
+    /// Cancelled as soon as the initial-input readiness wait ends.
+    initial_input_done: CancellationToken,
     default_detector_config: DetectorConfig,
     /// Definition of the session's launch pin, fixed when this daemon
     /// launched or adopted the session: the verified installed package, or the
@@ -855,6 +857,7 @@ struct DetectorInputs {
     config: watch::Receiver<DetectorConfigUpdate>,
     preview: mpsc::Receiver<DetectionPreviewRequest>,
     input_ready: watch::Sender<bool>,
+    initial_input_done: CancellationToken,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3108,21 +3111,23 @@ impl SessionRegistry {
     ///
     /// For a [`InputReadiness::BracketedPaste`] session an unobserved
     /// readiness is not an error: the prompt is written once the wait ends,
-    /// because a silent agent may still read it. For a [`InputReadiness::ScreenIdle`]
-    /// session the wait gets the full configured grace, since its readiness
-    /// has no silent-reader fallback, and only observed readiness releases the
+    /// because a silent agent may still read it. For a strict readiness
+    /// ([`InputReadiness::ScreenIdle`] or [`InputReadiness::ManifestIdle`])
+    /// the wait gets the full configured grace, since its readiness has no
+    /// silent-reader fallback, and only observed readiness releases the
     /// prompt.
     ///
     /// # Errors
     ///
-    /// Returns `session_input_not_ready` for a `ScreenIdle` session whose wait
-    /// ended by the deadline or by daemon shutdown rather than by readiness.
+    /// Returns `session_input_not_ready` for a strict-readiness session whose
+    /// wait ended by the deadline or by daemon shutdown rather than by
+    /// readiness.
     async fn await_initial_input_readiness(
         &self,
         session_id: &SessionId,
         extended_input_ready_wait: bool,
     ) -> Result<(), ProtocolError> {
-        let (input_ready, readiness, runtime_grace) = {
+        let (input_ready, readiness, runtime_grace, initial_input_done) = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(session_id) else {
                 return Ok(());
@@ -3134,9 +3139,14 @@ impl SessionRegistry {
                     .pinned
                     .as_ref()
                     .and_then(|definition| definition.startup_grace()),
+                entry.initial_input_done.clone(),
             )
         };
-        let strict = readiness == InputReadiness::ScreenIdle;
+        let _finish_observation = initial_input_done.clone().drop_guard();
+        let strict = matches!(
+            readiness,
+            InputReadiness::ScreenIdle | InputReadiness::ManifestIdle
+        );
         let configured = self.inner.config.initial_input_startup_grace;
         // Only a client that opted into the extended wait has a response budget
         // for a runtime's longer declared grace.
@@ -3151,6 +3161,7 @@ impl SessionRegistry {
             return Ok(());
         }
         let outcome = self.wait_for_input_readiness(input_ready, grace).await;
+        initial_input_done.cancel();
         #[cfg(test)]
         self.hold_initial_input_outcome().await;
         match (strict, outcome) {

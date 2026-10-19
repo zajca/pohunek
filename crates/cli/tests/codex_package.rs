@@ -28,8 +28,8 @@ use nix::unistd::Pid;
 use package::directory::build_directory_archive;
 use package::{read_archive, CatalogEntry, Limits, PackageDigest};
 use pohunek_daemon::agent::host::{
-    definition_from_archive, DefinitionError, DefinitionOrigin, HandlerId, LaunchProgram,
-    ProbeVersion, RuntimeDefinition, TranscriptParser,
+    definition_from_archive, DefinitionError, DefinitionOrigin, HandlerId, InputReadiness,
+    LaunchProgram, ProbeVersion, RuntimeDefinition, TranscriptParser,
 };
 use pohunek_daemon::agent::{NativeReferenceStrategy, SessionRef};
 use pohunek_daemon::catalog_anchor::CatalogTrust;
@@ -100,7 +100,7 @@ const GOLDEN_MANIFEST_NAME: &str = "codex";
 const PACKAGE_ID: &str = "pohunek.runtime.codex";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.1.1";
+const PACKAGE_VERSION: &str = "1.2.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -308,6 +308,11 @@ fn the_package_descriptor_preserves_every_builtin_codex_fact() {
     );
     assert_eq!(package.prompt_arg(), golden.prompt_arg());
     assert_eq!(package.native(), golden.native());
+    // The readiness is the one behavioral difference: the package opts into
+    // the strict manifest-idle readiness (#1114), which the built-in
+    // descriptor does not declare.
+    assert_eq!(package.input_readiness(), InputReadiness::ManifestIdle);
+    assert_eq!(golden.input_readiness(), InputReadiness::BracketedPaste);
     assert_eq!(
         package.native_reference_strategy(),
         golden.native_reference_strategy()
@@ -367,11 +372,31 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
         assert!(package.contains_key(section), "[{section}] is declared");
     }
     package.remove("transcripts");
+    // `ready` is the one key the package declares that v0.34.2 does not: the
+    // built-in descriptor relied on the bracketed-paste enable signal. The
+    // package opts into manifest-idle readiness so the startup update popup
+    // cannot take the initial prompt (#1114).
+    let input = package
+        .get_mut("input")
+        .and_then(toml::Value::as_table_mut)
+        .expect("an [input] table");
+    assert_eq!(
+        input.remove("ready").as_ref().and_then(toml::Value::as_str),
+        Some("manifest_idle"),
+        "the package waits for the manifest's idle evidence"
+    );
     let golden_text = golden_body(GOLDEN_DESCRIPTOR, BUILTIN_DESCRIPTOR);
     let golden: toml::Table = golden_text.parse().expect("the golden is TOML");
     assert!(
         !golden.contains_key("transcripts"),
         "v0.34.2 declares no transcript tree"
+    );
+    assert!(
+        golden
+            .get("input")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|input| !input.contains_key("ready")),
+        "v0.34.2 declares no input readiness"
     );
     assert_eq!(package, strip(golden, GOLDEN_PACKAGE_VERSION));
 }
@@ -380,9 +405,13 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
 /// dialog of Codex 0.160, which the built-in never matched.
 const FOLDER_TRUST_RULE: &str = "folder_trust_prompt";
 
+/// Rule the package adds to the golden built-in manifest: the startup update
+/// popup of Codex 0.160, which the built-in never matched.
+const UPDATE_POPUP_RULE: &str = "startup_update_prompt";
+
 /// The manifest file is the golden built-in manifest of release v0.34.2 plus
-/// [`FOLDER_TRUST_RULE`]: same process matchers, and every built-in rule in
-/// the same order with the same fields.
+/// [`FOLDER_TRUST_RULE`] and [`UPDATE_POPUP_RULE`]: same process matchers, and
+/// every built-in rule in the same order with the same fields.
 #[test]
 fn the_package_manifest_file_is_the_builtin_manifest_file_plus_the_folder_trust_rule() {
     let package = read_toml(&format!("{PACKAGE_DIR}/detect.toml"));
@@ -393,7 +422,12 @@ fn the_package_manifest_file_is_the_builtin_manifest_file_plus_the_folder_trust_
         .get_mut("rules")
         .and_then(toml::Value::as_array_mut)
         .expect("rules")
-        .retain(|rule| rule["id"].as_str() != Some(FOLDER_TRUST_RULE));
+        .retain(|rule| {
+            !matches!(
+                rule["id"].as_str(),
+                Some(FOLDER_TRUST_RULE | UPDATE_POPUP_RULE)
+            )
+        });
     assert_eq!(builtin_rules, golden);
     let ids: Vec<&str> = package["rules"]
         .as_array()
@@ -408,6 +442,7 @@ fn the_package_manifest_file_is_the_builtin_manifest_file_plus_the_folder_trust_
             "osc_title_working",
             "workspace_trust_prompt",
             FOLDER_TRUST_RULE,
+            UPDATE_POPUP_RULE,
             "live_strong_blocker",
             "weak_blocker",
             "osc_title_idle",
@@ -947,6 +982,718 @@ fn the_folder_trust_rule_needs_the_dialog_heading_at_the_top_of_the_screen() {
     let mut buried = vec![String::from("line"); 17];
     buried.extend(dialog(&folder_trust));
     assert_eq!(screen_activity(&definition, &buried, 80), None);
+}
+
+/// Captures of the startup update popup, copied from the independent real-PTY
+/// recordings behind #1114: `popup_w<columns>.txt` at 80, 100 and 160 columns.
+/// The real popup set no terminal title, so the stale title this rule must
+/// survive is only ever synthetic.
+const POPUP_CAPTURES_DIR: &str = "compat/codex/screens/update-popup";
+
+/// Columns the popup was captured at, widest to narrowest.
+const POPUP_CAPTURE_COLUMNS: [u16; 3] = [160, 100, 80];
+
+/// The popup rule reads the measured update popup as blocked from the screen
+/// at every captured width, and a synthetic stale idle title under the popup
+/// changes nothing: the screen blocker outranks the title's idle rule. The
+/// grid is as tall as the capturing terminal's visible rows, so feeding the
+/// measured rows cannot scroll the top of the screen away.
+#[test]
+fn the_startup_update_prompt_rule_blocks_the_measured_popup_and_outranks_a_stale_title() {
+    let definition = installed_definition();
+    let config = DetectorConfig {
+        input_readiness: InputReadiness::default(),
+        detection: DetectionConfig {
+            recheck_after: Duration::from_millis(100),
+            confirmations: 1,
+            cap: Duration::from_millis(700),
+            stable_visible_refresh: Duration::from_millis(800),
+            startup_grace: Duration::ZERO,
+        },
+        manifest: Some(Arc::clone(definition.manifest())),
+    };
+    for columns in POPUP_CAPTURE_COLUMNS {
+        let capture = fs::read_to_string(
+            workspace_root()
+                .join(POPUP_CAPTURES_DIR)
+                .join(format!("popup_w{columns}.txt")),
+        )
+        .unwrap_or_else(|error| panic!("read the {columns}-column popup capture: {error}"));
+        let rows: Vec<String> = capture.lines().map(str::to_owned).collect();
+        let feed = |title: Option<&str>| {
+            let mut detector = Detector::new(
+                u16::try_from(rows.len()).expect("capture rows"),
+                columns,
+                Instant::now(),
+                config.clone(),
+            );
+            detector.feed(Instant::now(), &frame_bytes(title, &rows))
+        };
+        assert_eq!(
+            feed(None)
+                .iter()
+                .rfind(|transition| transition.source == StateSource::Screen)
+                .map(|transition| (transition.activity, transition.source)),
+            Some((AgentActivity::Blocked, StateSource::Screen)),
+            "{columns} columns: the popup is blocked from the screen"
+        );
+        assert_eq!(
+            feed(Some("work"))
+                .iter()
+                .rfind(|transition| transition.source != StateSource::Process)
+                .map(|transition| (transition.activity, transition.source)),
+            Some((AgentActivity::Blocked, StateSource::Screen)),
+            "{columns} columns: the popup outranks a stale idle title"
+        );
+    }
+
+    let quoted = ["1. Update now", "2. Skip", "3. Skip until next version"];
+    assert_eq!(
+        screen_activity(&definition, &dialog(&quoted), 80),
+        None,
+        "the choices without the heading are not the popup"
+    );
+    let mut buried = vec![String::from("line"); 17];
+    buried.extend(dialog(&[
+        "Update available · 0.160.0 → 0.162.1",
+        "› 1. Update now",
+        "2. Skip",
+        "3. Skip until next version",
+    ]));
+    assert_eq!(
+        screen_activity(&definition, &buried, 80),
+        None,
+        "the dialog below the first sixteen non-empty lines is not the popup"
+    );
+}
+
+/// Rows of the measured update popup capture at `columns`.
+fn popup_rows(columns: u16) -> Vec<String> {
+    fs::read_to_string(
+        workspace_root()
+            .join(POPUP_CAPTURES_DIR)
+            .join(format!("popup_w{columns}.txt")),
+    )
+    .unwrap_or_else(|error| panic!("read the {columns}-column popup capture: {error}"))
+    .lines()
+    .map(str::to_owned)
+    .collect()
+}
+
+/// Rows of the captured prompt composer Codex renders while (or after) it
+/// loads, with no popup content and no title of its own.
+fn composer_rows() -> Vec<String> {
+    fs::read_to_string(workspace_root().join(SCREENS_DIR).join("idle.txt"))
+        .unwrap_or_else(|error| panic!("read the idle capture: {error}"))
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// One OSC title chunk.
+fn title_chunk(title: &str) -> Vec<u8> {
+    format!("\x1b]2;{title}\x07").into_bytes()
+}
+
+/// The clear-only chunk.
+fn clear_chunk() -> Vec<u8> {
+    b"\x1b[2J\x1b[H".to_vec()
+}
+
+/// A chunk that clears the screen and redraws `rows` with no title.
+fn clear_composer_chunk(rows: &[String]) -> Vec<u8> {
+    frame_bytes(None, rows)
+}
+
+/// An idle-looking terminal title that the popup never sets: it describes the
+/// project instead of an activity, and the Codex manifest reads any
+/// non-spinner, non-`Action Required` title as idle.
+const FAKE_TITLE: &str = "pohunek-issue-1114";
+
+/// The detection tuning the popup regressions share: one confirmation and no
+/// startup grace, so every readiness boundary is observable within a tick.
+fn latch_detection_config() -> DetectionConfig {
+    DetectionConfig {
+        recheck_after: Duration::from_millis(100),
+        confirmations: 1,
+        cap: Duration::from_millis(700),
+        stable_visible_refresh: Duration::from_millis(800),
+        startup_grace: Duration::ZERO,
+    }
+}
+
+/// Probe of a strict `manifest_idle` detector over a chunked startup
+/// sequence: `feed` steps PTY chunks, `tick` runs detector ticks, and `ready`
+/// is the readiness after the last step.
+struct LatchProbe {
+    detector: Detector,
+    columns: u16,
+    now: Instant,
+}
+
+impl LatchProbe {
+    /// A detector with `config`'s manifest, as tall as the tallest capture the
+    /// sequence feeds.
+    fn start(config: DetectorConfig, rows: u16, columns: u16) -> Self {
+        Self {
+            detector: Detector::new(rows, columns, Instant::now(), config),
+            columns,
+            now: Instant::now(),
+        }
+    }
+
+    /// Feeds one PTY chunk.
+    fn feed(&mut self, chunk: &[u8]) {
+        self.now += Duration::from_millis(100);
+        self.detector.feed(self.now, chunk);
+    }
+
+    fn tick(&mut self, count: usize) {
+        for _ in 0..count {
+            self.now += Duration::from_millis(100);
+            self.detector.tick(self.now);
+        }
+    }
+
+    /// Asserts the readiness after the last step.
+    fn assert_ready(&self, expected: bool, context: &str) {
+        assert_eq!(
+            self.detector.input_ready(),
+            expected,
+            "{:>4} columns: {context}",
+            self.columns
+        );
+    }
+}
+
+/// An adversarial startup sequence: a synthetic cached idle title, then the
+/// update popup it never set, drawn over the screen at `columns`. The prompt
+/// must not be released while any of this holds.
+fn latched_popup_probe(config: DetectorConfig, columns: u16) -> (LatchProbe, Vec<String>) {
+    let rows = popup_rows(columns);
+    let height = u16::try_from(rows.len()).expect("capture rows").max(24);
+    let mut probe = LatchProbe::start(config, height, columns);
+    probe.feed(&frame_bytes(Some(FAKE_TITLE), &rows));
+    probe.assert_ready(false, "the popup holds the prompt");
+    (probe, rows)
+}
+
+/// The strict latch of the production Codex detector: the popup and each
+/// split release path outlive every old piece of evidence, and only newly
+/// received idle evidence (a title, even one repeating its value) releases.
+#[test]
+fn manifest_idle_ready_only_on_idle_evidence_newer_than_the_blocker() {
+    let definition = installed_definition();
+    let columns = DEFAULT_COLUMNS;
+    let (mut probe, rows) = latched_popup_probe(manifest_idle_probe_config(&definition), columns);
+    // The same title received again while the blocker holds must not arm
+    // future readiness.
+    probe.feed(&frame_bytes(Some(FAKE_TITLE), &rows));
+    probe.assert_ready(
+        false,
+        "a fresh title received while the blocker holds must not arm readiness",
+    );
+
+    // A clear chunk alone removes the blocker; the cached title is older than
+    // the blocker and must not release the latch, whatever repaints follow.
+    probe.feed(&clear_chunk());
+    probe.assert_ready(
+        false,
+        "a screen clear with only the cached title stays latched",
+    );
+    probe.feed(rows[8..].join("\r\n").as_bytes());
+    probe.assert_ready(
+        false,
+        "a partial popup repaint without the heading stays latched",
+    );
+    probe.feed(&frame_bytes(None, &rows));
+    probe.assert_ready(false, "a full popup redraw re-arms the latch");
+
+    // The composer redraws without any fresh title; progress, process-only
+    // bytes and ticks are not idle evidence either.
+    probe.feed(&clear_chunk());
+    probe.assert_ready(false, "the clear alone must not release the re-armed latch");
+    probe.feed(&clear_composer_chunk(&composer_rows()));
+    probe.assert_ready(
+        false,
+        "a composer redraw with the stale cached title stays latched",
+    );
+    probe.feed(b"\x1b]9;60%\x07");
+    probe.tick(8);
+    probe.assert_ready(false, "progress and ticks never clear the latch");
+    probe.feed(b"\x1b[?25l");
+    probe.assert_ready(false, "process-only bytes never clear the latch");
+
+    // The release: a newly received idle title, same value as the cached one.
+    // The repeated value itself no longer re-emits a transition — the
+    // debounced classification keeps its title-change semantics — but the
+    // reception is fresh idle evidence arriving after the blocker's last
+    // sighting, so it releases the latch.
+    probe.feed(&title_chunk(FAKE_TITLE));
+    probe.assert_ready(
+        true,
+        "an idle title received after the blocker's last sighting releases the latch",
+    );
+}
+
+/// A PTY chunk that coalesces the stale idle title, the full captured popup,
+/// and the clear onto the provisional composer, the way one burst of startup
+/// output can arrive.
+fn coalesced_popup_chunk(rows: &[String], composer: &[String]) -> Vec<u8> {
+    let mut chunk = frame_bytes(Some(FAKE_TITLE), rows);
+    chunk.extend(clear_composer_chunk(composer));
+    chunk
+}
+
+/// The initial popup must be sighted before a VT clear inside the same PTY
+/// chunk erases it: an initial chunk with the title, the full popup, and the
+/// provisional composer in one feed latches exactly like the same bytes split
+/// after the popup, at every capture width. Partial popup repaints without
+/// the heading keep the latch, and quiet blank output with the title-only
+/// manifest is never readiness; only fresh idle evidence after the popup is
+/// gone (a repeated idle title) releases it.
+#[test]
+fn manifest_idle_latches_the_coalesced_initial_popup_like_the_split_one() {
+    let definition = installed_definition();
+    let config = manifest_idle_probe_config(&definition);
+    let composer = composer_rows();
+    for columns in POPUP_CAPTURE_COLUMNS {
+        let rows = popup_rows(columns);
+        let height = u16::try_from(rows.len()).expect("capture rows").max(24);
+
+        // Rule out the chunking itself: split after the popup, the sequence
+        // stays latched the whole way.
+        let mut split = LatchProbe::start(config.clone(), height, columns);
+        split.feed(&frame_bytes(Some(FAKE_TITLE), &rows));
+        split.assert_ready(false, "split: the popup holds the prompt");
+        split.feed(&clear_composer_chunk(&composer));
+        split.assert_ready(false, "split: the cached title stays stale after the clear");
+
+        // Coalesced: the same bytes in one feed. The popup exists on screen
+        // before the completed clear erases it, so the latch must still see it.
+        let mut coalesced = LatchProbe::start(config.clone(), height, columns);
+        coalesced.feed(&coalesced_popup_chunk(&rows, &composer));
+        coalesced.assert_ready(
+            false,
+            "coalesced: the popup sighted before its clear holds the prompt",
+        );
+        coalesced.tick(4);
+        coalesced.assert_ready(false, "coalesced: ticks do not lift a latched popup");
+
+        // A clear with only a partial popup repaint without the heading must
+        // not release...
+        coalesced.feed(&clear_chunk());
+        coalesced.assert_ready(false, "coalesced: the clear alone never releases the latch");
+        coalesced.feed(rows[8..].join("\r\n").as_bytes());
+        coalesced.assert_ready(
+            false,
+            "coalesced: a partial popup repaint without the heading stays latched",
+        );
+        // ...and a full popup redraw re-arms the latch.
+        coalesced.feed(&frame_bytes(None, &rows));
+        coalesced.feed(&clear_chunk());
+        coalesced.assert_ready(
+            false,
+            "coalesced: the clear after a redrawn popup keeps the latch",
+        );
+
+        // Blank quiet output is not readiness under the title-only manifest.
+        coalesced.tick(4);
+        coalesced.assert_ready(false, "coalesced: a quiet blank screen is not readiness");
+
+        // The release needs fresh idle evidence after the popup is gone.
+        coalesced.feed(&title_chunk(FAKE_TITLE));
+        coalesced.assert_ready(
+            true,
+            "coalesced: a fresh idle title after the popup lifts the latch",
+        );
+    }
+}
+
+#[test]
+fn manifest_idle_keeps_the_popup_hold_across_implicit_scroll() {
+    let definition = installed_definition();
+    let popup = [
+        "Update available! 0.160.0 -> 0.162.1",
+        "› 1. Update now",
+        "2. Skip",
+        "3. Skip until next version",
+    ]
+    .map(str::to_owned);
+    for columns in POPUP_CAPTURE_COLUMNS {
+        let height = u16::try_from(popup_rows(columns).len()).expect("capture height");
+        for (coalesced, styled) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut probe =
+                LatchProbe::start(manifest_idle_probe_config(&definition), height, columns);
+            let mut bytes = frame_bytes(Some(FAKE_TITLE), &popup);
+            if !coalesced {
+                probe.feed(&bytes);
+                probe.assert_ready(false, "the minimal complete popup blocks");
+                bytes.clear();
+            }
+            // Spaces preserve the last choice's text until automatic wrapping
+            // scrolls the popup away, including SGR at the right margin.
+            let padding: &[u8] = if styled { b" \x1b[0m" } else { b" " };
+            bytes.extend(padding.repeat(usize::from(columns) * usize::from(height) * 2));
+            bytes.extend(clear_composer_chunk(&composer_rows()));
+            probe.feed(&bytes);
+            probe.assert_ready(false, "implicit scrolling cannot hide a blocker sighting");
+            probe.feed(&title_chunk(FAKE_TITLE));
+            probe.assert_ready(true, "fresh idle evidence releases after the scroll");
+        }
+    }
+}
+
+fn manifest_idle_probe_config(definition: &RuntimeDefinition) -> DetectorConfig {
+    DetectorConfig {
+        input_readiness: InputReadiness::ManifestIdle,
+        detection: latch_detection_config(),
+        manifest: Some(Arc::clone(definition.manifest())),
+    }
+}
+
+/// Feeds one popup-latched probe with a chunking of the synthetic sequence
+/// and returns the probe after four settling ticks.
+fn run_chunks(definition: &RuntimeDefinition, columns: u16, chunking: &[Vec<u8>]) -> LatchProbe {
+    let (mut probe, _) = latched_popup_probe(manifest_idle_probe_config(definition), columns);
+    for chunk in chunking {
+        probe.feed(chunk);
+    }
+    probe.tick(4);
+    probe
+}
+
+/// The strict readiness must not depend on how the PTY coalesces the same raw
+/// byte stream after observing the popup. A synthetic title before its
+/// clear must not release it; with the title last, every tested chunking
+/// releases it even when the title repeats its value.
+#[test]
+fn manifest_idle_readiness_is_the_same_under_every_chunking_of_one_sequence() {
+    let definition = installed_definition();
+    let composer = composer_rows();
+    let title = title_chunk(FAKE_TITLE);
+    let (prefix, terminator) = title.split_at(title.len() - 1);
+    for columns in POPUP_CAPTURE_COLUMNS {
+        let chunkings: Vec<Vec<Vec<u8>>> = vec![
+            vec![{
+                let mut one = title_chunk(FAKE_TITLE);
+                one.extend(frame_bytes(None, &composer));
+                one
+            }],
+            vec![title_chunk(FAKE_TITLE), clear_composer_chunk(&composer)],
+            vec![
+                prefix.to_vec(),
+                [terminator.to_vec(), clear_composer_chunk(&composer)].concat(),
+            ],
+            vec![
+                {
+                    let mut title_and_clear = title_chunk(FAKE_TITLE);
+                    title_and_clear.extend(clear_chunk());
+                    title_and_clear
+                },
+                clear_composer_chunk(&composer),
+            ],
+        ];
+        for chunking in &chunkings {
+            let mut probe = run_chunks(&definition, columns, chunking);
+            probe.assert_ready(
+                false,
+                "a title arriving before the popup's clear stays latched under any chunking",
+            );
+            probe.feed(&title_chunk(FAKE_TITLE));
+            probe.assert_ready(
+                true,
+                "a title received later, after the clear and composer, releases",
+            );
+        }
+
+        let chunkings: Vec<Vec<Vec<u8>>> = vec![
+            vec![{
+                let mut one = clear_composer_chunk(&composer);
+                one.extend(title_chunk(FAKE_TITLE));
+                one
+            }],
+            vec![clear_composer_chunk(&composer), title_chunk(FAKE_TITLE)],
+            vec![
+                clear_composer_chunk(&composer),
+                prefix.to_vec(),
+                terminator.to_vec(),
+            ],
+            vec![
+                clear_chunk(),
+                frame_bytes(None, &composer),
+                title_chunk(FAKE_TITLE),
+            ],
+        ];
+        for chunking in &chunkings {
+            let probe = run_chunks(&definition, columns, chunking);
+            probe.assert_ready(
+                true,
+                "a title received after the clear and composer releases under any chunking",
+            );
+        }
+    }
+}
+
+#[test]
+fn manifest_idle_keeps_the_popup_hold_across_reconfigure_and_lag() {
+    let definition = installed_definition();
+    let config = manifest_idle_probe_config(&definition);
+    let (mut probe, _) = latched_popup_probe(config.clone(), DEFAULT_COLUMNS);
+    probe.detector.reconfigure(probe.now, config);
+    probe.feed(&clear_composer_chunk(&composer_rows()));
+    probe.assert_ready(false, "reconfigure does not revive the cached idle title");
+    probe.detector.resync_after_lag();
+    probe.assert_ready(false, "lost output requires new evidence");
+    probe.feed(&clear_composer_chunk(&composer_rows()));
+    probe.assert_ready(false, "a composer without its title is still not ready");
+    probe.feed(&title_chunk(FAKE_TITLE));
+    probe.assert_ready(true, "a new idle title releases after resync");
+}
+
+/// A repeated title in the same chunk retains the first changed title's
+/// activity evidence under the packaged Codex manifest.
+#[test]
+fn coalesced_titles_keep_the_package_activity_signal() {
+    let definition = installed_definition();
+    let now = Instant::now();
+    let mut detector = Detector::new(
+        24,
+        DEFAULT_COLUMNS,
+        now,
+        manifest_idle_probe_config(&definition),
+    );
+    let mut bytes = title_chunk("⠋ work");
+    bytes.extend(title_chunk("⠋ work"));
+    let transitions = detector.feed(now, &bytes);
+    assert!(
+        transitions.iter().any(|transition| {
+            transition.activity == AgentActivity::Working
+                && transition.source == StateSource::OscTitle
+        }),
+        "repeating a changed title must retain its activity evidence"
+    );
+}
+
+/// Fresh idle evidence that arrives after the blocker's disappearance is
+/// never title-only: with an idle rule on a screen region added to the
+/// shipped manifest, the composer redraw itself releases the latched prompt.
+fn manifest_with_screen_idle_rule() -> String {
+    let mut source = fs::read_to_string(package_dir().join("detect.toml"))
+        .expect("read the shipped Codex manifest");
+    source.push_str(
+        "\n[[rules]]\nid = \"fresh_composer_idle\"\nstate = \"idle\"\npriority = 1500\n\
+         region = \"whole_recent\"\ncontains = [\"Ask Codex to do anything\"]\n",
+    );
+    source
+}
+
+#[test]
+fn manifest_idle_releases_on_fresh_screen_idle_evidence() {
+    let columns = DEFAULT_COLUMNS;
+    let config = DetectorConfig {
+        input_readiness: InputReadiness::ManifestIdle,
+        detection: latch_detection_config(),
+        manifest: Some(Arc::new(
+            Manifest::parse_str(&manifest_with_screen_idle_rule())
+                .expect("the manifest with the screen idle rule parses"),
+        )),
+    };
+    let (mut probe, _rows) = latched_popup_probe(config, columns);
+
+    // A title that arrives before the popup's clear stays latched; the fresh
+    // composer redraw afterwards is itself the idle evidence the screen rule
+    // reads, so it releases without waiting for any title.
+    let mut held = title_chunk(FAKE_TITLE);
+    held.extend(clear_chunk());
+    probe.feed(&held);
+    probe.tick(4);
+    probe.assert_ready(
+        false,
+        "a title before the clear keeps the latch even under a screen idle rule",
+    );
+    probe.feed(&clear_composer_chunk(&composer_rows()));
+    probe.tick(4);
+    probe.assert_ready(
+        true,
+        "the freshly arrived composer redraw releases through the screen idle rule",
+    );
+}
+
+/// The shipped Codex manifest extended with a fresh-screen idle rule and a
+/// title blocker: the pairing the strict-latch screen regressions drive.
+fn screen_idle_manifest_with_title_blocker() -> String {
+    let mut source = manifest_with_screen_idle_rule();
+    source.push_str(
+        "\n[[rules]]\nid = \"title_blocker\"\nstate = \"blocked\"\npriority = 2000\n\
+         region = \"osc_title\"\nvisible_blocker = true\ncontains = [\"Action Required\"]\n",
+    );
+    source
+}
+
+/// A probe whose title blocker is armed while the composer is drawn under it
+/// and whose blocker title was then cleared: the composer sits on screen,
+/// unchanged by any later output, and no redraw arrived after the clearing.
+fn title_blocker_probe(config: DetectorConfig, columns: u16) -> LatchProbe {
+    let (mut probe, _) = latched_popup_probe(config, columns);
+    probe.feed(&title_chunk("Action Required"));
+    let mut held = clear_composer_chunk(&composer_rows());
+    held.extend(title_chunk(""));
+    probe.feed(&held);
+    probe
+}
+
+#[test]
+fn manifest_idle_rejects_screen_evidence_received_while_a_title_blocker_holds() {
+    let definition = installed_definition();
+    let mut config = manifest_idle_probe_config(&definition);
+    config.manifest = Some(Arc::new(
+        Manifest::parse_str(&screen_idle_manifest_with_title_blocker())
+            .expect("title blocker manifest"),
+    ));
+    let probe = title_blocker_probe(config, DEFAULT_COLUMNS);
+    probe.assert_ready(
+        false,
+        "screen evidence before the title blocker clears is stale",
+    );
+}
+
+#[test]
+fn manifest_idle_identical_redraw_releases_under_every_chunking() {
+    let definition = installed_definition();
+    let mut config = manifest_idle_probe_config(&definition);
+    config.manifest = Some(Arc::new(
+        Manifest::parse_str(&screen_idle_manifest_with_title_blocker())
+            .expect("title blocker manifest"),
+    ));
+    let redraw = clear_composer_chunk(&composer_rows());
+    let (clear, repaint) = redraw.split_at(clear_chunk().len());
+    for columns in POPUP_CAPTURE_COLUMNS {
+        // Coalesced: the clear and the identical redraw arrive together, so
+        // the segment's final text is the text it started from. The redraw
+        // has still drawn after the blocker cleared and must be fresh.
+        let mut probe = title_blocker_probe(config.clone(), columns);
+        probe.assert_ready(
+            false,
+            "after clearing the blocker title, before any redraw, stays latched",
+        );
+        probe.feed(&redraw);
+        probe.assert_ready(
+            true,
+            "the coalesced identical redraw counts as fresh screen evidence",
+        );
+
+        // Split: the same bytes split between the clear and the redraw.
+        let mut probe = title_blocker_probe(config.clone(), columns);
+        probe.feed(clear);
+        probe.assert_ready(
+            false,
+            "after the clear but before the repaint still stays latched",
+        );
+        probe.feed(repaint);
+        probe.assert_ready(true, "the split identical redraw releases the same way");
+    }
+}
+
+#[test]
+fn manifest_idle_counts_a_final_erase_as_fresh_screen_evidence() {
+    let definition = installed_definition();
+    let mut config = manifest_idle_probe_config(&definition);
+    config.manifest = Some(Arc::new(
+        Manifest::parse_str(&screen_idle_manifest_with_title_blocker())
+            .expect("title blocker manifest"),
+    ));
+    for columns in POPUP_CAPTURE_COLUMNS {
+        let mut probe = title_blocker_probe(config.clone(), columns);
+        probe.assert_ready(false, "the composer is still stale");
+        // Erase the header row, leaving the screen-idle composer's placeholder.
+        // The erasing CSI is the final byte sequence in this feed.
+        probe.feed(b"\x1b[2;1H\x1b[2K");
+        probe.assert_ready(true, "the final VT action changed the idle screen");
+    }
+}
+
+#[test]
+fn manifest_idle_control_output_does_not_refresh_a_stale_composer() {
+    let definition = installed_definition();
+    let mut config = manifest_idle_probe_config(&definition);
+    config.manifest = Some(Arc::new(
+        Manifest::parse_str(&screen_idle_manifest_with_title_blocker())
+            .expect("title blocker manifest"),
+    ));
+    let controls: &[(&str, &[u8])] = &[
+        ("incomplete UTF-8", b"\xe2"),
+        ("ignored C1 character", b"\xc2\x80"),
+        ("replacement character", "\u{fffd}".as_bytes()),
+        ("combining mark at cursor origin", b"\x1b[H\xcc\x81"),
+        ("cursor and style", b"\x1b[H\x1b[0m\x1b[?25h"),
+        ("OSC progress", b"\x1b]9;4;0;0\x07"),
+        (
+            "DCS payload including BEL",
+            b"\x1bPq\x07not screen text\x1b\\",
+        ),
+        ("split OSC prefix", b"\x1b]52;c;not screen text"),
+    ];
+    for columns in POPUP_CAPTURE_COLUMNS {
+        for &(name, bytes) in controls {
+            for fragmented in [false, true] {
+                let mut probe = title_blocker_probe(config.clone(), columns);
+                if fragmented {
+                    for byte in bytes {
+                        probe.feed(std::slice::from_ref(byte));
+                        probe.assert_ready(false, name);
+                    }
+                } else {
+                    probe.feed(bytes);
+                    probe.assert_ready(false, name);
+                }
+            }
+        }
+    }
+}
+
+/// A noisy terminal stream crosses the real VT parser and Codex manifest
+/// without turning each formatting control into a full-grid observation.
+#[test]
+fn manifest_idle_formatting_storm_has_bounded_screen_observations() {
+    let definition = installed_definition();
+    for columns in POPUP_CAPTURE_COLUMNS {
+        let (mut probe, rows) =
+            latched_popup_probe(manifest_idle_probe_config(&definition), columns);
+        let height = u16::try_from(rows.len()).expect("capture height");
+        let mut screen = pohunek_daemon::detect::ScreenTracker::new(height, columns);
+        screen.feed(&frame_bytes(None, &rows));
+        let original = screen.recent_text();
+        let resets = b"\x1b[0m".repeat(4096);
+        let cursor = b"\x1b[H\x1b[0m".repeat(2048);
+        for bytes in [&resets, &cursor] {
+            let mut observations = 0;
+            screen.feed_observed(bytes, &mut |_, _| observations += 1);
+            assert!(
+                observations <= 1,
+                "formatting-only chunk caused {observations} grid observations"
+            );
+            assert_eq!(screen.recent_text(), original);
+            probe.feed(bytes);
+            probe.assert_ready(false, "formatting never releases the popup hold");
+        }
+        // Style changes between every printable fragment still need only
+        // the final observation when no cursor movement or wrapping occurs.
+        let colored = b"\x1b[31mx\x1b[0m".repeat(usize::from(columns) / 2);
+        screen.feed(b"\x1b[H");
+        let mut observations = 0;
+        screen.feed_observed(&colored, &mut |_, _| observations += 1);
+        assert_eq!(observations, 1, "SGR does not split a printable run");
+        screen.finish_observation();
+        screen.reset();
+        screen.feed_observed(&colored, &mut |_, _| {
+            panic!("finished observation re-armed")
+        });
+        assert!(
+            screen.recent_text().contains('x'),
+            "grid updates continue after observation ends"
+        );
+    }
 }
 
 #[test]

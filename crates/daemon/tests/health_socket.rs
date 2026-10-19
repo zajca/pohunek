@@ -3733,6 +3733,363 @@ async fn claude_profile_with_a_screen_idle_rule_waits_for_screen_readiness() {
     let _ = handle.await;
 }
 
+/// The startup update popup Codex 0.160 draws over the whole screen when it
+/// finds a newer release: the heading with both releases, the release-notes
+/// line, the three numbered choices and the footer, measured at 100 columns
+/// from the real popup capture this regression mirrors.
+const CODEX_UPDATE_POPUP_SCREEN: &str = "\x1b[2J\x1b[H\r\n  Update available \u{b7} 0.160.0 \u{2192} 0.162.1\r\n  Release notes: https://github.com/openai/codex/releases/latest\r\n\r\n\u{203a} 1. Update now (runs `npm install -g @openai/codex`)\r\n  2. Skip\r\n  3. Skip until next version\r\n\r\n  enter continue \u{b7} esc skip\r\n";
+
+/// The provisional composer Codex 0.160 draws while it loads, before it sets a
+/// terminal title and before (or instead of) the update popup. No rule of the
+/// Codex manifest matches it.
+const CODEX_PROVISIONAL_COMPOSER_SCREEN: &str = "\x1b[2J\x1b[H  >_ OpenAI Codex (v0.160.0)\r\n     loading\r\n\r\n  Your keyboard has entered the chat.\r\n\r\n\u{203a} Ask Codex to do anything\r\n";
+
+/// The Python line that sets the idle terminal title Codex sets once its
+/// composer reads input, measured from the real captures (`ESC ] 0 ; work BEL`).
+const CODEX_IDLE_TITLE_PY: &str = r#"os.write(1, b"\x1b]0;work\x07")"#;
+
+/// Grace for the popup scenarios whose create must survive past the debounced
+/// blocked publication of the popup (the production startup grace of 3 s plus
+/// its confirmations) before the test releases or judges it.
+const CODEX_POPUP_GRACE: Duration = Duration::from_secs(8);
+
+/// Writes a Codex stub that replays the measured startup sequence: raw mode
+/// with `TCSANOW` (no flush) before any output, bracketed paste on at once,
+/// then [`CODEX_UPDATE_POPUP_SCREEN`] over the whole screen, and, with
+/// `stale_title`, a synthetic adversarial idle-looking title `work` while the
+/// popup still holds — the real popup set no title, so the stale title is the
+/// case the rule must survive, not one the capture observed.
+///
+/// With a `release` socket the stub then waits for one byte (the test's
+/// release of the popup), redraws [`CODEX_PROVISIONAL_COMPOSER_SCREEN`], sets
+/// the idle title again, and records every byte it reads into `received`.
+/// Without one the popup never goes and the stub records from the start,
+/// mirroring a popup the operator never dismisses.
+fn codex_update_popup_stub(
+    script: &Path,
+    received: &Path,
+    stale_title: bool,
+    release: Option<&Path>,
+) {
+    let hex = |screen: &str| {
+        screen
+            .bytes()
+            .map(|byte| format!("\\x{byte:02x}"))
+            .collect::<Vec<_>>()
+            .concat()
+    };
+    let stale_title_line = if stale_title {
+        format!("{CODEX_IDLE_TITLE_PY}\n")
+    } else {
+        String::new()
+    };
+    let release_block = release.map_or_else(String::new, |release| {
+        format!(
+            "release = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\nrelease.connect({release_display:?})\nrelease.recv(1)\n",
+            release_display = release.display().to_string(),
+        )
+    });
+    let redraw_block = release.map_or_else(String::new, |_| {
+        format!(
+            "os.write(1, b\"{}\")\n{CODEX_IDLE_TITLE_PY}\n",
+            hex(CODEX_PROVISIONAL_COMPOSER_SCREEN)
+        )
+    });
+    std::fs::write(
+        script,
+        format!(
+            r#"import os
+import socket
+import termios
+import tty
+
+# Raw mode before any output, with TCSANOW: a mode switch that late-flushes
+# could drop the fixed prompt the daemon writes once readiness shows.
+tty.setraw(0, termios.TCSANOW)
+os.write(1, b"\x1b[?2004h")
+os.write(1, b"{popup_hex}")
+{stale_title_line}{release_block}{redraw_block}with open({received:?}, "wb") as capture:
+    while True:
+        chunk = os.read(0, 4096)
+        if not chunk:
+            break
+        capture.write(chunk)
+        capture.flush()
+"#,
+            popup_hex = hex(CODEX_UPDATE_POPUP_SCREEN),
+            received = received.display().to_string(),
+        ),
+    )
+    .expect("write Codex update-popup stub");
+}
+
+/// A `session.new --input` for a profile over the official Codex package whose
+/// stub draws the startup update popup and never lets it go is refused with
+/// `session_input_not_ready`, rolled back, and writes nothing: the popup holds
+/// the screen and no readiness evidence may release the prompt into it.
+#[tokio::test]
+async fn codex_initial_input_is_refused_while_the_startup_update_popup_holds_the_screen() {
+    codex_popup_is_refused(None).await;
+}
+
+/// A profile override without idle evidence keeps Codex's strict policy.
+#[tokio::test]
+async fn codex_initial_input_is_refused_with_an_override_without_idle_evidence() {
+    codex_popup_is_refused(Some("rules = []\n")).await;
+}
+
+async fn codex_popup_is_refused(override_manifest: Option<&str>) {
+    let socket = temp_socket("codex-popup");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let received = socket.dir.join("received.bin");
+    let script = socket.dir.join("codex-popup.py");
+    codex_update_popup_stub(&script, &received, false, None);
+    write_official_profile(&agents_dir, "codex", "codexpopup", &script);
+    if let Some(manifest) = override_manifest {
+        let manifests = agents_dir.join("manifests");
+        std::fs::create_dir(&manifests).expect("create override manifest directory");
+        std::fs::write(manifests.join("popup.toml"), manifest).expect("write override manifest");
+        let profile = agents_dir.join("codexpopup.toml");
+        let body = std::fs::read_to_string(&profile).expect("read Codex profile");
+        std::fs::write(profile, format!("{body}manifest = \"popup\"\n"))
+            .expect("declare override manifest");
+    }
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        initial_input_startup_grace: UNRENDERED_PROMPT_GRACE,
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    params.cols = 100;
+    "codexpopup".clone_into(&mut params.agent);
+    params.input = Some("hello Codex".to_owned());
+    let error = err_payload(create_session_with_params(&mut control, params).await);
+    assert_eq!(error.code, "session_input_not_ready");
+
+    let list = Request::make("codex-popup-list", method::SESSION_LIST, Value::Null);
+    let sessions: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut control, &list).await))
+            .expect("list sessions");
+    assert!(sessions.is_empty(), "the refused session was rolled back");
+    let captured = std::fs::read(&received).unwrap_or_default();
+    assert!(
+        captured.is_empty(),
+        "the stub received input while the update popup held the screen"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Waits for the first `agent_state` event that reports `activity` from
+/// `source` for any session and returns it. The popup regressions run one
+/// session at a time and its create is still waiting for readiness when the
+/// popup is classified, so the event cannot name a session the test knows.
+async fn wait_for_any_agent_state_event(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    activity: AgentActivity,
+    source: StateSource,
+) -> Event {
+    let expected_activity = serde_json::to_value(activity).expect("serialize activity");
+    let expected_source = serde_json::to_value(source).expect("serialize source");
+    let deadline = tokio::time::Instant::now() + HANG_GUARD;
+    let mut seen = Vec::new();
+    loop {
+        let now = tokio::time::Instant::now();
+        assert!(
+            now < deadline,
+            "agent_state event did not arrive before timeout; expected activity={expected_activity} source={expected_source}; seen={seen:?}"
+        );
+        let line = tokio::time::timeout(deadline - now, framed.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "agent_state event did not arrive before timeout; expected activity={expected_activity} source={expected_source}; seen={seen:?}"
+                )
+            })
+            .expect("a streamed event line")
+            .expect("event framing ok");
+        let streamed: Event = serde_json::from_str(&line).expect("parse event");
+        if streamed.event() == event::AGENT_STATE {
+            seen.push(streamed.payload().clone());
+            if streamed.payload()["activity"] == expected_activity
+                && streamed.payload()["source"] == expected_source
+            {
+                return streamed;
+            }
+        }
+    }
+}
+
+/// The same refusal with a synthetic adversarial idle-looking terminal title
+/// (`work`) set while the popup holds — the measured popup set no title, so
+/// this is the case the rule must survive, not one the capture observed: the
+/// popup blocker outranks the title's idle evidence, so the stale title must
+/// not release the prompt. The test first waits for the daemon to classify
+/// the popup as blocked, which is what makes the later refusal a popup
+/// verdict.
+#[tokio::test]
+async fn codex_initial_input_is_refused_while_a_stale_idle_title_survives_under_the_update_popup() {
+    let socket = temp_socket("codex-popup-stale");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let received = socket.dir.join("received.bin");
+    let script = socket.dir.join("codex-popup-stale.py");
+    codex_update_popup_stub(&script, &received, true, None);
+    write_official_profile(&agents_dir, "codex", "codexpopupstale", &script);
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        initial_input_startup_grace: CODEX_POPUP_GRACE,
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::make(
+        "subscribe-codex-popup-stale",
+        method::SUBSCRIBE,
+        Value::Null,
+    );
+    let ack = exchange(&mut subscriber, &subscribe_req).await;
+    assert!(ack.is_ok(), "subscribe should ack");
+
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    params.cols = 100;
+    "codexpopupstale".clone_into(&mut params.agent);
+    params.input = Some("hello Codex".to_owned());
+    let mut create =
+        tokio::spawn(async move { create_session_with_params(&mut control, params).await });
+    let published = tokio::select! {
+        event = wait_for_any_agent_state_event(
+            &mut subscriber,
+            AgentActivity::Blocked,
+            StateSource::Screen,
+        ) => event,
+        answered = &mut create => panic!(
+            "session.new answered before the popup was classified: {answered:?}"
+        ),
+    };
+    assert_eq!(published.payload()["activity"], Value::from("blocked"));
+    assert_eq!(published.payload()["source"], Value::from("screen"));
+
+    let error = err_payload(create.await.expect("create task joins"));
+    assert_eq!(error.code, "session_input_not_ready");
+
+    let mut observer = connect(&socket).await;
+    let list = Request::make("codex-popup-stale-list", method::SESSION_LIST, Value::Null);
+    let sessions: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut observer, &list).await))
+            .expect("list sessions");
+    assert!(sessions.is_empty(), "the refused session was rolled back");
+    let captured = std::fs::read(&received).unwrap_or_default();
+    assert!(
+        captured.is_empty(),
+        "the stub received input while the popup outranked its stale idle title"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// A popup the test dismisses through the stub's release socket, followed by
+/// the real idle title, delivers the initial input exactly once: the strict
+/// wait ends on the first eligible idle evidence, not on the popup's
+/// disappearance alone.
+#[tokio::test]
+async fn codex_initial_input_is_delivered_once_the_update_popup_clears_and_the_title_turns_idle() {
+    let socket = temp_socket("codex-popup-release");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let received = socket.dir.join("received.bin");
+    let script = socket.dir.join("codex-popup-release.py");
+    let release_path = socket.dir.join("codex-popup-release.sock");
+    codex_update_popup_stub(&script, &received, true, Some(&release_path));
+    write_official_profile(&agents_dir, "codex", "codexpopuprelease", &script);
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        initial_input_startup_grace: CODEX_POPUP_GRACE,
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let release = tokio::net::UnixListener::bind(&release_path).expect("bind the release listener");
+
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::make(
+        "subscribe-codex-popup-release",
+        method::SUBSCRIBE,
+        Value::Null,
+    );
+    let ack = exchange(&mut subscriber, &subscribe_req).await;
+    assert!(ack.is_ok(), "subscribe should ack");
+
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    params.cols = 100;
+    "codexpopuprelease".clone_into(&mut params.agent);
+    params.input = Some("hello Codex".to_owned());
+    let mut create =
+        tokio::spawn(async move { create_session_with_params(&mut control, params).await });
+    let published = tokio::select! {
+        event = wait_for_any_agent_state_event(
+            &mut subscriber,
+            AgentActivity::Blocked,
+            StateSource::Screen,
+        ) => event,
+        answered = &mut create => panic!(
+            "session.new answered before the popup was classified: {answered:?}"
+        ),
+    };
+    assert_eq!(published.payload()["activity"], Value::from("blocked"));
+
+    // The daemon holds the popup as blocked. Dismissing it hands the stub the
+    // release byte, after which it redraws the composer and sets the idle
+    // title.
+    let (mut release_stream, _) = release
+        .accept()
+        .await
+        .expect("the stub awaits the popup release");
+    release_stream
+        .write_all(b"release")
+        .await
+        .expect("release the popup");
+
+    let created: SessionInfo =
+        serde_json::from_value(ok_payload(create.await.expect("create task joins")))
+            .expect("codex session info once the popup cleared");
+    let bytes = read_file_until(&received, b"hello Codex").await;
+    assert_eq!(
+        bytes
+            .windows(b"hello Codex".len())
+            .filter(|window| *window == b"hello Codex")
+            .count(),
+        1,
+        "the initial input is delivered exactly once"
+    );
+
+    let mut observer = connect(&socket).await;
+    let stop_req = Request::make(
+        "codex-popup-release-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut observer, &stop_req).await))
+            .expect("stop result");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 /// Writes a host profile `name` over the pinned official `runtime` package
 /// whose program is a launcher for `script`.
 fn write_official_profile(agents_dir: &Path, runtime: &str, name: &str, script: &Path) {

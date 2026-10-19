@@ -63,6 +63,7 @@ impl SessionRegistry {
             config: mut detector_config_rx,
             preview: mut preview_rx,
             input_ready,
+            initial_input_done,
         } = inputs;
         let registry = self.clone();
         let progress = self.inner.turns.progress(&scope.id);
@@ -78,6 +79,9 @@ impl SessionRegistry {
                 LagWarnThrottle::new(registry.inner.config.detector_lag_warn_interval);
 
             loop {
+                if initial_input_done.is_cancelled() {
+                    detector.finish_initial_input();
+                }
                 tokio::select! {
                     () = cancel.cancelled() => break,
                     changed = detector_config_rx.changed() => {
@@ -91,7 +95,9 @@ impl SessionRegistry {
                             &mut applied_config_generation,
                             update,
                         );
-                        input_ready.send_replace(detector.input_ready());
+                        if !initial_input_done.is_cancelled() {
+                            input_ready.send_replace(detector.input_ready());
+                        }
                     }
                     request = preview_rx.recv() => {
                         let Some(request) = request else {
@@ -106,7 +112,9 @@ impl SessionRegistry {
                         );
                     }
                     _ = tick.tick() => {
-                        input_ready.send_replace(detector.input_ready());
+                        if !initial_input_done.is_cancelled() {
+                            input_ready.send_replace(detector.input_ready());
+                        }
                         for transition in detector.tick(crate::time::now()) {
                             registry
                                 .record_detector_activity(&id, &runtime, transition)
@@ -129,8 +137,13 @@ impl SessionRegistry {
                         match received {
                             Ok(chunk) => {
                                 progress.note_output();
+                                if initial_input_done.is_cancelled() {
+                                    detector.finish_initial_input();
+                                }
                                 let transitions = detector.feed(crate::time::now(), &chunk);
-                                input_ready.send_replace(detector.input_ready());
+                                if !initial_input_done.is_cancelled() {
+                                    input_ready.send_replace(detector.input_ready());
+                                }
                                 for transition in transitions {
                                     registry
                                         .record_detector_activity(&id, &runtime, transition)
@@ -478,6 +491,7 @@ mod tests {
             config: config_rx,
             preview: preview_rx,
             input_ready,
+            initial_input_done: super::super::CancellationToken::new(),
         });
 
         tokio::time::pause();

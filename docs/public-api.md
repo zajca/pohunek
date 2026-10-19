@@ -3349,7 +3349,11 @@ Initial input waits for an editable prompt or bracketed-paste enable signal,
 up to the bounded startup grace for a silent agent; the body and submit key
 are sent as separate PTY writes under the runtime input rules. A runtime that
 declares `ready = "screen_idle"` waits for the editable prompt alone and fails
-with `session_input_not_ready` when none shows before the grace ends.
+with `session_input_not_ready` when none shows before the grace ends. A
+runtime that declares `ready = "manifest_idle"` (Codex) is as strict, but
+accepts the detection manifest's winning idle evidence from the screen or the
+terminal title, so a startup screen that is not the editable prompt — Codex's
+update popup — or a stale title cannot release the prompt either.
 Current SDK and CLI clients set `extended_input_ready_wait` on a typed
 `session.new` with initial input. The daemon then uses the configured host
 startup grace, or the runtime's longer `[input] startup_grace_ms` when it
