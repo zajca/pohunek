@@ -2398,3 +2398,95 @@ fn status_hold_ranks_an_uncommitted_change_above_an_untracked_file() {
         hold.1
     );
 }
+
+#[test]
+fn native_hook_deadline_diagnostics_redact_a_split_credential_url() {
+    partial_credential_diagnostics_are_redacted(true);
+}
+
+#[test]
+fn native_hook_cap_diagnostics_redact_a_split_credential_url() {
+    partial_credential_diagnostics_are_redacted(false);
+}
+
+fn partial_credential_diagnostics_are_redacted(deadline: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = init_repo("partial-url-redaction");
+    let state = unique_dir("partial-url-state");
+    let release = state.join("release");
+    let ended = state.join("ended");
+    let _release = ReleaseOnDrop(release.clone());
+    let python = crate::agent::trusted_program("python3").expect("test Python");
+    let hook = repo.join(".git/hooks/post-checkout");
+    let suffix = if deadline {
+        format!("if os.fork()==0:\n    while not pathlib.Path({:?}).exists(): time.sleep(0.01)\n    try: os.write(2,b'@example.invalid/repo.git')\n    except BrokenPipeError: pass\n    pathlib.Path({:?}).write_text('done')\n    os._exit(0)\n", release.to_str().expect("release path"), ended.to_str().expect("ended path"))
+    } else {
+        "os.write(2,b'x'*(9*1024*1024)+b'@example.invalid/repo.git')\n".to_owned()
+    };
+    fs::write(&hook, format!("#!{}\nimport os,time,pathlib\nos.write(2,b'partial diagnostic https://FAKE_REMOTE_USERINFO')\n{suffix}os._exit(7)\n", python.display())).expect("write native hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("executable hook");
+    let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+    let _subscriber = logs.install();
+    let error = manager("partial-url")
+        .bind(&request("first", &repo, "feat/first"))
+        .expect_err("hook exit 7 fails bind");
+    fs::write(&release, "go").expect("release writer");
+    if deadline {
+        pohunek_test_support::wait::poll_until("writer exits naturally", || {
+            ended.exists().then_some(())
+        });
+    }
+    assert_eq!(error.code, "worktree_add_failed");
+    assert!(error.msg.contains("partial diagnostic"));
+    assert!(
+        !error.msg.contains("FAKE_REMOTE_USERINFO"),
+        "partial credentials must never escape the capture boundary"
+    );
+    assert!(error.msg.contains("<redacted>"));
+    assert!(!logs.text().contains("FAKE_REMOTE_USERINFO"));
+}
+
+#[test]
+fn a_fetch_with_a_pipe_holding_hook_uses_the_remote_tip_and_removes_its_ref() {
+    use std::os::unix::fs::PermissionsExt;
+    let upstream = init_repo("held-fetch-upstream");
+    let downstream = clone_of(&upstream, "held-fetch-downstream");
+    git_in(
+        &upstream,
+        &["commit", "--allow-empty", "-q", "-m", "new upstream tip"],
+    );
+    let expected = git_stdout(&upstream, &["rev-parse", "HEAD"]);
+    let state = unique_dir("held-fetch-state");
+    let release = state.join("release");
+    let started = state.join("started");
+    let ended = state.join("ended");
+    let _release = ReleaseOnDrop(release.clone());
+    let python = crate::agent::trusted_program("python3").expect("test Python");
+    let hook = downstream.join(".git/hooks/reference-transaction");
+    fs::write(&hook, format!("#!{}\nimport os,sys,time,pathlib\ns=pathlib.Path({:?})\nrefs=sys.stdin.read()\nif sys.argv[1]=='committed' and ' refs/pohunek/fetch/' in refs and not (s/'started').exists():\n    (s/'started').write_text('ready')\n    if os.fork()==0:\n        while not (s/'release').exists(): time.sleep(0.01)\n        (s/'ended').write_text('done')\n        os._exit(0)\nos._exit(0)\n", python.display(), state.to_str().expect("state path"))).expect("write fetch hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("executable hook");
+    let result = manager("held-fetch").bind(&request("first", &downstream, "feat/first"));
+    fs::write(&release, "go").expect("release fetch writer");
+    assert!(started.exists(), "the fetch transaction hook ran");
+    pohunek_test_support::wait::poll_until("fetch descendant exits naturally", || {
+        ended.exists().then_some(())
+    });
+    let bound = result.expect("bind succeeds after successful fetch");
+    assert_eq!(
+        git_stdout(&bound.path, &["rev-parse", "HEAD"]),
+        expected,
+        "incomplete diagnostics must not select the stale local base"
+    );
+    assert!(
+        git_stdout(
+            &downstream,
+            &["for-each-ref", "--format=%(refname)", "refs/pohunek/fetch"]
+        )
+        .is_empty(),
+        "the owned temporary ref is removed"
+    );
+    assert!(bound
+        .warnings
+        .iter()
+        .all(|warning| warning.kind != SessionWarningKind::Fetch));
+}

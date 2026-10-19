@@ -8,3 +8,8 @@ capture is incomplete. Commands that parse or return git output fail explicitly
 on an expired drain deadline or capture overflow; `session.diff` returns
 `session_diff_failed`. No reader threads survive the call and no process group
 is signalled after its leader is reaped. See `docs/public-api.md`.
+
+Incomplete diagnostics redact credential-bearing URLs before escaping capture,
+including a trailing authority cut before its `@`. Successful fetches use their
+exit status despite incomplete diagnostics, so the fetched tip stays pinned
+until binding completes and the owned temporary fetch ref is then removed.

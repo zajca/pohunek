@@ -1496,7 +1496,12 @@ fn fetch_into_ref(repo: &Path, base_branch: &str, fetch_ref: &str) -> Result<Fet
         _ => return Err(output_failure_message(&probed)),
     }
     let cmd = fetch_command(repo, base_branch, fetch_ref)?;
-    run_command(cmd)?;
+    // Fetch diagnostics are not parsed: a successful fetch already owns its ref.
+    let output =
+        run_output_bounded_then(cmd, GIT_COMMAND_TIMEOUT, OutputPolicy::StatusOnly, || {})?;
+    if !output.status.success() {
+        return Err(output_failure_message(&output));
+    }
     // The fetch created the ref (it was absent above), so this request owns it
     // even when it does not resolve to a commit.
     let resolved = git_capture(repo, &["rev-parse", "--verify", fetch_ref]).and_then(|ref_oid| {
@@ -2370,13 +2375,21 @@ fn run_output_bounded_then(
     policy: OutputPolicy,
     after_exit: impl FnOnce(),
 ) -> Result<Output, String> {
-    let captured = git_output::capture(cmd, timeout, after_exit)?;
+    let mut captured = git_output::capture(cmd, timeout, after_exit)?;
     if captured.deadline_hit || captured.cap_exceeded {
         if matches!(policy, OutputPolicy::Complete) {
             return Err(format!(
                 "git output incomplete (post-exit drain deadline reached: {}, output cap exceeded: {})",
                 captured.deadline_hit, captured.cap_exceeded
             ));
+        }
+        // A cut inside userinfo may remove the '@' the ordinary redactor needs.
+        // Sanitize both partial diagnostic streams before returning or retaining them.
+        for bytes in [&mut captured.output.stdout, &mut captured.output.stderr] {
+            *bytes = redact_url_credentials_with_completion(&String::from_utf8_lossy(bytes), false)
+                .into_bytes();
+            // Redaction can expand short userinfo; only sanitized bytes are cut again.
+            bytes.truncate(git_output::GIT_OUTPUT_CAP_BYTES);
         }
         warn!(
             deadline_hit = captured.deadline_hit,
@@ -2439,6 +2452,11 @@ pub(crate) fn output_failure_message(output: &std::process::Output) -> String {
 /// A non-standard credential helper that smuggled a token into a query string
 /// would fall outside this; nothing in pohunek does. See the redaction tests.
 pub(crate) fn redact_url_credentials(message: &str) -> String {
+    redact_url_credentials_with_completion(message, true)
+}
+
+/// An incomplete trailing authority may still be userinfo awaiting its '@'.
+fn redact_url_credentials_with_completion(message: &str, complete: bool) -> String {
     const SCHEME_SEP: &str = "://";
     let mut out = String::with_capacity(message.len());
     let mut rest = message;
@@ -2455,6 +2473,8 @@ pub(crate) fn redact_url_credentials(message: &str) -> String {
         if let Some(at) = auth.rfind('@') {
             out.push_str("<redacted>");
             out.push_str(&auth[at..]);
+        } else if !complete && auth_end == authority.len() {
+            out.push_str("<redacted>");
         } else {
             out.push_str(auth);
         }
