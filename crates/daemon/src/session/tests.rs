@@ -9846,12 +9846,20 @@ async fn stale_procwatch_retirement_cannot_clear_replacement_runtime() {
 async fn mock_direct_codex_registry(
     tag: &str,
 ) -> (SessionRegistry, Arc<MockInspector>, SessionInfo) {
+    mock_direct_registry(tag, "codex").await
+}
+
+/// A registry whose sessions launch an agent of runtime `base` directly.
+async fn mock_direct_registry(
+    tag: &str,
+    base: &str,
+) -> (SessionRegistry, Arc<MockInspector>, SessionInfo) {
     let inspector = Arc::new(MockInspector::default());
     let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
     let agents_dir = temp_agents_dir_with(
         tag,
-        "direct-codex",
-        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+        "direct-agent",
+        &format!("base = \"{base}\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n"),
     );
     let registry = SessionRegistry::new_with_inspector(
         SessionRegistryConfig {
@@ -9867,7 +9875,7 @@ async fn mock_direct_codex_registry(
     let created = registry
         .create(SessionNewParams {
             name: Some(tag.to_owned()),
-            agent: "direct-codex".to_owned(),
+            agent: "direct-agent".to_owned(),
             ..params()
         })
         .await
@@ -10565,6 +10573,44 @@ async fn observed_reporter_below_the_launch_root_follows_the_root_kind() {
         }
         let _ = registry.stop(&created.id).await;
     }
+}
+
+/// The launch root anchors an observed reporter only as an agent of the
+/// claim's own runtime with no other runtime's agent in between.
+#[tokio::test]
+async fn launch_root_anchors_an_observed_reporter_only_within_its_runtime() {
+    // A claude launch root does not anchor a codex claim.
+    let (registry, inspector, created) = mock_direct_registry("root-other-runtime", "claude").await;
+    inspector.set_descendants(
+        created.pid,
+        vec![codex_fact(DESCENDANT_REPORTER_PID, created.pid)],
+    );
+    inspector.set_foreground_group(created.pid, Some(created.pid));
+    report_descendant_claim(&registry, &created).await;
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let other_runtime_root = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(other_runtime_root.active_agent_pid, None, "claude root");
+    let _ = registry.stop(&created.id).await;
+
+    // A codex launch root does not anchor a claim below a claude agent.
+    let (registry, inspector, created) = mock_direct_registry("root-agent-between", "codex").await;
+    inspector.set_descendants(
+        created.pid,
+        vec![
+            claude_fact(DESCENDANT_OTHER_AGENT_PID, created.pid),
+            codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_OTHER_AGENT_PID),
+        ],
+    );
+    inspector.set_foreground_group(created.pid, Some(created.pid));
+    report_descendant_claim(&registry, &created).await;
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let between = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(between.active_agent_pid, None, "other runtime in between");
+    let _ = registry.stop(&created.id).await;
 }
 
 /// A foreground switch to an agent the reporter does not descend from is the
