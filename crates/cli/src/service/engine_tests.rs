@@ -8627,6 +8627,61 @@ async fn a_verdict_without_a_scope_is_a_one_time_acceptance_and_not_recorded() {
 }
 
 #[tokio::test]
+async fn a_scope_of_an_unknown_scheme_or_malformed_digest_is_never_recorded_or_honoured() {
+    let uppercase = format!("v1:{}", "A".repeat(64));
+    let short = format!("v1:{}", "a".repeat(63));
+    let unknown_scheme = format!("v2:{}", "a".repeat(64));
+    let not_hex = format!("v1:{}", "g".repeat(64));
+    for scope in [
+        &uppercase,
+        &short,
+        &unknown_scheme,
+        &not_hex,
+        &String::new(),
+    ] {
+        let harness = Harness::new();
+        harness.install(V1).await.expect("install");
+        let risk = stopped_at_risk(OTHER_SESSION, "runtime_source_not_served", Some(scope));
+
+        let report = harness
+            .upgrade_over(V2, std::slice::from_ref(&risk), true)
+            .await
+            .expect("the flag accepts it once");
+        assert_eq!(
+            report.acceptance.one_time_acceptance,
+            std::slice::from_ref(&risk),
+            "{scope}"
+        );
+        assert!(report.acceptance.durable_acceptance.is_empty(), "{scope}");
+        assert!(
+            harness
+                .ledger()
+                .is_none_or(|ledger| ledger.entries.is_empty()),
+            "{scope}"
+        );
+
+        // Even a ledger that names the scope verbatim does not cover it.
+        harness.edit_ledger(|ledger| {
+            ledger["entries"] = serde_json::json!([{
+                "session_id": OTHER_SESSION,
+                "list": "stopped",
+                "verdict": "would_lose_recovery",
+                "code": "runtime_source_not_served",
+                "scope": scope,
+            }]);
+        });
+        let error = harness
+            .upgrade_over(V3, &[risk], false)
+            .await
+            .expect_err("an unsupported scope is asked about again");
+        assert!(
+            matches!(error, Error::UpgradeAtRisk { .. }),
+            "{scope}: {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_ledger_for_other_facts_is_ignored_with_a_warning_and_refuses() {
     type Edit = fn(&mut serde_json::Value);
     let edits: [(&str, Edit); 5] = [

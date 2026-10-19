@@ -65,15 +65,20 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// The entry of `verdict` in `list`, when it carries a scope.
+    /// The entry of `verdict` in `list`, when it carries a supported scope.
+    ///
+    /// A scope of another scheme or with a malformed digest cannot be
+    /// compared with confidence, so it yields no entry and the acceptance
+    /// stays one-time.
     #[must_use]
     pub fn of(list: List, verdict: &SessionVerdict) -> Option<Self> {
+        let scope = supported_scope(verdict)?;
         Some(Self {
             session_id: verdict.session_id.clone(),
             list,
             verdict: verdict.verdict,
             code: verdict.code.clone(),
-            scope: verdict.acceptance_scope.clone()?,
+            scope: scope.to_owned(),
         })
     }
 
@@ -82,9 +87,24 @@ impl Entry {
             && self.session_id == verdict.session_id
             && self.verdict == verdict.verdict
             && self.code == verdict.code
-            && verdict.acceptance_scope.as_deref() == Some(self.scope.as_str())
+            && supported_scope(verdict) == Some(self.scope.as_str())
     }
 }
+
+/// The scope of `verdict` when it is a `v1` scope: the scheme, a colon and a
+/// lowercase hex SHA-256.
+fn supported_scope(verdict: &SessionVerdict) -> Option<&str> {
+    let scope = verdict.acceptance_scope.as_deref()?;
+    let digest = scope.strip_prefix(ACCEPTANCE_SCOPE_V1)?.strip_prefix(':')?;
+    (digest.len() == SCOPE_DIGEST_HEX_LEN
+        && digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+    .then_some(scope)
+}
+
+/// Hex characters of a SHA-256 digest.
+const SCOPE_DIGEST_HEX_LEN: usize = 64;
 
 /// A verdict accepted by the flag that no scope can bind, kept for reporting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

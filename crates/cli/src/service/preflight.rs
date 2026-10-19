@@ -314,8 +314,8 @@ pub fn decide(
                 warnings,
             });
         }
-        for (_, verdict) in live.iter().chain(&stopped) {
-            if verdict.acceptance_scope.is_some() {
+        for (list, verdict) in live.iter().chain(&stopped) {
+            if Entry::of(*list, verdict).is_some() {
                 groups.durable_acceptance.push(verdict.clone());
             } else {
                 groups.one_time_acceptance.push(verdict.clone());
