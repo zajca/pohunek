@@ -1322,7 +1322,7 @@ fn manifest_idle_keeps_the_popup_hold_across_implicit_scroll() {
     .map(str::to_owned);
     for columns in POPUP_CAPTURE_COLUMNS {
         let height = u16::try_from(popup_rows(columns).len()).expect("capture height");
-        for coalesced in [false, true] {
+        for (coalesced, styled) in [(false, false), (true, false), (false, true), (true, true)] {
             let mut probe =
                 LatchProbe::start(manifest_idle_probe_config(&definition), height, columns);
             let mut bytes = frame_bytes(Some(FAKE_TITLE), &popup);
@@ -1332,11 +1332,9 @@ fn manifest_idle_keeps_the_popup_hold_across_implicit_scroll() {
                 bytes.clear();
             }
             // Spaces preserve the last choice's text until automatic wrapping
-            // scrolls the popup away, without any intervening VT controls.
-            bytes.extend(std::iter::repeat_n(
-                b' ',
-                usize::from(columns) * usize::from(height) * 2,
-            ));
+            // scrolls the popup away, including SGR at the right margin.
+            let padding: &[u8] = if styled { b" \x1b[0m" } else { b" " };
+            bytes.extend(padding.repeat(usize::from(columns) * usize::from(height) * 2));
             bytes.extend(clear_composer_chunk(&composer_rows()));
             probe.feed(&bytes);
             probe.assert_ready(false, "implicit scrolling cannot hide a blocker sighting");
@@ -1651,6 +1649,50 @@ fn manifest_idle_control_output_does_not_refresh_a_stale_composer() {
                 }
             }
         }
+    }
+}
+
+/// A noisy terminal stream crosses the real VT parser and Codex manifest
+/// without turning each formatting control into a full-grid observation.
+#[test]
+fn manifest_idle_formatting_storm_has_bounded_screen_observations() {
+    let definition = installed_definition();
+    for columns in POPUP_CAPTURE_COLUMNS {
+        let (mut probe, rows) =
+            latched_popup_probe(manifest_idle_probe_config(&definition), columns);
+        let height = u16::try_from(rows.len()).expect("capture height");
+        let mut screen = pohunek_daemon::detect::ScreenTracker::new(height, columns);
+        screen.feed(&frame_bytes(None, &rows));
+        let original = screen.recent_text();
+        let resets = b"\x1b[0m".repeat(4096);
+        let cursor = b"\x1b[H\x1b[0m".repeat(2048);
+        for bytes in [&resets, &cursor] {
+            let mut observations = 0;
+            screen.feed_observed(bytes, &mut |_, _| observations += 1);
+            assert!(
+                observations <= 1,
+                "formatting-only chunk caused {observations} grid observations"
+            );
+            assert_eq!(screen.recent_text(), original);
+            probe.feed(bytes);
+            probe.assert_ready(false, "formatting never releases the popup hold");
+        }
+        // Style changes between every printable fragment still need only
+        // the final observation when no cursor movement or wrapping occurs.
+        let colored = b"\x1b[31mx\x1b[0m".repeat(usize::from(columns) / 2);
+        screen.feed(b"\x1b[H");
+        let mut observations = 0;
+        screen.feed_observed(&colored, &mut |_, _| observations += 1);
+        assert_eq!(observations, 1, "SGR does not split a printable run");
+        screen.finish_observation();
+        screen.reset();
+        screen.feed_observed(&colored, &mut |_, _| {
+            panic!("finished observation re-armed")
+        });
+        assert!(
+            screen.recent_text().contains('x'),
+            "grid updates continue after observation ends"
+        );
     }
 }
 

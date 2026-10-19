@@ -227,6 +227,7 @@ pub struct Detector {
     state: StateMachine,
     manifest: Option<Arc<Manifest>>,
     input_readiness: InputReadiness,
+    initial_input_pending: bool,
     latest_title: Option<String>,
     latest_progress: Option<String>,
     latest_cwd_hint: Option<String>,
@@ -259,6 +260,7 @@ impl Detector {
             state: StateMachine::new(started_at, config.detection),
             manifest: config.manifest,
             input_readiness: config.input_readiness,
+            initial_input_pending: true,
             latest_title: None,
             latest_progress: None,
             latest_cwd_hint: None,
@@ -269,6 +271,14 @@ impl Detector {
             screen_seq: 0,
             idle_barrier: 0,
         }
+    }
+
+    /// Stops ordered startup observation once the initial-input wait resolves.
+    ///
+    /// Reconfiguration never re-arms a completed wait.
+    pub fn finish_initial_input(&mut self) {
+        self.initial_input_pending = false;
+        self.screen.finish_observation();
     }
 
     pub fn feed(&mut self, now: Instant, bytes: &[u8]) -> Vec<ActivityTransition> {
@@ -329,11 +339,16 @@ impl Detector {
     /// output does not refresh the cached screen's arrival sequence.
     ///
     /// Under strict `manifest_idle` readiness the segment is fed observed
-    /// instead: the full context is sighted before every completed VT control
-    /// action or potential character wrapping can change the grid. A complete
+    /// instead: pending text changes are sighted before cursor movement, erasure
+    /// or potential character wrapping can hide them. Formatting does not
+    /// split printable runs into repeated grid observations. A complete
     /// blocker is recorded before its clear, and the final grid is observed
     /// even when the final byte is itself a control action.
     fn feed_screen_segment(&mut self, bytes: &[u8]) {
+        if !self.initial_input_pending {
+            self.screen.feed(bytes);
+            return;
+        }
         if self.input_readiness == InputReadiness::ManifestIdle {
             self.feed_screen_segment_observed(bytes);
             return;
@@ -349,8 +364,7 @@ impl Detector {
         self.sight_full_context();
     }
 
-    /// Feeds one segment through [`ScreenTracker::feed_observed`], sighting
-    /// the full context at every control-action boundary.
+    /// Feeds one pending-startup segment through [`ScreenTracker::feed_observed`].
     ///
     /// The observer borrows the detector's sequence counters and OSC context
     /// field by field, so the screen tracker can be fed while the observer
@@ -512,7 +526,7 @@ impl Detector {
 
     /// Records only the full-context winner for strict input readiness.
     fn sight_full_context(&mut self) {
-        if self.input_readiness != InputReadiness::ManifestIdle {
+        if !self.initial_input_pending || self.input_readiness != InputReadiness::ManifestIdle {
             return;
         }
         if let Some(hit) = self.manifest_evidence(ContextFreshness::all()) {
@@ -526,7 +540,8 @@ impl Detector {
     /// replaces the barrier, so a fresh title or screen update received while
     /// the blocker still holds cannot arm future readiness.
     fn sight_visible_blocker(&mut self, hit: &ManifestEvidenceHit) {
-        if self.input_readiness == InputReadiness::ManifestIdle
+        if self.initial_input_pending
+            && self.input_readiness == InputReadiness::ManifestIdle
             && hit.evidence.activity == AgentActivity::Blocked
             && hit.visible_blocker
         {

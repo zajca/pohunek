@@ -3796,6 +3796,7 @@ impl SessionRegistry {
             detector_config,
             detector_preview,
             input_ready,
+            initial_input_done: cancelled_initial_input(),
             default_detector_config,
             pinned,
             procwatch_cancel: procwatch_cancel.clone(),
@@ -3834,6 +3835,7 @@ impl SessionRegistry {
             config: detector_config_rx,
             preview: detector_preview_rx,
             input_ready: input_ready_tx,
+            initial_input_done: cancelled_initial_input(),
         });
         if !root_missing_during_drain {
             self.spawn_procwatch(
@@ -4043,6 +4045,7 @@ impl SessionRegistry {
             detector_config,
             detector_preview,
             input_ready,
+            initial_input_done: cancelled_initial_input(),
             default_detector_config,
             pinned: self
                 .inner
@@ -6349,6 +6352,13 @@ fn classify_connect_error(error: &WorkerError) -> (RuntimeState, &'static str) {
         | WorkerError::AttachReadyTimeout { .. }
         | WorkerError::TornStream => (RuntimeState::Lost, UNREACHABLE_SOCKET),
     }
+}
+
+// Adopted sessions never own a new initial-input readiness wait.
+fn cancelled_initial_input() -> CancellationToken {
+    let done = CancellationToken::new();
+    done.cancel();
+    done
 }
 
 #[cfg(test)]

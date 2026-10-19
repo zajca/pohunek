@@ -51,3 +51,12 @@
 - This changes the `pohunek.runtime.codex` package digest; after release,
   service upgrade repins host profiles from the old digest to the released
   package digest.
+- Ordered screen observation runs only while initial input is pending. Sessions
+  without initial input and adopted sessions never enable it; readiness success,
+  timeout, shutdown or cancellation ends it before delivery or rollback, and
+  reconfiguration cannot re-arm it. Formatting-only chunks do not trigger
+  per-control screen scraping, and SGR between printable fragments does not
+  split observations.
+  Pending text still gets observed before cursor movement, erasure or scrolling
+  can hide a popup within one chunk; relying only on the final frame would miss
+  the coalesced popup regression.
