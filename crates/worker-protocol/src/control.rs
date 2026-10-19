@@ -222,6 +222,19 @@ pub struct ActiveIdentityClaim {
     pub reference_kind: Option<String>,
     /// Native reference for the active provider.
     pub native_reference: Option<String>,
+    /// Opaque profile label of a forwarded claim, absent for a hook claim.
+    ///
+    /// The worker stores it verbatim and never interprets it. Withheld from a
+    /// connection that negotiated below [`crate::ACTIVE_IDENTITY_FORWARD_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// How the worker came to hold the claim. Absent means [`ClaimOrigin::Hook`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ClaimOrigin>,
+    /// Public session annotation of a forwarded claim. It is never a verified
+    /// native reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_session: Option<ReportedSession>,
 }
 
 impl Debug for ActiveIdentityClaim {
@@ -233,8 +246,157 @@ impl Debug for ActiveIdentityClaim {
             .field("expires_at", &self.expires_at)
             .field("reference_kind", &self.reference_kind)
             .field("native_reference", &"[REDACTED]")
+            .field("agent", &self.agent)
+            .field("origin", &self.origin)
+            .field("reported_session", &self.reported_session)
             .finish()
     }
+}
+
+/// How the worker came to hold an active identity claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimOrigin {
+    /// A managed hook reported it over the worker's identity socket.
+    Hook,
+    /// The daemon forwarded a public report with
+    /// [`RequestKind::RecordActiveIdentity`].
+    Forwarded,
+}
+
+/// Selects how a [`ReportedSession`] value is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportedSessionKind {
+    /// An opaque provider session id.
+    Id,
+    /// A path to a provider session file.
+    Path,
+}
+
+/// Public session annotation a forwarded report carries.
+///
+/// The worker journals it beside the claim and hands it back unchanged. It
+/// never feeds launch identity, a native reference or a resume binding.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportedSession {
+    /// Whether `value` is an id or a path.
+    pub kind: ReportedSessionKind,
+    /// The id or path.
+    pub value: String,
+}
+
+impl ReportedSession {
+    /// Whether `value` fits the bound of its kind and holds no control
+    /// character.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let limit = match self.kind {
+            ReportedSessionKind::Id => crate::MAX_REPORTED_SESSION_ID_BYTES,
+            ReportedSessionKind::Path => crate::MAX_REPORTED_SESSION_PATH_BYTES,
+        };
+        !self.value.is_empty()
+            && self.value.len() <= limit
+            && !self.value.chars().any(char::is_control)
+    }
+}
+
+impl Debug for ReportedSession {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReportedSession")
+            .field("kind", &self.kind)
+            .field("value", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// A public `session.report_agent` the daemon forwards into the worker.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardedActiveReport {
+    /// Runtime base of the reporting provider.
+    pub provider: String,
+    /// Opaque profile label, omitted when it equals `provider`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Subject process of the report.
+    pub process: ProcessIdentity,
+    /// The hook's `CLOCK_MONOTONIC` value, never minted by the daemon.
+    pub sequence: u64,
+    /// RFC 3339 expiry: daemon receipt time plus the shared claim ceiling.
+    pub expires_at: String,
+    /// Public session annotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_session: Option<ReportedSession>,
+}
+
+impl Debug for ForwardedActiveReport {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForwardedActiveReport")
+            .field("provider", &self.provider)
+            .field("agent", &self.agent)
+            .field("process", &self.process)
+            .field("sequence", &self.sequence)
+            .field("expires_at", &self.expires_at)
+            .field("reported_session", &self.reported_session)
+            .finish()
+    }
+}
+
+/// A public `session.release_agent` the daemon forwards into the worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardedActiveRelease {
+    /// Runtime base of the releasing provider.
+    pub provider: String,
+    /// Subject process of the release.
+    pub process: ProcessIdentity,
+    /// The hook's `CLOCK_MONOTONIC` value.
+    pub sequence: u64,
+}
+
+/// Why the worker refused a forwarded report or release.
+///
+/// Mirrors the subject-side codes of the worker's own identity rejections; the
+/// peer-side codes cannot occur because the peer is the lease-authenticated
+/// daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityRejectReason {
+    /// The scope names another runtime generation.
+    RuntimeMismatch,
+    /// The runtime is not running.
+    PhaseNotRunning,
+    /// The session's hook schema does not admit the provider.
+    ProviderNotAllowed,
+    /// The session's hook schema does not admit the operation.
+    ActionNotAllowed,
+    /// The claim is already expired or exceeds the shared ceiling.
+    ClaimExpired,
+    /// The subject is gone, replaced or outside the managed PTY tree.
+    ReportedProcessInvalid,
+    /// The sequence is not ahead of the recorded ordering of the subject.
+    SequenceStale,
+    /// The subject has no ordering mark and the marks fill the worker's bound.
+    IdentityReportersExhausted,
+    /// The release names no active claim of that provider and process.
+    ReleaseUnmatched,
+    /// The label or the session annotation is outside its bound.
+    ForwardedFieldInvalid,
+}
+
+/// Result of a forwarded report or release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ActiveIdentityOutcome {
+    /// The worker journaled the operation and acknowledged it afterwards.
+    Accepted {
+        /// Revision of the worker's active identity after the operation.
+        revision: u64,
+    },
+    /// The worker refused the operation and changed nothing.
+    Rejected {
+        /// Why.
+        reason: IdentityRejectReason,
+    },
 }
 
 /// Ordering tombstone for an explicit worker-private identity release.
@@ -962,6 +1124,11 @@ pub struct InspectSnapshot {
     /// when none was applied or the last one was cleared.
     #[serde(default)]
     pub background: Option<BackgroundSnapshot>,
+    /// Number of journaled changes to the active identity or its release,
+    /// counting hook and forwarded operations alike. Absent on a connection
+    /// that negotiated below [`crate::ACTIVE_IDENTITY_FORWARD_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_identity_revision: Option<u64>,
 }
 
 /// Defines one daemon-to-worker request.
@@ -1071,6 +1238,26 @@ pub enum RequestKind {
         /// Current controller lease.
         lease_id: LeaseId,
     },
+    /// Records a public agent report as the session's active identity.
+    ///
+    /// Sent only on connections that negotiated at least
+    /// [`crate::ACTIVE_IDENTITY_FORWARD_VERSION`].
+    RecordActiveIdentity {
+        /// Exact leased runtime scope.
+        scope: RuntimeScope,
+        /// The report to validate and journal.
+        report: ForwardedActiveReport,
+    },
+    /// Releases the session's active identity on a public release.
+    ///
+    /// Sent only on connections that negotiated at least
+    /// [`crate::ACTIVE_IDENTITY_FORWARD_VERSION`].
+    ReleaseActiveIdentity {
+        /// Exact leased runtime scope.
+        scope: RuntimeScope,
+        /// The release to validate and journal.
+        release: ForwardedActiveRelease,
+    },
 }
 
 /// Defines one worker-to-daemon response.
@@ -1172,6 +1359,11 @@ pub enum ResponseKind {
     TerminalAcknowledged,
     /// Confirms explicit controller release.
     ControllerReleased,
+    /// Answers a forwarded report or release.
+    ActiveIdentityRecorded {
+        /// Whether the worker journaled the operation.
+        outcome: ActiveIdentityOutcome,
+    },
     /// Reports a typed request failure.
     Error {
         /// Structured failure.

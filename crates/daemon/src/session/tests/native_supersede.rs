@@ -935,6 +935,9 @@ async fn an_active_identity_that_is_not_the_launch_process_leaves_the_assigned_r
             expires_at: native_report_expiry(),
             reference_kind: Some("id".to_owned()),
             native_reference: Some("another-conversation".to_owned()),
+            agent: None,
+            origin: None,
+            reported_session: None,
         }
     };
 

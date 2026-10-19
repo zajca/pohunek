@@ -6,12 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pohunek_worker_protocol::{
-    read_frame, write_frame, AttachStart, Capability, ControlCode, ControlMessage, ControlReader,
-    ControlRequest, ControlResponse, ControlWriter, DaemonId, DataFrame, Dimensions, ExitStatus,
-    FrameHeader, FrameKind, Initialize, InputFragment, InputPlan, InspectSnapshot, LeaseId,
-    OutputGap, RequestId, RequestKind, ResizeRequest, ResponseKind, RuntimeScope, SessionId,
-    StopRequest, StreamId, StreamMode, TransactionId, Version, WorkerId, WorkerInstanceId, WriteId,
-    ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
+    read_frame, write_frame, ActiveIdentityOutcome, AttachStart, Capability, ControlCode,
+    ControlMessage, ControlReader, ControlRequest, ControlResponse, ControlWriter, DaemonId,
+    DataFrame, Dimensions, ExitStatus, ForwardedActiveRelease, ForwardedActiveReport, FrameHeader,
+    FrameKind, Initialize, InputFragment, InputPlan, InspectSnapshot, LeaseId, OutputGap,
+    RequestId, RequestKind, ResizeRequest, ResponseKind, RuntimeScope, SessionId, StopRequest,
+    StreamId, StreamMode, TransactionId, Version, WorkerId, WorkerInstanceId, WriteId,
+    ACTIVE_IDENTITY_FORWARD_VERSION, ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
 };
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
@@ -679,6 +680,59 @@ impl Worker {
         }
     }
 
+    /// Forwards a public agent report into the worker as the active identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::Rejected`] with
+    /// [`ControlCode::WorkerFeatureUnavailable`](pohunek_worker_protocol::ControlCode::WorkerFeatureUnavailable)
+    /// without sending a frame when the connection negotiated below
+    /// [`ACTIVE_IDENTITY_FORWARD_VERSION`], and [`WorkerError`] for an
+    /// unavailable runtime, a journal fault or a transport failure. A worker
+    /// refusal is an [`ActiveIdentityOutcome::Rejected`], not an error.
+    pub async fn record_active_identity(
+        &self,
+        report: ForwardedActiveReport,
+    ) -> Result<ActiveIdentityOutcome, WorkerError> {
+        let mut inner = self.inner.lock().await;
+        require_active_identity_forwarding(inner.selected_version)?;
+        let scope = scope(&inner)?;
+        let response = request_locked(
+            &mut inner,
+            self.next_request_id("record-active-identity")?,
+            RequestKind::RecordActiveIdentity { scope, report },
+        )
+        .await?;
+        match response {
+            ResponseKind::ActiveIdentityRecorded { outcome } => Ok(outcome),
+            other => response_error(other),
+        }
+    }
+
+    /// Forwards a public agent release into the worker.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::record_active_identity`] does.
+    pub async fn release_active_identity(
+        &self,
+        release: ForwardedActiveRelease,
+    ) -> Result<ActiveIdentityOutcome, WorkerError> {
+        let mut inner = self.inner.lock().await;
+        require_active_identity_forwarding(inner.selected_version)?;
+        let scope = scope(&inner)?;
+        let response = request_locked(
+            &mut inner,
+            self.next_request_id("release-active-identity")?,
+            RequestKind::ReleaseActiveIdentity { scope, release },
+        )
+        .await?;
+        match response {
+            ResponseKind::ActiveIdentityRecorded { outcome } => Ok(outcome),
+            other => response_error(other),
+        }
+    }
+
     /// Opens an authenticated framed output/input stream.
     ///
     /// # Errors
@@ -1302,6 +1356,18 @@ async fn read_response(
             }
         }
     }
+}
+
+/// Refuses a forwarded identity operation on a connection that cannot carry it.
+fn require_active_identity_forwarding(selected_version: Version) -> Result<(), WorkerError> {
+    if selected_version >= ACTIVE_IDENTITY_FORWARD_VERSION {
+        return Ok(());
+    }
+    Err(WorkerError::Rejected {
+        code: ControlCode::WorkerFeatureUnavailable,
+        message: format!("worker protocol {selected_version} cannot forward an active identity"),
+        retryable: false,
+    })
 }
 
 fn response_error<T>(response: ResponseKind) -> Result<T, WorkerError> {

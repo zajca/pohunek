@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pohunek_platform::filesystem::{AtomicReplaceError, TrustedDir};
-use pohunek_worker_protocol::BackgroundSnapshot;
+use pohunek_worker_protocol::{BackgroundSnapshot, ClaimOrigin, ReportedSession};
 use serde::{Deserialize, Serialize};
 
 /// Process that reported a background snapshot.
@@ -237,6 +237,15 @@ pub struct ActiveIdentity {
     pub reference_kind: Option<String>,
     /// Native reference for the active provider.
     pub native_reference: Option<String>,
+    /// Opaque profile label of a forwarded claim.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// How the worker came to hold the claim; absent means a hook reported it.
+    #[serde(default)]
+    pub origin: Option<ClaimOrigin>,
+    /// Public session annotation of a forwarded claim.
+    #[serde(default)]
+    pub reported_session: Option<ReportedSession>,
 }
 
 impl Debug for ActiveIdentity {
@@ -248,6 +257,9 @@ impl Debug for ActiveIdentity {
             .field("expires_at", &self.expires_at)
             .field("reference_kind", &self.reference_kind)
             .field("native_reference", &"[REDACTED]")
+            .field("agent", &self.agent)
+            .field("origin", &self.origin)
+            .field("reported_session", &self.reported_session)
             .finish()
     }
 }
@@ -435,6 +447,10 @@ pub struct JournalRecord {
     /// Latest accepted release, distinguishing explicit release from no report.
     #[serde(default)]
     pub active_identity_release: Option<ReleasedIdentity>,
+    /// Number of changes journaled to `active_identity` or
+    /// `active_identity_release`; read as 0 in a journal that predates it.
+    #[serde(default)]
+    pub active_identity_revision: u64,
     /// Latest native reference of the verified launch process, independent of
     /// the active claim's lease and release.
     #[serde(default)]
@@ -498,6 +514,7 @@ impl Debug for JournalRecord {
             .field("pending_launch_claims", &self.pending_launch_claims)
             .field("active_identity", &self.active_identity)
             .field("active_identity_release", &self.active_identity_release)
+            .field("active_identity_revision", &self.active_identity_revision)
             .field("native_reference_claim", &self.native_reference_claim)
             .field("subagent_revision", &self.subagent_revision)
             .field("subagents", &self.subagents)
@@ -556,6 +573,7 @@ impl JournalRecord {
             pending_launch_claims: Vec::new(),
             active_identity: None,
             active_identity_release: None,
+            active_identity_revision: 0,
             native_reference_claim: None,
             subagent_revision: 0,
             subagents: Vec::new(),
@@ -568,6 +586,23 @@ impl JournalRecord {
             terminal_acknowledged: false,
             updated_at,
         }
+    }
+
+    /// Makes `claim` the active identity, replacing any release tombstone.
+    ///
+    /// Every change to the active identity goes through this method or
+    /// [`Self::release_active_identity`], so the revision counts them all.
+    pub fn record_active_identity(&mut self, claim: ActiveIdentity) {
+        self.active_identity = Some(claim);
+        self.active_identity_release = None;
+        self.active_identity_revision = self.active_identity_revision.saturating_add(1);
+    }
+
+    /// Ends the active identity and records `release` as its tombstone.
+    pub fn release_active_identity(&mut self, release: ReleasedIdentity) {
+        self.active_identity = None;
+        self.active_identity_release = Some(release);
+        self.active_identity_revision = self.active_identity_revision.saturating_add(1);
     }
 }
 
