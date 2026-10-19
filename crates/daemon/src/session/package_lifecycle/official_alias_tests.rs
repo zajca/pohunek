@@ -5094,6 +5094,19 @@ async fn a_spent_probe_budget_leaves_a_present_conversation_unverified_not_adopt
             && detail.contains("--preflight-budget"),
         "the detail names the count and the setting: {detail}"
     );
+    // The verdict describes this run's budget, not the session, so nothing can
+    // durably accept it.
+    let report = stopped_preflight_report_entered(
+        &session.fixture,
+        &session.store_path,
+        spent_budget_entry(),
+    );
+    let verdict = report
+        .stopped_sessions
+        .iter()
+        .find(|verdict| verdict.session_id == session.id.0)
+        .expect("the stopped session is judged");
+    assert_eq!(verdict.acceptance_scope, None, "{verdict:?}");
 }
 
 /// Adds `copies` stopped sessions to the store of `store_path`, each a copy of

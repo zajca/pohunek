@@ -2956,3 +2956,379 @@ async fn the_probe_deadline_counts_the_work_before_the_probes_from_the_entry_of_
     );
     assert!(codes.contains(&CODE_PROBE_BUDGET_EXHAUSTED), "{codes:?}");
 }
+
+/// The facts a live session of an unserved package runtime is judged on. Each
+/// field is one input of the acceptance scope.
+#[derive(Clone)]
+struct ScopedFacts {
+    generation: &'static str,
+    instance: &'static str,
+    agent: &'static str,
+    package_digest: &'static str,
+    native_id: Option<&'static str>,
+    native_path: Option<&'static str>,
+    forkable: bool,
+}
+
+impl ScopedFacts {
+    fn baseline() -> Self {
+        Self {
+            generation: GENERATION,
+            instance: "r-fixture",
+            agent: "pi",
+            package_digest: MISSING_PACKAGE_DIGEST,
+            native_id: Some("native-fixture-2"),
+            native_path: None,
+            forkable: true,
+        }
+    }
+
+    /// The store line of session `s-1`, pinned to a package no host serves.
+    fn line(&self) -> Value {
+        let mut line = served_session_line("s-1", "w-fixture");
+        rebind_agent(&mut line, self.agent);
+        pin_recovery(
+            &mut line,
+            json!({
+                "runtime_id": "pi",
+                "provenance": {
+                    "kind": "package",
+                    "package": {"id": "acme.runtime.pi", "version": "1.0.0"},
+                    "package_digest": self.package_digest,
+                },
+            }),
+        );
+        line["runtime"]["generation"] = json!(self.generation);
+        line["runtime"]["service_id"] = json!(format!("s-1.{}", self.generation));
+        line["runtime"]["runtime_id"] = json!(self.instance);
+        line["recovery"]["native_session_id"] = self.native_id.map_or(Value::Null, |id| json!(id));
+        line["recovery"]["native_session_path"] =
+            self.native_path.map_or(Value::Null, |path| json!(path));
+        line["recovery"]["forkable"] = json!(self.forkable);
+        line
+    }
+
+    fn journal(&self) -> Value {
+        let mut journal = journal("s-1", "w-fixture");
+        journal["generation"] = json!(self.generation);
+        journal["runtime_id"] = json!(self.instance);
+        journal
+    }
+
+    /// The report of a host holding these facts as a live session.
+    async fn live_report(&self) -> PreflightReport {
+        let host = Host::serving().await;
+        host.write_store(&[self.line()]);
+        host.write_journal("s-1", "w-fixture", &self.journal());
+        host.report()
+    }
+
+    /// The report of a host holding these facts as a stopped session.
+    async fn stopped_report(&self) -> PreflightReport {
+        let host = Host::serving().await;
+        let mut line = self.line();
+        line["runtime"]["state"] = json!("lost");
+        host.write_store(&[line]);
+        host.report()
+    }
+}
+
+/// The acceptance scope of the verdict of `s-1` in the live list of `report`,
+/// which must be `code`.
+fn live_scope(report: &PreflightReport, code: &str) -> String {
+    let verdict = report
+        .sessions
+        .iter()
+        .find(|session| session.session_id == "s-1")
+        .unwrap_or_else(|| panic!("no live verdict: {report:?}"));
+    assert_eq!(verdict.code, code, "{verdict:?}");
+    verdict
+        .acceptance_scope
+        .clone()
+        .unwrap_or_else(|| panic!("an eligible verdict carries a scope: {verdict:?}"))
+}
+
+/// The acceptance scope of the verdict of `s-1` in the stopped list of
+/// `report`, which must be `code`.
+fn stopped_scope(report: &PreflightReport, code: &str) -> String {
+    let verdict = report
+        .stopped_sessions
+        .iter()
+        .find(|session| session.session_id == "s-1")
+        .unwrap_or_else(|| panic!("no stopped verdict: {report:?}"));
+    assert_eq!(verdict.code, code, "{verdict:?}");
+    verdict
+        .acceptance_scope
+        .clone()
+        .unwrap_or_else(|| panic!("an eligible verdict carries a scope: {verdict:?}"))
+}
+
+#[tokio::test]
+async fn the_acceptance_scope_is_stable_for_identical_facts_and_changes_with_each_bound_fact() {
+    let baseline = live_scope(
+        &ScopedFacts::baseline().live_report().await,
+        CODE_RUNTIME_SOURCE_NOT_SERVED,
+    );
+    assert!(baseline.starts_with("v1:"), "{baseline}");
+    assert_eq!(
+        live_scope(
+            &ScopedFacts::baseline().live_report().await,
+            CODE_RUNTIME_SOURCE_NOT_SERVED
+        ),
+        baseline,
+        "another host with the same facts reproduces the scope"
+    );
+
+    let facts = ScopedFacts::baseline;
+    let variants = [
+        (
+            "worker generation",
+            ScopedFacts {
+                generation: "wxyz2345",
+                ..facts()
+            },
+        ),
+        (
+            "worker instance",
+            ScopedFacts {
+                instance: "r-replaced",
+                ..facts()
+            },
+        ),
+        (
+            "agent base",
+            ScopedFacts {
+                agent: "pj",
+                ..facts()
+            },
+        ),
+        (
+            "launch pin",
+            ScopedFacts {
+                package_digest:
+                    "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                ..facts()
+            },
+        ),
+        (
+            "native session id",
+            ScopedFacts {
+                native_id: Some("native-fixture-3"),
+                ..facts()
+            },
+        ),
+        (
+            "native session path",
+            ScopedFacts {
+                native_path: Some("/native/session.jsonl"),
+                ..facts()
+            },
+        ),
+        (
+            "fork capability",
+            ScopedFacts {
+                forkable: false,
+                ..facts()
+            },
+        ),
+    ];
+    let mut seen = vec![baseline.clone()];
+    for (changed, variant) in variants {
+        let scope = live_scope(&variant.live_report().await, CODE_RUNTIME_SOURCE_NOT_SERVED);
+        assert!(
+            !seen.contains(&scope),
+            "a changed {changed} must change the scope: {scope}"
+        );
+        seen.push(scope);
+    }
+
+    // The same record under a worker of an unsupported protocol is another
+    // verdict code, and the same facts in the stopped list are another list:
+    // both change the scope.
+    let host = Host::serving().await;
+    let facts = ScopedFacts::baseline();
+    host.write_store(&[facts.line()]);
+    let mut incompatible = facts.journal();
+    incompatible["protocol_minimum"] = json!(1);
+    incompatible["protocol_maximum"] = json!(2);
+    host.write_journal("s-1", "w-fixture", &incompatible);
+    let other_code = live_scope(&host.report(), CODE_PROTOCOL_INCOMPATIBLE);
+    assert!(!seen.contains(&other_code), "{other_code}");
+    let stopped = stopped_scope(
+        &ScopedFacts::baseline().stopped_report().await,
+        CODE_RUNTIME_SOURCE_NOT_SERVED,
+    );
+    assert!(!seen.contains(&stopped), "{stopped}");
+    assert_ne!(stopped, other_code);
+}
+
+#[tokio::test]
+async fn the_acceptance_scope_binds_the_native_reference_startup_imports_from_the_journal() {
+    // Startup imports the reference a live worker journaled before it persists
+    // the record, so the scope of a record that still stores the older
+    // reference is the scope of the record that already stores the newer one.
+    let stored = ScopedFacts {
+        native_id: Some("native-fixture-2"),
+        ..ScopedFacts::baseline()
+    };
+    let host = Host::serving().await;
+    host.write_store(&[stored.line()]);
+    let mut switched = stored.journal();
+    let child = switched["child"].clone();
+    switched["launch_identity"] = json!({
+        "provider": "pi",
+        "process": child,
+        "reference_kind": "id",
+        "native_reference": "native-fixture-2",
+    });
+    switched["native_reference_claim"] = json!({
+        "provider": "pi",
+        "process": child,
+        "sequence": 1,
+        "reference_kind": "id",
+        "native_reference": "native-fixture-3",
+    });
+    host.write_journal("s-1", "w-fixture", &switched);
+    let imported = live_scope(&host.report(), CODE_RUNTIME_SOURCE_NOT_SERVED);
+
+    let already = ScopedFacts {
+        native_id: Some("native-fixture-3"),
+        ..ScopedFacts::baseline()
+    };
+    let persisted = live_scope(&already.live_report().await, CODE_RUNTIME_SOURCE_NOT_SERVED);
+    let unswitched = live_scope(&stored.live_report().await, CODE_RUNTIME_SOURCE_NOT_SERVED);
+
+    assert_ne!(
+        imported, unswitched,
+        "the journaled reference is not imported"
+    );
+    assert_eq!(imported, persisted);
+}
+
+#[tokio::test]
+async fn the_acceptance_scope_does_not_depend_on_the_volatile_fields_startup_rewrites() {
+    let baseline = stopped_scope(
+        &ScopedFacts::baseline().stopped_report().await,
+        CODE_RUNTIME_SOURCE_NOT_SERVED,
+    );
+    let host = Host::serving().await;
+    let mut line = ScopedFacts::baseline().line();
+    line["runtime"]["state"] = json!("terminal");
+    line["runtime"]["reason"] = json!("runtime_lost");
+    line["info"]["name"] = json!("renamed");
+    line["info"]["updated_at"] = json!("2026-07-01T00:00:00Z");
+    host.write_store(&[line]);
+
+    assert_eq!(
+        stopped_scope(&host.report(), CODE_RUNTIME_SOURCE_NOT_SERVED),
+        baseline
+    );
+}
+
+/// The scope of the frozen v1 encoding for the literal facts of
+/// [`ScopedFacts::baseline`] as a stopped session. A change to this digest is
+/// a change to the cross-release scope contract and needs a new scheme name.
+const GOLDEN_STOPPED_SCOPE_V1: &str =
+    "v1:523812f1bc359af6878d88f1cf27b8b4d460ef73139d8f0964fd6bfc73246ff8";
+
+#[tokio::test]
+async fn the_v1_acceptance_scope_of_fixed_facts_is_frozen() {
+    let scope = stopped_scope(
+        &ScopedFacts::baseline().stopped_report().await,
+        CODE_RUNTIME_SOURCE_NOT_SERVED,
+    );
+
+    assert_eq!(scope, GOLDEN_STOPPED_SCOPE_V1);
+}
+
+/// Asserts that no verdict of `report` carries a scope.
+fn assert_no_scope(case: &str, report: &PreflightReport) {
+    let verdicts: Vec<_> = report
+        .sessions
+        .iter()
+        .chain(&report.stopped_sessions)
+        .collect();
+    assert!(!verdicts.is_empty(), "{case}: nothing was judged");
+    for verdict in verdicts {
+        assert_eq!(verdict.acceptance_scope, None, "{case}: {verdict:?}");
+    }
+}
+
+#[tokio::test]
+async fn no_acceptance_scope_is_issued_for_a_verdict_nothing_can_durably_accept() {
+    // A verdict without a loaded record.
+    let host = Host::serving().await;
+    let mut broken = served_session_line("s-1", "w-fixture");
+    broken
+        .as_object_mut()
+        .expect("record object")
+        .remove("runtime");
+    host.write_store(&[broken]);
+    host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
+    let report = host.report();
+    assert_eq!(report.at_risk().count(), 1, "{report:?}");
+    assert_eq!(report.sessions[0].code, CODE_RECORD_UNREADABLE);
+    assert_no_scope("record_unreadable", &report);
+
+    let host = Host::serving().await;
+    host.write_store(&[served_session_line("s-1", "w-fixture")]);
+    let mut body = fs::read_to_string(&host.store).expect("read store");
+    body.push_str("this line is not json\n");
+    fs::write(&host.store, body).expect("append corrupt line");
+    host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
+    host.write_journal("s-2", "w-orphan", &journal("s-2", "w-orphan"));
+    let report = host.report();
+    assert_eq!(
+        verdict_of(&report, "s-2"),
+        (&Verdict::WouldNotBeAdopted, CODE_NO_SESSION_RECORD)
+    );
+    assert_no_scope("worker_without_session_record", &report);
+
+    let host = Host::new();
+    host.write_store(&[]);
+    fs::set_permissions(&host.workers, fs::Permissions::from_mode(0o755))
+        .expect("make the journal root unsafe");
+    let report = host.report();
+    assert_eq!(report.sessions[0].code, "evidence_unavailable");
+    assert_no_scope("evidence_unavailable", &report);
+
+    let host = Host::new();
+    let mut newer = session_line("s-1", "w-fixture");
+    newer["schema_version"] = json!(STORE_SCHEMA_VERSION + 1);
+    host.write_store(&[newer]);
+    host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
+    let report = host.report();
+    assert_eq!(report.sessions[0].code, CODE_STORE_UNUSABLE);
+    assert_no_scope("store_unusable", &report);
+
+    // The probe budget describes this run, not the session.
+    let host = Host::serving().await;
+    let agents: Vec<PathBuf> = (0..3)
+        .map(|index| hanging_agent(&host, &format!("hanging-{index}")))
+        .collect();
+    stopped_sessions_launching(&host, &agents);
+    let report = run_with(
+        &host.inputs(),
+        &PreflightOptions {
+            probe_budget: Duration::from_secs(3),
+            ..host.options()
+        },
+        &HostInspector::new(),
+    );
+    assert!(
+        report
+            .stopped_sessions
+            .iter()
+            .any(|session| session.code == CODE_PROBE_BUDGET_EXHAUSTED),
+        "{report:?}"
+    );
+    assert_no_scope("probe_budget_exhausted", &report);
+
+    // A verdict that is not at risk has nothing to accept.
+    let host = Host::serving().await;
+    host.write_store(&[served_session_line("s-1", "w-fixture")]);
+    host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
+    let report = host.report();
+    assert_eq!(report.sessions[0].verdict, Verdict::Adoptable);
+    assert_no_scope("adoptable", &report);
+}

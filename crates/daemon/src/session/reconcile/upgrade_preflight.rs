@@ -19,6 +19,11 @@
 //! as the refusal resume would return. Stopped sessions that keep native
 //! resume or fork are judged by the same recovery rules.
 //!
+//! Each at-risk verdict of a loaded record whose code is proven stable across
+//! the replacement daemon's startup also carries an acceptance scope (see
+//! [`acceptance_scope`]), the digest a later preflight must reproduce for an
+//! earlier acceptance to still apply.
+//!
 //! Evidence only a worker's socket can give (its answering protocol version,
 //! the identity it reports) is judged from what its journal recorded of it.
 //! The store migration does not consult the runtime registry, so a binding
@@ -63,10 +68,11 @@ use protocol::{
 };
 
 use super::{
-    import_terminal_native_reference, import_worker_identities, import_worker_subagents,
-    initial_input_orphaned, merge_persisted_recovery, recovery_not_advanced, reported_hook_schema,
-    runtime_identity_conflict, scan_worker_journals, validate_identity_claims, IdentityClaims,
-    JournalEvidence, JournalPhase, JournalReject, WorkerJournalScan,
+    import_native_reference, import_terminal_native_reference, import_worker_identities,
+    import_worker_subagents, initial_input_orphaned, merge_persisted_recovery,
+    recovery_not_advanced, reported_hook_schema, runtime_identity_conflict, scan_worker_journals,
+    validate_identity_claims, IdentityClaims, JournalEvidence, JournalPhase, JournalReject,
+    WorkerJournalScan,
 };
 use crate::agent::host::{
     adopts, adopts_newer, validate_launch_runtime_with_timeout_detailed, BuiltinSource,
@@ -97,6 +103,9 @@ use crate::store::{
     StoreBodyTooLarge, StoreSchemaError, STORE_SCHEMA_VERSION,
 };
 use protocol::RuntimeState;
+
+mod acceptance_scope;
+use acceptance_scope::{scope_of, ListKind};
 
 /// The installed state the preflight reads.
 #[derive(Debug, Clone)]
@@ -271,6 +280,7 @@ pub fn run_with(
                         verdict: Verdict::WouldNotBeAdopted,
                         code: CODE_STORE_UNUSABLE.to_owned(),
                         detail: format!("the new daemon cannot start: {detail}"),
+                        acceptance_scope: None,
                     })
                     .collect(),
                 Err(detail) => vec![evidence_unavailable(detail)],
@@ -600,7 +610,8 @@ fn judge_sessions(
             Err(detail) => Err(detail.as_str()),
         };
         let facts = facts_of(dry, record, &bindings, &unreadable_resume, anonymous_resume);
-        let (verdict, code, detail) = judge(record, &facts, scan, inspector, judging);
+        let ((verdict, code, detail), candidate) = judge(record, &facts, scan, inspector, judging);
+        let acceptance_scope = scope_of(ListKind::Live, &candidate, verdict, &code);
         verdicts.insert(
             record.session_id.clone(),
             SessionVerdict {
@@ -609,6 +620,7 @@ fn judge_sessions(
                 verdict,
                 code,
                 detail,
+                acceptance_scope,
             },
         );
     }
@@ -632,6 +644,7 @@ fn judge_sessions(
                     "the session record cannot be loaded and is skipped at startup: {}",
                     line.reason
                 ),
+                acceptance_scope: None,
             },
         );
     }
@@ -653,6 +666,7 @@ fn judge_sessions(
                              and a store line that names no session cannot be read; that line \
                              may be this session's record"
                         .to_owned(),
+                    acceptance_scope: None,
                 },
             );
         }
@@ -718,20 +732,23 @@ fn judge_stopped_sessions(
             continue;
         }
         let facts = facts_of(dry, record, &bindings, &unreadable_resume, anonymous_resume);
-        let Some((verdict, code, detail)) = judge_stopped(
+        let (judgement, candidate) = judge_stopped(
             record,
             &facts,
             journals.and_then(|journals| journals.get(&record.session_id)),
             judging,
-        ) else {
+        );
+        let Some((verdict, code, detail)) = judgement else {
             continue;
         };
+        let acceptance_scope = scope_of(ListKind::Stopped, &candidate, verdict, &code);
         verdicts.push(SessionVerdict {
             session_id: record.session_id.clone(),
             name: record.info.name.clone(),
             verdict,
             code,
             detail,
+            acceptance_scope,
         });
     }
     fill_unverified_counts(&mut verdicts, judging.probes.budget);
@@ -749,10 +766,21 @@ fn judge_stopped(
     facts: &Facts<'_>,
     journals: Option<&WorkerJournalScan>,
     judging: &Judging<'_>,
-) -> Option<Judgement> {
+) -> (Option<Judgement>, SessionRecord) {
     let mut candidate = record.clone();
+    let judgement = judge_stopped_candidate(record, &mut candidate, facts, journals, judging);
+    (judgement, candidate)
+}
+
+fn judge_stopped_candidate(
+    record: &SessionRecord,
+    candidate: &mut SessionRecord,
+    facts: &Facts<'_>,
+    journals: Option<&WorkerJournalScan>,
+    judging: &Judging<'_>,
+) -> Option<Judgement> {
     if let Some(binding) = facts.binding.cloned() {
-        if let Err(reason) = merge_persisted_recovery(&mut candidate, binding) {
+        if let Err(reason) = merge_persisted_recovery(candidate, binding) {
             // Reconciliation refuses a contradiction only for a running record;
             // a stopped record keeps its own recovery, which resume then uses.
             if candidate.desired_state == DesiredState::Running {
@@ -764,34 +792,34 @@ fn judge_stopped(
                         .to_owned(),
                 ));
             }
-            candidate = record.clone();
+            *candidate = record.clone();
         }
     }
     // A replayed stop imports the worker's final native reference before it
     // retains recovery. Judge that same reference rather than stale metadata.
     if record.desired_state == DesiredState::Stopped {
-        project_stopped_reference(&mut candidate, journals, judging.runtimes);
+        project_stopped_reference(candidate, journals, judging.runtimes);
     }
     if candidate.desired_state == DesiredState::Stopped
         && candidate.recovery.is_none()
         && (facts.resume_unreadable || facts.recovery != RecoveryOutcome::Preserved)
     {
-        return recovery_loss(facts, &candidate, judging);
+        return recovery_loss(facts, candidate, judging);
     }
     candidate.recovery.as_ref()?;
     let capabilities = &candidate.info.capabilities;
     if !capabilities.resume && !capabilities.fork {
         return match facts.recovery {
             RecoveryOutcome::Lost | RecoveryOutcome::NeedsRegistry => {
-                recovery_loss(facts, &candidate, judging)
+                recovery_loss(facts, candidate, judging)
             }
             RecoveryOutcome::Preserved => None,
         };
     }
-    Some(match recovery_loss(facts, &candidate, judging) {
+    Some(match recovery_loss(facts, candidate, judging) {
         Some(loss) => loss,
-        None => judge_reference(&candidate, judging)
-            .unwrap_or_else(|| adoptable_verdict(&candidate, judging)),
+        None => judge_reference(candidate, judging)
+            .unwrap_or_else(|| adoptable_verdict(candidate, judging)),
     })
 }
 
@@ -1219,6 +1247,7 @@ fn judge_rejected_records(
                  recovery is lost: {}",
                 line.reason
             ),
+            acceptance_scope: None,
         });
     }
     stopped.sort_by(|left, right| left.session_id.cmp(&right.session_id));
@@ -1256,6 +1285,7 @@ fn journal_gaps(
                             "{detail}, and a store line that names no session cannot be read; \
                              that line may be this session's record"
                         ),
+                        acceptance_scope: None,
                     },
                 );
             }
@@ -1287,6 +1317,7 @@ fn evidence_unavailable(detail: &str) -> SessionVerdict {
         verdict: Verdict::WouldNotBeAdopted,
         code: CODE_EVIDENCE_UNAVAILABLE.to_owned(),
         detail: format!("{detail}, so the live workers cannot be told"),
+        acceptance_scope: None,
     }
 }
 
@@ -1519,8 +1550,25 @@ fn reported_program(definition: &RuntimeDefinition, program: &str) -> String {
 }
 
 /// Judges one live session record against the journals of its session.
+///
+/// Returns the candidate the judgement ended on: the record after the resume
+/// binding merge and every identity the judgement imported, or the record
+/// itself when the judgement stopped before that.
 fn judge(
     record: &SessionRecord,
+    facts: &Facts<'_>,
+    scan: Result<Option<&WorkerJournalScan>, &str>,
+    inspector: &dyn ProcessInspector,
+    judging: &Judging<'_>,
+) -> (Judgement, SessionRecord) {
+    let mut candidate = record.clone();
+    let judgement = judge_candidate(record, &mut candidate, facts, scan, inspector, judging);
+    (judgement, candidate)
+}
+
+fn judge_candidate(
+    record: &SessionRecord,
+    candidate: &mut SessionRecord,
     facts: &Facts<'_>,
     scan: Result<Option<&WorkerJournalScan>, &str>,
     inspector: &dyn ProcessInspector,
@@ -1537,11 +1585,10 @@ fn judge(
     }
     // A stop or removal the owner asked for is finished at startup, not adopted.
     if record.desired_state != DesiredState::Running {
-        return judge_intent(record, scan, inspector, judging);
+        return judge_intent(record, candidate, scan, inspector, judging);
     }
-    let mut candidate = record.clone();
     if let Some(binding) = facts.binding.cloned() {
-        if let Err(reason) = merge_persisted_recovery(&mut candidate, binding) {
+        if let Err(reason) = merge_persisted_recovery(candidate, binding) {
             return not_adopted(
                 reason,
                 "the record contradicts its stored resume binding, so the runtime is quarantined",
@@ -1610,7 +1657,7 @@ fn judge(
         }
         _ => {}
     }
-    judge_adoption(facts, journal, &mut candidate, inspector, judging)
+    judge_adoption(facts, journal, candidate, inspector, judging)
 }
 
 /// Finishing an owner intent is expected, but never authorizes a foreign or
@@ -1618,6 +1665,7 @@ fn judge(
 /// still needs the identity evidence reconciliation uses before stopping it.
 fn judge_intent(
     record: &SessionRecord,
+    candidate: &mut SessionRecord,
     scan: Result<Option<&WorkerJournalScan>, &str>,
     inspector: &dyn ProcessInspector,
     judging: &Judging<'_>,
@@ -1687,8 +1735,7 @@ fn judge_intent(
     if let Some(judgement) = judge_protocol(journal) {
         return judgement;
     }
-    let mut candidate = record.clone();
-    judge_identity(journal, &mut candidate, inspector, judging.runtimes).unwrap_or_else(finished)
+    judge_identity(journal, candidate, inspector, judging.runtimes).unwrap_or_else(finished)
 }
 
 /// The live-worker evidence after the record's identity and generation are
@@ -1881,6 +1928,9 @@ fn judge_identity(
             }
         }
     }
+    // Startup imports the journaled native reference before the identities, so
+    // the candidate holds the reference the replacement daemon persists.
+    import_native_reference(candidate, &snapshot);
     if let Err(reason) = import_worker_identities(candidate, &snapshot) {
         return Some(not_adopted(
             reason,

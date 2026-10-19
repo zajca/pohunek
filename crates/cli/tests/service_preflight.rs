@@ -355,6 +355,7 @@ async fn an_already_not_resumable_session_is_listed_without_requiring_the_flag()
         verdict: Verdict::AlreadyNotResumable,
         code: "agent_native_reference_missing".to_owned(),
         detail: "resume refuses the session's native reference before any launch".to_owned(),
+        acceptance_scope: None,
     };
     let report = daemon_report(None, vec![not_resumable.clone()]);
     let daemon = reporting_daemon(&host.root, "not-resumable", &report);
@@ -548,6 +549,7 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
         verdict: Verdict::WouldLoseRecovery,
         code: "runtime_source_not_served".to_owned(),
         detail: "the stopped session's runtime source is not served".to_owned(),
+        acceptance_scope: None,
     };
     let at_risk = daemon_report(None, vec![stopped.clone()]);
     let daemon = reporting_daemon(&host.root, "at-risk", &at_risk);

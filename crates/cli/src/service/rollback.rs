@@ -261,6 +261,7 @@ fn unverified(session_id: String, detail: String) -> SessionVerdict {
         verdict: Verdict::WouldNotBeAdopted,
         code: "legacy_worker_adoption_unverified".to_owned(),
         detail,
+        acceptance_scope: None,
     }
 }
 

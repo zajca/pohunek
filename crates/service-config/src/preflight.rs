@@ -98,6 +98,37 @@ pub const PROFILE_WITHOUT_SCREEN_READINESS_DETAIL: &str = "The override manifest
 /// parses reports of older daemons, which ignore fields they do not know.
 pub const REPORT_VERSION: u32 = 1;
 
+/// Name of the acceptance-scope scheme of [`SessionVerdict::acceptance_scope`],
+/// the prefix before the digest: `v1:` followed by the lowercase hex SHA-256
+/// of a domain-separated, length-prefixed encoding.
+///
+/// The digest covers the facts a durable acceptance of an at-risk verdict
+/// stays bound to, taken from the record the judgement ended on (after the
+/// resume-binding merge and the identities the judgement imported, so the
+/// replacement daemon's startup reproduces it):
+/// - the list (live or stopped), the verdict and its code;
+/// - the session id, the runtime generation and the worker instance;
+/// - the agent base, the launch pin (including the package or descriptor
+///   digest), and digests of the native session id and path, so no raw
+///   reference leaves the daemon;
+/// - whether the session can resume and fork.
+///
+/// It leaves out everything startup rewrites (runtime state and reason,
+/// transactions, identity ordering, process ids), the human `detail` and
+/// `name`, and any environment or credential value.
+///
+/// The scope is absent for a verdict that is not at risk, for every verdict
+/// without a loaded record, and for each code a differential case does not
+/// prove stable across startup; the budget-limited codes
+/// [`CODE_PROBE_BUDGET_EXHAUSTED`] and [`CODE_REFERENCE_UNVERIFIED`] and the
+/// unprovable-process code [`CODE_WORKER_UNVERIFIABLE`] are never eligible.
+///
+/// The scheme is a cross-release contract: a daemon of a later release must
+/// reproduce the digest of an earlier one for identical facts. A change to the
+/// facts or their encoding needs a new scheme name, and a reader treats an
+/// unknown scheme, and a verdict without a scope, as not accepted.
+pub const ACCEPTANCE_SCOPE_V1: &str = "v1";
+
 /// The session is adopted with its native recovery intact.
 pub const CODE_ADOPTABLE: &str = "adoptable";
 /// The stopped session resumes and forks through a newer version of the
@@ -237,6 +268,11 @@ pub struct SessionVerdict {
     pub code: String,
     /// Human explanation naming the evidence.
     pub detail: String,
+    /// Digest of the facts a durable acceptance of this at-risk verdict is
+    /// bound to; see [`ACCEPTANCE_SCOPE_V1`]. Absent when nothing can durably
+    /// accept the verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_scope: Option<String>,
 }
 
 /// What the store dry run found.

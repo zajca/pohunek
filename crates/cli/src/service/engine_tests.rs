@@ -2798,6 +2798,7 @@ async fn a_stopped_session_at_risk_needs_the_flag_like_a_live_one() {
         verdict: Verdict::WouldLoseRecovery,
         code: "native_recovery_unmappable".to_owned(),
         detail: "the stopped session's recovery cannot be mapped".to_owned(),
+        acceptance_scope: None,
     };
     let scripted = || ScriptedPreflight {
         stopped: vec![stopped.clone()],
@@ -3561,6 +3562,7 @@ impl AdoptionPreflight for PostApplyPreflight {
                 verdict: Verdict::WouldLoseRecovery,
                 code: "runtime_source_not_served".to_owned(),
                 detail: "the applied package no longer serves the native contract".to_owned(),
+                acceptance_scope: None,
             });
             Ok(report)
         })
@@ -6693,6 +6695,7 @@ fn preflight_with_a_stopped_session() -> Box<ScriptedPreflight> {
             verdict: Verdict::Adoptable,
             code: "adoptable".to_owned(),
             detail: "the stopped session's conversation is in its store".to_owned(),
+            acceptance_scope: None,
         }],
         ..ScriptedPreflight::default()
     })
@@ -7120,6 +7123,7 @@ async fn rollback_refusal_distinguishes_live_and_stopped_session_risks() {
         verdict: Verdict::WouldLoseRecovery,
         code: "native_recovery_unmappable".to_owned(),
         detail: "the stopped session's recovery cannot be mapped".to_owned(),
+        acceptance_scope: None,
     };
     let error = harness
         .engine()
