@@ -3729,19 +3729,31 @@ impl SessionRegistry {
             // A hook refresh is not a new process observation. Keep the verified
             // generation of this exact claim even when the latest read failed
             // or the reporter is an unmatched helper beneath its wrapper.
-            let retained_identity = entry
-                .active_agent
-                .as_ref()
-                .filter(|active| {
-                    !active.observed
-                        && params.pid.is_some()
-                        && active.pid == pid
-                        && active.source == params.source
-                        && active.agent == resolved.name
-                        && entry.info.active_agent_base.as_ref()
-                            == Some(&RuntimeRef::from(resolved.base.clone()))
-                })
-                .and_then(|active| active.start_identity);
+            let retained_binding = entry.active_agent.as_ref().filter(|active| {
+                !active.observed
+                    && active.source == params.source
+                    && active.agent == resolved.name
+                    && entry.info.active_agent_base.as_ref()
+                        == Some(&RuntimeRef::from(resolved.base.clone()))
+                    && active.start_identity.is_some()
+                    && params.pid.map_or_else(
+                        || {
+                            // PID-less refreshes retain only the single cached
+                            // candidate of the established generation. A failed
+                            // probe supplies no new liveness or binding evidence.
+                            let mut matching = entry.observed_agents.iter().filter(|observed| {
+                                observed.agent_base == RuntimeRef::from(resolved.base.clone())
+                            });
+                            matching.next().is_some_and(|observed| {
+                                active.pid == Some(observed.pid)
+                                    && active.start_identity == Some(observed.start_identity)
+                            }) && matching.next().is_none()
+                        },
+                        |_| active.pid == pid,
+                    )
+            });
+            let pid = retained_binding.and_then(|active| active.pid).or(pid);
+            let retained_identity = retained_binding.and_then(|active| active.start_identity);
             let start_identity = retained_identity.or(start_identity);
             // Admission orders the metadata update, not the process's life.
             // Reusing the same binding retains its original proof age; a new

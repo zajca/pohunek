@@ -28,3 +28,10 @@ observations update the cache but never advance a bound claim's proof of life;
 a queued exact exit still applies after an inconclusive scan or a same-identity
 hook refresh. Only newer conclusive own-process evidence supersedes it, even
 when an ancestor remains unreadable.
+
+A PID-less refresh from the same source and agent retains its established PID
+and generation only while that generation remains the single matching cached
+candidate. An unreadable probe does not erase that binding or renew its liveness
+proof; an exact exit still clears the native metadata and reported activity.
+Ambiguous candidates, a replacement generation, absent observations, or a changed
+source/runtime do not inherit the previous binding.

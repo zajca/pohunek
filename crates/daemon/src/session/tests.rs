@@ -11690,6 +11690,148 @@ async fn descendant_reporter_pidless_hook_keeps_uncertainty_and_ambiguity() {
     }
 }
 
+/// A PID-less refresh retains established proof through an unreadable probe,
+/// so an already acquired exact exit still clears its native metadata.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_pidless_refresh_preserves_bound_exit() {
+    let (registry, inspector, created) = mock_procwatch_registry("pidless-refresh-exit").await;
+    let reporter = codex_fact(DESCENDANT_REPORTER_PID, created.pid);
+    inspector.set_descendants(created.pid, vec![reporter.clone()]);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let _scan_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+    let mut claim = audit_claim(
+        &created.id,
+        DIRECT_AGENT_REPORT_SEQ,
+        DESCENDANT_NATIVE_SESSION_ID,
+    );
+    claim.pid = None;
+    assert!(registry.report_agent(claim.clone()).await.recorded);
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: Some(created.id.0.clone()),
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *registry
+        .inner
+        .process_exit_hold
+        .lock()
+        .expect("exit hold lock") = Some(gate.clone());
+    let callback = tokio::spawn({
+        let registry = registry.clone();
+        let id = created.id.clone();
+        async move {
+            registry
+                .on_observed_agent_exit(&id, (reporter.pid, reporter.start_identity.get()))
+                .await;
+        }
+    });
+    guard("PID-less exact exit acquisition", gate.entered.notified()).await;
+    inspector.fail_identity_with(
+        DESCENDANT_REPORTER_PID,
+        std::io::ErrorKind::PermissionDenied,
+    );
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    claim.seq = Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 1));
+    claim.agent_session_id = Some("pidless-refreshed-native".to_owned());
+    assert!(registry.report_agent(claim).await.recorded);
+    let refreshed = registry
+        .inspect(&created.id)
+        .await
+        .expect("refreshed PID-less claim");
+    gate.release.notify_one();
+    guard("PID-less queued exact exit completion", callback)
+        .await
+        .expect("exit task");
+    let exited = registry
+        .inspect(&created.id)
+        .await
+        .expect("exact exit applied");
+    registry
+        .stop(&created.id)
+        .await
+        .expect("stop PID-less refresh fixture");
+    assert_eq!(refreshed.active_agent_pid, Some(DESCENDANT_REPORTER_PID));
+    assert_eq!(
+        refreshed.active_agent_session_id.as_deref(),
+        Some("pidless-refreshed-native")
+    );
+    assert_eq!(refreshed.activity, Some(AgentActivity::Working));
+    assert_eq!(exited.active_agent_session_id, None);
+    assert_eq!(exited.active_agent_session_path, None);
+    assert_ne!(exited.activity, Some(AgentActivity::Working));
+}
+
+/// A refresh cannot inherit a previous binding across ambiguity, a changed
+/// claim, absent evidence or an unreadable replacement generation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_pidless_refresh_rejects_conflicting_bindings() {
+    for state in ["ambiguous", "reuse", "source", "runtime", "absent"] {
+        let (registry, inspector, created) =
+            mock_procwatch_registry("pidless-refresh-conflict").await;
+        let mut reporter = codex_fact(DESCENDANT_REPORTER_PID, created.pid);
+        inspector.set_descendants(created.pid, vec![reporter.clone()]);
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let _scan_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+        let mut claim = audit_claim(
+            &created.id,
+            DIRECT_AGENT_REPORT_SEQ,
+            DESCENDANT_NATIVE_SESSION_ID,
+        );
+        claim.pid = None;
+        assert!(registry.report_agent(claim.clone()).await.recorded);
+        inspector.fail_identity_with(
+            DESCENDANT_REPORTER_PID,
+            std::io::ErrorKind::PermissionDenied,
+        );
+        let facts = match state {
+            "ambiguous" => vec![reporter, codex_fact(DESCENDANT_WRAPPER_PID, created.pid)],
+            "reuse" => {
+                reporter.start_identity = StartIdentity::new(reporter.start_identity.get() + 1);
+                vec![reporter]
+            }
+            "absent" => Vec::new(),
+            "source" | "runtime" => vec![reporter],
+            _ => unreachable!("known conflicting PID-less refresh"),
+        };
+        inspector.set_descendants(created.pid, facts);
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        claim.seq = Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 1));
+        if state == "source" {
+            claim.source = "another-hook-source".to_owned();
+        }
+        if state == "runtime" {
+            claim.agent = "claude".to_owned();
+        }
+        assert!(registry.report_agent(claim).await.recorded);
+        let info = registry
+            .inspect(&created.id)
+            .await
+            .expect("conflicting PID-less refresh");
+        let binding = {
+            let sessions = registry.inner.sessions.lock().await;
+            sessions[&created.id]
+                .active_agent
+                .as_ref()
+                .expect("admitted refresh")
+                .start_identity
+        };
+        registry
+            .stop(&created.id)
+            .await
+            .expect("stop conflicting PID-less fixture");
+        assert_eq!(info.active_agent_pid, None, "{state}");
+        assert_eq!(binding, None, "{state}");
+    }
+}
+
 /// Exact death of a bound generation is conclusive even if the observation
 /// has already advanced to an unreadable replacement of the same PID.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
