@@ -5189,7 +5189,10 @@ fn apply_worker_identities_with(
         }) {
             return Err("active_identity_release_provider_invalid");
         }
-        let release_matches = record.info.active_agent.as_deref() == Some(&release.provider)
+        // A forwarded claim shows its profile label as the active agent; the
+        // release names the provider, which the active base keeps.
+        let release_matches = (record.info.active_agent.as_deref() == Some(&release.provider)
+            || record.info.active_agent_base == Some(RuntimeRef::from_wire(&release.provider)))
             && record.info.active_agent_pid == Some(release.process.pid);
         if release_matches {
             clear_active_identity(record);

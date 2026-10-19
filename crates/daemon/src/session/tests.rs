@@ -7413,6 +7413,74 @@ async fn a_forwarded_claim_label_becomes_the_active_agent_only_when_it_resolves_
     let _ = registry.stop(&created.id).await;
 }
 
+/// A release carries the provider of the claim it ends, so it clears a claim
+/// whose provider was relabelled to a profile.
+#[tokio::test]
+async fn a_release_clears_a_forwarded_claim_that_was_relabelled_to_a_profile() {
+    let agents_dir = temp_agents_dir_with(
+        "forwarded-release",
+        "tuned",
+        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+    );
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            agents_dir: Some(agents_dir),
+            stop_grace: Duration::from_millis(50),
+            procwatch_poll: Duration::from_mins(1),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    let root = snapshot.child_process.expect("worker child");
+    snapshot.active_identity = Some(pohunek_worker_protocol::ActiveIdentityClaim {
+        provider: "codex".to_owned(),
+        process: root,
+        sequence: 1,
+        expires_at: native_report_expiry(),
+        reference_kind: None,
+        native_reference: None,
+        agent: Some("tuned".to_owned()),
+        origin: Some(pohunek_worker_protocol::ClaimOrigin::Forwarded),
+        reported_session: None,
+    });
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(info.active_agent.as_deref(), Some("tuned"));
+
+    snapshot.active_identity = None;
+    snapshot.active_identity_release = Some(pohunek_worker_protocol::ReleasedIdentityClaim {
+        provider: "codex".to_owned(),
+        process: root,
+        sequence: 2,
+    });
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(info.active_agent, None);
+    let _ = registry.stop(&created.id).await;
+}
+
 #[tokio::test]
 async fn subagent_only_metadata_skips_identity_process_validation() {
     let inspector = Arc::new(MockInspector::default());
