@@ -4,4 +4,5 @@
   write copies and imported legacy-manifest archives. Writers and purge share
   the artifact-name grammar. Recognized temp/archive symlinks are unlinked
   without following their targets; unrelated data entries and pending manifests
-  remain and are reported in `kept_purge_entries`.
+  remain and are reported as byte-escaped display strings in `kept_purge_entries`,
+  including Unix filenames that are not valid UTF-8.

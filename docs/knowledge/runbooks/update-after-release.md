@@ -448,7 +448,7 @@ also removes the store's schema backups, crashed `metadata.jsonl.tmp.<pid>.<sequ
 copies, and imported legacy-manifest archives in `migrations/`. It removes only
 recognized artifact names; a symlink at a recognized temp or archive name is
 unlinked without following its target. Unrecognized data and migration entries
-are kept and reported (`kept_purge_entries` in JSON). A pending migration
+are kept and reported (`kept_purge_entries` as byte-escaped display strings in JSON). A pending migration
 manifest is retained. The prefix ownership record is removed after the prefix's version directories and
 CLI copy (it stays while a version is kept for a worker journal or job of this
 installation). The transaction record (`service-install.json`) is cleared just before

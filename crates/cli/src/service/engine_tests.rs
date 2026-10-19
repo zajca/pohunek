@@ -1927,6 +1927,60 @@ async fn purge_unlinks_a_store_temp_symlink_and_preserves_its_referent() {
     assert_purged(&paths);
 }
 
+/// Purge must still emit successful CLI JSON when retained Unix names are not UTF-8.
+#[tokio::test]
+async fn purge_reports_non_utf8_retained_names_as_escaped_json_strings() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    for in_migrations in [false, true] {
+        let harness = Harness::new();
+        let paths = harness.context.paths().clone();
+        seed_durable_metadata(&paths);
+        let parent = if in_migrations {
+            let migrations = paths.data_dir.join("migrations");
+            std::fs::create_dir(&migrations).expect("migrations");
+            std::fs::set_permissions(
+                &migrations,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .expect("private migrations");
+            migrations
+        } else {
+            paths.data_dir.clone()
+        };
+        let names: [(&[u8], &str); 4] = [
+            (b"keep-\xff", r"keep-\xff"),
+            (b"keep-\\xff", r"keep-\\xff"),
+            (b"keep-\n", r"keep-\n"),
+            ("keep-é".as_bytes(), r"keep-\xc3\xa9"),
+        ];
+        for (name, _) in names {
+            std::fs::write(parent.join(std::ffi::OsStr::from_bytes(name)), "owner work")
+                .expect("retained file");
+        }
+        let _record = pending_install_at_config(&harness).await;
+
+        let report = harness.engine().uninstall(PURGE).await.expect("purge");
+        assert!(report.purged);
+        assert_purged(&paths);
+        harness.assert_clean();
+        let json = crate::commands::render_json(&report).expect("successful purge must serialize");
+        let document: serde_json::Value = serde_json::from_str(&json).expect("CLI JSON document");
+        let entries = document["ok"]["kept_purge_entries"]
+            .as_array()
+            .expect("retained paths");
+        for (name, escaped) in names {
+            let path = parent.join(std::ffi::OsStr::from_bytes(name));
+            assert_eq!(
+                std::fs::read_to_string(path).expect("retained file"),
+                "owner work"
+            );
+            let expected = format!("{}/{escaped}", parent.display());
+            assert!(entries.contains(&serde_json::Value::String(expected)));
+        }
+    }
+}
+
 #[tokio::test]
 async fn purge_never_follows_a_symlinked_migrations_directory() {
     let harness = Harness::new();

@@ -187,7 +187,10 @@ manifest archives under `migrations/`, event logs, worker journals, and host
 identity: it is never implicit. Only recognized artifact names are removed;
 a symlink at a recognized temp or archive name is unlinked without following
 its target. Unrecognized data and migration entries are retained and listed in
-`kept_purge_entries` in JSON, or as `kept ... (outside purge scope)` in text.
+`kept_purge_entries` as byte-escaped display strings in JSON, or as
+`kept ... (outside purge scope)` in text. Backslashes, control characters and
+non-ASCII bytes are escaped (for example, `\xff`) so arbitrary Unix filenames
+can be reported after purge without a JSON serialization error.
 
 ## Logs
 
