@@ -1168,10 +1168,10 @@ impl SessionRegistry {
                 cwd: command.cwd,
                 dimensions,
                 environment,
-                base_environment: Some(base_environment),
+                base_environment,
                 limits,
                 stop_policy,
-                input_policy: Some(input_policy),
+                input_policy,
                 hook_protocol_version: Version::new(1)
                     .expect("worker hook protocol version is nonzero"),
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),

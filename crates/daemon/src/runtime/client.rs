@@ -442,31 +442,15 @@ impl Worker {
 
     /// Initializes an uninitialized worker exactly once.
     ///
-    /// A worker that negotiated a version below
-    /// [`pohunek_worker_protocol::BASE_ENVIRONMENT_VERSION`] does not know the
-    /// base environment, so it is removed from `initialize` before sending; at
-    /// or above that version it is required. The input policy is removed the
-    /// same way below [`pohunek_worker_protocol::INPUT_STALL_VERSION`].
-    ///
     /// # Errors
     ///
     /// Returns [`WorkerError`] for connection, identity, spawn, or journal
-    /// failure, and [`WorkerError::Protocol`] when a worker that negotiated
-    /// the base-environment version receives no base environment.
+    /// failure.
     pub async fn initialize(
         &self,
-        mut initialize: Initialize,
+        initialize: Initialize,
     ) -> Result<WorkerInstanceId, WorkerError> {
         let mut inner = self.inner.lock().await;
-        if inner.selected_version < pohunek_worker_protocol::BASE_ENVIRONMENT_VERSION {
-            initialize.base_environment = None;
-        }
-        if inner.selected_version < pohunek_worker_protocol::INPUT_STALL_VERSION {
-            initialize.input_policy = None;
-        }
-        initialize
-            .check_version(inner.selected_version)
-            .map_err(|error| WorkerError::Protocol(error.to_string()))?;
         let lease_id = inner.lease_id.clone();
         let response = request_locked(
             &mut inner,
@@ -1364,13 +1348,11 @@ mod tests {
             dimensions: Dimensions::new(80, 24).expect("dimensions"),
             environment: pohunek_worker_protocol::SecretEnv::new(BTreeMap::new())
                 .expect("valid environment"),
-            base_environment: Some(
-                crate::runtime::environment::base_environment(
-                    pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
-                    &crate::test_support::thread_environment_source(),
-                )
-                .expect("base environment"),
-            ),
+            base_environment: crate::runtime::environment::base_environment(
+                pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+                &crate::test_support::thread_environment_source(),
+            )
+            .expect("base environment"),
             limits: pohunek_worker_protocol::InitializeLimits::new(
                 u64::try_from(output_bytes).expect("history fits u64"),
                 1_048_576,
@@ -1387,17 +1369,15 @@ mod tests {
                 .expect("stop grace fits u64"),
             )
             .expect("stop policy"),
-            input_policy: Some(
-                pohunek_worker_protocol::InputPolicy::new(
-                    u64::try_from(
-                        crate::session::SessionRegistryConfig::default()
-                            .input_write_stall_timeout
-                            .as_millis(),
-                    )
-                    .expect("input stall bound fits u64"),
+            input_policy: pohunek_worker_protocol::InputPolicy::new(
+                u64::try_from(
+                    crate::session::SessionRegistryConfig::default()
+                        .input_write_stall_timeout
+                        .as_millis(),
                 )
-                .expect("input policy"),
-            ),
+                .expect("input stall bound fits u64"),
+            )
+            .expect("input policy"),
             hook_protocol_version: pohunek_worker_protocol::CURRENT_VERSION,
             public_protocol_version: protocol::PROTOCOL_VERSION.get(),
             hook_schema: None,
@@ -1595,7 +1575,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_observation_requires_version_five() {
+    fn subagent_observation_requires_its_protocol_version() {
         let current = requested_capabilities(
             pohunek_worker_protocol::SUBAGENT_OBSERVATION_VERSION,
             &[Capability::SubagentObservation],

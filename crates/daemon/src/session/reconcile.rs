@@ -8240,16 +8240,14 @@ while os.getppid() == parent:
                 cwd: root.clone(),
                 dimensions: Dimensions::new(80, 24).expect("dimensions"),
                 environment: SecretEnv::new(BTreeMap::new()).expect("environment"),
-                base_environment: Some(
-                    crate::runtime::environment::base_environment(
-                        pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
-                        &crate::test_support::thread_environment_source(),
-                    )
-                    .expect("base environment"),
-                ),
+                base_environment: crate::runtime::environment::base_environment(
+                    pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+                    &crate::test_support::thread_environment_source(),
+                )
+                .expect("base environment"),
                 limits: InitializeLimits::new(1_000_000, 100_000, 128, 60_000).expect("limits"),
                 stop_policy: StopPolicy::new(100).expect("stop policy"),
-                input_policy: Some(InputPolicy::new(100).expect("input policy")),
+                input_policy: InputPolicy::new(100).expect("input policy"),
                 hook_protocol_version: Version::new(1).expect("version"),
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: Some("identity-subagent-v1".to_owned()),
@@ -8661,16 +8659,14 @@ while os.getppid() == parent:
                 cwd: root.clone(),
                 dimensions: Dimensions::new(80, 24).expect("dimensions"),
                 environment: SecretEnv::new(BTreeMap::new()).expect("environment"),
-                base_environment: Some(
-                    crate::runtime::environment::base_environment(
-                        pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
-                        &crate::test_support::thread_environment_source(),
-                    )
-                    .expect("base environment"),
-                ),
+                base_environment: crate::runtime::environment::base_environment(
+                    pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+                    &crate::test_support::thread_environment_source(),
+                )
+                .expect("base environment"),
                 limits: InitializeLimits::new(1_000_000, 100_000, 128, 60_000).expect("limits"),
                 stop_policy: StopPolicy::new(100).expect("stop policy"),
-                input_policy: Some(InputPolicy::new(100).expect("input policy")),
+                input_policy: InputPolicy::new(100).expect("input policy"),
                 hook_protocol_version: Version::new(1).expect("version"),
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: Some("identity-v1".to_owned()),
@@ -9671,16 +9667,14 @@ while os.getppid() == parent:
                 cwd: root.to_path_buf(),
                 dimensions: Dimensions::new(80, 24).expect("dimensions"),
                 environment: SecretEnv::new(BTreeMap::new()).expect("environment"),
-                base_environment: Some(
-                    crate::runtime::environment::base_environment(
-                        pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
-                        &crate::test_support::thread_environment_source(),
-                    )
-                    .expect("base environment"),
-                ),
+                base_environment: crate::runtime::environment::base_environment(
+                    pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+                    &crate::test_support::thread_environment_source(),
+                )
+                .expect("base environment"),
                 limits: InitializeLimits::new(1_000_000, 100_000, 128, 60_000).expect("limits"),
                 stop_policy: StopPolicy::new(100).expect("stop policy"),
-                input_policy: Some(InputPolicy::new(100).expect("input policy")),
+                input_policy: InputPolicy::new(100).expect("input policy"),
                 hook_protocol_version: Version::new(1).expect("version"),
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: Some("identity-subagent-v1".to_owned()),

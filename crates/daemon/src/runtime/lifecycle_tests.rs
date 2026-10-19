@@ -1626,18 +1626,6 @@ async fn one_session_is_serialized_and_different_sessions_are_not() {
     assert_eq!(locks.tracked(), 0, "released sessions leave no lock entry");
 }
 
-/// Serves one controller connection as a worker that only speaks version five.
-///
-/// Returns the request kinds received after the controller lease, so a test
-/// can prove the daemon never sent `Initialize`.
-fn serve_version_five_worker(
-    socket: &Path,
-    session_id: &str,
-    worker_id: &str,
-) -> tokio::task::JoinHandle<Vec<String>> {
-    serve_gated_version_five_worker(socket, session_id, worker_id, None)
-}
-
 /// Holds a fake worker's `ControllerAcquired` reply until released.
 #[derive(Debug, Clone, Default)]
 struct AcquireGate {
@@ -1647,17 +1635,18 @@ struct AcquireGate {
     release: Arc<Notify>,
 }
 
-/// [`serve_version_five_worker`] whose controller reply waits for `gate`.
-fn serve_gated_version_five_worker(
+/// Serves one controller connection as a previous-version worker whose
+/// controller reply waits for `gate`.
+fn serve_gated_previous_version_worker(
     socket: &Path,
     session_id: &str,
     worker_id: &str,
     gate: Option<AcquireGate>,
 ) -> tokio::task::JoinHandle<Vec<String>> {
-    serve_fake_version_five_worker(socket, session_id, worker_id, gate, 0, None).0
+    serve_fake_previous_version_worker(socket, session_id, worker_id, gate, 0, None).0
 }
 
-/// Serves controller connections as a version-five worker, rejecting the
+/// Serves controller connections as a previous-version worker, rejecting the
 /// controller request of the first `busy` connections with
 /// `ControllerBusy`.
 ///
@@ -1665,7 +1654,7 @@ fn serve_gated_version_five_worker(
 /// lease of the first served connection, and the count of busy rejections.
 /// When `refusal_closed` is set, the worker sends one unit on it each time the
 /// daemon has closed a connection after receiving a busy rejection.
-fn serve_fake_version_five_worker(
+fn serve_fake_previous_version_worker(
     socket: &Path,
     session_id: &str,
     worker_id: &str,
@@ -1676,7 +1665,7 @@ fn serve_fake_version_five_worker(
     use pohunek_worker_protocol::{
         Capability, ControlError, ControlMessage, ControlReader, ControlResponse, ControlWriter,
         LeaseChallenge, LeaseId, ProcessIdentity as WireProcess, RequestKind, ResponseKind,
-        RuntimePhase, SessionId, Version, VersionRange, WorkerId,
+        RuntimePhase, SessionId, VersionRange, WorkerId,
     };
 
     std::fs::DirBuilder::new()
@@ -1697,7 +1686,7 @@ fn serve_fake_version_five_worker(
             let (read_half, write_half) = stream.into_split();
             let mut reader = ControlReader::new(read_half);
             let mut writer = ControlWriter::new(write_half);
-            let five = Version::new(5).expect("version five");
+            let previous = pohunek_worker_protocol::PREVIOUS_VERSION;
             let mut after_lease = Vec::new();
             let mut refused = false;
             // A client that saw a rejection closes its connection, which
@@ -1708,9 +1697,8 @@ fn serve_fake_version_five_worker(
                 };
                 let kind = match request.kind {
                     RequestKind::Negotiate { .. } => ResponseKind::Negotiated {
-                        selected_version: five,
-                        supported_range: VersionRange::new(Version::new(4).expect("v4"), five)
-                            .expect("range"),
+                        selected_version: previous,
+                        supported_range: VersionRange::new(previous, previous).expect("range"),
                         session_id: session_id.clone(),
                         worker_id: worker_id.clone(),
                         worker_instance_id: None,
@@ -1720,7 +1708,7 @@ fn serve_fake_version_five_worker(
                         },
                         phase: RuntimePhase::Uninitialized,
                         capabilities: vec![Capability::AtomicReplay],
-                        challenge: LeaseChallenge::new("challenge-v5").expect("challenge"),
+                        challenge: LeaseChallenge::new("challenge-previous").expect("challenge"),
                     },
                     RequestKind::AcquireController { .. } if reject_busy => {
                         rejected.fetch_add(1, Ordering::Relaxed);
@@ -1739,7 +1727,7 @@ fn serve_fake_version_five_worker(
                             gate.release.notified().await;
                         }
                         ResponseKind::ControllerAcquired {
-                            lease_id: LeaseId::new("lease-v5").expect("lease"),
+                            lease_id: LeaseId::new("lease-previous").expect("lease"),
                             capabilities: Vec::new(),
                         }
                     }
@@ -1772,80 +1760,6 @@ fn serve_fake_version_five_worker(
         }
     });
     (task, rejections)
-}
-
-#[tokio::test]
-async fn a_new_generation_below_the_base_environment_protocol_is_retired_uninitialized() {
-    let harness = Harness::scripted(GENEROUS, INITIALIZE);
-    let generation = harness.generation("s-1");
-    harness.write_journal(
-        "s-1",
-        "worker-v5",
-        &journal(
-            "s-1",
-            "worker-v5",
-            generation.generation(),
-            "bootstrap",
-            std::process::id(),
-        ),
-    );
-    // The job runs while its worker (the fake) serves the socket.
-    harness.supervisor.script_inspects([InspectStep::Present {
-        state: ServiceState::Running,
-        process: true,
-    }]);
-    let fake = serve_version_five_worker(
-        &harness
-            .runtime_root
-            .join("s-1")
-            .join(pohunek_paths::WORKER_SOCKET_NAME),
-        "s-1",
-        "worker-v5",
-    );
-
-    let failure = harness
-        .lifecycle()
-        .launch(&generation)
-        .await
-        .expect_err("a version-five worker must not start a new generation");
-
-    assert!(
-        matches!(&failure, LaunchFailure::Cleaned(error) if error.code == WORKER_PROTOCOL_OUTDATED),
-        "{failure:?}"
-    );
-    assert_eq!(harness.supervisor.started(), [generation.service_id()]);
-    assert_eq!(harness.supervisor.retired(), [generation.service_id()]);
-    let after_lease = tokio::time::timeout(GENEROUS, fake)
-        .await
-        .expect("controller connection closed")
-        .expect("fake worker task");
-    assert!(
-        after_lease.is_empty(),
-        "no request may follow the lease, got {after_lease:?}"
-    );
-}
-
-#[tokio::test]
-async fn a_live_version_five_worker_stays_adoptable_by_reconnection() {
-    let harness = Harness::scripted(GENEROUS, INITIALIZE);
-    let socket = harness
-        .runtime_root
-        .join("s-1")
-        .join(pohunek_paths::WORKER_SOCKET_NAME);
-    let fake = serve_version_five_worker(&socket, "s-1", "worker-v5");
-
-    // Reconciliation reconnects through the worker client directly, never
-    // through `Lifecycle::launch`, so the version floor does not apply.
-    let worker = Worker::connect_discovered(&socket, "daemon-after-upgrade")
-        .await
-        .expect("reconnect to a live version-five worker");
-
-    assert_eq!(
-        worker.selected_version().await,
-        pohunek_worker_protocol::Version::new(5).expect("version five")
-    );
-    drop(worker);
-    fake.await.expect("fake worker task");
 }
 
 /// Connect deadline that a worker which already exited must never wait for.
@@ -2099,10 +2013,10 @@ async fn an_end_report_never_cancels_a_connect_the_worker_is_answering() {
     let generation = harness.generation("s-1");
     harness.write_journal(
         "s-1",
-        "worker-v5",
+        "worker-previous",
         &journal(
             "s-1",
-            "worker-v5",
+            "worker-previous",
             generation.generation(),
             "bootstrap",
             std::process::id(),
@@ -2111,13 +2025,13 @@ async fn an_end_report_never_cancels_a_connect_the_worker_is_answering() {
     let gate = AcquireGate::default();
     // The fake accepts one connection only, so a replacement attempt after a
     // cancelled one could never be adopted.
-    let fake = serve_gated_version_five_worker(
+    let fake = serve_gated_previous_version_worker(
         &harness
             .runtime_root
             .join("s-1")
             .join(pohunek_paths::WORKER_SOCKET_NAME),
         "s-1",
-        "worker-v5",
+        "worker-previous",
         Some(gate.clone()),
     );
 
@@ -2140,7 +2054,7 @@ async fn an_end_report_never_cancels_a_connect_the_worker_is_answering() {
     let worker = connecting
         .await
         .expect("the answering worker is adopted despite the end report");
-    assert_eq!(worker.worker_id().await.as_str(), "worker-v5");
+    assert_eq!(worker.worker_id().await.as_str(), "worker-previous");
     drop(worker);
     tokio::time::timeout(GENEROUS, fake)
         .await
@@ -2185,22 +2099,22 @@ async fn a_busy_controller_lease_is_retried_until_the_worker_is_adopted() {
     let generation = harness.generation("s-1");
     harness.write_journal(
         "s-1",
-        "worker-v5",
+        "worker-previous",
         &journal(
             "s-1",
-            "worker-v5",
+            "worker-previous",
             generation.generation(),
             "bootstrap",
             std::process::id(),
         ),
     );
-    let (fake, rejections) = serve_fake_version_five_worker(
+    let (fake, rejections) = serve_fake_previous_version_worker(
         &harness
             .runtime_root
             .join("s-1")
             .join(pohunek_paths::WORKER_SOCKET_NAME),
         "s-1",
-        "worker-v5",
+        "worker-previous",
         None,
         1,
         None,
@@ -2213,7 +2127,7 @@ async fn a_busy_controller_lease_is_retried_until_the_worker_is_adopted() {
         .await
         .expect("the worker is adopted once its lease is free");
 
-    assert_eq!(worker.worker_id().await.as_str(), "worker-v5");
+    assert_eq!(worker.worker_id().await.as_str(), "worker-previous");
     assert_eq!(rejections.load(Ordering::Relaxed), 1);
     drop(worker);
     tokio::time::timeout(GENEROUS, fake)
@@ -2236,13 +2150,13 @@ async fn a_controller_lease_busy_until_the_deadline_ends_with_the_deadline() {
     let harness = Harness::scripted(CONNECT, INITIALIZE);
     let generation = harness.generation("s-1");
     let (refusal_closed, mut closed_refusals) = tokio::sync::mpsc::unbounded_channel();
-    let (fake, rejections) = serve_fake_version_five_worker(
+    let (fake, rejections) = serve_fake_previous_version_worker(
         &harness
             .runtime_root
             .join("s-1")
             .join(pohunek_paths::WORKER_SOCKET_NAME),
         "s-1",
-        "worker-v5",
+        "worker-previous",
         None,
         usize::MAX,
         Some(refusal_closed),
@@ -2299,13 +2213,13 @@ async fn an_ended_job_stops_the_busy_lease_retries_after_the_first_refusal() {
     // The job reads as absent from the first inspection on.
     harness.supervisor.script_inspects([InspectStep::NotFound]);
     let generation = harness.generation("s-1");
-    let (fake, rejections) = serve_fake_version_five_worker(
+    let (fake, rejections) = serve_fake_previous_version_worker(
         &harness
             .runtime_root
             .join("s-1")
             .join(pohunek_paths::WORKER_SOCKET_NAME),
         "s-1",
-        "worker-v5",
+        "worker-previous",
         None,
         usize::MAX,
         None,

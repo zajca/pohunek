@@ -131,16 +131,14 @@ fn initialize(
         cwd: root.to_path_buf(),
         dimensions: Dimensions::new(80, 24).expect("dimensions"),
         environment: SecretEnv::new(BTreeMap::new()).expect("environment"),
-        base_environment: Some(
-            crate::runtime::environment::base_environment(
-                DEFAULT_ENVIRONMENT_ALLOWLIST,
-                &crate::test_support::thread_environment_source(),
-            )
-            .expect("base environment"),
-        ),
+        base_environment: crate::runtime::environment::base_environment(
+            DEFAULT_ENVIRONMENT_ALLOWLIST,
+            &crate::test_support::thread_environment_source(),
+        )
+        .expect("base environment"),
         limits: InitializeLimits::new(1_048_576, 1_048_576, 1_024, 10_000).expect("limits"),
         stop_policy: StopPolicy::new(500).expect("stop policy"),
-        input_policy: Some(InputPolicy::new(3000).expect("input policy")),
+        input_policy: InputPolicy::new(3000).expect("input policy"),
         hook_protocol_version: CURRENT_VERSION,
         public_protocol_version,
         hook_schema: Some(hook_schema.to_owned()),

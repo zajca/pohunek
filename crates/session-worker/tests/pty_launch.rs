@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
 
-use pohunek_session_worker::{Command, EnvBase, OutputEvent, PtyError, PtyOwner, WorkerConfig};
+use pohunek_session_worker::{Command, OutputEvent, PtyError, PtyOwner, WorkerConfig};
 use pohunek_test_support::tempdir;
 use rustix::io::FdFlags;
 use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
@@ -47,7 +47,6 @@ fn shell_command(script: &str, cwd: &Path, home: &Path) -> Command {
     Command {
         program: "/bin/sh".to_owned(),
         args: vec!["-c".to_owned(), script.to_owned()],
-        base: EnvBase::Empty,
         env: vec![
             ("PATH".to_owned(), SHELL_PATH.to_owned()),
             ("HOME".to_owned(), home.to_string_lossy().into_owned()),
@@ -342,7 +341,6 @@ async fn the_child_sees_only_the_pty_descriptors() {
             .to_string_lossy()
             .into_owned(),
         args: vec!["no-such-program".to_owned()],
-        base: EnvBase::Empty,
         env: vec![],
         cwd: cwd.path().to_path_buf(),
         cols: 80,

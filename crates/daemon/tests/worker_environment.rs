@@ -5,9 +5,8 @@
 //! environment. Protocol version seven must hand the child exactly the base
 //! environment, the worker's `TERM`, the profile, and the worker's reserved
 //! `POHUNEK_*` values. A profile value overrides the base one, while a profile
-//! can neither shadow a reserved value nor pass a service-manager variable. A
-//! version-six session receives the same base environment; the input policy the
-//! daemon sends with `Initialize` is withheld from it.
+//! can neither shadow a reserved value nor pass a service-manager variable. The
+//! previous protocol version receives the same contract as the current one.
 //!
 //! Build the worker first: `cargo build -p pohunek-session-worker --bin
 //! pohunek-sessiond`.
@@ -41,7 +40,7 @@ const PAGE_WAIT: Duration = Duration::from_millis(100);
 const DAEMON_ID: &str = "daemon-environment-test";
 /// Generation passed on the worker command line.
 const GENERATION: &str = "abcd2345";
-/// Value of the variable no allowlist names; it must never reach a v6 child.
+/// Value of the variable no allowlist names; it must never reach a child.
 const UNRELATED_VALUE: &str = "worker-only-value";
 
 static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -220,18 +219,16 @@ impl Fixture {
                 ("POHUNEK_HOOK_TRACE_MAX_BYTES".to_owned(), "1".to_owned()),
             ]))
             .expect("profile environment"),
-            base_environment: Some(
-                BaseEnv::new(BTreeMap::from([
-                    ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
-                    ("HOME".to_owned(), "/home/base".to_owned()),
-                    ("LANG".to_owned(), "C.UTF-8".to_owned()),
-                    ("SHELL".to_owned(), "/bin/sh".to_owned()),
-                ]))
-                .expect("base environment"),
-            ),
+            base_environment: BaseEnv::new(BTreeMap::from([
+                ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+                ("HOME".to_owned(), "/home/base".to_owned()),
+                ("LANG".to_owned(), "C.UTF-8".to_owned()),
+                ("SHELL".to_owned(), "/bin/sh".to_owned()),
+            ]))
+            .expect("base environment"),
             limits: InitializeLimits::new(1_048_576, 1_048_576, 128, 60_000).expect("limits"),
             stop_policy: StopPolicy::new(500).expect("stop policy"),
-            input_policy: Some(InputPolicy::new(3000).expect("input policy")),
+            input_policy: InputPolicy::new(3000).expect("input policy"),
             hook_protocol_version: Version::new(1).expect("hook version"),
             public_protocol_version: 7,
             hook_schema: None,
@@ -370,7 +367,7 @@ async fn previous_version_child_gets_the_base_environment_without_service_manage
 
     assert!(
         !environment.contains_key("UNRELATED_WORKER_VAR"),
-        "a version-six child receives the base environment, not the worker environment"
+        "a child receives the base environment, not the worker environment"
     );
     assert_eq!(
         environment.get("HOME").map(String::as_str),
@@ -413,7 +410,7 @@ async fn initialize_silent_child(fixture: &Fixture, worker: &Worker) {
     initialize.executable = PathBuf::from("/bin/sh");
     initialize.arguments = vec!["-c".to_owned(), "exec sleep 3600".to_owned()];
     initialize.input_policy =
-        Some(InputPolicy::new(SILENT_CHILD_STALL_MS).expect("silent child input policy"));
+        InputPolicy::new(SILENT_CHILD_STALL_MS).expect("silent child input policy");
     worker
         .initialize(initialize)
         .await
@@ -435,10 +432,19 @@ fn oversized_plan() -> Vec<InputFragment> {
 }
 
 #[tokio::test]
-async fn version_seven_controller_sees_a_stalled_write_as_input_stalled() {
+async fn current_version_controller_sees_a_stalled_write_as_input_stalled() {
+    assert_stalled_write_is_input_stalled(CURRENT_VERSION).await;
+}
+
+#[tokio::test]
+async fn previous_version_controller_sees_a_stalled_write_as_input_stalled() {
+    assert_stalled_write_is_input_stalled(PREVIOUS_VERSION).await;
+}
+
+async fn assert_stalled_write_is_input_stalled(version: Version) {
     let mut fixture = Fixture::start();
-    let worker = fixture.connect(CURRENT_VERSION).await;
-    assert_eq!(worker.selected_version().await, CURRENT_VERSION);
+    let worker = fixture.connect(version).await;
+    assert_eq!(worker.selected_version().await, version);
     initialize_silent_child(&fixture, &worker).await;
 
     let error = worker
@@ -461,42 +467,6 @@ async fn version_seven_controller_sees_a_stalled_write_as_input_stalled() {
         .expect("stop the silent child after the stall");
 }
 
-#[tokio::test]
-async fn version_six_controller_of_a_version_seven_worker_sees_a_stall_as_runtime_fault() {
-    let mut fixture = Fixture::start();
-    let initializer = fixture.connect(CURRENT_VERSION).await;
-    assert_eq!(initializer.selected_version().await, CURRENT_VERSION);
-    initialize_silent_child(&fixture, &initializer).await;
-    // Releasing the lease lets a version-six connection take over the same
-    // worker, which was initialized with the input stall bound.
-    initializer
-        .release_controller()
-        .await
-        .expect("release the version-seven controller");
-    drop(initializer);
-
-    let controller = fixture.connect_controller(PREVIOUS_VERSION).await;
-    assert_eq!(controller.selected_version().await, PREVIOUS_VERSION);
-    let error = controller
-        .write(oversized_plan())
-        .await
-        .expect_err("a write the silent child never reads must stall");
-    assert!(
-        matches!(
-            error,
-            WorkerError::Rejected {
-                code: ControlCode::RuntimeFault,
-                ..
-            }
-        ),
-        "a version-six peer cannot decode InputStalled, so it must see RuntimeFault: {error:?}"
-    );
-    controller
-        .stop(TransactionId::new("stall-cleanup").expect("transaction id"))
-        .await
-        .expect("stop the silent child after the stall");
-}
-
 /// Initializes the fixture's worker with a working directory that does not
 /// exist under the fixture root.
 async fn initialize_into_missing_cwd(fixture: &Fixture, worker: &Worker) -> WorkerError {
@@ -509,10 +479,19 @@ async fn initialize_into_missing_cwd(fixture: &Fixture, worker: &Worker) -> Work
 }
 
 #[tokio::test]
-async fn version_seven_initialize_into_a_missing_cwd_reports_launch_cwd_missing() {
+async fn current_version_initialize_into_a_missing_cwd_reports_launch_cwd_missing() {
+    assert_missing_cwd_is_launch_cwd_missing(CURRENT_VERSION).await;
+}
+
+#[tokio::test]
+async fn previous_version_initialize_into_a_missing_cwd_reports_launch_cwd_missing() {
+    assert_missing_cwd_is_launch_cwd_missing(PREVIOUS_VERSION).await;
+}
+
+async fn assert_missing_cwd_is_launch_cwd_missing(version: Version) {
     let mut fixture = Fixture::start();
-    let worker = fixture.connect(CURRENT_VERSION).await;
-    assert_eq!(worker.selected_version().await, CURRENT_VERSION);
+    let worker = fixture.connect(version).await;
+    assert_eq!(worker.selected_version().await, version);
 
     let error = initialize_into_missing_cwd(&fixture, &worker).await;
     assert!(
@@ -527,28 +506,6 @@ async fn version_seven_initialize_into_a_missing_cwd_reports_launch_cwd_missing(
     );
     // The fixture does not expose the spawned child, so the inspect snapshot
     // stands in: a refused launch leaves no child process and no running phase.
-    let snapshot = worker.inspect().await.expect("inspect refused worker");
-    assert_eq!(snapshot.child_process, None, "no child may be started");
-    assert_ne!(snapshot.phase, RuntimePhase::Running);
-}
-
-#[tokio::test]
-async fn version_six_initialize_into_a_missing_cwd_reports_runtime_fault() {
-    let mut fixture = Fixture::start();
-    let worker = fixture.connect(PREVIOUS_VERSION).await;
-    assert_eq!(worker.selected_version().await, PREVIOUS_VERSION);
-
-    let error = initialize_into_missing_cwd(&fixture, &worker).await;
-    assert!(
-        matches!(
-            error,
-            WorkerError::Rejected {
-                code: ControlCode::RuntimeFault,
-                ..
-            }
-        ),
-        "a version-six peer cannot decode LaunchCwdMissing, so it must see RuntimeFault: {error:?}"
-    );
     let snapshot = worker.inspect().await.expect("inspect refused worker");
     assert_eq!(snapshot.child_process, None, "no child may be started");
     assert_ne!(snapshot.phase, RuntimePhase::Running);
@@ -608,7 +565,7 @@ async fn a_stalled_attach_write_keeps_its_stream_while_control_input_fails_with_
         gate.to_str().expect("UTF-8 fixture path").to_owned(),
     ];
     initialize.input_policy =
-        Some(InputPolicy::new(SILENT_CHILD_STALL_MS).expect("gated child input policy"));
+        InputPolicy::new(SILENT_CHILD_STALL_MS).expect("gated child input policy");
     worker
         .initialize(initialize)
         .await
@@ -834,12 +791,25 @@ async fn an_attach_stream_receives_output_while_its_own_input_waits_for_the_chil
 }
 
 #[tokio::test]
-async fn worker_socket_rejects_a_disjoint_protocol_range() {
+async fn worker_socket_rejects_a_protocol_range_above_its_window() {
+    let above = Version::new(CURRENT_VERSION.get() + 1).expect("next version is nonzero");
+    assert_disjoint_range_rejected(above).await;
+}
+
+/// A daemon that only speaks protocol 6, the version that left the window, is
+/// refused: the window is the previous and the current version.
+#[tokio::test]
+async fn worker_socket_rejects_a_daemon_that_only_speaks_protocol_six() {
+    let dropped = Version::new(6).expect("version six is nonzero");
+    assert!(dropped < PREVIOUS_VERSION);
+    assert_disjoint_range_rejected(dropped).await;
+}
+
+async fn assert_disjoint_range_rejected(next_version: Version) {
     let mut fixture = Fixture::start();
     fixture.wait_ready();
     let socket = fixture.socket_path();
     let session_id = fixture.session_id.clone();
-    let next_version = Version::new(CURRENT_VERSION.get() + 1).expect("next version is nonzero");
     let child = std::cell::RefCell::new(&mut fixture.worker);
     let error = wait_until("the worker to reject a disjoint protocol range", || async {
         match Worker::connect_with_range(
@@ -863,7 +833,7 @@ async fn worker_socket_rejects_a_disjoint_protocol_range() {
                 None
             }
             Err(error) => Some(error),
-            Ok(_) => panic!("a worker accepted a version newer than its supported range"),
+            Ok(_) => panic!("a worker accepted a version outside its supported range"),
         }
     })
     .await;

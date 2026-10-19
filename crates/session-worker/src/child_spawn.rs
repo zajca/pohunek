@@ -17,15 +17,12 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Stdio};
 
 use nix::unistd::{access, AccessFlags, User};
-use pohunek_worker_protocol::is_denylisted;
 use rustix::fs::{open, Mode, OFlags};
 
-use crate::pty::{Command, EnvBase};
+use crate::pty::Command;
 
 /// Shell used when the password database has no usable login shell.
 const FALLBACK_SHELL: &str = "/bin/sh";
-/// Environment prefix reserved for pohunek-owned identity markers.
-const RESERVED_ENV_PREFIX: &str = "POHUNEK_";
 /// First descriptor the child marks close-on-exec; 0 through 2 are the slave.
 const FIRST_INHERITED_DESCRIPTOR: libc::c_int = 3;
 /// Signals whose inherited dispositions the child resets to the default.
@@ -85,19 +82,10 @@ pub(crate) fn spawn_pty_child(command: &Command, slave_device: &Path) -> io::Res
 
 /// Builds the child environment as `portable-pty` 0.9 does.
 ///
-/// `EnvBase::Empty` starts from nothing. `EnvBase::Inherited` starts from the
-/// worker's environment without `POHUNEK_*` markers or denylisted names.
-/// `command.env` is applied last, and `SHELL` is always present.
+/// The child starts from nothing: `command.env` is applied on top, and `SHELL`
+/// is always present.
 fn child_environment(command: &Command) -> BTreeMap<OsString, OsString> {
-    let mut environment: BTreeMap<OsString, OsString> = match command.base {
-        EnvBase::Empty => BTreeMap::new(),
-        EnvBase::Inherited => std::env::vars_os()
-            .filter(|(name, _)| {
-                !matches!(name.to_str(), Some(name)
-                    if name.starts_with(RESERVED_ENV_PREFIX) || is_denylisted(name))
-            })
-            .collect(),
-    };
+    let mut environment: BTreeMap<OsString, OsString> = BTreeMap::new();
     for (key, value) in &command.env {
         environment.insert(OsString::from(key), OsString::from(value));
     }

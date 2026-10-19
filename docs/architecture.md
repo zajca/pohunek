@@ -661,8 +661,9 @@ states the contract and then the current state.
 
 - **Live workers.** The private worker protocol negotiates the range
   `PREVIOUS_VERSION..=CURRENT_VERSION` (`crates/worker-protocol/src/version.rs`,
-  currently 5 and 6), so a worker started by N-1 keeps serving through a daemon
-  update.
+  currently 7 and 8), so a worker started by N-1 keeps serving through a daemon
+  update. A worker below the window is not adopted, and the upgrade preflight
+  reports its session as `would_not_be_adopted`.
 - **Worker journal.** The daemon reads the previous journal schema. The
   readable schemas are the explicit list `WORKER_JOURNAL_READABLE_SCHEMAS`
   (`crates/daemon/src/runtime/lifecycle.rs`); a schema is listed only when its

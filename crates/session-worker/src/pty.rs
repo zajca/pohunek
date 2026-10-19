@@ -65,20 +65,6 @@ const CANCEL_SLOT: usize = 1;
 /// a local malformed request from forcing multi-gigabyte VT allocations.
 const MAX_TERMINAL_CELLS: u64 = 4_000_000;
 
-/// Selects the environment a PTY child starts from before [`Command::env`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EnvBase {
-    /// No inherited variables: the child sees only [`Command::env`].
-    ///
-    /// `portable-pty` always sets `SHELL`; when `env` has none, it uses the
-    /// account's login shell from the password database.
-    Empty,
-    /// The worker's own environment without `POHUNEK_*` markers and without
-    /// service-manager variables, for sessions whose daemon predates the
-    /// base-environment contract.
-    Inherited,
-}
-
 /// Command launched inside one PTY.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Command {
@@ -86,8 +72,6 @@ pub struct Command {
     pub program: String,
     /// Executable arguments.
     pub args: Vec<String>,
-    /// Environment the child starts from.
-    pub base: EnvBase,
     /// Child environment additions or overrides.
     pub env: Vec<(String, String)>,
     /// Working directory.
@@ -103,7 +87,6 @@ impl Debug for Command {
         f.debug_struct("Command")
             .field("program", &"[REDACTED]")
             .field("argument_count", &self.args.len())
-            .field("base", &self.base)
             .field(
                 "env",
                 &format_args!("[REDACTED; {} entries]", self.env.len()),
@@ -2179,7 +2162,7 @@ fn lock_result<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, PtyE
 mod tests {
     use super::{
         commit_resize_before_resume, drain_available_output, drain_snapshot_boundary,
-        read_process_start, wait_for_child_status, Command, EnvBase, HeldOutput, OutputReadState,
+        read_process_start, wait_for_child_status, Command, HeldOutput, OutputReadState,
         OutputReady, OutputReadyState, PtyError, PtyOwner, ResizeCommit, ResizeState,
         SnapshotDrain, SpawnGuard, StartupLatch, OUTPUT_DRAIN_BATCH_BYTES, READ_CHUNK_BYTES,
     };
@@ -2258,7 +2241,6 @@ mod tests {
         Command {
             program: "/bin/sh".to_owned(),
             args: vec!["-c".to_owned(), script.to_owned()],
-            base: EnvBase::Empty,
             env: crate::test_support::child_env(),
             cwd: cwd.to_path_buf(),
             cols: 80,
@@ -2721,7 +2703,6 @@ mod tests {
             ]
             .map(str::to_owned)
             .to_vec(),
-            base: EnvBase::Empty,
             env: vec![
                 ("SHELL".to_owned(), "/bin/sh".to_owned()),
                 ("EXPLICIT".to_owned(), "value=with equals".to_owned()),
@@ -2760,63 +2741,6 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(listing, expected);
-    }
-
-    /// A worker started inside another session still holds that session's
-    /// `POHUNEK_WORKER_INSTANCE_ID`; its PTY child must not carry it, or the
-    /// child would be attributed to that session's worker instance.
-    #[tokio::test]
-    async fn inherited_base_child_does_not_carry_the_ambient_worker_instance_marker() {
-        if !pohunek_test_support::process_env::in_own_process() {
-            return;
-        }
-        let mut ambient = pohunek_test_support::process_env::ProcessEnv::lock();
-        ambient.set("POHUNEK_WORKER_INSTANCE_ID", "ambient-instance");
-        let cwd = pohunek_test_support::tempdir().expect("child working directory");
-        let pty = spawn(Command {
-            program: std::env::current_exe()
-                .expect("test executable")
-                .into_os_string()
-                .into_string()
-                .expect("test executable path is UTF-8"),
-            args: [
-                "--ignored",
-                "--exact",
-                ENV_LISTING_CHILD_TEST,
-                "--nocapture",
-            ]
-            .map(str::to_owned)
-            .to_vec(),
-            base: EnvBase::Inherited,
-            env: Vec::new(),
-            cwd: cwd.path().to_path_buf(),
-            cols: 4000,
-            rows: 24,
-        });
-        let mut output = pty.subscribe_output(None).expect("subscribe");
-        let exit = pty.wait_exit().await.expect("exit");
-        assert_eq!(exit.exit_code, Some(0));
-
-        let mut observed = Vec::new();
-        while let Some(event) = output.recv().await {
-            match event {
-                OutputEvent::Replay(chunk) | OutputEvent::Output(chunk) => {
-                    observed.extend_from_slice(&chunk.bytes);
-                }
-                OutputEvent::Exit { .. } => break,
-                OutputEvent::Gap { .. } => panic!("environment listing must fit the history"),
-                OutputEvent::TerminalSnapshot(_) => {}
-            }
-        }
-        let observed = String::from_utf8(observed).expect("environment listing is UTF-8");
-        assert!(
-            observed.contains(ENV_LISTING_PREFIX),
-            "the listing child printed nothing: {observed}"
-        );
-        assert!(
-            !observed.contains("POHUNEK_WORKER_INSTANCE_ID"),
-            "the ambient worker instance marker reached the child"
-        );
     }
 
     #[tokio::test]
@@ -3083,7 +3007,6 @@ mod tests {
             args: ["--ignored", "--exact", HELD_ROOT_CHILD_TEST, "--nocapture"]
                 .map(str::to_owned)
                 .to_vec(),
-            base: EnvBase::Empty,
             env,
             cwd: cwd.to_path_buf(),
             cols: 200,
@@ -3261,7 +3184,6 @@ mod tests {
                 barrier.path().to_string_lossy().into_owned(),
                 ready.to_string_lossy().into_owned(),
             ],
-            base: EnvBase::Empty,
             env: crate::test_support::child_env(),
             cwd: barrier.path().to_path_buf(),
             cols: 80,
@@ -3335,7 +3257,6 @@ mod tests {
                 barrier.path().to_string_lossy().into_owned(),
                 ready.to_string_lossy().into_owned(),
             ],
-            base: EnvBase::Empty,
             env: crate::test_support::child_env(),
             cwd: barrier.path().to_path_buf(),
             cols: 80,

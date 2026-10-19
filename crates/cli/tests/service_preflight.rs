@@ -231,7 +231,7 @@ impl Host {
             own.pid,
             own.start_identity.to_string(),
             "boot".to_owned(),
-            (5, 6),
+            (7, 8),
             "2026-09-24T00:00:00Z".to_owned(),
         );
         journal.phase = pohunek_session_worker::RuntimePhase::Live;

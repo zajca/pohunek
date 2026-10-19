@@ -15,7 +15,6 @@ use thiserror::Error;
 use crate::{
     BaseEnv, DaemonId, DataToken, LeaseChallenge, LeaseId, RequestId, SecretBytes, SecretEnv,
     SessionId, StreamId, TransactionId, Version, VersionRange, WorkerId, WorkerInstanceId, WriteId,
-    BASE_ENVIRONMENT_VERSION, INPUT_STALL_VERSION,
 };
 
 /// Features a daemon or worker may negotiate.
@@ -140,28 +139,6 @@ pub enum ControlTypeError {
     /// An input plan contained no fragments or only empty fragments.
     #[error("input plan must contain at least one nonempty fragment")]
     EmptyInputPlan,
-    /// An `Initialize` base environment did not match the negotiated version.
-    #[error(
-        "worker protocol {version} requires the base environment to be {}",
-        if *required { "present" } else { "absent" }
-    )]
-    BaseEnvironmentMismatch {
-        /// Protocol version negotiated for the connection.
-        version: Version,
-        /// Whether that version requires the field.
-        required: bool,
-    },
-    /// An `Initialize` input policy did not match the negotiated version.
-    #[error(
-        "worker protocol {version} requires the input policy to be {}",
-        if *required { "present" } else { "absent" }
-    )]
-    InputPolicyMismatch {
-        /// Protocol version negotiated for the connection.
-        version: Version,
-        /// Whether that version requires the field.
-        required: bool,
-    },
 }
 
 /// Identifies the logical launch agent without provider credentials.
@@ -513,25 +490,13 @@ pub struct Initialize {
     /// Profile environment passed only to child construction.
     pub environment: SecretEnv,
     /// Allowlisted non-secret environment placed under the child.
-    ///
-    /// Present exactly when the negotiated version is at least
-    /// [`BASE_ENVIRONMENT_VERSION`]. The wire omits it when absent so a
-    /// version-five peer neither sends nor sees it; `Option` rather than an
-    /// empty map keeps "not sent" distinguishable from "sent empty", which
-    /// [`Initialize::check_version`] relies on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_environment: Option<BaseEnv>,
+    pub base_environment: BaseEnv,
     /// Bounded worker memory and retention configuration.
     pub limits: InitializeLimits,
     /// Explicit process-group stop policy.
     pub stop_policy: StopPolicy,
     /// PTY input stall bound.
-    ///
-    /// Present exactly when the negotiated version is at least
-    /// [`INPUT_STALL_VERSION`]; the wire omits it when absent so a
-    /// version-six peer neither sends nor sees it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_policy: Option<InputPolicy>,
+    pub input_policy: InputPolicy,
     /// Worker-local identity-hook protocol version.
     pub hook_protocol_version: Version,
     /// Public daemon RPC protocol version the managed child's provider hooks
@@ -570,32 +535,6 @@ impl Debug for Initialize {
             .field("public_protocol_version", &self.public_protocol_version)
             .field("hook_schema", &self.hook_schema)
             .finish()
-    }
-}
-
-impl Initialize {
-    /// Checks that the version-gated fields match `version`.
-    ///
-    /// Serde accepts `Initialize` independently of the negotiated version, so
-    /// both peers call this after negotiation: the base environment is
-    /// required from [`BASE_ENVIRONMENT_VERSION`] and the input policy from
-    /// [`INPUT_STALL_VERSION`]; below its version each field must be absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControlTypeError::BaseEnvironmentMismatch`] or
-    /// [`ControlTypeError::InputPolicyMismatch`] when a field is missing for a
-    /// version that requires it, or present for one that does not know it.
-    pub fn check_version(&self, version: Version) -> Result<(), ControlTypeError> {
-        let required = version >= BASE_ENVIRONMENT_VERSION;
-        if self.base_environment.is_some() != required {
-            return Err(ControlTypeError::BaseEnvironmentMismatch { version, required });
-        }
-        let required = version >= INPUT_STALL_VERSION;
-        if self.input_policy.is_some() != required {
-            return Err(ControlTypeError::InputPolicyMismatch { version, required });
-        }
-        Ok(())
     }
 }
 
@@ -1266,14 +1205,10 @@ pub enum ControlCode {
     ObservationLimitExceeded,
     /// PTY input made no progress within the input stall bound.
     ///
-    /// Part of the plan may already have reached the child. Sent only on
-    /// connections that negotiated at least [`INPUT_STALL_VERSION`].
+    /// Part of the plan may already have reached the child.
     InputStalled,
     /// The launch working directory is not an existing directory, so no child
     /// process was spawned.
-    ///
-    /// Sent only on connections that negotiated at least
-    /// [`LAUNCH_CWD_CHECK_VERSION`](crate::LAUNCH_CWD_CHECK_VERSION).
     LaunchCwdMissing,
 }
 
@@ -1402,16 +1337,14 @@ mod tests {
             dimensions: Dimensions::new(120, 40).expect("valid dimensions"),
             environment: SecretEnv::new(BTreeMap::from([("TOKEN".to_owned(), secret.to_owned())]))
                 .expect("valid environment"),
-            base_environment: Some(
-                BaseEnv::new(BTreeMap::from([(
-                    "HOME".to_owned(),
-                    format!("/home/{secret}"),
-                )]))
-                .expect("valid base environment"),
-            ),
+            base_environment: BaseEnv::new(BTreeMap::from([(
+                "HOME".to_owned(),
+                format!("/home/{secret}"),
+            )]))
+            .expect("valid base environment"),
             limits: InitializeLimits::new(1024, 1024, 32, 60_000).expect("valid limits"),
             stop_policy: StopPolicy::new(5_000).expect("valid policy"),
-            input_policy: Some(InputPolicy::new(3_000).expect("valid policy")),
+            input_policy: InputPolicy::new(3_000).expect("valid policy"),
             hook_protocol_version: CURRENT_VERSION,
             public_protocol_version: 1,
             hook_schema: None,
@@ -1425,46 +1358,6 @@ mod tests {
 
         assert!(!rendered.contains(secret));
         assert!(rendered.contains("<redacted>"));
-    }
-
-    #[test]
-    fn initialize_gates_its_fields_on_the_negotiated_version() {
-        let v7 = initialize("value");
-        v7.check_version(INPUT_STALL_VERSION)
-            .expect("version seven carries the base environment and the input policy");
-        assert_eq!(
-            v7.check_version(BASE_ENVIRONMENT_VERSION),
-            Err(ControlTypeError::InputPolicyMismatch {
-                version: BASE_ENVIRONMENT_VERSION,
-                required: false,
-            })
-        );
-
-        let v6 = Initialize {
-            input_policy: None,
-            ..initialize("value")
-        };
-        v6.check_version(BASE_ENVIRONMENT_VERSION)
-            .expect("version six carries only the base environment");
-        assert_eq!(
-            v6.check_version(INPUT_STALL_VERSION),
-            Err(ControlTypeError::InputPolicyMismatch {
-                version: INPUT_STALL_VERSION,
-                required: true,
-            })
-        );
-
-        let without_base = Initialize {
-            base_environment: None,
-            ..v6
-        };
-        assert_eq!(
-            without_base.check_version(BASE_ENVIRONMENT_VERSION),
-            Err(ControlTypeError::BaseEnvironmentMismatch {
-                version: BASE_ENVIRONMENT_VERSION,
-                required: true,
-            })
-        );
     }
 
     #[test]
@@ -1503,25 +1396,26 @@ mod tests {
     }
 
     #[test]
-    fn version_five_initialize_wire_has_no_base_environment_field() {
-        let v5 = Initialize {
-            base_environment: None,
-            ..initialize("value")
-        };
-        let json = serde_json::to_value(&v5).expect("serialize initialize");
-        assert!(json.get("base_environment").is_none());
+    fn initialize_wire_requires_the_base_environment_and_the_input_policy() {
+        let wire = serde_json::to_value(initialize("value")).expect("serialize initialize");
+        assert_eq!(wire["base_environment"]["HOME"], "/home/value");
+        assert_eq!(wire["input_policy"]["stall_ms"], 3_000);
         assert_eq!(
-            serde_json::from_value::<Initialize>(json).expect("deserialize v5 initialize"),
-            v5
+            serde_json::from_value::<Initialize>(wire.clone()).expect("round trip"),
+            initialize("value")
         );
 
-        let v6 = initialize("value");
-        let json = serde_json::to_value(&v6).expect("serialize initialize");
-        assert_eq!(json["base_environment"]["HOME"], "/home/value");
-        assert_eq!(
-            serde_json::from_value::<Initialize>(json).expect("deserialize v6 initialize"),
-            v6
-        );
+        for field in ["base_environment", "input_policy"] {
+            let mut incomplete = wire.clone();
+            incomplete
+                .as_object_mut()
+                .expect("initialize object")
+                .remove(field);
+            assert!(
+                serde_json::from_value::<Initialize>(incomplete).is_err(),
+                "an initialize without {field} must be refused"
+            );
+        }
     }
 
     #[test]
