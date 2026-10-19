@@ -3973,13 +3973,13 @@ async fn a_procwatch_observed_own_agent_is_not_shadowed_by_a_profile_named_like_
         SLEEPING_LAUNCH,
     )
     .await;
-    observe_own_runtime_process(&adopted.registry, &created_id).await;
-    // The daemon restarts from its persisted record.
-    persist_session(&adopted.registry, &created_id).await;
+    // procwatch observations are memory-only: the restarted daemon observes the
+    // process again.
     let adopted = adopted.reopen_with_workers_of(&adopted.registry).await;
     Box::pin(adopted.registry.reconcile_workers())
         .await
         .expect("startup reconciliation");
+    observe_own_runtime_process(&adopted.registry, &created_id).await;
 
     install_unselected_next_claude(&adopted).await;
     let served = adopted
