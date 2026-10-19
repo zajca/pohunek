@@ -58,6 +58,7 @@ use super::{
 mod conflict_cleanup;
 mod native_recovery;
 mod native_supersede;
+mod stale_worker_metadata;
 
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.
 const CONCURRENT_TRANSITION_RETRY_LIMIT: usize = 32;
