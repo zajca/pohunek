@@ -1948,13 +1948,29 @@ async fn purge_reports_non_utf8_retained_names_as_escaped_json_strings() {
         } else {
             paths.data_dir.clone()
         };
-        let names: [(&[u8], &str); 4] = [
-            (b"keep-\xff", r"keep-\xff"),
+        let mut names: Vec<(&[u8], &str)> = vec![
             (b"keep-\\xff", r"keep-\\xff"),
             (b"keep-\n", r"keep-\n"),
             ("keep-é".as_bytes(), r"keep-\xc3\xa9"),
         ];
-        for (name, _) in names {
+        let non_utf8 = parent.join(std::ffi::OsStr::from_bytes(b"keep-\xff"));
+        match std::fs::write(&non_utf8, "owner work") {
+            Ok(()) => names.push((b"keep-\xff", r"keep-\xff")),
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                {
+                    // Native APFS rejects this name before a purge can ever observe it.
+                    assert_eq!(error.raw_os_error(), Some(nix::libc::EILSEQ));
+                    non_utf8
+                        .symlink_metadata()
+                        .expect_err("a rejected filename has no directory entry");
+                    eprintln!("filesystem explicitly rejected the non-UTF-8 fixture with EILSEQ; supported retained names still exercise purge and JSON");
+                }
+                #[cfg(not(target_os = "macos"))]
+                panic!("non-UTF-8 fixture must be supported on this filesystem: {error}");
+            }
+        }
+        for (name, _) in &names {
             std::fs::write(parent.join(std::ffi::OsStr::from_bytes(name)), "owner work")
                 .expect("retained file");
         }
@@ -1969,7 +1985,7 @@ async fn purge_reports_non_utf8_retained_names_as_escaped_json_strings() {
         let entries = document["ok"]["kept_purge_entries"]
             .as_array()
             .expect("retained paths");
-        for (name, escaped) in names {
+        for (name, escaped) in &names {
             let path = parent.join(std::ffi::OsStr::from_bytes(name));
             assert_eq!(
                 std::fs::read_to_string(path).expect("retained file"),
