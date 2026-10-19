@@ -3163,6 +3163,49 @@ async fn the_acceptance_scope_is_stable_for_identical_facts_and_changes_with_eac
 }
 
 #[tokio::test]
+async fn the_acceptance_scope_binds_the_native_reference_startup_imports_from_the_journal() {
+    // Startup imports the reference a live worker journaled before it persists
+    // the record, so the scope of a record that still stores the older
+    // reference is the scope of the record that already stores the newer one.
+    let stored = ScopedFacts {
+        native_id: Some("native-fixture-2"),
+        ..ScopedFacts::baseline()
+    };
+    let host = Host::serving().await;
+    host.write_store(&[stored.line()]);
+    let mut switched = stored.journal();
+    let child = switched["child"].clone();
+    switched["launch_identity"] = json!({
+        "provider": "pi",
+        "process": child,
+        "reference_kind": "id",
+        "native_reference": "native-fixture-2",
+    });
+    switched["native_reference_claim"] = json!({
+        "provider": "pi",
+        "process": child,
+        "sequence": 1,
+        "reference_kind": "id",
+        "native_reference": "native-fixture-3",
+    });
+    host.write_journal("s-1", "w-fixture", &switched);
+    let imported = live_scope(&host.report(), CODE_RUNTIME_SOURCE_NOT_SERVED);
+
+    let already = ScopedFacts {
+        native_id: Some("native-fixture-3"),
+        ..ScopedFacts::baseline()
+    };
+    let persisted = live_scope(&already.live_report().await, CODE_RUNTIME_SOURCE_NOT_SERVED);
+    let unswitched = live_scope(&stored.live_report().await, CODE_RUNTIME_SOURCE_NOT_SERVED);
+
+    assert_ne!(
+        imported, unswitched,
+        "the journaled reference is not imported"
+    );
+    assert_eq!(imported, persisted);
+}
+
+#[tokio::test]
 async fn the_acceptance_scope_does_not_depend_on_the_volatile_fields_startup_rewrites() {
     let baseline = stopped_scope(
         &ScopedFacts::baseline().stopped_report().await,

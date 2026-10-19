@@ -68,10 +68,11 @@ use protocol::{
 };
 
 use super::{
-    import_terminal_native_reference, import_worker_identities, import_worker_subagents,
-    initial_input_orphaned, merge_persisted_recovery, recovery_not_advanced, reported_hook_schema,
-    runtime_identity_conflict, scan_worker_journals, validate_identity_claims, IdentityClaims,
-    JournalEvidence, JournalPhase, JournalReject, WorkerJournalScan,
+    import_native_reference, import_terminal_native_reference, import_worker_identities,
+    import_worker_subagents, initial_input_orphaned, merge_persisted_recovery,
+    recovery_not_advanced, reported_hook_schema, runtime_identity_conflict, scan_worker_journals,
+    validate_identity_claims, IdentityClaims, JournalEvidence, JournalPhase, JournalReject,
+    WorkerJournalScan,
 };
 use crate::agent::host::{
     adopts, adopts_newer, validate_launch_runtime_with_timeout_detailed, BuiltinSource,
@@ -1927,6 +1928,9 @@ fn judge_identity(
             }
         }
     }
+    // Startup imports the journaled native reference before the identities, so
+    // the candidate holds the reference the replacement daemon persists.
+    import_native_reference(candidate, &snapshot);
     if let Err(reason) = import_worker_identities(candidate, &snapshot) {
         return Some(not_adopted(
             reason,
