@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -6549,10 +6549,6 @@ async fn daemon_reconnect_scopes_reset_activity_revision_with_new_epoch() {
 }
 
 #[tokio::test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the hook-to-journal reconnect scenario is intentionally linear so the trust-boundary assertions remain ordered"
-)]
 async fn codex_hook_journal_survives_daemon_reconciliation() {
     let store_path = temp_store_path("subagent-hook-reconcile");
     let worker_state_root = store_path
@@ -6632,20 +6628,10 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
         .await
         .expect("inspect after reconnect");
     assert_eq!(snapshot.subagents.len(), 1, "worker journal retained child");
-    // The apply accepts a snapshot only while the durable record still names the
-    // reconnected worker runtime as live. The worker task that is still running
-    // commits its own snapshots, so that record can be momentarily stale between
-    // this test's durable write and its apply. Waiting for the documented
-    // precondition removes the race without weakening what the apply is asked
-    // to prove, and a precondition that never holds says so.
-    wait_for_current_worker_metadata_record(&registry, &store, &created.id, &snapshot).await;
-    assert_eq!(
-        registry
-            .apply_worker_metadata_snapshot(&created.id, &snapshot)
-            .await,
-        WorkerMetadataApplyOutcome::Applied,
-        "reconnected snapshot applies"
-    );
+    // The worker task that is still running commits its own snapshots, so the
+    // record can be momentarily not current; the apply reports that as
+    // retryable.
+    assert_worker_metadata_applied(&registry, &created.id, &snapshot, "reconnected snapshot").await;
     registry
         .inner
         .sessions
@@ -6668,6 +6654,192 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
     assert!(!serialized.contains("prompt"));
 
     let _ = registry.stop(&created.id).await;
+}
+
+/// How long a retried worker metadata snapshot may take to be registered: a
+/// few of the retry delays, far below the lifetime of the test's worker.
+const METADATA_RETRY_BOUND: Duration = Duration::from_secs(10);
+
+/// A registry whose worker journals subagent `child-late` once the returned
+/// gate file exists, then runs `tail`.
+fn registry_with_late_subagent(name: &str, tail: &str) -> (SessionRegistry, PathBuf) {
+    let store_path = temp_store_path(name);
+    let state_dir = store_path.parent().expect("store parent").to_path_buf();
+    let gate = state_dir.join("late-subagent-gate");
+    let worker_state_root = state_dir.join("worker-state");
+    let worker_runtime_root = crate::test_support::thread_scoped_dir("pw-late-");
+    let hook_path = crate::integration::runnable_script("codex", "pohunek-agent-state.sh");
+    let payload = serde_json::json!({
+        "session_id": "native-parent",
+        "turn_id": "turn-child",
+        "hook_event_name": "SubagentStart",
+        "agent_id": "child-late",
+        "agent_type": "reviewer",
+    });
+    let command = format!(
+        "while [ ! -e '{}' ]; do sleep 0.05; done; printf '%s' '{payload}' | sh '{}' subagent-start; {tail}",
+        gate.display(),
+        hook_path.display()
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", command.as_str()]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path),
+        worker_runtime_root: Some(worker_runtime_root),
+        worker_state_root: Some(worker_state_root),
+        ..SessionRegistryConfig::default()
+    });
+    (registry, gate)
+}
+
+/// Lets the worker's shell journal the late subagent.
+fn release_late_subagent(gate: &Path) {
+    fs::write(gate, "").expect("release the late subagent");
+}
+
+/// Waits until the exit watcher logged `message`, the observable effect of its
+/// apply of the late subagent having reached that outcome.
+async fn wait_for_watcher_log(logs: &crate::runtime::lifecycle::tests::LogCapture, message: &str) {
+    tokio::time::timeout(
+        METADATA_RETRY_BOUND,
+        wait_until("the exit watcher's apply outcome", || async {
+            logs.text().contains(message).then_some(())
+        }),
+    )
+    .await
+    .unwrap_or_else(|_elapsed| panic!("the watcher never logged {message:?}: {}", logs.text()));
+}
+
+async fn registered_subagent_ids(registry: &SessionRegistry, id: &SessionId) -> Vec<String> {
+    registry
+        .inspect(id)
+        .await
+        .expect("inspect session")
+        .subagents
+        .into_iter()
+        .map(|subagent| subagent.id)
+        .collect()
+}
+
+/// A snapshot for the current worker whose record has not caught up yet is
+/// applied once the record is current, not dropped for good.
+#[tokio::test]
+async fn worker_metadata_reported_before_the_record_is_current_is_applied_afterwards() {
+    let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+    let _subscriber = logs.install();
+    let (registry, gate) = registry_with_late_subagent("metadata-not-current-yet", "sleep 120");
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, expected) = live_worker_and_identity(&registry, &created.id).await;
+    assert!(
+        registry
+            .mark_worker_reconnecting(
+                &created.id,
+                &expected,
+                &WorkerError::Protocol("test disconnect".to_owned()),
+            )
+            .await
+    );
+
+    release_late_subagent(&gate);
+    wait_for_watcher_log(&logs, "worker metadata waits for the record to be current").await;
+    assert!(
+        registered_subagent_ids(&registry, &created.id)
+            .await
+            .is_empty(),
+        "a record that is not live yet takes no worker metadata"
+    );
+    assert_reconnect_transition_applied(&registry, &created.id, &expected, &worker).await;
+
+    // The worker outlives the wait, so only a retry of the dropped snapshot
+    // can register the subagent within the bound.
+    let observed = tokio::time::timeout(
+        METADATA_RETRY_BOUND,
+        wait_until("the subagent reported while not current", || async {
+            registered_subagent_ids(&registry, &created.id)
+                .await
+                .into_iter()
+                .next()
+        }),
+    )
+    .await
+    .expect("the snapshot reported while not current is retried");
+    assert_eq!(observed, "child-late");
+
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A snapshot of a worker the record no longer names stays dropped, with a
+/// warning, even when the record later names that worker again.
+#[tokio::test]
+async fn worker_metadata_of_a_superseded_worker_is_dropped_with_a_warning() {
+    let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+    let _subscriber = logs.install();
+    let (registry, gate) = registry_with_late_subagent("metadata-superseded", "sleep 30");
+    let created = registry.create(params()).await.expect("create session");
+    let original = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let runtime = sessions
+            .get_mut(&created.id)
+            .expect("live entry")
+            .info
+            .runtime
+            .as_mut()
+            .expect("runtime info");
+        runtime
+            .worker_instance_id
+            .replace("runtime-replaced".to_owned())
+    };
+
+    release_late_subagent(&gate);
+    wait_for_watcher_log(&logs, "worker metadata discarded").await;
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .expect("live entry")
+        .info
+        .runtime
+        .as_mut()
+        .expect("runtime info")
+        .worker_instance_id = original;
+    // timing-allowed: #157 asserts the absence of a retry, which no event signals
+    tokio::time::sleep(super::WORKER_CONNECT_RETRY * 10).await;
+
+    assert!(
+        registered_subagent_ids(&registry, &created.id)
+            .await
+            .is_empty(),
+        "a superseded snapshot is not retried"
+    );
+
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A record that stays not current while the worker has exited does not hold
+/// the exit back.
+#[tokio::test]
+async fn a_not_current_record_does_not_hold_back_the_recorded_exit() {
+    let (registry, gate) = registry_with_late_subagent("metadata-not-current-exit", "true");
+    let created = registry.create(params()).await.expect("create session");
+    let (_worker, expected) = live_worker_and_identity(&registry, &created.id).await;
+    assert!(
+        registry
+            .mark_worker_reconnecting(
+                &created.id,
+                &expected,
+                &WorkerError::Protocol("test disconnect".to_owned()),
+            )
+            .await
+    );
+
+    release_late_subagent(&gate);
+    wait_until("the exit to be recorded", || async {
+        let info = registry.inspect(&created.id).await.ok()?;
+        (info.state != SessionState::Running).then_some(())
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -6745,14 +6917,13 @@ async fn a_worker_without_a_journaled_schema_is_reprojected_with_the_runtime_sch
         .expect("inspect after reconnect");
     // A worker built before schema delivery journals no schema.
     snapshot.hook_schema = None;
-    wait_for_current_worker_metadata_record(&registry, &store, &created.id, &snapshot).await;
-    assert_eq!(
-        registry
-            .apply_worker_metadata_snapshot(&created.id, &snapshot)
-            .await,
-        WorkerMetadataApplyOutcome::Applied,
-        "the daemon resolves the schema from the session's pinned runtime"
-    );
+    assert_worker_metadata_applied(
+        &registry,
+        &created.id,
+        &snapshot,
+        "the daemon resolves the schema from the session's pinned runtime",
+    )
+    .await;
     registry
         .inner
         .sessions
@@ -6819,60 +6990,25 @@ async fn a_worker_connection_lost_during_daemon_shutdown_leaves_the_runtime_live
     let _ = registry.stop(&created.id).await;
 }
 
-/// Waits until both records name the snapshot's worker runtime as live.
-///
-/// Applying worker metadata requires the in-memory and the durable record to be
-/// current, and a worker task that is still running commits its own snapshots,
-/// so either can be momentarily stale right after a test writes one of its own.
-/// Naming whichever record stayed stale keeps a discarded snapshot from being
-/// the only thing a failure reports.
-async fn wait_for_current_worker_metadata_record(
+/// Applies `snapshot` the way the exit watcher does: an outcome that says the
+/// record is not current yet is retried, anything else other than an applied
+/// snapshot fails the test.
+async fn assert_worker_metadata_applied(
     registry: &SessionRegistry,
-    store: &crate::store::Store,
     id: &SessionId,
     snapshot: &pohunek_worker_protocol::InspectSnapshot,
+    what: &str,
 ) {
-    let worker_id = snapshot.worker_id.to_string();
-    let worker_instance_id = snapshot
-        .worker_instance_id
-        .as_ref()
-        .map(ToString::to_string);
-    let is_current = |record: &crate::store::SessionRecord| {
-        super::reconcile::worker_metadata_record_is_current(
-            record,
-            &worker_id,
-            worker_instance_id.as_deref(),
-        )
-    };
-    let mut memory_current = false;
-    let mut durable_current = false;
     for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
-        memory_current = {
-            let sessions = registry.inner.sessions.lock().await;
-            let entry = sessions.get(id).expect("live session entry");
-            is_current(&SessionRegistry::session_record(
-                id,
-                entry,
-                entry.desired_state,
-                None,
-            ))
-        };
-        durable_current = store
-            .load_sessions()
-            .expect("load durable sessions")
-            .pop()
-            .is_some_and(|record| is_current(&record));
-        if memory_current && durable_current {
-            return;
+        match registry.apply_worker_metadata_snapshot(id, snapshot).await {
+            WorkerMetadataApplyOutcome::Applied => return,
+            WorkerMetadataApplyOutcome::Retryable(_) => tokio::task::yield_now().await,
+            outcome @ WorkerMetadataApplyOutcome::Discarded => {
+                panic!("{what}: unexpected worker metadata outcome: {outcome:?}")
+            }
         }
-        // `worker_metadata_record_is_current` is a plain bool with no retryable
-        // signal, so this waits on the committing task's wall-clock progress
-        // rather than on a scheduler turn the way `yield_now()` siblings do.
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!(
-        "worker runtime never settled as live (memory: {memory_current}, durable: {durable_current})"
-    );
+    panic!("{what}: worker metadata remained retryable");
 }
 
 fn worker_subagent_snapshot(id: &str) -> pohunek_worker_protocol::SubagentSnapshot {
