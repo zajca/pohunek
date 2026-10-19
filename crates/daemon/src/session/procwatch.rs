@@ -40,6 +40,10 @@ struct ScanLineage {
     /// running after collecting the facts and it is not owned by another
     /// session.
     reporter: Option<ProcessIdentity>,
+    /// Processes between the reporter and the root that another session or
+    /// worker owns. Such an agent is never observed, yet a claim cannot pass
+    /// through it.
+    foreign: HashSet<Pid>,
 }
 
 struct LineageEntry {
@@ -932,10 +936,25 @@ impl SessionRegistry {
                     }
                 }
             });
+        let mut foreign = HashSet::new();
+        if reporter.is_some() {
+            let mut current = processes.get(&pid).map(|entry| entry.parent);
+            // Bounded like the ancestry walk: a cyclic table ends the loop.
+            for _ in 0..processes.len() {
+                let Some(ancestor) = current.filter(|ancestor| *ancestor != root.pid) else {
+                    break;
+                };
+                if self.is_foreign_owned_agent(id, ancestor, Some(worker_instance_id)) {
+                    foreign.insert(ancestor);
+                }
+                current = processes.get(&ancestor).map(|entry| entry.parent);
+            }
+        }
         ScanLineage {
             root,
             processes,
             reporter,
+            foreign,
         }
     }
 
@@ -998,6 +1017,9 @@ impl SessionRegistry {
             let Some(current) = process else {
                 return false;
             };
+            if lineage.foreign.contains(&current.identity.pid) {
+                return false;
+            }
             if is_anchor(current.identity) {
                 return bind_report_start_identity(entry, reporter.start_identity.get());
             }

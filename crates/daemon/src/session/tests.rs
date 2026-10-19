@@ -10429,6 +10429,26 @@ fn invalidate_descendant_claim(case: &str, inspector: &MockInspector, root: Pid)
                 ],
             );
         }
+        "reporter-below-foreign-agent" => {
+            // The agent between the wrapper and the unmarked reporter belongs
+            // to another session, so the session never observes it.
+            reporter.ppid = DESCENDANT_OTHER_AGENT_PID;
+            inspector.set_descendants(
+                root,
+                vec![
+                    wrapper,
+                    claude_fact(DESCENDANT_OTHER_AGENT_PID, DESCENDANT_WRAPPER_PID),
+                    reporter,
+                ],
+            );
+            inspector.set_ownership_markers(
+                DESCENDANT_OTHER_AGENT_PID,
+                OwnershipMarkers {
+                    session_id: Some("another-session".to_owned()),
+                    ..OwnershipMarkers::default()
+                },
+            );
+        }
         "reporter-foreign-session" => inspector.set_ownership_markers(
             DESCENDANT_REPORTER_PID,
             OwnershipMarkers {
@@ -10494,6 +10514,11 @@ async fn descendant_reporter_different_runtime_releases_the_claim() {
 #[tokio::test]
 async fn descendant_reporter_below_another_runtime_releases_the_claim() {
     descendant_claim_replacement("reporter-below-other-runtime").await;
+}
+
+#[tokio::test]
+async fn descendant_reporter_below_a_foreign_owned_agent_releases_the_claim() {
+    descendant_claim_replacement("reporter-below-foreign-agent").await;
 }
 
 #[tokio::test]
