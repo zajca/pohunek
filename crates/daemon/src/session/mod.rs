@@ -813,9 +813,11 @@ struct SessionEntry {
     last_native_report: Option<NativeIdentityReport>,
     observed_agents: Vec<ObservedAgent>,
     process_lineage: HashMap<Pid, procwatch::ProcessLineage>,
-    /// Cached with lineage so an inconclusive scan preserves claims on exit
-    /// callbacks too, without supplying new identity or ancestry evidence.
-    process_uncertainty: Vec<Pid>,
+    /// Own-process probe errors, cached atomically with verified identities.
+    /// Ancestry uncertainty is derived from these after scans and exits.
+    process_uncertainty: Vec<ProcessIdentity>,
+    /// Invalidates snapshots collected before a confirmed process exit.
+    process_exit_generation: u64,
     /// When the evidence that set `info.cwd` was observed. Older cwd evidence
     /// never replaces it, so a scan that read a process before a newer OSC 7
     /// hint landed cannot move the session back.
@@ -6962,7 +6964,11 @@ fn bind_report_process(
         let start_identity = entry
             .observed_agents
             .iter()
-            .find(|observed| observed.pid == pid && &observed.agent_base == agent_base)
+            .find(|observed| {
+                observed.pid == pid
+                    && &observed.agent_base == agent_base
+                    && procwatch::observation_verified(entry, observed)
+            })
             .map(|observed| observed.start_identity);
         return (Some(pid), start_identity);
     }
@@ -6971,11 +6977,17 @@ fn bind_report_process(
         .observed_agents
         .iter()
         .filter(|observed| &observed.agent_base == agent_base)
-        .map(|observed| (observed.pid, observed.start_identity));
+        .map(|observed| {
+            (
+                observed.pid,
+                observed.start_identity,
+                procwatch::observation_verified(entry, observed),
+            )
+        });
     let Some(first) = matching.next() else {
         return (None, None);
     };
-    if matching.next().is_none() {
+    if matching.next().is_none() && first.2 {
         (Some(first.0), Some(first.1))
     } else {
         (None, None)

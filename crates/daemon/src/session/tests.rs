@@ -11082,6 +11082,792 @@ async fn foreground_probe_does_not_hold_global_session_lock() {
     let _ = registry.stop(&created.id).await;
 }
 
+/// Matrix rows D/P-S/R: conclusive identity refutation precedes ancestry
+/// uncertainty and every foreground decision, including probe failure.
+async fn descendant_reporter_refutation_precedes_ancestry_uncertainty(reused: bool) {
+    for foreground in [
+        None,
+        Some(DESCENDANT_WRAPPER_PID),
+        Some(DESCENDANT_REPORTER_PID),
+    ] {
+        for foreground_error in [false, true] {
+            let (registry, inspector, created) = mock_procwatch_registry("refuted-uncertain").await;
+            let wrapper = codex_fact(DESCENDANT_WRAPPER_PID, created.pid);
+            let mut reporter = ProcessFact {
+                comm: "wrapper-helper".to_owned(),
+                cmdline: vec!["/usr/bin/wrapper-helper".to_owned()],
+                ..codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID)
+            };
+            inspector.set_descendants(created.pid, vec![wrapper.clone(), reporter.clone()]);
+            inspector.set_foreground_group(created.pid, foreground);
+            assert!(
+                registry
+                    .report_agent(audit_claim(
+                        &created.id,
+                        DIRECT_AGENT_REPORT_SEQ,
+                        DESCENDANT_NATIVE_SESSION_ID
+                    ))
+                    .await
+                    .recorded
+            );
+            registry
+                .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+                .await;
+            let () = {
+                let sessions = registry.inner.sessions.lock().await;
+                assert_eq!(
+                    sessions[&created.id]
+                        .active_agent
+                        .as_ref()
+                        .expect("bound claim")
+                        .start_identity,
+                    Some(reporter.start_identity.get())
+                );
+            };
+            inspector
+                .fail_identity_with(DESCENDANT_WRAPPER_PID, std::io::ErrorKind::PermissionDenied);
+            if reused {
+                reporter.start_identity = StartIdentity::new(reporter.start_identity.get() + 1);
+                inspector.set_descendants(created.pid, vec![wrapper, reporter.clone()]);
+            } else {
+                inspector.set_not_running(reporter.identity());
+            }
+            if foreground_error {
+                inspector.fail_foreground_with(std::io::ErrorKind::PermissionDenied);
+            }
+            // Repeating the same evidence must never resurrect the old claim.
+            for _ in 0..2 {
+                registry
+                    .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+                    .await;
+                let info = registry.inspect(&created.id).await.expect("refuted claim");
+                assert_eq!(
+                    info.active_agent_session_id, None,
+                    "reused={reused}, foreground={foreground:?}, error={foreground_error}"
+                );
+                assert_eq!(info.active_agent_session_path, None);
+                assert_ne!(info.active_agent_pid, Some(DESCENDANT_REPORTER_PID));
+                assert_ne!(
+                    info.activity,
+                    Some(AgentActivity::Working),
+                    "refuted hook activity must clear"
+                );
+                assert_ne!(info.state_source, StateSource::Report);
+            }
+            registry
+                .stop(&created.id)
+                .await
+                .expect("stop refutation fixture");
+        }
+    }
+}
+
+#[tokio::test]
+async fn descendant_reporter_death_precedes_ancestry_uncertainty() {
+    descendant_reporter_refutation_precedes_ancestry_uncertainty(false).await;
+}
+
+#[tokio::test]
+async fn descendant_reporter_reuse_precedes_ancestry_uncertainty() {
+    descendant_reporter_refutation_precedes_ancestry_uncertainty(true).await;
+}
+
+fn audit_claim(id: &SessionId, seq: u64, native: &str) -> SessionReportAgentParams {
+    SessionReportAgentParams {
+        session_id: id.clone(),
+        source: CODEX_HOOK_SOURCE.to_owned(),
+        agent: CODEX_HOOK_AGENT.to_owned(),
+        activity: Some(AgentActivity::Working),
+        seq: Some(ReportSequence::new(seq)),
+        pid: Some(DESCENDANT_REPORTER_PID),
+        agent_session_id: Some(native.to_owned()),
+        agent_session_path: Some("/work/audit-native.jsonl".to_owned()),
+    }
+}
+
+/// Matrix H rows exercise admission, cached binding and subsequent scans
+/// through the registry boundary, for recognized and helper reporters.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one admitted claim crosses cached binding, callback, scan and rescan boundaries"
+)]
+async fn descendant_hook_evidence_case(state: &str) {
+    for recognized in [false, true] {
+        let (registry, inspector, created) = mock_procwatch_registry("hook-evidence").await;
+        let wrapper = codex_fact(DESCENDANT_WRAPPER_PID, created.pid);
+        let mut reporter = codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID);
+        if !recognized {
+            reporter.comm = "wrapper-helper".to_owned();
+            reporter.cmdline = vec!["/usr/bin/wrapper-helper".to_owned()];
+        }
+        match state {
+            "dead" | "dead-ancestor" => inspector.set_not_running(reporter.identity()),
+            "inconclusive" => inspector.fail_identity_with(
+                DESCENDANT_REPORTER_PID,
+                std::io::ErrorKind::PermissionDenied,
+            ),
+            "ancestor" => inspector
+                .fail_identity_with(DESCENDANT_WRAPPER_PID, std::io::ErrorKind::PermissionDenied),
+            "reused" | "reused-ancestor" => {
+                reporter.start_identity = StartIdentity::new(reporter.start_identity.get() + 1);
+            }
+            "live" => {}
+            _ => unreachable!("known evidence state"),
+        }
+        if matches!(state, "dead-ancestor" | "reused-ancestor") {
+            inspector
+                .fail_identity_with(DESCENDANT_WRAPPER_PID, std::io::ErrorKind::PermissionDenied);
+        }
+        inspector.set_descendants(
+            created.pid,
+            vec![
+                wrapper,
+                reporter.clone(),
+                codex_fact(UNRELATED_AGENT_PID, created.pid),
+            ],
+        );
+        inspector.set_foreground_group(created.pid, None);
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let _scan_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+        // A fresh admitted report carries its own metadata; an older report
+        // must not replace it, regardless of the current process evidence.
+        assert!(
+            registry
+                .report_agent(audit_claim(
+                    &created.id,
+                    DIRECT_AGENT_REPORT_SEQ + 1,
+                    "fresh-audit-native"
+                ))
+                .await
+                .recorded
+        );
+        assert!(
+            !registry
+                .report_agent(audit_claim(
+                    &created.id,
+                    DIRECT_AGENT_REPORT_SEQ,
+                    DESCENDANT_NATIVE_SESSION_ID
+                ))
+                .await
+                .recorded
+        );
+        let binding = {
+            let sessions = registry.inner.sessions.lock().await;
+            sessions[&created.id]
+                .active_agent
+                .as_ref()
+                .expect("new hook claim")
+                .start_identity
+        };
+        let expected_binding = (recognized
+            && !matches!(state, "dead" | "dead-ancestor" | "inconclusive"))
+        .then_some(reporter.start_identity.get());
+        assert_eq!(
+            binding, expected_binding,
+            "state={state}, recognized={recognized}"
+        );
+        inspector.fire_exit(UNRELATED_AGENT_PID);
+        wait_until("hook matrix unrelated exit applied", || async {
+            let sessions = registry.inner.sessions.lock().await;
+            sessions[&created.id]
+                .observed_agents
+                .iter()
+                .all(|observed| observed.pid != UNRELATED_AGENT_PID)
+                .then_some(())
+        })
+        .await;
+        for phase in ["callback", "scan", "rescan"] {
+            if phase != "callback" {
+                registry
+                    .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+                    .await;
+            }
+            let info = registry
+                .inspect(&created.id)
+                .await
+                .expect("hook evidence result");
+            if matches!(state, "dead" | "dead-ancestor") {
+                assert_eq!(
+                    info.active_agent_session_id, None,
+                    "dead late hook must release"
+                );
+                assert_ne!(info.activity, Some(AgentActivity::Working));
+            } else {
+                assert_eq!(info.active_agent_pid, Some(DESCENDANT_REPORTER_PID));
+                assert_eq!(
+                    info.active_agent_session_id.as_deref(),
+                    Some("fresh-audit-native")
+                );
+                assert_eq!(info.activity, Some(AgentActivity::Working));
+                let sessions = registry.inner.sessions.lock().await;
+                assert_eq!(
+                    super::active_agent_origin(&sessions[&created.id]),
+                    Some(crate::store::ActiveAgentOrigin::Reported)
+                );
+                let expected = (!matches!(state, "inconclusive")
+                    && (recognized || !matches!(state, "ancestor" | "reused-ancestor")))
+                .then_some(reporter.start_identity.get());
+                assert_eq!(
+                    sessions[&created.id]
+                        .active_agent
+                        .as_ref()
+                        .expect("preserved claim")
+                        .start_identity,
+                    expected,
+                    "state={state}, recognized={recognized}"
+                );
+            }
+        }
+        registry
+            .stop(&created.id)
+            .await
+            .expect("stop hook evidence fixture");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_live_hook_scan_and_callback_evidence() {
+    descendant_hook_evidence_case("live").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_dead_hook_scan_and_callback_evidence() {
+    descendant_hook_evidence_case("dead").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_inconclusive_hook_scan_and_callback_evidence() {
+    descendant_hook_evidence_case("inconclusive").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_ancestor_hook_scan_and_callback_evidence() {
+    descendant_hook_evidence_case("ancestor").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_reused_hook_scan_and_callback_evidence() {
+    descendant_hook_evidence_case("reused").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_dead_ancestor_hook_scan_and_callback_evidence() {
+    descendant_hook_evidence_case("dead-ancestor").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_reused_ancestor_hook_scan_and_callback_evidence() {
+    descendant_hook_evidence_case("reused-ancestor").await;
+}
+
+/// Matrix A-X: confirmed ancestor death removes uncertainty about that
+/// ancestor; the reporter's independent inconclusive read remains unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_ancestor_exit_recomputes_uncertainty() {
+    for reporter_error in [false, true] {
+        let (registry, inspector, created) =
+            mock_procwatch_registry("ancestor-exit-evidence").await;
+        let wrapper = codex_fact(DESCENDANT_WRAPPER_PID, created.pid);
+        let reporter = ProcessFact {
+            comm: "wrapper-helper".to_owned(),
+            cmdline: vec!["/usr/bin/wrapper-helper".to_owned()],
+            ..codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID)
+        };
+        inspector.fail_identity_with(DESCENDANT_WRAPPER_PID, std::io::ErrorKind::PermissionDenied);
+        if reporter_error {
+            inspector.fail_identity_with(
+                DESCENDANT_REPORTER_PID,
+                std::io::ErrorKind::PermissionDenied,
+            );
+        }
+        inspector.set_descendants(created.pid, vec![wrapper, reporter]);
+        inspector.set_foreground_group(created.pid, None);
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        assert!(
+            registry
+                .report_agent(audit_claim(
+                    &created.id,
+                    DIRECT_AGENT_REPORT_SEQ,
+                    DESCENDANT_NATIVE_SESSION_ID
+                ))
+                .await
+                .recorded
+        );
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let _scan_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+        assert!(inspector.exit_watch_count(DESCENDANT_WRAPPER_PID) > 0);
+        inspector.fire_exit(DESCENDANT_WRAPPER_PID);
+        wait_until("ancestor exit applied", || async {
+            let sessions = registry.inner.sessions.lock().await;
+            sessions[&created.id]
+                .observed_agents
+                .iter()
+                .all(|observed| observed.pid != DESCENDANT_WRAPPER_PID)
+                .then_some(())
+        })
+        .await;
+        let info = registry
+            .inspect(&created.id)
+            .await
+            .expect("ancestor exit result");
+        if reporter_error {
+            assert_eq!(
+                info.active_agent_session_id.as_deref(),
+                Some(DESCENDANT_NATIVE_SESSION_ID)
+            );
+            assert_eq!(info.activity, Some(AgentActivity::Working));
+        } else {
+            assert_eq!(
+                info.active_agent, None,
+                "a confirmed dead ancestor is no longer an uncertain ancestry proof"
+            );
+            assert_eq!(info.active_agent_session_id, None);
+            assert_ne!(info.activity, Some(AgentActivity::Working));
+        }
+        registry
+            .stop(&created.id)
+            .await
+            .expect("stop ancestor exit fixture");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_reused_identity_survives_stale_exit_with_unreadable_ancestor() {
+    let (registry, inspector, created) = mock_procwatch_registry("reused-exit-uncertainty").await;
+    let wrapper = codex_fact(DESCENDANT_WRAPPER_PID, created.pid);
+    let mut reporter = codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID);
+    inspector.set_descendants(created.pid, vec![wrapper.clone(), reporter.clone()]);
+    inspector.set_foreground_group(created.pid, None);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    assert!(
+        registry
+            .report_agent(audit_claim(
+                &created.id,
+                DIRECT_AGENT_REPORT_SEQ,
+                DESCENDANT_NATIVE_SESSION_ID
+            ))
+            .await
+            .recorded
+    );
+    let old_start = reporter.start_identity.get();
+    reporter.start_identity = StartIdentity::new(old_start + 1);
+    inspector.fail_identity_with(DESCENDANT_WRAPPER_PID, std::io::ErrorKind::PermissionDenied);
+    inspector.set_descendants(created.pid, vec![wrapper, reporter.clone()]);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let _scan_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+    assert!(
+        registry
+            .report_agent(audit_claim(
+                &created.id,
+                DIRECT_AGENT_REPORT_SEQ + 1,
+                "fresh-audit-native"
+            ))
+            .await
+            .recorded
+    );
+    registry
+        .on_observed_agent_exit(&created.id, (DESCENDANT_REPORTER_PID, old_start))
+        .await;
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("replacement after stale exit");
+    assert_eq!(info.active_agent_pid, Some(DESCENDANT_REPORTER_PID));
+    assert_eq!(
+        info.active_agent_session_id.as_deref(),
+        Some("fresh-audit-native")
+    );
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = &sessions[&created.id];
+        assert_eq!(
+            entry
+                .active_agent
+                .as_ref()
+                .expect("fresh claim")
+                .start_identity,
+            Some(reporter.start_identity.get())
+        );
+    };
+    inspector.fire_exit(DESCENDANT_REPORTER_PID);
+    wait_until("replacement exact exit applied", || async {
+        let sessions = registry.inner.sessions.lock().await;
+        sessions[&created.id]
+            .observed_agents
+            .iter()
+            .all(|observed| observed.pid != DESCENDANT_REPORTER_PID)
+            .then_some(())
+    })
+    .await;
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("replacement exited");
+    assert_eq!(info.active_agent, None);
+    assert_eq!(info.active_agent_session_id, None);
+    assert_ne!(info.activity, Some(AgentActivity::Working));
+    registry
+        .stop(&created.id)
+        .await
+        .expect("stop reused exit fixture");
+}
+
+/// An unreadable new generation is not a verified reuse. Only recovery of
+/// the reporter probe may invalidate the old binding through an unreadable A.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_unverified_reuse_waits_for_readable_recovery() {
+    let (registry, inspector, created) = mock_procwatch_registry("unverified-reuse").await;
+    let wrapper = codex_fact(DESCENDANT_WRAPPER_PID, created.pid);
+    let mut reporter = ProcessFact {
+        comm: "wrapper-helper".to_owned(),
+        cmdline: vec!["/usr/bin/wrapper-helper".to_owned()],
+        ..codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID)
+    };
+    inspector.set_descendants(created.pid, vec![wrapper.clone(), reporter.clone()]);
+    inspector.set_foreground_group(created.pid, None);
+    assert!(
+        registry
+            .report_agent(audit_claim(
+                &created.id,
+                DIRECT_AGENT_REPORT_SEQ,
+                DESCENDANT_NATIVE_SESSION_ID
+            ))
+            .await
+            .recorded
+    );
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let old_start = reporter.start_identity.get();
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        assert_eq!(
+            sessions[&created.id]
+                .active_agent
+                .as_ref()
+                .expect("old bound claim")
+                .start_identity,
+            Some(old_start)
+        );
+    };
+    inspector.fail_identity_with(DESCENDANT_WRAPPER_PID, std::io::ErrorKind::PermissionDenied);
+    inspector.fail_identity_with(
+        DESCENDANT_REPORTER_PID,
+        std::io::ErrorKind::PermissionDenied,
+    );
+    reporter.start_identity = StartIdentity::new(old_start + 1);
+    inspector.set_descendants(
+        created.pid,
+        vec![
+            wrapper,
+            reporter,
+            codex_fact(UNRELATED_AGENT_PID, created.pid),
+        ],
+    );
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let _scan_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+    inspector.fire_exit(UNRELATED_AGENT_PID);
+    wait_until("unverified reuse unrelated exit applied", || async {
+        let sessions = registry.inner.sessions.lock().await;
+        sessions[&created.id]
+            .observed_agents
+            .iter()
+            .all(|observed| observed.pid != UNRELATED_AGENT_PID)
+            .then_some(())
+    })
+    .await;
+    for phase in ["callback", "rescan"] {
+        if phase == "rescan" {
+            registry
+                .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+                .await;
+        }
+        let info = registry
+            .inspect(&created.id)
+            .await
+            .expect("unknown generation");
+        assert_eq!(info.active_agent_pid, Some(DESCENDANT_REPORTER_PID));
+        assert_eq!(
+            info.active_agent_session_id.as_deref(),
+            Some(DESCENDANT_NATIVE_SESSION_ID)
+        );
+        assert_eq!(info.activity, Some(AgentActivity::Working));
+        let sessions = registry.inner.sessions.lock().await;
+        assert_eq!(
+            sessions[&created.id]
+                .active_agent
+                .as_ref()
+                .expect("unchanged claim")
+                .start_identity,
+            Some(old_start)
+        );
+    }
+    // The ancestor stays unreadable; own identity recovery is sufficient to
+    // refute the old generation, and must not bind it to the new one.
+    inspector.clear_identity_error(DESCENDANT_REPORTER_PID);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let info = registry.inspect(&created.id).await.expect("verified reuse");
+    assert_eq!(info.active_agent_session_id, None);
+    assert_ne!(info.active_agent_pid, Some(DESCENDANT_REPORTER_PID));
+    assert_ne!(info.activity, Some(AgentActivity::Working));
+    registry
+        .stop(&created.id)
+        .await
+        .expect("stop unverified reuse fixture");
+}
+
+/// PID-less reports must not turn an unreadable observation into identity
+/// evidence, nor ignore that observation when deciding ambiguity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_pidless_hook_keeps_uncertainty_and_ambiguity() {
+    for state in ["live", "inconclusive", "ambiguous"] {
+        let (registry, inspector, created) = mock_procwatch_registry("pidless-evidence").await;
+        let reporter = codex_fact(DESCENDANT_REPORTER_PID, created.pid);
+        let mut facts = vec![reporter.clone()];
+        match state {
+            "inconclusive" => inspector.fail_identity_with(
+                DESCENDANT_REPORTER_PID,
+                std::io::ErrorKind::PermissionDenied,
+            ),
+            "ambiguous" => {
+                inspector.fail_identity_with(
+                    DESCENDANT_WRAPPER_PID,
+                    std::io::ErrorKind::PermissionDenied,
+                );
+                facts.push(codex_fact(DESCENDANT_WRAPPER_PID, created.pid));
+            }
+            "live" => {}
+            _ => unreachable!("known PID-less evidence"),
+        }
+        inspector.set_descendants(created.pid, facts);
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let _scan_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+        let mut claim = audit_claim(
+            &created.id,
+            DIRECT_AGENT_REPORT_SEQ,
+            DESCENDANT_NATIVE_SESSION_ID,
+        );
+        claim.pid = None;
+        assert!(registry.report_agent(claim).await.recorded);
+        let sessions = registry.inner.sessions.lock().await;
+        let claim = sessions[&created.id]
+            .active_agent
+            .as_ref()
+            .expect("PID-less report");
+        assert_eq!(
+            claim.pid,
+            (state == "live").then_some(DESCENDANT_REPORTER_PID)
+        );
+        assert_eq!(
+            claim.start_identity,
+            (state == "live").then_some(reporter.start_identity.get())
+        );
+        drop(sessions);
+        registry
+            .stop(&created.id)
+            .await
+            .expect("stop PID-less fixture");
+    }
+}
+
+/// Exact death of a bound generation is conclusive even if the observation
+/// has already advanced to an unreadable replacement of the same PID.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_bound_exit_precedes_unverified_replacement() {
+    let (registry, inspector, created) = mock_procwatch_registry("bound-exit-replacement").await;
+    let wrapper = codex_fact(DESCENDANT_WRAPPER_PID, created.pid);
+    let mut reporter = codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID);
+    inspector.set_descendants(created.pid, vec![wrapper.clone(), reporter.clone()]);
+    inspector.set_foreground_group(created.pid, None);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    assert!(
+        registry
+            .report_agent(audit_claim(
+                &created.id,
+                DIRECT_AGENT_REPORT_SEQ,
+                DESCENDANT_NATIVE_SESSION_ID
+            ))
+            .await
+            .recorded
+    );
+    let old_start = reporter.start_identity.get();
+    inspector.fail_identity_with(
+        DESCENDANT_REPORTER_PID,
+        std::io::ErrorKind::PermissionDenied,
+    );
+    reporter.start_identity = StartIdentity::new(old_start + 1);
+    inspector.set_descendants(created.pid, vec![wrapper, reporter.clone()]);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let _scan_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+    registry
+        .on_observed_agent_exit(&created.id, (DESCENDANT_REPORTER_PID, old_start))
+        .await;
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("bound generation exited");
+    assert_eq!(
+        info.active_agent_session_id, None,
+        "exact R1 death cannot be ignored because observed R2 is unreadable"
+    );
+    assert_ne!(info.activity, Some(AgentActivity::Working));
+    // The R1 exit must not erase uncertainty belonging to R2 or bind R2.
+    assert!(
+        registry
+            .report_agent(audit_claim(
+                &created.id,
+                DIRECT_AGENT_REPORT_SEQ + 1,
+                "fresh-audit-native"
+            ))
+            .await
+            .recorded
+    );
+    registry
+        .on_observed_agent_exit(&created.id, (DESCENDANT_REPORTER_PID, old_start))
+        .await;
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("replacement remains inconclusive");
+    assert_eq!(
+        info.active_agent_session_id.as_deref(),
+        Some("fresh-audit-native")
+    );
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        assert_eq!(
+            sessions[&created.id]
+                .active_agent
+                .as_ref()
+                .expect("unverified R2 claim")
+                .start_identity,
+            None
+        );
+    };
+    inspector.clear_identity_error(DESCENDANT_REPORTER_PID);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        assert_eq!(
+            sessions[&created.id]
+                .active_agent
+                .as_ref()
+                .expect("verified R2 claim")
+                .start_identity,
+            Some(reporter.start_identity.get())
+        );
+    };
+    registry
+        .stop(&created.id)
+        .await
+        .expect("stop replacement fixture");
+}
+
+/// A foreground-probe barrier orders the scan's identity collection before
+/// the callback and its application after it, without sleeps or retries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_exit_invalidates_an_inflight_snapshot() {
+    let (registry, inspector, created) = mock_procwatch_registry("inflight-exit").await;
+    let wrapper = codex_fact(DESCENDANT_WRAPPER_PID, created.pid);
+    let reporter = codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID);
+    inspector.set_descendants(created.pid, vec![wrapper, reporter.clone()]);
+    inspector.set_foreground_group(created.pid, None);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    assert!(
+        registry
+            .report_agent(audit_claim(
+                &created.id,
+                DIRECT_AGENT_REPORT_SEQ,
+                DESCENDANT_NATIVE_SESSION_ID
+            ))
+            .await
+            .recorded
+    );
+    // Keep the ordinary watcher held separately while the explicit scan
+    // collects the snapshot whose post-exit application is under test.
+    let _automatic_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+    let block = inspector.block_foreground();
+    let _release_guard = ForegroundReleaseGuard(Arc::clone(&block));
+    let scan_registry = registry.clone();
+    let scan_id = created.id.clone();
+    let root_pid = created.pid;
+    let runtime = tokio::runtime::Handle::current();
+    let scan = std::thread::spawn(move || {
+        runtime.block_on(scan_registry.rescan_procwatch_at(&scan_id, root_pid, Instant::now()));
+    });
+    wait_until("explicit scan collected pre-exit identities", || async {
+        block.entered.load(Ordering::Acquire).then_some(())
+    })
+    .await;
+    inspector.set_not_running(reporter.identity());
+    registry
+        .on_observed_agent_exit(&created.id, (reporter.pid, reporter.start_identity.get()))
+        .await;
+    let before = registry
+        .inspect(&created.id)
+        .await
+        .expect("exit applied before snapshot");
+    assert_eq!(before.active_agent_session_id, None);
+    block.release();
+    scan.join()
+        .expect("inflight scan completed after confirmed exit");
+    // A late admitted report does not prove life, and must not bind identity
+    // resurrected by the older scan after the confirmed exit.
+    assert!(
+        registry
+            .report_agent(audit_claim(
+                &created.id,
+                DIRECT_AGENT_REPORT_SEQ + 1,
+                "late-audit-native"
+            ))
+            .await
+            .recorded
+    );
+    let binding = {
+        let sessions = registry.inner.sessions.lock().await;
+        sessions[&created.id]
+            .active_agent
+            .as_ref()
+            .expect("late admitted claim")
+            .start_identity
+    };
+    registry
+        .stop(&created.id)
+        .await
+        .expect("stop inflight fixture");
+    assert_eq!(
+        binding, None,
+        "a pre-exit snapshot must not resurrect confirmed-dead identity evidence"
+    );
+}
+
 #[tokio::test]
 async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
     let (registry, inspector, created) = mock_procwatch_registry("pid-reuse-base").await;

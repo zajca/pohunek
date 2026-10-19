@@ -35,7 +35,7 @@ pub(super) struct ProcessLineage {
 struct ObservedRefresh {
     agents: HashMap<Pid, ObservedAgent>,
     lineage: HashMap<Pid, ProcessLineage>,
-    uncertainty: Vec<Pid>,
+    uncertainty: Vec<ProcessIdentity>,
 }
 
 /// How process recognition treats a session's own runtime.
@@ -163,6 +163,7 @@ impl SessionRegistry {
                 return;
             }
             entry.observed_agents.clear();
+            invalidate_process_scans(entry);
             entry.process_lineage.clear();
             entry.process_uncertainty.clear();
             entry.foreground_process_group = None;
@@ -203,13 +204,20 @@ impl SessionRegistry {
         now: Instant,
     ) -> bool {
         let root_pid = root.pid;
+        let scan_exit_generation = {
+            let sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get(id) else {
+                return false;
+            };
+            entry.process_exit_generation
+        };
         // The registry snapshot the scan identifies other runtimes with.
         let scan_registry = self.inner.profiles.runtimes().registry();
         let (scan_pin, observed_refresh) = match self.inner.inspector.descendants(root_pid) {
             Ok(facts) => {
                 let own = self.inner.sessions.lock().await.get(id).map(OwnRuntime::of);
                 let scan_pin = own.as_ref().and_then(OwnRuntime::pinned).cloned();
-                let mut inconclusive: Vec<Pid> = Vec::new();
+                let mut inconclusive = Vec::new();
                 // Only verified live identities may establish ancestry or bind claims.
                 let mut lineage: HashMap<_, _> = facts
                     .iter()
@@ -231,7 +239,7 @@ impl SessionRegistry {
                                     error = %err,
                                     "descendant identity read inconclusive"
                                 );
-                                inconclusive.push(fact.pid);
+                                inconclusive.push(fact.identity());
                                 false
                             }
                         }
@@ -246,22 +254,8 @@ impl SessionRegistry {
                         )
                     })
                     .collect();
-                // A failed ancestor probe also leaves its descendants' ancestry
-                // unproven. Preserve their claims without binding through that gap.
-                loop {
-                    let previous = inconclusive.len();
-                    lineage.retain(|pid, process| {
-                        if inconclusive.contains(&process.parent) {
-                            inconclusive.push(*pid);
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                    if previous == inconclusive.len() {
-                        break;
-                    }
-                }
+                // Keep verified identities even when an ancestor is unreadable:
+                // ancestry uncertainty cannot erase proof of a PID generation.
                 // The launch root is excluded from descendants, but the enclosing
                 // liveness bracket proves its identity for direct-agent claims.
                 lineage.insert(
@@ -273,7 +267,13 @@ impl SessionRegistry {
                 );
                 let observed = self.observed_agents_from_facts_for_runtime(
                     id,
-                    facts,
+                    facts
+                        .into_iter()
+                        .filter(|fact| {
+                            lineage.contains_key(&fact.pid)
+                                || inconclusive.iter().any(|identity| identity.pid == fact.pid)
+                        })
+                        .collect(),
                     now,
                     own.as_ref(),
                     Some(&expected.worker_instance_id),
@@ -336,6 +336,12 @@ impl SessionRegistry {
             if entry.stopping || is_terminal(entry.info.state) {
                 return false;
             }
+            // A callback confirmed an exit after this snapshot started. Its
+            // older child identities and foreground probe cannot supersede it.
+            if entry.process_exit_generation != scan_exit_generation {
+                entry.procwatch_rescan.notify_one();
+                return true;
+            }
             // A package change replaced a definition this scan matched with:
             // the session's own pin, or the registry other runtimes resolve
             // through. The next scan observes again.
@@ -354,7 +360,8 @@ impl SessionRegistry {
             let to_spawn = apply_observed_refresh(entry, observed_refresh, &mut exit_watches);
 
             let foreground_changed = apply_foreground_probe(entry, foreground_probe);
-            let updated = self.reconcile_process_evidence(entry, root_pid, now, foreground_probe);
+            let updated =
+                self.reconcile_process_evidence(entry, root_pid, now, foreground_probe, None);
             let focus = entry
                 .active_agent
                 .as_ref()
@@ -463,31 +470,38 @@ impl SessionRegistry {
                 return;
             }
 
+            let claimed_exit = entry.active_agent.as_ref().is_some_and(|active| {
+                active.pid == Some(identity.0) && active.start_identity == Some(identity.1)
+            });
+            let lineage_exit = entry
+                .process_lineage
+                .get(&identity.0)
+                .is_some_and(|lineage| lineage.identity.start_identity.get() == identity.1);
             let before = entry.observed_agents.len();
             entry
                 .observed_agents
                 .retain(|observed| (observed.pid, observed.start_identity) != identity);
-            if before == entry.observed_agents.len() {
+            if before == entry.observed_agents.len() && !claimed_exit && !lineage_exit {
                 return;
             }
+            invalidate_process_scans(entry);
 
             // An exit watch confirms death independently of a later scan.
             // Remove only this generation; stale callbacks returned above.
-            if entry
-                .process_lineage
-                .get(&identity.0)
-                .is_some_and(|lineage| lineage.identity.start_identity.get() == identity.1)
-            {
+            if lineage_exit {
                 entry.process_lineage.remove(&identity.0);
             }
             // Confirmed death supersedes an earlier inconclusive probe.
-            entry.process_uncertainty.retain(|pid| *pid != identity.0);
+            entry
+                .process_uncertainty
+                .retain(|uncertain| (uncertain.pid, uncertain.start_identity.get()) != identity);
 
             self.reconcile_process_evidence(
                 entry,
                 entry.info.pid,
                 crate::time::now(),
                 ForegroundProbe::Observed(entry.foreground_process_group),
+                Some(identity),
             )
         };
 
@@ -690,11 +704,8 @@ impl SessionRegistry {
         inconclusive: &[Pid],
     ) -> Option<SessionInfo> {
         let Some(active) = entry.active_agent.clone() else {
-            match choose_observed_agent(entry) {
-                Some(observed) if inconclusive.contains(&observed.pid) => return None,
-                Some(observed) => return self.auto_report_observed_agent(entry, &observed, now),
-                None => return None,
-            }
+            let observed = choose_observed_agent(entry)?;
+            return self.auto_report_observed_agent(entry, &observed, now);
         };
         let Some(active_base) = entry.info.active_agent_base.clone() else {
             return Some(clear_active_agent(
@@ -731,15 +742,9 @@ impl SessionRegistry {
                 return None;
             }
             if let Some(observed) = first_observed_agent_for_base(entry, &active_base) {
-                if inconclusive.contains(&observed.pid) {
-                    return None;
-                }
                 return self.auto_report_observed_agent(entry, &observed, now);
             }
             if let Some(observed) = choose_observed_agent(entry) {
-                if inconclusive.contains(&observed.pid) {
-                    return None;
-                }
                 return self.auto_report_observed_agent(entry, &observed, now);
             }
             return Some(clear_active_agent(
@@ -749,9 +754,6 @@ impl SessionRegistry {
         }
 
         if let Some(observed) = single_observed_for_base(entry, &active_base) {
-            if inconclusive.contains(&observed.pid) {
-                return None;
-            }
             if let Some(active) = entry.active_agent.as_mut() {
                 active.pid = Some(observed.pid);
                 active.start_identity = Some(observed.start_identity);
@@ -841,12 +843,22 @@ impl SessionRegistry {
         root_pid: Pid,
         now: Instant,
         probe: ForegroundProbe,
+        confirmed_exit: Option<ObservedIdentity>,
     ) -> Option<SessionInfo> {
-        let inconclusive = entry.process_uncertainty.clone();
+        // Negative identity evidence wins before any foreground or ancestry
+        // uncertainty can preserve a claim. A successful snapshot also proves
+        // absence; a failed snapshot retains the previous evidence unchanged.
+        let cleared = claim_identity_refuted(entry, confirmed_exit).then(|| {
+            let active = entry.active_agent.clone().expect("refuted active claim");
+            clear_active_agent(entry, self.procwatch_tombstone_for(&active, now))
+        });
+        let inconclusive = uncertain_ancestry(entry);
         let decision = self.reconcile_foreground_agent(entry, root_pid, now, probe, &inconclusive);
         match decision {
-            ForegroundDecision::Fallback => self.reconcile_active_agent(entry, now, &inconclusive),
-            ForegroundDecision::Preserve => None,
+            ForegroundDecision::Fallback => self
+                .reconcile_active_agent(entry, now, &inconclusive)
+                .or(cleared),
+            ForegroundDecision::Preserve => cleared,
             ForegroundDecision::Updated => Some(entry.info.clone()),
         }
     }
@@ -890,9 +902,6 @@ impl SessionRegistry {
         }
 
         if let Some(observed) = choose_foreground_observed(entry, foreground_group) {
-            if inconclusive.contains(&observed.pid) {
-                return ForegroundDecision::Preserve;
-            }
             if bind_matching_observed_identity(entry, &observed) {
                 return ForegroundDecision::Preserve;
             }
@@ -1041,10 +1050,77 @@ fn apply_observed_refresh(
     to_spawn
 }
 
+fn invalidate_process_scans(entry: &mut SessionEntry) {
+    entry.process_exit_generation = entry
+        .process_exit_generation
+        .checked_add(1)
+        .expect("process exit generation must not exhaust");
+}
+
+fn claim_identity_refuted(entry: &SessionEntry, confirmed_exit: Option<ObservedIdentity>) -> bool {
+    let Some(active) = entry.active_agent.as_ref() else {
+        return false;
+    };
+    if confirmed_exit.is_some_and(|identity| {
+        active.pid == Some(identity.0) && active.start_identity == Some(identity.1)
+    }) {
+        return true;
+    }
+    // Observed agents keep the established foreground selection policy;
+    // identity precedence here governs hook-reported claims and metadata.
+    if active.observed {
+        return false;
+    }
+    let Some(pid) = active.pid.filter(|pid| *pid != entry.info.pid) else {
+        return false;
+    };
+    match entry.process_lineage.get(&pid) {
+        Some(process) => active
+            .start_identity
+            .is_some_and(|start| start != process.identity.start_identity.get()),
+        None => {
+            entry.process_lineage.contains_key(&entry.info.pid)
+                && !entry
+                    .process_uncertainty
+                    .iter()
+                    .any(|identity| identity.pid == pid)
+        }
+    }
+}
+
+fn uncertain_ancestry(entry: &SessionEntry) -> Vec<Pid> {
+    let mut uncertain = entry
+        .process_uncertainty
+        .iter()
+        .map(|identity| identity.pid)
+        .collect::<Vec<_>>();
+    // Derived ancestry uncertainty is never cached as an identity verdict.
+    // Recompute it after exits so confirmed ancestor death removes the gap.
+    loop {
+        let previous = uncertain.len();
+        for (pid, process) in &entry.process_lineage {
+            if !uncertain.contains(pid) && uncertain.contains(&process.parent) {
+                uncertain.push(*pid);
+            }
+        }
+        if previous == uncertain.len() {
+            return uncertain;
+        }
+    }
+}
+
+pub(super) fn observation_verified(entry: &SessionEntry, observed: &ObservedAgent) -> bool {
+    entry
+        .process_lineage
+        .get(&observed.pid)
+        .is_some_and(|process| process.identity.start_identity.get() == observed.start_identity)
+}
+
 fn choose_observed_agent(entry: &SessionEntry) -> Option<ObservedAgent> {
     entry
         .observed_agents
         .iter()
+        .filter(|observed| observation_verified(entry, observed))
         .min_by_key(|observed| (observed.first_seen, observed.pid))
         .cloned()
 }
@@ -1067,13 +1143,15 @@ fn choose_foreground_observed(
     entry
         .observed_agents
         .iter()
-        .find(|observed| observed.pid == foreground_group)
+        .find(|observed| observed.pid == foreground_group && observation_verified(entry, observed))
         .cloned()
         .or_else(|| {
             entry
                 .observed_agents
                 .iter()
-                .filter(|observed| observed.pgid == foreground_group)
+                .filter(|observed| {
+                    observed.pgid == foreground_group && observation_verified(entry, observed)
+                })
                 .min_by_key(|observed| (observed.first_seen, observed.pid))
                 .cloned()
         })
@@ -1157,7 +1235,9 @@ fn first_observed_agent_for_base(
     entry
         .observed_agents
         .iter()
-        .filter(|observed| &observed.agent_base == agent_base)
+        .filter(|observed| {
+            &observed.agent_base == agent_base && observation_verified(entry, observed)
+        })
         .min_by_key(|observed| (observed.first_seen, observed.pid))
         .cloned()
 }
@@ -1171,7 +1251,7 @@ fn single_observed_for_base(
         .iter()
         .filter(|observed| &observed.agent_base == agent_base);
     let first = matching.next()?;
-    matching.next().is_none().then(|| first.clone())
+    (matching.next().is_none() && observation_verified(entry, first)).then(|| first.clone())
 }
 
 /// Verifies the reporter against an observed ancestor without changing its identity.

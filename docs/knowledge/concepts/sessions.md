@@ -728,7 +728,18 @@ process-bound nested claim, which prevents claim/clear flapping while the agent
 remains in the process tree. A recent unbound hook claim remains valid until its
 claim TTL because the foreground group alone does not identify that process.
 Direct-launch agent sessions preserve a matching PTY-root claim.
-Transient foreground probe failures retain the last-known PGID and claim. PID
+Transient foreground probe failures retain the last-known PGID and an unrefuted
+claim. Inconclusive reporter or ancestor probes preserve an existing claim
+without supplying a new identity or ancestry proof. A verified reporter death
+or changed kernel start identity takes precedence over that uncertainty, even
+in an exit callback; stale native metadata and hook-owned activity are cleared.
+Verified reporter identities remain separate from uncertain ancestry, which is
+recomputed after an ancestor exits. A fresh hook report binds only a verified
+observation and otherwise waits for the requested scan. An exact exit of an
+older bound generation still refutes that claim when a replacement generation
+is unreadable, without removing the replacement's uncertainty. Scans collected
+before a confirmed exit are discarded before they can restore stale process or
+foreground evidence. PID
 reuse is distinguished by kernel process-start identity, including delayed exit
 notifications from the replaced process.
 
