@@ -4938,6 +4938,12 @@ impl SessionRegistry {
                                         "discarding unverified terminal worker identity after safe metadata commit"
                                     );
                                 }
+                                WorkerMetadataProgress::NotCurrentDiscarded => {
+                                    warn!(
+                                        session_id = %id.0,
+                                        "discarding worker metadata: the record was not current when the worker exited"
+                                    );
+                                }
                                 WorkerMetadataProgress::Retry(retry) => {
                                     if retry.should_warn {
                                         warn!(
@@ -6025,6 +6031,8 @@ enum WorkerMetadataApplyOutcome {
 enum WorkerMetadataRetryCause {
     Commit,
     IdentityValidation,
+    /// The record names the snapshot's worker but has not caught up with it.
+    NotCurrent,
 }
 
 #[derive(Debug, Default)]
@@ -6045,6 +6053,7 @@ struct WorkerMetadataRetry {
 enum WorkerMetadataProgress {
     Complete,
     IdentityDiscarded,
+    NotCurrentDiscarded,
     Retry(WorkerMetadataRetry),
 }
 
@@ -6113,6 +6122,14 @@ impl WorkerMetadataTracker {
             {
                 self.complete(fingerprint);
                 WorkerMetadataProgress::IdentityDiscarded
+            }
+            // An exited worker's last snapshot gets no further attempt: a
+            // record that is still not current must not hold back the exit.
+            WorkerMetadataApplyOutcome::Retryable(WorkerMetadataRetryCause::NotCurrent)
+                if phase == pohunek_worker_protocol::RuntimePhase::Exited =>
+            {
+                self.complete(fingerprint);
+                WorkerMetadataProgress::NotCurrentDiscarded
             }
             WorkerMetadataApplyOutcome::Retryable(_) => {
                 WorkerMetadataProgress::Retry(self.retry(&fingerprint, now))

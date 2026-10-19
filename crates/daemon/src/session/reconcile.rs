@@ -528,12 +528,15 @@ impl SessionRegistry {
                 return WorkerMetadataApplyOutcome::Discarded;
             };
             let record = Self::session_record(id, entry, entry.desired_state, None);
-            if !worker_metadata_record_is_current(
-                &record,
-                &expected_worker_id,
-                expected_worker_instance_id.as_deref(),
+            if let Some(outcome) = metadata_currency_outcome(
+                id,
+                worker_metadata_record_currency(
+                    &record,
+                    &expected_worker_id,
+                    expected_worker_instance_id.as_deref(),
+                ),
             ) {
-                return WorkerMetadataApplyOutcome::Discarded;
+                return outcome;
             }
             record
         };
@@ -594,12 +597,15 @@ impl SessionRegistry {
                 );
             }
         };
-        if !worker_metadata_record_is_current(
-            &durable_base,
-            &expected_worker_id,
-            expected_worker_instance_id.as_deref(),
+        if let Some(outcome) = metadata_currency_outcome(
+            id,
+            worker_metadata_record_currency(
+                &durable_base,
+                &expected_worker_id,
+                expected_worker_instance_id.as_deref(),
+            ),
         ) {
-            return WorkerMetadataApplyOutcome::Discarded;
+            return outcome;
         }
         let mut candidate = memory_base.clone();
         preserve_durable_worker_metadata(&durable_base, &mut candidate);
@@ -643,12 +649,15 @@ impl SessionRegistry {
                 return WorkerMetadataApplyOutcome::Discarded;
             };
             let current = Self::session_record(id, entry, entry.desired_state, None);
-            if !worker_metadata_record_is_current(
-                &current,
-                &expected_worker_id,
-                expected_worker_instance_id.as_deref(),
+            if let Some(outcome) = metadata_currency_outcome(
+                id,
+                worker_metadata_record_currency(
+                    &current,
+                    &expected_worker_id,
+                    expected_worker_instance_id.as_deref(),
+                ),
             ) {
-                return WorkerMetadataApplyOutcome::Discarded;
+                return outcome;
             }
             (current, entry.pinned.clone())
         };
@@ -4736,28 +4745,119 @@ fn apply_identity_projection(
     }
 }
 
-pub(super) fn worker_metadata_record_is_current(
+/// How a session record relates to the worker runtime a snapshot came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WorkerMetadataCurrency {
+    /// The record names the snapshot's worker and runtime as live.
+    Current,
+    /// The record names the snapshot's worker and runtime but has not caught
+    /// up with its live state; applying the snapshot later can succeed.
+    NotYet,
+    /// The record no longer names the snapshot's worker and runtime as a
+    /// running session, so no later attempt can apply the snapshot.
+    Superseded(&'static str),
+}
+
+impl WorkerMetadataCurrency {
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Superseded(reason), _) | (_, Self::Superseded(reason)) => {
+                Self::Superseded(reason)
+            }
+            (Self::NotYet, _) | (_, Self::NotYet) => Self::NotYet,
+            (Self::Current, Self::Current) => Self::Current,
+        }
+    }
+}
+
+fn runtime_currency(
+    state: RuntimeState,
+    worker_id: Option<&str>,
+    worker_instance_id: Option<&str>,
+    expected_worker_id: &str,
+    expected_worker_instance_id: Option<&str>,
+) -> WorkerMetadataCurrency {
+    if worker_id != Some(expected_worker_id) || worker_instance_id != expected_worker_instance_id {
+        return WorkerMetadataCurrency::Superseded("worker_replaced");
+    }
+    match state {
+        RuntimeState::Live => WorkerMetadataCurrency::Current,
+        RuntimeState::Starting | RuntimeState::Reconnecting => WorkerMetadataCurrency::NotYet,
+        RuntimeState::Terminal
+        | RuntimeState::Lost
+        | RuntimeState::Conflict
+        | RuntimeState::Incompatible => WorkerMetadataCurrency::Superseded("runtime_ended"),
+    }
+}
+
+pub(super) fn worker_metadata_record_currency(
     record: &SessionRecord,
     worker_id: &str,
     worker_instance_id: Option<&str>,
-) -> bool {
+) -> WorkerMetadataCurrency {
     let Some(runtime) = record.info.runtime.as_ref() else {
-        return false;
+        return WorkerMetadataCurrency::Superseded("runtime_missing");
     };
-    record.desired_state == DesiredState::Running
-        && record.transaction.is_none()
-        && record.info.state == SessionState::Running
-        && runtime.state == RuntimeState::Live
-        && runtime.worker_id.as_deref() == Some(worker_id)
-        && runtime.worker_instance_id.as_deref() == worker_instance_id
-        && record.runtime.state == RuntimeState::Live
-        && record.runtime.worker_id.as_deref() == Some(worker_id)
-        && record.runtime.worker_instance_id.as_deref() == worker_instance_id
+    if record.desired_state != DesiredState::Running {
+        return WorkerMetadataCurrency::Superseded("stop_requested");
+    }
+    let state = match record.info.state {
+        SessionState::Running => WorkerMetadataCurrency::Current,
+        SessionState::Starting => WorkerMetadataCurrency::NotYet,
+        SessionState::Stopped | SessionState::Done | SessionState::Failed => {
+            WorkerMetadataCurrency::Superseded("session_ended")
+        }
+    };
+    let transaction = if record.transaction.is_some() {
+        WorkerMetadataCurrency::NotYet
+    } else {
+        WorkerMetadataCurrency::Current
+    };
+    state
+        .combine(transaction)
+        .combine(runtime_currency(
+            runtime.state,
+            runtime.worker_id.as_deref(),
+            runtime.worker_instance_id.as_deref(),
+            worker_id,
+            worker_instance_id,
+        ))
+        .combine(runtime_currency(
+            record.runtime.state,
+            record.runtime.worker_id.as_deref(),
+            record.runtime.worker_instance_id.as_deref(),
+            worker_id,
+            worker_instance_id,
+        ))
+}
+
+/// The outcome that ends an apply on a record that is not current, or `None`
+/// when the apply proceeds. A superseded snapshot is dropped for good and says
+/// why.
+fn metadata_currency_outcome(
+    id: &SessionId,
+    currency: WorkerMetadataCurrency,
+) -> Option<WorkerMetadataApplyOutcome> {
+    match currency {
+        WorkerMetadataCurrency::Current => None,
+        WorkerMetadataCurrency::NotYet => {
+            tracing::debug!(session_id = %id.0, "worker metadata waits for the record to be current");
+            Some(WorkerMetadataApplyOutcome::Retryable(
+                super::WorkerMetadataRetryCause::NotCurrent,
+            ))
+        }
+        WorkerMetadataCurrency::Superseded(reason) => {
+            tracing::warn!(session_id = %id.0, reason, "worker metadata discarded: the record no longer names this worker as running");
+            Some(WorkerMetadataApplyOutcome::Discarded)
+        }
+    }
 }
 
 fn metadata_write_failure_outcome(error: &ProtocolError) -> WorkerMetadataApplyOutcome {
     match error.code.as_str() {
-        "session_runtime_commit_stale" => WorkerMetadataApplyOutcome::Discarded,
+        "session_runtime_commit_stale" => {
+            WorkerMetadataApplyOutcome::Retryable(super::WorkerMetadataRetryCause::NotCurrent)
+        }
         _ => WorkerMetadataApplyOutcome::Retryable(super::WorkerMetadataRetryCause::Commit),
     }
 }
