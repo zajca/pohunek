@@ -11690,6 +11690,182 @@ async fn descendant_reporter_pidless_hook_keeps_uncertainty_and_ambiguity() {
     }
 }
 
+async fn worker_journal_report(
+    registry: &SessionRegistry,
+    inspector: &MockInspector,
+    created: &SessionInfo,
+) -> pohunek_worker_protocol::InspectSnapshot {
+    let (worker, _) = live_worker_and_identity(registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect journal worker");
+    let reporter = codex_fact(DESCENDANT_REPORTER_PID, created.pid);
+    inspector.set_descendants(created.pid, vec![reporter.clone()]);
+    snapshot.hook_schema = Some("identity-subagent-v1".to_owned());
+    snapshot.active_identity = Some(pohunek_worker_protocol::ActiveIdentityClaim {
+        provider: "codex".to_owned(),
+        process: pohunek_worker_protocol::ProcessIdentity {
+            pid: reporter.pid,
+            start_identity: reporter.start_identity.get(),
+        },
+        sequence: DIRECT_AGENT_REPORT_SEQ,
+        expires_at: native_report_expiry(),
+        reference_kind: Some("id".to_owned()),
+        native_reference: Some(DESCENDANT_NATIVE_SESSION_ID.to_owned()),
+    });
+    snapshot
+}
+
+/// Journal admission follows a pre-launch absence snapshot. Failed collection
+/// cannot promote that old absence into proof against the new managed claim.
+async fn worker_journal_preclaim_absence(foreground_error: bool) {
+    let (registry, inspector, created) = mock_procwatch_registry("worker-claim-cache-age").await;
+    inspector.set_descendants(created.pid, Vec::new());
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let _scan_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+    let snapshot = worker_journal_report(&registry, &inspector, &created).await;
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    let admitted = registry
+        .inspect(&created.id)
+        .await
+        .expect("admitted managed claim");
+    inspector.fail_descendants_with(std::io::ErrorKind::PermissionDenied);
+    if foreground_error {
+        inspector.fail_foreground_with(std::io::ErrorKind::PermissionDenied);
+    }
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let failed = registry
+        .inspect(&created.id)
+        .await
+        .expect("failed process collection");
+    inspector.clear_descendants_error();
+    inspector.set_descendants(created.pid, Vec::new());
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let absent = registry
+        .inspect(&created.id)
+        .await
+        .expect("fresh confirmed absence");
+    registry
+        .stop(&created.id)
+        .await
+        .expect("stop journal cache fixture");
+    assert_eq!(
+        admitted.active_agent_session_id.as_deref(),
+        Some(DESCENDANT_NATIVE_SESSION_ID)
+    );
+    assert_eq!(
+        failed.active_agent_pid, admitted.active_agent_pid,
+        "foreground error: {foreground_error}"
+    );
+    assert_eq!(
+        failed.active_agent_session_id, admitted.active_agent_session_id,
+        "foreground error: {foreground_error}"
+    );
+    assert_eq!(failed.state_source, admitted.state_source);
+    assert_eq!(
+        absent.active_agent_session_id, None,
+        "fresh absence still refutes despite foreground uncertainty"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_journal_claim_survives_preclaim_absence_and_failed_collection() {
+    Box::pin(worker_journal_preclaim_absence(false)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_journal_claim_keeps_main_transient_foreground_preservation() {
+    Box::pin(worker_journal_preclaim_absence(true)).await;
+}
+
+/// A journal refresh really validates the process again: that conclusive
+/// observation supersedes an earlier exit, but not a later exact exit.
+async fn worker_journal_validation_orders_exact_exits(update_identity: bool) {
+    let (registry, inspector, created) = mock_procwatch_registry("worker-proof-order").await;
+    inspector.set_descendants(created.pid, Vec::new());
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let _scan_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+    let mut snapshot = worker_journal_report(&registry, &inspector, &created).await;
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: Some(created.id.0.clone()),
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *registry.inner.process_exit_hold.lock().expect("exit gate") = Some(gate.clone());
+    let identity = (DESCENDANT_REPORTER_PID, u64::from(DESCENDANT_REPORTER_PID));
+    let callback = tokio::spawn({
+        let registry = registry.clone();
+        let id = created.id.clone();
+        async move {
+            registry.on_observed_agent_exit(&id, identity).await;
+        }
+    });
+    guard("journal old exit acquisition", gate.entered.notified()).await;
+    if update_identity {
+        snapshot
+            .active_identity
+            .as_mut()
+            .expect("worker claim")
+            .sequence += 1;
+    } else {
+        snapshot
+            .subagents
+            .push(worker_subagent_snapshot("validation-refresh"));
+    }
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    gate.release.notify_one();
+    guard("journal superseded exit completion", callback)
+        .await
+        .expect("exit task");
+    let refreshed = registry
+        .inspect(&created.id)
+        .await
+        .expect("validated refresh");
+    registry.on_observed_agent_exit(&created.id, identity).await;
+    let exited = registry.inspect(&created.id).await.expect("new exact exit");
+    registry
+        .stop(&created.id)
+        .await
+        .expect("stop worker proof fixture");
+    assert_eq!(
+        refreshed.active_agent_session_id.as_deref(),
+        Some(DESCENDANT_NATIVE_SESSION_ID)
+    );
+    assert_eq!(exited.active_agent_session_id, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_journal_fresh_validation_orders_exact_exits() {
+    Box::pin(worker_journal_validation_orders_exact_exits(true)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_journal_subagent_update_orders_exact_exits() {
+    Box::pin(worker_journal_validation_orders_exact_exits(false)).await;
+}
+
 /// A PID-less refresh retains established proof through an unreadable probe,
 /// so an already acquired exact exit still clears its native metadata.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

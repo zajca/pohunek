@@ -35,3 +35,10 @@ candidate. An unreadable probe does not erase that binding or renew its liveness
 proof; an exact exit still clears the native metadata and reported activity.
 Ambiguous candidates, a replacement generation, absent observations, or a changed
 source/runtime do not inherit the previous binding.
+
+Worker-journal identity admission uses the same evidence ordering (#1316).
+The import's actual process validation supplies conclusive liveness at its
+acquisition sequence; projecting its metadata later supplies only the admission
+fence. A failed scan with a transient foreground error does not refute a claim
+using old cached absence. Fresh confirmed absence, verified reuse and exact
+exits remain conclusive.

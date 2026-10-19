@@ -926,6 +926,15 @@ impl SessionRegistry {
             }
             return None;
         }
+        // A failed scan has no fresh negative evidence. Preserve the claim on
+        // foreground uncertainty as before; exact exit callbacks and successful
+        // snapshots still apply their conclusive evidence below.
+        if confirmed_exit.is_none()
+            && entry.process_snapshot_sequence != evidence_sequence
+            && matches!(probe, ForegroundProbe::TransientError)
+        {
+            return None;
+        }
         let previous_claim = entry.active_agent.clone();
         let conclusive_snapshot = entry.process_snapshot_sequence == evidence_sequence
             && claim_snapshot_is_conclusive(entry);

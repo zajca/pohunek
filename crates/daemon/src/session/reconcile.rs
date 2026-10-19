@@ -546,6 +546,9 @@ impl SessionRegistry {
         };
         let snapshot = &projected;
         let mut outcome = WorkerMetadataApplyOutcome::Applied;
+        // Sequence the actual process validation, not a later projection of its
+        // cached result. Worker-journal admission is a separate metadata fence.
+        let identity_evidence_sequence = self.next_process_evidence_sequence();
         let mut identities_accepted = true;
         if snapshot.launch_identity.is_some() || snapshot.active_identity.is_some() {
             if let Err(failure) =
@@ -728,7 +731,34 @@ impl SessionRegistry {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
+            let retains_binding = entry
+                .active_agent
+                .as_ref()
+                .zip(projection.active.as_ref())
+                .is_some_and(|(previous, current)| {
+                    !previous.observed
+                        && previous.source == current.source
+                        && previous.agent == current.agent
+                        && previous.pid == current.pid
+                        && previous.start_identity == current.start_identity
+                        && previous.start_identity.is_some()
+                });
             let projected = apply_identity_projection(entry, &candidate, &projection, snapshot);
+            // Worker import independently validates the claimed process, even
+            // when only subagent metadata changed. Only that conclusive read
+            // supplies liveness, at acquisition age, not projection time.
+            if projection.active.is_some() && (retains_binding || projected.active) {
+                entry.claim_evidence_sequence = if retains_binding {
+                    entry
+                        .claim_evidence_sequence
+                        .max(identity_evidence_sequence)
+                } else {
+                    identity_evidence_sequence
+                };
+            }
+            if projection.privately_reported && (retains_binding || projected.active) {
+                entry.claim_report_sequence = self.next_process_evidence_sequence();
+            }
             if projected.active {
                 let config = reported_detector_config
                     .clone()
@@ -4711,7 +4741,15 @@ fn apply_identity_projection(
             || entry.info.active_agent_base != candidate.info.active_agent_base
             || entry.info.active_agent_pid != candidate.info.active_agent_pid
             || entry.info.active_agent_session_id != candidate.info.active_agent_session_id
-            || entry.info.active_agent_session_path != candidate.info.active_agent_session_path);
+            || entry.info.active_agent_session_path != candidate.info.active_agent_session_path
+            || projection.active.as_ref().is_some_and(|active| {
+                entry.active_agent.as_ref().is_none_or(|current| {
+                    current.source != active.source
+                        || current.seq != active.seq
+                        || current.pid != active.pid
+                        || current.start_identity != active.start_identity
+                })
+            }));
     if !native_changed && !active_changed {
         return ProjectedIdentity {
             any: false,
