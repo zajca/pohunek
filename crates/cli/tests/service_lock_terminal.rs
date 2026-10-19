@@ -58,7 +58,7 @@ while [ ! -e "$d/stop" ]; do sleep 0.05; done
 /// The shell that owns the terminal: it runs the lock in its foreground on
 /// the command `$LOCKED`, then reports that the lock ended and waits for `end`.
 const OUTER: &str = r#"d=$1
-"$POHUNEK" service lock -- "$LOCKED" "$d/inner.sh" "$d"
+"$POHUNEK" service lock -- "$LOCKED" "$d/inner.sh" "$d" 2> "$d/lock.stderr"
 echo $? > "$d/lock.status"
 while [ ! -e "$d/end" ]; do sleep 0.05; done
 "#;
@@ -153,6 +153,10 @@ impl Session {
     }
 
     fn launch(with_hold: bool, locked: &str) -> Self {
+        Self::launch_with_failure(with_hold, locked, None)
+    }
+
+    fn launch_with_failure(with_hold: bool, locked: &str, failure: Option<&str>) -> Self {
         // `TestEnv` roots are canonical, so no symlinked ancestor (macOS `/var`)
         // is refused.
         let env = TestEnv::new().expect("create the hermetic test environment");
@@ -174,6 +178,9 @@ impl Session {
         }
         command.env("POHUNEK", pohunek_bin());
         command.env("LOCKED", locked);
+        if let Some(operation) = failure {
+            command.env(pohunek_cli::service::RECOVERY_FAILURE_ENV, operation);
+        }
         if let Some(hold) = &hold {
             command.env(pohunek_cli::service::HANDOFF_HOLD_ENV, &hold.path);
         }
@@ -201,6 +208,12 @@ impl Session {
         if let Some(hold) = &mut self.hold {
             hold.release();
         }
+    }
+
+    /// The command has ended before lock.status, so this captures complete stderr.
+    fn recovery_diagnostics(&self) -> String {
+        fs::read_to_string(self.path("lock.stderr"))
+            .unwrap_or_else(|error| format!("could not read recovery diagnostics: {error}"))
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -356,5 +369,48 @@ fn a_command_that_cannot_execute_leaves_the_terminal_to_the_shell() {
     let session = Session::launch(false, MISSING_COMMAND);
     let shell = i32::try_from(session.shell.process_id().expect("shell pid")).expect("pid");
     assert_ne!(line(&session.path("lock.status")), "0");
-    assert_eq!(session.foreground(), Some(shell));
+    assert_eq!(
+        session.foreground(),
+        Some(shell),
+        "shell_pgid={shell}; failed-spawn recovery: {}",
+        session.recovery_diagnostics()
+    );
+}
+
+/// Real failed execs report every recovery syscall failure without claiming success.
+#[test]
+fn failed_exec_reports_terminal_recovery_syscall_errors() {
+    let interrupted = nix::errno::Errno::EINTR as i32;
+    for (operation, field) in [
+        ("tcgetpgrp", format!("foreground_before=Err({interrupted})")),
+        ("killpg", format!("killpg=Some(Err({interrupted}))")),
+        ("tcsetpgrp", format!("tcsetpgrp=Some(Err({interrupted}))")),
+    ] {
+        let session = Session::launch_with_failure(false, MISSING_COMMAND, Some(operation));
+        let shell = i32::try_from(session.shell.process_id().expect("shell pid")).expect("pid");
+        assert_ne!(line(&session.path("lock.status")), "0");
+        let diagnostics = session.recovery_diagnostics();
+        let foreground = session
+            .foreground()
+            .expect("the terminal still has a group");
+        assert!(
+            diagnostics.contains(&format!("failed to run {MISSING_COMMAND}"))
+                && diagnostics.contains("No such file or directory"),
+            "the spawn failure remains visible: {diagnostics}"
+        );
+        for expected in [
+            format!("owner_pgid={shell}"),
+            field,
+            format!("foreground_after=Ok({foreground})"),
+        ] {
+            assert!(
+                diagnostics.contains(&expected),
+                "missing {expected:?}: {diagnostics}"
+            );
+        }
+        assert_ne!(
+            foreground, shell,
+            "the injected failure must leave recovery incomplete: {diagnostics}"
+        );
+    }
 }
