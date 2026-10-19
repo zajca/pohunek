@@ -426,7 +426,7 @@ group are forwarded to the command's group, so each reaches the command
 exactly once. On a terminal it behaves like a job: `Ctrl-Z` stops the command,
 the lock process takes the terminal back and stops too, so the shell reports
 the job stopped, and `fg` (or `SIGCONT` to the lock process) gives the
-terminal back to the command and continues it. One signal received while the
+terminal back to the command and continues it. If execution fails, the error retains the original spawn failure and reports the owner PGID, initial terminal ownership, foreground PGIDs before and after recovery, and each attempted recovery syscall result (numeric errno on failure). These observations do not retry the handoff or change its ownership rules. One signal received while the
 lock process waits for adopters ends that wait. If the lock process cannot tell whether an adopter still runs, it
 removes its record, releases the lock, and fails. `pohunek service check [--prefix <dir>] [--json]`
 runs, without changing anything, every check the install (while an install is

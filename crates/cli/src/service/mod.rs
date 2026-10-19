@@ -392,20 +392,19 @@ async fn run_locked(
 ) -> Result<ExitStatus, Error> {
     use std::os::unix::process::CommandExt as _;
 
-    let terminal = Terminal::owned();
+    let terminal = Terminal::observe();
     let mut command = std::process::Command::new(program);
     command
         .args(arguments)
         .env(inherited::LOCK_TOKEN_ENV, token.as_str())
         .process_group(0);
-    if let Some(terminal) = &terminal {
+    if terminal.was_foreground() {
         terminal.prepare(&mut command);
     }
-    let child = command.spawn().map_err(|source| {
-        if let Some(terminal) = &terminal {
-            terminal.recover();
-        }
-        error::io_error("run", program)(source)
+    let child = command.spawn().map_err(|source| Error::CommandSpawn {
+        path: program.into(),
+        source,
+        recovery: terminal.recover(),
     })?;
     let pid = i32::try_from(child.id())
         .map(nix::unistd::Pid::from_raw)
@@ -419,7 +418,10 @@ async fn run_locked(
     let waiter = std::thread::spawn(move || watch(pid, &events));
     #[cfg(feature = "test-util")]
     hold_before_handoff();
-    let terminal = terminal.and_then(|terminal| terminal.hand_to(group));
+    let terminal = terminal
+        .was_foreground()
+        .then_some(terminal)
+        .and_then(|terminal| terminal.hand_to(group));
     let status = loop {
         tokio::select! {
             change = changes.recv() => match change {
@@ -503,27 +505,32 @@ fn watch(pid: nix::unistd::Pid, events: &tokio::sync::mpsc::UnboundedSender<Chan
     }
 }
 
-/// The terminal on stdin while its foreground is this process's group.
+/// The initial terminal ownership, including failed ownership observations.
 #[derive(Debug, Clone, Copy)]
 struct Terminal {
-    /// This process's group.
     own: nix::unistd::Pid,
+    tty: nix::Result<bool>,
+    foreground: Option<nix::Result<nix::unistd::Pid>>,
 }
 
 impl Terminal {
-    /// Returns the terminal on stdin when this process's group owns it.
-    ///
-    /// Returns `None` when stdin is no terminal or this process runs in its
-    /// background; the child then leaves the foreground alone.
-    fn owned() -> Option<Self> {
+    /// Observes ownership without discarding a failed terminal query.
+    fn observe() -> Self {
         use std::os::fd::AsRawFd as _;
 
         let stdin = std::io::stdin();
-        if !nix::unistd::isatty(stdin.as_raw_fd()).unwrap_or(false) {
-            return None;
-        }
+        let tty = nix::unistd::isatty(stdin.as_raw_fd());
         let own = nix::unistd::getpgrp();
-        (nix::unistd::tcgetpgrp(&stdin).ok()? == own).then_some(Self { own })
+        let foreground = (tty == Ok(true)).then(|| nix::unistd::tcgetpgrp(&stdin));
+        Self {
+            own,
+            tty,
+            foreground,
+        }
+    }
+
+    fn was_foreground(self) -> bool {
+        self.tty == Ok(true) && self.foreground == Some(Ok(self.own))
     }
 
     /// Makes the child of `command` take the terminal for its own group
@@ -575,16 +582,36 @@ impl Terminal {
     /// reaps that child, so its group has no member left. The terminal is
     /// taken back only from a group without members, never from a live one
     /// that took it meanwhile.
-    fn recover(self) {
+    fn recover(self) -> String {
         let stdin = std::io::stdin();
-        let Ok(current) = nix::unistd::tcgetpgrp(&stdin) else {
-            return;
-        };
-        if current != self.own
-            && nix::sys::signal::killpg(current, None) == Err(nix::errno::Errno::ESRCH)
-        {
-            claim_from_background(&stdin, self.own);
+        let before = recovery_call("tcgetpgrp", || nix::unistd::tcgetpgrp(&stdin));
+        let mut probe = None;
+        let mut reclaim = None;
+        if self.was_foreground() {
+            if let Ok(current) = before {
+                if current != self.own {
+                    let result =
+                        recovery_call("killpg", || nix::sys::signal::killpg(current, None));
+                    probe = Some(result.map_err(raw_errno));
+                    if result == Err(nix::errno::Errno::ESRCH) {
+                        reclaim = Some(claim_from_background(&stdin, self.own));
+                    }
+                }
+            }
         }
+        // Observation only: no retry, extra handoff, or claim from a live group.
+        let after = nix::unistd::tcgetpgrp(&stdin);
+        format!(
+            "owner_pgid={} initial_tty={:?} initial_foreground={:?} \
+             foreground_before={:?} killpg={probe:?} reclaim=[{}] foreground_after={:?}",
+            self.own,
+            self.tty.map_err(raw_errno),
+            self.foreground
+                .map(|result| result.map(nix::unistd::Pid::as_raw).map_err(raw_errno)),
+            before.map(nix::unistd::Pid::as_raw).map_err(raw_errno),
+            reclaim.map_or_else(|| "not attempted".to_owned(), |report| report.to_string()),
+            after.map(nix::unistd::Pid::as_raw).map_err(raw_errno),
+        )
     }
 }
 
@@ -623,16 +650,63 @@ fn take_terminal(owner: nix::unistd::Pid, ttou: nix::sys::signal::SigSet) {
 /// Changing the foreground from there raises `SIGTTOU`, which would stop
 /// this process; the signal is blocked on this thread for the call, which
 /// both Linux and macOS honor for `tcsetpgrp`.
-fn claim_from_background(stdin: &std::io::Stdin, group: nix::unistd::Pid) {
+fn claim_from_background(stdin: &std::io::Stdin, group: nix::unistd::Pid) -> TerminalClaim {
     use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow, Signal};
 
     let mut ttou = SigSet::empty();
     ttou.add(Signal::SIGTTOU);
     let mut previous = SigSet::empty();
-    if pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&ttou), Some(&mut previous)).is_ok() {
-        let _ = nix::unistd::tcsetpgrp(stdin, group);
-        let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&previous), None);
+    let mask_block = pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&ttou), Some(&mut previous));
+    let (handoff, mask_restore) = if mask_block.is_ok() {
+        let handoff = recovery_call("tcsetpgrp", || nix::unistd::tcsetpgrp(stdin, group));
+        let restore = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&previous), None);
+        (
+            Some(handoff.map_err(raw_errno)),
+            Some(restore.map_err(raw_errno)),
+        )
+    } else {
+        (None, None)
+    };
+    TerminalClaim {
+        mask_block: mask_block.map_err(raw_errno),
+        handoff,
+        mask_restore,
     }
+}
+
+/// Each result of the existing handback, retained for failed-spawn diagnostics.
+#[derive(Debug)]
+struct TerminalClaim {
+    mask_block: Result<(), i32>,
+    handoff: Option<Result<(), i32>>,
+    mask_restore: Option<Result<(), i32>>,
+}
+
+impl std::fmt::Display for TerminalClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "mask_block={:?} tcsetpgrp={:?} mask_restore={:?}",
+            self.mask_block, self.handoff, self.mask_restore
+        )
+    }
+}
+
+fn raw_errno(error: nix::errno::Errno) -> i32 {
+    error as i32
+}
+
+/// A failed recovery syscall, injected only into the real CLI's test build.
+#[cfg(feature = "test-util")]
+pub const RECOVERY_FAILURE_ENV: &str = "POHUNEK_TEST_SERVICE_LOCK_RECOVERY_FAILURE";
+
+fn recovery_call<T>(operation: &str, call: impl FnOnce() -> nix::Result<T>) -> nix::Result<T> {
+    #[cfg(feature = "test-util")]
+    if std::env::var(RECOVERY_FAILURE_ENV).is_ok_and(|value| value == operation) {
+        return Err(nix::errno::Errno::EINTR);
+    }
+    let _ = operation;
+    call()
 }
 
 /// The terminal's foreground, handed to the child's process group.

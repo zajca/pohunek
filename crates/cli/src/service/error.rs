@@ -169,6 +169,18 @@ pub enum Error {
         source: io::Error,
     },
 
+    /// A command failed to spawn; terminal recovery observations accompany it.
+    #[error("failed to run {}: {source}; terminal recovery: {recovery}", path.display())]
+    CommandSpawn {
+        /// The program that could not execute.
+        path: PathBuf,
+        /// The original spawn error, retained with its OS error code.
+        #[source]
+        source: io::Error,
+        /// Ownership observations and raw errno values of the attempted recovery.
+        recovery: String,
+    },
+
     /// A staged binary is missing or not a regular file.
     #[error("staged binary {} is missing or not a regular file", path.display())]
     StagedBinary {
@@ -701,7 +713,9 @@ impl Error {
             Self::ResumeConfigMismatch { .. } => "service_resume_config_mismatch",
             Self::Config(_) => "service_config_invalid",
             Self::UntrustedDirectory { .. } => "service_untrusted_directory",
-            Self::Filesystem { .. } | Self::Io { .. } => "service_io_failed",
+            Self::Filesystem { .. } | Self::Io { .. } | Self::CommandSpawn { .. } => {
+                "service_io_failed"
+            }
             Self::StagedBinary { .. } => "service_staged_binary_missing",
             Self::StagedAnchor { .. } => "service_staged_anchor_invalid",
             Self::StagedRuntime { .. } => "service_staged_runtime_invalid",
