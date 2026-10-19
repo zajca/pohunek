@@ -7,6 +7,8 @@
 
 // Rust guideline compliant 2026-06-26
 
+use unicode_width::UnicodeWidthChar;
+
 const SCROLLBACK_LINES: usize = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +39,7 @@ impl ScreenTracker {
         }
     }
 
-    /// Feeds PTY bytes and reports whether characters were drawn.
+    /// Feeds PTY bytes and reports positive-width character prints.
     ///
     /// A second instance of the same VT state machine used by `vt100` observes
     /// print callbacks, including identical redraws that a final text diff
@@ -48,6 +50,44 @@ impl ScreenTracker {
         self.draw_parser.advance(&mut observation, bytes);
         self.parser.process(bytes);
         observation.drew_chars
+    }
+
+    /// Feeds bytes with observations before controls and possible wrapping.
+    ///
+    /// The observer sees the grid before completed VT controls or potential
+    /// character wrapping can erase a blocker, and again after all bytes.
+    /// Positive-width print observations accompany each rendered prefix.
+    /// Parser state survives split UTF-8 and escape sequences. Ordinary text
+    /// is batched: the observer never runs for each printable character.
+    pub fn feed_observed<F>(&mut self, bytes: &[u8], observe: &mut F)
+    where
+        F: FnMut(&ScreenTracker, ScreenObservation),
+    {
+        let mut applied = 0;
+        let mut printed = false;
+        let columns = usize::from(self.parser.screen().size().1);
+        let mut column = usize::from(self.parser.screen().cursor_position().1);
+        for index in 0..bytes.len() {
+            let mut event = ObservedFeed::default();
+            self.draw_parser.advance(&mut event, &bytes[index..=index]);
+            let may_wrap = event.width.is_some_and(|width| column + width > columns);
+            if event.completed_action || may_wrap {
+                // Exclude this action's final byte: the grid must still show
+                // the prefix the action is about to change or scroll away.
+                self.parser.process(&bytes[applied..index]);
+                observe(self, ScreenObservation::new(printed));
+                printed = false;
+                self.parser.process(&bytes[index..=index]);
+                applied = index + 1;
+                column = usize::from(self.parser.screen().cursor_position().1);
+            } else if let Some(width) = event.width {
+                column += width;
+            }
+            printed |= event.printed;
+        }
+        self.parser.process(&bytes[applied..]);
+        // A control may be the final byte, so this observation is unconditional.
+        observe(self, ScreenObservation::new(printed));
     }
 
     /// Whether the parsed terminal has bracketed paste enabled.
@@ -302,6 +342,20 @@ impl ScreenTracker {
     }
 }
 
+/// Character print observations accompanying a rendered terminal prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenObservation {
+    /// Positive-width print callbacks since the previous observation.
+    /// Zero-width changes are detected through the rendered text instead.
+    pub drew_chars: bool,
+}
+
+impl ScreenObservation {
+    fn new(drew_chars: bool) -> Self {
+        Self { drew_chars }
+    }
+}
+
 /// Print callbacks for one feed; parser state lives in `ScreenTracker`.
 #[derive(Default)]
 struct DrawObservation {
@@ -310,12 +364,65 @@ struct DrawObservation {
 
 impl vte::Perform for DrawObservation {
     fn print(&mut self, character: char) {
-        // Match vt100's print callback: replacement and C1 characters are
-        // ignored rather than written to cells. The shared vte parser already
-        // excludes C0 controls, escape payloads and incomplete UTF-8.
-        if character != '\u{fffd}' && !('\u{80}'..'\u{a0}').contains(&character) {
+        if grid_print_width(character).is_some() {
             self.drew_chars = true;
         }
+    }
+}
+
+/// Returns the width of a conservatively eligible character redraw.
+///
+/// `vt100` ignores replacement/C1 characters and can discard combining marks
+/// at the cursor origin. Positive-width callbacks count even for an identical
+/// repaint; actual zero-width cell changes remain covered by the text diff.
+fn grid_print_width(character: char) -> Option<usize> {
+    if character == '\u{fffd}' || ('\u{80}'..'\u{a0}').contains(&character) {
+        return None;
+    }
+    character.width().filter(|width| *width > 0)
+}
+
+/// Print and completed-control-action callbacks for
+/// [`ScreenTracker::feed_observed`]; parser state lives in `ScreenTracker`.
+#[derive(Default)]
+struct ObservedFeed {
+    printed: bool,
+    completed_action: bool,
+    width: Option<usize>,
+}
+
+impl vte::Perform for ObservedFeed {
+    fn print(&mut self, character: char) {
+        if let Some(width) = grid_print_width(character) {
+            self.width = Some(width);
+            self.printed = true;
+        }
+    }
+
+    fn execute(&mut self, _byte: u8) {
+        self.completed_action = true;
+    }
+
+    fn csi_dispatch(
+        &mut self,
+        _params: &vte::Params,
+        _intermediates: &[u8],
+        _ignore: bool,
+        _action: char,
+    ) {
+        self.completed_action = true;
+    }
+
+    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _action: u8) {
+        self.completed_action = true;
+    }
+
+    fn osc_dispatch(&mut self, _params: &[&[u8]], _wide_osc: bool) {
+        self.completed_action = true;
+    }
+
+    fn unhook(&mut self) {
+        self.completed_action = true;
     }
 }
 

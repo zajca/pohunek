@@ -21,6 +21,7 @@ mod snapshot;
 pub use compositor::{Compositor, OverlayFrame, OverlayLine, MIN_ROWS};
 #[doc(inline)]
 pub use menu::{step, MenuEffect, MenuEvent, MenuKey, MenuOutcome, MenuState};
-pub use screen::{ScreenRegion, ScreenTracker};
+#[doc(inline)]
+pub use screen::{ScreenObservation, ScreenRegion, ScreenTracker};
 pub use snapshot::{TerminalSnapshot, TerminalTracker};
 pub use vt100::{MouseProtocolEncoding, MouseProtocolMode};

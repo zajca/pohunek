@@ -1236,6 +1236,116 @@ fn manifest_idle_ready_only_on_idle_evidence_newer_than_the_blocker() {
     );
 }
 
+/// A PTY chunk that coalesces the stale idle title, the full captured popup,
+/// and the clear onto the provisional composer, the way one burst of startup
+/// output can arrive.
+fn coalesced_popup_chunk(rows: &[String], composer: &[String]) -> Vec<u8> {
+    let mut chunk = frame_bytes(Some(FAKE_TITLE), rows);
+    chunk.extend(clear_composer_chunk(composer));
+    chunk
+}
+
+/// The initial popup must be sighted before a VT clear inside the same PTY
+/// chunk erases it: an initial chunk with the title, the full popup, and the
+/// provisional composer in one feed latches exactly like the same bytes split
+/// after the popup, at every capture width. Partial popup repaints without
+/// the heading keep the latch, and quiet blank output with the title-only
+/// manifest is never readiness; only fresh idle evidence after the popup is
+/// gone (a repeated idle title) releases it.
+#[test]
+fn manifest_idle_latches_the_coalesced_initial_popup_like_the_split_one() {
+    let definition = installed_definition();
+    let config = manifest_idle_probe_config(&definition);
+    let composer = composer_rows();
+    for columns in POPUP_CAPTURE_COLUMNS {
+        let rows = popup_rows(columns);
+        let height = u16::try_from(rows.len()).expect("capture rows").max(24);
+
+        // Rule out the chunking itself: split after the popup, the sequence
+        // stays latched the whole way.
+        let mut split = LatchProbe::start(config.clone(), height, columns);
+        split.feed(&frame_bytes(Some(FAKE_TITLE), &rows));
+        split.assert_ready(false, "split: the popup holds the prompt");
+        split.feed(&clear_composer_chunk(&composer));
+        split.assert_ready(false, "split: the cached title stays stale after the clear");
+
+        // Coalesced: the same bytes in one feed. The popup exists on screen
+        // before the completed clear erases it, so the latch must still see it.
+        let mut coalesced = LatchProbe::start(config.clone(), height, columns);
+        coalesced.feed(&coalesced_popup_chunk(&rows, &composer));
+        coalesced.assert_ready(
+            false,
+            "coalesced: the popup sighted before its clear holds the prompt",
+        );
+        coalesced.tick(4);
+        coalesced.assert_ready(false, "coalesced: ticks do not lift a latched popup");
+
+        // A clear with only a partial popup repaint without the heading must
+        // not release...
+        coalesced.feed(&clear_chunk());
+        coalesced.assert_ready(false, "coalesced: the clear alone never releases the latch");
+        coalesced.feed(rows[8..].join("\r\n").as_bytes());
+        coalesced.assert_ready(
+            false,
+            "coalesced: a partial popup repaint without the heading stays latched",
+        );
+        // ...and a full popup redraw re-arms the latch.
+        coalesced.feed(&frame_bytes(None, &rows));
+        coalesced.feed(&clear_chunk());
+        coalesced.assert_ready(
+            false,
+            "coalesced: the clear after a redrawn popup keeps the latch",
+        );
+
+        // Blank quiet output is not readiness under the title-only manifest.
+        coalesced.tick(4);
+        coalesced.assert_ready(false, "coalesced: a quiet blank screen is not readiness");
+
+        // The release needs fresh idle evidence after the popup is gone.
+        coalesced.feed(&title_chunk(FAKE_TITLE));
+        coalesced.assert_ready(
+            true,
+            "coalesced: a fresh idle title after the popup lifts the latch",
+        );
+    }
+}
+
+#[test]
+fn manifest_idle_keeps_the_popup_hold_across_implicit_scroll() {
+    let definition = installed_definition();
+    let popup = [
+        "Update available! 0.160.0 -> 0.162.1",
+        "› 1. Update now",
+        "2. Skip",
+        "3. Skip until next version",
+    ]
+    .map(str::to_owned);
+    for columns in POPUP_CAPTURE_COLUMNS {
+        let height = u16::try_from(popup_rows(columns).len()).expect("capture height");
+        for coalesced in [false, true] {
+            let mut probe =
+                LatchProbe::start(manifest_idle_probe_config(&definition), height, columns);
+            let mut bytes = frame_bytes(Some(FAKE_TITLE), &popup);
+            if !coalesced {
+                probe.feed(&bytes);
+                probe.assert_ready(false, "the minimal complete popup blocks");
+                bytes.clear();
+            }
+            // Spaces preserve the last choice's text until automatic wrapping
+            // scrolls the popup away, without any intervening VT controls.
+            bytes.extend(std::iter::repeat_n(
+                b' ',
+                usize::from(columns) * usize::from(height) * 2,
+            ));
+            bytes.extend(clear_composer_chunk(&composer_rows()));
+            probe.feed(&bytes);
+            probe.assert_ready(false, "implicit scrolling cannot hide a blocker sighting");
+            probe.feed(&title_chunk(FAKE_TITLE));
+            probe.assert_ready(true, "fresh idle evidence releases after the scroll");
+        }
+    }
+}
+
 fn manifest_idle_probe_config(definition: &RuntimeDefinition) -> DetectorConfig {
     DetectorConfig {
         input_readiness: InputReadiness::ManifestIdle,
@@ -1488,6 +1598,24 @@ fn manifest_idle_identical_redraw_releases_under_every_chunking() {
 }
 
 #[test]
+fn manifest_idle_counts_a_final_erase_as_fresh_screen_evidence() {
+    let definition = installed_definition();
+    let mut config = manifest_idle_probe_config(&definition);
+    config.manifest = Some(Arc::new(
+        Manifest::parse_str(&screen_idle_manifest_with_title_blocker())
+            .expect("title blocker manifest"),
+    ));
+    for columns in POPUP_CAPTURE_COLUMNS {
+        let mut probe = title_blocker_probe(config.clone(), columns);
+        probe.assert_ready(false, "the composer is still stale");
+        // Erase the header row, leaving the screen-idle composer's placeholder.
+        // The erasing CSI is the final byte sequence in this feed.
+        probe.feed(b"\x1b[2;1H\x1b[2K");
+        probe.assert_ready(true, "the final VT action changed the idle screen");
+    }
+}
+
+#[test]
 fn manifest_idle_control_output_does_not_refresh_a_stale_composer() {
     let definition = installed_definition();
     let mut config = manifest_idle_probe_config(&definition);
@@ -1499,6 +1627,7 @@ fn manifest_idle_control_output_does_not_refresh_a_stale_composer() {
         ("incomplete UTF-8", b"\xe2"),
         ("ignored C1 character", b"\xc2\x80"),
         ("replacement character", "\u{fffd}".as_bytes()),
+        ("combining mark at cursor origin", b"\x1b[H\xcc\x81"),
         ("cursor and style", b"\x1b[H\x1b[0m\x1b[?25h"),
         ("OSC progress", b"\x1b]9;4;0;0\x07"),
         (

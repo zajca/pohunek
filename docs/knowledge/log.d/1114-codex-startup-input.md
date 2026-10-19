@@ -27,8 +27,12 @@
   sighted: only idle evidence that arrives after that sighting releases the
   prompt. OSC title arrivals are ordered against screen updates inside each
   PTY chunk, so a title received before a clear cannot be mistaken for a
-  later ready signal. Sighting the blocker again (a partial repaint that
-  keeps it on screen, or a full-context observation before new bytes after a
+  later ready signal. The sighting happens while the output chunk is still
+  being consumed: the screen context is observed before completed VT controls
+  or potential character wrapping can erase a blocker, and again after the
+  final byte. A complete popup drawn and cleared inside one chunk is therefore
+  recorded before its clear. Sighting the blocker again (a partial repaint
+  that keeps it on screen, or a full-context observation before new bytes after a
   reconfigure or resize) raises the barrier anew, so a fresh title received
   while the blocker holds cannot arm future readiness. A repeated reception
   of the same idle title counts as a fresh arrival for readiness only; the
@@ -38,7 +42,9 @@
   same `vte` state machine as the terminal grid. A clear and identical composer
   repaint count as fresh screen evidence whether received together or split
   into PTY chunks. Control-only output, incomplete UTF-8 and characters ignored
-  by `vt100` cannot refresh stale screen evidence. The blocker barrier still
+  by `vt100` cannot refresh stale screen evidence. Zero-width callbacks do not
+  count as redraws; actual combining changes still count through the text diff.
+  The blocker barrier still
   rejects screen output received while a title blocker holds. Screen text
   changes and character redraws affect strict input freshness; the debounced
   activity classifier retains its existing final-text-change semantics.
