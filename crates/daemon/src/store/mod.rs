@@ -1573,15 +1573,15 @@ impl Store {
     }
 
     fn temp_path(&self) -> PathBuf {
-        let mut name = self
+        let store = self
             .path
             .file_name()
-            .map_or_else(|| "metadata.jsonl".into(), std::ffi::OsStr::to_os_string);
-        name.push(format!(".tmp.{}", std::process::id()));
-        name.push(format!(
-            ".{}",
-            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
+            .unwrap_or_else(|| std::ffi::OsStr::new(pohunek_paths::METADATA_STORE_NAME));
+        let name = pohunek_paths::metadata_store_temp_name(
+            store,
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        );
         match self.path.parent() {
             Some(parent) => parent.join(name),
             None => PathBuf::from(name),

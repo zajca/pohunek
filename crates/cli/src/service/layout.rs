@@ -93,7 +93,7 @@ const ANCHOR_MODE: u32 = 0o644;
 const STAGING_MODE: u32 = 0o700;
 
 /// Mode bits that make a directory unsafe to install into.
-const FORBIDDEN_BITS: u32 = 0o022;
+pub(super) const FORBIDDEN_BITS: u32 = 0o022;
 
 /// Name prefix of staging directories inside the versions directory.
 const STAGING_PREFIX: &str = ".pohunek-staging-";

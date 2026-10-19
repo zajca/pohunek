@@ -443,8 +443,13 @@ code that command would fail with. For an upgrade it also runs the
 
 `pohunek service uninstall` refuses while sessions are live and lists them.
 `--stop-sessions` stops every session through its worker first; the session
-store, journals, and host identity are kept unless `--purge` is given. The
-prefix ownership record is removed after the prefix's version directories and
+store, journals, and host identity are kept unless `--purge` is given. Purge
+also removes the store's schema backups, crashed `metadata.jsonl.tmp.<pid>.<sequence>`
+copies, and imported legacy-manifest archives in `migrations/`. It removes only
+recognized artifact names; a symlink at a recognized temp or archive name is
+unlinked without following its target. Unrecognized data and migration entries
+are kept and reported (`kept_purge_entries` in JSON). A pending migration
+manifest is retained. The prefix ownership record is removed after the prefix's version directories and
 CLI copy (it stays while a version is kept for a worker journal or job of this
 installation). The transaction record (`service-install.json`) is cleared just before
 `service.toml`, which is removed last, so if an uninstall fails partway or is

@@ -143,6 +143,9 @@ pub struct UninstallReport {
     pub retired_workers: Vec<String>,
     /// Files and directories removed.
     pub removed: Vec<PathBuf>,
+    /// Data-root and migration entries retained by purge because they are outside its scope.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept_purge_entries: Vec<PathBuf>,
     /// Version directories kept, with the reason.
     pub kept_versions: Vec<KeptVersion>,
     /// Whether durable metadata was purged.

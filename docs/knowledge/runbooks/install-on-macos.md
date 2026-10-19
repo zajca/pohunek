@@ -181,8 +181,13 @@ refuses while sessions are live and names them; end them yourself, or accept the
 destructive path explicitly with `pohunek service uninstall --stop-sessions`. The
 default keeps the durable host identity, governance keys, session history, and
 worktrees. `pohunek service uninstall --purge` additionally removes the session
-store and its schema-migration backups (`metadata.jsonl.pre-schema-<n>`), event
-logs, worker journals, and host identity: it is never implicit.
+store, its schema-migration backups (`metadata.jsonl.pre-schema-<n>`), crashed
+atomic-write copies (`metadata.jsonl.tmp.<pid>.<sequence>`), imported legacy
+manifest archives under `migrations/`, event logs, worker journals, and host
+identity: it is never implicit. Only recognized artifact names are removed;
+a symlink at a recognized temp or archive name is unlinked without following
+its target. Unrecognized data and migration entries are retained and listed in
+`kept_purge_entries` in JSON, or as `kept ... (outside purge scope)` in text.
 
 ## Logs
 

@@ -939,10 +939,27 @@ pub(crate) fn open_state_dir(path: &Path, create: bool) -> Result<Option<Trusted
 
 /// Removes one regular file of a trusted directory; absence is not an error.
 pub(crate) fn remove_file(directory: &TrustedDir, name: &str) -> Result<(), Error> {
+    remove_entry(directory, name, EntryKind::RegularFile)
+}
+
+/// Unlinks a recognized purge artifact, including a symlink itself, never its target.
+pub(crate) fn remove_purge_artifact(directory: &TrustedDir, name: &str) -> Result<(), Error> {
+    let kind = match directory.entry_identity(name, EntryKind::RegularFile) {
+        Ok(_) => EntryKind::RegularFile,
+        Err(FsError::UnsafeType {
+            actual: "symbolic link",
+            ..
+        }) => EntryKind::Symlink,
+        Err(source) => return Err(fs_error("inspect purge artifact", source)),
+    };
+    remove_entry(directory, name, kind)
+}
+
+fn remove_entry(directory: &TrustedDir, name: &str, kind: EntryKind) -> Result<(), Error> {
     const OPERATION: &str = "remove file";
 
     let Some(identity) = directory
-        .entry_identity(name, EntryKind::RegularFile)
+        .entry_identity(name, kind)
         .map_err(|source| fs_error(OPERATION, source))?
     else {
         return Ok(());
