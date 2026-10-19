@@ -658,19 +658,112 @@ async fn a_liveness_failure_after_sigterm_prevents_sigkill() {
 /// Sweeps against real processes through the host inspector and real signals.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod host {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::process::{Child, Stdio};
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    use crate::process::{HostInspector, ProcessIdentity, ProcessInspector};
+    use crate::process::{
+        Error, ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity,
+        ProcessInspector,
+    };
 
     use super::super::{sweep_runtime, SweepRequest};
     use crate::process::hold;
+
+    /// Retains the error from the sweep's actual marker read, not a later retry.
+    #[derive(Debug, Default)]
+    struct Inspector {
+        host: HostInspector,
+        markers: Mutex<HashMap<Pid, String>>,
+    }
+
+    impl Inspector {
+        fn marker_diagnostic(&self, pid: Pid) -> String {
+            self.markers
+                .lock()
+                .expect("marker observations")
+                .get(&pid)
+                .cloned()
+                .unwrap_or_else(|| "not read by this inspector".to_owned())
+        }
+    }
+
+    impl ProcessInspector for Inspector {
+        fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, Error> {
+            self.host.identity(pid)
+        }
+        fn is_running(&self, identity: ProcessIdentity) -> Result<bool, Error> {
+            self.host.is_running(identity)
+        }
+        fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, Error> {
+            self.host.parent_pid(pid)
+        }
+        fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, Error> {
+            self.host.process(pid)
+        }
+        fn same_user_processes(&self) -> Result<Vec<ProcessFact>, Error> {
+            self.host.same_user_processes()
+        }
+        fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, Error> {
+            self.host.descendants(root)
+        }
+        fn cwd(&self, pid: Pid) -> Result<PathBuf, Error> {
+            self.host.cwd(pid)
+        }
+        fn executable(&self, pid: Pid) -> Result<Option<PathBuf>, Error> {
+            self.host.executable(pid)
+        }
+        fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, Error> {
+            self.host.exit_watch(identity)
+        }
+        fn foreground_process_group(&self, root_pid: Pid) -> Result<Option<Pid>, Error> {
+            self.host.foreground_process_group(root_pid)
+        }
+        fn lineage(&self, pid: Pid) -> Result<Option<crate::process::ProcessLineage>, Error> {
+            self.host.lineage(pid)
+        }
+        fn coalitions(&self, pid: Pid) -> Result<Option<crate::process::ProcessCoalitions>, Error> {
+            self.host.coalitions(pid)
+        }
+        fn descendant_identities(
+            &self,
+            root: ProcessIdentity,
+        ) -> Result<Vec<ProcessIdentity>, Error> {
+            self.host.descendant_identities(root)
+        }
+        fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, Error> {
+            let result = self.host.ownership_markers(pid);
+            // Retain only our fixtures' allowlisted markers and errors.
+            if let Some(observation) = self
+                .markers
+                .lock()
+                .expect("marker observations")
+                .get_mut(&pid)
+            {
+                *observation = match &result {
+                    Ok(markers) => format!("readable {markers:?}; errno=None"),
+                    Err(error) => {
+                        let errno = match error {
+                            Error::PermissionDenied { source, .. } | Error::Io { source, .. } => {
+                                source.raw_os_error()
+                            }
+                            _ => None,
+                        };
+                        format!("{error:?}; errno={errno:?}")
+                    }
+                };
+            }
+            result
+        }
+    }
 
     /// Short enough to keep the suite fast, long enough for a loaded runner
     /// to deliver `SIGTERM` and schedule the exiting process.
     const HOST_GRACE: Duration = Duration::from_secs(2);
     const HOST_POLL: Duration = Duration::from_millis(20);
-    /// Bound on waiting for a fixture shell to `exec` its final image.
+    /// Bound on the holding image's acknowledgement and readable markers.
     const READY_TIMEOUT: Duration = Duration::from_secs(10);
     const READY_POLL: Duration = Duration::from_millis(10);
 
@@ -699,9 +792,10 @@ mod host {
     struct Fixture {
         child: Child,
         identity: ProcessIdentity,
+        expected: OwnershipMarkers,
         /// Private working directory and scrubbed environment of the child;
         /// removed after the child is reaped.
-        _env: pohunek_test_support::env::TestEnv,
+        env: pohunek_test_support::env::TestEnv,
     }
 
     impl Drop for Fixture {
@@ -713,7 +807,7 @@ mod host {
     }
 
     fn spawn(
-        inspector: HostInspector,
+        inspector: &Inspector,
         behavior: Behavior,
         worker_instance_id: Option<&str>,
     ) -> Fixture {
@@ -723,9 +817,19 @@ mod host {
 
     /// Spawns the fixture with the given `(name, value)` environment markers.
     fn spawn_marked(
-        inspector: HostInspector,
+        inspector: &Inspector,
         behavior: Behavior,
         markers: &[(&str, &str)],
+    ) -> Fixture {
+        spawn_probed(inspector, behavior, markers, None, |_| {})
+    }
+
+    fn spawn_probed(
+        inspector: &Inspector,
+        behavior: Behavior,
+        markers: &[(&str, &str)],
+        gate: Option<&str>,
+        on_pending: impl FnOnce(&mut Fixture),
     ) -> Fixture {
         let env = pohunek_test_support::env::TestEnv::new().expect("test environment");
         let mut command = hold::shell_command(&env, &behavior.script());
@@ -736,6 +840,25 @@ mod host {
         for (name, value) in markers {
             command.env(name, value);
         }
+        command.env(hold::READY_FILE, env.root().join("holder-ready"));
+        #[cfg(target_os = "linux")]
+        if let Some(gate) = gate {
+            command.env(hold::BLOCK_READY, gate).stdin(Stdio::piped());
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert!(gate.is_none(), "unreadable gate is Linux-only");
+        let value = |key| {
+            markers
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).to_owned())
+        };
+        let expected = OwnershipMarkers {
+            daemon_id: value("POHUNEK_DAEMON_ID"),
+            session_id: value("POHUNEK_SESSION_ID"),
+            worker_id: value("POHUNEK_WORKER_ID"),
+            worker_instance_id: value("POHUNEK_WORKER_INSTANCE_ID"),
+        };
         let child = command.spawn().expect("spawn fixture");
         let pid = child.id();
         let mut fixture = Fixture {
@@ -744,21 +867,57 @@ mod host {
                 pid,
                 start_identity: crate::process::StartIdentity::new(0),
             },
-            _env: env,
+            expected,
+            env,
         };
-        // The trap must be installed before any signal arrives, so wait until
-        // the shell has replaced itself with the holding image.
+        inspector
+            .markers
+            .lock()
+            .expect("marker observations")
+            .insert(pid, "not read by this inspector".to_owned());
+        // Cmdline alone does not establish marker readability during exec.
+        // Require the holding body's acknowledgement and the same reader that
+        // the sweep uses to observe exactly the fixture's ownership markers.
         let image = hold::image();
+        let mut on_pending = Some(on_pending);
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
             let fact = inspector.process(pid).expect("inspect fixture");
             if let Some(fact) = fact.filter(|fact| fact.cmdline.first() == Some(&image)) {
                 fixture.identity = fact.identity();
-                return fixture;
+                let acknowledged = std::fs::read(fixture.env.root().join("holder-ready"))
+                    .ok()
+                    .as_deref()
+                    == Some(b"ready");
+                let markers = inspector.ownership_markers(pid);
+                if acknowledged
+                    && matches!(markers, Ok(ref markers) if *markers == fixture.expected)
+                {
+                    return fixture;
+                }
+                // The controlled probe runs only after the child has entered
+                // its gate; otherwise it could release the gate before testing it.
+                if gate.is_some_and(|gate| {
+                    let state: &[u8] = if gate == "after-ack" {
+                        b"ready"
+                    } else {
+                        b"blocked"
+                    };
+                    std::fs::read(fixture.env.root().join("holder-ready"))
+                        .ok()
+                        .as_deref()
+                        == Some(state)
+                }) {
+                    if let Some(probe) = on_pending.take() {
+                        probe(&mut fixture);
+                    }
+                }
             }
             assert!(
                 Instant::now() < deadline,
-                "fixture {pid} never exec'd the holding image"
+                "fixture {pid} did not acknowledge readable expected markers {:?}; marker_read={}",
+                fixture.expected,
+                inspector.marker_diagnostic(pid)
             );
             std::thread::sleep(READY_POLL);
         }
@@ -779,13 +938,14 @@ mod host {
         .expect("valid request")
     }
 
-    fn assert_untouched(inspector: HostInspector, report: &super::SweepReport, fixture: &Fixture) {
+    fn assert_untouched(inspector: &Inspector, report: &super::SweepReport, fixture: &Fixture) {
+        let running = inspector.is_running(fixture.identity);
         assert!(
-            inspector
-                .is_running(fixture.identity)
-                .expect("inspect survivor"),
-            "{:?} must survive the sweep",
-            fixture.identity
+            matches!(running, Ok(true)),
+            "{:?} must survive the sweep; running={running:?}; expected={:?}; report={report:?}; marker_read={}",
+            fixture.identity,
+            fixture.expected,
+            inspector.marker_diagnostic(fixture.identity.pid)
         );
         let listed = report
             .terminated
@@ -794,17 +954,23 @@ mod host {
             .chain(&report.unconfirmed)
             .chain(report.skipped.iter().map(|skipped| &skipped.identity))
             .any(|identity| *identity == fixture.identity);
-        assert!(!listed, "{:?} must not be selected", fixture.identity);
+        assert!(
+            !listed,
+            "{:?} must not be selected; expected={:?}; report={report:?}; marker_read={}",
+            fixture.identity,
+            fixture.expected,
+            inspector.marker_diagnostic(fixture.identity.pid)
+        );
     }
 
     #[tokio::test]
     async fn a_hangup_ignoring_process_is_killed_and_other_runtimes_survive() {
-        let inspector = HostInspector::new();
+        let inspector = Inspector::default();
         let runtime_a = unique_runtime("a");
         let runtime_b = unique_runtime("b");
-        let stubborn = spawn(inspector, Behavior::Stubborn, Some(&runtime_a));
-        let other_runtime = spawn(inspector, Behavior::Stubborn, Some(&runtime_b));
-        let unmarked = spawn(inspector, Behavior::Stubborn, None);
+        let stubborn = spawn(&inspector, Behavior::Stubborn, Some(&runtime_a));
+        let other_runtime = spawn(&inspector, Behavior::Stubborn, Some(&runtime_b));
+        let unmarked = spawn(&inspector, Behavior::Stubborn, None);
 
         let report = sweep_runtime(&inspector, &request(&runtime_a))
             .await
@@ -816,15 +982,15 @@ mod host {
         assert!(!inspector
             .is_running(stubborn.identity)
             .expect("inspect swept process"));
-        assert_untouched(inspector, &report, &other_runtime);
-        assert_untouched(inspector, &report, &unmarked);
+        assert_untouched(&inspector, &report, &other_runtime);
+        assert_untouched(&inspector, &report, &unmarked);
     }
 
     #[tokio::test]
     async fn a_term_honoring_process_is_terminated_by_sigterm() {
-        let inspector = HostInspector::new();
+        let inspector = Inspector::default();
         let runtime = unique_runtime("compliant");
-        let compliant = spawn(inspector, Behavior::Compliant, Some(&runtime));
+        let compliant = spawn(&inspector, Behavior::Compliant, Some(&runtime));
 
         let report = sweep_runtime(&inspector, &request(&runtime))
             .await
@@ -837,17 +1003,128 @@ mod host {
 
     #[tokio::test]
     async fn a_worker_instance_id_prefix_does_not_match_a_longer_worker_instance_id() {
-        let inspector = HostInspector::new();
+        let inspector = Inspector::default();
         let runtime = unique_runtime("prefix");
-        let exact = spawn(inspector, Behavior::Compliant, Some(&runtime));
-        let longer = spawn(inspector, Behavior::Compliant, Some(&format!("{runtime}B")));
+        let exact = spawn(&inspector, Behavior::Compliant, Some(&runtime));
+        let longer = spawn(
+            &inspector,
+            Behavior::Compliant,
+            Some(&format!("{runtime}B")),
+        );
 
         let report = sweep_runtime(&inspector, &request(&runtime))
             .await
             .expect("sweep runtime");
 
         assert_eq!(report.terminated, vec![exact.identity]);
-        assert_untouched(inspector, &report, &longer);
+        assert_untouched(&inspector, &report, &longer);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sweep_waits_for_the_holders_acknowledgement() {
+        readiness_scenario("before-ack");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sweep_waits_for_the_holders_readable_markers() {
+        readiness_scenario("after-ack");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_state(fixture: &Fixture, gate: &str) {
+        let state: &[u8] = if gate == "after-ack" {
+            b"ready"
+        } else {
+            b"blocked"
+        };
+        pohunek_test_support::wait::poll_until(
+            &format!("holder {:?} entering gate {gate}", fixture.identity),
+            || {
+                let observed = std::fs::read(fixture.env.root().join("holder-ready"));
+                (observed.as_deref().ok() == Some(state)).then_some(())
+            },
+        );
+    }
+
+    /// Real procfs denial must not escape fixture setup, even after acknowledgement.
+    #[cfg(target_os = "linux")]
+    fn readiness_scenario(gate: &str) {
+        use std::io::Write;
+
+        use pohunek_test_support::host_lock::{HostLock, UNREADABLE_HOLDERS};
+        let _held = HostLock::acquire(UNREADABLE_HOLDERS, gate);
+        let inspector = Inspector::default();
+        let runtime = unique_runtime("readiness");
+        let session = unique_runtime("readiness-session");
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let mut probed = false;
+        let fixture = spawn_probed(
+            &inspector,
+            Behavior::Compliant,
+            &[
+                ("POHUNEK_SESSION_ID", &session),
+                ("POHUNEK_HOOK_EVENT", "session-start"),
+            ],
+            Some(gate),
+            |fixture| {
+                wait_state(fixture, gate);
+                let report = executor
+                    .block_on(sweep_runtime(&inspector, &request(&runtime)))
+                    .expect("pre-ack sweep");
+                if gate == "after-ack" {
+                    assert!(
+                        report
+                            .skipped
+                            .iter()
+                            .any(|entry| entry.identity == fixture.identity
+                                && entry.reason == super::super::SkipReason::MarkersUnreadable),
+                        "{report:?}; marker_read={}",
+                        inspector.marker_diagnostic(fixture.identity.pid)
+                    );
+                    assert!(
+                        inspector
+                            .marker_diagnostic(fixture.identity.pid)
+                            .contains(&format!(
+                                "errno=Some({})",
+                                rustix::io::Errno::ACCESS.raw_os_error()
+                            )),
+                        "marker_read={}",
+                        inspector.marker_diagnostic(fixture.identity.pid)
+                    );
+                } else {
+                    // Readable markers alone cannot acknowledge the holder body.
+                    assert_untouched(&inspector, &report, fixture);
+                }
+                probed = true;
+                fixture
+                    .child
+                    .stdin
+                    .take()
+                    .expect("holder release")
+                    .write_all(b"x")
+                    .expect("release holder");
+            },
+        );
+        // Force an early-return mutant to meet the controlled child state
+        // before surveying, rather than racing the holder's startup.
+        if !probed {
+            wait_state(&fixture, gate);
+        }
+        let report = executor
+            .block_on(sweep_runtime(&inspector, &request(&runtime)))
+            .expect("post-ready sweep");
+        assert_untouched(&inspector, &report, &fixture);
+        assert_eq!(
+            std::fs::read(fixture.env.root().join("holder-ready")).expect("holder acknowledgement"),
+            b"ready",
+            "holder returned before acknowledgement; report={report:?}; marker_read={}",
+            inspector.marker_diagnostic(fixture.identity.pid)
+        );
     }
 
     /// A descendant of a worker released before `POHUNEK_WORKER_INSTANCE_ID`
@@ -858,11 +1135,11 @@ mod host {
     /// session, and a daemon-run hook of the session is not part of any.
     #[tokio::test]
     async fn a_session_process_without_an_instance_marker_survives_and_is_reported() {
-        let inspector = HostInspector::new();
+        let inspector = Inspector::default();
         let runtime = unique_runtime("unmarked");
         let session = unique_runtime("unmarked-session");
         let legacy = spawn_marked(
-            inspector,
+            &inspector,
             Behavior::Compliant,
             &[
                 ("POHUNEK_SESSION_ID", session.as_str()),
@@ -871,7 +1148,7 @@ mod host {
             ],
         );
         let other_session = spawn_marked(
-            inspector,
+            &inspector,
             Behavior::Compliant,
             &[
                 (
@@ -885,7 +1162,7 @@ mod host {
         // A lifecycle hook the daemon runs for the session carries the
         // session marker but no worker marker.
         let hook = spawn_marked(
-            inspector,
+            &inspector,
             Behavior::Compliant,
             &[
                 ("POHUNEK_SESSION_ID", session.as_str()),
@@ -898,9 +1175,14 @@ mod host {
             &request(&runtime).with_runtime_session(session.as_str()),
         )
         .await
-        .expect("sweep worker instance");
+        .unwrap_or_else(|error| {
+            panic!("sweep worker instance: {error:?}; observations={inspector:?}")
+        });
 
-        assert!(report.terminated.is_empty() && report.killed.is_empty());
+        assert!(
+            report.terminated.is_empty() && report.killed.is_empty(),
+            "report={report:?}; observations={inspector:?}"
+        );
         // Unrelated same-user processes with unreadable environments may also
         // be listed; only the fixtures' entries are asserted.
         let reasons = report
@@ -909,16 +1191,27 @@ mod host {
             .filter(|skipped| skipped.identity == legacy.identity)
             .map(|skipped| skipped.reason)
             .collect::<Vec<_>>();
-        assert_eq!(reasons, vec![super::super::SkipReason::InstanceUnmarked]);
-        assert!(inspector
-            .is_running(legacy.identity)
-            .expect("inspect survivor"));
-        assert_untouched(inspector, &report, &other_session);
-        assert_untouched(inspector, &report, &hook);
+        assert_eq!(
+            reasons,
+            vec![super::super::SkipReason::InstanceUnmarked],
+            "legacy={:?}; report={report:?}; marker_read={}",
+            legacy.identity,
+            inspector.marker_diagnostic(legacy.identity.pid)
+        );
+        assert!(
+            matches!(inspector.is_running(legacy.identity), Ok(true)),
+            "legacy={:?}; report={report:?}; marker_read={}",
+            legacy.identity,
+            inspector.marker_diagnostic(legacy.identity.pid)
+        );
+        assert_untouched(&inspector, &report, &other_session);
+        assert_untouched(&inspector, &report, &hook);
 
         let unnamed = sweep_runtime(&inspector, &request(&runtime))
             .await
-            .expect("sweep without a session");
-        assert_untouched(inspector, &unnamed, &legacy);
+            .unwrap_or_else(|error| {
+                panic!("sweep without a session: {error:?}; observations={inspector:?}")
+            });
+        assert_untouched(&inspector, &unnamed, &legacy);
     }
 }
