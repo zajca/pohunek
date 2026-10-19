@@ -163,7 +163,7 @@ impl SessionRegistry {
                 return;
             }
             entry.observed_agents.clear();
-            invalidate_process_scans(entry);
+            invalidate_process_scans(entry, self.next_process_evidence_sequence());
             entry.process_lineage.clear();
             entry.process_uncertainty.clear();
             entry.foreground_process_group = None;
@@ -204,13 +204,9 @@ impl SessionRegistry {
         now: Instant,
     ) -> bool {
         let root_pid = root.pid;
-        let scan_exit_generation = {
-            let sessions = self.inner.sessions.lock().await;
-            let Some(entry) = sessions.get(id) else {
-                return false;
-            };
-            entry.process_exit_generation
-        };
+        // Allocate before collection: waiting for foreground inspection or the
+        // session mutex must never make an older snapshot appear newer.
+        let evidence_sequence = self.next_process_evidence_sequence();
         // The registry snapshot the scan identifies other runtimes with.
         let scan_registry = self.inner.profiles.runtimes().registry();
         let (scan_pin, observed_refresh) = match self.inner.inspector.descendants(root_pid) {
@@ -336,9 +332,12 @@ impl SessionRegistry {
             if entry.stopping || is_terminal(entry.info.state) {
                 return false;
             }
-            // A callback confirmed an exit after this snapshot started. Its
-            // older child identities and foreground probe cannot supersede it.
-            if entry.process_exit_generation != scan_exit_generation {
+            // Neither a newer claim, snapshot nor confirmed exit may be
+            // superseded by this snapshot's delayed application.
+            if evidence_sequence < entry.claim_evidence_sequence
+                || evidence_sequence < entry.process_snapshot_sequence
+                || evidence_sequence < entry.process_exit_sequence
+            {
                 entry.procwatch_rescan.notify_one();
                 return true;
             }
@@ -357,11 +356,20 @@ impl SessionRegistry {
                 observed_refresh => observed_refresh,
             };
 
+            if observed_refresh.is_some() {
+                entry.process_snapshot_sequence = evidence_sequence;
+            }
             let to_spawn = apply_observed_refresh(entry, observed_refresh, &mut exit_watches);
 
             let foreground_changed = apply_foreground_probe(entry, foreground_probe);
-            let updated =
-                self.reconcile_process_evidence(entry, root_pid, now, foreground_probe, None);
+            let updated = self.reconcile_process_evidence(
+                entry,
+                root_pid,
+                now,
+                foreground_probe,
+                None,
+                evidence_sequence,
+            );
             let focus = entry
                 .active_agent
                 .as_ref()
@@ -460,6 +468,22 @@ impl SessionRegistry {
     }
 
     pub(super) async fn on_observed_agent_exit(&self, id: &SessionId, identity: ObservedIdentity) {
+        // Stamp notification before awaiting mutation, not when its queued
+        // callback eventually acquires the registry lock.
+        let evidence_sequence = self.next_process_evidence_sequence();
+        #[cfg(test)]
+        {
+            let hold = self
+                .inner
+                .process_exit_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(hold) = hold {
+                hold.entered.notify_one();
+                hold.release.notified().await;
+            }
+        }
         let updated = {
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(id) else {
@@ -470,6 +494,15 @@ impl SessionRegistry {
                 return;
             }
 
+            // A newer exit of another PID fences old scans, but says nothing
+            // about this identity. Only newer claim/snapshot evidence can make
+            // this callback stale.
+            if evidence_sequence < entry.claim_evidence_sequence
+                || evidence_sequence < entry.process_snapshot_sequence
+            {
+                entry.procwatch_rescan.notify_one();
+                return;
+            }
             let claimed_exit = entry.active_agent.as_ref().is_some_and(|active| {
                 active.pid == Some(identity.0) && active.start_identity == Some(identity.1)
             });
@@ -484,7 +517,7 @@ impl SessionRegistry {
             if before == entry.observed_agents.len() && !claimed_exit && !lineage_exit {
                 return;
             }
-            invalidate_process_scans(entry);
+            invalidate_process_scans(entry, evidence_sequence);
 
             // An exit watch confirms death independently of a later scan.
             // Remove only this generation; stale callbacks returned above.
@@ -502,6 +535,7 @@ impl SessionRegistry {
                 crate::time::now(),
                 ForegroundProbe::Observed(entry.foreground_process_group),
                 Some(identity),
+                evidence_sequence,
             )
         };
 
@@ -814,7 +848,13 @@ impl SessionRegistry {
         ActiveAgentReport {
             source: active.source.clone(),
             agent: active.agent.clone(),
-            seq: Some(active.seq.map_or(seq, |active_seq| active_seq.max(seq))),
+            // Do not invent a hook-source sequence from the procwatch clock:
+            // retain its acknowledged sequence so its next update stays valid.
+            seq: if active.observed {
+                Some(active.seq.map_or(seq, |active_seq| active_seq.max(seq)))
+            } else {
+                active.seq
+            },
             pid: None,
             start_identity: None,
             reported_at: now,
@@ -844,7 +884,41 @@ impl SessionRegistry {
         now: Instant,
         probe: ForegroundProbe,
         confirmed_exit: Option<ObservedIdentity>,
+        evidence_sequence: u64,
     ) -> Option<SessionInfo> {
+        if evidence_sequence < entry.claim_evidence_sequence {
+            return None;
+        }
+        // A callback has fresh evidence only for its exact exited generation.
+        // Its use of an older cached snapshot cannot refute or downgrade a
+        // newer hook, nor can a failed scan promote that cache to fresh proof.
+        if entry.process_snapshot_sequence < entry.claim_evidence_sequence {
+            let exact_exit = confirmed_exit.is_some_and(|identity| {
+                entry.active_agent.as_ref().is_some_and(|active| {
+                    active.pid == Some(identity.0) && active.start_identity == Some(identity.1)
+                })
+            });
+            // PID-less expiry is independent fresh clock evidence, even when
+            // process collection failed; it must not depend on cached absence.
+            let expired = entry.active_agent.as_ref().is_some_and(|active| {
+                active.pid.is_none()
+                    && now.saturating_duration_since(active.reported_at)
+                        >= self.inner.config.active_agent_claim_ttl
+            });
+            if exact_exit || expired {
+                let active = entry
+                    .active_agent
+                    .clone()
+                    .expect("expired or confirmed active claim");
+                entry.claim_evidence_sequence = evidence_sequence;
+                return Some(clear_active_agent(
+                    entry,
+                    self.procwatch_tombstone_for(&active, now),
+                ));
+            }
+            return None;
+        }
+        let previous_claim = entry.active_agent.clone();
         // Negative identity evidence wins before any foreground or ancestry
         // uncertainty can preserve a claim. A successful snapshot also proves
         // absence; a failed snapshot retains the previous evidence unchanged.
@@ -854,13 +928,32 @@ impl SessionRegistry {
         });
         let inconclusive = uncertain_ancestry(entry);
         let decision = self.reconcile_foreground_agent(entry, root_pid, now, probe, &inconclusive);
-        match decision {
+        let updated = match decision {
             ForegroundDecision::Fallback => self
                 .reconcile_active_agent(entry, now, &inconclusive)
                 .or(cleared),
             ForegroundDecision::Preserve => cleared,
             ForegroundDecision::Updated => Some(entry.info.clone()),
+        };
+        // Binding a generation from cache retains that snapshot's age. Only a
+        // fresh snapshot or an actual claim release/replacement advances the
+        // claim fence; unrelated preservation and late binding are not new proof.
+        let same_claim = match (previous_claim.as_ref(), entry.active_agent.as_ref()) {
+            (Some(previous), Some(current)) => {
+                previous.source == current.source
+                    && previous.agent == current.agent
+                    && previous.seq == current.seq
+                    && previous.pid == current.pid
+                    && previous.reported_at == current.reported_at
+                    && previous.observed == current.observed
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if entry.process_snapshot_sequence == evidence_sequence || !same_claim {
+            entry.claim_evidence_sequence = evidence_sequence;
         }
+        updated
     }
 
     fn reconcile_foreground_agent(
@@ -988,6 +1081,16 @@ impl SessionRegistry {
         bind_report_start_identity(entry, start)
     }
 
+    pub(super) fn next_process_evidence_sequence(&self) -> u64 {
+        self.inner
+            .process_evidence_seq
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |sequence| {
+                sequence.checked_add(1)
+            })
+            .expect("process evidence sequence must not exhaust")
+            + 1
+    }
+
     fn next_procwatch_seq(&self) -> u64 {
         self.inner
             .procwatch_seq
@@ -1050,11 +1153,8 @@ fn apply_observed_refresh(
     to_spawn
 }
 
-fn invalidate_process_scans(entry: &mut SessionEntry) {
-    entry.process_exit_generation = entry
-        .process_exit_generation
-        .checked_add(1)
-        .expect("process exit generation must not exhaust");
+fn invalidate_process_scans(entry: &mut SessionEntry, evidence_sequence: u64) {
+    entry.process_exit_sequence = entry.process_exit_sequence.max(evidence_sequence);
 }
 
 fn claim_identity_refuted(entry: &SessionEntry, confirmed_exit: Option<ObservedIdentity>) -> bool {

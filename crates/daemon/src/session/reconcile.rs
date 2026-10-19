@@ -3822,7 +3822,9 @@ impl SessionRegistry {
             observed_agents: Vec::<ObservedAgent>::new(),
             process_lineage: HashMap::new(),
             process_uncertainty: Vec::new(),
-            process_exit_generation: 0,
+            process_snapshot_sequence: 0,
+            claim_evidence_sequence: 0,
+            process_exit_sequence: 0,
             cwd_observed_at: crate::time::now(),
             initial_input_owner: initial_input_owner(&record),
         };
@@ -4078,7 +4080,9 @@ impl SessionRegistry {
             observed_agents: Vec::new(),
             process_lineage: HashMap::new(),
             process_uncertainty: Vec::new(),
-            process_exit_generation: 0,
+            process_snapshot_sequence: 0,
+            claim_evidence_sequence: 0,
+            process_exit_sequence: 0,
             cwd_observed_at: crate::time::now(),
             initial_input_owner: initial_input_owner(&record),
         };

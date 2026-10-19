@@ -16,3 +16,9 @@ probe errors alone neither refute nor bind a generation.
 Uncertainty carries its candidate generation, so an exact bound-process exit
 can invalidate the old claim without changing a replacement's inconclusive
 evidence. Confirmed exits invalidate snapshots collected before the callback.
+
+Process evidence retains its acquisition order across scans, callback delays and
+hook updates. An older snapshot cannot refute a newer claim, and a fresh callback
+does not make its cached snapshot fresh. Repeated hooks for the same identity
+keep the verified generation through uncertainty; only newer conclusive evidence
+can invalidate it. An explicit release also fences snapshots collected before it.

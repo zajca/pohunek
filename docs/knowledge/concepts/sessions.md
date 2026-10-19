@@ -339,7 +339,14 @@ and active native reference when the live process is a descendant of an observed
 agent of the same runtime in this session. The reporter does not have to match
 the agent's process matcher itself. A dead or reused reporter PID, a sibling
 outside that agent's tree, a different runtime, or a process belonging to another
-session cannot keep the claim.
+session cannot keep the claim. Process snapshots, confirmed exits and admitted
+hook updates are ordered by a daemon-owned monotonic observation sequence.
+Evidence acquired before the current claim cannot clear or downgrade it, even
+when an unrelated later callback reads that older cached snapshot. Updating the
+same hook-reported identity preserves its previously verified process generation;
+a hook does not prove a new generation. A newer conclusive scan or exact exit
+still invalidates death or PID reuse, while an inconclusive read preserves the
+existing binding without establishing a new one.
 Claude `SessionEnd` sends an explicit release for prompt clean-exit clearing;
 Codex has no installed session-end release because its `Stop` event is
 turn-level, so procwatch remains the release backstop. Hook claims must be

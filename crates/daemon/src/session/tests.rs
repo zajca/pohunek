@@ -11288,10 +11288,10 @@ async fn descendant_hook_evidence_case(state: &str) {
                 .inspect(&created.id)
                 .await
                 .expect("hook evidence result");
-            if matches!(state, "dead" | "dead-ancestor") {
+            if phase != "callback" && matches!(state, "dead" | "dead-ancestor") {
                 assert_eq!(
                     info.active_agent_session_id, None,
-                    "dead late hook must release"
+                    "fresh scan confirms that the late hook reporter is dead"
                 );
                 assert_ne!(info.activity, Some(AgentActivity::Working));
             } else {
@@ -11306,9 +11306,13 @@ async fn descendant_hook_evidence_case(state: &str) {
                     super::active_agent_origin(&sessions[&created.id]),
                     Some(crate::store::ActiveAgentOrigin::Reported)
                 );
-                let expected = (!matches!(state, "inconclusive")
-                    && (recognized || !matches!(state, "ancestor" | "reused-ancestor")))
-                .then_some(reporter.start_identity.get());
+                let expected = if phase == "callback" {
+                    expected_binding
+                } else {
+                    (!matches!(state, "inconclusive")
+                        && (recognized || !matches!(state, "ancestor" | "reused-ancestor")))
+                    .then_some(reporter.start_identity.get())
+                };
                 assert_eq!(
                     sessions[&created.id]
                         .active_agent
@@ -11866,6 +11870,706 @@ async fn descendant_reporter_exit_invalidates_an_inflight_snapshot() {
         binding, None,
         "a pre-exit snapshot must not resurrect confirmed-dead identity evidence"
     );
+}
+
+// These scenarios order evidence at external inspector and public report
+// boundaries. No claim or cached process state is injected into the registry.
+fn ordering_reporter_fact(recognized: bool) -> ProcessFact {
+    let mut reporter = codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID);
+    if !recognized {
+        reporter.comm = "wrapper-helper".to_owned();
+        reporter.cmdline = vec!["/usr/bin/wrapper-helper".to_owned()];
+    }
+    reporter
+}
+
+fn ordering_facts(inspector: &MockInspector, root: Pid, recognized: bool, state: &str) {
+    let mut reporter = ordering_reporter_fact(recognized);
+    match state {
+        "live" => {}
+        "dead" => inspector.set_not_running(reporter.identity()),
+        "inconclusive" => {
+            inspector.fail_identity_with(reporter.pid, std::io::ErrorKind::PermissionDenied);
+        }
+        "ancestor" => inspector
+            .fail_identity_with(DESCENDANT_WRAPPER_PID, std::io::ErrorKind::PermissionDenied),
+        "reused" => {
+            reporter.start_identity = StartIdentity::new(reporter.start_identity.get() + 1);
+        }
+        _ => unreachable!("known ordering evidence state"),
+    }
+    inspector.set_descendants(
+        root,
+        vec![
+            codex_fact(DESCENDANT_WRAPPER_PID, root),
+            reporter,
+            codex_fact(UNRELATED_AGENT_PID, root),
+        ],
+    );
+}
+
+async fn assert_updated_ordering_claim(registry: &SessionRegistry, id: &SessionId) {
+    let info = registry.inspect(id).await.expect("updated ordering claim");
+    assert_eq!(info.active_agent_pid, Some(DESCENDANT_REPORTER_PID));
+    assert_eq!(info.active_agent_base, Some(RuntimeRef::codex()));
+    assert_eq!(
+        info.active_agent_session_id.as_deref(),
+        Some("updated-ordering-native")
+    );
+    assert_eq!(
+        info.active_agent_session_path.as_deref(),
+        Some("/work/audit-native.jsonl")
+    );
+    assert_eq!(info.activity, Some(AgentActivity::Working));
+    assert_eq!(info.state_source, StateSource::Report);
+    let sessions = registry.inner.sessions.lock().await;
+    assert_eq!(
+        super::active_agent_origin(&sessions[id]),
+        Some(crate::store::ActiveAgentOrigin::Reported)
+    );
+    assert_eq!(
+        sessions[id]
+            .active_agent
+            .as_ref()
+            .expect("updated bound claim")
+            .start_identity,
+        Some(ordering_reporter_fact(false).start_identity.get()),
+        "a same-identity hook update retains the previously verified reporter generation"
+    );
+}
+
+/// The older-evidence column: a collected scan and its cached evidence must
+/// never downgrade a hook admitted after the snapshot was acquired.
+async fn descendant_older_evidence_after_hook(state: &str) {
+    for recognized in [false, true] {
+        let (registry, inspector, created) = mock_procwatch_registry("older-claim-evidence").await;
+        ordering_facts(&inspector, created.pid, recognized, "live");
+        inspector.set_foreground_group(created.pid, None);
+        assert!(
+            registry
+                .report_agent(audit_claim(
+                    &created.id,
+                    DIRECT_AGENT_REPORT_SEQ,
+                    DESCENDANT_NATIVE_SESSION_ID
+                ))
+                .await
+                .recorded
+        );
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let _automatic_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+        ordering_facts(&inspector, created.pid, recognized, state);
+        let block = inspector.block_foreground();
+        let _release_guard = ForegroundReleaseGuard(Arc::clone(&block));
+        let scan_registry = registry.clone();
+        let scan_id = created.id.clone();
+        let root_pid = created.pid;
+        let runtime = tokio::runtime::Handle::current();
+        let scan = std::thread::spawn(move || {
+            runtime.block_on(scan_registry.rescan_procwatch_at(&scan_id, root_pid, Instant::now()));
+        });
+        wait_until("older snapshot acquired before newer hook", || async {
+            block.entered.load(Ordering::Acquire).then_some(())
+        })
+        .await;
+        assert!(
+            registry
+                .report_agent(audit_claim(
+                    &created.id,
+                    DIRECT_AGENT_REPORT_SEQ + 1,
+                    "updated-ordering-native"
+                ))
+                .await
+                .recorded
+        );
+        block.release();
+        scan.join().expect("older evidence scan completed");
+        assert_updated_ordering_claim(&registry, &created.id).await;
+        // This callback is new, but it must not promote cached pre-hook
+        // absence, reuse or uncertainty into fresh evidence about the claim.
+        registry
+            .on_observed_agent_exit(
+                &created.id,
+                (
+                    UNRELATED_AGENT_PID,
+                    codex_fact(UNRELATED_AGENT_PID, created.pid)
+                        .start_identity
+                        .get(),
+                ),
+            )
+            .await;
+        assert_updated_ordering_claim(&registry, &created.id).await;
+        registry
+            .stop(&created.id)
+            .await
+            .expect("stop older evidence fixture");
+    }
+}
+
+/// The hook-update column: the same reporter updates metadata and activity
+/// without losing its verified generation; genuinely newer scans still win.
+async fn descendant_bound_hook_update(state: &str) {
+    for recognized in [false, true] {
+        let (registry, inspector, created) = mock_procwatch_registry("bound-hook-update").await;
+        ordering_facts(&inspector, created.pid, recognized, "live");
+        inspector.set_foreground_group(created.pid, None);
+        assert!(
+            registry
+                .report_agent(audit_claim(
+                    &created.id,
+                    DIRECT_AGENT_REPORT_SEQ,
+                    DESCENDANT_NATIVE_SESSION_ID
+                ))
+                .await
+                .recorded
+        );
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let _automatic_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+        ordering_facts(&inspector, created.pid, recognized, state);
+        if matches!(state, "inconclusive" | "ancestor") {
+            // Cache the actual inconclusive read before refreshing the hook;
+            // the update must preserve R1 even without a readable observation.
+            registry
+                .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+                .await;
+        }
+        assert!(
+            registry
+                .report_agent(audit_claim(
+                    &created.id,
+                    DIRECT_AGENT_REPORT_SEQ + 1,
+                    "updated-ordering-native"
+                ))
+                .await
+                .recorded
+        );
+        assert_updated_ordering_claim(&registry, &created.id).await;
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        if matches!(state, "dead" | "reused") {
+            let info = registry
+                .inspect(&created.id)
+                .await
+                .expect("newer conclusive evidence");
+            assert_eq!(info.active_agent_session_id, None);
+            assert_eq!(info.active_agent_session_path, None);
+            assert_ne!(info.activity, Some(AgentActivity::Working));
+            assert_ne!(info.state_source, StateSource::Report);
+        } else {
+            assert_updated_ordering_claim(&registry, &created.id).await;
+        }
+        if state == "inconclusive" {
+            inspector.clear_identity_error(DESCENDANT_REPORTER_PID);
+            ordering_facts(&inspector, created.pid, recognized, "reused");
+            registry
+                .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+                .await;
+            let info = registry
+                .inspect(&created.id)
+                .await
+                .expect("readable R2 recovery");
+            assert_eq!(info.active_agent_session_id, None);
+            assert_eq!(info.active_agent_session_path, None);
+            assert_ne!(info.activity, Some(AgentActivity::Working));
+            assert_ne!(info.state_source, StateSource::Report);
+        }
+        registry
+            .stop(&created.id)
+            .await
+            .expect("stop bound update fixture");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_older_live_evidence_cannot_downgrade_hook() {
+    descendant_older_evidence_after_hook("live").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_older_dead_evidence_cannot_downgrade_hook() {
+    descendant_older_evidence_after_hook("dead").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_older_inconclusive_evidence_cannot_downgrade_hook() {
+    descendant_older_evidence_after_hook("inconclusive").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_older_ancestor_evidence_cannot_downgrade_hook() {
+    descendant_older_evidence_after_hook("ancestor").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_older_reused_evidence_cannot_downgrade_hook() {
+    descendant_older_evidence_after_hook("reused").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_live_hook_update_keeps_bound_generation() {
+    descendant_bound_hook_update("live").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_dead_hook_update_keeps_bound_generation() {
+    descendant_bound_hook_update("dead").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_inconclusive_hook_update_keeps_bound_generation() {
+    descendant_bound_hook_update("inconclusive").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_ancestor_hook_update_keeps_bound_generation() {
+    descendant_bound_hook_update("ancestor").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_reused_hook_update_keeps_bound_generation() {
+    descendant_bound_hook_update("reused").await;
+}
+
+/// An unrelated fresh exit cannot promote already cached absence into
+/// evidence newer than a subsequently admitted hook claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_cached_absence_before_hook_is_not_fresh_exit_evidence() {
+    for recognized in [false, true] {
+        let (registry, inspector, created) = mock_procwatch_registry("cached-absence-hook").await;
+        ordering_facts(&inspector, created.pid, recognized, "dead");
+        inspector.set_foreground_group(created.pid, None);
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let _automatic_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+        assert!(
+            registry
+                .report_agent(audit_claim(
+                    &created.id,
+                    DIRECT_AGENT_REPORT_SEQ,
+                    "late-ordering-native"
+                ))
+                .await
+                .recorded
+        );
+        registry
+            .on_observed_agent_exit(
+                &created.id,
+                (
+                    UNRELATED_AGENT_PID,
+                    codex_fact(UNRELATED_AGENT_PID, created.pid)
+                        .start_identity
+                        .get(),
+                ),
+            )
+            .await;
+        let info = registry
+            .inspect(&created.id)
+            .await
+            .expect("late hook after cached absence callback");
+        assert_eq!(info.active_agent_pid, Some(DESCENDANT_REPORTER_PID));
+        assert_eq!(
+            info.active_agent_session_id.as_deref(),
+            Some("late-ordering-native")
+        );
+        assert_eq!(info.activity, Some(AgentActivity::Working));
+        assert_eq!(info.state_source, StateSource::Report);
+        let () = {
+            let sessions = registry.inner.sessions.lock().await;
+            assert_eq!(
+                sessions[&created.id]
+                    .active_agent
+                    .as_ref()
+                    .expect("late hook")
+                    .start_identity,
+                None,
+                "cached absence is not proof of a live generation"
+            );
+        };
+        // A scan actually acquired after the hook is conclusive new evidence.
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let info = registry
+            .inspect(&created.id)
+            .await
+            .expect("newly confirmed absence");
+        assert_eq!(info.active_agent_session_id, None);
+        assert_eq!(info.active_agent_session_path, None);
+        assert_ne!(info.activity, Some(AgentActivity::Working));
+        registry
+            .stop(&created.id)
+            .await
+            .expect("stop cached absence fixture");
+    }
+}
+
+/// Preserving a claim during an unrelated exit must not make the original
+/// snapshot too old to reconcile a subsequent confirmed ancestor exit.
+async fn descendant_two_callbacks_reconcile_ancestor_loss(late_binding: bool) {
+    let (registry, inspector, created) = mock_procwatch_registry("two-exit-callbacks").await;
+    ordering_facts(&inspector, created.pid, false, "live");
+    inspector.set_foreground_group(created.pid, None);
+    if late_binding {
+        inspector.fail_foreground_with(std::io::ErrorKind::PermissionDenied);
+    }
+    assert!(
+        registry
+            .report_agent(audit_claim(
+                &created.id,
+                DIRECT_AGENT_REPORT_SEQ,
+                "updated-ordering-native"
+            ))
+            .await
+            .recorded
+    );
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let _automatic_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+    if late_binding {
+        let sessions = registry.inner.sessions.lock().await;
+        assert_eq!(
+            sessions[&created.id]
+                .active_agent
+                .as_ref()
+                .expect("unbound helper claim")
+                .start_identity,
+            None,
+            "a transient foreground failure has not yet bound the helper"
+        );
+    }
+    registry
+        .on_observed_agent_exit(
+            &created.id,
+            (
+                UNRELATED_AGENT_PID,
+                codex_fact(UNRELATED_AGENT_PID, created.pid)
+                    .start_identity
+                    .get(),
+            ),
+        )
+        .await;
+    assert_updated_ordering_claim(&registry, &created.id).await;
+    registry
+        .on_observed_agent_exit(
+            &created.id,
+            (
+                DESCENDANT_WRAPPER_PID,
+                codex_fact(DESCENDANT_WRAPPER_PID, created.pid)
+                    .start_identity
+                    .get(),
+            ),
+        )
+        .await;
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("confirmed ancestor loss");
+    registry
+        .stop(&created.id)
+        .await
+        .expect("stop two callback fixture");
+    assert_eq!(info.active_agent, None);
+    assert_eq!(info.active_agent_session_id, None);
+    assert_eq!(info.active_agent_session_path, None);
+    assert_ne!(info.activity, Some(AgentActivity::Working));
+    assert_ne!(info.state_source, StateSource::Report);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_two_callbacks_reconcile_confirmed_ancestor_loss() {
+    descendant_two_callbacks_reconcile_ancestor_loss(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_late_binding_does_not_fence_confirmed_ancestor_loss() {
+    descendant_two_callbacks_reconcile_ancestor_loss(true).await;
+}
+
+/// A delayed inconclusive snapshot cannot replace a newer readable snapshot
+/// or remove the recovered reporter identity from the evidence cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_overlapping_snapshots_keep_newer_readable_evidence() {
+    let (registry, inspector, created) = mock_procwatch_registry("overlapping-evidence").await;
+    ordering_facts(&inspector, created.pid, false, "live");
+    inspector.set_foreground_group(created.pid, None);
+    assert!(
+        registry
+            .report_agent(audit_claim(
+                &created.id,
+                DIRECT_AGENT_REPORT_SEQ,
+                "updated-ordering-native"
+            ))
+            .await
+            .recorded
+    );
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let _automatic_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+    ordering_facts(&inspector, created.pid, false, "inconclusive");
+    let block = inspector.block_foreground();
+    let _release_guard = ForegroundReleaseGuard(Arc::clone(&block));
+    let scan_registry = registry.clone();
+    let scan_id = created.id.clone();
+    let root_pid = created.pid;
+    let runtime = tokio::runtime::Handle::current();
+    let scan = std::thread::spawn(move || {
+        runtime.block_on(scan_registry.rescan_procwatch_at(&scan_id, root_pid, Instant::now()));
+    });
+    wait_until("older inconclusive snapshot collected", || async {
+        block.entered.load(Ordering::Acquire).then_some(())
+    })
+    .await;
+    inspector.clear_identity_error(DESCENDANT_REPORTER_PID);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    block.release();
+    scan.join()
+        .expect("older snapshot completed after newer one");
+    assert_updated_ordering_claim(&registry, &created.id).await;
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = &sessions[&created.id];
+        assert!(entry.process_lineage.contains_key(&DESCENDANT_REPORTER_PID));
+        assert!(entry
+            .process_uncertainty
+            .iter()
+            .all(|identity| identity.pid != DESCENDANT_REPORTER_PID));
+    };
+    registry
+        .stop(&created.id)
+        .await
+        .expect("stop overlapping snapshot fixture");
+}
+
+/// Callback acquisition is ordered before a newer hook, independently of
+/// when the callback is finally allowed to mutate session state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_callback_acquired_before_hook_cannot_refute_it() {
+    for recognized in [false, true] {
+        let (registry, inspector, created) = mock_procwatch_registry("callback-hook-order").await;
+        ordering_facts(&inspector, created.pid, recognized, "live");
+        inspector.set_foreground_group(created.pid, None);
+        assert!(
+            registry
+                .report_agent(audit_claim(
+                    &created.id,
+                    DIRECT_AGENT_REPORT_SEQ,
+                    DESCENDANT_NATIVE_SESSION_ID
+                ))
+                .await
+                .recorded
+        );
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let _automatic_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+        let gate = crate::runtime::lifecycle::tests::StartGate {
+            session_id: Some(created.id.0.clone()),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *registry
+            .inner
+            .process_exit_hold
+            .lock()
+            .expect("exit callback hold lock") = Some(gate.clone());
+        let reporter = ordering_reporter_fact(recognized);
+        let callback = tokio::spawn({
+            let registry = registry.clone();
+            let id = created.id.clone();
+            async move {
+                registry
+                    .on_observed_agent_exit(&id, (reporter.pid, reporter.start_identity.get()))
+                    .await;
+            }
+        });
+        gate.entered.notified().await;
+        let report = registry
+            .report_agent(audit_claim(
+                &created.id,
+                DIRECT_AGENT_REPORT_SEQ + 1,
+                "updated-ordering-native",
+            ))
+            .await;
+        // Always release the queued callback before inspecting assertions.
+        gate.release.notify_one();
+        callback.await.expect("pre-hook callback completed");
+        assert!(report.recorded);
+        assert_updated_ordering_claim(&registry, &created.id).await;
+        // The old callback was not a permanent veto on this generation's
+        // genuinely newer exact exit notification.
+        let reporter = ordering_reporter_fact(recognized);
+        registry
+            .on_observed_agent_exit(&created.id, (reporter.pid, reporter.start_identity.get()))
+            .await;
+        let info = registry
+            .inspect(&created.id)
+            .await
+            .expect("new exact exit applied");
+        registry
+            .stop(&created.id)
+            .await
+            .expect("stop callback order fixture");
+        assert_eq!(info.active_agent_session_id, None);
+        assert_eq!(info.active_agent_session_path, None);
+        assert_ne!(info.activity, Some(AgentActivity::Working));
+        assert_ne!(info.state_source, StateSource::Report);
+    }
+}
+
+/// A newer exit from another PID must not veto a queued exact reporter
+/// exit that is still newer than the current claim and its snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_queued_exit_survives_a_newer_unrelated_exit() {
+    for recognized in [false, true] {
+        let (registry, inspector, created) = mock_procwatch_registry("cross-pid-exit-order").await;
+        ordering_facts(&inspector, created.pid, recognized, "live");
+        inspector.set_foreground_group(created.pid, None);
+        assert!(
+            registry
+                .report_agent(audit_claim(
+                    &created.id,
+                    DIRECT_AGENT_REPORT_SEQ,
+                    "updated-ordering-native"
+                ))
+                .await
+                .recorded
+        );
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let _automatic_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+        let gate = crate::runtime::lifecycle::tests::StartGate {
+            session_id: Some(created.id.0.clone()),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *registry
+            .inner
+            .process_exit_hold
+            .lock()
+            .expect("exit callback hold lock") = Some(gate.clone());
+        let reporter = ordering_reporter_fact(recognized);
+        let callback = tokio::spawn({
+            let registry = registry.clone();
+            let id = created.id.clone();
+            async move {
+                registry
+                    .on_observed_agent_exit(&id, (reporter.pid, reporter.start_identity.get()))
+                    .await;
+            }
+        });
+        gate.entered.notified().await;
+        registry
+            .on_observed_agent_exit(
+                &created.id,
+                (
+                    UNRELATED_AGENT_PID,
+                    codex_fact(UNRELATED_AGENT_PID, created.pid)
+                        .start_identity
+                        .get(),
+                ),
+            )
+            .await;
+        gate.release.notify_one();
+        callback
+            .await
+            .expect("queued reporter exit applied after unrelated exit");
+        let info = registry
+            .inspect(&created.id)
+            .await
+            .expect("queued exact exit result");
+        registry
+            .stop(&created.id)
+            .await
+            .expect("stop cross-PID fixture");
+        assert_eq!(info.active_agent_session_id, None);
+        assert_eq!(info.active_agent_session_path, None);
+        assert_ne!(info.activity, Some(AgentActivity::Working));
+        assert_ne!(info.state_source, StateSource::Report);
+    }
+}
+
+/// An explicit release is newer than an already collected live snapshot;
+/// only a fresh scan may select a process again after the release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_release_fences_an_older_inflight_snapshot() {
+    let (registry, inspector, created) = mock_procwatch_registry("release-snapshot-order").await;
+    ordering_facts(&inspector, created.pid, false, "live");
+    inspector.set_foreground_group(created.pid, None);
+    assert!(
+        registry
+            .report_agent(audit_claim(
+                &created.id,
+                DIRECT_AGENT_REPORT_SEQ,
+                DESCENDANT_NATIVE_SESSION_ID
+            ))
+            .await
+            .recorded
+    );
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let _automatic_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+    let block = inspector.block_foreground();
+    let _release_guard = ForegroundReleaseGuard(Arc::clone(&block));
+    let scan_registry = registry.clone();
+    let scan_id = created.id.clone();
+    let root_pid = created.pid;
+    let runtime = tokio::runtime::Handle::current();
+    let scan = std::thread::spawn(move || {
+        runtime.block_on(scan_registry.rescan_procwatch_at(&scan_id, root_pid, Instant::now()));
+    });
+    wait_until(
+        "live snapshot collected before explicit release",
+        || async { block.entered.load(Ordering::Acquire).then_some(()) },
+    )
+    .await;
+    let release = registry
+        .release_agent(SessionReleaseAgentParams {
+            session_id: created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: CODEX_HOOK_AGENT.to_owned(),
+            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 1)),
+        })
+        .await;
+    block.release();
+    scan.join().expect("pre-release snapshot completed");
+    assert!(release.released);
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("released claim remains absent");
+    assert_eq!(info.active_agent, None);
+    assert_eq!(info.active_agent_pid, None);
+    assert_eq!(info.active_agent_session_id, None);
+    assert_eq!(info.active_agent_session_path, None);
+    assert_ne!(info.activity, Some(AgentActivity::Working));
+    assert_ne!(info.state_source, StateSource::Report);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("fresh observed selection");
+    registry
+        .stop(&created.id)
+        .await
+        .expect("stop release ordering fixture");
+    assert_eq!(info.active_agent_pid, Some(DESCENDANT_WRAPPER_PID));
+    assert_eq!(info.active_agent_session_id, None);
+    assert_eq!(info.active_agent_session_path, None);
+    assert_ne!(info.activity, Some(AgentActivity::Working));
+    assert_ne!(info.state_source, StateSource::Report);
 }
 
 #[tokio::test]

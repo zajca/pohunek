@@ -680,6 +680,8 @@ struct SessionRegistryInner {
     /// in the same numeric space as hook timestamps, while same-source ordering
     /// remains monotonic if multiple procwatch events happen within one millisecond.
     procwatch_seq: AtomicU64,
+    /// Acquisition order shared by process snapshots, exits and admitted hooks.
+    process_evidence_seq: AtomicU64,
     /// Read-only external agent sessions observed outside pohunek-owned PTYs.
     external: ExternalSessions,
     /// Automatic session retention policy and its sweep serialization point.
@@ -704,6 +706,9 @@ struct SessionRegistryInner {
     /// resolving its agent and committing it.
     #[cfg(test)]
     report_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Parks a confirmed process exit after acquisition but before mutation.
+    #[cfg(test)]
+    process_exit_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     /// Parks the next worker metadata projection of a reported agent between
     /// resolving its detector configuration and committing it.
     #[cfg(test)]
@@ -816,8 +821,12 @@ struct SessionEntry {
     /// Own-process probe errors, cached atomically with verified identities.
     /// Ancestry uncertainty is derived from these after scans and exits.
     process_uncertainty: Vec<ProcessIdentity>,
-    /// Invalidates snapshots collected before a confirmed process exit.
-    process_exit_generation: u64,
+    /// Original acquisition order of the complete cached process snapshot.
+    process_snapshot_sequence: u64,
+    /// Newest evidence applied to the current claim or its release tombstone.
+    claim_evidence_sequence: u64,
+    /// Confirmed exits invalidate snapshots acquired before their notification.
+    process_exit_sequence: u64,
     /// When the evidence that set `info.cwd` was observed. Older cwd evidence
     /// never replaces it, so a scan that read a process before a newer OSC 7
     /// hint landed cannot move the session back.
@@ -1863,6 +1872,7 @@ impl SessionRegistry {
                 agent_state_hook_task: std::sync::Mutex::new(None),
                 inspector,
                 procwatch_seq: AtomicU64::new(current_time_millis()),
+                process_evidence_seq: AtomicU64::new(0),
                 external: external.clone(),
                 retention,
                 #[cfg(test)]
@@ -1877,6 +1887,8 @@ impl SessionRegistry {
                 refresh_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 report_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                process_exit_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 metadata_apply_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
@@ -3712,6 +3724,24 @@ impl SessionRegistry {
 
             let (pid, start_identity) =
                 bind_report_process(entry, params.pid, &RuntimeRef::from(resolved.base.clone()));
+            // A hook refresh is not a new process observation. Keep the verified
+            // generation of this exact claim even when the latest read failed
+            // or the reporter is an unmatched helper beneath its wrapper.
+            let start_identity = entry
+                .active_agent
+                .as_ref()
+                .filter(|active| {
+                    !active.observed
+                        && params.pid.is_some()
+                        && active.pid == pid
+                        && active.source == params.source
+                        && active.agent == resolved.name
+                        && entry.info.active_agent_base.as_ref()
+                            == Some(&RuntimeRef::from(resolved.base.clone()))
+                })
+                .and_then(|active| active.start_identity)
+                .or(start_identity);
+            entry.claim_evidence_sequence = self.next_process_evidence_sequence();
             let report = ActiveAgentReport {
                 source: params.source.clone(),
                 agent: resolved.name.clone(),
@@ -3837,6 +3867,7 @@ impl SessionRegistry {
                 activity_reported: false,
                 observed: false,
             };
+            entry.claim_evidence_sequence = self.next_process_evidence_sequence();
             clear_active_agent(entry, tombstone)
         };
 
