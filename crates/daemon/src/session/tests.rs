@@ -2179,6 +2179,8 @@ async fn shell_foreground_preserves_recent_unbound_claim_until_ttl() {
             pid: None,
             agent_session_id: None,
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(report.recorded);
@@ -2355,6 +2357,8 @@ async fn foreground_replacement_replaces_hook_identity_and_detector() {
             pid: Some(created.pid),
             agent_session_id: Some("stale-codex-native".to_owned()),
             agent_session_path: Some("/work/stale-codex.jsonl".to_owned()),
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(report.recorded);
@@ -2404,6 +2408,8 @@ async fn first_foreground_scan_binds_hook_identity_without_replacing_metadata() 
             pid: Some(observed.pid),
             agent_session_id: Some("hook-native-id".to_owned()),
             agent_session_path: Some("/work/hook-native.jsonl".to_owned()),
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(report.recorded);
@@ -8747,6 +8753,8 @@ async fn report_input_activity(
             pid: None,
             agent_session_id: None,
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await
 }
@@ -8909,6 +8917,8 @@ async fn report_agent_on_shell_session_sets_active_agent_without_changing_launch
             pid: None,
             agent_session_id: Some("codex-native".to_owned()),
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(result.recorded);
@@ -8985,6 +8995,8 @@ async fn report_agent_reconfigures_detector_and_release_restores_default_config(
             pid: None,
             agent_session_id: None,
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(report.recorded);
@@ -9004,6 +9016,9 @@ async fn report_agent_reconfigures_detector_and_release_restores_default_config(
             source: "pohunek:nested-codex".to_owned(),
             agent: "nested-codex".to_owned(),
             seq: Some(ReportSequence::new(1)),
+            pid: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(release.released);
@@ -9138,6 +9153,8 @@ async fn release_agent_clears_current_active_agent_but_ignores_stale_sequence() 
             pid: None,
             agent_session_id: Some("codex-newer".to_owned()),
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(newer.recorded);
@@ -9148,6 +9165,9 @@ async fn release_agent_clears_current_active_agent_but_ignores_stale_sequence() 
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             seq: Some(ReportSequence::new(9)),
+            pid: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(!stale_release.released);
@@ -9164,6 +9184,9 @@ async fn release_agent_clears_current_active_agent_but_ignores_stale_sequence() 
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             seq: Some(ReportSequence::new(10)),
+            pid: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(current_release.released);
@@ -9200,6 +9223,8 @@ async fn report_agent_release_with_no_sequence_does_not_clear_newer_sequenced_re
             pid: None,
             agent_session_id: Some("codex-newer".to_owned()),
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(result.recorded);
@@ -9210,6 +9235,9 @@ async fn report_agent_release_with_no_sequence_does_not_clear_newer_sequenced_re
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             seq: None,
+            pid: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(!stale_release.released);
@@ -9246,6 +9274,8 @@ async fn report_agent_with_no_sequence_does_not_overwrite_newer_sequenced_report
             pid: None,
             agent_session_id: Some("codex-newer".to_owned()),
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(newer.recorded);
@@ -9260,6 +9290,8 @@ async fn report_agent_with_no_sequence_does_not_overwrite_newer_sequenced_report
             pid: None,
             agent_session_id: Some("codex-stale".to_owned()),
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(!stale_report.recorded);
@@ -9297,6 +9329,8 @@ async fn report_agent_release_tombstone_rejects_delayed_lower_sequence() {
             pid: None,
             agent_session_id: Some("codex-seq-10".to_owned()),
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(report.recorded);
@@ -9307,6 +9341,9 @@ async fn report_agent_release_tombstone_rejects_delayed_lower_sequence() {
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             seq: Some(ReportSequence::new(11)),
+            pid: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(release.released);
@@ -9334,6 +9371,8 @@ async fn report_agent_release_tombstone_rejects_delayed_lower_sequence() {
             pid: None,
             agent_session_id: Some("codex-stale".to_owned()),
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(!delayed_report.recorded);
@@ -9355,6 +9394,8 @@ async fn report_agent_release_tombstone_rejects_delayed_lower_sequence() {
             pid: None,
             agent_session_id: Some("codex-seq-12".to_owned()),
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(higher_report.recorded);
@@ -9392,6 +9433,8 @@ async fn report_agent_activity_blocks_detector_until_release() {
             pid: None,
             agent_session_id: None,
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(report.recorded);
@@ -9409,6 +9452,9 @@ async fn report_agent_activity_blocks_detector_until_release() {
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             seq: Some(ReportSequence::new(1)),
+            pid: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(release.released);
@@ -9445,6 +9491,8 @@ async fn report_agent_without_activity_keeps_detector_activity_enabled() {
             pid: None,
             agent_session_id: Some("codex-native".to_owned()),
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(report.recorded);
@@ -9467,6 +9515,9 @@ async fn report_agent_without_activity_keeps_detector_activity_enabled() {
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             seq: Some(ReportSequence::new(1)),
+            pid: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(release.released);
@@ -9503,6 +9554,8 @@ async fn report_agent_active_metadata_is_cleared_on_terminal_session() {
             pid: None,
             agent_session_id: Some("codex-native".to_owned()),
             agent_session_path: Some("/work/codex-session.jsonl".to_owned()),
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(report.recorded);
@@ -9541,6 +9594,8 @@ async fn report_agent_returns_false_for_unknown_agent() {
             pid: None,
             agent_session_id: None,
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(!result.recorded);
@@ -9906,6 +9961,8 @@ async fn report_release_matrix_agent(registry: &SessionRegistry, created: &Sessi
             pid: Some(RELEASE_MATRIX_AGENT_PID),
             agent_session_id: Some(RELEASE_MATRIX_NATIVE_ID.to_owned()),
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(report.recorded);
@@ -9937,6 +9994,8 @@ async fn direct_agent_root_pid_hook_claim_survives_procwatch_reconciles() {
             pid: Some(created.pid),
             agent_session_id: Some("direct-native".to_owned()),
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(report.recorded);
@@ -10012,6 +10071,8 @@ async fn report_descendant_claim(registry: &SessionRegistry, created: &SessionIn
             pid: Some(DESCENDANT_REPORTER_PID),
             agent_session_id: Some(DESCENDANT_NATIVE_SESSION_ID.to_owned()),
             agent_session_path: Some(DESCENDANT_NATIVE_SESSION_PATH.to_owned()),
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(report.recorded);
@@ -10298,6 +10359,8 @@ async fn procwatch_unknown_foreground_never_binds_an_unverified_reporter() {
             pid: Some(UNVERIFIED_CLAIM_PID),
             agent_session_id: Some("unverified-native".to_owned()),
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(report.recorded);
@@ -11033,6 +11096,8 @@ async fn procwatch_reconciles_unbound_claim_after_descendants_error() {
             pid: None,
             agent_session_id: Some("codex-unbound".to_owned()),
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(report.recorded);
@@ -11439,6 +11504,8 @@ async fn procwatch_releases_hook_claim_when_observed_pid_exits() {
             pid: Some(100),
             agent_session_id: Some("codex-native".to_owned()),
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(report.recorded);
@@ -11482,6 +11549,8 @@ async fn procwatch_late_hook_report_for_dead_pid_is_cleared_on_reconcile() {
             pid: Some(100),
             agent_session_id: Some("late-native".to_owned()),
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(late.recorded);
@@ -11531,6 +11600,8 @@ async fn procwatch_expires_unbound_hook_claim_after_ttl() {
             pid: None,
             agent_session_id: Some("codex-native".to_owned()),
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(report.recorded);
@@ -11600,6 +11671,8 @@ async fn procwatch_rebinds_restart_to_new_observed_pid() {
             pid: Some(100),
             agent_session_id: Some("old-native".to_owned()),
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(report.recorded);
@@ -20695,6 +20768,8 @@ fn pi_report(id: &SessionId, agent: &str) -> SessionReportAgentParams {
         pid: None,
         agent_session_id: None,
         agent_session_path: None,
+        pid_start_identity: None,
+        monotonic_sequence: None,
     }
 }
 
@@ -20783,6 +20858,9 @@ async fn callbacks_of_a_running_package_session_are_accepted_after_disable_and_r
             source: "pohunek:pi".to_owned(),
             agent: "pi".to_owned(),
             seq: Some(ReportSequence::new(2)),
+            pid: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(release.released, "and releases");
@@ -22163,4 +22241,138 @@ async fn a_resume_of_a_profile_named_after_its_runtime_checks_the_profile_home()
         "{}",
         warning.message
     );
+}
+
+fn attested_report(
+    created: &SessionInfo,
+    start: Option<u64>,
+    pid: Option<Pid>,
+) -> SessionReportAgentParams {
+    SessionReportAgentParams {
+        session_id: created.id.clone(),
+        source: CODEX_HOOK_SOURCE.to_owned(),
+        agent: "codex".to_owned(),
+        activity: None,
+        seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+        pid,
+        agent_session_id: None,
+        agent_session_path: None,
+        pid_start_identity: start.map(protocol::ProcessStartIdentity::new),
+        monotonic_sequence: Some(ReportSequence::new(7)),
+    }
+}
+
+/// The start identity a hook claims for a process is checked against the host:
+/// a confirmed identity binds the claim to that process, anything else is
+/// refused before the claim changes state.
+#[tokio::test]
+async fn a_report_binds_the_start_identity_only_when_the_host_confirms_it() {
+    let (registry, inspector, created) = mock_direct_codex_registry("attested-report").await;
+    let real = inspector
+        .identity(created.pid)
+        .expect("read the agent process")
+        .expect("the agent process runs")
+        .start_identity
+        .get();
+
+    for (case, start, pid) in [
+        ("another start identity", Some(real + 1), Some(created.pid)),
+        ("an identity without a pid", Some(real), None),
+    ] {
+        assert!(
+            !registry
+                .report_agent(attested_report(&created, start, pid))
+                .await
+                .recorded,
+            "{case}"
+        );
+        assert!(
+            registry
+                .inspect(&created.id)
+                .await
+                .expect("inspect session")
+                .active_agent
+                .is_none(),
+            "{case}"
+        );
+    }
+    inspector.set_identity(created.pid, None);
+    assert!(
+        !registry
+            .report_agent(attested_report(&created, Some(real), Some(created.pid)))
+            .await
+            .recorded,
+        "a process that is gone"
+    );
+    inspector.set_identity(
+        created.pid,
+        Some(ProcessIdentity {
+            pid: created.pid,
+            start_identity: StartIdentity::new(real),
+        }),
+    );
+
+    assert!(
+        registry
+            .report_agent(attested_report(&created, Some(real), Some(created.pid)))
+            .await
+            .recorded
+    );
+    let sessions = registry.inner.sessions.lock().await;
+    let active = sessions[&created.id]
+        .active_agent
+        .as_ref()
+        .expect("the confirmed report is active");
+    assert_eq!(active.pid, Some(created.pid));
+    assert_eq!(active.start_identity, Some(real));
+    drop(sessions);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A release that names a start identity the host contradicts is ignored; one
+/// whose process already exited still releases.
+#[tokio::test]
+async fn a_release_is_ignored_when_the_host_contradicts_its_start_identity() {
+    let (registry, inspector, created) = mock_direct_codex_registry("attested-release").await;
+    let real = inspector
+        .identity(created.pid)
+        .expect("read the agent process")
+        .expect("the agent process runs")
+        .start_identity
+        .get();
+    assert!(
+        registry
+            .report_agent(attested_report(&created, Some(real), Some(created.pid)))
+            .await
+            .recorded
+    );
+    let release = |start: Option<u64>| SessionReleaseAgentParams {
+        session_id: created.id.clone(),
+        source: CODEX_HOOK_SOURCE.to_owned(),
+        agent: "codex".to_owned(),
+        seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+        pid: Some(created.pid),
+        pid_start_identity: start.map(protocol::ProcessStartIdentity::new),
+        monotonic_sequence: Some(ReportSequence::new(8)),
+    };
+
+    assert!(
+        !registry
+            .release_agent(release(Some(real + 1)))
+            .await
+            .released
+    );
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session")
+            .active_agent
+            .as_deref(),
+        Some("codex")
+    );
+
+    inspector.set_identity(created.pid, None);
+    assert!(registry.release_agent(release(Some(real))).await.released);
+    let _ = registry.stop(&created.id).await;
 }

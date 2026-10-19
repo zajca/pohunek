@@ -1340,6 +1340,8 @@ fn session_report_agent_params_roundtrip_with_optional_native_refs() {
         pid: Some(9001),
         agent_session_id: Some("codex-native".to_owned()),
         agent_session_path: None,
+        pid_start_identity: None,
+        monotonic_sequence: None,
     };
 
     let value = serde_json::to_value(&params).expect("serialize report params");
@@ -1369,6 +1371,9 @@ fn session_release_agent_params_omits_absent_sequence() {
         source: "pohunek:codex".to_owned(),
         agent: "codex".to_owned(),
         seq: None,
+        pid: None,
+        pid_start_identity: None,
+        monotonic_sequence: None,
     };
 
     let value = serde_json::to_value(&params).expect("serialize release params");
@@ -1383,6 +1388,48 @@ fn session_release_agent_params_omits_absent_sequence() {
 
     let back = line_roundtrip(&params);
     assert_eq!(back, params);
+}
+
+#[test]
+fn session_agent_bound_fields_use_decimal_strings_and_old_params_still_decode() {
+    let report = SessionReportAgentParams {
+        session_id: SessionId("s-42".to_owned()),
+        source: "pohunek:codex".to_owned(),
+        agent: "codex".to_owned(),
+        activity: None,
+        seq: Some(ReportSequence::new(1)),
+        pid: Some(9001),
+        agent_session_id: None,
+        agent_session_path: None,
+        pid_start_identity: Some(ProcessStartIdentity::new(u64::MAX)),
+        monotonic_sequence: Some(ReportSequence::new(1_790_000_000_123_456_789)),
+    };
+    let value = serde_json::to_value(&report).expect("serialize report params");
+    assert_eq!(value["pid_start_identity"], json!(u64::MAX.to_string()));
+    assert_eq!(value["monotonic_sequence"], json!("1790000000123456789"));
+    assert_eq!(line_roundtrip(&report), report);
+
+    let release = SessionReleaseAgentParams {
+        session_id: SessionId("s-42".to_owned()),
+        source: "pohunek:codex".to_owned(),
+        agent: "codex".to_owned(),
+        seq: None,
+        pid: Some(9001),
+        pid_start_identity: Some(ProcessStartIdentity::new(7)),
+        monotonic_sequence: Some(ReportSequence::new(8)),
+    };
+    let value = serde_json::to_value(&release).expect("serialize release params");
+    assert_eq!(value["pid"], json!(9001));
+    assert_eq!(value["pid_start_identity"], json!("7"));
+    assert_eq!(value["monotonic_sequence"], json!("8"));
+    assert_eq!(line_roundtrip(&release), release);
+
+    let previous: SessionReportAgentParams = serde_json::from_value(json!({
+        "session_id": "s-42", "source": "pohunek:codex", "agent": "codex", "seq": "5", "pid": 9001
+    }))
+    .expect("params of a release without the bound fields");
+    assert_eq!(previous.pid_start_identity, None);
+    assert_eq!(previous.monotonic_sequence, None);
 }
 
 #[test]

@@ -482,7 +482,7 @@ All params and result type names below refer to structs exported by
 | `session.output` | `SessionOutputParams` | `SessionOutputResult` | Reads a newest retained tail or continues from an exact runtime-scoped output cursor. A request with `wait_ms` uses a dedicated connection with bounded-wait headroom. |
 | `session.wait` | `SessionWaitParams` | `SessionWaitResult` | Performs one bounded long poll for state, activity, metadata, terminal, output, or runtime change. It always uses a dedicated connection. |
 | `session.wait_turn` | `SessionWaitTurnParams` | `SessionWaitTurnResult` | Waits for the next turn event (`turn_completed`, `agent_blocked`, `approval_required`, `exited`) of one or more sessions after an opaque cursor, bounded by an agent-chosen timeout under a daemon ceiling; a timeout returns per-session progress. It always uses a dedicated connection. New in protocol 4: a protocol 3 client or daemon does not define it. See [Turn Waits](#turn-waits). |
-| `session.report_agent` | `SessionReportAgentParams` | `SessionReportAgentResult` | Hook callback for nested agents running inside an existing session. It records an active-agent claim, optional process binding, and optional active native metadata without changing launch identity or resume binding; ignored reports return `recorded: false`. Claims are reconciled with process facts and can be auto-released when no live backing process remains. |
+| `session.report_agent` | `SessionReportAgentParams` | `SessionReportAgentResult` | Hook callback for nested agents running inside an existing session. It records an active-agent claim, optional process binding (`pid`, confirmed by an optional `pid_start_identity`), and optional active native metadata without changing launch identity or resume binding; ignored reports return `recorded: false`. Claims are reconciled with process facts and can be auto-released when no live backing process remains. |
 | `session.release_agent` | `SessionReleaseAgentParams` | `SessionReleaseAgentResult` | Hook callback that clears a matching active nested-agent report and restores the session's default detector identity. Claude `SessionEnd` hooks use this as the clean-exit fast path; non-current releases return `released: false`; process-backed auto-release uses the same clear path. |
 | `session.report_native_id` | `SessionReportNativeIdParams` | `SessionReportNativeIdResult` | Hardened public fallback for launch-agent resume metadata. Reports are runtime- and process-bound, ordered, expiring, and provider-matched; ignored reports return `recorded: false`. The caller is attested with its kernel peer credentials before any session state is read: only the session's PTY root itself is admitted, and a caller that fails the attestation (a remote connection, a descendant of the root, another user, or a root whose session uses the `identity-v1` schema) gets the error `native_report_unattested` (see the native-id report attestation rules below the schema section). The owner-private worker claim path is preferred. This is not the nested-agent active identity callback. |
 | `session.set_metadata` | `SessionSetMetadataParams` | `SessionSetMetadataResult` | Merges owner-controlled metadata. Values must not contain secrets. |
@@ -2406,8 +2406,25 @@ session (`session.stop`, `session.resize`, input, attach) keeps the state's code
 losing its runtime: the release that started such a worker is outside the
 supported upgrade window, and the daemon does not notice when it ends.
 
+`session.report_agent` also accepts two optional fields that bind a report to
+the agent process. `pid_start_identity` is the kernel process-start identity of
+`pid`, spelled as a decimal string like in `session.report_native_id`; the
+daemon reads the identity of the process behind `pid` and answers
+`recorded: false`, changing nothing, when the report names an identity without a
+`pid`, when no process runs under the `pid`, or when the process started
+differently. A confirmed identity binds the active claim to that exact process
+without waiting for procwatch to observe it. `monotonic_sequence` is a decimal
+string on the session host's `CLOCK_MONOTONIC` clock, the clock the worker hook
+path orders reports with. It is a separate field from `seq`, which stays the
+wall-clock value that orders the memory-only path, and the daemon does not
+compare the two. The shipped Claude and Codex state hooks send both fields on
+their daemon-socket fallback.
+
 `session.release_agent` accepts the same `source`/`agent` identity plus an
-optional `seq`. A release clears only the current matching active-agent claim;
+optional `seq`, and the same optional `pid`, `pid_start_identity` and
+`monotonic_sequence`. A release that names an identity the host contradicts is
+ignored (`released: false`); a release whose process has already exited is not
+checked and still applies. A release clears only the current matching active-agent claim;
 stale releases do not clear newer reports. Claude installs a `SessionEnd` state
 hook that sends `session.release_agent` with a fresh timestamp sequence, so
 clean exits normally clear active state promptly. Codex has no installed

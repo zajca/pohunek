@@ -1103,6 +1103,76 @@ async fn prebump_state_hooks_report_through_the_daemon_socket() {
     daemon.stop().await;
 }
 
+/// The public fallback of both managed state hooks names the agent process
+/// by its start identity and orders the report on the monotonic clock the
+/// worker path uses, so the daemon can forward it as a bound claim.
+#[tokio::test]
+async fn the_state_hook_fallbacks_send_the_bound_process_and_the_monotonic_sequence() {
+    use pohunek_platform::process::ProcessInspector as _;
+
+    let daemon = Daemon::start("hook-bound-fields").await;
+    let relay = RecordingRelay::start(&daemon);
+    let mut driver = daemon.connect().await;
+    let (live, _) = create_previous_session(&mut driver, &daemon).await;
+    let input = json!({"session_id": "native-1", "transcript_path": "/work/t.jsonl"});
+    // The hook runs as a child of this process and reports its parent.
+    let own = pohunek_platform::process::HostInspector::new()
+        .identity(std::process::id())
+        .expect("inspect own process")
+        .expect("own process exists");
+
+    for agent in ["claude", "codex"] {
+        let actions: &[&str] = if agent == "claude" {
+            &["session", "release"]
+        } else {
+            &["session"]
+        };
+        let before = relay.exchanges().len();
+        for action in actions.iter().copied() {
+            let status = run_prebump_hook(
+                &relay,
+                &live,
+                CURRENT_VERSION,
+                agent,
+                "pohunek-agent-state.sh",
+                &[action],
+                &input,
+            )
+            .await;
+            assert!(status.success(), "{agent} {action}");
+        }
+        let exchanges = relay.exchanges().split_off(before);
+        let public: Vec<_> = exchanges
+            .iter()
+            .map(|(request, _)| request)
+            .filter(|request| {
+                [method::SESSION_REPORT_AGENT, method::SESSION_RELEASE_AGENT]
+                    .contains(&request["method"].as_str().expect("method"))
+            })
+            .collect();
+        assert_eq!(public.len(), actions.len(), "{agent}");
+        for request in public {
+            let params = &request["params"];
+            let context = format!("{agent}: {request}");
+            assert_eq!(
+                params["pid_start_identity"],
+                json!(own.start_identity.get().to_string()),
+                "{context}"
+            );
+            assert_eq!(params["pid"], json!(std::process::id()), "{context}");
+            let monotonic: u64 = params["monotonic_sequence"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{context}"))
+                .parse()
+                .unwrap_or_else(|_| panic!("{context}"));
+            assert!(monotonic > 0, "{context}");
+            // The wall-clock `seq` stays as it was: it orders the memory path.
+            assert!(params.get("seq").is_some(), "{context}");
+        }
+    }
+    daemon.stop().await;
+}
+
 /// User metadata keys are free-form values: both adapters leave them untouched
 /// even when a user entry is named exactly like the key the two versions spell
 /// differently (`runtime_id`, `previous_runtime_id`, `worker_instance_id`). A
