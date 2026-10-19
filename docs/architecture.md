@@ -1090,7 +1090,11 @@ the oldest deterministic recognized member of that exact PGID win. A known
 foreground group suppresses first-seen descendant fallback, so returning to a
 shell cannot re-claim a background agent on the next poll. A recent unbound
 hook claim remains valid until its claim TTL because foreground identity alone
-cannot identify its process; process-bound nested claims clear immediately.
+cannot identify its process; process-bound nested claims clear immediately,
+except a reporter that one scan proves alive below an observed agent of the same
+runtime (or below an agent launch root): the foreground rules above then keep it
+and bind its own start identity, and any scan, probe or notification without
+that proof decides as if the exception did not exist.
 The PTY-root claim is preserved only for a direct-launch agent matching the
 launch provider.
 Transient probe failures retain the last-known PGID and active claim. Provider

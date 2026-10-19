@@ -334,6 +334,15 @@ procwatch are authoritative for start/stop, hooks are the fast path for rich
 claims and clean release, and PTY output remains an activity signal rather than
 lifecycle authority. `SessionStart` hooks report the nested agent's PID when the
 provider exposes it as the hook parent, so procwatch can bind the claim exactly.
+A reporter that is not an observed agent itself, such as the Codex binary below
+the `node codex.js` wrapper, keeps its claim while a scan proves it: the process
+runs now, still has the claim's start identity, is not owned by another session,
+and descends from an observed agent of the same runtime, or from the launch root
+of an agent session, without an agent of another runtime in between. The proof
+belongs to that scan alone: a failed collection, an unreadable reporter, an exit
+notification or a scan collected before the claim was admitted decides like a
+claim without it, so a dead or reused PID, a sibling outside the agent's tree,
+another runtime or another session's process cannot keep the claim.
 Claude `SessionEnd` sends an explicit release for prompt clean-exit clearing;
 Codex has no installed session-end release because its `Stop` event is
 turn-level, so procwatch remains the release backstop. Hook claims must be
@@ -693,7 +702,10 @@ reconnect or native recovery.
 Foreground reconciliation selects the recognized process-group leader first;
 when the leader is an unidentified wrapper, it selects a recognized member of
 the same foreground PGID. It never selects a nested agent by kind from another
-process group. Replacing an active agent clears stale native identity metadata
+process group. When the foreground selects an observed agent, a verified
+descendant claim is kept only if that agent is its ancestor; a switch to any
+other agent replaces it, and a foreground back on a shell root clears a claim
+anchored to an observed wrapper. Replacing an active agent clears stale native identity metadata
 and switches the detector configuration with the new agent. An active agent
 that a managed hook reports through the session's worker switches it the same
 way once the daemon projects the worker's journal, and its release restores the
