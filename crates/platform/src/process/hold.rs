@@ -20,6 +20,13 @@ use pohunek_test_support::env::TestEnv;
 /// run that died before cleanup cannot leave the process behind for long.
 const HOLD_LIFETIME: Duration = Duration::from_secs(300);
 
+/// Optional acknowledgement path used by sweep fixtures after exec.
+pub(super) const READY_FILE: &str = "POHUNEK_TEST_HOLD_READY_FILE";
+
+/// Linux regression gate: delay readiness, optionally hiding ownership markers.
+#[cfg(target_os = "linux")]
+pub(super) const BLOCK_READY: &str = "POHUNEK_TEST_HOLD_BLOCK_READY";
+
 /// Shell command that runs the holding image.
 ///
 /// `$0` is this test binary, passed by [`shell_command`]; the arguments select
@@ -48,6 +55,38 @@ pub(super) fn shell_command(env: &TestEnv, script: &str) -> Command {
 #[test]
 #[ignore = "image of the fixture processes spawned by the process scenarios"]
 fn hold() {
+    #[cfg(target_os = "linux")]
+    if let Ok(gate) = std::env::var(BLOCK_READY) {
+        use rustix::process::{set_dumpable_behavior, DumpableBehavior};
+        use std::io::Read;
+
+        if gate == "after-ack" {
+            set_dumpable_behavior(DumpableBehavior::NotDumpable).expect("hide fixture markers");
+        }
+        std::fs::write(
+            std::env::var_os(READY_FILE).expect("ready path"),
+            if gate == "after-ack" {
+                b"ready".as_slice()
+            } else {
+                b"blocked".as_slice()
+            },
+        )
+        .expect("acknowledge controlled gate");
+        let mut release = [0];
+        std::io::stdin()
+            .read_exact(&mut release)
+            .expect("parent releases holder");
+        if gate == "after-ack" {
+            set_dumpable_behavior(DumpableBehavior::Dumpable).expect("publish fixture markers");
+        }
+    }
+    if let Some(path) = std::env::var_os(READY_FILE) {
+        // The after-ack regression published this state before releasing its
+        // markers. Do not truncate it again while the parent observes readiness.
+        if std::fs::read(&path).ok().as_deref() != Some(b"ready") {
+            std::fs::write(path, b"ready").expect("acknowledge holding image");
+        }
+    }
     // timing-allowed: #790 the fixture's own lifetime; no scenario waits on this sleep, it ends when the scenario kills the process
     std::thread::sleep(HOLD_LIFETIME);
 }
