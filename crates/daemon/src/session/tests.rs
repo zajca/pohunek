@@ -10845,6 +10845,9 @@ async fn journal_projected_descendant_claim_survives_a_successful_scan() {
         expires_at: native_report_expiry(),
         reference_kind: None,
         native_reference: None,
+        agent: None,
+        origin: None,
+        reported_session: None,
     });
     assert_eq!(
         registry
