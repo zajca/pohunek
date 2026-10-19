@@ -13804,6 +13804,117 @@ generation "$1"
             fake.abort();
         }
 
+        /// The inputs of a preflight over the fixture `root`, with no plugin
+        /// installed.
+        fn preflight_inputs(root: &Path) -> crate::session::upgrade_preflight::PreflightInputs {
+            crate::session::upgrade_preflight::PreflightInputs {
+                store_path: root.join("data/metadata.jsonl"),
+                worker_state_root: root.join("state/workers"),
+                plugins_dir: root.join("state/plugins"),
+            }
+        }
+
+        /// A live worker released before the instance marker is quarantined by
+        /// startup and stays at risk, so its acceptance scope must be the one the
+        /// replacement daemon reproduces.
+        #[tokio::test]
+        async fn a_quarantined_worker_keeps_its_acceptance_scope_through_startup() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let runtime_root = fixture.root.join("runtime/workers");
+            let (controller, worker_instance_id, _child_pid, server_task) =
+                spawn_initialized_worker(&fixture.root, &runtime_root, "s-1221", "worker-s-1221")
+                    .await;
+            persist_record(&fixture.root, "s-1221", Some(worker_instance_id.as_str()));
+            drop(controller);
+            let legacy_child = Marked::spawn_with(
+                &fixture.root,
+                &[
+                    ("POHUNEK_SESSION_ID", "s-1221"),
+                    ("POHUNEK_WORKER_ID", "worker-s-1221"),
+                    ("POHUNEK_RUNTIME_ID", worker_instance_id.as_str()),
+                ],
+            );
+            rewrite_journal(&fixture.root, "s-1221", "worker-s-1221", |journal| {
+                journal.insert("version".to_owned(), "0.33.0".into());
+            });
+            let inputs = preflight_inputs(&fixture.root);
+            let inspector = HostInspector::new();
+            let before = crate::session::upgrade_preflight::run(&inputs, &inspector);
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-1221").await;
+            assert_eq!(runtime.state, RuntimeState::Incompatible, "{runtime:?}");
+            let after = crate::session::upgrade_preflight::run(&inputs, &inspector);
+            assert_eq!(
+                super::scoped_verdicts_staying_at_risk("quarantined worker", &before, &after),
+                std::collections::BTreeSet::from([
+                    pohunek_service_config::preflight::CODE_WORKER_MARKER_LEGACY.to_owned()
+                ]),
+                "{before:?} / {after:?}"
+            );
+            drop(legacy_child);
+            server_task.abort();
+        }
+
+        /// A stopped session pinned to a runtime source the new daemon does
+        /// not serve stays at risk through startup with the same scope.
+        #[tokio::test]
+        async fn a_stopped_session_of_an_unserved_runtime_keeps_its_acceptance_scope_through_startup(
+        ) {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let mut record = persist_record(&fixture.root, "s-1222", None);
+            record.desired_state = DesiredState::Stopped;
+            record.runtime.state = RuntimeState::Terminal;
+            record.runtime.generation = None;
+            record.runtime.service_id = None;
+            record.info.state = protocol::SessionState::Stopped;
+            record.info.agent = "pi".to_owned();
+            record.info.agent_base = protocol::RuntimeRef::from_wire("pi");
+            let recovery = record.recovery.as_mut().expect("recovery binding");
+            recovery.agent = "pi".to_owned();
+            recovery.agent_base = protocol::RuntimeRef::from_wire("pi");
+            recovery.native_session_id = Some("native-1222".to_owned());
+            recovery.launch_binding = crate::agent::host::LaunchPin::Pinned(Box::new(
+                serde_json::from_value(serde_json::json!({
+                    "runtime_id": "pi",
+                    "provenance": {
+                        "kind": "package",
+                        "package": {"id": "acme.runtime.pi", "version": "1.0.0"},
+                        "package_digest":
+                            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                    },
+                }))
+                .expect("the package launch binding"),
+            ));
+            Store::new(fixture.root.join("data/metadata.jsonl"))
+                .record_session(&record)
+                .expect("persist the stopped record");
+            let inputs = preflight_inputs(&fixture.root);
+            let inspector = HostInspector::new();
+            let before = crate::session::upgrade_preflight::run(&inputs, &inspector);
+            assert_eq!(
+                before.stopped_sessions.first().map(|v| v.code.as_str()),
+                Some(pohunek_service_config::preflight::CODE_RUNTIME_SOURCE_NOT_SERVED),
+                "{before:?}"
+            );
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let after = crate::session::upgrade_preflight::run(&inputs, &inspector);
+            assert_eq!(
+                super::scoped_verdicts_staying_at_risk("stopped session", &before, &after),
+                std::collections::BTreeSet::from([
+                    pohunek_service_config::preflight::CODE_RUNTIME_SOURCE_NOT_SERVED.to_owned()
+                ]),
+                "{before:?} / {after:?}"
+            );
+        }
+
         /// Whether `id` is still registered with the supervisor.
         async fn discovered(supervisor: &ScriptedSupervisor, id: &ServiceId) -> bool {
             pohunek_platform::supervisor::Supervisor::discover(supervisor)
@@ -19106,6 +19217,41 @@ generation "$1"
         }
     }
 
+    /// The codes of the scoped at-risk verdicts of `before` that `after`, the
+    /// preflight over the state startup reconciliation left behind, still lists
+    /// at risk for the same session.
+    ///
+    /// A verdict the startup settled is no longer listed and needs no scope. A
+    /// verdict that stays must carry the identical scope, or an acceptance
+    /// recorded before the upgrade would never match the verdict it covers.
+    fn scoped_verdicts_staying_at_risk(
+        label: &str,
+        before: &pohunek_service_config::preflight::PreflightReport,
+        after: &pohunek_service_config::preflight::PreflightReport,
+    ) -> std::collections::BTreeSet<String> {
+        let mut staying = std::collections::BTreeSet::new();
+        for verdict in before
+            .at_risk()
+            .filter(|verdict| verdict.acceptance_scope.is_some())
+        {
+            let still: Vec<_> = after
+                .at_risk()
+                .filter(|later| later.session_id == verdict.session_id)
+                .collect();
+            if still.is_empty() {
+                continue;
+            }
+            assert!(
+                still
+                    .iter()
+                    .any(|later| later.acceptance_scope == verdict.acceptance_scope),
+                "{label}: the scope of {verdict:?} must survive startup, but the session is now {still:?}"
+            );
+            staying.insert(verdict.code.clone());
+        }
+        staying
+    }
+
     /// What startup reconciliation does with one worker and record, against
     /// what the upgrade preflight says about the same files.
     #[expect(
@@ -19526,6 +19672,7 @@ generation "$1"
             },
         ];
 
+        let mut staying = std::collections::BTreeSet::new();
         for (with_plan, case) in cases
             .into_iter()
             .flat_map(|case| [(false, case), (true, case)])
@@ -19787,6 +19934,11 @@ generation "$1"
                 .inspect(&SessionId(session_id.to_owned()))
                 .await
                 .ok();
+            staying.extend(scoped_verdicts_staying_at_risk(
+                &format!("{} ({form})", case.name),
+                &report,
+                &run(&inputs, &inspector),
+            ));
             let runtime = reconciled.as_ref().and_then(|info| info.runtime.clone());
             let live = runtime
                 .as_ref()
@@ -19876,6 +20028,21 @@ generation "$1"
                 );
             }
         }
+
+        // The cases above must have kept scoped verdicts at risk across
+        // startup, or the scope check would pass for want of any.
+        for code in [
+            pohunek_service_config::preflight::CODE_RUNTIME_IDENTITY_MISMATCH,
+            pohunek_service_config::preflight::CODE_GENERATION_MISSING,
+            pohunek_service_config::preflight::CODE_JOURNAL_UNREADABLE,
+            pohunek_service_config::preflight::CODE_JOURNAL_SCHEMA_UNSUPPORTED,
+            pohunek_service_config::preflight::CODE_PROTOCOL_INCOMPATIBLE,
+        ] {
+            assert!(
+                staying.contains(code),
+                "{code} never stayed at risk: {staying:?}"
+            );
+        }
     }
 
     /// A process table that cannot be read never makes a session adoptable.
@@ -19954,6 +20121,8 @@ generation "$1"
         );
         assert_eq!(unreadable.verdict, Verdict::WouldNotBeAdopted);
         assert_eq!(unreadable.code, "identity_process_inspection_failed");
+        // A code the differential does not prove stable carries no scope.
+        assert_eq!(unreadable.acceptance_scope, None);
     }
 
     /// Ends the PTY root of an in-process worker and waits until the worker has

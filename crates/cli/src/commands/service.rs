@@ -1168,6 +1168,7 @@ mod tests {
             verdict,
             code: "native_recovery_unmappable".to_owned(),
             detail: "detail".to_owned(),
+            acceptance_scope: None,
         };
         PreflightReport {
             report_version: REPORT_VERSION,
@@ -1286,6 +1287,7 @@ mod tests {
             verdict,
             code: "test_code".to_owned(),
             detail: "test detail".to_owned(),
+            acceptance_scope: None,
         };
         let mut preflight = runtime_plan_preflight();
         preflight.stopped_sessions = vec![
