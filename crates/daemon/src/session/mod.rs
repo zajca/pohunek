@@ -3519,6 +3519,47 @@ impl SessionRegistry {
             .expect("a report from the session's PTY root is attested")
     }
 
+    /// Checks the process-start identity a hook claims for `pid` against the one
+    /// the host reports now, and returns the claimed identity when they agree.
+    ///
+    /// A hook that sends no identity is not checked and yields `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StartIdentityRefusal`] when the claim names an identity
+    /// without a pid, when the process is gone or unreadable, or when the
+    /// process now behind the pid started differently.
+    fn attest_start_identity(
+        &self,
+        id: &SessionId,
+        pid: Option<Pid>,
+        claimed: Option<protocol::ProcessStartIdentity>,
+        report: &str,
+    ) -> Result<Option<u64>, StartIdentityRefusal> {
+        let Some(claimed) = claimed else {
+            return Ok(None);
+        };
+        let refuse = |refusal: StartIdentityRefusal| {
+            debug!(
+                session_id = %id.0,
+                reason = ?refusal,
+                "{report} carries a process start identity the host does not confirm; ignoring"
+            );
+            Err(refusal)
+        };
+        let Some(pid) = pid else {
+            return refuse(StartIdentityRefusal::MissingPid);
+        };
+        match self.inner.inspector.identity(pid) {
+            Ok(Some(current)) if current.start_identity.get() == claimed.get() => {
+                Ok(Some(claimed.get()))
+            }
+            Ok(Some(_)) => refuse(StartIdentityRefusal::Mismatch),
+            Ok(None) => refuse(StartIdentityRefusal::ProcessGone),
+            Err(_) => refuse(StartIdentityRefusal::Unreadable),
+        }
+    }
+
     /// Resolves the agent a callback of session `id` names. A name that is the
     /// session's own runtime, bare or through a profile based on it, resolves
     /// against the definition the session was launched from, not the
@@ -3623,6 +3664,14 @@ impl SessionRegistry {
             validate_agent_session_path(&params.session_id, params.agent_session_path.as_deref());
         let reported_activity = params.activity;
         let report_sequence = params.seq.map(protocol::ReportSequence::get);
+        let Ok(attested_start) = self.attest_start_identity(
+            &params.session_id,
+            params.pid,
+            params.pid_start_identity,
+            "active-agent report",
+        ) else {
+            return not_recorded;
+        };
         let mut stale_resolutions = 0;
         let (info, rescan, evidence) = loop {
             let resolution = match self
@@ -3702,8 +3751,12 @@ impl SessionRegistry {
                 return not_recorded;
             }
 
-            let (pid, start_identity) =
-                bind_report_process(entry, params.pid, &RuntimeRef::from(resolved.base.clone()));
+            let (pid, start_identity) = bind_report_process(
+                entry,
+                params.pid,
+                &RuntimeRef::from(resolved.base.clone()),
+                attested_start,
+            );
             let report = ActiveAgentReport {
                 source: params.source.clone(),
                 agent: resolved.name.clone(),
@@ -3763,6 +3816,19 @@ impl SessionRegistry {
     ) -> SessionReleaseAgentResult {
         let not_released = SessionReleaseAgentResult { released: false };
         let report_sequence = params.seq.map(protocol::ReportSequence::get);
+        // A releasing process that already exited cannot be checked and does
+        // not block its release; any other refusal means the claimed subject is
+        // not the process behind the pid.
+        if let Err(refusal) = self.attest_start_identity(
+            &params.session_id,
+            params.pid,
+            params.pid_start_identity,
+            "active-agent release",
+        ) {
+            if refusal != StartIdentityRefusal::ProcessGone {
+                return not_released;
+            }
+        }
         let resolved = match self
             .resolve_session_agent(&params.session_id, &params.agent)
             .await
@@ -6944,20 +7010,38 @@ fn detector_config_for_resolved_agent(resolved: &ResolvedAgent) -> DetectorConfi
     }
 }
 
+/// Why a hook's claimed process-start identity was not confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartIdentityRefusal {
+    /// The claim names an identity but no pid.
+    MissingPid,
+    /// The process behind the pid started differently.
+    Mismatch,
+    /// No process runs under the pid.
+    ProcessGone,
+    /// The host could not read the process.
+    Unreadable,
+}
+
 fn bind_report_process(
     entry: &SessionEntry,
     reported_pid: Option<Pid>,
     agent_base: &RuntimeRef,
+    attested_start: Option<u64>,
 ) -> (Option<Pid>, Option<u64>) {
     if let Some(pid) = reported_pid {
-        // PID-bearing hooks are exact claims. If procwatch has not observed the
-        // process yet, keep the exact pid so the immediate rescan can either bind
-        // it or release it instead of falling back to an ambiguous base-kind match.
-        let start_identity = entry
-            .observed_agents
-            .iter()
-            .find(|observed| observed.pid == pid && &observed.agent_base == agent_base)
-            .map(|observed| observed.start_identity);
+        // PID-bearing hooks are exact claims. A start identity the daemon read
+        // for the pid binds the claim to that process. Without one, procwatch's
+        // observation supplies it; if procwatch has not observed the process
+        // yet, keep the exact pid so the immediate rescan can either bind it or
+        // release it instead of falling back to an ambiguous base-kind match.
+        let start_identity = attested_start.or_else(|| {
+            entry
+                .observed_agents
+                .iter()
+                .find(|observed| observed.pid == pid && &observed.agent_base == agent_base)
+                .map(|observed| observed.start_identity)
+        });
         return (Some(pid), start_identity);
     }
 

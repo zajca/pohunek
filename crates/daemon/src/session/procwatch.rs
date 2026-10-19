@@ -1308,6 +1308,8 @@ mod tests {
                 pid: None,
                 agent_session_id: None,
                 agent_session_path: None,
+                pid_start_identity: None,
+                monotonic_sequence: None,
             })
             .await;
         assert!(report.recorded);

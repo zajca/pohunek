@@ -1453,6 +1453,8 @@ fn identity_report(id: &protocol::SessionId, agent: &str) -> protocol::SessionRe
         pid: None,
         agent_session_id: Some("native-after-takeover".to_owned()),
         agent_session_path: None,
+        pid_start_identity: None,
+        monotonic_sequence: None,
     }
 }
 
@@ -1477,6 +1479,9 @@ async fn assert_hooks_not_attributed_through_the_package(
             source: "pohunek:hermes".to_owned(),
             agent: RuntimeId::HERMES.to_owned(),
             seq: None,
+            pid: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .await;
     assert!(!released.released, "the release is not applied");
@@ -2277,6 +2282,8 @@ fn claude_identity_report(id: &protocol::SessionId) -> protocol::SessionReportAg
         pid: None,
         agent_session_id: Some(CONVERSATION.to_owned()),
         agent_session_path: None,
+        pid_start_identity: None,
+        monotonic_sequence: None,
     }
 }
 
@@ -2984,6 +2991,8 @@ async fn a_nested_agent_report_held_across_an_uninstall_of_its_package_is_never_
         pid: None,
         agent_session_id: None,
         agent_session_path: None,
+        pid_start_identity: None,
+        monotonic_sequence: None,
     };
     let before = running_detector(&fixture.registry, &created.id).await;
 
@@ -3081,6 +3090,8 @@ async fn a_nested_agent_of_another_runtime_keeps_its_detector_through_a_package_
         pid: None,
         agent_session_id: None,
         agent_session_path: None,
+        pid_start_identity: None,
+        monotonic_sequence: None,
     };
     assert!(
         adopted.registry.report_agent(nested).await.recorded,
@@ -3113,6 +3124,22 @@ async fn a_nested_agent_of_another_runtime_keeps_its_detector_through_a_package_
 /// A host profile over the built-in Claude runtime that names its own
 /// detection manifest, which overrides the runtime's.
 const TUNED_PROFILE: &str = "tuned";
+
+/// A report that names the session's own tuned profile.
+fn tuned_report(id: &protocol::SessionId) -> protocol::SessionReportAgentParams {
+    protocol::SessionReportAgentParams {
+        session_id: id.clone(),
+        source: "pohunek:tuned".to_owned(),
+        agent: TUNED_PROFILE.to_owned(),
+        activity: None,
+        seq: None,
+        pid: None,
+        agent_session_id: None,
+        agent_session_path: None,
+        pid_start_identity: None,
+        monotonic_sequence: None,
+    }
+}
 
 #[tokio::test]
 async fn an_own_runtime_report_naming_a_profile_keeps_its_manifest_override_through_a_package_change(
@@ -3183,16 +3210,7 @@ async fn an_own_runtime_report_naming_a_profile_keeps_its_manifest_override_thro
     );
 
     // The session's own profile is the active agent: the report names it.
-    let report = protocol::SessionReportAgentParams {
-        session_id: created.id.clone(),
-        source: "pohunek:tuned".to_owned(),
-        agent: TUNED_PROFILE.to_owned(),
-        activity: None,
-        seq: None,
-        pid: None,
-        agent_session_id: None,
-        agent_session_path: None,
-    };
+    let report = tuned_report(&created.id);
     assert!(
         adopted.registry.report_agent(report).await.recorded,
         "the own-profile report is recorded"
@@ -4094,6 +4112,8 @@ async fn an_explicit_report_of_a_differently_named_profile_keeps_its_override_th
                 pid: None,
                 agent_session_id: None,
                 agent_session_path: None,
+                pid_start_identity: None,
+                monotonic_sequence: None,
             })
             .await
             .recorded,

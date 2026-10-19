@@ -795,7 +795,13 @@ if action == ACTION_RELEASE:
         "source": f"pohunek:{agent}",
         "agent": agent,
         "seq": str(timestamp_ms),
+        "monotonic_sequence": str(sequence),
     }
+    if agent_pid is not None:
+        release_agent_params["pid"] = agent_pid
+        start_identity = agent_start_identity()
+        if start_identity is not None:
+            release_agent_params["pid_start_identity"] = str(start_identity)
     send_request("session.release_agent", release_agent_params, "release")
     raise SystemExit(0)
 
@@ -816,8 +822,12 @@ report_agent_params = {
     "seq": str(timestamp_ms),
     "agent_session_id": native_session_id,
 }
+report_agent_params["monotonic_sequence"] = str(sequence)
 if agent_pid is not None:
     report_agent_params["pid"] = agent_pid
+    start_identity = agent_start_identity()
+    if start_identity is not None:
+        report_agent_params["pid_start_identity"] = str(start_identity)
 if transcript_path:
     report_agent_params["agent_session_path"] = transcript_path
 

@@ -5300,6 +5300,8 @@ async fn report_agent_api_records_active_agent_and_streams_report_state() {
             pid: None,
             agent_session_id: None,
             agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
         })
         .expect("serialize report-agent params"),
     );

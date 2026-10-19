@@ -2090,6 +2090,17 @@ pub struct SessionReportAgentParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub pid: Option<u32>,
+    /// Kernel process-start identity paired with [`Self::pid`]. The daemon
+    /// refuses the report when the process it reads for the pid differs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub pid_start_identity: Option<ProcessStartIdentity>,
+    /// Sequence on the session host's `CLOCK_MONOTONIC` clock, the clock the
+    /// worker hook path orders reports with. It is distinct from [`Self::seq`],
+    /// which orders wall-clock reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub monotonic_sequence: Option<ReportSequence>,
     /// Native session id for the active nested agent, when reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
@@ -2118,6 +2129,19 @@ pub struct SessionReleaseAgentParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub seq: Option<ReportSequence>,
+    /// OS pid of the agent process that releases, when the hook can report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub pid: Option<u32>,
+    /// Kernel process-start identity paired with [`Self::pid`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub pid_start_identity: Option<ProcessStartIdentity>,
+    /// Sequence on the session host's `CLOCK_MONOTONIC` clock; see
+    /// [`SessionReportAgentParams::monotonic_sequence`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub monotonic_sequence: Option<ReportSequence>,
 }
 
 /// Result returned by `session.report_agent`.
