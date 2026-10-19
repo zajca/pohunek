@@ -1034,24 +1034,18 @@ mod host {
 
     #[cfg(target_os = "linux")]
     fn wait_state(fixture: &Fixture, gate: &str) {
-        let deadline = Instant::now() + READY_TIMEOUT;
         let state: &[u8] = if gate == "after-ack" {
             b"ready"
         } else {
             b"blocked"
         };
-        loop {
-            let observed = std::fs::read(fixture.env.root().join("holder-ready"));
-            if observed.as_deref().ok() == Some(state) {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "holder {:?} never entered gate {gate}: observed={observed:?}",
-                fixture.identity
-            );
-            std::thread::sleep(READY_POLL);
-        }
+        pohunek_test_support::wait::poll_until(
+            &format!("holder {:?} entering gate {gate}", fixture.identity),
+            || {
+                let observed = std::fs::read(fixture.env.root().join("holder-ready"));
+                (observed.as_deref().ok() == Some(state)).then_some(())
+            },
+        );
     }
 
     /// Real procfs denial must not escape fixture setup, even after acknowledgement.
