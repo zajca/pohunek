@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use pohunek_session_worker::{Server, ServerArgs, WorkerConfig};
 use pohunek_worker_protocol::{
@@ -28,10 +29,17 @@ const WORKER_ID: &str = "worker-notify";
 struct DaemonStub {
     lines: Arc<Mutex<Vec<String>>>,
     replies: Arc<Mutex<Vec<String>>>,
+    notifications: crate::notifications::NotificationService,
 }
 
 impl DaemonStub {
     fn spawn(root: &Path, notification_dir: &Path) -> Self {
+        Self::spawn_delaying(root, notification_dir, Duration::ZERO)
+    }
+
+    /// Like [`Self::spawn`], but dispatches every request `reply_delay` after
+    /// it was received, which holds back the reply the caller waits for.
+    fn spawn_delaying(root: &Path, notification_dir: &Path, reply_delay: Duration) -> Self {
         let notifications = crate::notifications::NotificationService::open(notification_dir)
             .expect("notification service");
         let mut policy = crate::notifications::default_policy();
@@ -56,7 +64,7 @@ impl DaemonStub {
                 Arc::new(crate::governance::HostGovernanceService::open_test()),
                 crate::test_support::overlay_registry(),
             )
-            .with_notifications(notifications)
+            .with_notifications(notifications.clone())
             .with_attention_coordinator(attention),
         );
         let lines = Arc::new(Mutex::new(Vec::new()));
@@ -78,6 +86,8 @@ impl DaemonStub {
                         return;
                     }
                     lines.lock().expect("lines lock").push(line.clone());
+                    // timing-allowed: #1345 the injected daemon latency is the scenario input; the test waits on the replies, not on this sleep
+                    tokio::time::sleep(reply_delay).await;
                     let Dispatch::Reply(reply) = dispatch_line(&line, &state, None).await else {
                         return;
                     };
@@ -86,7 +96,18 @@ impl DaemonStub {
                 });
             }
         });
-        Self { lines, replies }
+        Self {
+            lines,
+            replies,
+            notifications,
+        }
+    }
+
+    fn records(&self) -> Vec<protocol::NotificationRecord> {
+        self.notifications
+            .list(protocol::NotificationListParams::default())
+            .expect("list the notification records")
+            .notifications
     }
 
     fn reply_lines(&self) -> Vec<Value> {
@@ -225,12 +246,32 @@ async fn start_worker_initialized(
     (worker, task, socket_path)
 }
 
+/// What the daemon received and recorded for one hook run.
+struct Delivery {
+    requests: Vec<Value>,
+    replies: Vec<Value>,
+    records: Vec<protocol::NotificationRecord>,
+}
+
 /// Runs the real notify asset of `agent` inside a real worker initialized with
 /// `public_version` and returns the daemon's recorded (request, reply) pair.
 async fn deliver_through_worker(agent: &str, args: &str, public_version: u32) -> (Value, Value) {
+    let delivery = deliver(agent, args, public_version, Duration::ZERO, 1).await;
+    (delivery.requests[0].clone(), delivery.replies[0].clone())
+}
+
+/// Runs the real notify asset of `agent` against a daemon that answers
+/// `reply_delay` late and waits until it has replied `replies` times.
+async fn deliver(
+    agent: &str,
+    args: &str,
+    public_version: u32,
+    reply_delay: Duration,
+    replies: usize,
+) -> Delivery {
     let root = crate::test_support::scoped_dir("ph-notify-worker-");
     let notifications = crate::test_support::scoped_dir("ph-notify-data-");
-    let daemon = DaemonStub::spawn(&root, &notifications);
+    let daemon = DaemonStub::spawn_delaying(&root, &notifications, reply_delay);
     // The piped provider payload closes the hook's stdin; `; true` keeps the
     // shell from exec-ing the hook, so the hook's parent is the PTY root the
     // worker attests.
@@ -241,21 +282,65 @@ async fn deliver_through_worker(agent: &str, args: &str, public_version: u32) ->
     let (worker, task, _socket) = start_worker(&root, &script, public_version).await;
 
     Box::pin(pohunek_test_support::wait::wait_until(
-        "the worker forwards the notification",
-        || async { (!daemon.reply_lines().is_empty()).then_some(()) },
+        "the daemon has replied",
+        || async { (daemon.reply_lines().len() >= replies).then_some(()) },
     ))
     .await;
 
-    let requests = daemon.request_lines();
-    assert_eq!(
-        requests.len(),
-        1,
-        "exactly one request reaches the daemon: {requests:?}"
-    );
-    let replies = daemon.reply_lines();
+    let delivery = Delivery {
+        requests: daemon.request_lines(),
+        replies: daemon.reply_lines(),
+        records: daemon.records(),
+    };
     drop(worker);
     task.abort();
-    (requests[0].clone(), replies[0].clone())
+    delivery
+}
+
+/// The hook gives the worker `SOCKET_TIMEOUT_SECS` (0.5 s) to answer before it
+/// dials the daemon itself; a daemon this late forces that fallback.
+const REPLY_DELAY_PAST_HOOK_TIMEOUT: Duration = Duration::from_millis(1_200);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hook_that_outwaits_the_worker_falls_back_without_a_second_notification() {
+    let delivery = deliver(
+        "claude",
+        "notification auth_success",
+        protocol::PROTOCOL_VERSION.get(),
+        REPLY_DELAY_PAST_HOOK_TIMEOUT,
+        2,
+    )
+    .await;
+    assert!(
+        delivery.requests[0]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("worker-hook:")),
+        "the worker's forward arrives first: {:?}",
+        delivery.requests
+    );
+    assert!(
+        delivery.requests[1]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("hook:")),
+        "the hook dials the daemon itself after the worker timed out: {:?}",
+        delivery.requests
+    );
+    assert_eq!(
+        delivery.requests[0]["params"]["source_id"], delivery.requests[1]["params"]["source_id"],
+        "both deliveries name the same source"
+    );
+    let created = delivery
+        .replies
+        .iter()
+        .filter(|reply| reply["ok"]["created"] == json!(true))
+        .count();
+    assert_eq!(created, 1, "one delivery creates: {:?}", delivery.replies);
+    assert_eq!(
+        delivery.records.len(),
+        1,
+        "the store holds one notification: {:?}",
+        delivery.records
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
