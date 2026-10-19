@@ -22,3 +22,9 @@ hook updates. An older snapshot cannot refute a newer claim, and a fresh callbac
 does not make its cached snapshot fresh. Repeated hooks for the same identity
 keep the verified generation through uncertainty; only newer conclusive evidence
 can invalidate it. An explicit release also fences snapshots collected before it.
+
+Hook admission and conclusive liveness have separate sequence fences. Unknown
+observations update the cache but never advance a bound claim's proof of life;
+a queued exact exit still applies after an inconclusive scan or a same-identity
+hook refresh. Only newer conclusive own-process evidence supersedes it, even
+when an ancestor remains unreadable.

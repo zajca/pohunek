@@ -3824,6 +3824,7 @@ impl SessionRegistry {
             process_uncertainty: Vec::new(),
             process_snapshot_sequence: 0,
             claim_evidence_sequence: 0,
+            claim_report_sequence: 0,
             process_exit_sequence: 0,
             cwd_observed_at: crate::time::now(),
             initial_input_owner: initial_input_owner(&record),
@@ -3977,6 +3978,10 @@ impl SessionRegistry {
 
     /// Classifies `record` as `state` for `reason` and builds the in-memory
     /// entry that shows it, returning the classified record with it.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "unavailable runtime state and all registry invariants are initialized together"
+    )]
     fn unavailable_entry(
         &self,
         mut record: SessionRecord,
@@ -4082,6 +4087,7 @@ impl SessionRegistry {
             process_uncertainty: Vec::new(),
             process_snapshot_sequence: 0,
             claim_evidence_sequence: 0,
+            claim_report_sequence: 0,
             process_exit_sequence: 0,
             cwd_observed_at: crate::time::now(),
             initial_input_owner: initial_input_owner(&record),

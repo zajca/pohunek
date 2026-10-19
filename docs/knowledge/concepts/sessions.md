@@ -341,12 +341,14 @@ the agent's process matcher itself. A dead or reused reporter PID, a sibling
 outside that agent's tree, a different runtime, or a process belonging to another
 session cannot keep the claim. Process snapshots, confirmed exits and admitted
 hook updates are ordered by a daemon-owned monotonic observation sequence.
-Evidence acquired before the current claim cannot clear or downgrade it, even
-when an unrelated later callback reads that older cached snapshot. Updating the
-same hook-reported identity preserves its previously verified process generation;
-a hook does not prove a new generation. A newer conclusive scan or exact exit
-still invalidates death or PID reuse, while an inconclusive read preserves the
-existing binding without establishing a new one.
+Hook admission orders metadata separately from conclusive process evidence.
+An old snapshot cannot refute a newly admitted unbound claim, and an unrelated
+later callback cannot make its old cached snapshot fresh. Updating the same
+hook-reported identity preserves its verified process generation and the age of
+its liveness proof; the hook itself is not proof of life. An inconclusive scan
+records uncertainty without advancing that proof's sequence, so it cannot veto
+a queued exact exit of the bound generation. Only newer conclusive own-process
+evidence can supersede that exit, independently of ancestor readability.
 Claude `SessionEnd` sends an explicit release for prompt clean-exit clearing;
 Codex has no installed session-end release because its `Stop` event is
 turn-level, so procwatch remains the release backstop. Hook claims must be

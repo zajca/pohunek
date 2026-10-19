@@ -823,8 +823,10 @@ struct SessionEntry {
     process_uncertainty: Vec<ProcessIdentity>,
     /// Original acquisition order of the complete cached process snapshot.
     process_snapshot_sequence: u64,
-    /// Newest evidence applied to the current claim or its release tombstone.
+    /// Newest conclusive own-process evidence for the current bound claim.
     claim_evidence_sequence: u64,
+    /// Admission/transition order protects metadata without proving liveness.
+    claim_report_sequence: u64,
     /// Confirmed exits invalidate snapshots acquired before their notification.
     process_exit_sequence: u64,
     /// When the evidence that set `info.cwd` was observed. Older cwd evidence
@@ -3727,7 +3729,7 @@ impl SessionRegistry {
             // A hook refresh is not a new process observation. Keep the verified
             // generation of this exact claim even when the latest read failed
             // or the reporter is an unmatched helper beneath its wrapper.
-            let start_identity = entry
+            let retained_identity = entry
                 .active_agent
                 .as_ref()
                 .filter(|active| {
@@ -3739,9 +3741,23 @@ impl SessionRegistry {
                         && entry.info.active_agent_base.as_ref()
                             == Some(&RuntimeRef::from(resolved.base.clone()))
                 })
-                .and_then(|active| active.start_identity)
-                .or(start_identity);
-            entry.claim_evidence_sequence = self.next_process_evidence_sequence();
+                .and_then(|active| active.start_identity);
+            let start_identity = retained_identity.or(start_identity);
+            // Admission orders the metadata update, not the process's life.
+            // Reusing the same binding retains its original proof age; a new
+            // binding can use only the cached verified observation's age.
+            if retained_identity.is_none() {
+                entry.claim_evidence_sequence = start_identity
+                    .filter(|start| {
+                        pid.is_some_and(|pid| {
+                            entry.process_lineage.get(&pid).is_some_and(|process| {
+                                process.identity.start_identity.get() == *start
+                            })
+                        })
+                    })
+                    .map_or(0, |_| entry.process_snapshot_sequence);
+            }
+            entry.claim_report_sequence = self.next_process_evidence_sequence();
             let report = ActiveAgentReport {
                 source: params.source.clone(),
                 agent: resolved.name.clone(),
@@ -3867,7 +3883,7 @@ impl SessionRegistry {
                 activity_reported: false,
                 observed: false,
             };
-            entry.claim_evidence_sequence = self.next_process_evidence_sequence();
+            entry.claim_report_sequence = self.next_process_evidence_sequence();
             clear_active_agent(entry, tombstone)
         };
 

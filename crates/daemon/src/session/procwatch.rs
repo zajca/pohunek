@@ -334,7 +334,7 @@ impl SessionRegistry {
             }
             // Neither a newer claim, snapshot nor confirmed exit may be
             // superseded by this snapshot's delayed application.
-            if evidence_sequence < entry.claim_evidence_sequence
+            if evidence_sequence < entry.claim_report_sequence
                 || evidence_sequence < entry.process_snapshot_sequence
                 || evidence_sequence < entry.process_exit_sequence
             {
@@ -494,18 +494,23 @@ impl SessionRegistry {
                 return;
             }
 
-            // A newer exit of another PID fences old scans, but says nothing
-            // about this identity. Only newer claim/snapshot evidence can make
-            // this callback stale.
-            if evidence_sequence < entry.claim_evidence_sequence
-                || evidence_sequence < entry.process_snapshot_sequence
-            {
-                entry.procwatch_rescan.notify_one();
-                return;
-            }
             let claimed_exit = entry.active_agent.as_ref().is_some_and(|active| {
                 active.pid == Some(identity.0) && active.start_identity == Some(identity.1)
             });
+            // An exact bound exit is superseded only by newer conclusive own
+            // evidence. Neither an unknown snapshot nor a hook refresh proves
+            // the process alive. Other callbacks also retain generation scope.
+            let superseded = if claimed_exit {
+                evidence_sequence < entry.claim_evidence_sequence
+            } else {
+                evidence_sequence < claim_snapshot_fence(entry)
+                    || (evidence_sequence < entry.process_snapshot_sequence
+                        && entry.process_lineage.contains_key(&identity.0))
+            };
+            if superseded {
+                entry.procwatch_rescan.notify_one();
+                return;
+            }
             let lineage_exit = entry
                 .process_lineage
                 .get(&identity.0)
@@ -892,7 +897,7 @@ impl SessionRegistry {
         // A callback has fresh evidence only for its exact exited generation.
         // Its use of an older cached snapshot cannot refute or downgrade a
         // newer hook, nor can a failed scan promote that cache to fresh proof.
-        if entry.process_snapshot_sequence < entry.claim_evidence_sequence {
+        if entry.process_snapshot_sequence < claim_snapshot_fence(entry) {
             let exact_exit = confirmed_exit.is_some_and(|identity| {
                 entry.active_agent.as_ref().is_some_and(|active| {
                     active.pid == Some(identity.0) && active.start_identity == Some(identity.1)
@@ -910,7 +915,10 @@ impl SessionRegistry {
                     .active_agent
                     .clone()
                     .expect("expired or confirmed active claim");
-                entry.claim_evidence_sequence = evidence_sequence;
+                if exact_exit {
+                    entry.claim_evidence_sequence = evidence_sequence;
+                }
+                entry.claim_report_sequence = entry.claim_report_sequence.max(evidence_sequence);
                 return Some(clear_active_agent(
                     entry,
                     self.procwatch_tombstone_for(&active, now),
@@ -919,6 +927,8 @@ impl SessionRegistry {
             return None;
         }
         let previous_claim = entry.active_agent.clone();
+        let conclusive_snapshot = entry.process_snapshot_sequence == evidence_sequence
+            && claim_snapshot_is_conclusive(entry);
         // Negative identity evidence wins before any foreground or ancestry
         // uncertainty can preserve a claim. A successful snapshot also proves
         // absence; a failed snapshot retains the previous evidence unchanged.
@@ -935,9 +945,9 @@ impl SessionRegistry {
             ForegroundDecision::Preserve => cleared,
             ForegroundDecision::Updated => Some(entry.info.clone()),
         };
-        // Binding a generation from cache retains that snapshot's age. Only a
-        // fresh snapshot or an actual claim release/replacement advances the
-        // claim fence; unrelated preservation and late binding are not new proof.
+        // Admission and conclusive liveness are different clocks. An unknown
+        // snapshot, unrelated callback or start-only cache binding cannot age
+        // out a queued exact exit. Replacements use their own verified proof.
         let same_claim = match (previous_claim.as_ref(), entry.active_agent.as_ref()) {
             (Some(previous), Some(current)) => {
                 previous.source == current.source
@@ -950,8 +960,23 @@ impl SessionRegistry {
             (None, None) => true,
             _ => false,
         };
-        if entry.process_snapshot_sequence == evidence_sequence || !same_claim {
-            entry.claim_evidence_sequence = evidence_sequence;
+        if !same_claim {
+            entry.claim_report_sequence = entry.claim_report_sequence.max(evidence_sequence);
+            entry.claim_evidence_sequence = if claim_snapshot_has_live_identity(entry) {
+                // A newly selected observation has only the original cache's
+                // proof age, not the callback's later application time.
+                entry.process_snapshot_sequence
+            } else if entry.active_agent.is_none()
+                && (conclusive_snapshot || confirmed_exit.is_some())
+            {
+                evidence_sequence
+            } else {
+                0
+            };
+        } else if conclusive_snapshot && claim_snapshot_has_live_identity(entry) {
+            // A negative scan that ordinary observed-agent foreground policy
+            // preserved is not newer proof of life for that bound generation.
+            entry.claim_evidence_sequence = entry.claim_evidence_sequence.max(evidence_sequence);
         }
         updated
     }
@@ -1155,6 +1180,49 @@ fn apply_observed_refresh(
 
 fn invalidate_process_scans(entry: &mut SessionEntry, evidence_sequence: u64) {
     entry.process_exit_sequence = entry.process_exit_sequence.max(evidence_sequence);
+}
+
+/// Keeps metadata admission separate from an established generation's proof.
+fn claim_snapshot_fence(entry: &SessionEntry) -> u64 {
+    if entry
+        .active_agent
+        .as_ref()
+        .is_some_and(|active| active.pid.is_some() && active.start_identity.is_some())
+    {
+        // Refreshing a bound hook cannot supersede an ancestor's exact exit.
+        entry.claim_evidence_sequence
+    } else {
+        // A process may have started after collection but before its first
+        // unbound report. Older absence cannot refute that newly admitted claim.
+        entry.claim_report_sequence
+    }
+}
+
+/// Whether a verified cached identity proves this claim's own generation alive.
+fn claim_snapshot_has_live_identity(entry: &SessionEntry) -> bool {
+    entry.active_agent.as_ref().is_some_and(|active| {
+        active
+            .pid
+            .and_then(|pid| entry.process_lineage.get(&pid))
+            .is_some_and(|process| {
+                active
+                    .start_identity
+                    .is_none_or(|start| start == process.identity.start_identity.get())
+            })
+    })
+}
+
+/// Whether the cached snapshot actually read the claimed process conclusively.
+fn claim_snapshot_is_conclusive(entry: &SessionEntry) -> bool {
+    let Some(pid) = entry.active_agent.as_ref().and_then(|active| active.pid) else {
+        return false;
+    };
+    entry.process_lineage.contains_key(&pid)
+        || (entry.process_lineage.contains_key(&entry.info.pid)
+            && !entry
+                .process_uncertainty
+                .iter()
+                .any(|identity| identity.pid == pid))
 }
 
 fn claim_identity_refuted(entry: &SessionEntry, confirmed_exit: Option<ObservedIdentity>) -> bool {

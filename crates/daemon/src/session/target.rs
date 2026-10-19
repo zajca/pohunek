@@ -949,6 +949,7 @@ impl SessionRegistry {
             process_uncertainty: Vec::new(),
             process_snapshot_sequence: 0,
             claim_evidence_sequence: 0,
+            claim_report_sequence: 0,
             process_exit_sequence: 0,
             cwd_observed_at: crate::time::now(),
             initial_input_owner: initial_input_pending

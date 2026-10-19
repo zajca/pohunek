@@ -12349,10 +12349,10 @@ async fn descendant_reporter_overlapping_snapshots_keep_newer_readable_evidence(
         .expect("stop overlapping snapshot fixture");
 }
 
-/// Callback acquisition is ordered before a newer hook, independently of
-/// when the callback is finally allowed to mutate session state.
+/// A same-generation hook update preserves the bound identity but supplies
+/// no liveness proof that could veto its queued confirmed exit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn descendant_reporter_callback_acquired_before_hook_cannot_refute_it() {
+async fn descendant_reporter_queued_exact_exit_survives_hook_update_without_new_liveness() {
     for recognized in [false, true] {
         let (registry, inspector, created) = mock_procwatch_registry("callback-hook-order").await;
         ordering_facts(&inspector, created.pid, recognized, "live");
@@ -12391,7 +12391,11 @@ async fn descendant_reporter_callback_acquired_before_hook_cannot_refute_it() {
                     .await;
             }
         });
-        gate.entered.notified().await;
+        guard(
+            "the exit callback acquisition barrier",
+            gate.entered.notified(),
+        )
+        .await;
         let report = registry
             .report_agent(audit_claim(
                 &created.id,
@@ -12399,21 +12403,16 @@ async fn descendant_reporter_callback_acquired_before_hook_cannot_refute_it() {
                 "updated-ordering-native",
             ))
             .await;
-        // Always release the queued callback before inspecting assertions.
-        gate.release.notify_one();
-        callback.await.expect("pre-hook callback completed");
         assert!(report.recorded);
         assert_updated_ordering_claim(&registry, &created.id).await;
-        // The old callback was not a permanent veto on this generation's
-        // genuinely newer exact exit notification.
-        let reporter = ordering_reporter_fact(recognized);
-        registry
-            .on_observed_agent_exit(&created.id, (reporter.pid, reporter.start_identity.get()))
-            .await;
+        gate.release.notify_one();
+        guard("the queued process exit callback completion", callback)
+            .await
+            .expect("exact bound exit completed after hook refresh");
         let info = registry
             .inspect(&created.id)
             .await
-            .expect("new exact exit applied");
+            .expect("queued exact exit defeats hook-only refresh");
         registry
             .stop(&created.id)
             .await
@@ -12566,6 +12565,364 @@ async fn descendant_reporter_release_fences_an_older_inflight_snapshot() {
         .await
         .expect("stop release ordering fixture");
     assert_eq!(info.active_agent_pid, Some(DESCENDANT_WRAPPER_PID));
+    assert_eq!(info.active_agent_session_id, None);
+    assert_eq!(info.active_agent_session_path, None);
+    assert_ne!(info.activity, Some(AgentActivity::Working));
+    assert_ne!(info.state_source, StateSource::Report);
+}
+
+/// Unknown observations do not veto queued confirmed death; a newer
+/// verified live generation is positive evidence that may supersede it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one queued exit crosses unknown and conclusive snapshot controls with both reporter forms"
+)]
+async fn descendant_queued_exit_after_newer_scan(state: &str) {
+    let hook_updates: &[bool] = if matches!(state, "inconclusive" | "unverified-reuse") {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    for &refresh_hook in hook_updates {
+        for recognized in [false, true] {
+            let (registry, inspector, created) =
+                mock_procwatch_registry("queued-exit-scan-quality").await;
+            ordering_facts(&inspector, created.pid, recognized, "live");
+            inspector.set_foreground_group(created.pid, None);
+            assert!(
+                registry
+                    .report_agent(audit_claim(
+                        &created.id,
+                        DIRECT_AGENT_REPORT_SEQ,
+                        "updated-ordering-native"
+                    ))
+                    .await
+                    .recorded
+            );
+            registry
+                .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+                .await;
+            let _automatic_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+            let gate = crate::runtime::lifecycle::tests::StartGate {
+                session_id: Some(created.id.0.clone()),
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+            };
+            *registry
+                .inner
+                .process_exit_hold
+                .lock()
+                .expect("exit callback hold lock") = Some(gate.clone());
+            let reporter = ordering_reporter_fact(recognized);
+            let callback = tokio::spawn({
+                let registry = registry.clone();
+                let id = created.id.clone();
+                async move {
+                    registry
+                        .on_observed_agent_exit(&id, (reporter.pid, reporter.start_identity.get()))
+                        .await;
+                }
+            });
+            guard(
+                "the exit callback acquisition barrier",
+                gate.entered.notified(),
+            )
+            .await;
+            if state == "failed-collection" {
+                inspector.fail_descendants_with(std::io::ErrorKind::PermissionDenied);
+            } else if state == "unverified-reuse" {
+                inspector.fail_identity_with(
+                    DESCENDANT_REPORTER_PID,
+                    std::io::ErrorKind::PermissionDenied,
+                );
+                ordering_facts(&inspector, created.pid, recognized, "reused");
+            } else {
+                ordering_facts(&inspector, created.pid, recognized, state);
+            }
+            registry
+                .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+                .await;
+            let before = registry
+                .inspect(&created.id)
+                .await
+                .expect("newer observation applied");
+            if refresh_hook {
+                assert!(
+                    registry
+                        .report_agent(audit_claim(
+                            &created.id,
+                            DIRECT_AGENT_REPORT_SEQ + 1,
+                            "updated-ordering-native"
+                        ))
+                        .await
+                        .recorded
+                );
+                assert_updated_ordering_claim(&registry, &created.id).await;
+            }
+            gate.release.notify_one();
+            guard("the queued process exit callback completion", callback)
+                .await
+                .expect("queued exit completed after newer scan");
+            let after = registry
+                .inspect(&created.id)
+                .await
+                .expect("queued exit reconciled");
+            registry
+                .stop(&created.id)
+                .await
+                .expect("stop evidence quality fixture");
+            if matches!(
+                state,
+                "inconclusive" | "unverified-reuse" | "failed-collection"
+            ) {
+                assert_eq!(
+                    before.active_agent_session_id.as_deref(),
+                    Some("updated-ordering-native")
+                );
+                assert_eq!(
+                after.active_agent_session_id, None,
+                "an unknown newer observation cannot veto confirmed death of the bound generation"
+            );
+                assert_eq!(after.active_agent_session_path, None);
+                assert_ne!(after.activity, Some(AgentActivity::Working));
+                assert_ne!(after.state_source, StateSource::Report);
+            } else {
+                assert_eq!(after.active_agent, before.active_agent);
+                assert_eq!(after.active_agent_pid, before.active_agent_pid);
+                assert_eq!(
+                    after.active_agent_session_id,
+                    before.active_agent_session_id
+                );
+                assert_eq!(
+                    after.active_agent_session_path,
+                    before.active_agent_session_path
+                );
+                assert_eq!(after.activity, before.activity);
+                assert_eq!(after.state_source, before.state_source);
+                if state == "reused" {
+                    assert_eq!(after.active_agent_session_id, None);
+                    assert_ne!(after.activity, Some(AgentActivity::Working));
+                } else {
+                    assert_eq!(
+                        after.active_agent_session_id.as_deref(),
+                        Some("updated-ordering-native")
+                    );
+                    assert_eq!(after.activity, Some(AgentActivity::Working));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_newer_own_error_does_not_veto_queued_exact_exit() {
+    descendant_queued_exit_after_newer_scan("inconclusive").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_newer_unverified_reuse_does_not_veto_queued_exact_exit() {
+    descendant_queued_exit_after_newer_scan("unverified-reuse").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_newer_own_live_with_ancestor_error_supersedes_queued_exit() {
+    descendant_queued_exit_after_newer_scan("ancestor").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_newer_readable_live_supersedes_queued_exit() {
+    descendant_queued_exit_after_newer_scan("live").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_newer_verified_reuse_supersedes_queued_old_exit() {
+    descendant_queued_exit_after_newer_scan("reused").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_newer_failed_collection_does_not_veto_queued_exact_exit() {
+    descendant_queued_exit_after_newer_scan("failed-collection").await;
+}
+
+/// Negative observations that foreground policy defers cannot masquerade
+/// as proof that the preserved observed generation is still alive.
+async fn observed_queued_exit_after_deferred_negative_snapshot(reused: bool) {
+    let (registry, inspector, created) = mock_procwatch_registry("observed-negative-exit").await;
+    let mut reporter = codex_fact(DESCENDANT_REPORTER_PID, created.pid);
+    inspector.set_descendants(created.pid, vec![reporter.clone()]);
+    inspector.set_foreground_group(created.pid, None);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let _automatic_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+    let old_start = reporter.start_identity.get();
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: Some(created.id.0.clone()),
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *registry
+        .inner
+        .process_exit_hold
+        .lock()
+        .expect("exit callback hold lock") = Some(gate.clone());
+    let callback = tokio::spawn({
+        let registry = registry.clone();
+        let id = created.id.clone();
+        async move {
+            registry
+                .on_observed_agent_exit(&id, (DESCENDANT_REPORTER_PID, old_start))
+                .await;
+        }
+    });
+    guard(
+        "the exit callback acquisition barrier",
+        gate.entered.notified(),
+    )
+    .await;
+    inspector.fail_foreground_with(std::io::ErrorKind::PermissionDenied);
+    reporter.start_identity = StartIdentity::new(old_start + 1);
+    inspector.set_descendants(
+        created.pid,
+        if reused {
+            vec![reporter.clone()]
+        } else {
+            Vec::new()
+        },
+    );
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let preserved_start = {
+        let sessions = registry.inner.sessions.lock().await;
+        assert_eq!(
+            super::active_agent_origin(&sessions[&created.id]),
+            Some(crate::store::ActiveAgentOrigin::Observed)
+        );
+        sessions[&created.id]
+            .active_agent
+            .as_ref()
+            .expect("foreground preserves observed claim")
+            .start_identity
+    };
+    gate.release.notify_one();
+    guard("the queued process exit callback completion", callback)
+        .await
+        .expect("observed exact exit applied after negative scan");
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("observed exit result");
+    let selected_start = {
+        let sessions = registry.inner.sessions.lock().await;
+        sessions[&created.id]
+            .active_agent
+            .as_ref()
+            .and_then(|active| active.start_identity)
+    };
+    registry
+        .stop(&created.id)
+        .await
+        .expect("stop observed negative fixture");
+    assert_eq!(
+        preserved_start,
+        Some(old_start),
+        "the scan deferred the negative transition"
+    );
+    assert_eq!(
+        info.active_agent_pid,
+        reused.then_some(DESCENDANT_REPORTER_PID)
+    );
+    assert_eq!(
+        selected_start,
+        reused.then_some(reporter.start_identity.get()),
+        "confirmed R1 death clears R1 and may select only the verified replacement R2"
+    );
+    assert_eq!(info.active_agent_session_id, None);
+    assert_eq!(info.active_agent_session_path, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_reporter_queued_exit_survives_newer_absence_and_failed_foreground() {
+    observed_queued_exit_after_deferred_negative_snapshot(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_reporter_queued_exit_survives_newer_reuse_and_failed_foreground() {
+    observed_queued_exit_after_deferred_negative_snapshot(true).await;
+}
+
+/// Refreshing a bound descendant's hook does not prove that its queued
+/// ancestor exit is stale or restore the lost ancestry dependency.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_queued_ancestor_exit_survives_bound_hook_refresh() {
+    let (registry, inspector, created) =
+        mock_procwatch_registry("ancestor-exit-hook-refresh").await;
+    ordering_facts(&inspector, created.pid, false, "live");
+    inspector.set_foreground_group(created.pid, None);
+    assert!(
+        registry
+            .report_agent(audit_claim(
+                &created.id,
+                DIRECT_AGENT_REPORT_SEQ,
+                DESCENDANT_NATIVE_SESSION_ID
+            ))
+            .await
+            .recorded
+    );
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let _automatic_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: Some(created.id.0.clone()),
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *registry
+        .inner
+        .process_exit_hold
+        .lock()
+        .expect("exit callback hold lock") = Some(gate.clone());
+    let callback = tokio::spawn({
+        let registry = registry.clone();
+        let id = created.id.clone();
+        let ancestor = codex_fact(DESCENDANT_WRAPPER_PID, created.pid);
+        async move {
+            registry
+                .on_observed_agent_exit(&id, (ancestor.pid, ancestor.start_identity.get()))
+                .await;
+        }
+    });
+    guard(
+        "the exit callback acquisition barrier",
+        gate.entered.notified(),
+    )
+    .await;
+    assert!(
+        registry
+            .report_agent(audit_claim(
+                &created.id,
+                DIRECT_AGENT_REPORT_SEQ + 1,
+                "updated-ordering-native"
+            ))
+            .await
+            .recorded
+    );
+    assert_updated_ordering_claim(&registry, &created.id).await;
+    gate.release.notify_one();
+    guard("the queued process exit callback completion", callback)
+        .await
+        .expect("queued ancestor exit completed after hook refresh");
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("lost ancestry result");
+    registry
+        .stop(&created.id)
+        .await
+        .expect("stop ancestor refresh fixture");
+    assert_ne!(info.active_agent_pid, Some(DESCENDANT_REPORTER_PID));
     assert_eq!(info.active_agent_session_id, None);
     assert_eq!(info.active_agent_session_path, None);
     assert_ne!(info.activity, Some(AgentActivity::Working));
