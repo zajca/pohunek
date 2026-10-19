@@ -1119,21 +1119,105 @@ fn remove_modified_of_a_hard_linked_root_never_wedges_the_registry() {
 
 #[test]
 fn remove_modified_of_an_unreadable_directory_never_wedges_the_registry() {
+    unreadable_directory_removal(|| {});
+}
+
+struct RestoreDirectoryPermissions {
+    directory: std::fs::File,
+    permissions: std::fs::Permissions,
+}
+
+impl RestoreDirectoryPermissions {
+    fn new(path: &std::path::Path) -> Self {
+        let directory = std::fs::File::open(path).expect("open fixture directory before chmod");
+        let permissions = directory
+            .metadata()
+            .expect("fixture directory metadata")
+            .permissions();
+        Self {
+            directory,
+            permissions,
+        }
+    }
+}
+
+impl Drop for RestoreDirectoryPermissions {
+    fn drop(&mut self) {
+        // Removal can rename the directory into .collect-*; its descriptor
+        // restores the same inode before the fixture's TempDir removes it.
+        if let Err(error) = self.directory.set_permissions(self.permissions.clone()) {
+            if std::thread::panicking() {
+                eprintln!("cannot restore fixture directory permissions while unwinding: {error}");
+            } else {
+                panic!("cannot restore fixture directory permissions: {error}");
+            }
+        }
+    }
+}
+
+fn unreadable_directory_removal(after_remove: impl FnOnce()) {
     let fixture = PluginFixture::new();
     let sample = sample();
     let other = other();
     let registry = fixture.open();
     registry.install(&request(&sample)).unwrap();
     let directory = fixture.root(&sample.digest).join("files/detect");
+    let _restore_permissions = RestoreDirectoryPermissions::new(&directory);
     set_mode(&directory, 0o000);
 
     let outcome = registry.remove_modified(&sample.digest, &no_references());
-    if directory.exists() {
-        set_mode(&directory, 0o700);
-    }
+    after_remove();
     assert!(
         matches!(outcome, Ok(_) | Err(RegistryError::RemovalIncomplete)),
         "unexpected outcome {outcome:?}"
     );
     registry.install(&request(&other)).unwrap();
+}
+
+#[test]
+fn an_unreadable_directory_fixture_restores_access_when_the_scenario_unwinds() {
+    let panic = std::panic::catch_unwind(|| {
+        unreadable_directory_removal(|| panic!("unwind after package removal"));
+    })
+    .expect_err("the registry scenario reaches the injected failure");
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"unwind after package removal")
+    );
+}
+
+#[test]
+fn unreadable_directory_scenarios_leave_their_temp_roots_empty() {
+    let mut leaked = Vec::new();
+    for scenario in [
+        "remove_modified_of_an_unreadable_directory_never_wedges_the_registry",
+        "an_unreadable_directory_fixture_restores_access_when_the_scenario_unwinds",
+    ] {
+        let environment = pohunek_test_support::env::TestEnv::new().expect("child environment");
+        let fixtures = environment.root().join("fixtures");
+        std::fs::create_dir(&fixtures).expect("fresh fixture temp root");
+        let output = environment
+            .command(std::env::current_exe().expect("registry test executable"))
+            .args(pohunek_test_support::exact_test_filter(
+                module_path!(),
+                scenario,
+            ))
+            .arg("--nocapture")
+            .env("TMPDIR", &fixtures)
+            // The shared helper honors this explicit root on macOS too.
+            .env("POHUNEK_TEST_TEMP_ROOT", &fixtures)
+            .output()
+            .expect("run the real registry scenario");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{scenario} did not pass in the child: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let residue = names(&fixtures);
+        if !residue.is_empty() {
+            leaked.push((scenario, residue));
+        }
+    }
+    assert!(leaked.is_empty(), "registry fixture residue: {leaked:?}");
 }
