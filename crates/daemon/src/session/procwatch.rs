@@ -28,13 +28,14 @@ type ObservedIdentity = (Pid, u64);
 /// Live process ancestry from the same identity-bracketed scan as the agents.
 #[derive(Debug, Clone)]
 pub(super) struct ProcessLineage {
-    identity: ProcessIdentity,
+    pub(super) identity: ProcessIdentity,
     parent: Pid,
 }
 
 struct ObservedRefresh {
     agents: HashMap<Pid, ObservedAgent>,
     lineage: HashMap<Pid, ProcessLineage>,
+    uncertainty: Vec<Pid>,
 }
 
 /// How process recognition treats a session's own runtime.
@@ -163,6 +164,7 @@ impl SessionRegistry {
             }
             entry.observed_agents.clear();
             entry.process_lineage.clear();
+            entry.process_uncertainty.clear();
             entry.foreground_process_group = None;
             entry
                 .active_agent
@@ -201,14 +203,13 @@ impl SessionRegistry {
         now: Instant,
     ) -> bool {
         let root_pid = root.pid;
-        // Failed probes preserve existing claims without supplying identity evidence.
-        let mut inconclusive: Vec<Pid> = Vec::new();
         // The registry snapshot the scan identifies other runtimes with.
         let scan_registry = self.inner.profiles.runtimes().registry();
         let (scan_pin, observed_refresh) = match self.inner.inspector.descendants(root_pid) {
             Ok(facts) => {
                 let own = self.inner.sessions.lock().await.get(id).map(OwnRuntime::of);
                 let scan_pin = own.as_ref().and_then(OwnRuntime::pinned).cloned();
+                let mut inconclusive: Vec<Pid> = Vec::new();
                 // Only verified live identities may establish ancestry or bind claims.
                 let mut lineage: HashMap<_, _> = facts
                     .iter()
@@ -282,6 +283,7 @@ impl SessionRegistry {
                     Some(ObservedRefresh {
                         agents: observed,
                         lineage,
+                        uncertainty: inconclusive,
                     }),
                 )
             }
@@ -352,20 +354,7 @@ impl SessionRegistry {
             let to_spawn = apply_observed_refresh(entry, observed_refresh, &mut exit_watches);
 
             let foreground_changed = apply_foreground_probe(entry, foreground_probe);
-            let decision = self.reconcile_foreground_agent(
-                entry,
-                root_pid,
-                now,
-                foreground_probe,
-                &inconclusive,
-            );
-            let updated = match decision {
-                ForegroundDecision::Fallback => {
-                    self.reconcile_active_agent(entry, now, &inconclusive)
-                }
-                ForegroundDecision::Preserve => None,
-                ForegroundDecision::Updated => Some(entry.info.clone()),
-            };
+            let updated = self.reconcile_process_evidence(entry, root_pid, now, foreground_probe);
             let focus = entry
                 .active_agent
                 .as_ref()
@@ -482,19 +471,24 @@ impl SessionRegistry {
                 return;
             }
 
-            match self.reconcile_foreground_agent(
+            // An exit watch confirms death independently of a later scan.
+            // Remove only this generation; stale callbacks returned above.
+            if entry
+                .process_lineage
+                .get(&identity.0)
+                .is_some_and(|lineage| lineage.identity.start_identity.get() == identity.1)
+            {
+                entry.process_lineage.remove(&identity.0);
+            }
+            // Confirmed death supersedes an earlier inconclusive probe.
+            entry.process_uncertainty.retain(|pid| *pid != identity.0);
+
+            self.reconcile_process_evidence(
                 entry,
                 entry.info.pid,
                 crate::time::now(),
                 ForegroundProbe::Observed(entry.foreground_process_group),
-                &[],
-            ) {
-                ForegroundDecision::Fallback => {
-                    self.reconcile_active_agent(entry, crate::time::now(), &[])
-                }
-                ForegroundDecision::Preserve => None,
-                ForegroundDecision::Updated => Some(entry.info.clone()),
-            }
+            )
         };
 
         if let Some(info) = updated {
@@ -840,6 +834,23 @@ impl SessionRegistry {
             })
     }
 
+    /// Reconciles scans and exit callbacks against the same cached evidence.
+    fn reconcile_process_evidence(
+        &self,
+        entry: &mut SessionEntry,
+        root_pid: Pid,
+        now: Instant,
+        probe: ForegroundProbe,
+    ) -> Option<SessionInfo> {
+        let inconclusive = entry.process_uncertainty.clone();
+        let decision = self.reconcile_foreground_agent(entry, root_pid, now, probe, &inconclusive);
+        match decision {
+            ForegroundDecision::Fallback => self.reconcile_active_agent(entry, now, &inconclusive),
+            ForegroundDecision::Preserve => None,
+            ForegroundDecision::Updated => Some(entry.info.clone()),
+        }
+    }
+
     fn reconcile_foreground_agent(
         &self,
         entry: &mut SessionEntry,
@@ -992,11 +1003,13 @@ fn apply_observed_refresh(
     let Some(ObservedRefresh {
         agents: observed,
         lineage,
+        uncertainty,
     }) = observed_refresh
     else {
         return Vec::new();
     };
     entry.process_lineage = lineage;
+    entry.process_uncertainty = uncertainty;
     let observed_pids = observed.keys().copied().collect::<HashSet<_>>();
     entry
         .observed_agents

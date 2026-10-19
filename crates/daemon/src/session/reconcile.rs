@@ -3821,6 +3821,7 @@ impl SessionRegistry {
             last_native_report: record.native_identity_ordering.clone(),
             observed_agents: Vec::<ObservedAgent>::new(),
             process_lineage: HashMap::new(),
+            process_uncertainty: Vec::new(),
             cwd_observed_at: crate::time::now(),
             initial_input_owner: initial_input_owner(&record),
         };
@@ -4075,6 +4076,7 @@ impl SessionRegistry {
             last_native_report: record.native_identity_ordering.clone(),
             observed_agents: Vec::new(),
             process_lineage: HashMap::new(),
+            process_uncertainty: Vec::new(),
             cwd_observed_at: crate::time::now(),
             initial_input_owner: initial_input_owner(&record),
         };

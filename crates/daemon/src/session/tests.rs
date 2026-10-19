@@ -10461,6 +10461,407 @@ async fn descendant_reporter_inconclusive_identity_scan_keeps_the_claim() {
     }
 }
 
+/// Pid of a third, unrelated observed agent whose exit drives the
+/// exit-callback regressions without touching the claim under test (#1107).
+const UNRELATED_AGENT_PID: Pid = 530;
+/// Pid of the observed agent child that the hook claim names and that later
+/// exits through its exit watch without any rescan (#1107).
+const EXIT_AGENT_PID: Pid = 522;
+/// Native session id of the hook claim on the exiting observed agent.
+const EXIT_AGENT_NATIVE_ID: &str = "exit-native";
+/// Pid of the observed agent child of a direct-agent launch root whose exit
+/// drives the launch-root exit-callback regression (#1107).
+const DIRECT_CHILD_PID: Pid = 310;
+/// Native session id of the hook claim on the direct launch root's child.
+const DIRECT_CHILD_NATIVE_ID: &str = "direct-child-native";
+
+// Hold the automatic watcher at its external OS probe, before it can apply a
+// snapshot. Exit watches remain live, so only their callbacks can reconcile.
+async fn hold_automatic_scan(
+    registry: &SessionRegistry,
+    inspector: &MockInspector,
+    id: &SessionId,
+) -> ForegroundReleaseGuard {
+    let block = inspector.block_foreground();
+    let guard = ForegroundReleaseGuard(Arc::clone(&block));
+    registry.inner.sessions.lock().await[id]
+        .procwatch_rescan
+        .notify_one();
+    wait_until("automatic process scan held before application", || async {
+        block.entered.load(Ordering::Acquire).then_some(())
+    })
+    .await;
+    guard
+}
+
+/// X001 invariant: the inconclusive evidence a scan cached outlives the
+/// scan. An unrelated observed agent's exit callback must reconcile with the
+/// same cached uncertainty as the scan that left the hook reporter and/or
+/// its ancestor unreadable, keeping the claim's pid, reported origin, native
+/// session id and activity instead of acting on a lost inconclusive state
+/// (#1107).
+#[expect(
+    clippy::too_many_lines,
+    reason = "one unreadable claim walks the unreadable scan and the unrelated-exit phases."
+)]
+async fn descendant_inconclusive_exit_callback(foreground: Option<Pid>, unreadable: Pid) {
+    let (registry, inspector, created) =
+        mock_procwatch_registry("descendant-inconclusive-exit").await;
+    let wrapper = codex_fact(DESCENDANT_WRAPPER_PID, created.pid);
+    let reporter = ProcessFact {
+        comm: "wrapper-helper".to_owned(),
+        cmdline: vec!["/usr/bin/wrapper-helper".to_owned()],
+        ..codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID)
+    };
+    let unrelated = codex_fact(UNRELATED_AGENT_PID, created.pid);
+    inspector.set_descendants(created.pid, vec![wrapper, reporter.clone(), unrelated]);
+    inspector.set_foreground_group(created.pid, foreground);
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    inspector.fail_identity_with(unreadable, std::io::ErrorKind::Other);
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: CODEX_HOOK_AGENT.to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+            pid: Some(DESCENDANT_REPORTER_PID),
+            agent_session_id: Some(DESCENDANT_NATIVE_SESSION_ID.to_owned()),
+            agent_session_path: None,
+        })
+        .await;
+    assert!(report.recorded);
+
+    // The reporter and/or its ancestor read inconclusive in the scan that
+    // follows the report: the claim survives without a bound identity.
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = &sessions[&created.id];
+        assert_eq!(
+            super::active_agent_origin(entry),
+            Some(crate::store::ActiveAgentOrigin::Reported),
+            "the identity origin must remain reported, foreground={foreground:?}"
+        );
+        assert_eq!(
+            entry
+                .active_agent
+                .as_ref()
+                .expect("surviving claim")
+                .start_identity,
+            None,
+            "an inconclusive read must not bind a start identity"
+        );
+    };
+
+    // An unrelated observed agent exits through its exit watch before any
+    // rescan. The callback drops the exited observation before it
+    // reconciles; that removal is the completion signal of the pass.
+    assert!(
+        inspector.exit_watch_count(UNRELATED_AGENT_PID) > 0,
+        "unrelated exit watch armed"
+    );
+    let _scan_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+    inspector.fire_exit(UNRELATED_AGENT_PID);
+    wait_until("unrelated observed exit callback", || async {
+        let done = {
+            let sessions = registry.inner.sessions.lock().await;
+            sessions[&created.id]
+                .observed_agents
+                .iter()
+                .all(|observed| observed.pid != UNRELATED_AGENT_PID)
+        };
+        done.then_some(())
+    })
+    .await;
+
+    let preserved = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect preserved claim");
+    assert_eq!(
+        preserved.active_agent_pid,
+        Some(DESCENDANT_REPORTER_PID),
+        "an unrelated exit must not release or replace the unreadable claim, foreground={foreground:?}"
+    );
+    assert_eq!(
+        preserved.active_agent.as_deref(),
+        Some(CODEX_HOOK_AGENT),
+        "an unrelated exit must keep the reported agent"
+    );
+    assert_eq!(
+        preserved.active_agent_session_id.as_deref(),
+        Some(DESCENDANT_NATIVE_SESSION_ID),
+        "an unrelated exit must keep the reported native session id"
+    );
+    assert_eq!(
+        preserved.activity,
+        Some(AgentActivity::Working),
+        "an unrelated exit must keep the reported activity"
+    );
+    assert_eq!(
+        preserved.state_source,
+        StateSource::Report,
+        "an unrelated exit must keep the Report origin"
+    );
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = &sessions[&created.id];
+        assert_eq!(
+            super::active_agent_origin(entry),
+            Some(crate::store::ActiveAgentOrigin::Reported),
+            "an unrelated exit must not switch the claim to observed origin"
+        );
+        assert_eq!(
+            entry
+                .active_agent
+                .as_ref()
+                .expect("claim preserved")
+                .start_identity,
+            None,
+            "an unrelated exit must not bind the unreadable reporter's identity"
+        );
+    };
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_inconclusive_survives_unrelated_observed_exit() {
+    for foreground in [
+        None,
+        Some(DESCENDANT_WRAPPER_PID),
+        Some(DESCENDANT_REPORTER_PID),
+    ] {
+        for unreadable in [DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID] {
+            descendant_inconclusive_exit_callback(foreground, unreadable).await;
+        }
+    }
+}
+
+/// X002 invariant: a confirmed observed exit through its exit watch, before
+/// any rescan, must invalidate the exact matching lineage identity too. A
+/// hook claim bound to the exited agent through a surviving observed wrapper
+/// would otherwise stay bound to the dead reporter; the wrapper replaces the
+/// claim and clears the native metadata, in the foreground and in the
+/// fallback path (#1107).
+#[expect(
+    clippy::too_many_lines,
+    reason = "one observed agent walks the report, bind, watch-exit and replacement phases."
+)]
+async fn descendant_reporter_exit_releases_claim_without_rescan(
+    foreground: Option<Pid>,
+    inconclusive: bool,
+) {
+    let (registry, inspector, created) = mock_procwatch_registry("descendant-exit").await;
+    let wrapper = codex_fact(DESCENDANT_WRAPPER_PID, created.pid);
+    let agent = codex_fact(EXIT_AGENT_PID, DESCENDANT_WRAPPER_PID);
+    inspector.set_descendants(created.pid, vec![wrapper, agent.clone()]);
+    inspector.set_foreground_group(created.pid, foreground);
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: CODEX_HOOK_AGENT.to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+            pid: Some(EXIT_AGENT_PID),
+            agent_session_id: Some(EXIT_AGENT_NATIVE_ID.to_owned()),
+            agent_session_path: None,
+        })
+        .await;
+    assert!(report.recorded);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let bound = registry.inspect(&created.id).await.expect("inspect bound");
+    assert_eq!(
+        bound.active_agent_pid,
+        Some(EXIT_AGENT_PID),
+        "the observed agent child keeps the hook claim, foreground={foreground:?}"
+    );
+    assert_eq!(
+        bound.active_agent.as_deref(),
+        Some(CODEX_HOOK_AGENT),
+        "the observed agent child keeps the report"
+    );
+    assert_eq!(
+        bound.active_agent_session_id.as_deref(),
+        Some(EXIT_AGENT_NATIVE_ID),
+        "the hook claim keeps its native session id until the agent exits"
+    );
+
+    if inconclusive {
+        inspector.fail_identity_with(EXIT_AGENT_PID, std::io::ErrorKind::PermissionDenied);
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let kept = registry
+            .inspect(&created.id)
+            .await
+            .expect("inconclusive claim");
+        assert_eq!(kept.active_agent_pid, Some(EXIT_AGENT_PID));
+        assert_eq!(
+            kept.active_agent_session_id.as_deref(),
+            Some(EXIT_AGENT_NATIVE_ID)
+        );
+    }
+
+    // The claimed agent exits and its exit watch observes that death with
+    // no rescan in between.
+    assert!(
+        inspector.exit_watch_count(EXIT_AGENT_PID) > 0,
+        "reporter exit watch armed"
+    );
+    let _scan_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+    inspector.fire_exit(EXIT_AGENT_PID);
+    wait_until("exited agent observation drop", || async {
+        let done = {
+            let sessions = registry.inner.sessions.lock().await;
+            sessions[&created.id]
+                .observed_agents
+                .iter()
+                .all(|observed| observed.pid != EXIT_AGENT_PID)
+        };
+        done.then_some(())
+    })
+    .await;
+
+    let replaced = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect replaced claim");
+    assert_eq!(
+        replaced.active_agent_pid,
+        Some(DESCENDANT_WRAPPER_PID),
+        "the surviving wrapper replaces the exited reporter, foreground={foreground:?}"
+    );
+    assert_eq!(
+        replaced.active_agent_base,
+        Some(RuntimeRef::codex()),
+        "the wrapper replaces the claim under the same runtime"
+    );
+    assert_eq!(
+        replaced.active_agent_session_id, None,
+        "the exited reporter's native session id must not survive its death"
+    );
+    assert_eq!(replaced.active_agent_session_path, None);
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = &sessions[&created.id];
+        assert!(
+            !entry.process_lineage.contains_key(&EXIT_AGENT_PID),
+            "the confirmed exit must invalidate the exited identity from the cached lineage"
+        );
+        assert!(
+            entry.process_lineage.contains_key(&DESCENDANT_WRAPPER_PID),
+            "the surviving wrapper's lineage entry must stay"
+        );
+    };
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_reporter_observed_exit_releases_the_claim_without_rescan() {
+    for foreground in [None, Some(DESCENDANT_WRAPPER_PID)] {
+        for inconclusive in [false, true] {
+            descendant_reporter_exit_releases_claim_without_rescan(foreground, inconclusive).await;
+        }
+    }
+}
+
+/// X002 invariant at a direct-agent launch root: a hook claim on an observed
+/// child of the launch root binds through the cached launch-root lineage
+/// entry, so the child's confirmed exit must invalidate that entry too and
+/// release the claim with its native metadata instead of keeping the dead
+/// reporter bound (#1107).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn procwatch_direct_agent_child_exit_releases_the_bound_claim() {
+    let (registry, inspector, created) = mock_direct_codex_registry("direct-exit").await;
+    let child = codex_fact(DIRECT_CHILD_PID, created.pid);
+    inspector.set_descendants(created.pid, vec![child.clone()]);
+    inspector.set_foreground_group(created.pid, Some(created.pid));
+    inspector.set_cwd(created.pid, temp_dir("direct-exit-cwd"));
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: CODEX_HOOK_AGENT.to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+            pid: Some(DIRECT_CHILD_PID),
+            agent_session_id: Some(DIRECT_CHILD_NATIVE_ID.to_owned()),
+            agent_session_path: None,
+        })
+        .await;
+    assert!(report.recorded);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let bound = registry.inspect(&created.id).await.expect("inspect bound");
+    assert_eq!(
+        bound.active_agent_pid,
+        Some(DIRECT_CHILD_PID),
+        "the launch root's observed child keeps the hook claim"
+    );
+    assert_eq!(
+        bound.active_agent.as_deref(),
+        Some(CODEX_HOOK_AGENT),
+        "the launch root's observed child keeps the report"
+    );
+
+    // The claimed child exits through its exit watch with no rescan.
+    let _scan_guard = hold_automatic_scan(&registry, &inspector, &created.id).await;
+    inspector.fire_exit(DIRECT_CHILD_PID);
+    wait_until("direct agent child observation drop", || async {
+        let done = {
+            let sessions = registry.inner.sessions.lock().await;
+            sessions[&created.id]
+                .observed_agents
+                .iter()
+                .all(|observed| observed.pid != DIRECT_CHILD_PID)
+        };
+        done.then_some(())
+    })
+    .await;
+
+    let cleared = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect cleared");
+    assert_eq!(
+        cleared.active_agent, None,
+        "the launched root's descendant claim must release on its confirmed exit"
+    );
+    assert_eq!(cleared.active_agent_pid, None);
+    assert_eq!(
+        cleared.active_agent_session_id, None,
+        "the exited child's native session id must not survive its death"
+    );
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        assert!(
+            !sessions[&created.id]
+                .process_lineage
+                .contains_key(&DIRECT_CHILD_PID),
+            "the confirmed exit must invalidate the child's cached lineage identity"
+        );
+    };
+    let _ = registry.stop(&created.id).await;
+}
+
 /// A reported pid no scan of the session verifies must never be bound: with
 /// an unknown foreground group the registry holds neither an observed agent
 /// nor a verified lineage entry for the reporter, so the claim releases
@@ -10747,6 +11148,17 @@ async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
     let after_old_exit = registry.inspect(&created.id).await.expect("inspect");
     assert_eq!(after_old_exit.active_agent.as_deref(), Some("claude"));
     assert_eq!(after_old_exit.active_agent_pid, Some(PID_REUSE_AGENT_PID));
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        assert_eq!(
+            sessions[&created.id]
+                .process_lineage
+                .get(&PID_REUSE_AGENT_PID)
+                .map(|lineage| lineage.identity.start_identity.get()),
+            Some(u64::from(PID_REUSE_AGENT_PID) + 1),
+            "a stale exit for the old generation must not delete the reused pid's replacement identity"
+        );
+    };
 
     inspector.set_descendants(created.pid, Vec::new());
     inspector.fire_exit_watch(PID_REUSE_AGENT_PID, 1);

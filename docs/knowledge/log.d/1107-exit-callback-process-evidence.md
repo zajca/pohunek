@@ -1,0 +1,9 @@
+## Unreleased (2026-10-19, exit-callback process evidence, #1107)
+
+The exit callback of an observed agent reconciles with the same cached
+process evidence as the scan that cached it: descendant pids read
+inconclusive keep preserving a hook-reported claim across an unrelated
+agent's exit until a scan can read them, and a confirmed observed exit
+invalidates the exact matching lineage identity, so a claim proven through a
+surviving wrapper or a direct launch root releases or is replaced instead of
+staying bound to a dead reporter. See [session identity](concepts/sessions.md).
