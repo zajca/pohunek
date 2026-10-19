@@ -6,7 +6,7 @@
 
 schema = 1
 id = "pohunek.runtime.codex"
-version = "1.2.0"
+version = "1.2.1"
 runtime_api = 1
 
 [runtime]
@@ -26,7 +26,8 @@ version_probe = { parser = "semver-line-v1", args = ["--version"], min = "0.160.
 # terminal title or the screen: Codex enables bracketed paste long before its
 # prompt reads input, and its startup update popup would take a prompt
 # released by the paste signal (or by a stale idle title) into its choices
-# (#1114).
+# (#1114). Login, API-key, folder-trust and incompatible-settings blockers
+# likewise hold input while their complete captured dialogs are visible (#1267).
 [input]
 bracketed_paste = true
 submit_delay_ms = 150

@@ -18,6 +18,9 @@
 # - startup_update_prompt: the update popup Codex 0.160 draws over the screen
 #   at startup when a newer release is available; its capture lives in
 #   compat/codex/screens/update-popup/.
+# - startup_login_prompt, startup_api_key_prompt and
+#   startup_incompatible_settings_prompt: complete visible startup dialogs,
+#   captured at 80/160 columns in compat/codex/screens/startup-dialogs/.
 # - live_strong_blocker and weak_blocker: confirmation prompts on screen.
 
 [process]
@@ -54,23 +57,65 @@ all = [
   { line_regex = ['(?i)^\s*2\.\s*no\b'] },
 ]
 
-# Codex 0.160 asks "Trust this folder?" below its "Folder access" heading and
-# above a paragraph that wraps to more lines the narrower the terminal is, so
-# its choices sit lower than the first-run dialog's. Requiring the heading as a
-# line of its own keeps a reply that quotes the question and its choices from
-# reading as the dialog. The region holds the dialog down to 30 columns; below
-# that the question itself wraps and the rule does not apply.
+# The complete folder dialog can occupy 28 nonempty lines at 20 columns.
+# Require its heading at the start of the bounded region, its question and
+# both complete choices; whitespace can include captured terminal wrapping.
 [[rules]]
 id = "folder_trust_prompt"
+state = "blocked"
+priority = 1000
+region = "top_non_empty_lines(32)"
+visible_blocker = true
+all = [
+  { regex = ['(?i)\A\s*folder access\s*(?:\n|\z)'] },
+  { regex = ['(?im)^\s*trust\s+this\s+folder\?'] },
+  { regex = ['(?im)^\s*(?:›|❯)?\s*1\.\s*trust\s+and\s+continue\s*$'] },
+  { regex = ['(?im)^\s*(?:›|❯)?\s*2\.\s*back\s+to\s+agent\s+command\s+center\s*$'] },
+]
+
+# These first-run surfaces set no title. Full headings and choices/hints
+# distinguish the captured 80/160-column dialogs from transcript mentions.
+[[rules]]
+id = "startup_login_prompt"
 state = "blocked"
 priority = 1000
 region = "top_non_empty_lines(16)"
 visible_blocker = true
 all = [
-  { line_regex = ['(?i)^\s*folder access\s*$'] },
-  { line_regex = ['(?i)^\s*trust this folder\?'] },
-  { line_regex = ['(?i)^\s*(?:›|❯)?\s*1\.\s*trust and continue\s*$'] },
-  { line_regex = ['(?i)^\s*(?:›|❯)?\s*2\.\s*back to agent command\b'] },
+  { regex = ["(?i)\\A\\s*welcome to codex, openai's command-line coding agent\\s*(?:\\n|\\z)"] },
+  { line_regex = ['(?i)^\s*(?:>|›|❯)?\s*1\.\s*sign in with chatgpt\s*$'] },
+  { line_regex = ['(?i)^\s*(?:>|›|❯)?\s*2\.\s*sign in with device code\s*$'] },
+  { line_regex = ['(?i)^\s*(?:>|›|❯)?\s*3\.\s*provide your own api key\s*$'] },
+  { line_regex = ['(?i)^\s*press enter to continue\s*$'] },
+]
+
+[[rules]]
+id = "startup_api_key_prompt"
+state = "blocked"
+priority = 1000
+region = "top_non_empty_lines(16)"
+visible_blocker = true
+all = [
+  { regex = ["(?i)\\A\\s*welcome to codex, openai's command-line coding agent\\s*(?:\\n|\\z)"] },
+  { line_regex = ['(?i)^\s*(?:>|›|❯)?\s*use your own openai api key for usage-based billing\s*$'] },
+  { line_regex = ['(?i)^\s*paste or type your api key below\. it will be stored locally in auth\.json\.\s*$'] },
+  { line_regex = ['(?i)^\s*╭api key─+╮\s*$'] },
+  { line_regex = ['(?i)^\s*press enter to save\s*$'] },
+  { line_regex = ['(?i)^\s*press esc to go back\s*$'] },
+]
+
+[[rules]]
+id = "startup_incompatible_settings_prompt"
+state = "blocked"
+priority = 1000
+region = "top_non_empty_lines(16)"
+visible_blocker = true
+all = [
+  { regex = ['(?i)\A\s*background server has incompatible feature settings\s*(?:\n|\z)'] },
+  { line_regex = ['(?i)^\s*restart will use these shared feature settings:\s*$'] },
+  { line_regex = ['(?i)^\s*(?:>|›|❯)?\s*1\.\s*run without daemon this time\s*$'] },
+  { line_regex = ['(?i)^\s*(?:>|›|❯)?\s*2\.\s*restart with these settings\s*$'] },
+  { line_regex = ['(?i)^\s*(?:>|›|❯)?\s*3\.\s*cancel\s*$'] },
 ]
 
 # The startup update popup covers the whole screen while Codex checks for a
