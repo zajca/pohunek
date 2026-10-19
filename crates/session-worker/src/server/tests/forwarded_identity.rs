@@ -18,6 +18,7 @@ use super::{
 };
 use crate::server::{handle_request, Server};
 use crate::PtyOwner;
+use pohunek_platform::process::{HostInspector, ProcessInspector};
 
 fn scope(lease_id: &LeaseId) -> RuntimeScope {
     RuntimeScope {
@@ -478,16 +479,21 @@ async fn a_connection_below_the_forwarding_version_cannot_forward() {
 
 /// The process a PTY child started in the background, as a second subject.
 async fn background_child(pty: &PtyOwner) -> ProcessIdentity {
-    let path = format!("/proc/{0}/task/{0}/children", pty.identity().pid);
-    let pid = pohunek_test_support::wait::wait_until("the shell to start its child", || async {
-        std::fs::read_to_string(&path)
+    let inspector = HostInspector::new();
+    let root = inspector
+        .identity(pty.identity().pid)
+        .expect("inspect the shell")
+        .expect("the shell is live");
+    let child = pohunek_test_support::wait::wait_until("the shell to start its child", || async {
+        inspector
+            .descendant_identities(root)
             .ok()
-            .and_then(|children| children.split_whitespace().next()?.parse::<u32>().ok())
+            .and_then(|children| children.into_iter().next())
     })
     .await;
     ProcessIdentity {
-        pid,
-        start_identity: super::super::process_start(pid).expect("start identity of the child"),
+        pid: child.pid,
+        start_identity: child.start_identity.get(),
     }
 }
 
