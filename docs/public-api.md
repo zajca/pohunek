@@ -3352,8 +3352,13 @@ declares `ready = "screen_idle"` waits for the editable prompt alone and fails
 with `session_input_not_ready` when none shows before the grace ends. A
 runtime that declares `ready = "manifest_idle"` (Codex) is as strict, but
 accepts the detection manifest's winning idle evidence from the screen or the
-terminal title, so a startup screen that is not the editable prompt — Codex's
-update popup — or a stale title cannot release the prompt either.
+terminal title. Recognized visible blockers outrank idle titles: the Codex
+package covers the update popup, login/API-key entry, incompatible settings
+and folder trust (including captured 20-column wrapping). After a recognized
+blocker, cached idle evidence cannot release input until fresh idle evidence
+arrives after the blocker disappears. This policy does not require a positive
+initialized-composer screen; a title alone can qualify before any recognized
+blocker appears.
 Current SDK and CLI clients set `extended_input_ready_wait` on a typed
 `session.new` with initial input. The daemon then uses the configured host
 startup grace, or the runtime's longer `[input] startup_grace_ms` when it

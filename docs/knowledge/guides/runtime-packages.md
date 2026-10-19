@@ -335,9 +335,11 @@ after the host's startup grace ends for a silent agent
   clears and redraws. Only a fresh winning screen or title idle signal after
   the blocker disappears releases the prompt; receiving the same title value
   again counts as fresh, while ticks and OSC progress do not.
-  Declare it when the agent enables bracketed paste while a screen other than
-  its editable prompt holds it, so a popup or a stale title cannot release the
-  prompt either.
+  Declare it when bracketed paste precedes input readiness, and provide
+  precise visible blockers for startup dialogs. A recognized blocker outranks
+  an idle title; this policy does not positively require an initialized
+  composer and can accept a title before any blocker has appeared. The
+  [Codex guide](codex-package.md) lists its captured dialog coverage and limits.
 
 The official packages declare:
 
@@ -360,7 +362,7 @@ The official packages declare:
 | Claude | `screen_idle` | absent (host grace) | `live_prompt_box`: Claude drops pastes sent before its prompt box renders |
 | Pi | `screen_idle` | absent (host grace) | `idle_editor_rule`: Pi enables bracketed paste before it draws any screen |
 | Hermes | `screen_idle` | 30000 | `idle_prompt` or `tui_idle_status`: Hermes discards queued terminal input during its start, and its first start after install compiles its Python modules first |
-| Codex | `manifest_idle` | absent (host grace) | `osc_title_idle`: Codex enables bracketed paste before its prompt reads input, and its startup update popup would take a prompt released early (#1114) |
+| Codex | `manifest_idle` | absent (host grace) | `osc_title_idle`: Codex enables bracketed paste before its prompt reads input, and visible startup dialogs outrank stale titles (#1114, #1267) |
 
 A `screen_idle` or `manifest_idle` session whose screen and title show no
 readiness by the end of that wait fails `session.new` with

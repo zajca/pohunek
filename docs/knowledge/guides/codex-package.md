@@ -160,20 +160,33 @@ classifies every one of them through the package manifest.
   within each PTY chunk. The rule is verified against captures at 80, 100
   and 160 columns (`compat/codex/screens/update-popup/`); a title left over
   from before the popup is only ever synthetic — the measured popup set no
-  title. Initial-input readiness for other startup dialogs (sign-in, folder
-  trust, settings prompts) has not been validated here and is tracked
-  separately in [#1267](https://github.com/zajca/pohunek/issues/1267).
-- **The folder dialog is blocked from 30 columns.** Codex 0.160.0 shows `Trust
+  title. The additional visible startup dialogs below use the same strict
+  blocker/freshness behavior.
+- **Visible login and incompatible-settings dialogs hold initial input.**
+  Package 1.2.1 recognizes the captured Codex 0.160.0 login selection at
+  80/160 columns by its welcome heading, all three sign-in/API-key choices
+  and continue hint. API-key entry requires the welcome and entry headings,
+  storage hint, input-box heading and both save/back hints. The incompatible
+  background-server-settings dialog requires its heading, shared-settings
+  hint and all three run/restart/cancel choices. These visible blockers
+  outrank an idle title; no credentials or model calls are needed to test them.
+- **The folder dialog is blocked from 20 columns.** Codex 0.160.0 shows `Trust
   this folder? Codex can read, edit, and run files here…` with `1. Trust and
-  continue` and `2. Back to Agent Command Center`. It appears when the working
-  directory carries a project-local `.codex/config.toml`. The dialog sets no
-  title. The package's `folder_trust_prompt` rule reads it from the screen as
-  blocked when its `Folder access` heading, the question and both choices are
-  in the top 16 non-empty lines; a reply that quotes the question and choices
-  without the heading line is not the dialog. Below 30 columns the question wraps
-  and the session keeps the byte-activity fallback. The built-in
-  `workspace_trust_prompt` rule for the older wording (`Do you trust the
-  contents of this directory?`, `1. Yes, continue`) is kept unchanged.
+  continue` and `2. Back to Agent Command Center` when the working directory
+  carries a project-local `.codex/config.toml`. The `folder_trust_prompt`
+  requires `Folder access` at the beginning of the top 32 nonempty lines,
+  the question and both complete choices, allowing line wrapping. Real
+  captures cover 20/30/80/160 columns. The older `workspace_trust_prompt`
+  wording remains unchanged. Quoted transcripts and incomplete dialogs do
+  not establish these blockers.
+- **These rules recognize visible dialogs, not completed startup.** The held
+  dialogs set no title; a stale idle title in regressions is synthetic.
+  `manifest_idle` still permits title evidence without a positive initialized
+  composer. Provisional version/CWD/placeholder frames cannot prove startup
+  completion; the separate strict screen-policy proposal is
+  [#1298](https://github.com/zajca/pohunek/issues/1298), awaiting owner scheduling.
+  This package update changes the `pohunek.runtime.codex` digest; after release,
+  host profiles pinned to the old digest are repinned during upgrade.
 - **Hooks run in a descendant process.** Codex 0.160.0 runs its hooks from a
   `codex app-server --listen unix:// --managed-daemon` process below the
   launched `codex`: a direct child of the native binary, which is itself a child
@@ -229,11 +242,16 @@ absence of egress), and the older folder-dialog wording the rule still names.
   built-in Codex goldens in `compat/codex/builtin-v0.34/` (as parsed
   definitions, as TOML data, and by feeding both manifests every captured frame,
   title and synthetic dialog). Those comparisons leave out the package's
-  `folder_trust_prompt` and `startup_update_prompt` rules and the folder dialog
-  frames and popup captures only they read; separate tests read every captured
+  package-only folder, update, login, API-key and settings rules and the
+  corresponding captures; separate tests read every captured
   folder dialog frame, and every popup capture with and without a synthetic
-  stale idle title, with the package
-  manifest. It requires the
+  stale idle title, with the package manifest. The startup-dialog JSON fixtures
+  retain exact hexadecimal PTY prefixes and 40 rendered rows from isolated
+  Codex 0.160.0 captures; API-key entry is empty. Daemon API scenarios replay
+  those bytes through a real PTY, require refusal/rollback with zero task
+  bytes while held (with and without a stale title), then explicitly dismiss
+  the dialog and require exactly one delivery after fresh idle evidence.
+  It requires the
   supported range to equal `compat/codex/compatibility-lock.json`, reads the
   version banner, runs the title, screen and process rules, and asserts the
   `--sha256` install refusal above.

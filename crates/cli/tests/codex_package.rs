@@ -100,7 +100,7 @@ const GOLDEN_MANIFEST_NAME: &str = "codex";
 const PACKAGE_ID: &str = "pohunek.runtime.codex";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.2.0";
+const PACKAGE_VERSION: &str = "1.2.1";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -410,10 +410,10 @@ const FOLDER_TRUST_RULE: &str = "folder_trust_prompt";
 const UPDATE_POPUP_RULE: &str = "startup_update_prompt";
 
 /// The manifest file is the golden built-in manifest of release v0.34.2 plus
-/// [`FOLDER_TRUST_RULE`] and [`UPDATE_POPUP_RULE`]: same process matchers, and
+/// folder, update and login/settings rules: same process matchers, and
 /// every built-in rule in the same order with the same fields.
 #[test]
-fn the_package_manifest_file_is_the_builtin_manifest_file_plus_the_folder_trust_rule() {
+fn the_package_manifest_preserves_builtin_rules_and_adds_startup_dialog_rules() {
     let package = read_toml(&format!("{PACKAGE_DIR}/detect.toml"));
     let golden_text = golden_body(GOLDEN_MANIFEST, BUILTIN_MANIFEST);
     let golden: toml::Table = golden_text.parse().expect("the golden is TOML");
@@ -425,7 +425,13 @@ fn the_package_manifest_file_is_the_builtin_manifest_file_plus_the_folder_trust_
         .retain(|rule| {
             !matches!(
                 rule["id"].as_str(),
-                Some(FOLDER_TRUST_RULE | UPDATE_POPUP_RULE)
+                Some(
+                    FOLDER_TRUST_RULE
+                        | UPDATE_POPUP_RULE
+                        | "startup_login_prompt"
+                        | "startup_api_key_prompt"
+                        | "startup_incompatible_settings_prompt"
+                )
             )
         });
     assert_eq!(builtin_rules, golden);
@@ -442,6 +448,9 @@ fn the_package_manifest_file_is_the_builtin_manifest_file_plus_the_folder_trust_
             "osc_title_working",
             "workspace_trust_prompt",
             FOLDER_TRUST_RULE,
+            "startup_login_prompt",
+            "startup_api_key_prompt",
+            "startup_incompatible_settings_prompt",
             UPDATE_POPUP_RULE,
             "live_strong_blocker",
             "weak_blocker",
@@ -627,9 +636,8 @@ enum Meaning {
     Silent,
 }
 
-/// Narrowest captured width at which the folder trust question is still on
-/// one row; below it the question wraps and the screen rule cannot match.
-const FOLDER_TRUST_MIN_COLUMNS: u16 = 30;
+/// Narrowest captured width covered by the wrapping-aware folder dialog rule.
+const FOLDER_TRUST_MIN_COLUMNS: u16 = 20;
 
 impl Meaning {
     fn of(state: &str) -> Self {
@@ -768,6 +776,14 @@ fn the_top_level_screens_cover_every_state() {
 fn every_captured_screen_is_classified_by_its_title() {
     let definition = installed_definition();
     for frame in top_level_frames().into_iter().chain(width_frames()) {
+        if frame.state == "login" {
+            // At 60 columns and wider the captured welcome heading and all
+            // choices remain intact; narrower legacy captures wrap them.
+            let expected =
+                (frame.columns >= 60).then_some((AgentActivity::Blocked, StateSource::Screen));
+            assert_eq!(frame.evidence(&definition), expected, "{}", frame.name);
+            continue;
+        }
         let expected = frame.meaning();
         if expected == Meaning::ScreenBlocked {
             continue;
@@ -820,7 +836,7 @@ fn the_captured_screens_span_the_supported_terminal_widths() {
 }
 
 /// The folder trust dialog sets no title, so its screen alone reads it as
-/// blocked, down to the narrowest width at which its question is on one row.
+/// blocked, including the captured wrapping at 20 columns.
 #[test]
 fn the_folder_trust_dialog_is_blocked_from_the_screen_alone() {
     let definition = installed_definition();
@@ -1064,6 +1080,142 @@ fn the_startup_update_prompt_rule_blocks_the_measured_popup_and_outranks_a_stale
         screen_activity(&definition, &buried, 80),
         None,
         "the dialog below the first sixteen non-empty lines is not the popup"
+    );
+}
+
+/// Real startup frames must beat cached titles; partial or quoted text must not.
+#[test]
+fn captured_startup_dialogs_require_the_complete_visible_surface() {
+    let definition = installed_definition();
+    for (surface, widths, required) in [
+        (
+            "login",
+            &[80_u16, 160][..],
+            &[
+                "Welcome to Codex",
+                "1. Sign in with ChatGPT",
+                "2. Sign in with Device Code",
+                "3. Provide your own API key",
+                "Press enter to continue",
+            ][..],
+        ),
+        (
+            "api-entry",
+            &[80, 160][..],
+            &[
+                "Welcome to Codex",
+                "Use your own OpenAI API key",
+                "Paste or type your API key below.",
+                "╭API key",
+                "Press enter to save",
+                "Press esc to go back",
+            ][..],
+        ),
+        (
+            "settings",
+            &[80, 160][..],
+            &[
+                "Background server has incompatible feature settings",
+                "Restart will use these shared feature settings:",
+                "1. Run without daemon this time",
+                "2. Restart with these settings",
+                "3. Cancel",
+            ][..],
+        ),
+        (
+            "trust",
+            &[20, 30, 80, 160][..],
+            &[
+                "Folder access",
+                "Trust this",
+                "1. Trust and",
+                "2. Back to Agent",
+            ][..],
+        ),
+    ] {
+        for &columns in widths {
+            check_captured_startup_dialog(&definition, surface, columns, required);
+        }
+    }
+}
+
+fn check_captured_startup_dialog(
+    definition: &RuntimeDefinition,
+    surface: &str,
+    columns: u16,
+    required: &[&str],
+) {
+    let activity = |rows: &[String], columns| {
+        let now = Instant::now();
+        let mut detector = Detector::new(
+            u16::try_from(rows.len().max(40)).expect("capture height"),
+            columns,
+            now,
+            manifest_idle_probe_config(definition),
+        );
+        detector
+            .feed(now, &frame_bytes(None, rows))
+            .into_iter()
+            .rfind(|transition| transition.source == StateSource::Screen)
+            .map(|transition| transition.activity)
+    };
+    let path = workspace_root()
+        .join("compat/codex/screens/startup-dialogs")
+        .join(format!("{surface}-{columns}.json"));
+    let capture: Value = serde_json::from_str(&fs::read_to_string(path).expect("read capture"))
+        .expect("parse capture");
+    let rows: Vec<String> = capture["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row.as_str().expect("row").to_owned())
+        .collect();
+    let raw = capture["raw_hex"].as_str().expect("raw PTY bytes");
+    let bytes: Vec<u8> = (0..raw.len())
+        .step_by(2)
+        .map(|offset| u8::from_str_radix(&raw[offset..offset + 2], 16).expect("hex byte"))
+        .collect();
+    let mut probe = LatchProbe::start(manifest_idle_probe_config(definition), 40, columns);
+    probe.feed(&bytes);
+    probe.feed(b"\x1b]0;synthetic-stale-idle\x07");
+    probe.tick(3);
+    probe.assert_ready(
+        false,
+        &format!("{surface}: captured dialog outranks stale title"),
+    );
+    assert_eq!(
+        activity(&rows, columns),
+        Some(AgentActivity::Blocked),
+        "{surface}-{columns}"
+    );
+    for fragment in required {
+        assert!(
+            rows.iter().any(|row| row.contains(fragment)),
+            "capture lacks {fragment}"
+        );
+        let partial: Vec<String> = rows
+            .iter()
+            .filter(|row| !row.contains(fragment))
+            .cloned()
+            .collect();
+        assert_eq!(
+            activity(&partial, columns),
+            None,
+            "{surface}-{columns}: missing {fragment}"
+        );
+    }
+    let quoted: Vec<String> = rows.iter().map(|row| format!("| {row}")).collect();
+    assert_eq!(
+        activity(&quoted, columns),
+        None,
+        "quoted {surface}-{columns}"
+    );
+    let mut buried = vec![String::from("The transcript discusses this dialog:")];
+    buried.extend(rows);
+    assert_eq!(
+        activity(&buried, columns),
+        None,
+        "buried {surface}-{columns}"
     );
 }
 
@@ -1859,7 +2011,7 @@ fn the_process_matchers_accept_the_observed_codex_process_forms() {
 /// Everything the golden built-in manifest of release v0.34.2 classifies, the
 /// package manifest classifies the same way: the captured frames with and
 /// without their titles, and the synthetic dialogs of the rule tests. The
-/// folder trust dialog, which only [`FOLDER_TRUST_RULE`] reads, is checked by
+/// login dialogs are checked separately above. The folder dialog is checked by
 /// `the_folder_trust_dialog_is_blocked_from_the_screen_alone`.
 #[test]
 fn the_package_manifest_behaves_like_the_builtin_manifest_on_every_frame() {
@@ -1867,7 +2019,7 @@ fn the_package_manifest_behaves_like_the_builtin_manifest_on_every_frame() {
     let golden = golden_definition();
     let mut compared = 0_usize;
     for frame in top_level_frames().into_iter().chain(width_frames()) {
-        if frame.meaning() == Meaning::ScreenBlocked {
+        if frame.meaning() == Meaning::ScreenBlocked || frame.state == "login" {
             continue;
         }
         for title in [frame.title.as_deref(), None] {

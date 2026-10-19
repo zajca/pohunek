@@ -3449,6 +3449,214 @@ const UNRENDERED_PROMPT_GRACE: Duration = Duration::from_millis(1_500);
 /// rules.
 const CLAUDE_PROMPT_BOX_SCREEN: &str = "\x1b[2J\x1b[H\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\r\n\u{276f} \r\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\r\n? for shortcuts\r\n";
 
+// Real Codex 0.160.0 recordings, replayed by an external runtime through a
+// real PTY and the official package. The stale title is an adversary, not
+// something the held dialogs emitted. No credentials or model are involved.
+fn codex_dialog_capture(surface: &str, columns: u16) -> Vec<u8> {
+    let capture: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            pohunek_test_support::workspace_root()
+                .join("compat/codex/screens/startup-dialogs")
+                .join(format!("{surface}-{columns}.json")),
+        )
+        .expect("read captured dialog"),
+    )
+    .expect("parse captured dialog");
+    let raw = capture["raw_hex"].as_str().expect("raw PTY bytes");
+    (0..raw.len())
+        .step_by(2)
+        .map(|offset| u8::from_str_radix(&raw[offset..offset + 2], 16).expect("hex byte"))
+        .collect()
+}
+
+async fn assert_codex_input_delivered_once(received: &Path) {
+    let bytes = read_file_until(received, b"hello Codex").await;
+    assert_eq!(
+        bytes
+            .windows(b"hello Codex".len())
+            .filter(|window| *window == b"hello Codex")
+            .count(),
+        1,
+        "task delivered once after dismissal"
+    );
+}
+
+async fn codex_captured_startup_dialog(
+    surface: &str,
+    columns: u16,
+    stale_title: bool,
+    dismiss: bool,
+) {
+    let socket = temp_socket("codex-startup-dialog");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let received = socket.dir.join("received.bin");
+    let script = socket.dir.join("codex-startup-dialog.py");
+    let bytes = codex_dialog_capture(surface, columns);
+    let release_path = socket.dir.join("release.sock");
+    let release = dismiss
+        .then(|| tokio::net::UnixListener::bind(&release_path).expect("bind release barrier"));
+    codex_startup_dialog_stub(
+        &script,
+        &received,
+        stale_title,
+        release.as_ref().map(|_| release_path.as_path()),
+        &bytes,
+    );
+    write_official_profile(&agents_dir, "codex", "codexstartupdialog", &script);
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        initial_input_startup_grace: CODEX_POPUP_GRACE,
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::make(
+        "subscribe-codex-startup-dialog",
+        method::SUBSCRIBE,
+        Value::Null,
+    );
+    let ack = exchange(&mut subscriber, &subscribe_req).await;
+    assert!(ack.is_ok(), "subscribe should ack");
+
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    params.cols = columns;
+    params.rows = 40;
+    "codexstartupdialog".clone_into(&mut params.agent);
+    params.input = Some("hello Codex".to_owned());
+    let mut create =
+        tokio::spawn(async move { create_session_with_params(&mut control, params).await });
+    let published = tokio::select! {
+        event = wait_for_any_agent_state_event(
+            &mut subscriber,
+            AgentActivity::Blocked,
+            StateSource::Screen,
+        ) => event,
+        answered = &mut create => panic!(
+            "session.new answered before {surface}-{columns} was classified: {answered:?}"
+        ),
+    };
+    assert_eq!(published.payload()["activity"], Value::from("blocked"));
+    assert_eq!(published.payload()["source"], Value::from("screen"));
+
+    if let Some(release) = release {
+        assert!(
+            std::fs::read(&received).unwrap_or_default().is_empty(),
+            "held dialog received task bytes"
+        );
+        let (mut barrier, _) = release.accept().await.expect("runtime awaits dismissal");
+        barrier.write_all(b"release").await.expect("dismiss dialog");
+        let created: SessionInfo =
+            serde_json::from_value(ok_payload(create.await.expect("create task joins")))
+                .expect("created session");
+        assert_codex_input_delivered_once(&received).await;
+        let mut observer = connect(&socket).await;
+        let request = Request::make(
+            "dialog-stop",
+            method::SESSION_STOP,
+            serde_json::to_value(&created.id).expect("session id"),
+        );
+        let _: SessionStopResult =
+            serde_json::from_value(ok_payload(exchange(&mut observer, &request).await))
+                .expect("stop session");
+    } else {
+        let error = err_payload(create.await.expect("create task joins"));
+        assert_eq!(error.code, "session_input_not_ready");
+
+        let mut observer = connect(&socket).await;
+        let list = Request::make(
+            "codex-startup-dialog-list",
+            method::SESSION_LIST,
+            Value::Null,
+        );
+        let sessions: Vec<SessionInfo> =
+            serde_json::from_value(ok_payload(exchange(&mut observer, &list).await))
+                .expect("list sessions");
+        assert!(sessions.is_empty(), "the refused session was rolled back");
+        let captured = std::fs::read(&received).unwrap_or_default();
+        assert!(
+            captured.is_empty(),
+            "the stub received input while the startup dialog held the screen"
+        );
+    }
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn codex_captured_login_80_holds_initial_input() {
+    codex_captured_startup_dialog("login", 80, true, false).await;
+    codex_captured_startup_dialog("login", 80, false, false).await;
+    codex_captured_startup_dialog("login", 80, true, true).await;
+}
+
+#[tokio::test]
+async fn codex_captured_login_160_holds_initial_input() {
+    codex_captured_startup_dialog("login", 160, true, false).await;
+    codex_captured_startup_dialog("login", 160, false, false).await;
+    codex_captured_startup_dialog("login", 160, true, true).await;
+}
+
+#[tokio::test]
+async fn codex_captured_api_entry_80_holds_initial_input() {
+    codex_captured_startup_dialog("api-entry", 80, true, false).await;
+    codex_captured_startup_dialog("api-entry", 80, false, false).await;
+    codex_captured_startup_dialog("api-entry", 80, true, true).await;
+}
+
+#[tokio::test]
+async fn codex_captured_api_entry_160_holds_initial_input() {
+    codex_captured_startup_dialog("api-entry", 160, true, false).await;
+    codex_captured_startup_dialog("api-entry", 160, false, false).await;
+    codex_captured_startup_dialog("api-entry", 160, true, true).await;
+}
+
+#[tokio::test]
+async fn codex_captured_settings_80_holds_initial_input() {
+    codex_captured_startup_dialog("settings", 80, true, false).await;
+    codex_captured_startup_dialog("settings", 80, false, false).await;
+    codex_captured_startup_dialog("settings", 80, true, true).await;
+}
+
+#[tokio::test]
+async fn codex_captured_settings_160_holds_initial_input() {
+    codex_captured_startup_dialog("settings", 160, true, false).await;
+    codex_captured_startup_dialog("settings", 160, false, false).await;
+    codex_captured_startup_dialog("settings", 160, true, true).await;
+}
+
+#[tokio::test]
+async fn codex_captured_trust_20_holds_initial_input() {
+    codex_captured_startup_dialog("trust", 20, true, false).await;
+    codex_captured_startup_dialog("trust", 20, false, false).await;
+    codex_captured_startup_dialog("trust", 20, true, true).await;
+}
+
+#[tokio::test]
+async fn codex_captured_trust_30_holds_initial_input() {
+    codex_captured_startup_dialog("trust", 30, true, false).await;
+    codex_captured_startup_dialog("trust", 30, false, false).await;
+    codex_captured_startup_dialog("trust", 30, true, true).await;
+}
+
+#[tokio::test]
+async fn codex_captured_trust_80_holds_initial_input() {
+    codex_captured_startup_dialog("trust", 80, true, false).await;
+    codex_captured_startup_dialog("trust", 80, false, false).await;
+    codex_captured_startup_dialog("trust", 80, true, true).await;
+}
+
+#[tokio::test]
+async fn codex_captured_trust_160_holds_initial_input() {
+    codex_captured_startup_dialog("trust", 160, true, false).await;
+    codex_captured_startup_dialog("trust", 160, false, false).await;
+    codex_captured_startup_dialog("trust", 160, true, true).await;
+}
+
 /// Writes a host profile `name` over the pinned official Claude package whose
 /// program is a launcher for `script`. A profile-backed launch writes the
 /// initial input once readiness is observed; an unprofiled `claude` launch
@@ -3771,9 +3979,25 @@ fn codex_update_popup_stub(
     stale_title: bool,
     release: Option<&Path>,
 ) {
-    let hex = |screen: &str| {
+    codex_startup_dialog_stub(
+        script,
+        received,
+        stale_title,
+        release,
+        CODEX_UPDATE_POPUP_SCREEN.as_bytes(),
+    );
+}
+
+fn codex_startup_dialog_stub(
+    script: &Path,
+    received: &Path,
+    stale_title: bool,
+    release: Option<&Path>,
+    screen: &[u8],
+) {
+    let hex = |screen: &[u8]| {
         screen
-            .bytes()
+            .iter()
             .map(|byte| format!("\\x{byte:02x}"))
             .collect::<Vec<_>>()
             .concat()
@@ -3792,7 +4016,7 @@ fn codex_update_popup_stub(
     let redraw_block = release.map_or_else(String::new, |_| {
         format!(
             "os.write(1, b\"{}\")\n{CODEX_IDLE_TITLE_PY}\n",
-            hex(CODEX_PROVISIONAL_COMPOSER_SCREEN)
+            hex(CODEX_PROVISIONAL_COMPOSER_SCREEN.as_bytes())
         )
     });
     std::fs::write(
@@ -3816,7 +4040,7 @@ os.write(1, b"{popup_hex}")
         capture.write(chunk)
         capture.flush()
 "#,
-            popup_hex = hex(CODEX_UPDATE_POPUP_SCREEN),
+            popup_hex = hex(screen),
             received = received.display().to_string(),
         ),
     )
