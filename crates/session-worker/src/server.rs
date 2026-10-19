@@ -32,7 +32,7 @@ use protocol::{
     ExitStatus, FrameError, FrameHeader, FrameKind, HookAction, HookSchema, Initialize,
     InspectSnapshot, LaunchProcess, LeaseChallenge, LeaseId, OutputGap,
     ProcessIdentity as WireProcessIdentity, PtyRelation, ReleasedIdentityClaim,
-    ReportedLaunchIdentity, ReportedNativeReference, RequestKind, ResponseKind,
+    ReportedLaunchIdentity, ReportedNativeReference, RequestId, RequestKind, ResponseKind,
     RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, StreamId, StreamMode, SubagentField,
     SubagentPhase as WireSubagentPhase, SubagentSequence, SubagentSnapshot,
     TerminalSnapshot as WireTerminalSnapshot, TransactionId, Version, WorkerId, WorkerInstanceId,
@@ -46,6 +46,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, oneshot, watch, Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{event, Level};
+
+mod forwarded_identity;
 
 use crate::background::{self, Candidate, Dropped};
 use crate::identity::{PeerContext, RejectReason};
@@ -1075,8 +1077,26 @@ async fn handle_request(
         RequestKind::ReleaseController { lease_id } => {
             release_request(shared, connection, &lease_id)
         }
+        RequestKind::RecordActiveIdentity { scope, report } => {
+            forwarded_identity::record_active_identity_request(shared, connection, &scope, report)
+                .await
+        }
+        RequestKind::ReleaseActiveIdentity { scope, release } => {
+            forwarded_identity::release_active_identity_request(shared, connection, &scope, release)
+                .await
+        }
     };
 
+    finish_response(shared, request_id, result)
+}
+
+/// Wraps a handler result into a response, rejecting a terminal snapshot that
+/// breaks the configured bounds.
+fn finish_response(
+    shared: &Shared,
+    request_id: RequestId,
+    result: Result<ResponseKind, ControlError>,
+) -> ControlResponse {
     let mut response = ControlResponse {
         request_id,
         kind: result.unwrap_or_else(|error| ResponseKind::Error { error }),
@@ -1174,10 +1194,11 @@ async fn inspect_request(
     lease_id: &LeaseId,
 ) -> Result<ResponseKind, ControlError> {
     validate_lease(shared, connection, lease_id)?;
+    let version = connection.selected_version.ok_or_else(identity_mismatch)?;
     let mut state = shared.state.lock().await;
     clear_exited_owner(shared, &mut state).await?;
     Ok(ResponseKind::Inspected {
-        snapshot: Box::new(inspect_snapshot(shared, &state).await?),
+        snapshot: Box::new(inspect_snapshot(shared, &state, version).await?),
     })
 }
 
@@ -1932,7 +1953,12 @@ fn reported_native_reference(
         .transpose()
 }
 
-async fn inspect_snapshot(shared: &Shared, state: &State) -> Result<InspectSnapshot, ControlError> {
+async fn inspect_snapshot(
+    shared: &Shared,
+    state: &State,
+    version: Version,
+) -> Result<InspectSnapshot, ControlError> {
+    let forwarding = version >= protocol::ACTIVE_IDENTITY_FORWARD_VERSION;
     let (child_process, dimensions, history_start_offset, next_offset) =
         if let Some(pty) = state.pty.as_ref() {
             let (cols, rows) = pty.dimensions().await;
@@ -1985,6 +2011,9 @@ async fn inspect_snapshot(shared: &Shared, state: &State) -> Result<InspectSnaps
                     expires_at: identity.expires_at.clone(),
                     reference_kind: identity.reference_kind.clone(),
                     native_reference: identity.native_reference.clone(),
+                    agent: identity.agent.clone().filter(|_| forwarding),
+                    origin: identity.origin.filter(|_| forwarding),
+                    reported_session: identity.reported_session.clone().filter(|_| forwarding),
                 })
             })
             .transpose()?,
@@ -2019,6 +2048,7 @@ async fn inspect_snapshot(shared: &Shared, state: &State) -> Result<InspectSnaps
             .collect(),
         hook_schema: state.journal.hook_schema.clone(),
         background: state.journal.background.clone(),
+        active_identity_revision: forwarding.then_some(state.journal.active_identity_revision),
     })
 }
 
@@ -3932,15 +3962,17 @@ where
                         process_group: root_identity.process_group,
                         start_identity: start_identity.to_string(),
                     };
-                    journal.active_identity = Some(ActiveIdentity {
+                    journal.record_active_identity(ActiveIdentity {
                         provider: provider.clone(),
                         process: process.clone(),
                         sequence,
                         expires_at: expires_at.clone(),
                         reference_kind: reference_kind.clone(),
                         native_reference: native_reference.clone(),
+                        agent: None,
+                        origin: None,
+                        reported_session: None,
                     });
-                    journal.active_identity_release = None;
                     // Accepted as the active identity, a report of another process
                     // clears the owner's snapshot whatever its own clock reads.
                     // That clock is not ordered against the owner's, so the
@@ -4144,8 +4176,7 @@ where
                 };
                 if let Some(process) = released_process {
                     let mut journal = state.journal.clone();
-                    journal.active_identity = None;
-                    journal.active_identity_release = Some(ReleasedIdentity {
+                    journal.release_active_identity(ReleasedIdentity {
                         provider,
                         process,
                         sequence,
@@ -7547,6 +7578,7 @@ mod launch_layout_tests;
 #[cfg(test)]
 mod tests {
     mod controller_cleanup;
+    mod forwarded_identity;
 
     use std::time::Duration;
 
@@ -7665,6 +7697,13 @@ mod tests {
     }
 
     async fn launch_claim_fixture() -> (super::Server, crate::PtyOwner, BarrierDirectory) {
+        launch_claim_fixture_running("read -r line").await
+    }
+
+    /// [`launch_claim_fixture`] whose PTY child runs `script`.
+    async fn launch_claim_fixture_running(
+        script: &str,
+    ) -> (super::Server, crate::PtyOwner, BarrierDirectory) {
         let directory = BarrierDirectory::new();
         let root = directory.path().to_path_buf();
         let config = crate::WorkerConfig::new();
@@ -7683,7 +7722,7 @@ mod tests {
         let pty = super::spawn_pty(
             crate::Command {
                 program: "/bin/sh".into(),
-                args: vec!["-c".into(), "read -r line".into()],
+                args: vec!["-c".into(), script.into()],
                 env: crate::test_support::child_env(),
                 cwd: root.clone(),
                 cols: 80,
@@ -7764,7 +7803,7 @@ mod tests {
         let mut state = server.shared.state.lock().await;
         assert!(state.journal.active_identity.is_none());
         state.journal.active_identity = None;
-        let snapshot = super::inspect_snapshot(&server.shared, &state)
+        let snapshot = super::inspect_snapshot(&server.shared, &state, CURRENT_VERSION)
             .await
             .unwrap();
         assert!(snapshot.active_identity.is_none());
@@ -8225,7 +8264,7 @@ mod tests {
             persisted.hook_schema.as_deref(),
             Some("identity-subagent-v1")
         );
-        let snapshot = super::inspect_snapshot(&server.shared, &state)
+        let snapshot = super::inspect_snapshot(&server.shared, &state, CURRENT_VERSION)
             .await
             .expect("inspect");
         assert_eq!(

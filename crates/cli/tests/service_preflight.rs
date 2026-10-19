@@ -244,18 +244,18 @@ impl Host {
             let expires_at = (time::OffsetDateTime::now_utc() + time::Duration::seconds(30))
                 .format(&time::format_description::well_known::Rfc3339)
                 .expect("format expiry");
-            journal.active_identity =
-                journal
-                    .child
-                    .clone()
-                    .map(|process| pohunek_session_worker::ActiveIdentity {
-                        provider: IDENTITY_RUNTIME.to_owned(),
-                        process,
-                        sequence: 1,
-                        expires_at,
-                        reference_kind: Some("id".to_owned()),
-                        native_reference: Some("native-reported".to_owned()),
-                    });
+            let process = journal.child.clone().expect("child");
+            journal.active_identity = Some(pohunek_session_worker::ActiveIdentity {
+                provider: IDENTITY_RUNTIME.to_owned(),
+                process,
+                sequence: 1,
+                expires_at,
+                reference_kind: Some("id".to_owned()),
+                native_reference: Some("native-reported".to_owned()),
+                agent: None,
+                origin: None,
+                reported_session: None,
+            });
         }
         let path = self
             .context

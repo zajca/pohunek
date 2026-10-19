@@ -355,6 +355,9 @@ impl JournalEvidence {
                     expires_at: claim.expires_at.clone(),
                     reference_kind: claim.reference_kind.clone(),
                     native_reference: claim.native_reference.clone(),
+                    agent: None,
+                    origin: None,
+                    reported_session: None,
                 })
             }
             _ => None,
@@ -412,6 +415,7 @@ impl JournalEvidence {
             subagents: self.subagents.clone(),
             hook_schema: self.hook_schema.clone(),
             background: None,
+            active_identity_revision: None,
         })
     }
 }
@@ -456,6 +460,52 @@ impl WorkerIdentityProjection {
 }
 
 impl SessionRegistry {
+    /// Gives a forwarded active identity the profile label it was reported
+    /// under.
+    ///
+    /// The label is opaque to the worker. It becomes the active agent only when
+    /// it resolves, against `pinned` for a pinned session, to a profile whose
+    /// base is the claim's provider; otherwise the active agent stays the
+    /// provider and the unresolved label is logged.
+    fn relabel_forwarded_identity(
+        &self,
+        record: &mut SessionRecord,
+        projection: &mut WorkerIdentityProjection,
+        snapshot: &InspectSnapshot,
+        pinned: Option<&Arc<RuntimeDefinition>>,
+    ) {
+        let Some(claim) = snapshot
+            .active_identity
+            .as_ref()
+            .filter(|claim| claim.origin == Some(pohunek_worker_protocol::ClaimOrigin::Forwarded))
+        else {
+            return;
+        };
+        let (Some(label), Some(active)) = (claim.agent.as_deref(), projection.active.as_mut())
+        else {
+            return;
+        };
+        if label == claim.provider {
+            return;
+        }
+        let resolved = match pinned {
+            Some(pinned) => self.inner.profiles.resolve_agent_pinned(label, pinned),
+            None => self.inner.profiles.resolve_agent(label),
+        };
+        if resolved.is_ok_and(|resolved| resolved.base.as_str() == claim.provider) {
+            label.clone_into(&mut active.agent);
+            record.info.active_agent = Some(label.to_owned());
+        } else {
+            tracing::warn!(
+                name: "session.active_identity.label_unresolved",
+                session_id = %record.info.id.0,
+                label,
+                provider = %claim.provider,
+                "the forwarded agent label does not resolve to a profile of its provider; the provider is the active agent"
+            );
+        }
+    }
+
     /// The hook schema id `snapshot` is validated with: the one the worker
     /// journaled, else the schema of the session's pinned runtime.
     ///
@@ -522,7 +572,7 @@ impl SessionRegistry {
             .worker_instance_id
             .as_ref()
             .map(ToString::to_string);
-        let mut memory_base = {
+        let (mut memory_base, import_pin) = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(id) else {
                 return WorkerMetadataApplyOutcome::Discarded;
@@ -538,7 +588,7 @@ impl SessionRegistry {
             ) {
                 return outcome;
             }
-            record
+            (record, entry.pinned.clone())
         };
         let projected = InspectSnapshot {
             hook_schema: self.effective_hook_schema_id(&memory_base, snapshot),
@@ -614,7 +664,15 @@ impl SessionRegistry {
         import_native_reference(&mut candidate, snapshot);
         let projection = if identities_accepted {
             match import_worker_identities(&mut candidate, snapshot) {
-                Ok(projection) => projection,
+                Ok(mut projection) => {
+                    self.relabel_forwarded_identity(
+                        &mut candidate,
+                        &mut projection,
+                        snapshot,
+                        import_pin.as_ref(),
+                    );
+                    projection
+                }
                 Err(reason) => {
                     tracing::warn!(session_id = %id.0, reason, "rejected worker identity snapshot");
                     identities_accepted = false;
@@ -3644,7 +3702,25 @@ impl SessionRegistry {
             WorkerIdentityProjection::unreported()
         } else {
             match import_worker_identities(&mut record, &snapshot) {
-                Ok(projection) => projection,
+                Ok(mut projection) => {
+                    let pin = record
+                        .recovery
+                        .as_ref()
+                        .map(|binding| binding.launch_binding.clone())
+                        .unwrap_or_default();
+                    let pinned = self
+                        .inner
+                        .profiles
+                        .runtimes()
+                        .pinned_definition(&record.info.agent_base, &pin);
+                    self.relabel_forwarded_identity(
+                        &mut record,
+                        &mut projection,
+                        &snapshot,
+                        pinned.as_ref(),
+                    );
+                    projection
+                }
                 Err(reason) => {
                     self.mark_pending(record, RuntimeState::Conflict, reason, retry)
                         .await;
@@ -5125,6 +5201,10 @@ fn apply_worker_identities_with(
         });
     };
     let agent_base = RuntimeRef::from_wire(&identity.provider);
+    let forwarded = identity.origin == Some(pohunek_worker_protocol::ClaimOrigin::Forwarded);
+    if forwarded && (identity.reference_kind.is_some() || identity.native_reference.is_some()) {
+        return Err("active_identity_forwarded_reference_invalid");
+    }
     let reference = verify_active_identity_reference(record, schema, identity)?;
     let (active_id, active_path) = match reference {
         Some((kind, native)) => {
@@ -5136,6 +5216,7 @@ fn apply_worker_identities_with(
                 SessionRefKind::Path => (None, Some(native)),
             }
         }
+        None if forwarded => forwarded_session_annotation(identity),
         None => (None, None),
     };
     record.active_agent_origin = Some(ActiveAgentOrigin::Reported);
@@ -5158,6 +5239,29 @@ fn apply_worker_identities_with(
         release: None,
         privately_reported: true,
     })
+}
+
+/// The session annotation of a forwarded claim, as the active agent's session
+/// id or path. It is a public annotation: it never becomes a native reference.
+/// An annotation the daemon would refuse on the public socket is dropped.
+fn forwarded_session_annotation(
+    identity: &pohunek_worker_protocol::ActiveIdentityClaim,
+) -> (Option<String>, Option<String>) {
+    use pohunek_worker_protocol::ReportedSessionKind;
+
+    let Some(session) = identity.reported_session.as_ref() else {
+        return (None, None);
+    };
+    match session.kind {
+        ReportedSessionKind::Id => (
+            validate_native_reference(SessionRefKind::Id, &session.value),
+            None,
+        ),
+        ReportedSessionKind::Path => (
+            None,
+            validate_native_reference(SessionRefKind::Path, &session.value),
+        ),
+    }
 }
 
 /// Validates the reference part of a worker's active identity claim exactly as
@@ -7242,6 +7346,146 @@ while os.getppid() == parent:
         "outcome": null, "subagents": []
     }"#;
 
+    /// A schema-4 journal as the protocol-8 worker writes it after a forwarded
+    /// report: the claim carries the label, the origin and the session
+    /// annotation, and no reference. `@EXPIRES_AT@` stands for the claim's
+    /// lease, which the offline reader honours.
+    const FORWARDED_CLAIM_JOURNAL: &str = r#"{
+        "schema_version": 4, "session_id": "s-1", "worker_id": "worker-1",
+        "executable": "/opt/pohunek/libexec/pohunek/0.36.0/pohunek-sessiond",
+        "version": "0.36.0", "generation": "abcd2345", "runtime_id": "runtime-1",
+        "protocol_minimum": 7, "protocol_maximum": 8, "worker_pid": 41,
+        "worker_start_identity": "410", "boot_identity": "boot-test",
+        "child": {"pid": 50, "process_group": 50, "start_identity": "500"},
+        "cols": 80, "rows": 24, "phase": "live", "outcome": null,
+        "launch_identity": null, "pending_launch_claims": [],
+        "active_identity": {
+            "provider": "claude",
+            "process": {"pid": 50, "process_group": 50, "start_identity": "500"},
+            "sequence": 100, "expires_at": "@EXPIRES_AT@",
+            "reference_kind": null, "native_reference": null,
+            "agent": "tuned", "origin": "forwarded",
+            "reported_session": {"kind": "id", "value": "annotation-1"}
+        },
+        "active_identity_release": null, "active_identity_revision": 1,
+        "native_reference_claim": null, "subagent_revision": 0, "subagents": [],
+        "hook_schema": "identity-subagent-v1"
+    }"#;
+
+    #[test]
+    fn a_journal_with_a_forwarded_claim_reads_offline_as_a_provider_only_claim() {
+        let expires_at = (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+            .format(&Rfc3339)
+            .expect("format expiry");
+        let journal = FORWARDED_CLAIM_JOURNAL.replace("@EXPIRES_AT@", &expires_at);
+
+        let evidence = serde_json::from_str::<super::JournalEvidence>(&journal)
+            .expect("the offline reader accepts the added journal fields");
+        let snapshot = evidence
+            .snapshot()
+            .expect("the journal stands for a snapshot");
+
+        let claim = snapshot.active_identity.expect("the active claim");
+        assert_eq!(claim.provider, "claude");
+        assert_eq!(claim.sequence, 100);
+        assert_eq!(
+            (
+                claim.reference_kind,
+                claim.native_reference,
+                claim.agent,
+                claim.origin,
+                claim.reported_session,
+            ),
+            (None, None, None, None, None),
+            "an offline reader sees the provider-only claim a previous release would"
+        );
+        assert_eq!(snapshot.active_identity_revision, None);
+        assert!(snapshot.launch_identity.is_none());
+        assert!(snapshot.native_reference.is_none());
+    }
+
+    fn forwarded_snapshot(
+        reported_session: Option<(pohunek_worker_protocol::ReportedSessionKind, &str)>,
+    ) -> InspectSnapshot {
+        let mut snapshot = identity_snapshot("launch-native");
+        let claim = snapshot.active_identity.as_mut().expect("active claim");
+        claim.reference_kind = None;
+        claim.native_reference = None;
+        claim.origin = Some(pohunek_worker_protocol::ClaimOrigin::Forwarded);
+        claim.agent = Some("tuned".to_owned());
+        claim.reported_session =
+            reported_session.map(|(kind, value)| pohunek_worker_protocol::ReportedSession {
+                kind,
+                value: value.to_owned(),
+            });
+        snapshot
+    }
+
+    #[test]
+    fn a_forwarded_claim_annotates_the_active_session_and_never_the_native_reference() {
+        use pohunek_worker_protocol::ReportedSessionKind;
+
+        let schema = pohunek_worker_protocol::hook_schema("identity-subagent-v1");
+        let mut record = identity_record();
+
+        let by_id = forwarded_snapshot(Some((ReportedSessionKind::Id, "annotation-1")));
+        apply_worker_identities_with(&mut record, &by_id, Ok(schema)).expect("forwarded claim");
+        assert_eq!(
+            record.info.active_agent_session_id.as_deref(),
+            Some("annotation-1")
+        );
+        assert_eq!(record.info.active_agent_session_path, None);
+        assert_eq!(record.info.active_agent.as_deref(), Some("claude"));
+        assert_eq!(
+            record.active_agent_origin,
+            Some(crate::store::ActiveAgentOrigin::Reported)
+        );
+        assert_eq!(
+            record.info.native_session_id.as_deref(),
+            Some("launch-native"),
+            "the native reference stays the launch identity the snapshot reports"
+        );
+        assert_eq!(record.info.native_session_path, None);
+        assert_ne!(
+            record
+                .recovery
+                .as_ref()
+                .and_then(|binding| binding.native_session_id.as_deref()),
+            Some("annotation-1"),
+            "the annotation never reaches the resume binding"
+        );
+
+        let by_path = forwarded_snapshot(Some((ReportedSessionKind::Path, "/work/session.jsonl")));
+        let mut record = identity_record();
+        apply_worker_identities_with(&mut record, &by_path, Ok(schema)).expect("path annotation");
+        assert_eq!(record.info.active_agent_session_id, None);
+        assert_eq!(
+            record.info.active_agent_session_path.as_deref(),
+            Some("/work/session.jsonl")
+        );
+
+        let relative = forwarded_snapshot(Some((ReportedSessionKind::Path, "relative/path")));
+        let mut record = identity_record();
+        apply_worker_identities_with(&mut record, &relative, Ok(schema))
+            .expect("a refused annotation is dropped, not fatal");
+        assert_eq!(record.info.active_agent_session_path, None);
+    }
+
+    #[test]
+    fn a_forwarded_claim_that_carries_a_reference_is_refused() {
+        let schema = pohunek_worker_protocol::hook_schema("identity-subagent-v1");
+        let mut snapshot = forwarded_snapshot(None);
+        let claim = snapshot.active_identity.as_mut().expect("active claim");
+        claim.reference_kind = Some("id".to_owned());
+        claim.native_reference = Some("smuggled".to_owned());
+
+        assert_eq!(
+            apply_worker_identities_with(&mut identity_record(), &snapshot, Ok(schema))
+                .expect_err("a forwarded claim has no native reference"),
+            "active_identity_forwarded_reference_invalid"
+        );
+    }
+
     #[test]
     fn frozen_schema_four_layout_decodes_as_the_previous_schema_after_a_bump() {
         use crate::runtime::lifecycle::{schema_in_window, WORKER_JOURNAL_READABLE_SCHEMAS};
@@ -7461,6 +7705,9 @@ while os.getppid() == parent:
                     .expect("an expiry"),
                 reference_kind: Some("id".to_owned()),
                 native_reference: Some("switched-before-the-stop".to_owned()),
+                agent: None,
+                origin: None,
+                reported_session: None,
             });
             snapshot
         };
@@ -9978,6 +10225,9 @@ while os.getppid() == parent:
                 .expect("format expiry"),
             reference_kind: Some("id".to_owned()),
             native_reference: Some(reference.to_owned()),
+            agent: None,
+            origin: None,
+            reported_session: None,
         });
         snapshot
     }
@@ -10832,12 +11082,16 @@ while os.getppid() == parent:
                     .expect("format expiry"),
                 reference_kind: Some("id".to_owned()),
                 native_reference: Some("nested-native".to_owned()),
+                agent: None,
+                origin: None,
+                reported_session: None,
             }),
             active_identity_release: None,
             native_reference: None,
             subagents: Vec::new(),
             hook_schema: Some("identity-subagent-v1".to_owned()),
             background: None,
+            active_identity_revision: None,
         }
     }
 
@@ -17016,6 +17270,9 @@ generation "$1"
                         expires_at,
                         reference_kind: Some("id".to_owned()),
                         native_reference: Some("switched-before-the-stop".to_owned()),
+                        agent: None,
+                        origin: None,
+                        reported_session: None,
                     });
                 },
             );

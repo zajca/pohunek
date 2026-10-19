@@ -103,6 +103,11 @@ pub enum RejectReason {
     SubagentClaimInvalid,
     /// The notification claim is not a bounded JSON object.
     NotificationInvalid,
+    /// A forwarded release names no active claim of that provider and process.
+    ReleaseUnmatched,
+    /// A forwarded report carries a label or session annotation outside its
+    /// bounds.
+    ForwardedFieldInvalid,
 }
 
 impl RejectReason {
@@ -128,6 +133,8 @@ impl RejectReason {
             Self::IdentityReportersExhausted => "identity_reporters_exhausted",
             Self::SubagentClaimInvalid => "subagent_claim_invalid",
             Self::NotificationInvalid => "notification_invalid",
+            Self::ReleaseUnmatched => "release_unmatched",
+            Self::ForwardedFieldInvalid => "forwarded_field_invalid",
         }
     }
 }

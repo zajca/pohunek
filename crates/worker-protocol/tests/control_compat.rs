@@ -1,6 +1,7 @@
 use pohunek_worker_protocol::{
-    ControlCodecError, ControlReader, ControlRequest, ControlResponse, ControlWriter, RequestKind,
-    ResponseKind,
+    ActiveIdentityOutcome, ControlCodecError, ControlReader, ControlRequest, ControlResponse,
+    ControlWriter, ForwardedActiveReport, IdentityRejectReason, ReportedSession,
+    ReportedSessionKind, RequestKind, ResponseKind,
 };
 use serde_json::json;
 
@@ -89,4 +90,170 @@ async fn attach_request_rejects_invalid_dimensions_and_accepts_omitted_size() {
             ..
         } if start.dimensions.is_none()
     ));
+}
+
+#[tokio::test]
+async fn previous_worker_claim_without_the_forwarding_fields_is_read_and_written_without_them() {
+    let (reader, writer) = tokio::io::duplex(4096);
+    let mut writer = ControlWriter::new(writer);
+    let mut reader = ControlReader::new(reader);
+    let response = json!({
+        "request_id": "request-1",
+        "type": "inspected",
+        "snapshot": {
+            "session_id": "s-1",
+            "worker_id": "worker-1",
+            "runtime_id": null,
+            "phase": "running",
+            "worker_process": {"pid": 1, "start_identity": 2},
+            "child_process": null,
+            "dimensions": null,
+            "history_start_offset": 0,
+            "next_offset": 0,
+            "exit": null,
+            "launch_identity": null,
+            "active_identity": {
+                "provider": "claude",
+                "process": {"pid": 5, "start_identity": 6},
+                "sequence": 7,
+                "expires_at": "2026-10-19T00:00:30Z",
+                "reference_kind": null,
+                "native_reference": null
+            }
+        }
+    });
+
+    writer.write(&response).await.expect("write previous claim");
+    let response = reader
+        .read::<ControlResponse>()
+        .await
+        .expect("read previous claim")
+        .expect("response");
+    let ResponseKind::Inspected { snapshot } = response.kind else {
+        panic!("an inspected response");
+    };
+    assert_eq!(snapshot.active_identity_revision, None);
+    let claim = snapshot.active_identity.expect("claim");
+    assert_eq!(
+        (&claim.agent, &claim.origin, &claim.reported_session),
+        (&None, &None, &None)
+    );
+    let wire = serde_json::to_value(&claim).expect("serialize claim");
+    for field in ["agent", "origin", "reported_session"] {
+        assert!(wire.get(field).is_none(), "{field} is omitted when absent");
+    }
+}
+
+#[test]
+fn forwarded_identity_requests_and_answers_keep_their_wire_spelling() {
+    let report = json!({
+        "request_id": "request-2",
+        "type": "record_active_identity",
+        "scope": {
+            "lease_id": "lease-1",
+            "session_id": "s-1",
+            "worker_id": "w-1",
+            "runtime_id": "runtime-1"
+        },
+        "report": {
+            "provider": "claude",
+            "agent": "tuned",
+            "process": {"pid": 5, "start_identity": 6},
+            "sequence": 7,
+            "expires_at": "2026-10-19T00:00:30Z",
+            "reported_session": {"kind": "path", "value": "/work/session.jsonl"}
+        }
+    });
+    let request: ControlRequest = serde_json::from_value(report.clone()).expect("decode report");
+    assert!(matches!(
+        request.kind,
+        RequestKind::RecordActiveIdentity { .. }
+    ));
+    assert_eq!(
+        serde_json::to_value(&request).expect("encode report"),
+        report
+    );
+
+    let release = json!({
+        "request_id": "request-3",
+        "type": "release_active_identity",
+        "scope": {
+            "lease_id": "lease-1",
+            "session_id": "s-1",
+            "worker_id": "w-1",
+            "runtime_id": "runtime-1"
+        },
+        "release": {
+            "provider": "claude",
+            "process": {"pid": 5, "start_identity": 6},
+            "sequence": 8
+        }
+    });
+    let request: ControlRequest = serde_json::from_value(release.clone()).expect("decode release");
+    assert!(matches!(
+        request.kind,
+        RequestKind::ReleaseActiveIdentity { .. }
+    ));
+    assert_eq!(
+        serde_json::to_value(&request).expect("encode release"),
+        release
+    );
+
+    for (answer, expected) in [
+        (
+            json!({"status": "accepted", "revision": 3}),
+            ActiveIdentityOutcome::Accepted { revision: 3 },
+        ),
+        (
+            json!({"status": "rejected", "reason": "release_unmatched"}),
+            ActiveIdentityOutcome::Rejected {
+                reason: IdentityRejectReason::ReleaseUnmatched,
+            },
+        ),
+        (
+            json!({"status": "rejected", "reason": "sequence_stale"}),
+            ActiveIdentityOutcome::Rejected {
+                reason: IdentityRejectReason::SequenceStale,
+            },
+        ),
+    ] {
+        let response = json!({
+            "request_id": "request-4",
+            "type": "active_identity_recorded",
+            "outcome": answer,
+        });
+        let decoded: ControlResponse =
+            serde_json::from_value(response.clone()).expect("decode answer");
+        assert!(
+            matches!(decoded.kind, ResponseKind::ActiveIdentityRecorded { outcome } if outcome == expected),
+            "{response}"
+        );
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("encode answer"),
+            response
+        );
+    }
+}
+
+#[test]
+fn a_reported_session_never_appears_in_debug_output() {
+    let report = ForwardedActiveReport {
+        provider: "claude".to_owned(),
+        agent: None,
+        process: pohunek_worker_protocol::ProcessIdentity {
+            pid: 5,
+            start_identity: 6,
+        },
+        sequence: 7,
+        expires_at: "2026-10-19T00:00:30Z".to_owned(),
+        reported_session: Some(ReportedSession {
+            kind: ReportedSessionKind::Path,
+            value: "/home/secret/session.jsonl".to_owned(),
+        }),
+    };
+
+    let rendered = format!("{report:?}");
+
+    assert!(!rendered.contains("secret"), "{rendered}");
+    assert!(rendered.contains("[REDACTED]"), "{rendered}");
 }

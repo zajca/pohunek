@@ -37,7 +37,11 @@ rule. The current state of each place is stated separately.
   optional field `worker_coalitions`, which lets the sweep dismiss processes
   the kernel places in other coalitions than the worker's. The optional outcome
   field `output_forced_closed` (also on the private `ExitStatus`) is additive
-  the same way: an N-1 worker's outcome lacks it and reads as `false`.
+  the same way: an N-1 worker's outcome lacks it and reads as `false`. The
+  optional claim fields `agent`, `origin` and `reported_session` of a forwarded
+  active identity and the optional `active_identity_revision` (read as 0) are
+  additive without a schema bump too: an N-1 reader of such a journal sees a
+  provider-only active claim with no native reference.
 - **Public-protocol clients.** Contract: a protocol change keeps the previous
   version served through adapters on both sides of the connection. An adapter
   translates shape only. A semantic change raises `MIN_PROTOCOL_VERSION` too

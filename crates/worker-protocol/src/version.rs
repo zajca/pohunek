@@ -33,6 +33,17 @@ pub const CONTROL_PLANE_OBSERVATION_VERSION: Version = Version(4);
 /// First version with durable provider-managed subagent observation.
 pub const SUBAGENT_OBSERVATION_VERSION: Version = Version(5);
 
+/// First version whose controller may forward an active identity.
+///
+/// From version eight the daemon sends
+/// [`RecordActiveIdentity`](crate::RequestKind::RecordActiveIdentity) and
+/// [`ReleaseActiveIdentity`](crate::RequestKind::ReleaseActiveIdentity), and the
+/// snapshot carries the active identity's revision, label, origin and reported
+/// session. A version-seven peer receives none of them. The gate is the
+/// version alone: an unknown capability in a version-seven decoder would fail
+/// its request.
+pub const ACTIVE_IDENTITY_FORWARD_VERSION: Version = Version(8);
+
 /// Versions supported by this crate release.
 pub const SUPPORTED_RANGE: VersionRange = VersionRange {
     minimum: PREVIOUS_VERSION,

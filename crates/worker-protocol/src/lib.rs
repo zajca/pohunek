@@ -20,6 +20,21 @@ pub const WORKER_DIAGNOSTIC_SCHEMA_VERSION: u32 = 1;
 /// path can create a longer-lived claim.
 pub const MAX_IDENTITY_CLAIM_TTL_SECS: u64 = 60;
 
+/// Maximum bytes of the opaque profile label a forwarded active identity
+/// carries.
+///
+/// Equals the profile-name limit of the daemon's profile registry. The worker
+/// never interprets the label.
+pub const MAX_FORWARDED_AGENT_LABEL_BYTES: usize = 250;
+
+/// Maximum bytes of an id-kind session reference a forwarded active identity
+/// annotates.
+pub const MAX_REPORTED_SESSION_ID_BYTES: usize = 512;
+
+/// Maximum bytes of a path-kind session reference a forwarded active identity
+/// annotates.
+pub const MAX_REPORTED_SESSION_PATH_BYTES: usize = 4096;
+
 mod background_fields;
 mod codec;
 mod control;
@@ -41,16 +56,17 @@ pub use background_fields::{
 pub use codec::{ControlCodecError, ControlReader, ControlWriter, MAX_CONTROL_LINE_BYTES};
 #[doc(inline)]
 pub use control::{
-    ActiveIdentityClaim, AttachStart, BackgroundItem, BackgroundKind, BackgroundSnapshot,
-    BackgroundStatus, Capability, ControlCode, ControlError, ControlEvent, ControlMessage,
-    ControlRequest, ControlResponse, ControlTypeError, Dimensions, EventKind, ExitStatus,
+    ActiveIdentityClaim, ActiveIdentityOutcome, AttachStart, BackgroundItem, BackgroundKind,
+    BackgroundSnapshot, BackgroundStatus, Capability, ClaimOrigin, ControlCode, ControlError,
+    ControlEvent, ControlMessage, ControlRequest, ControlResponse, ControlTypeError, Dimensions,
+    EventKind, ExitStatus, ForwardedActiveRelease, ForwardedActiveReport, IdentityRejectReason,
     Initialize, InitializeLimits, InputFragment, InputPlan, InputPolicy, InspectSnapshot,
     LaunchIdentity, OutputGap, ProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
-    ReportedNativeReference, RequestKind, ResizeRequest, ResponseKind, RuntimePhase, RuntimeScope,
-    StopPolicy, StopRequest, StreamMode, SubagentPhase, SubagentSnapshot, WriteAck,
-    BACKGROUND_AGENT_TYPE_MAX_BYTES, BACKGROUND_LABEL_MAX_BYTES, BACKGROUND_MAX_ITEMS,
-    BACKGROUND_PROGRAM_MAX_BYTES, BACKGROUND_TASK_ID_MAX_BYTES, BACKGROUND_TASK_STATUS_MAX_BYTES,
-    BACKGROUND_TASK_TYPE_MAX_BYTES,
+    ReportedNativeReference, ReportedSession, ReportedSessionKind, RequestKind, ResizeRequest,
+    ResponseKind, RuntimePhase, RuntimeScope, StopPolicy, StopRequest, StreamMode, SubagentPhase,
+    SubagentSnapshot, WriteAck, BACKGROUND_AGENT_TYPE_MAX_BYTES, BACKGROUND_LABEL_MAX_BYTES,
+    BACKGROUND_MAX_ITEMS, BACKGROUND_PROGRAM_MAX_BYTES, BACKGROUND_TASK_ID_MAX_BYTES,
+    BACKGROUND_TASK_STATUS_MAX_BYTES, BACKGROUND_TASK_TYPE_MAX_BYTES,
 };
 #[doc(inline)]
 pub use data::{
@@ -81,7 +97,7 @@ pub use text::is_hidden_or_separator;
 pub use token::{TokenClaims, TokenError, TokenVault};
 #[doc(inline)]
 pub use version::{
-    negotiate, Version, VersionError, VersionRange, ATTACH_SNAPSHOT_VERSION,
-    CONTROL_PLANE_OBSERVATION_VERSION, CURRENT_VERSION, PREVIOUS_VERSION,
+    negotiate, Version, VersionError, VersionRange, ACTIVE_IDENTITY_FORWARD_VERSION,
+    ATTACH_SNAPSHOT_VERSION, CONTROL_PLANE_OBSERVATION_VERSION, CURRENT_VERSION, PREVIOUS_VERSION,
     SUBAGENT_OBSERVATION_VERSION, SUPPORTED_RANGE,
 };

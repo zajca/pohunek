@@ -506,6 +506,22 @@ changes terminal geometry. A v3 worker remains valid for existing lifecycle and
 attach operations but reports observation unavailable; the daemon maps private
 failures to stable payload-free public errors.
 
+Private worker protocol v8 lets the controller forward a public agent report or
+release into the worker (`RecordActiveIdentity`, `ReleaseActiveIdentity`). The
+worker validates the subject like a hook claim does (hook schema, claim expiry,
+PTY-tree membership and start identity of the process, ordering against every
+earlier claim of that process), journals the claim and acknowledges only after
+the journal write returns. The peer-side checks do not apply, because the peer is
+the lease-authenticated daemon. A forwarded claim is marked `origin = forwarded`
+and carries the daemon's opaque profile label and an optional session
+annotation, but never a native reference: it cannot reach the launch identity,
+the pending launch claims, the native reference claim or the resume binding. The
+journal counts every change of the active identity or its release in
+`active_identity_revision`, and the v8 snapshot reports the revision, label,
+origin and annotation. A connection that negotiated v7 sees none of those fields,
+so the claim reads as a provider-only active claim there and in an older reader
+of the journal.
+
 Public observation is bounded by the 1 MiB control-line ceiling. Output accounts
 for base64 expansion and response metadata; screen snapshots are measured after
 JSON serialization. The default maximum wait is eight seconds. Waiting
