@@ -25,7 +25,9 @@ Markdown serve humans and agents.
 Materialization publishes the bundle only after its files and directories have
 been synchronized, then synchronizes the cache directory after the atomic rename.
 A synchronization error fails the operation; retrying completes the publication
-before it reports success. An interrupted, incomplete version is moved aside
+before it reports success. Each attempt also synchronizes the cache ancestry that
+may have been created by an earlier failed attempt, including when reusing a
+complete bundle. An interrupted, incomplete version is moved aside
 inside the private cache and rebuilt. Symbolic links and unsafe ownership or
 permissions are refused rather than followed or repaired outside that cache.
 

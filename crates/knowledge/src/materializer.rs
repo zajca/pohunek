@@ -84,6 +84,7 @@ mod implementation {
         let root =
             open_root(cache, true)?.ok_or_else(|| io::Error::other("knowledge root missing"))?;
         let _lock = lock_root(&root)?;
+        sync_root_ancestors(&root, observer)?;
         let target = root.path().join(version);
         if let Some(directory) = target_directory(&root, version)? {
             if is_complete(&directory)? {
@@ -164,6 +165,43 @@ mod implementation {
             Err(error) if !create && error.io_kind() == Some(io::ErrorKind::NotFound) => Ok(None),
             Err(error) => Err(fs_error(error)),
         }
+    }
+
+    fn sync_root_ancestors(root: &TrustedDir, observer: &mut Observer<'_>) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        // A failed creation can leave a renamed cache ancestor whose parent
+        // was not durably synchronized. Retry must persist those entries too.
+        // Every directory this materializer creates has the cache owner's UID.
+        // Once a differently owned ancestor has persisted its child entry, its
+        // own entry predates this operation and its parent need not be synced.
+        let owner = root
+            .try_clone_descriptor()
+            .map_err(fs_error)?
+            .metadata()?
+            .uid();
+        for path in root.path().ancestors().skip(1) {
+            if path == Path::new("/") {
+                // The filesystem root has no components (and no symlink to
+                // follow), so TrustedDir's nonempty-path API does not accept it.
+                let directory = fs::File::open(path)?;
+                observer(Event::AncestorSync, path)?;
+                pohunek_platform::filesystem::sync_file(&directory).map_err(fs_error)?;
+                break;
+            }
+            let ancestor = TrustedDir::open_absolute_ancestor(path).map_err(fs_error)?;
+            sync_directory(&ancestor, Event::AncestorSync, observer)?;
+            if ancestor
+                .try_clone_descriptor()
+                .map_err(fs_error)?
+                .metadata()?
+                .uid()
+                != owner
+            {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn lock_root(root: &TrustedDir) -> io::Result<AdvisoryLock> {
@@ -418,6 +456,8 @@ mod implementation {
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {
+    /// Synchronize a parent of the knowledge root, including reused ancestors.
+    AncestorSync,
     /// Write and durably synchronize a file.
     FileSync,
     /// Synchronize an extracted or reused directory.

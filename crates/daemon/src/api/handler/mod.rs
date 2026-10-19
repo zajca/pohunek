@@ -1420,7 +1420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assistant_materialize_refuses_incomplete_cache_without_deleting_it() {
+    async fn assistant_materialize_repairs_incomplete_cache_and_reuses_the_complete_bundle() {
         if !pohunek_test_support::process_env::in_own_process() {
             return;
         }
@@ -1434,13 +1434,19 @@ mod tests {
         std::fs::remove_file(bundle.join(".complete")).expect("remove completion marker");
         std::fs::write(bundle.join("stale.txt"), "stale").expect("write incomplete cache data");
 
-        let error = assistant_materialize_error(&state, "asst-incomplete-second").await;
-        assert_eq!(error.code, "materialization_failed");
+        let repaired = assistant_materialize_result(&state, "asst-incomplete-second", "{}").await;
+        assert_eq!(repaired.bundle_path, first.bundle_path);
+        assert!(bundle.join(".complete").is_file());
+        assert!(!bundle.join("stale.txt").exists());
         assert_eq!(
-            std::fs::read_to_string(bundle.join("stale.txt")).expect("incomplete cache data"),
-            "stale"
+            std::fs::read_to_string(bundle.join("index.md")).expect("repaired bundle index"),
+            knowledge::embedded_bundle()
+                .get_text("index.md")
+                .expect("embedded bundle index")
         );
-        assert!(!bundle.join(".complete").exists());
+        let reused = assistant_materialize_result(&state, "asst-incomplete-third", "{}").await;
+        assert_eq!(reused.bundle_path, repaired.bundle_path);
+        assert!(bundle.join(".complete").is_file());
     }
 
     #[cfg(unix)]

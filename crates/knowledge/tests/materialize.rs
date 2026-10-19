@@ -382,6 +382,130 @@ fn durability_failures_are_reported_and_a_normal_retry_finishes_the_bundle() {
     }
 }
 
+#[cfg(feature = "test-util")]
+#[test]
+fn root_creation_sync_failures_are_retried_before_publication_and_complete_reuse() {
+    use knowledge::Event;
+
+    let root = pohunek_test_support::tempdir().expect("private fixture root");
+    let cache = root.path().join("pohunek");
+    let target = cache.join("knowledge/retry-version");
+    let failed_parent = root.path();
+    let ancestors = cache_ancestors(&cache);
+
+    for attempt in 0..2 {
+        let mut observed = Vec::new();
+        let error = knowledge::materialize_with_observer(&cache, "retry-version", |event, path| {
+            if event == Event::AncestorSync {
+                observed.push(path.to_owned());
+                if path == failed_parent {
+                    return Err(std::io::Error::other(
+                        "injected cache parent synchronization failure",
+                    ));
+                }
+            }
+            Ok(())
+        })
+        .expect_err("an unsynchronized cache parent cannot produce success on creation or retry");
+        assert!(error
+            .to_string()
+            .contains("injected cache parent synchronization failure"));
+        assert_eq!(
+            observed,
+            [cache.clone(), failed_parent.to_owned()],
+            "attempt {attempt} must retry both already-visible directory entries"
+        );
+        assert!(
+            cache.join("knowledge").is_dir(),
+            "root creation precedes the injected failure"
+        );
+        assert!(
+            !target.exists(),
+            "publication waits for durable cache ancestors"
+        );
+    }
+
+    let mut events = Vec::new();
+    let published = knowledge::materialize_with_observer(&cache, "retry-version", |event, path| {
+        events.push((event, path.to_owned()));
+        Ok(())
+    })
+    .expect("synchronize the visible cache ancestors before retrying publication");
+    assert_eq!(published, target);
+    let observed: Vec<_> = events
+        .iter()
+        .filter(|(event, _)| *event == Event::AncestorSync)
+        .map(|(_, path)| path.clone())
+        .collect();
+    assert_eq!(
+        observed, ancestors,
+        "all potentially created directory entries synchronize bottom-up through the first foreign-owned ancestor"
+    );
+    let publish = events
+        .iter()
+        .position(|(event, _)| *event == Event::Publish)
+        .expect("retry publishes the bundle");
+    assert!(events[..ancestors.len()]
+        .iter()
+        .all(|(event, _)| *event == Event::AncestorSync));
+    assert!(ancestors.len() <= publish);
+    assert!(target.join(".complete").is_file());
+
+    let mut injected = false;
+    let error = knowledge::materialize_with_observer(&cache, "retry-version", |event, path| {
+        if event == Event::AncestorSync && path == failed_parent {
+            injected = true;
+            return Err(std::io::Error::other(
+                "injected complete-cache parent synchronization failure",
+            ));
+        }
+        Ok(())
+    })
+    .expect_err("the complete-version fast path must not bypass ancestor durability");
+    assert!(injected);
+    assert!(error
+        .to_string()
+        .contains("injected complete-cache parent synchronization failure"));
+
+    let mut reused_ancestors = Vec::new();
+    let reused = knowledge::materialize_with_observer(&cache, "retry-version", |event, path| {
+        if event == Event::AncestorSync {
+            reused_ancestors.push(path.to_owned());
+        }
+        assert_ne!(event, Event::Publish, "a complete bundle is reused");
+        Ok(())
+    })
+    .expect("retry complete-version reuse after synchronizing every ancestor again");
+    assert_eq!(reused, target);
+    assert_eq!(reused_ancestors, ancestors);
+    assert_eq!(
+        std::fs::read_to_string(reused.join("log.md")).expect("complete reused log"),
+        knowledge::embedded_bundle()
+            .get_text("log.md")
+            .expect("embedded log")
+    );
+}
+
+#[cfg(feature = "test-util")]
+fn cache_ancestors(cache: &std::path::Path) -> Vec<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let parent = cache.parent().expect("cache parent");
+    let owner = std::fs::metadata(parent).expect("fixture ownership").uid();
+    let mut ancestors = vec![cache.to_owned()];
+    for ancestor in parent.ancestors() {
+        ancestors.push(ancestor.to_owned());
+        if std::fs::metadata(ancestor)
+            .expect("ancestor ownership")
+            .uid()
+            != owner
+        {
+            break;
+        }
+    }
+    ancestors
+}
+
 #[test]
 fn reserved_materializer_names_are_rejected_without_creating_a_cache() {
     let root = pohunek_test_support::tempdir().expect("private fixture root");
