@@ -202,14 +202,19 @@ pub const MAX_HOLDER_BYTES: usize = 4 * 1024;
 
 /// Maximum size of the install transaction record.
 ///
-/// The record holds a few short fields; anything larger is corrupt.
-pub const MAX_RECORD_BYTES: usize = 64 * 1024;
+/// The record holds a few short fields and the accepted-risk set the gate
+/// journaled, which the preflight report (at most 4 MiB) bounds even when
+/// pretty-printed; anything larger is corrupt. A record that would exceed it
+/// is refused when it is saved, so every record that is written can be read.
+pub const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum size of the accepted-risk ledger.
 ///
-/// The ledger holds one short entry per at-risk session of the last upgrade;
-/// anything larger is corrupt.
-pub const MAX_LEDGER_BYTES: usize = 1024 * 1024;
+/// The ledger holds one short entry per at-risk session of the last upgrade,
+/// a subset of what the record journaled, so it is bounded by
+/// [`MAX_RECORD_BYTES`]; anything larger is corrupt. A ledger that would
+/// exceed it is refused when it is written.
+pub const MAX_LEDGER_BYTES: usize = MAX_RECORD_BYTES;
 
 pub use pohunek_platform::shell_env::{
     DEFAULT_LOGIN_SHELL, LOGIN_SHELL_OUTPUT, LOGIN_SHELL_TIMEOUT,

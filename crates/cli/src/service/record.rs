@@ -537,6 +537,15 @@ impl Store {
         let mut bytes = serde_json::to_vec_pretty(ledger)
             .expect("the ledger holds only strings, paths, booleans, and enums");
         bytes.push(b'\n');
+        if bytes.len() > MAX_LEDGER_BYTES {
+            return Err(Error::AcceptedRisks {
+                path: self.ledger_path(),
+                detail: format!(
+                    "it would be {} bytes, over the {MAX_LEDGER_BYTES} byte limit",
+                    bytes.len()
+                ),
+            });
+        }
         let temporary = format!(
             ".{}.{}.{}.tmp",
             ledger::FILE_NAME,
@@ -612,6 +621,15 @@ impl Store {
         let mut bytes = serde_json::to_vec_pretty(record)
             .expect("the record holds only strings, paths, booleans, and enums");
         bytes.push(b'\n');
+        if bytes.len() > MAX_RECORD_BYTES {
+            return Err(Error::Record {
+                path: self.path(),
+                detail: format!(
+                    "it would be {} bytes, over the {MAX_RECORD_BYTES} byte limit",
+                    bytes.len()
+                ),
+            });
+        }
         let temporary = format!(
             ".{FILE_NAME}.{}.{}.tmp",
             std::process::id(),
@@ -1177,6 +1195,130 @@ mod tests {
         store.clear().expect("clear");
         assert!(!state.join(RUNTIME_BACKUP_DIR_NAME).exists());
         assert_eq!(store.load().expect("load cleared"), None);
+    }
+
+    fn accepted_set(sessions: usize) -> ledger::AcceptedSet {
+        ledger::AcceptedSet {
+            store_path: PathBuf::from("/store"),
+            recorded_at: "2026-10-19T00:00:00Z".to_owned(),
+            entries: (0..sessions)
+                .map(|index| ledger::Entry {
+                    session_id: format!("s-{index:05}"),
+                    list: ledger::List::Live,
+                    verdict: pohunek_service_config::preflight::Verdict::WouldNotBeAdopted,
+                    code: "worker_generation_missing".to_owned(),
+                    scope: format!("v1:{}", "ab".repeat(32)),
+                })
+                .collect(),
+            one_time: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_record_and_a_ledger_of_thousands_of_accepted_risks_round_trip() {
+        let (_root, root) = temp_root();
+        let store = Store::new(root.as_path().join("state"));
+        // Far past the former 64 KiB record and 1 MiB ledger limits.
+        let set = accepted_set(9_000);
+        let saved = Record {
+            accepted_risks: Some(set.clone()),
+            ..record(Step::Runtimes)
+        };
+        store.save(&saved).expect("a large journal is saved");
+        assert_eq!(store.load().expect("and read back"), Some(saved));
+
+        let written = Ledger::of("ns", "1.0.0", None, &set);
+        store
+            .write_ledger(&written)
+            .expect("a large ledger is written");
+        let bytes = store.read_ledger().expect("read").expect("present");
+        assert_eq!(
+            serde_json::from_slice::<Ledger>(&bytes).expect("parse"),
+            written
+        );
+    }
+
+    #[test]
+    fn a_record_or_ledger_over_its_read_limit_is_refused_when_written() {
+        let (_root, root) = temp_root();
+        let state = root.as_path().join("state");
+        let store = Store::new(state.clone());
+        let huge = accepted_set(MAX_RECORD_BYTES / 100);
+        let record = Record {
+            accepted_risks: Some(huge.clone()),
+            ..record(Step::Runtimes)
+        };
+        assert!(matches!(store.save(&record), Err(Error::Record { .. })));
+        assert!(!state.join(FILE_NAME).exists(), "nothing was written");
+        assert!(matches!(
+            store.write_ledger(&Ledger::of("ns", "1.0.0", None, &huge)),
+            Err(Error::AcceptedRisks { .. })
+        ));
+        assert!(!state.join(ledger::FILE_NAME).exists());
+    }
+
+    /// Pads the last entry's code until `size_of` reports exactly `target` bytes.
+    fn padded_to(
+        mut set: ledger::AcceptedSet,
+        target: usize,
+        size_of: impl Fn(&ledger::AcceptedSet) -> usize,
+    ) -> ledger::AcceptedSet {
+        let missing = target - size_of(&set);
+        set.entries
+            .last_mut()
+            .expect("an entry")
+            .code
+            .push_str(&"x".repeat(missing));
+        assert_eq!(size_of(&set), target);
+        set
+    }
+
+    #[test]
+    fn a_record_and_a_ledger_exactly_at_the_limit_are_written_and_read() {
+        let (_root, root) = temp_root();
+        let store = Store::new(root.as_path().join("state"));
+        // `to_vec_pretty` plus the trailing newline is what is written.
+        let record_size = |set: &ledger::AcceptedSet| {
+            let record = Record {
+                accepted_risks: Some(set.clone()),
+                ..record(Step::Runtimes)
+            };
+            serde_json::to_vec_pretty(&record).expect("json").len() + 1
+        };
+        let ledger_size = |set: &ledger::AcceptedSet| {
+            serde_json::to_vec_pretty(&Ledger::of("ns", "1.0.0", None, set))
+                .expect("json")
+                .len()
+                + 1
+        };
+
+        let set = padded_to(accepted_set(100), MAX_RECORD_BYTES, record_size);
+        let saved = Record {
+            accepted_risks: Some(set),
+            ..record(Step::Runtimes)
+        };
+        store.save(&saved).expect("a record at the limit is saved");
+        assert_eq!(store.load().expect("and read"), Some(saved));
+
+        let set = padded_to(accepted_set(100), MAX_LEDGER_BYTES, ledger_size);
+        store
+            .write_ledger(&Ledger::of("ns", "1.0.0", None, &set))
+            .expect("a ledger at the limit is written");
+        assert_eq!(
+            store.read_ledger().expect("read").expect("present").len(),
+            MAX_LEDGER_BYTES
+        );
+
+        let over = padded_to(accepted_set(100), MAX_LEDGER_BYTES + 1, ledger_size);
+        assert!(store
+            .write_ledger(&Ledger::of("ns", "1.0.0", None, &over))
+            .is_err());
+        let over = padded_to(accepted_set(100), MAX_RECORD_BYTES + 1, record_size);
+        let over = Record {
+            accepted_risks: Some(over),
+            ..record(Step::Runtimes)
+        };
+        assert!(store.save(&over).is_err());
     }
 
     #[test]
