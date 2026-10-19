@@ -1,6 +1,6 @@
 //! Enforces one connection-bound daemon controller.
 
-// Rust guideline compliant 2026-07-23
+// Rust guideline compliant 2026-10-19
 
 use std::sync::{Arc, Mutex};
 
@@ -84,16 +84,29 @@ impl ControllerLease {
     ///
     /// Returns [`LeaseError::Mismatch`] for a stale connection.
     pub fn release(&self, owner: &LeaseOwner, lease_id: &str) -> Result<(), LeaseError> {
-        self.validate(owner, lease_id)?;
-        *lock(&self.active) = None;
-        Ok(())
+        if self.release_connection(owner, lease_id) {
+            Ok(())
+        } else {
+            Err(LeaseError::Mismatch)
+        }
     }
 
-    /// Releases a connection at EOF without trusting a request payload.
-    pub fn release_connection(&self, owner: &LeaseOwner) {
+    /// Releases the connection's exact lease when the connection ends.
+    ///
+    /// Compares and clears under one lock, so stale connection cleanup cannot
+    /// release a replacement lease held by the same daemon process. Returns
+    /// whether the active lease was removed.
+    #[must_use]
+    pub fn release_connection(&self, owner: &LeaseOwner, lease_id: &str) -> bool {
         let mut active = lock(&self.active);
-        if active.as_ref().is_some_and(|record| record.owner == *owner) {
+        if active
+            .as_ref()
+            .is_some_and(|record| record.owner == *owner && record.lease_id == lease_id)
+        {
             *active = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -155,7 +168,7 @@ mod tests {
         leases
             .acquire(first.clone(), "lease-a".to_owned())
             .expect("acquire");
-        leases.release_connection(&first);
+        assert!(leases.release_connection(&first, "lease-a"));
 
         leases
             .acquire(owner("daemon-b", 11), "lease-b".to_owned())

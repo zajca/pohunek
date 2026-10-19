@@ -883,9 +883,13 @@ where
     // leaks the lease when an in-flight event write fails first, which makes
     // the worker answer `ControllerBusy` to the replacement daemon for the
     // whole connect deadline and misclassifies a live runtime as a conflict.
-    if let Some(owner) = connection.owner.as_ref() {
-        shared.lease.release_connection(owner);
-        shared.bump_lease_epoch();
+    if let (Some(owner), Some(lease_id)) = (connection.owner.as_ref(), connection.lease_id.as_ref())
+    {
+        // A released connection must not revoke a replacement owned by the
+        // same process while its final response was still being delivered.
+        if shared.lease.release_connection(owner, lease_id.as_str()) {
+            shared.bump_lease_epoch();
+        }
     }
     result
 }
@@ -7574,6 +7578,8 @@ mod launch_layout_tests;
 
 #[cfg(test)]
 mod tests {
+    mod controller_cleanup;
+
     use std::time::Duration;
 
     use super::{
@@ -9538,7 +9544,7 @@ mod tests {
             stale,
         );
 
-        leases.release_connection(&first_owner);
+        assert!(leases.release_connection(&first_owner, first_lease.as_str()));
         let next_owner = crate::LeaseOwner {
             daemon_id: "daemon-next".to_owned(),
             peer_pid: 11,
