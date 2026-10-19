@@ -701,6 +701,13 @@ fn render_uninstall(report: &report::UninstallReport) -> String {
     for path in &report.removed {
         let _ = writeln!(text, "removed {}", path.display());
     }
+    for path in &report.kept_purge_entries {
+        let _ = writeln!(
+            text,
+            "kept {} (outside purge scope)",
+            report::escaped_purge_path(path)
+        );
+    }
     for kept in &report.kept_versions {
         let _ = writeln!(text, "kept version {}: {}", kept.version, kept.reason);
     }

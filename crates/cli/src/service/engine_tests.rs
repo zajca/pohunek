@@ -1721,7 +1721,7 @@ fn seed_schema_backups(paths: &BasePaths) -> (Vec<PathBuf>, Vec<PathBuf>) {
         std::fs::write(backup, "{\"kind\":\"resume\"}\n").expect("schema backup");
     }
     let lookalikes = [
-        "metadata.jsonl.tmp.1.2",
+        "metadata.jsonl.tmp.01.2",
         "metadata.jsonl.pre-schema-",
         "metadata.jsonl.pre-schema-01",
         "metadata.jsonl.pre-schema--1",
@@ -1808,6 +1808,235 @@ async fn purge_removes_the_schema_migration_backups_with_the_store() {
         );
         assert!(!report.removed.contains(lookalike));
     }
+}
+
+/// Purge consumes the archived manifest, without deleting unrelated migrations.
+#[tokio::test]
+async fn purge_removes_imported_legacy_manifest_archives() {
+    let harness = Harness::new();
+    let paths = harness.context.paths().clone();
+    seed_durable_metadata(&paths);
+    let migrations = paths.data_dir.join("migrations");
+    std::fs::create_dir(&migrations).expect("migrations");
+    std::fs::set_permissions(
+        &migrations,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("private migrations");
+    let archive =
+        migrations.join("durable-session-workers.imported-0123456789abcdef-fedcba9876543210.json");
+    std::fs::write(&archive, "synthetic legacy sessions").expect("archive");
+    let short_archive = migrations.join("durable-session-workers.imported--0123456789abcdef.json");
+    std::fs::write(&short_archive, "already migrated archive").expect("short archive");
+    let lookalike =
+        migrations.join("durable-session-workers.imported-0123456789abcdef0-fedcba9876543210.json");
+    std::fs::write(&lookalike, "unrelated").expect("archive lookalike");
+    let unrelated = migrations.join("durable-session-workers.json");
+    std::fs::write(&unrelated, "pending manifest").expect("unrelated migration");
+    let _record = pending_install_at_config(&harness).await;
+
+    let report = harness.engine().uninstall(PURGE).await.expect("purge");
+    assert!(report.purged);
+    assert!(!archive.exists(), "imported session archive survives purge");
+    assert!(report.removed.contains(&archive));
+    assert!(!short_archive.exists());
+    assert!(report.removed.contains(&short_archive));
+    assert_eq!(
+        std::fs::read_to_string(&lookalike).expect("lookalike"),
+        "unrelated"
+    );
+    assert!(report.kept_purge_entries.contains(&lookalike));
+    assert!(report.kept_purge_entries.contains(&unrelated));
+    assert!(report
+        .kept_purge_entries
+        .contains(&paths.data_dir.join("worktrees")));
+    assert_eq!(
+        std::fs::read_to_string(&unrelated).expect("pending manifest"),
+        "pending manifest"
+    );
+    assert_purged(&paths);
+    let retry = harness.engine().uninstall(PURGE).await;
+    assert!(matches!(retry, Err(Error::NotInstalled { .. })));
+    assert_eq!(
+        std::fs::read_to_string(&unrelated).expect("retained after retry"),
+        "pending manifest"
+    );
+}
+
+/// Atomic store copies from crashed writers are session metadata too.
+#[tokio::test]
+async fn purge_removes_crashed_store_temps() {
+    let harness = Harness::new();
+    let paths = harness.context.paths().clone();
+    seed_durable_metadata(&paths);
+    let temporary = paths.data_dir.join("metadata.jsonl.tmp.4242.0");
+    std::fs::write(&temporary, "synthetic store copy").expect("store temp");
+    let second = paths
+        .data_dir
+        .join("metadata.jsonl.tmp.4294967295.18446744073709551615");
+    std::fs::write(&second, "store copy").expect("second temp");
+    let lookalikes = [
+        "metadata.jsonl.tmp.01.2",
+        "metadata.jsonl.tmp.1.2.3",
+        "metadata.jsonl.tmp.4294967296.0",
+        "metadata.jsonl.tmp.1.18446744073709551616",
+        "other.jsonl.tmp.1.2",
+    ];
+    for name in lookalikes {
+        std::fs::write(paths.data_dir.join(name), "keep").expect("lookalike");
+    }
+    let _record = pending_install_at_config(&harness).await;
+
+    let report = harness.engine().uninstall(PURGE).await.expect("purge");
+    assert!(report.purged);
+    assert!(!temporary.exists(), "crashed store temp survives purge");
+    assert!(report.removed.contains(&temporary));
+    assert!(!second.exists());
+    assert!(report.removed.contains(&second));
+    for name in lookalikes {
+        let path = paths.data_dir.join(name);
+        assert_eq!(std::fs::read_to_string(&path).expect("lookalike"), "keep");
+        assert!(report.kept_purge_entries.contains(&path));
+    }
+    assert_purged(&paths);
+}
+
+/// A recognized temp-name symlink is unlinked without touching its target.
+#[tokio::test]
+async fn purge_unlinks_a_store_temp_symlink_and_preserves_its_referent() {
+    let harness = Harness::new();
+    let paths = harness.context.paths().clone();
+    seed_durable_metadata(&paths);
+    let referent = paths.data_dir.join("worktrees/repo/keep");
+    std::fs::write(&referent, "owner work").expect("referent");
+    let temporary = paths.data_dir.join("metadata.jsonl.tmp.4242.0");
+    std::os::unix::fs::symlink(&referent, &temporary).expect("temp symlink");
+    let _record = pending_install_at_config(&harness).await;
+
+    let report = harness.engine().uninstall(PURGE).await.expect("purge");
+    assert!(report.purged);
+    assert!(
+        temporary.symlink_metadata().is_err(),
+        "temp symlink survives purge"
+    );
+    assert!(report.removed.contains(&temporary));
+    assert_eq!(
+        std::fs::read_to_string(&referent).expect("referent"),
+        "owner work"
+    );
+    assert_purged(&paths);
+}
+
+/// Purge must still emit successful CLI JSON when retained Unix names are not UTF-8.
+#[tokio::test]
+async fn purge_reports_non_utf8_retained_names_as_escaped_json_strings() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    for in_migrations in [false, true] {
+        let harness = Harness::new();
+        let paths = harness.context.paths().clone();
+        seed_durable_metadata(&paths);
+        let parent = if in_migrations {
+            let migrations = paths.data_dir.join("migrations");
+            std::fs::create_dir(&migrations).expect("migrations");
+            std::fs::set_permissions(
+                &migrations,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .expect("private migrations");
+            migrations
+        } else {
+            paths.data_dir.clone()
+        };
+        let mut names: Vec<(&[u8], &str)> = vec![
+            (b"keep-\\xff", r"keep-\\xff"),
+            (b"keep-\n", r"keep-\n"),
+            ("keep-é".as_bytes(), r"keep-\xc3\xa9"),
+        ];
+        let non_utf8 = parent.join(std::ffi::OsStr::from_bytes(b"keep-\xff"));
+        match std::fs::write(&non_utf8, "owner work") {
+            Ok(()) => names.push((b"keep-\xff", r"keep-\xff")),
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                {
+                    // Native APFS rejects this name before a purge can ever observe it.
+                    assert_eq!(error.raw_os_error(), Some(nix::libc::EILSEQ));
+                    non_utf8
+                        .symlink_metadata()
+                        .expect_err("a rejected filename has no directory entry");
+                    eprintln!("filesystem explicitly rejected the non-UTF-8 fixture with EILSEQ; supported retained names still exercise purge and JSON");
+                }
+                #[cfg(not(target_os = "macos"))]
+                panic!("non-UTF-8 fixture must be supported on this filesystem: {error}");
+            }
+        }
+        for (name, _) in &names {
+            std::fs::write(parent.join(std::ffi::OsStr::from_bytes(name)), "owner work")
+                .expect("retained file");
+        }
+        let _record = pending_install_at_config(&harness).await;
+
+        let report = harness.engine().uninstall(PURGE).await.expect("purge");
+        assert!(report.purged);
+        assert_purged(&paths);
+        harness.assert_clean();
+        let json = crate::commands::render_json(&report).expect("successful purge must serialize");
+        let document: serde_json::Value = serde_json::from_str(&json).expect("CLI JSON document");
+        let entries = document["ok"]["kept_purge_entries"]
+            .as_array()
+            .expect("retained paths");
+        for (name, escaped) in &names {
+            let path = parent.join(std::ffi::OsStr::from_bytes(name));
+            assert_eq!(
+                std::fs::read_to_string(path).expect("retained file"),
+                "owner work"
+            );
+            let expected = format!("{}/{escaped}", parent.display());
+            assert!(entries.contains(&serde_json::Value::String(expected)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn purge_never_follows_a_symlinked_migrations_directory() {
+    let harness = Harness::new();
+    let paths = harness.context.paths().clone();
+    seed_durable_metadata(&paths);
+    let owner = paths.data_dir.join("worktrees/repo");
+    let archive =
+        owner.join("durable-session-workers.imported-0123456789abcdef-fedcba9876543210.json");
+    std::fs::write(&archive, "owner work").expect("referent");
+    std::os::unix::fs::symlink(&owner, paths.data_dir.join("migrations")).expect("migrations link");
+    let _record = pending_install_at_config(&harness).await;
+    harness
+        .engine()
+        .uninstall(PURGE)
+        .await
+        .expect_err("symlinked parent is refused");
+    assert_eq!(
+        std::fs::read_to_string(&archive).expect("owner archive"),
+        "owner work"
+    );
+}
+
+#[tokio::test]
+async fn purge_refuses_a_directory_at_a_recognized_store_temp_name() {
+    let harness = Harness::new();
+    let paths = harness.context.paths().clone();
+    seed_durable_metadata(&paths);
+    let directory = paths.data_dir.join("metadata.jsonl.tmp.4242.0");
+    std::fs::create_dir(&directory).expect("wrong type");
+    std::fs::write(directory.join("keep"), "owner work").expect("owner file");
+    let _record = pending_install_at_config(&harness).await;
+    harness
+        .engine()
+        .uninstall(PURGE)
+        .await
+        .expect_err("directory is not a temp file");
+    assert_eq!(
+        std::fs::read_to_string(directory.join("keep")).expect("owner file"),
+        "owner work"
+    );
 }
 
 #[tokio::test]

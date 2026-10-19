@@ -5,12 +5,13 @@
 
 // Rust guideline compliant 2026-09-30
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use pohunek_platform::supervisor::{ServiceObservation, ServiceState};
 use pohunek_service_config::preflight::PreflightReport;
 use pohunek_service_config::runtimes::EnsureReport;
-use serde::Serialize;
+use serde::ser::SerializeSeq as _;
+use serde::{Serialize, Serializer};
 
 use super::usage::JournalRef;
 
@@ -143,6 +144,15 @@ pub struct UninstallReport {
     pub retired_workers: Vec<String>,
     /// Files and directories removed.
     pub removed: Vec<PathBuf>,
+    /// Retained data/migration entries, serialized as byte-escaped display strings.
+    ///
+    /// Arbitrary Unix names must not make JSON rendering fail after purge commits.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_purge_paths"
+    )]
+    pub kept_purge_entries: Vec<PathBuf>,
     /// Version directories kept, with the reason.
     pub kept_versions: Vec<KeptVersion>,
     /// Whether durable metadata was purged.
@@ -151,6 +161,25 @@ pub struct UninstallReport {
     pub started_daemon: bool,
     /// An interrupted transaction that was rolled back first.
     pub rolled_back: Option<PendingReport>,
+}
+
+/// Display a retained path without losing invalid UTF-8 bytes or emitting controls.
+pub(crate) fn escaped_purge_path(path: &Path) -> String {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .escape_ascii()
+        .to_string()
+}
+
+fn serialize_purge_paths<S: Serializer>(
+    paths: &[PathBuf],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let mut sequence = serializer.serialize_seq(Some(paths.len()))?;
+    for path in paths {
+        sequence.serialize_element(&escaped_purge_path(path))?;
+    }
+    sequence.end()
 }
 
 /// Result of a passing `pohunek service check`.

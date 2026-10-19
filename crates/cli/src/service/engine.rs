@@ -202,7 +202,8 @@ use crate::paths::Paths;
 /// directory (`events`). Worktrees, notifications, and configuration are
 /// never purged: they may hold the owner's work. The store's pre-migration
 /// backups (`pohunek_paths::is_schema_backup_artifact`) are full copies of it
-/// and are purged with it.
+/// and are purged with it, alongside crashed store-write copies and imported
+/// legacy-manifest archives. Unrecognized data entries are retained and reported.
 const PURGED_DATA_FILES: [&str; 1] = [pohunek_paths::METADATA_STORE_NAME];
 
 /// Durable metadata directories `--purge` removes from the data directory.
@@ -2210,11 +2211,18 @@ impl<'a> Engine<'a> {
                     report.removed.push(paths.data_dir.join(backup));
                 }
             }
+            purge_store_artifacts(&data, report)?;
             for name in PURGED_DATA_DIRS {
                 if layout::remove_tree(&data, name)? {
                     report.removed.push(paths.data_dir.join(name));
                 }
             }
+            report.kept_purge_entries.extend(
+                data.entry_names()
+                    .map_err(|source| super::error::fs_error("list retained data entries", source))?
+                    .into_iter()
+                    .map(|name| paths.data_dir.join(name)),
+            );
         }
         if let Some(state) = layout::open_existing_owner_dir(&paths.state_dir)? {
             for name in PURGED_STATE_DIRS {
@@ -2223,6 +2231,7 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+        report.kept_purge_entries.sort();
         Ok(())
     }
 
@@ -3287,6 +3296,53 @@ fn file_exists(path: &Path) -> Result<bool, Error> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(super::error::io_error("inspect", path)(error)),
     }
+}
+
+/// Removes only producer-recognized artifacts through retained directory descriptors.
+fn purge_store_artifacts(
+    data: &pohunek_platform::filesystem::TrustedDir,
+    report: &mut UninstallReport,
+) -> Result<(), Error> {
+    purge_recognized_entries(
+        data,
+        report,
+        |name| pohunek_paths::is_metadata_store_temp(pohunek_paths::METADATA_STORE_NAME, name),
+        false,
+    )?;
+    let migrations = match data
+        .open_child_owner_safe(pohunek_paths::MIGRATIONS_SUBDIR, layout::FORBIDDEN_BITS)
+    {
+        Ok(directory) => directory,
+        Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => return Ok(()),
+        Err(source) => return Err(super::error::fs_error("open migrations for purge", source)),
+    };
+    purge_recognized_entries(
+        &migrations,
+        report,
+        pohunek_paths::is_imported_manifest_archive,
+        true,
+    )
+}
+
+fn purge_recognized_entries(
+    directory: &pohunek_platform::filesystem::TrustedDir,
+    report: &mut UninstallReport,
+    recognized: impl Fn(&str) -> bool,
+    report_kept: bool,
+) -> Result<(), Error> {
+    let mut names = directory
+        .entry_names()
+        .map_err(|source| super::error::fs_error("list purge artifacts", source))?;
+    names.sort();
+    for name in names {
+        if let Some(name) = name.to_str().filter(|name| recognized(name)) {
+            record::remove_purge_artifact(directory, name)?;
+            report.removed.push(directory.path().join(name));
+        } else if report_kept {
+            report.kept_purge_entries.push(directory.path().join(name));
+        }
+    }
+    Ok(())
 }
 
 /// Names of the schema-migration backups of `store` in `data`.

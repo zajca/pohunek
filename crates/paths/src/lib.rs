@@ -1036,6 +1036,13 @@ pub fn encode_worker_generation(entropy: [u8; WORKER_GENERATION_ENTROPY_BYTES]) 
         .collect()
 }
 
+/// Atomic metadata-store and imported legacy-manifest artifact names.
+mod store_artifacts;
+pub use store_artifacts::{
+    is_imported_manifest_archive, is_metadata_store_temp, legacy_manifest_archive_name,
+    metadata_store_temp_name, LEGACY_MANIFEST_NAME, MIGRATIONS_SUBDIR,
+};
+
 /// Name of the pre-migration backup of `store` taken at schema `schema`.
 ///
 /// The daemon writes it next to the store; `is_schema_backup_artifact` is its

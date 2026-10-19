@@ -5777,8 +5777,8 @@ fn import_legacy_manifest(store: &crate::store::Store) -> Result<LegacyManifest,
         ));
     };
     let path = data_dir
-        .join("migrations")
-        .join("durable-session-workers.json");
+        .join(pohunek_paths::MIGRATIONS_SUBDIR)
+        .join(pohunek_paths::LEGACY_MANIFEST_NAME);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -5982,17 +5982,10 @@ fn archive_imported_manifest(
     path: &std::path::Path,
     manifest: &LegacyMigrationManifest,
 ) -> Result<(), ProtocolError> {
-    let fingerprint = manifest
-        .store_sha256
-        .chars()
-        .filter(char::is_ascii_hexdigit)
-        .take(16)
-        .collect::<String>();
-    let created_hash = format!("{:x}", Sha256::digest(manifest.created_at.as_bytes()));
-    let archive = path.with_file_name(format!(
-        "durable-session-workers.imported-{}-{}.json",
-        fingerprint,
-        &created_hash[..16]
+    let created_digest = Sha256::digest(manifest.created_at.as_bytes()).into();
+    let archive = path.with_file_name(pohunek_paths::legacy_manifest_archive_name(
+        &manifest.store_sha256,
+        &created_digest,
     ));
     std::fs::rename(path, archive).map_err(|error| {
         runtime_error(
@@ -11673,10 +11666,7 @@ handler = "codex-hook-v1"
             .expect("read migrations dir")
             .filter_map(Result::ok)
             .any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("durable-session-workers.imported-")
+                pohunek_paths::is_imported_manifest_archive(&entry.file_name().to_string_lossy())
             });
         assert!(
             archived,
