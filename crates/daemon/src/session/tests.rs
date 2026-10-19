@@ -10514,13 +10514,15 @@ async fn descendant_inconclusive_exit_callback(foreground: Option<Pid>, unreadab
         ..codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID)
     };
     let unrelated = codex_fact(UNRELATED_AGENT_PID, created.pid);
+    // No scan may first verify this identity: an already-bound claim correctly
+    // keeps its start identity when a later probe becomes inconclusive.
+    inspector.fail_identity_with(unreadable, std::io::ErrorKind::Other);
     inspector.set_descendants(created.pid, vec![wrapper, reporter.clone(), unrelated]);
     inspector.set_foreground_group(created.pid, foreground);
 
     registry
         .rescan_procwatch_at(&created.id, created.pid, Instant::now())
         .await;
-    inspector.fail_identity_with(unreadable, std::io::ErrorKind::Other);
     let report = registry
         .report_agent(SessionReportAgentParams {
             session_id: created.id.clone(),
