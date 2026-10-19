@@ -36,6 +36,7 @@ pub mod engine;
 pub mod error;
 pub mod inherited;
 pub mod layout;
+pub mod ledger;
 mod legacy_store;
 pub mod manager_env;
 pub mod preflight;
@@ -262,6 +263,20 @@ async fn finish_check(
     if checked.adoption == Adoption::Required {
         let job = engine::installed_job_path(context).await?;
         let warnings = engine::job_warnings(context, &job);
+        // Reading the ledger changes nothing, so a check with the flag leaves the
+        // state exactly as it found it.
+        let acceptance = match &checked.installed_version {
+            Some(installed) => {
+                let store = record::Store::new(context.paths().state_dir.clone());
+                ledger::Acceptance::bind(
+                    store.read_ledger()?.as_deref(),
+                    &store.ledger_path(),
+                    context.namespace()?.as_str(),
+                    installed,
+                )?
+            }
+            None => ledger::Acceptance::none(),
+        };
         let gated = preflight::gate_upgrade(
             preflight,
             context,
@@ -271,12 +286,15 @@ async fn finish_check(
             &job.variables,
             preflight::ReleasePlan::Included,
             accept_runtime_loss,
+            &acceptance,
         )
         .await
         .map_err(|error| error.with_warnings(&warnings))?;
         checked.report.accepted_runtime_loss |= gated.accepted;
+        checked.report.acceptance = gated.acceptance;
         checked.report.preflight = Some(gated.report);
         checked.report.warnings = warnings;
+        checked.report.warnings.extend(gated.warnings);
     }
     Ok(checked.report)
 }
@@ -866,6 +884,9 @@ pub(crate) struct Checked {
     pub(crate) adoption: Adoption,
     /// Pending upgrade whose rollback needs the previous reader's verdict.
     pub(crate) rollback: Option<record::Record>,
+    /// The installed version whose sessions the adoption gate judges; the
+    /// accepted-risk ledger applies only to it.
+    pub(crate) installed_version: Option<String>,
 }
 
 /// Whether a check asks the new daemon's adoption preflight
@@ -903,6 +924,7 @@ pub(crate) fn check_local(
         .map(|prefix| absolute("--prefix", prefix))
         .transpose()?;
     let mut adoption = Adoption::NotApplicable;
+    let mut installed_version = None;
     let config_path = context.config_path();
     let store = record::Store::new(context.paths().state_dir.clone());
     let pending = store.load()?;
@@ -942,6 +964,11 @@ pub(crate) fn check_local(
             if engine::swaps_daemon(&plan, Some(config.active_version()), version) {
                 adoption = Adoption::Required;
             }
+            installed_version = Some(
+                plan.record()
+                    .and_then(|record| record.previous_version.clone())
+                    .unwrap_or_else(|| config.active_version().to_owned()),
+            );
             let layout = config.layout();
             if let Some(requested) = prefix.filter(|requested| requested != layout.prefix()) {
                 return Err(Error::PrefixMismatch {
@@ -985,6 +1012,7 @@ pub(crate) fn check_local(
         locked,
         preflight: None,
         accepted_runtime_loss: false,
+        acceptance: report::AcceptanceGroups::default(),
         config_schema_migration,
         warnings: Vec::new(),
     };
@@ -995,6 +1023,7 @@ pub(crate) fn check_local(
         discovery_first: matches!(plan, engine::Plan::RollBack(_)),
         adoption,
         rollback,
+        installed_version,
     })
 }
 
@@ -1392,6 +1421,7 @@ mod tests {
             runtime_stop: false,
             runtime_backup: None,
             launchd_default_path: None,
+            accepted_risks: None,
         };
         assert_eq!(
             checked_config_migration(&engine::Plan::Resume(record.clone()), &source, "2.0.0"),

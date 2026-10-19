@@ -5,7 +5,8 @@
 //! daemon (see `pohunek_daemon::session::upgrade_preflight` for its evidence).
 //! This module runs it, reads the report, and decides: a store the new daemon
 //! cannot start with is always refused, and sessions at risk are refused unless
-//! the operator passed `--accept-runtime-loss`.
+//! the operator passed `--accept-runtime-loss` or an earlier upgrade accepted
+//! the identical risk (see [`super::ledger`]).
 
 // Rust guideline compliant 2026-06-26
 
@@ -20,14 +21,16 @@ use std::time::Duration;
 use pohunek_paths::DAEMON_EXECUTABLE_NAME;
 use pohunek_platform::supervisor::SEARCH_PATH_VARIABLE;
 use pohunek_service_config::preflight::{
-    preflight_timeout, PreflightReport, SessionVerdict, PROBE_BUDGET, PROBE_BUDGET_FLAG,
-    RELEASE_PLAN_FLAG, REPORT_VERSION,
+    preflight_timeout, PreflightReport, PROBE_BUDGET, PROBE_BUDGET_FLAG, RELEASE_PLAN_FLAG,
+    REPORT_VERSION,
 };
 use tokio::io::AsyncReadExt as _;
 
 use super::context::Context;
 use super::error::Error;
 use super::layout;
+use super::ledger::{Acceptance, AcceptedSet, Entry, List, OneTime};
+use super::report::AcceptanceGroups;
 use super::runtimes;
 use super::settings;
 use super::VERSION;
@@ -117,10 +120,17 @@ pub(super) fn set_search_path(command: &mut tokio::process::Command, search_path
 pub struct Gated {
     /// What the new daemon reported.
     pub report: PreflightReport,
-    /// Whether at-risk sessions exist and `--accept-runtime-loss` accepted them.
+    /// Whether at-risk sessions that no earlier upgrade accepted exist and
+    /// `--accept-runtime-loss` accepted them.
     pub accepted: bool,
     /// Conditions of the judgement's inputs that the operator must be told.
     pub warnings: Vec<String>,
+    /// How the at-risk sessions were accepted.
+    pub acceptance: AcceptanceGroups,
+    /// The scoped at-risk verdicts this gate lets through, for the ledger the
+    /// completed transaction writes; its `recorded_at` is stamped by the
+    /// engine when the gate is journaled.
+    pub accepted_set: AcceptedSet,
 }
 
 /// Runs the preflight of the staged `daemon` and applies the operator's choice.
@@ -153,7 +163,7 @@ pub async fn gate(
         false,
     )
     .await?;
-    decide(report, accept_runtime_loss)
+    decide(report, accept_runtime_loss, &Acceptance::none())
 }
 
 /// Runs [`gate`] for an upgrade, which also refuses a runtime plan that cannot
@@ -166,7 +176,7 @@ pub async fn gate(
 /// # Errors
 ///
 /// Returns [`Error::UpgradeRuntimesRefused`] for a refused plan, and the errors
-/// of [`gate`] otherwise.
+/// of [`gate`] otherwise. At-risk verdicts `acceptance` holds do not block.
 #[allow(
     clippy::too_many_arguments,
     reason = "the judgement inputs are passed one by one, as gate does, and the plan is the eighth"
@@ -180,6 +190,7 @@ pub async fn gate_upgrade(
     variables: &BTreeMap<String, String>,
     plan: ReleasePlan,
     accept_runtime_loss: bool,
+    acceptance: &Acceptance,
 ) -> Result<Gated, Error> {
     let report = judge_daemon(
         preflight,
@@ -195,7 +206,7 @@ pub async fn gate_upgrade(
     if let Some(plan) = &report.runtimes {
         runtimes::check_plan(plan)?;
     }
-    decide(report, accept_runtime_loss)
+    decide(report, accept_runtime_loss, acceptance)
 }
 
 /// Checks the staged `daemon` is of `version` and returns its report.
@@ -249,12 +260,21 @@ pub(super) async fn probe_daemon(daemon: &Path, version: &str) -> Result<(), Err
 
 /// Applies the operator's choice to `report`.
 ///
+/// An at-risk verdict that `acceptance` holds, with the identical scope, is
+/// previously accepted and does not block. `accept_runtime_loss` accepts the
+/// whole remainder.
+///
 /// # Errors
 ///
 /// Returns [`Error::UpgradeStoreUnusable`] when the new daemon would refuse to
 /// start with the store, whatever the flag says, and [`Error::UpgradeAtRisk`]
-/// when sessions are at risk and `accept_runtime_loss` is `false`.
-pub fn decide(report: PreflightReport, accept_runtime_loss: bool) -> Result<Gated, Error> {
+/// when sessions remain at risk and `accept_runtime_loss` is `false`; it lists
+/// only the remainder.
+pub fn decide(
+    report: PreflightReport,
+    accept_runtime_loss: bool,
+    acceptance: &Acceptance,
+) -> Result<Gated, Error> {
     if report.store_refused() {
         return Err(Error::UpgradeStoreUnusable {
             path: report.store.path,
@@ -262,38 +282,70 @@ pub fn decide(report: PreflightReport, accept_runtime_loss: bool) -> Result<Gate
             detail: report.store.error.unwrap_or_default(),
         });
     }
-    let sessions: Vec<SessionVerdict> = report
-        .sessions
-        .iter()
-        .filter(|session| session.verdict.at_risk())
-        .cloned()
-        .collect();
-    let stopped_sessions: Vec<SessionVerdict> = report
-        .stopped_sessions
-        .iter()
-        .filter(|session| session.verdict.at_risk())
-        .cloned()
-        .collect();
-    if sessions.is_empty() && stopped_sessions.is_empty() {
-        return Ok(Gated {
-            report,
-            accepted: false,
-            warnings: Vec::new(),
-        });
+    let store = report.store.path.clone();
+    let mut warnings = acceptance.warnings().to_vec();
+    warnings.extend(acceptance.store_mismatch(&store));
+    let mut remainder = [Vec::new(), Vec::new()];
+    let mut covered = Vec::new();
+    for (slot, list, verdicts) in [
+        (0, List::Live, &report.sessions),
+        (1, List::Stopped, &report.stopped_sessions),
+    ] {
+        for verdict in verdicts.iter().filter(|verdict| verdict.verdict.at_risk()) {
+            if acceptance.covers(&store, list, verdict) {
+                covered.push((list, verdict.clone()));
+            } else {
+                remainder[slot].push((list, verdict.clone()));
+            }
+        }
     }
-    if accept_runtime_loss {
-        Ok(Gated {
-            report,
-            accepted: true,
-            warnings: Vec::new(),
-        })
-    } else {
-        Err(Error::UpgradeAtRisk {
-            sessions,
-            stopped_sessions,
-            warnings: Vec::new(),
-        })
+    let mut groups = AcceptanceGroups::default();
+    if !covered.is_empty() {
+        groups.previously_accepted_at = acceptance.applied_version().map(ToOwned::to_owned);
+        groups.previously_accepted = covered.iter().map(|(_, verdict)| verdict.clone()).collect();
     }
+    let [live, stopped] = remainder;
+    if !live.is_empty() || !stopped.is_empty() {
+        if !accept_runtime_loss {
+            return Err(Error::UpgradeAtRisk {
+                sessions: live.into_iter().map(|(_, verdict)| verdict).collect(),
+                stopped_sessions: stopped.into_iter().map(|(_, verdict)| verdict).collect(),
+                acceptance: Box::new(groups),
+                warnings,
+            });
+        }
+        for (_, verdict) in live.iter().chain(&stopped) {
+            if verdict.acceptance_scope.is_some() {
+                groups.durable_acceptance.push(verdict.clone());
+            } else {
+                groups.one_time_acceptance.push(verdict.clone());
+            }
+        }
+    }
+    let accepted = !groups.durable_acceptance.is_empty() || !groups.one_time_acceptance.is_empty();
+    let mut entries = Vec::new();
+    let mut one_time = Vec::new();
+    for (list, verdict) in covered.iter().chain(live.iter()).chain(stopped.iter()) {
+        match Entry::of(*list, verdict) {
+            Some(entry) => entries.push(entry),
+            None => one_time.push(OneTime {
+                session_id: verdict.session_id.clone(),
+                code: verdict.code.clone(),
+            }),
+        }
+    }
+    Ok(Gated {
+        accepted_set: AcceptedSet {
+            store_path: store,
+            recorded_at: String::new(),
+            entries,
+            one_time,
+        },
+        report,
+        accepted,
+        warnings,
+        acceptance: groups,
+    })
 }
 
 /// Runs the daemon's preflight with the environment the installed daemon gets.

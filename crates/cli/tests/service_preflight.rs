@@ -19,6 +19,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+use pohunek_cli::service::ledger::Acceptance;
 use pohunek_cli::service::manager_env::{
     user_manager_environment, EnvironmentFailure, UserManager,
 };
@@ -72,6 +73,16 @@ fn service_upgrade_and_check_help_name_stopped_session_recovery_risks() {
                     "It never overrides a metadata store the new daemon cannot start with"
                 ),
                 "{text}"
+            );
+            assert!(
+                loss_help.contains("the identical risk is not asked about again")
+                    && loss_help.contains("it changes no session"),
+                "{loss_help}"
+            );
+        } else {
+            assert!(
+                loss_help.contains("The check records nothing"),
+                "{loss_help}"
             );
         }
     }
@@ -369,6 +380,7 @@ async fn an_already_not_resumable_session_is_listed_without_requiring_the_flag()
         &std::collections::BTreeMap::new(),
         ReleasePlan::Included,
         false,
+        &Acceptance::none(),
     )
     .await
     .expect("a session the running release already refuses is not at risk");
@@ -416,10 +428,86 @@ async fn the_real_daemon_names_a_session_it_would_not_adopt_and_the_flag_accepts
     assert!(gated.accepted);
     assert_eq!(gated.report.at_risk().count(), 1);
     // `decide` is the whole policy: the same report is refused without the flag.
-    let refused = decide(gated.report, false).expect_err("refused without the flag");
+    let refused =
+        decide(gated.report, false, &Acceptance::none()).expect_err("refused without the flag");
     assert!(
         matches!(refused, Error::UpgradeAtRisk { .. }),
         "{refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_real_daemons_acceptance_scope_is_honoured_by_the_coverage_decision() {
+    use pohunek_cli::service::ledger::{Entry, Ledger, List, SCHEMA_VERSION};
+    use pohunek_service_config::preflight::ACCEPTANCE_SCOPE_V1;
+
+    let host = Host::new();
+    host.seed_live_session(false);
+    // A record that names no worker generation is judged, not adopted, and the
+    // verdict is one the daemon binds to a scope.
+    let store = host.context.paths().data_dir.join("metadata.jsonl");
+    let body = std::fs::read_to_string(&store).expect("read store");
+    let mut line: serde_json::Value = serde_json::from_str(body.trim()).expect("store line");
+    let runtime = line["runtime"].as_object_mut().expect("runtime");
+    for field in ["generation", "service_id", "executable"] {
+        runtime.remove(field);
+    }
+    std::fs::write(&store, format!("{line}\n")).expect("write store");
+    let archive = host.archive();
+
+    let judged = gate(
+        &DaemonPreflight,
+        &host.context,
+        &archive,
+        VERSION,
+        "/usr/bin:/bin",
+        &std::collections::BTreeMap::new(),
+        true,
+    )
+    .await
+    .expect("the flag accepts the session");
+    let report = judged.report;
+    let verdict = report.sessions[0].clone();
+    assert_eq!(verdict.code, "worker_generation_missing", "{verdict:?}");
+    let scope = verdict
+        .acceptance_scope
+        .clone()
+        .expect("the real daemon binds the verdict to a scope");
+    assert!(
+        scope.starts_with(&format!("{ACCEPTANCE_SCOPE_V1}:")),
+        "{scope}"
+    );
+    let refused = decide(report.clone(), false, &Acceptance::none())
+        .expect_err("nothing accepted the risk yet");
+    assert!(
+        matches!(refused, Error::UpgradeAtRisk { .. }),
+        "{refused:?}"
+    );
+
+    let ledger = Ledger {
+        schema_version: SCHEMA_VERSION,
+        namespace: "test".to_owned(),
+        store_path: report.store.path.clone(),
+        applied_version: "0.0.1".to_owned(),
+        previous_version: None,
+        applied_at: "2026-10-19T00:00:00Z".to_owned(),
+        scope_scheme: ACCEPTANCE_SCOPE_V1.to_owned(),
+        entries: vec![Entry::of(List::Live, &verdict).expect("a scoped verdict")],
+    };
+    let acceptance = Acceptance::bind(
+        Some(&serde_json::to_vec(&ledger).expect("serialize the ledger")),
+        Path::new("ledger.json"),
+        "test",
+        "0.0.1",
+    )
+    .expect("a valid ledger");
+    let gated =
+        decide(report, false, &acceptance).expect("the identical scope is previously accepted");
+    assert!(!gated.accepted, "the flag was not needed");
+    assert_eq!(gated.acceptance.previously_accepted.len(), 1);
+    assert_eq!(
+        gated.acceptance.previously_accepted_at.as_deref(),
+        Some("0.0.1")
     );
 }
 
@@ -535,6 +623,7 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
         &std::collections::BTreeMap::new(),
         ReleasePlan::Included,
         true,
+        &Acceptance::none(),
     )
     .await
     .expect_err("a refused plan is not overridable");
@@ -562,6 +651,7 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
         &std::collections::BTreeMap::new(),
         ReleasePlan::Included,
         false,
+        &Acceptance::none(),
     )
     .await
     .expect_err("a stopped session at risk needs the flag");
@@ -595,6 +685,7 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
         &std::collections::BTreeMap::new(),
         ReleasePlan::Included,
         true,
+        &Acceptance::none(),
     )
     .await
     .expect("the flag accepts the stopped session");
@@ -635,6 +726,7 @@ async fn a_profile_warning_reaches_the_gate_and_leaves_its_decision_unchanged() 
         &std::collections::BTreeMap::new(),
         ReleasePlan::Included,
         false,
+        &Acceptance::none(),
     )
     .await
     .expect("a profile warning does not refuse the upgrade");
@@ -650,6 +742,7 @@ async fn a_profile_warning_reaches_the_gate_and_leaves_its_decision_unchanged() 
         &std::collections::BTreeMap::new(),
         ReleasePlan::Included,
         false,
+        &Acceptance::none(),
     )
     .await
     .expect("the clean report passes the gate");
@@ -893,6 +986,7 @@ async fn a_raised_probe_budget_reaches_only_this_releases_upgrade_judgement() {
         &no_variables,
         ReleasePlan::Omitted,
         false,
+        &Acceptance::none(),
     )
     .await
     .expect("this release accepts the raised budget");
@@ -909,6 +1003,7 @@ async fn a_raised_probe_budget_reaches_only_this_releases_upgrade_judgement() {
         &no_variables,
         ReleasePlan::Omitted,
         false,
+        &Acceptance::none(),
     )
     .await
     .expect("the default budget judges");
@@ -1100,6 +1195,7 @@ async fn the_release_plan_flag_reaches_the_daemon_only_for_the_upgrade_judgement
         &std::collections::BTreeMap::new(),
         ReleasePlan::Included,
         false,
+        &Acceptance::none(),
     )
     .await
     .expect_err("the upgrade's judgement without the flag is not what the daemon answers");

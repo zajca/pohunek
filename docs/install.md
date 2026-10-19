@@ -132,7 +132,10 @@ sessions, leaves its stopped sessions resumable (a resume relaunches them from
 the package digest), and reinstalls the hooks. A host already on official
 packages gets the release's versions: profiles pinned to an older version of the
 same official package are repinned, and its stopped sessions move to the newer
-version on their next resume or fork, see the update runbook. `--accept-runtime-loss` is only
+version on their next resume or fork, see the update runbook. An accepted risk is remembered:
+after `--accept-runtime-loss` the completed upgrade records each verdict the daemon binds to a
+scope, and the next upgrade lists the identical risk as previously accepted instead of refusing
+(see the update runbook); no session is changed by that. `--accept-runtime-loss` is only
 for a session the new daemon cannot adopt, after you have reviewed the session
 list; it never overrides a plan the release cannot apply
 (`service_upgrade_runtimes_refused`, before anything is stopped) or a store the

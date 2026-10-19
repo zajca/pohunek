@@ -5619,7 +5619,7 @@ async fn a_second_command_is_refused_while_a_transaction_holds_the_lock() {
     drop(held);
     let status = status_once_free(&harness, config.as_ref()).await;
     assert!(!status.transaction_in_progress);
-    once_free("the transaction lock", || harness.upgrade(V2))
+    Box::pin(once_free("the transaction lock", || harness.upgrade(V2)))
         .await
         .expect("upgrade after release");
     harness.assert_installed(V2);
@@ -8247,4 +8247,549 @@ impl AdoptionPreflight for CountingFailure {
             })
         })
     }
+}
+
+// Durable acceptance of upgrade risk (the accepted-risk ledger).
+
+const SCOPE_A: &str = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const SCOPE_A_CHANGED: &str = "v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// A stopped session at risk whose verdict the daemon bound to `scope`.
+fn stopped_at_risk(session: &str, code: &str, scope: Option<&str>) -> SessionVerdict {
+    SessionVerdict {
+        session_id: session.to_owned(),
+        name: None,
+        verdict: Verdict::WouldLoseRecovery,
+        code: code.to_owned(),
+        detail: "the runtime source is not served".to_owned(),
+        acceptance_scope: scope.map(ToOwned::to_owned),
+    }
+}
+
+fn risk_a() -> SessionVerdict {
+    stopped_at_risk(OTHER_SESSION, "runtime_source_not_served", Some(SCOPE_A))
+}
+
+fn risk_b() -> SessionVerdict {
+    stopped_at_risk(THIRD_SESSION, "runtime_source_not_served", Some(SCOPE_A))
+}
+
+fn judging(stopped: &[SessionVerdict]) -> Box<ScriptedPreflight> {
+    Box::new(ScriptedPreflight {
+        stopped: stopped.to_vec(),
+        ..ScriptedPreflight::default()
+    })
+}
+
+impl Harness {
+    /// Upgrades to `version` over `stopped` with the given flag.
+    async fn upgrade_over(
+        &self,
+        version: &str,
+        stopped: &[SessionVerdict],
+        accept: bool,
+    ) -> Result<UpgradeReport, Error> {
+        self.engine()
+            .with_runtime_loss_accepted(accept)
+            .with_adoption_preflight(judging(stopped))
+            .upgrade(&self.staged(version), version)
+            .await
+    }
+
+    fn ledger_bytes(&self) -> Option<Vec<u8>> {
+        self.engine().store.read_ledger().expect("read the ledger")
+    }
+
+    fn ledger(&self) -> Option<Ledger> {
+        self.ledger_bytes()
+            .map(|bytes| serde_json::from_slice(&bytes).expect("a valid ledger"))
+    }
+
+    /// Replaces the ledger file with `edit` applied to the current one.
+    fn edit_ledger(&self, edit: impl FnOnce(&mut serde_json::Value)) {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&self.ledger_bytes().expect("a ledger")).expect("ledger json");
+        edit(&mut value);
+        std::fs::write(
+            self.engine().store.ledger_path(),
+            serde_json::to_vec(&value).expect("serialize"),
+        )
+        .expect("write the ledger");
+    }
+
+    /// Every file of the state directory with its bytes and mode.
+    fn state_snapshot(&self) -> std::collections::BTreeMap<PathBuf, (u32, Vec<u8>)> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn walk(path: &Path, into: &mut std::collections::BTreeMap<PathBuf, (u32, Vec<u8>)>) {
+            let metadata = std::fs::symlink_metadata(path).expect("stat");
+            let bytes = if metadata.is_file() {
+                std::fs::read(path).expect("read")
+            } else {
+                Vec::new()
+            };
+            into.insert(path.to_path_buf(), (metadata.permissions().mode(), bytes));
+            if metadata.is_dir() {
+                for entry in std::fs::read_dir(path).expect("list") {
+                    walk(&entry.expect("entry").path(), into);
+                }
+            }
+        }
+        let mut into = std::collections::BTreeMap::new();
+        walk(&self.context.paths().state_dir, &mut into);
+        into
+    }
+}
+
+/// Installs V1 and upgrades to V2 accepting `risk_a`, leaving its ledger.
+async fn harness_with_accepted_risk() -> Harness {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let report = harness
+        .upgrade_over(V2, &[risk_a()], true)
+        .await
+        .expect("the flag accepts the risk");
+    assert!(report.accepted_runtime_loss);
+    assert_eq!(report.acceptance.durable_acceptance, [risk_a()]);
+    harness
+}
+
+#[tokio::test]
+async fn an_accepted_risk_is_not_asked_about_again_at_the_next_upgrade() {
+    let harness = harness_with_accepted_risk().await;
+    let ledger = harness.ledger().expect("the upgrade left a ledger");
+    assert_eq!(ledger.applied_version, V2);
+    assert_eq!(ledger.previous_version.as_deref(), Some(V1));
+    assert_eq!(ledger.entries.len(), 1);
+    assert_eq!(ledger.entries[0].session_id, OTHER_SESSION);
+    assert_eq!(ledger.entries[0].scope, SCOPE_A);
+
+    let report = harness
+        .upgrade_over(V3, &[risk_a()], false)
+        .await
+        .expect("the identical risk was accepted at the previous upgrade");
+
+    assert!(!report.accepted_runtime_loss, "the flag was not needed");
+    assert_eq!(report.acceptance.previously_accepted, [risk_a()]);
+    assert_eq!(
+        report.acceptance.previously_accepted_at.as_deref(),
+        Some(V2)
+    );
+    harness.assert_installed(V3);
+    let carried = harness.ledger().expect("the ledger is replaced");
+    assert_eq!(carried.applied_version, V3);
+    assert_eq!(carried.entries, ledger.entries);
+}
+
+#[tokio::test]
+async fn a_new_risk_beside_an_accepted_one_refuses_and_lists_only_the_new_one() {
+    let harness = harness_with_accepted_risk().await;
+
+    let error = harness
+        .upgrade_over(V3, &[risk_a(), risk_b()], false)
+        .await
+        .expect_err("the second session was never accepted");
+
+    let Error::UpgradeAtRisk {
+        sessions,
+        stopped_sessions,
+        acceptance,
+        ..
+    } = &error
+    else {
+        panic!("{error:?}");
+    };
+    assert!(sessions.is_empty());
+    assert_eq!(stopped_sessions, &[risk_b()]);
+    assert_eq!(acceptance.previously_accepted, [risk_a()]);
+    assert!(
+        error
+            .to_string()
+            .contains("previously accepted at upgrade to"),
+        "{error}"
+    );
+    harness.assert_installed(V2);
+}
+
+#[tokio::test]
+async fn a_risk_whose_scope_changed_is_asked_about_again() {
+    let harness = harness_with_accepted_risk().await;
+    let changed = stopped_at_risk(
+        OTHER_SESSION,
+        "runtime_source_not_served",
+        Some(SCOPE_A_CHANGED),
+    );
+
+    let error = harness
+        .upgrade_over(V3, std::slice::from_ref(&changed), false)
+        .await
+        .expect_err("the daemon bound the verdict to other facts");
+
+    let Error::UpgradeAtRisk {
+        stopped_sessions, ..
+    } = &error
+    else {
+        panic!("{error:?}");
+    };
+    assert_eq!(stopped_sessions, &[changed]);
+    harness.assert_installed(V2);
+}
+
+#[tokio::test]
+async fn a_check_with_the_flag_changes_nothing_on_disk() {
+    let harness = harness_with_accepted_risk().await;
+    let before = harness.state_snapshot();
+
+    let checked = crate::service::check_with_preflight(
+        &harness.context,
+        &harness.staged(V3),
+        &ScriptedPreflight {
+            stopped: vec![risk_a(), risk_b()],
+            ..ScriptedPreflight::default()
+        },
+        V3,
+        true,
+    )
+    .await
+    .expect("the flag accepts the new risk in a check");
+
+    assert_eq!(checked.acceptance.previously_accepted, [risk_a()]);
+    assert_eq!(checked.acceptance.durable_acceptance, [risk_b()]);
+    assert_eq!(harness.state_snapshot(), before, "a check writes no ledger");
+}
+
+#[tokio::test]
+async fn a_refused_or_failed_upgrade_leaves_the_earlier_ledger_untouched() {
+    let harness = harness_with_accepted_risk().await;
+    let before = harness.ledger_bytes();
+
+    harness
+        .upgrade_over(V3, &[risk_a(), risk_b()], false)
+        .await
+        .expect_err("refused at the gate");
+    assert_eq!(harness.ledger_bytes(), before, "a refusal writes nothing");
+
+    // The new daemon definition is refused after the gate passed with the
+    // flag, so the transaction rolls back.
+    harness.fake.world().refused_replace = Some(V3.to_owned());
+    harness
+        .upgrade_over(V3, &[risk_a(), risk_b()], true)
+        .await
+        .expect_err("the replacement fails and rolls back");
+    assert_eq!(harness.pending(), None);
+    harness.assert_installed(V2);
+    assert_eq!(harness.ledger_bytes(), before, "a rollback writes nothing");
+}
+
+#[tokio::test]
+async fn an_interrupted_accepting_upgrade_resumes_to_the_same_ledger() {
+    let reference = harness_with_accepted_risk().await;
+    let expected = reference.ledger().expect("a ledger");
+
+    for interrupted_at in [Step::Registering, Step::Registered, Step::Ready, Step::Cli] {
+        let harness = Harness::new();
+        harness.install(V1).await.expect("install");
+        let mut engine = harness
+            .engine()
+            .with_runtime_loss_accepted(true)
+            .with_adoption_preflight(judging(&[risk_a()]));
+        engine.interrupt_after = Some(interrupted_at);
+        engine
+            .upgrade(&harness.staged(V2), V2)
+            .await
+            .expect_err("interrupted");
+        assert_eq!(
+            harness.ledger_bytes(),
+            None,
+            "{interrupted_at:?}: not final"
+        );
+        let journaled = harness
+            .pending()
+            .expect("the record is kept")
+            .accepted_risks
+            .expect("the gate journaled its accepted set");
+        assert_eq!(journaled.entries.len(), 1, "{interrupted_at:?}");
+
+        harness
+            .upgrade_over(V2, &[risk_a()], true)
+            .await
+            .expect("the resume completes");
+
+        let mut ledger = harness.ledger().expect("the resume wrote the ledger");
+        // Each harness has its own roots and clock.
+        ledger.applied_at.clone_from(&expected.applied_at);
+        ledger.namespace.clone_from(&expected.namespace);
+        ledger.store_path.clone_from(&expected.store_path);
+        assert_eq!(ledger, expected, "{interrupted_at:?}");
+    }
+
+    // A crash after the ledger write and before the record is cleared repeats
+    // the same replace.
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let mut engine = harness
+        .engine()
+        .with_runtime_loss_accepted(true)
+        .with_adoption_preflight(judging(&[risk_a()]));
+    engine.interrupt_after = Some(Step::Cli);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted");
+    let record = harness.pending().expect("the record is kept");
+    harness
+        .engine()
+        .write_ledger(&record)
+        .expect("the write that precedes the clear");
+    let written = harness.ledger_bytes();
+    harness
+        .upgrade_over(V2, &[risk_a()], true)
+        .await
+        .expect("the resume completes");
+    assert_eq!(harness.ledger_bytes(), written);
+}
+
+#[tokio::test]
+async fn a_ledger_of_a_rolled_back_transaction_is_inert() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.upgrade_over(V2, &[], false).await.expect("upgrade");
+    let mut engine = harness
+        .engine()
+        .with_runtime_loss_accepted(true)
+        .with_adoption_preflight(judging(&[risk_a()]));
+    engine.interrupt_after = Some(Step::Cli);
+    engine
+        .upgrade(&harness.staged(V3), V3)
+        .await
+        .expect_err("interrupted at the last step");
+    let record = harness.pending().expect("the record is kept");
+    harness
+        .engine()
+        .write_ledger(&record)
+        .expect("the ledger is written before the clear");
+    assert_eq!(harness.ledger().expect("a ledger").applied_version, V3);
+
+    // Another version rolls the Ready record back to V2, which the ledger no
+    // longer names, and then judges the risk without it.
+    let error = harness
+        .upgrade_over("4.0.0", &[risk_a()], false)
+        .await
+        .expect_err("the ledger names V3, which the rollback undid");
+
+    let Error::UpgradeAtRisk {
+        stopped_sessions,
+        warnings,
+        ..
+    } = &error
+    else {
+        panic!("{error:?}");
+    };
+    assert_eq!(stopped_sessions, &[risk_a()]);
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("accepted-risk ledger")),
+        "{warnings:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_verdict_without_a_scope_is_a_one_time_acceptance_and_not_recorded() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let unscoped = stopped_at_risk(OTHER_SESSION, "probe_budget_exhausted", None);
+    let scoped = risk_b();
+
+    let report = harness
+        .upgrade_over(V2, &[unscoped.clone(), scoped.clone()], true)
+        .await
+        .expect("the flag accepts both");
+
+    assert_eq!(report.acceptance.one_time_acceptance, [unscoped]);
+    assert_eq!(report.acceptance.durable_acceptance, [scoped]);
+    let ledger = harness.ledger().expect("a ledger");
+    assert_eq!(ledger.entries.len(), 1);
+    assert_eq!(ledger.entries[0].session_id, THIRD_SESSION);
+    let error = harness
+        .upgrade_over(
+            V3,
+            &[stopped_at_risk(
+                OTHER_SESSION,
+                "probe_budget_exhausted",
+                None,
+            )],
+            false,
+        )
+        .await
+        .expect_err("a one-time acceptance is asked about again");
+    assert!(matches!(error, Error::UpgradeAtRisk { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_ledger_for_other_facts_is_ignored_with_a_warning_and_refuses() {
+    type Edit = fn(&mut serde_json::Value);
+    let edits: [(&str, Edit); 5] = [
+        ("version", |ledger| {
+            ledger["applied_version"] = "9.9.9".into();
+        }),
+        ("namespace", |ledger| ledger["namespace"] = "another".into()),
+        ("store path", |ledger| {
+            ledger["store_path"] = "/elsewhere/metadata.jsonl".into();
+        }),
+        ("scope scheme", |ledger| {
+            ledger["scope_scheme"] = "v2".into();
+        }),
+        ("schema", |ledger| {
+            ledger["schema_version"] = 2.into();
+            ledger["unknown_future_field"] = true.into();
+        }),
+    ];
+    for (name, edit) in edits {
+        let harness = harness_with_accepted_risk().await;
+        harness.edit_ledger(edit);
+
+        let error = harness
+            .upgrade_over(V3, &[risk_a()], false)
+            .await
+            .expect_err(name);
+
+        let Error::UpgradeAtRisk {
+            stopped_sessions,
+            warnings,
+            ..
+        } = &error
+        else {
+            panic!("{name}: {error:?}");
+        };
+        assert_eq!(stopped_sessions, &[risk_a()], "{name}");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("accepted-risk ledger")),
+            "{name}: {warnings:?}"
+        );
+        harness.assert_installed(V2);
+
+        // With the flag the upgrade and the check pass, and both still say why
+        // the ledger did not apply.
+        let checked = crate::service::check_with_preflight(
+            &harness.context,
+            &harness.staged(V3),
+            &ScriptedPreflight {
+                stopped: vec![risk_a()],
+                ..ScriptedPreflight::default()
+            },
+            V3,
+            true,
+        )
+        .await
+        .expect(name);
+        assert!(
+            checked
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("accepted-risk ledger")),
+            "{name}: {:?}",
+            checked.warnings
+        );
+        let report = harness
+            .upgrade_over(V3, &[risk_a()], true)
+            .await
+            .expect(name);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("accepted-risk ledger")),
+            "{name}: {:?}",
+            report.warnings
+        );
+        assert_eq!(report.acceptance.durable_acceptance, [risk_a()], "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_corrupt_or_unsafe_ledger_is_a_typed_error_that_names_the_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let corrupt = harness_with_accepted_risk().await;
+    std::fs::write(corrupt.engine().store.ledger_path(), b"{ not json")
+        .expect("corrupt the ledger");
+    let error = corrupt
+        .upgrade_over(V3, &[risk_a()], true)
+        .await
+        .expect_err("a corrupt ledger is not guessed at");
+    assert_eq!(error.code(), "service_accepted_risks_invalid");
+    assert!(
+        error.to_string().contains("service-accepted-risks.json"),
+        "{error}"
+    );
+    corrupt.assert_installed(V2);
+
+    let unsafe_mode = harness_with_accepted_risk().await;
+    std::fs::set_permissions(
+        unsafe_mode.engine().store.ledger_path(),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .expect("loosen the mode");
+    let error = unsafe_mode
+        .upgrade_over(V3, &[risk_a()], true)
+        .await
+        .expect_err("a ledger others can read is refused");
+    assert_eq!(error.code(), "service_accepted_risks_invalid");
+}
+
+#[tokio::test]
+async fn a_schema_4_record_resumes_and_loads_without_an_accepted_set() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted");
+    let path = harness.engine().store.path();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read the record"))
+            .expect("record json");
+    value["schema_version"] = 4.into();
+    value
+        .as_object_mut()
+        .expect("object")
+        .remove("accepted_risks");
+    std::fs::write(&path, serde_json::to_vec(&value).expect("serialize"))
+        .expect("write the schema 4 record");
+    assert_eq!(harness.pending().expect("loads").accepted_risks, None);
+
+    harness
+        .upgrade(V2)
+        .await
+        .expect("the schema 4 record resumes");
+
+    harness.assert_installed(V2);
+    assert_eq!(harness.ledger_bytes(), None, "no gate ran, so no ledger");
+}
+
+#[tokio::test]
+async fn the_rollback_gate_never_consults_the_ledger() {
+    let harness = harness_with_accepted_risk().await;
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .with_runtime_loss_accepted(true)
+        .with_adoption_preflight(judging(&[risk_a()]))
+        .upgrade(&harness.staged(V3), V3)
+        .await
+        .expect_err("interrupted after replacement");
+
+    let error = harness
+        .engine()
+        .with_adoption_preflight(judging(&[risk_a()]))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("the previous release emits no scope, so nothing is accepted");
+
+    assert_eq!(error.code(), "service_rollback_sessions_at_risk");
 }

@@ -17,7 +17,7 @@ except inside the upgrade window below.
 
 ### Upgrade window
 
-The contract: release N stays compatible with release N-1 in exactly four
+The contract: release N stays compatible with release N-1 in exactly five
 places, and nowhere else; everything outside this window keeps the no-shim
 rule. The current state of each place is stated separately.
 
@@ -54,6 +54,17 @@ rule. The current state of each place is stated separately.
   tested against the same recordings) when the daemon answers in N-1. A method
   new in N fails on the client with `daemon/daemon_protocol_too_old` before it
   is sent ([#527](https://github.com/zajca/pohunek/issues/527)).
+- **Accepted upgrade risk.** Contract: the CLI remembers which at-risk verdicts
+  an upgrade accepted, and the next gate treats a verdict as previously
+  accepted only when the daemon of the release being installed reproduces the
+  digest recorded with it. State: the preflight report's optional
+  `acceptance_scope` (`v1:` and a digest, frozen by a golden test in
+  `crates/daemon/tests/upgrade_preflight.rs`) and the CLI's
+  `<state>/pohunek/service-accepted-risks.json` (schema 1, replaced by every
+  completed upgrade, bound to the installed version, namespace and metadata
+  store). It fails closed in both directions: a missing, mismatched, unknown or
+  unreadable scope, scheme, schema or ledger means not accepted, and there are
+  no reader shims. A change to the digested facts needs a new scheme name.
 - **Persisted daemon state.** Contract and state: `metadata.jsonl` migrates
   from any older kept schema, because skipping releases is normal with
   `update-pohunek`. A persisted shape change requires a schema bump and a

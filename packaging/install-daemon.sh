@@ -38,7 +38,9 @@
 # and `service upgrade`, whose upgrade preflight refuses (with the typed error
 # `service_upgrade_sessions_at_risk`) while a live session would not be adopted
 # by the new daemon or would lose its native recovery; the flag lets the
-# upgrade proceed and report what it accepted. A store the new daemon refuses
+# upgrade proceed and report what it accepted; the completed upgrade records the
+# accepted verdicts, so the identical risk is not asked about again at the next
+# upgrade, and no session is changed. A store the new daemon refuses
 # to start with is never overridable. `service install` takes no such flag and
 # is never given it.
 

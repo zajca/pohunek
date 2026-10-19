@@ -205,6 +205,12 @@ pub const MAX_HOLDER_BYTES: usize = 4 * 1024;
 /// The record holds a few short fields; anything larger is corrupt.
 pub const MAX_RECORD_BYTES: usize = 64 * 1024;
 
+/// Maximum size of the accepted-risk ledger.
+///
+/// The ledger holds one short entry per at-risk session of the last upgrade;
+/// anything larger is corrupt.
+pub const MAX_LEDGER_BYTES: usize = 1024 * 1024;
+
 pub use pohunek_platform::shell_env::{
     DEFAULT_LOGIN_SHELL, LOGIN_SHELL_OUTPUT, LOGIN_SHELL_TIMEOUT,
 };

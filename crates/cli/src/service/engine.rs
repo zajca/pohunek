@@ -179,14 +179,15 @@ use super::error::{supervisor_error, Error, LiveSession, OutdatedWorker};
 use super::layout::{self, Staged};
 use pohunek_platform::shell_env::SearchPath;
 
+use super::ledger::{Acceptance, Ledger};
 use super::manager_env;
 use super::preflight::{self, AdoptionPreflight, DaemonPreflight, Gated};
 use super::record::{self, ConfigBackup, Operation, Record, Step, Store, TransactionLock};
-use super::report::IntegrationReinstall;
 use super::report::{
     state_name, InstallReport, JobReport, KeptVersion, PendingReport, SearchPathReport,
     StatusReport, UninstallReport, UpgradeReport, VersionReport, WorkerReport,
 };
+use super::report::{AcceptanceGroups, IntegrationReinstall};
 use super::rollback;
 use super::runtimes::{self, CliIntegrations, DaemonRuntimes, IntegrationStep, RuntimeStep};
 use super::settings;
@@ -544,6 +545,7 @@ impl<'a> Engine<'a> {
                     runtime_stop: false,
                     runtime_backup: None,
                     launchd_default_path: None,
+                    accepted_risks: None,
                 };
                 self.store.save(&record)?;
                 record
@@ -682,6 +684,7 @@ impl<'a> Engine<'a> {
                 accepted_runtime_loss: rolled_back
                     .as_ref()
                     .is_some_and(|report| report.accepted_runtime_loss),
+                acceptance: AcceptanceGroups::default(),
                 rolled_back,
                 config_schema_migration: None,
                 runtimes: None,
@@ -711,6 +714,7 @@ impl<'a> Engine<'a> {
                 runtime_stop: false,
                 runtime_backup: None,
                 launchd_default_path,
+                accepted_risks: None,
             };
             self.store.save(&record)?;
             record
@@ -738,10 +742,19 @@ impl<'a> Engine<'a> {
             .await;
         // The preflight right before the swap is the one that counts.
         let gated = late.gated.or(gated);
+        let acceptance = gated
+            .as_ref()
+            .map(|gated| gated.acceptance.clone())
+            .unwrap_or_default();
+        // A ledger the gate ignored is reported even when the upgrade passes.
+        let mut warnings = late.warnings;
+        if let Some(gated) = &gated {
+            warnings.extend(gated.warnings.iter().cloned());
+        }
         let (removed_versions, kept_versions, gc_error) =
             self.collect_garbage_reported(&layout, version).await;
         Ok(UpgradeReport {
-            warnings: late.warnings,
+            warnings,
             from_version,
             to_version: version.to_owned(),
             unchanged: false,
@@ -753,6 +766,7 @@ impl<'a> Engine<'a> {
                 || rolled_back
                     .as_ref()
                     .is_some_and(|report| report.accepted_runtime_loss),
+            acceptance,
             preflight: gated.map(|Gated { report, .. }| report).or_else(|| {
                 rolled_back
                     .as_ref()
@@ -797,6 +811,14 @@ impl<'a> Engine<'a> {
         }
         let job = installed_job_path(self.context).await?;
         let warnings = job_warnings(self.context, &job);
+        let basis = match (&installed, plan) {
+            (Some(config), _) => config.active_version().to_owned(),
+            (None, Plan::Resume(record) | Plan::RollBack(record)) => self.gate_basis(record)?,
+            (None, Plan::Fresh) => {
+                unreachable!("a fresh plan loads the installed configuration")
+            }
+        };
+        let acceptance = self.acceptance(&basis)?;
         let gated = preflight::gate_upgrade(
             &*self.preflight,
             self.context,
@@ -806,6 +828,7 @@ impl<'a> Engine<'a> {
             &job.variables,
             preflight::ReleasePlan::Included,
             self.accept_runtime_loss,
+            &acceptance,
         )
         .await
         .map_err(|error| error.with_warnings(&warnings))?;
@@ -1107,32 +1130,8 @@ impl<'a> Engine<'a> {
         late.warnings.extend(warnings.iter().cloned());
         if swap {
             if let Some(dir) = config.daemon_executable().parent() {
-                match preflight::gate_upgrade(
-                    &*self.preflight,
-                    self.context,
-                    dir,
-                    self.reported(&version),
-                    &job.value,
-                    &job.variables,
-                    preflight::ReleasePlan::Included,
-                    self.accept_runtime_loss,
-                )
-                .await
-                {
-                    Ok(gated) => {
-                        if let Err(error) =
-                            require_manager_variables(&job, &gated.report, self.accept_runtime_loss)
-                        {
-                            late.refused = true;
-                            return Err(error);
-                        }
-                        late.gated = Some(gated);
-                    }
-                    Err(error) => {
-                        late.refused = true;
-                        return Err(error.with_warnings(&warnings));
-                    }
-                }
+                self.pass_swap_gate(record, dir, &job, &warnings, late)
+                    .await?;
             }
         }
         self.run_runtimes(record, layout, late, &job, &warnings)
@@ -1159,7 +1158,137 @@ impl<'a> Engine<'a> {
             self.advance(record, Step::Cli)?;
         }
         self.checkpoint(Step::Cli)?;
+        self.write_ledger(record)?;
         self.store.clear()
+    }
+
+    /// The version whose sessions the gates of `record` judge: the one the
+    /// upgrade replaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Record`] for a record that names no previous version.
+    fn gate_basis(&self, record: &Record) -> Result<String, Error> {
+        record
+            .previous_version
+            .clone()
+            .ok_or_else(|| Error::Record {
+                path: self.store.path(),
+                detail: "an upgrade record names no previous version".to_owned(),
+            })
+    }
+
+    /// The acceptances an earlier upgrade left for the installed `version`.
+    ///
+    /// Reading writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::AcceptedRisks`] for a ledger that cannot be read safely.
+    fn acceptance(&self, version: &str) -> Result<Acceptance, Error> {
+        let namespace = self.context.namespace()?;
+        let read = self.store.read_ledger()?;
+        Acceptance::bind(
+            read.as_deref(),
+            &self.store.ledger_path(),
+            namespace.as_str(),
+            version,
+        )
+    }
+
+    /// [`Self::acceptance`] for the gates of `record`.
+    fn gate_acceptance(&self, record: &Record) -> Result<Acceptance, Error> {
+        self.acceptance(&self.gate_basis(record)?)
+    }
+
+    /// Journals what the gate that just passed accepted, before the
+    /// transaction advances past it.
+    ///
+    /// A later gate of the same run, or a resumed run that repeats this one,
+    /// replaces the set, so consent always comes from the invocation that
+    /// passed the gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem error when the record cannot be saved.
+    fn journal_gate(&self, record: &mut Record, gated: &mut Gated) -> Result<(), Error> {
+        gated.accepted_set.recorded_at = now();
+        record.accepted_risks = Some(gated.accepted_set.clone());
+        self.store.save(record)
+    }
+
+    /// Replaces the accepted-risk ledger with the set the last gate journaled.
+    ///
+    /// It is the last effect before the record is cleared, so a crash before
+    /// the clear repeats this idempotent replace and a rollback, which clears
+    /// the record without it, never writes.
+    fn write_ledger(&self, record: &Record) -> Result<(), Error> {
+        let Some(set) = &record.accepted_risks else {
+            return Ok(());
+        };
+        let namespace = self.context.namespace()?;
+        self.store.write_ledger(&Ledger::of(
+            namespace.as_str(),
+            &record.version,
+            record.previous_version.as_deref(),
+            set,
+        ))
+    }
+
+    /// Runs the adoption gate right before the daemon is replaced or stopped
+    /// and journals what it accepted.
+    ///
+    /// A refusal leaves the running daemon untouched, which `late.refused`
+    /// records.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusals of the gate and a filesystem error when the
+    /// accepted set cannot be journaled.
+    async fn pass_swap_gate(
+        &self,
+        record: &mut Record,
+        daemon_dir: &Path,
+        job: &JobPath,
+        warnings: &[String],
+        late: &mut LateGate,
+    ) -> Result<(), Error> {
+        let acceptance = match self.gate_acceptance(record) {
+            Ok(acceptance) => acceptance,
+            Err(error) => {
+                late.refused = true;
+                return Err(error);
+            }
+        };
+        match preflight::gate_upgrade(
+            &*self.preflight,
+            self.context,
+            daemon_dir,
+            self.reported(&record.version),
+            &job.value,
+            &job.variables,
+            preflight::ReleasePlan::Included,
+            self.accept_runtime_loss,
+            &acceptance,
+        )
+        .await
+        {
+            Ok(mut gated) => {
+                if let Err(error) =
+                    require_manager_variables(job, &gated.report, self.accept_runtime_loss)
+                {
+                    late.refused = true;
+                    return Err(error);
+                }
+                self.journal_gate(record, &mut gated)?;
+                late.gated = Some(gated);
+                Ok(())
+            }
+            Err(error) => {
+                late.refused = true;
+                Err(error.with_warnings(warnings))
+            }
+        }
     }
 
     /// Verifies that the pre-upgrade bytes still on disk are the ones the
@@ -1260,34 +1389,8 @@ impl<'a> Engine<'a> {
         let warnings = job_warnings(self.context, &job);
         late.warnings.extend(warnings.iter().cloned());
         if let Some(dir) = config.daemon_executable().parent() {
-            match preflight::gate_upgrade(
-                &*self.preflight,
-                self.context,
-                dir,
-                self.reported(&record.version),
-                &job.value,
-                &job.variables,
-                preflight::ReleasePlan::Included,
-                self.accept_runtime_loss,
-            )
-            .await
-            {
-                Ok(gated) => {
-                    if let Err(error) =
-                        require_manager_variables(&job, &gated.report, self.accept_runtime_loss)
-                    {
-                        late.refused = true;
-                        return Err(error);
-                    }
-                    late.gated = Some(gated);
-                }
-                Err(error) => {
-                    late.refused = true;
-                    // Nothing stopped or written yet; the record rolls
-                    // back without stopping any daemon.
-                    return Err(error.with_warnings(&warnings));
-                }
-            }
+            self.pass_swap_gate(record, dir, &job, &warnings, late)
+                .await?;
         }
         // Record the intent before the service-manager effect. A crash
         // between these calls replays the idempotent stop on resume, and
@@ -1368,7 +1471,8 @@ impl<'a> Engine<'a> {
             // release judges the live sessions again, with the same decision as
             // the late gate. A refusal or a preflight that cannot run fails this
             // step, which rolls the apply back.
-            let gated = preflight::gate_upgrade(
+            let acceptance = self.gate_acceptance(record)?;
+            let mut gated = preflight::gate_upgrade(
                 &*self.preflight,
                 self.context,
                 &dir,
@@ -1378,10 +1482,12 @@ impl<'a> Engine<'a> {
                 // The apply has run, so the installed packages are the plan's result.
                 preflight::ReleasePlan::Omitted,
                 self.accept_runtime_loss,
+                &acceptance,
             )
             .await
             .map_err(|error| error.with_warnings(warnings))?;
             require_manager_variables(job, &gated.report, self.accept_runtime_loss)?;
+            self.journal_gate(record, &mut gated)?;
             late.gated = Some(gated);
         }
         self.advance(record, Step::Runtimes)
@@ -2399,6 +2505,13 @@ pub(super) fn job_alive(observation: &ServiceObservation) -> bool {
                 | ServiceState::Stopping
                 | ServiceState::Unknown
         )
+}
+
+/// The current time, RFC 3339.
+fn now() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("a UTC timestamp always formats")
 }
 
 /// The report of a pending transaction. Its warnings come from the rollback

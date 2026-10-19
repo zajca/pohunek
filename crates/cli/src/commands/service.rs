@@ -65,7 +65,9 @@ pub(crate) enum Action {
         /// adopt or would adopt without native recovery, and stopped sessions
         /// whose native recovery would be lost. The upgrade refuses either
         /// group without this flag. It never overrides a metadata store the new
-        /// daemon cannot start with.
+        /// daemon cannot start with. Accepting records each verdict the daemon
+        /// binds to a scope, so the identical risk is not asked about again at
+        /// the next upgrade; it changes no session.
         #[arg(long)]
         accept_runtime_loss: bool,
         /// Probe budget, in seconds, of the preflight that judges live and
@@ -123,6 +125,7 @@ pub(crate) enum Action {
         prefix: Option<PathBuf>,
         /// Pass the check although live or stopped sessions would lose runtime or
         /// native recovery, as `service upgrade --accept-runtime-loss` would.
+        /// The check records nothing.
         #[arg(long)]
         accept_runtime_loss: bool,
         /// Probe budget, in seconds, of the preflight that judges live and
@@ -390,6 +393,37 @@ fn render_preflight(text: &mut String, preflight: &PreflightReport, accepted_run
     render_profile_warnings(text, &preflight.profile_warnings);
 }
 
+/// Appends how the at-risk verdicts of the gate were, or would be, accepted.
+///
+/// Accepting records the verdicts for the next upgrade to recognize; it never
+/// changes a session.
+fn render_acceptance(text: &mut String, acceptance: &report::AcceptanceGroups) {
+    let mut group = |label: &str, note: &str, sessions: &[SessionVerdict]| {
+        if sessions.is_empty() {
+            return;
+        }
+        let _ = writeln!(text, "{label:<10} {} session(s) {note}", sessions.len());
+        for session in sessions {
+            let _ = writeln!(text, "  {}: [{}]", session.session_id, session.code);
+        }
+    };
+    let previously = acceptance.previously_accepted_at.as_deref().map_or_else(
+        || "previously accepted (not blocking)".to_owned(),
+        |version| format!("previously accepted at upgrade to {version} (not blocking)"),
+    );
+    group("accepted", &previously, &acceptance.previously_accepted);
+    group(
+        "recorded",
+        "accepted with --accept-runtime-loss; the identical risk is not asked about again, and the sessions are not changed",
+        &acceptance.durable_acceptance,
+    );
+    group(
+        "one-time",
+        "accepted with --accept-runtime-loss; nothing binds them, so the next upgrade asks again",
+        &acceptance.one_time_acceptance,
+    );
+}
+
 /// Appends the count line of the host profiles that load with a reduced
 /// guarantee and one line per profile. Warnings never block the upgrade.
 fn render_profile_warnings(text: &mut String, warnings: &[ProfileWarning]) {
@@ -574,6 +608,7 @@ fn render_upgrade(report: &report::UpgradeReport) -> String {
             }
         }
         render_preflight(&mut text, preflight, report.accepted_runtime_loss);
+        render_acceptance(&mut text, &report.acceptance);
     }
     text
 }
@@ -680,6 +715,7 @@ fn render_check(report: &report::CheckReport) -> String {
             render_plan(&mut text, plan);
         }
         render_preflight(&mut text, preflight, report.accepted_runtime_loss);
+        render_acceptance(&mut text, &report.acceptance);
     }
     text
 }
@@ -1140,6 +1176,7 @@ mod tests {
             locked: true,
             preflight: None,
             accepted_runtime_loss: false,
+            acceptance: report::AcceptanceGroups::default(),
             config_schema_migration: None,
             warnings: Vec::new(),
         });
@@ -1242,6 +1279,7 @@ mod tests {
             locked: false,
             preflight: Some(preflight),
             accepted_runtime_loss: false,
+            acceptance: report::AcceptanceGroups::default(),
             config_schema_migration: None,
             warnings: Vec::new(),
         });
@@ -1306,6 +1344,7 @@ mod tests {
             locked: false,
             preflight: Some(preflight),
             accepted_runtime_loss: false,
+            acceptance: report::AcceptanceGroups::default(),
             config_schema_migration: None,
             warnings: Vec::new(),
         });
@@ -1420,6 +1459,7 @@ mod tests {
             gc_error: Some("journals unreadable".to_owned()),
             preflight: None,
             accepted_runtime_loss: false,
+            acceptance: report::AcceptanceGroups::default(),
             config_schema_migration: None,
             runtimes: None,
             integrations: Vec::new(),

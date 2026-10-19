@@ -753,7 +753,9 @@ listed as an unmanaged worker and does not refuse the upgrade, unless a store
 line that names no session cannot be read (`worker_without_session_record`).
 Sessions at risk refuse the upgrade with
 `service_upgrade_sessions_at_risk` unless `--accept-runtime-loss`, the single
-loss-accepting flag, is given; a store the new daemon would refuse
+loss-accepting flag, is given or an earlier upgrade accepted the identical risk
+(the CLI-owned ledger `service-accepted-risks.json`, matched against the
+daemon-computed `acceptance_scope`; no session is changed); a store the new daemon would refuse
 (`service_upgrade_store_unusable`) and a preflight that cannot run
 (`service_upgrade_preflight_failed`) and a systemd user manager whose `PATH` cannot be read (`service_manager_environment_unavailable`) are never overridable. The report also carries the release's official runtime plan (`runtimes`, an `EnsureReport` of `ensure-official-runtimes --dry-run` judged against the registry as it will be after the plan is applied) and the stopped sessions that keep native resume or fork (`stopped_sessions`, judged by the same rules as live sessions and at risk under the same flag).  The official runtime step adds five codes, none overridden by `--accept-runtime-loss`: `service_upgrade_runtimes_refused` (the release's plan cannot be applied; nothing was stopped), `service_upgrade_runtimes_failed` (the release's runtime step did not produce a finished report), `service_runtime_backup_invalid` (a registry, catalog state or host profile cannot be backed up exactly), `service_staged_runtime_invalid` (the release's `runtime/` tree is not the layout the release assembles, or a sealed release lists a `runtime/` file it does not carry), and `service_upgrade_runtimes_unconfirmed` (the step's daemon run could not be ended and its exit confirmed, so the upgrade is kept and not rolled back). The preflight runs before any effect and again right
 before the daemon is replaced (the previous daemon cannot be paused, and its own
