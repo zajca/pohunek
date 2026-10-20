@@ -3697,7 +3697,16 @@ impl SessionRegistry {
         });
         let Some(child) = snapshot.child_process else {
             return !self
-                .insert_lost_record(record, "worker_child_missing", LossProof::Ended)
+                .insert_lost_record(
+                    record,
+                    "worker_child_missing",
+                    // A worker still `Starting` has not spawned its child yet.
+                    if snapshot.phase == RuntimePhase::Starting {
+                        LossProof::Unproven
+                    } else {
+                        LossProof::Ended
+                    },
+                )
                 .await;
         };
         let job = match super::Generation::from_record(&record.session_id, &record.runtime) {

@@ -60,11 +60,12 @@ where
 /// The registry retains terminal sessions — `record_exit` flips the state, it
 /// does not evict the entry — so without this filter a stopped/done/failed
 /// session would keep marking its worktree as occupied in `project show`. Only
-/// non-terminal (`Starting`/`Running`) sessions actually hold a worktree.
+/// non-terminal (`Starting`/`Running`) sessions, and lost runtimes whose cleanup
+/// is unconfirmed, actually hold a worktree.
 pub(super) fn live_sessions(infos: Vec<protocol::SessionInfo>) -> Vec<LiveSession> {
     infos
         .into_iter()
-        .filter(|session| !session.state.is_terminal())
+        .filter(|session| crate::session::holds_worktree(session))
         .map(|session| LiveSession {
             session_id: session.id.0,
             cwd: session.cwd,

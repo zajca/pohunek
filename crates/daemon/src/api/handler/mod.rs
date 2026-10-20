@@ -1621,6 +1621,21 @@ mod tests {
         }
     }
 
+    /// A `failed` session whose runtime was lost for `reason`.
+    fn lost_session(id: &str, reason: &str) -> protocol::SessionInfo {
+        let mut info = session(id, SessionState::Failed);
+        info.runtime = Some(protocol::SessionRuntime {
+            state: protocol::RuntimeState::Lost,
+            runtime_generation: protocol::RuntimeGeneration::new(1),
+            worker_id: None,
+            worker_instance_id: None,
+            started_at: None,
+            last_connected_at: None,
+            loss_reason: Some(reason.to_owned()),
+        });
+        info
+    }
+
     #[test]
     fn live_sessions_keeps_only_non_terminal_sessions() {
         let infos = vec![
@@ -1629,14 +1644,18 @@ mod tests {
             session("stopped", SessionState::Stopped),
             session("done", SessionState::Done),
             session("failed", SessionState::Failed),
+            lost_session("lost-confirmed", "runtime_lost"),
+            lost_session("lost-unconfirmed", "runtime_lost_cleanup_unconfirmed"),
         ];
 
         let live = live_sessions(infos);
 
         // Starting + Running survive; the three terminal states are dropped, so a
         // stopped session can no longer mark its worktree as occupied in `show`.
+        // A failed session whose lost runtime has an unconfirmed cleanup keeps
+        // its worktree occupied: marked processes may still run in it.
         let ids: Vec<&str> = live.iter().map(|s| s.session_id.as_str()).collect();
-        assert_eq!(ids, vec!["starting", "running"]);
+        assert_eq!(ids, vec!["starting", "running", "lost-unconfirmed"]);
     }
 
     #[test]

@@ -1463,7 +1463,9 @@ Durability tiers (honest about limits):
    as `running` with a lost runtime is re-classified by its call site's proof;
    a worker that answers again re-adopts the session as `running`. A `failed`
    session with a lost runtime stays resumable (resume keys on the runtime) and
-   ages under the lost retention window, aged from the last connection.
+   ages under the lost retention window, aged from the last connection. Like any
+   ended session it no longer holds its worktree, except while its cleanup is
+   unconfirmed (`runtime_lost_cleanup_unconfirmed`).
    Operations that need a running session still refuse it with
    `session_runtime_lost` and its recovery hint. N-1 readers know both values:
    they treat the session as ended and not stoppable. Rolled back to a release
