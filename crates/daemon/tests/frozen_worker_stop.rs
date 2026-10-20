@@ -25,9 +25,12 @@ use pohunek_daemon::runtime::{
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::process_env::ProcessEnv;
+use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
 use pohunek_test_support::wait::{guard, wait_until};
 use pohunek_test_support::worker_binary;
-use protocol::{SessionId, SessionNewParams, SessionState, ENV_DAEMON_ID, ENV_SESSION_ID};
+use protocol::{
+    SessionId, SessionInputParams, SessionNewParams, SessionState, ENV_DAEMON_ID, ENV_SESSION_ID,
+};
 
 /// Seconds the session's root sleeps if the stop never ends it.
 const ROOT_SLEEP_SECONDS: u32 = 30;
@@ -50,6 +53,22 @@ const WORKER_STOP_HEADROOM: Duration = Duration::from_millis(300);
 /// control connection (a periodic inspection already stuck on it).
 const EXCHANGE_WAIT: Duration = Duration::from_millis(500);
 
+/// How long a stop waits behind an input write holding the control connection,
+/// well above [`EXCHANGE_WAIT`] so the scenarios can tell the two apart.
+const INPUT_STOP_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the worker waits for the agent to read a byte before it fails an
+/// input; the scenarios' root never reads, so a large input holds the control
+/// connection for this long.
+const INPUT_STALL: Duration = Duration::from_secs(4);
+
+/// Bytes of an input too large for the terminal's line buffer, so the worker
+/// blocks delivering it.
+const BLOCKING_INPUT_BYTES: usize = 200 * 1024;
+
+/// Scheduler yields that let spawned tasks reach their next await.
+const SETTLE_YIELDS: usize = 256;
+
 /// Text the typed error carries.
 const NO_ANSWER: &str = "did not answer the stop";
 
@@ -64,6 +83,13 @@ struct Frozen {
 impl Frozen {
     /// Starts a session on a real worker and freezes the worker.
     async fn start() -> Self {
+        let frozen = Self::start_running().await;
+        kill(frozen.worker, Signal::SIGSTOP).expect("freeze the worker");
+        frozen
+    }
+
+    /// Starts a session on a real worker that answers.
+    async fn start_running() -> Self {
         let env = TestEnv::new().expect("create the test environment");
         let config = SessionRegistryConfig {
             shell_command: ShellCommand::new(
@@ -75,6 +101,8 @@ impl Frozen {
             terminal_commit_wait: TERMINAL_COMMIT_WAIT,
             worker_stop_headroom: WORKER_STOP_HEADROOM,
             worker_exchange_wait: EXCHANGE_WAIT,
+            worker_input_stop_wait: INPUT_STOP_WAIT,
+            input_write_stall_timeout: INPUT_STALL,
             ..SessionRegistryConfig::default()
         };
         let launcher = Arc::new(SubprocessWorkerLauncher::new());
@@ -128,7 +156,6 @@ impl Frozen {
             .await
             .expect("the session runs on a worker process");
         let worker = Pid::from_raw(i32::try_from(worker).expect("pid fits i32"));
-        kill(worker, Signal::SIGSTOP).expect("freeze the worker");
         Self {
             env,
             launcher,
@@ -226,4 +253,94 @@ async fn a_remove_of_a_frozen_worker_is_a_typed_error_and_keeps_the_record() {
         frozen.registry.inspect(&frozen.id).await.is_err(),
         "the removed session is gone"
     );
+}
+
+/// Lets spawned tasks run until they wait on something that needs time or the
+/// frozen worker.
+async fn settle() {
+    for _ in 0..SETTLE_YIELDS {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Starts an input the session's root never reads, so the worker blocks
+/// delivering it and the input holds the control connection until the stall
+/// timeout fails it.
+async fn hold_the_connection_with_input(
+    frozen: &Frozen,
+) -> tokio::task::JoinHandle<Result<protocol::SessionInputResult, protocol::ProtocolError>> {
+    let registry = frozen.registry.clone();
+    let id = frozen.id.clone();
+    let input = tokio::spawn(async move {
+        registry
+            .input(SessionInputParams {
+                session_id: id,
+                text: "x".repeat(BLOCKING_INPUT_BYTES),
+                wait: None,
+            })
+            .await
+    });
+    settle().await;
+    input
+}
+
+#[tokio::test]
+async fn a_stop_behind_an_input_outlasts_the_exchange_wait_and_proceeds_once_it_ends() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let frozen = Frozen::start_running().await;
+    let input = hold_the_connection_with_input(&frozen).await;
+    let registry = frozen.registry.clone();
+    let id = frozen.id.clone();
+    let stopping = tokio::spawn(async move { registry.stop(&id).await });
+    settle().await;
+
+    // The exchange wait elapses twice on the virtual clock while the input
+    // still holds the connection; the stop keeps waiting.
+    tokio::time::pause();
+    let inhibitor = AutoAdvanceInhibitor::new();
+    tokio::time::advance(EXCHANGE_WAIT * 2 + TIMER_TICK).await;
+    settle().await;
+    assert!(!stopping.is_finished(), "the stop waits behind the input");
+
+    // The input ends on the worker (acknowledged or failed by its stall
+    // policy) and the stop runs.
+    let _outcome = guard("the blocked input", input)
+        .await
+        .expect("input task joins");
+    guard("the stop behind the input", stopping)
+        .await
+        .expect("stop task joins")
+        .expect("the stop proceeds once the input ended");
+    inhibitor.release().await;
+}
+
+#[tokio::test]
+async fn a_worker_frozen_during_an_input_ends_the_stop_at_the_input_wait() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let frozen = Frozen::start_running().await;
+    let input = hold_the_connection_with_input(&frozen).await;
+    kill(frozen.worker, Signal::SIGSTOP).expect("freeze the worker mid-input");
+    let registry = frozen.registry.clone();
+    let id = frozen.id.clone();
+    let stopping = tokio::spawn(async move { registry.stop(&id).await });
+    settle().await;
+
+    tokio::time::pause();
+    let inhibitor = AutoAdvanceInhibitor::new();
+    tokio::time::advance(INPUT_STOP_WAIT + EXCHANGE_WAIT + TIMER_TICK).await;
+    let error = guard("the stop behind a frozen input", stopping)
+        .await
+        .expect("stop task joins")
+        .expect_err("a frozen worker cannot finish the input the stop waits behind");
+
+    assert_eq!(error.code, "worker_operation_failed", "{error:?}");
+    assert!(error.msg.contains(NO_ANSWER), "{error:?}");
+    assert!(error.msg.contains("input write"), "{error:?}");
+    frozen.thaw();
+    let _ = input.await;
+    inhibitor.release().await;
 }

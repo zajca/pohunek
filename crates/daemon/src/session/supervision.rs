@@ -1967,6 +1967,13 @@ mod tests {
                 config.worker_exchange_wait + config.worker_stop_bound()
             } <= 2 * pohunek_service_config::MAX_DEADLINE
         );
+        // A stop that waits the longest behind an input still ends with its
+        // typed error before the SDK's stop budget elapses.
+        let config = crate::session::SessionRegistryConfig::default();
+        assert!(
+            config.worker_input_stop_wait + config.worker_stop_bound()
+                < Duration::from_millis(u64::from(pohunek_client::SESSION_STOP_REQUEST_BUDGET_MS))
+        );
     }
 
     #[test]

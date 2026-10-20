@@ -54,7 +54,9 @@ use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessIdentity, ProcessInsp
 use crate::project::detect::{project_id, DetectedProject};
 use crate::project::{detect_at, ProjectManager};
 use crate::runtime::lifecycle::{Generation, LifecycleGuard, SessionLocks};
-use crate::runtime::{DimensionUpdate, SupervisionConfig, Worker, WorkerError, WorkerLauncher};
+use crate::runtime::{
+    DimensionUpdate, StopWaits, SupervisionConfig, Worker, WorkerError, WorkerLauncher,
+};
 use crate::store::{
     ActiveAgentOrigin, DesiredState, ProjectRecord, ReportTransport, ResumeBinding, RuntimeRecord,
     SessionRecord, SessionTransaction, SessionWriteOutcome, Store, TransactionKind, WorktreeStatus,
@@ -369,6 +371,10 @@ pub struct SessionRegistryConfig {
     /// connection to finish. Every such exchange is bounded by the worker's
     /// own limits, the longest being [`pohunek_service_config::MAX_DEADLINE`].
     pub worker_exchange_wait: Duration,
+    /// How long a stop waits behind an input write that holds the worker's
+    /// control connection; an input exchange may legitimately outlast
+    /// [`Self::worker_exchange_wait`].
+    pub worker_input_stop_wait: Duration,
     /// How long a one-shot attach token may remain pending before redemption.
     pub attach_token_ttl: Duration,
     /// How long a failed attach outcome remains available to `session.detach`.
@@ -564,6 +570,7 @@ impl Default for SessionRegistryConfig {
             terminal_commit_wait: pohunek_service_config::DEFAULT_TERMINAL_COMMIT_WAIT,
             worker_stop_headroom: pohunek_service_config::DEFAULT_WORKER_STOP_HEADROOM,
             worker_exchange_wait: pohunek_service_config::MAX_DEADLINE,
+            worker_input_stop_wait: pohunek_service_config::DEFAULT_WORKER_INPUT_STOP_WAIT,
             attach_token_ttl: DEFAULT_ATTACH_TOKEN_TTL,
             attach_result_ttl: DEFAULT_ATTACH_RESULT_TTL,
             attach_result_capacity: DEFAULT_ATTACH_RESULT_CAPACITY,
@@ -4663,7 +4670,14 @@ impl SessionRegistry {
                         .map_err(|error| runtime_error("worker_stop_invalid", error.to_string()))?;
                 let bound = self.inner.config.worker_stop_bound();
                 let status = match worker
-                    .stop_within(transaction, self.inner.config.worker_exchange_wait, bound)
+                    .stop_within(
+                        transaction,
+                        StopWaits {
+                            exchange: self.inner.config.worker_exchange_wait,
+                            input: self.inner.config.worker_input_stop_wait,
+                            answer: bound,
+                        },
+                    )
                     .await
                 {
                     Ok(Some(status)) => status,

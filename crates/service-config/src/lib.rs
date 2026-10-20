@@ -294,6 +294,17 @@ pub const DEFAULT_TERMINAL_COMMIT_WAIT: Duration = Duration::from_secs(10);
 /// margin is frozen, not slow.
 pub const DEFAULT_WORKER_STOP_HEADROOM: Duration = Duration::from_secs(2);
 
+/// Longest a stop waits behind an input write that holds the worker's control
+/// connection.
+///
+/// The worker delivers an input on its own stall policy, which restarts after
+/// every byte the agent reads, so a large input read slowly legitimately holds
+/// the connection for a long time and the daemon cannot see its progress. Eight
+/// [`MAX_DEADLINE`] steps leave the SDK's stop budget (nine steps) room for the
+/// stop itself; a worker frozen mid-input ends the stop with a typed error at
+/// this bound instead of waiting for the caller's budget.
+pub const DEFAULT_WORKER_INPUT_STOP_WAIT: Duration = MAX_DEADLINE.saturating_mul(8);
+
 /// Longest accepted path in bytes.
 ///
 /// Equal to the supervisor's job value limit, because the prefix and roots
