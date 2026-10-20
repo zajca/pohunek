@@ -293,6 +293,21 @@ describe("connecting by host route", () => {
     }
   });
 
+  test("an unreachable local daemon fails the attach without dialing a peer", async () => {
+    const peer = await startTcpDaemon([]);
+    const local = await startUnixDaemon([]);
+    const socketPath = unixPath(local);
+    await local.close();
+    try {
+      const error = await failure(attachRaw(PEER_ROUTE, socketPath, "stream-none"));
+
+      expect(error.kind).toBe("daemonUnreachable");
+      await peer.expectNoRequest(NO_REQUEST_WINDOW_MS);
+    } finally {
+      await peer.close();
+    }
+  });
+
   test("a failed resolution connects to nothing", async () => {
     const peer = await startTcpDaemon([]);
     const local = await startUnixDaemon([
