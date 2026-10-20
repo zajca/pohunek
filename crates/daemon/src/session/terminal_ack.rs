@@ -9,8 +9,10 @@
 use protocol::SessionId;
 use tracing::{debug, warn};
 
+use pohunek_platform::process::{ProcessIdentity, StartIdentity};
+
 use super::{Generation, RuntimeWatchIdentity, SessionRegistry};
-use crate::runtime::Worker;
+use crate::runtime::{lifecycle, Worker};
 use crate::store::DesiredState;
 
 /// What an acknowledgement task needs, captured at the terminal commit.
@@ -178,8 +180,8 @@ impl SessionRegistry {
         }
         // A worker that does not drain its attached streams exits at once on
         // the acknowledgement and would cut them off, so it keeps its retention.
-        match ack.worker.inspect().await {
-            Ok(snapshot) if self.worker_drains_streams(&snapshot) => {}
+        let worker_process = match ack.worker.inspect().await {
+            Ok(snapshot) if self.worker_drains_streams(&snapshot) => snapshot.worker_process,
             Ok(_) => {
                 debug!(
                     session_id = %id.0,
@@ -199,7 +201,7 @@ impl SessionRegistry {
                 self.schedule_supervision_retry(id);
                 return;
             }
-        }
+        };
         // The worker cancels its shutdown before it answers, so a lost answer
         // may follow an acknowledgement that took effect. The supervision
         // retry retires the generation only once its socket is gone and its
@@ -245,6 +247,38 @@ impl SessionRegistry {
         let Ok(lifecycle) = self.lifecycle() else {
             return;
         };
+        // Retirement stops whatever job holds the service ID, so a job that is
+        // not provably the acknowledged worker's is left alone.
+        if let Some(generation) = ack.generation.as_ref() {
+            let worker = worker_identity(worker_process);
+            match lifecycle.inspect(generation).await {
+                Ok(None) => return,
+                Ok(Some(observation)) => {
+                    if let Some(detail) =
+                        lifecycle::job_identity_mismatch(&observation, generation, Some(worker))
+                    {
+                        warn!(
+                            name: "session.terminal.retirement_refused",
+                            session_id = %id.0,
+                            service_id = %generation.service_id(),
+                            detail = %detail,
+                            "the job is not the acknowledged worker's; it is not retired"
+                        );
+                        return;
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        session_id = %id.0,
+                        service_id = %generation.service_id(),
+                        error = %error,
+                        "the terminal worker job cannot be inspected before its retirement"
+                    );
+                    self.schedule_supervision_retry(id);
+                    return;
+                }
+            }
+        }
         if !self
             .retire_terminal_generation(&id.0, ack.generation.as_ref(), Some(&lifecycle))
             .await
@@ -252,4 +286,19 @@ impl SessionRegistry {
             self.schedule_supervision_retry(id);
         }
     }
+}
+
+/// The acknowledged worker's process identity in the supervisor's terms.
+fn worker_identity(
+    process: pohunek_worker_protocol::ProcessIdentity,
+) -> Result<ProcessIdentity, String> {
+    let start_identity = process
+        .start_identity
+        .to_string()
+        .parse::<StartIdentity>()
+        .map_err(|error| format!("worker start identity is malformed: {error}"))?;
+    Ok(ProcessIdentity {
+        pid: process.pid,
+        start_identity,
+    })
 }

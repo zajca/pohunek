@@ -957,6 +957,22 @@ async fn read_observation_stream(
     socket_path: &Path,
     open: ObservationOpen,
 ) -> Result<ObservedOutput, WorkerError> {
+    let mut stream = connect_observation_stream(socket_path, &open).await?;
+    collect_observation_frames(
+        &mut stream,
+        open.version,
+        open.stream_id,
+        open.worker_instance_id,
+        open.max_bytes,
+    )
+    .await
+}
+
+/// Connects the dedicated observation socket and sends its open frame.
+async fn connect_observation_stream(
+    socket_path: &Path,
+    open: &ObservationOpen,
+) -> Result<UnixStream, WorkerError> {
     let mut stream =
         UnixStream::connect(socket_path)
             .await
@@ -970,7 +986,7 @@ async fn read_observation_stream(
             stream_id: open.stream_id.clone(),
             worker_instance_id: open.worker_instance_id.clone(),
             kind: FrameKind::Open {
-                token: open.token,
+                token: open.token.clone(),
                 mode: StreamMode::Observation,
                 after_offset: open.after_offset,
                 attach: None,
@@ -982,15 +998,7 @@ async fn read_observation_stream(
     write_frame(&mut stream, &open_frame)
         .await
         .map_err(|error| WorkerError::Protocol(error.to_string()))?;
-
-    collect_observation_frames(
-        &mut stream,
-        open.version,
-        open.stream_id,
-        open.worker_instance_id,
-        open.max_bytes,
-    )
-    .await
+    Ok(stream)
 }
 
 async fn collect_observation_frames(
@@ -2342,6 +2350,61 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), fixture.server)
             .await
             .expect("the worker exits after the acknowledgement")
+            .expect("server task")
+            .expect("serve");
+    }
+
+    #[tokio::test]
+    async fn an_acknowledgement_waits_for_an_observation_in_flight() {
+        const OUTPUT: usize = 1_048_576;
+        let fixture =
+            exited_worker("ack-observation", OUTPUT, Duration::from_secs(30), false).await;
+        let mut stream = fixture.stream;
+        assert_eq!(read_to_close(&mut stream.stream).await, OUTPUT);
+        drop(stream);
+
+        let open = fixture
+            .worker
+            .open_observation(
+                Some(0),
+                u32::try_from(OUTPUT).expect("output fits u32"),
+                Duration::ZERO,
+            )
+            .await
+            .expect("open the observation");
+        let socket_path = fixture.worker.socket_path().to_path_buf();
+        let mut observation = connect_observation_stream(&socket_path, &open)
+            .await
+            .expect("connect the observation");
+
+        let worker = fixture.worker.clone();
+        let mut acknowledged = tokio::spawn(async move { worker.acknowledge_terminal().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut acknowledged)
+                .await
+                .is_err(),
+            "the acknowledgement waits while the observation still has output to send"
+        );
+        assert!(!fixture.server.is_finished(), "the worker keeps serving");
+
+        let observed = collect_observation_frames(
+            &mut observation,
+            open.version,
+            open.stream_id,
+            open.worker_instance_id,
+            open.max_bytes,
+        )
+        .await
+        .expect("the observation completes");
+        assert_eq!(observed.data.expose().len(), OUTPUT);
+        tokio::time::timeout(pohunek_test_support::wait::HANG_GUARD, acknowledged)
+            .await
+            .expect("the acknowledgement finishes once the observation drained")
+            .expect("task")
+            .expect("acknowledged");
+        tokio::time::timeout(Duration::from_secs(10), fixture.server)
+            .await
+            .expect("the worker exits")
             .expect("server task")
             .expect("serve");
     }

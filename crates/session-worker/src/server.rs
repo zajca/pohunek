@@ -573,7 +573,7 @@ struct Shared {
     started: Instant,
     initialized_tx: watch::Sender<bool>,
     lease_epoch_tx: watch::Sender<u64>,
-    /// Attach and output data streams currently being served.
+    /// Attach, output and observation data streams currently being served.
     data_streams: watch::Sender<usize>,
     state_changed: Notify,
     shutdown: CancellationToken,
@@ -2850,6 +2850,7 @@ async fn serve_data(
             .clone()
             .ok_or_else(|| WorkerError::Protocol("runtime is not live".to_owned()))?
     };
+    let _stream = DataStreamGuard::enter(&shared.data_streams);
     if mode == StreamMode::Observation {
         let observation = grant.observation.ok_or_else(|| {
             WorkerError::Protocol("observation data grant is incomplete".to_owned())
@@ -2871,7 +2872,6 @@ async fn serve_data(
         )
         .await;
     }
-    let _stream = DataStreamGuard::enter(&shared.data_streams);
     let subscriber = if let Some(attach) = attach {
         let dimensions = attach
             .dimensions

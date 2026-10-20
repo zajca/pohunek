@@ -5,14 +5,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pohunek_platform::supervisor::ServiceId;
+use pohunek_platform::supervisor::{DefinitionFacts, ServiceId, ServiceState};
 use protocol::{SessionId, SessionInfo, SessionState};
 
 use super::{
     drop_settled, exit_settled, native_report_params, params, resumable_params, scripted_registry,
     stored_record, temp_agents_dir_with, temp_dir, wait_until, RestartableDaemon,
 };
-use crate::runtime::lifecycle::tests::{LogCapture, ScriptedSupervisor};
+use crate::runtime::lifecycle::tests::{JobScript, LogCapture, ScriptedSupervisor};
 use crate::session::{RuntimeHandle, SessionRegistry, SessionRegistryConfig, ShellCommand};
 
 /// Shell of the sessions that end on their own once they read a line.
@@ -616,5 +616,40 @@ async fn a_worker_without_the_stream_drain_is_not_acknowledged() {
         snapshot.phase,
         pohunek_worker_protocol::RuntimePhase::Exited
     );
+    assert!(rig.supervisor.retired().is_empty());
+}
+
+/// A job that now holds the generation's service ID but is not the
+/// acknowledged worker's is not retired: retirement would stop a stranger.
+#[tokio::test]
+async fn a_replaced_job_is_not_retired_after_the_acknowledgement() {
+    let capture = LogCapture::default();
+    let _logs = capture.install();
+    let rig = Rig::sleeping("ack-replaced-job").await;
+    rig.supervisor.script_job(
+        rig.service_id.clone(),
+        JobScript::Present {
+            state: ServiceState::Running,
+            process: None,
+            definition: Some(DefinitionFacts {
+                executable: PathBuf::from("/opt/other/pohunek-sessiond"),
+                arguments: vec![
+                    "--session-id".to_owned(),
+                    rig.created.id.0.clone(),
+                    "--worker-generation".to_owned(),
+                    "abcd2345".to_owned(),
+                ],
+            }),
+        },
+    );
+    rig.registry.stop(&rig.created.id).await.expect("stop");
+
+    wait_until("the retirement to be refused", || async {
+        capture
+            .text()
+            .contains("the job is not the acknowledged worker's")
+            .then_some(())
+    })
+    .await;
     assert!(rig.supervisor.retired().is_empty());
 }
