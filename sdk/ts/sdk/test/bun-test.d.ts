@@ -21,6 +21,13 @@ declare module "bun:test" {
     skip(name: string, fn?: () => void | Promise<void>, timeout?: number): void;
   }
 
+  export interface Jest {
+    useFakeTimers(): void;
+    useRealTimers(): void;
+    advanceTimersByTime(milliseconds: number): void;
+  }
+
+  export const jest: Jest;
   export const expect: Expect;
   export function describe(name: string, fn: () => void): void;
   export const test: Test;

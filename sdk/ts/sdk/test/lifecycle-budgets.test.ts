@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, jest, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,6 +6,7 @@ import { PROTOCOL_VERSION } from "@pohunek/protocol";
 import {
   Client,
   ClientError,
+  DEFAULT_REQUEST_TIMEOUT_MS,
   LIFECYCLE_STEP_BOUND_MS,
   RESUME_SWEEP_PASSES,
   SESSION_FORK_REQUEST_BUDGET_MS,
@@ -17,7 +18,6 @@ import {
   connectLocal,
   type ClientErrorKind,
   type ConnectOptions,
-  type Transport,
 } from "@pohunek/sdk";
 import {
   minimalSessionInfo,
@@ -141,33 +141,38 @@ describe("lifecycle response budgets", () => {
   });
 
   for (const lifecycle of LIFECYCLE_CASES) {
-    test(`${lifecycle.method} runs on a dedicated connection with its own budget`, async () => {
+    test(`${lifecycle.method} outlasts the default request timeout within its budget`, async () => {
+      let releaseReply: () => void = () => undefined;
+      const ready = new Promise<void>((resolve) => {
+        releaseReply = resolve;
+      });
       const daemon = startMemoryDaemon([
-        { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), lifecycle.result) },
+        { kind: "gate", ready, line: (line) => okResponseLine(requestIdFromLine(line), lifecycle.result) },
+        { kind: "reply", line: healthLine },
       ]);
       if (daemon.endpoint.kind !== "memory") {
         throw new Error("memory daemon returned a different transport");
       }
-      const source = daemon.endpoint.transport;
-      let controlConnections = 0;
-      const transport: Transport = {
-        control: (): ReturnType<Transport["control"]> => {
-          controlConnections += 1;
-          return source.control();
-        },
-        raw: (): ReturnType<Transport["raw"]> => source.raw(),
-      };
+      // The client keeps its default request timeout; the mock reply waits past
+      // it, on the virtual clock, but inside the lifecycle budget.
+      jest.useFakeTimers();
       try {
-        const client = await Client.connectTransport(transport);
-        expect(controlConnections).toBe(1);
-
-        const result = await client.call(lifecycle.method, lifecycle.params as never);
-
-        expect(result).toEqual(lifecycle.result);
-        expect(controlConnections).toBe(2);
+        const client = await Client.connectTransport(daemon.endpoint.transport);
+        const call = client.call(lifecycle.method, lifecycle.params as never);
         expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe(lifecycle.method);
+        jest.advanceTimersByTime(DEFAULT_REQUEST_TIMEOUT_MS + 1_000);
+        releaseReply();
+
+        expect(await call).toEqual(lifecycle.result);
+        // The shared connection stayed usable.
+        expect(await client.call("daemon.health", null)).toEqual({
+          status: "ok",
+          daemon_version: "test",
+          protocol_version: PROTOCOL_VERSION,
+        });
         await client.close();
       } finally {
+        jest.useRealTimers();
         await daemon.close();
       }
     });
