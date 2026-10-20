@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use pohunek_test_support::env::TestEnv;
+use pohunek_test_support::wait::poll_until;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use protocol::{Request, Response, PROTOCOL_VERSION};
 use serde_json::{json, Value};
@@ -53,16 +54,9 @@ const TERMINAL_COLS: u16 = 80;
 /// Byte that opens the attach menu (Ctrl-\).
 const MENU_KEY: u8 = 0x1c;
 
-/// Longest the retrying attach may run: three attempts back off for 3 seconds
-/// in all, so this is the hang guard of the scenario.
-const ATTACH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Pause between menu keys, longer than the client's shortcut sequence timeout
 /// so each key arrives as its own input chunk.
 const KEY_PAUSE: std::time::Duration = std::time::Duration::from_millis(300);
-
-/// Pause between checks of a running CLI.
-const POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Mode of the runtime and state directories the client expects private.
 const PRIVATE_DIR_MODE: u32 = 0o700;
@@ -272,19 +266,9 @@ fn the_automatic_reattach_stays_on_the_peer_the_name_first_selected() {
     );
     drop(stdin);
 
-    let started = std::time::Instant::now();
-    let status = loop {
-        if let Some(status) = cli.0.try_wait().expect("poll pohunek attach") {
-            break status;
-        }
-        assert!(
-            started.elapsed() < ATTACH_DEADLINE,
-            "the attach did not end: served {:?}, dialed {:?}",
-            scene.served(),
-            scene.dialed()
-        );
-        thread::sleep(POLL);
-    };
+    let status = poll_until("the attach to end", || {
+        cli.0.try_wait().expect("poll pohunek attach")
+    });
     assert!(status.success(), "the attach gives up quietly");
 
     let served = scene.served();
@@ -345,6 +329,9 @@ fn the_status_subscription_and_menu_action_stay_on_the_first_peer() {
     for keys in [&[MENU_KEY][..], b"k", b"y"] {
         writer.write_all(keys).expect("type a menu key");
         writer.flush().expect("flush the key");
+        // timing-allowed: #1111 the client folds keys that arrive within its
+        // 25 ms shortcut window into one chunk, and no screen output marks the
+        // moment a key was consumed.
         thread::sleep(KEY_PAUSE);
     }
     wait_served(&scene, protocol::method::SESSION_STOP);
@@ -362,35 +349,20 @@ fn the_status_subscription_and_menu_action_stay_on_the_first_peer() {
     );
 }
 
-/// Waits until the fixture served `method`, naming what it served otherwise.
+/// Waits until the fixture served `method`.
 fn wait_served(scene: &Scene, method: &str) {
-    let started = std::time::Instant::now();
-    while !scene.served().iter().any(|served| served == method) {
-        assert!(
-            started.elapsed() < ATTACH_DEADLINE,
-            "no {method} request: served {:?}, dialed {:?}",
-            scene.served(),
-            scene.dialed()
-        );
-        thread::sleep(POLL);
-    }
+    wait_for_count(scene, method, 1);
 }
 
 /// Waits until the fixture served `method` `count` times.
 fn wait_for_count(scene: &Scene, method: &str, count: usize) {
-    let started = std::time::Instant::now();
-    while scene
-        .served()
-        .iter()
-        .filter(|served| *served == method)
-        .count()
-        < count
-    {
-        assert!(
-            started.elapsed() < ATTACH_DEADLINE,
-            "fewer than {count} {method} requests: served {:?}",
-            scene.served()
-        );
-        thread::sleep(POLL);
-    }
+    poll_until(&format!("{count} {method} request(s)"), || {
+        (scene
+            .served()
+            .iter()
+            .filter(|served| *served == method)
+            .count()
+            >= count)
+            .then_some(())
+    });
 }

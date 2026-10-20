@@ -34,9 +34,6 @@ const PEER_KEY: &str = "peer-key";
 const PEER_NAME: &str = "peer-b";
 const TWIN_NAME: &str = "twin";
 
-/// How long a scenario waits for a daemon to have seen nothing.
-const QUIET: Duration = Duration::from_millis(200);
-
 /// Provider that knows this machine and one peer on the loopback address.
 #[derive(Debug)]
 struct StubOverlay {
@@ -249,7 +246,6 @@ async fn a_name_this_machine_shares_with_a_peer_is_ambiguous_and_dials_nothing()
     .await
     .expect_err("an ambiguous name never connects");
     assert_eq!(error.to_protocol_error().code, "overlay_host_ambiguous");
-    tokio::time::sleep(QUIET).await;
     assert_eq!(seen(&daemons.local) + seen(&daemons.tcp), 0);
 }
 

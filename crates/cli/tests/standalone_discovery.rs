@@ -549,7 +549,10 @@ fn this_machine_is_listed_first_as_one_local_record() {
 #[test]
 #[cfg(target_os = "linux")]
 fn a_failed_probe_of_this_machine_reads_unreachable() {
-    let records = discover_redirected(&status_with_self(Some(SELF_IP)), pin_overlay::closed_port());
+    let records = discover_redirected(
+        &status_with_self(Some(SELF_IP)),
+        pin_overlay::serve_unresponsive(),
+    );
     let local = records
         .iter()
         .find(|record| record.get("local").is_some())
@@ -563,7 +566,7 @@ fn a_failed_probe_of_this_machine_reads_unreachable() {
 #[test]
 #[cfg(target_os = "linux")]
 fn this_machine_without_an_address_is_a_candidate() {
-    let records = discover_redirected(&status_with_self(None), pin_overlay::closed_port());
+    let records = discover_redirected(&status_with_self(None), pin_overlay::serve_unresponsive());
     let local = &records[0];
     assert_eq!(local["local"], true);
     assert!(local["address"].is_null());

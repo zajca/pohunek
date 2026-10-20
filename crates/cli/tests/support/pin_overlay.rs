@@ -153,11 +153,16 @@ pub(crate) fn serve_health() -> u16 {
     port
 }
 
-/// A port nothing listens on.
-pub(crate) fn closed_port() -> u16 {
-    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .expect("bind a port to free")
-        .local_addr()
-        .expect("port address")
-        .port()
+/// A loopback daemon that closes every connection without answering, so a
+/// probe of it fails the way a daemon that is not listening does.
+pub(crate) fn serve_unresponsive() -> u16 {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("bind the unresponsive fixture");
+    let port = listener.local_addr().expect("fixture address").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            drop(stream);
+        }
+    });
+    port
 }
