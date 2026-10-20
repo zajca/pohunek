@@ -535,13 +535,16 @@ pub struct SessionRegistryConfig {
 impl SessionRegistryConfig {
     /// Longest the daemon waits for a worker to answer a stop.
     ///
-    /// A worker answers within its stop grace before `SIGKILL`, the kill reap
-    /// deadline, a second grace for the marker sweep's re-read and its
-    /// terminal-commit wait; a worker silent past those and the headroom is
-    /// frozen.
+    /// A worker's stop waits one grace for the process group after `SIGTERM`
+    /// and, up to the kill reap deadline, for the root after `SIGKILL`. Its
+    /// marker sweep then waits a grace after `SIGTERM`, a grace after
+    /// `SIGKILL` and up to a grace re-reading unreadable markers, before the
+    /// terminal-commit wait. A worker silent past all of them and the headroom
+    /// is frozen; the bound is deliberately generous because only a frozen
+    /// worker ever reaches it.
     pub(crate) fn worker_stop_bound(&self) -> Duration {
         self.stop_grace
-            .saturating_mul(2)
+            .saturating_mul(4)
             .saturating_add(self.kill_reap_deadline)
             .saturating_add(self.terminal_commit_wait)
             .saturating_add(self.worker_stop_headroom)

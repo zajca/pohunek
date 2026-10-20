@@ -12,6 +12,6 @@
   5 s, never with `--json`. An explicit request timeout still overrides the
   budgets. The TypeScript SDK also gives `session.resume` its budget and the
   `sessionResume/Fork/Stop/RemoveOutcomeUnknown` error kinds.
-- The daemon bounds its wait for a worker's stop answer (two stop graces, the
+- The daemon bounds its wait for a worker's stop answer (four stop graces, the
   kill reap deadline, the worker's terminal-commit wait and a margin); a worker
   that stays silent ends the stop or removal with `worker_operation_failed`.

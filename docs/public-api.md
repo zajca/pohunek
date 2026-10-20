@@ -3969,9 +3969,9 @@ Public exports:
   queued behind a resume or fork of the same session waits for that
   operation's lifecycle lock and can exceed any budget; that is an unknown
   outcome too, and the daemon completes the queued call after the client left.
-  The daemon bounds its own wait for a worker's stop answer by the stop grace,
-  the kill reap deadline, a second grace and the worker's terminal-commit wait
-  plus a margin; a worker silent past that ends the stop or removal with
+  The daemon bounds its own wait for a worker's stop answer by the stop grace
+  (four times, for the stop and the marker sweep), the kill reap deadline and
+  the worker's terminal-commit wait plus a margin; a worker silent past that ends the stop or removal with
   `worker_operation_failed`. The Hermes integration passes an explicit
   `request_timeout_ms`, which keeps overriding these budgets.
   `with_request_timeout` explicitly overrides
