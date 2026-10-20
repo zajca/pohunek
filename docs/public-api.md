@@ -3980,7 +3980,9 @@ Connection APIs:
   connect_timeout, &registry)`: whether a host name is this machine's own
   overlay identity, resolved with `OverlayRegistry::resolve_target`. A
   provider's `resolve_selector` matches its own identity at the same steps as
-  a peer's, so a name both carry is `overlay_host_ambiguous`. `local`, an
+  a peer's, so a name both carry is `overlay_host_ambiguous`, whose message
+  lists every matching host and whose `recover` text names the
+  selector of each: provider-qualified for a peer, `local` for this machine. `local`, an
   unknown name, an unavailable provider, and a `@<port>` route answer `false`.
   `Client::connect` itself still treats only `""` and `"local"` as local; the
   CLI applies this check before it connects (see `docs/cli.md`, host

@@ -60,8 +60,13 @@ pub enum NetbirdError {
     #[error("host '{0}' was not found among NetBird peers")]
     HostUnknown(String),
     /// The selector matched more than one current peer.
-    #[error("host '{0}' is ambiguous among NetBird peers")]
-    HostAmbiguous(String),
+    #[error("host '{host}' is ambiguous among NetBird peers")]
+    HostAmbiguous {
+        /// The selector that matched several hosts.
+        host: String,
+        /// The hosts it matched.
+        candidates: Vec<overlay::CandidateIdentity>,
+    },
 }
 
 /// This host's local peer state (shape B: `localPeerState`).

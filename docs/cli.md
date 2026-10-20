@@ -28,7 +28,9 @@ A host name resolves in this order:
    selects the local daemon exactly like `local`: the same socket, no mesh
    dial, and local behaviour in every command, so one host name works on the
    machine itself and from its peers. A short name that this machine and a
-   peer both carry is `overlay_host_ambiguous`, never a silent choice. A
+   peer both carry is `overlay_host_ambiguous`, never a silent choice; its
+   message lists the matching hosts (`this machine (<fqdn>)`, `peer <fqdn>`) and
+   its hint the selector that names each (`<overlay>:<selector>`, or `local` for this machine). A
    `@<port>` route and a typed `peer~` or `fqdn~` selector always name a peer.
 3. A peer of a configured overlay, dialed over its route.
 4. Anything else: `host_unknown`. When the overlay status cannot be read, steps

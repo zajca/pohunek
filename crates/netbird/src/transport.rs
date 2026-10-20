@@ -141,9 +141,10 @@ fn map_error(error: NetbirdError, id: &OverlayId) -> OverlayError {
             host,
             overlay: id.clone(),
         },
-        NetbirdError::HostAmbiguous(host) => OverlayError::PeerCollision {
+        NetbirdError::HostAmbiguous { host, candidates } => OverlayError::PeerCollision {
             host,
             overlay: id.clone(),
+            candidates,
         },
     }
 }

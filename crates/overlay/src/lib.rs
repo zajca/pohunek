@@ -53,6 +53,9 @@ pub enum OverlayError {
         host: String,
         /// Stable overlay identifier.
         overlay: OverlayId,
+        /// The hosts the selector matched; empty when the provider does not
+        /// report them.
+        candidates: Vec<CandidateIdentity>,
     },
     /// The provider CLI is unavailable.
     #[error("overlay CLI for {0} is not installed")]
@@ -128,13 +131,13 @@ pub enum RegistryError {
     /// A provider-qualified host named an overlay that is not configured.
     #[error("overlay '{0}' is not configured")]
     OverlayNotConfigured(OverlayId),
-    /// More than one healthy overlay resolved the same unqualified host.
-    #[error("host '{host}' is ambiguous across overlays: {overlays:?}")]
+    /// A selector matched more than one host, on one overlay or across several.
+    #[error("host '{host}' matches {} hosts{}", candidates.len(), describe_candidates(candidates))]
     AmbiguousHost {
         /// User-provided host selector.
         host: String,
-        /// Healthy overlays that resolved the selector.
-        overlays: Vec<OverlayId>,
+        /// Every host the selector matched.
+        candidates: Vec<HostCandidate>,
     },
     /// No configured overlay knows the requested host.
     #[error("host '{0}' was not found in any configured overlay")]
@@ -248,6 +251,105 @@ impl ExternalIdentity {
                 detail: "the decoded identity must be UTF-8",
             })?;
         Self::new(kind, value).map(Some)
+    }
+}
+
+/// One host a selector matched on an overlay, before the overlay is attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateIdentity {
+    /// Whether the host is this machine rather than a peer.
+    pub local: bool,
+    /// Provider-qualified DNS name, falling back to the peer identity.
+    pub name: String,
+    /// Selector that names this host on its overlay, when one exists.
+    pub selector: Option<String>,
+    /// Whether `selector` is a provider peer identity, which no other peer
+    /// shares. An FQDN selector can match a second peer with the same name.
+    pub selector_is_peer_id: bool,
+}
+
+impl CandidateIdentity {
+    /// This machine, named by its overlay FQDN when the provider reports one.
+    ///
+    /// Its selector is `local`: an overlay name can collide with a peer's
+    /// again, `local` cannot.
+    #[must_use]
+    pub fn this_machine(fqdn: Option<&str>) -> Self {
+        Self {
+            local: true,
+            name: fqdn.unwrap_or("unnamed").to_owned(),
+            selector: Some("local".to_owned()),
+            selector_is_peer_id: false,
+        }
+    }
+
+    /// A peer, selected by its provider identity or else its FQDN.
+    #[must_use]
+    pub fn peer(peer_id: Option<&str>, fqdn: Option<&str>) -> Self {
+        let by_id = peer_id.and_then(|id| ExternalIdentity::peer_id(id).ok());
+        let selector_is_peer_id = by_id.is_some();
+        let identity = by_id.or_else(|| fqdn.and_then(|name| ExternalIdentity::fqdn(name).ok()));
+        Self {
+            local: false,
+            name: fqdn.or(peer_id).unwrap_or("unnamed").to_owned(),
+            selector: identity.map(|identity| identity.selector()),
+            selector_is_peer_id,
+        }
+    }
+}
+
+/// One host a selector matched, with the overlay that reported it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostCandidate {
+    /// Stable overlay identifier.
+    pub overlay: OverlayId,
+    /// The matched host.
+    pub identity: CandidateIdentity,
+}
+
+impl HostCandidate {
+    fn label(&self) -> String {
+        if self.identity.local {
+            format!("this machine ({})", self.identity.name)
+        } else {
+            format!("peer {}", self.identity.name)
+        }
+    }
+
+    /// The selector that names only this host: `<overlay>:<selector>` for a
+    /// peer, `local` for this machine, when one exists.
+    #[must_use]
+    pub fn qualified_selector(&self) -> Option<String> {
+        let selector = self.identity.selector.as_ref()?;
+        Some(if self.identity.local {
+            selector.clone()
+        } else {
+            format!("{}:{selector}", self.overlay)
+        })
+    }
+}
+
+/// Describe `candidates` in plain words, as the tail of an ambiguity message.
+///
+/// Candidates on one overlay read ` on overlay netbird: this machine (a), peer
+/// b`; across overlays each names its own overlay.
+#[must_use]
+pub fn describe_candidates(candidates: &[HostCandidate]) -> String {
+    let Some(first) = candidates.first() else {
+        return String::new();
+    };
+    if candidates.iter().all(|c| c.overlay == first.overlay) {
+        let labels = candidates
+            .iter()
+            .map(HostCandidate::label)
+            .collect::<Vec<_>>();
+        format!(" on overlay {}: {}", first.overlay, labels.join(", "))
+    } else {
+        let labels = candidates
+            .iter()
+            .map(|c| format!("{} on overlay {}", c.label(), c.overlay))
+            .collect::<Vec<_>>();
+        format!(": {}", labels.join(", "))
     }
 }
 
@@ -581,7 +683,7 @@ impl OverlayRegistry {
 
         let mut routes = Vec::new();
         let mut failures = Vec::new();
-        let mut collision_overlays = Vec::new();
+        let mut collisions = Vec::new();
         let results = join_all(self.entries().iter().map(|entry| async move {
             (
                 entry.id().clone(),
@@ -601,26 +703,24 @@ impl OverlayRegistry {
                 }),
                 Err(OverlayError::HostUnknown { .. }) => {}
                 Err(error @ OverlayError::PeerCollision { .. }) => {
-                    collision_overlays.push(overlay.clone());
+                    collisions.extend(collision_candidates(&overlay, host, &error));
                     failures.push(OverlayFailure { overlay, error });
                 }
                 Err(error) => failures.push(OverlayFailure { overlay, error }),
             }
         }
-        if !collision_overlays.is_empty() {
-            collision_overlays.extend(routes.into_iter().map(|route| route.overlay));
-            collision_overlays.sort();
-            collision_overlays.dedup();
+        if !collisions.is_empty() {
+            collisions.extend(routes.iter().map(route_candidate));
             return Err(RegistryError::AmbiguousHost {
                 host: host.to_owned(),
-                overlays: collision_overlays,
+                candidates: collisions,
             });
         }
         match routes.len() {
             1 => Ok(routes.remove(0)),
             count if count > 1 => Err(RegistryError::AmbiguousHost {
                 host: host.to_owned(),
-                overlays: routes.into_iter().map(|route| route.overlay).collect(),
+                candidates: routes.iter().map(route_candidate).collect(),
             }),
             _ if failures.is_empty() => Err(RegistryError::HostUnknown(host.to_owned())),
             _ => Err(RegistryError::HostUnavailable {
@@ -661,7 +761,7 @@ impl OverlayRegistry {
             }
             Err(error @ OverlayError::PeerCollision { .. }) => Err(RegistryError::AmbiguousHost {
                 host: host.to_owned(),
-                overlays: vec![error.overlay().clone()],
+                candidates: collision_candidates(&overlay, host, &error),
             }),
             Err(error) => Err(RegistryError::HostUnavailable {
                 host: host.to_owned(),
@@ -691,7 +791,7 @@ impl OverlayRegistry {
         let mut local_overlays = Vec::new();
         let mut routes = Vec::new();
         let mut failures = Vec::new();
-        let mut collision_overlays = Vec::new();
+        let mut collisions = Vec::new();
         let results = join_all(self.entries().iter().map(|entry| async move {
             (
                 entry.id().clone(),
@@ -712,20 +812,23 @@ impl OverlayRegistry {
                 }),
                 Err(OverlayError::HostUnknown { .. }) => {}
                 Err(error @ OverlayError::PeerCollision { .. }) => {
-                    collision_overlays.push(overlay.clone());
+                    collisions.extend(collision_candidates(&overlay, host, &error));
                     failures.push(OverlayFailure { overlay, error });
                 }
                 Err(error) => failures.push(OverlayFailure { overlay, error }),
             }
         }
-        if !collision_overlays.is_empty() || (!local_overlays.is_empty() && !routes.is_empty()) {
-            collision_overlays.extend(local_overlays);
-            collision_overlays.extend(routes.into_iter().map(|route| route.overlay));
-            collision_overlays.sort();
-            collision_overlays.dedup();
+        if !collisions.is_empty() || (!local_overlays.is_empty() && !routes.is_empty()) {
+            // Named by the selector: the error path starts no further provider
+            // I/O, which a timeout could turn into a different outcome.
+            collisions.extend(local_overlays.into_iter().map(|overlay| HostCandidate {
+                overlay,
+                identity: CandidateIdentity::this_machine(Some(host)),
+            }));
+            collisions.extend(routes.iter().map(route_candidate));
             return Err(RegistryError::AmbiguousHost {
                 host: host.to_owned(),
-                overlays: collision_overlays,
+                candidates: collisions,
             });
         }
         if !local_overlays.is_empty() {
@@ -735,7 +838,7 @@ impl OverlayRegistry {
             1 => Ok(HostTarget::Remote(routes.remove(0))),
             count if count > 1 => Err(RegistryError::AmbiguousHost {
                 host: host.to_owned(),
-                overlays: routes.into_iter().map(|route| route.overlay).collect(),
+                candidates: routes.iter().map(route_candidate).collect(),
             }),
             _ if failures.is_empty() => Err(RegistryError::HostUnknown(host.to_owned())),
             _ => Err(RegistryError::HostUnavailable {
@@ -777,7 +880,7 @@ impl OverlayRegistry {
             }
             Err(error @ OverlayError::PeerCollision { .. }) => Err(RegistryError::AmbiguousHost {
                 host: host.to_owned(),
-                overlays: vec![error.overlay().clone()],
+                candidates: collision_candidates(&overlay, host, &error),
             }),
             Err(error) => Err(RegistryError::HostUnavailable {
                 host: host.to_owned(),
@@ -808,3 +911,41 @@ impl OverlayRegistry {
 }
 
 // Rust guideline compliant 2026-08-31
+
+fn route_candidate(route: &OverlayRoute) -> HostCandidate {
+    HostCandidate {
+        overlay: route.overlay.clone(),
+        identity: CandidateIdentity::peer(route.peer_id.as_deref(), route.fqdn.as_deref()),
+    }
+}
+
+/// The hosts a provider's collision error names, or the selector itself when
+/// the provider reports none.
+fn collision_candidates(
+    overlay: &OverlayId,
+    host: &str,
+    error: &OverlayError,
+) -> Vec<HostCandidate> {
+    let reported = match error {
+        OverlayError::PeerCollision { candidates, .. } => candidates.as_slice(),
+        _ => &[],
+    };
+    if reported.is_empty() {
+        return vec![HostCandidate {
+            overlay: overlay.clone(),
+            identity: CandidateIdentity {
+                local: false,
+                name: host.to_owned(),
+                selector: None,
+                selector_is_peer_id: false,
+            },
+        }];
+    }
+    reported
+        .iter()
+        .map(|identity| HostCandidate {
+            overlay: overlay.clone(),
+            identity: identity.clone(),
+        })
+        .collect()
+}

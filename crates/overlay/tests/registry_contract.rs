@@ -3,9 +3,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
 
 use overlay::{
-    BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, ExternalIdentityKind,
-    OverlayError, OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, RegistryError,
-    ResolvedPeer,
+    BindAddrError, CandidateIdentity, ConfiguredTransport, DiscoveredPeer, ExternalIdentity,
+    ExternalIdentityKind, OverlayError, OverlayFuture, OverlayId, OverlayRegistry,
+    OverlayTransport, RegistryError, ResolvedPeer, ResolvedSelector,
 };
 
 #[derive(Debug)]
@@ -17,6 +17,7 @@ struct MemoryTransport {
     resolutions: HashMap<String, Result<ResolvedPeer, OverlayError>>,
     peer_id_resolutions: HashMap<String, Result<ResolvedPeer, OverlayError>>,
     fqdn_resolutions: HashMap<String, Result<ResolvedPeer, OverlayError>>,
+    own_names: Vec<String>,
 }
 
 impl MemoryTransport {
@@ -29,6 +30,7 @@ impl MemoryTransport {
             resolutions: HashMap::new(),
             peer_id_resolutions: HashMap::new(),
             fqdn_resolutions: HashMap::new(),
+            own_names: Vec::new(),
         }
     }
 
@@ -45,7 +47,12 @@ impl MemoryTransport {
             resolutions: HashMap::new(),
             peer_id_resolutions: HashMap::new(),
             fqdn_resolutions: HashMap::new(),
+            own_names: Vec::new(),
         }
+    }
+
+    fn add_own_name(&mut self, name: &str) {
+        self.own_names.push(name.to_owned());
     }
 
     fn add_member(&mut self, address: IpAddr) {
@@ -93,6 +100,10 @@ impl MemoryTransport {
             Err(OverlayError::PeerCollision {
                 host: host.to_owned(),
                 overlay: self.id.clone(),
+                candidates: vec![
+                    CandidateIdentity::peer(None, Some(&format!("{host}.one.test"))),
+                    CandidateIdentity::peer(None, Some(&format!("{host}.two.test"))),
+                ],
             }),
         );
     }
@@ -153,6 +164,13 @@ impl OverlayTransport for MemoryTransport {
         Box::pin(async move { result })
     }
 
+    fn resolve_selector<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedSelector> {
+        if self.own_names.iter().any(|name| name == host) {
+            return Box::pin(async { Ok(ResolvedSelector::LocalHost) });
+        }
+        Box::pin(async move { self.resolve_peer(host).await.map(ResolvedSelector::Peer) })
+    }
+
     fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>> {
         let result = self.listener.clone().map(|_| self.peers.clone());
         Box::pin(async move { result })
@@ -211,12 +229,21 @@ async fn registry_isolates_failure_but_rejects_name_collisions() {
         registry.entries()[1].clone(),
     ])
     .expect("collision registry");
+    let ambiguous = registry
+        .resolve_host("build")
+        .await
+        .expect_err("a collision on one overlay is ambiguous");
     assert!(matches!(
-        registry.resolve_host("build").await,
-        Err(RegistryError::AmbiguousHost { overlays, .. })
-            if overlays.iter().any(|id| id.as_str() == "collision")
-                && overlays.iter().any(|id| id.as_str() == "healthy")
+        &ambiguous,
+        RegistryError::AmbiguousHost { candidates, .. }
+            if candidates.iter().any(|c| c.overlay.as_str() == "collision")
+                && candidates.iter().any(|c| c.overlay.as_str() == "healthy")
     ));
+    assert_eq!(
+        ambiguous.to_string(),
+        "host 'build' matches 3 hosts: peer build.one.test on overlay collision, \
+         peer build.two.test on overlay collision, peer build.example on overlay healthy"
+    );
 }
 
 #[tokio::test]
@@ -333,9 +360,9 @@ async fn ipv6_literals_distinguish_unqualified_peers_qualifiers_and_socket_addre
 
     assert!(matches!(
         registry.resolve_host("fd00::2").await,
-        Err(RegistryError::AmbiguousHost { host, overlays })
+        Err(RegistryError::AmbiguousHost { host, candidates })
             if host == "fd00::2"
-                && overlays.iter().map(OverlayId::as_str).eq(["first", "second"])
+                && candidates.iter().map(|c| c.overlay.as_str()).eq(["first", "second"])
     ));
 
     let route = registry
@@ -395,3 +422,34 @@ async fn diagnostics_and_concurrent_listeners_keep_per_overlay_ports() {
 }
 
 // Rust guideline compliant 2026-08-31
+
+#[tokio::test]
+async fn a_name_this_machine_shares_with_a_peer_on_another_overlay_names_both() {
+    let listener = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let address = "100.64.0.2".parse().expect("peer address");
+    let mut mine = MemoryTransport::new("one", listener);
+    mine.add_own_name("box");
+    let mut theirs = MemoryTransport::new("two", listener);
+    theirs.add_member(address);
+    theirs.add_peer("box", Some("peer-key"), Some(address));
+    let registry = OverlayRegistry::new(vec![configured(mine, 17001), configured(theirs, 17002)])
+        .expect("registry");
+
+    let ambiguous = registry
+        .resolve_target("box")
+        .await
+        .expect_err("this machine and a peer on another overlay are ambiguous");
+    assert_eq!(
+        ambiguous.to_string(),
+        "host 'box' matches 2 hosts: this machine (box) on overlay one, \
+         peer box.example on overlay two"
+    );
+    let RegistryError::AmbiguousHost { candidates, .. } = &ambiguous else {
+        panic!("expected an ambiguity: {ambiguous:?}");
+    };
+    assert_eq!(
+        candidates[0].qualified_selector().as_deref(),
+        Some("local"),
+        "this machine is selected by `local`, never by an overlay name"
+    );
+}
