@@ -4172,7 +4172,7 @@ mod tests {
         for (action, args, expected_method, result, expected_outcome) in cases {
             let mut daemon = crate::test_daemon::HeldDaemon::start(result);
             let control = AttachControlContext {
-                host: crate::target::LOCAL_HOST.to_owned(),
+                host: PinnedHost::local(),
                 paths: daemon.paths.clone(),
                 target: "local/s-42".parse().expect("target"),
             };
