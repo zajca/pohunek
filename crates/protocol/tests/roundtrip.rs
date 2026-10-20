@@ -14,27 +14,27 @@ use protocol::{
     HostCapabilities, HostGovernanceStatus, HostId, HostOwner, IntegrationAgentDoctor,
     IntegrationAgentStatus, IntegrationDoctorParams, IntegrationDoctorResult, IntegrationFinding,
     IntegrationFindingCode, IntegrationFindingSeverity, IntegrationInstallState,
-    IntegrationRecovery, NotificationCreateParams, NotificationCreateResult,
-    NotificationCreatedEvent, NotificationDeleteParams, NotificationDeletedEvent, NotificationId,
-    NotificationKind, NotificationKindPolicy, NotificationListParams, NotificationPolicy,
-    NotificationPolicyParams, NotificationRecord, NotificationRetentionParams,
-    NotificationRetentionPolicy, NotificationSeverity, NotificationSource, NotificationStatus,
-    NotificationUpdateParams, NotificationUpdatedEvent, ObservationParamsError, OutputOffset,
-    OwnerRevision, PrincipalId, ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId,
-    ProposalNonce, ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind,
-    QuarantineReason, RelayId, ReportSequence, Request, Response, RuntimeGeneration, RuntimeId,
-    RuntimeInventoryEntry, RuntimeRef, SessionAttachResult, SessionBackground, SessionCapabilities,
-    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
-    SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionOutputGap, SessionOutputParams, SessionOutputResult, SessionReadFormat,
-    SessionReadParams, SessionReadResult, SessionReadSource, SessionReleaseAgentParams,
-    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionRuntime,
-    SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
-    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
-    SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
+    IntegrationRecovery, IntegrationUninstallState, NotificationCreateParams,
+    NotificationCreateResult, NotificationCreatedEvent, NotificationDeleteParams,
+    NotificationDeletedEvent, NotificationId, NotificationKind, NotificationKindPolicy,
+    NotificationListParams, NotificationPolicy, NotificationPolicyParams, NotificationRecord,
+    NotificationRetentionParams, NotificationRetentionPolicy, NotificationSeverity,
+    NotificationSource, NotificationStatus, NotificationUpdateParams, NotificationUpdatedEvent,
+    ObservationParamsError, OutputOffset, OwnerRevision, PrincipalId, ProcessStartIdentity,
+    ProjectSource, ProposalExpiry, ProposalId, ProposalNonce, ProtocolError, ProtocolVersion,
+    ProtocolVersionRange, ProviderKind, QuarantineReason, RelayId, ReportSequence, Request,
+    Response, RuntimeGeneration, RuntimeId, RuntimeInventoryEntry, RuntimeRef, SessionAttachResult,
+    SessionBackground, SessionCapabilities, SessionDetachParams, SessionDetachResult,
+    SessionDetectionParams, SessionDetectionResult, SessionForkParams, SessionForkResult,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
+    SessionListFilter, SessionListParams, SessionNewParams, SessionOutputGap, SessionOutputParams,
+    SessionOutputResult, SessionReadFormat, SessionReadParams, SessionReadResult,
+    SessionReadSource, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
+    SessionRuntime, SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
+    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
     ShareSuspensionIntent, SignedTransferOutcome, StateSource, SubagentInfo, SubagentLifecycle,
     SubagentRevision, TeamId, TerminalCursor, TerminalDimensions, TerminalWatermark,
     TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeId, TransferProposal,
@@ -5001,4 +5001,153 @@ fn a_session_snapshot_with_every_display_enum_unknown_decodes_only_on_the_client
     let item = &decoded.background.expect("background").items[0];
     assert_eq!(item.kind, BackgroundKind::Other);
     assert_eq!(item.status, BackgroundStatus::Other);
+}
+
+#[test]
+fn doctor_and_integration_state_enums_are_tolerant_only_on_the_client() {
+    TolerantEnum {
+        known: vec![
+            ("ok", DoctorStatus::Ok),
+            ("warn", DoctorStatus::Warn),
+            ("fail", DoctorStatus::Fail),
+        ],
+        unknown: DoctorStatus::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("DoctorStatus");
+    TolerantEnum {
+        known: vec![
+            ("none", IntegrationRecovery::None),
+            ("reinstall", IntegrationRecovery::Reinstall),
+            (
+                "repair_configuration",
+                IntegrationRecovery::RepairConfiguration,
+            ),
+        ],
+        unknown: IntegrationRecovery::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("IntegrationRecovery");
+    TolerantEnum {
+        known: vec![
+            ("not_installed", IntegrationInstallState::NotInstalled),
+            ("current", IntegrationInstallState::Current),
+            ("outdated", IntegrationInstallState::Outdated),
+        ],
+        unknown: IntegrationInstallState::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("IntegrationInstallState");
+    TolerantEnum {
+        known: vec![
+            ("removed", IntegrationUninstallState::Removed),
+            ("not_installed", IntegrationUninstallState::NotInstalled),
+        ],
+        unknown: IntegrationUninstallState::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("IntegrationUninstallState");
+}
+
+#[test]
+fn integration_finding_enums_are_tolerant_only_on_the_client() {
+    TolerantEnum {
+        known: vec![
+            ("info", IntegrationFindingSeverity::Info),
+            ("error", IntegrationFindingSeverity::Error),
+        ],
+        unknown: IntegrationFindingSeverity::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("IntegrationFindingSeverity");
+    TolerantEnum {
+        known: vec![
+            (
+                "agent_not_installed",
+                IntegrationFindingCode::AgentNotInstalled,
+            ),
+            (
+                "hooks_not_installed",
+                IntegrationFindingCode::HooksNotInstalled,
+            ),
+            (
+                "config_root_invalid",
+                IntegrationFindingCode::ConfigRootInvalid,
+            ),
+            ("asset_missing", IntegrationFindingCode::AssetMissing),
+            ("asset_modified", IntegrationFindingCode::AssetModified),
+            ("asset_unsafe", IntegrationFindingCode::AssetUnsafe),
+            (
+                "registration_drift",
+                IntegrationFindingCode::RegistrationDrift,
+            ),
+            (
+                "provider_config_invalid",
+                IntegrationFindingCode::ProviderConfigInvalid,
+            ),
+            (
+                "codex_hooks_feature_disabled",
+                IntegrationFindingCode::CodexHooksFeatureDisabled,
+            ),
+            ("codex_trust_drift", IntegrationFindingCode::CodexTrustDrift),
+            (
+                "hook_runtime_python_found",
+                IntegrationFindingCode::HookRuntimePythonFound,
+            ),
+            (
+                "hook_runtime_missing",
+                IntegrationFindingCode::HookRuntimeMissing,
+            ),
+            (
+                "hook_runtime_macos_shim",
+                IntegrationFindingCode::HookRuntimeMacosShim,
+            ),
+            (
+                "hook_socket_path_invalid",
+                IntegrationFindingCode::HookSocketPathInvalid,
+            ),
+            (
+                "unsafe_installer_lock",
+                IntegrationFindingCode::UnsafeInstallerLock,
+            ),
+            (
+                "displaced_original_left_behind",
+                IntegrationFindingCode::DisplacedOriginalLeftBehind,
+            ),
+            (
+                "operation_in_progress",
+                IntegrationFindingCode::OperationInProgress,
+            ),
+            (
+                "quarantine_scan_incomplete",
+                IntegrationFindingCode::QuarantineScanIncomplete,
+            ),
+            ("install_drift", IntegrationFindingCode::InstallDrift),
+        ],
+        unknown: IntegrationFindingCode::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("IntegrationFindingCode");
+}
+
+#[test]
+fn a_doctor_report_with_an_unknown_status_decodes_only_on_the_client() {
+    let document = json!({
+        "checks": [
+            {"name": "daemon_check", "status": "a_status_from_a_newer_daemon", "detail": "x"},
+        ],
+        "overall": "a_status_from_a_newer_daemon",
+    });
+
+    serde_json::from_value::<DoctorReport>(document.clone())
+        .expect_err("plain decoding rejects the report");
+    let report = protocol::tolerant::from_value::<DoctorReport>(document).expect("tolerant decode");
+
+    assert_eq!(report.checks[0].status, DoctorStatus::Unknown);
+    assert_eq!(report.overall, DoctorStatus::Unknown);
+    assert_eq!(
+        DoctorReport::from_checks(report.checks).overall,
+        DoctorStatus::Warn,
+        "an unknown check never makes the aggregate ok"
+    );
 }

@@ -222,7 +222,9 @@ macOS adds the following checks. The daemon report also includes redacted
 Codex and Claude hook integration readiness. A local request checks each
 distinct configured profile home; a remote request checks only runtime homes.
 Current hooks are `ok`, missing or outdated hooks are `warn`, and malformed or
-unsafe provider state is `fail`. Configured Hermes profiles are explicitly
+unsafe provider state is `fail`. A status that a newer daemon adds reads as
+`unknown` in `pohunek doctor`, ranks like `warn` and never makes a merged check
+`ok`; the daemon's other checks stay listed. Configured Hermes profiles are explicitly
 reported as unverified because the daemon has no inspection policy for their
 CLI-managed hooks. No provider home or profile environment value is returned.
 For detailed hook findings, including Python interpreter readiness, run
