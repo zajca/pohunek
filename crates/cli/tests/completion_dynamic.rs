@@ -842,3 +842,44 @@ fn completion_scripts_do_no_workflow_store_io() {
         "script generation created the workflow store"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[path = "support/connect_redirect.rs"]
+mod connect_redirect;
+#[cfg(target_os = "linux")]
+#[path = "support/pin_overlay.rs"]
+mod pin_overlay;
+
+/// `--host` completion on a machine that lists itself: this machine's own
+/// record is not a second dialable target, `local` stays the only entry for it.
+#[cfg(target_os = "linux")]
+#[test]
+fn host_completion_offers_this_machine_only_as_local() {
+    let env = TestEnv::new().expect("private completion environment");
+    let port = pin_overlay::serve_health();
+    let (library, capture) = connect_redirect::build(env.root());
+    let status = pin_overlay::status(
+        Some(("fixture-self.netbird.test", "100.64.0.7")),
+        &[pin_overlay::Peer::new(
+            "fixture-remote.netbird.test",
+            "100.64.0.42",
+            "remote-key",
+        )],
+    );
+    let path = pin_overlay::install(&env.root().join("bin"), &capture, &status, &status);
+    let words = ["pohunek", "--host", ""];
+    let output = complete_bash_command(&env, &words)
+        .env("PATH", &path)
+        .env("LD_PRELOAD", &library)
+        .env("POHUNEK_TEST_CONNECT_CAPTURE", &capture)
+        .env("POHUNEK_REMOTE_PORT", port.to_string())
+        .output()
+        .expect("spawn pohunek");
+    let identity = pohunek_client::ExternalIdentity::peer_id("remote-key")
+        .expect("peer identity")
+        .selector();
+    assert_eq!(
+        value_candidates(&words, &output),
+        ["local".to_owned(), format!("netbird:{identity}@{port}")]
+    );
+}

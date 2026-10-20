@@ -90,3 +90,52 @@ pub(crate) fn dialed_ips(capture: &Path) -> Vec<String> {
         .map(|line| line.split(':').next().unwrap_or(line).to_owned())
         .collect()
 }
+
+/// A loopback daemon that answers every `daemon.health` probe.
+pub(crate) fn serve_health() -> u16 {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("bind the health fixture");
+    let port = listener.local_addr().expect("fixture address").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let stream = stream.expect("accept a probe");
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
+                    let request: protocol::Request =
+                        serde_json::from_str(line.trim_end()).expect("a probe request");
+                    let response = protocol::Response::ok(
+                        protocol::PROTOCOL_VERSION,
+                        request.id(),
+                        serde_json::json!({
+                            "status": "ok",
+                            "daemon_version": "fixture",
+                            "protocol_version": protocol::PROTOCOL_VERSION.get()
+                        }),
+                    )
+                    .expect("a probe response");
+                    writeln!(
+                        reader.get_mut(),
+                        "{}",
+                        serde_json::to_string(&response).expect("serialize the response")
+                    )
+                    .expect("write the probe response");
+                    line.clear();
+                }
+            });
+        }
+    });
+    port
+}
+
+/// A port nothing listens on.
+pub(crate) fn closed_port() -> u16 {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("bind a port to free")
+        .local_addr()
+        .expect("port address")
+        .port()
+}
+

@@ -7,6 +7,9 @@ use pohunek_test_support::env::TestEnv;
 #[cfg(target_os = "linux")]
 #[path = "support/connect_redirect.rs"]
 mod connect_redirect;
+#[cfg(target_os = "linux")]
+#[path = "support/pin_overlay.rs"]
+mod pin_overlay;
 
 fn fake_netbird(bin: &std::path::Path) {
     let path = bin.join("netbird");
@@ -497,56 +500,6 @@ fn discover_redirected(status: &str, port: u16) -> Vec<serde_json::Value> {
     document["ok"].as_array().expect("host records").clone()
 }
 
-/// A loopback daemon that answers every `daemon.health` probe.
-#[cfg(target_os = "linux")]
-fn serve_health() -> u16 {
-    use std::io::{BufRead as _, BufReader, Write as _};
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .expect("bind the health fixture");
-    let port = listener.local_addr().expect("fixture address").port();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let stream = stream.expect("accept a probe");
-            std::thread::spawn(move || {
-                let mut reader = BufReader::new(stream);
-                let mut line = String::new();
-                while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
-                    let request: protocol::Request =
-                        serde_json::from_str(line.trim_end()).expect("a probe request");
-                    let response = protocol::Response::ok(
-                        protocol::PROTOCOL_VERSION,
-                        request.id(),
-                        serde_json::json!({
-                            "status": "ok",
-                            "daemon_version": "fixture",
-                            "protocol_version": protocol::PROTOCOL_VERSION.get()
-                        }),
-                    )
-                    .expect("a probe response");
-                    writeln!(
-                        reader.get_mut(),
-                        "{}",
-                        serde_json::to_string(&response).expect("serialize the response")
-                    )
-                    .expect("write the probe response");
-                    line.clear();
-                }
-            });
-        }
-    });
-    port
-}
-
-/// A port nothing listens on.
-#[cfg(target_os = "linux")]
-fn closed_port() -> u16 {
-    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .expect("bind a port to free")
-        .local_addr()
-        .expect("port address")
-        .port()
-}
-
 #[cfg(target_os = "linux")]
 fn status_with_self(self_address: Option<&str>) -> String {
     let mut document = serde_json::json!({
@@ -567,7 +520,7 @@ fn status_with_self(self_address: Option<&str>) -> String {
 #[test]
 #[cfg(target_os = "linux")]
 fn this_machine_is_listed_first_as_one_local_record() {
-    let port = serve_health();
+    let port = pin_overlay::serve_health();
     let records = discover_redirected(&status_with_self(Some(SELF_IP)), port);
     assert_eq!(records.len(), 2, "{records:?}");
     let locals = records
@@ -596,7 +549,7 @@ fn this_machine_is_listed_first_as_one_local_record() {
 #[test]
 #[cfg(target_os = "linux")]
 fn a_failed_probe_of_this_machine_reads_unreachable() {
-    let records = discover_redirected(&status_with_self(Some(SELF_IP)), closed_port());
+    let records = discover_redirected(&status_with_self(Some(SELF_IP)), pin_overlay::closed_port());
     let local = records
         .iter()
         .find(|record| record.get("local").is_some())
@@ -610,7 +563,7 @@ fn a_failed_probe_of_this_machine_reads_unreachable() {
 #[test]
 #[cfg(target_os = "linux")]
 fn this_machine_without_an_address_is_a_candidate() {
-    let records = discover_redirected(&status_with_self(None), closed_port());
+    let records = discover_redirected(&status_with_self(None), pin_overlay::closed_port());
     let local = &records[0];
     assert_eq!(local["local"], true);
     assert!(local["address"].is_null());
