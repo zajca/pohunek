@@ -315,7 +315,7 @@ async fn resolving_a_host_once_pins_its_identity_and_keeps_the_typed_name() {
             assert_eq!(pinned_route, expected);
             assert_eq!(display, PEER_NAME);
         }
-        other => panic!("expected a remote host, got {other:?}"),
+        other @ ResolvedHost::Local => panic!("expected a remote host, got {other:?}"),
     }
     match resolve_host_target_in(&format!("{PEER_NAME}@19000"), timeout, &registry)
         .await
@@ -324,7 +324,7 @@ async fn resolving_a_host_once_pins_its_identity_and_keeps_the_typed_name() {
         ResolvedHost::Remote { pinned_route, .. } => {
             assert_eq!(pinned_route, format!("stub:{identity}@19000"));
         }
-        other => panic!("expected a remote host, got {other:?}"),
+        other @ ResolvedHost::Local => panic!("expected a remote host, got {other:?}"),
     }
 }
 

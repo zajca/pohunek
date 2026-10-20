@@ -107,6 +107,10 @@ pub(crate) fn overlay_registry() -> OverlayRegistry {
 }
 
 /// A registry whose provider reports `own_fqdn` as this machine's own name.
+#[allow(
+    dead_code,
+    reason = "each test binary using this module needs a different subset of its helpers"
+)]
 pub(crate) fn overlay_registry_with_own_name(own_fqdn: &'static str) -> OverlayRegistry {
     registry_reporting(Some(own_fqdn))
 }
