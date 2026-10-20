@@ -20464,6 +20464,119 @@ generation "$1"
             drop(worker.reporter);
         }
 
+        /// Reconciles the stored record of an answering worker whose snapshot
+        /// is reshaped by `reshape`, and returns the session afterwards.
+        async fn reconcile_reshaped_snapshot(
+            session_id: &str,
+            reshape: impl FnOnce(&mut pohunek_worker_protocol::InspectSnapshot),
+        ) -> protocol::SessionInfo {
+            let previous = &SHAPES[0];
+            let root = temp_root();
+            let runtime_root = root.join("runtime/workers");
+            let worker = spawn_launch_worker(
+                &root,
+                &runtime_root,
+                session_id,
+                "worker-n1",
+                STORED_REFERENCE,
+            )
+            .await;
+            let store_path = write_previous_store(
+                &root,
+                previous,
+                session_id,
+                "worker-n1",
+                worker.worker_instance_id.as_str(),
+                worker.child_pid,
+            );
+            let store = Store::new(store_path.clone());
+            let mut record = store
+                .load_sessions()
+                .expect("load store")
+                .into_iter()
+                .find(|record| record.session_id == session_id)
+                .expect("record");
+            record.info.activity = Some(protocol::AgentActivity::Working);
+            store.record_session(&record).expect("store working record");
+            let registry = upgraded_registry(
+                &root,
+                store_path,
+                previous,
+                Arc::new(RetryInspector::default()),
+            );
+            let mut snapshot = worker.controller.inspect().await.expect("inspect");
+            reshape(&mut snapshot);
+
+            let _pending = Box::pin(registry.reconcile_record(
+                record,
+                Some((worker.controller.clone(), snapshot)),
+                false,
+            ))
+            .await;
+
+            let info = registry
+                .inspect(&SessionId(session_id.to_owned()))
+                .await
+                .expect("inspect");
+            worker.server_task.abort();
+            drop(worker.reporter);
+            info
+        }
+
+        #[tokio::test]
+        async fn an_answering_worker_that_is_stopping_or_faulted_is_an_unproven_loss() {
+            use pohunek_worker_protocol::RuntimePhase;
+            for (id, phase) in [
+                ("s-1334", RuntimePhase::Stopping),
+                ("s-1335", RuntimePhase::Faulted),
+            ] {
+                let info = reconcile_reshaped_snapshot(id, |snapshot| snapshot.phase = phase).await;
+
+                let runtime = info.runtime.as_ref().expect("runtime");
+                assert_eq!(runtime.state, RuntimeState::Lost, "{phase:?}");
+                assert_eq!(
+                    runtime.loss_reason.as_deref(),
+                    Some("worker_runtime_terminal")
+                );
+                assert_eq!(
+                    info.state,
+                    protocol::SessionState::Running,
+                    "{phase:?}: the worker still answers, so nothing proves the end"
+                );
+                assert_eq!(info.activity, None, "{phase:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_missing_child_ends_the_session_only_once_the_worker_has_started() {
+            use pohunek_worker_protocol::RuntimePhase;
+            let starting = reconcile_reshaped_snapshot("s-1336", |snapshot| {
+                snapshot.phase = RuntimePhase::Starting;
+                snapshot.child_process = None;
+            })
+            .await;
+            assert_eq!(
+                starting.runtime.as_ref().map(|runtime| runtime.state),
+                Some(RuntimeState::Lost)
+            );
+            assert_eq!(
+                starting.state,
+                protocol::SessionState::Running,
+                "a starting worker has not spawned its child yet"
+            );
+            assert_eq!(starting.activity, None);
+
+            let running = reconcile_reshaped_snapshot("s-1337", |snapshot| {
+                snapshot.child_process = None;
+            })
+            .await;
+            let runtime = running.runtime.as_ref().expect("runtime");
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.loss_reason.as_deref(), Some("worker_child_missing"));
+            assert_eq!(running.state, protocol::SessionState::Failed);
+            assert_eq!(running.activity, None);
+        }
+
         #[tokio::test]
         async fn a_contradicting_launch_reference_still_conflicts() {
             let logs = crate::runtime::lifecycle::tests::LogCapture::default();
