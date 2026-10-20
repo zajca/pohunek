@@ -633,6 +633,15 @@ fn ambiguity_hint(candidates: &[overlay::HostCandidate]) -> String {
     }
 }
 
+/// Message of a lifecycle deadline that elapsed while the daemon `action` was
+/// still pending.
+fn lifecycle_timeout_message(host: Option<&str>, timeout: Duration, action: &str) -> String {
+    host.map_or_else(
+        || format!("timed out after {timeout:?} waiting for the local daemon to {action}"),
+        |host| format!("timed out after {timeout:?} waiting for host '{host}' to {action}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -817,13 +826,4 @@ mod tests {
             .as_deref()
             .is_some_and(|hint| hint.contains("<non-zero-port>")));
     }
-}
-
-/// Message of a lifecycle deadline that elapsed while the daemon `action` was
-/// still pending.
-fn lifecycle_timeout_message(host: Option<&str>, timeout: Duration, action: &str) -> String {
-    host.map_or_else(
-        || format!("timed out after {timeout:?} waiting for the local daemon to {action}"),
-        |host| format!("timed out after {timeout:?} waiting for host '{host}' to {action}"),
-    )
 }

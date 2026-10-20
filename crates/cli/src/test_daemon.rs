@@ -56,7 +56,8 @@ impl HeldDaemon {
         let (release, release_rx) = oneshot::channel::<()>();
         let release_rx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
         let accept = tokio::spawn(async move {
-            for connection in 0_usize.. {
+            let mut connection = 0_usize;
+            loop {
                 let (stream, _) = listener.accept().await.expect("accept control client");
                 tokio::spawn(serve_connection(
                     stream,
@@ -65,6 +66,7 @@ impl HeldDaemon {
                     received_tx.clone(),
                     std::sync::Arc::clone(&release_rx),
                 ));
+                connection += 1;
             }
         });
         Self {

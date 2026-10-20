@@ -92,7 +92,7 @@ impl Frozen {
         );
         let registry = SessionRegistry::new_with_launcher_and_inspector(
             config,
-            launcher.clone(),
+            Arc::<SubprocessWorkerLauncher>::clone(&launcher),
             Arc::new(HostInspector::new()),
         );
         let created = {
@@ -163,7 +163,7 @@ async fn a_stop_of_a_frozen_worker_is_a_typed_error_and_retryable() {
 
     let error = guard(
         "a stop of a frozen worker",
-        frozen.registry.stop(&frozen.id),
+        Box::pin(frozen.registry.stop(&frozen.id)),
     )
     .await
     .expect_err("a frozen worker cannot answer the stop");
@@ -179,7 +179,7 @@ async fn a_stop_of_a_frozen_worker_is_a_typed_error_and_retryable() {
     frozen.thaw();
     guard(
         "a retried stop after the worker thawed",
-        frozen.registry.stop(&frozen.id),
+        Box::pin(frozen.registry.stop(&frozen.id)),
     )
     .await
     .expect("a retried stop succeeds once the worker answers");
@@ -198,7 +198,7 @@ async fn a_remove_of_a_frozen_worker_is_a_typed_error_and_keeps_the_record() {
 
     let error = guard(
         "a removal of a frozen worker",
-        frozen.registry.remove(&frozen.id),
+        Box::pin(frozen.registry.remove(&frozen.id)),
     )
     .await
     .expect_err("a frozen worker cannot answer the stop inside the removal");
@@ -213,7 +213,7 @@ async fn a_remove_of_a_frozen_worker_is_a_typed_error_and_keeps_the_record() {
     frozen.thaw();
     guard(
         "a retried removal after the worker thawed",
-        frozen.registry.remove(&frozen.id),
+        Box::pin(frozen.registry.remove(&frozen.id)),
     )
     .await
     .expect("a retried removal succeeds once the worker answers");

@@ -102,7 +102,7 @@ fn run_scenario(scenario: &Scenario) {
             )
             .expect("make the directory owner-private");
         }
-        let fixture = Fixture::serve(&root.join("run/pohunek/daemon.sock"), &scenario);
+        let fixture = Fixture::serve(&root.join("run/pohunek/daemon.sock"), scenario);
 
         // The `--json` run starts first, so its notice timer expires before
         // the plain run's: when the plain notice is out, a `--json` notice
