@@ -843,6 +843,12 @@ resumes from its frozen digest, as before the upgrade. The profile counts as
 unchanged when only its pin moved to a strictly newer official version of the
 same package. The preflight reports the session as `adoptable`.
 
+A digest the registry already records under another trust source (for example
+`explicit_digest`) is never the official newer pin, even when the release plan
+lists it: the preflight and resume both judge it by that record, so a session
+whose profile pins such a digest is not adopted and resume refuses
+`agent_profile_changed`.
+
 The relaunch keeps the frozen program and arguments. It probes the agent with
 the newer version's version probe and records the newer digest as the session's
 pin. A lower version never adopts a session, and neither does another digest of

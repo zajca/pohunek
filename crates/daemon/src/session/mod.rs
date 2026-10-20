@@ -709,6 +709,10 @@ struct SessionRegistryInner {
     /// before it launches.
     #[cfg(test)]
     recovery_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Holds the next resume or fork once its recovery definition is resolved,
+    /// before it plans the relaunch.
+    #[cfg(test)]
+    definition_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     /// Parks an adopted detector refresh between resolving the runtime sources
     /// and applying them.
     #[cfg(test)]
@@ -1926,6 +1930,8 @@ impl SessionRegistry {
                 #[cfg(test)]
                 recovery_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
+                definition_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
                 refresh_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 report_hold: std::sync::Mutex::new(None),
@@ -2945,6 +2951,22 @@ impl SessionRegistry {
         let gate = self
             .inner
             .metadata_apply_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Parks a resume or fork after its recovery definition resolved, before
+    /// the relaunch is planned, when a test armed the hold.
+    #[cfg(test)]
+    async fn hold_definition(&self) {
+        let gate = self
+            .inner
+            .definition_hold
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
