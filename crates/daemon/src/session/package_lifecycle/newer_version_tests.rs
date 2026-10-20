@@ -1258,6 +1258,26 @@ async fn assert_repin_during_recovery(tag: &str, fork: bool) {
         Some(revision_on(&restarted.registry, &session.store_path, id)),
         "the recorded profile revision describes the digest that launched"
     );
+    // The repin is part of the profile now: stopping and recovering the session
+    // again needs no further decision and adopts the newer version.
+    if fork {
+        let report = native_report_params(
+            &restarted.registry,
+            id.clone(),
+            CLAUDE.runtime.to_owned(),
+            CONVERSATION.to_owned(),
+            None,
+        )
+        .await;
+        assert!(restarted.registry.report_as_root(report).await.recorded);
+    }
+    restarted.registry.stop(id).await.expect("stop the session");
+    restarted
+        .registry
+        .resume_with(id, ProfileChange::Refuse)
+        .await
+        .expect("the next recovery matches the revision the race recorded");
+    assert_eq!(pinned_digest(&session.store_path, id), new.digest);
     restarted
         .registry
         .remove(id)

@@ -1502,7 +1502,13 @@ fn adopted_profile_matches_in(
         package: package.id.clone(),
         digest: package_digest.clone(),
     };
-    profiles.frozen_package_matches(name, stored, launch, (&launched, &served), frozen)
+    // A profile repinned while the session was recovering is recorded under the
+    // frozen binding with its new pin, so the text as it stands reproduces the
+    // frozen revision.
+    Ok(
+        profiles.frozen_package_matches(name, stored, launch, (&launched, &served), frozen)?
+            || profiles.frozen_package_matches(name, stored, launch, (&served, &served), frozen)?,
+    )
 }
 
 /// Whether a profile that a release step repinned still matches the revision
