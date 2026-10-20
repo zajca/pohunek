@@ -1119,7 +1119,7 @@ impl Bus {
             .map_err(|source| unit_error(OPERATION, id, source))?;
         let unit = self.proxy(path.clone(), UNIT_INTERFACE, OPERATION).await?;
         let service = self.proxy(path, SERVICE_INTERFACE, OPERATION).await?;
-        let before = read_invocation(&unit, id).await?;
+        let before = read_invocation(&unit, id, true).await?;
         if before.active_state != "failed" {
             return Ok(None);
         }
@@ -1135,7 +1135,7 @@ impl Bus {
             .get_property("ExecMainStatus")
             .await
             .map_err(|source| unit_error(OPERATION, id, source))?;
-        let after = read_invocation(&unit, id).await?;
+        let after = read_invocation(&unit, id, false).await?;
         if before != after {
             return Err(Error::Race {
                 operation: OPERATION,
@@ -1538,19 +1538,44 @@ struct Invocation {
     invocation_id: Vec<u8>,
 }
 
-async fn read_invocation(unit: &zbus::Proxy<'_>, id: &ServiceId) -> Result<Invocation, Error> {
+/// Reads the state and invocation of a unit, in the order that brackets the
+/// reads between them: the invocation first when `opening`, last otherwise.
+///
+/// A restart between the two reads of one call changes the invocation seen by
+/// the other call, so a state of one run is never paired with the properties
+/// of another.
+async fn read_invocation(
+    unit: &zbus::Proxy<'_>,
+    id: &ServiceId,
+    opening: bool,
+) -> Result<Invocation, Error> {
     const OPERATION: &str = "exit_evidence";
 
-    Ok(Invocation {
-        active_state: unit
-            .get_property("ActiveState")
+    async fn invocation_id(unit: &zbus::Proxy<'_>, id: &ServiceId) -> Result<Vec<u8>, Error> {
+        unit.get_property("InvocationID")
             .await
-            .map_err(|source| unit_error(OPERATION, id, source))?,
-        invocation_id: unit
-            .get_property("InvocationID")
+            .map_err(|source| unit_error(OPERATION, id, source))
+    }
+    async fn active_state(unit: &zbus::Proxy<'_>, id: &ServiceId) -> Result<String, Error> {
+        unit.get_property("ActiveState")
             .await
-            .map_err(|source| unit_error(OPERATION, id, source))?,
-    })
+            .map_err(|source| unit_error(OPERATION, id, source))
+    }
+    if opening {
+        let invocation_id = invocation_id(unit, id).await?;
+        let active_state = active_state(unit, id).await?;
+        Ok(Invocation {
+            active_state,
+            invocation_id,
+        })
+    } else {
+        let active_state = active_state(unit, id).await?;
+        let invocation_id = invocation_id(unit, id).await?;
+        Ok(Invocation {
+            active_state,
+            invocation_id,
+        })
+    }
 }
 
 /// Accepts the manager's `Result` string when it is a short token.
