@@ -1441,6 +1441,7 @@ mod tests {
             runtime_stop: false,
             runtime_backup: None,
             launchd_default_path: None,
+            launchd_boot_identity: None,
             accepted_risks: None,
         };
         assert_eq!(

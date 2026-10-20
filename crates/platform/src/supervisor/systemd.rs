@@ -104,8 +104,8 @@ use zbus::zvariant::{OwnedObjectPath, Value};
 use super::{
     Activation, DaemonSupervisor, DefinitionFacts, Error, ExitEvidence, JobDefinition, JobExit,
     Namespace, Operation, PluginUnitDefinition, PluginUnitKey, PluginUnitKind, PluginUnits,
-    RestartPolicy, ServiceId, ServiceObservation, ServiceState, Supervisor, WorkerKey,
-    MAX_JOB_TIMEOUT,
+    RestartPolicy, ServiceId, ServiceObservation, ServiceState, Supervisor, UnitEnvironment,
+    WorkerKey, MAX_JOB_TIMEOUT,
 };
 use crate::filesystem::{EntryKind, FsError, StageOutcome, TrustedDir};
 use crate::process::{Error as ProcessError, LinuxInspector, ProcessIdentity, ProcessInspector};
@@ -935,6 +935,71 @@ async fn read_user_manager_environment(
         .get_property::<Vec<String>>(MANAGER_ENVIRONMENT_PROPERTY)
         .await
         .map_err(|source| bus_error(OPERATION, source))
+}
+
+/// Reads the environment configuration the user manager holds for `unit`.
+///
+/// The unit is loaded (not started) so drop-ins apply. A unit with no file and
+/// no drop-in reports `not-found` and empty settings, which is the state of a
+/// job that is not installed yet. Both the connection and the calls are bounded
+/// by `call_timeout`.
+///
+/// # Errors
+///
+/// Returns [`Error::Unavailable`] when the session bus cannot be reached,
+/// [`Error::Timeout`] when a call does not finish within `call_timeout`, and
+/// [`Error::Operation`] when the manager rejects a read.
+pub async fn unit_environment(
+    unit: &str,
+    call_timeout: Duration,
+) -> Result<UnitEnvironment, Error> {
+    read_unit_environment(None, unit, call_timeout).await
+}
+
+/// [`unit_environment`] over the bus at `address`, or over the session bus the
+/// environment names when `address` is `None`.
+async fn read_unit_environment(
+    address: Option<&str>,
+    unit: &str,
+    call_timeout: Duration,
+) -> Result<UnitEnvironment, Error> {
+    const OPERATION: &str = "read_unit_environment";
+
+    let bus = Bus::connect_to(address, call_timeout).await?;
+    let path: OwnedObjectPath = bus
+        .manager(OPERATION)
+        .await?
+        .call("LoadUnit", &(unit,))
+        .await
+        .map_err(|source| bus_error(OPERATION, source))?;
+    let unit_proxy = bus.proxy(path.clone(), UNIT_INTERFACE, OPERATION).await?;
+    let service = bus.proxy(path, SERVICE_INTERFACE, OPERATION).await?;
+    let read = |source| bus_error(OPERATION, source);
+    let load_state: String = unit_proxy.get_property("LoadState").await.map_err(read)?;
+    let drop_in_paths: Vec<String> = unit_proxy.get_property("DropInPaths").await.map_err(read)?;
+    if load_state == "not-found" && drop_in_paths.is_empty() {
+        return Ok(UnitEnvironment {
+            load_state,
+            ..UnitEnvironment::default()
+        });
+    }
+    Ok(UnitEnvironment {
+        load_state,
+        drop_in_paths,
+        environment: service.get_property("Environment").await.map_err(read)?,
+        environment_files: service
+            .get_property("EnvironmentFiles")
+            .await
+            .map_err(read)?,
+        pass_environment: service
+            .get_property("PassEnvironment")
+            .await
+            .map_err(read)?,
+        unset_environment: service
+            .get_property("UnsetEnvironment")
+            .await
+            .map_err(read)?,
+    })
 }
 
 /// Session-bus connection to the systemd user manager.

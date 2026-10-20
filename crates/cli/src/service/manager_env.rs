@@ -15,6 +15,7 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 
+use pohunek_platform::supervisor::UnitEnvironment;
 use pohunek_platform::supervisor::SEARCH_PATH_VARIABLE;
 use pohunek_worker_protocol::BaseEnv;
 
@@ -38,6 +39,13 @@ pub trait UserManager: Debug + Send + Sync {
     fn environment(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, EnvironmentFailure>> + Send + '_>>;
+
+    /// Returns the environment settings the manager holds for `unit`, drop-ins
+    /// included, or why they cannot be read.
+    fn unit_environment<'a>(
+        &'a self,
+        unit: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<UnitEnvironment, EnvironmentFailure>> + Send + 'a>>;
 }
 
 /// Reads the environment through the platform's D-Bus client on Linux.
@@ -56,20 +64,25 @@ impl UserManager for SystemdUserManager {
                 settings::MANAGER_ENVIRONMENT_TIMEOUT,
             )
             .await
-            .map_err(|error| {
-                // Only an absent bus means no manager is reachable; a bus that
-                // refuses the client is an answer that cannot be used.
-                let detail = if error.is_bus_address_invalid() {
-                    "the session bus address cannot be used (zbus address error)".to_owned()
-                } else {
-                    error.to_string()
-                };
-                if error.is_no_bus() {
-                    EnvironmentFailure::Unreachable(detail)
-                } else {
-                    EnvironmentFailure::Unusable(detail)
-                }
-            })
+            .map_err(|error| bus_failure(&error))
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unit_environment<'a>(
+        &'a self,
+        unit: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<UnitEnvironment, EnvironmentFailure>> + Send + 'a>>
+    {
+        use super::settings;
+
+        Box::pin(async move {
+            pohunek_platform::supervisor::systemd::unit_environment(
+                unit,
+                settings::MANAGER_ENVIRONMENT_TIMEOUT,
+            )
+            .await
+            .map_err(|error| bus_failure(&error))
         })
     }
 
@@ -81,6 +94,36 @@ impl UserManager for SystemdUserManager {
         Box::pin(std::future::ready(Err(EnvironmentFailure::Unreachable(
             "the systemd user manager exists only on Linux".to_owned(),
         ))))
+    }
+
+    /// The systemd user manager exists only on Linux.
+    #[cfg(not(target_os = "linux"))]
+    fn unit_environment<'a>(
+        &'a self,
+        _unit: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<UnitEnvironment, EnvironmentFailure>> + Send + 'a>>
+    {
+        Box::pin(std::future::ready(Err(EnvironmentFailure::Unreachable(
+            "the systemd user manager exists only on Linux".to_owned(),
+        ))))
+    }
+}
+
+/// Classifies a failed bus read.
+///
+/// Only an absent bus means no manager is reachable; a bus that refuses the
+/// client is an answer that cannot be used.
+#[cfg(target_os = "linux")]
+fn bus_failure(error: &pohunek_platform::supervisor::Error) -> EnvironmentFailure {
+    let detail = if error.is_bus_address_invalid() {
+        "the session bus address cannot be used (zbus address error)".to_owned()
+    } else {
+        error.to_string()
+    };
+    if error.is_no_bus() {
+        EnvironmentFailure::Unreachable(detail)
+    } else {
+        EnvironmentFailure::Unusable(detail)
     }
 }
 
@@ -209,6 +252,110 @@ pub(crate) fn carry(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
+/// The `PATH` the daemon job gets from the user manager and its own unit.
+///
+/// `manager_path` is the manager's `PATH`; `unit` is what the manager holds for
+/// the daemon unit (`unit_name`), drop-ins merged. A unit `Environment=` entry
+/// for `PATH` wins over the manager's, the last one first. Every setting that
+/// could change `PATH` but whose result is not derivable here is refused, with
+/// the cause and the directive to remove, so the caller never judges a `PATH`
+/// the job does not get. Reads each `EnvironmentFile=` named; values are never
+/// part of an error.
+///
+/// # Errors
+///
+/// Returns [`Error::ManagerEnvironment`] for a unit that is masked or failed to
+/// load, a drop-in on a unit with no file, an `EnvironmentFile=` that sets
+/// `PATH`, cannot be read or is a wildcard, and `PassEnvironment=` or
+/// `UnsetEnvironment=` naming `PATH`.
+pub async fn effective_search_path(
+    manager_path: Option<String>,
+    unit: &UnitEnvironment,
+    unit_name: &str,
+) -> Result<Option<String>, Error> {
+    let refuse = |detail: String| Error::ManagerEnvironment { detail };
+    match unit.load_state.as_str() {
+        "loaded" => {}
+        "not-found" if unit.drop_in_paths.is_empty() => return Ok(manager_path),
+        "not-found" => {
+            return Err(refuse(format!(
+                "{unit_name} has drop-in files ({}) but no unit file yet, so the PATH they set cannot be read before the unit is written. Remove the drop-ins, or install the unit first and retry",
+                unit.drop_in_paths.join(", ")
+            )))
+        }
+        other => {
+            return Err(refuse(format!(
+                "{unit_name} is {other}, so the PATH its job gets cannot be determined. Fix the unit (`systemctl --user status {unit_name}`) and retry"
+            )))
+        }
+    }
+    let names_path = |entry: &String| {
+        entry == SEARCH_PATH_VARIABLE
+            || entry
+                .strip_prefix(SEARCH_PATH_VARIABLE)
+                .is_some_and(|rest| rest.starts_with('='))
+    };
+    if unit
+        .pass_environment
+        .iter()
+        .any(|name| name == SEARCH_PATH_VARIABLE)
+    {
+        return Err(refuse(format!(
+            "{unit_name} sets PassEnvironment= with {SEARCH_PATH_VARIABLE}, whose value is the service manager process's own and cannot be read here. Remove {SEARCH_PATH_VARIABLE} from PassEnvironment= in the unit or its drop-ins (`systemctl --user cat {unit_name}`) and retry"
+        )));
+    }
+    if unit.unset_environment.iter().any(names_path) {
+        return Err(refuse(format!(
+            "{unit_name} sets UnsetEnvironment= for {SEARCH_PATH_VARIABLE}, so its job has no PATH to judge. Remove it from the unit or its drop-ins (`systemctl --user cat {unit_name}`) and retry"
+        )));
+    }
+    for (file, optional) in &unit.environment_files {
+        check_environment_file(file, *optional, unit_name).await?;
+    }
+    let prefix = format!("{SEARCH_PATH_VARIABLE}=");
+    let unit_path = unit
+        .environment
+        .iter()
+        .rev()
+        .find_map(|entry| entry.strip_prefix(prefix.as_str()))
+        .map(carry)
+        .transpose()
+        .map_err(refuse)?;
+    Ok(unit_path.or(manager_path))
+}
+
+/// Refuses an `EnvironmentFile=` that sets `PATH` or cannot be shown not to.
+async fn check_environment_file(file: &str, optional: bool, unit_name: &str) -> Result<(), Error> {
+    let refuse = |detail: String| Error::ManagerEnvironment { detail };
+    if file.contains(['*', '?', '[']) {
+        return Err(refuse(format!(
+            "{unit_name} names the EnvironmentFile= pattern {file}, whose files cannot be listed here. Replace it with plain paths in the unit or its drop-ins (`systemctl --user cat {unit_name}`) and retry"
+        )));
+    }
+    let bytes = match tokio::fs::read(file).await {
+        Ok(bytes) => bytes,
+        Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(refuse(format!(
+                "{unit_name} names the EnvironmentFile= {file}, which cannot be read ({}), so its PATH cannot be judged. Make the file readable, or prefix the path with `-` if it may be absent, and retry",
+                error.kind()
+            )))
+        }
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let sets_path = text.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix(SEARCH_PATH_VARIABLE)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    });
+    if sets_path {
+        return Err(refuse(format!(
+            "the EnvironmentFile= {file} of {unit_name} sets {SEARCH_PATH_VARIABLE}, and its quoting is not re-parsed here. Move the {SEARCH_PATH_VARIABLE} assignment to an Environment= line of a drop-in, or record the PATH in service.toml, and retry"
+        )));
+    }
+    Ok(())
+}
+
 /// What launchd reports for the daemon job's `PATH`, from both of its sources.
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct ActiveJob {
@@ -250,6 +397,10 @@ pub trait LaunchdJob: Debug + Send + Sync {
     /// naming any job. `None` when launchd has no such domain (no GUI session).
     /// Reads no state the install or upgrade has to create.
     fn domain_environment(&self, uid: u32) -> DomainEnvironment<'_>;
+
+    /// Returns the current boot identity (`kern.boottime`), or why it cannot be
+    /// read. Two equal values mean no reboot happened between the reads.
+    fn boot_identity(&self) -> Result<String, String>;
 }
 
 /// A pending read of a launchd domain's variables, in launchd's order, or
@@ -314,5 +465,19 @@ impl LaunchdJob for SystemLaunchd {
         Box::pin(std::future::ready(Err(
             "launchd exists only on macOS".to_owned()
         )))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn boot_identity(&self) -> Result<String, String> {
+        pohunek_platform::process::DarwinInspector::new()
+            .boot_identity()
+            .map(|identity| identity.as_str().to_owned())
+            .map_err(|error| error.to_string())
+    }
+
+    /// The boot identity of a launchd host exists only on macOS.
+    #[cfg(not(target_os = "macos"))]
+    fn boot_identity(&self) -> Result<String, String> {
+        Err("launchd exists only on macOS".to_owned())
     }
 }

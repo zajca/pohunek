@@ -548,6 +548,7 @@ impl<'a> Engine<'a> {
                     runtime_stop: false,
                     runtime_backup: None,
                     launchd_default_path: None,
+                    launchd_boot_identity: None,
                     accepted_risks: None,
                 };
                 self.store.save(&record)?;
@@ -706,6 +707,9 @@ impl<'a> Engine<'a> {
             // launchd default of a loaded job is journaled: the other sources
             // can be read again later.
             let launchd_default_path = job_path.and_then(|job| job.loaded_default);
+            let launchd_boot_identity = launchd_default_path
+                .as_ref()
+                .and_then(|_| journaled_boot_identity(self.context));
             let record = Record {
                 schema_version: record::SCHEMA_VERSION,
                 operation: Operation::Upgrade,
@@ -719,6 +723,7 @@ impl<'a> Engine<'a> {
                 runtime_stop: false,
                 runtime_backup: None,
                 launchd_default_path,
+                launchd_boot_identity,
                 accepted_risks: None,
             };
             self.store.save(&record)?;
@@ -738,12 +743,7 @@ impl<'a> Engine<'a> {
         };
         self.settle(&record, result).await?;
         let (post, integrations) = self
-            .reinstall_integrations(
-                &layout,
-                version,
-                config,
-                record.launchd_default_path.as_deref(),
-            )
+            .reinstall_integrations(&layout, version, config, record.journal_default())
             .await;
         // The preflight right before the swap is the one that counts.
         let gated = late.gated.or(gated);
@@ -1157,7 +1157,7 @@ impl<'a> Engine<'a> {
         }
         // The job is resolved here, after the hook and after a migration's stop,
         // so the value the runtime step gets is the one the new daemon gets.
-        let job = job_path(self.context, config, record.launchd_default_path.as_deref()).await?;
+        let job = job_path(self.context, config, record.journal_default()).await?;
         let warnings = job_warnings(self.context, &job);
         late.warnings.extend(warnings.iter().cloned());
         if swap {
@@ -1425,7 +1425,7 @@ impl<'a> Engine<'a> {
         if let Some(hook) = &self.before_swap {
             (hook.0)();
         }
-        let job = job_path(self.context, config, record.launchd_default_path.as_deref()).await?;
+        let job = job_path(self.context, config, record.journal_default()).await?;
         let warnings = job_warnings(self.context, &job);
         late.warnings.extend(warnings.iter().cloned());
         if let Some(dir) = config.daemon_executable().parent() {
@@ -1543,7 +1543,7 @@ impl<'a> Engine<'a> {
         layout: &InstallLayout,
         version: &str,
         config: &ServiceConfig,
-        journal_default: Option<&str>,
+        journal_default: Option<JournalDefault<'_>>,
     ) -> (Option<EnsureReport>, Vec<IntegrationReinstall>) {
         let plan = match layout.version_dir(version) {
             Some(dir) => match layout::verify_installed(layout, &dir) {
@@ -2649,12 +2649,7 @@ pub(crate) async fn journal_job_path(context: &Context, record: &Record) -> Resu
     let source = load_config_for_upgrade(&context.config_path())?.ok_or(Error::NotInstalled {
         path: context.config_path(),
     })?;
-    job_path(
-        context,
-        &source.config,
-        record.launchd_default_path.as_deref(),
-    )
-    .await
+    job_path(context, &source.config, record.journal_default()).await
 }
 
 /// What an install or upgrade does with the pending transaction record.
@@ -2976,6 +2971,34 @@ pub(crate) async fn installed_job_search_path(context: &Context) -> Result<JobPa
     job_search_path(context, &source.config, None).await
 }
 
+/// The launchd default a transaction journaled, with the boot it was read in.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(
+        dead_code,
+        reason = "only the launchd path reads the journaled default"
+    )
+)]
+pub(crate) struct JournalDefault<'a> {
+    /// The loaded job's `default environment` `PATH`.
+    pub(crate) path: &'a str,
+    /// The boot identity read with it, when it could be.
+    pub(crate) boot_identity: Option<&'a str>,
+}
+
+impl Record {
+    /// The launchd default this record journaled, with its boot identity.
+    pub(crate) fn journal_default(&self) -> Option<JournalDefault<'_>> {
+        self.launchd_default_path
+            .as_deref()
+            .map(|path| JournalDefault {
+                path,
+                boot_identity: self.launchd_boot_identity.as_deref(),
+            })
+    }
+}
+
 /// Where the `PATH` of a job without its own came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PathSource {
@@ -3066,13 +3089,14 @@ fn manager_warnings(job: &JobPath) -> Vec<String> {
 /// - macOS, in launchd's order: the domain's `environment` `PATH` (readable
 ///   whether or not the job is loaded); the loaded job's `default environment`;
 ///   for a job that is not loaded, `journal_default` (the launchd default the
-///   upgrade journaled while the job was loaded); and only without that, the
+///   upgrade journaled while the job was loaded) while the host has not
+///   rebooted since, otherwise the persisted configuration; and only without that, the
 ///   persisted launchd configuration, then launchd's standard `PATH`. The last
 ///   two are the best evidence available and are reported as
 ///   [`PathSource::Persisted`].
 ///
-/// `journal_default` is the journal's `launchd_default_path` of the transaction
-/// the call belongs to, or `None` outside a transaction.
+/// `journal_default` is the journal's `launchd_default_path` with its boot
+/// identity, for the transaction the call belongs to, or `None` outside one.
 ///
 /// # Errors
 ///
@@ -3081,7 +3105,7 @@ fn manager_warnings(job: &JobPath) -> Vec<String> {
 pub(crate) async fn job_path(
     context: &Context,
     config: &ServiceConfig,
-    journal_default: Option<&str>,
+    journal_default: Option<JournalDefault<'_>>,
 ) -> Result<JobPath, Error> {
     recorded_job_path(
         context,
@@ -3102,7 +3126,7 @@ pub(crate) async fn job_path(
 pub(crate) async fn job_search_path(
     context: &Context,
     config: &ServiceConfig,
-    journal_default: Option<&str>,
+    journal_default: Option<JournalDefault<'_>>,
 ) -> Result<JobPath, Error> {
     recorded_job_search_path(context, config.search_path(), journal_default).await
 }
@@ -3116,7 +3140,7 @@ pub(crate) async fn job_search_path(
 pub(crate) async fn recorded_job_search_path(
     context: &Context,
     recorded: &SearchPath,
-    journal_default: Option<&str>,
+    journal_default: Option<JournalDefault<'_>>,
 ) -> Result<JobPath, Error> {
     if !recorded.is_empty() {
         return Ok(JobPath {
@@ -3143,7 +3167,7 @@ pub(crate) async fn recorded_job_path(
     context: &Context,
     recorded: &SearchPath,
     allowlist: &[String],
-    journal_default: Option<&str>,
+    journal_default: Option<JournalDefault<'_>>,
 ) -> Result<JobPath, Error> {
     if !recorded.is_empty() {
         // The recorded `PATH` does not depend on the manager, so an unreachable
@@ -3163,8 +3187,20 @@ pub(crate) async fn recorded_job_path(
     if cfg!(target_os = "linux") {
         let environment =
             manager_env::user_manager_environment(context.user_manager(), allowlist).await?;
-        let value = environment
-            .search_path
+        // The daemon unit's own settings and drop-ins can replace the manager's
+        // `PATH`, so the job's value is resolved from both.
+        let unit_name = context.namespace()?.daemon_unit();
+        let unit = context
+            .user_manager()
+            .unit_environment(&unit_name)
+            .await
+            .map_err(|failure| {
+                let (manager_env::EnvironmentFailure::Unreachable(detail)
+                | manager_env::EnvironmentFailure::Unusable(detail)) = failure;
+                Error::ManagerEnvironment { detail }
+            })?;
+        let value = manager_env::effective_search_path(environment.search_path, &unit, &unit_name)
+            .await?
             .ok_or_else(|| Error::ManagerEnvironment {
                 detail: "it sets no PATH entry".to_owned(),
             })?;
@@ -3261,7 +3297,7 @@ async fn manager_variables(
 #[cfg(target_os = "macos")]
 async fn launchd_job_path(
     context: &Context,
-    journal_default: Option<&str>,
+    journal_default: Option<JournalDefault<'_>>,
     allowlist: &[String],
 ) -> Result<JobPath, Error> {
     use super::manager_env::ActiveJob;
@@ -3282,16 +3318,10 @@ async fn launchd_job_path(
         (value, PathSource::Domain)
     } else if let Some(value) = loaded_default.clone() {
         (value, PathSource::LoadedDefault)
-    } else if let Some(value) = journal_default {
-        (value.to_owned(), PathSource::Journal)
+    } else if let Some(journal) = journal_default {
+        journaled_or_persisted_path(context, journal)?
     } else {
-        let value = pohunek_platform::supervisor::launchd::read_user_domain_path(
-            context.launchd_domain_config(),
-        )
-        .map_err(|error| Error::ManagerEnvironment {
-            detail: format!("the launchd user domain's PATH cannot be read: {error}"),
-        })?;
-        (value, PathSource::Persisted)
+        (persisted_user_domain_path(context)?, PathSource::Persisted)
     };
     let value =
         manager_env::carry(&value).map_err(|detail| Error::ManagerEnvironment { detail })?;
@@ -3302,6 +3332,71 @@ async fn launchd_job_path(
         variables,
         manager_unreachable: unreachable,
     })
+}
+
+/// The `PATH` of the persisted launchd user-domain configuration, which a
+/// reboot makes active (`launchctl config user path`), or launchd's standard one.
+#[cfg(target_os = "macos")]
+fn persisted_user_domain_path(context: &Context) -> Result<String, Error> {
+    pohunek_platform::supervisor::launchd::read_user_domain_path(context.launchd_domain_config())
+        .map_err(|error| Error::ManagerEnvironment {
+            detail: format!("the launchd user domain's PATH cannot be read: {error}"),
+        })
+}
+
+/// The journaled launchd default of a job that is not loaded, or the persisted
+/// configuration when the host rebooted since it was journaled.
+///
+/// The default was read from the loaded job's environment, which a pending
+/// `launchctl config user path` replaces at the next boot. A different boot
+/// identity therefore makes the persisted value the active one. When the
+/// journal has no boot identity or the current one cannot be read, the two
+/// sources are compared: equal values need no decision, different ones cannot
+/// be told apart and are refused.
+#[cfg(target_os = "macos")]
+fn journaled_or_persisted_path(
+    context: &Context,
+    journal: JournalDefault<'_>,
+) -> Result<(String, PathSource), Error> {
+    let current = context.launchd_job().boot_identity();
+    let reason = match (journal.boot_identity, &current) {
+        (Some(journaled), Ok(now)) if journaled == now => {
+            return Ok((journal.path.to_owned(), PathSource::Journal));
+        }
+        (Some(_), Ok(_)) => {
+            return Ok((persisted_user_domain_path(context)?, PathSource::Persisted));
+        }
+        (None, _) => "the journal has no boot marker".to_owned(),
+        (Some(_), Err(error)) => format!("the current boot time cannot be read ({error})"),
+    };
+    let persisted = persisted_user_domain_path(context)?;
+    if persisted == journal.path {
+        return Ok((persisted, PathSource::Journal));
+    }
+    Err(Error::ManagerEnvironment {
+        detail: format!(
+            "the daemon job is not loaded and the PATH the upgrade journaled differs from the persisted launchd user-domain configuration, and whether the host rebooted since cannot be told ({reason}). Set the PATH explicitly with `launchctl setenv PATH <directories>` in the GUI session, or make `launchctl config user path` match the journaled value, and retry"
+        ),
+    })
+}
+
+/// The boot identity to journal next to a launchd default, or `None` with a
+/// warning when it cannot be read: the journal then proves nothing about reboots.
+#[cfg(target_os = "macos")]
+fn journaled_boot_identity(context: &Context) -> Option<String> {
+    match context.launchd_job().boot_identity() {
+        Ok(identity) => Some(identity),
+        Err(error) => {
+            tracing::warn!(%error, "the boot time cannot be read, so the journaled launchd PATH carries no boot marker");
+            None
+        }
+    }
+}
+
+/// Only macOS journals a launchd default.
+#[cfg(not(target_os = "macos"))]
+fn journaled_boot_identity(_context: &Context) -> Option<String> {
+    None
 }
 
 /// Why launchd's variables were not read: it has no user domain for `context`'s
@@ -3329,7 +3424,7 @@ async fn active_launchd_job(context: &Context) -> Result<super::manager_env::Act
 #[cfg(not(target_os = "macos"))]
 fn launchd_job_path<'a>(
     _context: &'a Context,
-    _journal_default: Option<&'a str>,
+    _journal_default: Option<JournalDefault<'a>>,
     _allowlist: &'a [String],
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<JobPath, Error>> + Send + 'a>> {
     Box::pin(std::future::ready(Err(Error::ManagerEnvironment {

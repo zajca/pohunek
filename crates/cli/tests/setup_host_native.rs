@@ -44,6 +44,8 @@ use pohunek_cli::service::layout::VerifiedVersionDir;
 use pohunek_cli::service::manager_env::{EnvironmentFailure, UserManager};
 use pohunek_cli::service::runtimes::DaemonRuntimes;
 use pohunek_cli::service::{self, Context, VERSION};
+#[cfg(target_os = "linux")]
+use pohunek_platform::supervisor::UnitEnvironment;
 use pohunek_service_config::runtimes::{EnsureReport, PackageStatus};
 use pohunek_test_support::catalog::test_key;
 use pohunek_test_support::fs::copy_shell_image;
@@ -396,6 +398,19 @@ impl UserManager for FakeUserManager {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, EnvironmentFailure>> + Send + '_>> {
         let value = self.0.clone();
         Box::pin(async move { Ok(value) })
+    }
+
+    fn unit_environment<'a>(
+        &'a self,
+        _unit: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<UnitEnvironment, EnvironmentFailure>> + Send + 'a>>
+    {
+        Box::pin(async {
+            Ok(UnitEnvironment {
+                load_state: "loaded".to_owned(),
+                ..UnitEnvironment::default()
+            })
+        })
     }
 }
 

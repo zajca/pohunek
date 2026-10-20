@@ -31,6 +31,27 @@ pub mod namespace;
 #[cfg(target_os = "linux")]
 pub mod systemd;
 
+/// What the user manager has loaded for one unit that decides the unit's
+/// process environment.
+///
+/// systemd has already merged the unit file and its drop-ins into these
+/// properties, so a caller never parses a drop-in itself.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UnitEnvironment {
+    /// The unit's `LoadState`: `loaded`, `not-found`, `masked`, `error`, ...
+    pub load_state: String,
+    /// The drop-in files the manager read for the unit.
+    pub drop_in_paths: Vec<String>,
+    /// The merged `Environment=` entries, in order; a later entry wins.
+    pub environment: Vec<String>,
+    /// The `EnvironmentFile=` paths with their optional (`-`) flag.
+    pub environment_files: Vec<(String, bool)>,
+    /// The variable names `PassEnvironment=` copies from the manager.
+    pub pass_environment: Vec<String>,
+    /// The `UnsetEnvironment=` names or assignments.
+    pub unset_environment: Vec<String>,
+}
+
 #[doc(inline)]
 pub use namespace::{Namespace, PluginUnitKey, PluginUnitKind, WorkerKey};
 

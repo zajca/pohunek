@@ -299,6 +299,15 @@ pub struct Record {
     /// never written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launchd_default_path: Option<String>,
+    /// The boot identity (`kern.boottime`) read when `launchd_default_path` was
+    /// journaled.
+    ///
+    /// A `launchctl config user path` change takes effect at the next boot, so a
+    /// journaled default is current only while the boot is the same. A journal
+    /// without it (written before it existed, or when the boot time could not be
+    /// read) cannot prove that. Never written on Linux.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launchd_boot_identity: Option<String>,
     /// The at-risk verdicts the last adoption gate of this transaction passed.
     ///
     /// Written before the transaction advances past the gate, so a resume past
@@ -1093,6 +1102,7 @@ mod tests {
             runtime_stop: false,
             runtime_backup: None,
             launchd_default_path: None,
+            launchd_boot_identity: None,
             accepted_risks: None,
         }
     }
@@ -1174,6 +1184,7 @@ mod tests {
             runtime_stop: true,
             runtime_backup: Some(journal.clone()),
             launchd_default_path: None,
+            launchd_boot_identity: None,
             step: Step::Runtimes,
             ..record(Step::Runtimes)
         };
