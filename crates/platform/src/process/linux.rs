@@ -894,7 +894,7 @@ mod tests {
         let age = inspector.process_age(me).expect("age read");
 
         assert!(
-            age.is_some_and(|age| age < Duration::from_secs(24 * 3_600)),
+            age.is_some_and(|age| age < Duration::from_hours(24)),
             "{age:?}"
         );
         let substituted = ProcessIdentity {
