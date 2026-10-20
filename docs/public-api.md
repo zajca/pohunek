@@ -3977,6 +3977,10 @@ Public exports:
 - `OverlayTransport`: provider contract whose required typed identity resolver
   must match only the requested peer-ID or FQDN field; implementations cannot
   inherit an untyped selector fallback.
+  `discover_snapshot` reads the visible peers and this machine's own identity in
+  one pass; a provider that derives both from one state read overrides it, so
+  discovery runs the provider once and the `local` record and the peers cannot
+  disagree (the default reads them separately).
 - `discover_hosts(registry)`: aggregated configured-overlay discovery with
   default bounded probes.
 - `discover_hosts_with_options(registry, options)`: the same discovery with an
