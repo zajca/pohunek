@@ -478,18 +478,42 @@ fn environment_file_sets_path(text: &str) -> Option<bool> {
     }
 }
 
+/// The logical lines of a unit file: a trailing backslash joins the next line,
+/// and comment lines are skipped, also inside a continuation.
+fn logical_lines(text: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current: Option<String> = None;
+    for physical in text.lines() {
+        let trimmed = physical.trim_start();
+        if trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        let (content, continues) = match physical.strip_suffix('\\') {
+            Some(content) => (content, true),
+            None => (physical, false),
+        };
+        match current.as_mut() {
+            Some(line) => {
+                line.push(' ');
+                line.push_str(content);
+            }
+            None => current = Some(content.to_owned()),
+        }
+        if !continues {
+            lines.extend(current.take());
+        }
+    }
+    lines.extend(current);
+    lines
+}
+
 /// Whether a unit drop-in has an `Environment=` assignment of `PATH`.
 ///
 /// Joins continuation lines, skips comment lines, and splits the value into
 /// words outside quotes, as the unit file syntax does.
 fn drop_in_sets_path(text: &str) -> bool {
-    let joined = text.replace("\\\n", " ");
-    joined.lines().any(|line| {
-        let line = line.trim_start();
-        if line.starts_with('#') || line.starts_with(';') {
-            return false;
-        }
-        let Some((key, value)) = line.split_once('=') else {
+    logical_lines(text).iter().any(|line| {
+        let Some((key, value)) = line.trim_start().split_once('=') else {
             return false;
         };
         if key.trim_end() != "Environment" {

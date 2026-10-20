@@ -10052,6 +10052,17 @@ async fn a_path_set_only_by_the_replaced_unit_file_does_not_apply() {
         job.value, MANAGER_PATH,
         "a drop-in without a PATH assignment"
     );
+
+    let (_dir, drop_in) = environment_file(
+        "[Service]\nEnvironment=OTHER=v \\\n# PATH=/commented\n; PATH=/commented\n  FOO=bar\n",
+    );
+    let unit = UnitEnvironment {
+        drop_in_paths: vec![drop_in],
+        environment: vec!["PATH=/unit-file/bin".to_owned()],
+        ..loaded_unit()
+    };
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, MANAGER_PATH, "a comment inside a continuation");
 }
 
 #[cfg(target_os = "linux")]
