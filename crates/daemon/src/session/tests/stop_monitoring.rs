@@ -9,8 +9,8 @@ use tokio::task::JoinHandle;
 
 use super::{
     claude_fact, codex_fact, descendant_claim_fixture, mock_procwatch_registry, next_runtime_event,
-    wait_for_first_procwatch_scan, wait_until, MockInspector, DESCENDANT_REPORTER_PID,
-    DESCENDANT_WRAPPER_PID, PID_REUSE_AGENT_PID,
+    settle_procwatch_scans, wait_for_first_procwatch_scan, wait_until, MockInspector,
+    DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID, PID_REUSE_AGENT_PID,
 };
 use crate::procwatch::StartIdentity;
 use crate::session::{RuntimeHandle, SessionRegistry};
@@ -156,9 +156,12 @@ async fn wait_for_observed_pids(registry: &SessionRegistry, id: &SessionId, expe
 #[tokio::test]
 async fn stop_cancels_watchers_only_at_terminal_commit() {
     let (registry, inspector, created) = mock_procwatch_registry("stop-cancels-at-commit").await;
-    // A scan still pending when the stop kills the root would find it gone and
-    // end the process watch before the terminal commit.
+    // A scan still running when the stop kills the root would find it gone and
+    // end the process watch before the terminal commit. The descendant read
+    // ends before the scan's last liveness read, so the scan gate is awaited
+    // too.
     wait_for_first_procwatch_scan(&inspector).await;
+    settle_procwatch_scans(&registry).await;
     let commit = registry.hold_next_exit_commit(&created.id);
     let stopping = {
         let registry = registry.clone();
