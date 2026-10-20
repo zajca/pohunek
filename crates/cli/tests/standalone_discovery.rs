@@ -279,23 +279,25 @@ fn discovery_uses_only_trusted_home_fallback_executables() {
     };
 
     run();
-    assert_eq!(
-        fs::read_to_string(&local_marker).expect("first fallback ran"),
-        "local"
-    );
+    // Each discovery runs `netbird` once for the peers and once for this
+    // machine's own identity, so a marker holds its word once per run.
+    let ran_only = |marker: &std::path::Path, word: &str| {
+        let content = fs::read_to_string(marker).expect("the fallback ran");
+        !content.is_empty() && content.replace(word, "").is_empty()
+    };
+    assert!(ran_only(&local_marker, "local"));
     assert!(!cargo_marker.exists());
+    let local_runs = fs::read_to_string(&local_marker).expect("first fallback marker");
 
     fs::set_permissions(&local, fs::Permissions::from_mode(0o777))
         .expect("make first fallback executable untrusted");
     run();
     assert_eq!(
         fs::read_to_string(&local_marker).expect("first fallback marker"),
-        "local"
+        local_runs,
+        "the untrusted first fallback never runs again"
     );
-    assert_eq!(
-        fs::read_to_string(&cargo_marker).expect("second fallback ran"),
-        "cargo"
-    );
+    assert!(ran_only(&cargo_marker, "cargo"));
 }
 
 #[test]
