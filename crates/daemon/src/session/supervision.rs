@@ -669,14 +669,22 @@ enum Waiting {
     Compensation,
 }
 
+/// The unreadable-marker processes that blocked a removal of one generation.
+#[derive(Debug)]
+struct Blocked {
+    generation: Option<String>,
+    identities: Vec<ProcessIdentity>,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct RetryState {
     /// Sessions waiting for a pass; a session is absent while its own pass
     /// runs and is inserted again when that pass does not settle it.
     pub(super) pending: BTreeSet<String>,
     /// Unreadable-marker processes that alone block a pending removal, by
-    /// session. A retry skips its scan while every one of them still runs.
-    blocked: std::collections::HashMap<String, Vec<ProcessIdentity>>,
+    /// session. A retry skips its scan while every one of them still runs
+    /// and the session still has the generation they blocked.
+    blocked: std::collections::HashMap<String, Blocked>,
     pub(super) running: bool,
     /// Session whose pass is running. A schedule for it comes from its own
     /// pass and keeps the backoff.
@@ -848,7 +856,9 @@ impl SessionRegistry {
                 // waits for it (see [`settle_unreadable`]).
                 let only_unreadable = leaves_only_unreadable(&report);
                 let settling = only_unreadable
-                    && self.candidates_may_still_settle(&report.skipped, grace)
+                    && self
+                        .candidates_may_still_settle(&report.skipped, grace)
+                        .await
                     && settle_unreadable(grace).await;
                 tally.settle_polls += usize::from(settling);
                 let role = if settling {
@@ -945,7 +955,9 @@ impl SessionRegistry {
                     .iter()
                     .all(|skipped| skipped.reason == SkipReason::MarkersUnreadable);
             let settling = only_unreadable
-                && self.candidates_may_still_settle(&survey.skipped, grace)
+                && self
+                    .candidates_may_still_settle(&survey.skipped, grace)
+                    .await
                 && settle_unreadable(grace).await;
             tally.settle_polls += usize::from(settling);
             log_sweep_survey(session_id, worker_instance_id, &survey, settling);
@@ -972,18 +984,30 @@ impl SessionRegistry {
     /// Whether waiting could still change the outcome for the unreadable-marker
     /// `candidates`.
     ///
-    /// The wait covers a process caught between images or about to follow its
-    /// creator out. A candidate that has run longer than `grace` is neither,
-    /// so it keeps the cleanup unconfirmed without a wait; a retry decides it
-    /// later. The age counts from the process start, which an `exec` does not
-    /// reset. A candidate whose age the host cannot tell keeps the wait.
-    fn candidates_may_still_settle(&self, candidates: &[Skipped], grace: Duration) -> bool {
-        candidates.iter().any(|candidate| {
-            !matches!(
-                self.inner.inspector.process_age(candidate.identity),
-                Ok(Some(age)) if age >= grace
-            )
+    /// The wait covers a process caught between images (its markers read as
+    /// unobservable) or about to follow its creator out. Only a candidate that
+    /// has run longer than `grace` and whose markers are persistently
+    /// withheld is neither, so it keeps the cleanup unconfirmed without a
+    /// wait; a retry decides it later. The age counts from the process start,
+    /// which an `exec` does not reset, so age alone never rules out a
+    /// transition. A candidate whose age the host cannot tell keeps the wait.
+    async fn candidates_may_still_settle(&self, candidates: &[Skipped], grace: Duration) -> bool {
+        let inspector = Arc::clone(&self.inner.inspector);
+        let identities: Vec<ProcessIdentity> = candidates
+            .iter()
+            .map(|candidate| candidate.identity)
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            !identities.iter().all(|identity| {
+                matches!(inspector.process_age(*identity), Ok(Some(age)) if age >= grace)
+                    && matches!(
+                        inspector.ownership_markers(identity.pid),
+                        Err(pohunek_platform::process::Error::PermissionDenied { .. })
+                    )
+            })
         })
+        .await
+        .unwrap_or(true)
     }
 
     /// The outcome of a sweep that ended with `skipped` processes left.
@@ -1124,6 +1148,7 @@ impl SessionRegistry {
     pub(super) fn note_unreadable_blockers(
         &self,
         id: &SessionId,
+        generation: Option<&str>,
         candidates: &[UnreadableCandidate],
     ) {
         let identities = candidates
@@ -1136,7 +1161,13 @@ impl SessionRegistry {
             .lock()
             .expect("supervision retry state is never poisoned")
             .blocked
-            .insert(id.0.clone(), identities);
+            .insert(
+                id.0.clone(),
+                Blocked {
+                    generation: generation.map(ToOwned::to_owned),
+                    identities,
+                },
+            );
     }
 
     /// Whether `identity` still runs and still withholds its ownership
@@ -1156,7 +1187,7 @@ impl SessionRegistry {
     ///
     /// Any other state, including a candidate the host cannot inspect, forgets
     /// the record and lets the retry scan.
-    fn blockers_unchanged(&self, id: &SessionId) -> bool {
+    fn blockers_unchanged(&self, id: &SessionId, generation: Option<&str>) -> bool {
         let Some(blockers) = self
             .inner
             .supervision_retries
@@ -1168,8 +1199,10 @@ impl SessionRegistry {
         else {
             return false;
         };
-        let unchanged = !blockers.is_empty()
+        let unchanged = blockers.generation.as_deref() == generation
+            && !blockers.identities.is_empty()
             && blockers
+                .identities
                 .iter()
                 .all(|identity| self.still_unreadable(*identity));
         if unchanged {
@@ -1277,6 +1310,13 @@ impl SessionRegistry {
     /// removed, or changed by another lifecycle operation.
     pub(super) async fn retry_supervised_session(&self, id: &SessionId) -> bool {
         let _guard = self.lock_lifecycle(id).await;
+        let current_generation = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .and_then(|entry| entry.job.as_ref().map(|job| job.generation().to_owned()));
         let waiting = self.inner.sessions.lock().await.get(id).and_then(|entry| {
             if !matches!(entry.runtime, super::RuntimeHandle::Unavailable(_)) {
                 return None;
@@ -1310,7 +1350,9 @@ impl SessionRegistry {
         let Some(waiting) = waiting else {
             return true;
         };
-        if waiting == Waiting::Evidence && self.blockers_unchanged(id) {
+        if waiting == Waiting::Evidence
+            && self.blockers_unchanged(id, current_generation.as_deref())
+        {
             tracing::debug!(session_id = %id.0, "removal still blocked by the same unreadable processes; not rescanning");
             return false;
         }

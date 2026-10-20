@@ -2801,7 +2801,11 @@ impl SessionRegistry {
                         error.msg,
                         describe_unreadable_candidates(&outcome.unreadable)
                     );
-                    self.note_unreadable_blockers(id, &outcome.unreadable);
+                    self.note_unreadable_blockers(
+                        id,
+                        generation.map(super::Generation::generation),
+                        &outcome.unreadable,
+                    );
                     error.recover = Some(UNREADABLE_CANDIDATES_RECOVER.to_owned());
                 }
                 return Err(error);
@@ -6711,6 +6715,12 @@ mod tests {
         fail_descendants: AtomicBool,
         fail_enumeration: AtomicBool,
         fail_markers: AtomicBool,
+        /// Whether failing marker reads report `Unobservable` (an image being
+        /// replaced) instead of `PermissionDenied` (markers withheld).
+        markers_unobservable: AtomicBool,
+        /// Marker reads that still report `Unobservable` before the process
+        /// reads normally again.
+        unobservable_reads: AtomicUsize,
         descendant_calls: AtomicUsize,
         /// Marker reads (the per-process step of a sweep scan) made so far.
         scans: AtomicUsize,
@@ -6737,6 +6747,17 @@ mod tests {
 
         fn fail_markers(&self, fail: bool) {
             self.fail_markers.store(fail, Ordering::Release);
+        }
+
+        /// The next `reads` marker reads are `Unobservable`, then the process
+        /// reads normally.
+        fn unobservable_for(&self, reads: usize) {
+            self.unobservable_reads.store(reads, Ordering::Release);
+        }
+
+        fn markers_unobservable(&self, unobservable: bool) {
+            self.markers_unobservable
+                .store(unobservable, Ordering::Release);
         }
 
         fn descendant_calls(&self) -> usize {
@@ -6845,7 +6866,23 @@ mod tests {
             if self.executor_thread.get() == Some(&std::thread::current().id()) {
                 self.scanned_on_executor.store(true, Ordering::Release);
             }
+            if self
+                .unobservable_reads
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(crate::procwatch::Error::Unobservable {
+                    operation: "test_markers",
+                });
+            }
             if self.fail_markers.load(Ordering::Acquire) {
+                if self.markers_unobservable.load(Ordering::Acquire) {
+                    return Err(crate::procwatch::Error::Unobservable {
+                        operation: "test_markers",
+                    });
+                }
                 return Err(crate::procwatch::Error::from_io(
                     "test_markers",
                     std::io::Error::from(std::io::ErrorKind::PermissionDenied),
@@ -13738,6 +13775,124 @@ generation "$1"
                     started.elapsed()
                 );
             }
+        }
+
+        /// An old process whose markers read as unobservable is caught between
+        /// executable images: the sweep keeps polling and ends it once it reads
+        /// again, however old the process is.
+        #[tokio::test]
+        async fn an_old_process_between_images_is_swept_once_it_reads_again() {
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.unobservable_for(12);
+            inspector.set_age(Some(SLOW_SWEEP_GRACE * 2));
+            let fixture = fixture_graced(
+                Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>,
+                None,
+                ScriptedSupervisor::scripted(),
+                crate::session::supervision::SUPERVISION_RETRY_INITIAL,
+                SLOW_SWEEP_GRACE,
+                crate::agent::host::fixture::compiled_in_host(),
+            );
+            let marked = Marked::spawn(&fixture.root, "runtime-s-13691");
+            persist_record(&fixture.root, "s-13691", Some("runtime-s-13691"));
+            write_live_journal(
+                &fixture.root,
+                "s-13691",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-13691"),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            marked.wait_gone().await;
+            let runtime = runtime_of(&fixture.registry, "s-13691").await;
+            assert_ne!(
+                runtime.loss_reason.as_deref(),
+                Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED),
+                "the process read again inside the sweep grace"
+            );
+        }
+
+        /// An old process that stays unobservable past the sweep grace is not
+        /// ruled out: the sweep ends fail closed at the grace, the process
+        /// keeps blocking the cleanup and is never signalled.
+        #[tokio::test(start_paused = true)]
+        async fn an_old_unobservable_process_blocks_the_cleanup_for_the_whole_grace() {
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.markers_unobservable(true);
+            inspector.set_age(Some(SLOW_SWEEP_GRACE * 2));
+            let started = tokio::time::Instant::now();
+
+            let (_fixture, marked) = lost_runtime_over("s-13693", Arc::clone(&inspector)).await;
+
+            assert!(
+                started.elapsed() >= SLOW_SWEEP_GRACE,
+                "an unobservable candidate gets the grace: {:?}",
+                started.elapsed()
+            );
+            assert!(
+                marked.alive(),
+                "an unreadable marker is never a signal permit"
+            );
+        }
+
+        /// The blockers a refused removal recorded belong to the generation it
+        /// swept: once the session names another generation, a retry scans
+        /// again instead of trusting them.
+        #[tokio::test]
+        async fn cached_blockers_do_not_outlive_their_generation() {
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.fail_markers(true);
+            inspector.set_age(Some(SLOW_SWEEP_GRACE * 2));
+            let fixture =
+                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+            let _bystander = Marked::spawn(&fixture.root, "runtime-s-13692");
+            persist_removal_intent(&fixture.root, "s-13692", Some("runtime-s-13692"));
+            write_live_journal(
+                &fixture.root,
+                "s-13692",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-13692"),
+            );
+            fixture.supervisor.script_job(
+                service_id("s-13692", TEST_GENERATION),
+                present(ServiceState::Failed, None),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let id = SessionId("s-13692".to_owned());
+            assert!(
+                !fixture.registry.retry_supervised_session(&id).await,
+                "the removal stays refused"
+            );
+            let unchanged = inspector.table_scans();
+            assert!(
+                !fixture.registry.retry_supervised_session(&id).await,
+                "the removal stays refused"
+            );
+            assert_eq!(
+                inspector.table_scans(),
+                unchanged,
+                "same generation: no scan"
+            );
+
+            fixture
+                .registry
+                .inner
+                .sessions
+                .lock()
+                .await
+                .get_mut(&id)
+                .expect("the refused removal keeps the session listed")
+                .job = None;
+            fixture.registry.retry_supervised_session(&id).await;
+
+            assert!(
+                inspector.table_scans() > unchanged,
+                "another generation scans again"
+            );
         }
 
         /// The process-table scans of a sweep run on the blocking pool, never
