@@ -1453,8 +1453,8 @@ Durability tiers (honest about limits):
    and no activity; recovery is explicit and creates a new worker, runtime ID,
    PTY, and child PID. A loss counts as ended only when the daemon observed it:
    the service manager's job for the recorded generation ended and was retired
-   (including a host restart), or a worker that still answers reported that its
-   runtime ended. Every commit of a lost runtime names that proof explicitly;
+   (including a host restart), or a worker that still answers reports that its
+   child process is gone after it started. Every commit of a lost runtime names that proof explicitly;
    it is never derived from the loss reason. A loss without such proof (the
    record names no generation, a recovery whose previous worker still answers,
    an unreachable socket) keeps the session state and clears only the activity,

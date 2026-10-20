@@ -3454,15 +3454,9 @@ impl SessionRegistry {
             record.info.state_source = StateSource::Process;
         }
         if state == RuntimeState::Lost {
-            // A worker that is `Stopping` may still own its PTY; every other
-            // phase that reaches this import is final (`Faulted`, never
-            // initialized), so the answering worker proves the runtime ended.
-            let proof = if snapshot.phase == RuntimePhase::Stopping {
-                LossProof::Unproven
-            } else {
-                LossProof::Ended
-            };
-            self.insert_lost_record(record, "worker_runtime_terminal", proof)
+            // The worker still answers: a `Stopping` or `Faulted` runtime may
+            // still own processes, so nothing proves the session's end.
+            self.insert_lost_record(record, "worker_runtime_terminal", LossProof::Unproven)
                 .await
         } else {
             self.insert_unavailable_record(record, state, "worker_runtime_terminal")

@@ -1221,7 +1221,7 @@ enum RuntimeMetadataPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LossProof {
     /// The job of the runtime's generation was observed ended and retired, or
-    /// the worker answered and reported that its runtime ended.
+    /// the worker answered and has no child process after it started.
     Ended,
     /// The worker may still run: nothing proves the session's process ended.
     Unproven,
@@ -2250,7 +2250,7 @@ impl SessionRegistry {
             self.list_raw()
                 .await
                 .into_iter()
-                .filter(|session| holds_worktree(session))
+                .filter(holds_worktree)
                 .filter_map(|session| {
                     session
                         .worktree_path
@@ -2353,7 +2353,7 @@ impl SessionRegistry {
             .list_raw()
             .await
             .into_iter()
-            .filter(|session| holds_worktree(session))
+            .filter(holds_worktree)
             .filter_map(|session| session.worktree_path)
             .any(|worktree_path| canonical_or_original(&worktree_path) == target);
         if in_use {

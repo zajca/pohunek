@@ -65,7 +65,7 @@ where
 pub(super) fn live_sessions(infos: Vec<protocol::SessionInfo>) -> Vec<LiveSession> {
     infos
         .into_iter()
-        .filter(|session| crate::session::holds_worktree(session))
+        .filter(crate::session::holds_worktree)
         .map(|session| LiveSession {
             session_id: session.id.0,
             cwd: session.cwd,

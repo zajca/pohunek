@@ -1474,8 +1474,8 @@ Important fields:
   identifies the PTY generation. `started_at`, `last_connected_at`, and
   `loss_reason` are optional. Daemon reconnection preserves both identities;
   explicit native recovery changes them. A `lost` runtime whose end the daemon
-  observed (the worker's job ended and was retired, a host restart, or the
-  worker reported the end) belongs to a `failed` session with no `activity`
+  observed (the worker's job ended and was retired, a host restart, or an
+  answering worker whose child process is gone) belongs to a `failed` session with no `activity`
   and no `exit_code`; a `lost` runtime without that proof leaves the session's
   `state` as it was and has no `activity`. Operations that need a running
   session (`session.input`, `session.resize`, attach) answer a lost runtime
