@@ -4255,8 +4255,11 @@ SDK error mapping:
   previous one.
   `host_governance_inspect_contract_mismatch` is the separate fixed, redacted
   SDK-originated governance-response validation error.
-- `ClientError.toProtocolError()` returns the structured `ProtocolError` for
-  CLI/API rendering, and `recoverHint()` returns the optional recovery text.
+- `ClientError.toProtocolError()` returns the structured error
+  (`ObservedProtocolError`, a `ProtocolError` whose `class` may be `"unknown"`)
+  for CLI/API rendering, and `recoverHint()` returns the optional recovery text.
+  `errorClass` is `"unknown"` for an error whose class a newer daemon defines
+  and this SDK does not; its `code`, `msg` and recovery text are the daemon's.
 
 The Bun-only `@pohunek/testkit/bun-relay` subpath (not the root entry, which
 also runs on Node) exports the loopback-only test relay used by the SDK

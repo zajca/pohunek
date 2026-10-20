@@ -5,6 +5,19 @@ import type {
   ProtocolVersionRange,
 } from "@pohunek/protocol";
 
+/**
+ * The class of an error as a client observes it. A class that a newer daemon
+ * defines and this build does not reads as `"unknown"`, so the daemon's `code`,
+ * `msg` and `recover` stay available. The generated `ErrorClass` type lists
+ * only the classes this build defines and is unchanged.
+ */
+export type ObservedErrorClass = ErrorClass | "unknown";
+
+/** A `ProtocolError` whose class may be `"unknown"`. */
+export type ObservedProtocolError = Omit<ProtocolError, "class"> & {
+  class: ObservedErrorClass;
+};
+
 export const ClientErrorClass = {
   Configuration: "configuration",
   Daemon: "daemon",
@@ -56,18 +69,18 @@ export interface DaemonProtocolTooOldDetail {
 export class ClientError extends Error {
   public override readonly name = "ClientError";
   public readonly kind: ClientErrorKind;
-  public readonly errorClass: ErrorClass;
+  public readonly errorClass: ObservedErrorClass;
   public readonly code: string;
   public readonly source: unknown;
   /** Set for `daemonProtocolTooOld` errors. */
   public readonly tooOld: DaemonProtocolTooOldDetail | undefined;
 
-  private readonly structured: ProtocolError;
+  private readonly structured: ObservedProtocolError;
 
   private constructor(
     kind: ClientErrorKind,
     message: string,
-    structured: ProtocolError,
+    structured: ObservedProtocolError,
     source?: unknown,
     tooOld?: DaemonProtocolTooOldDetail,
   ) {
@@ -108,11 +121,11 @@ export class ClientError extends Error {
     );
   }
 
-  public static protocol(source: ProtocolError): ClientError {
+  public static protocol(source: ObservedProtocolError): ClientError {
     return new ClientError("protocol", `daemon error: ${source.msg}`, source, source);
   }
 
-  public static remoteProtocol(host: string, source: ProtocolError): ClientError {
+  public static remoteProtocol(host: string, source: ObservedProtocolError): ClientError {
     const structured = cloneProtocolError(source);
     structured.msg = `host '${host}': ${source.msg}`;
     return new ClientError("remoteProtocol", structured.msg, structured, source);
@@ -256,7 +269,7 @@ export class ClientError extends Error {
     );
   }
 
-  public toProtocolError(): ProtocolError {
+  public toProtocolError(): ObservedProtocolError {
     return cloneProtocolError(this.structured);
   }
 
@@ -270,18 +283,18 @@ function daemonTarget(host: string | undefined): string {
 }
 
 function protocolError(
-  errorClass: ErrorClass,
+  errorClass: ObservedErrorClass,
   code: string,
   msg: string,
   recover?: string,
-): ProtocolError {
+): ObservedProtocolError {
   if (recover === undefined) {
     return { class: errorClass, code, msg };
   }
   return { class: errorClass, code, msg, recover };
 }
 
-function cloneProtocolError(error: ProtocolError): ProtocolError {
+function cloneProtocolError(error: ObservedProtocolError): ObservedProtocolError {
   return protocolError(error.class, error.code, error.msg, error.recover);
 }
 

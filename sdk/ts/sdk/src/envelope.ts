@@ -1,4 +1,5 @@
-import type { ProtocolError, ProtocolVersion, ProtocolVersionRange } from "@pohunek/protocol";
+import type { ErrorClass, ProtocolVersion, ProtocolVersionRange } from "@pohunek/protocol";
+import type { ObservedErrorClass, ObservedProtocolError } from "./error";
 import { hasValidWireOrigin } from "./origin";
 
 export interface Request {
@@ -19,7 +20,7 @@ export interface OkResponse {
 export interface ErrResponse {
   v: ProtocolVersion;
   id: string;
-  err: ProtocolError;
+  err: ObservedProtocolError;
 }
 
 export type Response = OkResponse | ErrResponse;
@@ -72,6 +73,11 @@ export function isOkResponse(value: unknown): value is OkResponse {
   );
 }
 
+/**
+ * Whether `value` has the shape of an error response. Any string class passes:
+ * `decodeResponse` is what maps a class this build does not define to
+ * `"unknown"`.
+ */
 export function isErrResponse(value: unknown): value is ErrResponse {
   if (!isRecord(value)) {
     return false;
@@ -89,7 +95,7 @@ export function decodeResponse(value: unknown): Response {
     return value;
   }
   if (isErrResponse(value)) {
-    return value;
+    return { ...value, err: { ...value.err, class: observedErrorClass(value.err.class) } };
   }
   throw new Error("invalid response envelope");
 }
@@ -110,20 +116,24 @@ function isProtocolVersion(value: unknown): value is ProtocolVersion {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
-function isProtocolError(value: unknown): value is ProtocolError {
+function isProtocolError(value: unknown): value is ObservedProtocolError {
   if (!isRecord(value)) {
     return false;
   }
   const recover = value["recover"];
   return (
-    isErrorClass(value["class"]) &&
+    typeof value["class"] === "string" &&
     typeof value["code"] === "string" &&
     typeof value["msg"] === "string" &&
     (recover === undefined || typeof recover === "string")
   );
 }
 
-function isErrorClass(value: unknown): value is ProtocolError["class"] {
+function observedErrorClass(value: string): ObservedErrorClass {
+  return isKnownErrorClass(value) ? value : "unknown";
+}
+
+function isKnownErrorClass(value: string): value is ErrorClass {
   return (
     value === "configuration" ||
     value === "daemon" ||

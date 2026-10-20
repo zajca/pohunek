@@ -6,7 +6,6 @@ import {
   CLIENT_PROTOCOL_VERSIONS,
   RANGE_FORWARDING_METHODS,
   type Methods,
-  type ProtocolError,
   type ProtocolVersion,
   type ProtocolVersionRange,
   type SessionOutputParams,
@@ -24,7 +23,7 @@ import {
   type SessionWaitTurnResult,
 } from "@pohunek/protocol";
 import { CompatError, downgradeRequestParams, requestIsVersionIndependent, upgradeResult } from "./compat";
-import { ClientError } from "./error";
+import { ClientError, type ObservedProtocolError } from "./error";
 import { decodeResponse, type Request, type Response } from "./envelope";
 import { decodeHostGovernanceInspect } from "./governance";
 import { hasValidWireOrigin, type RequestOrigin } from "./origin";
@@ -642,7 +641,7 @@ function stringifyRequest(request: Request): string {
   }
 }
 
-function mapDaemonError(remoteHost: string | undefined, error: ProtocolError): ClientError {
+function mapDaemonError(remoteHost: string | undefined, error: ObservedProtocolError): ClientError {
   if (remoteHost !== undefined) {
     return ClientError.remoteProtocol(remoteHost, error);
   }

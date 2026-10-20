@@ -251,6 +251,37 @@ describe("Client request/response", () => {
     }
   });
 
+  test("err response with a class from a newer daemon keeps the daemon's code, message and hint", async () => {
+    const daemon = await startUnixDaemon([
+      {
+        kind: "reply",
+        line: (requestLine) => errResponseLine(requestIdFromLine(requestLine), {
+          class: "a_class_from_a_newer_daemon",
+          code: "quota_exhausted",
+          msg: "the quota is used up",
+          recover: "free some space",
+        }),
+      },
+    ]);
+    try {
+      const client = await connectClient(daemon);
+
+      const error = await expectClientError(client.call("daemon.health", null));
+
+      expect(error.kind).toBe("protocol");
+      expect(error.errorClass).toBe("unknown");
+      expect(error.code).toBe("quota_exhausted");
+      expect(error.toProtocolError()).toEqual({
+        class: "unknown",
+        code: "quota_exhausted",
+        msg: "the quota is used up",
+        recover: "free some space",
+      });
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("err response preserves an omitted recovery hint", async () => {
     const daemon = await startUnixDaemon([
       {

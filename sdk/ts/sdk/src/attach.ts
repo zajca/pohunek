@@ -1,5 +1,5 @@
-import type { AttachPrelude, ProtocolError } from "@pohunek/protocol";
-import { ClientError } from "./error";
+import type { AttachPrelude } from "@pohunek/protocol";
+import { ClientError, type ObservedProtocolError } from "./error";
 import { decodeResponse } from "./envelope";
 import type { ConnectOptions, RawDuplex, Transport } from "./transport";
 import { WsTransport } from "./transport-ws";
@@ -183,7 +183,7 @@ function readableWithPrefix(
   });
 }
 
-function mapDaemonError(remoteHost: string | undefined, error: ProtocolError): ClientError {
+function mapDaemonError(remoteHost: string | undefined, error: ObservedProtocolError): ClientError {
   if (remoteHost !== undefined) {
     return ClientError.remoteProtocol(remoteHost, error);
   }

@@ -1718,6 +1718,12 @@ tolerant only where the client opts in:
   event through the tolerant entry points.
 - `SessionWarningKind` keeps its own mechanism: an unknown warning is dropped on
   decode.
+- The TypeScript SDK follows the same rule per guard: a daemon error response
+  whose `class` is a string this build does not define is decoded with the class
+  `"unknown"` (`ObservedErrorClass`), keeping `code`, `msg` and `recover`. The
+  generated `ErrorClass` type is unchanged. A later slice that makes a Rust
+  enum tolerant decides its TypeScript guard by this rule; a bump-only enum
+  stays strict in TypeScript too.
 
 Rejected alternatives: a derive-level `#[serde(other)]` makes persisted and
 param decoding fail open; a Cargo feature is switched on in the daemon too by
