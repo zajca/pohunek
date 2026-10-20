@@ -4669,17 +4669,12 @@ impl SessionRegistry {
                     pohunek_worker_protocol::TransactionId::new(transaction_id.clone())
                         .map_err(|error| runtime_error("worker_stop_invalid", error.to_string()))?;
                 let bound = self.inner.config.worker_stop_bound();
-                let status = match worker
-                    .stop_within(
-                        transaction,
-                        StopWaits {
-                            exchange: self.inner.config.worker_exchange_wait,
-                            input: self.inner.config.worker_input_stop_wait,
-                            answer: bound,
-                        },
-                    )
-                    .await
-                {
+                let waits = StopWaits {
+                    exchange: self.inner.config.worker_exchange_wait,
+                    input: self.inner.config.worker_input_stop_wait,
+                    answer: bound,
+                };
+                let status = match Box::pin(worker.stop_within(transaction, waits)).await {
                     Ok(Some(status)) => status,
                     Ok(None) => {
                         self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())

@@ -124,8 +124,14 @@ pub struct ObservedOutput {
 pub struct Worker {
     inner: Arc<Mutex<Inner>>,
     socket_path: PathBuf,
-    request_sequence: Arc<AtomicU64>,
+    counters: Arc<Counters>,
     dimension_order: Arc<Mutex<()>>,
+}
+
+/// Counters shared by every clone of a [`Worker`].
+#[derive(Debug)]
+struct Counters {
+    request_sequence: AtomicU64,
     /// Input writes holding the control connection. An input exchange lasts as
     /// long as the worker needs to deliver the plan and is bounded by the
     /// worker's own stall policy, so a stop queued behind one keeps waiting;
@@ -144,29 +150,17 @@ pub struct StopWaits {
     pub answer: Duration,
 }
 
-/// Marks the control connection as held by an input write while it lives.
-#[derive(Debug)]
-struct InputHold(Arc<AtomicUsize>);
-
-impl InputHold {
-    fn take(holds: &Arc<AtomicUsize>) -> Self {
-        holds.fetch_add(1, Ordering::AcqRel);
-        Self(Arc::clone(holds))
-    }
-}
-
-impl Drop for InputHold {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 /// Prepared exclusive input write that has not started transport delivery.
 #[derive(Debug)]
 pub(crate) struct WriteReservation {
     inner: OwnedMutexGuard<Inner>,
-    request: ControlRequest,
-    _hold: InputHold,
+    request: Option<ControlRequest>,
+}
+
+impl Drop for WriteReservation {
+    fn drop(&mut self) {
+        self.inner.input_holds.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Debug)]
@@ -185,6 +179,8 @@ struct Inner {
     /// Shared send-phase marker the send guard flips when a future is
     /// dropped mid-write; see [`SEND_IN_FLIGHT`].
     send_state: Arc<AtomicU8>,
+    /// Input writes holding the control connection; shared with [`Worker`].
+    input_holds: Arc<AtomicUsize>,
 }
 
 /// Byte-stream state of the shared control connection between exchanges.
@@ -419,6 +415,7 @@ impl Worker {
             other => return response_error(other),
         };
 
+        let input_holds = Arc::new(AtomicUsize::new(0));
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 reader,
@@ -432,11 +429,14 @@ impl Worker {
                 next_write_sequence: 1,
                 stream_state: StreamState::Ready,
                 send_state: Arc::new(AtomicU8::new(SEND_IDLE)),
+                input_holds: Arc::clone(&input_holds),
             })),
             socket_path,
-            request_sequence: Arc::new(AtomicU64::new(1)),
+            counters: Arc::new(Counters {
+                request_sequence: AtomicU64::new(1),
+                input_holds,
+            }),
             dimension_order: Arc::new(Mutex::new(())),
-            input_holds: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -639,7 +639,7 @@ impl Worker {
         fragments: Vec<InputFragment>,
     ) -> Result<WriteReservation, WorkerError> {
         let mut inner = Arc::clone(&self.inner).lock_owned().await;
-        let hold = InputHold::take(&self.input_holds);
+        inner.input_holds.fetch_add(1, Ordering::AcqRel);
         // A torn stream cannot carry the prepared plan; fail before the
         // caller starts waiting for its acknowledgement.
         reconcile_interrupted_send(&mut inner);
@@ -656,11 +656,10 @@ impl Worker {
             .map_err(|error| WorkerError::Protocol(error.to_string()))?;
         Ok(WriteReservation {
             inner,
-            request: ControlRequest {
+            request: Some(ControlRequest {
                 request_id: self.next_request_id("write")?,
                 kind: RequestKind::WritePlan { scope, plan },
-            },
-            _hold: hold,
+            }),
         })
     }
 
@@ -770,7 +769,7 @@ impl Worker {
         let mut inner = loop {
             match tokio::time::timeout(waits.exchange, self.inner.lock()).await {
                 Ok(inner) => break inner,
-                Err(_elapsed) if self.input_holds.load(Ordering::Acquire) > 0 => {
+                Err(_elapsed) if self.counters.input_holds.load(Ordering::Acquire) > 0 => {
                     if started.elapsed() >= waits.input {
                         return Err(WorkerError::StopUnanswered {
                             bound: waits.input,
@@ -1010,13 +1009,19 @@ impl Worker {
     }
 
     fn next_request_id(&self, operation: &str) -> Result<RequestId, WorkerError> {
-        let sequence = self.request_sequence.fetch_add(1, Ordering::Relaxed);
+        let sequence = self
+            .counters
+            .request_sequence
+            .fetch_add(1, Ordering::Relaxed);
         RequestId::new(format!("{operation}-{sequence}"))
             .map_err(|error| WorkerError::Protocol(error.to_string()))
     }
 
     fn next_stream_id(&self, operation: &str) -> Result<StreamId, WorkerError> {
-        let sequence = self.request_sequence.fetch_add(1, Ordering::Relaxed);
+        let sequence = self
+            .counters
+            .request_sequence
+            .fetch_add(1, Ordering::Relaxed);
         StreamId::new(format!("{operation}-{sequence}"))
             .map_err(|error| WorkerError::Protocol(error.to_string()))
     }
@@ -1041,7 +1046,8 @@ impl WriteReservation {
     where
         F: FnOnce(),
     {
-        let response = exchange_locked(&mut self.inner, self.request, send_started).await?;
+        let request = self.request.take().expect("a reservation commits once");
+        let response = exchange_locked(&mut self.inner, request, send_started).await?;
         match response {
             ResponseKind::WriteCompleted { acknowledgement } => Ok(acknowledgement.bytes_written),
             other => response_error(other),
