@@ -50,6 +50,7 @@ fn report(process: ProcessIdentity, sequence: u64) -> ForwardedActiveReport {
         reported_session: Some(ReportedSession {
             kind: ReportedSessionKind::Id,
             value: "native-annotation".to_owned(),
+            transcript_path: Some("/work/native-annotation.jsonl".to_owned()),
         }),
     }
 }
@@ -157,8 +158,12 @@ async fn an_accepted_report_is_journaled_before_the_answer_and_never_touches_the
     );
     assert_eq!(claim.agent.as_deref(), Some("tuned"));
     assert_eq!(
-        claim.reported_session.as_ref().map(|s| s.value.as_str()),
-        Some("native-annotation")
+        claim
+            .reported_session
+            .as_ref()
+            .map(|s| (s.value.as_str(), s.transcript_path.as_deref())),
+        Some(("native-annotation", Some("/work/native-annotation.jsonl"))),
+        "the id and its transcript path are journaled together"
     );
     assert_eq!(
         (&claim.reference_kind, &claim.native_reference),
@@ -371,11 +376,29 @@ async fn a_label_or_annotation_outside_its_bound_is_refused() {
         reported_session: Some(ReportedSession {
             kind: ReportedSessionKind::Id,
             value: "bad\nid".to_owned(),
+            transcript_path: None,
         }),
         ..report(root, 7)
     };
 
-    for invalid in [oversized, control] {
+    let transcript_control = ForwardedActiveReport {
+        reported_session: Some(ReportedSession {
+            kind: ReportedSessionKind::Id,
+            value: "id".to_owned(),
+            transcript_path: Some("/work/bad\npath".to_owned()),
+        }),
+        ..report(root, 8)
+    };
+    let transcript_on_a_path = ForwardedActiveReport {
+        reported_session: Some(ReportedSession {
+            kind: ReportedSessionKind::Path,
+            value: "/work/session.jsonl".to_owned(),
+            transcript_path: Some("/work/other.jsonl".to_owned()),
+        }),
+        ..report(root, 9)
+    };
+
+    for invalid in [oversized, control, transcript_control, transcript_on_a_path] {
         assert_eq!(
             record(&server, &mut connection, &lease_id, invalid).await,
             rejected(IdentityRejectReason::ForwardedFieldInvalid)

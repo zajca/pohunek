@@ -249,11 +249,59 @@ fn a_reported_session_never_appears_in_debug_output() {
         reported_session: Some(ReportedSession {
             kind: ReportedSessionKind::Path,
             value: "/home/secret/session.jsonl".to_owned(),
+            transcript_path: None,
         }),
     };
+    let with_transcript = ReportedSession {
+        kind: ReportedSessionKind::Id,
+        value: "provider-id".to_owned(),
+        transcript_path: Some("/home/secret/transcript.jsonl".to_owned()),
+    };
 
+    assert!(
+        !format!("{with_transcript:?}").contains("secret"),
+        "the transcript path is redacted"
+    );
     let rendered = format!("{report:?}");
 
     assert!(!rendered.contains("secret"), "{rendered}");
     assert!(rendered.contains("[REDACTED]"), "{rendered}");
+}
+
+#[test]
+fn a_reported_session_keeps_its_transcript_path_and_reads_the_shape_without_one() {
+    let both = ReportedSession {
+        kind: ReportedSessionKind::Id,
+        value: "provider-id".to_owned(),
+        transcript_path: Some("/work/transcript.jsonl".to_owned()),
+    };
+    let wire = serde_json::to_value(&both).expect("encode");
+    assert_eq!(
+        wire,
+        json!({"kind": "id", "value": "provider-id", "transcript_path": "/work/transcript.jsonl"})
+    );
+    assert_eq!(
+        serde_json::from_value::<ReportedSession>(wire).expect("decode"),
+        both
+    );
+    assert!(both.is_valid());
+
+    let without =
+        serde_json::from_value::<ReportedSession>(json!({"kind": "id", "value": "provider-id"}))
+            .expect("the shape without a transcript path decodes");
+    assert_eq!(without.transcript_path, None);
+    assert_eq!(
+        serde_json::to_value(&without).expect("encode"),
+        json!({"kind": "id", "value": "provider-id"}),
+        "an unset transcript path is not written"
+    );
+
+    let on_a_path = ReportedSession {
+        kind: ReportedSessionKind::Path,
+        ..both
+    };
+    assert!(
+        !on_a_path.is_valid(),
+        "a path annotation carries no second path"
+    );
 }

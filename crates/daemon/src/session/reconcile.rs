@@ -5258,7 +5258,10 @@ fn forwarded_session_annotation(
     match session.kind {
         ReportedSessionKind::Id => (
             validate_native_reference(SessionRefKind::Id, &session.value),
-            None,
+            session
+                .transcript_path
+                .as_deref()
+                .and_then(|path| validate_native_reference(SessionRefKind::Path, path)),
         ),
         ReportedSessionKind::Path => (
             None,
@@ -7420,6 +7423,7 @@ while os.getppid() == parent:
             reported_session.map(|(kind, value)| pohunek_worker_protocol::ReportedSession {
                 kind,
                 value: value.to_owned(),
+                transcript_path: None,
             });
         snapshot
     }
@@ -7457,6 +7461,28 @@ while os.getppid() == parent:
             Some("annotation-1"),
             "the annotation never reaches the resume binding"
         );
+
+        let mut with_transcript =
+            forwarded_snapshot(Some((ReportedSessionKind::Id, "annotation-1")));
+        with_transcript
+            .active_identity
+            .as_mut()
+            .and_then(|claim| claim.reported_session.as_mut())
+            .expect("annotation")
+            .transcript_path = Some("/work/session.jsonl".to_owned());
+        let mut record = identity_record();
+        apply_worker_identities_with(&mut record, &with_transcript, Ok(schema))
+            .expect("id and transcript path");
+        assert_eq!(
+            record.info.active_agent_session_id.as_deref(),
+            Some("annotation-1")
+        );
+        assert_eq!(
+            record.info.active_agent_session_path.as_deref(),
+            Some("/work/session.jsonl"),
+            "an id and its transcript path are both kept"
+        );
+        assert_eq!(record.info.native_session_path, None);
 
         let by_path = forwarded_snapshot(Some((ReportedSessionKind::Path, "/work/session.jsonl")));
         let mut record = identity_record();
