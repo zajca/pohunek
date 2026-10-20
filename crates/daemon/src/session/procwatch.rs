@@ -262,7 +262,10 @@ impl SessionRegistry {
             let mut tick = tokio::time::interval(registry.inner.config.procwatch_poll);
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
+                // Cancellation wins over a ready tick or rescan so a stopped
+                // loop never starts another scan.
                 tokio::select! {
+                    biased;
                     () = cancel.cancelled() => break,
                     _ = tick.tick() => {
                         if !registry.rescan_live_root(&id, &expected, root, crate::time::now()).await {

@@ -1725,6 +1725,7 @@ struct MockInspectorState {
     foreground_groups: HashMap<Pid, Option<Pid>>,
     foreground_error: Option<std::io::ErrorKind>,
     foreground_block: Option<Arc<ForegroundBlock>>,
+    foreground_probes: usize,
     cwd: HashMap<Pid, PathBuf>,
     identity_overrides: HashMap<Pid, Option<ProcessIdentity>>,
     identity_after_descendants: HashMap<Pid, ProcessIdentity>,
@@ -1822,6 +1823,13 @@ impl MockInspector {
             .lock()
             .expect("mock inspector lock")
             .foreground_error = None;
+    }
+
+    fn foreground_probes(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .foreground_probes
     }
 
     fn block_foreground(&self) -> Arc<ForegroundBlock> {
@@ -2127,6 +2135,7 @@ impl ProcessInspector for MockInspector {
     ) -> Result<Option<Pid>, crate::procwatch::Error> {
         let (kind, foreground, block) = {
             let mut inner = self.inner.lock().expect("mock inspector lock");
+            inner.foreground_probes += 1;
             (
                 inner.foreground_error,
                 inner.foreground_groups.get(&root_pid).copied().flatten(),
@@ -9671,6 +9680,21 @@ const PID_REUSE_AGENT_PID: Pid = 225;
 const FOREIGN_AGENT_PID: Pid = 240;
 /// Delay separating pid-reuse observations so `first_seen` changes if reset.
 const PID_REUSE_RESCAN_DELAY: Duration = Duration::from_millis(5);
+/// Stops the session's own procwatch loop once its first scan has reached the
+/// foreground probe, so no scan of the loop overlaps what the test drives.
+async fn stop_procwatch_loop(
+    registry: &SessionRegistry,
+    inspector: &MockInspector,
+    id: &SessionId,
+) {
+    wait_until("the loop's first scan probed the foreground", || async {
+        (inspector.foreground_probes() > 0).then_some(())
+    })
+    .await;
+    let sessions = registry.inner.sessions.lock().await;
+    sessions[id].procwatch_cancel.cancel();
+}
+
 async fn mock_procwatch_registry(tag: &str) -> (SessionRegistry, Arc<MockInspector>, SessionInfo) {
     let inspector = Arc::new(MockInspector::default());
     let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
@@ -11550,10 +11574,7 @@ async fn pre_admission_scan_does_not_refute_a_descendant_claim() {
     );
     // Only this test's scan may take the foreground block: stop the session's
     // own procwatch loop.
-    let () = {
-        let sessions = registry.inner.sessions.lock().await;
-        sessions[&created.id].procwatch_cancel.cancel();
-    };
+    stop_procwatch_loop(&registry, &inspector, &created.id).await;
     let block = inspector.block_foreground();
     let _release_guard = ForegroundReleaseGuard(Arc::clone(&block));
     let scan_registry = registry.clone();
@@ -11688,11 +11709,8 @@ async fn journal_projected_claim_requests_a_rescan_that_binds_it() {
     );
     // Only the requested rescan may reach the scan: stop the session's own loop
     // and drain what it left pending.
-    let rescan = {
-        let sessions = registry.inner.sessions.lock().await;
-        sessions[&created.id].procwatch_cancel.cancel();
-        Arc::clone(&sessions[&created.id].procwatch_rescan)
-    };
+    stop_procwatch_loop(&registry, &inspector, &created.id).await;
+    let rescan = Arc::clone(&registry.inner.sessions.lock().await[&created.id].procwatch_rescan);
     let _ = tokio::time::timeout(Duration::ZERO, rescan.notified()).await;
 
     project_journal_descendant_claim(&registry, &created.id).await;
