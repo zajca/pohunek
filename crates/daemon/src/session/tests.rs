@@ -10101,6 +10101,18 @@ fn backoff_scans_due(elapsed: u64) -> usize {
     due
 }
 
+/// Asserts the paused clock stands at `expected` up to the timer wheel's
+/// millisecond rounding. A scan that is late parks the runtime and the clock
+/// jumps to the next periodic timer, at least half a poll further.
+fn assert_clock_not_jumped(expected: tokio::time::Instant, what: &str) {
+    let now = tokio::time::Instant::now();
+    assert!(
+        now >= expected && now - expected < BACKOFF_POLL / 2,
+        "{what} ran without the paused clock jumping ahead ({:?})",
+        now.saturating_duration_since(expected)
+    );
+}
+
 /// Advances the paused clock one second at a time. A scan runs its process
 /// reads on a blocking thread, so a scan due at a tick is awaited by count
 /// rather than assumed finished after a number of yields.
@@ -10112,10 +10124,12 @@ async fn advance_settling(
     seconds: u64,
 ) {
     for elapsed in from + 1..=from + seconds {
+        let tick_end = tokio::time::Instant::now() + Duration::from_secs(1);
         tokio::time::advance(Duration::from_secs(1)).await;
         let due = sessions * backoff_scans_due(elapsed);
         wait_for_scans_started(inspector, due).await;
         settle_procwatch_scans(registry).await;
+        assert_clock_not_jumped(tick_end, &format!("every scan due at second {elapsed}"));
     }
 }
 
@@ -10177,11 +10191,7 @@ async fn a_working_transition_rescans_a_backed_off_session_at_once() {
     wait_for_scans_started(&inspector, before + 1).await;
     settle_procwatch_scans(&registry).await;
 
-    assert_eq!(
-        tokio::time::Instant::now(),
-        paused_at,
-        "the scan ran on the transition, not on a periodic timer"
-    );
+    assert_clock_not_jumped(paused_at, "the working transition's scan");
 
     assert_eq!(
         inspector.descendant_scans().0,
