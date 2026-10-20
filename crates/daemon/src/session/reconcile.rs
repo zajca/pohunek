@@ -13706,10 +13706,10 @@ generation "$1"
 
             let (_fixture, _marked) = lost_runtime_over("s-1368", Arc::clone(&inspector)).await;
 
+            let waited = started.elapsed();
             assert!(
-                started.elapsed() < SLOW_SWEEP_GRACE / 4,
-                "an old candidate is not waited for: {:?}",
-                started.elapsed()
+                waited < SLOW_SWEEP_GRACE / 4,
+                "an old candidate is not waited for: {waited:?}"
             );
         }
 
