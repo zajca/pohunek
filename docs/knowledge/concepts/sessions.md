@@ -102,7 +102,7 @@ closing the control connection.
 
 Use `--input-stdin` (alias `--stdin`) with `session new`, or `--stdin` with
 `session input`, when prompt text should not appear in argv. Stdin and inline
-input are mutually exclusive and bounded. Hermes programmatic input rejects
+input are mutually exclusive and bounded. On a remote host, `session new --input-stdin` needs `--yes`: stdin leaves no prompt, so it fails with `confirmation_required` before reading stdin. Hermes programmatic input rejects
 terminal controls other than intentional LF and tab, and it is disabled while
 Hermes is visibly blocked on owner approval. In JSON mode, stdout contains
 exactly one versioned document with either `ok` or `err`; diagnostics remain on
