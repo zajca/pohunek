@@ -329,9 +329,8 @@ fn the_status_subscription_and_menu_action_stay_on_the_first_peer() {
     for keys in [&[MENU_KEY][..], b"k", b"y"] {
         writer.write_all(keys).expect("type a menu key");
         writer.flush().expect("flush the key");
-        // timing-allowed: #1111 the client folds keys that arrive within its
-        // 25 ms shortcut window into one chunk, and no screen output marks the
-        // moment a key was consumed.
+        // The client folds keys within its 25 ms shortcut window into one chunk.
+        // timing-allowed: #1111 no screen output marks the moment a key was consumed
         thread::sleep(KEY_PAUSE);
     }
     wait_served(&scene, protocol::method::SESSION_STOP);
