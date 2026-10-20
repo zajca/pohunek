@@ -446,7 +446,7 @@ impl<'de> Deserialize<'de> for Response {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "StateSource.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum StateSource {
     /// Derived from the OSC terminal title.
     OscTitle,
@@ -458,7 +458,16 @@ pub enum StateSource {
     Process,
     /// Reported by an agent hook running inside the session.
     Report,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(StateSource);
 
 /// An asynchronous event pushed on a subscription connection.
 ///

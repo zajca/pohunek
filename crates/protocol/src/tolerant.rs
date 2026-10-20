@@ -108,15 +108,22 @@ where
 }
 
 /// Implements `Serialize` and `Deserialize` for an enum that derives both with
-/// `#[serde(remote = "Self")]`, a `#[serde(rename = "unknown")]` variant
-/// `Unknown` and `#[serde(skip_deserializing)]` on that variant.
+/// `#[serde(remote = "Self")]`.
 ///
-/// The derive stays the only definition of the wire names. `Unknown` serializes
-/// as `"unknown"` but plain decoding rejects it, so only the tolerant entry
-/// points in this module can produce one.
+/// `tolerant_enum!(Name)` expects a variant `Unknown` with
+/// `#[serde(rename = "unknown", skip_deserializing)]`. The derive stays the only
+/// definition of the wire names; `Unknown` serializes as `"unknown"` but plain
+/// decoding rejects it, so only the tolerant entry points in this module can
+/// produce one.
+///
+/// `tolerant_enum!(Name => Variant)` maps an unknown string to an existing
+/// variant instead, for an enum that already has a catch-all such as `Other`.
 #[macro_export]
 macro_rules! tolerant_enum {
     ($name:ident) => {
+        $crate::tolerant_enum!($name => Unknown);
+    };
+    ($name:ident => $fallback:ident) => {
         impl ::serde::Serialize for $name {
             fn serialize<S>(&self, serializer: S) -> ::core::result::Result<S::Ok, S::Error>
             where
@@ -135,7 +142,7 @@ macro_rules! tolerant_enum {
                     deserializer,
                     |value| $name::deserialize(value),
                     |deserializer| $name::deserialize(deserializer),
-                    $name::Unknown,
+                    $name::$fallback,
                 )
             }
         }

@@ -6,8 +6,9 @@ use std::{collections::BTreeMap, path::PathBuf};
 use proptest::prelude::*;
 use protocol::{
     event, method, negotiate, ActivityRevision, AgentActivity, AgentRuntime, ApprovalKeyReference,
-    AssistantMaterializeParams, AssistantMaterializeResult, AttachHeader, ConceptDeprecation,
-    ConceptIntent, ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult, DetectionRegionKind,
+    AssistantMaterializeParams, AssistantMaterializeResult, AttachHeader, BackgroundItem,
+    BackgroundKind, BackgroundRevision, BackgroundStatus, ConceptDeprecation, ConceptIntent,
+    ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult, DetectionRegionKind,
     DetectionRegionPreview, DoctorCheck, DoctorReport, DoctorStatus, EnrollmentInfo,
     EnrollmentRevision, EnrollmentStatus, ErrorClass, Event, ForkCwdMode, HostApprovalSignature,
     HostCapabilities, HostGovernanceStatus, HostId, HostOwner, IntegrationAgentDoctor,
@@ -22,7 +23,7 @@ use protocol::{
     OwnerRevision, PrincipalId, ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId,
     ProposalNonce, ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind,
     QuarantineReason, RelayId, ReportSequence, Request, Response, RuntimeGeneration, RuntimeId,
-    RuntimeInventoryEntry, RuntimeRef, SessionAttachResult, SessionCapabilities,
+    RuntimeInventoryEntry, RuntimeRef, SessionAttachResult, SessionBackground, SessionCapabilities,
     SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
     SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
     SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
@@ -34,13 +35,13 @@ use protocol::{
     SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
     SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
     SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
-    ShareSuspensionIntent, SignedTransferOutcome, StateSource, TeamId, TerminalCursor,
-    TerminalDimensions, TerminalWatermark, TransferCoordinates, TransferOutcomeCandidate,
-    TransferOutcomeId, TransferProposal, UnconfirmedProcess, GOVERNANCE_ID_PAYLOAD_BYTES,
-    MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES,
-    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_SCREEN_RESPONSE_BYTES,
-    MAX_SESSION_WAIT_MS, MAX_WORKER_INSTANCE_ID_BYTES,
-    OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
+    ShareSuspensionIntent, SignedTransferOutcome, StateSource, SubagentInfo, SubagentLifecycle,
+    SubagentRevision, TeamId, TerminalCursor, TerminalDimensions, TerminalWatermark,
+    TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeId, TransferProposal,
+    UnconfirmedProcess, GOVERNANCE_ID_PAYLOAD_BYTES, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
+    MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
+    MAX_SESSION_READ_LINES, MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS,
+    MAX_WORKER_INSTANCE_ID_BYTES, OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
     SESSION_OUTPUT_METADATA_HEADROOM_BYTES,
 };
 use serde_json::{json, Value};
@@ -4745,11 +4746,13 @@ fn worker_instance_fields_are_written_and_read_under_one_name() {
     assert_eq!(stale.worker_instance_id, None);
 }
 
-/// One tolerant enum: its known wire values, the value its hidden `Unknown`
-/// variant takes, and a value no build defines.
+/// One tolerant enum: its known wire values, the value a tolerant decode gives
+/// an unknown string (its hidden `Unknown` variant, or an existing catch-all
+/// variant), and that value's wire form.
 struct TolerantEnum<T> {
     known: Vec<(&'static str, T)>,
     unknown: T,
+    unknown_wire: &'static str,
 }
 
 impl<T> TolerantEnum<T>
@@ -4794,12 +4797,16 @@ where
         protocol::tolerant::from_value::<T>(json!(7))
             .expect_err("tolerance covers unknown strings only");
 
-        let token = serde_json::to_value(self.unknown).expect("serialize Unknown");
-        assert_eq!(token, json!("unknown"), "{name}: Unknown serializes");
+        let token = serde_json::to_value(self.unknown).expect("serialize the fallback");
+        assert_eq!(
+            token,
+            json!(self.unknown_wire),
+            "{name}: the fallback serializes"
+        );
         assert_eq!(
             protocol::tolerant::from_value::<T>(token).expect("tolerant round trip"),
             self.unknown,
-            "{name}: the Unknown token survives a client round trip"
+            "{name}: the fallback survives a client round trip"
         );
 
         // The mode ends with the call, also when the call fails.
@@ -4820,6 +4827,7 @@ fn a_tolerant_enum_rejects_unknown_values_unless_the_client_decodes_it() {
             ("discovery", ErrorClass::Discovery),
         ],
         unknown: ErrorClass::Unknown,
+        unknown_wire: "unknown",
     }
     .check("ErrorClass");
     assert_eq!(ErrorClass::Unknown.to_string(), "unknown");
@@ -4860,4 +4868,137 @@ fn an_error_with_a_class_from_a_newer_daemon_keeps_its_code_message_and_hint() {
     .to_string();
     let response = protocol::tolerant::from_str::<protocol::Response>(&line).expect("response");
     assert_eq!(response.into_result().expect_err("error response"), error);
+}
+
+#[test]
+fn session_snapshot_display_enums_are_tolerant_only_on_the_client() {
+    TolerantEnum {
+        known: vec![
+            ("working", AgentActivity::Working),
+            ("blocked", AgentActivity::Blocked),
+            ("idle", AgentActivity::Idle),
+        ],
+        unknown: AgentActivity::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("AgentActivity");
+    TolerantEnum {
+        known: vec![
+            ("osc_title", StateSource::OscTitle),
+            ("osc_progress", StateSource::OscProgress),
+            ("screen", StateSource::Screen),
+            ("process", StateSource::Process),
+            ("report", StateSource::Report),
+        ],
+        unknown: StateSource::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("StateSource");
+    TolerantEnum {
+        known: vec![
+            ("launch", CwdSource::Launch),
+            ("procwatch", CwdSource::Procwatch),
+            ("osc7", CwdSource::Osc7),
+        ],
+        unknown: CwdSource::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("CwdSource");
+    TolerantEnum {
+        known: vec![
+            ("running", SubagentLifecycle::Running),
+            ("completed", SubagentLifecycle::Completed),
+            ("failed", SubagentLifecycle::Failed),
+            ("cancelled", SubagentLifecycle::Cancelled),
+            ("lost", SubagentLifecycle::Lost),
+        ],
+        unknown: SubagentLifecycle::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("SubagentLifecycle");
+    TolerantEnum {
+        known: vec![
+            ("subagent", BackgroundKind::Subagent),
+            ("workflow", BackgroundKind::Workflow),
+            ("shell", BackgroundKind::Shell),
+            ("monitor", BackgroundKind::Monitor),
+            ("mcp_task", BackgroundKind::McpTask),
+            ("teammate", BackgroundKind::Teammate),
+            ("dream", BackgroundKind::Dream),
+            ("auto_mode_scan", BackgroundKind::AutoModeScan),
+            ("memory_import", BackgroundKind::MemoryImport),
+            ("cloud_session", BackgroundKind::CloudSession),
+            ("other", BackgroundKind::Other),
+        ],
+        unknown: BackgroundKind::Other,
+        unknown_wire: "other",
+    }
+    .check("BackgroundKind");
+    TolerantEnum {
+        known: vec![
+            ("running", BackgroundStatus::Running),
+            ("pending", BackgroundStatus::Pending),
+            ("other", BackgroundStatus::Other),
+        ],
+        unknown: BackgroundStatus::Other,
+        unknown_wire: "other",
+    }
+    .check("BackgroundStatus");
+}
+
+#[test]
+fn a_session_snapshot_with_every_display_enum_unknown_decodes_only_on_the_client() {
+    let info = SessionInfo {
+        activity: Some(AgentActivity::Working),
+        subagents: vec![SubagentInfo {
+            id: "sub-1".to_owned(),
+            parent_id: None,
+            provider: RuntimeRef::codex(),
+            agent_type: None,
+            lifecycle: SubagentLifecycle::Running,
+            activity: Some(AgentActivity::Working),
+            revision: SubagentRevision::new(1),
+            started_at_ms: 1,
+            updated_at_ms: 2,
+            finished_at_ms: None,
+        }],
+        background: Some(SessionBackground {
+            revision: BackgroundRevision::new(1),
+            observed_at_ms: 3,
+            items: vec![BackgroundItem {
+                id: "task-1".to_owned(),
+                kind: BackgroundKind::Shell,
+                provider_kind: None,
+                status: BackgroundStatus::Running,
+                agent_type: None,
+                label: None,
+                program: None,
+                first_seen_ms: 1,
+                last_seen_ms: 2,
+            }],
+        }),
+        ..running_shell_session(None)
+    };
+    let mut document = serde_json::to_value(&info).expect("serialize session info");
+    let newer = json!("a_value_from_a_newer_daemon");
+    document["activity"] = newer.clone();
+    document["state_source"] = newer.clone();
+    document["cwd_source"] = newer.clone();
+    document["subagents"][0]["lifecycle"] = newer.clone();
+    document["subagents"][0]["activity"] = newer.clone();
+    document["background"]["items"][0]["kind"] = newer.clone();
+    document["background"]["items"][0]["status"] = newer;
+
+    serde_json::from_value::<SessionInfo>(document.clone())
+        .expect_err("plain decoding rejects the snapshot");
+    let decoded = protocol::tolerant::from_value::<SessionInfo>(document).expect("tolerant decode");
+
+    assert_eq!(decoded.activity, Some(AgentActivity::Unknown));
+    assert_eq!(decoded.state_source, StateSource::Unknown);
+    assert_eq!(decoded.cwd_source, Some(CwdSource::Unknown));
+    assert_eq!(decoded.subagents[0].lifecycle, SubagentLifecycle::Unknown);
+    assert_eq!(decoded.subagents[0].activity, Some(AgentActivity::Unknown));
+    let item = &decoded.background.expect("background").items[0];
+    assert_eq!(item.kind, BackgroundKind::Other);
+    assert_eq!(item.status, BackgroundStatus::Other);
 }

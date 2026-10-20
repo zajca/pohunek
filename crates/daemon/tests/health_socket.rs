@@ -2051,6 +2051,40 @@ async fn host_governance_inspect_requires_null_and_reports_never_enrolled_absenc
 }
 
 #[tokio::test]
+async fn session_wait_with_an_activity_this_daemon_does_not_define_is_refused() {
+    // A client that sends an activity from a newer protocol build must get the
+    // typed refusal, not a wait that silently never matches.
+    let socket = temp_socket("wait-activity");
+    let (shutdown, handle) = spawn_server(&socket, "0.0.0").await;
+    let mut client = connect(&socket).await;
+
+    for (index, activity) in ["an_activity_from_a_newer_daemon", "unknown"]
+        .into_iter()
+        .enumerate()
+    {
+        let request_id = format!("wait-activity-{index}");
+        let response = exchange(
+            &mut client,
+            &Request::make(
+                &request_id,
+                method::SESSION_WAIT,
+                serde_json::json!({
+                    "session_id": "s-1",
+                    "activities": [activity],
+                    "timeout_ms": 1_000,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(response.id(), request_id);
+        assert_eq!(err_payload(response).code, "bad_request");
+    }
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
 async fn session_list_with_malformed_filter_returns_typed_error() {
     // A foreign client (e.g. a shell script or another CLI) can talk JSON to the
     // daemon directly, bypassing clap's value parser. An unknown filter key or an

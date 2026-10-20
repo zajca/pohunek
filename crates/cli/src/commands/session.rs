@@ -2413,6 +2413,7 @@ const fn subagent_lifecycle_label(lifecycle: SubagentLifecycle) -> &'static str 
         SubagentLifecycle::Failed => "failed",
         SubagentLifecycle::Cancelled => "cancelled",
         SubagentLifecycle::Lost => "lost",
+        SubagentLifecycle::Unknown => "unknown",
     }
 }
 
@@ -2524,6 +2525,7 @@ fn activity_label(activity: AgentActivity) -> &'static str {
         AgentActivity::Working => "working",
         AgentActivity::Blocked => "blocked",
         AgentActivity::Idle => "idle",
+        AgentActivity::Unknown => "unknown",
     }
 }
 
@@ -2534,6 +2536,7 @@ fn state_source_label(source: StateSource) -> &'static str {
         StateSource::Screen => "screen",
         StateSource::Process => "process",
         StateSource::Report => "report",
+        StateSource::Unknown => "unknown",
     }
 }
 

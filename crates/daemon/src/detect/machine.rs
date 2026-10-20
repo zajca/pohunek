@@ -153,6 +153,9 @@ impl StateMachine {
                 self.observe_working(now, evidence.into())
             }
             AgentActivity::Blocked | AgentActivity::Idle => self.observe_debounced(now, evidence),
+            // Evidence of an unknown activity asserts no state, so it neither
+            // publishes nor disturbs a pending candidate.
+            AgentActivity::Unknown => None,
         }
     }
 

@@ -22,7 +22,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "AgentActivity.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum AgentActivity {
     /// The agent is actively processing work.
     Working,
@@ -30,13 +30,22 @@ pub enum AgentActivity {
     Blocked,
     /// The agent is running but not currently producing work.
     Idle,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(AgentActivity);
 
 /// Lifecycle of one provider-managed subagent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SubagentLifecycle.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum SubagentLifecycle {
     /// The provider reports that the subagent is still running.
     Running,
@@ -48,7 +57,16 @@ pub enum SubagentLifecycle {
     Cancelled,
     /// The owning runtime ended before the provider reported completion.
     Lost,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(SubagentLifecycle);
 
 /// Sanitized durable state for one provider-managed subagent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,7 +114,7 @@ pub struct SubagentInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "BackgroundKind.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum BackgroundKind {
     /// A provider subagent. Its lifecycle is also tracked in [`SubagentInfo`].
     Subagent,
@@ -119,23 +137,29 @@ pub enum BackgroundKind {
     /// A cloud session.
     CloudSession,
     /// A provider task type this protocol does not name; see
-    /// [`BackgroundItem::provider_kind`].
+    /// [`BackgroundItem::provider_kind`]. A kind a newer daemon defines also
+    /// decodes to it on the client.
     Other,
 }
+
+crate::tolerant_enum!(BackgroundKind => Other);
 
 /// Lifecycle of one background task as reported by the provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "BackgroundStatus.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum BackgroundStatus {
     /// The provider reports the task as running.
     Running,
     /// The provider reports the task as queued or waiting to start.
     Pending,
-    /// The provider reports a status this protocol does not name.
+    /// The provider reports a status this protocol does not name. A status a
+    /// newer daemon defines also decodes to it on the client.
     Other,
 }
+
+crate::tolerant_enum!(BackgroundStatus => Other);
 
 /// Sanitized state of one background task in a [`SessionBackground`] snapshot.
 ///
@@ -208,6 +232,7 @@ impl AgentActivity {
             Self::Working => "working",
             Self::Blocked => "blocked",
             Self::Idle => "idle",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -216,7 +241,7 @@ impl AgentActivity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "CwdSource.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum CwdSource {
     /// Captured at session launch or resume.
     Launch,
@@ -224,7 +249,16 @@ pub enum CwdSource {
     Procwatch,
     /// Reported by OSC 7 terminal output.
     Osc7,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(CwdSource);
 
 impl CwdSource {
     /// Returns the stable wire string.
@@ -234,6 +268,7 @@ impl CwdSource {
             Self::Launch => "launch",
             Self::Procwatch => "procwatch",
             Self::Osc7 => "osc7",
+            Self::Unknown => "unknown",
         }
     }
 }

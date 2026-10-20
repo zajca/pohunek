@@ -697,7 +697,10 @@ fn manifest_hit(
     let arrival = match source {
         StateSource::OscTitle => title_arrival,
         StateSource::Screen => screen_arrival,
-        StateSource::OscProgress | StateSource::Process | StateSource::Report => 0,
+        StateSource::OscProgress
+        | StateSource::Process
+        | StateSource::Report
+        | StateSource::Unknown => 0,
     };
 
     Some(ManifestEvidenceHit {

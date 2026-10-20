@@ -452,5 +452,6 @@ fn agent_activity_env(activity: AgentActivity) -> &'static str {
         AgentActivity::Working => "working",
         AgentActivity::Blocked => "blocked",
         AgentActivity::Idle => "idle",
+        AgentActivity::Unknown => "unknown",
     }
 }
