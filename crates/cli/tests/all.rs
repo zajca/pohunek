@@ -38,6 +38,8 @@ mod hermes_plugin_suites;
 mod integration_hooks;
 #[path = "json_usage_errors.rs"]
 mod json_usage_errors;
+#[path = "newer_daemon.rs"]
+mod newer_daemon;
 #[path = "notifications_list_paging.rs"]
 mod notifications_list_paging;
 #[path = "notifications_policy.rs"]

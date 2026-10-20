@@ -236,6 +236,16 @@ and is announced as a break in the release notes. The next protocol bump deletes
 the oldest adapter, so each release accepts exactly its predecessor and no more.
 See `docs/architecture.md` "Protocol versioning".
 
+Within one protocol version a daemon of a newer build can answer with an enum
+value an older Rust client does not know. The Rust client and the CLI decode
+daemon responses and events tolerantly: `ErrorClass` has a hidden variant
+`Unknown`, which prints as and serializes to `"unknown"`, so an error with a class
+the client does not know still reports the daemon's `code`, `msg` and `recover`,
+and `--json` emits `{"class": "unknown", ...}`. The daemon never emits `unknown`
+and rejects it in params. The TypeScript types do not list the variant. The
+per-enum policy is in `docs/architecture.md` "Unknown enum values from a newer
+daemon".
+
 Protocol v3 is the coordinated overlay-routing boundary. It changes
 `HostRecord.address` to an optional IP-only value and adds required `port` and
 `overlay` fields plus optional `peer_id`. Every daemon and bundled client must

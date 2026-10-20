@@ -53,7 +53,11 @@ rule. The current state of each place is stated separately.
   through the same adapter (ported to TypeScript in `sdk/ts/sdk/src/compat.ts`,
   tested against the same recordings) when the daemon answers in N-1. A method
   new in N fails on the client with `daemon/daemon_protocol_too_old` before it
-  is sent ([#527](https://github.com/zajca/pohunek/issues/527)).
+  is sent ([#527](https://github.com/zajca/pohunek/issues/527)). A new value of
+  an existing enum on the same version is decoded tolerantly only by the client
+  (`protocol::tolerant`, hidden `Unknown` variant); each enum's policy, and the
+  bump-only ones, are in `docs/architecture.md` "Unknown enum values from a
+  newer daemon".
 - **Accepted upgrade risk.** Contract: the CLI remembers which at-risk verdicts
   an upgrade accepted, and the next gate treats a verdict as previously
   accepted only when the daemon of the release being installed reproduces the

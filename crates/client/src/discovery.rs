@@ -367,7 +367,7 @@ async fn probe_health(
     stream.write_all(&line).await?;
     stream.flush().await?;
     let reply = read_line(&mut stream, MAX_CONTROL_LINE_BYTES).await?;
-    let response: Response = serde_json::from_slice(&reply)?;
+    let response: Response = protocol::tolerant::from_slice(&reply)?;
     if response.id() != request.id() {
         return Err("probe response id did not match request".into());
     }

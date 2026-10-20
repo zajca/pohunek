@@ -135,7 +135,7 @@ impl SocketControl {
                 received: response.version(),
             });
         }
-        let result = serde_json::from_value(response.into_result()?)?;
+        let result = protocol::tolerant::from_value(response.into_result()?)?;
         Ok(Health {
             result,
             pid: served_by.pid,
@@ -160,7 +160,7 @@ async fn exchange(
             ClientError::Framing("daemon closed the connection without a response".to_owned())
         })?
         .map_err(codec)?;
-    let response: Response = serde_json::from_str(&line)?;
+    let response: Response = protocol::tolerant::from_str(&line)?;
     if response.id() != request.id() {
         return Err(ClientError::Framing(format!(
             "daemon answered request '{}' with response '{}'",

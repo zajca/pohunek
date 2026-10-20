@@ -546,30 +546,40 @@ impl Client {
             let params =
                 serde_json::from_value::<SessionInputParams>(serde_json::to_value(params)?)?;
             let result = self.session_input(params).await?;
-            return Ok(serde_json::from_value(serde_json::to_value(result)?)?);
+            return Ok(protocol::tolerant::from_value(serde_json::to_value(
+                result,
+            )?)?);
         }
         if M::NAME == protocol::method::SESSION_WAIT_TURN {
             let params =
                 serde_json::from_value::<SessionWaitTurnParams>(serde_json::to_value(params)?)?;
             let result = self.session_wait_turn(params).await?;
-            return Ok(serde_json::from_value(serde_json::to_value(result)?)?);
+            return Ok(protocol::tolerant::from_value(serde_json::to_value(
+                result,
+            )?)?);
         }
         if M::NAME == protocol::method::SESSION_NEW {
             let params = serde_json::from_value::<SessionNewParams>(serde_json::to_value(params)?)?;
             let result = self.session_new(params).await?;
-            return Ok(serde_json::from_value(serde_json::to_value(result)?)?);
+            return Ok(protocol::tolerant::from_value(serde_json::to_value(
+                result,
+            )?)?);
         }
         if M::NAME == protocol::method::SESSION_WAIT {
             let params =
                 serde_json::from_value::<SessionWaitParams>(serde_json::to_value(params)?)?;
             let result = self.session_wait(params).await?;
-            return Ok(serde_json::from_value(serde_json::to_value(result)?)?);
+            return Ok(protocol::tolerant::from_value(serde_json::to_value(
+                result,
+            )?)?);
         }
         if M::NAME == protocol::method::SESSION_OUTPUT {
             let params =
                 serde_json::from_value::<SessionOutputParams>(serde_json::to_value(params)?)?;
             let result = self.session_output(params).await?;
-            return Ok(serde_json::from_value(serde_json::to_value(result)?)?);
+            return Ok(protocol::tolerant::from_value(serde_json::to_value(
+                result,
+            )?)?);
         }
         self.call_direct::<M>(params).await
     }
@@ -603,7 +613,7 @@ impl Client {
             serde_json::to_value(params)?,
         )?;
         let value = self.request(&request).await?;
-        Ok(serde_json::from_value(value)?)
+        Ok(protocol::tolerant::from_value(value)?)
     }
 
     /// Probe the daemon and return the negotiated protocol version it reports.
@@ -1088,7 +1098,7 @@ where
             }
         };
 
-        let response: Response = match serde_json::from_str(&reply) {
+        let response: Response = match protocol::tolerant::from_str(&reply) {
             Ok(response) => response,
             Err(err) => return Err(unparseable_reply_error(host, err)),
         };
@@ -1160,7 +1170,7 @@ where
         selected_version: ProtocolVersion,
     ) -> Result<Event, ClientError> {
         let host = self.remote_host.as_deref();
-        match serde_json::from_str::<Event>(line) {
+        match protocol::tolerant::from_str::<Event>(line) {
             Ok(event) if event.version() == selected_version => compat::upgrade_event(event)
                 .map_err(|error| response_translation_error(host, selected_version, error)),
             Ok(event) => Err(map_version_validation_error(

@@ -1025,12 +1025,12 @@ fn watch_event_selected(event: &Event, filters: &WatchFilters) -> Result<bool, C
     match event.event() {
         event::NOTIFICATION_CREATED => {
             let payload: NotificationCreatedEvent =
-                serde_json::from_value(event.payload().clone())?;
+                protocol::tolerant::from_value(event.payload().clone())?;
             Ok(filters.matches(&payload.record))
         }
         event::NOTIFICATION_UPDATED => {
             let payload: NotificationUpdatedEvent =
-                serde_json::from_value(event.payload().clone())?;
+                protocol::tolerant::from_value(event.payload().clone())?;
             Ok(filters.matches(&payload.record))
         }
         _ => Ok(false),
@@ -1045,17 +1045,17 @@ fn render_watch_event(
     match event.event() {
         event::NOTIFICATION_CREATED => {
             let payload: NotificationCreatedEvent =
-                serde_json::from_value(event.payload().clone())?;
+                protocol::tolerant::from_value(event.payload().clone())?;
             render_watch_record(host_id, event::NOTIFICATION_CREATED, &payload.record, mode)
         }
         event::NOTIFICATION_UPDATED => {
             let payload: NotificationUpdatedEvent =
-                serde_json::from_value(event.payload().clone())?;
+                protocol::tolerant::from_value(event.payload().clone())?;
             render_watch_record(host_id, event::NOTIFICATION_UPDATED, &payload.record, mode)
         }
         event::NOTIFICATION_DELETED => {
             let payload: NotificationDeletedEvent =
-                serde_json::from_value(event.payload().clone())?;
+                protocol::tolerant::from_value(event.payload().clone())?;
             match mode {
                 WatchOutputMode::Human => Ok(format!(
                     "{host_id} notification_deleted {} deleted\n",
