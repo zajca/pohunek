@@ -12,9 +12,14 @@ intents: [project, debug, help]
 Pohunek sessions can run in place or in a dedicated Git worktree. A worktree is
 requested through `pohunek session new` with a repository or project plus a
 branch. The base branch is taken from `--base-branch`, then the project's
-configured default, then the repository default. When an explicit base branch
-is not present locally, Pohunek fetches that branch from `origin` before it
-considers falling back to the repository default.
+configured default, then the repository default. A requested base branch (the
+flag or the project's configured default) is never replaced by another branch.
+When it is not present locally, Pohunek fetches it from `origin`; if it does not
+exist, or the fetch fails, the create fails with `invalid_base_branch` or
+`base_branch_fetch_failed` and no worktree is made. A base that exists locally
+is used even when its fetch from `origin` fails; the `session.new` result then
+carries a `fetch` warning. Only a request without any base starts from the
+repository's current branch.
 
 The base branch only applies to a branch the worktree creates. A `--branch`
 that already exists locally is checked out as it is. When `--base-branch` was
