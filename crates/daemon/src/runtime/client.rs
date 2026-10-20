@@ -645,7 +645,6 @@ impl Worker {
         fragments: Vec<InputFragment>,
     ) -> Result<WriteReservation, WorkerError> {
         let mut inner = Arc::clone(&self.inner).lock_owned().await;
-        inner.input_holds.fetch_add(1, Ordering::AcqRel);
         // A torn stream cannot carry the prepared plan; fail before the
         // caller starts waiting for its acknowledgement.
         reconcile_interrupted_send(&mut inner);
@@ -660,10 +659,14 @@ impl Worker {
         let write_id = input_write_id(&inner.lease_id, sequence)?;
         let plan = InputPlan::new(write_id, fragments)
             .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+        let request_id = self.next_request_id("write")?;
+        // Counted only once the reservation exists, so every failed
+        // preparation above leaves the count untouched.
+        inner.input_holds.fetch_add(1, Ordering::AcqRel);
         Ok(WriteReservation {
             inner,
             request: Some(ControlRequest {
-                request_id: self.next_request_id("write")?,
+                request_id,
                 kind: RequestKind::WritePlan { scope, plan },
             }),
         })
@@ -1922,6 +1925,11 @@ mod tests {
             matches!(reserved, Err(WorkerError::TornStream)),
             "input write reserved over a torn stream"
         );
+        assert_eq!(
+            worker.input_writes_in_flight(),
+            0,
+            "a torn stream holds no input"
+        );
 
         let error = tokio::time::timeout(Duration::from_secs(5), worker.inspect())
             .await
@@ -1932,6 +1940,79 @@ mod tests {
             worker.inner.lock().await.stream_state,
             StreamState::Torn
         ));
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_input_reservation_leaves_no_input_hold() {
+        let root = test_root("hold-balance");
+        std::fs::create_dir_all(&root).expect("create test root");
+        let socket_path = root.join("worker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind fake worker");
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept control");
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = ControlReader::new(read_half);
+            let mut writer = ControlWriter::new(write_half);
+            let session_id = SessionId::new("session-hold").expect("session id");
+            let worker_id = WorkerId::new("worker-hold").expect("worker id");
+            let worker_instance_id = WorkerInstanceId::new("runtime-hold").expect("runtime id");
+            let challenge =
+                pohunek_worker_protocol::LeaseChallenge::new("challenge-hold").expect("challenge");
+            negotiate_and_acquire(
+                &mut reader,
+                &mut writer,
+                &session_id,
+                &worker_id,
+                Some(&worker_instance_id),
+                &challenge,
+            )
+            .await;
+            futures::future::pending::<()>().await;
+        });
+        let worker = Worker::connect(&socket_path, "session-hold", "daemon-hold")
+            .await
+            .expect("connect fake worker");
+
+        // An empty plan fails framing after the connection is locked.
+        let empty = worker.reserve_write(Vec::new()).await;
+        assert!(matches!(empty, Err(WorkerError::Protocol(_))), "{empty:?}");
+        assert_eq!(
+            worker.input_writes_in_flight(),
+            0,
+            "an invalid plan holds no input"
+        );
+
+        // An exhausted write sequence fails before the plan is built.
+        worker.inner.lock().await.next_write_sequence = u64::MAX;
+        let exhausted = worker.reserve_write(Vec::new()).await;
+        assert!(
+            matches!(exhausted, Err(WorkerError::Protocol(_))),
+            "{exhausted:?}"
+        );
+        assert_eq!(
+            worker.input_writes_in_flight(),
+            0,
+            "an exhausted sequence holds no input"
+        );
+        worker.inner.lock().await.next_write_sequence = 1;
+
+        let reserved = worker
+            .reserve_write(scripted_fragments())
+            .await
+            .expect("a valid plan reserves");
+        assert_eq!(
+            worker.input_writes_in_flight(),
+            1,
+            "a reservation is one hold"
+        );
+        drop(reserved);
+        assert_eq!(
+            worker.input_writes_in_flight(),
+            0,
+            "a dropped reservation releases its hold"
+        );
 
         server_task.abort();
     }
