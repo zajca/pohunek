@@ -918,10 +918,15 @@ fn bind_with_pipe_holding_grandchild(detached: bool, fails: bool) {
         assert!(!ended.exists(), "no post-reap signal ended the grandchild");
         fs::write(&release, "go").expect("release grandchild");
         first.join().expect("bind thread");
-        pohunek_test_support::wait::poll_until("grandchild exits naturally", || {
-            ended.exists().then_some(())
-        });
-        assert_eq!(fs::read_to_string(&ended).expect("pipe result"), "closed");
+        // The hook creates the file before it writes the result, so an existing
+        // file can still be empty.
+        let pipe_result =
+            pohunek_test_support::wait::poll_until("grandchild exits naturally", || {
+                fs::read_to_string(&ended)
+                    .ok()
+                    .filter(|result| !result.is_empty())
+            });
+        assert_eq!(pipe_result, "closed");
     });
     assert_eq!(
         logs.text()
