@@ -9348,6 +9348,109 @@ async fn a_check_classifies_the_source_in_every_adoption_mode() {
     }
 }
 
+#[tokio::test]
+async fn a_link_chain_through_the_versions_directory_is_verified_hop_by_hop_on_every_command() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let versions = harness.layout().versions_dir();
+    let version_dir = harness.layout().version_dir(V1).expect("version dir");
+    let aliases = harness.root.join("aliases");
+    std::fs::create_dir(&aliases).expect("aliases");
+    let link = |target: &Path, name: &str| {
+        let alias = aliases.join(name);
+        std::os::unix::fs::symlink(target, &alias).expect("link");
+        alias
+    };
+
+    // A version directory that is itself a link to a directory outside.
+    let outside = harness.root.join("outside");
+    std::fs::create_dir(&outside).expect("outside directory");
+    let marker = harness.root.join("ran");
+    mark_runs(&outside, &marker);
+    std::os::unix::fs::symlink(&outside, versions.join("9.9.9")).expect("version link");
+    let to_outward = link(&versions.join("9.9.9"), "to-outward-version");
+    let two_hops = link(&to_outward, "two-hops");
+
+    // A link to the versions directory, then a nested path and a tampered version.
+    let dir_link = link(&versions, "dir-link");
+    let nested_dir = version_dir.join("nested");
+    std::fs::create_dir(&nested_dir).expect("nested directory");
+    let nested = dir_link.join(V1).join("nested");
+
+    // Loops and chains beyond the hop limit.
+    let loop_a = aliases.join("loop-a");
+    let loop_b = aliases.join("loop-b");
+    std::os::unix::fs::symlink(&loop_b, &loop_a).expect("loop a");
+    std::os::unix::fs::symlink(&loop_a, &loop_b).expect("loop b");
+    let mut previous = version_dir.clone();
+    for index in 0..=crate::service::settings::MAX_SOURCE_LINK_HOPS {
+        previous = link(&previous, &format!("chain-{index}"));
+    }
+
+    let refused = [
+        ("an alias to a version link pointing outside", to_outward),
+        ("a chain of aliases to a version link", two_hops),
+        ("a path below a link to the versions directory", nested),
+        ("a link loop", loop_a),
+        ("a chain beyond the hop limit", previous),
+    ];
+    for (label, source) in &refused {
+        let upgrade = harness.engine().upgrade(source, V2).await.expect_err(label);
+        let install = harness
+            .engine()
+            .install(source, &harness.prefix(), V1)
+            .await
+            .expect_err(label);
+        let check = super::super::check_with_preflight(
+            &harness.context,
+            source,
+            &ScriptedPreflight::default(),
+            V2,
+            false,
+        )
+        .await
+        .expect_err(label);
+        for error in [upgrade, install, check] {
+            assert_eq!(
+                error.code(),
+                "service_version_untrusted",
+                "{label}: {error:?}"
+            );
+        }
+    }
+    assert!(!marker.exists(), "nothing ran from the outside directory");
+
+    // A tampered version reached through the directory link is refused too.
+    let named = Tamper::GroupWritableDirectory.apply(&version_dir);
+    let through = dir_link.join(V1);
+    let error = harness
+        .engine()
+        .upgrade(&through, V2)
+        .await
+        .expect_err("tampered");
+    assert_untrusted_version(&error, &named);
+    std::fs::set_permissions(
+        &version_dir,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("restore the mode");
+
+    // An intact chain resolves to the canonical version directory.
+    let chain = link(&link(&version_dir, "first"), "second");
+    let verified = layout::operator_release(&harness.layout(), &chain).expect("an intact chain");
+    assert_eq!(verified.path(), version_dir);
+    let through = layout::operator_release(&harness.layout(), &dir_link.join(V1))
+        .expect("through the directory link");
+    assert_eq!(through.path(), version_dir);
+
+    // A chain that never touches the versions directory is the operator's own.
+    let elsewhere = harness.root.join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("elsewhere");
+    let own = layout::operator_release(&harness.layout(), &link(&elsewhere, "own"))
+        .expect("an operator directory");
+    assert_ne!(own.path(), version_dir);
+}
+
 /// Counts the plans the setup asks the release daemon for.
 #[derive(Debug, Default)]
 struct CountingPlanner(AtomicUsize);

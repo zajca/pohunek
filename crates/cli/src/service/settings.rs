@@ -176,6 +176,10 @@ pub const UNIT_VERIFY_OUTPUT: usize = 16 * 1024;
 /// open for writing.
 pub const EXEC_BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Most symbolic links followed while classifying the release directory an
+/// operator names, so a link loop is refused instead of followed forever.
+pub const MAX_SOURCE_LINK_HOPS: usize = 40;
+
 /// Interval between attempts to execute a file that is busy.
 ///
 /// Short, because the busy window is the pre-`exec` gap of another child.

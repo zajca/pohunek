@@ -50,7 +50,8 @@ use tokio::io::AsyncReadExt as _;
 
 use super::error::{fs_error, io_error, Error};
 use super::settings::{
-    EXEC_BUSY_POLL, EXEC_BUSY_WAIT, VERSION_PROBE_OUTPUT, VERSION_PROBE_TIMEOUT,
+    EXEC_BUSY_POLL, EXEC_BUSY_WAIT, MAX_SOURCE_LINK_HOPS, VERSION_PROBE_OUTPUT,
+    VERSION_PROBE_TIMEOUT,
 };
 
 /// File name of the CLI in a staging directory, a version directory, and `<prefix>/bin`.
@@ -685,16 +686,20 @@ fn verify_tree(directory: &TrustedDir) -> Result<(), Error> {
 /// Classifies the release directory an operator names (`--from`, or the one
 /// holding the running CLI) by where it is.
 ///
-/// A directory inside the installed versions directory, reached by its own
-/// path or through a link, must be exactly a version directory and goes
-/// through [`verify_installed`]; a nested path, the versions directory itself
-/// or a link that cannot be resolved is refused. Any directory outside is the
+/// The path is resolved one component and one link at a time. Every step that
+/// lands inside the installed versions directory, spelled by its own path or
+/// by its canonical one, makes the directory an installed version: that
+/// version directory goes through [`verify_installed`] (which refuses a link
+/// in its place) and the path must resolve to exactly it. A nested path, the
+/// versions directory itself, a link loop, a chain longer than
+/// `MAX_SOURCE_LINK_HOPS` and a link that does not resolve are
+/// refused. A path no step of which touches the versions directory is the
 /// operator's own release.
 ///
 /// # Errors
 ///
 /// Returns the errors of [`verify_installed`] for a directory inside the
-/// versions directory.
+/// versions directory and [`Error::UntrustedVersion`] for the refusals above.
 pub fn operator_release(layout: &InstallLayout, dir: &Path) -> Result<VerifiedVersionDir, Error> {
     if version_of(layout, dir).is_some() {
         return verify_installed(layout, dir);
@@ -703,36 +708,145 @@ pub fn operator_release(layout: &InstallLayout, dir: &Path) -> Result<VerifiedVe
         path: dir.to_path_buf(),
         detail: detail.to_owned(),
     };
-    let resolved = match std::fs::canonicalize(dir) {
-        Ok(resolved) => Some(resolved),
-        Err(_) if std::fs::symlink_metadata(dir).is_ok() => {
-            return Err(untrusted("the link does not resolve to a directory"));
-        }
-        Err(_) => None,
-    };
-    let versions = std::fs::canonicalize(layout.versions_dir()).ok();
-    if let (Some(resolved), Some(versions)) = (resolved, versions) {
-        if let Ok(relative) = resolved.strip_prefix(&versions) {
-            let mut parts = relative.components();
-            let name = parts
-                .next()
-                .and_then(|first| first.as_os_str().to_str())
-                .and_then(valid_install_version);
-            return match (name, parts.next()) {
-                (Some(name), None) => {
-                    let installed = layout.version_dir(name).expect("a validated version name");
-                    verify_installed(layout, &installed)
-                }
-                _ => Err(untrusted(
-                    "it resolves into the versions directory but is not a version directory",
-                )),
-            };
-        }
+    let lexical = layout.versions_dir();
+    let real = std::fs::canonicalize(&lexical).ok();
+    let (resolved, touched) = resolve_source(dir, &lexical, real.as_deref())?;
+    if let Some(name) = touched {
+        let installed = layout.version_dir(&name).expect("a validated version name");
+        let verified = verify_installed(layout, &installed)?;
+        let exact = resolved == installed
+            || real
+                .as_deref()
+                .is_some_and(|real| resolved == real.join(&name));
+        return if exact {
+            Ok(verified)
+        } else {
+            Err(untrusted(
+                "it resolves into the versions directory but is not a version directory",
+            ))
+        };
+    }
+    if resolved == lexical || Some(&resolved) == real.as_ref() {
+        return Err(untrusted("it is the versions directory"));
     }
     Ok(VerifiedVersionDir {
         path: dir.to_path_buf(),
         origin: Origin::Operator,
     })
+}
+
+/// Where a path lies relative to the versions directory.
+enum Below {
+    /// Not inside it.
+    Outside,
+    /// The versions directory itself.
+    Versions,
+    /// Inside the entry of this version name.
+    Version(String),
+    /// Inside an entry that is not a valid version name.
+    Invalid,
+}
+
+/// Locates `path` relative to the versions directory, spelled by `lexical` or
+/// by `real`.
+fn version_below(path: &Path, lexical: &Path, real: Option<&Path>) -> Below {
+    let Some(relative) = path
+        .strip_prefix(lexical)
+        .ok()
+        .or_else(|| real.and_then(|real| path.strip_prefix(real).ok()))
+    else {
+        return Below::Outside;
+    };
+    match relative.components().next() {
+        None => Below::Versions,
+        Some(first) => first
+            .as_os_str()
+            .to_str()
+            .and_then(valid_install_version)
+            .map_or(Below::Invalid, |name| Below::Version(name.to_owned())),
+    }
+}
+
+/// Resolves `dir` one component and one link at a time.
+///
+/// Returns the resolved path and the first version name any step landed on
+/// inside the versions directory. A link loop, a chain beyond
+/// `MAX_SOURCE_LINK_HOPS`, an unreadable or dangling link and an entry of the
+/// versions directory that is not a version name are refused.
+fn resolve_source(
+    dir: &Path,
+    lexical: &Path,
+    real: Option<&Path>,
+) -> Result<(PathBuf, Option<String>), Error> {
+    let untrusted = |detail: &str| Error::UntrustedVersion {
+        path: dir.to_path_buf(),
+        detail: detail.to_owned(),
+    };
+    let start = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(io_error("read the working directory of", dir))?
+            .join(dir)
+    };
+    let mut pending: std::collections::VecDeque<std::ffi::OsString> = start
+        .components()
+        .filter(|part| !matches!(part, std::path::Component::RootDir))
+        .map(|part| part.as_os_str().to_owned())
+        .collect();
+    let mut resolved = PathBuf::from("/");
+    let (mut hops, mut touched) = (0_usize, None::<String>);
+    while let Some(part) = pending.pop_front() {
+        if part == "." {
+            continue;
+        }
+        if part == ".." {
+            resolved.pop();
+            continue;
+        }
+        resolved.push(&part);
+        match version_below(&resolved, lexical, real) {
+            Below::Version(name) if touched.is_none() => touched = Some(name),
+            Below::Invalid => {
+                return Err(untrusted(
+                    "it is inside the versions directory but not a version directory",
+                ));
+            }
+            _ => {}
+        }
+        match std::fs::symlink_metadata(&resolved) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                hops += 1;
+                if hops > MAX_SOURCE_LINK_HOPS {
+                    return Err(untrusted("it passes through too many symbolic links"));
+                }
+                let target =
+                    std::fs::read_link(&resolved).map_err(io_error("read the link", &resolved))?;
+                resolved.pop();
+                if target.is_absolute() {
+                    resolved = PathBuf::from("/");
+                }
+                for component in target
+                    .components()
+                    .filter(|part| !matches!(part, std::path::Component::RootDir))
+                    .rev()
+                {
+                    pending.push_front(component.as_os_str().to_owned());
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if hops > 0 {
+                    return Err(untrusted("a link on its path does not resolve"));
+                }
+                // Nothing to classify yet; staging reports a missing source.
+                resolved.extend(pending.drain(..));
+                break;
+            }
+            Err(error) => return Err(io_error("inspect", &resolved)(error)),
+        }
+    }
+    Ok((resolved, touched))
 }
 
 /// Atomically installs the version directory's CLI as `<prefix>/bin/pohunek`.
