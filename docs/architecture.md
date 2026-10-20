@@ -1470,7 +1470,19 @@ Durability tiers (honest about limits):
    session with a lost runtime stays resumable (resume keys on the runtime) and
    ages under the lost retention window, aged from the last connection.
    Operations that need a running session still refuse it with
-   `session_runtime_lost` and its recovery hint. N-1 readers know both values:
+   `session_runtime_lost` and its recovery hint. When the service manager still
+   holds the failed worker job, the daemon reads its verdict before it retires
+   the job (retirement resets the failed unit and the verdict with it) and
+   records it as `runtime.exit`: an open cause string mapped from the manager's
+   result (`oom_kill`, `signal`, `exit_code`, `core_dump`, `timeout`,
+   `watchdog`, `resources`, `other`) with the signal or exit code of the worker
+   process. Only the Linux systemd backend implements the read
+   (`Supervisor::exit_evidence`); the launchd backend returns none (#1343), and a
+   failed read never blocks the classification. A lost runtime that is
+   classified again without a verdict keeps the one it has; any other
+   classification of the runtime drops it. The field is additive on the wire
+   and in the store (no protocol or store schema bump); protocol 3 peers do not
+   receive it. N-1 readers know both values:
    they treat the session as ended and not stoppable. Rolled back to a release
    that predates this presentation, the stored `failed` record is aged by the
    shorter terminal window when automatic retention is enabled.
