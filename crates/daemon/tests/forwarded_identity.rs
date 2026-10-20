@@ -223,6 +223,7 @@ fn report(subject: ProcessIdentity, sequence: u64) -> ForwardedActiveReport {
         reported_session: Some(ReportedSession {
             kind: ReportedSessionKind::Id,
             value: "annotation-1".to_owned(),
+            transcript_path: None,
         }),
     }
 }

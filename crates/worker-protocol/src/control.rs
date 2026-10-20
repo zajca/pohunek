@@ -284,20 +284,29 @@ pub struct ReportedSession {
     pub kind: ReportedSessionKind,
     /// The id or path.
     pub value: String,
+    /// The provider's session file, reported beside an id. A path-kind
+    /// annotation carries its path in `value` and leaves this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
 }
 
 impl ReportedSession {
-    /// Whether `value` fits the bound of its kind and holds no control
-    /// character.
+    /// Whether `value` and `transcript_path` fit their bounds and hold no
+    /// control character, and `transcript_path` rides only on an id.
     #[must_use]
     pub fn is_valid(&self) -> bool {
         let limit = match self.kind {
             ReportedSessionKind::Id => crate::MAX_REPORTED_SESSION_ID_BYTES,
             ReportedSessionKind::Path => crate::MAX_REPORTED_SESSION_PATH_BYTES,
         };
-        !self.value.is_empty()
-            && self.value.len() <= limit
-            && !self.value.chars().any(char::is_control)
+        let bounded = |value: &str, limit: usize| {
+            !value.is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
+        };
+        bounded(&self.value, limit)
+            && self.transcript_path.as_deref().is_none_or(|path| {
+                self.kind == ReportedSessionKind::Id
+                    && bounded(path, crate::MAX_REPORTED_SESSION_PATH_BYTES)
+            })
     }
 }
 
@@ -306,6 +315,10 @@ impl Debug for ReportedSession {
         f.debug_struct("ReportedSession")
             .field("kind", &self.kind)
             .field("value", &"[REDACTED]")
+            .field(
+                "transcript_path",
+                &self.transcript_path.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
