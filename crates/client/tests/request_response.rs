@@ -759,6 +759,147 @@ async fn session_creation_without_input_outlasts_the_default_request_timeout() {
     inhibitor.release().await;
 }
 
+/// Daemon-side duration of a resume the fixture answers: a cleanup sweep that
+/// waits out its grace, above the client's 5 s default request timeout.
+const SLOW_RESUME: Duration = Duration::from_secs(30);
+
+/// Serves one `session.resume`: a health reply on the shared connection, then
+/// the resume request on whichever connection it arrives, answered with a
+/// typed refusal once the test releases `reply`. `request_tx` reports the
+/// request and whether it arrived on a dedicated connection.
+fn spawn_resume_daemon(
+    listener: UnixListener,
+    request_tx: oneshot::Sender<(Request, bool)>,
+    reply: oneshot::Receiver<()>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let (primary, _) = listener.accept().await.expect("accept primary connection");
+        let mut primary = BufReader::new(primary);
+        let mut health_line = String::new();
+        primary
+            .read_line(&mut health_line)
+            .await
+            .expect("read health request");
+        let health: Request =
+            serde_json::from_str(trim_line_end(&health_line)).expect("parse health request");
+        write_health_reply(primary.get_mut(), health.id()).await;
+
+        let mut resume_line = String::new();
+        let (mut stream, dedicated) = tokio::select! {
+            accepted = listener.accept() => {
+                let (dedicated, _) = accepted.expect("accept resume connection");
+                let mut dedicated = BufReader::new(dedicated);
+                dedicated
+                    .read_line(&mut resume_line)
+                    .await
+                    .expect("read resume request");
+                (dedicated, true)
+            }
+            read = primary.read_line(&mut resume_line) => {
+                read.expect("read resume request");
+                (primary, false)
+            }
+        };
+        let resume: Request =
+            serde_json::from_str(trim_line_end(&resume_line)).expect("parse resume request");
+        let resume_id = resume.id().to_owned();
+        request_tx
+            .send((resume, dedicated))
+            .expect("report resume request");
+        reply.await.expect("the test releases the resume reply");
+        let response = Response::err(
+            protocol::PROTOCOL_VERSION,
+            resume_id,
+            ProtocolError::new(
+                ErrorClass::Runtime,
+                "fixture_resume_finished",
+                "the fixture daemon finished the resume",
+                None,
+            ),
+        )
+        .expect("resume fixture response");
+        // The client may have given up already; the reply is best effort.
+        let _ = stream
+            .get_mut()
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&response).expect("response JSON")
+                )
+                .as_bytes(),
+            )
+            .await;
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_resume_outlasts_the_default_request_timeout() {
+    let inhibitor = AutoAdvanceInhibitor::new();
+    let socket_file = SocketFile::new();
+    let listener = UnixListener::bind(socket_file.path()).expect("bind fixture daemon");
+    let (request_tx, request_rx) = oneshot::channel();
+    let (reply_tx, reply_rx) = oneshot::channel::<()>();
+    let server = spawn_resume_daemon(listener, request_tx, reply_rx);
+
+    let mut client = Client::connect_local_with_options(socket_file.path(), no_origin_options())
+        .await
+        .expect("connect fixture daemon");
+    client.handshake().await.expect("negotiate protocol");
+    let session_id = protocol::SessionId("s-resume".to_owned());
+    let resume = tokio::spawn(async move { client.session_resume(session_id).await });
+    let (request, dedicated) = request_rx.await.expect("resume request reached daemon");
+    assert_eq!(request.method(), protocol::method::SESSION_RESUME);
+    assert!(dedicated, "the resume runs on a dedicated connection");
+    tokio::time::advance(SLOW_RESUME).await;
+    reply_tx.send(()).expect("release the resume reply");
+
+    let error = resume
+        .await
+        .expect("resume task completed")
+        .expect_err("the fixture daemon reports a typed refusal");
+    assert!(
+        matches!(&error, ClientError::Protocol(source) if source.code == "fixture_resume_finished"),
+        "the client waits for the daemon's reply instead of timing out: {error:?}"
+    );
+    server.await.expect("fixture daemon completed");
+    inhibitor.release().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_resume_with_an_explicit_timeout_below_the_daemon_duration_times_out() {
+    let inhibitor = AutoAdvanceInhibitor::new();
+    let socket_file = SocketFile::new();
+    let listener = UnixListener::bind(socket_file.path()).expect("bind fixture daemon");
+    let (request_tx, request_rx) = oneshot::channel();
+    let (reply_tx, reply_rx) = oneshot::channel::<()>();
+    let server = spawn_resume_daemon(listener, request_tx, reply_rx);
+
+    let explicit = Duration::from_secs(2);
+    let mut client = Client::connect_local_with_options(
+        socket_file.path(),
+        no_origin_options().with_request_timeout(explicit),
+    )
+    .await
+    .expect("connect fixture daemon");
+    client.handshake().await.expect("negotiate protocol");
+    let session_id = protocol::SessionId("s-resume".to_owned());
+    let resume = tokio::spawn(async move { client.session_resume(session_id).await });
+    request_rx.await.expect("resume request reached daemon");
+    tokio::time::advance(explicit + TIMER_TICK).await;
+
+    let error = resume
+        .await
+        .expect("resume task completed")
+        .expect_err("the explicit deadline elapses before the daemon answers");
+    assert!(
+        matches!(error, ClientError::RequestTimeout { timeout, .. } if timeout == explicit),
+        "{error:?}"
+    );
+    reply_tx.send(()).expect("release the resume reply");
+    server.await.expect("fixture daemon completed");
+    inhibitor.release().await;
+}
+
 /// Daemon-side duration of each turn wait the fixture answers, far above the
 /// client's 5 s default request timeout and the 30 min default ceiling.
 const TURN_WAIT_FIXTURE_DELAY: Duration = Duration::from_mins(45);

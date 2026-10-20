@@ -2661,9 +2661,14 @@ impl SessionRegistry {
             .sweep_lost_runtime_detailed(&id.0, worker_instance_id, worker.bounds())
             .await;
         if outcome.cleanup == Cleanup::Unconfirmed {
-            return Err(refusal(
-                "marked process cleanup is still unconfirmed".to_owned(),
-            ));
+            let mut detail = "marked process cleanup is still unconfirmed".to_owned();
+            if outcome.only_unreadable_candidates_blocked() {
+                detail = format!(
+                    "{detail}; processes whose environment cannot be read may belong to it: {}",
+                    describe_unreadable_candidates(&outcome.unreadable)
+                );
+            }
+            return Err(refusal(detail));
         }
         Ok(())
     }
@@ -12693,6 +12698,28 @@ handler = "codex-hook-v1"
             supervisor: ScriptedSupervisor,
             supervision_retry_initial: Duration,
         ) -> Fixture {
+            fixture_graced(
+                inspector,
+                worker_initialize,
+                supervisor,
+                supervision_retry_initial,
+                SWEEP_GRACE,
+                crate::agent::host::fixture::official_host_over(
+                    &crate::agent::host::BuiltinSource::from_host_environment(),
+                ),
+            )
+        }
+
+        /// A [`fixture_over_retrying`] whose marker sweep waits `sweep_grace`
+        /// and whose runtimes come from `host`.
+        fn fixture_graced(
+            inspector: Arc<dyn ProcessInspector>,
+            worker_initialize: Option<Duration>,
+            supervisor: ScriptedSupervisor,
+            supervision_retry_initial: Duration,
+            sweep_grace: Duration,
+            host: crate::agent::host::RuntimeHost,
+        ) -> Fixture {
             let root = temp_root();
             let runtime_root = root.join("runtime/workers");
             let state_root = root.join("state/workers");
@@ -12708,7 +12735,7 @@ handler = "codex-hook-v1"
                     .expect("private worker root");
             }
             let mut supervision = crate::session::test_supervision(&runtime_root, &state_root);
-            supervision.sweep_grace = SWEEP_GRACE;
+            supervision.sweep_grace = sweep_grace;
             if let Some(worker_initialize) = worker_initialize {
                 supervision.worker_initialize = worker_initialize;
             }
@@ -12726,9 +12753,7 @@ handler = "codex-hook-v1"
                     session_tmp_root: Some(root.join(FIXTURE_TMP_ROOT)),
                     ..SessionRegistryConfig::default()
                 },
-                crate::agent::host::fixture::official_host_over(
-                    &crate::agent::host::BuiltinSource::from_host_environment(),
-                ),
+                host,
                 Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
                 Arc::new(FixtureProcesses::new(inspector, &root)),
             );
@@ -13558,6 +13583,104 @@ generation "$1"
             assert_eq!(
                 runtime.loss_reason.as_deref(),
                 Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED)
+            );
+            assert!(
+                marked.alive(),
+                "an unreadable marker is never a signal permit"
+            );
+        }
+
+        /// Sweep grace of the resume scenarios: above the SDK client's
+        /// ordinary 5 s request timeout, so the refusal arrives after it.
+        const SLOW_SWEEP_GRACE: Duration = Duration::from_secs(8);
+
+        /// Serves the registry of `fixture` on a control socket below its root
+        /// and returns an SDK client connected to it. The server task ends with
+        /// the test runtime.
+        async fn control_client(
+            fixture: &Fixture,
+            options: pohunek_client::ClientOptions,
+        ) -> pohunek_client::Client {
+            let socket = fixture.root.join("c.sock");
+            let state = crate::api::DaemonState::new(
+                crate::api::HealthInfo::new("test"),
+                fixture.registry.clone(),
+                Arc::new(crate::governance::HostGovernanceService::open_test()),
+                crate::test_support::overlay_registry(),
+            );
+            let server = crate::api::ControlServer::bind_with_state(&socket, state)
+                .await
+                .expect("bind the control socket");
+            tokio::spawn(server.serve(std::future::pending()));
+            pohunek_client::Client::connect_local_with_options(&socket, options)
+                .await
+                .expect("connect the control client")
+        }
+
+        /// A lost runtime whose only remaining marked processes have unreadable
+        /// markers, so a resume must sweep for [`SLOW_SWEEP_GRACE`] before it
+        /// refuses.
+        async fn lost_runtime_with_unreadable_markers(session_id: &str) -> (Fixture, Marked) {
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.fail_markers(true);
+            let fixture = fixture_graced(
+                Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>,
+                None,
+                ScriptedSupervisor::scripted(),
+                crate::session::supervision::SUPERVISION_RETRY_INITIAL,
+                SLOW_SWEEP_GRACE,
+                crate::agent::host::fixture::compiled_in_host(),
+            );
+            let runtime = format!("runtime-{session_id}");
+            let marked = Marked::spawn(&fixture.root, &runtime);
+            let mut record = persist_record(&fixture.root, session_id, Some(&runtime));
+            record.info.native_session_id = Some("native-resume".to_owned());
+            record
+                .recovery
+                .as_mut()
+                .expect("recovery binding")
+                .native_session_id = Some("native-resume".to_owned());
+            Store::new(fixture.root.join("data/metadata.jsonl"))
+                .record_session(&record)
+                .expect("persist the resumable record");
+            write_live_journal(&fixture.root, session_id, dead_worker(), Some(&runtime));
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let lost = runtime_of(&fixture.registry, session_id).await;
+            assert_eq!(lost.state, RuntimeState::Lost);
+            assert_eq!(
+                lost.loss_reason.as_deref(),
+                Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED)
+            );
+            (fixture, marked)
+        }
+
+        /// A resume whose cleanup sweep outlasts the client's ordinary 5 s
+        /// request timeout returns the daemon's refusal, which names the
+        /// unreadable-marker processes, instead of `request_timeout`.
+        #[tokio::test(start_paused = true)]
+        async fn a_resume_refused_after_a_slow_sweep_names_the_unreadable_processes() {
+            let (fixture, marked) = lost_runtime_with_unreadable_markers("s-1328").await;
+            let mut client = control_client(
+                &fixture,
+                pohunek_client::ClientOptions::default()
+                    .with_origin_source(pohunek_client::OriginSource::Omitted),
+            )
+            .await;
+
+            let refused = client
+                .session_resume(SessionId("s-1328".to_owned()))
+                .await
+                .expect_err("unreadable markers leave the cleanup unconfirmed");
+
+            let pohunek_client::ClientError::Protocol(refused) = refused else {
+                panic!("the daemon's refusal is returned, not a transport error: {refused:?}");
+            };
+            assert_eq!(refused.code, SUPERVISION_AMBIGUOUS, "{refused:?}");
+            assert!(
+                refused.msg.contains(&format!("pid {}", marked.0)),
+                "the refusal names the unreadable candidate: {refused:?}"
             );
             assert!(
                 marked.alive(),

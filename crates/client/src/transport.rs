@@ -40,6 +40,21 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 10 minutes cover the rest of creation, so this client bound does not race
 /// those valid settings.
 const SESSION_NEW_REQUEST_BUDGET_MS: u32 = 60 * 60 * 1_000;
+/// Longest valid daemon bound of one lifecycle step, in milliseconds.
+///
+/// Worker connection, worker initialization, a job's exit timeout, and the
+/// marker sweep's grace are each validated up to 10 minutes.
+const LIFECYCLE_STEP_BOUND_MS: u32 = 10 * 60 * 1_000;
+/// Lifecycle steps of a resume whose daemon bound is [`LIFECYCLE_STEP_BOUND_MS`]:
+/// retiring the lost generation's job (1), the cleanup sweep (its signalling
+/// passes plus one settle window: 4), and the new worker's connection and
+/// initialization (2).
+const SESSION_RESUME_STEPS: u32 = 7;
+/// A resume of a lost runtime waits for the previous generation's retirement,
+/// a fresh marker sweep, and bounded worker startup, so its response budget
+/// covers every step at its longest valid daemon bound rather than the
+/// ordinary request timeout.
+const SESSION_RESUME_REQUEST_BUDGET_MS: u32 = SESSION_RESUME_STEPS * LIFECYCLE_STEP_BOUND_MS;
 /// Transport processing budget added after a validated daemon-side deadline.
 ///
 /// One second leaves room for request framing, waiter teardown, scheduling,
@@ -565,6 +580,14 @@ impl Client {
                 result,
             )?)?);
         }
+        if M::NAME == protocol::method::SESSION_RESUME {
+            let params =
+                serde_json::from_value::<SessionResumeParams>(serde_json::to_value(params)?)?;
+            let result = self.session_resume_with(params).await?;
+            return Ok(protocol::tolerant::from_value(serde_json::to_value(
+                result,
+            )?)?);
+        }
         if M::NAME == protocol::method::SESSION_WAIT {
             let params =
                 serde_json::from_value::<SessionWaitParams>(serde_json::to_value(params)?)?;
@@ -594,7 +617,7 @@ impl Client {
         if params.input.is_some() {
             params.extended_input_ready_wait = Some(true);
         }
-        let timeout = session_new_request_timeout(self.options);
+        let timeout = lifecycle_request_timeout(self.options, SESSION_NEW_REQUEST_BUDGET_MS);
         let mut client = self
             .connect_dedicated(self.options.with_request_timeout(timeout))
             .await?;
@@ -769,11 +792,22 @@ impl Client {
     /// Resume one logical session with an explicit decision on a changed host
     /// profile. The daemon honors `accept_profile_change` on its local control
     /// socket only.
+    ///
+    /// Runs on a dedicated connection whose response budget covers the
+    /// daemon's bounded retirement, cleanup sweep, and worker startup; an
+    /// explicit request timeout overrides it. After a
+    /// [`ClientError::RequestTimeout`] the resume may still complete.
     pub async fn session_resume_with(
         &mut self,
         params: SessionResumeParams,
     ) -> Result<SessionResumeResult, ClientError> {
-        self.call::<protocol::method::SessionResume>(params).await
+        let timeout = lifecycle_request_timeout(self.options, SESSION_RESUME_REQUEST_BUDGET_MS);
+        let mut client = self
+            .connect_dedicated(self.options.with_request_timeout(timeout))
+            .await?;
+        client
+            .call_direct::<protocol::method::SessionResume>(params)
+            .await
     }
 
     /// Resize one managed terminal through the typed lifecycle API.
@@ -1291,11 +1325,13 @@ fn dedicated_request_timeout(configured: Duration, wire_timeout_ms: u32) -> Dura
         .max(configured)
 }
 
-fn session_new_request_timeout(options: ClientOptions) -> Duration {
+/// Response timeout of a lifecycle request whose daemon work is bounded by
+/// `budget_ms`; an explicit or nondefault `request_timeout` wins.
+fn lifecycle_request_timeout(options: ClientOptions, budget_ms: u32) -> Duration {
     if options.request_timeout_explicit || options.request_timeout != DEFAULT_REQUEST_TIMEOUT {
         options.request_timeout
     } else {
-        dedicated_request_timeout(options.request_timeout, SESSION_NEW_REQUEST_BUDGET_MS)
+        dedicated_request_timeout(options.request_timeout, budget_ms)
     }
 }
 
