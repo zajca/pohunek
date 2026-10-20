@@ -1955,6 +1955,12 @@ mod tests {
             usize::try_from(pohunek_client::RESUME_SWEEP_PASSES).expect("pass count"),
             MAX_SWEEP_PASSES
         );
+        assert_eq!(
+            u128::from(pohunek_client::WORKTREE_HOOK_TIMEOUT_MS),
+            crate::session::SessionRegistryConfig::default()
+                .hook_timeout
+                .as_millis()
+        );
         assert!(
             crate::session::SessionRegistryConfig::default().worker_stop_bound()
                 <= pohunek_service_config::MAX_DEADLINE

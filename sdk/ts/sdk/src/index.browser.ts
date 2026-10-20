@@ -35,6 +35,7 @@ export {
   SESSION_REMOVE_REQUEST_BUDGET_MS,
   SESSION_RESUME_REQUEST_BUDGET_MS,
   SESSION_STOP_REQUEST_BUDGET_MS,
+  WORKTREE_HOOK_TIMEOUT_MS,
   resolveConnectOptions,
 } from "./transport";
 export type {

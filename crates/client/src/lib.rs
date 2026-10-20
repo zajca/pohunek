@@ -29,7 +29,8 @@ pub use transport::{
     resolve_host_target, resolve_host_target_in, Client, ClientOptions, OriginSource, RawStream,
     ResolvedHost, ResolvedPeer, Subscription, LIFECYCLE_STEP_BOUND_MS, LOCAL_HOST,
     RESUME_SWEEP_PASSES, SESSION_FORK_REQUEST_BUDGET_MS, SESSION_NEW_REQUEST_BUDGET_MS,
-    SESSION_RESUME_REQUEST_BUDGET_MS, SESSION_STOP_REQUEST_BUDGET_MS,
+    SESSION_REMOVE_REQUEST_BUDGET_MS, SESSION_RESUME_REQUEST_BUDGET_MS,
+    SESSION_STOP_REQUEST_BUDGET_MS, WORKTREE_HOOK_TIMEOUT_MS,
 };
 
 /// Load the production overlay registry from fail-fast provider configuration.

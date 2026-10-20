@@ -13,6 +13,7 @@ import {
   SESSION_REMOVE_REQUEST_BUDGET_MS,
   SESSION_RESUME_REQUEST_BUDGET_MS,
   SESSION_STOP_REQUEST_BUDGET_MS,
+  WORKTREE_HOOK_TIMEOUT_MS,
   connectLocal,
   type ClientErrorKind,
   type ConnectOptions,
@@ -128,8 +129,12 @@ describe("lifecycle response budgets", () => {
       session_resume_request_budget_ms: SESSION_RESUME_REQUEST_BUDGET_MS,
       session_fork_request_budget_ms: SESSION_FORK_REQUEST_BUDGET_MS,
       session_stop_request_budget_ms: SESSION_STOP_REQUEST_BUDGET_MS,
+      worktree_hook_timeout_ms: WORKTREE_HOOK_TIMEOUT_MS,
       session_remove_request_budget_ms: SESSION_REMOVE_REQUEST_BUDGET_MS,
     }).toEqual(fixture);
+    expect(SESSION_REMOVE_REQUEST_BUDGET_MS).toBe(
+      SESSION_STOP_REQUEST_BUDGET_MS + 4 * WORKTREE_HOOK_TIMEOUT_MS,
+    );
   });
 
   for (const lifecycle of LIFECYCLE_CASES) {

@@ -68,7 +68,7 @@ const SESSION_FORK_STEPS: u32 = 2 + 1;
 /// A fork waits for bounded worker startup, so its response budget covers
 /// every step at its longest valid daemon bound.
 pub const SESSION_FORK_REQUEST_BUDGET_MS: u32 = SESSION_FORK_STEPS * LIFECYCLE_STEP_BOUND_MS;
-/// Lifecycle steps of a stop or remove: the worker's stop, or the retirement
+/// Lifecycle steps of a stop (and of the stop a remove performs): the worker's stop, or the retirement
 /// of a conflicted runtime's job (1), the cleanup sweep of a conflicted
 /// runtime (each signalling pass waits a `SIGTERM` grace and a `SIGKILL`
 /// grace, plus one settle window), and the rest of the call (1). A stop
@@ -76,9 +76,19 @@ pub const SESSION_FORK_REQUEST_BUDGET_MS: u32 = SESSION_FORK_STEPS * LIFECYCLE_S
 /// operation's lifecycle lock as well; an elapsed budget then reports an
 /// unknown outcome.
 const SESSION_STOP_STEPS: u32 = 1 + (2 * RESUME_SWEEP_PASSES + 1) + 1;
-/// A stop or remove waits for the worker's bounded stop and, for a conflicted
-/// runtime, the job's retirement and the cleanup sweep.
+/// A stop waits for the worker's bounded stop and, for a conflicted runtime,
+/// the job's retirement and the cleanup sweep.
 pub const SESSION_STOP_REQUEST_BUDGET_MS: u32 = SESSION_STOP_STEPS * LIFECYCLE_STEP_BOUND_MS;
+/// Longest one worktree hook layer runs, in milliseconds. A daemon test ties
+/// this value to the hook timeout the daemon enforces.
+pub const WORKTREE_HOOK_TIMEOUT_MS: u32 = 5 * 60 * 1_000;
+/// Hook runs a removal can wait for: the `pre-remove` and `post-remove` events,
+/// each with a host layer and a repository layer.
+const SESSION_REMOVE_HOOK_RUNS: u32 = 2 * 2;
+/// A remove adds its worktree hooks to the stop it performs first, so its
+/// budget is the stop budget plus every hook run at its timeout.
+pub const SESSION_REMOVE_REQUEST_BUDGET_MS: u32 =
+    SESSION_STOP_REQUEST_BUDGET_MS + SESSION_REMOVE_HOOK_RUNS * WORKTREE_HOOK_TIMEOUT_MS;
 /// Transport processing budget added after a validated daemon-side deadline.
 ///
 /// One second leaves room for request framing, waiter teardown, scheduling,
@@ -953,15 +963,16 @@ impl Client {
     /// Remove one session from the daemon's registry, stopping it first when
     /// it is live.
     ///
-    /// Shares the stop's budget and returns
-    /// [`ClientError::SessionRemoveOutcomeUnknown`] when the deadline elapses.
+    /// The budget is the stop's plus the worktree hooks a removal runs; the
+    /// call returns [`ClientError::SessionRemoveOutcomeUnknown`] when the
+    /// deadline elapses.
     pub async fn session_remove(
         &mut self,
         session_id: SessionId,
     ) -> Result<SessionRemoveResult, ClientError> {
         self.call_lifecycle::<protocol::method::SessionRemove>(
             session_id,
-            SESSION_STOP_REQUEST_BUDGET_MS,
+            SESSION_REMOVE_REQUEST_BUDGET_MS,
             |host, timeout| ClientError::SessionRemoveOutcomeUnknown { host, timeout },
         )
         .await
@@ -970,15 +981,16 @@ impl Client {
     /// Remove one session, consenting for this call only to accept processes
     /// whose runtime membership cannot be proven.
     ///
-    /// Shares the stop's budget and returns
-    /// [`ClientError::SessionRemoveOutcomeUnknown`] when the deadline elapses.
+    /// The budget is the stop's plus the worktree hooks a removal runs; the
+    /// call returns [`ClientError::SessionRemoveOutcomeUnknown`] when the
+    /// deadline elapses.
     pub async fn session_remove_accepting_unconfirmed(
         &mut self,
         session_id: SessionId,
     ) -> Result<SessionRemoveResult, ClientError> {
         self.call_lifecycle::<protocol::method::SessionRemoveAcceptingUnconfirmed>(
             session_id,
-            SESSION_STOP_REQUEST_BUDGET_MS,
+            SESSION_REMOVE_REQUEST_BUDGET_MS,
             |host, timeout| ClientError::SessionRemoveOutcomeUnknown { host, timeout },
         )
         .await

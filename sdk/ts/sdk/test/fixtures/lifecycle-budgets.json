@@ -5,5 +5,6 @@
   "session_resume_request_budget_ms": 6600000,
   "session_fork_request_budget_ms": 1800000,
   "session_stop_request_budget_ms": 5400000,
-  "session_remove_request_budget_ms": 5400000
+  "worktree_hook_timeout_ms": 300000,
+  "session_remove_request_budget_ms": 6600000
 }

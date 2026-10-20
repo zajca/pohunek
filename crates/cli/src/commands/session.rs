@@ -3781,7 +3781,7 @@ mod tests {
             ),
             (
                 "remove",
-                pohunek_client::SESSION_STOP_REQUEST_BUDGET_MS,
+                pohunek_client::SESSION_REMOVE_REQUEST_BUDGET_MS,
                 "session_remove_outcome_unknown",
                 |paths, target, json| {
                     Box::pin(run_remove(LOCAL_HOST, paths, target, false, json))

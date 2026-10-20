@@ -63,9 +63,16 @@ export const SESSION_RESUME_REQUEST_BUDGET_MS = SESSION_RESUME_STEPS * LIFECYCLE
 export const SESSION_FORK_REQUEST_BUDGET_MS = SESSION_FORK_STEPS * LIFECYCLE_STEP_BOUND_MS;
 /** Budget for `session.stop`. */
 export const SESSION_STOP_REQUEST_BUDGET_MS = SESSION_STOP_STEPS * LIFECYCLE_STEP_BOUND_MS;
-/** Budget for `session.remove` and `session.remove_accepting_unconfirmed`; the
- * removal stops a live session first, so it shares the stop's steps. */
-export const SESSION_REMOVE_REQUEST_BUDGET_MS = SESSION_STOP_REQUEST_BUDGET_MS;
+/** Longest one worktree hook layer runs; a shared fixture ties it to the
+ * Rust client, whose daemon test ties it to the daemon's hook timeout. */
+export const WORKTREE_HOOK_TIMEOUT_MS = 5 * 60 * 1_000;
+/** Hook runs a removal waits for: `pre-remove` and `post-remove`, each with a
+ * host layer and a repository layer. */
+const SESSION_REMOVE_HOOK_RUNS = 2 * 2;
+/** Budget for `session.remove` and `session.remove_accepting_unconfirmed`: the
+ * stop the removal performs first plus every hook run at its timeout. */
+export const SESSION_REMOVE_REQUEST_BUDGET_MS =
+  SESSION_STOP_REQUEST_BUDGET_MS + SESSION_REMOVE_HOOK_RUNS * WORKTREE_HOOK_TIMEOUT_MS;
 
 export function resolveConnectOptions(options: ConnectOptions = {}): ResolvedConnectOptions {
   return {
