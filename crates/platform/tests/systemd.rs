@@ -28,9 +28,9 @@ use pohunek_platform::supervisor::systemd::{
     SystemdPluginUnits, SystemdSupervisor,
 };
 use pohunek_platform::supervisor::{
-    Activation, DaemonSupervisor, Error, JobDefinition, JobSpec, Namespace, PluginUnitDefinition,
-    PluginUnitKey, PluginUnitKind, PluginUnits, RestartPolicy, ServiceId, ServiceObservation,
-    ServiceState, Supervisor, WorkerKey,
+    Activation, DaemonSupervisor, Error, ExitEvidence, JobDefinition, JobExit, JobSpec, Namespace,
+    PluginUnitDefinition, PluginUnitKey, PluginUnitKind, PluginUnits, RestartPolicy, ServiceId,
+    ServiceObservation, ServiceState, Supervisor, WorkerKey,
 };
 use pohunek_test_support::wait;
 use tempfile::TempDir;
@@ -47,10 +47,22 @@ const STATE_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Lifetime of fixture processes; far longer than any test.
 const FIXTURE_LIFETIME: Duration = Duration::from_secs(300);
+/// Fixture file whose appearance tells the `allocate` fixture to start
+/// allocating; named next to the state root of the installation.
+const ALLOCATE_TRIGGER: &str = "allocate-now";
+/// Memory limit injected into the unit of the out-of-memory scenario.
+const OOM_MEMORY_MAX: &str = "64M";
+/// Bytes the `allocate` fixture touches after its trigger; well above
+/// [`OOM_MEMORY_MAX`].
+const ALLOCATE_BYTES: usize = 512 * 1024 * 1024;
+/// Start timeout of the worker whose activation never completes.
+const SHORT_START_TIMEOUT: Duration = Duration::from_secs(2);
 /// Session ID shared by the tests; namespaces keep them apart.
 const SESSION: &str = "s-01KYAPVPFVHD56Z69B9CX3XWN2";
 /// Command-line prefix naming the marker file a plugin unit fixture appends to.
 const MARKER_ARGUMENT: &str = "pohunek-systemd-marker=";
+/// Command-line prefix naming the file whose appearance starts `allocate`.
+const ALLOCATE_TRIGGER_ARGUMENT: &str = "pohunek-systemd-allocate-trigger=";
 /// Command-line prefix naming how long a `job` fixture run sleeps, in ms.
 const SLEEP_ARGUMENT: &str = "pohunek-systemd-sleep-ms=";
 /// Interval of the periodic plugin job fixtures.
@@ -106,6 +118,26 @@ fn fixture_entry() {
                 .arg(FIXTURE_LIFETIME.as_secs().to_string())
                 .exec();
             panic!("exec another program: {error}");
+        }
+        "ready-then-sigkill" => {
+            notify_ready();
+            nix::sys::signal::kill(nix::unistd::getpid(), nix::sys::signal::Signal::SIGKILL)
+                .expect("kill the fixture's own process");
+        }
+        "allocate" => {
+            notify_ready();
+            let trigger = PathBuf::from(argument(ALLOCATE_TRIGGER_ARGUMENT));
+            while !trigger.exists() {
+                // timing-allowed: #326 the fixture waits for the scenario to inject the memory limit; the scenario waits on the unit's state, not on this poll
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            let mut memory = vec![0_u8; ALLOCATE_BYTES];
+            for page in memory.chunks_mut(4_096) {
+                page[0] = 1;
+            }
+            std::hint::black_box(&memory);
+            // timing-allowed: #326 the fixture's own lifetime; the manager ends the unit
+            std::thread::sleep(FIXTURE_LIFETIME);
         }
         "ready-then-fail" => {
             notify_ready();
@@ -286,6 +318,21 @@ fn systemctl(arguments: &[&str]) {
         ),
         Err(error) => eprintln!("cleanup could not run systemctl: {error}"),
     }
+}
+
+/// Runs `systemctl --user` and fails the scenario when it does not succeed.
+fn systemctl_checked(arguments: &[&str]) {
+    let output = Command::new("systemctl")
+        .arg("--user")
+        .args(arguments)
+        .output()
+        .expect("run systemctl");
+    assert!(
+        output.status.success(),
+        "`systemctl --user {}` failed: {}",
+        arguments.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// A namespace unique to one test and the directory it was derived from.
@@ -698,6 +745,182 @@ async fn a_failed_worker_is_observed_and_reset_by_retire() {
         supervisor.inspect(&id).await,
         Err(Error::NotFound(_))
     ));
+}
+
+/// Polls `exit_evidence` until the failed unit reports a verdict.
+async fn failed_evidence(supervisor: &SystemdSupervisor, id: &ServiceId) -> ExitEvidence {
+    let deadline = Instant::now() + STATE_TIMEOUT;
+    loop {
+        match supervisor.exit_evidence(id).await {
+            Ok(Some(evidence)) => return evidence,
+            Ok(None) | Err(Error::Race { .. }) => {}
+            Err(error) => panic!("exit_evidence {id} failed: {error:?}"),
+        }
+        assert!(Instant::now() < deadline, "{id} never reported a verdict");
+        // timing-allowed: #326 polls the real manager, which publishes the failed state asynchronously; bounded by STATE_TIMEOUT
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn exit_evidence_is_absent_for_a_missing_or_running_worker() {
+    require_e2e();
+    let installation = Installation::new();
+    let supervisor = installation.supervisor().await;
+    let id = worker_id("verdicta");
+
+    assert!(matches!(
+        supervisor.exit_evidence(&id).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        supervisor.exit_status(&id).await,
+        Err(Error::NotFound(_))
+    ));
+
+    supervisor
+        .start(&id, &fixture(installation.root.path(), "ready"))
+        .await
+        .expect("start transient worker");
+    wait_for(&supervisor, &id, |observation| {
+        observation.state == ServiceState::Running
+    })
+    .await;
+    assert_eq!(supervisor.exit_evidence(&id).await.expect("running"), None);
+    assert_eq!(supervisor.exit_status(&id).await.expect("running"), None);
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_failed_worker_reports_its_exit_code_until_it_is_retired() {
+    require_e2e();
+    let installation = Installation::new();
+    let supervisor = installation.supervisor().await;
+    let id = worker_id("verdict2");
+
+    supervisor
+        .start(&id, &fixture(installation.root.path(), "ready-then-fail"))
+        .await
+        .expect("start transient worker");
+    let evidence = failed_evidence(&supervisor, &id).await;
+
+    assert_eq!(evidence.result(), "exit-code");
+    assert_eq!(evidence.exit(), Some(JobExit::Code(3)));
+    assert_eq!(
+        supervisor.exit_status(&id).await.expect("exit status"),
+        Some(JobExit::Code(3))
+    );
+
+    supervisor.retire(&id).await.expect("retire failed worker");
+    assert!(
+        matches!(supervisor.exit_evidence(&id).await, Err(Error::NotFound(_))),
+        "retiring a failed unit resets it and destroys the record"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_worker_killed_by_a_signal_reports_the_signal() {
+    require_e2e();
+    let installation = Installation::new();
+    let supervisor = installation.supervisor().await;
+    let id = worker_id("verdict3");
+
+    supervisor
+        .start(
+            &id,
+            &fixture(installation.root.path(), "ready-then-sigkill"),
+        )
+        .await
+        .expect("start transient worker");
+    let evidence = failed_evidence(&supervisor, &id).await;
+
+    assert_eq!(evidence.result(), "signal");
+    assert_eq!(
+        evidence.exit(),
+        Some(JobExit::Signal(nix::sys::signal::Signal::SIGKILL as i32))
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_worker_that_never_becomes_ready_reports_a_timeout() {
+    require_e2e();
+    let installation = Installation::new();
+    let supervisor = installation.supervisor().await;
+    let id = worker_id("verdict4");
+    let mut spec = fixture_spec(installation.root.path(), "never-ready");
+    spec.start_timeout = SHORT_START_TIMEOUT;
+
+    supervisor
+        .start(&id, &JobDefinition::new(spec).expect("valid definition"))
+        .await
+        .expect("start transient worker");
+    let evidence = failed_evidence(&supervisor, &id).await;
+
+    assert_eq!(evidence.result(), "timeout");
+}
+
+/// Fails with a stated precondition unless the unit's cgroup enforces a
+/// memory limit, which needs the memory controller delegated to the user
+/// manager.
+fn require_memory_controller(unit: &str) {
+    let properties = show(unit, &["ControlGroup"]);
+    let group = properties
+        .get("ControlGroup")
+        .filter(|group| !group.is_empty())
+        .unwrap_or_else(|| panic!("precondition: {unit} has no control group"));
+    let limit = Path::new("/sys/fs/cgroup")
+        .join(group.trim_start_matches('/'))
+        .join("memory.max");
+    let value = std::fs::read_to_string(&limit).unwrap_or_default();
+    assert!(
+        value.trim() != "" && value.trim() != "max",
+        "precondition: the systemd user manager does not enforce MemoryMax for {unit}; \
+         delegate the memory controller to the user manager (Delegate=memory on \
+         user@.service) before running this scenario"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager with the memory controller"]
+async fn a_worker_under_memory_pressure_reports_an_oom_kill() {
+    require_e2e();
+    let installation = Installation::new();
+    let supervisor = installation.supervisor().await;
+    let id = worker_id("verdict5");
+    let trigger = installation.root.path().join(ALLOCATE_TRIGGER);
+    let mut spec = fixture_spec(installation.root.path(), "allocate");
+    spec.arguments
+        .push(format!("{ALLOCATE_TRIGGER_ARGUMENT}{}", trigger.display()));
+
+    supervisor
+        .start(&id, &JobDefinition::new(spec).expect("valid definition"))
+        .await
+        .expect("start transient worker");
+    wait_for(&supervisor, &id, |observation| {
+        observation.state == ServiceState::Running
+    })
+    .await;
+    let unit = installation.unit(&id);
+    systemctl_checked(&[
+        "set-property",
+        "--runtime",
+        &unit,
+        &format!("MemoryMax={OOM_MEMORY_MAX}"),
+        "MemorySwapMax=0",
+    ]);
+    require_memory_controller(&unit);
+    std::fs::write(&trigger, b"go").expect("trigger the allocation");
+
+    let evidence = failed_evidence(&supervisor, &id).await;
+
+    assert_eq!(evidence.result(), "oom-kill");
+    assert!(
+        matches!(evidence.exit(), Some(JobExit::Signal(_))),
+        "the main process died of a signal: {evidence:?}"
+    );
 }
 
 #[tokio::test]

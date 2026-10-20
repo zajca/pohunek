@@ -78,6 +78,21 @@
 //! A starting unit whose process is not bound is present but not ready, so
 //! callers watch it until its initialization deadline instead of treating it
 //! as unavailable.
+//!
+//! # Exit evidence
+//!
+//! [`Supervisor::exit_evidence`] reads the verdict of a `failed` unit from the
+//! service interface: `Result` (an open string such as `exit-code`, `signal`,
+//! `core-dump`, `timeout`, `oom-kill`), and `ExecMainCode` / `ExecMainStatus`
+//! (the `si_code` and the exit code or signal number of the main process).
+//! `ExecMainCode` and `ExecMainStatus` keep the last run's values and describe
+//! the current process of a running unit, so any state other than `failed`
+//! yields `None`. A unit the manager does not hold is [`Error::NotFound`];
+//! retiring a failed unit resets it and destroys the record. With the default
+//! `OOMPolicy=stop` a kernel OOM kill inside the unit's cgroup ends it
+//! `failed` with `Result=oom-kill`, and `ExecMainStatus` then shows the signal
+//! that stopped the main process, not the OOM, which is why the verdict comes
+//! from `Result`.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -87,9 +102,10 @@ use zbus::proxy::CacheProperties;
 use zbus::zvariant::{OwnedObjectPath, Value};
 
 use super::{
-    Activation, DaemonSupervisor, DefinitionFacts, Error, JobDefinition, Namespace, Operation,
-    PluginUnitDefinition, PluginUnitKey, PluginUnitKind, PluginUnits, RestartPolicy, ServiceId,
-    ServiceObservation, ServiceState, Supervisor, WorkerKey, MAX_JOB_TIMEOUT,
+    Activation, DaemonSupervisor, DefinitionFacts, Error, ExitEvidence, JobDefinition, JobExit,
+    Namespace, Operation, PluginUnitDefinition, PluginUnitKey, PluginUnitKind, PluginUnits,
+    RestartPolicy, ServiceId, ServiceObservation, ServiceState, Supervisor, WorkerKey,
+    MAX_JOB_TIMEOUT,
 };
 use crate::filesystem::{EntryKind, FsError, StageOutcome, TrustedDir};
 use crate::process::{Error as ProcessError, LinuxInspector, ProcessIdentity, ProcessInspector};
@@ -162,6 +178,20 @@ const UNIT_DIR_FORBIDDEN_BITS: u32 = 0o022;
 const REMOVAL_PREFIX: &str = ".pohunek-unit-removed-";
 /// Random bytes in a temporary unit-file name.
 const TEMPORARY_NAME_ENTROPY: usize = 8;
+
+/// Longest `Result` string the backend accepts from the manager.
+///
+/// The longest value systemd 262 defines is `start-limit-hit` (15 bytes);
+/// 32 leaves room for a newer value while keeping a hostile or corrupted
+/// property from being copied into callers' logs and records.
+const MAX_RESULT_BYTES: usize = 32;
+
+/// `ExecMainCode` of a main process that exited (`CLD_EXITED`).
+const MAIN_EXITED: i32 = 1;
+/// `ExecMainCode` of a main process killed by a signal (`CLD_KILLED`).
+const MAIN_KILLED: i32 = 2;
+/// `ExecMainCode` of a main process that dumped core (`CLD_DUMPED`).
+const MAIN_DUMPED: i32 = 3;
 
 const NO_SUCH_UNIT: &str = "org.freedesktop.systemd1.NoSuchUnit";
 const UNIT_EXISTS: &str = "org.freedesktop.systemd1.UnitExists";
@@ -337,6 +367,29 @@ impl Supervisor for SystemdSupervisor {
         Box::pin(async move {
             let (_key, name) = self.unit_name(id)?;
             self.bus.stop_and_settle(&name, id, "retire").await
+        })
+    }
+
+    fn exit_status<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, Option<JobExit>> {
+        Box::pin(async move {
+            Ok(self
+                .exit_evidence(id)
+                .await?
+                .and_then(|evidence| evidence.exit()))
+        })
+    }
+
+    /// Reads the verdict of a `failed` unit.
+    ///
+    /// A transient unit that ended cleanly is collected, so only a failed
+    /// unit keeps `Result`, `ExecMainCode` and `ExecMainStatus`; the last two
+    /// also describe a running unit's current process, which is why any other
+    /// state yields `None`. The reads are bracketed by the unit's state and
+    /// invocation, and a change between them is a [`Error::Race`].
+    fn exit_evidence<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, Option<ExitEvidence>> {
+        Box::pin(async move {
+            let (_key, name) = self.unit_name(id)?;
+            self.bus.exit_evidence(&name, id).await
         })
     }
 }
@@ -1052,6 +1105,48 @@ impl Bus {
         })
     }
 
+    /// Reads the recorded end of one unit; `None` unless it is `failed`.
+    async fn exit_evidence(
+        &self,
+        name: &str,
+        id: &ServiceId,
+    ) -> Result<Option<ExitEvidence>, Error> {
+        const OPERATION: &str = "exit_evidence";
+
+        let path = self
+            .get_unit(name)
+            .await
+            .map_err(|source| unit_error(OPERATION, id, source))?;
+        let unit = self.proxy(path.clone(), UNIT_INTERFACE, OPERATION).await?;
+        let service = self.proxy(path, SERVICE_INTERFACE, OPERATION).await?;
+        let before = read_invocation(&unit, id, true).await?;
+        if before.active_state != "failed" {
+            return Ok(None);
+        }
+        let result: String = service
+            .get_property("Result")
+            .await
+            .map_err(|source| unit_error(OPERATION, id, source))?;
+        let code: i32 = service
+            .get_property("ExecMainCode")
+            .await
+            .map_err(|source| unit_error(OPERATION, id, source))?;
+        let status: i32 = service
+            .get_property("ExecMainStatus")
+            .await
+            .map_err(|source| unit_error(OPERATION, id, source))?;
+        let after = read_invocation(&unit, id, false).await?;
+        if before != after {
+            return Err(Error::Race {
+                operation: OPERATION,
+            });
+        }
+        Ok(Some(ExitEvidence::new(
+            decode_result(result)?,
+            decode_exit(code, status),
+        )))
+    }
+
     /// Stops a unit and waits until its control group is proven empty.
     ///
     /// The wait is bounded by the unit's own `TimeoutStopUSec` for both stop
@@ -1433,6 +1528,83 @@ fn portable_state(active: &str, sub: &str) -> ServiceState {
         "failed" => ServiceState::Failed,
         _ if sub == "failed" => ServiceState::Failed,
         _ => ServiceState::Unknown,
+    }
+}
+
+/// The identity of one run of a unit: its state and invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Invocation {
+    active_state: String,
+    invocation_id: Vec<u8>,
+}
+
+/// Reads the state and invocation of a unit, in the order that brackets the
+/// reads between them: the invocation first when `opening`, last otherwise.
+///
+/// A restart between the two reads of one call changes the invocation seen by
+/// the other call, so a state of one run is never paired with the properties
+/// of another.
+async fn read_invocation(
+    unit: &zbus::Proxy<'_>,
+    id: &ServiceId,
+    opening: bool,
+) -> Result<Invocation, Error> {
+    const OPERATION: &str = "exit_evidence";
+
+    async fn invocation_id(unit: &zbus::Proxy<'_>, id: &ServiceId) -> Result<Vec<u8>, Error> {
+        unit.get_property("InvocationID")
+            .await
+            .map_err(|source| unit_error(OPERATION, id, source))
+    }
+    async fn active_state(unit: &zbus::Proxy<'_>, id: &ServiceId) -> Result<String, Error> {
+        unit.get_property("ActiveState")
+            .await
+            .map_err(|source| unit_error(OPERATION, id, source))
+    }
+    if opening {
+        let invocation_id = invocation_id(unit, id).await?;
+        let active_state = active_state(unit, id).await?;
+        Ok(Invocation {
+            active_state,
+            invocation_id,
+        })
+    } else {
+        let active_state = active_state(unit, id).await?;
+        let invocation_id = invocation_id(unit, id).await?;
+        Ok(Invocation {
+            active_state,
+            invocation_id,
+        })
+    }
+}
+
+/// Accepts the manager's `Result` string when it is a short token.
+fn decode_result(result: String) -> Result<String, Error> {
+    let token = !result.is_empty()
+        && result.len() <= MAX_RESULT_BYTES
+        && result
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if token {
+        Ok(result)
+    } else {
+        Err(Error::InvalidData {
+            operation: "exit_evidence",
+            detail: format!(
+                "the unit result is not a short token ({} bytes)",
+                result.len()
+            ),
+        })
+    }
+}
+
+/// Decodes `ExecMainCode` and `ExecMainStatus` into how the main process
+/// ended; `None` when no main process ended (code 0) or the code is unknown.
+fn decode_exit(code: i32, status: i32) -> Option<JobExit> {
+    match code {
+        MAIN_EXITED => Some(JobExit::Code(status)),
+        MAIN_KILLED | MAIN_DUMPED => Some(JobExit::Signal(status)),
+        _ => None,
     }
 }
 
@@ -2050,6 +2222,34 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn unit_results_are_short_tokens_and_exit_codes_map_to_job_exits() {
+        for accepted in ["exit-code", "oom-kill", "start-limit-hit", "core-dump"] {
+            assert_eq!(
+                decode_result(accepted.to_owned()).ok().as_deref(),
+                Some(accepted)
+            );
+        }
+        for rejected in [
+            String::new(),
+            "Exit-Code".to_owned(),
+            "oom kill".to_owned(),
+            "x".repeat(MAX_RESULT_BYTES + 1),
+            "caf\u{e9}".to_owned(),
+            "a\nb".to_owned(),
+        ] {
+            assert!(
+                matches!(decode_result(rejected), Err(Error::InvalidData { .. })),
+                "a hostile result is never copied"
+            );
+        }
+        assert_eq!(decode_exit(MAIN_EXITED, 3), Some(JobExit::Code(3)));
+        assert_eq!(decode_exit(MAIN_KILLED, 9), Some(JobExit::Signal(9)));
+        assert_eq!(decode_exit(MAIN_DUMPED, 11), Some(JobExit::Signal(11)));
+        assert_eq!(decode_exit(0, 0), None, "no main process ended");
+        assert_eq!(decode_exit(42, 1), None, "an unknown code is not guessed");
     }
 
     #[test]
