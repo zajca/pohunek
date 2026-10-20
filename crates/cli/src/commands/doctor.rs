@@ -357,11 +357,12 @@ fn merge_collision(local: &mut DoctorCheck, remote: &DoctorCheck) {
     local.status = worse(local.status, remote.status);
 }
 
-/// The more severe of two statuses (`fail` over `warn` over `ok`).
+/// The more severe of two statuses (`fail` over `warn` over `ok`); an
+/// `unknown` ranks as `warn`, so it never makes a merged check `ok`.
 fn worse(left: Status, right: Status) -> Status {
     match (left, right) {
         (Status::Fail, _) | (_, Status::Fail) => Status::Fail,
-        (Status::Warn, _) | (_, Status::Warn) => Status::Warn,
+        (Status::Warn | Status::Unknown, _) | (_, Status::Warn | Status::Unknown) => Status::Warn,
         (Status::Ok, Status::Ok) => Status::Ok,
     }
 }

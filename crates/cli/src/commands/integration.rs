@@ -1423,6 +1423,9 @@ fn render_uninstall_human(result: &IntegrationUninstallResult) -> String {
             IntegrationUninstallState::Removed => {
                 let _ = writeln!(output, "{agent}: removed managed hooks");
             }
+            IntegrationUninstallState::Unknown => {
+                let _ = writeln!(output, "{agent}: unknown uninstall state");
+            }
         }
         for path in &report.removed_paths {
             let _ = writeln!(output, "  removed: {path}");
@@ -1454,6 +1457,7 @@ fn render_doctor_human(result: &IntegrationDoctorResult) -> String {
             let severity = match finding.severity {
                 IntegrationFindingSeverity::Info => "info",
                 IntegrationFindingSeverity::Error => "error",
+                IntegrationFindingSeverity::Unknown => "unknown",
             };
             let code = serde_json::to_value(finding.code)
                 .ok()
@@ -1528,6 +1532,12 @@ fn render_status_human(host: &str, result: &IntegrationStatusResult) -> String {
                     );
                 }
             }
+            protocol::IntegrationRecovery::Unknown => {
+                let _ = writeln!(
+                    output,
+                    "  hint: the daemon reports a recovery this client does not know; upgrade the client"
+                );
+            }
         }
     }
     output
@@ -1567,6 +1577,7 @@ fn state_label(state: IntegrationInstallState) -> &'static str {
         IntegrationInstallState::NotInstalled => "not_installed",
         IntegrationInstallState::Current => "current",
         IntegrationInstallState::Outdated => "outdated",
+        IntegrationInstallState::Unknown => "unknown",
     }
 }
 

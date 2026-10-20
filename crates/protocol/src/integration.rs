@@ -251,7 +251,7 @@ pub struct IntegrationAgentStatus {
 
 /// Safe recovery action for one managed hook integration report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationRecovery.ts"))]
 pub enum IntegrationRecovery {
@@ -261,11 +261,20 @@ pub enum IntegrationRecovery {
     Reinstall,
     /// Provider configuration must be repaired before reinstalling safely.
     RepairConfiguration,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(IntegrationRecovery);
 
 /// Derived installation health for one managed hook integration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationInstallState.ts"))]
 pub enum IntegrationInstallState {
@@ -275,7 +284,16 @@ pub enum IntegrationInstallState {
     Current,
     /// A detected or unreadable install is incomplete, modified, or malformed.
     Outdated,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(IntegrationInstallState);
 
 /// Per-agent record of what the installer wrote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,7 +348,7 @@ pub struct IntegrationUninstallParams {
 
 /// Outcome of removing one agent's managed hooks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationUninstallState.ts"))]
 pub enum IntegrationUninstallState {
@@ -338,7 +356,16 @@ pub enum IntegrationUninstallState {
     Removed,
     /// Nothing owned by the installer was present, so nothing changed.
     NotInstalled,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(IntegrationUninstallState);
 
 /// Per-agent record of what the uninstaller changed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,7 +448,7 @@ pub struct IntegrationDoctorParams {
 
 /// Stable identifier of one doctor finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationFindingCode.ts"))]
 pub enum IntegrationFindingCode {
@@ -469,11 +496,20 @@ pub enum IntegrationFindingCode {
     QuarantineScanIncomplete,
     /// Drift that no more specific finding describes.
     InstallDrift,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(IntegrationFindingCode);
 
 /// Severity of one doctor finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts",
@@ -484,7 +520,16 @@ pub enum IntegrationFindingSeverity {
     Info,
     /// The integration cannot work until the finding is remediated.
     Error,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(IntegrationFindingSeverity);
 
 /// One diagnosed cause with its remediation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

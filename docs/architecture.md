@@ -1749,10 +1749,10 @@ never `unreachable!()`.
 | Enum | Policy | Behaviour of `Unknown` | Slice |
 |---|---|---|---|
 | `ErrorClass` | display | `code`, `msg` and `recover` survive; `--json` keeps the envelope | done |
-| `DoctorStatus` | safe | ranks as warn in `worse()`, never `ok` | [#1335](https://github.com/zajca/pohunek/issues/1335) |
-| `IntegrationFindingCode`, `IntegrationFindingSeverity`, `IntegrationUninstallState` | display | | [#1335](https://github.com/zajca/pohunek/issues/1335) |
-| `IntegrationInstallState` | safe | never `Current` | [#1335](https://github.com/zajca/pohunek/issues/1335) |
-| `IntegrationRecovery` | safe | never `None`; generic hint | [#1335](https://github.com/zajca/pohunek/issues/1335) |
+| `DoctorStatus` | safe | ranks as warn in `worse()`, never `ok` | done |
+| `IntegrationFindingCode`, `IntegrationFindingSeverity`, `IntegrationUninstallState` | display | | done |
+| `IntegrationInstallState` | safe | never `Current` | done |
+| `IntegrationRecovery` | safe | never `None`; generic hint | done |
 | `AgentActivity` | display, safe | an input-wait miss is the existing typed error | done |
 | `StateSource`, `CwdSource`, `SubagentLifecycle` | display | a lifecycle `unknown` is not counted as running | done |
 | `BackgroundKind`, `BackgroundStatus` | display | maps to the existing `Other` | done |

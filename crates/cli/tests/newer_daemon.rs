@@ -237,3 +237,116 @@ fn a_session_inspect_with_display_values_from_a_newer_daemon_reemits_unknown() {
         "{document}"
     );
 }
+
+/// Answers `method` with `result` and every other method with a health result.
+fn single_result_daemon(
+    method: &'static str,
+    result: Value,
+) -> impl Fn(&Request) -> Option<Result<Value, String>> {
+    move |request| (request.method() == method).then(|| Ok(result.clone()))
+}
+
+#[test]
+fn a_doctor_check_status_from_a_newer_daemon_keeps_the_daemon_checks_visible() {
+    let output = run_against_scripted_daemon(
+        &["doctor"],
+        single_result_daemon(
+            protocol::method::DAEMON_DOCTOR,
+            json!({
+                "report": {
+                    "checks": [
+                        {"name": "newer_daemon_check", "status": "a_status_from_a_newer_daemon", "detail": "judged by the daemon"},
+                    ],
+                    "overall": "a_status_from_a_newer_daemon",
+                },
+            }),
+        ),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("newer_daemon_check"), "{stdout}");
+    let row = stdout
+        .lines()
+        .find(|line| line.contains("newer_daemon_check"))
+        .expect("the daemon check row");
+    assert!(row.contains("unknown"), "{row}");
+    assert!(
+        !stdout.contains("host_governance_inspection"),
+        "the daemon checks are not replaced by the unavailable check: {stdout}"
+    );
+}
+
+fn newer_daemon_integration_status() -> Value {
+    json!({
+        "agent": "claude",
+        "available": true,
+        "expected_asset_paths": [],
+        "present_asset_paths": [],
+        "registration_paths": [],
+        "expected_version": 1,
+        "state": "a_state_from_a_newer_daemon",
+        "recovery": "a_recovery_from_a_newer_daemon",
+    })
+}
+
+#[test]
+fn an_integration_status_from_a_newer_daemon_shows_unknown_and_a_generic_hint() {
+    let status = json!({ "agents": [newer_daemon_integration_status()] });
+
+    let human = run_against_scripted_daemon(
+        &["integration", "status"],
+        single_result_daemon(protocol::method::INTEGRATION_STATUS, status.clone()),
+    );
+    assert_eq!(human.status.code(), Some(0), "{human:?}");
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(stdout.contains("unknown"), "{stdout}");
+    assert!(stdout.contains("upgrade the client"), "{stdout}");
+
+    let json_run = run_against_scripted_daemon(
+        &["integration", "status", "--json"],
+        single_result_daemon(protocol::method::INTEGRATION_STATUS, status),
+    );
+    assert_eq!(json_run.status.code(), Some(0), "{json_run:?}");
+    let document: Value = serde_json::from_slice(&json_run.stdout).expect("one JSON document");
+    let agent = &document["ok"]["agents"][0];
+    assert_eq!(agent["state"], "unknown", "{document}");
+    assert_eq!(agent["recovery"], "unknown", "{document}");
+}
+
+#[test]
+fn an_integration_doctor_finding_from_a_newer_daemon_renders_unknown() {
+    let doctor = json!({
+        "ok": true,
+        "agents": [{
+            "agent": "claude",
+            "ok": true,
+            "status": newer_daemon_integration_status(),
+            "findings": [{
+                "code": "a_code_from_a_newer_daemon",
+                "severity": "a_severity_from_a_newer_daemon",
+                "summary": "judged by the daemon",
+            }],
+        }],
+    });
+
+    let human = run_against_scripted_daemon(
+        &["integration", "doctor"],
+        single_result_daemon(protocol::method::INTEGRATION_DOCTOR, doctor.clone()),
+    );
+    assert_eq!(human.status.code(), Some(0), "{human:?}");
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        stdout.contains("[unknown] unknown: judged by the daemon"),
+        "{stdout}"
+    );
+
+    let json_run = run_against_scripted_daemon(
+        &["integration", "doctor", "--json"],
+        single_result_daemon(protocol::method::INTEGRATION_DOCTOR, doctor),
+    );
+    assert_eq!(json_run.status.code(), Some(0), "{json_run:?}");
+    let document: Value = serde_json::from_slice(&json_run.stdout).expect("one JSON document");
+    let finding = &document["ok"]["agents"][0]["findings"][0];
+    assert_eq!(finding["code"], "unknown", "{document}");
+    assert_eq!(finding["severity"], "unknown", "{document}");
+}

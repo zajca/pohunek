@@ -8,7 +8,7 @@ use crate::version::ProtocolVersion;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "DoctorStatus.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum DoctorStatus {
     /// Check passed.
     Ok,
@@ -16,7 +16,16 @@ pub enum DoctorStatus {
     Warn,
     /// Check failed.
     Fail,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(DoctorStatus);
 
 impl DoctorStatus {
     /// Human-readable compact status label.
@@ -26,6 +35,7 @@ impl DoctorStatus {
             Self::Ok => "ok",
             Self::Warn => "warn",
             Self::Fail => "fail",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -69,13 +79,15 @@ impl DoctorReport {
     /// Aggregate checks by their highest severity.
     ///
     /// An empty report and an all-`Ok` report are `Ok`. A `Warn` is retained
-    /// unless any check is `Fail`, which always takes precedence.
+    /// unless any check is `Fail`, which always takes precedence. An `Unknown`
+    /// ranks as `Warn`, so it never makes the report `Ok`.
     #[must_use]
     pub fn from_checks(checks: Vec<DoctorCheck>) -> Self {
         let overall = checks.iter().fold(DoctorStatus::Ok, |overall, check| {
             match (overall, check.status) {
                 (DoctorStatus::Fail, _) | (_, DoctorStatus::Fail) => DoctorStatus::Fail,
-                (DoctorStatus::Warn, _) | (_, DoctorStatus::Warn) => DoctorStatus::Warn,
+                (DoctorStatus::Warn | DoctorStatus::Unknown, _)
+                | (_, DoctorStatus::Warn | DoctorStatus::Unknown) => DoctorStatus::Warn,
                 (DoctorStatus::Ok, DoctorStatus::Ok) => DoctorStatus::Ok,
             }
         });
