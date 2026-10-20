@@ -1126,8 +1126,20 @@ impl SessionRegistry {
             .insert(id.0.clone(), identities);
     }
 
+    /// Whether `identity` still runs and still withholds its ownership
+    /// markers, the two facts that keep it a blocker.
+    fn still_unreadable(&self, identity: ProcessIdentity) -> bool {
+        matches!(self.inner.inspector.is_running(identity), Ok(true))
+            && matches!(
+                self.inner.inspector.ownership_markers(identity.pid),
+                Err(pohunek_platform::process::Error::PermissionDenied { .. }
+                    | pohunek_platform::process::Error::Unobservable { .. })
+            )
+    }
+
     /// Whether the retry of `id` can only reach the refusal it already
-    /// reached: every unreadable-marker process that blocked it still runs.
+    /// reached: every unreadable-marker process that blocked it still runs and
+    /// still withholds its markers.
     ///
     /// Any other state, including a candidate the host cannot inspect, forgets
     /// the record and lets the retry scan.
@@ -1146,7 +1158,7 @@ impl SessionRegistry {
         let unchanged = !blockers.is_empty()
             && blockers
                 .iter()
-                .all(|identity| matches!(self.inner.inspector.is_running(*identity), Ok(true)));
+                .all(|identity| self.still_unreadable(*identity));
         if unchanged {
             self.inner
                 .supervision_retries

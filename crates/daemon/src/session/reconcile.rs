@@ -6713,6 +6713,8 @@ mod tests {
         descendant_calls: AtomicUsize,
         /// Marker reads (the per-process step of a sweep scan) made so far.
         scans: AtomicUsize,
+        /// Process-table enumerations (`same_user_processes`) made so far.
+        table_scans: AtomicUsize,
         /// The thread a current-thread test runtime runs its tasks on.
         executor_thread: std::sync::OnceLock<std::thread::ThreadId>,
         /// Whether a scan ever ran on [`Self::executor_thread`] instead of the
@@ -6738,6 +6740,10 @@ mod tests {
 
         fn descendant_calls(&self) -> usize {
             self.descendant_calls.load(Ordering::Acquire)
+        }
+
+        fn table_scans(&self) -> usize {
+            self.table_scans.load(Ordering::Acquire)
         }
 
         fn scans(&self) -> usize {
@@ -6794,6 +6800,7 @@ mod tests {
         }
 
         fn same_user_processes(&self) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
+            self.table_scans.fetch_add(1, Ordering::AcqRel);
             if self.fail_enumeration.load(Ordering::Acquire) {
                 return Err(crate::procwatch::Error::from_io(
                     "test_enumeration",
@@ -13785,7 +13792,7 @@ generation "$1"
                     .await
                     .expect("a refused removal keeps the session listed");
             }
-            let scans_after_refusal = inspector.scans();
+            let scans_after_refusal = inspector.table_scans();
 
             for _round in 0..3 {
                 for session_id in SESSIONS {
@@ -13801,7 +13808,7 @@ generation "$1"
             }
 
             assert_eq!(
-                inspector.scans(),
+                inspector.table_scans(),
                 scans_after_refusal,
                 "retry rounds with an unchanged candidate set do not scan"
             );
