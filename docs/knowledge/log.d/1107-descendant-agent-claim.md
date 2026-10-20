@@ -10,4 +10,7 @@ in between) binds the claim to that process generation. A bound claim ends only
 with the exit of that generation: failed collections, failed probes, a reporter
 missing from a scan and the exit of other agents leave it in place, and a hook
 refresh keeps the binding. A claim whose probe is inconclusive stays up to the
-claim TTL. See [session identity](concepts/sessions.md).
+claim TTL. A scan that began before a claim was admitted neither binds nor refutes it;
+the rescan the admission requests decides, and a claim projected from the
+worker's journal requests that rescan.
+See [session identity](concepts/sessions.md).

@@ -717,7 +717,10 @@ its ancestors at the time it was bound; a switch to any other agent replaces
 it, and a foreground back on a shell root clears a claim anchored to an observed
 wrapper. A claim whose probe is inconclusive (a failed liveness read, a failed
 collection or an ancestry the scan cannot complete) stays up to the claim TTL
-before the replacement applies. Replacing an active agent clears stale native identity metadata
+before the replacement applies. A scan neither binds nor refutes a claim admitted after it began (a hook
+report, a journal projection or an adoption): the rescan the admission requests
+decides, and a claim projected from the worker's journal requests that rescan.
+Replacing an active agent clears stale native identity metadata
 and switches the detector configuration with the new agent. An active agent
 that a managed hook reports through the session's worker switches it the same
 way once the daemon projects the worker's journal, and its release restores the
