@@ -7,13 +7,14 @@
 //! daemon already owns or creates a new one under the data dir at
 //! `worktrees/<session>-<repo>-<branch-slug>/`, running `git worktree add`.
 //!
-//! Three setup failures are treated as **non-fatal warnings** (mirroring
-//! Kandev's `FetchWarning` / `BaseBranchFallbackWarning` / `SetupScriptWarning`):
-//! a failed `git fetch` falls back to the local base ref, a base branch missing
-//! both locally and on `origin` falls back to the repository's default branch,
-//! and a failing setup script keeps the worktree. None of them aborts session
-//! creation — the worktree is kept, the warning surfaced, and the user decides
-//! whether to intervene.
+//! Setup failures that leave the requested base intact are **non-fatal
+//! warnings** (mirroring Kandev's `FetchWarning` / `SetupScriptWarning`): a
+//! failed `git fetch` of a base that exists locally uses the local base ref, and
+//! a failing setup script keeps the worktree. Neither aborts session creation —
+//! the worktree is kept, the warning surfaced, and the user decides whether to
+//! intervene. An explicitly requested base branch is never replaced by another
+//! branch: a base that is neither local nor fetchable fails the create. Only a
+//! request without a base starts from the repository's current branch.
 //!
 //! Ownership is implicit, exactly as in Kandev: the daemon owns a worktree iff
 //! it has a [`WorktreeBinding`] recording that path. `bind` refuses to adopt a
@@ -359,10 +360,11 @@ impl WorktreeManager {
     /// Fatal failures abort with a typed [`ProtocolError`]: an empty branch slug
     /// (`invalid_branch_slug`), a non-git or unreadable repository
     /// (`not_a_git_repo`), a foreign directory already at the target path
-    /// (`worktree_path_conflict`), an unresolvable base branch with no fallback
-    /// (`invalid_base_branch`), or a `git worktree add` failure
-    /// (`worktree_add_failed`). The three non-fatal paths (fetch, base-branch
-    /// fallback, setup script) never abort; they are returned in
+    /// (`worktree_path_conflict`), a requested base branch that does not exist
+    /// (`invalid_base_branch`) or that is not local and could not be fetched
+    /// from `origin` (`base_branch_fetch_failed`), or a `git worktree add`
+    /// failure (`worktree_add_failed`). The non-fatal paths (a failed fetch of
+    /// a locally present base, setup script) never abort; they are returned in
     /// [`WorktreeBound::warnings`].
     pub fn bind(&self, req: &WorktreeRequest) -> Result<WorktreeBound, ProtocolError> {
         let slug = require_branch_slug(&req.branch)?;
@@ -496,7 +498,7 @@ impl WorktreeManager {
 
         let mut warnings = Vec::new();
         let mut stderr_tails = Vec::new();
-        let resolved_base = Self::resolve_base_branch(&repository, req, &mut warnings)?;
+        let resolved_base = Self::resolve_base_branch(&repository, req)?;
         let base_branch = resolved_base.name;
         // Resolve the start-point for a new branch: the commit id pinned by a
         // successful fetch, else the (recorded) local base. The logical
@@ -1008,16 +1010,16 @@ impl WorktreeManager {
         Ok(())
     }
 
-    /// Resolve the base ref, fetching a remote-only requested branch before
-    /// falling back to the repository's default branch.
+    /// Resolve the base ref: the requested branch when it exists locally or can
+    /// be fetched from `origin`, else an error. A request without a base uses
+    /// the repository's current branch.
     ///
     /// The default branch is resolved **lazily** — only when no base was
-    /// requested or a fallback is needed — so a repository in detached HEAD can
-    /// still bind a worktree as long as an existing `--base-branch` is supplied.
+    /// requested — so a repository in detached HEAD can still bind a worktree as
+    /// long as an existing `--base-branch` is supplied.
     fn resolve_base_branch(
         repository: &Path,
         req: &WorktreeRequest,
-        warnings: &mut Vec<SessionWarning>,
     ) -> Result<BaseRef, ProtocolError> {
         let Some(requested) = req
             .base_branch
@@ -1038,26 +1040,10 @@ impl WorktreeManager {
                 name: requested.to_owned(),
                 fetched: None,
             }),
+            // An explicitly requested base is never replaced by another branch:
+            // either origin supplies it, or the create fails.
             Ok(false) => {
-                if has_origin(repository) {
-                    match fetch_origin(repository, requested) {
-                        Ok(fetched) => {
-                            return Ok(BaseRef {
-                                name: requested.to_owned(),
-                                fetched: Some(fetched),
-                            });
-                        }
-                        Err(message) => warnings.push(SessionWarning {
-                            kind: SessionWarningKind::Fetch,
-                            message: format!(
-                                "Could not fetch requested base branch {requested:?} from origin; trying the repository default branch."
-                            ),
-                            detail: Some(message),
-                        }),
-                    }
-                }
-                let default_branch = Self::default_branch(repository)?;
-                if default_branch == requested {
+                if !has_origin(repository) {
                     return Err(error(
                         ErrorClass::Runtime,
                         "invalid_base_branch",
@@ -1065,19 +1051,23 @@ impl WorktreeManager {
                         Some("create the base branch or omit --base-branch".to_owned()),
                     ));
                 }
-                warnings.push(SessionWarning {
-                    kind: SessionWarningKind::BaseBranchFallback,
-                    message: format!(
-                        "Requested base branch {requested:?} not found; used {default_branch:?} instead."
-                    ),
-                    detail: Some(format!(
-                        "git could not resolve refs/heads/{requested}; recovered using the repository's current branch {default_branch:?}"
+                match fetch_origin(repository, requested) {
+                    Ok(fetched) => Ok(BaseRef {
+                        name: requested.to_owned(),
+                        fetched: Some(fetched),
+                    }),
+                    Err(message) => Err(error(
+                        ErrorClass::Runtime,
+                        "base_branch_fetch_failed",
+                        format!(
+                            "base branch {requested:?} is not present locally and fetching it from origin failed: {message}"
+                        ),
+                        Some(
+                            "check the remote and the base branch name, fetch the base branch manually, or omit --base-branch"
+                                .to_owned(),
+                        ),
                     )),
-                });
-                Ok(BaseRef {
-                    name: default_branch,
-                    fetched: None,
-                })
+                }
             }
             // Three-valued: a "could not tell" error is loud, not a silent
             // fallback, so we do not mask a broken repository as a missing branch.

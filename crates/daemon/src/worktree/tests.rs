@@ -621,7 +621,11 @@ fn concurrent_creates_in_one_repository_each_start_from_their_own_base() {
 
     for ((base, tip), result) in bases.iter().zip(results) {
         let bound = result.expect("concurrent bind succeeds");
-        assert_eq!(&bound.base_branch, base, "the logical base name is kept");
+        assert_eq!(
+            &bound.base_branch, base,
+            "the logical base name is kept; warnings: {:#?}",
+            bound.warnings
+        );
         assert!(
             bound.warnings.is_empty(),
             "no warnings expected: {:?}",
@@ -1145,25 +1149,109 @@ fn second_session_on_same_branch_gets_a_clear_in_use_error() {
 // --- non-fatal warning paths ----------------------------------------------
 
 #[test]
-fn base_branch_fallback_keeps_the_worktree_with_a_warning() {
-    let mgr = manager("base-fallback");
-    let repo = init_repo("base-fallback-repo");
+fn a_requested_base_that_does_not_exist_fails_instead_of_using_the_default_branch() {
+    let mgr = manager("base-missing");
+    let repo = init_repo("base-missing-repo");
     let mut req = request("s-1", &repo, "feat/x");
     req.base_branch = Some("release/does-not-exist".to_owned());
 
-    let bound = mgr.bind(&req).expect("bind falls back, does not abort");
+    let err = mgr.bind(&req).expect_err("a missing base fails the create");
+
+    assert_eq!(err.code, "invalid_base_branch", "{err:?}");
+    assert!(err.msg.contains("release/does-not-exist"), "{err:?}");
     assert!(
-        is_valid_worktree(&bound.path),
-        "worktree must survive fallback"
+        !mgr.path_for(&req.session_id, &repo, "feat-x").exists(),
+        "no worktree is created on another base"
     );
-    assert_eq!(bound.base_branch, "main", "fell back to the default branch");
-    let warning = bound
-        .warnings
-        .iter()
-        .find(|w| w.kind == SessionWarningKind::BaseBranchFallback)
-        .expect("base-branch fallback warning present");
-    assert!(warning.message.contains("release/does-not-exist"));
-    assert!(warning.message.contains("main"));
+}
+
+/// A repository whose `origin` cannot be fetched from.
+fn repo_with_an_unreachable_origin(tag: &str) -> PathBuf {
+    let repo = init_repo(tag);
+    let bogus = unique_dir(&format!("{tag}-bogus")).join("missing.git");
+    git_in(
+        &repo,
+        &["remote", "add", "origin", &bogus.to_string_lossy()],
+    );
+    repo
+}
+
+#[test]
+fn a_requested_base_that_cannot_be_fetched_fails_naming_the_fetch_failure() {
+    let mgr = manager("base-fetch-fails");
+    let repo = repo_with_an_unreachable_origin("base-fetch-fails-repo");
+    let mut req = request("s-1", &repo, "feat/x");
+    req.base_branch = Some("stacked/base-4".to_owned());
+
+    let err = mgr
+        .bind(&req)
+        .expect_err("a base that is neither local nor fetchable fails the create");
+
+    assert_eq!(err.code, "base_branch_fetch_failed", "{err:?}");
+    assert!(err.msg.contains("stacked/base-4"), "{err:?}");
+    assert!(
+        err.msg.contains("fetching it from origin failed"),
+        "{err:?}"
+    );
+    assert!(
+        err.msg.contains("does not appear to be a git repository"),
+        "git's own failure is named: {err:?}"
+    );
+    assert!(
+        !mgr.path_for(&req.session_id, &repo, "feat-x").exists(),
+        "no worktree is created on another base"
+    );
+}
+
+#[test]
+fn a_local_requested_base_is_used_when_its_fetch_fails_with_a_fetch_warning_only() {
+    let mgr = manager("base-local-fetch-fails");
+    let repo = repo_with_an_unreachable_origin("base-local-fetch-fails-repo");
+    git_in(&repo, &["branch", "release"]);
+    git_in(&repo, &["checkout", "-q", "release"]);
+    git_in(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "release moves on"],
+    );
+    let release = git_stdout(&repo, &["rev-parse", "refs/heads/release"]);
+    git_in(&repo, &["checkout", "-q", "main"]);
+    let mut req = request("s-1", &repo, "feat/x");
+    req.base_branch = Some("release".to_owned());
+
+    let bound = mgr
+        .bind(&req)
+        .expect("a local base survives a failed fetch");
+
+    assert_eq!(bound.base_branch, "release");
+    assert_eq!(git_stdout(&bound.path, &["rev-parse", "HEAD"]), release);
+    assert!(
+        bound
+            .warnings
+            .iter()
+            .any(|w| w.kind == SessionWarningKind::Fetch),
+        "the failed fetch is reported: {:?}",
+        bound.warnings
+    );
+    assert!(
+        bound
+            .warnings
+            .iter()
+            .all(|w| w.kind != SessionWarningKind::BaseBranchFallback),
+        "the requested base was not replaced: {:?}",
+        bound.warnings
+    );
+}
+
+#[test]
+fn a_create_without_a_base_still_starts_from_the_current_branch_when_fetch_fails() {
+    let mgr = manager("no-base-fetch-fails");
+    let repo = repo_with_an_unreachable_origin("no-base-fetch-fails-repo");
+
+    let bound = mgr
+        .bind(&request("s-1", &repo, "feat/x"))
+        .expect("a request without a base falls back to the current branch");
+
+    assert_eq!(bound.base_branch, "main");
 }
 
 /// A repository whose `feat/x` branch is one commit behind `main`, and the
