@@ -33,9 +33,14 @@ Use these commands for orientation:
 - `pohunek host discover --json` to enumerate configured overlay peers and probe
   daemons. Each record carries its overlay, optional provider peer identity,
   address, and that overlay's effective daemon port. Address-less peers remain
-  visible as candidates instead of being discarded. Discovery emits remote
-  peers only; browser and `--all-hosts` consumers add the explicit local target
-  through its Unix socket.
+  visible as candidates instead of being discarded. This machine is listed first
+  as a record with `"local": true` for each overlay that reports its identity; a
+  consumer that fans out to all hosts adds the explicit local target through its
+  Unix socket and skips that record, so this machine is contacted once. A remote
+  `--host` is resolved once per operation that opens several connections
+  (`attach`, `session output`, `session wait`, `assistant`) and pinned to the
+  peer identity it selected, so a renamed short name is never followed midway; a
+  peer with no peer id and no FQDN fails with `host_identity_unpinnable`.
 - `pohunek host list --json` to list known live peers. These commands need the
   local overlay CLI/state, but do not connect to local `pohunekd`; a short
   owner-private cache avoids repeated probing, and `--refresh` bypasses it.

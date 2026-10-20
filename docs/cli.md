@@ -46,9 +46,27 @@ reads it. A `--host` that the command ignores, or that an explicit
 command.
 
 `pohunek host list` and `host discover` show this machine first, named by its
-own overlay name, with route and status `local`. When the overlay status does
-not answer within the 5 s connect timeout, that row is left out and the
-discovered records still print. The `--json` records list peers only.
+own overlay name, with route `local`. In `--json` it is one record per overlay
+that reports the machine's identity, marked `"local": true`, with `peer_id`
+`null`; peer records carry no `local` key. Its classification comes from the
+same health probe the peers get, sent to the machine's own overlay address and
+daemon port: a daemon that does not answer there reads `unreachable` (the reason
+is logged at WARN), and an overlay that reports no address leaves a `candidate`.
+The status column shows `local` for a reachable daemon and `local:<status>`
+otherwise. When the overlay does not report the machine's identity within the 5 s
+connect timeout, no local record is listed and the peers still print. `--all-hosts`
+fan-out skips the local record, because the explicit `local` target already
+covers this machine.
+
+A remote host is resolved once per operation when the operation opens more than
+one connection: `attach` (including its automatic re-attach, the live status
+line and the menu actions), `session output`, `session wait` and `assistant`.
+Every connection of the operation then looks the peer up by its stable identity
+(`<overlay>:peer~<id>@<port>`, or `fqdn~` when the provider reports no peer id),
+so a short name that starts selecting another peer midway is never followed; the
+address may still change. A peer that reports neither a peer id nor an FQDN
+cannot be pinned: the operation fails before its first connection with
+`host_identity_unpinnable`. Errors and output keep the name you typed.
 
 | Command | What it does |
 |---|---|
