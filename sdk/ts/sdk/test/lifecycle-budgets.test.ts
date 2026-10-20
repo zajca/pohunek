@@ -103,8 +103,11 @@ async function startLifecycleDaemon(result: unknown): Promise<MockDaemon> {
 }
 
 async function connect(daemon: MockDaemon, options?: ConnectOptions): Promise<Client> {
+  if (daemon.endpoint.kind === "memory") {
+    return Client.connectTransport(daemon.endpoint.transport, options);
+  }
   if (daemon.endpoint.kind !== "unix") {
-    throw new Error("lifecycle scenarios use the Unix daemon");
+    throw new Error("lifecycle scenarios use the Unix or in-memory daemon");
   }
   return connectLocal(daemon.endpoint.socketPath, options);
 }

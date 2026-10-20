@@ -12,8 +12,7 @@ use pohunek_client::{
 use serde_json::{json, Value};
 
 fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../sdk/ts/sdk/test/fixtures/lifecycle-budgets.json")
+    pohunek_test_support::workspace_root().join("sdk/ts/sdk/test/fixtures/lifecycle-budgets.json")
 }
 
 #[test]
