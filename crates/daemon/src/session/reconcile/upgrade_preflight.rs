@@ -1081,9 +1081,15 @@ fn judge_reference(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<J
     // environment that does not resolve before this check is reached, so the
     // lookups below succeed for every session that gets here.
     let fork = !capabilities.resume;
-    let profile =
-        recovery_profile_in(judging.profiles, binding, ProfileChange::Refuse, fork).ok()?;
     let definition = recovery_definition(judging.profiles, binding).ok()?;
+    let profile = recovery_profile_in(
+        judging.profiles,
+        binding,
+        Some(&definition),
+        ProfileChange::Refuse,
+        fork,
+    )
+    .ok()?;
     let base = judging.base_env.as_ref().ok()?;
     let identity = reported_check_identity(binding, &definition, judging);
     let launch = binding_native_launch(binding, &definition);
@@ -2028,12 +2034,19 @@ fn judge_launch(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judg
     if !capabilities.resume && !capabilities.fork {
         return None;
     }
+    let definition = recovery_definition(judging.profiles, binding);
     let mut profile_env = None;
     for (fork, required) in [(false, capabilities.resume), (true, capabilities.fork)] {
         if !required {
             continue;
         }
-        match recovery_profile_in(judging.profiles, binding, ProfileChange::Refuse, fork) {
+        match recovery_profile_in(
+            judging.profiles,
+            binding,
+            definition.as_ref().ok(),
+            ProfileChange::Refuse,
+            fork,
+        ) {
             Ok(profile) => {
                 profile_env.get_or_insert(profile.env);
             }
@@ -2052,7 +2065,7 @@ fn judge_launch(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judg
         }
     }
     let profile_env = profile_env.unwrap_or_default();
-    let definition = recovery_definition(judging.profiles, binding).ok()?;
+    let definition = definition.ok()?;
     // Resume builds the base environment for every relaunch and validates the
     // frozen executable for every relaunch; only a declared version probe reads
     // the `PATH` the agent launches under.

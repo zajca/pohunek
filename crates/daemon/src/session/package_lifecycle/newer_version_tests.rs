@@ -1030,3 +1030,390 @@ async fn assert_release_step(tag: &str, new: Package, adopts: bool) {
         .await
         .expect("remove the resumed session");
 }
+
+/// Records `package` of `kind` in the registry of `session`'s host with
+/// `source`, as a registry written outside the daemon's install path would
+/// hold it (the install path refuses a reserved runtime id for a local
+/// package). The package is neither enabled nor selected.
+fn seed_record(
+    session: &Stopped,
+    package: &Package,
+    version_package: &str,
+    source: package::registry::PackageSource,
+) {
+    let limits = package::Limits::DEFAULT;
+    let entries = package::read_archive(&package.bytes, &limits)
+        .expect("the fixture archive reads")
+        .entries()
+        .to_vec();
+    let protocol::BindingProvenance::Package {
+        package: identity, ..
+    } = crate::agent::host::definition_from_archive(&entries, &package.digest)
+        .expect("the official package parses")
+        .binding()
+        .provenance
+        .clone()
+    else {
+        panic!("{version_package} has package provenance");
+    };
+    package::registry::Registry::open_at(&session.fixture.plugins, limits)
+        .expect("open the registry")
+        .install(&package::registry::InstallRequest {
+            archive: &package.bytes,
+            expected: &package.digest,
+            identity,
+            source,
+            enabled: false,
+            select: false,
+            installed_at_unix_seconds: 1,
+        })
+        .expect("seed the record");
+}
+
+/// A profile pinned to the release package, a registry record of that package
+/// with `source`, and the release step planning it: the preflight verdict and
+/// the resume outcome must be the same judgement. `adopts` says whether the
+/// release package serves the session.
+async fn assert_release_record(tag: &str, source: package::registry::PackageSource, adopts: bool) {
+    let old = CLAUDE.older();
+    let new = CLAUDE.newer();
+    let session = stopped_on(tag, &CLAUDE, &old, CLAUDE.old_version).await;
+    CLAUDE.write_agent(&session.agent, CLAUDE.only_new);
+    seed_record(&session, &new, "claude", source);
+    let bound = fs::read_to_string(session.fixture.agents.join(format!("{PROFILE}.toml")))
+        .expect("read the bound profile");
+    assert!(bound.contains(old.digest.as_str()), "{bound}");
+    session.fixture.write_profile(
+        PROFILE,
+        &bound.replace(old.digest.as_str(), new.digest.as_str()),
+    );
+    let release = session.fixture.dir.join("release").join("runtime");
+    write_release(&release, &CLAUDE, &new, CLAUDE.new_version, 6);
+    let trust =
+        crate::catalog_anchor::CatalogTrust::Loaded(anchor(&[&signing_key("root")], Vec::new()));
+
+    let report = release_preflight(&session, &release, &trust);
+    let verdict = report
+        .stopped_sessions
+        .iter()
+        .find(|verdict| verdict.session_id == session.id.0)
+        .unwrap_or_else(|| panic!("the session is judged: {:?}", report.stopped_sessions));
+    let judged = (verdict.verdict, verdict.code.clone());
+
+    // The step refuses to restore a package whose record is not official; the
+    // resume is judged over whatever it left.
+    let _ = crate::session::ensure_official_runtimes(&crate::session::EnsureInputs {
+        store_path: session.store_path.clone(),
+        plugins_dir: session.fixture.plugins.clone(),
+        profiles_dir: session.fixture.agents.clone(),
+        release_dir: release,
+        catalog_trust: trust,
+        dry_run: false,
+        daemon_version: crate::DAEMON_VERSION.to_owned(),
+        environment: Ok(test_launch_environment()),
+    });
+    let restarted = restart(&session.fixture).await;
+    let resumed = restarted
+        .registry
+        .resume_with(&session.id, ProfileChange::Refuse)
+        .await;
+    if adopts {
+        assert_eq!(
+            judged,
+            (
+                Verdict::Adoptable,
+                CODE_ADOPTABLE_BY_NEWER_PACKAGE.to_owned()
+            ),
+            "{}",
+            verdict.detail
+        );
+        resumed.expect("the release package adopts the session");
+        assert_eq!(pinned_digest(&session.store_path, &session.id), new.digest);
+    } else {
+        let refused = resumed.expect_err("a non-official record is not an official pin");
+        assert_eq!(refused.code, "agent_profile_changed", "{refused:?}");
+        assert_eq!(
+            judged,
+            (Verdict::WouldLoseRecovery, refused.code.clone()),
+            "the preflight judges what resume refuses: {}",
+            verdict.detail
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_planned_digest_with_an_official_record_is_the_official_newer_pin() {
+    assert_release_record(
+        "newer-record-official",
+        package::registry::PackageSource::Official,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_planned_digest_with_an_explicit_digest_record_is_not_the_official_newer_pin() {
+    assert_release_record(
+        "newer-record-explicit",
+        package::registry::PackageSource::ExplicitDigest,
+        false,
+    )
+    .await;
+}
+
+/// Arms `registry` to park its next resume or fork once its recovery
+/// definition is resolved.
+fn arm_definition_hold(registry: &SessionRegistry) -> crate::runtime::lifecycle::tests::StartGate {
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: std::sync::Arc::new(tokio::sync::Notify::new()),
+        release: std::sync::Arc::new(tokio::sync::Notify::new()),
+    };
+    *registry
+        .inner
+        .definition_hold
+        .lock()
+        .expect("definition hold is never poisoned") = Some(gate.clone());
+    gate
+}
+
+/// Rewrites the bound [`PROFILE`] file from the `old` digest to the `new` one,
+/// as the release step does from another process.
+fn repin_profile_file(fixture: &Fixture, old: &Package, new: &Package) {
+    let bound = fs::read_to_string(fixture.agents.join(format!("{PROFILE}.toml")))
+        .expect("read the bound profile");
+    assert!(bound.contains(old.digest.as_str()), "{bound}");
+    fixture.write_profile(
+        PROFILE,
+        &bound.replace(old.digest.as_str(), new.digest.as_str()),
+    );
+}
+
+/// The profile revision that describes a launch of the exact digest `old`
+/// under the profile file as it is now.
+fn revision_on(
+    registry: &SessionRegistry,
+    store_path: &Path,
+    id: &SessionId,
+) -> crate::agent::host::ProfileRevision {
+    let binding = durable_recovery(store_path, id);
+    let launched = registry
+        .inner
+        .profiles
+        .runtimes()
+        .resolve_pinned(&binding.agent_base, &binding.launch_binding)
+        .expect("the launched digest still resolves");
+    let agent = registry
+        .inner
+        .profiles
+        .resolve_agent_pinned(PROFILE, &launched)
+        .expect("the profile resolves on the launched digest");
+    registry
+        .inner
+        .profiles
+        .revision_of(&agent)
+        .expect("revision key")
+        .expect("a profile has a revision")
+}
+
+/// A resume or fork (`fork`) of a session on the older version resolves its
+/// recovery definition once. The profile is repinned to the newer version, which
+/// would adopt the session, after the definition resolved: the operation
+/// launches the digest it resolved, and the profile revision it records
+/// describes that digest.
+async fn assert_repin_during_recovery(tag: &str, fork: bool) {
+    let old = CLAUDE.older();
+    let new = CLAUDE.newer();
+    let session = stopped_on(tag, &CLAUDE, &old, CLAUDE.old_version).await;
+    install(&session.fixture, &CLAUDE, &new, CLAUDE.new_version, 6).await;
+    let restarted = restart(&session.fixture).await;
+    let gate = arm_definition_hold(&restarted.registry);
+    let task = tokio::spawn({
+        let registry = restarted.registry.clone();
+        let id = session.id.clone();
+        async move {
+            if fork {
+                registry.fork(fork_params(&id)).await
+            } else {
+                registry.resume_with(&id, ProfileChange::Refuse).await
+            }
+        }
+    });
+    gate.entered.notified().await;
+    repin_profile_file(&session.fixture, &old, &new);
+    gate.release.notify_one();
+    let recovered = task
+        .await
+        .expect("recovery task")
+        .expect("the operation completes on the definition it resolved");
+
+    let id = if fork { &recovered.id } else { &session.id };
+    assert_eq!(
+        pinned_digest(&session.store_path, id),
+        old.digest,
+        "the relaunch records the digest it resolved"
+    );
+    assert_eq!(
+        durable_recovery(&session.store_path, id).profile_revision,
+        Some(revision_on(&restarted.registry, &session.store_path, id)),
+        "the recorded profile revision describes the digest that launched"
+    );
+    restarted
+        .registry
+        .remove(id)
+        .await
+        .expect("remove the session");
+}
+
+#[tokio::test]
+async fn a_repin_during_a_resume_leaves_the_binding_and_the_profile_revision_consistent() {
+    assert_repin_during_recovery("repin-during-resume", false).await;
+}
+
+#[tokio::test]
+async fn a_repin_during_a_fork_leaves_the_binding_and_the_profile_revision_consistent() {
+    assert_repin_during_recovery("repin-during-fork", true).await;
+}
+
+/// A stopped session of the bare Claude runtime (no host profile) launched from
+/// `launched`. The agent is a fake `claude` the registry finds through its
+/// launch `PATH`, ahead of any real one.
+async fn stopped_bare(tag: &str, launched: &Package, version: &str) -> Stopped {
+    let bin = crate::test_support::thread_scoped_dir("bare-launch-path-");
+    crate::test_support::prepend_thread_launch_path(&bin);
+    let agent = bin.join("claude");
+    CLAUDE.write_agent(&agent, CLAUDE.in_both);
+    let store_path = temp_store_path(tag);
+    let fixture = Fixture::with_anchor_and_store(
+        &format!("{tag}-plugins"),
+        anchor(&[&signing_key("root")], Vec::new()),
+        store_path.clone(),
+    );
+    install(&fixture, &CLAUDE, launched, version, 5).await;
+    let created = fixture
+        .registry
+        .create(protocol::SessionNewParams {
+            agent: RuntimeId::CLAUDE.to_owned(),
+            cwd: Some(temp_dir(tag)),
+            ..params()
+        })
+        .await
+        .expect("a bare session of the older package");
+    let conversations = crate::test_support::thread_environment_home()
+        .join(".claude")
+        .join("projects")
+        .join("work");
+    fs::create_dir_all(&conversations).expect("the conversation directory");
+    fs::write(conversations.join(format!("{CONVERSATION}.jsonl")), b"{}\n")
+        .expect("the conversation");
+    let report = native_report_params(
+        &fixture.registry,
+        created.id.clone(),
+        RuntimeId::CLAUDE.to_owned(),
+        CONVERSATION.to_owned(),
+        None,
+    )
+    .await;
+    assert!(fixture.registry.report_as_root(report).await.recorded);
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+    assert_eq!(pinned_digest(&store_path, &created.id), launched.digest);
+    Stopped {
+        fixture,
+        store_path,
+        agent,
+        id: created.id,
+    }
+}
+
+/// A bare-runtime session whose agent left the older range, with the newer
+/// version installed and selected.
+async fn bare_moved_to_newer(tag: &str) -> (Stopped, Package, Package) {
+    let old = CLAUDE.older();
+    let new = CLAUDE.newer();
+    let session = stopped_bare(tag, &old, CLAUDE.old_version).await;
+    CLAUDE.write_agent(&session.agent, CLAUDE.only_new);
+    install(&session.fixture, &CLAUDE, &new, CLAUDE.new_version, 6).await;
+    (session, old, new)
+}
+
+#[tokio::test]
+async fn a_newer_package_version_adopts_a_stopped_bare_runtime_session() {
+    let (session, _old, new) = bare_moved_to_newer("bare-adopts-resume").await;
+    let restarted = restart(&session.fixture).await;
+    assert_eq!(
+        stopped_verdict(&restarted, &session.store_path, &session.id),
+        (
+            Verdict::Adoptable,
+            CODE_ADOPTABLE_BY_NEWER_PACKAGE.to_owned()
+        ),
+        "the preflight names the adoption the resume performs"
+    );
+    restarted
+        .registry
+        .resume_with(&session.id, ProfileChange::Refuse)
+        .await
+        .expect("the newer version adopts the bare session");
+    assert_eq!(pinned_digest(&session.store_path, &session.id), new.digest);
+    restarted
+        .registry
+        .remove(&session.id)
+        .await
+        .expect("remove the resumed session");
+}
+
+#[tokio::test]
+async fn a_newer_package_version_adopts_a_fork_of_a_stopped_bare_runtime_session() {
+    let (session, old, new) = bare_moved_to_newer("bare-adopts-fork").await;
+    let restarted = restart(&session.fixture).await;
+    let forked = restarted
+        .registry
+        .fork(fork_params(&session.id))
+        .await
+        .expect("the newer version adopts the fork");
+    assert_eq!(pinned_digest(&session.store_path, &forked.id), new.digest);
+    assert_eq!(pinned_digest(&session.store_path, &session.id), old.digest);
+    restarted
+        .registry
+        .remove(&forked.id)
+        .await
+        .expect("remove the fork");
+}
+
+/// A session of a host profile whose frozen revision outlives the profile file
+/// is not a bare-runtime session: the newer version does not adopt it.
+#[tokio::test]
+async fn a_newer_package_version_does_not_adopt_a_session_whose_frozen_profile_is_gone() {
+    let (session, old, _new) = moved_to_newer("bare-profile-gone", &CLAUDE).await;
+    fs::remove_file(session.fixture.agents.join(format!("{PROFILE}.toml")))
+        .expect("delete the profile");
+    let restarted = restart(&session.fixture).await;
+    let binding = durable_recovery(&session.store_path, &session.id);
+    let resolved =
+        crate::session::resume::recovery_definition(&restarted.registry.inner.profiles, &binding)
+            .expect("the frozen digest still resolves");
+    assert!(
+        matches!(
+            &resolved.binding().provenance,
+            BindingProvenance::Package { package_digest, .. } if *package_digest == old.digest
+        ),
+        "the session stays on its frozen digest"
+    );
+    let refused = restarted
+        .registry
+        .resume_with(&session.id, ProfileChange::Refuse)
+        .await
+        .expect_err("the deleted profile cannot be resumed under");
+    assert_eq!(refused.code, "agent_profile_missing", "{refused:?}");
+    assert_eq!(
+        stopped_verdict(&restarted, &session.store_path, &session.id),
+        (
+            Verdict::WouldLoseRecovery,
+            "agent_profile_missing".to_owned()
+        ),
+        "the preflight judges what resume refuses"
+    );
+}

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use crate::agent::host::{ProfileRevision, RuntimeDefinition};
 use crate::agent::{
     InputRules, LaunchEnv, LaunchView, NativeReferenceProvenance, Pin, ProfilePin, ProfileRegistry,
-    ReferenceCheckFailure, ReferenceExistence, ResolvedAgent, StoreRoot,
+    ReferenceCheckFailure, ReferenceExistence, StoreRoot,
 };
 use crate::detect::Manifest;
 use crate::runtime::environment::{base_environment, effective_variable};
@@ -218,7 +218,8 @@ impl SessionRegistry {
     ) -> Option<(ReferenceExistence, SessionRef, LaunchEnv)> {
         let launch = binding_native_launch(&binding, &definition);
         let existence = reference_existence(&binding, launch.as_ref(), &definition)?;
-        let Ok(profile) = self.resolve_recovery_profile(&binding, ProfileChange::Refuse, false)
+        let Ok(profile) =
+            self.resolve_recovery_profile(&binding, &definition, ProfileChange::Refuse, false)
         else {
             return None;
         };
@@ -527,6 +528,8 @@ impl SessionRegistry {
             .ok_or_else(|| agent_not_resumable(&binding.agent))?;
         self.hook_recovery_journal_error(&record, &binding, &launch)
             .await?;
+        #[cfg(test)]
+        self.hold_definition().await;
         let relaunch = self.plan_relaunch(&binding, definition, launch, change, false)?;
 
         let info = match self
@@ -790,18 +793,15 @@ impl SessionRegistry {
 
         // Fork is fail-closed: only a spec frozen into the binding can fork, never
         // the base kind's compiled spec.
-        let launch = binding
-            .native_launch
-            .clone()
-            .filter(NativeSessionLaunch::supports_fork)
-            .ok_or_else(agent_fork_unsupported)?;
+        let launch = frozen_fork_launch(&binding)?;
         recovery_contract(&binding, &definition, true)?;
         self.hook_recovery_journal_error(&record, &binding, &launch)
             .await?;
-        let change = ProfileChange::requested(params.accept_profile_change);
-
+        #[cfg(test)]
+        self.hold_definition().await;
         // A fork starts a new process of the runtime, so a runtime with a
         // version probe is probed again before anything is allocated.
+        let change = ProfileChange::requested(params.accept_profile_change);
         let relaunch = self.plan_relaunch(&binding, definition, launch, change, true)?;
         let relaunch_pin = host::relaunch_pin(&binding.launch_binding, &relaunch.definition);
         let outdated_hooks = self.outdated_relaunch_warnings(&binding, &relaunch).await;
@@ -951,10 +951,17 @@ impl SessionRegistry {
     pub(super) fn resolve_recovery_profile(
         &self,
         binding: &ResumeBinding,
+        definition: &Arc<RuntimeDefinition>,
         change: ProfileChange,
         fork: bool,
     ) -> Result<RecoveryProfile, ProtocolError> {
-        recovery_profile_in(&self.inner.profiles, binding, change, fork)
+        recovery_profile_in(
+            &self.inner.profiles,
+            binding,
+            Some(definition),
+            change,
+            fork,
+        )
     }
 
     /// The input framing a relaunch of `binding` uses: the rules frozen into
@@ -994,7 +1001,7 @@ impl SessionRegistry {
         // names, so a `path`-kind spec applies the absolute-path guard and an
         // `id`-kind spec the leading-dash guard (the documented asymmetry).
         let session_ref = session_ref_from_binding(launch.reference_kind(), binding)?;
-        let profile = self.resolve_recovery_profile(binding, change, fork)?;
+        let profile = self.resolve_recovery_profile(binding, &definition, change, fork)?;
         let base_environment = self.launch_base_environment()?;
         let program = binding_program(binding, &definition);
         let launch_path = self.probe_search_path(&definition, profile.env.as_slice())?;
@@ -1427,17 +1434,6 @@ fn clear_refused_capabilities(
     info.capability_refusals = (!refusals.is_empty()).then_some(refusals);
 }
 
-/// Re-resolves the agent `binding` was launched as.
-fn resolve_recovery_agent_in(
-    profiles: &ProfileRegistry,
-    binding: &ResumeBinding,
-) -> Result<ResolvedAgent, ProtocolError> {
-    match recovery_definition(profiles, binding) {
-        Ok(pinned) => profiles.resolve_agent_pinned(&binding.agent, &pinned),
-        Err(_unresolved) => profiles.resolve_agent(&binding.agent),
-    }
-}
-
 /// Whether a profile whose revision was frozen over a pin the definition now
 /// serves by adoption still matches that revision.
 ///
@@ -1565,6 +1561,12 @@ fn repinned_profile_matches_in(
 /// the revision frozen into the binding, as a resume or a fork of `binding`
 /// does. Resume and the upgrade preflight both run this one check.
 ///
+/// `definition` is the [`recovery_definition`] the operation resolved; the
+/// profile is built on it, so the definition and the profile revision never
+/// come from two resolutions. `None` when the definition did not resolve: the
+/// profile is then resolved by name against what the registry serves now, to
+/// report its own error.
+///
 /// # Errors
 ///
 /// Returns `agent_profile_missing` when a profile the session was launched
@@ -1576,11 +1578,15 @@ fn repinned_profile_matches_in(
 pub(super) fn recovery_profile_in(
     profiles: &ProfileRegistry,
     binding: &ResumeBinding,
+    definition: Option<&Arc<RuntimeDefinition>>,
     change: ProfileChange,
     fork: bool,
 ) -> Result<RecoveryProfile, ProtocolError> {
     let frozen = binding.profile_revision.as_ref();
-    let resolved = match resolve_recovery_agent_in(profiles, binding) {
+    let resolved = match definition.map_or_else(
+        || profiles.resolve_agent(&binding.agent),
+        |definition| profiles.resolve_agent_pinned(&binding.agent, definition),
+    ) {
         Ok(resolved) => resolved,
         Err(error) => {
             warn!(
@@ -1740,16 +1746,25 @@ pub(super) fn recovery_contract(
     fork: bool,
 ) -> Result<(), ProtocolError> {
     let frozen = if fork {
-        let frozen = binding
-            .native_launch
-            .clone()
-            .filter(NativeSessionLaunch::supports_fork)
-            .ok_or_else(agent_fork_unsupported)?;
-        Some(frozen)
+        Some(frozen_fork_launch(binding)?)
     } else {
         binding_native_launch(binding, definition)
     };
     host::honors_frozen_launch(&binding.launch_binding, definition, frozen.as_ref(), fork)
+}
+
+/// The launch spec a fork of `binding` runs from: only a spec frozen into the
+/// binding can fork, never the base kind's compiled spec.
+///
+/// # Errors
+///
+/// Returns `agent_fork_unsupported` when the frozen spec does not fork.
+fn frozen_fork_launch(binding: &ResumeBinding) -> Result<NativeSessionLaunch, ProtocolError> {
+    binding
+        .native_launch
+        .clone()
+        .filter(NativeSessionLaunch::supports_fork)
+        .ok_or_else(agent_fork_unsupported)
 }
 
 /// Return the native-session launch spec frozen into a persisted binding.

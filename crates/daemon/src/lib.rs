@@ -152,13 +152,58 @@ pub(crate) mod test_support {
     /// child sees the fixture's private `HOME` and none of the developer's
     /// variables. The environment lives until the calling thread ends, which
     /// is the end of the test.
+    ///
+    /// Directories registered with [`prepend_thread_launch_path`] come first in
+    /// `PATH`, so a fixture executable shadows the host's real one.
     pub(crate) fn thread_environment_source() -> crate::runtime::EnvironmentSource {
         THREAD_ENV.with(|cell| {
             let env = cell.get_or_init(|| {
                 pohunek_test_support::env::TestEnv::new()
                     .expect("create the thread-scoped test environment")
             });
-            crate::runtime::EnvironmentSource::fixed(env.environment().clone())
+            let mut variables = env.environment().clone();
+            THREAD_PATH_PREFIX.with(|prefix| {
+                let prefix = prefix.borrow();
+                if prefix.is_empty() {
+                    return;
+                }
+                let inherited = variables.get(std::ffi::OsStr::new("PATH")).cloned();
+                let joined = std::env::join_paths(
+                    prefix
+                        .iter()
+                        .cloned()
+                        .chain(inherited.iter().flat_map(std::env::split_paths)),
+                )
+                .expect("the launch path joins");
+                variables.insert("PATH".into(), joined);
+            });
+            crate::runtime::EnvironmentSource::fixed(variables)
+        })
+    }
+
+    std::thread_local! {
+        /// Directories placed before the inherited `PATH` of the current test
+        /// thread's launch environment.
+        static THREAD_PATH_PREFIX: std::cell::RefCell<Vec<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Puts `directory` first in the `PATH` that
+    /// [`thread_environment_source`] hands out on this test thread. Call it
+    /// before the registry under test is built.
+    pub(crate) fn prepend_thread_launch_path(directory: &std::path::Path) {
+        THREAD_PATH_PREFIX.with(|prefix| prefix.borrow_mut().insert(0, directory.to_path_buf()));
+    }
+
+    /// The `HOME` of the current test thread's hermetic environment.
+    pub(crate) fn thread_environment_home() -> std::path::PathBuf {
+        THREAD_ENV.with(|cell| {
+            cell.get_or_init(|| {
+                pohunek_test_support::env::TestEnv::new()
+                    .expect("create the thread-scoped test environment")
+            })
+            .home()
+            .to_path_buf()
         })
     }
 

@@ -495,7 +495,10 @@ impl RuntimeHost {
         if !state.package(frozen_digest).is_some_and(official) {
             return None;
         }
-        let planned = self.is_planned(package_digest);
+        // A planned release package counts as official only while the registry
+        // holds no record of its digest under another trust source.
+        let planned =
+            self.is_planned(package_digest) && state.package(package_digest).is_none_or(official);
         let served = planned
             || (state.package(package_digest).is_some_and(|record| {
                 official(record) && record.enabled() && record.identity() == package
@@ -577,10 +580,13 @@ impl RuntimeHost {
             return false;
         };
         // A digest the planned release step installs is an official release
-        // package the plan verified; an installed one must be recorded official.
+        // package the plan verified, unless the registry already holds it under
+        // another trust source; an installed one must be recorded official.
+        let installed = state.package(digest);
         let pinned = match self.planned_identity(digest) {
-            Some(planned) => planned,
-            None => match state.package(digest).filter(|record| official(record)) {
+            Some(planned) if installed.is_none_or(official) => planned,
+            Some(_) => return false,
+            None => match installed.filter(|record| official(record)) {
                 Some(record) => record.identity().clone(),
                 None => return false,
             },
