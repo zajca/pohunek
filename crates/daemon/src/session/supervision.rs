@@ -15,7 +15,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use pohunek_platform::process::{
-    survey_runtime, sweep_runtime, HostInspector, ProcessCoalitions, ProcessIdentity,
+    survey_runtime_shared, sweep_runtime_shared, HostInspector, ProcessCoalitions, ProcessIdentity,
     ProcessInspector, SkipReason, Skipped, SpawnId, StartIdentity, SweepReport, SweepRequest,
     SweepSurvey,
 };
@@ -669,11 +669,22 @@ enum Waiting {
     Compensation,
 }
 
+/// The unreadable-marker processes that blocked a removal of one generation.
+#[derive(Debug)]
+struct Blocked {
+    generation: Option<String>,
+    identities: Vec<ProcessIdentity>,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct RetryState {
     /// Sessions waiting for a pass; a session is absent while its own pass
     /// runs and is inserted again when that pass does not settle it.
     pub(super) pending: BTreeSet<String>,
+    /// Unreadable-marker processes that alone block a pending removal, by
+    /// session. A retry skips its scan while every one of them still runs
+    /// and the session still has the generation they blocked.
+    blocked: std::collections::HashMap<String, Blocked>,
     pub(super) running: bool,
     /// Session whose pass is running. A schedule for it comes from its own
     /// pass and keeps the backoff.
@@ -820,71 +831,79 @@ impl SessionRegistry {
         // Sweep passes made, not counting the pauses of an unreadable-marker
         // wait; the pass in flight is `passes + 1`.
         let mut passes = 0;
-        let deciding_pass = loop {
-            let pass = passes + 1;
-            tally.passes = pass;
-            let report = match sweep_runtime(self.inner.inspector.as_ref(), request).await {
-                Ok(report) => report,
-                Err(error) => {
+        let deciding_pass =
+            loop {
+                let pass = passes + 1;
+                tally.passes = pass;
+                let report =
+                    match sweep_runtime_shared(Arc::clone(&self.inner.inspector), request.clone())
+                        .await
+                    {
+                        Ok(report) => report,
+                        Err(error) => {
+                            tracing::warn!(
+                                session_id,
+                                worker_instance_id,
+                                sweep.pass = pass,
+                                error = %error,
+                                "lost runtime sweep aborted; remaining processes are left alone"
+                            );
+                            return SweepOutcome::blocked_by_other();
+                        }
+                    };
+                // An unreadable-marker process that could still belong to the
+                // runtime counts as selected; once nothing else remains, the sweep
+                // waits for it (see [`settle_unreadable`]).
+                let only_unreadable = leaves_only_unreadable(&report);
+                let settling = only_unreadable
+                    && self
+                        .candidates_may_still_settle(&report.skipped, grace)
+                        .await
+                    && settle_unreadable(grace).await;
+                tally.settle_polls += usize::from(settling);
+                let role = if settling {
+                    PassRole::Settling
+                } else if only_unreadable {
+                    PassRole::Deciding
+                } else {
+                    PassRole::Intermediate
+                };
+                log_sweep_pass(session_id, worker_instance_id, pass, role, &report);
+                if settling {
+                    continue;
+                }
+                if !report.is_complete()
+                    || report
+                        .skipped
+                        .iter()
+                        .any(|skipped| skipped.reason == SkipReason::CurrentProcess)
+                {
                     tracing::warn!(
                         session_id,
                         worker_instance_id,
-                        sweep.pass = pass,
-                        error = %error,
-                        "lost runtime sweep aborted; remaining processes are left alone"
+                        "lost runtime sweep could not confirm every process exited"
                     );
                     return SweepOutcome::blocked_by_other();
                 }
+                // Selected counts every process this pass attributed to the
+                // runtime; the sweep repeats until a pass attributes none.
+                let selected = report.terminated.len()
+                    + report.killed.len()
+                    + report.unconfirmed.len()
+                    + report.skipped.len();
+                if selected == 0 {
+                    return SweepOutcome::complete();
+                }
+                passes += 1;
+                if only_unreadable {
+                    break report;
+                }
+                if passes >= MAX_SWEEP_PASSES {
+                    return self
+                        .verify_last_pass(session_id, worker_instance_id, grace, request, tally)
+                        .await;
+                }
             };
-            // An unreadable-marker process that could still belong to the
-            // runtime counts as selected; once nothing else remains, the sweep
-            // waits for it (see [`settle_unreadable`]).
-            let only_unreadable = leaves_only_unreadable(&report);
-            let settling = only_unreadable && settle_unreadable(grace).await;
-            tally.settle_polls += usize::from(settling);
-            let role = if settling {
-                PassRole::Settling
-            } else if only_unreadable {
-                PassRole::Deciding
-            } else {
-                PassRole::Intermediate
-            };
-            log_sweep_pass(session_id, worker_instance_id, pass, role, &report);
-            if settling {
-                continue;
-            }
-            if !report.is_complete()
-                || report
-                    .skipped
-                    .iter()
-                    .any(|skipped| skipped.reason == SkipReason::CurrentProcess)
-            {
-                tracing::warn!(
-                    session_id,
-                    worker_instance_id,
-                    "lost runtime sweep could not confirm every process exited"
-                );
-                return SweepOutcome::blocked_by_other();
-            }
-            // Selected counts every process this pass attributed to the
-            // runtime; the sweep repeats until a pass attributes none.
-            let selected = report.terminated.len()
-                + report.killed.len()
-                + report.unconfirmed.len()
-                + report.skipped.len();
-            if selected == 0 {
-                return SweepOutcome::complete();
-            }
-            passes += 1;
-            if only_unreadable {
-                break report;
-            }
-            if passes >= MAX_SWEEP_PASSES {
-                return self
-                    .verify_last_pass(session_id, worker_instance_id, grace, request, tally)
-                    .await;
-            }
-        };
         tracing::warn!(
             session_id,
             worker_instance_id,
@@ -912,7 +931,12 @@ impl SessionRegistry {
         tally: &mut SweepTally,
     ) -> SweepOutcome {
         loop {
-            let survey = match survey_runtime(self.inner.inspector.as_ref(), request) {
+            let survey = match survey_runtime_shared(
+                Arc::clone(&self.inner.inspector),
+                request.clone(),
+            )
+            .await
+            {
                 Ok(survey) => survey,
                 Err(error) => {
                     tracing::warn!(
@@ -930,7 +954,11 @@ impl SessionRegistry {
                     .skipped
                     .iter()
                     .all(|skipped| skipped.reason == SkipReason::MarkersUnreadable);
-            let settling = only_unreadable && settle_unreadable(grace).await;
+            let settling = only_unreadable
+                && self
+                    .candidates_may_still_settle(&survey.skipped, grace)
+                    .await
+                && settle_unreadable(grace).await;
             tally.settle_polls += usize::from(settling);
             log_sweep_survey(session_id, worker_instance_id, &survey, settling);
             if survey.is_empty() {
@@ -951,6 +979,35 @@ impl SessionRegistry {
             }
             return self.unreadable_outcome(&survey.skipped);
         }
+    }
+
+    /// Whether waiting could still change the outcome for the unreadable-marker
+    /// `candidates`.
+    ///
+    /// The wait covers a process caught between images (its markers read as
+    /// unobservable) or about to follow its creator out. Only a candidate that
+    /// has run longer than `grace` and whose markers are persistently
+    /// withheld is neither, so it keeps the cleanup unconfirmed without a
+    /// wait; a retry decides it later. The age counts from the process start,
+    /// which an `exec` does not reset, so age alone never rules out a
+    /// transition. A candidate whose age the host cannot tell keeps the wait.
+    async fn candidates_may_still_settle(&self, candidates: &[Skipped], grace: Duration) -> bool {
+        let inspector = Arc::clone(&self.inner.inspector);
+        let identities: Vec<ProcessIdentity> = candidates
+            .iter()
+            .map(|candidate| candidate.identity)
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            !identities.iter().all(|identity| {
+                matches!(inspector.process_age(*identity), Ok(Some(age)) if age >= grace)
+                    && matches!(
+                        inspector.ownership_markers(identity.pid),
+                        Err(pohunek_platform::process::Error::PermissionDenied { .. })
+                    )
+            })
+        })
+        .await
+        .unwrap_or(true)
     }
 
     /// The outcome of a sweep that ended with `skipped` processes left.
@@ -1074,6 +1131,92 @@ impl SessionRegistry {
         (orphans, None)
     }
 
+    /// Forgets the blockers recorded for `id`; every removal sweep starts from
+    /// none, and a refusal records its own.
+    pub(super) fn clear_unreadable_blockers(&self, id: &SessionId) {
+        self.inner
+            .supervision_retries
+            .state
+            .lock()
+            .expect("supervision retry state is never poisoned")
+            .blocked
+            .remove(&id.0);
+    }
+
+    /// Records the unreadable-marker `candidates` that alone keep the removal
+    /// of `id` refused, so its retries rescan only after one of them exits.
+    pub(super) fn note_unreadable_blockers(
+        &self,
+        id: &SessionId,
+        generation: Option<&str>,
+        candidates: &[UnreadableCandidate],
+    ) {
+        let identities = candidates
+            .iter()
+            .map(|candidate| candidate.identity)
+            .collect();
+        self.inner
+            .supervision_retries
+            .state
+            .lock()
+            .expect("supervision retry state is never poisoned")
+            .blocked
+            .insert(
+                id.0.clone(),
+                Blocked {
+                    generation: generation.map(ToOwned::to_owned),
+                    identities,
+                },
+            );
+    }
+
+    /// Whether `identity` still runs and still withholds its ownership
+    /// markers, the two facts that keep it a blocker.
+    fn still_unreadable(&self, identity: ProcessIdentity) -> bool {
+        matches!(self.inner.inspector.is_running(identity), Ok(true))
+            && matches!(
+                self.inner.inspector.ownership_markers(identity.pid),
+                Err(pohunek_platform::process::Error::PermissionDenied { .. }
+                    | pohunek_platform::process::Error::Unobservable { .. })
+            )
+    }
+
+    /// Whether the retry of `id` can only reach the refusal it already
+    /// reached: every unreadable-marker process that blocked it still runs and
+    /// still withholds its markers.
+    ///
+    /// Any other state, including a candidate the host cannot inspect, forgets
+    /// the record and lets the retry scan.
+    fn blockers_unchanged(&self, id: &SessionId, generation: Option<&str>) -> bool {
+        let Some(blockers) = self
+            .inner
+            .supervision_retries
+            .state
+            .lock()
+            .expect("supervision retry state is never poisoned")
+            .blocked
+            .remove(&id.0)
+        else {
+            return false;
+        };
+        let unchanged = blockers.generation.as_deref() == generation
+            && !blockers.identities.is_empty()
+            && blockers
+                .identities
+                .iter()
+                .all(|identity| self.still_unreadable(*identity));
+        if unchanged {
+            self.inner
+                .supervision_retries
+                .state
+                .lock()
+                .expect("supervision retry state is never poisoned")
+                .blocked
+                .insert(id.0.clone(), blockers);
+        }
+        unchanged
+    }
+
     /// Re-reconciles `id` in the background until its evidence settles.
     ///
     /// Sessions wait here while their supervisor is unavailable, while their
@@ -1167,6 +1310,13 @@ impl SessionRegistry {
     /// removed, or changed by another lifecycle operation.
     pub(super) async fn retry_supervised_session(&self, id: &SessionId) -> bool {
         let _guard = self.lock_lifecycle(id).await;
+        let current_generation = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .and_then(|entry| entry.job.as_ref().map(|job| job.generation().to_owned()));
         let waiting = self.inner.sessions.lock().await.get(id).and_then(|entry| {
             if !matches!(entry.runtime, super::RuntimeHandle::Unavailable(_)) {
                 return None;
@@ -1200,6 +1350,12 @@ impl SessionRegistry {
         let Some(waiting) = waiting else {
             return true;
         };
+        if waiting == Waiting::Evidence
+            && self.blockers_unchanged(id, current_generation.as_deref())
+        {
+            tracing::debug!(session_id = %id.0, "removal still blocked by the same unreadable processes; not rescanning");
+            return false;
+        }
         let record = match self.load_durable_session_record(id).await {
             Ok(Some(record)) => record,
             Ok(None) => return true,

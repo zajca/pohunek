@@ -430,6 +430,68 @@ pub async fn sweep_runtime(
     .await
 }
 
+/// [`sweep_runtime`] for a caller on an async executor: the full process-table
+/// scan that selects the targets runs on the blocking pool, so it never
+/// occupies an executor thread.
+///
+/// # Errors
+///
+/// The errors of [`sweep_runtime`].
+///
+/// # Panics
+///
+/// Resumes the panic of the scan if the inspector panics.
+pub async fn sweep_runtime_shared(
+    inspector: std::sync::Arc<dyn ProcessInspector>,
+    request: SweepRequest,
+) -> Result<SweepReport, SweepError> {
+    let effective_uid = rustix::process::geteuid().as_raw();
+    if request.owner_uid != effective_uid {
+        return Err(SweepError::ForeignOwner {
+            owner_uid: request.owner_uid,
+            effective_uid,
+        });
+    }
+    let own_pid = std::process::id();
+    let scan = {
+        let inspector = std::sync::Arc::clone(&inspector);
+        let request = request.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut report = SweepReport::default();
+            match select_targets(inspector.as_ref(), &request, own_pid, &mut report) {
+                Ok(targets) => Ok((report, targets)),
+                Err(fault) => Err(fault.into_error(report)),
+            }
+        })
+        .await
+    };
+    let (report, targets) = match scan {
+        Ok(selected) => selected?,
+        Err(join) => std::panic::resume_unwind(join.into_panic()),
+    };
+    sweep_selected(inspector.as_ref(), &request, deliver, report, targets).await
+}
+
+/// [`survey_runtime`] for a caller on an async executor: the scan runs on the
+/// blocking pool.
+///
+/// # Errors
+///
+/// The errors of [`survey_runtime`].
+///
+/// # Panics
+///
+/// Resumes the panic of the scan if the inspector panics.
+pub async fn survey_runtime_shared(
+    inspector: std::sync::Arc<dyn ProcessInspector>,
+    request: SweepRequest,
+) -> Result<SweepSurvey, SweepError> {
+    match tokio::task::spawn_blocking(move || survey_runtime(inspector.as_ref(), &request)).await {
+        Ok(survey) => survey,
+        Err(join) => std::panic::resume_unwind(join.into_panic()),
+    }
+}
+
 /// Classifies the same-user processes as [`sweep_runtime`] does, signalling
 /// nothing.
 ///
@@ -531,7 +593,20 @@ where
         Ok(targets) => targets,
         Err(fault) => return Err(fault.into_error(report)),
     };
+    sweep_selected(inspector, request, deliver, report, targets).await
+}
 
+/// Signals the `targets` a selection found and waits for them to exit.
+async fn sweep_selected<D>(
+    inspector: &dyn ProcessInspector,
+    request: &SweepRequest,
+    deliver: D,
+    mut report: SweepReport,
+    targets: Vec<ProcessIdentity>,
+) -> Result<SweepReport, SweepError>
+where
+    D: Fn(&dyn ProcessInspector, ProcessIdentity, Signal) -> Result<Delivery, Fault>,
+{
     let mut pending = Vec::with_capacity(targets.len());
     for (index, identity) in targets.iter().copied().enumerate() {
         match deliver(inspector, identity, Signal::TERM) {

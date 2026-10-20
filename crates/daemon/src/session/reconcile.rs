@@ -2714,6 +2714,7 @@ impl SessionRegistry {
                 None,
             )
         };
+        self.clear_unreadable_blockers(id);
         // The marker requirement applies only to a runtime no journal names.
         let mut runtimes: Vec<(String, WorkerBounds, bool)> = Vec::new();
         if let Some(generation) = generation {
@@ -2799,6 +2800,11 @@ impl SessionRegistry {
                         "{}; processes whose environment cannot be read may belong to it: {}",
                         error.msg,
                         describe_unreadable_candidates(&outcome.unreadable)
+                    );
+                    self.note_unreadable_blockers(
+                        id,
+                        generation.map(super::Generation::generation),
+                        &outcome.unreadable,
                     );
                     error.recover = Some(UNREADABLE_CANDIDATES_RECOVER.to_owned());
                 }
@@ -6711,7 +6717,24 @@ mod tests {
         fail_descendants: AtomicBool,
         fail_enumeration: AtomicBool,
         fail_markers: AtomicBool,
+        /// Whether failing marker reads report `Unobservable` (an image being
+        /// replaced) instead of `PermissionDenied` (markers withheld).
+        markers_unobservable: AtomicBool,
+        /// Marker reads that still report `Unobservable` before the process
+        /// reads normally again.
+        unobservable_reads: AtomicUsize,
         descendant_calls: AtomicUsize,
+        /// Marker reads (the per-process step of a sweep scan) made so far.
+        scans: AtomicUsize,
+        /// Process-table enumerations (`same_user_processes`) made so far.
+        table_scans: AtomicUsize,
+        /// The thread a current-thread test runtime runs its tasks on.
+        executor_thread: std::sync::OnceLock<std::thread::ThreadId>,
+        /// Whether a scan ever ran on [`Self::executor_thread`] instead of the
+        /// blocking pool.
+        scanned_on_executor: AtomicBool,
+        /// Age every process reports, in milliseconds; `u64::MAX` reports none.
+        age_ms: std::sync::atomic::AtomicU64,
         inner: ReadableHost,
     }
 
@@ -6728,8 +6751,45 @@ mod tests {
             self.fail_markers.store(fail, Ordering::Release);
         }
 
+        /// The next `reads` marker reads are `Unobservable`, then the process
+        /// reads normally.
+        fn unobservable_for(&self, reads: usize) {
+            self.unobservable_reads.store(reads, Ordering::Release);
+        }
+
+        fn markers_unobservable(&self, unobservable: bool) {
+            self.markers_unobservable
+                .store(unobservable, Ordering::Release);
+        }
+
         fn descendant_calls(&self) -> usize {
             self.descendant_calls.load(Ordering::Acquire)
+        }
+
+        fn table_scans(&self) -> usize {
+            self.table_scans.load(Ordering::Acquire)
+        }
+
+        fn scans(&self) -> usize {
+            self.scans.load(Ordering::Acquire)
+        }
+
+        /// Treats the calling thread as the executor: a scan on it is a scan
+        /// on the async executor.
+        fn pin_executor_thread(&self) {
+            let _ = self.executor_thread.set(std::thread::current().id());
+        }
+
+        fn scanned_on_executor(&self) -> bool {
+            self.scanned_on_executor.load(Ordering::Acquire)
+        }
+
+        /// Makes every process report `age` (`None`: the host cannot tell).
+        fn set_age(&self, age: Option<Duration>) {
+            let millis = age.map_or(u64::MAX, |age| {
+                u64::try_from(age.as_millis()).expect("test age fits")
+            });
+            self.age_ms.store(millis, Ordering::Release);
         }
     }
 
@@ -6753,7 +6813,18 @@ mod tests {
             self.inner.process(pid)
         }
 
+        fn process_age(
+            &self,
+            _identity: OsProcessIdentity,
+        ) -> Result<Option<Duration>, crate::procwatch::Error> {
+            Ok(match self.age_ms.load(Ordering::Acquire) {
+                u64::MAX => None,
+                millis => Some(Duration::from_millis(millis)),
+            })
+        }
+
         fn same_user_processes(&self) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
+            self.table_scans.fetch_add(1, Ordering::AcqRel);
             if self.fail_enumeration.load(Ordering::Acquire) {
                 return Err(crate::procwatch::Error::from_io(
                     "test_enumeration",
@@ -6793,7 +6864,27 @@ mod tests {
         }
 
         fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, crate::procwatch::Error> {
+            self.scans.fetch_add(1, Ordering::AcqRel);
+            if self.executor_thread.get() == Some(&std::thread::current().id()) {
+                self.scanned_on_executor.store(true, Ordering::Release);
+            }
+            if self
+                .unobservable_reads
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(crate::procwatch::Error::Unobservable {
+                    operation: "test_markers",
+                });
+            }
             if self.fail_markers.load(Ordering::Acquire) {
+                if self.markers_unobservable.load(Ordering::Acquire) {
+                    return Err(crate::procwatch::Error::Unobservable {
+                        operation: "test_markers",
+                    });
+                }
                 return Err(crate::procwatch::Error::from_io(
                     "test_markers",
                     std::io::Error::from(std::io::ErrorKind::PermissionDenied),
@@ -12560,6 +12651,13 @@ handler = "codex-hook-v1"
                 self.inner.lineage(pid)
             }
 
+            fn process_age(
+                &self,
+                identity: crate::procwatch::ProcessIdentity,
+            ) -> Result<Option<Duration>, crate::procwatch::Error> {
+                self.inner.process_age(identity)
+            }
+
             fn coalitions(
                 &self,
                 pid: crate::procwatch::Pid,
@@ -13644,6 +13742,250 @@ generation "$1"
             );
         }
 
+        /// A bystander that has run longer than the sweep grace cannot be caught
+        /// between images, so the sweep leaves the cleanup unconfirmed at once
+        /// instead of waiting out the settle window.
+        #[tokio::test(start_paused = true)]
+        async fn an_old_unreadable_process_does_not_hold_the_sweep_for_the_settle_window() {
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.set_age(Some(SLOW_SWEEP_GRACE * 2));
+            let started = tokio::time::Instant::now();
+
+            let (_fixture, _marked) = lost_runtime_over("s-1368", Arc::clone(&inspector)).await;
+
+            let waited = started.elapsed();
+            assert!(
+                waited < SLOW_SWEEP_GRACE / 4,
+                "an old candidate is not waited for: {waited:?}"
+            );
+        }
+
+        /// A bystander inside the exec window, or one whose age the host cannot
+        /// tell, still gets the settle window.
+        #[tokio::test(start_paused = true)]
+        async fn a_young_or_unaged_unreadable_process_still_gets_the_settle_window() {
+            for age in [Some(Duration::ZERO), None] {
+                let inspector = Arc::new(RetryInspector::default());
+                inspector.set_age(age);
+                let started = tokio::time::Instant::now();
+
+                let (_fixture, _marked) = lost_runtime_over("s-1368", Arc::clone(&inspector)).await;
+
+                assert!(
+                    started.elapsed() >= SLOW_SWEEP_GRACE,
+                    "age {age:?} settles for the grace: {:?}",
+                    started.elapsed()
+                );
+            }
+        }
+
+        /// An old process whose markers read as unobservable is caught between
+        /// executable images: the sweep keeps polling and ends it once it reads
+        /// again, however old the process is.
+        #[tokio::test]
+        async fn an_old_process_between_images_is_swept_once_it_reads_again() {
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.unobservable_for(12);
+            inspector.set_age(Some(SLOW_SWEEP_GRACE * 2));
+            let fixture = fixture_graced(
+                Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>,
+                None,
+                ScriptedSupervisor::scripted(),
+                crate::session::supervision::SUPERVISION_RETRY_INITIAL,
+                SLOW_SWEEP_GRACE,
+                crate::agent::host::fixture::compiled_in_host(),
+            );
+            let marked = Marked::spawn(&fixture.root, "runtime-s-13691");
+            persist_record(&fixture.root, "s-13691", Some("runtime-s-13691"));
+            write_live_journal(
+                &fixture.root,
+                "s-13691",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-13691"),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            marked.wait_gone().await;
+            let runtime = runtime_of(&fixture.registry, "s-13691").await;
+            assert_ne!(
+                runtime.loss_reason.as_deref(),
+                Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED),
+                "the process read again inside the sweep grace"
+            );
+        }
+
+        /// An old process that stays unobservable past the sweep grace is not
+        /// ruled out: the sweep ends fail closed at the grace, the process
+        /// keeps blocking the cleanup and is never signalled.
+        #[tokio::test(start_paused = true)]
+        async fn an_old_unobservable_process_blocks_the_cleanup_for_the_whole_grace() {
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.markers_unobservable(true);
+            inspector.set_age(Some(SLOW_SWEEP_GRACE * 2));
+            let started = tokio::time::Instant::now();
+
+            let (_fixture, marked) = lost_runtime_over("s-13693", Arc::clone(&inspector)).await;
+
+            assert!(
+                started.elapsed() >= SLOW_SWEEP_GRACE,
+                "an unobservable candidate gets the grace: {:?}",
+                started.elapsed()
+            );
+            assert!(
+                marked.alive(),
+                "an unreadable marker is never a signal permit"
+            );
+        }
+
+        /// The blockers a refused removal recorded belong to the generation it
+        /// swept: once the session names another generation, a retry scans
+        /// again instead of trusting them.
+        #[tokio::test]
+        async fn cached_blockers_do_not_outlive_their_generation() {
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.fail_markers(true);
+            inspector.set_age(Some(SLOW_SWEEP_GRACE * 2));
+            let fixture =
+                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+            let _bystander = Marked::spawn(&fixture.root, "runtime-s-13692");
+            persist_removal_intent(&fixture.root, "s-13692", Some("runtime-s-13692"));
+            write_live_journal(
+                &fixture.root,
+                "s-13692",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-13692"),
+            );
+            fixture.supervisor.script_job(
+                service_id("s-13692", TEST_GENERATION),
+                present(ServiceState::Failed, None),
+            );
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let id = SessionId("s-13692".to_owned());
+            assert!(
+                !fixture.registry.retry_supervised_session(&id).await,
+                "the removal stays refused"
+            );
+            let unchanged = inspector.table_scans();
+            assert!(
+                !fixture.registry.retry_supervised_session(&id).await,
+                "the removal stays refused"
+            );
+            assert_eq!(
+                inspector.table_scans(),
+                unchanged,
+                "same generation: no scan"
+            );
+
+            fixture
+                .registry
+                .inner
+                .sessions
+                .lock()
+                .await
+                .get_mut(&id)
+                .expect("the refused removal keeps the session listed")
+                .job = None;
+            fixture.registry.retry_supervised_session(&id).await;
+
+            assert!(
+                inspector.table_scans() > unchanged,
+                "another generation scans again"
+            );
+        }
+
+        /// The process-table scans of a sweep run on the blocking pool, never
+        /// inside an async task.
+        #[tokio::test(start_paused = true)]
+        async fn sweep_scans_do_not_run_on_the_async_executor() {
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.set_age(Some(SLOW_SWEEP_GRACE * 2));
+            inspector.pin_executor_thread();
+
+            let (_fixture, _marked) = lost_runtime_over("s-1368", Arc::clone(&inspector)).await;
+
+            assert!(inspector.scans() > 0, "the sweep scanned the process table");
+            assert!(
+                !inspector.scanned_on_executor(),
+                "a scan ran inside an async task"
+            );
+        }
+
+        /// Removals blocked only by the same unreadable bystanders do not rescan
+        /// the process table on each retry round, and finish once the
+        /// bystander is gone.
+        #[tokio::test]
+        async fn pending_removals_blocked_by_an_unchanged_bystander_do_not_rescan() {
+            const SESSIONS: [&str; 3] = ["s-13681", "s-13682", "s-13683"];
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.fail_markers(true);
+            inspector.set_age(Some(SLOW_SWEEP_GRACE * 2));
+            let fixture =
+                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+            let bystander = Marked::spawn(&fixture.root, "runtime-s-13681");
+            for session_id in SESSIONS {
+                let runtime = format!("runtime-{session_id}");
+                persist_removal_intent(&fixture.root, session_id, Some(&runtime));
+                write_live_journal(
+                    &fixture.root,
+                    session_id,
+                    dead_worker_with_realistic_start(),
+                    Some(&runtime),
+                );
+                fixture.supervisor.script_job(
+                    service_id(session_id, TEST_GENERATION),
+                    present(ServiceState::Failed, None),
+                );
+            }
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            for session_id in SESSIONS {
+                fixture
+                    .registry
+                    .inspect(&SessionId(session_id.to_owned()))
+                    .await
+                    .expect("a refused removal keeps the session listed");
+            }
+            let scans_after_refusal = inspector.table_scans();
+
+            for _round in 0..3 {
+                for session_id in SESSIONS {
+                    let settled = fixture
+                        .registry
+                        .retry_supervised_session(&SessionId(session_id.to_owned()))
+                        .await;
+                    assert!(
+                        !settled,
+                        "{session_id} stays pending while the bystander runs"
+                    );
+                }
+            }
+
+            assert_eq!(
+                inspector.table_scans(),
+                scans_after_refusal,
+                "retry rounds with an unchanged candidate set do not scan"
+            );
+            crate::procwatch::scoped_host::kill_if_current(&HostInspector::new(), bystander.1);
+            bystander.wait_gone().await;
+            for session_id in SESSIONS {
+                let settled = fixture
+                    .registry
+                    .retry_supervised_session(&SessionId(session_id.to_owned()))
+                    .await;
+                assert!(settled, "{session_id} finishes once the bystander is gone");
+                fixture
+                    .registry
+                    .inspect(&SessionId(session_id.to_owned()))
+                    .await
+                    .expect_err("the finished removal leaves the registry");
+            }
+        }
+
         /// Sweep grace of the resume scenarios: above the SDK client's
         /// ordinary 5 s request timeout, so the refusal arrives after it.
         const SLOW_SWEEP_GRACE: Duration = Duration::from_secs(8);
@@ -13676,6 +14018,15 @@ generation "$1"
         /// refuses.
         async fn lost_runtime_with_unreadable_markers(session_id: &str) -> (Fixture, Marked) {
             let inspector = Arc::new(RetryInspector::default());
+            lost_runtime_over(session_id, inspector).await
+        }
+
+        /// [`lost_runtime_with_unreadable_markers`] over `inspector`, whose
+        /// markers are unreadable.
+        async fn lost_runtime_over(
+            session_id: &str,
+            inspector: Arc<RetryInspector>,
+        ) -> (Fixture, Marked) {
             inspector.fail_markers(true);
             let fixture = fixture_graced(
                 Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>,
