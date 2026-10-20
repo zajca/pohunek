@@ -578,7 +578,7 @@ impl SessionRegistry {
         let id = spec.id.clone();
         let creating = matches!(spec.registration, PtyRegistration::Create);
         let worktree_path = spec.worktree_path.clone();
-        match self.transact_pty_registration(spec).await {
+        match Box::pin(self.transact_pty_registration(spec)).await {
             Ok(info) => Ok(info),
             Err(LaunchFailure::Cleaned(mut error)) => {
                 if creating && !self.compensate_abandoned_create(&id).await {

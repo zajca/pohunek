@@ -6,6 +6,14 @@ use super::{
     SessionId, SessionRegistry, SessionState, SystemTime, UNIX_EPOCH,
 };
 use crate::runtime::DataStream;
+
+fn runtime_is_lost(entry: &super::SessionEntry) -> bool {
+    entry
+        .info
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.state == super::RuntimeState::Lost)
+}
 use pohunek_worker_protocol::{AttachStart, Dimensions as WorkerDimensions, StreamId};
 
 #[derive(Debug, Clone)]
@@ -72,7 +80,8 @@ impl SessionRegistry {
         let target_worker_id = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
-            if entry.info.state != SessionState::Running {
+            // A lost runtime is refused when the token is redeemed.
+            if entry.info.state != SessionState::Running && !runtime_is_lost(entry) {
                 return Err(session_not_running(id));
             }
             entry
@@ -123,7 +132,7 @@ impl SessionRegistry {
                 .get(&pending.session_id)
                 .ok_or_else(|| session_not_found(&pending.session_id.0))?;
             if entry.info.state != SessionState::Running {
-                return Err(session_not_running(&pending.session_id));
+                return Err(super::not_running_refusal(&pending.session_id, entry));
             }
             (entry.runtime.clone(), super::runtime_loss_reason(entry))
         };

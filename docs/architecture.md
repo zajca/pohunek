@@ -1449,8 +1449,27 @@ Durability tiers (honest about limits):
    and runtime ID continue. Existing public sockets close; clients reconnect
    after the replacement daemon completes reconciliation.
 4. **Worker loss or host restart:** the PTY generation is gone. The logical
-   record remains visible with `runtime.state=lost`; recovery is explicit and
-   creates a new worker, runtime ID, PTY, and child PID.
+   record remains visible as a `failed` session with `runtime.state=lost`
+   and no activity; recovery is explicit and creates a new worker, runtime ID,
+   PTY, and child PID. A loss counts as ended only when the daemon observed it:
+   the service manager's job for the recorded generation ended and was retired
+   (including a host restart), or a worker that still answers reports that its
+   child process is gone after it started. Every commit of a lost runtime names that proof explicitly;
+   it is never derived from the loss reason. A loss without such proof (the
+   record names no generation, a recovery whose previous worker still answers,
+   an unreachable socket, a sweep that could not confirm the cleanup of marked
+   processes: `runtime_lost_cleanup_unconfirmed`) keeps the session state and clears only the activity,
+   because no detector is attached to a lost runtime. Startup reconciliation
+   re-examines every stored record, so a record committed by an earlier release
+   as `running` with a lost runtime is re-classified by its call site's proof;
+   a worker that answers again re-adopts the session as `running`. A `failed`
+   session with a lost runtime stays resumable (resume keys on the runtime) and
+   ages under the lost retention window, aged from the last connection.
+   Operations that need a running session still refuse it with
+   `session_runtime_lost` and its recovery hint. N-1 readers know both values:
+   they treat the session as ended and not stoppable. Rolled back to a release
+   that predates this presentation, the stored `failed` record is aged by the
+   shorter terminal window when automatic retention is enabled.
 
 Recovery safety rules:
 

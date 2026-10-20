@@ -1186,16 +1186,20 @@ async fn requested_stops_judge_the_native_reference_retained_from_the_worker_jou
 #[test]
 fn a_session_whose_runtime_the_record_already_lost_is_judged_only_as_a_stopped_session() {
     let host = Host::new();
-    // The persisted state of a lost runtime keeps the session `running`.
+    // A lost runtime whose end was not proven keeps the session `running`; a
+    // proven one presents it `failed`. Both are judged by the runtime state.
     let mut lost = session_line("s-1", "w-fixture");
     lost["runtime"]["state"] = json!("lost");
+    let mut failed_and_lost = session_line("s-3", "w-three");
+    failed_and_lost["runtime"]["state"] = json!("lost");
+    failed_and_lost["info"]["state"] = json!("failed");
     let mut unreadable_and_lost = session_line("s-2", "w-two");
     unreadable_and_lost["runtime"]["state"] = json!("lost");
     unreadable_and_lost["info"]
         .as_object_mut()
         .expect("info")
         .remove("cwd");
-    host.write_store(&[lost, unreadable_and_lost]);
+    host.write_store(&[lost, unreadable_and_lost, failed_and_lost]);
     host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
 
     let report = host.report();
@@ -1212,12 +1216,13 @@ fn a_session_whose_runtime_the_record_already_lost_is_judged_only_as_a_stopped_s
             .collect::<Vec<_>>(),
         [
             ("s-1", Verdict::WouldLoseRecovery),
-            ("s-2", Verdict::WouldLoseRecovery)
+            ("s-2", Verdict::WouldLoseRecovery),
+            ("s-3", Verdict::WouldLoseRecovery)
         ],
         "{:?}",
         report.stopped_sessions
     );
-    assert_eq!(report.at_risk().count(), 2);
+    assert_eq!(report.at_risk().count(), 3);
 }
 
 #[tokio::test]

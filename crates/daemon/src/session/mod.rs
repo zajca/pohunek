@@ -1213,6 +1213,101 @@ enum RuntimeMetadataPolicy {
     Terminal,
 }
 
+/// What the caller proved about the end of a runtime it classifies `Lost`.
+///
+/// Passed explicitly by every call site; it is never derived from the loss
+/// reason, because the same reason string is written by proven and unproven
+/// sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LossProof {
+    /// The job of the runtime's generation was observed ended and retired, or
+    /// the worker answered and has no child process after it started.
+    Ended,
+    /// The worker may still run: nothing proves the session's process ended.
+    Unproven,
+}
+
+/// A runtime classification committed by the unavailable-runtime funnels.
+///
+/// A `Lost` classification cannot be built without its [`LossProof`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Unavailability {
+    Lost(LossProof),
+    Other(RuntimeState),
+}
+
+impl Unavailability {
+    /// A classification other than `Lost`.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds when `state` is `Lost`, which needs a proof.
+    pub(super) fn other(state: RuntimeState) -> Self {
+        debug_assert!(state != RuntimeState::Lost, "a lost runtime needs a proof");
+        Self::Other(state)
+    }
+
+    pub(super) fn state(self) -> RuntimeState {
+        match self {
+            Self::Lost(_) => RuntimeState::Lost,
+            Self::Other(state) => state,
+        }
+    }
+
+    pub(super) fn proof(self) -> Option<LossProof> {
+        match self {
+            Self::Lost(proof) => Some(proof),
+            Self::Other(_) => None,
+        }
+    }
+}
+
+/// Clears what a session shows about a running agent: the activity and the
+/// active-agent identity.
+fn clear_agent_presentation(info: &mut SessionInfo) {
+    info.activity = None;
+    info.active_agent = None;
+    info.active_agent_base = None;
+    info.active_agent_pid = None;
+    info.active_agent_session_id = None;
+    info.active_agent_session_path = None;
+}
+
+/// Clears the agent presentation of `info` and the entry-side agent state.
+fn clear_entry_agent(entry: &mut SessionEntry) {
+    clear_agent_presentation(&mut entry.info);
+    entry.active_agent = None;
+    entry.last_agent_report = None;
+    entry.observed_agents.clear();
+    entry.bound_reporter = None;
+}
+
+/// Applies the session presentation of a `Lost` classification to `info`.
+///
+/// No detector is attached to a lost runtime, so the activity is always
+/// cleared. A proven-ended loss also ends the session: `failed`, or `stopped`
+/// when a stop or removal was requested, and the agent presentation is
+/// cleared. An unproven loss keeps the session state. A session that is
+/// already terminal keeps it. Returns whether the session ended.
+fn present_lost_runtime(
+    info: &mut SessionInfo,
+    proof: LossProof,
+    desired_state: DesiredState,
+) -> bool {
+    info.activity = None;
+    if proof != LossProof::Ended || info.state.is_terminal() {
+        return false;
+    }
+    clear_agent_presentation(info);
+    info.state = if desired_state == DesiredState::Running {
+        SessionState::Failed
+    } else {
+        SessionState::Stopped
+    };
+    info.state_source = StateSource::Process;
+    true
+}
+
 struct ExitTransition {
     event: &'static str,
     stop_reason: &'static str,
@@ -1253,20 +1348,11 @@ fn exit_transition(
         "failed"
     };
     candidate.info.state_source = StateSource::Process;
-    candidate.info.activity = None;
     terminalize_running_subagents(&mut candidate.info.subagents, current_time_millis());
     candidate.info.background = None;
-    candidate.active_agent = None;
-    candidate.last_agent_report = None;
-    candidate.info.active_agent = None;
-    candidate.info.active_agent_base = None;
-    candidate.info.active_agent_pid = None;
-    candidate.info.active_agent_session_id = None;
-    candidate.info.active_agent_session_path = None;
-    candidate.observed_agents.clear();
     // The watch task ends with `procwatch_cancel`; the live entry keeps it
     // until the transition commits.
-    candidate.bound_reporter = None;
+    clear_entry_agent(&mut candidate);
     candidate.info.exit_code = exit.exit_code;
     if observed.output_forced_closed {
         note_output_force_closed(&mut candidate.info);
@@ -4312,7 +4398,7 @@ impl SessionRegistry {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
             if entry.info.state != SessionState::Running {
-                return Err(session_not_running(id));
+                return Err(not_running_refusal(id, entry));
             }
             (entry.runtime.clone(), runtime_loss_reason(entry))
         };
@@ -4355,7 +4441,7 @@ impl SessionRegistry {
                 .get_mut(id)
                 .ok_or_else(|| session_not_found(&id.0))?;
             if entry.info.state != SessionState::Running {
-                return Err(session_not_running(id));
+                return Err(not_running_refusal(id, entry));
             }
             entry.info.cols = cols;
             entry.info.rows = rows;
@@ -5303,9 +5389,10 @@ impl SessionRegistry {
         &self,
         id: &SessionId,
         expected: &RuntimeWatchIdentity,
-        state: RuntimeState,
+        classification: Unavailability,
         reason: &str,
     ) -> RuntimeTransitionOutcome {
+        let state = classification.state();
         let (base, candidate) = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(id) else {
@@ -5321,6 +5408,12 @@ impl SessionRegistry {
             if let Some(runtime) = candidate.info.runtime.as_mut() {
                 runtime.state = state;
                 runtime.loss_reason = Some(reason.to_owned());
+            }
+            if let Some(proof) = classification.proof() {
+                let desired_state = candidate.desired_state;
+                if present_lost_runtime(&mut candidate.info, proof, desired_state) {
+                    clear_entry_agent(&mut candidate);
+                }
             }
             candidate.info.updated_at = timestamp_now();
             (base, candidate)
@@ -5824,7 +5917,7 @@ impl SessionRegistry {
         if entry.info.state == SessionState::Running {
             Ok(())
         } else {
-            Err(session_not_running(id))
+            Err(not_running_refusal(id, entry))
         }
     }
 
@@ -7283,6 +7376,19 @@ fn session_not_found(id: &str) -> ProtocolError {
         format!("session not found: {id}"),
         None,
     )
+}
+
+/// The refusal for an operation that needs a running session.
+///
+/// A lost runtime keeps its own error, with the recovery it carries, whether
+/// or not the session also ended.
+fn not_running_refusal(id: &SessionId, entry: &SessionEntry) -> ProtocolError {
+    match entry.info.runtime.as_ref() {
+        Some(runtime) if runtime.state == RuntimeState::Lost => {
+            unavailable_runtime_error(id, runtime.state, runtime.loss_reason.as_deref())
+        }
+        _ => session_not_running(id),
+    }
 }
 
 fn session_not_running(id: &SessionId) -> ProtocolError {

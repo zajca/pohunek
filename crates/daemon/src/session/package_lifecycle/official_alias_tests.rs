@@ -1282,7 +1282,7 @@ async fn a_hook_report_while_an_unpinned_sessions_runtime_is_reconnecting_is_adm
                 .mark_worker_unavailable(
                     &released.id,
                     &released.expected,
-                    protocol::RuntimeState::Reconnecting,
+                    crate::session::Unavailability::other(protocol::RuntimeState::Reconnecting),
                     crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE,
                 )
                 .await,
