@@ -1643,6 +1643,7 @@ mod tests {
                 started_at: started_at.map(str::to_owned),
                 last_connected_at: None,
                 loss_reason: None,
+                exit: None,
             }),
             ..session_info(session_id, state, exit_code)
         }

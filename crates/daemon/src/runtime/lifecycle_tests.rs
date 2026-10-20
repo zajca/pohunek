@@ -74,6 +74,15 @@ pub(crate) enum JobScript {
     Panic,
 }
 
+/// What the manager reports for a failed job; retiring the job resets it.
+#[derive(Debug, Clone)]
+pub(crate) enum EvidenceScript {
+    /// The failed job's verdict.
+    Failed(ExitEvidence),
+    /// The manager cannot be read.
+    Unavailable,
+}
+
 /// One supervisor call, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Call {
@@ -108,6 +117,7 @@ pub(crate) struct ScriptedSupervisor {
     retire_ends: StdMutex<HashMap<ServiceId, u32>>,
     retire_ends_then_fails: StdMutex<HashMap<ServiceId, u32>>,
     retire_gate: StdMutex<Option<StartGate>>,
+    evidence: StdMutex<HashMap<ServiceId, EvidenceScript>>,
     discovery_unavailable: std::sync::atomic::AtomicBool,
 }
 
@@ -174,6 +184,12 @@ impl ScriptedSupervisor {
             .lock()
             .expect("retire script")
             .insert(id, pid);
+    }
+
+    /// Scripts the verdict of the failed job `id`. Retiring the job removes
+    /// it, the way resetting a failed unit destroys its result.
+    pub(crate) fn script_exit_evidence(&self, id: ServiceId, script: EvidenceScript) {
+        self.evidence.lock().expect("evidence").insert(id, script);
     }
 
     /// Makes `discover` fail as an unreachable manager.
@@ -424,6 +440,7 @@ impl Supervisor for ScriptedSupervisor {
                 end_process(pid, "the process of the failing retirement");
                 return Err(unavailable("retire"));
             }
+            self.evidence.lock().expect("evidence").remove(id);
             let scripted = self.jobs.lock().expect("jobs").remove(id);
             if let Some(script) = scripted {
                 return match script {
@@ -451,6 +468,20 @@ impl Supervisor for ScriptedSupervisor {
             match &self.delegate {
                 Some(delegate) => delegate.exit_status(id).await,
                 None => Ok(None),
+            }
+        })
+    }
+
+    fn exit_evidence<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, Option<ExitEvidence>> {
+        Box::pin(async move {
+            let scripted = self.evidence.lock().expect("evidence").get(id).cloned();
+            match scripted {
+                Some(EvidenceScript::Failed(evidence)) => Ok(Some(evidence)),
+                Some(EvidenceScript::Unavailable) => Err(unavailable("exit_evidence")),
+                None => match &self.delegate {
+                    Some(delegate) => delegate.exit_evidence(id).await,
+                    None => Ok(None),
+                },
             }
         })
     }

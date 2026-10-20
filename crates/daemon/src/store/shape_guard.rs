@@ -406,6 +406,7 @@ fn assert_every_field_is_reviewed(
         started_at: _,
         last_connected_at: _,
         loss_reason: _,
+        exit: _,
     }) = session_runtime
     {}
     for protocol::SubagentInfo {

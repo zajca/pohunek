@@ -31,10 +31,10 @@ use pohunek_paths::Platform;
 use pohunek_platform::filesystem::TrustedDir;
 use pohunek_platform::process::{ProcessIdentity, ProcessInspector, StartIdentity};
 use pohunek_platform::supervisor::{
-    Error as SupervisorError, JobDefinition, JobExit, JobLogs, JobSpec, Namespace, RestartPolicy,
-    ServiceId, ServiceObservation, ServiceState, WorkerKey,
+    Error as SupervisorError, ExitEvidence, JobDefinition, JobExit, JobLogs, JobSpec, Namespace,
+    RestartPolicy, ServiceId, ServiceObservation, ServiceState, WorkerKey,
 };
-use protocol::{ErrorClass, ProtocolError};
+use protocol::{ErrorClass, ProtocolError, RuntimeExit};
 use serde::Deserialize;
 use tokio::sync::OwnedMutexGuard;
 use tokio::time::Instant;
@@ -763,6 +763,27 @@ impl Lifecycle<'_> {
         match self.supervisor.retire(&generation.service_id()).await {
             Ok(()) | Err(SupervisorError::NotFound(_)) => Ok(()),
             Err(error) => Err(error),
+        }
+    }
+
+    /// Reads how the service manager saw the generation's job end.
+    ///
+    /// Must run before [`Self::retire`]: retirement resets the failed job
+    /// and with it the evidence. `None` when the manager holds none (the job
+    /// is gone or did not fail); a failed read is logged and also `None`,
+    /// because the evidence is diagnostic and never blocks a classification.
+    pub async fn exit_evidence(&self, generation: &Generation) -> Option<RuntimeExit> {
+        let id = generation.service_id();
+        match self.supervisor.exit_evidence(&id).await {
+            Ok(evidence) => evidence.as_ref().map(runtime_exit),
+            Err(error) => {
+                tracing::debug!(
+                    service_id = %id,
+                    error = %error,
+                    "exit evidence of an ended worker job is unavailable"
+                );
+                None
+            }
         }
     }
 
@@ -1562,6 +1583,34 @@ fn read_journal(
         ));
     }
     Ok(journal)
+}
+
+/// Maps the service manager's verdict on a job to the wire exit.
+///
+/// The cause comes from the manager's `Result` token and never from the
+/// signal, because an OOM kill reports the stop signal as the main status.
+/// A token outside the documented set is `other`.
+pub(crate) fn runtime_exit(evidence: &ExitEvidence) -> RuntimeExit {
+    let cause = match evidence.result() {
+        "oom-kill" => "oom_kill",
+        "signal" => "signal",
+        "exit-code" => "exit_code",
+        "core-dump" => "core_dump",
+        "timeout" => "timeout",
+        "watchdog" => "watchdog",
+        "resources" => "resources",
+        _ => "other",
+    };
+    let (signal, code) = match evidence.exit() {
+        Some(JobExit::Signal(signal)) => (Some(signal), None),
+        Some(JobExit::Code(code)) => (None, Some(code)),
+        _ => (None, None),
+    };
+    RuntimeExit {
+        cause: cause.to_owned(),
+        signal,
+        code,
+    }
 }
 
 #[cfg(test)]

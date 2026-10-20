@@ -247,6 +247,7 @@ mod tests {
             started_at: None,
             last_connected_at: None,
             loss_reason: None,
+            exit: None,
         });
         worker.native_session_id = Some("native-worker".to_owned());
         let mut external = session("external", SessionState::Running);
