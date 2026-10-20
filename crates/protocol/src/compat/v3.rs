@@ -72,6 +72,7 @@ pub(super) const INTRODUCED_METHODS: &[&str] = &[
     method::PACKAGE_UNINSTALL,
     method::PACKAGE_BIND_PROFILE,
     method::SESSION_WAIT_TURN,
+    method::HOST_RESOLVE,
 ];
 
 /// Event names protocol 3 defined; every other event is withheld from a

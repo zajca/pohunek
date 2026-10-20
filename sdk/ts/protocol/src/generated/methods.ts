@@ -9,6 +9,8 @@ import type {
   HostDiscoverParams,
   HostGovernanceStatus,
   HostRecord,
+  HostResolution,
+  HostResolveParams,
   IntegrationDoctorParams,
   IntegrationDoctorResult,
   IntegrationInstallParams,
@@ -118,6 +120,7 @@ export interface Methods {
   "host.discover": { params: HostDiscoverParams; output: HostRecord[] };
   "host.governance.inspect": { params: null; output: HostGovernanceStatus };
   "host.inspect": { params: null; output: HostCapabilities };
+  "host.resolve": { params: HostResolveParams; output: HostResolution };
   "integration.doctor": { params: IntegrationDoctorParams; output: IntegrationDoctorResult };
   "integration.install": { params: IntegrationInstallParams; output: IntegrationInstallResult };
   "integration.status": { params: IntegrationStatusParams; output: IntegrationStatusResult };
@@ -186,6 +189,7 @@ export const METHOD_NAMES = [
   "host.discover",
   "host.governance.inspect",
   "host.inspect",
+  "host.resolve",
   "integration.doctor",
   "integration.install",
   "integration.status",

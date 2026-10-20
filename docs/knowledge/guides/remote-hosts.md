@@ -108,6 +108,13 @@ prefix such as `netbird:fd00::2` qualifies it. A failure in one configured
 overlay does not hide healthy peers from another overlay; discovery reports an
 error only when every provider fails.
 
+The TypeScript SDK resolves a host route by asking the local daemon:
+`host.resolve` applies the same selector rules as the CLI and returns this
+machine (`local`, the empty route or its own overlay name) or one peer with an
+identity-pinned route, so the SDK holds no copy of the rules. The method is
+served on the local Unix socket only. `resolveHost`, `connectHost` and the remote
+form of `attachRaw` use it (`docs/public-api.md`, TypeScript SDK).
+
 ## macOS hosts
 
 A Mac is a first-class host on the same direct overlay path; there is no

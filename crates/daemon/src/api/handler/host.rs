@@ -1,11 +1,11 @@
-//! Host-scoped methods: `host.inspect` and `host.discover`.
+//! Host-scoped methods: `host.inspect`, `host.discover` and `host.resolve`.
 
-use protocol::{HostDiscoverParams, Request, Response};
+use protocol::{HostDiscoverParams, HostResolveParams, ProtocolError, Request, Response};
 
 use super::util::error_value;
 
-use super::util::{ok_value, parse_optional_params, selected_version};
-use super::HealthInfo;
+use super::util::{ok_value, parse_optional_params, parse_params, selected_version};
+use super::{ControlTransport, HealthInfo};
 use crate::discovery::DiscoveryCache;
 use crate::session::SessionRegistry;
 
@@ -51,6 +51,29 @@ pub(super) async fn handle_host_discover(
         .await
     {
         Ok(records) => ok_value(request, &records),
+        Err(err) => error_value(request, err.to_protocol_error()),
+    }
+}
+
+/// `host.resolve`: map a host route to this machine or to one pinned peer.
+///
+/// The answer is about this daemon's own overlay view, so only the local
+/// control socket serves it. Over the overlay the method does not exist, as
+/// for a method the daemon never defined.
+pub(super) async fn handle_host_resolve(
+    request: &Request,
+    discovery: &DiscoveryCache,
+    transport: ControlTransport,
+) -> Response {
+    if transport != ControlTransport::Local {
+        return error_value(request, ProtocolError::method_not_found(request.method()));
+    }
+    let params = match parse_params::<HostResolveParams>(request) {
+        Ok(params) => params,
+        Err(err) => return error_value(request, err),
+    };
+    match discovery.resolve(&params.route).await {
+        Ok(resolution) => ok_value(request, &resolution),
         Err(err) => error_value(request, err.to_protocol_error()),
     }
 }
