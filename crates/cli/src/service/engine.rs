@@ -176,7 +176,7 @@ use super::definition::{
     config_with_search_path, daemon_definition, identity_config, with_version,
 };
 use super::error::{supervisor_error, Error, LiveSession, OutdatedWorker};
-use super::layout::{self, Staged};
+use super::layout::{self, ReleaseSource, Staged};
 use pohunek_platform::shell_env::SearchPath;
 
 use super::ledger::{Acceptance, Ledger};
@@ -822,7 +822,7 @@ impl<'a> Engine<'a> {
         let gated = preflight::gate_upgrade(
             &*self.preflight,
             self.context,
-            from,
+            &layout::trust_release_source(from, ReleaseSource::Operator),
             self.reported(version),
             &job.value,
             &job.variables,
@@ -1130,7 +1130,7 @@ impl<'a> Engine<'a> {
         late.warnings.extend(warnings.iter().cloned());
         if swap {
             if let Some(dir) = config.daemon_executable().parent() {
-                self.pass_swap_gate(record, dir, &job, &warnings, late)
+                self.pass_swap_gate(record, layout, dir, &job, &warnings, late)
                     .await?;
             }
         }
@@ -1248,6 +1248,7 @@ impl<'a> Engine<'a> {
     async fn pass_swap_gate(
         &self,
         record: &mut Record,
+        layout: &InstallLayout,
         daemon_dir: &Path,
         job: &JobPath,
         warnings: &[String],
@@ -1260,10 +1261,17 @@ impl<'a> Engine<'a> {
                 return Err(error);
             }
         };
+        let daemon_dir = match layout::verify_installed(layout, daemon_dir) {
+            Ok(daemon_dir) => daemon_dir,
+            Err(error) => {
+                late.refused = true;
+                return Err(error);
+            }
+        };
         match preflight::gate_upgrade(
             &*self.preflight,
             self.context,
-            daemon_dir,
+            &daemon_dir,
             self.reported(&record.version),
             &job.value,
             &job.variables,
@@ -1389,7 +1397,7 @@ impl<'a> Engine<'a> {
         let warnings = job_warnings(self.context, &job);
         late.warnings.extend(warnings.iter().cloned());
         if let Some(dir) = config.daemon_executable().parent() {
-            self.pass_swap_gate(record, dir, &job, &warnings, late)
+            self.pass_swap_gate(record, config.layout(), dir, &job, &warnings, late)
                 .await?;
         }
         // Record the intent before the service-manager effect. A crash
@@ -1434,6 +1442,7 @@ impl<'a> Engine<'a> {
                 path: self.store.path(),
                 detail: format!("version {} has no directory", record.version),
             })?;
+        let dir = layout::verify_installed(layout, &dir)?;
         let plan = self
             .runtimes
             .run(self.context, &dir, true, search_path)
@@ -1463,7 +1472,7 @@ impl<'a> Engine<'a> {
             .runtimes
             .run(self.context, &dir, false, search_path)
             .await?;
-        runtimes::check_applied(&dir, &applied)?;
+        runtimes::check_applied(dir.path(), &applied)?;
         late.runtimes = Some(applied);
         if record.operation == Operation::Upgrade {
             // The verdict taken before the apply judged the packages that were
@@ -1505,12 +1514,15 @@ impl<'a> Engine<'a> {
         journal_default: Option<&str>,
     ) -> (Option<EnsureReport>, Vec<IntegrationReinstall>) {
         let plan = match layout.version_dir(version) {
-            Some(dir) => match job_search_path(self.context, config, journal_default).await {
-                Ok(job) => self
-                    .runtimes
-                    .run(self.context, &dir, true, &job.value)
-                    .await
-                    .map(|plan| (plan, job)),
+            Some(dir) => match layout::verify_installed(layout, &dir) {
+                Ok(dir) => match job_search_path(self.context, config, journal_default).await {
+                    Ok(job) => self
+                        .runtimes
+                        .run(self.context, &dir, true, &job.value)
+                        .await
+                        .map(|plan| (plan, job)),
+                    Err(error) => Err(error),
+                },
                 Err(error) => Err(error),
             },
             None => Err(Error::Record {
@@ -1757,6 +1769,7 @@ impl<'a> Engine<'a> {
                     version: previous.to_owned(),
                     detail: "previous version has no valid installation directory".to_owned(),
                 })?;
+        let daemon_dir = layout::verify_installed(layout, &daemon_dir)?;
         let job = journal_job_path(self.context, record).await?;
         let warnings = job_warnings(self.context, &job);
         let mut gated = rollback::gate(

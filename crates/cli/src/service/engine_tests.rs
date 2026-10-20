@@ -17,7 +17,7 @@ use pohunek_daemon::session::upgrade_preflight::PreflightInputs;
 use pohunek_daemon::store::{
     DesiredState, ProjectRecord, RuntimeRecord, SessionRecord, Store as DaemonStore,
 };
-use pohunek_paths::{BasePaths, DAEMON_EXECUTABLE_NAME};
+use pohunek_paths::BasePaths;
 use pohunek_platform::process::{
     Error as ProcessError, ExitWatch, OwnershipMarkers, ProcessFact, ProcessIdentity, StartIdentity,
 };
@@ -40,7 +40,7 @@ use crate::service::context::tests::{context, temp_root};
 use crate::service::definition::initial_config;
 use crate::service::inherited::Token;
 use crate::service::layout::tests::{anchor_bytes, stage_dir, write_anchor};
-use crate::service::layout::CLI_NAME;
+use crate::service::layout::{VerifiedVersionDir, CLI_NAME};
 #[cfg(target_os = "macos")]
 use crate::service::manager_env::{ActiveJob, LaunchdJob};
 use crate::service::manager_env::{EnvironmentFailure, UserManager};
@@ -50,6 +50,7 @@ use crate::service::usage::tests::{
     own_identity, spawn_when_exec_free, write_journal, write_live_journal, write_outdated_journal,
     SESSION,
 };
+use crate::service::VERSION;
 
 const V1: &str = "1.0.0";
 const V2: &str = "2.0.0";
@@ -187,7 +188,7 @@ impl AdoptionPreflight for InProcessPreflight {
     fn judge<'a>(
         &'a self,
         context: &'a Context,
-        _daemon: &'a Path,
+        _dir: &'a VerifiedVersionDir,
         _search_path: &'a str,
         _variables: &'a BTreeMap<String, String>,
         _probe_budget: Option<Duration>,
@@ -228,7 +229,7 @@ impl AdoptionPreflight for ScriptedPreflight {
     fn judge<'a>(
         &'a self,
         context: &'a Context,
-        daemon: &'a Path,
+        dir: &'a VerifiedVersionDir,
         search_path: &'a str,
         variables: &'a BTreeMap<String, String>,
         probe_budget: Option<Duration>,
@@ -246,7 +247,7 @@ impl AdoptionPreflight for ScriptedPreflight {
                 .push(variables.clone());
             let mut report: PreflightReport = self
                 .inner
-                .judge(context, daemon, search_path, variables, probe_budget, plan)
+                .judge(context, dir, search_path, variables, probe_budget, plan)
                 .await?;
             report.runtimes = self.runtimes.clone();
             report.stopped_sessions = self.stopped.clone();
@@ -374,7 +375,7 @@ impl RuntimeStep for RuntimeFake {
     fn run<'a>(
         &'a self,
         context: &'a Context,
-        dir: &'a Path,
+        dir: &'a VerifiedVersionDir,
         dry_run: bool,
         search_path: &'a str,
     ) -> Running<'a> {
@@ -412,13 +413,13 @@ impl RuntimeStep for RuntimeFake {
             }
             if unconfirmed {
                 return Err(Error::UpgradeRuntimesUnconfirmed {
-                    binary: dir.join(DAEMON_EXECUTABLE_NAME),
+                    binary: dir.daemon(),
                     detail: "the scripted daemon's exit was not confirmed".to_owned(),
                 });
             }
             if fail {
                 return Err(Error::UpgradeRuntimesFailed {
-                    binary: dir.join(DAEMON_EXECUTABLE_NAME),
+                    binary: dir.daemon(),
                     detail: "the fake apply failed after writing".to_owned(),
                 });
             }
@@ -916,6 +917,15 @@ impl Harness {
 
     async fn upgrade(&self, version: &str) -> Result<UpgradeReport, Error> {
         self.engine().upgrade(&self.staged(version), version).await
+    }
+
+    /// Upgrades with the prepared `engine`.
+    async fn upgrade_with(
+        &self,
+        engine: Engine<'_>,
+        version: &str,
+    ) -> Result<UpgradeReport, Error> {
+        engine.upgrade(&self.staged(version), version).await
     }
 
     /// Upgrades with `--accept-runtime-loss`.
@@ -3531,7 +3541,7 @@ impl AdoptionPreflight for PostApplyPreflight {
     fn judge<'a>(
         &'a self,
         context: &'a Context,
-        daemon: &'a Path,
+        dir: &'a VerifiedVersionDir,
         search_path: &'a str,
         variables: &'a BTreeMap<String, String>,
         probe_budget: Option<Duration>,
@@ -3540,21 +3550,21 @@ impl AdoptionPreflight for PostApplyPreflight {
         Box::pin(async move {
             // Only the new release's judgment after the apply is scripted; the
             // rollback judges the previous release's daemon as it stands.
-            let new_release = daemon.components().any(|part| part.as_os_str() == V2);
+            let new_release = dir.path().components().any(|part| part.as_os_str() == V2);
             if !self.runtimes.applied() || !new_release || self.post == PostApply::Clean {
                 return InProcessPreflight::default()
-                    .judge(context, daemon, search_path, variables, probe_budget, plan)
+                    .judge(context, dir, search_path, variables, probe_budget, plan)
                     .await;
             }
             self.judged_after_apply.fetch_add(1, Ordering::SeqCst);
             if self.post == PostApply::CannotRun {
                 return Err(Error::UpgradePreflightFailed {
-                    binary: daemon.to_path_buf(),
+                    binary: dir.daemon(),
                     detail: "the scripted post-apply judgment produced no report".to_owned(),
                 });
             }
             let mut report = InProcessPreflight::default()
-                .judge(context, daemon, search_path, variables, probe_budget, plan)
+                .judge(context, dir, search_path, variables, probe_budget, plan)
                 .await?;
             report.sessions.push(SessionVerdict {
                 session_id: "s-after-apply".to_owned(),
@@ -6961,7 +6971,7 @@ impl AdoptionPreflight for FailingFrom {
     fn judge<'a>(
         &'a self,
         context: &'a Context,
-        daemon: &'a Path,
+        dir: &'a VerifiedVersionDir,
         search_path: &'a str,
         variables: &'a BTreeMap<String, String>,
         probe_budget: Option<Duration>,
@@ -6971,13 +6981,13 @@ impl AdoptionPreflight for FailingFrom {
         if call >= self.fail_from {
             return Box::pin(async move {
                 Err(Error::UpgradePreflightFailed {
-                    binary: daemon.to_path_buf(),
+                    binary: dir.daemon(),
                     detail: "injected".to_owned(),
                 })
             });
         }
         self.inner
-            .judge(context, daemon, search_path, variables, probe_budget, plan)
+            .judge(context, dir, search_path, variables, probe_budget, plan)
     }
 }
 
@@ -8233,7 +8243,7 @@ impl AdoptionPreflight for CountingFailure {
     fn judge<'a>(
         &'a self,
         _context: &'a Context,
-        daemon: &'a Path,
+        dir: &'a VerifiedVersionDir,
         _search_path: &'a str,
         _variables: &'a BTreeMap<String, String>,
         _probe_budget: Option<Duration>,
@@ -8242,7 +8252,7 @@ impl AdoptionPreflight for CountingFailure {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             Err(Error::UpgradePreflightFailed {
-                binary: daemon.to_path_buf(),
+                binary: dir.daemon(),
                 detail: "must not be consulted".to_owned(),
             })
         })
@@ -8847,4 +8857,239 @@ async fn the_rollback_gate_never_consults_the_ledger() {
         .expect_err("the previous release emits no scope, so nothing is accepted");
 
     assert_eq!(error.code(), "service_rollback_sessions_at_risk");
+}
+
+/// The ways an installed version directory can stop being what publishing made.
+#[derive(Debug, Clone, Copy)]
+enum Tamper {
+    GroupWritableDirectory,
+    GroupWritableDaemon,
+    GroupWritableWorker,
+    SymlinkedDaemon,
+    MissingWorker,
+}
+
+impl Tamper {
+    const ALL: [Self; 5] = [
+        Self::GroupWritableDirectory,
+        Self::GroupWritableDaemon,
+        Self::GroupWritableWorker,
+        Self::SymlinkedDaemon,
+        Self::MissingWorker,
+    ];
+
+    /// Applies the change to `dir` and returns the path verification must name.
+    fn apply(self, dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let chmod = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        };
+        let daemon = dir.join(pohunek_paths::DAEMON_EXECUTABLE_NAME);
+        let worker = dir.join(pohunek_paths::WORKER_EXECUTABLE_NAME);
+        match self {
+            Self::GroupWritableDirectory => {
+                chmod(dir, 0o775);
+                dir.to_path_buf()
+            }
+            Self::GroupWritableDaemon => {
+                chmod(&daemon, 0o775);
+                daemon
+            }
+            Self::GroupWritableWorker => {
+                chmod(&worker, 0o775);
+                worker
+            }
+            Self::SymlinkedDaemon => {
+                let prefix = dir.ancestors().nth(3).expect("the prefix");
+                let elsewhere = prefix.join("daemon.elsewhere");
+                std::fs::rename(&daemon, &elsewhere).expect("move the daemon away");
+                std::os::unix::fs::symlink(&elsewhere, &daemon).expect("link the daemon");
+                daemon
+            }
+            Self::MissingWorker => {
+                std::fs::remove_file(&worker).expect("remove the worker");
+                worker
+            }
+        }
+    }
+}
+
+fn assert_untrusted_version(error: &Error, named: &Path) {
+    assert_eq!(error.code(), "service_version_untrusted", "{error:?}");
+    assert!(
+        matches!(error, Error::UntrustedVersion { path, .. } if path == named),
+        "the refusal names {}: {error:?}",
+        named.display()
+    );
+}
+
+#[tokio::test]
+async fn an_upgrade_runs_nothing_from_a_new_version_directory_that_stopped_being_trusted() {
+    for tamper in Tamper::ALL {
+        let harness = Harness::new();
+        harness.install(V1).await.expect("install");
+        harness.runtimes.script().calls.clear();
+        let preflight = ScriptedPreflight::default();
+        let judged = Arc::clone(&preflight.search_paths);
+        let mut engine = harness
+            .engine()
+            .with_adoption_preflight(Box::new(preflight));
+        let version_dir = harness.layout().version_dir(V2).expect("version dir");
+        let named = Arc::new(Mutex::new(PathBuf::new()));
+        let recorded = Arc::clone(&named);
+        engine.before_swap = Some(SwapHook(Box::new(move || {
+            *recorded.lock().expect("named path") = tamper.apply(&version_dir);
+        })));
+
+        let error = harness
+            .upgrade_with(engine, V2)
+            .await
+            .expect_err("an untrusted version directory is refused");
+
+        let named = named.lock().expect("named path").clone();
+        assert_untrusted_version(&error, &named);
+        assert!(
+            harness.runtimes.calls().is_empty(),
+            "{tamper:?}: no runtime step ran"
+        );
+        assert_eq!(
+            judged.lock().expect("search path lock").len(),
+            1,
+            "{tamper:?}: only the gate on the staged source judged"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_rollback_judges_nothing_from_a_previous_version_directory_that_stopped_being_trusted() {
+    for tamper in Tamper::ALL {
+        let mut harness = Harness::new();
+        interrupted_upgrade_journal(&mut harness).await;
+        let named = tamper.apply(&harness.layout().version_dir(V1).expect("version dir"));
+        let preflight = ScriptedPreflight::default();
+        let judged = Arc::clone(&preflight.search_paths);
+
+        let error = harness
+            .engine()
+            .with_adoption_preflight(Box::new(preflight))
+            .upgrade(&harness.staged(V1), V1)
+            .await
+            .expect_err("an untrusted previous version is not run");
+
+        assert_untrusted_version(&error, &named);
+        assert!(
+            judged.lock().expect("search path lock").is_empty(),
+            "{tamper:?}: the rollback gate ran nothing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_check_of_a_pending_rollback_runs_nothing_from_a_previous_version_directory_that_stopped_being_trusted(
+) {
+    for tamper in Tamper::ALL {
+        let mut harness = Harness::new();
+        interrupted_upgrade_journal(&mut harness).await;
+        let named = tamper.apply(&harness.layout().version_dir(V1).expect("version dir"));
+        let preflight = ScriptedPreflight::default();
+        let judged = Arc::clone(&preflight.search_paths);
+
+        let error = super::super::check_with_preflight(
+            &harness.context,
+            &harness.staged(V1),
+            &preflight,
+            V1,
+            false,
+        )
+        .await
+        .expect_err("an untrusted previous version is not run");
+
+        assert_untrusted_version(&error, &named);
+        assert!(
+            judged.lock().expect("search path lock").is_empty(),
+            "{tamper:?}: the check ran nothing"
+        );
+    }
+}
+
+/// Counts the plans the setup asks the release daemon for.
+#[derive(Debug, Default)]
+struct CountingPlanner(AtomicUsize);
+
+impl crate::commands::setup_host::ReleasePlanner for CountingPlanner {
+    fn plan<'a>(
+        &'a self,
+        _context: &'a Context,
+        _dir: &'a VerifiedVersionDir,
+        _search_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<EnsureReport, Error>> + Send + 'a>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Ok(runtime_report(
+                true,
+                vec![package(PackageStatus::Present)],
+                Vec::new(),
+                Vec::new(),
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn setup_plans_nothing_from_an_installed_version_directory_that_stopped_being_trusted() {
+    for tamper in Tamper::ALL {
+        let harness = Harness::new();
+        harness.install(VERSION).await.expect("install");
+        let named = tamper.apply(&harness.layout().version_dir(VERSION).expect("version dir"));
+        let planner = CountingPlanner::default();
+
+        let error =
+            crate::commands::setup_host::plan(&harness.context, &harness.staged(VERSION), &planner)
+                .await
+                .expect_err("an untrusted version directory is refused");
+
+        assert_eq!(error.code(), "service_version_untrusted", "{tamper:?}");
+        assert!(
+            error.to_string().contains(&named.display().to_string()),
+            "{tamper:?}: the refusal names {}: {error}",
+            named.display()
+        );
+        assert_eq!(
+            planner.0.load(Ordering::SeqCst),
+            0,
+            "{tamper:?}: the release daemon was not asked for a plan"
+        );
+    }
+}
+
+#[tokio::test]
+async fn setup_applies_nothing_when_the_version_directory_stopped_being_trusted_after_the_preview()
+{
+    for tamper in Tamper::ALL {
+        let harness = Harness::new();
+        harness.install(VERSION).await.expect("install");
+        let planner = CountingPlanner::default();
+        let host_plan =
+            crate::commands::setup_host::plan(&harness.context, &harness.staged(VERSION), &planner)
+                .await
+                .expect("a trusted directory is planned");
+        assert_eq!(planner.0.load(Ordering::SeqCst), 1);
+        let named = tamper.apply(&harness.layout().version_dir(VERSION).expect("version dir"));
+
+        let error = crate::commands::setup_host::apply(&harness.context, host_plan, &planner)
+            .await
+            .expect_err("an untrusted version directory is refused");
+
+        assert_eq!(error.code(), "service_version_untrusted", "{tamper:?}");
+        assert!(
+            error.to_string().contains(&named.display().to_string()),
+            "{tamper:?}: the refusal names {}: {error}",
+            named.display()
+        );
+        assert_eq!(
+            planner.0.load(Ordering::SeqCst),
+            1,
+            "{tamper:?}: the apply asked for no further plan"
+        );
+    }
 }

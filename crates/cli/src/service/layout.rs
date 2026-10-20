@@ -510,6 +510,89 @@ pub fn version_of(layout: &InstallLayout, path: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// A release directory whose binaries this process may execute.
+///
+/// Only [`verify_installed`] and [`trust_release_source`] construct one, so a
+/// call that runs a binary from a release directory cannot skip the check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedVersionDir {
+    path: PathBuf,
+}
+
+impl VerifiedVersionDir {
+    /// Returns the directory.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the daemon executable inside the directory.
+    #[must_use]
+    pub fn daemon(&self) -> PathBuf {
+        self.path.join(DAEMON_EXECUTABLE_NAME)
+    }
+}
+
+/// Why a release directory outside the versions directory is trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseSource {
+    /// The directory the operator named with `--from`, or the one holding the
+    /// running CLI. The operator chose to run that release, and publishing
+    /// copies it through its own checks before the service manager runs from it.
+    Operator,
+    /// A sealed release archive that `pohunek setup` verified against its
+    /// manifest before anything from it runs.
+    SealedArchive,
+}
+
+/// Verifies an installed version directory before a binary of it is executed.
+///
+/// `dir` must be exactly `<prefix>/libexec/pohunek/<version>`. The versions
+/// directory, the version directory and every binary are opened without
+/// following links and must be what publishing creates, so a directory or
+/// binary that became group-writable, linked or retyped after publishing is
+/// refused.
+///
+/// # Errors
+///
+/// Returns [`Error::UntrustedVersion`] when `dir` is not an installed version
+/// directory or a directory or binary fails verification, and a filesystem
+/// error when the versions directory is unsafe.
+pub fn verify_installed(layout: &InstallLayout, dir: &Path) -> Result<VerifiedVersionDir, Error> {
+    let untrusted = |detail: &str| Error::UntrustedVersion {
+        path: dir.to_path_buf(),
+        detail: detail.to_owned(),
+    };
+    let version =
+        version_of(layout, dir).ok_or_else(|| untrusted("it is not a version directory"))?;
+    if layout.version_dir(&version).as_deref() != Some(dir) {
+        return Err(untrusted("it is not a version directory"));
+    }
+    let versions = open_existing_owner_dir(&layout.versions_dir())?
+        .ok_or_else(|| untrusted("the versions directory does not exist"))?;
+    let directory = open_version(&versions, &version)?;
+    for binary in BINARIES {
+        if open_binary(&directory, binary)?.is_none() {
+            return Err(Error::UntrustedVersion {
+                path: dir.join(binary),
+                detail: "it is missing".to_owned(),
+            });
+        }
+    }
+    Ok(VerifiedVersionDir {
+        path: dir.to_path_buf(),
+    })
+}
+
+/// Trusts a release directory outside the versions directory for the stated
+/// `source`.
+#[must_use]
+pub fn trust_release_source(dir: &Path, _source: ReleaseSource) -> VerifiedVersionDir {
+    VerifiedVersionDir {
+        path: dir.to_path_buf(),
+    }
+}
+
 /// Atomically installs the version directory's CLI as `<prefix>/bin/pohunek`.
 ///
 /// # Errors

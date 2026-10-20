@@ -232,6 +232,7 @@ async fn finish_check(
                     version: previous.to_owned(),
                     detail: "previous version has no valid installation directory".to_owned(),
                 })?;
+        let daemon_dir = layout::verify_installed(&layout, &daemon_dir)?;
         let job = engine::journal_job_path(context, record).await?;
         let warnings = engine::job_warnings(context, &job);
         let mut gated = rollback::gate(
@@ -280,7 +281,7 @@ async fn finish_check(
         let gated = preflight::gate_upgrade(
             preflight,
             context,
-            daemon_dir,
+            &layout::trust_release_source(daemon_dir, layout::ReleaseSource::Operator),
             version,
             &job.value,
             &job.variables,

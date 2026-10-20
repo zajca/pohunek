@@ -13,7 +13,7 @@
 
 // Rust guideline compliant 2026-10-09
 
-use pohunek_paths::{InstallLayout, DAEMON_EXECUTABLE_NAME, METADATA_STORE_NAME};
+use pohunek_paths::{InstallLayout, METADATA_STORE_NAME};
 use pohunek_platform::filesystem::{EntryKind, TrustedDir};
 use pohunek_platform::process::ProcessInspector;
 use pohunek_platform::supervisor::WorkerKey;
@@ -27,7 +27,7 @@ use super::backend::Backend;
 use super::context::Context;
 use super::engine::job_alive;
 use super::error::Error;
-use super::layout;
+use super::layout::{self, VerifiedVersionDir};
 use super::legacy_store;
 use super::legacy_store::LegacyReader;
 use super::preflight::{self, AdoptionPreflight, Gated};
@@ -58,7 +58,7 @@ pub(super) struct Inputs<'a> {
 /// workers without consent, or a previous daemon that cannot judge itself.
 pub(super) async fn gate(
     inputs: Inputs<'_>,
-    daemon_dir: &Path,
+    daemon_dir: &VerifiedVersionDir,
     previous: &str,
     reported_version: &str,
     search_path: &str,
@@ -66,8 +66,7 @@ pub(super) async fn gate(
     accept_runtime_loss: bool,
 ) -> Result<Gated, Error> {
     let judged = if let Some(reader) = LegacyReader::from_version(previous) {
-        let daemon = daemon_dir.join(DAEMON_EXECUTABLE_NAME);
-        preflight::probe_daemon(&daemon, reported_version)
+        preflight::probe_daemon(daemon_dir, reported_version)
             .await
             .map_err(|error| Error::RollbackPreflightFailed {
                 version: previous.to_owned(),

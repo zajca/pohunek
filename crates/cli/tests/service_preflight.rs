@@ -19,6 +19,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+use pohunek_cli::service::layout::{trust_release_source, ReleaseSource, VerifiedVersionDir};
 use pohunek_cli::service::ledger::Acceptance;
 use pohunek_cli::service::manager_env::{
     user_manager_environment, EnvironmentFailure, UserManager,
@@ -328,6 +329,11 @@ fn session_info() -> SessionInfo {
     }
 }
 
+/// A scripted release directory standing for the operator's release.
+fn trusted(dir: &Path) -> VerifiedVersionDir {
+    trust_release_source(dir, ReleaseSource::Operator)
+}
+
 #[tokio::test]
 async fn the_real_daemon_reports_a_clean_live_session_adoptable() {
     let host = Host::new();
@@ -337,7 +343,7 @@ async fn the_real_daemon_reports_a_clean_live_session_adoptable() {
     let gated = gate(
         &DaemonPreflight,
         &host.context,
-        &archive,
+        &trusted(&archive),
         VERSION,
         "/usr/bin:/bin",
         &std::collections::BTreeMap::new(),
@@ -374,7 +380,7 @@ async fn an_already_not_resumable_session_is_listed_without_requiring_the_flag()
     let gated = gate_upgrade(
         &DaemonPreflight,
         &host.context,
-        &daemon,
+        &trusted(&daemon),
         VERSION,
         "/usr/bin:/bin",
         &std::collections::BTreeMap::new(),
@@ -398,7 +404,7 @@ async fn the_real_daemon_names_a_session_it_would_not_adopt_and_the_flag_accepts
     let error = gate(
         &DaemonPreflight,
         &host.context,
-        &archive,
+        &trusted(&archive),
         VERSION,
         "/usr/bin:/bin",
         &std::collections::BTreeMap::new(),
@@ -417,7 +423,7 @@ async fn the_real_daemon_names_a_session_it_would_not_adopt_and_the_flag_accepts
     let gated = gate(
         &DaemonPreflight,
         &host.context,
-        &archive,
+        &trusted(&archive),
         VERSION,
         "/usr/bin:/bin",
         &std::collections::BTreeMap::new(),
@@ -458,7 +464,7 @@ async fn the_real_daemons_acceptance_scope_is_honoured_by_the_coverage_decision(
     let judged = gate(
         &DaemonPreflight,
         &host.context,
-        &archive,
+        &trusted(&archive),
         VERSION,
         "/usr/bin:/bin",
         &std::collections::BTreeMap::new(),
@@ -544,7 +550,7 @@ async fn a_preflight_that_fails_or_prints_garbage_fails_closed() {
         let error = gate(
             &DaemonPreflight,
             &host.context,
-            &archive,
+            &trusted(&archive),
             VERSION,
             "/usr/bin:/bin",
             &std::collections::BTreeMap::new(),
@@ -617,7 +623,7 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
     let error = gate_upgrade(
         &DaemonPreflight,
         &host.context,
-        &daemon,
+        &trusted(&daemon),
         VERSION,
         "/usr/bin:/bin",
         &std::collections::BTreeMap::new(),
@@ -645,7 +651,7 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
     let error = gate_upgrade(
         &DaemonPreflight,
         &host.context,
-        &daemon,
+        &trusted(&daemon),
         VERSION,
         "/usr/bin:/bin",
         &std::collections::BTreeMap::new(),
@@ -679,7 +685,7 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
     let gated = gate_upgrade(
         &DaemonPreflight,
         &host.context,
-        &daemon,
+        &trusted(&daemon),
         VERSION,
         "/usr/bin:/bin",
         &std::collections::BTreeMap::new(),
@@ -720,7 +726,7 @@ async fn a_profile_warning_reaches_the_gate_and_leaves_its_decision_unchanged() 
     let gated = gate_upgrade(
         &DaemonPreflight,
         &host.context,
-        &daemon,
+        &trusted(&daemon),
         VERSION,
         "/usr/bin:/bin",
         &std::collections::BTreeMap::new(),
@@ -736,7 +742,7 @@ async fn a_profile_warning_reaches_the_gate_and_leaves_its_decision_unchanged() 
     let clean_gate = gate_upgrade(
         &DaemonPreflight,
         &host.context,
-        &daemon,
+        &trusted(&daemon),
         VERSION,
         "/usr/bin:/bin",
         &std::collections::BTreeMap::new(),
@@ -774,7 +780,7 @@ async fn the_daemon_judges_with_the_path_its_job_carries() {
     let gated = gate(
         &DaemonPreflight,
         &host.context,
-        &wrapper,
+        &trusted(&wrapper),
         VERSION,
         &search_path,
         &std::collections::BTreeMap::new(),
@@ -787,7 +793,7 @@ async fn the_daemon_judges_with_the_path_its_job_carries() {
     let error = gate(
         &DaemonPreflight,
         &host.context,
-        &wrapper,
+        &trusted(&wrapper),
         VERSION,
         "/usr/bin:/bin",
         &std::collections::BTreeMap::new(),
@@ -846,7 +852,7 @@ async fn the_daemon_judges_with_the_user_managers_path_and_an_unreadable_one_fai
     let gated = gate(
         &DaemonPreflight,
         &host.context,
-        &wrapper,
+        &trusted(&wrapper),
         VERSION,
         &search_path,
         &std::collections::BTreeMap::new(),
@@ -961,7 +967,7 @@ async fn a_raised_probe_budget_reaches_only_this_releases_upgrade_judgement() {
     gate(
         &DaemonPreflight,
         &raised,
-        &previous,
+        &trusted(&previous),
         "0.0.1",
         "/usr/bin:/bin",
         &no_variables,
@@ -980,7 +986,7 @@ async fn a_raised_probe_budget_reaches_only_this_releases_upgrade_judgement() {
     gate_upgrade(
         &DaemonPreflight,
         &raised,
-        &current,
+        &trusted(&current),
         VERSION,
         "/usr/bin:/bin",
         &no_variables,
@@ -997,7 +1003,7 @@ async fn a_raised_probe_budget_reaches_only_this_releases_upgrade_judgement() {
     gate_upgrade(
         &DaemonPreflight,
         &host.context,
-        &current,
+        &trusted(&current),
         VERSION,
         "/usr/bin:/bin",
         &no_variables,
@@ -1036,7 +1042,7 @@ async fn the_manager_variables_reach_the_spawned_daemon_and_their_values_stay_ou
     let gated = gate(
         &DaemonPreflight,
         &host.context,
-        &recording,
+        &trusted(&recording),
         VERSION,
         "/usr/bin:/bin",
         &variables,
@@ -1057,7 +1063,7 @@ async fn the_manager_variables_reach_the_spawned_daemon_and_their_values_stay_ou
     let error = gate(
         &DaemonPreflight,
         &host.context,
-        &failing,
+        &trusted(&failing),
         VERSION,
         "/usr/bin:/bin",
         &variables,
@@ -1109,7 +1115,7 @@ async fn a_user_manager_path_reaches_the_spawned_daemon_byte_for_byte() {
     let gated = gate(
         &DaemonPreflight,
         &host.context,
-        &recording,
+        &trusted(&recording),
         VERSION,
         &search_path,
         &std::collections::BTreeMap::new(),
@@ -1164,7 +1170,7 @@ async fn the_release_plan_flag_reaches_the_daemon_only_for_the_upgrade_judgement
     let report = DaemonPreflight
         .judge(
             &host.context,
-            &with_plan.join("pohunekd"),
+            &trusted(&with_plan),
             "/usr/bin:/bin",
             &std::collections::BTreeMap::new(),
             None,
@@ -1177,7 +1183,7 @@ async fn the_release_plan_flag_reaches_the_daemon_only_for_the_upgrade_judgement
     gate(
         &DaemonPreflight,
         &host.context,
-        &without_plan,
+        &trusted(&without_plan),
         VERSION,
         "/usr/bin:/bin",
         &std::collections::BTreeMap::new(),
@@ -1189,7 +1195,7 @@ async fn the_release_plan_flag_reaches_the_daemon_only_for_the_upgrade_judgement
     let error = gate_upgrade(
         &DaemonPreflight,
         &host.context,
-        &without_plan,
+        &trusted(&without_plan),
         VERSION,
         "/usr/bin:/bin",
         &std::collections::BTreeMap::new(),
@@ -1214,7 +1220,7 @@ async fn a_missing_daemon_is_a_staged_binary_error() {
     let error = gate(
         &DaemonPreflight,
         &host.context,
-        &empty,
+        &trusted(&empty),
         VERSION,
         "/usr/bin:/bin",
         &std::collections::BTreeMap::new(),
@@ -1236,7 +1242,7 @@ async fn a_live_agent_session_that_reported_its_identity_is_adoptable_under_the_
     let gated = gate(
         &DaemonPreflight,
         &host.context,
-        &archive,
+        &trusted(&archive),
         VERSION,
         "/usr/bin:/bin",
         &std::collections::BTreeMap::new(),

@@ -329,7 +329,8 @@ state directory was deleted by hand), delete that record and rerun. A version
 directory that already exists is reused only when it and its binaries are
 owned by you, mode `0755`, free of symbolic links, and single-linked;
 otherwise the command fails with `service_version_untrusted` naming the
-offending entry. Make sure nothing runs from it, remove it, and rerun. The
+offending entry, and it does so again before a later command runs a binary from
+the installed directory. Make sure nothing runs from it, remove it, and rerun. The
 installer counts the daemon as ready only when `daemon.health`
 reports the new version on a connection whose kernel peer credentials name the
 daemon job's running main process, as the service manager reports it. A
