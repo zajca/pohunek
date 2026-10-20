@@ -279,25 +279,23 @@ fn discovery_uses_only_trusted_home_fallback_executables() {
     };
 
     run();
-    // Each discovery runs `netbird` once for the peers and once for this
-    // machine's own identity, so a marker holds its word once per run.
-    let ran_only = |marker: &std::path::Path, word: &str| {
-        let content = fs::read_to_string(marker).expect("the fallback ran");
-        !content.is_empty() && content.replace(word, "").is_empty()
-    };
-    assert!(ran_only(&local_marker, "local"));
+    assert_eq!(
+        fs::read_to_string(&local_marker).expect("first fallback ran"),
+        "local"
+    );
     assert!(!cargo_marker.exists());
-    let local_runs = fs::read_to_string(&local_marker).expect("first fallback marker");
 
     fs::set_permissions(&local, fs::Permissions::from_mode(0o777))
         .expect("make first fallback executable untrusted");
     run();
     assert_eq!(
         fs::read_to_string(&local_marker).expect("first fallback marker"),
-        local_runs,
-        "the untrusted first fallback never runs again"
+        "local"
     );
-    assert!(ran_only(&cargo_marker, "cargo"));
+    assert_eq!(
+        fs::read_to_string(&cargo_marker).expect("second fallback ran"),
+        "cargo"
+    );
 }
 
 #[test]
@@ -655,19 +653,21 @@ fn a_cache_of_the_previous_schema_is_discarded_not_read() {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn a_stuck_lookup_of_this_machine_does_not_starve_the_peer_probes() {
+fn this_machine_and_its_peers_come_from_one_netbird_run() {
     let env = TestEnv::new().expect("create the hermetic test environment");
     let bin = env.root().join("bin");
     fs::create_dir_all(&bin).expect("create bin");
-    let ran = env.root().join("netbird-ran");
-    // The first `netbird` run lists the peers; the later run, which looks up
-    // this machine's own identity, hangs.
+    let runs = env.root().join("netbird-runs");
+    // The first run answers with this machine and a peer; any later run would
+    // answer with a machine of another name and no peer.
+    let later =
+        serde_json::json!({"fqdn": "renamed.netbird.test", "netbirdIp": SELF_IP, "peers": []});
     pohunek_test_support::fs::write_executable(
         bin.join("netbird"),
         format!(
-            "#!/bin/sh\nif [ -e '{ran}' ]; then exec sleep 30; fi\n: > '{ran}'\ncat <<'EOF'\n{status}\nEOF\n",
-            ran = ran.display(),
-            status = status_with_self(Some(SELF_IP)),
+            "#!/bin/sh\nprintf x >> '{runs}'\nif [ \"$(wc -c < '{runs}')\" -gt 1 ]; then\ncat <<'EOF'\n{later}\nEOF\nexit 0\nfi\ncat <<'EOF'\n{first}\nEOF\n",
+            runs = runs.display(),
+            first = status_with_self(Some(SELF_IP)),
         ),
     )
     .expect("write fake netbird");
@@ -688,17 +688,16 @@ fn a_stuck_lookup_of_this_machine_does_not_starve_the_peer_probes() {
         "discovery failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(
+        fs::read_to_string(&runs).expect("netbird ran"),
+        "x",
+        "one netbird run serves the peers and this machine's own identity"
+    );
     let document: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("versioned JSON envelope");
     let records = document["ok"].as_array().expect("host records");
-    assert_eq!(
-        records.len(),
-        1,
-        "no local record without the lookup: {records:?}"
-    );
-    assert_eq!(records[0]["peer_id"], "remote-key");
-    assert_eq!(
-        records[0]["classification"], "reachable_daemon",
-        "the peer probe kept its whole deadline: {records:?}"
-    );
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0]["local"], true);
+    assert_eq!(records[0]["fqdn"], SELF_FQDN);
+    assert_eq!(records[1]["peer_id"], "remote-key");
 }

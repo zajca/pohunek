@@ -232,7 +232,7 @@ async fn discover_with_registry(
     let mut pending = stream::iter(registry.entries().iter().cloned().enumerate())
         .map(|(index, configured)| async move {
             let overlay = configured.id().clone();
-            let result = configured.discover_peers().await;
+            let result = configured.discover_snapshot().await;
             (index, overlay, result)
         })
         .buffer_unordered(registry.entries().len());
@@ -261,13 +261,15 @@ async fn discover_with_registry(
 
     results.sort_by_key(|(index, _, _)| *index);
     let mut snapshots = Vec::new();
+    let mut identities = Vec::new();
     let mut failures = Vec::new();
     let mut healthy_overlays = 0_usize;
     for (_, overlay, result) in results {
         match result {
-            Ok(peers) => {
+            Ok(snapshot) => {
                 healthy_overlays += 1;
-                snapshots.extend(peers);
+                snapshots.extend(snapshot.peers);
+                identities.extend(snapshot.local);
             }
             Err(error) => {
                 tracing::debug!(
@@ -287,17 +289,18 @@ async fn discover_with_registry(
         }
         return Err(crate::ClientError::OverlayDiscoveryFailed { failures });
     }
-    // Independent of each other: a stuck lookup of this machine's identity must
-    // not take time from the peer probes.
+    // Probed concurrently: the local daemon's probe must not take time from the
+    // peer probes.
     let (mut records, peers) = tokio::join!(
-        local_records(registry, options, origin.as_ref(), deadline),
+        local_records(registry, identities, options, origin.as_ref(), deadline),
         discover_peers(snapshots, options, origin.as_ref(), Some(deadline)),
     );
     records.extend(peers);
     Ok(records)
 }
 
-/// One record per overlay that reports this machine's own identity.
+/// One record per overlay that reported this machine's own identity in the same
+/// provider read as the peers.
 ///
 /// The record is probed like a peer, at the overlay address the daemon listens
 /// on. A failed probe is logged and reported as [`HostClass::Unreachable`],
@@ -305,13 +308,11 @@ async fn discover_with_registry(
 /// leaves a [`HostClass::Candidate`].
 async fn local_records(
     registry: &OverlayRegistry,
+    identities: Vec<overlay::LocalIdentity>,
     options: DiscoveryOptions,
     origin: Option<&RequestOrigin>,
     deadline: tokio::time::Instant,
 ) -> Vec<HostRecord> {
-    let identities = tokio::time::timeout_at(deadline, registry.local_identities())
-        .await
-        .unwrap_or_default();
     let records = identities.into_iter().filter_map(|identity| {
         let port = registry
             .entries()
