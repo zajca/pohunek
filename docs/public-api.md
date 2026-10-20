@@ -3971,8 +3971,9 @@ Public exports:
   outcome too, and the daemon completes the queued call after the client left.
   The daemon bounds its own wait for a worker's stop answer by the stop grace
   (four times, for the stop and the marker sweep), the kill reap deadline and
-  the worker's terminal-commit wait plus a margin; a worker silent past that ends the stop or removal with
-  `worker_operation_failed`. The Hermes integration passes an explicit
+  the worker's terminal-commit wait plus a margin, after waiting up to 10 minutes for an earlier exchange on the
+  worker's control connection; a worker silent past that ends the stop or
+  removal with `worker_operation_failed`. The Hermes integration passes an explicit
   `request_timeout_ms`, which keeps overriding these budgets.
   `with_request_timeout` explicitly overrides
   these budgets, including with a shorter deadline; assigning a nondefault value

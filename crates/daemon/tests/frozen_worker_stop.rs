@@ -46,6 +46,10 @@ const TERMINAL_COMMIT_WAIT: Duration = Duration::from_millis(300);
 /// Margin the daemon adds to the worker's stop bounds.
 const WORKER_STOP_HEADROOM: Duration = Duration::from_millis(300);
 
+/// How long a stop waits for an earlier exchange on the frozen worker's
+/// control connection (a periodic inspection already stuck on it).
+const EXCHANGE_WAIT: Duration = Duration::from_millis(500);
+
 /// Text the typed error carries.
 const NO_ANSWER: &str = "did not answer the stop";
 
@@ -70,6 +74,7 @@ impl Frozen {
             kill_reap_deadline: KILL_REAP_DEADLINE,
             terminal_commit_wait: TERMINAL_COMMIT_WAIT,
             worker_stop_headroom: WORKER_STOP_HEADROOM,
+            worker_exchange_wait: EXCHANGE_WAIT,
             ..SessionRegistryConfig::default()
         };
         let launcher = Arc::new(SubprocessWorkerLauncher::new());

@@ -64,6 +64,15 @@ pub enum WorkerError {
         "worker control stream was interrupted mid-request and cannot carry further exchanges"
     )]
     TornStream,
+    /// The worker did not answer a stop within the daemon's bound, so it is
+    /// frozen rather than slow.
+    #[error("worker did not answer the stop within {bound:?} {stage}")]
+    StopUnanswered {
+        /// Bound the daemon waited.
+        bound: Duration,
+        /// Which wait elapsed.
+        stage: &'static str,
+    },
     /// The worker runtime has not been initialized.
     #[error("worker has no live runtime generation")]
     NotInitialized,
@@ -697,6 +706,51 @@ impl Worker {
         .await?;
         match response {
             ResponseKind::TerminalAcknowledged => Ok(()),
+            other => response_error(other),
+        }
+    }
+
+    /// Stops like [`Self::stop`], giving up on a worker that does not answer.
+    ///
+    /// An earlier exchange on the control connection gets `lock_wait` to
+    /// finish, so a legitimately long one (a delayed input write) is not
+    /// mistaken for a frozen worker; once this caller holds the connection,
+    /// the worker gets `bound` to answer. The abandoned exchange is drained by
+    /// the next caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::StopUnanswered`] when either wait elapses, and
+    /// otherwise the errors of [`Self::stop`].
+    pub async fn stop_within(
+        &self,
+        transaction_id: TransactionId,
+        lock_wait: Duration,
+        bound: Duration,
+    ) -> Result<Option<ExitStatus>, WorkerError> {
+        let mut inner = tokio::time::timeout(lock_wait, self.inner.lock())
+            .await
+            .map_err(|_elapsed| WorkerError::StopUnanswered {
+                bound: lock_wait,
+                stage: "because an earlier exchange kept the control connection busy",
+            })?;
+        let scope = scope(&inner)?;
+        let exchange = request_locked(
+            &mut inner,
+            self.next_request_id("stop")?,
+            RequestKind::Stop {
+                scope,
+                stop: StopRequest { transaction_id },
+            },
+        );
+        let response = tokio::time::timeout(bound, exchange)
+            .await
+            .map_err(|_elapsed| WorkerError::StopUnanswered {
+                bound,
+                stage: "after the request was sent",
+            })??;
+        match response {
+            ResponseKind::Stopped { exit } => Ok(exit),
             other => response_error(other),
         }
     }

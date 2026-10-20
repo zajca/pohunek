@@ -365,6 +365,10 @@ pub struct SessionRegistryConfig {
     /// Margin added to the worker's own stop bounds before the daemon gives up
     /// on a worker that has not answered a stop.
     pub worker_stop_headroom: Duration,
+    /// How long a stop waits for an earlier exchange on the worker's control
+    /// connection to finish. Every such exchange is bounded by the worker's
+    /// own limits, the longest being [`pohunek_service_config::MAX_DEADLINE`].
+    pub worker_exchange_wait: Duration,
     /// How long a one-shot attach token may remain pending before redemption.
     pub attach_token_ttl: Duration,
     /// How long a failed attach outcome remains available to `session.detach`.
@@ -559,6 +563,7 @@ impl Default for SessionRegistryConfig {
             kill_reap_deadline: pohunek_service_config::DEFAULT_KILL_REAP_DEADLINE,
             terminal_commit_wait: pohunek_service_config::DEFAULT_TERMINAL_COMMIT_WAIT,
             worker_stop_headroom: pohunek_service_config::DEFAULT_WORKER_STOP_HEADROOM,
+            worker_exchange_wait: pohunek_service_config::MAX_DEADLINE,
             attach_token_ttl: DEFAULT_ATTACH_TOKEN_TTL,
             attach_result_ttl: DEFAULT_ATTACH_RESULT_TTL,
             attach_result_capacity: DEFAULT_ATTACH_RESULT_CAPACITY,
@@ -4657,9 +4662,12 @@ impl SessionRegistry {
                     pohunek_worker_protocol::TransactionId::new(transaction_id.clone())
                         .map_err(|error| runtime_error("worker_stop_invalid", error.to_string()))?;
                 let bound = self.inner.config.worker_stop_bound();
-                let status = match tokio::time::timeout(bound, worker.stop(transaction)).await {
-                    Ok(Ok(Some(status))) => status,
-                    Ok(Ok(None)) => {
+                let status = match worker
+                    .stop_within(transaction, self.inner.config.worker_exchange_wait, bound)
+                    .await
+                {
+                    Ok(Some(status)) => status,
+                    Ok(None) => {
                         self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
                             .await;
                         return Err(runtime_error(
@@ -4667,26 +4675,10 @@ impl SessionRegistry {
                             format!("worker for {} did not return a terminal outcome", id.0),
                         ));
                     }
-                    Ok(Err(error)) => {
+                    Err(error) => {
                         self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
                             .await;
                         return Err(worker_error_to_protocol(error));
-                    }
-                    Err(_elapsed) => {
-                        self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
-                            .await;
-                        return Err(ProtocolError::new(
-                            ErrorClass::Runtime,
-                            "worker_operation_failed",
-                            format!(
-                                "worker for {} did not answer the stop within {bound:?}",
-                                id.0
-                            ),
-                            Some(
-                                "the worker is not responding: inspect the session and retry the stop once the worker answers"
-                                    .to_owned(),
-                            ),
-                        ));
                     }
                 };
                 ObservedExit::from_status(&status)
@@ -7533,6 +7525,15 @@ fn worker_error_to_protocol(err: WorkerError) -> ProtocolError {
             message,
             Some(
                 "the session's working directory no longer exists; nothing was started".to_owned(),
+            ),
+        ),
+        unanswered @ WorkerError::StopUnanswered { .. } => ProtocolError::new(
+            ErrorClass::Runtime,
+            "worker_operation_failed",
+            unanswered.to_string(),
+            Some(
+                "the worker is not responding: inspect the session and retry the stop once the worker answers"
+                    .to_owned(),
             ),
         ),
         other => runtime_error("worker_operation_failed", other.to_string()),

@@ -1939,8 +1939,8 @@ mod tests {
     /// maximum of one lifecycle step and from the sweep's pass limit; the
     /// budgets follow when either daemon bound changes. Worker connection and
     /// initialization are validated up to the same maximum, and the daemon's
-    /// bound on a worker's stop answer fits the single step the budgets give a
-    /// worker stop.
+    /// waits on a worker's stop fit the two steps the budgets can give a worker
+    /// stop.
     #[test]
     fn the_sdk_lifecycle_budgets_follow_the_daemon_bounds() {
         assert_eq!(
@@ -1962,8 +1962,10 @@ mod tests {
                 .as_millis()
         );
         assert!(
-            crate::session::SessionRegistryConfig::default().worker_stop_bound()
-                <= pohunek_service_config::MAX_DEADLINE
+            {
+                let config = crate::session::SessionRegistryConfig::default();
+                config.worker_exchange_wait + config.worker_stop_bound()
+            } <= 2 * pohunek_service_config::MAX_DEADLINE
         );
     }
 
