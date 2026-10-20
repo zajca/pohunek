@@ -2180,8 +2180,8 @@ fn host_commands_treat_the_machines_own_overlay_name_as_local() {
         "{table}"
     );
 
-    // With a stuck overlay CLI, the cached records still print without this
-    // machine's row once the lookup's deadline passes.
+    // With a stuck overlay CLI, the cached records, this machine's included,
+    // print without waiting for it.
     netbird.stall();
     let started = std::time::Instant::now();
     let listed = run(&["host", "list"]);
@@ -2198,7 +2198,7 @@ fn host_commands_treat_the_machines_own_overlay_name_as_local() {
     assert!(
         table
             .lines()
-            .all(|row| row.split_whitespace().nth(1) != Some("local")),
+            .any(|row| row.split_whitespace().take(3).eq(["fixture-self", "local", "local"])),
         "{table}"
     );
     assert!(
