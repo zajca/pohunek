@@ -20,6 +20,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -46,8 +47,9 @@ mod hold;
 #[cfg(unix)]
 #[doc(inline)]
 pub use sweep::{
-    survey_runtime, sweep_runtime, SkipReason, Skipped, SweepError, SweepReport, SweepRequest,
-    SweepSurvey, MAX_SWEEP_GRACE, MAX_WORKER_INSTANCE_ID_BYTES,
+    survey_runtime, survey_runtime_shared, sweep_runtime, sweep_runtime_shared, SkipReason,
+    Skipped, SweepError, SweepReport, SweepRequest, SweepSurvey, MAX_SWEEP_GRACE,
+    MAX_WORKER_INSTANCE_ID_BYTES,
 };
 
 #[cfg(target_os = "macos")]
@@ -579,6 +581,19 @@ pub trait ProcessInspector: Debug + Send + Sync + 'static {
         Err(Error::Unavailable {
             operation: "inspect_process_coalitions",
         })
+    }
+
+    /// Returns how long the exact process has been running, or `None` when the
+    /// host cannot tell or `identity` no longer names a live process.
+    ///
+    /// The default reports `None`, so a host whose start identities are not a
+    /// readable clock needs no implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed failures when the process record cannot be inspected.
+    fn process_age(&self, _identity: ProcessIdentity) -> Result<Option<Duration>, Error> {
+        Ok(None)
     }
 
     /// Returns the current parent PID without reading unrelated process facts.

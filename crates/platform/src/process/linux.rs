@@ -8,6 +8,7 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_io::Async;
 use rustix::process::{pidfd_open, Pid as NativePid, PidfdFlags};
@@ -112,6 +113,20 @@ impl ProcessInspector for LinuxInspector {
         let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
         process_is_running_at(Path::new(PROC_ROOT), identity, euid)
             .map_err(|source| process_error("inspect_process_liveness", source))
+    }
+
+    fn process_age(&self, identity: ProcessIdentity) -> Result<Option<Duration>, Error> {
+        let euid = current_euid().map_err(|source| Error::from_io("read_effective_uid", source))?;
+        let running = process_is_running_at(Path::new(PROC_ROOT), identity, euid)
+            .map_err(|source| process_error("inspect_process_age", source))?;
+        if !running {
+            return Ok(None);
+        }
+        Ok(Some(age_from_ticks(
+            identity.start_identity.get(),
+            boot_ticks_now(),
+            rustix::param::clock_ticks_per_second(),
+        )))
     }
 
     fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, Error> {
@@ -768,6 +783,28 @@ fn read_cmdline(pid: Pid) -> io::Result<Vec<String>> {
         .collect())
 }
 
+/// Clock ticks elapsed on the boot clock, the clock `/proc/<pid>/stat` start
+/// times count in.
+fn boot_ticks_now() -> u64 {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+    let seconds = u64::try_from(now.tv_sec).unwrap_or(0);
+    let nanoseconds = u64::try_from(now.tv_nsec).unwrap_or(0);
+    let ticks_per_second = rustix::param::clock_ticks_per_second();
+    seconds
+        .saturating_mul(ticks_per_second)
+        .saturating_add(nanoseconds.saturating_mul(ticks_per_second) / 1_000_000_000)
+}
+
+/// Age of a process that started at `start_ticks` when the boot clock reads
+/// `now_ticks`, at `ticks_per_second` ticks a second.
+fn age_from_ticks(start_ticks: u64, now_ticks: u64, ticks_per_second: u64) -> Duration {
+    let elapsed = now_ticks.saturating_sub(start_ticks);
+    Duration::from_secs(elapsed / ticks_per_second.max(1))
+        + Duration::from_nanos(
+            (elapsed % ticks_per_second.max(1)) * 1_000_000_000 / ticks_per_second.max(1),
+        )
+}
+
 fn current_euid() -> io::Result<u32> {
     Ok(fs::metadata(proc_path(std::process::id()))?.uid())
 }
@@ -835,6 +872,37 @@ fn facility_error(operation: &'static str, source: io::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_process_age_counts_boot_clock_ticks_since_its_start() {
+        assert_eq!(age_from_ticks(100, 100, 100), Duration::ZERO);
+        assert_eq!(
+            age_from_ticks(100, 1_050, 100),
+            Duration::from_millis(9_500)
+        );
+        assert_eq!(age_from_ticks(500, 100, 100), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_age_of_the_running_test_process_is_known_and_a_substituted_identity_has_none() {
+        let inspector = LinuxInspector;
+        let me = inspector
+            .identity(std::process::id())
+            .expect("identity read")
+            .expect("the test process exists");
+
+        let age = inspector.process_age(me).expect("age read");
+
+        assert!(
+            age.is_some_and(|age| age < Duration::from_secs(24 * 3_600)),
+            "{age:?}"
+        );
+        let substituted = ProcessIdentity {
+            start_identity: StartIdentity::new(me.start_identity.get() + 1),
+            ..me
+        };
+        assert_eq!(inspector.process_age(substituted).expect("age read"), None);
+    }
 
     #[test]
     fn stat_fields_are_counted_after_the_command_name() {
@@ -1370,7 +1438,6 @@ POHUNEK_WORKER_INSTANCE_IDX=r-2\0HOME=/home/u\0";
     /// mock a marker answer or an error.
     mod exec_window {
         use std::sync::Mutex;
-        use std::time::Duration;
 
         use super::*;
 
