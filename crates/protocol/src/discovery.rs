@@ -99,7 +99,7 @@ pub struct HostDiscoverParams {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "HostResolveParams.ts"))]
 pub struct HostResolveParams {
-    /// The host route as `--host` accepts it: a short name, an FQDN, a NetBird
+    /// The host route as `--host` accepts it: a short name, an FQDN, a `NetBird`
     /// IP, an identity selector (`peer~<id>`, `fqdn~<name>`), an
     /// `<overlay>:`-qualified form, each optionally followed by `@<port>`.
     pub route: String,

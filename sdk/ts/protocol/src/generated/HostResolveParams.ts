@@ -5,7 +5,7 @@
  */
 export type HostResolveParams = {
   /**
-   * The host route as `--host` accepts it: a short name, an FQDN, a NetBird
+   * The host route as `--host` accepts it: a short name, an FQDN, a `NetBird`
    * IP, an identity selector (`peer~<id>`, `fqdn~<name>`), an
    * `<overlay>:`-qualified form, each optionally followed by `@<port>`.
    */

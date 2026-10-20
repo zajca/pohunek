@@ -246,16 +246,16 @@ where
     serde_json::from_str(&line).expect("a response")
 }
 
-fn resolution(response: Response) -> HostResolution {
+fn resolution(response: &Response) -> HostResolution {
     serde_json::from_value(ok(response)).expect("a host resolution")
 }
 
-fn ok(response: Response) -> Value {
-    serde_json::to_value(&response).expect("response serializes")["ok"].clone()
+fn ok(response: &Response) -> Value {
+    serde_json::to_value(response).expect("response serializes")["ok"].clone()
 }
 
-fn error_code(response: Response) -> String {
-    let value = serde_json::to_value(&response).expect("response serializes");
+fn error_code(response: &Response) -> String {
+    let value = serde_json::to_value(response).expect("response serializes");
     value["err"]["code"]
         .as_str()
         .unwrap_or_else(|| panic!("an error response: {value}"))
@@ -275,13 +275,16 @@ async fn a_peer_name_resolves_to_its_endpoint_and_a_pinned_identity_route() {
         peer_id: Some(PEER_KEY.to_owned()),
         fqdn: Some(PEER_FQDN.to_owned()),
     };
-    assert_eq!(resolution(exchange(&mut client, PEER_NAME).await), expected);
+    assert_eq!(
+        resolution(&exchange(&mut client, PEER_NAME).await),
+        expected
+    );
 
     // The pinned route names the same peer, with an explicit port kept.
     let pinned = format!("{OVERLAY}:peer~{PEER_KEY_SELECTOR}@19000");
     let HostResolution::Remote {
         port, pinned_route, ..
-    } = resolution(exchange(&mut client, &pinned).await)
+    } = resolution(&exchange(&mut client, &pinned).await)
     else {
         panic!("a pinned route names a peer");
     };
@@ -298,7 +301,7 @@ async fn local_names_resolve_to_this_machine() {
 
     for route in ["local", "", SELF_FQDN] {
         assert_eq!(
-            resolution(exchange(&mut client, route).await),
+            resolution(&exchange(&mut client, route).await),
             HostResolution::Local,
             "route {route:?}"
         );
@@ -313,21 +316,21 @@ async fn unresolvable_routes_fail_with_the_typed_registry_errors() {
     let mut client = unix_client(&daemon.socket).await;
 
     assert_eq!(
-        error_code(exchange(&mut client, "nobody").await),
+        error_code(&exchange(&mut client, "nobody").await),
         "host_unknown"
     );
     assert_eq!(
-        error_code(exchange(&mut client, TWIN_NAME).await),
+        error_code(&exchange(&mut client, TWIN_NAME).await),
         "overlay_host_ambiguous"
     );
     // A peer without a peer id or an FQDN cannot be pinned.
     assert_eq!(
-        error_code(exchange(&mut client, BARE_NAME).await),
+        error_code(&exchange(&mut client, BARE_NAME).await),
         "host_identity_unpinnable"
     );
     // An explicit port always names a peer, so this machine is not found.
     assert_eq!(
-        error_code(exchange(&mut client, &format!("{SELF_FQDN}@19000")).await),
+        error_code(&exchange(&mut client, &format!("{SELF_FQDN}@19000")).await),
         "host_unknown"
     );
 
@@ -341,7 +344,7 @@ async fn the_overlay_listener_does_not_serve_the_method() {
     let mut client = Framed::new(stream, LinesCodec::new());
 
     assert_eq!(
-        error_code(exchange(&mut client, PEER_NAME).await),
+        error_code(&exchange(&mut client, PEER_NAME).await),
         "method_not_found"
     );
 
