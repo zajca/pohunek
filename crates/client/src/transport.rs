@@ -1765,11 +1765,51 @@ pub async fn resolve_host_target_in(
     connect_timeout: Duration,
     registry: &OverlayRegistry,
 ) -> Result<ResolvedHost, ClientError> {
+    Ok(
+        match resolve_host_peer_in(host, connect_timeout, registry).await? {
+            None => ResolvedHost::Local,
+            Some(peer) => ResolvedHost::Remote {
+                pinned_route: peer.pinned_route,
+                display: host.to_owned(),
+            },
+        },
+    )
+}
+
+/// The peer a host name selected, with the endpoint it is dialed at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPeer {
+    /// The identity route of the peer; see [`ResolvedHost::Remote`].
+    pub pinned_route: String,
+    /// The address and effective daemon port the peer is dialed at.
+    pub address: SocketAddr,
+    /// The overlay that reported the peer.
+    pub overlay: String,
+    /// The provider's stable peer identity, when it reports one.
+    pub peer_id: Option<String>,
+    /// The peer's provider-qualified DNS name, when it reports one.
+    pub fqdn: Option<String>,
+}
+
+/// Resolve `host` once; `None` names this machine.
+///
+/// The selection rules are those of [`resolve_host_target`]: `local`, the empty
+/// name and this machine's own overlay name select the local daemon, and a
+/// remote name is pinned to the identity it selects now.
+///
+/// # Errors
+///
+/// Same as [`resolve_host_target`].
+pub async fn resolve_host_peer_in(
+    host: &str,
+    connect_timeout: Duration,
+    registry: &OverlayRegistry,
+) -> Result<Option<ResolvedPeer>, ClientError> {
     if is_local_host(host) {
-        return Ok(ResolvedHost::Local);
+        return Ok(None);
     }
     match select_host(host, connect_timeout, registry).await? {
-        Selected::Local => Ok(ResolvedHost::Local),
+        Selected::Local => Ok(None),
         Selected::Route { route, port } => {
             let host_id = pinned_host_id(
                 route.overlay.as_str(),
@@ -1780,10 +1820,13 @@ pub async fn resolve_host_target_in(
                 host: host.to_owned(),
             })?;
             let port = port.map_or(route.addr.port(), NonZeroU16::get);
-            Ok(ResolvedHost::Remote {
+            Ok(Some(ResolvedPeer {
                 pinned_route: remote_host_with_port(&host_id, port)?,
-                display: host.to_owned(),
-            })
+                address: SocketAddr::new(route.addr.ip(), port),
+                overlay: route.overlay.as_str().to_owned(),
+                peer_id: route.peer_id,
+                fqdn: route.fqdn,
+            }))
         }
     }
 }

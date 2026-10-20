@@ -229,6 +229,41 @@ try {
 without writing the attach prelude. `attachRawLocal`, `attachRawTcp`, and
 `attachRawWs` write exactly one prelude and return a `RawStream`.
 
+## Remote Hosts
+
+`resolveHost` maps a host route, as `pohunek --host` accepts it, to this machine
+or to one overlay peer by asking the local daemon. `connectHost` and `attachRaw`
+use it to reach a remote host:
+
+```ts
+import { connectHost, resolveHost } from "@pohunek/sdk";
+
+const socketPath = process.env["POHUNEK_SOCKET"];
+if (socketPath === undefined) {
+  throw new Error("set POHUNEK_SOCKET to the pohunek daemon socket path");
+}
+
+const resolved = await resolveHost("build-box", socketPath);
+if (resolved.target === "remote") {
+  // Later lookups of `pinnedRoute` keep selecting this peer even if the name
+  // `build-box` is reassigned.
+  console.log(resolved.address, resolved.pinnedRoute);
+}
+
+const client = await connectHost("build-box", socketPath);
+try {
+  console.log(await client.call("session.list", null));
+} finally {
+  await client.close();
+}
+```
+
+The daemon applies the CLI's selector rules, including this machine's own
+overlay name (`local`) and the typed `host_unknown` and `overlay_host_ambiguous`
+errors. `host.resolve` exists from protocol 4 and is served on the local socket
+only; against a daemon of the previous release the calls fail with
+`daemon_protocol_too_old`.
+
 ## WebSocket Relay
 
 Browsers use the relay transport because they cannot dial daemon sockets or

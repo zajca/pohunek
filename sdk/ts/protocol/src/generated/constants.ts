@@ -20,6 +20,7 @@ export const PREVIOUS_VERSION_INTRODUCED_METHODS = [
   "package.uninstall",
   "package.bind_profile",
   "session.wait_turn",
+  "host.resolve",
 ] as const;
 /** Keys the previous protocol version spelled differently, as [previous, current]. */
 /** Methods whose handler forwards the asking client's range to other hosts; a client keeps advertising its whole window on them. */

@@ -54,7 +54,7 @@ pub use decimal::{
     ReportSequence, RuntimeGeneration, SubagentRevision, TerminalWatermark,
 };
 #[doc(inline)]
-pub use discovery::{HostClass, HostDiscoverParams, HostRecord};
+pub use discovery::{HostClass, HostDiscoverParams, HostRecord, HostResolution, HostResolveParams};
 #[doc(inline)]
 pub use doctor::{DaemonDoctorResult, DaemonHealthResult, DoctorCheck, DoctorReport, DoctorStatus};
 #[doc(inline)]

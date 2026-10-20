@@ -93,3 +93,49 @@ pub struct HostDiscoverParams {
     #[serde(default)]
     pub force: bool,
 }
+
+/// Parameters for `host.resolve`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "HostResolveParams.ts"))]
+pub struct HostResolveParams {
+    /// The host route as `--host` accepts it: a short name, an FQDN, a NetBird
+    /// IP, an identity selector (`peer~<id>`, `fqdn~<name>`), an
+    /// `<overlay>:`-qualified form, each optionally followed by `@<port>`.
+    pub route: String,
+}
+
+/// What `host.resolve` selected.
+///
+/// Serializes with an internal `target` tag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "HostResolution.ts"))]
+#[serde(rename_all = "snake_case", tag = "target")]
+pub enum HostResolution {
+    /// The route names the machine that answered: `local`, the empty route or
+    /// its own overlay name.
+    Local,
+    /// The route names one peer of an overlay.
+    Remote {
+        /// The dialable IP address of the peer, without a port.
+        address: String,
+        /// The effective daemon port: the route's explicit port or the
+        /// overlay's.
+        port: u16,
+        /// `<overlay>:peer~<id>@<port>` (or `<overlay>:fqdn~<name>@<port>` when
+        /// the provider reports no peer id). Resolving it selects the same peer
+        /// even after a name or address changes.
+        pinned_route: String,
+        /// The overlay that reported the peer.
+        overlay: String,
+        /// The provider's stable peer identity, when it reports one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        peer_id: Option<String>,
+        /// The peer's provider-qualified DNS name, when it reports one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        fqdn: Option<String>,
+    },
+}

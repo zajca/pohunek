@@ -10,8 +10,8 @@ use serde::Serialize;
 
 use crate::{
     AssistantMaterializeParams, AssistantMaterializeResult, DaemonDoctorResult, DaemonHealthResult,
-    HostCapabilities, HostDiscoverParams, HostGovernanceStatus, HostRecord,
-    IntegrationDoctorParams, IntegrationDoctorResult, IntegrationInstallParams,
+    HostCapabilities, HostDiscoverParams, HostGovernanceStatus, HostRecord, HostResolution,
+    HostResolveParams, IntegrationDoctorParams, IntegrationDoctorResult, IntegrationInstallParams,
     IntegrationInstallResult, IntegrationStatusParams, IntegrationStatusResult,
     IntegrationUninstallParams, IntegrationUninstallResult, NotificationCreateParams,
     NotificationCreateResult, NotificationDeleteParams, NotificationDeleteResult,
@@ -484,6 +484,15 @@ method_table!(
     Vec<HostRecord>,
     "HostDiscoverParams",
     "HostRecord[]";
+
+    /// Resolve a host route to this machine or to one pinned overlay peer.
+    HostResolve,
+    HOST_RESOLVE,
+    "host.resolve",
+    HostResolveParams,
+    HostResolution,
+    "HostResolveParams",
+    "HostResolution";
 
     /// Create a durable notification record.
     NotificationCreate,

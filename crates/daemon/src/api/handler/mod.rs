@@ -447,6 +447,9 @@ async fn handle_negotiated(
             governance::handle_host_governance_inspect(request, &state.governance).await
         }
         method::HOST_DISCOVER => host::handle_host_discover(request, &state.discovery).await,
+        method::HOST_RESOLVE => {
+            host::handle_host_resolve(request, &state.discovery, state.transport).await
+        }
         method::NOTIFICATION_CREATE => {
             notification::handle_notification_create(
                 request,

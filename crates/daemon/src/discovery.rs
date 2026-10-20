@@ -6,13 +6,17 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use pohunek_client::{
-    discover_hosts_with_options, DiscoveryOptions, OverlayRegistry, DISCOVERY_CACHE_TTL,
+    discover_hosts_with_options, resolve_host_peer_in, DiscoveryOptions, OverlayRegistry,
+    DISCOVERY_CACHE_TTL,
 };
-use protocol::{HostRecord, ProtocolVersionRange, SUPPORTED_PROTOCOL_VERSIONS};
+use protocol::{HostRecord, HostResolution, ProtocolVersionRange, SUPPORTED_PROTOCOL_VERSIONS};
 use tokio::sync::Mutex;
+
+/// Bound on one `host.resolve` lookup through the configured overlays.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A short-lived, process-local cache of discovery records.
 #[derive(Clone, Debug)]
@@ -82,6 +86,36 @@ impl DiscoveryCache {
             },
         );
         Ok(records)
+    }
+
+    /// Resolve `route` against the configured overlays.
+    ///
+    /// Selection and pinning are the rules every other client uses
+    /// ([`resolve_host_peer_in`]); the answer is not cached, so it reflects the
+    /// overlay state of this moment.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed registry errors (`host_unknown`,
+    /// `overlay_host_ambiguous`, `overlay_host_unavailable`) and
+    /// `host_identity_unpinnable`.
+    pub async fn resolve(
+        &self,
+        route: &str,
+    ) -> Result<HostResolution, pohunek_client::ClientError> {
+        Ok(
+            match resolve_host_peer_in(route, RESOLVE_TIMEOUT, &self.registry).await? {
+                None => HostResolution::Local,
+                Some(peer) => HostResolution::Remote {
+                    address: peer.address.ip().to_string(),
+                    port: peer.address.port(),
+                    pinned_route: peer.pinned_route,
+                    overlay: peer.overlay,
+                    peer_id: peer.peer_id,
+                    fqdn: peer.fqdn,
+                },
+            },
+        )
     }
 }
 

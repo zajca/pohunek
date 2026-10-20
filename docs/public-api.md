@@ -472,6 +472,7 @@ All params and result type names below refer to structs exported by
 | `daemon.doctor` | `null` | `DaemonDoctorResult` | Runs daemon-local checks. Non-null params are `daemon/bad_request`. Each check is `{name, status, detail}`: `name` is the stable code and `detail` carries the remediation. Both platforms report `worker_executable` for the active supervision's worker, including a bounded capability probe of its readable journal schema and overlapping private protocol range; an older worker without capability reporting is `warn` (unverified), while a missing, unsafe, malformed or incompatible required worker is `fail`. Linux also reports `bin:git`, `bin:codex`, `bin:claude`, the socket, state and log directory writability checks, `netbird_cli` and `schema_version`; macOS adds `runtime_dir_private`, `socket_path_length`, `filesystem_access`, `login_shell`, `launchd_domain`, `desktop_notifications` and `keychain`. It also reports configured profile checks as `agent_profile_<name>`, optional provider checks as `agent_runtime_codex`, `agent_runtime_claude` and `agent_runtime_hermes`, embedded manifest checks as `agent_manifest_embedded_<runtime>` for the runtime compiled in (`agent_manifest_embedded_shell`; Codex, Claude Code and Hermes ship only as packages, so no embedded Codex, Claude or Hermes manifest is checked), and host override checks as `agent_manifest_override_<name>`. Configured profiles fail when they cannot resolve securely, their package runtime is unavailable, their executable is missing, or the provider's existing pinned version rule rejects it. An absent unconfigured optional provider warns. Embedded manifests are parsed from the daemon's canonical sources; host overrides use the same bounded, contained loader and precedence as launch. An invalid referenced override fails, an invalid unreferenced override warns, and an empty override is valid and disables detection. Details are fixed and redacted. The daemon also reports Codex and Claude hook readiness as `agent_integration_<provider>` for runtime homes and `agent_integration_<provider>_profile_<name>` for configured profile homes. Current hooks are `ok`; missing or outdated hooks and an active install lock are `warn`; malformed or unsafe provider state is `fail`. A local request checks each distinct launch home using the same integration inspector as `integration.doctor`; a remote request checks runtime homes only, preserving the local-only boundary for profile-derived homes. Configured Hermes profiles receive `agent_integration_hermes_profile_<name>` with `warn` and an explicit unverified detail because their hook lifecycle is CLI-managed and the daemon has no config-home inspection policy. No home path, profile environment value, provider config text or parser output is returned. `catalog_trust_anchor` is `ok` when the release's catalog trust anchor is loaded, `warn` when the installation ships none, and `fail` when it cannot be trusted. Hook interpreter readiness (`python3`) is reported by `integration.doctor`, not here. `overall` is `fail` only for required failures. A check status a newer daemon defines reads as `unknown` on the Rust client and the CLI, ranks like `warn` when checks are merged (never `ok`), and keeps the daemon's other checks visible. |
 | `host.inspect` | `null` | `HostCapabilities` | Live capability snapshot for the daemon's host. |
 | `host.discover` | `HostDiscoverParams` or `null` | `Vec<HostRecord>` | Enumerates peers from configured overlay transports and classifies daemon reachability. |
+| `host.resolve` | `HostResolveParams` (`{route}`) | `HostResolution` | Resolves a host route as `--host` accepts it against this daemon's own overlay view: `{target: "local"}` for `local`, the empty route and this machine's own overlay name, or `{target: "remote", address, port, pinned_route, overlay, peer_id?, fqdn?}` for one peer. `pinned_route` (`<overlay>:peer~<id>@<port>`, or `fqdn~` without a peer id) selects the same peer after a name or address change. Same rules and typed errors as `Client::connect` (`host_unknown`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `host_identity_unpinnable`). Served on the local Unix socket only: over the overlay and on a protocol 3 connection it answers `method_not_found`, and a client of this build refuses it against a protocol 3 daemon with `daemon/daemon_protocol_too_old`. |
 | `host.governance.inspect` | `null` | `HostGovernanceStatus` | Owner-safe, read-only snapshot of the daemon's stable host identity and local governance state. Explicit `null` and omitted params both succeed; every non-null JSON value returns `daemon/bad_request`. The method never changes enrollment, ownership, or sessions. On unavailable governance it returns the fixed redacted `daemon/host_governance_unavailable` error; reload or restart the daemon, then retry. |
 | `session.new` | `SessionNewParams` | `SessionNewResult` | Starts an agent PTY session. With initial `input`, a write the agent does not read for the configured stall bound (`[input] write_stall_timeout_ms`, 3000 ms by default) fails with `session_input_stalled`; part of the input may already have been written, and `session.new` then rolls the session back: the create fails with that error and the session is removed, not left running. Before session, worker, or worktree creation, the program a bare or profile-based launch names must resolve to an executable on the daemon's `PATH`, or the call fails with `agent_binary_missing`; this refusal's message and recover hint name only the program's file name. A bare host-shell session is the exception: it launches the configured shell command, which its launch resolves and reports with the same code. A runtime that declares a version probe (runtime packages that declare one) then requires the isolated, bounded probe to accept that executable; a rejected release, unparseable output, a failing or timed-out probe, or a parser this daemon does not compile in returns `agent_runtime_unsupported`, also before session, worker, or worktree creation; its message names the parsed release and the supported range, or that the output did not parse, and never carries probe output (see "Version probe"). While startup found legacy resume bindings with no logical record and no migration manifest (listed in `session.runtime_inventory` as `orphaned`, `migration_manifest_missing`), it fails with `migration_manifest_missing` before anything is written, because a first logical record would make a later manifest unimportable; run `pohunek migration preflight` against the legacy daemon, and the next daemon start that imports the manifest lifts the refusal. A session whose worker socket could never be bound (the published `control.sock` path or the longer staged bind path beside it exceeds the platform `sun_path` limit) fails with configuration-class `worker_socket_path_invalid`, naming the path and the limit, before anything is written or launched; `session.fork` applies the same check. A worker job that ends before accepting connections fails the call with `worker_exited_before_ready` as soon as the service manager shows the job ended, carrying the worker's exit status where the supervisor retains it, instead of waiting for the worker connect deadline (`worker_connect_failed`). A launch whose working directory is no longer a directory (a worktree removed after it was bound) is refused by the worker before the agent spawns, and the call fails with runtime-class `session_cwd_missing`; the create is compensated as below, so no agent runs outside its working directory. A create that fails after binding a worktree is compensated once its runtime is proven ended (checkout and binding, then the durable record); a compensation that cannot finish (for example a checkout locked with `git worktree lock`) still fails the call with its original error, keeps the record, and lists the session as `reconnecting` with reason `create_compensation_pending` while the daemon retries the compensation with the supervision backoff, until the session leaves with `session_removed`. A session launched from a host profile freezes the keyed revision of that profile into its resume binding; when the host cannot read or create its revision key the create fails with `agent_profile_revision_unavailable` before anything is written (a session without a profile needs no key). Optional `metadata` is written atomically with the session (see the `metadata` field note under `SessionInfo` below); the CLI exposes it as repeatable `--meta key=value`. A session created with initial input into a runtime whose `[input]` table declares `ready = "screen_idle"` writes that input only once the agent's rendered prompt box shows it reads input; the enable of bracketed paste does not count. The wait uses the host's full `input.initial_startup_grace_ms` even when the request omits `extended_input_ready_wait`; a request that sets it waits up to the runtime's longer `[input] startup_grace_ms` when one is declared (the Hermes package declares 30000 ms). The grace is an upper bound: the input is written as soon as readiness shows. If no readiness is observed by the deadline, or the daemon begins shutting down first, nothing is written to the PTY, the call fails with `session_input_not_ready` (runtime class; a deadline names the grace and the session's last observed activity, such as blocked, and a shutdown names the shutdown instead), and the session is removed as for any failed initial-input create (a removal that cannot finish is completed by reconciliation). A runtime whose existence check declares how its agent moves its store refuses a launch that would move it out of reach with `agent_native_store_relocated` before anything is spawned, and with `native_store_check_task_panicked` if that check crashes (see "Native session references"). |
 | `session.list` | `SessionListParams` or `null` | `Vec<SessionInfo>` | Lists sessions; filters use AND semantics. Metadata filters require the current protocol; a client refuses them against a protocol-3 daemon with `daemon/daemon_protocol_too_old` before sending the request. |
@@ -3891,11 +3892,12 @@ TypeScript SDK handshake accepts any version inside `CLIENT_PROTOCOL_VERSIONS`
 and translates an older daemon's payloads, and a daemon one release newer serves
 the previous version. Core crates beyond
 `pohunek-client` that a Rust client links are a pinned, not a stable, API with no
-back-compat shims. Three methods
+back-compat shims. Four methods
 are public obligations whose callers are mostly those external UI clients, so
 core keeps server-side contract tests for each of them: `host.discover` and
-`worktree.remove` are called only by the UI clients, and `subscribe` is also
-called by the CLI (`pohunek subscribe`, `pohunek attach`, `pohunek notifications`).
+`worktree.remove` are called only by the UI clients, `host.resolve` by the
+TypeScript SDK, and `subscribe` is also called by the CLI (`pohunek subscribe`,
+`pohunek attach`, `pohunek notifications`).
 
 - `host.discover`: socket-level coverage in
   `crates/daemon/tests/health_socket.rs`
@@ -3904,6 +3906,12 @@ called by the CLI (`pohunek subscribe`, `pohunek attach`, `pohunek notifications
   version-mismatch contract test in `crates/daemon/tests/remote_tcp.rs`. The
   previous release's record shape decoding a `local` record is covered by
   `crates/protocol/tests/host_record_previous.rs`.
+- `host.resolve`: socket-level coverage in `crates/daemon/tests/host_resolve.rs`
+  (peer and pinned-route answers, `local` names, the typed errors, and
+  `method_not_found` over the overlay listener) and the protocol 3 refusal in
+  `crates/daemon/tests/protocol_window.rs`; the TypeScript SDK side is covered by
+  `sdk/ts/sdk/test/host-resolution.test.ts` and, against a real daemon,
+  `sdk/ts/sdk/test/host-resolution.e2e.test.ts`.
 - `subscribe`: socket-level coverage in `crates/daemon/tests/health_socket.rs`
   (`subscribe_streams_session_created_event` and the notification and
   agent-state subscribe tests) and the client subscription tests in
@@ -4212,6 +4220,8 @@ Public exports:
   `connectRawTransport`, and `attachRawTransport`; the root entry additionally
   exports `connectRawLocal`, `connectRawTcp`, `attachRaw`, `attachRawLocal`, and
   `attachRawTcp`.
+- Host resolution (root entry only): `resolveHost`, `connectHost`, and the
+  `ResolvedHost` type.
 - Re-export of every symbol from `@pohunek/protocol`, including generated domain
   types, `Methods`, `ProtocolEvent`, `EventName`, `AttachPrelude`,
   `PROTOCOL_VERSION`, `MAX_CONTROL_LINE_BYTES`, `EVENT_NAMES`, and individual
@@ -4291,14 +4301,38 @@ Attach APIs:
 
 - Root-entry `connectRawLocal` and `connectRawTcp`, plus shared `connectRawWs`,
   open unframed raw byte channels without writing the attach prelude.
-- Root-entry `attachRaw(host, socketPath, streamId, opts?)` mirrors the Rust
-  convenience helper for local hosts (`""` or `"local"`). The TypeScript SDK
-  core does not perform NetBird host resolution; remote callers pass an
-  explicit address to `attachRawTcp` or use a WebSocket relay with
-  `attachRawWs`.
+- Root-entry `attachRaw(host, socketPath, streamId, opts?)` redeems the stream
+  on the daemon `host` names. `""` and `"local"` use `socketPath`; any other
+  route is resolved once through the local daemon (see "Host resolution"), and a
+  route that names this machine's own overlay name redeems on `socketPath`.
 - Root-entry `attachRawLocal` and `attachRawTcp`, plus shared `attachRawWs`, open
   a raw channel, write exactly one attach prelude, parse a failed redemption
   response as `ClientError`, and otherwise return the raw attach stream.
+
+Host resolution:
+
+- `resolveHost(route, socketPath, opts?)` maps a host route as `--host` accepts
+  it to a `ResolvedHost`: `{target: "local"}`, or `{target: "remote", display,
+  address: {host, port}, pinnedRoute, overlay, peerId?, fqdn?}`. `""` and
+  `"local"` answer without contacting the daemon. Any other route is resolved by
+  the local daemon on `socketPath` through `host.resolve`, so the selector rules
+  (provider-qualified selectors, `peer~`/`fqdn~` identities, `@port`, ambiguity,
+  this machine's own overlay name) are the CLI's and the Rust client's; the SDK
+  holds no copy of them. The daemon's typed errors keep their `code`, message
+  and recovery hint (`host_unknown`, `overlay_host_ambiguous`,
+  `overlay_host_unavailable`, `host_identity_unpinnable`), and a daemon of the
+  previous protocol version fails with `daemon_protocol_too_old`. `display` is
+  the route as the caller typed it.
+- `pinnedRoute` names the peer by its stable identity. Resolving it again
+  selects the same peer after a name or address change, or fails with the typed
+  unknown-host error if the peer is gone; it never selects another peer. A
+  caller that opens several connections for one operation resolves once and
+  reuses the endpoint.
+- `connectHost(route, socketPath, opts?)` resolves the route once and connects:
+  to `socketPath` for a local route, otherwise to the resolved peer with
+  `connectTcp`. `host.resolve` is served on the local Unix socket only, so
+  `socketPath` must name the local daemon.
+- The browser entry does not export these functions; it has no Unix socket.
 
 SDK error mapping:
 

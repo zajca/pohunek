@@ -42,6 +42,8 @@ export type { HostId } from "./HostId";
 export type { HostOwner } from "./HostOwner";
 export type { HostOwnerKind } from "./HostOwnerKind";
 export type { HostRecord } from "./HostRecord";
+export type { HostResolution } from "./HostResolution";
+export type { HostResolveParams } from "./HostResolveParams";
 export type { IntegrationAgentDoctor } from "./IntegrationAgentDoctor";
 export type { IntegrationAgentStatus } from "./IntegrationAgentStatus";
 export type { IntegrationDoctorParams } from "./IntegrationDoctorParams";
