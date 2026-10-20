@@ -1,4 +1,5 @@
-import type { ProtocolError, ProtocolVersion, ProtocolVersionRange } from "@pohunek/protocol";
+import type { ErrorClass, ProtocolVersion, ProtocolVersionRange } from "@pohunek/protocol";
+import type { ObservedErrorClass, ObservedProtocolError } from "./error";
 import { hasValidWireOrigin } from "./origin";
 
 export interface Request {
@@ -19,7 +20,7 @@ export interface OkResponse {
 export interface ErrResponse {
   v: ProtocolVersion;
   id: string;
-  err: ProtocolError;
+  err: ObservedProtocolError;
 }
 
 export type Response = OkResponse | ErrResponse;
@@ -72,7 +73,16 @@ export function isOkResponse(value: unknown): value is OkResponse {
   );
 }
 
+/**
+ * Whether `value` is an error response in the normalized shape `decodeResponse`
+ * returns: its class is one this build defines or `"unknown"`.
+ */
 export function isErrResponse(value: unknown): value is ErrResponse {
+  return isErrEnvelope(value) && isObservedErrorClass(value.err["class"]);
+}
+
+/** The wire shape of an error response, whatever its class string. */
+function isErrEnvelope(value: unknown): value is { err: Record<string, unknown> } & Record<string, unknown> {
   if (!isRecord(value)) {
     return false;
   }
@@ -80,7 +90,7 @@ export function isErrResponse(value: unknown): value is ErrResponse {
     isProtocolVersion(value["v"]) &&
     typeof value["id"] === "string" &&
     !hasOwn(value, "ok") &&
-    isProtocolError(value["err"])
+    isRawProtocolError(value["err"])
   );
 }
 
@@ -88,8 +98,10 @@ export function decodeResponse(value: unknown): Response {
   if (isOkResponse(value)) {
     return value;
   }
-  if (isErrResponse(value)) {
-    return value;
+  if (isErrEnvelope(value)) {
+    const err = value.err;
+    const normalized = { ...err, class: observedErrorClass(String(err["class"])) };
+    return { ...value, err: normalized } as ErrResponse;
   }
   throw new Error("invalid response envelope");
 }
@@ -110,20 +122,28 @@ function isProtocolVersion(value: unknown): value is ProtocolVersion {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
-function isProtocolError(value: unknown): value is ProtocolError {
+function isRawProtocolError(value: unknown): value is Record<string, unknown> {
   if (!isRecord(value)) {
     return false;
   }
   const recover = value["recover"];
   return (
-    isErrorClass(value["class"]) &&
+    typeof value["class"] === "string" &&
     typeof value["code"] === "string" &&
     typeof value["msg"] === "string" &&
     (recover === undefined || typeof recover === "string")
   );
 }
 
-function isErrorClass(value: unknown): value is ProtocolError["class"] {
+function observedErrorClass(value: string): ObservedErrorClass {
+  return isKnownErrorClass(value) ? value : "unknown";
+}
+
+function isObservedErrorClass(value: unknown): value is ObservedErrorClass {
+  return typeof value === "string" && (value === "unknown" || isKnownErrorClass(value));
+}
+
+function isKnownErrorClass(value: string): value is ErrorClass {
   return (
     value === "configuration" ||
     value === "daemon" ||

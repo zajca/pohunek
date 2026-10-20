@@ -15,6 +15,8 @@ import {
   ClientError,
   connectLocal,
   connectTcp,
+  decodeResponse,
+  isErrResponse,
   type ConnectOptions,
   type Request,
   type Transport,
@@ -249,6 +251,54 @@ describe("Client request/response", () => {
     } finally {
       await daemon.close();
     }
+  });
+
+  test("err response with a class from a newer daemon keeps the daemon's code, message and hint", async () => {
+    const daemon = await startUnixDaemon([
+      {
+        kind: "reply",
+        line: (requestLine) => errResponseLine(requestIdFromLine(requestLine), {
+          class: "a_class_from_a_newer_daemon",
+          code: "quota_exhausted",
+          msg: "the quota is used up",
+          recover: "free some space",
+        }),
+      },
+    ]);
+    try {
+      const client = await connectClient(daemon);
+
+      const error = await expectClientError(client.call("daemon.health", null));
+
+      expect(error.kind).toBe("protocol");
+      expect(error.errorClass).toBe("unknown");
+      expect(error.code).toBe("quota_exhausted");
+      expect(error.toProtocolError()).toEqual({
+        class: "unknown",
+        code: "quota_exhausted",
+        msg: "the quota is used up",
+        recover: "free some space",
+      });
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("isErrResponse accepts only the classes of its narrowed type", () => {
+    const envelope = (errorClass: string): unknown => ({
+      v: PROTOCOL_VERSION,
+      id: "r1",
+      err: { class: errorClass, code: "c", msg: "m" },
+    });
+
+    expect(isErrResponse(envelope("runtime"))).toBe(true);
+    expect(isErrResponse(envelope("unknown"))).toBe(true);
+    expect(isErrResponse(envelope("future_class"))).toBe(false);
+    expect(decodeResponse(envelope("future_class"))).toEqual({
+      v: PROTOCOL_VERSION,
+      id: "r1",
+      err: { class: "unknown", code: "c", msg: "m" },
+    });
   });
 
   test("err response preserves an omitted recovery hint", async () => {
