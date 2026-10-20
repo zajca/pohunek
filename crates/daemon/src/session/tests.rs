@@ -17826,6 +17826,26 @@ async fn record_only_session_in(registry: &SessionRegistry, repo: Option<&PathBu
         .as_ref()
         .expect("worker state root")
         .join(&session.id.0);
+    // The worker persists its acknowledged journal after the terminal commit;
+    // removing the journals first would let that write bring one back.
+    wait_until("the worker journal to be acknowledged", || async {
+        let acknowledged = fs::read_dir(&journals)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .all(|path| {
+                fs::read(path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .is_some_and(|journal| journal["terminal_acknowledged"] == true)
+            });
+        acknowledged.then_some(())
+    })
+    .await;
     let mut removed_journals = 0;
     for journal in fs::read_dir(&journals).expect("read the session's journals") {
         let journal = journal.expect("journal entry").path();
