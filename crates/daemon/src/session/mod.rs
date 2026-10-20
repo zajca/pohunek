@@ -748,6 +748,10 @@ struct SessionRegistryInner {
     /// Makes the next terminal acknowledgement fail as if its answer was lost.
     #[cfg(test)]
     terminal_acknowledgement_fails: AtomicBool,
+    /// Makes the inspected worker report no stream drain, as a worker of a
+    /// release that exits at once on the acknowledgement does.
+    #[cfg(test)]
+    terminal_acknowledgement_old_worker: AtomicBool,
     /// Parks the next terminal acknowledgement before it takes the lifecycle
     /// lock.
     #[cfg(test)]
@@ -2062,6 +2066,8 @@ impl SessionRegistry {
                 terminal_acknowledgement_suppressed: AtomicBool::new(false),
                 #[cfg(test)]
                 terminal_acknowledgement_fails: AtomicBool::new(false),
+                #[cfg(test)]
+                terminal_acknowledgement_old_worker: AtomicBool::new(false),
                 #[cfg(test)]
                 terminal_acknowledgement_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]

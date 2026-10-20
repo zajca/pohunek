@@ -2220,6 +2220,184 @@ mod tests {
         server_task.abort();
     }
 
+    /// A real worker whose runtime wrote `output_bytes` and exited, with one
+    /// detector stream opened before any output was read.
+    struct ExitedWorker {
+        worker: Worker,
+        stream: DataStream,
+        server: tokio::task::JoinHandle<Result<(), pohunek_session_worker::WorkerError>>,
+        _root: crate::test_support::ScopedDir,
+    }
+
+    async fn exited_worker(
+        name: &str,
+        output_bytes: usize,
+        post_exit_drain_timeout: Duration,
+        open_stream: bool,
+    ) -> ExitedWorker {
+        const SESSION_ID: &str = "s-9001";
+        let root = test_root(name);
+        let socket_path = root.join("socket/worker.sock");
+        let server = Server::bind(ServerArgs {
+            session_id: SESSION_ID.to_owned(),
+            worker_id: "worker-e2e".to_owned(),
+            generation: "abcd2345".to_owned(),
+            socket_path: socket_path.clone(),
+            journal_path: root.join("journal/worker.json"),
+            daemon_socket_path: root.join("daemon.sock"),
+            hook_trace_path: root.join(pohunek_logging::config::HOOK_TRACE_FILE_NAME),
+            config: WorkerConfig {
+                data_payload_bytes: 1_024,
+                post_exit_drain_timeout,
+                ..WorkerConfig::new()
+            },
+        })
+        .await
+        .expect("bind real worker");
+        let server = tokio::spawn(server.serve());
+        let worker = Worker::connect(&socket_path, SESSION_ID, "daemon-e2e")
+            .await
+            .expect("control handshake");
+        worker
+            .initialize(observation_initialize(&root, output_bytes))
+            .await
+            .expect("initialize runtime");
+        let stream = worker
+            .open_data(
+                StreamId::new("drain-stream").expect("stream id"),
+                StreamMode::Detector,
+                Some(0),
+            )
+            .await
+            .expect("open the output stream");
+        let stream = if open_stream {
+            stream
+        } else {
+            drop(stream);
+            worker
+                .open_data(
+                    StreamId::new("drain-unused").expect("stream id"),
+                    StreamMode::Detector,
+                    Some(0),
+                )
+                .await
+                .expect("reopen")
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let snapshot = worker.inspect().await.expect("inspect runtime");
+                assert!(snapshot.drains_streams_on_terminal_ack);
+                if snapshot.phase == pohunek_worker_protocol::RuntimePhase::Exited {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("runtime exit");
+        ExitedWorker {
+            worker,
+            stream,
+            server,
+            _root: root,
+        }
+    }
+
+    /// Reads a stream to its close frame and returns the output byte count.
+    async fn read_to_close(stream: &mut UnixStream) -> usize {
+        let mut bytes = 0;
+        loop {
+            let frame = read_frame(stream)
+                .await
+                .expect("read a frame")
+                .expect("the stream closes with a frame");
+            let (header, payload) = frame.into_parts();
+            match header.kind {
+                FrameKind::Output { .. } | FrameKind::Replay { .. } => bytes += payload.len(),
+                FrameKind::Close {
+                    reason: pohunek_worker_protocol::CloseReason::RuntimeExited,
+                } => return bytes,
+                FrameKind::Close { reason } => panic!("unexpected close {reason:?}"),
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_acknowledgement_waits_for_a_slow_stream_to_receive_the_whole_output() {
+        const OUTPUT: usize = 1_048_576;
+        let mut fixture = exited_worker("ack-drain", OUTPUT, Duration::from_secs(30), true).await;
+
+        let worker = fixture.worker.clone();
+        let mut acknowledged = tokio::spawn(async move { worker.acknowledge_terminal().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut acknowledged)
+                .await
+                .is_err(),
+            "the acknowledgement waits while the stream still has output to deliver"
+        );
+        assert!(!fixture.server.is_finished(), "the worker keeps serving");
+
+        let received = read_to_close(&mut fixture.stream.stream).await;
+        assert_eq!(received, OUTPUT, "the client receives every output byte");
+        tokio::time::timeout(Duration::from_secs(10), acknowledged)
+            .await
+            .expect("the acknowledgement finishes once the stream drained")
+            .expect("task")
+            .expect("acknowledged");
+        tokio::time::timeout(Duration::from_secs(10), fixture.server)
+            .await
+            .expect("the worker exits after the acknowledgement")
+            .expect("server task")
+            .expect("serve");
+    }
+
+    #[tokio::test]
+    async fn an_acknowledgement_gives_up_on_a_stream_that_never_reads() {
+        const OUTPUT: usize = 1_048_576;
+        const BOUND: Duration = Duration::from_millis(600);
+        let fixture = exited_worker("ack-bound", OUTPUT, BOUND, true).await;
+
+        let started = std::time::Instant::now();
+        fixture
+            .worker
+            .acknowledge_terminal()
+            .await
+            .expect("acknowledged");
+        assert!(
+            started.elapsed() >= BOUND,
+            "the acknowledgement waited for the configured bound"
+        );
+        tokio::time::timeout(Duration::from_secs(10), fixture.server)
+            .await
+            .expect("the worker exits at the bound")
+            .expect("server task")
+            .expect("serve");
+        drop(fixture.stream);
+    }
+
+    #[tokio::test]
+    async fn an_acknowledgement_without_a_stream_answers_at_once() {
+        let fixture = exited_worker("ack-idle", 1_024, Duration::from_secs(30), false).await;
+        let mut stream = fixture.stream;
+        assert_eq!(read_to_close(&mut stream.stream).await, 1_024);
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let started = std::time::Instant::now();
+        fixture
+            .worker
+            .acknowledge_terminal()
+            .await
+            .expect("acknowledged");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        tokio::time::timeout(Duration::from_secs(10), fixture.server)
+            .await
+            .expect("the worker exits")
+            .expect("server task")
+            .expect("serve");
+    }
+
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,

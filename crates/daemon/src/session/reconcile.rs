@@ -434,6 +434,7 @@ impl JournalEvidence {
             hook_schema: self.hook_schema.clone(),
             background: None,
             active_identity_revision: None,
+            drains_streams_on_terminal_ack: false,
         })
     }
 }
@@ -11314,6 +11315,7 @@ while os.getppid() == parent:
             hook_schema: Some("identity-subagent-v1".to_owned()),
             background: None,
             active_identity_revision: None,
+            drains_streams_on_terminal_ack: false,
         }
     }
 

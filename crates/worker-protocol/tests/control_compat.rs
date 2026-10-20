@@ -305,3 +305,51 @@ fn a_reported_session_keeps_its_transcript_path_and_reads_the_shape_without_one(
         "a path annotation carries no second path"
     );
 }
+
+#[tokio::test]
+async fn the_stream_drain_field_defaults_to_false_and_an_unknown_one_is_ignored() {
+    let (reader, writer) = tokio::io::duplex(4096);
+    let mut writer = ControlWriter::new(writer);
+    let mut reader = ControlReader::new(reader);
+    let snapshot = |extra: serde_json::Value| {
+        let mut snapshot = json!({
+            "session_id": "s-1",
+            "worker_id": "worker-1",
+            "runtime_id": null,
+            "phase": "exited",
+            "worker_process": {"pid": 1, "start_identity": 2},
+            "child_process": null,
+            "dimensions": null,
+            "history_start_offset": 0,
+            "next_offset": 0,
+            "exit": null,
+            "launch_identity": null,
+            "active_identity": null
+        });
+        snapshot
+            .as_object_mut()
+            .expect("snapshot object")
+            .extend(extra.as_object().expect("extra fields").clone());
+        json!({"request_id": "request-1", "type": "inspected", "snapshot": snapshot})
+    };
+
+    for (extra, drains) in [
+        (json!({}), false),
+        (json!({"drains_streams_on_terminal_ack": true}), true),
+        (json!({"a_field_of_a_later_release": 1}), false),
+    ] {
+        writer
+            .write(&snapshot(extra))
+            .await
+            .expect("write snapshot");
+        let response = reader
+            .read::<ControlResponse>()
+            .await
+            .expect("read snapshot")
+            .expect("response");
+        let ResponseKind::Inspected { snapshot } = response.kind else {
+            panic!("an inspect answer");
+        };
+        assert_eq!(snapshot.drains_streams_on_terminal_ack, drains);
+    }
+}

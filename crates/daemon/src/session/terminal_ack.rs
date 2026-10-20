@@ -7,7 +7,7 @@
 //! supervisor job.
 
 use protocol::SessionId;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::{Generation, RuntimeWatchIdentity, SessionRegistry};
 use crate::runtime::Worker;
@@ -116,6 +116,30 @@ impl SessionRegistry {
         gate
     }
 
+    #[cfg(test)]
+    fn worker_drains_streams(&self, snapshot: &pohunek_worker_protocol::InspectSnapshot) -> bool {
+        snapshot.drains_streams_on_terminal_ack
+            && !self
+                .inner
+                .terminal_acknowledgement_old_worker
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(not(test))]
+    fn worker_drains_streams(&self, snapshot: &pohunek_worker_protocol::InspectSnapshot) -> bool {
+        let _ = self;
+        snapshot.drains_streams_on_terminal_ack
+    }
+
+    /// Makes the registry treat every worker as one that does not drain
+    /// its streams on the acknowledgement.
+    #[cfg(test)]
+    pub(crate) fn model_worker_without_stream_drain(&self) {
+        self.inner
+            .terminal_acknowledgement_old_worker
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Makes the next terminal acknowledgement fail after the worker took it,
     /// the way a lost answer does.
     #[cfg(test)]
@@ -151,6 +175,30 @@ impl SessionRegistry {
         drop(barrier);
         if !applies {
             return;
+        }
+        // A worker that does not drain its attached streams exits at once on
+        // the acknowledgement and would cut them off, so it keeps its retention.
+        match ack.worker.inspect().await {
+            Ok(snapshot) if self.worker_drains_streams(&snapshot) => {}
+            Ok(_) => {
+                debug!(
+                    session_id = %id.0,
+                    worker_instance_id = %ack.expected.worker_instance_id,
+                    "worker does not drain streams on acknowledgement; it keeps its retention"
+                );
+                return;
+            }
+            Err(error) => {
+                warn!(
+                    name: "session.terminal.acknowledge_failed",
+                    session_id = %id.0,
+                    worker_instance_id = %ack.expected.worker_instance_id,
+                    error = %error,
+                    "terminal acknowledgement failed: the worker could not be inspected; it keeps its retention unless it ended"
+                );
+                self.schedule_supervision_retry(id);
+                return;
+            }
         }
         // The worker cancels its shutdown before it answers, so a lost answer
         // may follow an acknowledgement that took effect. The supervision

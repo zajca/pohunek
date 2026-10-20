@@ -522,6 +522,10 @@ origin and annotation. A connection that negotiated v7 sees none of those fields
 so the claim reads as a provider-only active claim there and in an older reader
 of the journal.
 
+The inspect snapshot also reports `drains_streams_on_terminal_ack` (absent means
+false): a worker that sets it lets attached data streams finish before it
+answers `AcknowledgeTerminal`, and the daemon acknowledges no worker that omits it.
+
 Public observation is bounded by the 1 MiB control-line ceiling. Output accounts
 for base64 expansion and response metadata; screen snapshots are measured after
 JSON serialization. The default maximum wait is eight seconds. Waiting

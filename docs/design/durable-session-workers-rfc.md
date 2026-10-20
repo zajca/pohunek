@@ -814,7 +814,7 @@ Control operations are:
 | `WritePlan` | execute deduplicated ordered input fragments |
 | `Resize` | idempotently resize the PTY and terminal tracker |
 | `Stop` | idempotently terminate the retained process group |
-| `AcknowledgeTerminal` | confirm daemon imported final state |
+| `AcknowledgeTerminal` | confirm daemon imported final state; the worker first lets every attached data stream deliver its remaining output and close frame, bounded by `post_exit_drain_timeout` |
 | `ReleaseController` | gracefully release the lease |
 
 Worker events on the control connection are:
@@ -1286,6 +1286,15 @@ output and the rendered screen disappear when the process exits and are never
 written to disk. A terminal session answers `session screen` and
 `session output` with `session_terminal_unavailable` whether or not its worker
 is still retained, because both require a live runtime.
+
+The worker answers `AcknowledgeTerminal` only after every attached data stream
+has delivered its remaining output and its `RuntimeExited` close frame, so an
+attached client never loses the tail of the output; a stream that does not
+finish within `post_exit_drain_timeout` is cut off. A worker reports this in
+`drains_streams_on_terminal_ack` of the inspect snapshot (absent means false,
+and a reader that does not know the field ignores it). A daemon acknowledges
+only a worker that reports it; a worker of an earlier release exits at once on
+the acknowledgement, so it keeps the terminal retention above.
 
 ### 16.2 Durable stop intent
 

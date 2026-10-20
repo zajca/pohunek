@@ -7819,6 +7819,7 @@ fn a_journaled_native_reference_alone_changes_the_worker_metadata_fingerprint() 
         hook_schema: None,
         background: None,
         active_identity_revision: None,
+        drains_streams_on_terminal_ack: false,
     };
     let (first, second) = (
         super::worker_metadata_fingerprint(&snapshot(Some("a"))),

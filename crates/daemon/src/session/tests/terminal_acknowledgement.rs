@@ -583,3 +583,29 @@ async fn lost_acknowledgement_reply_still_retires_the_job() {
         std::slice::from_ref(&rig.service_id)
     );
 }
+
+/// A worker that does not report the stream drain exits at once on the
+/// acknowledgement, so the daemon leaves it alone: it keeps serving its
+/// terminal runtime under the retention fallback and its job stays registered.
+#[tokio::test]
+async fn a_worker_without_the_stream_drain_is_not_acknowledged() {
+    let rig = Rig::sleeping("ack-old-worker").await;
+    rig.registry.model_worker_without_stream_drain();
+    rig.registry.stop(&rig.created.id).await.expect("stop");
+
+    // A sent acknowledgement would end the worker; give the task time to act.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let worker = {
+        let sessions = rig.registry.inner.sessions.lock().await;
+        let RuntimeHandle::Worker(worker) = &sessions[&rig.created.id].runtime else {
+            panic!("terminal entry keeps its worker handle");
+        };
+        worker.clone()
+    };
+    let snapshot = worker.inspect().await.expect("the worker still answers");
+    assert_eq!(
+        snapshot.phase,
+        pohunek_worker_protocol::RuntimePhase::Exited
+    );
+    assert!(rig.supervisor.retired().is_empty());
+}
