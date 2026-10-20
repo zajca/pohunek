@@ -945,7 +945,7 @@ configuration gives the same `PATH`; when they differ the call is refused with
 `PATH` with `launchctl setenv PATH <directories>` in the GUI session, or make
 `launchctl config user path` match the journaled value). On Linux a job gets the
 systemd user manager's `Environment` `PATH`, replaced by an `Environment=PATH=` of
-the daemon unit or its drop-ins; the journal does not change that. A unit setting
+a drop-in of the daemon unit (the install replaces the unit file itself); the journal does not change that. A unit setting
 that changes `PATH` in a way the CLI cannot read is refused with the same code,
 and the message names the file or directive to change: an `EnvironmentFile=` that
 sets `PATH` (or is a wildcard, or a required file that cannot be read),

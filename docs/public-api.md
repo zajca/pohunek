@@ -2467,9 +2467,9 @@ upgrade's own gates and `service check` of an upgrade); without it, as for a
 rollback, which never applies the plan, the preflight judges the installed
 packages only. The preflight runs with the `PATH` the daemon job runs with, byte
 for byte: the one `service.toml` records; else, on Linux, the systemd user
-manager's `Environment` `PATH`, replaced by an `Environment=PATH=` entry of the daemon unit
-or its drop-ins and refused (`service_manager_environment_unavailable`, naming the file or
-directive) when the unit has an `EnvironmentFile=` that sets `PATH`, a wildcard or unreadable
+manager's `Environment` `PATH`, replaced by an `Environment=PATH=` entry of a drop-in of the daemon unit
+(the install replaces the unit file itself) and refused (`service_manager_environment_unavailable`, naming the file or
+directive) when the unit has an `EnvironmentFile=` that sets `PATH`, a wildcard, unreadable or non-regular
 required `EnvironmentFile=`, `PassEnvironment=PATH`, `UnsetEnvironment=PATH`, is masked or broken,
 or has drop-ins but no unit file yet; else, on macOS, launchd's active `PATH` of the job:
 the domain's `environment` `PATH` (`launchctl print gui/<uid>`, set by `launchctl

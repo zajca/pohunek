@@ -255,19 +255,20 @@ pub(crate) fn carry(value: &str) -> Result<String, String> {
 /// The `PATH` the daemon job gets from the user manager and its own unit.
 ///
 /// `manager_path` is the manager's `PATH`; `unit` is what the manager holds for
-/// the daemon unit (`unit_name`), drop-ins merged. A unit `Environment=` entry
-/// for `PATH` wins over the manager's, the last one first. Every setting that
+/// the daemon unit (`unit_name`), drop-ins merged. The install replaces the unit
+/// file itself and keeps its drop-ins, so only an `Environment=` entry for `PATH`
+/// that a drop-in sets applies to the job; the last one wins. Every setting that
 /// could change `PATH` but whose result is not derivable here is refused, with
-/// the cause and the directive to remove, so the caller never judges a `PATH`
-/// the job does not get. Reads each `EnvironmentFile=` named; values are never
-/// part of an error.
+/// the cause and the directive to change, so the caller never judges a `PATH` the
+/// job does not get. Each `EnvironmentFile=` and drop-in is read once, bounded;
+/// values are never part of an error.
 ///
 /// # Errors
 ///
 /// Returns [`Error::ManagerEnvironment`] for a unit that is masked or failed to
 /// load, a drop-in on a unit with no file, an `EnvironmentFile=` that sets
-/// `PATH`, cannot be read or is a wildcard, and `PassEnvironment=` or
-/// `UnsetEnvironment=` naming `PATH`.
+/// `PATH`, cannot be read, is not a regular file or is a wildcard, a drop-in that
+/// cannot be read, and `PassEnvironment=` or `UnsetEnvironment=` naming `PATH`.
 pub async fn effective_search_path(
     manager_path: Option<String>,
     unit: &UnitEnvironment,
@@ -313,15 +314,73 @@ pub async fn effective_search_path(
         check_environment_file(file, *optional, unit_name).await?;
     }
     let prefix = format!("{SEARCH_PATH_VARIABLE}=");
-    let unit_path = unit
+    let merged = unit
         .environment
         .iter()
         .rev()
-        .find_map(|entry| entry.strip_prefix(prefix.as_str()))
-        .map(carry)
-        .transpose()
-        .map_err(refuse)?;
-    Ok(unit_path.or(manager_path))
+        .find_map(|entry| entry.strip_prefix(prefix.as_str()));
+    let Some(merged) = merged else {
+        return Ok(manager_path);
+    };
+    // The merged list also holds the unit file's own entries, which the install
+    // replaces; the entry applies only when a drop-in sets `PATH`.
+    for drop_in in &unit.drop_in_paths {
+        let text = read_unit_settings_file(drop_in, unit_name, "drop-in")
+            .await?
+            .map_err(|error| {
+                refuse(format!(
+                    "the drop-in {drop_in} of {unit_name} cannot be read ({error}), so the PATH it may set cannot be judged. Make it a readable regular file of at most {} bytes and retry",
+                    super::settings::UNIT_SETTINGS_FILE_LIMIT
+                ))
+            })?;
+        if drop_in_sets_path(&text) {
+            return carry(merged).map(Some).map_err(refuse);
+        }
+    }
+    Ok(manager_path)
+}
+
+/// Reads a unit setting file: a regular file of at most
+/// [`super::settings::UNIT_SETTINGS_FILE_LIMIT`] bytes, opened without blocking.
+///
+/// systemd follows symlinks here, so the CLI does too, but it never reads from a
+/// FIFO or device and never reads more than the limit.
+async fn read_unit_settings_file(
+    path: &str,
+    unit_name: &str,
+    kind: &str,
+) -> Result<std::io::Result<String>, Error> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let owned = path.to_owned();
+    let read = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&owned)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(super::settings::UNIT_SETTINGS_FILE_LIMIT + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > super::settings::UNIT_SETTINGS_FILE_LIMIT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "larger than the read limit",
+            ));
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    })
+    .await
+    .map_err(|error| Error::ManagerEnvironment {
+        detail: format!("reading the {kind} {path} of {unit_name} did not finish: {error}"),
+    })?;
+    Ok(read)
 }
 
 /// Refuses an `EnvironmentFile=` that sets `PATH` or cannot be shown not to.
@@ -332,28 +391,109 @@ async fn check_environment_file(file: &str, optional: bool, unit_name: &str) -> 
             "{unit_name} names the EnvironmentFile= pattern {file}, whose files cannot be listed here. Replace it with plain paths in the unit or its drop-ins (`systemctl --user cat {unit_name}`) and retry"
         )));
     }
-    let bytes = match tokio::fs::read(file).await {
-        Ok(bytes) => bytes,
+    let text = match read_unit_settings_file(file, unit_name, "EnvironmentFile=").await? {
+        Ok(text) => text,
         Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
             return Err(refuse(format!(
-                "{unit_name} names the EnvironmentFile= {file}, which cannot be read ({}), so its PATH cannot be judged. Make the file readable, or prefix the path with `-` if it may be absent, and retry",
-                error.kind()
+                "{unit_name} names the EnvironmentFile= {file}, which cannot be read ({error}), so its PATH cannot be judged. Make it a readable regular file of at most {} bytes, or prefix the path with `-` if it may be absent, and retry",
+                super::settings::UNIT_SETTINGS_FILE_LIMIT
             )))
         }
     };
-    let text = String::from_utf8_lossy(&bytes);
-    let sets_path = text.lines().any(|line| {
-        line.trim_start()
-            .strip_prefix(SEARCH_PATH_VARIABLE)
-            .is_some_and(|rest| rest.trim_start().starts_with('='))
-    });
-    if sets_path {
-        return Err(refuse(format!(
+    match environment_file_sets_path(&text) {
+        Some(false) => Ok(()),
+        Some(true) => Err(refuse(format!(
             "the EnvironmentFile= {file} of {unit_name} sets {SEARCH_PATH_VARIABLE}, and its quoting is not re-parsed here. Move the {SEARCH_PATH_VARIABLE} assignment to an Environment= line of a drop-in, or record the PATH in service.toml, and retry"
-        )));
+        ))),
+        None => Err(refuse(format!(
+            "the EnvironmentFile= {file} of {unit_name} has an unterminated quote, so whether it sets {SEARCH_PATH_VARIABLE} cannot be told. Fix the file and retry"
+        ))),
     }
-    Ok(())
+}
+
+/// Whether an `EnvironmentFile=` assigns `PATH`, or `None` when a quote is not
+/// closed.
+///
+/// Follows the file format: `KEY=VALUE` assignments, `#` and `;` comment lines,
+/// values that may be quoted with `'` or `"` or continue after a trailing
+/// backslash, so text inside such a value is never taken for a key.
+fn environment_file_sets_path(text: &str) -> Option<bool> {
+    let mut chars = text.chars().peekable();
+    let mut sets_path = false;
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let Some(first) = chars.peek().copied() else {
+            return Some(sets_path);
+        };
+        if first == '#' || first == ';' {
+            for c in chars.by_ref() {
+                if c == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        let mut key = String::new();
+        while let Some(c) = chars.next_if(|c| *c != '=' && *c != '\n') {
+            key.push(c);
+        }
+        if chars.next_if_eq(&'=').is_none() {
+            // A line without `=` assigns nothing.
+            continue;
+        }
+        if key.trim() == SEARCH_PATH_VARIABLE {
+            sets_path = true;
+        }
+        let mut quote: Option<char> = None;
+        loop {
+            match (chars.next(), quote) {
+                (None, None) => return Some(sets_path),
+                (None, Some(_)) => return None,
+                (Some('\n'), None) => break,
+                (Some('\\'), q) if q != Some('\'') => {
+                    chars.next();
+                }
+                (Some(c @ ('\'' | '"')), None) => quote = Some(c),
+                (Some(c), Some(q)) if c == q => quote = None,
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Whether a unit drop-in has an `Environment=` assignment of `PATH`.
+///
+/// Joins continuation lines, skips comment lines, and splits the value into
+/// words outside quotes, as the unit file syntax does.
+fn drop_in_sets_path(text: &str) -> bool {
+    let joined = text.replace("\\\n", " ");
+    joined.lines().any(|line| {
+        let line = line.trim_start();
+        if line.starts_with('#') || line.starts_with(';') {
+            return false;
+        }
+        let Some(value) = line.strip_prefix("Environment=") else {
+            return false;
+        };
+        let mut word = String::new();
+        let mut quote: Option<char> = None;
+        let mut words = Vec::new();
+        let mut chars = value.chars();
+        while let Some(c) = chars.next() {
+            match (c, quote) {
+                ('\\', _) => word.extend(chars.next()),
+                ('\'' | '"', None) => quote = Some(c),
+                (c, Some(q)) if c == q => quote = None,
+                (c, None) if c.is_whitespace() => words.push(std::mem::take(&mut word)),
+                (c, _) => word.push(c),
+            }
+        }
+        words.push(word);
+        words
+            .iter()
+            .any(|word| word.starts_with(&format!("{SEARCH_PATH_VARIABLE}=")))
+    })
 }
 
 /// What launchd reports for the daemon job's `PATH`, from both of its sources.

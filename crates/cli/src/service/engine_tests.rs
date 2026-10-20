@@ -10012,8 +10012,10 @@ async fn a_unit_without_environment_settings_gets_the_managers_path() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_drop_in_environment_path_replaces_the_managers_path_and_the_last_one_wins() {
+    let (_dir, drop_in) =
+        environment_file("[Service]\nEnvironment=\"OTHER=1\" PATH=/drop-in/bin\n");
     let unit = UnitEnvironment {
-        drop_in_paths: vec!["/home/u/.config/systemd/user/x.service.d/p.conf".to_owned()],
+        drop_in_paths: vec![drop_in],
         environment: vec![
             "PATH=/first".to_owned(),
             "OTHER=1".to_owned(),
@@ -10023,6 +10025,48 @@ async fn a_drop_in_environment_path_replaces_the_managers_path_and_the_last_one_
     };
     let job = unrecorded_job_path(Ok(unit)).await.expect("path");
     assert_eq!(job.value, "/drop-in/bin");
+}
+
+/// The install replaces the unit file and keeps its drop-ins, so a `PATH` that
+/// only the unit file sets does not reach the job.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_path_set_only_by_the_replaced_unit_file_does_not_apply() {
+    let unit = UnitEnvironment {
+        environment: vec!["PATH=/unit-file/bin".to_owned()],
+        ..loaded_unit()
+    };
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, MANAGER_PATH, "no drop-in");
+
+    let (_dir, drop_in) = environment_file(
+        "# Environment=PATH=/commented\n[Service]\nEnvironment=MYPATH=/x \\\n  OTHER=2\nEnvironment=\n",
+    );
+    let unit = UnitEnvironment {
+        drop_in_paths: vec![drop_in],
+        environment: vec!["PATH=/unit-file/bin".to_owned()],
+        ..loaded_unit()
+    };
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(
+        job.value, MANAGER_PATH,
+        "a drop-in without a PATH assignment"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_drop_in_that_cannot_be_read_is_refused() {
+    let unit = UnitEnvironment {
+        drop_in_paths: vec!["/nonexistent/p.conf".to_owned()],
+        environment: vec!["PATH=/unit-file/bin".to_owned()],
+        ..loaded_unit()
+    };
+    let text = refusal(unrecorded_job_path(Ok(unit)).await);
+    assert!(
+        text.contains("/nonexistent/p.conf") && text.contains("readable regular file"),
+        "{text}"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -10061,7 +10105,11 @@ async fn an_environment_file_without_a_path_line_keeps_the_managers_path() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn an_environment_file_that_sets_path_is_refused_with_the_file_and_the_fix() {
-    for content in ["PATH=/file/bin\n", "A=1\n  PATH = \"/x:/y\"\n"] {
+    for content in [
+        "PATH=/file/bin\n",
+        "A=1\n  PATH = \"/x:/y\"\n",
+        "A='x\ny'\nPATH=/file/bin\n",
+    ] {
         let (_dir, file) = environment_file(content);
         let unit = UnitEnvironment {
             environment_files: vec![(file.clone(), false)],
@@ -10071,6 +10119,63 @@ async fn an_environment_file_that_sets_path_is_refused_with_the_file_and_the_fix
         assert!(text.contains(&file), "{text}");
         assert!(text.contains("Environment= line of a drop-in"), "{text}");
         assert!(!text.contains("/file/bin"), "values stay out: {text}");
+    }
+}
+
+/// A PATH-looking line inside a quoted or continued value, or in a comment, is
+/// not an assignment of `PATH`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn path_text_inside_values_and_comments_of_an_environment_file_is_not_an_assignment() {
+    for content in [
+        "OTHER='first\nPATH=/not-path\nlast'\n",
+        "OTHER=\"a\nPATH=/not-path\"\nSTORE=/s\n",
+        "OTHER=a\\\nPATH=/not-path\nSTORE=/s\n",
+        "# PATH=/commented\n; PATH=/commented\nSTORE=/s\n",
+    ] {
+        let (_dir, file) = environment_file(content);
+        let unit = UnitEnvironment {
+            environment_files: vec![(file, false)],
+            ..loaded_unit()
+        };
+        let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+        assert_eq!(job.value, MANAGER_PATH, "{content:?}");
+    }
+    let (_dir, file) = environment_file("OTHER='never closed\nPATH=/x\n");
+    let unit = UnitEnvironment {
+        environment_files: vec![(file, false)],
+        ..loaded_unit()
+    };
+    let text = refusal(unrecorded_job_path(Ok(unit)).await);
+    assert!(text.contains("unterminated quote"), "{text}");
+}
+
+/// An `EnvironmentFile=` that is not a plain readable file never blocks or
+/// exhausts the check.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_environment_file_that_is_a_fifo_a_device_or_too_large_is_refused() {
+    let dir = tempfile::tempdir().expect("scratch directory");
+    let fifo = dir.path().join("job.fifo");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).expect("fifo");
+    let link = dir.path().join("zero.link");
+    std::os::unix::fs::symlink("/dev/zero", &link).expect("symlink");
+    let big = dir.path().join("big.env");
+    std::fs::write(
+        &big,
+        vec![
+            b'#';
+            usize::try_from(crate::service::settings::UNIT_SETTINGS_FILE_LIMIT).expect("fits") + 1
+        ],
+    )
+    .expect("large file");
+    for file in [fifo, link, big] {
+        let unit = UnitEnvironment {
+            environment_files: vec![(file.display().to_string(), false)],
+            ..loaded_unit()
+        };
+        let text = refusal(unrecorded_job_path(Ok(unit)).await);
+        assert!(text.contains("readable regular file"), "{text}");
     }
 }
 
@@ -10190,8 +10295,9 @@ async fn a_masked_or_broken_unit_is_refused_and_unreadable_properties_fail_close
 async fn the_upgrade_judges_and_runs_with_the_drop_in_path_not_the_managers() {
     let mut harness = Harness::new();
     harness.install(V1).await.expect("install");
+    let (_dir, drop_in) = environment_file("[Service]\nEnvironment=PATH=/drop-in/bin\n");
     let unit = UnitEnvironment {
-        drop_in_paths: vec!["/home/u/.config/systemd/user/x.service.d/p.conf".to_owned()],
+        drop_in_paths: vec![drop_in],
         environment: vec!["PATH=/drop-in/bin".to_owned()],
         ..loaded_unit()
     };
