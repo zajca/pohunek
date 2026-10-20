@@ -105,6 +105,11 @@ struct DiscoveredWorker {
     snapshot: InspectSnapshot,
 }
 
+/// The classification of a worker whose supervisor cannot be reached.
+const RECONNECTING: Unavailability = Unavailability::Other(RuntimeState::Reconnecting);
+/// The classification of a worker or job that may still be live.
+const CONFLICT: Unavailability = Unavailability::Other(RuntimeState::Conflict);
+
 /// Whether classifying an unreachable running worker finished its watch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LossClassification {
@@ -2134,24 +2139,15 @@ impl SessionRegistry {
         let (classification, reason) = match decision {
             Unreachable::Unavailable(detail) => {
                 tracing::debug!(session_id = %id.0, detail, "worker supervisor is unavailable; nothing is touched");
-                (
-                    Unavailability::other(RuntimeState::Reconnecting),
-                    SUPERVISION_UNAVAILABLE,
-                )
+                (RECONNECTING, SUPERVISION_UNAVAILABLE)
             }
             Unreachable::Ambiguous(detail) => {
                 tracing::debug!(session_id = %id.0, detail, "unreachable worker may still be live; nothing is touched");
-                (
-                    Unavailability::other(RuntimeState::Conflict),
-                    SUPERVISION_AMBIGUOUS,
-                )
+                (CONFLICT, SUPERVISION_AMBIGUOUS)
             }
             Unreachable::Mismatch(detail) => {
                 tracing::debug!(session_id = %id.0, detail, "unreachable worker identity mismatch; failing closed");
-                (
-                    Unavailability::other(RuntimeState::Conflict),
-                    IDENTITY_MISMATCH,
-                )
+                (CONFLICT, IDENTITY_MISMATCH)
             }
             Unreachable::Ended {
                 journaled,
@@ -2186,10 +2182,7 @@ impl SessionRegistry {
                 // until the job is retired the session stays unavailable and
                 // the background re-check reaches this classification again.
                 if retired.is_err() {
-                    (
-                        Unavailability::other(RuntimeState::Reconnecting),
-                        SUPERVISION_UNAVAILABLE,
-                    )
+                    (RECONNECTING, SUPERVISION_UNAVAILABLE)
                 } else {
                     let reason = match (journaled, cleanup) {
                         (false, _) => "worker_unavailable",
@@ -4136,14 +4129,7 @@ impl SessionRegistry {
         runtime.loss_reason = (state != RuntimeState::Terminal).then(|| reason.to_owned());
         record.runtime.state = state;
         record.runtime.reason.clone_from(&runtime.loss_reason);
-        if matches!(state, RuntimeState::Lost | RuntimeState::Terminal) {
-            terminalize_running_subagents(&mut record.info.subagents, current_time_millis());
-        }
-        // A runtime that cannot be reached holds no background snapshot it can vouch for.
-        record.info.background = None;
-        if let Some(proof) = classification.proof() {
-            present_lost_runtime(&mut record.info, proof, record.desired_state);
-        }
+        present_unavailable_record(&mut record, classification);
         record.info.updated_at = now;
         let recovery = record.recovery.clone();
         let input_rules = recovery.as_ref().map_or_else(
@@ -6627,6 +6613,23 @@ fn classify_connect_error(error: &WorkerError) -> (RuntimeState, &'static str) {
         | WorkerError::NotInitialized
         | WorkerError::AttachReadyTimeout { .. }
         | WorkerError::TornStream => (RuntimeState::Lost, UNREACHABLE_SOCKET),
+    }
+}
+
+/// Shows what an unavailable runtime leaves of `record`'s session: running
+/// subagents end with a lost or terminal runtime, an unreachable runtime holds
+/// no background snapshot it can vouch for, and a lost runtime applies its
+/// [`LossProof`].
+fn present_unavailable_record(record: &mut SessionRecord, classification: Unavailability) {
+    if matches!(
+        classification.state(),
+        RuntimeState::Lost | RuntimeState::Terminal
+    ) {
+        terminalize_running_subagents(&mut record.info.subagents, current_time_millis());
+    }
+    record.info.background = None;
+    if let Some(proof) = classification.proof() {
+        present_lost_runtime(&mut record.info, proof, record.desired_state);
     }
 }
 
@@ -19199,14 +19202,13 @@ generation "$1"
         async fn a_proven_loss_presents_a_failed_session_that_still_reports_the_lost_runtime() {
             let fixture = fixture(LONG_CONNECT);
             let (created, _job, descendant) = fixture.create().await;
-            {
-                let mut sessions = fixture.registry.inner.sessions.lock().await;
-                sessions
-                    .get_mut(&created.id)
-                    .expect("session entry")
-                    .info
-                    .activity = Some(protocol::AgentActivity::Working);
-            }
+            let mut sessions = fixture.registry.inner.sessions.lock().await;
+            sessions
+                .get_mut(&created.id)
+                .expect("session entry")
+                .info
+                .activity = Some(protocol::AgentActivity::Working);
+            drop(sessions);
             let ids = vec![created.id.clone()];
             let wait = protocol::SessionWaitTurnParams::new(
                 ids,
@@ -19215,7 +19217,7 @@ generation "$1"
                 Some(u32::try_from(HANG_GUARD.as_millis()).expect("guard fits")),
             )
             .expect("wait params");
-            let waiter = {
+            let turn_wait = {
                 let registry = fixture.registry.clone();
                 tokio::spawn(async move { registry.wait_turn(&wait).await })
             };
@@ -19267,13 +19269,13 @@ generation "$1"
                 "the lost event carries the failed session: {lost_event}"
             );
 
-            let waited = tokio::time::timeout(HANG_GUARD, waiter)
+            let turn = tokio::time::timeout(HANG_GUARD, turn_wait)
                 .await
                 .expect("wait-turn ends")
                 .expect("join")
                 .expect("wait-turn result");
             assert_eq!(
-                waited.event.map(|event| event.kind),
+                turn.event.map(|event| event.kind),
                 Some(protocol::SessionTurnEventKind::Exited)
             );
 
@@ -19302,14 +19304,13 @@ generation "$1"
         async fn a_proven_loss_after_a_stop_intent_presents_a_stopped_session() {
             let fixture = fixture(LONG_CONNECT);
             let (created, _job, descendant) = fixture.create().await;
-            {
-                let mut sessions = fixture.registry.inner.sessions.lock().await;
-                // A stop that gave up waiting leaves its intent behind.
-                sessions
-                    .get_mut(&created.id)
-                    .expect("session entry")
-                    .desired_state = crate::store::DesiredState::Stopped;
-            }
+            // A stop that gave up waiting leaves its intent behind.
+            let mut sessions = fixture.registry.inner.sessions.lock().await;
+            sessions
+                .get_mut(&created.id)
+                .expect("session entry")
+                .desired_state = crate::store::DesiredState::Stopped;
+            drop(sessions);
 
             fixture.crash(&created.id).await;
             fixture.wait_for(&created.id, RuntimeState::Lost).await;

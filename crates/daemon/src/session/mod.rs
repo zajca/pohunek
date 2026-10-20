@@ -1254,7 +1254,7 @@ impl Unavailability {
         }
     }
 
-    fn proof(self) -> Option<LossProof> {
+    pub(super) fn proof(self) -> Option<LossProof> {
         match self {
             Self::Lost(proof) => Some(proof),
             Self::Other(_) => None,
