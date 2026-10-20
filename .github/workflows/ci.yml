@@ -1324,6 +1324,13 @@ jobs:
           echo "DBUS_SESSION_BUS_ADDRESS=unix:path=${XDG_RUNTIME_DIR}/bus" >> "$GITHUB_ENV"
           systemctl --user is-system-running --wait || systemctl --user is-system-running | grep -qx degraded
 
+      # The exit-evidence OOM scenario needs the user manager to enforce
+      # MemoryMax, which requires the memory controller to be delegated to it.
+      - name: Show the controllers delegated to the user manager
+        run: |
+          systemctl show -p Delegate -p DelegateControllers user@"$(id -u)".service || true
+          cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers" || true
+
       - name: Build daemon, worker, and CLI binaries
         run: cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli --bins
 
