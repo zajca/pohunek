@@ -784,7 +784,27 @@ impl SessionRegistry {
         ) else {
             return SweepOutcome::blocked_by_other();
         };
-        with_settle_window(self.sweep_passes(session_id, worker_instance_id, grace, &request)).await
+        let started = tokio::time::Instant::now();
+        let mut tally = SweepTally::default();
+        let outcome = with_settle_window(self.sweep_passes(
+            session_id,
+            worker_instance_id,
+            grace,
+            &request,
+            &mut tally,
+        ))
+        .await;
+        tracing::info!(
+            session_id,
+            worker_instance_id,
+            sweep.passes = tally.passes,
+            sweep.settle_polls = tally.settle_polls,
+            sweep.settled = outcome.cleanup != Cleanup::Unconfirmed,
+            sweep.unreadable = outcome.unreadable.len(),
+            sweep.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "swept processes of a lost runtime"
+        );
+        outcome
     }
 
     /// The sweep passes of [`Self::sweep_runtime_detailed`], within the settle
@@ -795,12 +815,14 @@ impl SessionRegistry {
         worker_instance_id: &str,
         grace: Duration,
         request: &SweepRequest,
+        tally: &mut SweepTally,
     ) -> SweepOutcome {
         // Sweep passes made, not counting the pauses of an unreadable-marker
         // wait; the pass in flight is `passes + 1`.
         let mut passes = 0;
         let deciding_pass = loop {
             let pass = passes + 1;
+            tally.passes = pass;
             let report = match sweep_runtime(self.inner.inspector.as_ref(), request).await {
                 Ok(report) => report,
                 Err(error) => {
@@ -819,6 +841,7 @@ impl SessionRegistry {
             // waits for it (see [`settle_unreadable`]).
             let only_unreadable = leaves_only_unreadable(&report);
             let settling = only_unreadable && settle_unreadable(grace).await;
+            tally.settle_polls += usize::from(settling);
             let role = if settling {
                 PassRole::Settling
             } else if only_unreadable {
@@ -858,7 +881,7 @@ impl SessionRegistry {
             }
             if passes >= MAX_SWEEP_PASSES {
                 return self
-                    .verify_last_pass(session_id, worker_instance_id, grace, request)
+                    .verify_last_pass(session_id, worker_instance_id, grace, request, tally)
                     .await;
             }
         };
@@ -886,6 +909,7 @@ impl SessionRegistry {
         worker_instance_id: &str,
         grace: Duration,
         request: &SweepRequest,
+        tally: &mut SweepTally,
     ) -> SweepOutcome {
         loop {
             let survey = match survey_runtime(self.inner.inspector.as_ref(), request) {
@@ -907,6 +931,7 @@ impl SessionRegistry {
                     .iter()
                     .all(|skipped| skipped.reason == SkipReason::MarkersUnreadable);
             let settling = only_unreadable && settle_unreadable(grace).await;
+            tally.settle_polls += usize::from(settling);
             log_sweep_survey(session_id, worker_instance_id, &survey, settling);
             if survey.is_empty() {
                 return SweepOutcome::complete();
@@ -1649,8 +1674,18 @@ enum PassRole {
     Deciding,
 }
 
-/// Logs what one pass of a lost-runtime sweep did, and on the deciding pass
-/// warns about session processes it could not attribute.
+/// What one lost-runtime sweep did, for its single summary line.
+#[derive(Debug, Default)]
+struct SweepTally {
+    /// Sweep passes that selected processes or decided the outcome.
+    passes: usize,
+    /// Re-reads of the process table while only unreadable-marker processes
+    /// remained.
+    settle_polls: usize,
+}
+
+/// Logs at `debug` what one pass of a lost-runtime sweep did, and on the
+/// deciding pass warns about session processes it could not attribute.
 fn log_sweep_pass(
     session_id: &str,
     worker_instance_id: &str,
@@ -1668,7 +1703,7 @@ fn log_sweep_pass(
         .iter()
         .filter(|skipped| skipped.reason == SkipReason::InstanceUnmarked)
         .count();
-    tracing::info!(
+    tracing::debug!(
         session_id,
         worker_instance_id,
         sweep.pass = pass,
@@ -1678,7 +1713,7 @@ fn log_sweep_pass(
         sweep.unreadable = unreadable,
         sweep.unmarked = unmarked,
         sweep.settling = role == PassRole::Settling,
-        "swept processes of a lost runtime"
+        "sweep pass of a lost runtime"
     );
     // The deciding pass settles the outcome, so it alone names the cause.
     if role == PassRole::Deciding {
@@ -1686,8 +1721,8 @@ fn log_sweep_pass(
     }
 }
 
-/// Logs what the survey after the last sweep pass found, and on the survey
-/// that decides the outcome warns about session processes it could not
+/// Logs at `debug` what the survey after the last sweep pass found, and on the
+/// survey that decides the outcome warns about session processes it could not
 /// attribute.
 fn log_sweep_survey(
     session_id: &str,
@@ -1695,7 +1730,7 @@ fn log_sweep_survey(
     survey: &SweepSurvey,
     settling: bool,
 ) {
-    tracing::info!(
+    tracing::debug!(
         session_id,
         worker_instance_id,
         sweep.attributed = survey.attributed.len(),

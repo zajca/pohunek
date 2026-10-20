@@ -13590,6 +13590,58 @@ generation "$1"
             );
         }
 
+        /// A sweep that settles for many polls logs one `info` summary, however
+        /// many polls it took; the polls themselves log at `debug`.
+        #[tokio::test(start_paused = true)]
+        async fn a_settling_sweep_logs_one_info_summary_whatever_the_poll_count() {
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.fail_markers(true);
+            let fixture =
+                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+            let _marked = Marked::spawn(&fixture.root, "runtime-s-1329");
+            persist_record(&fixture.root, "s-1329", Some("runtime-s-1329"));
+            write_live_journal(
+                &fixture.root,
+                "s-1329",
+                dead_worker(),
+                Some("runtime-s-1329"),
+            );
+            let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+            let _subscriber = logs.install();
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let text = logs.text();
+            let summaries = text
+                .lines()
+                .filter(|line| {
+                    line.contains(" INFO ") && line.contains("swept processes of a lost runtime")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(summaries.len(), 1, "one summary per sweep: {text}");
+            assert!(
+                summaries[0].contains("sweep.settled=false"),
+                "{}",
+                summaries[0]
+            );
+            assert!(
+                summaries[0].contains("sweep.unreadable=1"),
+                "{}",
+                summaries[0]
+            );
+            let polls = text.matches("sweep pass of a lost runtime").count();
+            assert!(polls > 2, "the settle polled many times at debug: {polls}");
+            assert!(
+                !text
+                    .lines()
+                    .any(|line| line.contains(" INFO ")
+                        && line.contains("sweep pass of a lost runtime")),
+                "no poll logs at info: {text}"
+            );
+        }
+
         /// Sweep grace of the resume scenarios: above the SDK client's
         /// ordinary 5 s request timeout, so the refusal arrives after it.
         const SLOW_SWEEP_GRACE: Duration = Duration::from_secs(8);
