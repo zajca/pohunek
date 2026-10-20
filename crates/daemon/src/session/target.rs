@@ -936,6 +936,7 @@ impl SessionRegistry {
             procwatch_cancel: procwatch_cancel.clone(),
             runtime_watch_cancel: runtime_watch_cancel.clone(),
             procwatch_rescan: Arc::clone(&procwatch_rescan),
+            procwatch_scan: Arc::new(Mutex::new(())),
             stopping: false,
             stop_transaction_id: None,
             input_rules,

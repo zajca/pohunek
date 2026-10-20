@@ -420,8 +420,13 @@ mod tests {
             loop {
                 let event = events.recv().await.expect("event stream stays open");
                 if event.event() == protocol::event::AGENT_STATE {
-                    return serde_json::from_value(event.payload().clone())
-                        .expect("valid agent state event");
+                    let state: protocol::AgentStateEvent =
+                        serde_json::from_value(event.payload().clone())
+                            .expect("valid agent state event");
+                    // Only the detector under test reports from the screen.
+                    if state.source == StateSource::Screen {
+                        return state;
+                    }
                 }
             }
         })
@@ -468,6 +473,11 @@ mod tests {
                 })
                 .await
                 .expect("create shell session");
+            // The session's own detector would add process-sourced events of
+            // its own; the detector under test is the only one.
+            registry.inner.sessions.lock().await[&session.id]
+                .detector_cancel
+                .cancel();
             let events = registry.subscribe();
 
             let config = DetectorConfig {
@@ -554,7 +564,9 @@ mod tests {
         tokio::time::timeout(window, async {
             loop {
                 let event = events.recv().await.expect("event stream stays open");
-                if event.event() == protocol::event::AGENT_STATE {
+                if event.event() == protocol::event::AGENT_STATE
+                    && event.payload()["source"] == "screen"
+                {
                     return;
                 }
             }

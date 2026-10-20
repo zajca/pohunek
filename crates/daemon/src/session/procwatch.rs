@@ -4,10 +4,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use protocol::{event, CwdSource, RuntimeRef, SessionInfo};
-use tokio::time::MissedTickBehavior;
+use protocol::{event, AgentActivity, CwdSource, RuntimeRef, SessionInfo};
 use tracing::{debug, warn};
 
 use crate::agent::host::LaunchProgram;
@@ -199,6 +198,88 @@ struct ObservedRefresh {
     lineage: Option<ScanLineage>,
 }
 
+/// What one rescan found, for pacing the next one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ScanOutcome {
+    /// Whether the watch keeps running.
+    pub(super) alive: bool,
+    /// Digest of the process tree the scan read; `None` when it read none.
+    tree: Option<u64>,
+    /// Whether the scan changed the session or opened an exit watch.
+    changed: bool,
+    /// Whether the session was not working when the scan applied.
+    quiet: bool,
+}
+
+impl ScanOutcome {
+    const fn stopped() -> Self {
+        Self {
+            alive: false,
+            tree: None,
+            changed: false,
+            quiet: false,
+        }
+    }
+
+    const fn unchanged() -> Self {
+        Self {
+            alive: true,
+            tree: None,
+            changed: false,
+            quiet: false,
+        }
+    }
+}
+
+/// The inspector reads of one scan, taken together off the async executor.
+struct ScanCollection {
+    exited_reporter: Option<ProcessIdentity>,
+    descendants: DescendantsScan,
+    foreground_probe: ForegroundProbe,
+    root_running: Result<bool, String>,
+}
+
+enum DescendantsScan {
+    Read {
+        scan_pin: Option<Arc<RuntimeDefinition>>,
+        refresh: ObservedRefresh,
+        tree: u64,
+    },
+    Failed(Option<ScanLineage>),
+}
+
+/// Whether a scan of `entry` may be followed by a slower one: the agent is not
+/// working and no reported claim still waits for a scan to bind or expire it.
+fn scan_is_quiet(entry: &SessionEntry) -> bool {
+    let unbound_claim = entry
+        .active_agent
+        .as_ref()
+        .is_some_and(|active| !active.observed)
+        && bound_reporter_of(entry).is_none();
+    entry.info.activity != Some(AgentActivity::Working) && !unbound_claim
+}
+
+/// Digest of the identity and command of every process in the tree.
+fn tree_digest(facts: &[ProcessFact]) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut ordered: Vec<&ProcessFact> = facts.iter().collect();
+    ordered.sort_by_key(|fact| fact.pid);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for fact in ordered {
+        (
+            fact.pid,
+            fact.ppid,
+            fact.pgid,
+            fact.start_identity,
+            &fact.comm,
+            &fact.cmdline,
+        )
+            .hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// How process recognition treats a session's own runtime.
 #[derive(Debug, Clone)]
 pub(super) enum OwnRuntime {
@@ -259,27 +340,41 @@ impl SessionRegistry {
     ) {
         let registry = self.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(registry.inner.config.procwatch_poll);
-            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let base = registry.inner.config.procwatch_poll;
+            let ceiling = registry.inner.config.procwatch_idle_poll_max.max(base);
+            // The first scan runs at once; later ones wait `delay`, which grows
+            // while a quiet session's process tree stays the same.
+            let mut delay = Duration::ZERO;
+            let mut last_tree = None;
             loop {
-                // Cancellation wins over a ready tick or rescan so a stopped
+                // Cancellation wins over a ready timer or rescan so a stopped
                 // loop never starts another scan.
-                tokio::select! {
+                let outcome = tokio::select! {
                     biased;
                     () = cancel.cancelled() => break,
-                    _ = tick.tick() => {
-                        if !registry.rescan_live_root(&id, &expected, root, crate::time::now()).await {
-                            cancel.cancel();
-                            break;
-                        }
+                    () = tokio::time::sleep(delay) => {
+                        let outcome = registry
+                            .rescan_live_root(&id, &expected, root, crate::time::now())
+                            .await;
+                        let steady = outcome.quiet
+                            && !outcome.changed
+                            && outcome.tree.is_some()
+                            && outcome.tree == last_tree;
+                        delay = if steady { (delay * 2).clamp(base, ceiling) } else { base };
+                        outcome
                     }
                     () = rescan.notified() => {
-                        if !registry.rescan_live_root(&id, &expected, root, crate::time::now()).await {
-                            cancel.cancel();
-                            break;
-                        }
+                        delay = base;
+                        registry
+                            .rescan_live_root(&id, &expected, root, crate::time::now())
+                            .await
                     }
+                };
+                if !outcome.alive {
+                    cancel.cancel();
+                    break;
                 }
+                last_tree = outcome.tree;
             }
         });
     }
@@ -290,15 +385,18 @@ impl SessionRegistry {
         expected: &RuntimeWatchIdentity,
         root: ProcessIdentity,
         now: Instant,
-    ) -> bool {
-        match self.inner.inspector.is_running(root) {
+    ) -> ScanOutcome {
+        let running = self
+            .off_executor(move |registry| registry.inner.inspector.is_running(root))
+            .await;
+        match running {
             Ok(true) => {
                 self.rescan_guarded_procwatch_at(id, expected, root, now)
                     .await
             }
             Ok(false) => {
                 self.retire_procwatch_root(id, expected, now).await;
-                false
+                ScanOutcome::stopped()
             }
             Err(err) => {
                 debug!(
@@ -307,8 +405,26 @@ impl SessionRegistry {
                     error = %err,
                     "failed to validate procwatch root identity"
                 );
-                true
+                ScanOutcome::unchanged()
             }
+        }
+    }
+
+    /// Runs synchronous process-inspector reads on a blocking thread, so they
+    /// never occupy a worker that serves control requests.
+    async fn off_executor<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Self) -> T + Send + 'static,
+    ) -> T {
+        let registry = self.clone();
+        match tokio::task::spawn_blocking(move || work(&registry)).await {
+            Ok(value) => value,
+            Err(error) => match error.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                // The runtime is shutting down; the caller's task is dropped
+                // with it, so this value is never observed.
+                Err(_cancelled) => std::future::pending().await,
+            },
         }
     }
 
@@ -339,6 +455,79 @@ impl SessionRegistry {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the scan's inputs are read under the session mutex and handed to a blocking thread together"
+    )]
+    fn collect_procwatch_scan(
+        &self,
+        id: &SessionId,
+        worker_instance_id: &str,
+        root: ProcessIdentity,
+        own: Option<&OwnRuntime>,
+        claimed_reporter: Option<Pid>,
+        unwatched_reporter: Option<ProcessIdentity>,
+        now: Instant,
+    ) -> ScanCollection {
+        let exited_reporter = unwatched_reporter.filter(|identity| {
+            match self.inner.inspector.is_running(*identity) {
+                Ok(running) => !running,
+                Err(err) => {
+                    debug!(
+                        session_id = %id.0,
+                        pid = identity.pid,
+                        error = %err,
+                        "bound reporter liveness read failed; the claim stays"
+                    );
+                    false
+                }
+            }
+        });
+        let descendants = match self.inner.inspector.descendants(root.pid) {
+            Ok(facts) => {
+                let tree = tree_digest(&facts);
+                let scan_pin = own.and_then(OwnRuntime::pinned).cloned();
+                let lineage = claimed_reporter
+                    .map(|pid| self.scan_lineage(id, worker_instance_id, root, &facts, pid));
+                let agents = self.observed_agents_from_facts_for_runtime(
+                    id,
+                    facts,
+                    now,
+                    own,
+                    Some(worker_instance_id),
+                );
+                DescendantsScan::Read {
+                    scan_pin,
+                    refresh: ObservedRefresh { agents, lineage },
+                    tree,
+                }
+            }
+            Err(err) => {
+                warn!(
+                    session_id = %id.0,
+                    root_pid = root.pid,
+                    error = %err,
+                    "failed to inspect session process descendants"
+                );
+                DescendantsScan::Failed(
+                    claimed_reporter.map(|pid| ScanLineage::unavailable(root, pid)),
+                )
+            }
+        };
+        let foreground_probe = self.probe_foreground_group(id, root.pid);
+        let root_running = self
+            .inner
+            .inspector
+            .is_running(root)
+            .map_err(|err| err.to_string());
+        ScanCollection {
+            exited_reporter,
+            descendants,
+            foreground_probe,
+            root_running,
+        }
+    }
+
     fn probe_foreground_group(&self, id: &SessionId, root_pid: Pid) -> ForegroundProbe {
         match self.inner.inspector.foreground_process_group(root_pid) {
             Ok(foreground) => ForegroundProbe::Observed(foreground),
@@ -364,8 +553,19 @@ impl SessionRegistry {
         expected: &RuntimeWatchIdentity,
         root: ProcessIdentity,
         now: Instant,
-    ) -> bool {
+    ) -> ScanOutcome {
         let root_pid = root.pid;
+        let scan_gate = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|entry| Arc::clone(&entry.procwatch_scan));
+        let Some(scan_gate) = scan_gate else {
+            return ScanOutcome::stopped();
+        };
+        let _scan = scan_gate.lock().await;
         // The registry snapshot the scan identifies other runtimes with.
         let scan_registry = self.inner.profiles.runtimes().registry();
         // The claim a scan may prove is the one current before it collects: a
@@ -391,58 +591,52 @@ impl SessionRegistry {
                 )
             })
             .unwrap_or_default();
-        let exited_reporter = unwatched_reporter.filter(|identity| {
-            match self.inner.inspector.is_running(*identity) {
-                Ok(running) => !running,
-                Err(err) => {
-                    debug!(
-                        session_id = %id.0,
-                        pid = identity.pid,
-                        error = %err,
-                        "bound reporter liveness read failed; the claim stays"
-                    );
-                    false
+        let own = self.inner.sessions.lock().await.get(id).map(OwnRuntime::of);
+        // Procfs inspection is synchronous and walks the whole process tree.
+        // It runs on a blocking thread, outside the global session mutex, so a
+        // slow or permission-gated probe stalls neither the executor nor
+        // unrelated RPCs. The facts are collected before the probes that
+        // verify them.
+        let collection = self
+            .off_executor({
+                let id = id.clone();
+                let worker_instance_id = expected.worker_instance_id.clone();
+                move |registry| {
+                    registry.collect_procwatch_scan(
+                        &id,
+                        &worker_instance_id,
+                        root,
+                        own.as_ref(),
+                        claimed_reporter,
+                        unwatched_reporter,
+                        now,
+                    )
                 }
-            }
-        });
+            })
+            .await;
+        let ScanCollection {
+            exited_reporter,
+            descendants,
+            foreground_probe,
+            root_running,
+        } = collection;
         let mut collection_failed = None;
-        let (scan_pin, observed_refresh) = match self.inner.inspector.descendants(root_pid) {
-            Ok(facts) => {
-                let own = self.inner.sessions.lock().await.get(id).map(OwnRuntime::of);
-                let scan_pin = own.as_ref().and_then(OwnRuntime::pinned).cloned();
-                // Probes stay outside the session mutex, after the facts they
-                // verify were collected.
-                let lineage = claimed_reporter.map(|pid| {
-                    self.scan_lineage(id, &expected.worker_instance_id, root, &facts, pid)
-                });
-                let agents = self.observed_agents_from_facts_for_runtime(
-                    id,
-                    facts,
-                    now,
-                    own.as_ref(),
-                    Some(&expected.worker_instance_id),
-                );
-                (scan_pin, Some(ObservedRefresh { agents, lineage }))
-            }
-            Err(err) => {
-                warn!(
-                    session_id = %id.0,
-                    root_pid,
-                    error = %err,
-                    "failed to inspect session process descendants"
-                );
-                collection_failed = claimed_reporter.map(|pid| ScanLineage::unavailable(root, pid));
-                (None, None)
+        let (scan_pin, observed_refresh, tree) = match descendants {
+            DescendantsScan::Read {
+                scan_pin,
+                refresh,
+                tree,
+            } => (scan_pin, Some(refresh), Some(tree)),
+            DescendantsScan::Failed(lineage) => {
+                collection_failed = lineage;
+                (None, None, None)
             }
         };
-        // Procfs inspection is synchronous. Keep it outside the global session
-        // mutex so a slow or permission-gated probe cannot stall unrelated RPCs.
-        let foreground_probe = self.probe_foreground_group(id, root_pid);
-        match self.inner.inspector.is_running(root) {
+        match root_running {
             Ok(true) => {}
             Ok(false) => {
                 self.retire_procwatch_root(id, expected, now).await;
-                return false;
+                return ScanOutcome::stopped();
             }
             Err(err) => {
                 debug!(
@@ -451,7 +645,7 @@ impl SessionRegistry {
                     error = %err,
                     "failed to close procwatch root identity bracket"
                 );
-                return true;
+                return ScanOutcome::unchanged();
             }
         }
         let mut exit_watches = match observed_refresh.as_ref() {
@@ -462,17 +656,17 @@ impl SessionRegistry {
             None => HashMap::new(),
         };
 
-        let (to_spawn, updated, focus, foreground_group, foreground_changed) = {
+        let (to_spawn, updated, focus, foreground_group, foreground_changed, quiet) = {
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(id) else {
                 debug!(session_id = %id.0, "procwatch rescan for unknown session");
-                return false;
+                return ScanOutcome::stopped();
             };
             if !expected.matches(entry) {
-                return false;
+                return ScanOutcome::stopped();
             }
             if entry.stopping || is_terminal(entry.info.state) {
-                return false;
+                return ScanOutcome::stopped();
             }
             // A package change replaced a definition this scan matched with:
             // the session's own pin, or the registry other runtimes resolve
@@ -559,7 +753,15 @@ impl SessionRegistry {
                 focus,
                 entry.foreground_process_group,
                 foreground_changed,
+                scan_is_quiet(entry),
             )
+        };
+        let changed = foreground_changed || updated.is_some() || !to_spawn.is_empty();
+        let outcome = ScanOutcome {
+            alive: true,
+            tree,
+            changed,
+            quiet,
         };
 
         for (identity, watch, cancel) in to_spawn {
@@ -577,30 +779,34 @@ impl SessionRegistry {
         if let Some(info) = updated {
             self.emit(event::SESSION_UPDATED, &info);
         }
-        let focus_is_current = || {
-            self.inner
-                .inspector
-                .identity(focus.pid)
-                .is_ok_and(|current| current == Some(focus))
-        };
-        if !focus_is_current() {
-            return true;
-        }
+        // The focus process is re-identified around the cwd read so a reused
+        // pid never lends its cwd to the session.
         let observed_at = crate::time::now();
-        match self.inner.inspector.cwd(focus.pid) {
-            Ok(cwd) => {
-                if focus_is_current() {
-                    self.apply_cwd_change(
-                        id,
-                        cwd,
-                        CwdSource::Procwatch,
-                        Some(expected),
-                        observed_at,
-                    )
-                    .await;
+        let focus_cwd = self
+            .off_executor(move |registry| {
+                let inspector = &registry.inner.inspector;
+                let current = || {
+                    inspector
+                        .identity(focus.pid)
+                        .is_ok_and(|current| current == Some(focus))
+                };
+                if !current() {
+                    return None;
                 }
+                Some(
+                    inspector
+                        .cwd(focus.pid)
+                        .map(|cwd| (cwd, current()))
+                        .map_err(|err| err.to_string()),
+                )
+            })
+            .await;
+        match focus_cwd {
+            Some(Ok((cwd, true))) => {
+                self.apply_cwd_change(id, cwd, CwdSource::Procwatch, Some(expected), observed_at)
+                    .await;
             }
-            Err(err) => {
+            Some(Err(err)) => {
                 debug!(
                     session_id = %id.0,
                     focus_pid = focus.pid,
@@ -608,8 +814,9 @@ impl SessionRegistry {
                     "failed to inspect focus process cwd"
                 );
             }
+            Some(Ok((_, false))) | None => {}
         }
-        true
+        outcome
     }
 
     #[cfg(test)]

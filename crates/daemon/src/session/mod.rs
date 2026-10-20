@@ -232,6 +232,10 @@ const DEFAULT_DETECTOR_LAG_WARN_INTERVAL: Duration = Duration::from_secs(5);
 /// immediate stop detection after a process has been observed. One second keeps
 /// launch detection responsive without continuously scanning procfs.
 const DEFAULT_PROCWATCH_POLL: Duration = Duration::from_secs(1);
+/// Backoff ceiling for a quiet session with a stable process tree: a scan
+/// every 5 s keeps new children visible within seconds while cutting the idle
+/// scan rate fivefold.
+const DEFAULT_PROCWATCH_IDLE_POLL_MAX: Duration = Duration::from_secs(5);
 /// Default maximum age for an unbound active-agent hook claim.
 ///
 /// Hooks are rich but lossy claims. Thirty seconds gives procwatch enough time
@@ -484,6 +488,11 @@ pub struct SessionRegistryConfig {
     pub detector_lag_warn_interval: Duration,
     /// Poll interval for per-session process discovery and fallback cleanup.
     pub procwatch_poll: Duration,
+    /// Longest poll interval of a quiet session whose process tree has not
+    /// changed. A rescan trigger (a working transition, a hook, an exit watch)
+    /// or a changed tree returns the session to [`Self::procwatch_poll`], so
+    /// this also bounds how long a new child of a quiet session goes unseen.
+    pub procwatch_idle_poll_max: Duration,
     /// Maximum age for an active-agent claim with no backing observed process.
     pub active_agent_claim_ttl: Duration,
     /// Whether to observe same-user agents started outside pohunek-owned PTYs.
@@ -562,6 +571,7 @@ impl Default for SessionRegistryConfig {
             catalog_trust: CatalogTrust::Absent,
             detector_lag_warn_interval: DEFAULT_DETECTOR_LAG_WARN_INTERVAL,
             procwatch_poll: DEFAULT_PROCWATCH_POLL,
+            procwatch_idle_poll_max: DEFAULT_PROCWATCH_IDLE_POLL_MAX,
             active_agent_claim_ttl: DEFAULT_ACTIVE_AGENT_CLAIM_TTL,
             observe_external_agents: false,
             worker_runtime_root: None,
@@ -801,6 +811,9 @@ struct SessionEntry {
     procwatch_cancel: CancellationToken,
     runtime_watch_cancel: CancellationToken,
     procwatch_rescan: Arc<Notify>,
+    /// Serializes this session's procwatch scans: a scan collects, then applies
+    /// against the state the previous scan left.
+    procwatch_scan: Arc<Mutex<()>>,
     stopping: bool,
     stop_transaction_id: Option<String>,
     /// Resolved input-framing rules (base-kind defaults, profile-overridden), used

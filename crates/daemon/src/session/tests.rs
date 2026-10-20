@@ -1726,6 +1726,7 @@ struct MockInspectorState {
     foreground_groups: HashMap<Pid, Option<Pid>>,
     foreground_error: Option<std::io::ErrorKind>,
     foreground_block: Option<Arc<ForegroundBlock>>,
+    exit_watch_block: Option<Arc<ForegroundBlock>>,
     foreground_probes: usize,
     cwd: HashMap<Pid, PathBuf>,
     identity_overrides: HashMap<Pid, Option<ProcessIdentity>>,
@@ -1740,6 +1741,13 @@ struct MockInspectorState {
     exit_watch_failures: HashMap<Pid, bool>,
     events_expected_before_watch: HashMap<Pid, tokio::sync::broadcast::Receiver<Event>>,
     ownership_markers: HashMap<Pid, OwnershipMarkers>,
+    descendant_scans_started: usize,
+    descendant_scans_finished: usize,
+    /// Thread that drives the test's current-thread executor, once registered.
+    executor_thread: Option<std::thread::ThreadId>,
+    /// Scans that ran on `executor_thread`, where they would occupy the
+    /// executor that serves requests.
+    descendant_scans_in_task: usize,
 }
 
 #[derive(Debug, Default)]
@@ -1798,6 +1806,39 @@ impl MockInspector {
         inner.descendants.insert(root, facts);
     }
 
+    fn scripted_descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
+        let mut inner = self.inner.lock().expect("mock inspector lock");
+        if let Some(kind) = inner.descendants_error {
+            return Err(crate::procwatch::Error::from_io(
+                "mock_descendants",
+                std::io::Error::new(kind, "mock descendants failure"),
+            ));
+        }
+        let descendants = inner.descendants.get(&root).cloned().unwrap_or_default();
+        if let Some(identity) = inner.identity_after_descendants.remove(&root) {
+            inner.identity_overrides.insert(root, Some(identity));
+        }
+        Ok(descendants)
+    }
+
+    /// Counts the descendant scans that run on the calling thread from now on.
+    fn count_scans_on_current_thread(&self) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .executor_thread = Some(std::thread::current().id());
+    }
+
+    /// Returns `(started, finished, on_executor_thread)` descendant scan counts.
+    fn descendant_scans(&self) -> (usize, usize, usize) {
+        let inner = self.inner.lock().expect("mock inspector lock");
+        (
+            inner.descendant_scans_started,
+            inner.descendant_scans_finished,
+            inner.descendant_scans_in_task,
+        )
+    }
+
     fn fail_descendants_with(&self, kind: std::io::ErrorKind) {
         self.inner
             .lock()
@@ -1831,6 +1872,16 @@ impl MockInspector {
             .lock()
             .expect("mock inspector lock")
             .foreground_probes
+    }
+
+    /// Parks the next armed exit watch after it was registered.
+    fn block_exit_watch(&self) -> Arc<ForegroundBlock> {
+        let block = Arc::new(ForegroundBlock::default());
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .exit_watch_block = Some(Arc::clone(&block));
+        block
     }
 
     fn block_foreground(&self) -> Arc<ForegroundBlock> {
@@ -2042,18 +2093,19 @@ impl ProcessInspector for MockInspector {
     }
 
     fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, crate::procwatch::Error> {
-        let mut inner = self.inner.lock().expect("mock inspector lock");
-        if let Some(kind) = inner.descendants_error {
-            return Err(crate::procwatch::Error::from_io(
-                "mock_descendants",
-                std::io::Error::new(kind, "mock descendants failure"),
-            ));
+        {
+            let mut inner = self.inner.lock().expect("mock inspector lock");
+            inner.descendant_scans_started += 1;
+            if inner.executor_thread == Some(std::thread::current().id()) {
+                inner.descendant_scans_in_task += 1;
+            }
         }
-        let descendants = inner.descendants.get(&root).cloned().unwrap_or_default();
-        if let Some(identity) = inner.identity_after_descendants.remove(&root) {
-            inner.identity_overrides.insert(root, Some(identity));
-        }
-        Ok(descendants)
+        let result = self.scripted_descendants(root);
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .descendant_scans_finished += 1;
+        result
     }
 
     fn cwd(&self, pid: Pid) -> Result<PathBuf, crate::procwatch::Error> {
@@ -2097,8 +2149,16 @@ impl ProcessInspector for MockInspector {
                     .expect("external creation must be published before its exit watch is armed");
                 assert_eq!(event.event(), protocol::event::SESSION_CREATED);
             }
-            inner.immediate_exits.contains(&identity.pid)
+            (
+                inner.immediate_exits.contains(&identity.pid),
+                inner.exit_watch_block.take(),
+            )
         };
+        let (immediate, block) = immediate;
+        if let Some(block) = block {
+            block.entered.store(true, Ordering::Release);
+            block.wait_for_release();
+        }
         Ok(ExitWatch::from_future(async move {
             if immediate {
                 return Ok(());
@@ -8449,11 +8509,17 @@ fn drain_agent_state(events: &mut tokio::sync::broadcast::Receiver<protocol::Eve
     count
 }
 
+/// Creates a shell session whose own detector is stopped, so the test is the
+/// only source of its activity.
 async fn shell_session(registry: &SessionRegistry) -> protocol::SessionInfo {
-    registry
+    let created = registry
         .create(params())
         .await
-        .expect("create shell session")
+        .expect("create shell session");
+    registry.inner.sessions.lock().await[&created.id]
+        .detector_cancel
+        .cancel();
+    created
 }
 
 fn sleeping_registry() -> SessionRegistry {
@@ -9931,6 +9997,16 @@ async fn stop_procwatch_loop(
     sessions[id].procwatch_cancel.cancel();
 }
 
+/// Waits until the session's own procwatch loop finished its first scan, so the
+/// test's scripted process tree is read only by the scans the test runs.
+async fn wait_for_first_procwatch_scan(inspector: &MockInspector) {
+    wait_until("the loop's first scan finished", || async {
+        let (started, finished, _) = inspector.descendant_scans();
+        (started >= 1 && started == finished).then_some(())
+    })
+    .await;
+}
+
 async fn mock_procwatch_registry(tag: &str) -> (SessionRegistry, Arc<MockInspector>, SessionInfo) {
     let inspector = Arc::new(MockInspector::default());
     let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
@@ -9952,6 +10028,215 @@ async fn mock_procwatch_registry(tag: &str) -> (SessionRegistry, Arc<MockInspect
         .await
         .expect("create shell session");
     (registry, inspector, created)
+}
+
+/// Poll of the idle-backoff scenarios; the backoff ceiling is eight polls.
+const BACKOFF_POLL: Duration = Duration::from_secs(1);
+const BACKOFF_CEILING: Duration = Duration::from_secs(8);
+/// Virtual seconds that bring every quiet session to the backoff ceiling.
+const BACKOFF_SETTLE_SECS: u64 = 16;
+const BACKOFF_CHILD_PID: Pid = 4_242;
+
+fn backoff_registry() -> (SessionRegistry, Arc<MockInspector>) {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            procwatch_poll: BACKOFF_POLL,
+            procwatch_idle_poll_max: BACKOFF_CEILING,
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    (registry, inspector)
+}
+
+/// Lets every scan the loops started finish and apply, on the paused clock.
+async fn settle_procwatch_scans(inspector: &MockInspector) {
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    wait_until("in-flight procwatch scans finish", || async {
+        let (started, finished, _) = inspector.descendant_scans();
+        (started == finished).then_some(())
+    })
+    .await;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn advance_settling(inspector: &MockInspector, seconds: u64) {
+    for _ in 0..seconds {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle_procwatch_scans(inspector).await;
+    }
+}
+
+#[tokio::test]
+async fn quiet_sessions_with_a_stable_tree_are_scanned_at_the_backoff_rate_off_the_executor() {
+    const SESSIONS: usize = 3;
+    let (registry, inspector) = backoff_registry();
+    let mut created = Vec::new();
+    for _ in 0..SESSIONS {
+        created.push(registry.create(params()).await.expect("create session"));
+    }
+    wait_until("every loop's first scan", || async {
+        (inspector.descendant_scans().0 >= SESSIONS).then_some(())
+    })
+    .await;
+    inspector.count_scans_on_current_thread();
+    tokio::time::pause();
+    settle_procwatch_scans(&inspector).await;
+    let (before, _, in_task_before) = inspector.descendant_scans();
+
+    advance_settling(&inspector, BACKOFF_SETTLE_SECS).await;
+
+    let (started, _, in_task) = inspector.descendant_scans();
+    let scans = started - before;
+    // Scanning every poll would be one scan per session per second.
+    let unbacked_off = SESSIONS * usize::try_from(BACKOFF_SETTLE_SECS).expect("small count");
+    assert!(
+        scans <= SESSIONS * 6 && scans < unbacked_off / 2,
+        "{scans} scans of {SESSIONS} quiet sessions in {BACKOFF_SETTLE_SECS}s"
+    );
+    assert!(scans >= SESSIONS * 2, "the backoff never stops the scans");
+    assert_eq!(
+        in_task, in_task_before,
+        "no periodic process-tree scan runs on the executor thread"
+    );
+
+    tokio::time::resume();
+    for session in &created {
+        let _ = registry.stop(&session.id).await;
+    }
+}
+
+#[tokio::test]
+async fn a_working_transition_rescans_a_backed_off_session_at_once() {
+    let (registry, inspector) = backoff_registry();
+    let created = registry.create(params()).await.expect("create session");
+    wait_until("the first scan", || async {
+        (inspector.descendant_scans().0 >= 1).then_some(())
+    })
+    .await;
+    tokio::time::pause();
+    advance_settling(&inspector, BACKOFF_SETTLE_SECS).await;
+    let before = inspector.descendant_scans().0;
+
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    settle_procwatch_scans(&inspector).await;
+
+    assert_eq!(
+        inspector.descendant_scans().0,
+        before + 1,
+        "the working transition triggers a scan without waiting for the backoff"
+    );
+    tokio::time::resume();
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_child_of_a_backed_off_session_is_observed_within_the_ceiling() {
+    let (registry, inspector) = backoff_registry();
+    let created = registry.create(params()).await.expect("create session");
+    wait_until("the first scan", || async {
+        (inspector.descendant_scans().0 >= 1).then_some(())
+    })
+    .await;
+    tokio::time::pause();
+    advance_settling(&inspector, BACKOFF_SETTLE_SECS).await;
+    let observed = |registry: &SessionRegistry| {
+        let registry = registry.clone();
+        let id = created.id.clone();
+        async move {
+            registry.inner.sessions.lock().await[&id]
+                .observed_agents
+                .len()
+        }
+    };
+    assert_eq!(observed(&registry).await, 0);
+
+    inspector.set_descendants(
+        created.pid,
+        vec![codex_fact(BACKOFF_CHILD_PID, created.pid)],
+    );
+    let mut seen_after = None;
+    for second in 1..=BACKOFF_CEILING.as_secs() {
+        advance_settling(&inspector, 1).await;
+        if observed(&registry).await == 1 {
+            seen_after = Some(second);
+            break;
+        }
+    }
+
+    assert!(
+        seen_after.is_some(),
+        "a child started under a quiet session is observed within {BACKOFF_CEILING:?}"
+    );
+    tokio::time::resume();
+    let _ = registry.stop(&created.id).await;
+}
+
+/// Two scans of one session never overlap: the second collects after the
+/// first applied, so one observation arms one exit watch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlapping_scans_of_one_session_arm_one_exit_watch_per_observation() {
+    let (registry, inspector, created) = mock_procwatch_registry("overlapping-scans").await;
+    wait_until("the loop's first scan finished", || async {
+        let (started, finished, _) = inspector.descendant_scans();
+        (started >= 1 && started == finished).then_some(())
+    })
+    .await;
+    registry.inner.sessions.lock().await[&created.id]
+        .procwatch_cancel
+        .cancel();
+    inspector.set_descendants(
+        created.pid,
+        vec![codex_fact(DESCENDANT_WRAPPER_PID, created.pid)],
+    );
+    let block = inspector.block_exit_watch();
+    let _release_guard = ForegroundReleaseGuard(Arc::clone(&block));
+    // The first scan parks while arming its watch, after it read that no watch
+    // exists and before it applied its observation.
+    let first = {
+        let registry = registry.clone();
+        let (id, pid) = (created.id.clone(), created.pid);
+        let runtime = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            runtime.block_on(registry.rescan_procwatch_at(&id, pid, Instant::now()));
+        })
+    };
+    tokio::time::timeout(HANG_GUARD, async {
+        while !block.entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first scan armed its exit watch");
+    let gate = Arc::clone(&registry.inner.sessions.lock().await[&created.id].procwatch_scan);
+    assert!(
+        gate.try_lock().is_err(),
+        "a scan that is arming its watches still owns the session's scan gate"
+    );
+    let second = {
+        let registry = registry.clone();
+        let (id, pid) = (created.id.clone(), created.pid);
+        tokio::spawn(async move {
+            registry.rescan_procwatch_at(&id, pid, Instant::now()).await;
+        })
+    };
+
+    block.release();
+    first.join().expect("first scan thread");
+    second.await.expect("second scan joins");
+
+    assert_eq!(inspector.exit_watch_count(DESCENDANT_WRAPPER_PID), 1);
+    let _ = registry.stop(&created.id).await;
 }
 
 #[tokio::test]
@@ -10041,7 +10326,8 @@ async fn procwatch_retires_a_zombie_root_with_its_exact_generation() {
     assert!(
         !registry
             .rescan_live_root(&created.id, &expected, root, Instant::now())
-            .await,
+            .await
+            .alive,
         "a zombie must release procwatch root authority"
     );
     assert!(registry
@@ -12147,6 +12433,7 @@ async fn foreground_probe_does_not_hold_global_session_lock() {
 #[tokio::test]
 async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
     let (registry, inspector, created) = mock_procwatch_registry("pid-reuse-base").await;
+    wait_for_first_procwatch_scan(&inspector).await;
     inspector.set_descendants(
         created.pid,
         vec![codex_fact(PID_REUSE_AGENT_PID, created.pid)],

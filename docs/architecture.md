@@ -1086,6 +1086,14 @@ generation that created its output stream. Cancellation is advisory; a final
 transition from a superseded detector is discarded instead of being stamped
 with a replacement runtime's identity.
 
+Each session's procwatch loop scans its process tree on a blocking thread, never
+on the executor that serves requests. It scans every `procwatch_poll` (1 s). A
+session that is not working, holds no unbound hook claim and whose process tree
+is unchanged between scans doubles the wait up to `procwatch_idle_poll_max`
+(5 s); a changed tree, a `Working` transition, a hook or an exit watch returns it
+to the base poll, so a new child of a quiet session is observed within that
+ceiling.
+
 Procwatch reads Linux `/proc/<root>/stat` `tpgid` as the terminal foreground
 identity. A recognized process-group leader wins; an unrecognized wrapper lets
 the oldest deterministic recognized member of that exact PGID win. A known
