@@ -182,6 +182,16 @@ pub enum ClientError {
         timeout: Duration,
     },
 
+    /// A `session.resume` exceeded its response deadline, so the daemon may
+    /// still complete the resume.
+    #[error("timed out after {timeout:?} waiting for the result of a session resume")]
+    SessionResumeOutcomeUnknown {
+        /// Remote host involved in the request, or `None` for the local daemon.
+        host: Option<String>,
+        /// Configured response deadline that elapsed.
+        timeout: Duration,
+    },
+
     /// A daemon on a remote host returned a typed protocol error.
     #[error("host '{host}': {source}")]
     RemoteProtocol {
@@ -368,6 +378,22 @@ impl ClientError {
                 ),
                 Some(
                     "the request may have completed; reconcile daemon state before retrying a mutation"
+                        .to_owned(),
+                ),
+            ),
+            ClientError::SessionResumeOutcomeUnknown { host, timeout } => ProtocolError::new(
+                ErrorClass::Transport,
+                "session_resume_outcome_unknown",
+                host.as_ref().map_or_else(
+                    || format!("timed out after {timeout:?} waiting for the local daemon to resume the session"),
+                    |host| {
+                        format!(
+                            "timed out after {timeout:?} waiting for host '{host}' to resume the session"
+                        )
+                    },
+                ),
+                Some(
+                    "the resume may still complete: run `pohunek session inspect <session>` and read its runtime state before retrying"
                         .to_owned(),
                 ),
             ),
