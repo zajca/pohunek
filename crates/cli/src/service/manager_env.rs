@@ -329,6 +329,7 @@ pub async fn effective_search_path(
     };
     // The merged list also holds the unit file's own entries, which the install
     // replaces; the entry applies only when a drop-in sets `PATH`.
+    let mut unclear: Option<&str> = None;
     for drop_in in &unit.drop_in_paths {
         let text = read_unit_settings_file(drop_in, unit_name, "drop-in")
             .await?
@@ -338,9 +339,16 @@ pub async fn effective_search_path(
                     super::settings::UNIT_SETTINGS_FILE_LIMIT
                 ))
             })?;
-        if drop_in_sets_path(&text) {
-            return carry(merged).map(Some).map_err(refuse);
+        match drop_in_path_assignment(&text) {
+            PathAssignment::Sets => return carry(merged).map(Some).map_err(refuse),
+            PathAssignment::Unclear => unclear = Some(drop_in),
+            PathAssignment::No => {}
         }
+    }
+    if let Some(drop_in) = unclear {
+        return Err(refuse(format!(
+            "the drop-in {drop_in} of {unit_name} has an Environment= line that may set {SEARCH_PATH_VARIABLE} in a form not read here (an escape sequence or a name containing {SEARCH_PATH_VARIABLE}), while {unit_name} also gets {SEARCH_PATH_VARIABLE} from its unit file, which the install replaces. Write it as a plain `Environment={SEARCH_PATH_VARIABLE}=...` assignment or remove the other {SEARCH_PATH_VARIABLE} entry, and retry"
+        )));
     }
     Ok(manager_path)
 }
@@ -507,25 +515,42 @@ fn logical_lines(text: &str) -> Vec<String> {
     lines
 }
 
-/// Whether a unit drop-in has an `Environment=` assignment of `PATH`.
+/// What a unit drop-in says about `PATH` in its `Environment=` lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathAssignment {
+    /// A plain `PATH=` assignment.
+    Sets,
+    /// No plain assignment, but an escape sequence or a name containing `PATH`
+    /// that could still decode to one.
+    Unclear,
+    /// Nothing that can set `PATH`.
+    No,
+}
+
+/// Classifies the `Environment=` lines of a unit drop-in.
 ///
-/// Joins continuation lines, skips comment lines, and splits the value into
+/// Joins continuation lines, skips comment lines, and splits each value into
 /// words outside quotes, as the unit file syntax does.
-fn drop_in_sets_path(text: &str) -> bool {
-    logical_lines(text).iter().any(|line| {
+fn drop_in_path_assignment(text: &str) -> PathAssignment {
+    let mut result = PathAssignment::No;
+    for line in logical_lines(text) {
         let Some((key, value)) = line.trim_start().split_once('=') else {
-            return false;
+            continue;
         };
         if key.trim_end() != "Environment" {
-            return false;
+            continue;
         }
         let mut word = String::new();
         let mut quote: Option<char> = None;
         let mut words = Vec::new();
+        let mut escaped = false;
         let mut chars = value.chars();
         while let Some(c) = chars.next() {
             match (c, quote) {
-                ('\\', _) => word.extend(chars.next()),
+                ('\\', _) => {
+                    escaped = true;
+                    word.extend(chars.next());
+                }
                 ('\'' | '"', None) => quote = Some(c),
                 (c, Some(q)) if c == q => quote = None,
                 (c, None) if c.is_whitespace() => words.push(std::mem::take(&mut word)),
@@ -533,10 +558,15 @@ fn drop_in_sets_path(text: &str) -> bool {
             }
         }
         words.push(word);
-        words
-            .iter()
-            .any(|word| word.starts_with(&format!("{SEARCH_PATH_VARIABLE}=")))
-    })
+        let assignment = format!("{SEARCH_PATH_VARIABLE}=");
+        if !escaped && words.iter().any(|word| word.starts_with(&assignment)) {
+            return PathAssignment::Sets;
+        }
+        if escaped || value.contains(SEARCH_PATH_VARIABLE) {
+            result = PathAssignment::Unclear;
+        }
+    }
+    result
 }
 
 /// What launchd reports for the daemon job's `PATH`, from both of its sources.

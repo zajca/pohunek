@@ -950,7 +950,7 @@ that changes `PATH` in a way the CLI cannot read is refused with the same code,
 and the message names the file or directive to change: an `EnvironmentFile=` that
 sets `PATH` (or is a wildcard, or a required file that cannot be read),
 `PassEnvironment=PATH`, `UnsetEnvironment=PATH`, a masked or broken unit, and a
-drop-in of a unit that has no unit file yet.
+drop-in of a unit that has no unit file yet, a unit or drop-in changed on disk since the manager loaded it (run `systemctl --user daemon-reload`), and a drop-in `Environment=` line that may set `PATH` in a form the CLI does not read (an escape sequence or a lookalike name) while the unit file also sets `PATH`. The CLI reads each named `EnvironmentFile=` and drop-in once, as a regular file of at most 1 MiB.
 
 A journal written by an older CLI, or one whose job was not loaded when the upgrade
 started, has no journaled default; its rollback of a job that is not loaded reads

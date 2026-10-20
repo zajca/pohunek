@@ -10040,7 +10040,7 @@ async fn a_path_set_only_by_the_replaced_unit_file_does_not_apply() {
     assert_eq!(job.value, MANAGER_PATH, "no drop-in");
 
     let (_dir, drop_in) = environment_file(
-        "# Environment=PATH=/commented\n[Service]\nEnvironment=MYPATH=/x \\\n  OTHER=2\nEnvironment=\n",
+        "# Environment=PATH=/commented\n[Service]\nEnvironment=STORE=/x \\\n  OTHER=2\nEnvironment=\n",
     );
     let unit = UnitEnvironment {
         drop_in_paths: vec![drop_in],
@@ -10087,6 +10087,30 @@ async fn a_drop_in_with_spaces_around_the_equals_sign_still_sets_the_path() {
     };
     let job = unrecorded_job_path(Ok(unit)).await.expect("path");
     assert_eq!(job.value, "/drop-in/bin");
+}
+
+/// An escaped or lookalike `PATH` in a drop-in, next to a `PATH` of the replaced
+/// unit file, is refused instead of guessed.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_drop_in_path_in_an_unreadable_form_is_refused() {
+    for content in [
+        "[Service]\nEnvironment=\"PATH\\x3d/drop-in/bin\"\n",
+        "[Service]\nEnvironment=MYPATH=/x\n",
+    ] {
+        let (_dir, drop_in) = environment_file(content);
+        let unit = UnitEnvironment {
+            drop_in_paths: vec![drop_in.clone()],
+            environment: vec!["PATH=/unit-file/bin".to_owned()],
+            ..loaded_unit()
+        };
+        let text = refusal(unrecorded_job_path(Ok(unit)).await);
+        assert!(
+            text.contains(&drop_in) && text.contains("plain `Environment=PATH=...`"),
+            "{text}"
+        );
+        assert!(!text.contains("/unit-file/bin"), "values stay out: {text}");
+    }
 }
 
 #[cfg(target_os = "linux")]
