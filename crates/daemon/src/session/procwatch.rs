@@ -490,14 +490,18 @@ impl SessionRegistry {
             };
             let lineage = lineage.or(collection_failed);
             let to_spawn = apply_observed_refresh(entry, agents, &mut exit_watches);
-            if entry
-                .bound_reporter
-                .as_ref()
-                .is_some_and(|bound| Some(bound.identity) == exited_reporter)
-                || bound_reporter_of(entry).is_none()
-            {
+            // A reporter read gone ends its claim here, whatever the
+            // foreground probe says.
+            let dead_reporter = bound_reporter_of(entry)
+                .map(|bound| bound.identity)
+                .filter(|identity| Some(*identity) == exited_reporter);
+            if dead_reporter.is_some() || bound_reporter_of(entry).is_none() {
                 drop_bound_reporter(entry);
             }
+            let retired = dead_reporter.and_then(|identity| {
+                forget_observed_generation(entry, identity);
+                self.reconcile_active_agent(entry, now, None)
+            });
             self.bind_proven_reporter(id, entry, lineage.as_ref());
 
             let foreground_changed = apply_foreground_probe(entry, foreground_probe);
@@ -514,7 +518,8 @@ impl SessionRegistry {
                 }
                 ForegroundDecision::Preserve => None,
                 ForegroundDecision::Updated => Some(entry.info.clone()),
-            };
+            }
+            .or(retired);
             let focus = entry
                 .active_agent
                 .as_ref()
@@ -680,6 +685,7 @@ impl SessionRegistry {
             if !names_claim {
                 return;
             }
+            forget_observed_generation(entry, identity);
             self.reconcile_without_scan(entry)
         };
 
@@ -1404,6 +1410,14 @@ impl SessionRegistry {
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1)
     }
+}
+
+/// Removes the observation of the exact process generation `identity`: its
+/// exit is established, so no claim may stand on it.
+fn forget_observed_generation(entry: &mut SessionEntry, identity: ProcessIdentity) {
+    entry.observed_agents.retain(|observed| {
+        (observed.pid, observed.start_identity) != (identity.pid, identity.start_identity.get())
+    });
 }
 
 fn unbound_claim_is_current(

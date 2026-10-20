@@ -11237,6 +11237,67 @@ async fn reporter_that_exits_while_its_watch_is_armed_is_not_bound() {
     let _ = registry.stop(&created.id).await;
 }
 
+/// A reporter an unwatched binding reads gone ends its claim in the same scan
+/// even when the foreground probe fails.
+#[tokio::test]
+async fn unwatched_reporter_death_ends_the_claim_despite_a_foreground_probe_error() {
+    let (registry, inspector, created) = mock_procwatch_registry("unwatched-death-fg-error").await;
+    inspector.fail_exit_watch(DESCENDANT_REPORTER_PID, false);
+    inspector.set_descendants(
+        created.pid,
+        vec![
+            codex_fact(DESCENDANT_WRAPPER_PID, created.pid),
+            fixture_reporter_fact(),
+        ],
+    );
+    report_descendant_claim(&registry, &created).await;
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    assert!(reporter_is_bound(&registry, &created.id).await);
+
+    inspector.set_not_running(fixture_reporter_fact().identity());
+    inspector.fail_descendants_with(std::io::ErrorKind::Interrupted);
+    inspector.fail_foreground_with(std::io::ErrorKind::Interrupted);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    assert_descendant_claim_replaced(
+        &registry,
+        &created.id,
+        DESCENDANT_WRAPPER_PID,
+        RuntimeRef::codex(),
+        "unwatched death, foreground probe error",
+    )
+    .await;
+    let _ = registry.stop(&created.id).await;
+}
+
+/// The binding's exit signal alone ends the claim of a reporter that is also
+/// an observed agent: the observation of the exited generation goes with it.
+#[tokio::test]
+async fn binding_exit_alone_ends_an_observed_reporters_claim() {
+    let (registry, inspector, created) = mock_procwatch_registry("binding-exit-only").await;
+    inspector.set_descendants(
+        created.pid,
+        vec![
+            codex_fact(DESCENDANT_WRAPPER_PID, created.pid),
+            codex_fact(DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID),
+        ],
+    );
+    report_descendant_claim(&registry, &created).await;
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    assert!(reporter_is_bound(&registry, &created.id).await);
+
+    inspector.fail_descendants_with(std::io::ErrorKind::Interrupted);
+    // The binding's watch is armed before the observation's.
+    inspector.fire_exit_watch(DESCENDANT_REPORTER_PID, 0);
+    assert_wrapper_replaces_bound_claim(&registry, &created.id, "binding exit only").await;
+    let _ = registry.stop(&created.id).await;
+}
+
 /// A bound reporter that is itself an observed agent ends through either of
 /// its two exit signals, in either order.
 #[tokio::test]
