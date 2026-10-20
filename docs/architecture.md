@@ -1707,8 +1707,11 @@ tolerant only where the client opts in:
   so the mode can never be held across an `.await`.
 - `Unknown` serializes as the fixed token `"unknown"`, so `--json` output and
   the `Client::call` round trip keep working. Plain decoding rejects that token
-  too. The daemon never decodes in the tolerant mode, so it never holds or emits
-  an `Unknown`.
+  too. The daemon decodes its params, stores and config strictly and never
+  holds an `Unknown` in its own state. Its host discovery probes peer daemons
+  through the client code, so a peer reply is decoded tolerantly there; the
+  verdict reads only the version and whether the reply is a success, never an
+  enum value, and no `Unknown` is stored or emitted.
 - The enum's serde derive is the only definition of its wire names; the
   `tolerant_enum!` macro adds the strict-or-tolerant `Deserialize` around it.
 - The Rust client, the CLI and the assistant decode every daemon response and
