@@ -1436,8 +1436,8 @@ fn forget_observed_generation(entry: &mut SessionEntry, identity: ProcessIdentit
 }
 
 /// The identity of the claim a scan reads: its source, agent, sequence,
-/// process and origin.
-type ClaimKey = (String, String, Option<u64>, Option<Pid>, bool);
+/// process, the process generation and origin.
+type ClaimKey = (String, String, Option<u64>, Option<Pid>, Option<u64>, bool);
 
 fn claim_key(entry: &SessionEntry) -> Option<ClaimKey> {
     entry.active_agent.as_ref().map(|active| {
@@ -1446,6 +1446,7 @@ fn claim_key(entry: &SessionEntry) -> Option<ClaimKey> {
             active.agent.clone(),
             active.seq,
             active.pid,
+            active.start_identity,
             active.observed,
         )
     })

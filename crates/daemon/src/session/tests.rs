@@ -10127,6 +10127,16 @@ async fn report_descendant_claim(registry: &SessionRegistry, created: &SessionIn
 /// Admits the descendant reporter's claim directly, without the report path's
 /// request for a rescan, so only the scans a test runs observe it.
 async fn admit_descendant_claim_unannounced(registry: &SessionRegistry, id: &SessionId) {
+    admit_descendant_claim_unannounced_at(registry, id, None).await;
+}
+
+/// [`admit_descendant_claim_unannounced`] with the reporter's attested start
+/// identity.
+async fn admit_descendant_claim_unannounced_at(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    start_identity: Option<u64>,
+) {
     let mut sessions = registry.inner.sessions.lock().await;
     let entry = sessions.get_mut(id).expect("live session entry");
     let report = ActiveAgentReport {
@@ -10134,7 +10144,7 @@ async fn admit_descendant_claim_unannounced(registry: &SessionRegistry, id: &Ses
         agent: CODEX_HOOK_AGENT.to_owned(),
         seq: Some(DIRECT_AGENT_REPORT_SEQ),
         pid: Some(DESCENDANT_REPORTER_PID),
-        start_identity: None,
+        start_identity,
         reported_at: Instant::now(),
         activity_reported: false,
         observed: false,
@@ -11609,6 +11619,49 @@ async fn pre_admission_scan_does_not_refute_a_descendant_claim() {
         .await;
     assert_descendant_claim_kept(&registry, &created.id, "rescan after admission").await;
     assert!(reporter_is_bound(&registry, &created.id).await);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A report admitted during a scan for a reused reporter pid carries another
+/// process generation than the claim the scan read: the scan's evidence is
+/// not applied to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reused_pid_report_admitted_during_a_scan_is_not_refuted_by_it() {
+    let (registry, inspector, created) = mock_procwatch_registry("descendant-reused-pid").await;
+    let reporter = fixture_reporter_fact();
+    let old_generation = reporter.start_identity.get();
+    inspector.set_descendants(
+        created.pid,
+        vec![codex_fact(DESCENDANT_WRAPPER_PID, created.pid), reporter],
+    );
+    stop_procwatch_loop(&registry, &inspector, &created.id).await;
+    admit_descendant_claim_unannounced_at(&registry, &created.id, Some(old_generation)).await;
+    let block = inspector.block_foreground();
+    let _release_guard = ForegroundReleaseGuard(Arc::clone(&block));
+    let scan_registry = registry.clone();
+    let scan_id = created.id.clone();
+    let root_pid = created.pid;
+    let runtime = tokio::runtime::Handle::current();
+    let scan = std::thread::spawn(move || {
+        runtime.block_on(scan_registry.rescan_procwatch_at(&scan_id, root_pid, Instant::now()));
+    });
+    tokio::time::timeout(HANG_GUARD, async {
+        while !block.entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the scan collected its descendants");
+
+    admit_descendant_claim_unannounced_at(&registry, &created.id, Some(old_generation + 1)).await;
+    block.release();
+    scan.join().expect("reused-pid scan thread");
+
+    assert_descendant_claim_kept(&registry, &created.id, "reused-pid report").await;
+    assert!(
+        !reporter_is_bound(&registry, &created.id).await,
+        "the scan proves nothing for the new generation"
+    );
     let _ = registry.stop(&created.id).await;
 }
 
