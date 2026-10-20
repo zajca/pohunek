@@ -2066,9 +2066,19 @@ fn the_machines_own_overlay_name_selects_the_local_daemon() {
 
     // A short name this machine shares with a peer is ambiguous, never a
     // silent choice; an unknown name keeps its typed error.
-    assert_json_error(
+    let ambiguous = assert_json_error(
         &screen("fixture-self", SESSION_ID),
         "overlay_host_ambiguous",
+    );
+    assert_eq!(
+        ambiguous["err"]["msg"],
+        "host 'fixture-self' matches 2 hosts on overlay netbird: \
+         this machine (fixture-self.netbird.test), peer fixture-self.lan.test"
+    );
+    let recover = ambiguous["err"]["recover"].as_str().expect("recover text");
+    assert!(
+        recover.contains(": local, ") && recover.contains("netbird:peer~"),
+        "{recover}"
     );
     assert_json_error(&screen("fixture-nobody", SESSION_ID), "host_unknown");
     // An explicit target host overrides that `--host`, so it is never resolved.

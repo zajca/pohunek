@@ -2,7 +2,7 @@
 
 use std::net::IpAddr;
 
-use overlay::{ExternalIdentity, ExternalIdentityKind};
+use overlay::{CandidateIdentity, ExternalIdentity, ExternalIdentityKind};
 
 use crate::is_netbird_ip;
 use crate::status::{NetbirdError, NetbirdStatus};
@@ -139,12 +139,31 @@ fn resolve_staged<'a>(
         (&by_raw_ip, false),
     ];
     for (matches_peer, matches_own) in stages {
-        let peer = unique_peer(
+        let peer = match unique_peer(
             status.peers().iter().filter(|peer| matches_peer(peer)),
             name,
-        )?;
+        ) {
+            // Several peers collide and this machine matches at the same step,
+            // so it is one of the candidates too.
+            Err(NetbirdError::HostAmbiguous {
+                host,
+                mut candidates,
+            }) if matches_own => {
+                candidates.insert(0, CandidateIdentity::this_machine(own_fqdn));
+                return Err(NetbirdError::HostAmbiguous { host, candidates });
+            }
+            other => other?,
+        };
         match (peer, matches_own) {
-            (Some(_), true) => return Err(NetbirdError::HostAmbiguous(name.to_owned())),
+            (Some(peer), true) => {
+                return Err(NetbirdError::HostAmbiguous {
+                    host: name.to_owned(),
+                    candidates: vec![
+                        CandidateIdentity::this_machine(own_fqdn),
+                        peer_candidate(peer),
+                    ],
+                })
+            }
             (Some(peer), false) => return Ok(Selected::Peer(peer)),
             (None, true) => return Ok(Selected::LocalHost),
             (None, false) => {}
@@ -185,8 +204,15 @@ fn unique_peer<'a>(
     match peers.as_slice() {
         [] => Ok(None),
         [peer] => Ok(Some(*peer)),
-        _ => Err(NetbirdError::HostAmbiguous(name.to_owned())),
+        _ => Err(NetbirdError::HostAmbiguous {
+            host: name.to_owned(),
+            candidates: peers.iter().map(|peer| peer_candidate(peer)).collect(),
+        }),
     }
+}
+
+fn peer_candidate(peer: &crate::Peer) -> CandidateIdentity {
+    CandidateIdentity::peer(peer.peer_id(), peer.fqdn.as_deref())
 }
 
 /// The short hostname: the first DNS label of a fully qualified name.
@@ -194,4 +220,40 @@ fn unique_peer<'a>(
 /// Returns `None` for an empty input or a leading-dot name.
 fn short_hostname(fqdn: &str) -> Option<&str> {
     fqdn.split('.').next().filter(|label| !label.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::status::parse_status;
+
+    #[test]
+    fn a_name_this_machine_shares_with_several_peers_lists_every_candidate() {
+        let status = parse_status(
+            r#"{"fqdn":"box.a.test","netbirdIp":"100.64.0.7","peers":{"details":[
+                {"fqdn":"box.b.test","netbirdIp":"100.64.0.8","publicKey":"key-b"},
+                {"fqdn":"box.c.test","netbirdIp":"100.64.0.9","publicKey":"key-c"}
+            ]}}"#,
+        )
+        .expect("status parses");
+
+        let Err(NetbirdError::HostAmbiguous { host, candidates }) =
+            resolve_selector(&status, "box")
+        else {
+            panic!("a short name shared by this machine and two peers is ambiguous");
+        };
+        assert_eq!(host, "box");
+        let names = candidates
+            .iter()
+            .map(|candidate| (candidate.local, candidate.name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                (true, "box.a.test"),
+                (false, "box.b.test"),
+                (false, "box.c.test")
+            ]
+        );
+    }
 }

@@ -469,11 +469,11 @@ fn registry_error_to_protocol(error: &overlay::RegistryError) -> ProtocolError {
             format!("overlay '{overlay}' is not configured"),
             Some("run `pohunek host list` to see configured overlay selectors".to_owned()),
         ),
-        overlay::RegistryError::AmbiguousHost { host, overlays } => ProtocolError::new(
+        overlay::RegistryError::AmbiguousHost { candidates, .. } => ProtocolError::new(
             ErrorClass::Discovery,
             "overlay_host_ambiguous",
-            format!("host '{host}' exists on multiple overlays: {overlays:?}"),
-            Some("select the provider-qualified selector shown by `pohunek host list`".to_owned()),
+            error.to_string(),
+            Some(ambiguity_hint(candidates)),
         ),
         overlay::RegistryError::HostUnavailable { failures, .. } if failures.len() == 1 => {
             overlay_error_to_protocol(&failures[0].error)
@@ -505,10 +505,71 @@ fn exact_version_range(version: ProtocolVersion) -> ProtocolVersionRange {
         .expect("a protocol version is always a valid exact range")
 }
 
+/// Recovery text for an ambiguous host: the provider-qualified selectors that
+/// each name one candidate.
+fn ambiguity_hint(candidates: &[overlay::HostCandidate]) -> String {
+    // A selector that could also match another candidate would not pick one
+    // host: an FQDN selector is offered only when no other candidate carries
+    // that name. Peer identities are unique, and `local` may repeat across
+    // overlays.
+    let mut selectors = std::collections::BTreeSet::new();
+    for candidate in candidates {
+        let identity = &candidate.identity;
+        let name_is_shared = candidates
+            .iter()
+            .filter(|other| !std::ptr::eq(*other, candidate) && !other.identity.local)
+            .any(|other| other.identity.name.eq_ignore_ascii_case(&identity.name));
+        if identity.local || identity.selector_is_peer_id || !name_is_shared {
+            selectors.extend(candidate.qualified_selector());
+        }
+    }
+    if selectors.is_empty() {
+        "select the provider-qualified selector shown by `pohunek host list`".to_owned()
+    } else {
+        format!(
+            "select one host with a provider-qualified selector: {}",
+            selectors.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use overlay::{OverlayError, OverlayId};
+    use overlay::{CandidateIdentity, HostCandidate, OverlayError, OverlayId};
+
+    fn candidate(identity: CandidateIdentity) -> HostCandidate {
+        HostCandidate {
+            overlay: OverlayId::new("netbird").expect("overlay id"),
+            identity,
+        }
+    }
+
+    #[test]
+    fn an_ambiguity_hint_offers_only_selectors_that_name_one_candidate() {
+        let twins = [
+            candidate(CandidateIdentity::peer(None, Some("twin.test"))),
+            candidate(CandidateIdentity::peer(None, Some("twin.test"))),
+            candidate(CandidateIdentity::peer(Some("key-3"), Some("twin.test"))),
+        ];
+        let hint = ambiguity_hint(&twins);
+        assert!(hint.contains("netbird:peer~"), "{hint}");
+        assert!(!hint.contains("netbird:fqdn~"), "{hint}");
+
+        let indistinguishable = [
+            candidate(CandidateIdentity::peer(None, Some("twin.test"))),
+            candidate(CandidateIdentity::peer(None, Some("twin.test"))),
+        ];
+        let cased = [
+            candidate(CandidateIdentity::peer(None, Some("box.test"))),
+            candidate(CandidateIdentity::peer(None, Some("BOX.test"))),
+        ];
+        assert!(!ambiguity_hint(&cased).contains("fqdn~"));
+        assert_eq!(
+            ambiguity_hint(&indistinguishable),
+            "select the provider-qualified selector shown by `pohunek host list`"
+        );
+    }
 
     fn netbird_id() -> OverlayId {
         OverlayId::new("netbird").expect("id")
