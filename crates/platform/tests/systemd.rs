@@ -757,6 +757,7 @@ async fn failed_evidence(supervisor: &SystemdSupervisor, id: &ServiceId) -> Exit
             Err(error) => panic!("exit_evidence {id} failed: {error:?}"),
         }
         assert!(Instant::now() < deadline, "{id} never reported a verdict");
+        // timing-allowed: #326 polls the real manager, which publishes the failed state asynchronously; bounded by STATE_TIMEOUT
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
