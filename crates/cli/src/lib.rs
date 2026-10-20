@@ -25,6 +25,8 @@ pub mod host_setup {
 }
 pub mod service;
 mod target;
+#[cfg(test)]
+mod test_daemon;
 mod workflow;
 
 /// Enables and disables workflow plugins with service manager units against

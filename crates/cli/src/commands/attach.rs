@@ -884,18 +884,15 @@ fn build_menu_rename_request(target: &Target, name: &str) -> Result<Request, Cli
     )
 }
 
-fn build_menu_fork_request(target: &Target, cols: u16, rows: u16) -> Result<Request, CliError> {
-    request_with_params(
-        method::SESSION_FORK,
-        &SessionForkParams {
-            session_id: SessionId(target.session_id.clone()),
-            name: None,
-            cwd_mode: ForkCwdMode::Same,
-            cols,
-            rows,
-            accept_profile_change: false,
-        },
-    )
+fn menu_fork_params(target: &Target, cols: u16, rows: u16) -> SessionForkParams {
+    SessionForkParams {
+        session_id: SessionId(target.session_id.clone()),
+        name: None,
+        cwd_mode: ForkCwdMode::Same,
+        cols,
+        rows,
+        accept_profile_change: false,
+    }
 }
 
 /// Builds the dialog header rows: session identity first, live state last.
@@ -2336,9 +2333,9 @@ async fn send_menu_fork(
     cols: u16,
     rows: u16,
 ) -> Result<SessionForkResult, CliError> {
-    let request = build_menu_fork_request(target, cols, rows)?;
-    let value = client.request(&request).await?;
-    Ok(protocol::tolerant::from_value(value)?)
+    client
+        .call::<method::SessionFork>(menu_fork_params(target, cols, rows))
+        .await
 }
 
 fn spawn_menu_task(
@@ -2411,9 +2408,10 @@ enum MenuTaskArgs {
 }
 
 async fn send_stop(client: &mut Client, target: &Target) -> Result<(), CliError> {
-    let request = build_stop_request(target)?;
-    let _ = client.request(&request).await?;
-    Ok(())
+    client
+        .call::<method::SessionStop>(SessionId(target.session_id.clone()))
+        .await
+        .map(drop)
 }
 
 /// Evicts the session through the refusing `session.remove`; consent to
@@ -2422,20 +2420,9 @@ async fn send_remove(
     client: &mut Client,
     target: &Target,
 ) -> Result<SessionRemoveResult, CliError> {
-    let request = build_remove_request(target)?;
-    let value = client.request(&request).await?;
-    Ok(protocol::tolerant::from_value(value)?)
-}
-
-fn build_remove_request(target: &Target) -> Result<Request, CliError> {
-    request_with_params(
-        method::SESSION_REMOVE,
-        &SessionId(target.session_id.clone()),
-    )
-}
-
-fn build_stop_request(target: &Target) -> Result<Request, CliError> {
-    request_with_params(method::SESSION_STOP, &SessionId(target.session_id.clone()))
+    client
+        .call::<method::SessionRemove>(SessionId(target.session_id.clone()))
+        .await
 }
 
 #[derive(Debug)]
@@ -3755,15 +3742,6 @@ mod tests {
         assert_eq!(state, MenuState::ConfirmRemove);
     }
 
-    #[test]
-    fn remove_request_uses_the_refusing_remove_method() {
-        let target: Target = "host-a/s-42".parse().expect("target");
-
-        let request = build_remove_request(&target).expect("request");
-
-        assert_eq!(request.method(), method::SESSION_REMOVE);
-    }
-
     fn removed_outcome() -> MenuOutcome {
         MenuOutcome::Removed {
             worktrees_removed: 1,
@@ -4134,21 +4112,98 @@ mod tests {
         );
     }
 
+    /// Daemon-side duration of a menu fork, stop or remove, above the 5 s
+    /// default response timeout of a shared connection.
+    const SLOW_MENU_ACTION: Duration = Duration::from_secs(6);
+
+    #[tokio::test(start_paused = true)]
+    async fn menu_fork_stop_and_remove_wait_on_a_dedicated_budget() {
+        use pohunek_test_support::time::AutoAdvanceInhibitor;
+
+        let session_info = json!({
+            "id": "s-forked",
+            "agent": "codex",
+            "agent_base": "codex",
+            "capabilities": {"fork": true, "resume": true},
+            "cwd": "/workspace/pohunek",
+            "pid": 42424,
+            "state": "running",
+            "state_source": "process",
+            "cols": 100,
+            "rows": 30,
+            "created_at": "2026-07-08T00:00:00Z",
+            "updated_at": "2026-07-08T00:01:00Z",
+        });
+        let removed = json!({
+            "removed": true,
+            "stopped": true,
+            "worktrees_removed": 1,
+            "worktrees_failed": 2
+        });
+        let cases = [
+            (
+                MenuTaskAction::Fork,
+                MenuTaskArgs::Fork { cols: 100, rows: 30 },
+                method::SESSION_FORK,
+                session_info,
+                MenuOutcome::Forked {
+                    id: "s-forked".to_owned(),
+                },
+            ),
+            (
+                MenuTaskAction::Kill,
+                MenuTaskArgs::Kill,
+                method::SESSION_STOP,
+                json!({"stopped": true}),
+                MenuOutcome::Killed,
+            ),
+            (
+                MenuTaskAction::Remove,
+                MenuTaskArgs::Remove,
+                method::SESSION_REMOVE,
+                removed,
+                removed_outcome(),
+            ),
+        ];
+        let inhibitor = AutoAdvanceInhibitor::new();
+        for (action, args, expected_method, result, expected_outcome) in cases {
+            let mut daemon = crate::test_daemon::HeldDaemon::start(result);
+            let control = AttachControlContext {
+                host: crate::target::LOCAL_HOST.to_owned(),
+                paths: daemon.paths.clone(),
+                target: "local/s-42".parse().expect("target"),
+            };
+            let task = spawn_menu_task(FIRST_MENU_GENERATION, action, &control, args);
+
+            let received = daemon.request().await;
+            assert_eq!(received.request.method(), expected_method);
+            assert!(
+                !received.on_shared_connection,
+                "{expected_method} must not use the shared 5 s connection"
+            );
+            tokio::time::advance(SLOW_MENU_ACTION).await;
+            daemon.release();
+
+            let outcome = task.handle.await.expect("menu task");
+            assert_eq!(outcome, Ok(expected_outcome), "{expected_method}");
+        }
+        inhibitor.release().await;
+    }
+
     #[test]
-    fn menu_fork_request_sends_session_id_size_and_same_cwd_mode() {
+    fn menu_fork_params_send_session_id_size_and_same_cwd_mode() {
         let target: Target = "host-a/s-42".parse().expect("target");
 
-        let request = build_menu_fork_request(&target, 100, 30).expect("request");
+        let params = menu_fork_params(&target, 100, 30);
 
-        assert_request(
-            &request,
-            method::SESSION_FORK,
+        assert_eq!(
+            serde_json::to_value(&params).expect("serialize params"),
             json!({
                 "session_id": "s-42",
                 "cwd_mode": "same",
                 "cols": 100,
                 "rows": 30
-            }),
+            })
         );
     }
 

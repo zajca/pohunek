@@ -38,9 +38,10 @@ use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::{is_local_host, Target};
 
-/// How long a resume runs before the CLI tells the operator it is still
-/// waiting for the daemon (the ordinary request timeout of other commands).
-const RESUME_PROGRESS_NOTICE_AFTER: Duration = Duration::from_secs(5);
+/// How long a resume, fork, stop or remove runs before the CLI tells the
+/// operator it is still waiting for the daemon (the ordinary request timeout
+/// of other commands).
+const LIFECYCLE_PROGRESS_NOTICE_AFTER: Duration = Duration::from_secs(5);
 
 /// Default fork PTY width when the command is not launched from an attach view.
 ///
@@ -767,10 +768,18 @@ pub(crate) async fn run_stop(
     target: &Target,
     json: bool,
 ) -> Result<(), CliError> {
-    let mut client = Client::connect(host, paths).await?;
-    let stop = client
-        .call::<method::SessionStop>(SessionId(target.session_id.clone()))
-        .await?;
+    let mut sdk = Client::connect(host, paths).await?.into_sdk();
+    let stop = with_wait_notice(
+        sdk.session_stop(SessionId(target.session_id.clone())),
+        json,
+        || {
+            format!(
+                "waiting for the daemon to stop {}: it waits for the session's processes to end",
+                target.session_id
+            )
+        },
+    )
+    .await?;
 
     if json {
         print!("{}", crate::commands::render_json(&stop)?);
@@ -795,16 +804,24 @@ pub(crate) async fn run_fork(
     accept_profile_change: bool,
     json: bool,
 ) -> Result<(), CliError> {
-    let mut client = Client::connect(host, paths).await?;
-    let forked = client
-        .call::<method::SessionFork>(fork_params(
+    let mut sdk = Client::connect(host, paths).await?.into_sdk();
+    let forked = with_wait_notice(
+        sdk.session_fork(fork_params(
             target,
             name,
             accept_profile_change,
             DEFAULT_FORK_COLS,
             DEFAULT_FORK_ROWS,
-        ))
-        .await?;
+        )),
+        json,
+        || {
+            format!(
+                "waiting for the daemon to fork {}: it starts the new session's worker first",
+                target.session_id
+            )
+        },
+    )
+    .await?;
     let info = &forked.session;
 
     if json {
@@ -841,15 +858,24 @@ pub(crate) async fn run_remove(
     accept_unconfirmed_cleanup: bool,
     json: bool,
 ) -> Result<(), CliError> {
-    let mut client = Client::connect(host, paths).await?;
+    let mut sdk = Client::connect(host, paths).await?.into_sdk();
     let session_id = SessionId(target.session_id.clone());
+    let notice = || {
+        format!(
+            "waiting for the daemon to remove {}: it stops the session's processes first",
+            target.session_id
+        )
+    };
     let removed = if accept_unconfirmed_cleanup {
-        client
-            .call::<method::SessionRemoveAcceptingUnconfirmed>(session_id)
-            .await
-            .map_err(missing_consent_method_hint)?
+        with_wait_notice(
+            sdk.session_remove_accepting_unconfirmed(session_id),
+            json,
+            notice,
+        )
+        .await
+        .map_err(missing_consent_method_hint)?
     } else {
-        client.call::<method::SessionRemove>(session_id).await?
+        with_wait_notice(sdk.session_remove(session_id), json, notice).await?
     };
 
     if json {
@@ -1316,22 +1342,18 @@ pub(crate) async fn run_resume(
     accept_profile_change: bool,
     json: bool,
 ) -> Result<(), CliError> {
-    let client = Client::connect(host, paths).await?;
-    let mut sdk = client.into_sdk();
-    let resume = sdk.session_resume_with(resume_params(target, accept_profile_change));
-    tokio::pin!(resume);
-    let result = tokio::select! {
-        result = &mut resume => result,
-        () = tokio::time::sleep(RESUME_PROGRESS_NOTICE_AFTER) => {
-            if !json {
-                eprintln!(
-                    "waiting for the daemon to resume {}: it first proves the previous runtime ended",
-                    target.session_id
-                );
-            }
-            resume.await
-        }
-    }?;
+    let mut sdk = Client::connect(host, paths).await?.into_sdk();
+    let result = with_wait_notice(
+        sdk.session_resume_with(resume_params(target, accept_profile_change)),
+        json,
+        || {
+            format!(
+                "waiting for the daemon to resume {}: it first proves the previous runtime ended",
+                target.session_id
+            )
+        },
+    )
+    .await?;
     if json {
         print!(
             "{}",
@@ -1341,6 +1363,27 @@ pub(crate) async fn run_resume(
         println!("resumed {}", result.session.id.0);
     }
     Ok(())
+}
+
+/// Awaits a lifecycle `call`. Once it has waited
+/// [`LIFECYCLE_PROGRESS_NOTICE_AFTER`], prints `notice` to stderr (never to
+/// stdout, which `--json` consumers parse) unless `json` is set.
+async fn with_wait_notice<T>(
+    call: impl std::future::Future<Output = Result<T, pohunek_client::ClientError>>,
+    json: bool,
+    notice: impl FnOnce() -> String,
+) -> Result<T, CliError> {
+    tokio::pin!(call);
+    let result = tokio::select! {
+        result = &mut call => result,
+        () = tokio::time::sleep(LIFECYCLE_PROGRESS_NOTICE_AFTER) => {
+            if !json {
+                eprintln!("{}", notice());
+            }
+            call.await
+        }
+    };
+    result.map_err(crate::client::map_client_error)
 }
 
 pub(crate) async fn run_resize(
@@ -3664,119 +3707,110 @@ mod tests {
         assert_eq!(output, "session s-99 forked (state: running)\n");
     }
 
-    /// Accepts control connections on `listener`, answers `daemon.health` like a
-    /// daemon, and returns the first method request after answering it with
-    /// `result`.
-    async fn answer_first_method_request(
-        listener: &tokio::net::UnixListener,
-        result: serde_json::Value,
-    ) -> Request {
-        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
-
-        loop {
-            let (stream, _) = listener.accept().await.expect("accept control client");
-            let mut stream = tokio::io::BufReader::new(stream);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                if stream.read_line(&mut line).await.expect("read request") == 0 {
-                    break;
-                }
-                let request: Request = serde_json::from_str(&line).expect("decode request");
-                let is_health = request.method() == method::DAEMON_HEALTH;
-                let value = if is_health {
-                    json!({
-                        "status": "ok",
-                        "daemon_version": "fixture",
-                        "protocol_version": protocol::PROTOCOL_VERSION.get()
-                    })
-                } else {
-                    result.clone()
-                };
-                let response = protocol::Response::ok(
-                    request.version_range().maximum(),
-                    request.id().to_owned(),
-                    value,
-                )
-                .expect("valid response");
-                let mut encoded = serde_json::to_vec(&response).expect("encode response");
-                encoded.push(b'\n');
-                stream
-                    .get_mut()
-                    .write_all(&encoded)
-                    .await
-                    .expect("write response");
-                if !is_health {
-                    return request;
-                }
-            }
-        }
-    }
-
     #[tokio::test]
     async fn run_remove_calls_the_consenting_method_only_with_explicit_consent() {
         for (accept_unconfirmed_cleanup, expected_method) in [
             (true, method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED),
             (false, method::SESSION_REMOVE),
         ] {
-            let env = pohunek_test_support::env::TestEnv::new()
-                .expect("create the hermetic test environment");
-            let socket = env
-                .socket_path("daemon.sock")
-                .expect("socket path fits the sun_path limit");
-            let root = socket.parent().expect("socket parent").to_path_buf();
-            let paths = Paths {
-                runtime_dir: root.clone(),
-                socket: socket.clone(),
-                data_dir: root.join("data"),
-                log_dir: root.join("logs"),
-                cache_dir: root.join("cache"),
-                config_home: root.join("config-home"),
-                config_dir: root.join("config"),
-                origin_source: pohunek_client::OriginSource::Omitted,
-            };
-            // Binding before the command runs is the readiness signal.
-            let listener = tokio::net::UnixListener::bind(&socket).expect("bind fixture daemon");
-            let target: Target = "local/s-42".parse().expect("target");
-            let result = json!({
+            let mut daemon = crate::test_daemon::HeldDaemon::start(json!({
                 "removed": true,
                 "stopped": true,
                 "worktrees_removed": 0,
                 "worktrees_failed": 0
-            });
+            }));
+            let paths = daemon.paths.clone();
+            let target: Target = "local/s-42".parse().expect("target");
 
-            // The fixture runs as its own task so a client that fails before
-            // sending the request ends the scenario with its error instead of
-            // leaving the fixture waiting in `accept`.
-            let fixture =
-                tokio::spawn(async move { answer_first_method_request(&listener, result).await });
-            let outcome = pohunek_test_support::wait::guard(
-                "session remove against the fixture daemon",
-                run_remove(
-                    LOCAL_HOST,
-                    &paths,
-                    &target,
-                    accept_unconfirmed_cleanup,
-                    true,
-                ),
+            let remove = tokio::spawn(async move {
+                run_remove(LOCAL_HOST, &paths, &target, accept_unconfirmed_cleanup, true).await
+            });
+            let received = pohunek_test_support::wait::guard(
+                "the fixture to record the request",
+                daemon.request(),
             )
             .await;
-            if let Err(error) = outcome {
-                fixture.abort();
-                panic!("remove failed against the fixture daemon: {error:?}");
-            }
-            let request =
-                pohunek_test_support::wait::guard("the fixture to record the request", fixture)
-                    .await
-                    .expect("fixture daemon task");
+            daemon.release();
+            pohunek_test_support::wait::guard("session remove against the fixture daemon", remove)
+                .await
+                .expect("remove task")
+                .expect("remove succeeds against the fixture daemon");
 
             assert_eq!(
-                request.method(),
+                received.request.method(),
                 expected_method,
                 "accept_unconfirmed_cleanup={accept_unconfirmed_cleanup}"
             );
-            assert_eq!(request.params(), &json!("s-42"));
+            assert_eq!(received.request.params(), &json!("s-42"));
+            assert!(
+                !received.on_shared_connection,
+                "a remove runs on a dedicated connection"
+            );
         }
+    }
+
+    /// Margin past a lifecycle budget that covers the client's response
+    /// headroom.
+    const BUDGET_MARGIN: Duration = Duration::from_secs(2);
+
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle_commands_report_an_unknown_outcome_past_their_budget() {
+        use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
+
+        type Command = for<'a> fn(
+            &'a Paths,
+            &'a Target,
+            bool,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), CliError>> + Send + 'a>,
+        >;
+        let commands: [(&str, u32, &str, Command); 3] = [
+            (
+                "stop",
+                pohunek_client::SESSION_STOP_REQUEST_BUDGET_MS,
+                "session_stop_outcome_unknown",
+                |paths, target, json| Box::pin(run_stop(LOCAL_HOST, paths, target, json)),
+            ),
+            (
+                "fork",
+                pohunek_client::SESSION_FORK_REQUEST_BUDGET_MS,
+                "session_fork_outcome_unknown",
+                |paths, target, json| {
+                    Box::pin(run_fork(LOCAL_HOST, paths, target, None, false, json))
+                },
+            ),
+            (
+                "remove",
+                pohunek_client::SESSION_STOP_REQUEST_BUDGET_MS,
+                "session_remove_outcome_unknown",
+                |paths, target, json| {
+                    Box::pin(run_remove(LOCAL_HOST, paths, target, false, json))
+                },
+            ),
+        ];
+        let inhibitor = AutoAdvanceInhibitor::new();
+        for (name, budget_ms, code, command) in commands {
+            for json in [false, true] {
+                let mut daemon = crate::test_daemon::HeldDaemon::start(json!({}));
+                let paths = daemon.paths.clone();
+                let target: Target = "local/s-42".parse().expect("target");
+                let run = tokio::spawn(async move { command(&paths, &target, json).await });
+                daemon.request().await;
+                tokio::time::advance(Duration::from_millis(u64::from(budget_ms)) + BUDGET_MARGIN + TIMER_TICK)
+                    .await;
+
+                let error = run
+                    .await
+                    .expect("command task")
+                    .expect_err("the lifecycle budget elapses before the daemon answers");
+                let structured = error.to_protocol_error();
+                assert_eq!(structured.code, code, "{name} json={json}");
+                assert_eq!(structured.class, protocol::ErrorClass::Transport);
+                assert!(structured.recover.is_some(), "{name} json={json}");
+                daemon.release();
+            }
+        }
+        inhibitor.release().await;
     }
 
     #[test]
