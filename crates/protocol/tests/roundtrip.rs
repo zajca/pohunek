@@ -4607,6 +4607,7 @@ fn session_remove_result_carries_accepted_processes_as_decimal_identities() {
         worktrees_removed: 1,
         worktrees_failed: 0,
         accepted_unconfirmed_processes: Vec::new(),
+        warnings: Vec::new(),
     };
     assert_eq!(
         serde_json::to_value(&result).expect("serialize remove result"),
@@ -4648,6 +4649,26 @@ fn session_remove_result_carries_accepted_processes_as_decimal_identities() {
         ])
     );
     assert_eq!(line_roundtrip(&result), result);
+
+    result.warnings = vec![SessionWarning {
+        kind: SessionWarningKind::Hook,
+        message: "pre-remove hook failed".to_owned(),
+        detail: None,
+    }];
+    assert_eq!(
+        serde_json::to_value(&result).expect("serialize remove result")["warnings"],
+        json!([{ "kind": "hook", "message": "pre-remove hook failed" }])
+    );
+    assert_eq!(line_roundtrip(&result), result);
+    let from_newer: SessionRemoveResult = serde_json::from_value(json!({
+        "removed": true,
+        "stopped": false,
+        "worktrees_removed": 0,
+        "worktrees_failed": 0,
+        "warnings": [{ "kind": "from_the_future", "message": "unknown" }]
+    }))
+    .expect("a warning of an unknown kind is dropped, not fatal");
+    assert!(from_newer.warnings.is_empty());
 }
 
 #[test]

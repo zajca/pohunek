@@ -1084,6 +1084,8 @@ struct ReleasedSession {
     /// Unreadable-marker processes the removal accepted without proving
     /// them gone.
     accepted_unconfirmed: Vec<UnconfirmedProcess>,
+    /// Warnings the worktree cleanup raised, such as a failing remove hook.
+    warnings: Vec<SessionWarning>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4789,6 +4791,7 @@ impl SessionRegistry {
             worktrees_removed: u32::try_from(released.worktrees.removed).unwrap_or(u32::MAX),
             worktrees_failed: u32::try_from(released.worktrees.failed).unwrap_or(u32::MAX),
             accepted_unconfirmed_processes: released.accepted_unconfirmed,
+            warnings: released.warnings,
         })
     }
 
@@ -4841,11 +4844,11 @@ impl SessionRegistry {
         if !cleanup_warnings.is_empty() {
             let mut sessions = self.inner.sessions.lock().await;
             if let Some(entry) = sessions.get_mut(id) {
-                entry.info.warnings.extend(cleanup_warnings);
+                entry.info.warnings.extend(cleanup_warnings.iter().cloned());
             }
         }
-        // The entry is about to leave the map and its warnings with it, so a
-        // checkout that survived is reported to the caller as well.
+        // The entry is about to leave the map and its warnings with it, so the
+        // caller's result carries them and a checkout that survived is logged.
         if worktrees.failed > 0 {
             warn!(
                 session_id = %id.0,
@@ -4896,6 +4899,7 @@ impl SessionRegistry {
             evicted: evicted.is_some(),
             worktrees,
             accepted_unconfirmed,
+            warnings: cleanup_warnings,
         })
     }
 

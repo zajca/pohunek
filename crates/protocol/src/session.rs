@@ -3015,6 +3015,16 @@ pub struct SessionRemoveResult {
     /// removal needed no consent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_unconfirmed_processes: Vec<UnconfirmedProcess>,
+    /// Non-fatal warnings the removal raised, such as a failing `pre-remove`
+    /// or `post-remove` worktree hook. The session record is gone once the
+    /// result is returned, so this is the only place they are reported.
+    /// Omitted from the wire form when empty.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "known_warnings"
+    )]
+    pub warnings: Vec<SessionWarning>,
 }
 
 /// Default interval between daemon-owned session retention sweeps.
