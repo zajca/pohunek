@@ -107,6 +107,7 @@ pub(crate) struct ScriptedSupervisor {
     retire_unavailable: StdMutex<HashSet<ServiceId>>,
     retire_ends: StdMutex<HashMap<ServiceId, u32>>,
     retire_ends_then_fails: StdMutex<HashMap<ServiceId, u32>>,
+    retire_gate: StdMutex<Option<StartGate>>,
     discovery_unavailable: std::sync::atomic::AtomicBool,
 }
 
@@ -178,6 +179,12 @@ impl ScriptedSupervisor {
     /// Makes `discover` fail as an unreachable manager.
     pub(crate) fn fail_discovery(&self) {
         self.discovery_unavailable.store(true, Ordering::Release);
+    }
+
+    /// Holds the next `retire` until the gate is released, as a job whose exit
+    /// takes long does.
+    pub(crate) fn hold_retire(&self, gate: StartGate) {
+        *self.retire_gate.lock().expect("retire gate") = Some(gate);
     }
 
     pub(crate) fn hold_start(&self, gate: StartGate) {
@@ -394,6 +401,11 @@ impl Supervisor for ScriptedSupervisor {
     fn retire<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, ()> {
         Box::pin(async move {
             self.record(Call::Retire(id.clone()));
+            let held = self.retire_gate.lock().expect("retire gate").take();
+            if let Some(gate) = held {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
             if self
                 .retire_unavailable
                 .lock()

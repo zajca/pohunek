@@ -327,6 +327,50 @@ async fn a_proven_dead_conflict_can_be_stopped_then_removed() {
     assert_eq!(fixture.record_count(), 0);
 }
 
+/// A journal-proven conflict whose job takes long to exit keeps its stop
+/// waiting: the stop neither fails early nor times out on the daemon side, and
+/// ends with the typed result once the job is gone, so a client that budgets
+/// for the retirement sees the result instead of a timeout.
+#[tokio::test]
+async fn a_conflict_stop_waits_for_a_held_job_exit_and_returns_the_typed_result() {
+    let fixture = Fixture::new(RUNTIME).await;
+    let stand_in = LiveWorkerStandIn::spawn();
+    let identity = stand_in.identity();
+    write_live_journal(&fixture.state_root, RUNTIME, &stand_in);
+    fixture.supervisor.script_job(
+        service_id(),
+        JobScript::Present {
+            state: ServiceState::Running,
+            process: Some(identity),
+            definition: None,
+        },
+    );
+    fixture
+        .supervisor
+        .script_retire_ends(service_id(), identity.pid);
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    fixture.supervisor.hold_retire(gate.clone());
+
+    let registry = fixture.registry.clone();
+    let id = fixture.id.clone();
+    let stopping = tokio::spawn(async move { registry.stop(&id).await });
+    gate.entered.notified().await;
+    assert!(!stopping.is_finished(), "the stop waits for the job's exit");
+
+    gate.release.notify_one();
+    let stopped = pohunek_test_support::wait::guard("the held stop", stopping)
+        .await
+        .expect("stop task joins")
+        .expect("the stop ends with the typed result, not an error");
+    assert!(stopped.stopped);
+    let info = fixture.registry.inspect(&fixture.id).await.expect("listed");
+    assert_eq!(info.state, protocol::SessionState::Stopped);
+}
+
 #[tokio::test]
 async fn a_conflict_with_another_runtime_in_its_journal_stays_untouched() {
     let fixture = Fixture::new(OTHER_RUNTIME).await;
