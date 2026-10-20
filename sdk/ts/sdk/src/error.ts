@@ -32,6 +32,10 @@ export const ClientErrorCode = {
   HostUnreachable: "host_unreachable",
   RemoteDaemonUnavailable: "remote_daemon_unavailable",
   RequestTimeout: "request_timeout",
+  SessionResumeOutcomeUnknown: "session_resume_outcome_unknown",
+  SessionForkOutcomeUnknown: "session_fork_outcome_unknown",
+  SessionStopOutcomeUnknown: "session_stop_outcome_unknown",
+  SessionRemoveOutcomeUnknown: "session_remove_outcome_unknown",
   Io: "io_error",
   Json: "json_error",
   InputWaitContract: "session_input_wait_contract_mismatch",
@@ -47,6 +51,10 @@ export type ClientErrorKind =
   | "hostUnreachable"
   | "remoteDaemonUnavailable"
   | "requestTimeout"
+  | "sessionResumeOutcomeUnknown"
+  | "sessionForkOutcomeUnknown"
+  | "sessionStopOutcomeUnknown"
+  | "sessionRemoveOutcomeUnknown"
   | "remoteProtocol"
   | "io"
   | "json"
@@ -176,6 +184,25 @@ export class ClientError extends Error {
     );
   }
 
+  /**
+   * A lifecycle request whose response deadline elapsed. The daemon may still
+   * complete it, so the outcome is unknown.
+   */
+  public static lifecycleOutcomeUnknown(
+    operation: LifecycleOperation,
+    remoteHost: string | undefined,
+    timeoutMs: number,
+  ): ClientError {
+    const detail = LIFECYCLE_OUTCOME_UNKNOWN[operation];
+    const target = remoteHost === undefined ? "the local daemon" : `host '${remoteHost}'`;
+    const msg = `timed out after ${timeoutMs}ms waiting for ${target} to ${detail.action}`;
+    return new ClientError(
+      detail.kind,
+      msg,
+      protocolError(ClientErrorClass.Transport, detail.code, msg, detail.recover),
+    );
+  }
+
   public static io(source: unknown): ClientError {
     const msg = `io error: ${messageFromUnknown(source)}`;
     return new ClientError(
@@ -277,6 +304,39 @@ export class ClientError extends Error {
     return this.structured.recover;
   }
 }
+
+/** Lifecycle requests whose elapsed deadline leaves the outcome unknown. */
+export type LifecycleOperation = "resume" | "fork" | "stop" | "remove";
+
+const LIFECYCLE_OUTCOME_UNKNOWN: Record<
+  LifecycleOperation,
+  { kind: ClientErrorKind; code: string; action: string; recover: string }
+> = {
+  resume: {
+    kind: "sessionResumeOutcomeUnknown",
+    code: ClientErrorCode.SessionResumeOutcomeUnknown,
+    action: "resume the session",
+    recover: "the resume may still complete: run `pohunek session inspect <session>` and read its runtime state before retrying",
+  },
+  fork: {
+    kind: "sessionForkOutcomeUnknown",
+    code: ClientErrorCode.SessionForkOutcomeUnknown,
+    action: "fork the session",
+    recover: "the fork may still complete and a retried fork creates a second child session: run `pohunek session list` and look for the new session before retrying",
+  },
+  stop: {
+    kind: "sessionStopOutcomeUnknown",
+    code: ClientErrorCode.SessionStopOutcomeUnknown,
+    action: "stop the session",
+    recover: "the stop may still complete: run `pohunek session inspect <session>` and read its state; repeating a stop is harmless",
+  },
+  remove: {
+    kind: "sessionRemoveOutcomeUnknown",
+    code: ClientErrorCode.SessionRemoveOutcomeUnknown,
+    action: "remove the session",
+    recover: "the removal may still complete: run `pohunek session list` to see whether the session is gone before retrying",
+  },
+};
 
 function daemonTarget(host: string | undefined): string {
   return host === undefined ? "the local daemon" : `host '${host}'`;

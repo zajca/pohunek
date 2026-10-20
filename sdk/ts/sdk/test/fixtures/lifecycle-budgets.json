@@ -1,0 +1,9 @@
+{
+  "lifecycle_step_bound_ms": 600000,
+  "resume_sweep_passes": 3,
+  "session_new_request_budget_ms": 3600000,
+  "session_resume_request_budget_ms": 6600000,
+  "session_fork_request_budget_ms": 1800000,
+  "session_stop_request_budget_ms": 5400000,
+  "session_remove_request_budget_ms": 5400000
+}

@@ -14,11 +14,11 @@ use protocol::compat::{self, CompatError};
 use protocol::{
     AttachHeader, DoctorReport, Event, HostGovernanceStatus, Method, ProtocolError,
     ProtocolVersion, ProtocolVersionRange, Request, Response, SessionDetectionParams,
-    SessionDetectionResult, SessionId, SessionInputParams, SessionInputResult, SessionNewParams,
+    SessionDetectionResult, SessionForkParams, SessionForkResult, SessionId, SessionInputParams, SessionInputResult, SessionNewParams,
     SessionNewResult, SessionOutputParams, SessionOutputResult, SessionReadParams,
-    SessionReadResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
-    SessionResumeResult, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
-    SessionSetMetadataResult, SessionWaitParams, SessionWaitResult, SessionWaitTurnParams,
+    SessionReadResult, SessionRemoveResult, SessionResizeParams, SessionResizeResult,
+    SessionResumeParams, SessionResumeResult, SessionScreenParams, SessionScreenResult,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult, SessionWaitParams, SessionWaitResult, SessionWaitTurnParams,
     SessionWaitTurnResult, ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION,
 };
 use serde_json::Value;
@@ -39,7 +39,7 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// a repository layer capped at 5 minutes, 20 minutes in all. The remaining
 /// 10 minutes cover the rest of creation, so this client bound does not race
 /// those valid settings.
-const SESSION_NEW_REQUEST_BUDGET_MS: u32 = 60 * 60 * 1_000;
+pub const SESSION_NEW_REQUEST_BUDGET_MS: u32 = 60 * 60 * 1_000;
 /// Longest valid daemon bound of one lifecycle step, in milliseconds.
 ///
 /// Worker connection, worker initialization, a job's exit timeout, and the
@@ -60,7 +60,25 @@ const SESSION_RESUME_STEPS: u32 = 1 + (2 * RESUME_SWEEP_PASSES + 1) + 2 + 1;
 /// a fresh marker sweep, and bounded worker startup, so its response budget
 /// covers every step at its longest valid daemon bound rather than the
 /// ordinary request timeout.
-const SESSION_RESUME_REQUEST_BUDGET_MS: u32 = SESSION_RESUME_STEPS * LIFECYCLE_STEP_BOUND_MS;
+pub const SESSION_RESUME_REQUEST_BUDGET_MS: u32 = SESSION_RESUME_STEPS * LIFECYCLE_STEP_BOUND_MS;
+/// Lifecycle steps of a fork: the new worker's connection and initialization
+/// (2), and the rest of the fork, such as the version probe, the native store
+/// check and the registration (1). A fork runs no create hooks.
+const SESSION_FORK_STEPS: u32 = 2 + 1;
+/// A fork waits for bounded worker startup, so its response budget covers
+/// every step at its longest valid daemon bound.
+pub const SESSION_FORK_REQUEST_BUDGET_MS: u32 = SESSION_FORK_STEPS * LIFECYCLE_STEP_BOUND_MS;
+/// Lifecycle steps of a stop or remove: the worker's stop, or the retirement
+/// of a conflicted runtime's job (1), the cleanup sweep of a conflicted
+/// runtime (each signalling pass waits a `SIGTERM` grace and a `SIGKILL`
+/// grace, plus one settle window), and the rest of the call (1). A stop
+/// queued behind a resume or fork of the same session waits for that
+/// operation's lifecycle lock as well; an elapsed budget then reports an
+/// unknown outcome.
+const SESSION_STOP_STEPS: u32 = 1 + (2 * RESUME_SWEEP_PASSES + 1) + 1;
+/// A stop or remove waits for the worker's bounded stop and, for a conflicted
+/// runtime, the job's retirement and the cleanup sweep.
+pub const SESSION_STOP_REQUEST_BUDGET_MS: u32 = SESSION_STOP_STEPS * LIFECYCLE_STEP_BOUND_MS;
 /// Transport processing budget added after a validated daemon-side deadline.
 ///
 /// One second leaves room for request framing, waiter teardown, scheduling,
@@ -600,9 +618,10 @@ impl Client {
     /// Send one typed control-method request and decode its success payload.
     ///
     /// This is the public SDK path for normal request/response methods.
-    /// `session.input`, `session.new`, `session.wait`, `session.wait_turn`,
-    /// and `session.output` take the same dedicated-connection budgets as
-    /// their typed helpers. The lower-level
+    /// `session.input`, `session.new`, `session.resume`, `session.fork`,
+    /// `session.stop`, `session.remove`, `session.remove_accepting_unconfirmed`,
+    /// `session.wait`, `session.wait_turn`, and `session.output` take the same
+    /// dedicated-connection budgets as their typed helpers. The lower-level
     /// [`Self::request`] remains available for callers that need raw JSON
     /// envelopes or are testing framing behavior directly.
     pub async fn call<M>(&mut self, params: M::Params) -> Result<M::Output, ClientError>
@@ -636,6 +655,38 @@ impl Client {
             let params =
                 serde_json::from_value::<SessionResumeParams>(serde_json::to_value(params)?)?;
             let result = self.session_resume_with(params).await?;
+            return Ok(protocol::tolerant::from_value(serde_json::to_value(
+                result,
+            )?)?);
+        }
+        if M::NAME == protocol::method::SESSION_FORK {
+            let params =
+                serde_json::from_value::<SessionForkParams>(serde_json::to_value(params)?)?;
+            let result = self.session_fork(params).await?;
+            return Ok(protocol::tolerant::from_value(serde_json::to_value(
+                result,
+            )?)?);
+        }
+        if M::NAME == protocol::method::SESSION_STOP {
+            let session_id =
+                serde_json::from_value::<SessionId>(serde_json::to_value(params)?)?;
+            let result = self.session_stop(session_id).await?;
+            return Ok(protocol::tolerant::from_value(serde_json::to_value(
+                result,
+            )?)?);
+        }
+        if M::NAME == protocol::method::SESSION_REMOVE {
+            let session_id =
+                serde_json::from_value::<SessionId>(serde_json::to_value(params)?)?;
+            let result = self.session_remove(session_id).await?;
+            return Ok(protocol::tolerant::from_value(serde_json::to_value(
+                result,
+            )?)?);
+        }
+        if M::NAME == protocol::method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED {
+            let session_id =
+                serde_json::from_value::<SessionId>(serde_json::to_value(params)?)?;
+            let result = self.session_remove_accepting_unconfirmed(session_id).await?;
             return Ok(protocol::tolerant::from_value(serde_json::to_value(
                 result,
             )?)?);
@@ -854,17 +905,106 @@ impl Client {
         &mut self,
         params: SessionResumeParams,
     ) -> Result<SessionResumeResult, ClientError> {
-        let timeout = lifecycle_request_timeout(self.options, SESSION_RESUME_REQUEST_BUDGET_MS);
+        self.call_lifecycle::<protocol::method::SessionResume>(
+            params,
+            SESSION_RESUME_REQUEST_BUDGET_MS,
+            |host, timeout| ClientError::SessionResumeOutcomeUnknown { host, timeout },
+        )
+        .await
+    }
+
+    /// Fork one session's native conversation into a new session.
+    ///
+    /// Runs on a dedicated connection whose response budget covers the
+    /// daemon's bounded worker startup; an explicit request timeout overrides
+    /// it. An elapsed deadline returns [`ClientError::SessionForkOutcomeUnknown`]:
+    /// the fork may still complete, and a retried fork creates a second child.
+    pub async fn session_fork(
+        &mut self,
+        params: SessionForkParams,
+    ) -> Result<SessionForkResult, ClientError> {
+        self.call_lifecycle::<protocol::method::SessionFork>(
+            params,
+            SESSION_FORK_REQUEST_BUDGET_MS,
+            |host, timeout| ClientError::SessionForkOutcomeUnknown { host, timeout },
+        )
+        .await
+    }
+
+    /// Stop one live session through the typed lifecycle API.
+    ///
+    /// Runs on a dedicated connection whose response budget covers the
+    /// worker's bounded stop and a conflicted runtime's retirement and cleanup
+    /// sweep; an explicit request timeout overrides it. An elapsed deadline
+    /// returns [`ClientError::SessionStopOutcomeUnknown`]: the stop may still
+    /// complete, and a repeated stop is idempotent.
+    pub async fn session_stop(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<SessionStopResult, ClientError> {
+        self.call_lifecycle::<protocol::method::SessionStop>(
+            session_id,
+            SESSION_STOP_REQUEST_BUDGET_MS,
+            |host, timeout| ClientError::SessionStopOutcomeUnknown { host, timeout },
+        )
+        .await
+    }
+
+    /// Remove one session from the daemon's registry, stopping it first when
+    /// it is live.
+    ///
+    /// Shares the stop's budget and returns
+    /// [`ClientError::SessionRemoveOutcomeUnknown`] when the deadline elapses.
+    pub async fn session_remove(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<SessionRemoveResult, ClientError> {
+        self.call_lifecycle::<protocol::method::SessionRemove>(
+            session_id,
+            SESSION_STOP_REQUEST_BUDGET_MS,
+            |host, timeout| ClientError::SessionRemoveOutcomeUnknown { host, timeout },
+        )
+        .await
+    }
+
+    /// Remove one session, consenting for this call only to accept processes
+    /// whose runtime membership cannot be proven.
+    ///
+    /// Shares the stop's budget and returns
+    /// [`ClientError::SessionRemoveOutcomeUnknown`] when the deadline elapses.
+    pub async fn session_remove_accepting_unconfirmed(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<SessionRemoveResult, ClientError> {
+        self.call_lifecycle::<protocol::method::SessionRemoveAcceptingUnconfirmed>(
+            session_id,
+            SESSION_STOP_REQUEST_BUDGET_MS,
+            |host, timeout| ClientError::SessionRemoveOutcomeUnknown { host, timeout },
+        )
+        .await
+    }
+
+    /// Run one lifecycle request on a dedicated connection whose response
+    /// budget is `budget_ms`; an elapsed deadline becomes the method's
+    /// outcome-unknown error.
+    async fn call_lifecycle<M>(
+        &mut self,
+        params: M::Params,
+        budget_ms: u32,
+        outcome_unknown: fn(Option<String>, Duration) -> ClientError,
+    ) -> Result<M::Output, ClientError>
+    where
+        M: Method,
+    {
+        let timeout = lifecycle_request_timeout(self.options, budget_ms);
         let mut client = self
             .connect_dedicated(self.options.with_request_timeout(timeout))
             .await?;
         client
-            .call_direct::<protocol::method::SessionResume>(params)
+            .call_direct::<M>(params)
             .await
             .map_err(|error| match error {
-                ClientError::RequestTimeout { host, timeout } => {
-                    ClientError::SessionResumeOutcomeUnknown { host, timeout }
-                }
+                ClientError::RequestTimeout { host, timeout } => outcome_unknown(host, timeout),
                 other => other,
             })
     }

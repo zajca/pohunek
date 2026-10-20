@@ -39,6 +39,33 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
  * `pre-create` and `post-create` hooks with a host and a repository layer of
  * 5 minutes each, and 10 minutes for the rest of creation. */
 export const SESSION_NEW_REQUEST_BUDGET_MS = 60 * 60 * 1_000;
+/** Longest valid daemon bound of one lifecycle step: worker connection, worker
+ * initialization, a job's exit timeout and the marker sweep's grace are each
+ * validated up to 10 minutes. A shared fixture ties it to the Rust client. */
+export const LIFECYCLE_STEP_BOUND_MS = 10 * 60 * 1_000;
+/** Signalling passes the daemon's marker sweep makes at most. */
+export const RESUME_SWEEP_PASSES = 3;
+/** Steps of the daemon's sweep: each pass waits a `SIGTERM` grace and a
+ * `SIGKILL` grace, plus one settle window. */
+const SWEEP_STEPS = 2 * RESUME_SWEEP_PASSES + 1;
+/** Resume: retiring the lost generation's job (1), the cleanup sweep, the new
+ * worker's connection and initialization (2), and the rest of the resume (1). */
+const SESSION_RESUME_STEPS = 1 + SWEEP_STEPS + 2 + 1;
+/** Fork: the new worker's connection and initialization (2) and the rest of
+ * the fork (1); a fork runs no create hooks. */
+const SESSION_FORK_STEPS = 2 + 1;
+/** Stop and remove: the worker's stop or a conflicted runtime's job
+ * retirement (1), the conflicted runtime's cleanup sweep, and the rest (1). */
+const SESSION_STOP_STEPS = 1 + SWEEP_STEPS + 1;
+/** Budget for `session.resume`. */
+export const SESSION_RESUME_REQUEST_BUDGET_MS = SESSION_RESUME_STEPS * LIFECYCLE_STEP_BOUND_MS;
+/** Budget for `session.fork`. */
+export const SESSION_FORK_REQUEST_BUDGET_MS = SESSION_FORK_STEPS * LIFECYCLE_STEP_BOUND_MS;
+/** Budget for `session.stop`. */
+export const SESSION_STOP_REQUEST_BUDGET_MS = SESSION_STOP_STEPS * LIFECYCLE_STEP_BOUND_MS;
+/** Budget for `session.remove` and `session.remove_accepting_unconfirmed`; the
+ * removal stops a live session first, so it shares the stop's steps. */
+export const SESSION_REMOVE_REQUEST_BUDGET_MS = SESSION_STOP_REQUEST_BUDGET_MS;
 
 export function resolveConnectOptions(options: ConnectOptions = {}): ResolvedConnectOptions {
   return {
