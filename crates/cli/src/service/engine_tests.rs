@@ -10176,7 +10176,7 @@ async fn unit_environment_without_a_path_keeps_the_managers_path() {
 /// Writes `content` to a file in a scratch directory and returns both.
 #[cfg(target_os = "linux")]
 fn environment_file(content: &str) -> (tempfile::TempDir, String) {
-    let dir = tempfile::tempdir().expect("scratch directory");
+    let dir = pohunek_test_support::tempdir().expect("scratch directory");
     let file = dir.path().join("job.env");
     std::fs::write(&file, content).expect("environment file");
     let path = file.display().to_string();
@@ -10252,7 +10252,7 @@ async fn path_text_inside_values_and_comments_of_an_environment_file_is_not_an_a
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn an_environment_file_that_is_a_fifo_a_device_or_too_large_is_refused() {
-    let dir = tempfile::tempdir().expect("scratch directory");
+    let dir = pohunek_test_support::tempdir().expect("scratch directory");
     let fifo = dir.path().join("job.fifo");
     nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).expect("fifo");
     let link = dir.path().join("zero.link");
