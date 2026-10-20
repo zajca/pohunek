@@ -19,7 +19,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-use pohunek_cli::service::layout::{trust_release_source, ReleaseSource, VerifiedVersionDir};
+use pohunek_cli::service::layout::{operator_release_for_test, VerifiedVersionDir};
 use pohunek_cli::service::ledger::Acceptance;
 use pohunek_cli::service::manager_env::{
     user_manager_environment, EnvironmentFailure, UserManager,
@@ -331,7 +331,7 @@ fn session_info() -> SessionInfo {
 
 /// A scripted release directory standing for the operator's release.
 fn trusted(dir: &Path) -> VerifiedVersionDir {
-    trust_release_source(dir, ReleaseSource::Operator)
+    operator_release_for_test(dir)
 }
 
 #[tokio::test]

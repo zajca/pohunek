@@ -61,7 +61,7 @@ use crate::error::CliError;
 use crate::hermes_integration::runner::safe_ancestor;
 use crate::paths::Paths;
 use crate::service::engine::{install_layout, installed_job_search_path, recorded_job_search_path};
-use crate::service::layout::{self, ReleaseSource, VerifiedVersionDir};
+use crate::service::layout::{self, SealedRelease, VerifiedVersionDir};
 use crate::service::report::IntegrationReinstall;
 use crate::service::runtimes::{profile_detail, replaces_newer_warning, DaemonRuntimes};
 use crate::service::{self, Context, VERSION};
@@ -481,6 +481,27 @@ fn catalog_note(service: &ServiceStep, previewed: &EnsureReport) -> Option<Strin
         })
 }
 
+/// The directory a fresh host's plan runs the release daemon from: the sealed
+/// archive its verification vouched for, or the operator's own release.
+///
+/// # Errors
+///
+/// Returns the verification errors of [`layout::operator_release`] for a
+/// directory inside the default prefix's versions directory.
+fn release_for_fresh_host(
+    context: &Context,
+    staged: &Path,
+    sealed: Option<SealedRelease>,
+) -> Result<VerifiedVersionDir, CliError> {
+    match sealed {
+        Some(sealed) => Ok(layout::sealed_release(&sealed)),
+        None => Ok(layout::operator_release(
+            &install_layout(&context.default_prefix()?)?,
+            staged,
+        )?),
+    }
+}
+
 /// Reads the service state and the release plan without changing anything.
 ///
 /// # Errors
@@ -524,7 +545,7 @@ async fn plan_in(
     } else {
         // The plan runs the release's daemon, so a sealed archive is verified
         // before anything from it runs.
-        verify_sealed_archive(staged, context.uid()).await?;
+        let sealed = verify_sealed_archive(staged, context.uid()).await?;
         // The PATH the daemon job of a fresh install gets: the search path the
         // install records, or the service manager's own when it records none,
         // so the plan judges the packages as the installed daemon will.
@@ -543,7 +564,7 @@ async fn plan_in(
             ServiceStep::Install {
                 from: staged.display().to_string(),
             },
-            layout::trust_release_source(staged, ReleaseSource::SealedArchive),
+            release_for_fresh_host(context, staged, sealed)?,
             None,
             job.value,
         )
@@ -1315,8 +1336,9 @@ fn hook_lines(hooks: &[IntegrationReinstall], status: &str) -> Vec<String> {
 /// # Errors
 ///
 /// Returns [`CliError::SetupBlocked`] with the verifier's reason when the
-/// archive is refused or the verifier cannot run.
-async fn verify_sealed_archive(staged: &Path, uid: u32) -> Result<(), CliError> {
+/// archive is refused or the verifier cannot run. A directory that is not a
+/// sealed archive returns `None`.
+async fn verify_sealed_archive(staged: &Path, uid: u32) -> Result<Option<SealedRelease>, CliError> {
     use std::os::unix::fs::MetadataExt as _;
 
     let blocked = |detail: String| CliError::SetupBlocked { detail };
@@ -1337,7 +1359,7 @@ async fn verify_sealed_archive(staged: &Path, uid: u32) -> Result<(), CliError> 
         }
     }
     if !sealed {
-        return Ok(());
+        return Ok(None);
     }
     // Every directory above the release is closed to other accounts, so none
     // can rename the checked tree away and put its own verifier at this path
@@ -1412,7 +1434,7 @@ async fn verify_sealed_archive(staged: &Path, uid: u32) -> Result<(), CliError> 
         .await
         .map_err(|error| blocked(format!("cannot run {}: {error}", verifier.display())))?;
     if output.status.success() {
-        return Ok(());
+        return Ok(Some(SealedRelease::attest(staged)));
     }
     let reason = String::from_utf8_lossy(&output.stderr);
     Err(blocked(format!(

@@ -216,6 +216,10 @@ async fn finish_check(
     version: &str,
     accept_runtime_loss: bool,
 ) -> Result<report::CheckReport, Error> {
+    // The source is classified for every adoption mode, as install and upgrade
+    // classify it, so a check refuses what they would refuse.
+    let release =
+        layout::operator_release(&engine::install_layout(&checked.report.prefix)?, daemon_dir)?;
     if let Some(record) = &checked.rollback {
         let layout = engine::install_layout(&record.prefix)?;
         let previous = record
@@ -278,8 +282,6 @@ async fn finish_check(
             }
             None => ledger::Acceptance::none(),
         };
-        let release =
-            layout::operator_release(&engine::install_layout(&checked.report.prefix)?, daemon_dir)?;
         let gated = preflight::gate_upgrade(
             preflight,
             context,

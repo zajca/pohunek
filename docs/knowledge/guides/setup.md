@@ -112,10 +112,11 @@ installation first, which releases the prefix. An existing version directory
 is reused only when it and its binaries are exactly what the installer creates
 (owned by you, mode `0755`, no symbolic links, no extra hard links); otherwise
 the install fails with `service_version_untrusted`. The same check runs again
-before any command executes a binary from an installed version directory (the
-upgrade, rollback and runtime steps, `service check`, and `pohunek setup` on an
-installed host), so a directory that became group-writable after the install is
-refused instead of run. On macOS the install also
+before any command executes or copies content from an installed version directory
+(the source of an install or upgrade, including `service check`, the rollback and
+runtime steps, and `pohunek setup` on an installed host). It covers the binaries,
+the catalog trust anchor and the `runtime/` tree, so a directory that became
+group-writable after the install is refused instead of run. On macOS the install also
 resolves the daemon's `PATH` (login-shell discovery plus a trusted fallback
 directory list) and prints a `path` line, with a `warning:` line for a failed
 login shell or a refused directory; see

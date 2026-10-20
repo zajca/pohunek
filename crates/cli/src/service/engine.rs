@@ -176,7 +176,7 @@ use super::definition::{
     config_with_search_path, daemon_definition, identity_config, with_version,
 };
 use super::error::{supervisor_error, Error, LiveSession, OutdatedWorker};
-use super::layout::{self, Staged};
+use super::layout::{self, Staged, VerifiedVersionDir};
 use pohunek_platform::shell_env::SearchPath;
 
 use super::ledger::{Acceptance, Ledger};
@@ -481,7 +481,7 @@ impl<'a> Engine<'a> {
     ) -> Result<InstallReport, Error> {
         let _transaction = self.transaction().await?;
         let layout = install_preflight(self.context, prefix)?;
-        layout::operator_release(&layout, from)?;
+        let source = layout::operator_release(&layout, from)?;
         let plan = install_plan(self.store.load()?, prefix, version)?;
         // The discovery environment is judged, and discovery run, before a
         // foreign pending transaction is rolled back, so a hostile environment
@@ -529,7 +529,7 @@ impl<'a> Engine<'a> {
         let claimed = layout::claim_prefix(&layout, &namespace)?;
         let resumed = resume.is_some();
         let started = async {
-            let staged = layout::stage(&layout, from, self.reported(version)).await?;
+            let staged = layout::stage(&layout, &source, self.reported(version)).await?;
             let record = if let Some(record) = resume {
                 record
             } else {
@@ -641,7 +641,8 @@ impl<'a> Engine<'a> {
         upgrade_preflight(self.context)?;
         let config_path = self.context.config_path();
         let plan = upgrade_plan(self.store.load()?, version)?;
-        let (gated, job_path) = self.adoption_gate(&plan, from, version).await?;
+        let release = self.upgrade_source(&plan, from)?;
+        let (gated, job_path) = self.adoption_gate(&plan, &release, version).await?;
         let (resume, rolled_back) = self.resolve_plan(plan).await?;
         // The file is read as an upgrade source, so a previous release's
         // schema-2, schema-3, schema-4 or schema-5 installation upgrades into this one
@@ -660,7 +661,7 @@ impl<'a> Engine<'a> {
         let layout = config.layout().clone();
         check_layout_dirs(self.context, &layout)?;
         layout::claim_prefix(&layout, &config.namespace())?;
-        let staged = layout::stage(&layout, from, self.reported(version)).await?;
+        let staged = layout::stage(&layout, &release, self.reported(version)).await?;
         let resumed = resume.is_some();
         let from_version = resume
             .as_ref()
@@ -783,6 +784,30 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// Resolves the operator's release directory once for an upgrade, against
+    /// the layout of the installation the upgrade changes. The same value is
+    /// judged by the adoption gate and staged, so an installed version
+    /// directory is verified before anything from it runs or is copied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotInstalled`] without an installation and the
+    /// verification errors of [`layout::operator_release`].
+    fn upgrade_source(&self, plan: &Plan, from: &Path) -> Result<VerifiedVersionDir, Error> {
+        let layout = match plan {
+            Plan::Fresh => {
+                let config_path = self.context.config_path();
+                load_config_for_upgrade(&config_path)?
+                    .ok_or(Error::NotInstalled { path: config_path })?
+                    .config
+                    .layout()
+                    .clone()
+            }
+            Plan::Resume(record) | Plan::RollBack(record) => install_layout(&record.prefix)?,
+        };
+        layout::operator_release(&layout, from)
+    }
+
     /// Asks the new daemon's adoption preflight about the live sessions when
     /// `plan` swaps the daemon, and applies the operator's choice.
     ///
@@ -792,7 +817,7 @@ impl<'a> Engine<'a> {
     async fn adoption_gate(
         &self,
         plan: &Plan,
-        from: &Path,
+        release: &VerifiedVersionDir,
         version: &str,
     ) -> Result<(Option<Gated>, Option<JobPath>), Error> {
         // Only a fresh plan needs the installed version, which a rollback
@@ -803,18 +828,6 @@ impl<'a> Engine<'a> {
             }
             Plan::Resume(_) | Plan::RollBack(_) => None,
         };
-        // The source is staged and run on every upgrade, so it is verified
-        // whether or not the daemon swaps.
-        let layout = match (&installed, plan) {
-            (Some(config), _) => Some(config.layout().clone()),
-            (None, Plan::Resume(record) | Plan::RollBack(record)) => {
-                Some(install_layout(&record.prefix)?)
-            }
-            (None, Plan::Fresh) => None,
-        };
-        let release = layout
-            .map(|layout| layout::operator_release(&layout, from))
-            .transpose()?;
         if !swaps_daemon(
             plan,
             installed.as_ref().map(ServiceConfig::active_version),
@@ -822,7 +835,6 @@ impl<'a> Engine<'a> {
         ) {
             return Ok((None, None));
         }
-        let release = release.expect("a swapping plan has an installation to verify against");
         let job = installed_job_path(self.context).await?;
         let warnings = job_warnings(self.context, &job);
         let basis = match (&installed, plan) {
@@ -836,7 +848,7 @@ impl<'a> Engine<'a> {
         let gated = preflight::gate_upgrade(
             &*self.preflight,
             self.context,
-            &release,
+            release,
             self.reported(version),
             &job.value,
             &job.variables,

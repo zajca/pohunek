@@ -703,7 +703,7 @@ mod tests {
     }
 
     fn trusted(dir: &Path) -> VerifiedVersionDir {
-        layout::trust_release_source(dir, layout::ReleaseSource::Operator)
+        layout::operator_release_for_test(dir)
     }
 
     fn failure_detail(error: Error) -> String {
