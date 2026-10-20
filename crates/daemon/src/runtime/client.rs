@@ -680,6 +680,27 @@ impl Worker {
         }
     }
 
+    /// Acknowledges the committed terminal outcome so the worker exits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError`] for an unavailable runtime, a lost controller
+    /// lease, or a worker that is not terminal.
+    pub async fn acknowledge_terminal(&self) -> Result<(), WorkerError> {
+        let mut inner = self.inner.lock().await;
+        let scope = scope(&inner)?;
+        let response = request_locked(
+            &mut inner,
+            self.next_request_id("acknowledge-terminal")?,
+            RequestKind::AcknowledgeTerminal { scope },
+        )
+        .await?;
+        match response {
+            ResponseKind::TerminalAcknowledged => Ok(()),
+            other => response_error(other),
+        }
+    }
+
     /// Forwards a public agent report into the worker as the active identity.
     ///
     /// # Errors

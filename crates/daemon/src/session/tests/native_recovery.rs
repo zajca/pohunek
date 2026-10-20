@@ -296,17 +296,20 @@ impl Rig {
     }
 
     /// Commits a terminal exit the way `record_exit` is called by the stop
-    /// path (`stopped_by_user`) and by the natural-exit watcher.
+    /// path (`stopped_by_user`) and by the natural-exit watcher, which retries
+    /// a commit that lost a race with a concurrent change of the session.
     async fn commit_terminal_exit(&self, exit: RuntimeExit, stopped_by_user: bool) {
-        let committed = self
-            .registry
-            .record_exit(&self.session.id, exit, stopped_by_user, None, None)
-            .await
-            .expect("terminal commit of the fixture session");
-        assert!(
-            committed,
-            "the quiescent fixture session commits its terminal outcome"
-        );
+        wait_until(
+            "the fixture session commits its terminal outcome",
+            || async move {
+                self.registry
+                    .record_exit(&self.session.id, exit, stopped_by_user, None, None)
+                    .await
+                    .expect("terminal commit of the fixture session")
+                    .then_some(())
+            },
+        )
+        .await;
     }
 
     async fn finish(&self) {

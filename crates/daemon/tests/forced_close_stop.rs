@@ -714,6 +714,12 @@ async fn a_late_exit_after_the_stop_gave_up_honours_the_stop_intent() {
             .expect("inspect the escaped holder"),
         "the late commit follows the sweep of the holder"
     );
+    // The stop failed, but the late exit is the terminal commit of this
+    // generation, so the daemon acknowledges it and the worker exits.
+    wait_until("the late terminal commit to be acknowledged", || async {
+        (scenario.worker_journal()["terminal_acknowledged"] == true).then_some(())
+    })
+    .await;
     registry
         .remove(&created.id)
         .await
@@ -795,6 +801,13 @@ async fn an_exited_worker_still_answering_after_a_restart_honours_the_stop_inten
             .expect("inspect the escaped holder"),
         "the worker swept the holder before it committed"
     );
+    // The worker kept answering with its exited runtime, so the restarted
+    // daemon acknowledges the outcome it imported and the worker exits.
+    wait_until(
+        "the imported terminal outcome to be acknowledged",
+        || async { (scenario.worker_journal()["terminal_acknowledged"] == true).then_some(()) },
+    )
+    .await;
     restarted
         .remove(&created.id)
         .await

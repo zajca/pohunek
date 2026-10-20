@@ -89,7 +89,7 @@ pub(super) struct BoundReporter {
     /// Whether an exit watch reports the exit of `identity`. Without one, or
     /// once its task was cancelled with the runtime watchers, every scan reads
     /// the generation's liveness.
-    watched: bool,
+    pub(super) watched: bool,
     /// Ends the watch task when the record is dropped.
     pub(super) cancel: CancellationToken,
 }
@@ -200,6 +200,10 @@ struct ObservedRefresh {
 
 /// What one rescan found, for pacing the next one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent facts of one scan that the pacing loop reads separately"
+)]
 pub(super) struct ScanOutcome {
     /// Whether the watch keeps running.
     pub(super) alive: bool,
@@ -209,6 +213,9 @@ pub(super) struct ScanOutcome {
     changed: bool,
     /// Whether the session was not working when the scan applied.
     quiet: bool,
+    /// Whether the scan was skipped because a stop is in flight; the loop then
+    /// waits for a rescan request instead of its timer.
+    paused: bool,
 }
 
 impl ScanOutcome {
@@ -218,6 +225,7 @@ impl ScanOutcome {
             tree: None,
             changed: false,
             quiet: false,
+            paused: false,
         }
     }
 
@@ -227,6 +235,18 @@ impl ScanOutcome {
             tree: None,
             changed: false,
             quiet: false,
+            paused: false,
+        }
+    }
+
+    /// The session is alive but stopping: nothing was read or applied.
+    const fn paused() -> Self {
+        Self {
+            alive: true,
+            tree: None,
+            changed: false,
+            quiet: false,
+            paused: true,
         }
     }
 }
@@ -346,13 +366,23 @@ impl SessionRegistry {
             // while a quiet session's process tree stays the same.
             let mut delay = Duration::ZERO;
             let mut last_tree = None;
+            // A stopping session has nothing to scan; the loop then waits for
+            // the rescan its failed stop requests, or for cancellation at the
+            // terminal commit.
+            let mut paused = false;
             loop {
                 // Cancellation wins over a ready timer or rescan so a stopped
                 // loop never starts another scan.
                 let outcome = tokio::select! {
                     biased;
                     () = cancel.cancelled() => break,
-                    () = tokio::time::sleep(delay) => {
+                    () = async {
+                        if paused {
+                            std::future::pending::<()>().await;
+                        } else {
+                            tokio::time::sleep(delay).await;
+                        }
+                    } => {
                         let outcome = registry
                             .rescan_live_root(&id, &expected, root, crate::time::now())
                             .await;
@@ -374,6 +404,7 @@ impl SessionRegistry {
                     cancel.cancel();
                     break;
                 }
+                paused = outcome.paused;
                 last_tree = outcome.tree;
             }
         });
@@ -386,6 +417,9 @@ impl SessionRegistry {
         root: ProcessIdentity,
         now: Instant,
     ) -> ScanOutcome {
+        if self.procwatch_stop_in_flight(id, expected).await {
+            return ScanOutcome::paused();
+        }
         let running = self
             .off_executor(move |registry| registry.inner.inspector.is_running(root))
             .await;
@@ -408,6 +442,23 @@ impl SessionRegistry {
                 ScanOutcome::unchanged()
             }
         }
+    }
+
+    /// Whether a stop of the runtime `expected` is in flight: the scans leave
+    /// the session alone until the stop commits or fails.
+    async fn procwatch_stop_in_flight(
+        &self,
+        id: &SessionId,
+        expected: &RuntimeWatchIdentity,
+    ) -> bool {
+        self.inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|entry| {
+                entry.stopping && !is_terminal(entry.info.state) && expected.matches(entry)
+            })
     }
 
     /// Runs synchronous process-inspector reads on a blocking thread, so they
@@ -566,6 +617,9 @@ impl SessionRegistry {
             return ScanOutcome::stopped();
         };
         let _scan = scan_gate.lock().await;
+        if self.procwatch_stop_in_flight(id, expected).await {
+            return ScanOutcome::paused();
+        }
         // The registry snapshot the scan identifies other runtimes with.
         let scan_registry = self.inner.profiles.runtimes().registry();
         // The claim a scan may prove is the one current before it collects: a
@@ -665,8 +719,11 @@ impl SessionRegistry {
             if !expected.matches(entry) {
                 return ScanOutcome::stopped();
             }
-            if entry.stopping || is_terminal(entry.info.state) {
+            if is_terminal(entry.info.state) {
                 return ScanOutcome::stopped();
+            }
+            if entry.stopping {
+                return ScanOutcome::paused();
             }
             // A package change replaced a definition this scan matched with:
             // the session's own pin, or the registry other runtimes resolve
@@ -762,6 +819,7 @@ impl SessionRegistry {
             tree,
             changed,
             quiet,
+            paused: false,
         };
 
         for (identity, watch, cancel) in to_spawn {
@@ -892,7 +950,19 @@ impl SessionRegistry {
             let Some(entry) = sessions.get_mut(id) else {
                 return;
             };
-            if entry.stopping || is_terminal(entry.info.state) {
+            if is_terminal(entry.info.state) {
+                return;
+            }
+            if entry.stopping {
+                // The watch task has ended; the first scan after the stop
+                // reads the generation's liveness.
+                if let Some(bound) = entry
+                    .bound_reporter
+                    .as_mut()
+                    .filter(|bound| bound.identity == identity)
+                {
+                    bound.watched = false;
+                }
                 return;
             }
             if entry

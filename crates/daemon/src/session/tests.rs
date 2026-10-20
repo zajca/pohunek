@@ -60,6 +60,8 @@ mod conflict_cleanup;
 mod native_recovery;
 mod native_supersede;
 mod stale_worker_metadata;
+mod stop_monitoring;
+mod terminal_acknowledgement;
 
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.
 const CONCURRENT_TRANSITION_RETRY_LIMIT: usize = 32;
@@ -19694,6 +19696,9 @@ async fn reconciled_create_whose_worker_ended_is_retired_then_compensated() {
         .expect("create session");
     let launched = stored_record(&daemon.store_path, &created.id).runtime;
     let mut events = registry.subscribe();
+    // The daemon ends before it acknowledges the stop, so the worker keeps
+    // serving the ended runtime.
+    registry.suppress_terminal_acknowledgement();
     registry.stop(&created.id).await.expect("stop session");
     let worktree = created.worktree_path.clone().expect("bound worktree");
     registry.begin_daemon_shutdown();
@@ -20786,10 +20791,12 @@ async fn concurrent_recoveries_of_one_session_start_exactly_one_generation() {
     assert_eq!(refused.code, "session_runtime_not_recoverable");
     let started = supervisor.started();
     assert_eq!(started.len(), 2, "create plus one recovery: {started:?}");
-    assert_eq!(
-        supervisor.retired(),
-        [first_job],
-        "the superseded generation is retired exactly"
+    // The acknowledgement of the finished generation and the recovery may both
+    // retire it; retiring an absent job is a no-op.
+    let retired = supervisor.retired();
+    assert!(
+        !retired.is_empty() && retired.iter().all(|job| *job == first_job),
+        "only the superseded generation is retired: {retired:?}"
     );
     assert_eq!(supervisor.live_jobs().await, [started[1].clone()]);
     registry

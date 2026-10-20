@@ -401,3 +401,35 @@ async fn a_subject_outside_the_session_tree_or_with_a_reused_start_identity_chan
     assert_eq!(snapshot.active_identity_revision, Some(0));
     stop(&reconnected).await;
 }
+
+/// A controller that negotiated the previous protocol version acknowledges a
+/// terminal runtime the same way: the worker journals the acknowledgement and
+/// exits.
+#[tokio::test]
+async fn previous_protocol_worker_accepts_terminal_acknowledgement() {
+    let (mut fixture, worker, _child) = running_fixture().await;
+    worker.release_controller().await.expect("release lease");
+    drop(worker);
+
+    let previous = fixture.connect(PREVIOUS_VERSION).await;
+    assert_eq!(previous.selected_version().await, PREVIOUS_VERSION);
+    assert!(
+        previous.acknowledge_terminal().await.is_err(),
+        "a running worker refuses the acknowledgement"
+    );
+    stop(&previous).await;
+    previous
+        .acknowledge_terminal()
+        .await
+        .expect("a terminal worker accepts the acknowledgement");
+
+    let worker_process = std::cell::RefCell::new(&mut fixture.worker);
+    wait_until("the acknowledged worker to exit", || async {
+        worker_process
+            .borrow_mut()
+            .try_wait()
+            .expect("inspect the worker process")
+            .map(|_status| ())
+    })
+    .await;
+}

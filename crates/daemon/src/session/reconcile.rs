@@ -3120,7 +3120,7 @@ impl SessionRegistry {
     /// absent job counts), or there is no generation or supervisor to retire
     /// it through. A failed retirement is logged and returns `false`, so the
     /// caller keeps the session for the background re-check.
-    async fn retire_terminal_generation(
+    pub(super) async fn retire_terminal_generation(
         &self,
         session_id: &str,
         generation: Option<&super::Generation>,
@@ -3378,7 +3378,18 @@ impl SessionRegistry {
                     .settle_ended_create(record, generation.as_ref(), lifecycle.as_ref(), retry)
                     .await;
             }
-            return !self.import_ended_worker(record, &snapshot).await;
+            let generation = super::Generation::from_record(&record.session_id, &record.runtime)
+                .ok()
+                .flatten();
+            let exited = snapshot.phase == RuntimePhase::Exited;
+            let imported = self.import_ended_worker(record, &snapshot).await;
+            // The outcome is durable, so the worker that still serves its
+            // exited runtime is released and its job retired.
+            if imported && exited {
+                self.acknowledge_committed_terminal(&id, worker, generation)
+                    .await;
+            }
+            return !imported;
         }
 
         if record.desired_state == DesiredState::Stopped {
@@ -4260,6 +4271,10 @@ impl SessionRegistry {
         };
         match worker.stop(transaction).await {
             Ok(Some(exit)) => {
+                let generation =
+                    super::Generation::from_record(&record.session_id, &record.runtime)
+                        .ok()
+                        .flatten();
                 let mut terminal = record;
                 if let Ok(final_snapshot) = worker.inspect().await {
                     let snapshot = InspectSnapshot {
@@ -4291,13 +4306,18 @@ impl SessionRegistry {
                         loss_reason: None,
                     })
                     .state = RuntimeState::Terminal;
-                !self
+                let imported = self
                     .insert_unavailable_record(
                         terminal,
                         RuntimeState::Terminal,
                         "worker_runtime_terminal",
                     )
-                    .await
+                    .await;
+                if imported {
+                    self.acknowledge_committed_terminal(id, worker, generation)
+                        .await;
+                }
+                !imported
             }
             Ok(None) => {
                 tracing::warn!(session_id = %id.0, "worker returned no terminal outcome for the replayed stop");

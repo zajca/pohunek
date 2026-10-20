@@ -1318,10 +1318,14 @@ impl SessionRegistry {
             .get(id)
             .and_then(|entry| entry.job.as_ref().map(|job| job.generation().to_owned()));
         let waiting = self.inner.sessions.lock().await.get(id).and_then(|entry| {
-            if !matches!(entry.runtime, super::RuntimeHandle::Unavailable(_)) {
+            let runtime = entry.info.runtime.as_ref()?;
+            // A terminal entry may still hold the worker handle of the
+            // runtime that ended.
+            if !matches!(entry.runtime, super::RuntimeHandle::Unavailable(_))
+                && runtime.state != RuntimeState::Terminal
+            {
                 return None;
             }
-            let runtime = entry.info.runtime.as_ref()?;
             match (runtime.state, runtime.loss_reason.as_deref()) {
                 (RuntimeState::Reconnecting, Some(SUPERVISION_UNAVAILABLE))
                 | (RuntimeState::Conflict, Some(SUPERVISION_AMBIGUOUS)) => Some(Waiting::Evidence),
