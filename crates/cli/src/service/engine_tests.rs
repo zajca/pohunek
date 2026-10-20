@@ -10113,6 +10113,21 @@ async fn a_drop_in_path_in_an_unreadable_form_is_refused() {
     }
 }
 
+/// systemd ignores an `Environment=` outside `[Service]`, so it is not a drop-in
+/// override of the unit file's `PATH`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_environment_line_outside_the_service_section_does_not_count() {
+    let (_dir, drop_in) = environment_file("[Unit]\nEnvironment=PATH=/ignored/bin\n");
+    let unit = UnitEnvironment {
+        drop_in_paths: vec![drop_in],
+        environment: vec!["PATH=/unit-file/bin".to_owned()],
+        ..loaded_unit()
+    };
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, MANAGER_PATH);
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_drop_in_that_cannot_be_read_is_refused() {

@@ -529,11 +529,24 @@ enum PathAssignment {
 
 /// Classifies the `Environment=` lines of a unit drop-in.
 ///
-/// Joins continuation lines, skips comment lines, and splits each value into
-/// words outside quotes, as the unit file syntax does.
+/// Joins continuation lines, skips comment lines, reads only the `[Service]`
+/// section, and splits each value into words outside quotes, as the unit file
+/// syntax does.
 fn drop_in_path_assignment(text: &str) -> PathAssignment {
     let mut result = PathAssignment::No;
+    let mut in_service = false;
     for line in logical_lines(text) {
+        let trimmed = line.trim();
+        if let Some(section) = trimmed
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            in_service = section == "Service";
+            continue;
+        }
+        if !in_service {
+            continue;
+        }
         let Some((key, value)) = line.trim_start().split_once('=') else {
             continue;
         };
