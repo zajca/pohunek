@@ -1717,6 +1717,8 @@ fn transition(activity: AgentActivity) -> ActivityTransition {
 #[derive(Debug, Default)]
 struct MockInspector {
     inner: Mutex<MockInspectorState>,
+    /// Signalled whenever a descendant scan starts, from whichever thread runs it.
+    scan_started: tokio::sync::Notify,
 }
 
 #[derive(Debug, Default)]
@@ -2096,6 +2098,7 @@ impl ProcessInspector for MockInspector {
         {
             let mut inner = self.inner.lock().expect("mock inspector lock");
             inner.descendant_scans_started += 1;
+            self.scan_started.notify_one();
             if inner.executor_thread == Some(std::thread::current().id()) {
                 inner.descendant_scans_in_task += 1;
             }
@@ -10053,25 +10056,80 @@ fn backoff_registry() -> (SessionRegistry, Arc<MockInspector>) {
     (registry, inspector)
 }
 
-/// Lets every scan the loops started finish and apply, on the paused clock.
-async fn settle_procwatch_scans(inspector: &MockInspector) {
-    for _ in 0..64 {
-        tokio::task::yield_now().await;
+/// Lets every scan the loops started finish, apply and re-arm its timer, on the
+/// paused clock. A scan holds its session's scan gate from its first read to
+/// its applied result, so locking the gate waits out exactly that span.
+async fn settle_procwatch_scans(registry: &SessionRegistry) {
+    let gates: Vec<_> = registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .values()
+        .map(|entry| Arc::clone(&entry.procwatch_scan))
+        .collect();
+    for gate in gates {
+        drop(guard("the in-flight procwatch scan finished", gate.lock()).await);
     }
-    wait_until("in-flight procwatch scans finish", || async {
-        let (started, finished, _) = inspector.descendant_scans();
-        (started == finished).then_some(())
-    })
-    .await;
     for _ in 0..64 {
         tokio::task::yield_now().await;
     }
 }
 
-async fn advance_settling(inspector: &MockInspector, seconds: u64) {
-    for _ in 0..seconds {
+/// Waits until `total` scans started. The wait parks on the scan's own signal
+/// rather than a timer, so the paused clock never moves on its account.
+async fn wait_for_scans_started(inspector: &MockInspector, total: usize) {
+    guard("the due procwatch scans started", async {
+        while inspector.descendant_scans().0 < total {
+            inspector.scan_started.notified().await;
+        }
+    })
+    .await;
+}
+
+/// Scans one quiet session with a stable tree has started once `elapsed`
+/// virtual seconds passed: at 0, then after 1, 2, 4 and 8 s (the ceiling).
+fn backoff_scans_due(elapsed: u64) -> usize {
+    let mut due = 1;
+    let mut at = 0;
+    let mut delay = BACKOFF_POLL.as_secs();
+    while at + delay <= elapsed {
+        at += delay;
+        due += 1;
+        delay = (delay * 2).min(BACKOFF_CEILING.as_secs());
+    }
+    due
+}
+
+/// Asserts the paused clock stands at `expected` up to the timer wheel's
+/// millisecond rounding. A scan that is late parks the runtime and the clock
+/// jumps to the next periodic timer, at least half a poll further.
+fn assert_clock_not_jumped(expected: tokio::time::Instant, what: &str) {
+    let now = tokio::time::Instant::now();
+    assert!(
+        now >= expected && now - expected < BACKOFF_POLL / 2,
+        "{what} ran without the paused clock jumping ahead ({:?})",
+        now.saturating_duration_since(expected)
+    );
+}
+
+/// Advances the paused clock one second at a time. A scan runs its process
+/// reads on a blocking thread, so a scan due at a tick is awaited by count
+/// rather than assumed finished after a number of yields.
+async fn advance_settling(
+    registry: &SessionRegistry,
+    inspector: &MockInspector,
+    sessions: usize,
+    from: u64,
+    seconds: u64,
+) {
+    for elapsed in from + 1..=from + seconds {
+        let tick_end = tokio::time::Instant::now() + Duration::from_secs(1);
         tokio::time::advance(Duration::from_secs(1)).await;
-        settle_procwatch_scans(inspector).await;
+        let due = sessions * backoff_scans_due(elapsed);
+        wait_for_scans_started(inspector, due).await;
+        settle_procwatch_scans(registry).await;
+        assert_clock_not_jumped(tick_end, &format!("every scan due at second {elapsed}"));
     }
 }
 
@@ -10089,10 +10147,10 @@ async fn quiet_sessions_with_a_stable_tree_are_scanned_at_the_backoff_rate_off_t
     .await;
     inspector.count_scans_on_current_thread();
     tokio::time::pause();
-    settle_procwatch_scans(&inspector).await;
+    settle_procwatch_scans(&registry).await;
     let (before, _, in_task_before) = inspector.descendant_scans();
 
-    advance_settling(&inspector, BACKOFF_SETTLE_SECS).await;
+    advance_settling(&registry, &inspector, SESSIONS, 0, BACKOFF_SETTLE_SECS).await;
 
     let (started, _, in_task) = inspector.descendant_scans();
     let scans = started - before;
@@ -10123,13 +10181,18 @@ async fn a_working_transition_rescans_a_backed_off_session_at_once() {
     })
     .await;
     tokio::time::pause();
-    advance_settling(&inspector, BACKOFF_SETTLE_SECS).await;
+    settle_procwatch_scans(&registry).await;
+    advance_settling(&registry, &inspector, 1, 0, BACKOFF_SETTLE_SECS).await;
     let before = inspector.descendant_scans().0;
+    let paused_at = tokio::time::Instant::now();
 
     registry
         .record_activity(&created.id, transition(AgentActivity::Working))
         .await;
-    settle_procwatch_scans(&inspector).await;
+    wait_for_scans_started(&inspector, before + 1).await;
+    settle_procwatch_scans(&registry).await;
+
+    assert_clock_not_jumped(paused_at, "the working transition's scan");
 
     assert_eq!(
         inspector.descendant_scans().0,
@@ -10149,7 +10212,8 @@ async fn a_child_of_a_backed_off_session_is_observed_within_the_ceiling() {
     })
     .await;
     tokio::time::pause();
-    advance_settling(&inspector, BACKOFF_SETTLE_SECS).await;
+    settle_procwatch_scans(&registry).await;
+    advance_settling(&registry, &inspector, 1, 0, BACKOFF_SETTLE_SECS).await;
     let observed = |registry: &SessionRegistry| {
         let registry = registry.clone();
         let id = created.id.clone();
@@ -10167,7 +10231,16 @@ async fn a_child_of_a_backed_off_session_is_observed_within_the_ceiling() {
     );
     let mut seen_after = None;
     for second in 1..=BACKOFF_CEILING.as_secs() {
-        advance_settling(&inspector, 1).await;
+        let elapsed = BACKOFF_SETTLE_SECS + second;
+        advance_settling(&registry, &inspector, 1, elapsed - 1, 1).await;
+        if backoff_scans_due(elapsed) > backoff_scans_due(elapsed - 1) {
+            // The scan due at this tick applies on the loop task after its
+            // blocking read returns.
+            wait_until("the due scan applied the new child", || async {
+                (observed(&registry).await == 1).then_some(())
+            })
+            .await;
+        }
         if observed(&registry).await == 1 {
             seen_after = Some(second);
             break;
