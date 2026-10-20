@@ -812,6 +812,11 @@ struct SessionEntry {
     last_agent_report: Option<ActiveAgentReport>,
     last_native_report: Option<NativeIdentityReport>,
     observed_agents: Vec<ObservedAgent>,
+    /// The reporter of the reported claim, once a scan proved it below a
+    /// same-runtime anchor. It lives beside the claim so that a rebuilt claim
+    /// of the same process (hook refresh, journal projection) keeps matching
+    /// it; see [`procwatch::BoundReporter`].
+    bound_reporter: Option<procwatch::BoundReporter>,
     /// When the evidence that set `info.cwd` was observed. Older cwd evidence
     /// never replaces it, so a scan that read a process before a newer OSC 7
     /// hint landed cannot move the session back.
@@ -1204,6 +1209,9 @@ fn exit_transition(
     candidate.info.active_agent_session_id = None;
     candidate.info.active_agent_session_path = None;
     candidate.observed_agents.clear();
+    // The watch task ends with `procwatch_cancel`; the live entry keeps it
+    // until the transition commits.
+    candidate.bound_reporter = None;
     candidate.info.exit_code = exit.exit_code;
     if observed.output_forced_closed {
         note_output_force_closed(&mut candidate.info);
@@ -3751,11 +3759,14 @@ impl SessionRegistry {
                 return not_recorded;
             }
 
-            let (pid, start_identity) = bind_report_process(
+            let report_base = RuntimeRef::from(resolved.base.clone());
+            let (pid, start_identity) = procwatch::keep_bound_reporter(
                 entry,
+                &params.source,
+                &resolved.name,
+                &report_base,
                 params.pid,
-                &RuntimeRef::from(resolved.base.clone()),
-                attested_start,
+                bind_report_process(entry, params.pid, &report_base, attested_start),
             );
             let report = ActiveAgentReport {
                 source: params.source.clone(),

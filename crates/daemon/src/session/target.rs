@@ -945,6 +945,7 @@ impl SessionRegistry {
             last_agent_report: None,
             last_native_report: carried_native_report.as_deref().cloned(),
             observed_agents: Vec::new(),
+            bound_reporter: None,
             cwd_observed_at: crate::time::now(),
             initial_input_owner: initial_input_pending
                 .then(|| self.daemon_instance_id().to_owned()),

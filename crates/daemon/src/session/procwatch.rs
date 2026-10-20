@@ -25,12 +25,12 @@ use super::{
 const PROCWATCH_SOURCE: &str = "pohunek:procwatch";
 type ObservedIdentity = (Pid, u64);
 
-/// Process ancestry of one successful scan, used to verify a hook-reported
-/// claim whose process is not itself an observed agent.
+/// Process ancestry of one scan, used to bind a hook-reported claim to the
+/// process generation the scan proves.
 ///
 /// The evidence is local to the scan that collected it. It only ever proves a
 /// claim (a running reporter below an anchor); a scan without it, an exit
-/// callback included, decides exactly as without the descendant rule.
+/// callback included, leaves an unbound claim to main's replacement.
 struct ScanLineage {
     /// The launch root, which the descendant listing excludes.
     root: ProcessIdentity,
@@ -44,6 +44,139 @@ struct ScanLineage {
     /// worker owns. Such an agent is never observed, yet a claim cannot pass
     /// through it.
     foreign: HashSet<Pid>,
+    /// The pid of the claim this scan examined.
+    claimed: Pid,
+    /// The scan could not decide whether the claim's reporter runs below an
+    /// anchor: its facts or a liveness read were unavailable.
+    inconclusive: bool,
+    /// The exit watch armed for `reporter` before the session mutex was
+    /// taken; it moves into the binding when the scan binds the reporter.
+    reporter_watch: std::sync::Mutex<Option<ExitWatch>>,
+}
+
+impl ScanLineage {
+    /// Lineage of a scan whose collection failed: it proves nothing and
+    /// leaves the reporter undecided.
+    fn unavailable(root: ProcessIdentity, claimed: Pid) -> Self {
+        Self {
+            root,
+            claimed,
+            processes: HashMap::new(),
+            reporter: None,
+            foreign: HashSet::new(),
+            inconclusive: true,
+            reporter_watch: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+/// The reporter of a hook-reported claim, proven by a scan to run below a
+/// same-runtime anchor.
+///
+/// The record is keyed by the reporter's process generation and lives beside
+/// the claim, so a rebuilt claim of the same process keeps matching it. Once
+/// bound, only the exit of that generation ends the claim: scans, probe
+/// errors and unrelated exits neither refute nor renew it.
+#[derive(Debug, Clone)]
+pub(super) struct BoundReporter {
+    identity: ProcessIdentity,
+    /// Runtime of the claim the scan bound.
+    base: RuntimeRef,
+    /// Same-runtime observed agents the reporter descends from.
+    observed_anchors: Vec<ProcessIdentity>,
+    /// Whether the reporter descends from the launch root, which is an agent
+    /// of the claim's runtime.
+    root_anchor: bool,
+    /// Whether an exit watch reports the exit of `identity`. Without one, or
+    /// once its task was cancelled with the runtime watchers, every scan reads
+    /// the generation's liveness.
+    watched: bool,
+    /// Ends the watch task when the record is dropped.
+    pub(super) cancel: CancellationToken,
+}
+
+impl BoundReporter {
+    /// Whether the reporter descends from the agent `anchor` names.
+    fn anchored_at(&self, anchor: &ReporterAnchor) -> bool {
+        match anchor {
+            ReporterAnchor::Observed(observed) => {
+                observed.agent_base == self.base
+                    && self.observed_anchors.contains(&ProcessIdentity {
+                        pid: observed.pid,
+                        start_identity: StartIdentity::new(observed.start_identity),
+                    })
+            }
+            ReporterAnchor::LaunchRoot => self.root_anchor,
+            ReporterAnchor::Any => true,
+        }
+    }
+}
+
+/// Ends the binding of `entry`, if any, and its watch task.
+pub(super) fn drop_bound_reporter(entry: &mut SessionEntry) {
+    if let Some(bound) = entry.bound_reporter.take() {
+        bound.cancel.cancel();
+    }
+}
+
+/// The binding the session's current reported claim matches: same process
+/// generation (a claim start identity is absent or equal) and same runtime.
+fn bound_reporter_of(entry: &SessionEntry) -> Option<&BoundReporter> {
+    let bound = entry.bound_reporter.as_ref()?;
+    let active = entry
+        .active_agent
+        .as_ref()
+        .filter(|active| !active.observed)?;
+    (active.pid == Some(bound.identity.pid)
+        && active
+            .start_identity
+            .is_none_or(|start| start == bound.identity.start_identity.get())
+        && entry.info.active_agent_base.as_ref() == Some(&bound.base))
+    .then_some(bound)
+}
+
+/// The process a refreshed report of a bound claim names: a report of the same
+/// source and agent that names no process, or the bound process, keeps the
+/// proven generation.
+pub(super) fn keep_bound_reporter(
+    entry: &SessionEntry,
+    source: &str,
+    agent: &str,
+    base: &RuntimeRef,
+    reported_pid: Option<Pid>,
+    bound_process: (Option<Pid>, Option<u64>),
+) -> (Option<Pid>, Option<u64>) {
+    let Some(bound) = bound_reporter_of(entry) else {
+        return bound_process;
+    };
+    let same_claim = entry
+        .active_agent
+        .as_ref()
+        .is_some_and(|active| active.source == source && active.agent == agent)
+        && &bound.base == base;
+    // A start identity the daemon read for the reported pid that differs from
+    // the bound one names another process generation.
+    let same_generation = reported_pid.is_none()
+        || (reported_pid == Some(bound.identity.pid)
+            && bound_process
+                .1
+                .is_none_or(|start| start == bound.identity.start_identity.get()));
+    let keeps = same_claim && same_generation;
+    if keeps {
+        (
+            Some(bound.identity.pid),
+            Some(bound.identity.start_identity.get()),
+        )
+    } else {
+        bound_process
+    }
+}
+
+/// What reading a reporter's liveness and arming its exit watch concluded.
+enum ReporterLiveness {
+    Running { watch: Option<ExitWatch> },
+    Gone,
+    Unknown,
 }
 
 struct LineageEntry {
@@ -191,6 +324,7 @@ impl SessionRegistry {
                 return;
             }
             entry.observed_agents.clear();
+            drop_bound_reporter(entry);
             entry.foreground_process_group = None;
             entry
                 .active_agent
@@ -232,14 +366,42 @@ impl SessionRegistry {
         // The registry snapshot the scan identifies other runtimes with.
         let scan_registry = self.inner.profiles.runtimes().registry();
         // The claim a scan may prove is the one current before it collects: a
-        // claim admitted during or after collection gets no proof from it.
-        let claimed_reporter = self
+        // claim admitted during or after collection gets no proof from it. A
+        // bound claim needs none.
+        let (claimed_reporter, unwatched_reporter) = self
             .inner
             .sessions
             .lock()
             .await
             .get(id)
-            .and_then(reported_descendant_pid);
+            .map(|entry| {
+                let bound = bound_reporter_of(entry);
+                (
+                    bound
+                        .is_none()
+                        .then(|| reported_descendant_pid(entry))
+                        .flatten(),
+                    bound
+                        .filter(|bound| !bound.watched || bound.cancel.is_cancelled())
+                        .map(|bound| bound.identity),
+                )
+            })
+            .unwrap_or_default();
+        let exited_reporter = unwatched_reporter.filter(|identity| {
+            match self.inner.inspector.is_running(*identity) {
+                Ok(running) => !running,
+                Err(err) => {
+                    debug!(
+                        session_id = %id.0,
+                        pid = identity.pid,
+                        error = %err,
+                        "bound reporter liveness read failed; the claim stays"
+                    );
+                    false
+                }
+            }
+        });
+        let mut collection_failed = None;
         let (scan_pin, observed_refresh) = match self.inner.inspector.descendants(root_pid) {
             Ok(facts) => {
                 let own = self.inner.sessions.lock().await.get(id).map(OwnRuntime::of);
@@ -265,6 +427,7 @@ impl SessionRegistry {
                     error = %err,
                     "failed to inspect session process descendants"
                 );
+                collection_failed = claimed_reporter.map(|pid| ScanLineage::unavailable(root, pid));
                 (None, None)
             }
         };
@@ -326,7 +489,21 @@ impl SessionRegistry {
                 Some(ObservedRefresh { agents, lineage }) => (Some(agents), lineage),
                 None => (None, None),
             };
+            let lineage = lineage.or(collection_failed);
             let to_spawn = apply_observed_refresh(entry, agents, &mut exit_watches);
+            // A reporter read gone ends its claim here, whatever the
+            // foreground probe says.
+            let dead_reporter = bound_reporter_of(entry)
+                .map(|bound| bound.identity)
+                .filter(|identity| Some(*identity) == exited_reporter);
+            if dead_reporter.is_some() || bound_reporter_of(entry).is_none() {
+                drop_bound_reporter(entry);
+            }
+            let retired = dead_reporter.and_then(|identity| {
+                forget_observed_generation(entry, identity);
+                self.reconcile_active_agent(entry, now, None)
+            });
+            self.bind_proven_reporter(id, entry, lineage.as_ref());
 
             let foreground_changed = apply_foreground_probe(entry, foreground_probe);
             let decision = self.reconcile_foreground_agent(
@@ -342,7 +519,8 @@ impl SessionRegistry {
                 }
                 ForegroundDecision::Preserve => None,
                 ForegroundDecision::Updated => Some(entry.info.clone()),
-            };
+            }
+            .or(retired);
             let focus = entry
                 .active_agent
                 .as_ref()
@@ -459,24 +637,101 @@ impl SessionRegistry {
                 return;
             }
 
-            match self.reconcile_foreground_agent(
-                entry,
-                entry.info.pid,
-                crate::time::now(),
-                ForegroundProbe::Observed(entry.foreground_process_group),
-                None,
-            ) {
-                ForegroundDecision::Fallback => {
-                    self.reconcile_active_agent(entry, crate::time::now(), None)
-                }
-                ForegroundDecision::Preserve => None,
-                ForegroundDecision::Updated => Some(entry.info.clone()),
-            }
+            self.reconcile_without_scan(entry)
         };
 
         if let Some(info) = updated {
             self.emit(event::SESSION_UPDATED, &info);
         }
+    }
+
+    /// Reconciles the claim against the recorded foreground and observed
+    /// agents, with no scan evidence.
+    fn reconcile_without_scan(&self, entry: &mut SessionEntry) -> Option<SessionInfo> {
+        let now = crate::time::now();
+        match self.reconcile_foreground_agent(
+            entry,
+            entry.info.pid,
+            now,
+            ForegroundProbe::Observed(entry.foreground_process_group),
+            None,
+        ) {
+            ForegroundDecision::Fallback => self.reconcile_active_agent(entry, now, None),
+            ForegroundDecision::Preserve => None,
+            ForegroundDecision::Updated => Some(entry.info.clone()),
+        }
+    }
+
+    /// The exit of the bound reporter generation `identity` ends its claim;
+    /// the observed agents then decide as without the claim. An exit of any
+    /// other generation leaves the claim alone.
+    pub(super) async fn on_bound_reporter_exit(&self, id: &SessionId, identity: ProcessIdentity) {
+        let updated = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get_mut(id) else {
+                return;
+            };
+            if entry.stopping || is_terminal(entry.info.state) {
+                return;
+            }
+            if entry
+                .bound_reporter
+                .as_ref()
+                .is_none_or(|bound| bound.identity != identity)
+            {
+                return;
+            }
+            let names_claim = bound_reporter_of(entry).is_some();
+            drop_bound_reporter(entry);
+            if !names_claim {
+                return;
+            }
+            forget_observed_generation(entry, identity);
+            self.reconcile_without_scan(entry)
+        };
+
+        if let Some(info) = updated {
+            self.emit(event::SESSION_UPDATED, &info);
+        }
+    }
+
+    /// A failed exit watch leaves the generation's liveness to the scans.
+    async fn on_bound_reporter_watch_failed(&self, id: &SessionId, identity: ProcessIdentity) {
+        let mut sessions = self.inner.sessions.lock().await;
+        if let Some(bound) = sessions
+            .get_mut(id)
+            .and_then(|entry| entry.bound_reporter.as_mut())
+            .filter(|bound| bound.identity == identity)
+        {
+            bound.watched = false;
+        }
+    }
+
+    fn spawn_bound_reporter_watch(
+        &self,
+        id: SessionId,
+        identity: ProcessIdentity,
+        watch: ExitWatch,
+        cancel: CancellationToken,
+    ) {
+        let registry = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = cancel.cancelled() => {}
+                result = watch.wait() => match result {
+                    Ok(()) => registry.on_bound_reporter_exit(&id, identity).await,
+                    Err(err) => {
+                        debug!(
+                            session_id = %id.0,
+                            pid = identity.pid,
+                            error = %err,
+                            "bound reporter exit watch failed; scans read its liveness"
+                        );
+                        registry.on_bound_reporter_watch_failed(&id, identity).await;
+                    }
+                }
+            }
+        });
     }
 
     #[cfg(test)]
@@ -693,7 +948,7 @@ impl SessionRegistry {
             if observed_process_matches(entry, pid, active.start_identity, &active_base) {
                 return None;
             }
-            if self.preserve_descendant_reporter(entry, lineage, &ReporterAnchor::Any) {
+            if self.keep_reported_descendant(entry, lineage, now, &ReporterAnchor::Any) {
                 return None;
             }
             if let Some(observed) = first_observed_agent_for_base(entry, &active_base) {
@@ -824,9 +1079,10 @@ impl SessionRegistry {
             if bind_matching_observed_identity(entry, &observed) {
                 return ForegroundDecision::Preserve;
             }
-            if self.preserve_descendant_reporter(
+            if self.keep_reported_descendant(
                 entry,
                 lineage,
+                now,
                 &ReporterAnchor::Observed(observed.clone()),
             ) {
                 return ForegroundDecision::Preserve;
@@ -847,7 +1103,7 @@ impl SessionRegistry {
         }
 
         if foreground_group == root_pid {
-            if self.preserve_descendant_reporter(entry, lineage, &ReporterAnchor::LaunchRoot) {
+            if self.keep_reported_descendant(entry, lineage, now, &ReporterAnchor::LaunchRoot) {
                 return ForegroundDecision::Preserve;
             }
             let Some(active) = entry.active_agent.clone() else {
@@ -877,7 +1133,7 @@ impl SessionRegistry {
             unbound_claim_is_current(&active, now, self.inner.config.active_agent_claim_ttl);
         if active_is_live
             || unbound_is_current
-            || self.preserve_descendant_reporter(entry, lineage, &ReporterAnchor::Any)
+            || self.keep_reported_descendant(entry, lineage, now, &ReporterAnchor::Any)
         {
             ForegroundDecision::Preserve
         } else {
@@ -887,7 +1143,8 @@ impl SessionRegistry {
     }
 
     /// Reads the ancestry of `facts` and, for the reporter `pid` of the
-    /// session's reported claim, whether it runs now.
+    /// session's reported claim, whether it runs now. A running reporter gets
+    /// its exit watch armed here, outside the session mutex.
     fn scan_lineage(
         &self,
         id: &SessionId,
@@ -915,6 +1172,8 @@ impl SessionRegistry {
                 parent: root.pid,
             },
         );
+        let mut inconclusive = false;
+        let mut reporter_watch = None;
         let reporter = facts
             .iter()
             .find(|fact| fact.pid == pid)
@@ -923,15 +1182,14 @@ impl SessionRegistry {
                 if self.is_foreign_owned_agent(id, pid, Some(worker_instance_id)) {
                     return false;
                 }
-                match self.inner.inspector.is_running(*identity) {
-                    Ok(running) => running,
-                    Err(err) => {
-                        debug!(
-                            session_id = %id.0,
-                            pid,
-                            error = %err,
-                            "reported agent liveness read failed; the claim gets no scan proof"
-                        );
+                match self.read_reporter_liveness(id, *identity) {
+                    ReporterLiveness::Running { watch } => {
+                        reporter_watch = watch;
+                        true
+                    }
+                    ReporterLiveness::Gone => false,
+                    ReporterLiveness::Unknown => {
+                        inconclusive = true;
                         false
                     }
                 }
@@ -947,93 +1205,204 @@ impl SessionRegistry {
                 if self.is_foreign_owned_agent(id, ancestor, Some(worker_instance_id)) {
                     foreign.insert(ancestor);
                 }
+                // An ancestor missing from the scan leaves the ancestry open.
                 current = processes.get(&ancestor).map(|entry| entry.parent);
+                inconclusive |= current.is_none();
             }
         }
         ScanLineage {
             root,
+            claimed: pid,
             processes,
             reporter,
             foreign,
+            inconclusive,
+            reporter_watch: std::sync::Mutex::new(reporter_watch),
         }
     }
 
-    /// Keeps a hook-reported claim whose process is not an observed agent when
-    /// this scan proves it: the reporter runs, still has the claim's start
-    /// identity, and descends from `anchor` through processes of this scan
-    /// without passing an agent of another runtime. Binds the reporter's own
-    /// start identity to the claim. Any other case returns `false` and leaves
-    /// the decision to the caller.
-    fn preserve_descendant_reporter(
+    /// Reads whether `identity` runs and arms an exit watch for it. A watch
+    /// that cannot be armed leaves the reporter to per-scan liveness reads,
+    /// unless the process is already gone.
+    fn read_reporter_liveness(
         &self,
+        id: &SessionId,
+        identity: ProcessIdentity,
+    ) -> ReporterLiveness {
+        let running = |context: &'static str| match self.inner.inspector.is_running(identity) {
+            Ok(running) => Some(running),
+            Err(err) => {
+                debug!(
+                    session_id = %id.0,
+                    pid = identity.pid,
+                    error = %err,
+                    context,
+                    "reported agent liveness read failed; the claim gets no scan proof"
+                );
+                None
+            }
+        };
+        match running("scan") {
+            Some(true) => {}
+            Some(false) => return ReporterLiveness::Gone,
+            None => return ReporterLiveness::Unknown,
+        }
+        match self.inner.inspector.exit_watch(identity) {
+            Ok(watch) => ReporterLiveness::Running { watch: Some(watch) },
+            Err(err) => {
+                debug!(
+                    session_id = %id.0,
+                    pid = identity.pid,
+                    error = %err,
+                    "failed to arm the reported agent exit watch; scans read its liveness"
+                );
+                match running("after watch failure") {
+                    Some(true) => ReporterLiveness::Running { watch: None },
+                    Some(false) => ReporterLiveness::Gone,
+                    None => ReporterLiveness::Unknown,
+                }
+            }
+        }
+    }
+
+    /// Binds the reporter of the session's reported claim when this scan
+    /// proves it: the reporter runs, still has the claim's start identity, and
+    /// descends from a same-runtime anchor through processes of this scan
+    /// without passing an agent of another runtime or another session's
+    /// process. Binds the reporter's own start identity to the claim. Any
+    /// other case leaves the claim unbound.
+    fn bind_proven_reporter(
+        &self,
+        id: &SessionId,
         entry: &mut SessionEntry,
         lineage: Option<&ScanLineage>,
-        anchor: &ReporterAnchor,
-    ) -> bool {
-        let Some(lineage) = lineage else {
-            return false;
+    ) {
+        let Some((lineage, reporter)) =
+            lineage.and_then(|lineage| Some((lineage, lineage.reporter?)))
+        else {
+            return;
         };
-        let Some(reporter) = lineage.reporter else {
-            return false;
-        };
+        if bound_reporter_of(entry).is_some() {
+            return;
+        }
         let Some(active) = entry
             .active_agent
             .as_ref()
             .filter(|active| !active.observed && active.pid == Some(reporter.pid))
         else {
-            return false;
+            return;
         };
         if active
             .start_identity
             .is_some_and(|start| start != reporter.start_identity.get())
         {
-            return false;
+            return;
         }
         let Some(base) = entry.info.active_agent_base.clone() else {
-            return false;
+            return;
         };
+        let (observed_anchors, root_anchor) =
+            self.reporter_anchors(entry, lineage, reporter, &base);
+        if observed_anchors.is_empty() && !root_anchor {
+            return;
+        }
+        if !bind_report_start_identity(entry, reporter.start_identity.get()) {
+            return;
+        }
+        let watch = lineage
+            .reporter_watch
+            .lock()
+            .ok()
+            .and_then(|mut watch| watch.take());
+        drop_bound_reporter(entry);
+        let cancel = entry.procwatch_cancel.child_token();
+        let watched = watch.is_some();
+        if let Some(watch) = watch {
+            self.spawn_bound_reporter_watch(id.clone(), reporter, watch, cancel.clone());
+        }
+        entry.bound_reporter = Some(BoundReporter {
+            identity: reporter,
+            base,
+            observed_anchors,
+            root_anchor,
+            watched,
+            cancel,
+        });
+    }
+
+    /// The same-runtime agents `reporter` descends from in this scan: observed
+    /// agents, and whether the launch root is one. The walk ends at a process
+    /// another session owns or an agent of another runtime.
+    fn reporter_anchors(
+        &self,
+        entry: &SessionEntry,
+        lineage: &ScanLineage,
+        reporter: ProcessIdentity,
+        base: &RuntimeRef,
+    ) -> (Vec<ProcessIdentity>, bool) {
         let launch_root = (self.launch_root_is_agent(&entry.info.agent_base)
-            && entry.info.agent_base == base)
+            && &entry.info.agent_base == base)
             .then_some(lineage.root);
-        let is_anchor = |identity: ProcessIdentity| match anchor {
-            ReporterAnchor::Observed(observed) => {
-                observed.agent_base == base
-                    && identity.pid == observed.pid
-                    && identity.start_identity.get() == observed.start_identity
-            }
-            ReporterAnchor::LaunchRoot => launch_root == Some(identity),
-            ReporterAnchor::Any => {
-                launch_root == Some(identity)
-                    || entry.observed_agents.iter().any(|observed| {
-                        observed.agent_base == base
-                            && identity.pid == observed.pid
-                            && identity.start_identity.get() == observed.start_identity
-                    })
-            }
-        };
+        let mut observed_anchors = Vec::new();
+        let mut root_anchor = false;
         let mut process = lineage.processes.get(&reporter.pid);
         // A malformed or cyclic process table never proves ancestry.
-        for _ in 0..lineage.processes.len() {
+        for step in 0..lineage.processes.len() {
             let Some(current) = process else {
-                return false;
+                break;
             };
-            if lineage.foreign.contains(&current.identity.pid) {
-                return false;
-            }
-            if is_anchor(current.identity) {
-                return bind_report_start_identity(entry, reporter.start_identity.get());
+            let identity = current.identity;
+            if lineage.foreign.contains(&identity.pid) {
+                break;
             }
             // A claim is not carried through a different recognized runtime.
             if entry
                 .observed_agents
                 .iter()
-                .any(|observed| observed.pid == current.identity.pid && observed.agent_base != base)
+                .any(|observed| observed.pid == identity.pid && &observed.agent_base != base)
             {
-                return false;
+                break;
+            }
+            // The reporter itself is no anchor of its claim.
+            if step > 0 {
+                if launch_root == Some(identity) {
+                    root_anchor = true;
+                } else if entry.observed_agents.iter().any(|observed| {
+                    &observed.agent_base == base
+                        && identity.pid == observed.pid
+                        && identity.start_identity.get() == observed.start_identity
+                }) {
+                    observed_anchors.push(identity);
+                }
+            }
+            if identity.pid == lineage.root.pid {
+                break;
             }
             process = lineage.processes.get(&current.parent);
         }
-        false
+        (observed_anchors, root_anchor)
+    }
+
+    /// Whether the reported claim of a process that is not an observed agent
+    /// stays instead of main's replacement: its bound reporter descends from
+    /// `anchor`, or this scan could not decide the reporter's ancestry and the
+    /// unbound claim is still younger than the claim TTL.
+    fn keep_reported_descendant(
+        &self,
+        entry: &SessionEntry,
+        lineage: Option<&ScanLineage>,
+        now: Instant,
+        anchor: &ReporterAnchor,
+    ) -> bool {
+        if let Some(bound) = bound_reporter_of(entry) {
+            return bound.anchored_at(anchor);
+        }
+        lineage.is_some_and(|lineage| {
+            lineage.inconclusive && reported_descendant_pid(entry) == Some(lineage.claimed)
+        }) && entry.active_agent.as_ref().is_some_and(|active| {
+            now.saturating_duration_since(active.reported_at)
+                < self.inner.config.active_agent_claim_ttl
+        })
     }
 
     fn next_procwatch_seq(&self) -> u64 {
@@ -1042,6 +1411,14 @@ impl SessionRegistry {
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1)
     }
+}
+
+/// Removes the observation of the exact process generation `identity`: its
+/// exit is established, so no claim may stand on it.
+fn forget_observed_generation(entry: &mut SessionEntry, identity: ProcessIdentity) {
+    entry.observed_agents.retain(|observed| {
+        (observed.pid, observed.start_identity) != (identity.pid, identity.start_identity.get())
+    });
 }
 
 fn unbound_claim_is_current(

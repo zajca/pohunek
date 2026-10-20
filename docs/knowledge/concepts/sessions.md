@@ -704,10 +704,20 @@ reconnect or native recovery.
 Foreground reconciliation selects the recognized process-group leader first;
 when the leader is an unidentified wrapper, it selects a recognized member of
 the same foreground PGID. It never selects a nested agent by kind from another
-process group. When the foreground selects an observed agent, a verified
-descendant claim is kept only if that agent is its ancestor; a switch to any
-other agent replaces it, and a foreground back on a shell root clears a claim
-anchored to an observed wrapper. Replacing an active agent clears stale native identity metadata
+process group. A scan that proves a hook-reported reporter (it runs, keeps
+the claim's start identity, is not owned by another session, and descends from
+an observed same-runtime agent or an agent launch root without another runtime
+in between) binds the claim to that process generation. A bound claim ends only
+with the exit of its generation, reported by an exit watch or, when no watch can
+be armed, read by every scan; failed collections, failed probes, a reporter
+missing from a scan, the exit of other agents and refreshes of the same report
+(also one that names no process) neither end nor renew it. When the foreground
+selects an observed agent, a bound claim is kept only if that agent is one of
+its ancestors at the time it was bound; a switch to any other agent replaces
+it, and a foreground back on a shell root clears a claim anchored to an observed
+wrapper. A claim whose probe is inconclusive (a failed liveness read, a failed
+collection or an ancestry the scan cannot complete) stays up to the claim TTL
+before the replacement applies. Replacing an active agent clears stale native identity metadata
 and switches the detector configuration with the new agent. An active agent
 that a managed hook reports through the session's worker switches it the same
 way once the daemon projects the worker's journal, and its release restores the
