@@ -9047,6 +9047,54 @@ async fn an_upgrade_or_check_from_a_retained_version_directory_verifies_it_first
     }
 }
 
+#[tokio::test]
+async fn a_release_directory_that_resolves_into_a_version_directory_is_judged_as_that_directory_or_refused(
+) {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let versions = harness.layout().versions_dir();
+    let version_dir = harness.layout().version_dir(V1).expect("version dir");
+    std::fs::create_dir(version_dir.join("nested")).expect("nested directory");
+    let aliases = harness.root.join("aliases");
+    std::fs::create_dir(&aliases).expect("aliases");
+    let cases = [
+        ("a link to a nested directory", version_dir.join("nested")),
+        ("a link to the versions directory", versions.clone()),
+    ];
+    for (label, target) in cases {
+        let alias = aliases.join(label.replace(' ', "-"));
+        std::os::unix::fs::symlink(&target, &alias).expect("alias");
+        let preflight = ScriptedPreflight::default();
+        let judged = Arc::clone(&preflight.search_paths);
+
+        let error = harness
+            .engine()
+            .with_adoption_preflight(Box::new(preflight))
+            .upgrade(&alias, V2)
+            .await
+            .expect_err("the alias is not a version directory");
+
+        assert_eq!(
+            error.code(),
+            "service_version_untrusted",
+            "{label}: {error:?}"
+        );
+        assert!(
+            judged.lock().expect("search path lock").is_empty(),
+            "{label}: nothing was judged"
+        );
+    }
+
+    let alias = aliases.join("exact");
+    std::os::unix::fs::symlink(&version_dir, &alias).expect("alias");
+    let verified = layout::operator_release(&harness.layout(), &alias).expect("an exact alias");
+    assert_eq!(
+        verified.path(),
+        version_dir,
+        "the alias resolves to the version directory"
+    );
+}
+
 /// Counts the plans the setup asks the release daemon for.
 #[derive(Debug, Default)]
 struct CountingPlanner(AtomicUsize);

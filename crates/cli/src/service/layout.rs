@@ -588,8 +588,9 @@ pub fn verify_installed(layout: &InstallLayout, dir: &Path) -> Result<VerifiedVe
 /// holding the running CLI) by where it is.
 ///
 /// A directory inside the installed versions directory, reached by its own
-/// path or through a link, is an installed version and goes through
-/// [`verify_installed`]; any other directory is the operator's own release.
+/// path or through a link, must be exactly a version directory and goes
+/// through [`verify_installed`]; a nested path or the versions directory
+/// itself is refused. Any directory outside is the operator's own release.
 ///
 /// # Errors
 ///
@@ -602,15 +603,24 @@ pub fn operator_release(layout: &InstallLayout, dir: &Path) -> Result<VerifiedVe
     let resolved = std::fs::canonicalize(dir).ok();
     let versions = std::fs::canonicalize(layout.versions_dir()).ok();
     if let (Some(resolved), Some(versions)) = (resolved, versions) {
-        if let Some(name) = resolved
-            .strip_prefix(&versions)
-            .ok()
-            .and_then(|relative| relative.components().next())
-            .and_then(|first| first.as_os_str().to_str())
-            .and_then(valid_install_version)
-        {
-            let installed = layout.version_dir(name).expect("a validated version name");
-            return verify_installed(layout, &installed);
+        if let Ok(relative) = resolved.strip_prefix(&versions) {
+            let mut parts = relative.components();
+            let name = parts
+                .next()
+                .and_then(|first| first.as_os_str().to_str())
+                .and_then(valid_install_version);
+            return match (name, parts.next()) {
+                (Some(name), None) => {
+                    let installed = layout.version_dir(name).expect("a validated version name");
+                    verify_installed(layout, &installed)
+                }
+                _ => Err(Error::UntrustedVersion {
+                    path: dir.to_path_buf(),
+                    detail:
+                        "it resolves into the versions directory but is not a version directory"
+                            .to_owned(),
+                }),
+            };
         }
     }
     Ok(trust_release_source(dir, ReleaseSource::Operator))
