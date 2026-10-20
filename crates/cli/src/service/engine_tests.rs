@@ -10056,6 +10056,30 @@ async fn a_path_set_only_by_the_replaced_unit_file_does_not_apply() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn a_unit_changed_on_disk_since_it_was_loaded_is_refused() {
+    let unit = UnitEnvironment {
+        need_daemon_reload: true,
+        ..loaded_unit()
+    };
+    let text = refusal(unrecorded_job_path(Ok(unit)).await);
+    assert!(text.contains("systemctl --user daemon-reload"), "{text}");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_drop_in_with_spaces_around_the_equals_sign_still_sets_the_path() {
+    let (_dir, drop_in) = environment_file("[Service]\nEnvironment = PATH=/drop-in/bin\n");
+    let unit = UnitEnvironment {
+        drop_in_paths: vec![drop_in],
+        environment: vec!["PATH=/drop-in/bin".to_owned()],
+        ..loaded_unit()
+    };
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, "/drop-in/bin");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn a_drop_in_that_cannot_be_read_is_refused() {
     let unit = UnitEnvironment {
         drop_in_paths: vec!["/nonexistent/p.conf".to_owned()],
@@ -10109,6 +10133,8 @@ async fn an_environment_file_that_sets_path_is_refused_with_the_file_and_the_fix
         "PATH=/file/bin\n",
         "A=1\n  PATH = \"/x:/y\"\n",
         "A='x\ny'\nPATH=/file/bin\n",
+        "OTHER=it's\nPATH=/file/bin\nNEXT=it's\n",
+        "OTHER=\"a b\" c\nPATH=/file/bin\n",
     ] {
         let (_dir, file) = environment_file(content);
         let unit = UnitEnvironment {
@@ -10132,6 +10158,8 @@ async fn path_text_inside_values_and_comments_of_an_environment_file_is_not_an_a
         "OTHER=\"a\nPATH=/not-path\"\nSTORE=/s\n",
         "OTHER=a\\\nPATH=/not-path\nSTORE=/s\n",
         "# PATH=/commented\n; PATH=/commented\nSTORE=/s\n",
+        "OTHER=\"a b\" c\nSTORE=/s\n",
+        "OTHER=it's \"x\nSTORE=/s\n",
     ] {
         let (_dir, file) = environment_file(content);
         let unit = UnitEnvironment {

@@ -976,15 +976,21 @@ async fn read_unit_environment(
     let service = bus.proxy(path, SERVICE_INTERFACE, OPERATION).await?;
     let read = |source| bus_error(OPERATION, source);
     let load_state: String = unit_proxy.get_property("LoadState").await.map_err(read)?;
+    let need_daemon_reload: bool = unit_proxy
+        .get_property("NeedDaemonReload")
+        .await
+        .map_err(read)?;
     let drop_in_paths: Vec<String> = unit_proxy.get_property("DropInPaths").await.map_err(read)?;
     if load_state == "not-found" && drop_in_paths.is_empty() {
         return Ok(UnitEnvironment {
             load_state,
+            need_daemon_reload,
             ..UnitEnvironment::default()
         });
     }
     Ok(UnitEnvironment {
         load_state,
+        need_daemon_reload,
         drop_in_paths,
         environment: service.get_property("Environment").await.map_err(read)?,
         environment_files: service

@@ -275,6 +275,11 @@ pub async fn effective_search_path(
     unit_name: &str,
 ) -> Result<Option<String>, Error> {
     let refuse = |detail: String| Error::ManagerEnvironment { detail };
+    if unit.need_daemon_reload {
+        return Err(refuse(format!(
+            "{unit_name} or one of its drop-ins changed on disk after the service manager loaded it, so the PATH the manager reports may not be the one its job gets. Run `systemctl --user daemon-reload` and retry"
+        )));
+    }
     match unit.load_state.as_str() {
         "loaded" => {}
         "not-found" if unit.drop_in_paths.is_empty() => return Ok(manager_path),
@@ -445,18 +450,29 @@ fn environment_file_sets_path(text: &str) -> Option<bool> {
         if key.trim() == SEARCH_PATH_VARIABLE {
             sets_path = true;
         }
-        let mut quote: Option<char> = None;
+        // A value that opens with a quote ends at the matching one; quotes
+        // anywhere else are literal. A trailing backslash continues the line.
+        while chars.next_if(|c| *c == ' ' || *c == '\t').is_some() {}
+        if let Some(quote) = chars.next_if(|c| *c == '\'' || *c == '"') {
+            loop {
+                match chars.next() {
+                    None => return None,
+                    Some(c) if c == quote => break,
+                    Some('\\') if quote == '"' => {
+                        chars.next();
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
         loop {
-            match (chars.next(), quote) {
-                (None, None) => return Some(sets_path),
-                (None, Some(_)) => return None,
-                (Some('\n'), None) => break,
-                (Some('\\'), q) if q != Some('\'') => {
+            match chars.next() {
+                None => return Some(sets_path),
+                Some('\n') => break,
+                Some('\\') => {
                     chars.next();
                 }
-                (Some(c @ ('\'' | '"')), None) => quote = Some(c),
-                (Some(c), Some(q)) if c == q => quote = None,
-                _ => {}
+                Some(_) => {}
             }
         }
     }
@@ -473,9 +489,12 @@ fn drop_in_sets_path(text: &str) -> bool {
         if line.starts_with('#') || line.starts_with(';') {
             return false;
         }
-        let Some(value) = line.strip_prefix("Environment=") else {
+        let Some((key, value)) = line.split_once('=') else {
             return false;
         };
+        if key.trim_end() != "Environment" {
+            return false;
+        }
         let mut word = String::new();
         let mut quote: Option<char> = None;
         let mut words = Vec::new();

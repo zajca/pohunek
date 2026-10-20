@@ -2123,6 +2123,7 @@ struct UnitFiles {
 
 impl Drop for UnitFiles {
     fn drop(&mut self) {
+        systemctl(&["stop", &self.unit]);
         let _ = std::fs::remove_dir_all(self.directory.join(format!("{}.d", self.unit)));
         let _ = std::fs::remove_file(self.directory.join(&self.unit));
         systemctl(&["daemon-reload"]);
@@ -2151,7 +2152,7 @@ fn the_real_user_manager_reports_a_units_environment_settings_with_drop_ins() {
 
     std::fs::write(
         directory.join(&unit),
-        "[Service]\nExecStart=/bin/true\nEnvironment=PATH=/unit/bin\nEnvironmentFile=-/nonexistent/pohunek-e2e.env\nPassEnvironment=HOME\nUnsetEnvironment=GONE\n",
+        "[Service]\nExecStart=/bin/sleep 300\nEnvironment=PATH=/unit/bin\nEnvironmentFile=-/nonexistent/pohunek-e2e.env\nPassEnvironment=HOME\nUnsetEnvironment=GONE\n",
     )
     .expect("unit file");
     let drop_ins = directory.join(format!("{unit}.d"));
@@ -2165,6 +2166,7 @@ fn the_real_user_manager_reports_a_units_environment_settings_with_drop_ins() {
 
     let loaded = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded unit");
     assert_eq!(loaded.load_state, "loaded");
+    assert!(!loaded.need_daemon_reload);
     assert_eq!(
         loaded.environment.last().map(String::as_str),
         Some("PATH=/drop-in/bin")
@@ -2183,6 +2185,17 @@ fn the_real_user_manager_reports_a_units_environment_settings_with_drop_ins() {
     );
     assert_eq!(loaded.pass_environment, ["HOME"]);
     assert_eq!(loaded.unset_environment, ["GONE"]);
+
+    // A drop-in edited while the unit stays loaded (it runs) leaves the
+    // properties stale.
+    systemctl(&["start", &unit]);
+    std::fs::write(
+        drop_ins.join("path.conf"),
+        "[Service]\nEnvironment=PATH=/edited/bin\n",
+    )
+    .expect("edited drop-in");
+    let stale = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("stale unit");
+    assert!(stale.need_daemon_reload, "{stale:?}");
 }
 
 /// The real user manager reports the `KEY=VALUE` environment its units get,

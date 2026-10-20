@@ -40,6 +40,9 @@ pub mod systemd;
 pub struct UnitEnvironment {
     /// The unit's `LoadState`: `loaded`, `not-found`, `masked`, `error`, ...
     pub load_state: String,
+    /// Whether the unit file or a drop-in changed on disk after the manager
+    /// loaded it, so the properties below are stale until a `daemon-reload`.
+    pub need_daemon_reload: bool,
     /// The drop-in files the manager read for the unit.
     pub drop_in_paths: Vec<String>,
     /// The merged `Environment=` entries, in order; a later entry wins.
