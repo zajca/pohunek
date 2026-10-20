@@ -321,26 +321,18 @@ impl Context {
     }
 
     /// Derives the namespace like [`Self::namespace`] without creating any
-    /// directory: `None` while the state or runtime root does not exist yet. A
-    /// read-only caller uses it, because a preview must change nothing; without
-    /// the roots no daemon unit of this namespace can exist either.
+    /// directory. A preview uses it, because it must change nothing; a root that
+    /// does not exist yet (the runtime root after a reboot, a fresh host) resolves
+    /// to the canonical form it will have once created.
     ///
     /// # Errors
     ///
-    /// Returns a filesystem error when a root cannot be resolved.
-    pub fn existing_namespace(&self) -> Result<Option<Namespace>, Error> {
-        let resolve = |path: &Path| match std::fs::canonicalize(path) {
-            Ok(canonical) => Ok(Some(canonical)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(io_error("canonicalize", path)(error)),
-        };
-        let (Some(state), Some(runtime)) = (
-            resolve(&self.paths.state_dir)?,
-            resolve(&self.paths.runtime_dir)?,
-        ) else {
-            return Ok(None);
-        };
-        Ok(Some(Namespace::derive(self.uid, &state, &runtime)))
+    /// Returns a filesystem error when an existing part of a root cannot be
+    /// resolved.
+    pub fn namespace_without_creating(&self) -> Result<Namespace, Error> {
+        let state = canonical_path_without_creating(&self.paths.state_dir)?;
+        let runtime = canonical_path_without_creating(&self.paths.runtime_dir)?;
+        Ok(Namespace::derive(self.uid, &state, &runtime))
     }
 
     /// Resolves the executable search path a fresh install records.
@@ -577,6 +569,29 @@ pub fn default_supervisor_dir(_paths: &BasePaths, home: Option<&Path>) -> Result
         .ok_or_else(|| Error::MissingEnv {
             var: HOME.to_owned(),
         })
+}
+
+/// The canonical form `path` has once created: its longest existing ancestor
+/// resolved, the missing components appended as they are.
+fn canonical_path_without_creating(path: &Path) -> Result<PathBuf, Error> {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(mut canonical) => {
+                canonical.extend(missing.iter().rev());
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+                    return Err(io_error("canonicalize", path)(error));
+                };
+                missing.push(name);
+                existing = parent;
+            }
+            Err(error) => return Err(io_error("canonicalize", existing)(error)),
+        }
+    }
 }
 
 fn canonical_root(path: &Path) -> Result<PathBuf, Error> {

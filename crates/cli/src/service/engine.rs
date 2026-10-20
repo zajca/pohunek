@@ -3188,28 +3188,23 @@ pub(crate) async fn recorded_job_path(
         let environment =
             manager_env::user_manager_environment(context.user_manager(), allowlist).await?;
         // The daemon unit's own settings and drop-ins can replace the manager's
-        // `PATH`, so the job's value is resolved from both. Without the state
-        // and runtime roots no daemon unit exists yet, and a preview creates none.
-        let value = match context.existing_namespace()? {
-            Some(namespace) => {
-                let unit_name = namespace.daemon_unit();
-                let unit = context
-                    .user_manager()
-                    .unit_environment(&unit_name)
-                    .await
-                    .map_err(|failure| {
-                        let (manager_env::EnvironmentFailure::Unreachable(detail)
-                        | manager_env::EnvironmentFailure::Unusable(detail)) = failure;
-                        Error::ManagerEnvironment { detail }
-                    })?;
-                manager_env::effective_search_path(environment.search_path, &unit, &unit_name)
-                    .await?
-            }
-            None => environment.search_path,
-        }
-        .ok_or_else(|| Error::ManagerEnvironment {
-            detail: "it sets no PATH entry".to_owned(),
-        })?;
+        // `PATH`, so the job's value is resolved from both. The unit's name is
+        // derived without creating the application roots: a preview changes nothing.
+        let unit_name = context.namespace_without_creating()?.daemon_unit();
+        let unit = context
+            .user_manager()
+            .unit_environment(&unit_name)
+            .await
+            .map_err(|failure| {
+                let (manager_env::EnvironmentFailure::Unreachable(detail)
+                | manager_env::EnvironmentFailure::Unusable(detail)) = failure;
+                Error::ManagerEnvironment { detail }
+            })?;
+        let value = manager_env::effective_search_path(environment.search_path, &unit, &unit_name)
+            .await?
+            .ok_or_else(|| Error::ManagerEnvironment {
+                detail: "it sets no PATH entry".to_owned(),
+            })?;
         return Ok(JobPath {
             value,
             source: PathSource::UserManager,

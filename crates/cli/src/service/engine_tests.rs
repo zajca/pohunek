@@ -10645,8 +10645,8 @@ async fn a_loaded_job_ignores_the_journal_and_its_boot_marker() {
     assert!(judged.iter().all(|path| path == CURRENT_PATH), "{judged:?}");
 }
 
-/// A preview on a host without the application roots asks no unit and creates
-/// no directory: no daemon unit of that namespace can exist yet.
+/// A preview on a host without the application roots still asks for the unit of
+/// the namespace its roots will have, and creates no directory.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn judging_the_path_before_the_application_roots_exist_creates_nothing() {
@@ -10655,22 +10655,36 @@ async fn judging_the_path_before_the_application_roots_exist_creates_nothing() {
         .context
         .clone()
         .with_user_manager(Arc::new(UnitManager {
-            unit: Err(EnvironmentFailure::Unusable("must not be asked".to_owned())),
+            unit: Ok(UnitEnvironment {
+                pass_environment: vec!["PATH".to_owned()],
+                ..loaded_unit()
+            }),
         }));
     let (state, runtime) = (
         context.paths().state_dir.clone(),
         context.paths().runtime_dir.clone(),
     );
+    // The namespace of the roots as they exist now.
+    let before = context.namespace().expect("the roots exist");
     for root in [&state, &runtime] {
-        let _ = std::fs::remove_dir_all(root);
+        std::fs::remove_dir_all(root).expect("remove root");
     }
-    let job = crate::service::engine::recorded_job_search_path(
-        &context,
-        &pohunek_platform::shell_env::SearchPath::empty(),
-        None,
-    )
-    .await
-    .expect("path");
-    assert_eq!(job.value, MANAGER_PATH);
+    assert_eq!(
+        context.namespace_without_creating().expect("derives"),
+        before,
+        "the namespace does not depend on the roots existing"
+    );
+    let text = refusal(
+        crate::service::engine::recorded_job_search_path(
+            &context,
+            &pohunek_platform::shell_env::SearchPath::empty(),
+            None,
+        )
+        .await,
+    );
+    assert!(
+        text.contains("PassEnvironment="),
+        "the unit was judged: {text}"
+    );
     assert!(!state.exists() && !runtime.exists(), "nothing was created");
 }
