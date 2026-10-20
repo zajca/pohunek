@@ -19794,10 +19794,11 @@ async fn reconciled_create_whose_worker_ended_is_retired_then_compensated() {
             &calls[before_restart..],
             [
                 crate::runtime::lifecycle::tests::Call::Inspect(_),
+                crate::runtime::lifecycle::tests::Call::Inspect(_),
                 crate::runtime::lifecycle::tests::Call::Retire(_),
             ]
         ),
-        "the answering worker's job is inspected, then retired: {calls:?}"
+        "the answering worker's job is inspected, verified, then retired: {calls:?}"
     );
     assert_eq!(
         supervisor.retired(),

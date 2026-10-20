@@ -12,7 +12,7 @@ use super::{
     drop_settled, exit_settled, native_report_params, params, resumable_params, scripted_registry,
     stored_record, temp_agents_dir_with, temp_dir, wait_until, RestartableDaemon,
 };
-use crate::runtime::lifecycle::tests::{JobScript, LogCapture, ScriptedSupervisor};
+use crate::runtime::lifecycle::tests::{InspectStep, JobScript, LogCapture, ScriptedSupervisor};
 use crate::session::{RuntimeHandle, SessionRegistry, SessionRegistryConfig, ShellCommand};
 
 /// Shell of the sessions that end on their own once they read a line.
@@ -647,7 +647,105 @@ async fn a_replaced_job_is_not_retired_after_the_acknowledgement() {
     wait_until("the retirement to be refused", || async {
         capture
             .text()
-            .contains("the job is not the acknowledged worker's")
+            .contains("the job is not the terminal generation's")
+            .then_some(())
+    })
+    .await;
+    assert!(rig.supervisor.retired().is_empty());
+}
+
+fn foreign_job(rig: &Rig) -> JobScript {
+    JobScript::Present {
+        state: ServiceState::Running,
+        process: None,
+        definition: Some(DefinitionFacts {
+            executable: PathBuf::from("/opt/other/pohunek-sessiond"),
+            arguments: vec![
+                "--session-id".to_owned(),
+                rig.created.id.0.clone(),
+                "--worker-generation".to_owned(),
+                "abcd2345".to_owned(),
+            ],
+        }),
+    }
+}
+
+/// The retirement a lost acknowledgement answer leaves to the supervision
+/// retry checks the job too.
+#[tokio::test]
+async fn a_replaced_job_is_not_retired_by_the_retry_after_a_lost_answer() {
+    let capture = LogCapture::default();
+    let _logs = capture.install();
+    let rig = Rig::sleeping("ack-lost-replaced").await;
+    let held = rig
+        .registry
+        .hold_next_terminal_acknowledgement(&rig.created.id);
+    rig.registry.stop(&rig.created.id).await.expect("stop");
+    held.entered.notified().await;
+    let worker = {
+        let sessions = rig.registry.inner.sessions.lock().await;
+        let RuntimeHandle::Worker(worker) = &sessions[&rig.created.id].runtime else {
+            panic!("terminal entry keeps its worker handle");
+        };
+        worker.clone()
+    };
+    worker
+        .acknowledge_terminal()
+        .await
+        .expect("the acknowledgement takes effect");
+    rig.wait_worker_gone().await;
+    rig.registry.fail_next_terminal_acknowledgement();
+    held.release.notify_one();
+    wait_until("the acknowledgement to fail", || async {
+        capture
+            .text()
+            .contains("terminal acknowledgement failed")
+            .then_some(())
+    })
+    .await;
+    rig.supervisor
+        .script_job(rig.service_id.clone(), foreign_job(&rig));
+
+    wait_until("the retry to refuse the retirement", || async {
+        capture
+            .text()
+            .contains("the job is not the terminal generation's")
+            .then_some(())
+    })
+    .await;
+    assert!(rig.supervisor.retired().is_empty());
+}
+
+/// An inspection that keeps racing right after the acknowledgement is retried
+/// later, never read as a reason to retire the service ID unchecked.
+#[tokio::test]
+async fn a_replaced_job_is_not_retired_by_the_retry_after_a_raced_inspection() {
+    let capture = LogCapture::default();
+    let _logs = capture.install();
+    let rig = Rig::sleeping("ack-raced-replaced").await;
+    let held = rig
+        .registry
+        .hold_next_terminal_acknowledgement(&rig.created.id);
+    rig.registry.stop(&rig.created.id).await.expect("stop");
+    held.entered.notified().await;
+    rig.supervisor
+        .script_inspects(std::iter::repeat_n(InspectStep::Race, 8));
+    held.release.notify_one();
+    wait_until("the raced inspection to be left pending", || async {
+        capture
+            .text()
+            .contains("cannot be inspected before its retirement")
+            .then_some(())
+    })
+    .await;
+    assert!(rig.supervisor.retired().is_empty());
+    rig.supervisor
+        .script_job(rig.service_id.clone(), foreign_job(&rig));
+
+    wait_until("the retry to refuse the retirement", || async {
+        capture
+            .text()
+            .contains("the job is not the terminal generation's")
             .then_some(())
     })
     .await;

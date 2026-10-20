@@ -259,6 +259,17 @@ pub(super) struct JournalLaunchIdentity {
 /// runtime whose processes no sweep can attribute.
 const FIRST_INSTANCE_MARKER_RELEASE: semver::Version = semver::Version::new(0, 33, 1);
 
+/// How the retirement of a terminal generation's job ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Retirement {
+    /// The job is gone: retired, absent, or there was none to retire.
+    Done,
+    /// The job holding the service ID is not the generation's and was left alone.
+    Refused,
+    /// The job could not be inspected or retired; the background re-check retries.
+    Pending,
+}
+
 impl JournalEvidence {
     /// Whether the journaled worker release marks its children with
     /// `POHUNEK_WORKER_INSTANCE_ID`.
@@ -1547,6 +1558,7 @@ impl SessionRegistry {
                         .await;
                     return true;
                 }
+                let worker = evidence.worker().identity();
                 if !self.import_terminal_journal(record, *evidence).await {
                     return true;
                 }
@@ -1558,9 +1570,15 @@ impl SessionRegistry {
                 if !matches!(socket, SocketEvidence::Absent) {
                     return false;
                 }
-                return !self
-                    .retire_terminal_generation(&session_id, generation.as_ref(), lifecycle)
-                    .await;
+                return self
+                    .retire_terminal_generation(
+                        &session_id,
+                        generation.as_ref(),
+                        lifecycle,
+                        Some(worker),
+                    )
+                    .await
+                    == Retirement::Pending;
             }
             TerminalJournalClassification::Conflict => {
                 return !self
@@ -2384,9 +2402,10 @@ impl SessionRegistry {
         retry: bool,
     ) -> bool {
         let id = SessionId(record.session_id.clone());
-        if !self
-            .retire_terminal_generation(&id.0, generation, lifecycle)
+        if self
+            .retire_terminal_generation(&id.0, generation, lifecycle, None)
             .await
+            != Retirement::Done
         {
             if !retry || self.classification_unpersisted(&record.session_id) {
                 // An uncommitted classification leaves the session pending
@@ -3117,21 +3136,54 @@ impl SessionRegistry {
 
     /// Retires the job of a generation whose terminal journal proves it ended.
     ///
-    /// Returns whether nothing is left to retry: the job was retired (an
-    /// absent job counts), or there is no generation or supervisor to retire
-    /// it through. A failed retirement is logged and returns `false`, so the
-    /// caller keeps the session for the background re-check.
+    /// Retirement acts on the service ID, which a replaced or rewritten job
+    /// can hold, so the job is inspected first and retired only when it is
+    /// provably the generation's ([`job_identity_mismatch`], with the worker's
+    /// process identity when the caller has one). An absent job counts as
+    /// retired; a raced or unreachable job, or a failed retirement, is logged
+    /// and left [`Retirement::Pending`] for the background re-check; a job that
+    /// is not the generation's is [`Retirement::Refused`] and never touched.
+    /// With no generation or supervisor there is nothing to retire.
     pub(super) async fn retire_terminal_generation(
         &self,
         session_id: &str,
         generation: Option<&super::Generation>,
         lifecycle: Option<&Lifecycle<'_>>,
-    ) -> bool {
+        worker: Option<Result<pohunek_platform::process::ProcessIdentity, String>>,
+    ) -> Retirement {
         let (Some(generation), Some(lifecycle)) = (generation, lifecycle) else {
-            return true;
+            return Retirement::Done;
         };
+        match lifecycle.inspect(generation).await {
+            Ok(None) => return Retirement::Done,
+            Ok(Some(observation)) => {
+                if let Some(detail) = crate::runtime::lifecycle::job_identity_mismatch(
+                    &observation,
+                    generation,
+                    worker,
+                ) {
+                    tracing::warn!(
+                        name: "session.terminal.retirement_refused",
+                        session_id,
+                        service_id = %generation.service_id(),
+                        detail = %detail,
+                        "the job is not the terminal generation's; it is not retired"
+                    );
+                    return Retirement::Refused;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    service_id = %generation.service_id(),
+                    error = %error,
+                    "the terminal worker job cannot be inspected before its retirement"
+                );
+                return Retirement::Pending;
+            }
+        }
         match lifecycle.retire(generation).await {
-            Ok(()) => true,
+            Ok(()) => Retirement::Done,
             Err(error) => {
                 tracing::warn!(
                     session_id,
@@ -3139,7 +3191,7 @@ impl SessionRegistry {
                     error = %error,
                     "failed to retire the terminal worker generation"
                 );
-                false
+                Retirement::Pending
             }
         }
     }
@@ -3176,19 +3228,24 @@ impl SessionRegistry {
             Err(_) => return false,
         };
         let scoped = scan.scoped_to(Some(&generation));
-        if !matches!(
-            classify_terminal_journals(&scoped, record),
-            TerminalJournalClassification::Exact(_)
-        ) {
+        let TerminalJournalClassification::Exact(evidence) =
+            classify_terminal_journals(&scoped, record)
+        else {
             tracing::warn!(
                 session_id = %record.session_id,
                 service_id = %generation.service_id(),
                 "terminal generation is no longer proven by its journal; its job is left to the next reconciliation"
             );
             return true;
-        }
-        self.retire_terminal_generation(&record.session_id, Some(&generation), Some(&lifecycle))
-            .await
+        };
+        self.retire_terminal_generation(
+            &record.session_id,
+            Some(&generation),
+            Some(&lifecycle),
+            Some(evidence.worker().identity()),
+        )
+        .await
+            != Retirement::Pending
     }
 
     /// Records the terminal outcome the journal proves; returns whether it was
@@ -15011,6 +15068,75 @@ generation "$1"
             assert_eq!(info.runtime.expect("runtime").state, RuntimeState::Terminal);
             assert_eq!(fixture.supervisor.retired(), vec![id.clone()]);
             assert!(!discovered(&fixture.supervisor, &id).await);
+        }
+
+        fn foreign_job(session_id: &str) -> JobScript {
+            present(
+                ServiceState::Stopped,
+                Some(DefinitionFacts {
+                    executable: PathBuf::from("/opt/other/pohunek-sessiond"),
+                    arguments: vec![
+                        "--session-id".to_owned(),
+                        session_id.to_owned(),
+                        "--worker-generation".to_owned(),
+                        TEST_GENERATION.to_owned(),
+                    ],
+                }),
+            )
+        }
+
+        #[tokio::test]
+        async fn terminal_journal_does_not_retire_a_foreign_job_holding_its_service_id() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            persist_record(&fixture.root, "s-352", Some("runtime-s-352"));
+            write_terminal_journal(&fixture.root, "s-352", "runtime-s-352");
+            let id = service_id("s-352", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), foreign_job("s-352"));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-352").await;
+            assert_eq!(runtime.state, RuntimeState::Terminal);
+            assert_eq!(retire_count(&fixture.supervisor, &id), 0);
+            assert!(discovered(&fixture.supervisor, &id).await);
+        }
+
+        #[tokio::test]
+        async fn the_retry_does_not_retire_a_job_replaced_after_a_failed_retirement() {
+            let capture = crate::runtime::lifecycle::tests::LogCapture::default();
+            let _logs = capture.install();
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            persist_record(&fixture.root, "s-353", Some("runtime-s-353"));
+            write_terminal_journal(&fixture.root, "s-353", "runtime-s-353");
+            let id = service_id("s-353", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Stopped, None));
+            fixture.supervisor.script_retire_unavailable(id.clone());
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            assert_eq!(retire_count(&fixture.supervisor, &id), 1);
+            fixture
+                .supervisor
+                .script_job(id.clone(), foreign_job("s-353"));
+
+            pohunek_test_support::wait::wait_until(
+                "the retry to refuse the retirement",
+                || async {
+                    capture
+                        .text()
+                        .contains("the job is not the terminal generation's")
+                        .then_some(())
+                },
+            )
+            .await;
+            assert_eq!(retire_count(&fixture.supervisor, &id), 1);
         }
 
         #[tokio::test]

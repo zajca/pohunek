@@ -1276,9 +1276,9 @@ timestamp. It enters terminal-retention mode.
 While retained, the worker holds the terminal journal. Once a daemon imports
 and durably commits the outcome, it sends `AcknowledgeTerminal`; the worker
 marks the acknowledgement and exits, and the daemon then retires the supervisor
-job of that exact generation. The daemon sends the acknowledgement after every
+job of that exact generation after proving that the job is that generation's. The daemon sends the acknowledgement after every
 terminal commit of a worker runtime: a natural exit and a user stop alike, and
-for a worker that still answers when a restarted daemon imports its outcome. A
+for a drain-capable worker that still answers when a restarted daemon imports its outcome. A
 removal retires the job itself and sends none. If the daemon remains absent, the
 worker retains state for the configured terminal retention period, then exits
 with the journal still present; the next reconciliation retires its job. Raw
