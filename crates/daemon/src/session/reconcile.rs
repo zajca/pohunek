@@ -13692,6 +13692,13 @@ generation "$1"
                 .as_mut()
                 .expect("recovery binding")
                 .native_session_id = Some("native-resume".to_owned());
+            // The relaunch plan resolves the frozen program before the sweep
+            // runs, so the record names an executable of its own instead of
+            // the host's `codex`.
+            let program = fixture.root.join("resume-agent");
+            crate::session::tests::write_executable(&program, "#!/bin/sh\nexit 0\n");
+            record.recovery.as_mut().expect("recovery binding").program =
+                program.display().to_string();
             Store::new(fixture.root.join("data/metadata.jsonl"))
                 .record_session(&record)
                 .expect("persist the resumable record");
