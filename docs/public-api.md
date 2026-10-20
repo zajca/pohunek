@@ -3980,7 +3980,7 @@ Public exports:
   `discover_snapshot` reads the visible peers and this machine's own identity in
   one pass; a provider that derives both from one state read overrides it, so
   discovery runs the provider once and the `local` record and the peers cannot
-  disagree (the default reads them separately).
+  disagree (the default reports the peers only, so a provider without the override adds no local record).
 - `discover_hosts(registry)`: aggregated configured-overlay discovery with
   default bounded probes.
 - `discover_hosts_with_options(registry, options)`: the same discovery with an

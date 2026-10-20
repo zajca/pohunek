@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use overlay::{
     BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, LocalIdentity,
-    OverlayError, OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, ResolvedPeer,
+    OverlayError, OverlayFuture, OverlayId, OverlayRegistry, OverlaySnapshot, OverlayTransport,
+    ResolvedPeer,
 };
 use pohunek_daemon::runtime::EnvironmentSource;
 use pohunek_daemon::session::{SessionRegistryConfig, ShellCommand};
@@ -33,6 +34,16 @@ struct EmptyTransport {
     id: OverlayId,
     /// Own overlay name the provider reports, when it knows one.
     own_fqdn: Option<&'static str>,
+}
+
+impl EmptyTransport {
+    fn identity(&self) -> Option<LocalIdentity> {
+        self.own_fqdn.map(|fqdn| LocalIdentity {
+            overlay: self.id.clone(),
+            fqdn: Some(fqdn.to_owned()),
+            address: None,
+        })
+    }
 }
 
 impl OverlayTransport for EmptyTransport {
@@ -76,12 +87,18 @@ impl OverlayTransport for EmptyTransport {
     }
 
     fn local_identity(&self) -> OverlayFuture<'_, Option<LocalIdentity>> {
-        let identity = self.own_fqdn.map(|fqdn| LocalIdentity {
-            overlay: self.id.clone(),
-            fqdn: Some(fqdn.to_owned()),
-            address: None,
-        });
+        let identity = self.identity();
         Box::pin(async move { Ok(identity) })
+    }
+
+    fn discover_snapshot(&self) -> OverlayFuture<'_, OverlaySnapshot> {
+        let local = self.identity();
+        Box::pin(async move {
+            Ok(OverlaySnapshot {
+                peers: Vec::new(),
+                local,
+            })
+        })
     }
 }
 

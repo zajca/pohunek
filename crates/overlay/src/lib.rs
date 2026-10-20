@@ -550,13 +550,14 @@ pub trait OverlayTransport: Send + Sync + fmt::Debug {
     /// Read the visible peers and this machine's own identity in one pass.
     ///
     /// A provider that derives both from one state read overrides this, so the
-    /// two cannot disagree and the state is read once. The default reads them
-    /// separately; a failed identity read leaves the identity out.
+    /// two cannot disagree and the state is read once. The default reports the
+    /// peers only: a separate identity read could stall the peer enumeration
+    /// that already finished, so a provider without the override contributes
+    /// no local host record.
     fn discover_snapshot(&self) -> OverlayFuture<'_, OverlaySnapshot> {
         Box::pin(async move {
             let peers = self.discover_peers().await?;
-            let local = self.local_identity().await.unwrap_or_default();
-            Ok(OverlaySnapshot { peers, local })
+            Ok(OverlaySnapshot { peers, local: None })
         })
     }
 
