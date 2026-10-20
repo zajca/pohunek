@@ -118,6 +118,20 @@ async fn observed_pids(registry: &SessionRegistry, id: &SessionId) -> Vec<u32> {
         .collect()
 }
 
+/// The next runtime transition other than a worker reconnect. A stop the worker
+/// refuses breaks its control connection, so the exit watcher reconnects at a
+/// moment the scenarios do not control.
+async fn next_transition_after_reconnects(
+    events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
+) -> String {
+    loop {
+        let name = next_runtime_event(events).await;
+        if name != event::SESSION_RUNTIME_RECONNECTED {
+            return name;
+        }
+    }
+}
+
 /// A registry whose session observes one Codex agent below its root.
 async fn observed_agent_fixture(tag: &str) -> (SessionRegistry, Arc<MockInspector>, SessionInfo) {
     let (registry, inspector, created) = mock_procwatch_registry(tag).await;
@@ -141,7 +155,10 @@ async fn wait_for_observed_pids(registry: &SessionRegistry, id: &SessionId, expe
 /// stop request.
 #[tokio::test]
 async fn stop_cancels_watchers_only_at_terminal_commit() {
-    let (registry, _inspector, created) = mock_procwatch_registry("stop-cancels-at-commit").await;
+    let (registry, inspector, created) = mock_procwatch_registry("stop-cancels-at-commit").await;
+    // A scan still pending when the stop kills the root would find it gone and
+    // end the process watch before the terminal commit.
+    wait_for_first_procwatch_scan(&inspector).await;
     let commit = registry.hold_next_exit_commit(&created.id);
     let stopping = {
         let registry = registry.clone();
@@ -208,7 +225,7 @@ async fn failed_stop_keeps_procwatch_and_detector() {
     inspector.fire_exit(AGENT_PID);
     wait_for_observed_pids(&registry, &created.id, &[]).await;
     assert_eq!(
-        next_runtime_event(&mut events).await,
+        next_transition_after_reconnects(&mut events).await,
         event::SESSION_UPDATED,
         "the exit after the failed stop is notified"
     );
@@ -236,7 +253,7 @@ async fn observed_exit_during_failed_stop_is_applied_by_rescan() {
     stop.fail().await;
     wait_for_observed_pids(&registry, &created.id, &[]).await;
     assert_eq!(
-        next_runtime_event(&mut events).await,
+        next_transition_after_reconnects(&mut events).await,
         event::SESSION_UPDATED
     );
     let inspected = registry.inspect(&created.id).await.expect("inspect");
