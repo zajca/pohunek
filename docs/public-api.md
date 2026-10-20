@@ -1459,6 +1459,12 @@ Important fields:
 - `cwd_source`: optional source of the current `cwd`: `launch`, `procwatch`, or
   `osc7`. `procwatch` is authoritative; `osc7` is an immediate hint that the
   next procwatch tick can overwrite if the focus process disagrees.
+  A value a newer daemon defines reads as `unknown` on the Rust client and the
+  CLI, as do the other display values below (`state_source`, `activity`, a
+  subagent's `lifecycle` and `activity`); a background item's `kind` and
+  `status` read as `other`. The daemon never emits `unknown`, rejects it in
+  params and in its store, and the hidden variant is not in the TypeScript
+  types.
 - `pid`: root process id, or the observed external agent process id.
 - `runtime`: optional durable runtime object. It is absent for observed external
   sessions and peers predating worker-backed sessions. `runtime_generation` is

@@ -658,6 +658,11 @@ and `BACKGROUND_AGENT_TYPE_MAX_BYTES` (128). The worker refuses a snapshot whose
 task id, type or status exceeds its bound, and drops an agent type that exceeds
 its bound from that item alone.
 
+A client of an older build decodes a kind or status that a newer daemon adds as
+`other`, and the session's activity, state source, working-directory source and
+a subagent's lifecycle as `unknown`; the daemon's own store and params stay
+strict.
+
 Clients read the snapshot as `SessionInfo.background`: the decimal-string
 `revision`, `observed_at_ms` and the items, with `id`, `kind`, `status`,
 `agent_type`, `label`, `program`, `first_seen_ms` and `last_seen_ms`. The daemon

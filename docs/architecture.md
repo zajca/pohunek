@@ -1753,9 +1753,9 @@ never `unreachable!()`.
 | `IntegrationFindingCode`, `IntegrationFindingSeverity`, `IntegrationUninstallState` | display | | [#1335](https://github.com/zajca/pohunek/issues/1335) |
 | `IntegrationInstallState` | safe | never `Current` | [#1335](https://github.com/zajca/pohunek/issues/1335) |
 | `IntegrationRecovery` | safe | never `None`; generic hint | [#1335](https://github.com/zajca/pohunek/issues/1335) |
-| `AgentActivity` | display, safe | an input-wait miss is the existing typed error | [#1334](https://github.com/zajca/pohunek/issues/1334) |
-| `StateSource`, `CwdSource`, `SubagentLifecycle` | display | a lifecycle `unknown` is not counted as running | [#1334](https://github.com/zajca/pohunek/issues/1334) |
-| `BackgroundKind`, `BackgroundStatus` | display | maps to the existing `Other` | [#1334](https://github.com/zajca/pohunek/issues/1334) |
+| `AgentActivity` | display, safe | an input-wait miss is the existing typed error | done |
+| `StateSource`, `CwdSource`, `SubagentLifecycle` | display | a lifecycle `unknown` is not counted as running | done |
+| `BackgroundKind`, `BackgroundStatus` | display | maps to the existing `Other` | done |
 | `RuntimeState` | safe | may own a runtime, cannot be stopped or removed, blocks upgrade | [#1336](https://github.com/zajca/pohunek/issues/1336) |
 | `RuntimeInventoryStatus`, `SessionRetentionReason`, `SessionWaitTurnReason`, `SessionReadSource` | display | | [#1337](https://github.com/zajca/pohunek/issues/1337) |
 | `SessionRetentionHold` | safe | never `None` (free to remove) | [#1337](https://github.com/zajca/pohunek/issues/1337) |
