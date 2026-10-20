@@ -39,6 +39,7 @@ use package::ANCHOR_FILE_NAME;
 
 use pohunek_cli::host_setup::{apply, plan, ReleasePlanner, ServiceStep, SetupReport};
 use pohunek_cli::service::context::PathDiscovery;
+use pohunek_cli::service::layout::VerifiedVersionDir;
 #[cfg(target_os = "linux")]
 use pohunek_cli::service::manager_env::{EnvironmentFailure, UserManager};
 use pohunek_cli::service::runtimes::DaemonRuntimes;
@@ -81,7 +82,7 @@ impl ReleasePlanner for ScriptedPlanner {
     fn plan<'a>(
         &'a self,
         _context: &'a Context,
-        _dir: &'a Path,
+        _dir: &'a VerifiedVersionDir,
         _search_path: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<EnsureReport, service::Error>> + Send + 'a>> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -372,7 +373,7 @@ impl ReleasePlanner for RecordingPlanner {
     fn plan<'a>(
         &'a self,
         _context: &'a Context,
-        _dir: &'a Path,
+        _dir: &'a VerifiedVersionDir,
         search_path: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<EnsureReport, service::Error>> + Send + 'a>> {
         self.search_paths

@@ -347,7 +347,7 @@ async fn pending_migration(
     )
     .expect("read previous schema");
     let layout = source.config.layout();
-    let staged = layout::stage(layout, from, &old)
+    let staged = layout::stage(layout, &layout::operator_release_for_test(from), &old)
         .await
         .expect("stage the new version");
     layout::publish(layout, &staged, &new).expect("publish the new version");

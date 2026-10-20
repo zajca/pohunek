@@ -50,7 +50,8 @@ use tokio::io::AsyncReadExt as _;
 
 use super::error::{fs_error, io_error, Error};
 use super::settings::{
-    EXEC_BUSY_POLL, EXEC_BUSY_WAIT, VERSION_PROBE_OUTPUT, VERSION_PROBE_TIMEOUT,
+    EXEC_BUSY_POLL, EXEC_BUSY_WAIT, MAX_SOURCE_LINK_HOPS, VERSION_PROBE_OUTPUT,
+    VERSION_PROBE_TIMEOUT,
 };
 
 /// File name of the CLI in a staging directory, a version directory, and `<prefix>/bin`.
@@ -311,7 +312,7 @@ impl Staged {
     }
 }
 
-/// Copies the three binaries from `from` into a staging directory and probes them.
+/// Copies the three binaries of `source` into a staging directory and probes them.
 ///
 /// Every staged copy must answer `--version` with its own name and
 /// `reported`, which is the version being installed except under the
@@ -323,7 +324,20 @@ impl Staged {
 /// Returns [`Error::StagedBinary`] for a missing source,
 /// [`Error::VersionProbe`] or [`Error::VersionMismatch`] for a failed probe,
 /// and filesystem errors for unsafe directories.
-pub async fn stage(layout: &InstallLayout, from: &Path, reported: &str) -> Result<Staged, Error> {
+pub async fn stage(
+    layout: &InstallLayout,
+    source: &VerifiedVersionDir,
+    reported: &str,
+) -> Result<Staged, Error> {
+    if let Origin::Installed { layout: verified } = &source.origin {
+        if verified != layout {
+            return Err(Error::UntrustedVersion {
+                path: source.path.clone(),
+                detail: "it was verified against another installation prefix".to_owned(),
+            });
+        }
+    }
+    let from = source.path();
     check_sealed_runtime(from)?;
     let versions = open_owner_dir(&layout.versions_dir(), PUBLIC_MODE)?;
     sweep(&versions)?;
@@ -508,6 +522,331 @@ pub fn version_of(layout: &InstallLayout, path: &Path) -> Option<String> {
         .to_str()
         .and_then(valid_install_version)
         .map(str::to_owned)
+}
+
+/// How a release directory was vetted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Origin {
+    /// An installed version directory, verified against `layout`.
+    Installed { layout: InstallLayout },
+    /// A directory outside the versions directory that the operator named
+    /// (`--from`) or that holds the running CLI. The operator chose to run that
+    /// release, and staging copies it through its own checks before the
+    /// service manager runs from it.
+    Operator,
+    /// A sealed release archive that `pohunek setup` verified against its
+    /// manifest.
+    SealedArchive,
+}
+
+/// A release directory whose binaries this process may execute or copy.
+///
+/// Only [`verify_installed`], [`operator_release`] and [`sealed_release`]
+/// construct one (plus a test constructor), so a call that runs or stages
+/// release content cannot skip the check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedVersionDir {
+    path: PathBuf,
+    origin: Origin,
+}
+
+impl VerifiedVersionDir {
+    /// Returns the directory. For an installed version it is the canonical
+    /// version directory, never a link to it.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the daemon executable inside the directory.
+    #[must_use]
+    pub fn daemon(&self) -> PathBuf {
+        self.path.join(DAEMON_EXECUTABLE_NAME)
+    }
+}
+
+/// Proof that a sealed release archive passed its manifest verification.
+#[derive(Debug)]
+pub struct SealedRelease {
+    path: PathBuf,
+}
+
+impl SealedRelease {
+    /// Records that the archive at `path` was verified. Only the verification
+    /// itself calls this.
+    pub(crate) fn attest(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+/// Returns the verified directory of a sealed release archive.
+#[must_use]
+pub fn sealed_release(sealed: &SealedRelease) -> VerifiedVersionDir {
+    VerifiedVersionDir {
+        path: sealed.path.clone(),
+        origin: Origin::SealedArchive,
+    }
+}
+
+/// Treats `dir` as the operator's own release in a test, without classifying it.
+#[cfg(any(test, feature = "test-util"))]
+#[must_use]
+pub fn operator_release_for_test(dir: &Path) -> VerifiedVersionDir {
+    VerifiedVersionDir {
+        path: dir.to_path_buf(),
+        origin: Origin::Operator,
+    }
+}
+
+/// Verifies an installed version directory before a binary of it is executed
+/// or copied.
+///
+/// `dir` must be exactly `<prefix>/libexec/pohunek/<version>`. The versions
+/// directory, the version directory, every binary, the catalog trust anchor
+/// and the `runtime/` tree are opened without following links and must be
+/// what publishing creates, so an entry that became group-writable, linked or
+/// retyped after publishing is refused.
+///
+/// # Errors
+///
+/// Returns [`Error::UntrustedVersion`] when `dir` is not an installed version
+/// directory or an entry fails verification, and a filesystem error when the
+/// versions directory is unsafe.
+pub fn verify_installed(layout: &InstallLayout, dir: &Path) -> Result<VerifiedVersionDir, Error> {
+    let untrusted = |detail: &str| Error::UntrustedVersion {
+        path: dir.to_path_buf(),
+        detail: detail.to_owned(),
+    };
+    let version =
+        version_of(layout, dir).ok_or_else(|| untrusted("it is not a version directory"))?;
+    if layout.version_dir(&version).as_deref() != Some(dir) {
+        return Err(untrusted("it is not a version directory"));
+    }
+    let versions = open_existing_owner_dir(&layout.versions_dir())?
+        .ok_or_else(|| untrusted("the versions directory does not exist"))?;
+    let directory = open_version(&versions, &version)?;
+    for binary in BINARIES {
+        if open_binary(&directory, binary)?.is_none() {
+            return Err(Error::UntrustedVersion {
+                path: dir.join(binary),
+                detail: "it is missing".to_owned(),
+            });
+        }
+    }
+    open_anchor(&directory)?;
+    let runtime = directory
+        .entry_identity(RUNTIME_DIR, EntryKind::Directory)
+        .map_err(|source| version_error(directory.path().join(RUNTIME_DIR), source))?;
+    if runtime.is_some() {
+        let runtime = directory
+            .open_child(RUNTIME_DIR, PUBLIC_MODE)
+            .map_err(|source| version_error(directory.path().join(RUNTIME_DIR), source))?;
+        verify_tree(&runtime)?;
+    }
+    Ok(VerifiedVersionDir {
+        path: dir.to_path_buf(),
+        origin: Origin::Installed {
+            layout: layout.clone(),
+        },
+    })
+}
+
+/// Verifies every entry below a verified directory the way publishing creates
+/// it: subdirectories `0755`, regular files `0644`, no links.
+fn verify_tree(directory: &TrustedDir) -> Result<(), Error> {
+    let names = directory
+        .entry_names()
+        .map_err(|source| fs_error("list runtime tree", source))?;
+    for name in names {
+        let path = directory.path().join(&name);
+        let kind = std::fs::symlink_metadata(&path)
+            .map_err(io_error("inspect", &path))?
+            .file_type();
+        if kind.is_dir() {
+            let child = directory
+                .open_child(&name, PUBLIC_MODE)
+                .map_err(|source| version_error(path, source))?;
+            verify_tree(&child)?;
+        } else if directory
+            .open_file(&name, ANCHOR_MODE)
+            .map_err(|source| version_error(path.clone(), source))?
+            .is_none()
+        {
+            return Err(Error::UntrustedVersion {
+                path,
+                detail: "it is not a regular file".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Classifies the release directory an operator names (`--from`, or the one
+/// holding the running CLI) by where it is.
+///
+/// The path is resolved one component and one link at a time. Every step that
+/// lands inside the installed versions directory, spelled by its own path or
+/// by its canonical one, makes the directory an installed version: that
+/// version directory goes through [`verify_installed`] (which refuses a link
+/// in its place) and the path must resolve to exactly it. A nested path, the
+/// versions directory itself, a link loop, a chain longer than
+/// `MAX_SOURCE_LINK_HOPS` and a link that does not resolve are
+/// refused. A path no step of which touches the versions directory is the
+/// operator's own release.
+///
+/// # Errors
+///
+/// Returns the errors of [`verify_installed`] for a directory inside the
+/// versions directory and [`Error::UntrustedVersion`] for the refusals above.
+pub fn operator_release(layout: &InstallLayout, dir: &Path) -> Result<VerifiedVersionDir, Error> {
+    if version_of(layout, dir).is_some() {
+        return verify_installed(layout, dir);
+    }
+    let untrusted = |detail: &str| Error::UntrustedVersion {
+        path: dir.to_path_buf(),
+        detail: detail.to_owned(),
+    };
+    let lexical = layout.versions_dir();
+    let real = std::fs::canonicalize(&lexical).ok();
+    let (resolved, touched) = resolve_source(dir, &lexical, real.as_deref())?;
+    if let Some(name) = touched {
+        let installed = layout.version_dir(&name).expect("a validated version name");
+        let verified = verify_installed(layout, &installed)?;
+        let exact = resolved == installed
+            || real
+                .as_deref()
+                .is_some_and(|real| resolved == real.join(&name));
+        return if exact {
+            Ok(verified)
+        } else {
+            Err(untrusted(
+                "it resolves into the versions directory but is not a version directory",
+            ))
+        };
+    }
+    if resolved == lexical || Some(&resolved) == real.as_ref() {
+        return Err(untrusted("it is the versions directory"));
+    }
+    Ok(VerifiedVersionDir {
+        path: dir.to_path_buf(),
+        origin: Origin::Operator,
+    })
+}
+
+/// Where a path lies relative to the versions directory.
+enum Below {
+    /// Not inside it.
+    Outside,
+    /// The versions directory itself.
+    Versions,
+    /// Inside the entry of this version name.
+    Version(String),
+    /// Inside an entry that is not a valid version name.
+    Invalid,
+}
+
+/// Locates `path` relative to the versions directory, spelled by `lexical` or
+/// by `real`.
+fn version_below(path: &Path, lexical: &Path, real: Option<&Path>) -> Below {
+    let Some(relative) = path
+        .strip_prefix(lexical)
+        .ok()
+        .or_else(|| real.and_then(|real| path.strip_prefix(real).ok()))
+    else {
+        return Below::Outside;
+    };
+    match relative.components().next() {
+        None => Below::Versions,
+        Some(first) => first
+            .as_os_str()
+            .to_str()
+            .and_then(valid_install_version)
+            .map_or(Below::Invalid, |name| Below::Version(name.to_owned())),
+    }
+}
+
+/// Resolves `dir` one component and one link at a time.
+///
+/// Returns the resolved path and the first version name any step landed on
+/// inside the versions directory. A link loop, a chain beyond
+/// `MAX_SOURCE_LINK_HOPS`, an unreadable or dangling link and an entry of the
+/// versions directory that is not a version name are refused.
+fn resolve_source(
+    dir: &Path,
+    lexical: &Path,
+    real: Option<&Path>,
+) -> Result<(PathBuf, Option<String>), Error> {
+    let untrusted = |detail: &str| Error::UntrustedVersion {
+        path: dir.to_path_buf(),
+        detail: detail.to_owned(),
+    };
+    let start = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(io_error("read the working directory of", dir))?
+            .join(dir)
+    };
+    let mut pending: std::collections::VecDeque<std::ffi::OsString> = start
+        .components()
+        .filter(|part| !matches!(part, std::path::Component::RootDir))
+        .map(|part| part.as_os_str().to_owned())
+        .collect();
+    let mut resolved = PathBuf::from("/");
+    let (mut hops, mut touched) = (0_usize, None::<String>);
+    while let Some(part) = pending.pop_front() {
+        if part == "." {
+            continue;
+        }
+        if part == ".." {
+            resolved.pop();
+            continue;
+        }
+        resolved.push(&part);
+        match version_below(&resolved, lexical, real) {
+            Below::Version(name) if touched.is_none() => touched = Some(name),
+            Below::Invalid => {
+                return Err(untrusted(
+                    "it is inside the versions directory but not a version directory",
+                ));
+            }
+            _ => {}
+        }
+        match std::fs::symlink_metadata(&resolved) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                hops += 1;
+                if hops > MAX_SOURCE_LINK_HOPS {
+                    return Err(untrusted("it passes through too many symbolic links"));
+                }
+                let target =
+                    std::fs::read_link(&resolved).map_err(io_error("read the link", &resolved))?;
+                resolved.pop();
+                if target.is_absolute() {
+                    resolved = PathBuf::from("/");
+                }
+                for component in target
+                    .components()
+                    .filter(|part| !matches!(part, std::path::Component::RootDir))
+                    .rev()
+                {
+                    pending.push_front(component.as_os_str().to_owned());
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if hops > 0 {
+                    return Err(untrusted("a link on its path does not resolve"));
+                }
+                // Nothing to classify yet; staging reports a missing source.
+                resolved.extend(pending.drain(..));
+                break;
+            }
+            Err(error) => return Err(io_error("inspect", &resolved)(error)),
+        }
+    }
+    Ok((resolved, touched))
 }
 
 /// Atomically installs the version directory's CLI as `<prefix>/bin/pohunek`.
@@ -1367,7 +1706,9 @@ pub(crate) mod tests {
         let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
         let from = stage_dir(root.as_path(), "1.0.0");
 
-        let staged = stage(&layout, &from, "1.0.0").await.expect("stage");
+        let staged = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect("stage");
         assert!(publish(&layout, &staged, "1.0.0").expect("publish"));
         let dir = layout.version_dir("1.0.0").expect("version dir");
         for binary in BINARIES {
@@ -1379,7 +1720,9 @@ pub(crate) mod tests {
         }
         assert_eq!(installed_versions(&layout).expect("list"), ["1.0.0"]);
 
-        let again = stage(&layout, &from, "1.0.0").await.expect("stage again");
+        let again = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect("stage again");
         assert!(!publish(&layout, &again, "1.0.0").expect("identical publish"));
 
         write_fake(&from, DAEMON_EXECUTABLE_NAME, "1.0.0");
@@ -1388,7 +1731,7 @@ pub(crate) mod tests {
             "#!/bin/sh\necho 'pohunekd 1.0.0' # changed\n",
         )
         .expect("change binary");
-        let different = stage(&layout, &from, "1.0.0")
+        let different = stage(&layout, &operator_release_for_test(&from), "1.0.0")
             .await
             .expect("stage different");
         assert!(matches!(
@@ -1421,7 +1764,9 @@ pub(crate) mod tests {
         let from = stage_dir(root.as_path(), "1.0.0");
         write_runtime(&from, b"package one");
 
-        let staged = stage(&layout, &from, "1.0.0").await.expect("stage");
+        let staged = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect("stage");
         assert!(publish(&layout, &staged, "1.0.0").expect("publish"));
         let installed = layout
             .version_dir("1.0.0")
@@ -1438,11 +1783,13 @@ pub(crate) mod tests {
             .mode();
         assert_eq!(mode & 0o777, ANCHOR_MODE, "runtime files are 0644");
 
-        let again = stage(&layout, &from, "1.0.0").await.expect("stage again");
+        let again = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect("stage again");
         assert!(!publish(&layout, &again, "1.0.0").expect("identical publish"));
 
         write_runtime(&from, b"package two");
-        let different = stage(&layout, &from, "1.0.0")
+        let different = stage(&layout, &operator_release_for_test(&from), "1.0.0")
             .await
             .expect("stage different");
         assert!(
@@ -1463,7 +1810,7 @@ pub(crate) mod tests {
         write_runtime(&from, b"package");
         std::fs::write(from.join(RUNTIME_DIR).join("extra.txt"), b"x").expect("extra");
         assert!(matches!(
-            stage(&layout, &from, "1.0.0").await,
+            stage(&layout, &operator_release_for_test(&from), "1.0.0").await,
             Err(Error::StagedRuntime { .. })
         ));
 
@@ -1473,7 +1820,7 @@ pub(crate) mod tests {
         std::fs::remove_file(packages.join("claude.tar.zst")).expect("remove");
         std::os::unix::fs::symlink("/etc/passwd", packages.join("claude.tar.zst")).expect("link");
         assert!(matches!(
-            stage(&layout, &from, "1.1.0").await,
+            stage(&layout, &operator_release_for_test(&from), "1.1.0").await,
             Err(Error::StagedRuntime { .. })
         ));
         assert!(
@@ -1498,7 +1845,7 @@ pub(crate) mod tests {
 
         assert!(
             matches!(
-                stage(&layout, &from, "1.0.0").await,
+                stage(&layout, &operator_release_for_test(&from), "1.0.0").await,
                 Err(Error::StagedRuntime { .. })
             ),
             "a listed runtime file that is absent refuses the release"
@@ -1524,7 +1871,9 @@ pub(crate) mod tests {
         )
         .expect("manifest");
 
-        stage(&layout, &from, "1.0.0").await.expect("staged");
+        stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect("staged");
     }
 
     /// Publishes `1.0.0` from a source holding `anchor`, if any, and returns
@@ -1535,7 +1884,9 @@ pub(crate) mod tests {
         if let Some(bytes) = anchor {
             write_anchor(&from, bytes);
         }
-        let staged = stage(&layout, &from, "1.0.0").await.expect("stage");
+        let staged = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect("stage");
         assert!(publish(&layout, &staged, "1.0.0").expect("publish"));
         let dir = layout.version_dir("1.0.0").expect("version dir");
         let trust = load_from_directory(&dir);
@@ -1581,7 +1932,9 @@ pub(crate) mod tests {
         ];
         for (label, bytes) in cases {
             write_anchor(&from, bytes);
-            let error = stage(&layout, &from, "1.0.0").await.expect_err(label);
+            let error = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+                .await
+                .expect_err(label);
             assert!(
                 matches!(error, Error::StagedAnchor { .. }),
                 "{label}: {error:?}"
@@ -1597,12 +1950,16 @@ pub(crate) mod tests {
         let anchor = from.join(ANCHOR_FILE_NAME);
         std::fs::remove_file(&anchor).expect("remove anchor");
         std::os::unix::fs::symlink(root.as_path().join("missing"), &anchor).expect("symlink");
-        let error = stage(&layout, &from, "1.0.0").await.expect_err("dangling");
+        let error = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect_err("dangling");
         assert!(matches!(error, Error::StagedAnchor { .. }), "{error:?}");
 
         std::fs::remove_file(&anchor).expect("remove link");
         std::fs::create_dir(&anchor).expect("anchor directory");
-        let error = stage(&layout, &from, "1.0.0").await.expect_err("directory");
+        let error = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect_err("directory");
         assert!(matches!(error, Error::StagedAnchor { .. }), "{error:?}");
 
         assert!(installed_versions(&layout).expect("list").is_empty());
@@ -1616,15 +1973,21 @@ pub(crate) mod tests {
         let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
         let from = stage_dir(root.as_path(), "1.0.0");
         write_anchor(&from, &anchor_bytes(1));
-        let staged = stage(&layout, &from, "1.0.0").await.expect("stage");
+        let staged = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect("stage");
         assert!(publish(&layout, &staged, "1.0.0").expect("publish"));
 
-        let same = stage(&layout, &from, "1.0.0").await.expect("stage again");
+        let same = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect("stage again");
         verify_existing(&layout, &same, "1.0.0").expect("same anchor is reused");
         assert!(!publish(&layout, &same, "1.0.0").expect("identical publish"));
 
         write_anchor(&from, &anchor_bytes(2));
-        let other = stage(&layout, &from, "1.0.0").await.expect("stage other");
+        let other = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect("stage other");
         assert!(matches!(
             verify_existing(&layout, &other, "1.0.0"),
             Err(Error::VersionConflict { .. })
@@ -1635,7 +1998,9 @@ pub(crate) mod tests {
         ));
 
         std::fs::remove_file(from.join(ANCHOR_FILE_NAME)).expect("drop anchor");
-        let missing = stage(&layout, &from, "1.0.0").await.expect("stage bare");
+        let missing = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect("stage bare");
         assert!(matches!(
             publish(&layout, &missing, "1.0.0"),
             Err(Error::VersionConflict { .. })
@@ -1653,9 +2018,13 @@ pub(crate) mod tests {
         let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
         let from = stage_dir(root.as_path(), "1.0.0");
         write_anchor(&from, &anchor_bytes(1));
-        let staged = stage(&layout, &from, "1.0.0").await.expect("stage");
+        let staged = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect("stage");
         publish(&layout, &staged, "1.0.0").expect("publish");
-        let again = stage(&layout, &from, "1.0.0").await.expect("stage again");
+        let again = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect("stage again");
         let anchor = layout
             .version_dir("1.0.0")
             .expect("version dir")
@@ -1670,7 +2039,9 @@ pub(crate) mod tests {
         let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
         let from = stage_dir(root.as_path(), "1.0.0");
         write_fake(&from, WORKER_EXECUTABLE_NAME, "0.9.0");
-        let error = stage(&layout, &from, "1.0.0").await.expect_err("mismatch");
+        let error = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect_err("mismatch");
         assert!(
             matches!(&error, Error::VersionMismatch { found, .. } if found == "pohunek-sessiond 0.9.0"),
             "{error:?}"
@@ -1678,7 +2049,7 @@ pub(crate) mod tests {
 
         std::fs::remove_file(from.join(CLI_NAME)).expect("remove cli");
         assert!(matches!(
-            stage(&layout, &from, "1.0.0").await,
+            stage(&layout, &operator_release_for_test(&from), "1.0.0").await,
             Err(Error::StagedBinary { .. })
         ));
         assert!(installed_versions(&layout).expect("list").is_empty());
@@ -1695,7 +2066,7 @@ pub(crate) mod tests {
         )
         .expect("broken daemon");
         assert!(matches!(
-            stage(&layout, &from, "1.0.0").await,
+            stage(&layout, &operator_release_for_test(&from), "1.0.0").await,
             Err(Error::VersionProbe { .. })
         ));
     }
@@ -1705,7 +2076,9 @@ pub(crate) mod tests {
         let (_root, root) = temp_root();
         let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
         let from = stage_dir(root.as_path(), "1.0.0");
-        let staged = stage(&layout, &from, "1.0.0").await.expect("stage");
+        let staged = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect("stage");
         publish(&layout, &staged, "1.0.0").expect("publish");
 
         assert!(!installed_cli_copy(&layout).expect("absent copy"));
@@ -1720,9 +2093,13 @@ pub(crate) mod tests {
     async fn published_and_restaged(root: &Path) -> (InstallLayout, Staged) {
         let layout = InstallLayout::new(root.join("prefix")).expect("layout");
         let from = stage_dir(root, "1.0.0");
-        let staged = stage(&layout, &from, "1.0.0").await.expect("stage");
+        let staged = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect("stage");
         assert!(publish(&layout, &staged, "1.0.0").expect("publish"));
-        let again = stage(&layout, &from, "1.0.0").await.expect("stage again");
+        let again = stage(&layout, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect("stage again");
         (layout, again)
     }
 
@@ -1742,6 +2119,29 @@ pub(crate) mod tests {
         let (layout, again) = published_and_restaged(root.as_path()).await;
         verify_existing(&layout, &again, "1.0.0").expect("verified reuse");
         assert!(!publish(&layout, &again, "1.0.0").expect("identical publish"));
+    }
+
+    #[tokio::test]
+    async fn an_installed_source_is_never_staged_into_another_installation() {
+        let (_root, root) = temp_root();
+        let ours = InstallLayout::new(root.as_path().join("ours")).expect("layout");
+        let theirs = InstallLayout::new(root.as_path().join("theirs")).expect("layout");
+        let from = stage_dir(root.as_path(), "1.0.0");
+        let staged = stage(&ours, &operator_release_for_test(&from), "1.0.0")
+            .await
+            .expect("stage");
+        publish(&ours, &staged, "1.0.0").expect("publish");
+        let installed = verify_installed(&ours, &ours.version_dir("1.0.0").expect("dir"))
+            .expect("a published directory");
+
+        let error = stage(&theirs, &installed, "1.0.0")
+            .await
+            .expect_err("another installation");
+
+        assert!(
+            matches!(&error, Error::UntrustedVersion { detail, .. } if detail.contains("another installation prefix")),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

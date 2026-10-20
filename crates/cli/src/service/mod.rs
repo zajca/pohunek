@@ -216,6 +216,10 @@ async fn finish_check(
     version: &str,
     accept_runtime_loss: bool,
 ) -> Result<report::CheckReport, Error> {
+    // The source is classified for every adoption mode, as install and upgrade
+    // classify it, so a check refuses what they would refuse.
+    let release =
+        layout::operator_release(&engine::install_layout(&checked.report.prefix)?, daemon_dir)?;
     if let Some(record) = &checked.rollback {
         let layout = engine::install_layout(&record.prefix)?;
         let previous = record
@@ -232,6 +236,7 @@ async fn finish_check(
                     version: previous.to_owned(),
                     detail: "previous version has no valid installation directory".to_owned(),
                 })?;
+        let daemon_dir = layout::verify_installed(&layout, &daemon_dir)?;
         let job = engine::journal_job_path(context, record).await?;
         let warnings = engine::job_warnings(context, &job);
         let mut gated = rollback::gate(
@@ -280,7 +285,7 @@ async fn finish_check(
         let gated = preflight::gate_upgrade(
             preflight,
             context,
-            daemon_dir,
+            &release,
             version,
             &job.value,
             &job.variables,

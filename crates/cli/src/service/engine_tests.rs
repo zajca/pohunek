@@ -17,7 +17,7 @@ use pohunek_daemon::session::upgrade_preflight::PreflightInputs;
 use pohunek_daemon::store::{
     DesiredState, ProjectRecord, RuntimeRecord, SessionRecord, Store as DaemonStore,
 };
-use pohunek_paths::{BasePaths, DAEMON_EXECUTABLE_NAME};
+use pohunek_paths::BasePaths;
 use pohunek_platform::process::{
     Error as ProcessError, ExitWatch, OwnershipMarkers, ProcessFact, ProcessIdentity, StartIdentity,
 };
@@ -50,6 +50,7 @@ use crate::service::usage::tests::{
     own_identity, spawn_when_exec_free, write_journal, write_live_journal, write_outdated_journal,
     SESSION,
 };
+use crate::service::VERSION;
 
 const V1: &str = "1.0.0";
 const V2: &str = "2.0.0";
@@ -187,7 +188,7 @@ impl AdoptionPreflight for InProcessPreflight {
     fn judge<'a>(
         &'a self,
         context: &'a Context,
-        _daemon: &'a Path,
+        _dir: &'a VerifiedVersionDir,
         _search_path: &'a str,
         _variables: &'a BTreeMap<String, String>,
         _probe_budget: Option<Duration>,
@@ -228,7 +229,7 @@ impl AdoptionPreflight for ScriptedPreflight {
     fn judge<'a>(
         &'a self,
         context: &'a Context,
-        daemon: &'a Path,
+        dir: &'a VerifiedVersionDir,
         search_path: &'a str,
         variables: &'a BTreeMap<String, String>,
         probe_budget: Option<Duration>,
@@ -246,7 +247,7 @@ impl AdoptionPreflight for ScriptedPreflight {
                 .push(variables.clone());
             let mut report: PreflightReport = self
                 .inner
-                .judge(context, daemon, search_path, variables, probe_budget, plan)
+                .judge(context, dir, search_path, variables, probe_budget, plan)
                 .await?;
             report.runtimes = self.runtimes.clone();
             report.stopped_sessions = self.stopped.clone();
@@ -374,7 +375,7 @@ impl RuntimeStep for RuntimeFake {
     fn run<'a>(
         &'a self,
         context: &'a Context,
-        dir: &'a Path,
+        dir: &'a VerifiedVersionDir,
         dry_run: bool,
         search_path: &'a str,
     ) -> Running<'a> {
@@ -412,13 +413,13 @@ impl RuntimeStep for RuntimeFake {
             }
             if unconfirmed {
                 return Err(Error::UpgradeRuntimesUnconfirmed {
-                    binary: dir.join(DAEMON_EXECUTABLE_NAME),
+                    binary: dir.daemon(),
                     detail: "the scripted daemon's exit was not confirmed".to_owned(),
                 });
             }
             if fail {
                 return Err(Error::UpgradeRuntimesFailed {
-                    binary: dir.join(DAEMON_EXECUTABLE_NAME),
+                    binary: dir.daemon(),
                     detail: "the fake apply failed after writing".to_owned(),
                 });
             }
@@ -916,6 +917,15 @@ impl Harness {
 
     async fn upgrade(&self, version: &str) -> Result<UpgradeReport, Error> {
         self.engine().upgrade(&self.staged(version), version).await
+    }
+
+    /// Upgrades with the prepared `engine`.
+    async fn upgrade_with(
+        &self,
+        engine: Engine<'_>,
+        version: &str,
+    ) -> Result<UpgradeReport, Error> {
+        engine.upgrade(&self.staged(version), version).await
     }
 
     /// Upgrades with `--accept-runtime-loss`.
@@ -3531,7 +3541,7 @@ impl AdoptionPreflight for PostApplyPreflight {
     fn judge<'a>(
         &'a self,
         context: &'a Context,
-        daemon: &'a Path,
+        dir: &'a VerifiedVersionDir,
         search_path: &'a str,
         variables: &'a BTreeMap<String, String>,
         probe_budget: Option<Duration>,
@@ -3540,21 +3550,21 @@ impl AdoptionPreflight for PostApplyPreflight {
         Box::pin(async move {
             // Only the new release's judgment after the apply is scripted; the
             // rollback judges the previous release's daemon as it stands.
-            let new_release = daemon.components().any(|part| part.as_os_str() == V2);
+            let new_release = dir.path().components().any(|part| part.as_os_str() == V2);
             if !self.runtimes.applied() || !new_release || self.post == PostApply::Clean {
                 return InProcessPreflight::default()
-                    .judge(context, daemon, search_path, variables, probe_budget, plan)
+                    .judge(context, dir, search_path, variables, probe_budget, plan)
                     .await;
             }
             self.judged_after_apply.fetch_add(1, Ordering::SeqCst);
             if self.post == PostApply::CannotRun {
                 return Err(Error::UpgradePreflightFailed {
-                    binary: daemon.to_path_buf(),
+                    binary: dir.daemon(),
                     detail: "the scripted post-apply judgment produced no report".to_owned(),
                 });
             }
             let mut report = InProcessPreflight::default()
-                .judge(context, daemon, search_path, variables, probe_budget, plan)
+                .judge(context, dir, search_path, variables, probe_budget, plan)
                 .await?;
             report.sessions.push(SessionVerdict {
                 session_id: "s-after-apply".to_owned(),
@@ -6961,7 +6971,7 @@ impl AdoptionPreflight for FailingFrom {
     fn judge<'a>(
         &'a self,
         context: &'a Context,
-        daemon: &'a Path,
+        dir: &'a VerifiedVersionDir,
         search_path: &'a str,
         variables: &'a BTreeMap<String, String>,
         probe_budget: Option<Duration>,
@@ -6971,13 +6981,13 @@ impl AdoptionPreflight for FailingFrom {
         if call >= self.fail_from {
             return Box::pin(async move {
                 Err(Error::UpgradePreflightFailed {
-                    binary: daemon.to_path_buf(),
+                    binary: dir.daemon(),
                     detail: "injected".to_owned(),
                 })
             });
         }
         self.inner
-            .judge(context, daemon, search_path, variables, probe_budget, plan)
+            .judge(context, dir, search_path, variables, probe_budget, plan)
     }
 }
 
@@ -8233,7 +8243,7 @@ impl AdoptionPreflight for CountingFailure {
     fn judge<'a>(
         &'a self,
         _context: &'a Context,
-        daemon: &'a Path,
+        dir: &'a VerifiedVersionDir,
         _search_path: &'a str,
         _variables: &'a BTreeMap<String, String>,
         _probe_budget: Option<Duration>,
@@ -8242,7 +8252,7 @@ impl AdoptionPreflight for CountingFailure {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             Err(Error::UpgradePreflightFailed {
-                binary: daemon.to_path_buf(),
+                binary: dir.daemon(),
                 detail: "must not be consulted".to_owned(),
             })
         })
@@ -8847,4 +8857,678 @@ async fn the_rollback_gate_never_consults_the_ledger() {
         .expect_err("the previous release emits no scope, so nothing is accepted");
 
     assert_eq!(error.code(), "service_rollback_sessions_at_risk");
+}
+
+/// The ways an installed version directory can stop being what publishing made.
+#[derive(Debug, Clone, Copy)]
+enum Tamper {
+    GroupWritableDirectory,
+    GroupWritableDaemon,
+    GroupWritableWorker,
+    SymlinkedDaemon,
+    HardLinkedDaemon,
+    MissingWorker,
+    WritableAnchor,
+    WritableRuntimeEntry,
+    SymlinkedRuntimeEntry,
+}
+
+impl Tamper {
+    const ALL: [Self; 9] = [
+        Self::GroupWritableDirectory,
+        Self::GroupWritableDaemon,
+        Self::GroupWritableWorker,
+        Self::SymlinkedDaemon,
+        Self::HardLinkedDaemon,
+        Self::MissingWorker,
+        Self::WritableAnchor,
+        Self::WritableRuntimeEntry,
+        Self::SymlinkedRuntimeEntry,
+    ];
+
+    /// Applies the change to `dir` and returns the path verification must name.
+    fn apply(self, dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let chmod = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        };
+        let daemon = dir.join(pohunek_paths::DAEMON_EXECUTABLE_NAME);
+        let worker = dir.join(pohunek_paths::WORKER_EXECUTABLE_NAME);
+        match self {
+            Self::GroupWritableDirectory => {
+                chmod(dir, 0o775);
+                dir.to_path_buf()
+            }
+            Self::GroupWritableDaemon => {
+                chmod(&daemon, 0o775);
+                daemon
+            }
+            Self::GroupWritableWorker => {
+                chmod(&worker, 0o775);
+                worker
+            }
+            Self::SymlinkedDaemon => {
+                let prefix = dir.ancestors().nth(3).expect("the prefix");
+                let elsewhere = prefix.join("daemon.elsewhere");
+                std::fs::rename(&daemon, &elsewhere).expect("move the daemon away");
+                std::os::unix::fs::symlink(&elsewhere, &daemon).expect("link the daemon");
+                daemon
+            }
+            Self::HardLinkedDaemon => {
+                let prefix = dir.ancestors().nth(3).expect("the prefix");
+                std::fs::hard_link(&daemon, prefix.join("daemon.link")).expect("link the daemon");
+                daemon
+            }
+            Self::MissingWorker => {
+                std::fs::remove_file(&worker).expect("remove the worker");
+                worker
+            }
+            Self::WritableAnchor => {
+                let anchor = dir.join(package::ANCHOR_FILE_NAME);
+                std::fs::write(&anchor, b"anchor").expect("write the anchor");
+                chmod(&anchor, 0o666);
+                anchor
+            }
+            Self::WritableRuntimeEntry => {
+                let runtime = dir.join("runtime");
+                std::fs::create_dir(&runtime).expect("runtime directory");
+                chmod(&runtime, 0o755);
+                let entry = runtime.join("entry");
+                std::fs::write(&entry, b"entry").expect("write the entry");
+                chmod(&entry, 0o666);
+                entry
+            }
+            Self::SymlinkedRuntimeEntry => {
+                let runtime = dir.join("runtime");
+                std::fs::create_dir(&runtime).expect("runtime directory");
+                chmod(&runtime, 0o755);
+                let entry = runtime.join("entry");
+                std::os::unix::fs::symlink(&daemon, &entry).expect("link the entry");
+                entry
+            }
+        }
+    }
+}
+
+fn assert_untrusted_version(error: &Error, named: &Path) {
+    // A rollback that cannot remove the tampered directory still reports the
+    // refusal that started it.
+    let error = match error {
+        Error::RollbackFailed { original, .. } => original,
+        other => other,
+    };
+    assert_eq!(error.code(), "service_version_untrusted", "{error:?}");
+    assert!(
+        matches!(error, Error::UntrustedVersion { path, .. } if path == named),
+        "the refusal names {}: {error:?}",
+        named.display()
+    );
+}
+
+#[tokio::test]
+async fn an_upgrade_runs_nothing_from_a_new_version_directory_that_stopped_being_trusted() {
+    for tamper in Tamper::ALL {
+        let harness = Harness::new();
+        harness.install(V1).await.expect("install");
+        harness.runtimes.script().calls.clear();
+        let preflight = ScriptedPreflight::default();
+        let judged = Arc::clone(&preflight.search_paths);
+        let mut engine = harness
+            .engine()
+            .with_adoption_preflight(Box::new(preflight));
+        let version_dir = harness.layout().version_dir(V2).expect("version dir");
+        let named = Arc::new(Mutex::new(PathBuf::new()));
+        let recorded = Arc::clone(&named);
+        engine.before_swap = Some(SwapHook(Box::new(move || {
+            *recorded.lock().expect("named path") = tamper.apply(&version_dir);
+        })));
+
+        let error = harness
+            .upgrade_with(engine, V2)
+            .await
+            .expect_err("an untrusted version directory is refused");
+
+        let named = named.lock().expect("named path").clone();
+        assert_untrusted_version(&error, &named);
+        assert!(
+            harness.runtimes.calls().is_empty(),
+            "{tamper:?}: no runtime step ran"
+        );
+        assert_eq!(
+            judged.lock().expect("search path lock").len(),
+            1,
+            "{tamper:?}: only the gate on the staged source judged"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_rollback_judges_nothing_from_a_previous_version_directory_that_stopped_being_trusted() {
+    for tamper in Tamper::ALL {
+        let mut harness = Harness::new();
+        interrupted_upgrade_journal(&mut harness).await;
+        let named = tamper.apply(&harness.layout().version_dir(V1).expect("version dir"));
+        let preflight = ScriptedPreflight::default();
+        let judged = Arc::clone(&preflight.search_paths);
+
+        let error = harness
+            .engine()
+            .with_adoption_preflight(Box::new(preflight))
+            .upgrade(&harness.staged(V1), V1)
+            .await
+            .expect_err("an untrusted previous version is not run");
+
+        assert_untrusted_version(&error, &named);
+        assert!(
+            judged.lock().expect("search path lock").is_empty(),
+            "{tamper:?}: the rollback gate ran nothing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_check_of_a_pending_rollback_runs_nothing_from_a_previous_version_directory_that_stopped_being_trusted(
+) {
+    for tamper in Tamper::ALL {
+        let mut harness = Harness::new();
+        interrupted_upgrade_journal(&mut harness).await;
+        let named = tamper.apply(&harness.layout().version_dir(V1).expect("version dir"));
+        let preflight = ScriptedPreflight::default();
+        let judged = Arc::clone(&preflight.search_paths);
+
+        let error = super::super::check_with_preflight(
+            &harness.context,
+            &harness.staged(V1),
+            &preflight,
+            V1,
+            false,
+        )
+        .await
+        .expect_err("an untrusted previous version is not run");
+
+        assert_untrusted_version(&error, &named);
+        assert!(
+            judged.lock().expect("search path lock").is_empty(),
+            "{tamper:?}: the check ran nothing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_upgrade_or_check_from_a_retained_version_directory_verifies_it_first() {
+    for tamper in Tamper::ALL {
+        let harness = Harness::new();
+        harness.install(V1).await.expect("install");
+        let retained = harness.layout().version_dir(V1).expect("version dir");
+        let named = tamper.apply(&retained);
+        let preflight = ScriptedPreflight::default();
+        let judged = Arc::clone(&preflight.search_paths);
+
+        let upgrade = harness
+            .engine()
+            .with_adoption_preflight(Box::new(preflight))
+            .upgrade(&retained, V2)
+            .await
+            .expect_err("an untrusted retained directory is refused");
+        assert_untrusted_version(&upgrade, &named);
+
+        let check = super::super::check_with_preflight(
+            &harness.context,
+            &retained,
+            &ScriptedPreflight::default(),
+            V2,
+            false,
+        )
+        .await
+        .expect_err("an untrusted retained directory is refused");
+        assert_untrusted_version(&check, &named);
+        assert!(
+            judged.lock().expect("search path lock").is_empty(),
+            "{tamper:?}: nothing was judged"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_release_directory_that_resolves_into_a_version_directory_is_judged_as_that_directory_or_refused(
+) {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let versions = harness.layout().versions_dir();
+    let version_dir = harness.layout().version_dir(V1).expect("version dir");
+    std::fs::create_dir(version_dir.join("nested")).expect("nested directory");
+    let aliases = harness.root.join("aliases");
+    std::fs::create_dir(&aliases).expect("aliases");
+    let cases = [
+        ("a link to a nested directory", version_dir.join("nested")),
+        ("a link to the versions directory", versions.clone()),
+    ];
+    for (label, target) in cases {
+        let alias = aliases.join(label.replace(' ', "-"));
+        std::os::unix::fs::symlink(&target, &alias).expect("alias");
+        let preflight = ScriptedPreflight::default();
+        let judged = Arc::clone(&preflight.search_paths);
+
+        let error = harness
+            .engine()
+            .with_adoption_preflight(Box::new(preflight))
+            .upgrade(&alias, V2)
+            .await
+            .expect_err("the alias is not a version directory");
+
+        assert_eq!(
+            error.code(),
+            "service_version_untrusted",
+            "{label}: {error:?}"
+        );
+        assert!(
+            judged.lock().expect("search path lock").is_empty(),
+            "{label}: nothing was judged"
+        );
+    }
+
+    let alias = aliases.join("exact");
+    std::os::unix::fs::symlink(&version_dir, &alias).expect("alias");
+    let verified = layout::operator_release(&harness.layout(), &alias).expect("an exact alias");
+    assert_eq!(
+        verified.path(),
+        version_dir,
+        "the alias resolves to the version directory"
+    );
+}
+
+/// Makes every binary of `dir` leave a marker when it runs.
+fn mark_runs(dir: &Path, marker: &Path) {
+    for binary in layout::BINARIES {
+        pohunek_test_support::fs::write_executable(
+            dir.join(binary),
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .expect("marking binary");
+    }
+}
+
+#[tokio::test]
+async fn an_upgrade_without_a_daemon_swap_runs_nothing_from_an_untrusted_source_version_directory()
+{
+    for tamper in Tamper::ALL {
+        let harness = Harness::new();
+        harness.install(V1).await.expect("install");
+        let source = harness.layout().version_dir(V1).expect("version dir");
+        let marker = harness.root.join("ran");
+        mark_runs(&source, &marker);
+        let named = tamper.apply(&source);
+
+        let error = harness
+            .engine()
+            .upgrade(&source, V1)
+            .await
+            .expect_err("an untrusted source is refused");
+
+        assert_untrusted_version(&error, &named);
+        assert!(!marker.exists(), "{tamper:?}: a source binary ran");
+    }
+}
+
+#[tokio::test]
+async fn an_install_from_an_untrusted_version_directory_runs_nothing_from_it() {
+    for tamper in Tamper::ALL {
+        let harness = Harness::new();
+        let source = harness.layout().version_dir(V1).expect("version dir");
+        crate::service::context::tests::make_dirs(&harness.root, &source);
+        let marker = harness.root.join("ran");
+        mark_runs(&source, &marker);
+        let named = tamper.apply(&source);
+
+        let error = harness
+            .engine()
+            .install(&source, &harness.prefix(), V1)
+            .await
+            .expect_err("an untrusted source is refused");
+
+        assert_untrusted_version(&error, &named);
+        assert!(!marker.exists(), "{tamper:?}: a source binary ran");
+    }
+}
+
+#[tokio::test]
+async fn an_upgrade_from_another_retained_version_directory_verifies_it_first() {
+    for tamper in Tamper::ALL {
+        let harness = Harness::new();
+        harness.install(V1).await.expect("install");
+        let retained = harness.layout().version_dir("0.9.0").expect("version dir");
+        crate::service::context::tests::make_dirs(&harness.root, &retained);
+        for binary in layout::BINARIES {
+            crate::service::layout::tests::write_fake(&retained, binary, "0.9.0");
+        }
+        let named = tamper.apply(&retained);
+        let preflight = ScriptedPreflight::default();
+        let judged = Arc::clone(&preflight.search_paths);
+
+        let error = harness
+            .engine()
+            .with_adoption_preflight(Box::new(preflight))
+            .upgrade(&retained, V2)
+            .await
+            .expect_err("an untrusted retained directory is refused");
+
+        assert_untrusted_version(&error, &named);
+        assert!(
+            judged.lock().expect("search path lock").is_empty(),
+            "{tamper:?}: nothing was judged"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_intact_retained_version_directory_passes_the_verification_and_fails_later_on_its_content(
+) {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let retained = harness.layout().version_dir("0.9.0").expect("version dir");
+    crate::service::context::tests::make_dirs(&harness.root, &retained);
+    for binary in layout::BINARIES {
+        crate::service::layout::tests::write_fake(&retained, binary, "0.9.0");
+    }
+
+    let error = harness
+        .engine()
+        .upgrade(&retained, V2)
+        .await
+        .expect_err("the old release does not report the new version");
+
+    assert_ne!(error.code(), "service_version_untrusted", "{error:?}");
+}
+
+#[tokio::test]
+async fn a_source_that_is_not_exactly_a_version_directory_is_refused_before_anything_runs() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let versions = harness.layout().versions_dir();
+    let version_dir = harness.layout().version_dir(V1).expect("version dir");
+    std::fs::create_dir(version_dir.join("nested")).expect("nested directory");
+    let scratch = versions.join(".staging-left-over");
+    std::fs::create_dir(&scratch).expect("staging-shaped directory");
+    std::fs::set_permissions(
+        &scratch,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("chmod");
+    let aliases = harness.root.join("aliases");
+    std::fs::create_dir(&aliases).expect("aliases");
+    let dangling = aliases.join("dangling");
+    std::os::unix::fs::symlink(harness.root.join("missing"), &dangling).expect("dangling alias");
+    let looping = aliases.join("looping");
+    std::os::unix::fs::symlink(&looping, &looping).expect("looping alias");
+    let sources = [
+        ("the versions directory", versions.clone()),
+        ("a nested directory", version_dir.join("nested")),
+        ("a staging-shaped directory", scratch),
+        ("a dangling link", dangling),
+        ("a looping link", looping),
+    ];
+    for (label, source) in sources {
+        for install in [false, true] {
+            let preflight = ScriptedPreflight::default();
+            let judged = Arc::clone(&preflight.search_paths);
+            let engine = harness
+                .engine()
+                .with_adoption_preflight(Box::new(preflight));
+
+            let error = if install {
+                engine
+                    .install(&source, &harness.prefix(), V1)
+                    .await
+                    .map(drop)
+            } else {
+                engine.upgrade(&source, V2).await.map(drop)
+            }
+            .expect_err("not a version directory");
+
+            let error = match &error {
+                Error::RollbackFailed { original, .. } => original,
+                other => other,
+            };
+            assert!(
+                matches!(
+                    error,
+                    Error::UntrustedVersion { .. } | Error::AlreadyInstalled { .. }
+                ),
+                "{label} (install={install}): {error:?}"
+            );
+            assert!(
+                judged.lock().expect("search path lock").is_empty(),
+                "{label}: nothing was judged"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_check_classifies_the_source_in_every_adoption_mode() {
+    for tamper in Tamper::ALL {
+        // Same version: no daemon swap, so no adoption gate.
+        let harness = Harness::new();
+        harness.install(V1).await.expect("install");
+        let source = harness.layout().version_dir(V1).expect("version dir");
+        let named = tamper.apply(&source);
+        let error = super::super::check_with_preflight(
+            &harness.context,
+            &source,
+            &ScriptedPreflight::default(),
+            V1,
+            false,
+        )
+        .await
+        .expect_err("an untrusted source is refused");
+        assert_untrusted_version(&error, &named);
+
+        // Fresh install from a retained prefix.
+        let harness = Harness::new();
+        let prefix = harness.context.default_prefix().expect("default prefix");
+        let source = InstallLayout::new(prefix)
+            .expect("layout")
+            .version_dir(V1)
+            .expect("version dir");
+        crate::service::context::tests::make_dirs(&harness.root, &source);
+        for binary in layout::BINARIES {
+            crate::service::layout::tests::write_fake(&source, binary, V1);
+        }
+        let named = tamper.apply(&source);
+        let error = super::super::check_with_preflight(
+            &harness.context,
+            &source,
+            &ScriptedPreflight::default(),
+            V1,
+            false,
+        )
+        .await
+        .expect_err("an untrusted source is refused");
+        assert_untrusted_version(&error, &named);
+    }
+}
+
+#[tokio::test]
+async fn a_link_chain_through_the_versions_directory_is_verified_hop_by_hop_on_every_command() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let versions = harness.layout().versions_dir();
+    let version_dir = harness.layout().version_dir(V1).expect("version dir");
+    let aliases = harness.root.join("aliases");
+    std::fs::create_dir(&aliases).expect("aliases");
+    let link = |target: &Path, name: &str| {
+        let alias = aliases.join(name);
+        std::os::unix::fs::symlink(target, &alias).expect("link");
+        alias
+    };
+
+    // A version directory that is itself a link to a directory outside.
+    let outside = harness.root.join("outside");
+    std::fs::create_dir(&outside).expect("outside directory");
+    let marker = harness.root.join("ran");
+    mark_runs(&outside, &marker);
+    std::os::unix::fs::symlink(&outside, versions.join("9.9.9")).expect("version link");
+    let to_outward = link(&versions.join("9.9.9"), "to-outward-version");
+    let two_hops = link(&to_outward, "two-hops");
+
+    // A link to the versions directory, then a nested path and a tampered version.
+    let dir_link = link(&versions, "dir-link");
+    let nested_dir = version_dir.join("nested");
+    std::fs::create_dir(&nested_dir).expect("nested directory");
+    let nested = dir_link.join(V1).join("nested");
+
+    // Loops and chains beyond the hop limit.
+    let loop_a = aliases.join("loop-a");
+    let loop_b = aliases.join("loop-b");
+    std::os::unix::fs::symlink(&loop_b, &loop_a).expect("loop a");
+    std::os::unix::fs::symlink(&loop_a, &loop_b).expect("loop b");
+    let mut previous = version_dir.clone();
+    for index in 0..=crate::service::settings::MAX_SOURCE_LINK_HOPS {
+        previous = link(&previous, &format!("chain-{index}"));
+    }
+
+    let refused = [
+        ("an alias to a version link pointing outside", to_outward),
+        ("a chain of aliases to a version link", two_hops),
+        ("a path below a link to the versions directory", nested),
+        ("a link loop", loop_a),
+        ("a chain beyond the hop limit", previous),
+    ];
+    for (label, source) in &refused {
+        let upgrade = harness.engine().upgrade(source, V2).await.expect_err(label);
+        let install = harness
+            .engine()
+            .install(source, &harness.prefix(), V1)
+            .await
+            .expect_err(label);
+        let check = super::super::check_with_preflight(
+            &harness.context,
+            source,
+            &ScriptedPreflight::default(),
+            V2,
+            false,
+        )
+        .await
+        .expect_err(label);
+        for error in [upgrade, install, check] {
+            assert_eq!(
+                error.code(),
+                "service_version_untrusted",
+                "{label}: {error:?}"
+            );
+        }
+    }
+    assert!(!marker.exists(), "nothing ran from the outside directory");
+
+    // A tampered version reached through the directory link is refused too.
+    let named = Tamper::GroupWritableDirectory.apply(&version_dir);
+    let through = dir_link.join(V1);
+    let error = harness
+        .engine()
+        .upgrade(&through, V2)
+        .await
+        .expect_err("tampered");
+    assert_untrusted_version(&error, &named);
+    std::fs::set_permissions(
+        &version_dir,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("restore the mode");
+
+    // An intact chain resolves to the canonical version directory.
+    let chain = link(&link(&version_dir, "first"), "second");
+    let verified = layout::operator_release(&harness.layout(), &chain).expect("an intact chain");
+    assert_eq!(verified.path(), version_dir);
+    let through = layout::operator_release(&harness.layout(), &dir_link.join(V1))
+        .expect("through the directory link");
+    assert_eq!(through.path(), version_dir);
+
+    // A chain that never touches the versions directory is the operator's own.
+    let elsewhere = harness.root.join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("elsewhere");
+    let own = layout::operator_release(&harness.layout(), &link(&elsewhere, "own"))
+        .expect("an operator directory");
+    assert_ne!(own.path(), version_dir);
+}
+
+/// Counts the plans the setup asks the release daemon for.
+#[derive(Debug, Default)]
+struct CountingPlanner(AtomicUsize);
+
+impl crate::commands::setup_host::ReleasePlanner for CountingPlanner {
+    fn plan<'a>(
+        &'a self,
+        _context: &'a Context,
+        _dir: &'a VerifiedVersionDir,
+        _search_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<EnsureReport, Error>> + Send + 'a>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Ok(runtime_report(
+                true,
+                vec![package(PackageStatus::Present)],
+                Vec::new(),
+                Vec::new(),
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn setup_plans_nothing_from_an_installed_version_directory_that_stopped_being_trusted() {
+    for tamper in Tamper::ALL {
+        let harness = Harness::new();
+        harness.install(VERSION).await.expect("install");
+        let named = tamper.apply(&harness.layout().version_dir(VERSION).expect("version dir"));
+        let planner = CountingPlanner::default();
+
+        let error =
+            crate::commands::setup_host::plan(&harness.context, &harness.staged(VERSION), &planner)
+                .await
+                .expect_err("an untrusted version directory is refused");
+
+        assert_eq!(error.code(), "service_version_untrusted", "{tamper:?}");
+        assert!(
+            error.to_string().contains(&named.display().to_string()),
+            "{tamper:?}: the refusal names {}: {error}",
+            named.display()
+        );
+        assert_eq!(
+            planner.0.load(Ordering::SeqCst),
+            0,
+            "{tamper:?}: the release daemon was not asked for a plan"
+        );
+    }
+}
+
+#[tokio::test]
+async fn setup_applies_nothing_when_the_version_directory_stopped_being_trusted_after_the_preview()
+{
+    for tamper in Tamper::ALL {
+        let harness = Harness::new();
+        harness.install(VERSION).await.expect("install");
+        let planner = CountingPlanner::default();
+        let host_plan =
+            crate::commands::setup_host::plan(&harness.context, &harness.staged(VERSION), &planner)
+                .await
+                .expect("a trusted directory is planned");
+        assert_eq!(planner.0.load(Ordering::SeqCst), 1);
+        let named = tamper.apply(&harness.layout().version_dir(VERSION).expect("version dir"));
+
+        let error = crate::commands::setup_host::apply(&harness.context, host_plan, &planner)
+            .await
+            .expect_err("an untrusted version directory is refused");
+
+        assert_eq!(error.code(), "service_version_untrusted", "{tamper:?}");
+        assert!(
+            error.to_string().contains(&named.display().to_string()),
+            "{tamper:?}: the refusal names {}: {error}",
+            named.display()
+        );
+        assert_eq!(
+            planner.0.load(Ordering::SeqCst),
+            1,
+            "{tamper:?}: the apply asked for no further plan"
+        );
+    }
 }

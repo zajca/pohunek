@@ -176,7 +176,7 @@ use super::definition::{
     config_with_search_path, daemon_definition, identity_config, with_version,
 };
 use super::error::{supervisor_error, Error, LiveSession, OutdatedWorker};
-use super::layout::{self, Staged};
+use super::layout::{self, Staged, VerifiedVersionDir};
 use pohunek_platform::shell_env::SearchPath;
 
 use super::ledger::{Acceptance, Ledger};
@@ -481,6 +481,7 @@ impl<'a> Engine<'a> {
     ) -> Result<InstallReport, Error> {
         let _transaction = self.transaction().await?;
         let layout = install_preflight(self.context, prefix)?;
+        let source = layout::operator_release(&layout, from)?;
         let plan = install_plan(self.store.load()?, prefix, version)?;
         // The discovery environment is judged, and discovery run, before a
         // foreign pending transaction is rolled back, so a hostile environment
@@ -528,7 +529,7 @@ impl<'a> Engine<'a> {
         let claimed = layout::claim_prefix(&layout, &namespace)?;
         let resumed = resume.is_some();
         let started = async {
-            let staged = layout::stage(&layout, from, self.reported(version)).await?;
+            let staged = layout::stage(&layout, &source, self.reported(version)).await?;
             let record = if let Some(record) = resume {
                 record
             } else {
@@ -640,7 +641,8 @@ impl<'a> Engine<'a> {
         upgrade_preflight(self.context)?;
         let config_path = self.context.config_path();
         let plan = upgrade_plan(self.store.load()?, version)?;
-        let (gated, job_path) = self.adoption_gate(&plan, from, version).await?;
+        let release = self.upgrade_source(&plan, from)?;
+        let (gated, job_path) = self.adoption_gate(&plan, &release, version).await?;
         let (resume, rolled_back) = self.resolve_plan(plan).await?;
         // The file is read as an upgrade source, so a previous release's
         // schema-2, schema-3, schema-4 or schema-5 installation upgrades into this one
@@ -659,7 +661,7 @@ impl<'a> Engine<'a> {
         let layout = config.layout().clone();
         check_layout_dirs(self.context, &layout)?;
         layout::claim_prefix(&layout, &config.namespace())?;
-        let staged = layout::stage(&layout, from, self.reported(version)).await?;
+        let staged = layout::stage(&layout, &release, self.reported(version)).await?;
         let resumed = resume.is_some();
         let from_version = resume
             .as_ref()
@@ -782,6 +784,30 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// Resolves the operator's release directory once for an upgrade, against
+    /// the layout of the installation the upgrade changes. The same value is
+    /// judged by the adoption gate and staged, so an installed version
+    /// directory is verified before anything from it runs or is copied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotInstalled`] without an installation and the
+    /// verification errors of [`layout::operator_release`].
+    fn upgrade_source(&self, plan: &Plan, from: &Path) -> Result<VerifiedVersionDir, Error> {
+        let layout = match plan {
+            Plan::Fresh => {
+                let config_path = self.context.config_path();
+                load_config_for_upgrade(&config_path)?
+                    .ok_or(Error::NotInstalled { path: config_path })?
+                    .config
+                    .layout()
+                    .clone()
+            }
+            Plan::Resume(record) | Plan::RollBack(record) => install_layout(&record.prefix)?,
+        };
+        layout::operator_release(&layout, from)
+    }
+
     /// Asks the new daemon's adoption preflight about the live sessions when
     /// `plan` swaps the daemon, and applies the operator's choice.
     ///
@@ -791,7 +817,7 @@ impl<'a> Engine<'a> {
     async fn adoption_gate(
         &self,
         plan: &Plan,
-        from: &Path,
+        release: &VerifiedVersionDir,
         version: &str,
     ) -> Result<(Option<Gated>, Option<JobPath>), Error> {
         // Only a fresh plan needs the installed version, which a rollback
@@ -822,7 +848,7 @@ impl<'a> Engine<'a> {
         let gated = preflight::gate_upgrade(
             &*self.preflight,
             self.context,
-            from,
+            release,
             self.reported(version),
             &job.value,
             &job.variables,
@@ -1130,7 +1156,7 @@ impl<'a> Engine<'a> {
         late.warnings.extend(warnings.iter().cloned());
         if swap {
             if let Some(dir) = config.daemon_executable().parent() {
-                self.pass_swap_gate(record, dir, &job, &warnings, late)
+                self.pass_swap_gate(record, layout, dir, &job, &warnings, late)
                     .await?;
             }
         }
@@ -1248,6 +1274,7 @@ impl<'a> Engine<'a> {
     async fn pass_swap_gate(
         &self,
         record: &mut Record,
+        layout: &InstallLayout,
         daemon_dir: &Path,
         job: &JobPath,
         warnings: &[String],
@@ -1260,10 +1287,17 @@ impl<'a> Engine<'a> {
                 return Err(error);
             }
         };
+        let daemon_dir = match layout::verify_installed(layout, daemon_dir) {
+            Ok(daemon_dir) => daemon_dir,
+            Err(error) => {
+                late.refused = true;
+                return Err(error);
+            }
+        };
         match preflight::gate_upgrade(
             &*self.preflight,
             self.context,
-            daemon_dir,
+            &daemon_dir,
             self.reported(&record.version),
             &job.value,
             &job.variables,
@@ -1389,7 +1423,7 @@ impl<'a> Engine<'a> {
         let warnings = job_warnings(self.context, &job);
         late.warnings.extend(warnings.iter().cloned());
         if let Some(dir) = config.daemon_executable().parent() {
-            self.pass_swap_gate(record, dir, &job, &warnings, late)
+            self.pass_swap_gate(record, config.layout(), dir, &job, &warnings, late)
                 .await?;
         }
         // Record the intent before the service-manager effect. A crash
@@ -1434,6 +1468,7 @@ impl<'a> Engine<'a> {
                 path: self.store.path(),
                 detail: format!("version {} has no directory", record.version),
             })?;
+        let dir = layout::verify_installed(layout, &dir)?;
         let plan = self
             .runtimes
             .run(self.context, &dir, true, search_path)
@@ -1463,7 +1498,7 @@ impl<'a> Engine<'a> {
             .runtimes
             .run(self.context, &dir, false, search_path)
             .await?;
-        runtimes::check_applied(&dir, &applied)?;
+        runtimes::check_applied(dir.path(), &applied)?;
         late.runtimes = Some(applied);
         if record.operation == Operation::Upgrade {
             // The verdict taken before the apply judged the packages that were
@@ -1505,12 +1540,15 @@ impl<'a> Engine<'a> {
         journal_default: Option<&str>,
     ) -> (Option<EnsureReport>, Vec<IntegrationReinstall>) {
         let plan = match layout.version_dir(version) {
-            Some(dir) => match job_search_path(self.context, config, journal_default).await {
-                Ok(job) => self
-                    .runtimes
-                    .run(self.context, &dir, true, &job.value)
-                    .await
-                    .map(|plan| (plan, job)),
+            Some(dir) => match layout::verify_installed(layout, &dir) {
+                Ok(dir) => match job_search_path(self.context, config, journal_default).await {
+                    Ok(job) => self
+                        .runtimes
+                        .run(self.context, &dir, true, &job.value)
+                        .await
+                        .map(|plan| (plan, job)),
+                    Err(error) => Err(error),
+                },
                 Err(error) => Err(error),
             },
             None => Err(Error::Record {
@@ -1757,6 +1795,7 @@ impl<'a> Engine<'a> {
                     version: previous.to_owned(),
                     detail: "previous version has no valid installation directory".to_owned(),
                 })?;
+        let daemon_dir = layout::verify_installed(layout, &daemon_dir)?;
         let job = journal_job_path(self.context, record).await?;
         let warnings = job_warnings(self.context, &job);
         let mut gated = rollback::gate(

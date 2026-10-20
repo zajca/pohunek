@@ -29,7 +29,7 @@ use tokio::io::AsyncReadExt as _;
 use super::context::Context;
 use super::engine::config_digest;
 use super::error::Error;
-use super::layout;
+use super::layout::{self, VerifiedVersionDir};
 use super::preflight::set_search_path;
 use super::record::{RuntimeBackup, RuntimeBackupEntry, RuntimeDir, Store};
 use super::report::IntegrationReinstall;
@@ -107,7 +107,7 @@ pub trait RuntimeStep: Debug + Send + Sync {
     fn run<'a>(
         &'a self,
         context: &'a Context,
-        dir: &'a Path,
+        dir: &'a VerifiedVersionDir,
         dry_run: bool,
         search_path: &'a str,
     ) -> Running<'a>;
@@ -139,7 +139,7 @@ impl RuntimeStep for DaemonRuntimes {
     fn run<'a>(
         &'a self,
         context: &'a Context,
-        dir: &'a Path,
+        dir: &'a VerifiedVersionDir,
         dry_run: bool,
         search_path: &'a str,
     ) -> Running<'a> {
@@ -159,7 +159,7 @@ impl DaemonRuntimes {
     pub async fn plan_detected(
         &self,
         context: &Context,
-        dir: &Path,
+        dir: &VerifiedVersionDir,
         search_path: &str,
     ) -> Result<EnsureReport, Error> {
         run_daemon(*self, context, dir, true, true, search_path).await
@@ -177,12 +177,12 @@ impl DaemonRuntimes {
 async fn run_daemon(
     runtimes: DaemonRuntimes,
     context: &Context,
-    dir: &Path,
+    dir: &VerifiedVersionDir,
     dry_run: bool,
     detect: bool,
     search_path: &str,
 ) -> Result<EnsureReport, Error> {
-    let daemon = dir.join(DAEMON_EXECUTABLE_NAME);
+    let daemon = dir.daemon();
     let failure = |detail: String| Error::UpgradeRuntimesFailed {
         binary: daemon.clone(),
         detail,
@@ -702,6 +702,10 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("mode");
     }
 
+    fn trusted(dir: &Path) -> VerifiedVersionDir {
+        layout::operator_release_for_test(dir)
+    }
+
     fn failure_detail(error: Error) -> String {
         match error {
             Error::UpgradeRuntimesFailed { detail, .. } => detail,
@@ -718,7 +722,7 @@ mod tests {
         let plan = run_daemon(
             DaemonRuntimes::default(),
             &context,
-            root.as_path(),
+            &trusted(root.as_path()),
             true,
             false,
             "/usr/bin:/bin",
@@ -729,7 +733,7 @@ mod tests {
         let applied = run_daemon(
             DaemonRuntimes::default(),
             &context,
-            root.as_path(),
+            &trusted(root.as_path()),
             false,
             false,
             "/usr/bin:/bin",
@@ -768,7 +772,7 @@ mod tests {
         run_daemon(
             DaemonRuntimes::default(),
             &context,
-            root.as_path(),
+            &trusted(root.as_path()),
             true,
             false,
             &search_path,
@@ -778,7 +782,7 @@ mod tests {
         run_daemon(
             DaemonRuntimes::default(),
             &context,
-            root.as_path(),
+            &trusted(root.as_path()),
             false,
             false,
             &search_path,
@@ -789,7 +793,7 @@ mod tests {
             run_daemon(
                 DaemonRuntimes::default(),
                 &context,
-                root.as_path(),
+                &trusted(root.as_path()),
                 true,
                 false,
                 "/usr/bin:/bin",
@@ -810,7 +814,7 @@ mod tests {
             run_daemon(
                 DaemonRuntimes::default(),
                 &context,
-                root.as_path(),
+                &trusted(root.as_path()),
                 true,
                 false,
                 "/usr/bin:/bin",
@@ -835,7 +839,7 @@ mod tests {
             run_daemon(
                 DaemonRuntimes::default(),
                 &context,
-                root.as_path(),
+                &trusted(root.as_path()),
                 false,
                 false,
                 "/usr/bin:/bin",
@@ -856,7 +860,7 @@ mod tests {
             run_daemon(
                 DaemonRuntimes::default(),
                 &context,
-                root.as_path(),
+                &trusted(root.as_path()),
                 false,
                 false,
                 "/usr/bin:/bin",
@@ -895,7 +899,7 @@ mod tests {
         hanging_daemon(root.as_path(), &pid_file);
 
         let error = short_timeouts(Duration::from_secs(10))
-            .run(&context, root.as_path(), false, "/usr/bin:/bin")
+            .run(&context, &trusted(root.as_path()), false, "/usr/bin:/bin")
             .await
             .expect_err("the apply does not finish");
         let detail = failure_detail(error);

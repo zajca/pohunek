@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;
-use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
@@ -28,7 +28,7 @@ use tokio::io::AsyncReadExt as _;
 
 use super::context::Context;
 use super::error::Error;
-use super::layout;
+use super::layout::{self, VerifiedVersionDir};
 use super::ledger::{Acceptance, AcceptedSet, Entry, List, OneTime};
 use super::report::AcceptanceGroups;
 use super::runtimes;
@@ -67,14 +67,14 @@ pub type Judging<'a> = Pin<Box<dyn Future<Output = Result<PreflightReport, Error
 
 /// Judges the adoption of the live sessions of the installed state.
 pub trait AdoptionPreflight: Debug + Send + Sync {
-    /// Returns the report of the daemon executable `daemon` for the state
+    /// Returns the report of the daemon executable in `dir` for the state
     /// `context` locates, run with the `PATH` `search_path` gives the daemon
     /// job and the service manager's allowlisted `variables`. `probe_budget`
     /// is passed to the daemon only when it is `Some`.
     fn judge<'a>(
         &'a self,
         context: &'a Context,
-        daemon: &'a Path,
+        dir: &'a VerifiedVersionDir,
         search_path: &'a str,
         variables: &'a BTreeMap<String, String>,
         probe_budget: Option<Duration>,
@@ -90,7 +90,7 @@ impl AdoptionPreflight for DaemonPreflight {
     fn judge<'a>(
         &'a self,
         context: &'a Context,
-        daemon: &'a Path,
+        dir: &'a VerifiedVersionDir,
         search_path: &'a str,
         variables: &'a BTreeMap<String, String>,
         probe_budget: Option<Duration>,
@@ -98,7 +98,7 @@ impl AdoptionPreflight for DaemonPreflight {
     ) -> Judging<'a> {
         Box::pin(run_daemon(
             context,
-            daemon,
+            dir.daemon(),
             search_path,
             variables,
             probe_budget,
@@ -146,7 +146,7 @@ pub struct Gated {
 pub async fn gate(
     preflight: &dyn AdoptionPreflight,
     context: &Context,
-    daemon_dir: &Path,
+    daemon_dir: &VerifiedVersionDir,
     version: &str,
     search_path: &str,
     variables: &BTreeMap<String, String>,
@@ -184,7 +184,7 @@ pub async fn gate(
 pub async fn gate_upgrade(
     preflight: &dyn AdoptionPreflight,
     context: &Context,
-    daemon_dir: &Path,
+    daemon_dir: &VerifiedVersionDir,
     version: &str,
     search_path: &str,
     variables: &BTreeMap<String, String>,
@@ -223,20 +223,26 @@ pub async fn gate_upgrade(
 async fn judge_daemon(
     preflight: &dyn AdoptionPreflight,
     context: &Context,
-    daemon_dir: &Path,
+    daemon_dir: &VerifiedVersionDir,
     version: &str,
     search_path: &str,
     variables: &BTreeMap<String, String>,
     plan: ReleasePlan,
     own_release: bool,
 ) -> Result<PreflightReport, Error> {
-    let daemon = daemon_dir.join(DAEMON_EXECUTABLE_NAME);
-    probe_daemon(&daemon, version).await?;
+    probe_daemon(daemon_dir, version).await?;
     let budget = context.preflight_budget();
     let probe_budget =
         (own_release && version == VERSION && budget != PROBE_BUDGET).then_some(budget);
     preflight
-        .judge(context, &daemon, search_path, variables, probe_budget, plan)
+        .judge(
+            context,
+            daemon_dir,
+            search_path,
+            variables,
+            probe_budget,
+            plan,
+        )
         .await
 }
 
@@ -245,16 +251,13 @@ async fn judge_daemon(
 /// # Errors
 ///
 /// Returns the staged-binary or version-probe failure.
-pub(super) async fn probe_daemon(daemon: &Path, version: &str) -> Result<(), Error> {
-    match std::fs::metadata(daemon) {
+pub(super) async fn probe_daemon(dir: &VerifiedVersionDir, version: &str) -> Result<(), Error> {
+    let daemon = dir.daemon();
+    match std::fs::metadata(&daemon) {
         Ok(metadata) if metadata.is_file() => {}
-        _ => {
-            return Err(Error::StagedBinary {
-                path: daemon.to_path_buf(),
-            })
-        }
+        _ => return Err(Error::StagedBinary { path: daemon }),
     }
-    layout::probe(daemon, DAEMON_EXECUTABLE_NAME, version).await?;
+    layout::probe(&daemon, DAEMON_EXECUTABLE_NAME, version).await?;
     Ok(())
 }
 
@@ -351,17 +354,17 @@ pub fn decide(
 /// Runs the daemon's preflight with the environment the installed daemon gets.
 async fn run_daemon(
     context: &Context,
-    daemon: &Path,
+    daemon: PathBuf,
     search_path: &str,
     variables: &BTreeMap<String, String>,
     probe_budget: Option<Duration>,
     plan: ReleasePlan,
 ) -> Result<PreflightReport, Error> {
     let failure = |detail: String| Error::UpgradePreflightFailed {
-        binary: daemon.to_path_buf(),
+        binary: daemon.clone(),
         detail,
     };
-    let mut command = tokio::process::Command::new(daemon);
+    let mut command = tokio::process::Command::new(&daemon);
     command.arg(PREFLIGHT_ARGUMENT);
     if let Some(flag) = plan.argument() {
         command.arg(flag);

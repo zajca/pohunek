@@ -34,9 +34,10 @@ use std::fmt::{self, Write as _};
 use std::fs;
 use std::future::Future;
 use std::io::{self, IsTerminal as _, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 
+use pohunek_paths::InstallLayout;
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Gap, IntegrationAction, PackageAction, PackageStatus,
     ProfileAction, Refusal, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, RELEASE_RUNTIME_DIR,
@@ -60,6 +61,7 @@ use crate::error::CliError;
 use crate::hermes_integration::runner::safe_ancestor;
 use crate::paths::Paths;
 use crate::service::engine::{install_layout, installed_job_search_path, recorded_job_search_path};
+use crate::service::layout::{self, SealedRelease, VerifiedVersionDir};
 use crate::service::report::IntegrationReinstall;
 use crate::service::runtimes::{profile_detail, replaces_newer_warning, DaemonRuntimes};
 use crate::service::{self, Context, VERSION};
@@ -157,7 +159,7 @@ pub trait ReleasePlanner: fmt::Debug + Send + Sync {
     fn plan<'a>(
         &'a self,
         context: &'a Context,
-        dir: &'a Path,
+        dir: &'a VerifiedVersionDir,
         search_path: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<EnsureReport, service::Error>> + Send + 'a>>;
 }
@@ -166,7 +168,7 @@ impl ReleasePlanner for DaemonRuntimes {
     fn plan<'a>(
         &'a self,
         context: &'a Context,
-        dir: &'a Path,
+        dir: &'a VerifiedVersionDir,
         search_path: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<EnsureReport, service::Error>> + Send + 'a>> {
         Box::pin(self.plan_detected(context, dir, search_path))
@@ -267,7 +269,10 @@ pub struct HostPlan {
     /// The service step the plan assumes.
     service: ServiceStep,
     /// The release directory the plan was read from.
-    dir: PathBuf,
+    dir: VerifiedVersionDir,
+    /// The layout an installed `dir` was verified against, to verify it again
+    /// before the apply runs from it.
+    layout: Option<InstallLayout>,
     /// The `PATH` the daemon job runs with.
     search_path: String,
     /// What the release planner reported for `dir`.
@@ -476,6 +481,27 @@ fn catalog_note(service: &ServiceStep, previewed: &EnsureReport) -> Option<Strin
         })
 }
 
+/// The directory a fresh host's plan runs the release daemon from: the sealed
+/// archive its verification vouched for, or the operator's own release.
+///
+/// # Errors
+///
+/// Returns the verification errors of [`layout::operator_release`] for a
+/// directory inside the default prefix's versions directory.
+fn release_for_fresh_host(
+    context: &Context,
+    staged: &Path,
+    sealed: Option<SealedRelease>,
+) -> Result<VerifiedVersionDir, CliError> {
+    match sealed {
+        Some(sealed) => Ok(layout::sealed_release(&sealed)),
+        None => Ok(layout::operator_release(
+            &install_layout(&context.default_prefix()?)?,
+            staged,
+        )?),
+    }
+}
+
 /// Reads the service state and the release plan without changing anything.
 ///
 /// # Errors
@@ -499,12 +525,12 @@ async fn plan_in(
             ),
         });
     }
-    let (service, dir, search_path) = if status.installed {
+    let (service, dir, layout, search_path) = if status.installed {
         match status.active_version.as_deref() {
             Some(VERSION) => {
-                let dir = installed_version_dir(&status)?;
+                let (layout, dir) = installed_version_dir(&status)?;
                 let search = installed_job_search_path(context).await?.value;
-                (ServiceStep::Present, dir, search)
+                (ServiceStep::Present, dir, Some(layout), search)
             }
             other => {
                 return Err(CliError::SetupBlocked {
@@ -519,7 +545,7 @@ async fn plan_in(
     } else {
         // The plan runs the release's daemon, so a sealed archive is verified
         // before anything from it runs.
-        verify_sealed_archive(staged, context.uid()).await?;
+        let sealed = verify_sealed_archive(staged, context.uid()).await?;
         // The PATH the daemon job of a fresh install gets: the search path the
         // install records, or the service manager's own when it records none,
         // so the plan judges the packages as the installed daemon will.
@@ -538,7 +564,8 @@ async fn plan_in(
             ServiceStep::Install {
                 from: staged.display().to_string(),
             },
-            staged.to_path_buf(),
+            release_for_fresh_host(context, staged, sealed)?,
+            None,
             job.value,
         )
     };
@@ -588,6 +615,7 @@ async fn plan_in(
     Ok(HostPlan {
         service,
         dir,
+        layout,
         search_path,
         previewed,
         preview,
@@ -652,8 +680,8 @@ async fn apply_steps(
             install_service(context, Path::new(from), previewed, applied, planner).await?
         }
         ServiceStep::Present => {
-            let current = recheck_present(context, plan, planner).await?;
-            (plan.dir.clone(), plan.search_path.clone(), current)
+            let (dir, current) = recheck_present(context, plan, planner).await?;
+            (dir, plan.search_path.clone(), current)
         }
     };
 
@@ -663,7 +691,7 @@ async fn apply_steps(
         .packages
         .iter()
         .any(|package| package.status == PackageStatus::Install);
-    apply_remaining(&mut client, &dir, &remaining, applied).await?;
+    apply_remaining(&mut client, dir.path(), &remaining, applied).await?;
 
     let env = integration_env(context);
     let mut stale = Vec::new();
@@ -740,7 +768,7 @@ async fn install_service(
     previewed: &EnsureReport,
     applied: &mut Vec<String>,
     planner: &dyn ReleasePlanner,
-) -> Result<(PathBuf, String, EnsureReport), CliError> {
+) -> Result<(VerifiedVersionDir, String, EnsureReport), CliError> {
     let installed = service::install_in(context, Some(from.to_path_buf()), None).await?;
     applied.push(format!("service: installed version {}", installed.version));
     applied.extend(engine_changes(installed.runtimes.as_ref()));
@@ -752,6 +780,7 @@ async fn install_service(
             detail: "the installed daemon has no version directory".to_owned(),
             applied: Vec::new(),
         })?;
+    let version_dir = layout::verify_installed(&install_layout(&installed.prefix)?, &version_dir)?;
     let installed_search = installed_job_search_path(context).await?.value;
     let after = planner
         .plan(context, &version_dir, &installed_search)
@@ -784,8 +813,12 @@ async fn recheck_present(
     context: &Context,
     plan: &HostPlan,
     planner: &dyn ReleasePlanner,
-) -> Result<EnsureReport, CliError> {
-    let current = planner.plan(context, &plan.dir, &plan.search_path).await?;
+) -> Result<(VerifiedVersionDir, EnsureReport), CliError> {
+    let dir = match &plan.layout {
+        Some(layout) => layout::verify_installed(layout, plan.dir.path())?,
+        None => plan.dir.clone(),
+    };
+    let current = planner.plan(context, &dir, &plan.search_path).await?;
     check_transitions(&plan.previewed, &current, None).map_err(|detail| {
         CliError::SetupBlocked {
             detail: format!(
@@ -794,7 +827,7 @@ async fn recheck_present(
             ),
         }
     })?;
-    Ok(current)
+    Ok((dir, current))
 }
 
 /// The changes the install engine's runtime step made, as the install report
@@ -1303,8 +1336,9 @@ fn hook_lines(hooks: &[IntegrationReinstall], status: &str) -> Vec<String> {
 /// # Errors
 ///
 /// Returns [`CliError::SetupBlocked`] with the verifier's reason when the
-/// archive is refused or the verifier cannot run.
-async fn verify_sealed_archive(staged: &Path, uid: u32) -> Result<(), CliError> {
+/// archive is refused or the verifier cannot run. A directory that is not a
+/// sealed archive returns `None`.
+async fn verify_sealed_archive(staged: &Path, uid: u32) -> Result<Option<SealedRelease>, CliError> {
     use std::os::unix::fs::MetadataExt as _;
 
     let blocked = |detail: String| CliError::SetupBlocked { detail };
@@ -1325,7 +1359,7 @@ async fn verify_sealed_archive(staged: &Path, uid: u32) -> Result<(), CliError> 
         }
     }
     if !sealed {
-        return Ok(());
+        return Ok(None);
     }
     // Every directory above the release is closed to other accounts, so none
     // can rename the checked tree away and put its own verifier at this path
@@ -1400,7 +1434,7 @@ async fn verify_sealed_archive(staged: &Path, uid: u32) -> Result<(), CliError> 
         .await
         .map_err(|error| blocked(format!("cannot run {}: {error}", verifier.display())))?;
     if output.status.success() {
-        return Ok(());
+        return Ok(Some(SealedRelease::attest(staged)));
     }
     let reason = String::from_utf8_lossy(&output.stderr);
     Err(blocked(format!(
@@ -1410,24 +1444,30 @@ async fn verify_sealed_archive(staged: &Path, uid: u32) -> Result<(), CliError> 
     )))
 }
 
-/// The version directory of the installed release.
+/// The verified version directory of the installed release, with its layout.
 ///
 /// # Errors
 ///
 /// Returns [`CliError::SetupBlocked`] when the recorded prefix has no version
-/// directory for this release.
-fn installed_version_dir(status: &service::InstalledFacts) -> Result<PathBuf, CliError> {
+/// directory for this release, and the verification error when it cannot be
+/// trusted.
+fn installed_version_dir(
+    status: &service::InstalledFacts,
+) -> Result<(InstallLayout, VerifiedVersionDir), CliError> {
     let prefix = status
         .prefix
         .as_deref()
         .ok_or_else(|| CliError::SetupBlocked {
             detail: "the installed service records no prefix".to_owned(),
         })?;
-    install_layout(prefix)?
+    let layout = install_layout(prefix)?;
+    let dir = layout
         .version_dir(VERSION)
         .ok_or_else(|| CliError::SetupBlocked {
             detail: format!("the installed prefix has no directory for version {VERSION}"),
-        })
+        })?;
+    let dir = layout::verify_installed(&layout, &dir)?;
+    Ok((layout, dir))
 }
 
 /// Asks once whether to apply the plan.
