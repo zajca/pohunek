@@ -186,6 +186,42 @@ impl std::fmt::Display for JobExit {
     }
 }
 
+/// What the service manager recorded about the end of a failed job.
+///
+/// Diagnostic evidence only. `result` is the manager's own verdict as an open
+/// string (systemd: `exit-code`, `signal`, `core-dump`, `timeout`, `oom-kill`,
+/// `resources`, ...); a caller tolerates a value it does not know, because a
+/// newer manager can add one. `exit` describes how the main process died,
+/// which is not always the cause: the manager ends a job it killed for memory
+/// with `oom-kill` while the main process shows the signal that stopped it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExitEvidence {
+    result: String,
+    exit: Option<JobExit>,
+}
+
+impl ExitEvidence {
+    /// Creates evidence from the manager's `result` and the main process's
+    /// `exit`, when one was recorded.
+    #[must_use]
+    pub fn new(result: String, exit: Option<JobExit>) -> Self {
+        Self { result, exit }
+    }
+
+    /// The manager's verdict on the job.
+    #[must_use]
+    pub fn result(&self) -> &str {
+        &self.result
+    }
+
+    /// How the main process ended, when the manager recorded it.
+    #[must_use]
+    pub fn exit(&self) -> Option<JobExit> {
+        self.exit
+    }
+}
+
 /// How the native manager treats a job whose process exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartPolicy {
@@ -568,6 +604,19 @@ pub trait Supervisor: std::fmt::Debug + Send + Sync {
     /// from [`Supervisor::inspect`]. A backend that keeps records reports an
     /// absent job as [`Error::NotFound`]; the default keeps none.
     fn exit_status<'a>(&'a self, _id: &'a ServiceId) -> Operation<'a, Option<JobExit>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Reports what the backend recorded about the end of one failed job,
+    /// including the manager's own verdict.
+    ///
+    /// Diagnostic evidence only. `Ok(None)` means the job did not fail or the
+    /// backend holds no record, never that its process still runs. The record
+    /// lives only until the job is retired: a failed transient job is reset
+    /// by [`Supervisor::retire`], which destroys it, so a caller that wants
+    /// the evidence reads it first. A backend that keeps records reports an
+    /// absent job as [`Error::NotFound`]; the default keeps none.
+    fn exit_evidence<'a>(&'a self, _id: &'a ServiceId) -> Operation<'a, Option<ExitEvidence>> {
         Box::pin(async { Ok(None) })
     }
 }
