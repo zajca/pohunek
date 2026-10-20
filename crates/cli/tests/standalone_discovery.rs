@@ -672,5 +672,9 @@ fn a_cache_of_the_previous_schema_is_discarded_not_read() {
         .iter()
         .filter_map(|record| record["peer_id"].as_str())
         .collect();
-    assert_eq!(names, ["fresh-key"], "the old cache is refreshed: {document}");
+    assert_eq!(
+        names,
+        ["fresh-key"],
+        "the old cache is refreshed: {document}"
+    );
 }

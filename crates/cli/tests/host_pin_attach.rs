@@ -19,8 +19,8 @@ use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use pohunek_test_support::env::TestEnv;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use protocol::{Request, Response, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 
@@ -265,7 +265,11 @@ fn the_automatic_reattach_stays_on_the_peer_the_name_first_selected() {
     let stdin = cli.0.stdin.take().expect("piped stdin");
     // The CLI's runtime waits for its blocking stdin read on exit, so the
     // pipe closes once the last attempt was served.
-    wait_for_count(&scene, protocol::method::SESSION_DETACH, 1 + RECONNECT_ATTEMPTS);
+    wait_for_count(
+        &scene,
+        protocol::method::SESSION_DETACH,
+        1 + RECONNECT_ATTEMPTS,
+    );
     drop(stdin);
 
     let started = std::time::Instant::now();
@@ -375,7 +379,13 @@ fn wait_served(scene: &Scene, method: &str) {
 /// Waits until the fixture served `method` `count` times.
 fn wait_for_count(scene: &Scene, method: &str, count: usize) {
     let started = std::time::Instant::now();
-    while scene.served().iter().filter(|served| *served == method).count() < count {
+    while scene
+        .served()
+        .iter()
+        .filter(|served| *served == method)
+        .count()
+        < count
+    {
         assert!(
             started.elapsed() < ATTACH_DEADLINE,
             "fewer than {count} {method} requests: served {:?}",

@@ -257,14 +257,9 @@ async fn spawn_server_with_overlay(
     overlay: overlay::OverlayRegistry,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let health = HealthInfo::new(version);
-    let server = ControlServer::bind(
-        socket,
-        health,
-        governance_service(socket).await,
-        overlay,
-    )
-    .await
-    .expect("server binds");
+    let server = ControlServer::bind(socket, health, governance_service(socket).await, overlay)
+        .await
+        .expect("server binds");
     let (tx, rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
         server

@@ -2196,9 +2196,11 @@ fn host_commands_treat_the_machines_own_overlay_name_as_local() {
     );
     let table = utf8(&listed.stdout);
     assert!(
-        table
-            .lines()
-            .any(|row| row.split_whitespace().take(3).eq(["fixture-self", "local", "local"])),
+        table.lines().any(|row| row.split_whitespace().take(3).eq([
+            "fixture-self",
+            "local",
+            "local"
+        ])),
         "{table}"
     );
     assert!(
@@ -2949,7 +2951,13 @@ const PIN_SELECTORS: [(&str, Option<&str>); 3] = [
 fn session_output_and_wait_stay_on_the_peer_the_name_first_selected() {
     for command in PINNED_SESSION_COMMANDS {
         for (selector, env_port) in PIN_SELECTORS {
-            let run = run_pinned(selector, command, &pin_before(), &pin_after_rename(), env_port);
+            let run = run_pinned(
+                selector,
+                command,
+                &pin_before(),
+                &pin_after_rename(),
+                env_port,
+            );
             assert_json_success(&run.output);
             assert!(
                 run.dialed.len() >= 2,
@@ -2994,7 +3002,10 @@ fn a_pinned_peer_that_changes_address_is_followed_by_identity() {
             "{command:?}: the later connection follows the pinned peer to its new address: {:?}",
             run.dialed
         );
-        assert!(!run.dialed.iter().any(|ip| ip == PIN_SECOND_IP), "{command:?}");
+        assert!(
+            !run.dialed.iter().any(|ip| ip == PIN_SECOND_IP),
+            "{command:?}"
+        );
     }
 }
 

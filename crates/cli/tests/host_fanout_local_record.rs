@@ -60,8 +60,8 @@ fn serve_lines<S: Read + Write + Send + 'static>(stream: S, served: Served) {
                 .lock()
                 .expect("served requests")
                 .push(request.method().to_owned());
-            let response = Response::ok(PROTOCOL_VERSION, request.id(), answer(&request))
-                .expect("a response");
+            let response =
+                Response::ok(PROTOCOL_VERSION, request.id(), answer(&request)).expect("a response");
             writeln!(
                 reader.get_mut(),
                 "{}",

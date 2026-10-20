@@ -332,7 +332,11 @@ async fn local_records(
                 None => HostClass::Candidate,
             };
             HostRecord {
-                name: identity.fqdn.as_deref().map(short_hostname).map(str::to_owned),
+                name: identity
+                    .fqdn
+                    .as_deref()
+                    .map(short_hostname)
+                    .map(str::to_owned),
                 fqdn: identity.fqdn,
                 address: addr.map(|addr| addr.ip().to_string()),
                 port,

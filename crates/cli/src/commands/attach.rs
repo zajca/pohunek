@@ -708,7 +708,8 @@ where
     let (modal, status_updates) = if let Some((cols, rows)) =
         terminal_size(libc::STDOUT_FILENO).filter(|&(_, rows)| rows >= MIN_ROWS_FOR_MENU)
     {
-        let snapshot = load_initial_status_snapshot(&mut client, host.label(), &target.session_id).await;
+        let snapshot =
+            load_initial_status_snapshot(&mut client, host.label(), &target.session_id).await;
         // Best-effort live status updates keep the transient modal current. A
         // dropped subscription leaves the last snapshot available without
         // interrupting raw terminal passthrough.

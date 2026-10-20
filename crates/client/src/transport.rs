@@ -1917,8 +1917,8 @@ mod tests {
 
     use super::*;
     use overlay::{
-        BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentityKind,
-        OverlayError, OverlayFuture, OverlayId, OverlayTransport, ResolvedPeer,
+        BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentityKind, OverlayError,
+        OverlayFuture, OverlayId, OverlayTransport, ResolvedPeer,
     };
     use tokio::io::{AsyncBufReadExt as _, BufReader};
     use tokio::net::TcpListener;
