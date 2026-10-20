@@ -1865,6 +1865,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
+    use pohunek_test_support::wait::wait_until;
     use protocol::{ReportSequence, SessionNewParams, SessionReportAgentParams};
 
     use crate::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
@@ -1878,7 +1879,8 @@ mod tests {
     const TEST_AGENT_SOURCE: &str = "pohunek:codex";
     /// Hook sequence of the reported claim.
     const TEST_REPORT_SEQ: u64 = 1_000;
-    /// Scheduler yields granted to the procwatch task to react to one tick.
+    /// Scheduler yields that let the procwatch task run its ticks while the
+    /// claim is still younger than its TTL.
     const TEST_YIELD_BUDGET: usize = 256;
 
     /// The procwatch loop must read tokio's clock: an unbound claim older than
@@ -1941,19 +1943,13 @@ mod tests {
         );
 
         tokio::time::advance(TEST_CLAIM_TTL).await;
-        let mut released = false;
-        for _ in 0..TEST_YIELD_BUDGET {
-            tokio::task::yield_now().await;
+        // The tick's scan reads the process tree on a blocking thread, so the
+        // release lands whenever that read returns; no yield count bounds it.
+        wait_until("a procwatch tick released the expired claim", || async {
             let info = registry.inspect(&created.id).await.expect("inspect");
-            if info.active_agent.is_none() {
-                released = true;
-                break;
-            }
-        }
-        assert!(
-            released,
-            "a procwatch tick after the TTL elapsed on the paused clock releases the claim"
-        );
+            info.active_agent.is_none().then_some(())
+        })
+        .await;
 
         tokio::time::resume();
         let _ = registry.stop(&created.id).await;
