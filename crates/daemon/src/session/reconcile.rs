@@ -30,13 +30,14 @@ use super::supervision::{
 use super::tmpdir::TmpdirOwners;
 use super::{
     current_time_millis, event, event_payload, event_runtime, identity_claim_expiry_is_valid, mpsc,
-    preserve_durable_worker_metadata, preserve_newer_updated_at, runtime_error, sort_subagents,
-    terminalize_running_subagents, timestamp_now, watch, ActiveAgentReport, CancellationToken,
-    DesiredState, DetectorConfig, DetectorConfigUpdate, DetectorInputs, DetectorScope, Mutex,
-    Notify, ObservedAgent, ProtocolError, ResumeSnapshot, RuntimeHandle, RuntimeState,
-    RuntimeWatchIdentity, SessionEntry, SessionId, SessionRecord, SessionRef, SessionRefKind,
-    SessionRegistry, SessionRuntime, SessionState, StateSource, UnconfirmedCleanup, Worker,
-    WorkerError, WorkerMetadataApplyOutcome, WORKER_CONNECT_RETRY,
+    present_lost_runtime, preserve_durable_worker_metadata, preserve_newer_updated_at,
+    runtime_error, sort_subagents, terminalize_running_subagents, timestamp_now, watch,
+    ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig, DetectorConfigUpdate,
+    DetectorInputs, DetectorScope, LossProof, Mutex, Notify, ObservedAgent, ProtocolError,
+    ResumeSnapshot, RuntimeHandle, RuntimeState, RuntimeWatchIdentity, SessionEntry, SessionId,
+    SessionRecord, SessionRef, SessionRefKind, SessionRegistry, SessionRuntime, SessionState,
+    StateSource, Unavailability, UnconfirmedCleanup, Worker, WorkerError,
+    WorkerMetadataApplyOutcome, WORKER_CONNECT_RETRY,
 };
 use crate::agent::host::RuntimeDefinition;
 use crate::agent::NativeReferenceProvenance;
@@ -1567,7 +1568,7 @@ impl SessionRegistry {
                 return false;
             }
             return !self
-                .insert_unavailable_record(record, RuntimeState::Lost, "worker_unavailable")
+                .insert_lost_record(record, "worker_unavailable", LossProof::Unproven)
                 .await;
         };
 
@@ -1731,7 +1732,7 @@ impl SessionRegistry {
                     (true, Cleanup::Unconfirmed) => RUNTIME_LOST_CLEANUP_UNCONFIRMED,
                 };
                 !self
-                    .insert_unavailable_record(record, RuntimeState::Lost, reason)
+                    .insert_lost_record(record, reason, LossProof::Ended)
                     .await
             }
         }
@@ -1919,8 +1920,11 @@ impl SessionRegistry {
         {
             return;
         }
-        let (_record, entry) =
-            self.unavailable_entry(record, RuntimeState::Conflict, SUPERVISION_AMBIGUOUS);
+        let (_record, entry) = self.unavailable_entry(
+            record,
+            Unavailability::other(RuntimeState::Conflict),
+            SUPERVISION_AMBIGUOUS,
+        );
         let info = entry.info.clone();
         self.install_session_entry(&id, entry).await;
         warn_unavailable(
@@ -1972,7 +1976,14 @@ impl SessionRegistry {
                 return;
             }
         }
-        let _persisted = self.insert_unavailable_record(record, state, reason).await;
+        // A pending classification is never proven ended: its `Lost` comes
+        // from a worker socket that could not be reached.
+        let _persisted = if state == RuntimeState::Lost {
+            self.insert_lost_record(record, reason, LossProof::Unproven)
+                .await
+        } else {
+            self.insert_unavailable_record(record, state, reason).await
+        };
     }
 
     /// Shows the discovered worker of `session_id` as `incompatible` with
@@ -2120,18 +2131,27 @@ impl SessionRegistry {
         {
             return LossClassification::Pending;
         }
-        let (state, reason) = match decision {
+        let (classification, reason) = match decision {
             Unreachable::Unavailable(detail) => {
                 tracing::debug!(session_id = %id.0, detail, "worker supervisor is unavailable; nothing is touched");
-                (RuntimeState::Reconnecting, SUPERVISION_UNAVAILABLE)
+                (
+                    Unavailability::other(RuntimeState::Reconnecting),
+                    SUPERVISION_UNAVAILABLE,
+                )
             }
             Unreachable::Ambiguous(detail) => {
                 tracing::debug!(session_id = %id.0, detail, "unreachable worker may still be live; nothing is touched");
-                (RuntimeState::Conflict, SUPERVISION_AMBIGUOUS)
+                (
+                    Unavailability::other(RuntimeState::Conflict),
+                    SUPERVISION_AMBIGUOUS,
+                )
             }
             Unreachable::Mismatch(detail) => {
                 tracing::debug!(session_id = %id.0, detail, "unreachable worker identity mismatch; failing closed");
-                (RuntimeState::Conflict, IDENTITY_MISMATCH)
+                (
+                    Unavailability::other(RuntimeState::Conflict),
+                    IDENTITY_MISMATCH,
+                )
             }
             Unreachable::Ended {
                 journaled,
@@ -2166,19 +2186,23 @@ impl SessionRegistry {
                 // until the job is retired the session stays unavailable and
                 // the background re-check reaches this classification again.
                 if retired.is_err() {
-                    (RuntimeState::Reconnecting, SUPERVISION_UNAVAILABLE)
+                    (
+                        Unavailability::other(RuntimeState::Reconnecting),
+                        SUPERVISION_UNAVAILABLE,
+                    )
                 } else {
                     let reason = match (journaled, cleanup) {
                         (false, _) => "worker_unavailable",
                         (true, Cleanup::Complete) => RUNTIME_LOST,
                         (true, Cleanup::Unconfirmed) => RUNTIME_LOST_CLEANUP_UNCONFIRMED,
                     };
-                    (RuntimeState::Lost, reason)
+                    (Unavailability::Lost(LossProof::Ended), reason)
                 }
             }
         };
+        let state = classification.state();
         match self
-            .mark_worker_unavailable(id, expected, state, reason)
+            .mark_worker_unavailable(id, expected, classification, reason)
             .await
         {
             super::RuntimeTransitionOutcome::Applied(_) => {
@@ -3303,7 +3327,7 @@ impl SessionRegistry {
         let id = SessionId(record.session_id.clone());
         let Some((worker, snapshot)) = candidate else {
             return !self
-                .insert_unavailable_record(record, RuntimeState::Lost, "worker_unavailable")
+                .insert_lost_record(record, "worker_unavailable", LossProof::Unproven)
                 .await;
         };
 
@@ -3326,11 +3350,7 @@ impl SessionRegistry {
         }
         if recovery_not_advanced(&record, snapshot.worker_id.as_str()) {
             return !self
-                .insert_unavailable_record(
-                    record,
-                    RuntimeState::Lost,
-                    WORKER_GENERATION_NOT_ADVANCED,
-                )
+                .insert_lost_record(record, WORKER_GENERATION_NOT_ADVANCED, LossProof::Unproven)
                 .await;
         }
 
@@ -3440,8 +3460,14 @@ impl SessionRegistry {
             };
             record.info.state_source = StateSource::Process;
         }
-        self.insert_unavailable_record(record, state, "worker_runtime_terminal")
-            .await
+        if state == RuntimeState::Lost {
+            // The worker answered and reported that its runtime ended.
+            self.insert_lost_record(record, "worker_runtime_terminal", LossProof::Ended)
+                .await
+        } else {
+            self.insert_unavailable_record(record, state, "worker_runtime_terminal")
+                .await
+        }
     }
 
     /// Connects every worker socket under the runtime root.
@@ -3671,7 +3697,7 @@ impl SessionRegistry {
         });
         let Some(child) = snapshot.child_process else {
             return !self
-                .insert_unavailable_record(record, RuntimeState::Lost, "worker_child_missing")
+                .insert_lost_record(record, "worker_child_missing", LossProof::Ended)
                 .await;
         };
         let job = match super::Generation::from_record(&record.session_id, &record.runtime) {
@@ -3977,8 +4003,33 @@ impl SessionRegistry {
         state: RuntimeState,
         reason: &str,
     ) -> bool {
+        self.insert_classified_record(record, Unavailability::other(state), reason)
+            .await
+    }
+
+    /// [`Self::insert_unavailable_record`] for a `Lost` runtime, with what the
+    /// caller proved about its end.
+    #[must_use = "an uncommitted classification must keep the session pending"]
+    pub(super) async fn insert_lost_record(
+        &self,
+        record: SessionRecord,
+        reason: &str,
+        proof: LossProof,
+    ) -> bool {
+        self.insert_classified_record(record, Unavailability::Lost(proof), reason)
+            .await
+    }
+
+    #[must_use = "an uncommitted classification must keep the session pending"]
+    async fn insert_classified_record(
+        &self,
+        record: SessionRecord,
+        classification: Unavailability,
+        reason: &str,
+    ) -> bool {
+        let state = classification.state();
         let id = SessionId(record.session_id.clone());
-        let (classified, entry) = self.unavailable_entry(record.clone(), state, reason);
+        let (classified, entry) = self.unavailable_entry(record.clone(), classification, reason);
         let info = entry.info.clone();
         if let Err(error) = self.write_session_record(classified).await {
             tracing::warn!(session_id = %id.0, error = %error, "failed to persist runtime classification");
@@ -4030,7 +4081,7 @@ impl SessionRegistry {
         }
         let (_, placeholder) = self.unavailable_entry(
             record.clone(),
-            RuntimeState::Reconnecting,
+            Unavailability::other(RuntimeState::Reconnecting),
             SUPERVISION_UNAVAILABLE,
         );
         let info = placeholder.info.clone();
@@ -4067,9 +4118,10 @@ impl SessionRegistry {
     fn unavailable_entry(
         &self,
         mut record: SessionRecord,
-        state: RuntimeState,
+        classification: Unavailability,
         reason: &str,
     ) -> (SessionRecord, SessionEntry) {
+        let state = classification.state();
         let now = timestamp_now();
         let runtime = record.info.runtime.get_or_insert(SessionRuntime {
             state,
@@ -4089,6 +4141,9 @@ impl SessionRegistry {
         }
         // A runtime that cannot be reached holds no background snapshot it can vouch for.
         record.info.background = None;
+        if let Some(proof) = classification.proof() {
+            present_lost_runtime(&mut record.info, proof, record.desired_state);
+        }
         record.info.updated_at = now;
         let recovery = record.recovery.clone();
         let input_rules = recovery.as_ref().map_or_else(
@@ -13219,6 +13274,144 @@ handler = "codex-hook-v1"
             assert_eq!(fixture.supervisor.retired(), vec![id]);
         }
 
+        /// Rewrites the stored record of `session_id` into the shape release 0.35
+        /// committed for a lost runtime: `running`, `working`, runtime `lost`.
+        fn store_as_running_lost(root: &Path, session_id: &str) {
+            let store = Store::new(root.join("data/metadata.jsonl"));
+            let mut record = store
+                .load_sessions()
+                .expect("load store")
+                .into_iter()
+                .find(|record| record.session_id == session_id)
+                .expect("record");
+            record.info.state = protocol::SessionState::Running;
+            record.info.activity = Some(protocol::AgentActivity::Working);
+            record.runtime.state = RuntimeState::Lost;
+            let runtime = record.info.runtime.as_mut().expect("runtime");
+            runtime.state = RuntimeState::Lost;
+            runtime.loss_reason = Some(RUNTIME_LOST.to_owned());
+            store.record_session(&record).expect("store running+lost");
+        }
+
+        #[tokio::test]
+        async fn a_running_lost_record_with_an_ended_job_is_failed_by_the_next_start() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let lost = Marked::spawn(&fixture.root, "runtime-s-1330");
+            persist_record(&fixture.root, "s-1330", Some("runtime-s-1330"));
+            store_as_running_lost(&fixture.root, "s-1330");
+            write_live_journal(
+                &fixture.root,
+                "s-1330",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-1330"),
+            );
+            let id = service_id("s-1330", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let info = fixture
+                .registry
+                .inspect(&SessionId("s-1330".to_owned()))
+                .await
+                .expect("inspect");
+            assert_eq!(info.state, protocol::SessionState::Failed);
+            assert_eq!(info.state_source, protocol::StateSource::Process);
+            assert_eq!(info.activity, None);
+            let runtime = info.runtime.expect("runtime");
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            lost.wait_gone().await;
+            let stored = Store::new(fixture.root.join("data/metadata.jsonl"))
+                .load_sessions()
+                .expect("load store")
+                .into_iter()
+                .find(|record| record.session_id == "s-1330")
+                .expect("record");
+            assert_eq!(stored.info.state, protocol::SessionState::Failed);
+            assert_eq!(stored.info.activity, None);
+            let stop = fixture
+                .registry
+                .stop(&SessionId("s-1330".to_owned()))
+                .await
+                .expect("stop");
+            assert!(!stop.stopped);
+        }
+
+        #[tokio::test]
+        async fn a_lost_record_without_a_generation_keeps_its_state_and_loses_its_activity() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let mut record = persist_record(&fixture.root, "s-1331", Some("runtime-s-1331"));
+            record.runtime.service_id = None;
+            record.runtime.generation = None;
+            record.runtime.executable = None;
+            record.info.activity = Some(protocol::AgentActivity::Working);
+            Store::new(fixture.root.join("data/metadata.jsonl"))
+                .record_session(&record)
+                .expect("store record without a generation");
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let id = SessionId("s-1331".to_owned());
+            let info = fixture.registry.inspect(&id).await.expect("inspect");
+            let runtime = info.runtime.as_ref().expect("runtime");
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.loss_reason.as_deref(), Some("worker_unavailable"));
+            assert_eq!(
+                info.state,
+                protocol::SessionState::Running,
+                "nothing proves the end"
+            );
+            assert_eq!(info.activity, None);
+            let error = fixture
+                .registry
+                .stop(&id)
+                .await
+                .expect_err("an unproven loss is refused");
+            assert_eq!(error.code, "session_runtime_lost");
+        }
+
+        #[tokio::test]
+        async fn a_failed_lost_session_keeps_its_state_across_a_second_start() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            Marked::spawn(&fixture.root, "runtime-s-1332");
+            persist_record(&fixture.root, "s-1332", Some("runtime-s-1332"));
+            store_as_running_lost(&fixture.root, "s-1332");
+            write_live_journal(
+                &fixture.root,
+                "s-1332",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-1332"),
+            );
+            let id = service_id("s-1332", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id, present(ServiceState::Failed, None));
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("first start");
+            let mut events = fixture.registry.subscribe();
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("second start");
+
+            let info = fixture
+                .registry
+                .inspect(&SessionId("s-1332".to_owned()))
+                .await
+                .expect("inspect");
+            assert_eq!(info.state, protocol::SessionState::Failed);
+            assert_eq!(info.runtime.expect("runtime").state, RuntimeState::Lost);
+            let _ = &mut events;
+        }
+
         /// Generations of [`FORKING_HOLDER`] after the first: the sweep's
         /// first two passes each end one and leave the next, so its last
         /// allowed pass ends the last one.
@@ -15210,7 +15403,7 @@ generation "$1"
                 .mark_worker_unavailable(
                     &id,
                     &identity,
-                    RuntimeState::Conflict,
+                    crate::session::Unavailability::other(RuntimeState::Conflict),
                     SUPERVISION_AMBIGUOUS,
                 )
                 .await;
@@ -18660,12 +18853,20 @@ generation "$1"
                 unbound.runtime.service_id = None;
                 unbound.runtime.generation = None;
                 unbound.runtime.executable = None;
-                assert!(
+                // A lost runtime that is not proven ended keeps its session
+                // state, so a stop is still refused with the runtime's code.
+                let committed = if state == RuntimeState::Lost {
+                    fixture
+                        .registry
+                        .insert_lost_record(unbound, reason, crate::session::LossProof::Unproven)
+                        .await
+                } else {
                     fixture
                         .registry
                         .insert_unavailable_record(unbound, state, reason)
                         .await
-                );
+                };
+                assert!(committed);
                 let before = stop_intent_of(&fixture.root, session);
 
                 let error = fixture
@@ -18992,6 +19193,135 @@ generation "$1"
                 .expect("the logical record is kept");
             assert_eq!(stored.runtime.state, RuntimeState::Lost);
             assert_eq!(stored.runtime.reason.as_deref(), Some(RUNTIME_LOST));
+        }
+
+        #[tokio::test]
+        async fn a_proven_loss_presents_a_failed_session_that_still_reports_the_lost_runtime() {
+            let fixture = fixture(LONG_CONNECT);
+            let (created, _job, descendant) = fixture.create().await;
+            {
+                let mut sessions = fixture.registry.inner.sessions.lock().await;
+                sessions
+                    .get_mut(&created.id)
+                    .expect("session entry")
+                    .info
+                    .activity = Some(protocol::AgentActivity::Working);
+            }
+            let ids = vec![created.id.clone()];
+            let wait = protocol::SessionWaitTurnParams::new(
+                ids,
+                vec![protocol::SessionTurnEventKind::Exited],
+                None,
+                Some(u32::try_from(HANG_GUARD.as_millis()).expect("guard fits")),
+            )
+            .expect("wait params");
+            let waiter = {
+                let registry = fixture.registry.clone();
+                tokio::spawn(async move { registry.wait_turn(&wait).await })
+            };
+            let mut events = fixture.registry.subscribe();
+
+            fixture.crash(&created.id).await;
+            let runtime = fixture.wait_for(&created.id, RuntimeState::Lost).await;
+
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            let info = fixture
+                .registry
+                .inspect(&created.id)
+                .await
+                .expect("inspect");
+            assert_eq!(info.state, protocol::SessionState::Failed);
+            assert_eq!(info.state_source, protocol::StateSource::Process);
+            assert_eq!(info.activity, None);
+            assert_eq!(info.exit_code, None);
+            let listed = fixture
+                .registry
+                .list()
+                .await
+                .into_iter()
+                .find(|session| session.id == created.id)
+                .expect("listed");
+            assert_eq!(listed.state, protocol::SessionState::Failed);
+            assert_eq!(listed.activity, None);
+            let stored = Store::new(fixture.root.join("data/metadata.jsonl"))
+                .load_sessions()
+                .expect("load store")
+                .into_iter()
+                .find(|record| record.session_id == created.id.0)
+                .expect("the logical record is kept");
+            assert_eq!(stored.info.state, protocol::SessionState::Failed);
+            assert_eq!(stored.info.activity, None);
+
+            let lost_event = loop {
+                let event = tokio::time::timeout(HANG_GUARD, events.recv())
+                    .await
+                    .expect("the lost event arrives")
+                    .expect("event stream");
+                let text = serde_json::to_string(&event).expect("event json");
+                if text.contains(crate::session::event::SESSION_RUNTIME_LOST) {
+                    break text;
+                }
+            };
+            assert!(
+                lost_event.contains("\"state\":\"failed\""),
+                "the lost event carries the failed session: {lost_event}"
+            );
+
+            let waited = tokio::time::timeout(HANG_GUARD, waiter)
+                .await
+                .expect("wait-turn ends")
+                .expect("join")
+                .expect("wait-turn result");
+            assert_eq!(
+                waited.event.map(|event| event.kind),
+                Some(protocol::SessionTurnEventKind::Exited)
+            );
+
+            let stopped = fixture.registry.stop(&created.id).await.expect("stop");
+            assert!(!stopped.stopped, "an ended session has nothing to stop");
+            let resize = fixture
+                .registry
+                .resize(&created.id, 100, 30)
+                .await
+                .expect_err("resize is refused");
+            assert_eq!(resize.code, "session_runtime_lost");
+            let input = fixture
+                .registry
+                .input(protocol::SessionInputParams {
+                    session_id: created.id.clone(),
+                    text: "x".to_owned(),
+                    wait: None,
+                })
+                .await
+                .expect_err("input is refused");
+            assert_eq!(input.code, "session_runtime_lost");
+            wait_gone(descendant).await;
+        }
+
+        #[tokio::test]
+        async fn a_proven_loss_after_a_stop_intent_presents_a_stopped_session() {
+            let fixture = fixture(LONG_CONNECT);
+            let (created, _job, descendant) = fixture.create().await;
+            {
+                let mut sessions = fixture.registry.inner.sessions.lock().await;
+                // A stop that gave up waiting leaves its intent behind.
+                sessions
+                    .get_mut(&created.id)
+                    .expect("session entry")
+                    .desired_state = crate::store::DesiredState::Stopped;
+            }
+
+            fixture.crash(&created.id).await;
+            fixture.wait_for(&created.id, RuntimeState::Lost).await;
+
+            let info = fixture
+                .registry
+                .inspect(&created.id)
+                .await
+                .expect("inspect");
+            assert_eq!(info.state, protocol::SessionState::Stopped);
+            assert_eq!(info.activity, None);
+            wait_gone(descendant).await;
         }
 
         #[tokio::test]
@@ -19974,6 +20304,143 @@ generation "$1"
                 worker.server_task.abort();
                 drop(worker.reporter);
             }
+        }
+
+        #[tokio::test]
+        async fn a_failed_lost_record_whose_worker_answers_is_adopted_back_to_running() {
+            let previous = &SHAPES[0];
+            let root = temp_root();
+            let runtime_root = root.join("runtime/workers");
+            let session_id = "s-1330";
+            let worker = spawn_launch_worker(
+                &root,
+                &runtime_root,
+                session_id,
+                "worker-n1",
+                STORED_REFERENCE,
+            )
+            .await;
+            let store_path = write_previous_store(
+                &root,
+                previous,
+                session_id,
+                "worker-n1",
+                worker.worker_instance_id.as_str(),
+                worker.child_pid,
+            );
+            // The record a previous start committed for a proven loss.
+            let store = Store::new(store_path.clone());
+            let mut record = store
+                .load_sessions()
+                .expect("load store")
+                .into_iter()
+                .find(|record| record.session_id == session_id)
+                .expect("record");
+            record.info.state = protocol::SessionState::Failed;
+            record.info.activity = None;
+            record.runtime.state = RuntimeState::Lost;
+            record.info.runtime = Some(protocol::SessionRuntime {
+                state: RuntimeState::Lost,
+                runtime_generation: protocol::RuntimeGeneration::new(1),
+                worker_id: record.runtime.worker_id.clone(),
+                worker_instance_id: record.runtime.worker_instance_id.clone(),
+                started_at: None,
+                last_connected_at: None,
+                loss_reason: Some("runtime_lost".to_owned()),
+            });
+            store.record_session(&record).expect("store failed+lost");
+            let registry = upgraded_registry(
+                &root,
+                store_path,
+                previous,
+                Arc::new(RetryInspector::default()),
+            );
+            drop(worker.controller);
+
+            Box::pin(registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let session = runtime_state(&registry, &SessionId(session_id.to_owned())).await;
+            let runtime = session.runtime.expect("runtime");
+            assert_eq!(
+                runtime.state,
+                RuntimeState::Live,
+                "{:?}",
+                runtime.loss_reason
+            );
+            assert_eq!(runtime.loss_reason, None);
+            assert_eq!(session.state, protocol::SessionState::Running);
+            worker.server_task.abort();
+            drop(worker.reporter);
+        }
+
+        #[tokio::test]
+        async fn a_recovery_whose_previous_worker_still_answers_is_an_unproven_loss() {
+            let previous = &SHAPES[0];
+            let root = temp_root();
+            let runtime_root = root.join("runtime/workers");
+            let session_id = "s-1333";
+            let worker = spawn_launch_worker(
+                &root,
+                &runtime_root,
+                session_id,
+                "worker-n1",
+                STORED_REFERENCE,
+            )
+            .await;
+            let store_path = write_previous_store(
+                &root,
+                previous,
+                session_id,
+                "worker-n1",
+                worker.worker_instance_id.as_str(),
+                worker.child_pid,
+            );
+            let store = Store::new(store_path.clone());
+            let mut record = store
+                .load_sessions()
+                .expect("load store")
+                .into_iter()
+                .find(|record| record.session_id == session_id)
+                .expect("record");
+            record.info.activity = Some(protocol::AgentActivity::Working);
+            record.transaction = Some(crate::store::SessionTransaction {
+                id: "recover-1".to_owned(),
+                kind: crate::store::TransactionKind::Recover,
+                phase: "requested".to_owned(),
+                previous_worker_id: Some("worker-n1".to_owned()),
+                previous_worker_instance_id: None,
+                daemon_instance_id: None,
+            });
+            store.record_session(&record).expect("store recovery");
+            let registry = upgraded_registry(
+                &root,
+                store_path,
+                previous,
+                Arc::new(RetryInspector::default()),
+            );
+            drop(worker.controller);
+
+            Box::pin(registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let session = runtime_state(&registry, &SessionId(session_id.to_owned())).await;
+            let runtime = session.runtime.as_ref().expect("runtime");
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(
+                runtime.loss_reason.as_deref(),
+                Some(super::super::WORKER_GENERATION_NOT_ADVANCED)
+            );
+            assert_eq!(
+                session.state,
+                protocol::SessionState::Running,
+                "the previous worker still answers, so nothing proves the end"
+            );
+            assert_eq!(session.activity, None);
+            worker.server_task.abort();
+            drop(worker.reporter);
         }
 
         #[tokio::test]

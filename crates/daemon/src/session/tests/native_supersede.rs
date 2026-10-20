@@ -2225,7 +2225,12 @@ async fn a_worker_crash_after_a_journaled_switch_keeps_the_switch_when_the_worke
 
     let outcome = rig
         .registry
-        .mark_worker_unavailable(rig.id(), &identity, RuntimeState::Lost, "worker_lost")
+        .mark_worker_unavailable(
+            rig.id(),
+            &identity,
+            crate::session::Unavailability::Lost(crate::session::LossProof::Ended),
+            "worker_lost",
+        )
         .await;
 
     assert!(matches!(

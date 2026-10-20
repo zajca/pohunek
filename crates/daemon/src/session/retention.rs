@@ -487,22 +487,24 @@ fn count<T>(items: impl Iterator<Item = T>) -> u32 {
 
 /// Returns the rule that applies to `session` and the timestamp it ages from.
 fn retention_reason(session: &SessionInfo) -> Option<(SessionRetentionReason, &str)> {
+    let runtime = session.runtime.as_ref();
+    if let Some(runtime) = runtime.filter(|runtime| runtime.state == RuntimeState::Lost) {
+        // A lost runtime ages from the last time the daemon reached it, which
+        // is when it actually became unusable rather than when its record
+        // last moved. The check precedes the terminal one: a proven-lost
+        // session is `failed` yet still resumable, so it keeps the lost TTL.
+        let timestamp = runtime
+            .last_connected_at
+            .as_deref()
+            .unwrap_or(&session.updated_at);
+        return Some((SessionRetentionReason::Lost, timestamp));
+    }
     if session.state.is_terminal() {
         // A terminal session is finished regardless of its runtime: `resume`
         // refuses it, so the shorter terminal grace is the right one.
         return Some((SessionRetentionReason::Terminal, &session.updated_at));
     }
-    let runtime = session.runtime.as_ref()?;
-    if runtime.state != RuntimeState::Lost {
-        return None;
-    }
-    // A lost runtime ages from the last time the daemon reached it, which is
-    // when it actually became unusable rather than when its record last moved.
-    let timestamp = runtime
-        .last_connected_at
-        .as_deref()
-        .unwrap_or(&session.updated_at);
-    Some((SessionRetentionReason::Lost, timestamp))
+    None
 }
 
 /// Returns the age of `timestamp` at `now`, or `None` when it cannot be read.
@@ -789,21 +791,30 @@ mod tests {
         let between = TimeDuration::seconds(i64::from(policy.terminal_ttl_secs) + 1);
         let past_lost = TimeDuration::seconds(i64::from(policy.lost_ttl_secs) + 1);
 
-        let mut younger = session("s-lost-young", SessionState::Running, stamp(between));
-        younger.runtime = Some(runtime(RuntimeState::Lost, Some(stamp(between))));
-        let mut older = session("s-lost-old", SessionState::Running, stamp(past_lost));
-        older.runtime = Some(runtime(RuntimeState::Lost, Some(stamp(past_lost))));
-        older.worktree_path = Some(PathBuf::from("/data/worktrees/s-lost-old"));
+        // A proven loss presents `failed`, an unproven one keeps `running`;
+        // both age under the lost grace.
+        for (label, state) in [
+            ("failed", SessionState::Failed),
+            ("running", SessionState::Running),
+        ] {
+            let young_id = format!("s-lost-young-{label}");
+            let old_id = format!("s-lost-old-{label}");
+            let mut younger = session(&young_id, state, stamp(between));
+            younger.runtime = Some(runtime(RuntimeState::Lost, Some(stamp(between))));
+            let mut older = session(&old_id, state, stamp(past_lost));
+            older.runtime = Some(runtime(RuntimeState::Lost, Some(stamp(past_lost))));
+            older.worktree_path = Some(PathBuf::from(format!("/data/worktrees/{old_id}")));
 
-        let selected = select_candidates(&[younger, older], &policy, now());
+            let selected = select_candidates(&[younger, older], &policy, now());
 
-        assert_eq!(selected.len(), 1, "{selected:?}");
-        assert_eq!(selected[0].session_id.0, "s-lost-old");
-        assert_eq!(selected[0].reason, SessionRetentionReason::Lost);
-        assert_eq!(
-            selected[0].worktree_path.as_deref(),
-            Some(std::path::Path::new("/data/worktrees/s-lost-old"))
-        );
+            assert_eq!(selected.len(), 1, "{label}: {selected:?}");
+            assert_eq!(selected[0].session_id.0, old_id);
+            assert_eq!(selected[0].reason, SessionRetentionReason::Lost);
+            assert_eq!(
+                selected[0].worktree_path.as_deref(),
+                Some(std::path::Path::new(&format!("/data/worktrees/{old_id}")))
+            );
+        }
     }
 
     #[test]

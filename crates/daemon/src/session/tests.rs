@@ -8182,7 +8182,7 @@ async fn lost_transition_preserves_worker_metadata_committed_ahead_of_memory() {
             .mark_worker_unavailable(
                 &created.id,
                 &identity,
-                RuntimeState::Lost,
+                crate::session::Unavailability::Lost(crate::session::LossProof::Ended),
                 crate::session::supervision::RUNTIME_LOST,
             )
             .await,
@@ -13725,7 +13725,7 @@ async fn stale_runtime_watchers_emit_nothing_during_new_runtime_commit() {
         .mark_worker_unavailable(
             &created.id,
             &expected_old,
-            RuntimeState::Lost,
+            crate::session::Unavailability::Lost(crate::session::LossProof::Ended),
             crate::session::supervision::RUNTIME_LOST,
         )
         .await;
@@ -14033,7 +14033,7 @@ async fn lost_transition_retries_precommit_failure_before_single_event() {
             .mark_worker_unavailable(
                 &created.id,
                 &expected,
-                RuntimeState::Lost,
+                crate::session::Unavailability::Lost(crate::session::LossProof::Ended),
                 crate::session::supervision::RUNTIME_LOST,
             )
             .await;
@@ -14319,7 +14319,7 @@ async fn assert_lost_transition_applied(
             .mark_worker_unavailable(
                 id,
                 expected,
-                RuntimeState::Lost,
+                crate::session::Unavailability::Lost(crate::session::LossProof::Ended),
                 crate::session::supervision::RUNTIME_LOST,
             )
             .await

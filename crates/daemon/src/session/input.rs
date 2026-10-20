@@ -8,11 +8,11 @@ use crate::agent::host::{RuntimeDefinition, RuntimeHost};
 use crate::runtime::WriteReservation;
 
 use super::{
-    broadcast, event_concerns_other_session, runtime_loss_reason, session_not_found,
-    session_not_running, unavailable_runtime_error, warn, worker_error_to_protocol,
-    ActivityEvidence, AgentActivity, Duration, ErrorClass, InputRules, LaunchCommand,
-    LaunchCommandPlan, ProtocolError, ResolvedAgent, RuntimeHandle, RuntimeRef, SessionEntry,
-    SessionId, SessionInputParams, SessionInputResult, SessionInputWait, SessionRegistry,
+    broadcast, event_concerns_other_session, not_running_refusal, runtime_loss_reason,
+    session_not_found, unavailable_runtime_error, warn, worker_error_to_protocol, ActivityEvidence,
+    AgentActivity, Duration, ErrorClass, InputRules, LaunchCommand, LaunchCommandPlan,
+    ProtocolError, ResolvedAgent, RuntimeHandle, RuntimeRef, SessionEntry, SessionId,
+    SessionInputParams, SessionInputResult, SessionInputWait, SessionRegistry,
     SessionRegistryConfig, SessionState, Worker,
 };
 
@@ -554,7 +554,7 @@ fn input_runtime_identity(
     session_id: &SessionId,
 ) -> Result<SessionRuntimeIdentity, ProtocolError> {
     if entry.info.state != SessionState::Running {
-        return Err(session_not_running(session_id));
+        return Err(not_running_refusal(session_id, entry));
     }
     let runtime = entry
         .info

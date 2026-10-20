@@ -1364,8 +1364,9 @@ fn live_journal_sessions(
 
 /// Whether the record already classifies the runtime as ended.
 ///
-/// A lost runtime keeps the session's `running` state on disk, so the
-/// persisted runtime state decides: the upgrade is not what loses it.
+/// A lost runtime may keep the session's `running` state on disk (a loss that
+/// was not proven ended), so the persisted runtime state decides: the upgrade
+/// is not what loses it.
 fn runtime_ended(record: &SessionRecord) -> bool {
     let ended = |state| matches!(state, RuntimeState::Lost | RuntimeState::Terminal);
     ended(record.runtime.state)

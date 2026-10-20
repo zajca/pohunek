@@ -374,7 +374,8 @@ A manager agent that starts sessions and follows them waits for turn events
 instead of polling. A turn event is a finished turn (`turn_completed`), an agent
 blocked on the owner (`agent_blocked`), a pending approval
 (`approval_required`), or the session entering `stopped`, `done`, or `failed`
-(`exited`). Events are recorded whatever the notification policy keeps in the
+(`exited`); a session whose runtime was lost with an observed end enters
+`failed`, so it records `exited` and ends the wait. Events are recorded whatever the notification policy keeps in the
 inbox. `turn_completed`, `agent_blocked`, and `approval_required` are recorded
 when the attention debounce window (`attention_debounce_secs`, 5 seconds by
 default) after the agent's report ends, so a stop followed at once by resumed
