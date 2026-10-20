@@ -37,6 +37,12 @@ export type HostRecord =
      * and an older reader decodes the field as absent.
      */
     local?: boolean;
+    /**
+     * Why the probe of this record failed, set only on the local record when
+     * its own daemon did not answer. Omitted otherwise, so a peer record is
+     * unchanged on the wire.
+     */
+    reason?: string;
   }
   & (
     | {

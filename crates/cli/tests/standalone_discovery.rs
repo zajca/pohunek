@@ -561,6 +561,22 @@ fn a_failed_probe_of_this_machine_reads_unreachable() {
         local["classification"], "unreachable",
         "a failed self-probe is never a healthy default: {local}"
     );
+    assert!(
+        local["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "the record says why the probe failed: {local}"
+    );
+    let reachable = discover_redirected(
+        &status_with_self(Some(SELF_IP)),
+        pin_overlay::serve_health(),
+    );
+    assert!(
+        reachable
+            .iter()
+            .all(|record| record.get("reason").is_none()),
+        "no record carries a reason when the probe succeeds: {reachable:?}"
+    );
 }
 
 #[test]

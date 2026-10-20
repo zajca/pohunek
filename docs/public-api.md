@@ -863,6 +863,9 @@ wire shapes are the exported `crates/protocol` structs.
   machine that enumerated the hosts, not a peer; its `peer_id` is `null` and its
   class comes from a health probe of its own overlay address. A reader that
   predates the field ignores it and shows the record as one more host.
+- `reason`: optional string, serialized only when set. A `local` record whose
+  probe failed carries the probe error next to `unreachable`; it is never set on
+  a peer record.
 - `name` and `fqdn`: optional display selectors, never sufficient by themselves
   to bypass collision checks.
 - The flattened host class remains `candidate`, `reachable_daemon`,

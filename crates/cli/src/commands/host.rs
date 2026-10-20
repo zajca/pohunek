@@ -122,7 +122,10 @@ fn render_records_human(records: &[HostRecord]) -> String {
     let rows = records
         .iter()
         .map(|record| {
-            let (status, version) = class_columns(&record.class);
+            let (status, mut version) = class_columns(&record.class);
+            if let Some(reason) = &record.reason {
+                version = format!("probe failed: {reason}");
+            }
             let status = match (record.local, &record.class) {
                 (true, HostClass::ReachableDaemon { .. }) => LOCAL_STATUS.to_owned(),
                 (true, _) => format!("{LOCAL_STATUS}:{status}"),
@@ -443,6 +446,7 @@ mod tests {
                 overlay: "netbird".to_owned(),
                 peer_id: Some("100.92.30.40".to_owned()),
                 local: false,
+                reason: None,
                 class: HostClass::ReachableDaemon {
                     daemon_version: "0.1.0".to_owned(),
                 },
@@ -455,6 +459,7 @@ mod tests {
                 overlay: "netbird".to_owned(),
                 peer_id: None,
                 local: false,
+                reason: None,
                 class: HostClass::Candidate,
             },
         ];

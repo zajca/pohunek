@@ -50,8 +50,9 @@ own overlay name, with route `local`. In `--json` it is one record per overlay
 that reports the machine's identity, marked `"local": true`, with `peer_id`
 `null`; peer records carry no `local` key. Its classification comes from the
 same health probe the peers get, sent to the machine's own overlay address and
-daemon port: a daemon that does not answer there reads `unreachable` (the reason
-is logged at WARN), and an overlay that reports no address leaves a `candidate`.
+daemon port: a daemon that does not answer there reads `unreachable` with the
+probe error in the record's `reason` (also logged at WARN by the daemon, and shown
+in the VERSION column as `probe failed: <reason>`), and an overlay that reports no address leaves a `candidate`.
 The status column shows `local` for a reachable daemon and `local:<status>`
 otherwise. When the overlay does not report the machine's identity within the 5 s
 connect timeout, no local record is listed and the peers still print. `--all-hosts`

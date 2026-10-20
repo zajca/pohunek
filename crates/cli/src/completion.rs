@@ -1008,6 +1008,7 @@ mod tests {
             overlay: "netbird".to_owned(),
             peer_id: Some(format!("peer-{name}")),
             local: false,
+            reason: None,
             class,
         }
     }

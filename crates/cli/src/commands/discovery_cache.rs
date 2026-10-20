@@ -315,6 +315,7 @@ mod tests {
             overlay: "netbird".to_owned(),
             peer_id: Some("100.64.0.1".to_owned()),
             local: false,
+            reason: None,
             class: protocol::HostClass::Unreachable,
         }
     }

@@ -323,7 +323,7 @@ async fn local_records(
             let probe_timeout = options
                 .probe_timeout()
                 .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
-            let class = match addr {
+            let (class, reason) = match addr {
                 Some(addr) => {
                     classify_local(
                         &identity.overlay,
@@ -334,7 +334,7 @@ async fn local_records(
                     )
                     .await
                 }
-                None => HostClass::Candidate,
+                None => (HostClass::Candidate, None),
             };
             HostRecord {
                 name: identity
@@ -348,6 +348,7 @@ async fn local_records(
                 overlay: identity.overlay.to_string(),
                 peer_id: None,
                 local: true,
+                reason,
                 class,
             }
         })
@@ -361,11 +362,11 @@ async fn classify_local(
     timeout: Duration,
     origin: Option<&RequestOrigin>,
     range: ProtocolVersionRange,
-) -> HostClass {
+) -> (HostClass, Option<String>) {
     let reason = match tokio::time::timeout(timeout, probe_health(addr, origin, range)).await {
         Ok(Ok(response)) => match classify_response(&response, range) {
             HostClass::Unreachable => "the daemon answered with an error".to_owned(),
-            class => return class,
+            class => return (class, None),
         },
         Ok(Err(error)) => error.to_string(),
         Err(_elapsed) => format!("no answer within {timeout:?}"),
@@ -376,7 +377,7 @@ async fn classify_local(
         reason = %reason,
         "the local daemon did not answer its own overlay probe"
     );
-    HostClass::Unreachable
+    (HostClass::Unreachable, Some(reason))
 }
 
 /// Classify aggregated overlay peer snapshots.
@@ -413,6 +414,7 @@ async fn discover_peers(
                 overlay: peer.overlay.to_string(),
                 peer_id: peer.peer_id,
                 local: false,
+                reason: None,
                 class,
             }
         })

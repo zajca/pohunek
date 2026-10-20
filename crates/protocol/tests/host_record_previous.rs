@@ -41,6 +41,7 @@ fn record(local: bool, class: HostClass) -> HostRecord {
         overlay: "netbird".to_owned(),
         peer_id: None,
         local,
+        reason: None,
         class,
     }
 }
@@ -68,8 +69,11 @@ fn the_previous_release_decodes_a_local_record_in_every_classification() {
         (HostClass::Candidate, PreviousHostClass::Candidate),
     ];
     for (class, previous_class) in cases {
-        let wire = serde_json::to_value(record(true, class)).expect("serialize the record");
+        let mut with_reason = record(true, class);
+        with_reason.reason = Some("connection refused".to_owned());
+        let wire = serde_json::to_value(with_reason).expect("serialize the record");
         assert_eq!(wire["local"], json!(true));
+        assert_eq!(wire["reason"], json!("connection refused"));
         let previous: PreviousHostRecord =
             serde_json::from_value(wire).expect("the previous release decodes the record");
         assert_eq!(previous.name.as_deref(), Some("self-box"));
@@ -85,6 +89,7 @@ fn the_previous_release_decodes_a_local_record_in_every_classification() {
 fn a_peer_record_has_no_local_key_on_the_wire() {
     let wire = serde_json::to_value(record(false, HostClass::Candidate)).expect("serialize");
     assert!(wire.get("local").is_none(), "{wire}");
+    assert!(wire.get("reason").is_none(), "{wire}");
     let current: HostRecord = serde_json::from_value(wire).expect("decode without `local`");
     assert!(!current.local);
 }
