@@ -481,6 +481,7 @@ impl<'a> Engine<'a> {
     ) -> Result<InstallReport, Error> {
         let _transaction = self.transaction().await?;
         let layout = install_preflight(self.context, prefix)?;
+        layout::operator_release(&layout, from)?;
         let plan = install_plan(self.store.load()?, prefix, version)?;
         // The discovery environment is judged, and discovery run, before a
         // foreign pending transaction is rolled back, so a hostile environment
@@ -802,6 +803,18 @@ impl<'a> Engine<'a> {
             }
             Plan::Resume(_) | Plan::RollBack(_) => None,
         };
+        // The source is staged and run on every upgrade, so it is verified
+        // whether or not the daemon swaps.
+        let layout = match (&installed, plan) {
+            (Some(config), _) => Some(config.layout().clone()),
+            (None, Plan::Resume(record) | Plan::RollBack(record)) => {
+                Some(install_layout(&record.prefix)?)
+            }
+            (None, Plan::Fresh) => None,
+        };
+        let release = layout
+            .map(|layout| layout::operator_release(&layout, from))
+            .transpose()?;
         if !swaps_daemon(
             plan,
             installed.as_ref().map(ServiceConfig::active_version),
@@ -809,6 +822,7 @@ impl<'a> Engine<'a> {
         ) {
             return Ok((None, None));
         }
+        let release = release.expect("a swapping plan has an installation to verify against");
         let job = installed_job_path(self.context).await?;
         let warnings = job_warnings(self.context, &job);
         let basis = match (&installed, plan) {
@@ -819,16 +833,6 @@ impl<'a> Engine<'a> {
             }
         };
         let acceptance = self.acceptance(&basis)?;
-        let layout = match (&installed, plan) {
-            (Some(config), _) => config.layout().clone(),
-            (None, Plan::Resume(record) | Plan::RollBack(record)) => {
-                install_layout(&record.prefix)?
-            }
-            (None, Plan::Fresh) => {
-                unreachable!("a fresh plan loads the installed configuration")
-            }
-        };
-        let release = layout::operator_release(&layout, from)?;
         let gated = preflight::gate_upgrade(
             &*self.preflight,
             self.context,

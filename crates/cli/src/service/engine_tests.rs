@@ -9095,6 +9095,60 @@ async fn a_release_directory_that_resolves_into_a_version_directory_is_judged_as
     );
 }
 
+/// Makes every binary of `dir` leave a marker when it runs.
+fn mark_runs(dir: &Path, marker: &Path) {
+    for binary in layout::BINARIES {
+        pohunek_test_support::fs::write_executable(
+            dir.join(binary),
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .expect("marking binary");
+    }
+}
+
+#[tokio::test]
+async fn an_upgrade_without_a_daemon_swap_runs_nothing_from_an_untrusted_source_version_directory()
+{
+    for tamper in Tamper::ALL {
+        let harness = Harness::new();
+        harness.install(V1).await.expect("install");
+        let source = harness.layout().version_dir(V1).expect("version dir");
+        let marker = harness.root.join("ran");
+        mark_runs(&source, &marker);
+        let named = tamper.apply(&source);
+
+        let error = harness
+            .engine()
+            .upgrade(&source, V1)
+            .await
+            .expect_err("an untrusted source is refused");
+
+        assert_untrusted_version(&error, &named);
+        assert!(!marker.exists(), "{tamper:?}: a source binary ran");
+    }
+}
+
+#[tokio::test]
+async fn an_install_from_an_untrusted_version_directory_runs_nothing_from_it() {
+    for tamper in Tamper::ALL {
+        let harness = Harness::new();
+        let source = harness.layout().version_dir(V1).expect("version dir");
+        crate::service::context::tests::make_dirs(&harness.root, &source);
+        let marker = harness.root.join("ran");
+        mark_runs(&source, &marker);
+        let named = tamper.apply(&source);
+
+        let error = harness
+            .engine()
+            .install(&source, &harness.prefix(), V1)
+            .await
+            .expect_err("an untrusted source is refused");
+
+        assert_untrusted_version(&error, &named);
+        assert!(!marker.exists(), "{tamper:?}: a source binary ran");
+    }
+}
+
 /// Counts the plans the setup asks the release daemon for.
 #[derive(Debug, Default)]
 struct CountingPlanner(AtomicUsize);
