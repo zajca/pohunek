@@ -788,6 +788,9 @@ impl SessionRegistry {
                 .collect::<Vec<_>>();
             let projected = apply_identity_projection(entry, &candidate, &projection, snapshot);
             if projected.active {
+                // A projected claim is bound or released by a scan that reads
+                // its process, so ask for one.
+                entry.procwatch_rescan.notify_one();
                 let config = reported_detector_config
                     .clone()
                     .unwrap_or_else(|| entry.default_detector_config.clone());
