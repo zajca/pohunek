@@ -432,7 +432,7 @@ impl Client {
                 let addr =
                     resolve_remote_addr(pinned_route.clone(), options.connect_timeout, registry)
                         .await
-                        .map_err(|error| name_typed_host(error, display))?;
+                        .map_err(|error| name_typed_host(error, pinned_route, display))?;
                 Self::connect_trusted_tcp_addr_with_options(display.as_str(), addr, options).await
             }
         }
@@ -1789,17 +1789,28 @@ pub async fn resolve_host_target_in(
 }
 
 /// Report a failed lookup of a pinned route under the name the caller typed.
-fn name_typed_host(error: ClientError, display: &str) -> ClientError {
+fn name_typed_host(error: ClientError, pinned_route: &str, display: &str) -> ClientError {
     match error {
         ClientError::OverlayRegistry(RegistryError::HostUnknown(_)) => {
             RegistryError::HostUnknown(display.to_owned()).into()
+        }
+        ClientError::OverlayRegistry(RegistryError::AmbiguousHost { candidates, .. }) => {
+            RegistryError::AmbiguousHost {
+                host: display.to_owned(),
+                candidates,
+            }
+            .into()
         }
         ClientError::OverlayRegistry(RegistryError::HostUnavailable { failures, .. }) => {
             let failures = failures
                 .into_iter()
                 .map(|mut failure| {
-                    if let overlay::OverlayError::HostUnknown { host, .. } = &mut failure.error {
-                        display.clone_into(host);
+                    match &mut failure.error {
+                        overlay::OverlayError::HostUnknown { host, .. }
+                        | overlay::OverlayError::PeerCollision { host, .. } => {
+                            display.clone_into(host);
+                        }
+                        _ => {}
                     }
                     failure
                 })
@@ -1810,6 +1821,9 @@ fn name_typed_host(error: ClientError, display: &str) -> ClientError {
             }
             .into()
         }
+        ClientError::RemoteDiscoveryFailed { detail } => ClientError::RemoteDiscoveryFailed {
+            detail: detail.replace(pinned_route, display),
+        },
         other => other,
     }
 }

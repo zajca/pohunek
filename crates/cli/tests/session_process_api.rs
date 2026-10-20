@@ -2823,6 +2823,16 @@ const PIN_MOVED_IP: &str = "100.64.0.13";
 #[cfg(target_os = "linux")]
 const PIN_WRONG_PORT: &str = "1";
 
+/// `after` table of [`run_pinned`] that makes every lookup after the first
+/// dialed connection hang.
+#[cfg(target_os = "linux")]
+const PIN_STALL: &str = "stall";
+
+/// How long a stalled fake `netbird` hangs: beyond the client's 5 s connect
+/// timeout, so only a bounded lookup finishes.
+#[cfg(target_os = "linux")]
+const PIN_STALL_SECONDS: u32 = 30;
+
 /// Placeholder of the fixture daemon's port in a host selector template.
 #[cfg(target_os = "linux")]
 const PORT_PLACEHOLDER: &str = "{port}";
@@ -2888,7 +2898,12 @@ fn run_pinned(
     let tcp_fixture = TcpFixtureDaemon::start(Ipv4Addr::LOCALHOST, Scenario::Success);
     let fixture_port = tcp_fixture.address.port().to_string();
     let (connect_redirect, connect_capture) = connect_redirect::build(&home.root);
-    let path = pin_overlay::install(&home.root.join("bin"), &connect_capture, before, after);
+    let bin = home.root.join("bin");
+    let path = if after == PIN_STALL {
+        pin_overlay::install_stalling(&bin, &connect_capture, before, PIN_STALL_SECONDS)
+    } else {
+        pin_overlay::install(&bin, &connect_capture, before, after)
+    };
     let output = home
         .command()
         .env("PATH", &path)
@@ -3113,4 +3128,21 @@ fn pinned_operations_of_the_machines_own_overlay_name_stay_on_the_local_daemon()
         tcp_fixture.finish().is_empty(),
         "an own-name operation never dials the overlay"
     );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_stalled_lookup_of_a_pinned_peer_fails_under_the_typed_name() {
+    for command in PINNED_SESSION_COMMANDS {
+        let run = run_pinned("peer-a", command, &pin_before(), PIN_STALL, None);
+        let document = assert_json_error(&run.output, "remote_discovery_failed");
+        let message = document["err"]["msg"].as_str().expect("error message");
+        assert!(message.contains("peer-a"), "{command:?}: {message}");
+        assert!(!message.contains("peer~"), "{command:?}: {message}");
+        assert!(
+            run.dialed.iter().all(|ip| ip == PIN_FIRST_IP),
+            "{command:?}: {:?}",
+            run.dialed
+        );
+    }
 }

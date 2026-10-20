@@ -287,8 +287,13 @@ async fn discover_with_registry(
         }
         return Err(crate::ClientError::OverlayDiscoveryFailed { failures });
     }
-    let mut records = local_records(registry, options, origin.as_ref(), deadline).await;
-    records.extend(discover_peers(snapshots, options, origin.as_ref(), Some(deadline)).await);
+    // Independent of each other: a stuck lookup of this machine's identity must
+    // not take time from the peer probes.
+    let (mut records, peers) = tokio::join!(
+        local_records(registry, options, origin.as_ref(), deadline),
+        discover_peers(snapshots, options, origin.as_ref(), Some(deadline)),
+    );
+    records.extend(peers);
     Ok(records)
 }
 

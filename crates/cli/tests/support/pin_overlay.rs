@@ -82,6 +82,29 @@ pub(crate) fn install(bin: &Path, capture: &Path, before: &str, after: &str) -> 
     std::env::join_paths(paths).expect("join PATH")
 }
 
+/// Like [`install`], but every run after the first dialed connection hangs for
+/// `stall` seconds instead of answering.
+pub(crate) fn install_stalling(
+    bin: &Path,
+    capture: &Path,
+    before: &str,
+    stall_seconds: u32,
+) -> std::ffi::OsString {
+    fs::create_dir_all(bin).expect("create fixture bin");
+    let netbird = bin.join("netbird");
+    let script = format!(
+        "#!/bin/sh\nif [ -s '{capture}' ]; then\nexec sleep {stall_seconds}\nfi\ncat <<'POHUNEK_EOF'\n{before}\nPOHUNEK_EOF\n",
+        capture = capture.display()
+    );
+    pohunek_test_support::fs::write_file(&netbird, script).expect("write fake netbird");
+    fs::set_permissions(&netbird, fs::Permissions::from_mode(0o700))
+        .expect("make fake netbird executable");
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![PathBuf::from(bin)];
+    paths.extend(std::env::split_paths(&inherited_path));
+    std::env::join_paths(paths).expect("join PATH")
+}
+
 /// The `NetBird` addresses the CLI dialed, in order, without ports.
 pub(crate) fn dialed_ips(capture: &Path) -> Vec<String> {
     fs::read_to_string(capture)

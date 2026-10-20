@@ -631,3 +631,49 @@ fn a_cache_of_the_previous_schema_is_discarded_not_read() {
         "the old cache is refreshed: {document}"
     );
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_stuck_lookup_of_this_machine_does_not_starve_the_peer_probes() {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let bin = env.root().join("bin");
+    fs::create_dir_all(&bin).expect("create bin");
+    let ran = env.root().join("netbird-ran");
+    // The first `netbird` run lists the peers; the later run, which looks up
+    // this machine's own identity, hangs.
+    pohunek_test_support::fs::write_executable(
+        bin.join("netbird"),
+        format!(
+            "#!/bin/sh\nif [ -e '{ran}' ]; then exec sleep 30; fi\n: > '{ran}'\ncat <<'EOF'\n{status}\nEOF\n",
+            ran = ran.display(),
+            status = status_with_self(Some(SELF_IP)),
+        ),
+    )
+    .expect("write fake netbird");
+    let port = pin_overlay::serve_health();
+    let (library, capture) = connect_redirect::build(env.root());
+    let inherited_path = std::env::var("PATH").expect("PATH");
+    let output = env
+        .command(pohunek_test_support::bin_exe("pohunek"))
+        .args(["host", "discover", "--refresh", "--json"])
+        .env("PATH", format!("{}:{inherited_path}", bin.display()))
+        .env("LD_PRELOAD", &library)
+        .env("POHUNEK_TEST_CONNECT_CAPTURE", &capture)
+        .env("POHUNEK_REMOTE_PORT", port.to_string())
+        .output()
+        .expect("run CLI discovery");
+    assert!(
+        output.status.success(),
+        "discovery failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("versioned JSON envelope");
+    let records = document["ok"].as_array().expect("host records");
+    assert_eq!(records.len(), 1, "no local record without the lookup: {records:?}");
+    assert_eq!(records[0]["peer_id"], "remote-key");
+    assert_eq!(
+        records[0]["classification"], "reachable_daemon",
+        "the peer probe kept its whole deadline: {records:?}"
+    );
+}
