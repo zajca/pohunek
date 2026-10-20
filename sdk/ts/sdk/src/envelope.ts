@@ -74,11 +74,15 @@ export function isOkResponse(value: unknown): value is OkResponse {
 }
 
 /**
- * Whether `value` has the shape of an error response. Any string class passes:
- * `decodeResponse` is what maps a class this build does not define to
- * `"unknown"`.
+ * Whether `value` is an error response in the normalized shape `decodeResponse`
+ * returns: its class is one this build defines or `"unknown"`.
  */
 export function isErrResponse(value: unknown): value is ErrResponse {
+  return isErrEnvelope(value) && isObservedErrorClass(value.err["class"]);
+}
+
+/** The wire shape of an error response, whatever its class string. */
+function isErrEnvelope(value: unknown): value is { err: Record<string, unknown> } & Record<string, unknown> {
   if (!isRecord(value)) {
     return false;
   }
@@ -86,7 +90,7 @@ export function isErrResponse(value: unknown): value is ErrResponse {
     isProtocolVersion(value["v"]) &&
     typeof value["id"] === "string" &&
     !hasOwn(value, "ok") &&
-    isProtocolError(value["err"])
+    isRawProtocolError(value["err"])
   );
 }
 
@@ -94,8 +98,10 @@ export function decodeResponse(value: unknown): Response {
   if (isOkResponse(value)) {
     return value;
   }
-  if (isErrResponse(value)) {
-    return { ...value, err: { ...value.err, class: observedErrorClass(value.err.class) } };
+  if (isErrEnvelope(value)) {
+    const err = value.err;
+    const normalized = { ...err, class: observedErrorClass(String(err["class"])) };
+    return { ...value, err: normalized } as ErrResponse;
   }
   throw new Error("invalid response envelope");
 }
@@ -116,7 +122,7 @@ function isProtocolVersion(value: unknown): value is ProtocolVersion {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
-function isProtocolError(value: unknown): value is ObservedProtocolError {
+function isRawProtocolError(value: unknown): value is Record<string, unknown> {
   if (!isRecord(value)) {
     return false;
   }
@@ -131,6 +137,10 @@ function isProtocolError(value: unknown): value is ObservedProtocolError {
 
 function observedErrorClass(value: string): ObservedErrorClass {
   return isKnownErrorClass(value) ? value : "unknown";
+}
+
+function isObservedErrorClass(value: unknown): value is ObservedErrorClass {
+  return typeof value === "string" && (value === "unknown" || isKnownErrorClass(value));
 }
 
 function isKnownErrorClass(value: string): value is ErrorClass {
