@@ -11298,6 +11298,36 @@ async fn binding_exit_alone_ends_an_observed_reporters_claim() {
     let _ = registry.stop(&created.id).await;
 }
 
+/// A binding whose watch task was cancelled with the runtime watchers falls
+/// back to per-scan liveness reads.
+#[tokio::test]
+async fn bound_reporter_with_a_cancelled_watch_ends_when_a_scan_reads_it_gone() {
+    let (registry, inspector, created) =
+        descendant_claim_fixture("bound-cancelled-watch", false).await;
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        sessions[&created.id]
+            .bound_reporter
+            .as_ref()
+            .expect("bound reporter")
+            .cancel
+            .cancel();
+    };
+    inspector.set_not_running(fixture_reporter_fact().identity());
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    assert_descendant_claim_replaced(
+        &registry,
+        &created.id,
+        DESCENDANT_WRAPPER_PID,
+        RuntimeRef::codex(),
+        "cancelled watch, reporter gone",
+    )
+    .await;
+    let _ = registry.stop(&created.id).await;
+}
+
 /// A bound reporter that is itself an observed agent ends through either of
 /// its two exit signals, in either order.
 #[tokio::test]

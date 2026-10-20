@@ -87,11 +87,12 @@ pub(super) struct BoundReporter {
     /// Whether the reporter descends from the launch root, which is an agent
     /// of the claim's runtime.
     root_anchor: bool,
-    /// Whether an exit watch reports the exit of `identity`. Without one,
-    /// every scan reads the generation's liveness.
+    /// Whether an exit watch reports the exit of `identity`. Without one, or
+    /// once its task was cancelled with the runtime watchers, every scan reads
+    /// the generation's liveness.
     watched: bool,
     /// Ends the watch task when the record is dropped.
-    cancel: CancellationToken,
+    pub(super) cancel: CancellationToken,
 }
 
 impl BoundReporter {
@@ -381,7 +382,7 @@ impl SessionRegistry {
                         .then(|| reported_descendant_pid(entry))
                         .flatten(),
                     bound
-                        .filter(|bound| !bound.watched)
+                        .filter(|bound| !bound.watched || bound.cancel.is_cancelled())
                         .map(|bound| bound.identity),
                 )
             })
