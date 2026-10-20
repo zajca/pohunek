@@ -3146,3 +3146,56 @@ fn a_stalled_lookup_of_a_pinned_peer_fails_under_the_typed_name() {
         );
     }
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn the_names_of_the_local_record_select_the_local_daemon() {
+    let home = TestHome::new();
+    let local_fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+    let tcp_fixture = TcpFixtureDaemon::start(Ipv4Addr::LOCALHOST, Scenario::Success);
+    let remote_port = tcp_fixture.address.port();
+    let (connect_redirect, connect_capture) = connect_redirect::build(&home.root);
+    let netbird = SelfNetbird::install(&home.root);
+    let run = |args: &[&str]| {
+        home.command()
+            .env("PATH", &netbird.path)
+            .env("LD_PRELOAD", &connect_redirect)
+            .env("POHUNEK_TEST_CONNECT_CAPTURE", &connect_capture)
+            .env("POHUNEK_REMOTE_PORT", remote_port.to_string())
+            .args(args)
+            .output()
+            .expect("run pohunek")
+    };
+    let records = assert_json_success(&run(&["host", "discover", "--refresh", "--json"]));
+    let local = records
+        .as_array()
+        .expect("host records")
+        .iter()
+        .find(|record| record["local"] == true)
+        .expect("the local record");
+    // A consumer feeds the record's own names back as `--host`; a release
+    // that predates the record maps them to the local daemon the same way.
+    for field in ["fqdn", "address"] {
+        let host = local[field].as_str().expect("record field");
+        let ok = assert_json_success(&run(&[
+            "--host", host, "session", "screen", SESSION_ID, "--json",
+        ]));
+        assert_eq!(ok["session_id"], SESSION_ID, "{field}");
+    }
+    let screens = |requests: Vec<Request>| {
+        requests
+            .iter()
+            .filter(|request| request.method() == protocol::method::SESSION_SCREEN)
+            .count()
+    };
+    assert_eq!(
+        screens(local_fixture.finish()),
+        2,
+        "both reached the local daemon"
+    );
+    assert_eq!(
+        screens(tcp_fixture.finish()),
+        0,
+        "neither dialed the overlay"
+    );
+}
