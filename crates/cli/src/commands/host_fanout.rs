@@ -183,7 +183,14 @@ async fn fetch_records(paths: &Paths) -> Result<Vec<HostRecord>, CliError> {
     crate::commands::host::fetch_records(&paths.cache_dir, false).await
 }
 
+/// The fan-out target of a reachable peer record.
+///
+/// This machine's own record yields none: the explicit `local` target already
+/// covers it, and dialing its overlay address would contact it twice.
 pub(crate) fn reachable_target(record: &HostRecord) -> Option<HostTarget> {
+    if record.local {
+        return None;
+    }
     match &record.class {
         HostClass::ReachableDaemon { .. } => {
             record
@@ -191,20 +198,11 @@ pub(crate) fn reachable_target(record: &HostRecord) -> Option<HostTarget> {
                 .as_deref()?
                 .parse::<std::net::IpAddr>()
                 .ok()?;
-            let identity = record
-                .peer_id
-                .as_deref()
-                .filter(|identity| !identity.is_empty())
-                .map(pohunek_client::ExternalIdentity::peer_id)
-                .or_else(|| {
-                    record
-                        .fqdn
-                        .as_deref()
-                        .filter(|fqdn| !fqdn.is_empty())
-                        .map(pohunek_client::ExternalIdentity::fqdn)
-                })?
-                .ok()?;
-            let host_id = format!("{}:{}", record.overlay, identity.selector());
+            let host_id = pohunek_client::pinned_host_id(
+                &record.overlay,
+                record.peer_id.as_deref(),
+                record.fqdn.as_deref(),
+            )?;
             let transport_target =
                 pohunek_client::remote_host_with_port(&host_id, record.port).ok()?;
             Some(HostTarget::new(host_id, transport_target))
@@ -245,6 +243,7 @@ mod tests {
             port: 18722,
             overlay: "netbird".to_owned(),
             peer_id: Some(name.to_owned()),
+            local: false,
             class,
         }
     }

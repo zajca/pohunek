@@ -31,7 +31,7 @@ use protocol::{
     MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_TURN_MS,
 };
 
-use crate::client::Client;
+use crate::client::{Client, PinnedHost};
 #[cfg(test)]
 use crate::commands::request_with_params;
 use crate::error::CliError;
@@ -239,6 +239,20 @@ pub(crate) async fn resolve_target(
     target: &Target,
 ) -> Result<Target, CliError> {
     let client = Client::connect(host, paths).await?;
+    resolve_target_on(client, target).await
+}
+
+/// [`resolve_target`] on the host an operation pinned for all its connections.
+async fn resolve_target_pinned(
+    host: &PinnedHost,
+    paths: &Paths,
+    target: &Target,
+) -> Result<Target, CliError> {
+    let client = Client::connect_pinned(host, paths).await?;
+    resolve_target_on(client, target).await
+}
+
+async fn resolve_target_on(client: Client, target: &Target) -> Result<Target, CliError> {
     let mut sdk = client.into_sdk();
     let sessions = sdk
         .call::<protocol::method::SessionList>(SessionListParams {
@@ -1090,7 +1104,9 @@ pub(crate) async fn run_output(
     .map_err(|error| CliError::InvalidObservation {
         detail: error.to_string(),
     })?;
-    let target = resolve_target(host, paths, target).await?;
+    // The session id resolved on one peer is only ever sent to that peer.
+    let host = &PinnedHost::resolve(host).await?;
+    let target = resolve_target_pinned(host, paths, target).await?;
     let params = SessionOutputParams::new(
         SessionId(target.session_id.clone()),
         runtime,
@@ -1099,7 +1115,7 @@ pub(crate) async fn run_output(
         args.wait_ms,
     )
     .expect("only the already-validated session id changed");
-    let client = Client::connect(host, paths).await?;
+    let client = Client::connect_pinned(host, paths).await?;
     let result = if args.wait_ms.is_some() {
         cancellable(client.into_sdk().session_output(params)).await?
     } else {
@@ -1143,7 +1159,8 @@ pub(crate) async fn run_wait(
     .map_err(|error| CliError::InvalidObservation {
         detail: error.to_string(),
     })?;
-    let target = resolve_target(host, paths, target).await?;
+    let host = &PinnedHost::resolve(host).await?;
+    let target = resolve_target_pinned(host, paths, target).await?;
     let params = SessionWaitParams::new(
         SessionId(target.session_id.clone()),
         runtime,
@@ -1155,7 +1172,7 @@ pub(crate) async fn run_wait(
         args.timeout_ms,
     )
     .expect("only the already-validated session id changed");
-    let client = Client::connect(host, paths).await?;
+    let client = Client::connect_pinned(host, paths).await?;
     let result = cancellable(client.into_sdk().session_wait(params)).await?;
     if json {
         print!(

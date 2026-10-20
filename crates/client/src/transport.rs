@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{SinkExt, StreamExt};
-use overlay::{HostTarget, OverlayRegistry, RegistryError};
+use overlay::{ExternalIdentity, HostTarget, OverlayRegistry, RegistryError};
 use protocol::compat::{self, CompatError};
 use protocol::{
     AttachHeader, DoctorReport, Event, HostGovernanceStatus, Method, ProtocolError,
@@ -346,9 +346,7 @@ impl Client {
             Self::connect_local_with_options(socket_path, options).await
         } else {
             let registry = crate::default_overlay_registry()?;
-            let addr =
-                resolve_remote_addr(host.to_owned(), options.connect_timeout, registry).await?;
-            Self::connect_trusted_tcp_addr_with_options(host, addr, options).await
+            Self::connect_overlay_host(host, socket_path, registry, options).await
         }
     }
 
@@ -386,9 +384,57 @@ impl Client {
         if is_local_host(host) {
             Self::connect_local_with_options(socket_path, options).await
         } else {
-            let addr =
-                resolve_remote_addr(host.to_owned(), options.connect_timeout, registry).await?;
-            Self::connect_trusted_tcp_addr_with_options(host, addr, options).await
+            Self::connect_overlay_host(host, socket_path, registry, options).await
+        }
+    }
+
+    /// Dial `host` after one lookup: this machine's own overlay name reaches the
+    /// local socket, a peer its overlay address.
+    async fn connect_overlay_host(
+        host: &str,
+        socket_path: impl AsRef<Path>,
+        registry: OverlayRegistry,
+        options: ClientOptions,
+    ) -> Result<Self, ClientError> {
+        match select_host(host, options.connect_timeout, &registry).await? {
+            Selected::Local => Self::connect_local_with_options(socket_path, options).await,
+            Selected::Route { route, port } => {
+                let addr = SocketAddr::new(
+                    route.addr.ip(),
+                    port.map_or(route.addr.port(), NonZeroU16::get),
+                );
+                Self::connect_trusted_tcp_addr_with_options(host, addr, options).await
+            }
+        }
+    }
+
+    /// Connect to a host resolved once by [`resolve_host_target`].
+    ///
+    /// A remote host is looked up by the identity in its pinned route and
+    /// errors name the host as the caller typed it.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed registry, provider, connection, and protocol errors.
+    pub async fn connect_resolved_with_options(
+        resolved: &ResolvedHost,
+        socket_path: impl AsRef<Path>,
+        options: ClientOptions,
+    ) -> Result<Self, ClientError> {
+        options.origin_source.resolve()?;
+        match resolved {
+            ResolvedHost::Local => Self::connect_local_with_options(socket_path, options).await,
+            ResolvedHost::Remote {
+                pinned_route,
+                display,
+            } => {
+                let registry = crate::default_overlay_registry()?;
+                let addr =
+                    resolve_remote_addr(pinned_route.clone(), options.connect_timeout, registry)
+                        .await
+                        .map_err(|error| name_typed_host(error, display))?;
+                Self::connect_trusted_tcp_addr_with_options(display.as_str(), addr, options).await
+            }
         }
     }
 
@@ -1603,6 +1649,171 @@ pub async fn names_this_machine_in(
     }
 }
 
+/// A host route resolved once for all connections of one operation.
+///
+/// Built by [`resolve_host_target`]. A remote host carries a route pinned to
+/// the peer identity the name selected at that moment, so a later connection
+/// cannot follow the name to another peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedHost {
+    /// The local daemon's Unix socket.
+    Local,
+    /// One remote peer, addressed by its stable identity.
+    Remote {
+        /// `<overlay>:peer~<id>@<port>`, or `<overlay>:fqdn~<fqdn>@<port>` when
+        /// the provider reports no peer id. Accepted wherever a remote host is.
+        pinned_route: String,
+        /// Host name as the caller typed it, for errors and output.
+        display: String,
+    },
+}
+
+/// Format the stable `<overlay>:<identity selector>` of a peer.
+///
+/// The peer id wins over the FQDN. Returns `None` when the provider reports
+/// neither, or an empty value for both.
+#[must_use]
+pub fn pinned_host_id(overlay: &str, peer_id: Option<&str>, fqdn: Option<&str>) -> Option<String> {
+    let identity = peer_id
+        .filter(|identity| !identity.is_empty())
+        .map(ExternalIdentity::peer_id)
+        .or_else(|| {
+            fqdn.filter(|fqdn| !fqdn.is_empty())
+                .map(ExternalIdentity::fqdn)
+        })?
+        .ok()?;
+    Some(format!("{overlay}:{}", identity.selector()))
+}
+
+/// What a host name selected on the overlays.
+enum Selected {
+    Local,
+    Route {
+        route: overlay::OverlayRoute,
+        port: Option<NonZeroU16>,
+    },
+}
+
+/// Resolve `host` once through `registry`.
+///
+/// An explicit `@port` always selects a peer; without one this machine's own
+/// overlay name selects the local daemon.
+async fn select_host(
+    host: &str,
+    connect_timeout: Duration,
+    registry: &OverlayRegistry,
+) -> Result<Selected, ClientError> {
+    let target = RemoteTarget::parse(host)?;
+    let selected = async {
+        if target.port.is_some() {
+            registry
+                .resolve_host(target.selector)
+                .await
+                .map(|route| Selected::Route {
+                    route,
+                    port: target.port,
+                })
+        } else {
+            registry
+                .resolve_target(target.selector)
+                .await
+                .map(|selected| match selected {
+                    HostTarget::Local => Selected::Local,
+                    HostTarget::Remote(route) => Selected::Route { route, port: None },
+                })
+        }
+    };
+    match tokio::time::timeout(connect_timeout, selected).await {
+        Ok(result) => result.map_err(ClientError::from),
+        Err(_elapsed) => Err(ClientError::RemoteDiscoveryFailed {
+            detail: format!("timed out resolving remote host '{host}' after {connect_timeout:?}"),
+        }),
+    }
+}
+
+/// Resolve `host` once to a target whose later connections cannot change peer.
+///
+/// `local`, the empty name and this machine's own overlay name resolve to
+/// [`ResolvedHost::Local`]. A remote name resolves to the pinned route of the
+/// peer it names now; connecting to that route looks the peer up by identity,
+/// so a renamed or reassigned short name never selects another peer. The
+/// address may change.
+///
+/// # Errors
+///
+/// Returns the typed registry errors of the lookup, and
+/// [`ClientError::HostIdentityUnpinnable`] when the peer reports neither a peer
+/// id nor an FQDN.
+pub async fn resolve_host_target(
+    host: &str,
+    connect_timeout: Duration,
+) -> Result<ResolvedHost, ClientError> {
+    if is_local_host(host) {
+        return Ok(ResolvedHost::Local);
+    }
+    let registry = crate::default_overlay_registry()?;
+    resolve_host_target_in(host, connect_timeout, &registry).await
+}
+
+/// [`resolve_host_target`] through an explicit overlay registry.
+///
+/// # Errors
+///
+/// Same as [`resolve_host_target`].
+pub async fn resolve_host_target_in(
+    host: &str,
+    connect_timeout: Duration,
+    registry: &OverlayRegistry,
+) -> Result<ResolvedHost, ClientError> {
+    if is_local_host(host) {
+        return Ok(ResolvedHost::Local);
+    }
+    match select_host(host, connect_timeout, registry).await? {
+        Selected::Local => Ok(ResolvedHost::Local),
+        Selected::Route { route, port } => {
+            let host_id = pinned_host_id(
+                route.overlay.as_str(),
+                route.peer_id.as_deref(),
+                route.fqdn.as_deref(),
+            )
+            .ok_or_else(|| ClientError::HostIdentityUnpinnable {
+                host: host.to_owned(),
+            })?;
+            let port = port.map_or(route.addr.port(), NonZeroU16::get);
+            Ok(ResolvedHost::Remote {
+                pinned_route: remote_host_with_port(&host_id, port)?,
+                display: host.to_owned(),
+            })
+        }
+    }
+}
+
+/// Report a failed lookup of a pinned route under the name the caller typed.
+fn name_typed_host(error: ClientError, display: &str) -> ClientError {
+    match error {
+        ClientError::OverlayRegistry(RegistryError::HostUnknown(_)) => {
+            RegistryError::HostUnknown(display.to_owned()).into()
+        }
+        ClientError::OverlayRegistry(RegistryError::HostUnavailable { failures, .. }) => {
+            let failures = failures
+                .into_iter()
+                .map(|mut failure| {
+                    if let overlay::OverlayError::HostUnknown { host, .. } = &mut failure.error {
+                        display.clone_into(host);
+                    }
+                    failure
+                })
+                .collect();
+            RegistryError::HostUnavailable {
+                host: display.to_owned(),
+                failures,
+            }
+            .into()
+        }
+        other => other,
+    }
+}
+
 async fn resolve_remote_addr(
     host: String,
     connect_timeout: Duration,
@@ -1706,7 +1917,7 @@ mod tests {
 
     use super::*;
     use overlay::{
-        BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, ExternalIdentityKind,
+        BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentityKind,
         OverlayError, OverlayFuture, OverlayId, OverlayTransport, ResolvedPeer,
     };
     use tokio::io::{AsyncBufReadExt as _, BufReader};

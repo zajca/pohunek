@@ -25,7 +25,8 @@ pub use transport::{
     attach_raw_tcp_addr_with_options, attach_raw_with_options, connect_raw, connect_raw_local,
     connect_raw_local_with_options, connect_raw_tcp_addr, connect_raw_tcp_addr_with_options,
     connect_raw_with_options, is_local_host, names_this_machine, names_this_machine_in,
-    next_request_id, remote_host_with_port, Client, ClientOptions, OriginSource, RawStream,
+    next_request_id, pinned_host_id, remote_host_with_port, resolve_host_target,
+    resolve_host_target_in, Client, ClientOptions, OriginSource, RawStream, ResolvedHost,
     Subscription, LIFECYCLE_STEP_BOUND_MS, LOCAL_HOST, RESUME_SWEEP_PASSES,
 };
 

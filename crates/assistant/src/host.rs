@@ -91,6 +91,14 @@ pub enum HostTransport {
     Local { socket_path: PathBuf },
     /// Remote daemon resolved by the SDK through `NetBird`.
     Remote { host: String, socket_path: PathBuf },
+    /// Remote daemon pinned to the peer identity `host` selected when the
+    /// operation started; every connection looks the peer up by `pinned_route`.
+    Pinned {
+        /// Host name as the caller typed it, for errors and output.
+        host: String,
+        /// Identity-qualified route from `pohunek_client::resolve_host_target`.
+        pinned_route: String,
+    },
     /// Remote daemon over a trusted TCP route with a policy-resolved attach selector.
     Tcp {
         addr: SocketAddr,
@@ -163,12 +171,35 @@ impl HostConfig {
         }
     }
 
+    /// Build a remote host config pinned to one peer identity.
+    ///
+    /// `host` is the name the caller typed; `pinned_route` comes from
+    /// `pohunek_client::resolve_host_target`.
+    #[must_use]
+    pub fn pinned(
+        id: impl Into<String>,
+        host: impl Into<String>,
+        pinned_route: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: HostId::new(id),
+            transport: HostTransport::Pinned {
+                host: host.into(),
+                pinned_route: pinned_route.into(),
+            },
+        }
+    }
+
     /// Value substituted into `{host}` for attach commands.
+    ///
+    /// A pinned host yields its pinned route, so the attach command reaches the
+    /// peer the launch used.
     #[must_use]
     pub fn attach_host(&self) -> String {
         match &self.transport {
             HostTransport::Local { .. } => String::new(),
             HostTransport::Remote { host, .. } => host.clone(),
+            HostTransport::Pinned { pinned_route, .. } => pinned_route.clone(),
             HostTransport::Tcp { attach_host, .. } => attach_host.clone(),
         }
     }
@@ -218,6 +249,14 @@ pub async fn connect_client(
         }
         HostTransport::Remote { host, socket_path } => {
             Ok(Client::connect_with_options(host, socket_path, options).await?)
+        }
+        HostTransport::Pinned { host, pinned_route } => {
+            let resolved = pohunek_client::ResolvedHost::Remote {
+                pinned_route: pinned_route.clone(),
+                display: host.clone(),
+            };
+            // No local socket is involved: the resolved host is remote.
+            Ok(Client::connect_resolved_with_options(&resolved, "", options).await?)
         }
         HostTransport::Tcp { addr, .. } => {
             Ok(

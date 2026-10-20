@@ -31,25 +31,9 @@ pub(crate) async fn run_discover(refresh: bool, json: bool) -> Result<(), CliErr
     if json {
         print!("{}", crate::commands::render_json(&records)?);
     } else {
-        print!(
-            "{}",
-            render_records_human(&local_identities().await, &records)
-        );
+        print!("{}", render_records_human(&records));
     }
     Ok(())
-}
-
-/// This machine's identity on each configured overlay that reports one; empty
-/// when no overlay is configured or none answers within the client's connect
-/// timeout, so a stuck overlay CLI never withholds the discovered records.
-async fn local_identities() -> Vec<pohunek_client::LocalIdentity> {
-    let Ok(registry) = pohunek_client::default_overlay_registry() else {
-        return Vec::new();
-    };
-    let deadline = pohunek_client::ClientOptions::default().connect_timeout;
-    tokio::time::timeout(deadline, registry.local_identities())
-        .await
-        .unwrap_or_default()
 }
 
 /// Run `host list`: the same discovery core as `discover`, emphasizing the
@@ -116,65 +100,45 @@ pub(crate) async fn run_governance_inspect(
 /// Status label of this machine's own row.
 const LOCAL_STATUS: &str = "local";
 
-/// Render this machine and the discovered hosts as an aligned table.
+/// Render the enumerated hosts as an aligned table.
 ///
-/// This machine comes first, one row per overlay that reports it, named by its
-/// own overlay name and routed as `local`: that name selects the local daemon in
-/// `--host` on this machine and over the overlay from every peer.
-fn render_records_human(local: &[pohunek_client::LocalIdentity], records: &[HostRecord]) -> String {
+/// This machine's own record comes first, named by its own overlay name and
+/// routed as `local`: that name selects the local daemon in `--host` on this
+/// machine and over the overlay from every peer. Its status carries the result
+/// of the probe of its own overlay address.
+fn render_records_human(records: &[HostRecord]) -> String {
     let route_of = |record: &HostRecord| {
-        let identity = record
-            .peer_id
-            .as_deref()
-            .filter(|peer_id| !peer_id.is_empty())
-            .map(pohunek_client::ExternalIdentity::peer_id)
-            .or_else(|| {
-                record
-                    .fqdn
-                    .as_deref()
-                    .filter(|fqdn| !fqdn.is_empty())
-                    .map(pohunek_client::ExternalIdentity::fqdn)
-            })
-            .and_then(Result::ok);
-        identity
-            .and_then(|identity| {
-                pohunek_client::remote_host_with_port(
-                    &format!("{}:{}", record.overlay, identity.selector()),
-                    record.port,
-                )
-                .ok()
-            })
-            .unwrap_or_else(|| "-".to_owned())
+        if record.local {
+            return crate::target::LOCAL_HOST.to_owned();
+        }
+        pohunek_client::pinned_host_id(
+            &record.overlay,
+            record.peer_id.as_deref(),
+            record.fqdn.as_deref(),
+        )
+        .and_then(|host_id| pohunek_client::remote_host_with_port(&host_id, record.port).ok())
+        .unwrap_or_else(|| "-".to_owned())
     };
-    let local_name = |identity: &pohunek_client::LocalIdentity| {
-        identity
-            .fqdn
-            .as_deref()
-            .and_then(|fqdn| fqdn.split('.').next())
-            .filter(|label| !label.is_empty())
-            .map(str::to_owned)
-            .or_else(|| identity.address.map(|address| address.to_string()))
-            .unwrap_or_else(|| "-".to_owned())
-    };
-    let rows = local
+    let rows = records
         .iter()
-        .map(|identity| {
-            [
-                local_name(identity),
-                crate::target::LOCAL_HOST.to_owned(),
-                LOCAL_STATUS.to_owned(),
-                "-".to_owned(),
-            ]
-        })
-        .chain(records.iter().map(|record| {
+        .map(|record| {
             let (status, version) = class_columns(&record.class);
+            let status = match (record.local, &record.class) {
+                (true, HostClass::ReachableDaemon { .. }) => LOCAL_STATUS.to_owned(),
+                (true, _) => format!("{LOCAL_STATUS}:{status}"),
+                (false, _) => status.to_owned(),
+            };
             [
-                record.name.clone().unwrap_or_else(|| "-".to_owned()),
+                record
+                    .name
+                    .clone()
+                    .or_else(|| record.address.clone())
+                    .unwrap_or_else(|| "-".to_owned()),
                 route_of(record),
-                status.to_owned(),
+                status,
                 version,
             ]
-        }))
+        })
         .collect::<Vec<_>>();
     let route_header = "ROUTE";
 
@@ -478,6 +442,7 @@ mod tests {
                 port: 18722,
                 overlay: "netbird".to_owned(),
                 peer_id: Some("100.92.30.40".to_owned()),
+                local: false,
                 class: HostClass::ReachableDaemon {
                     daemon_version: "0.1.0".to_owned(),
                 },
@@ -489,10 +454,11 @@ mod tests {
                 port: 18722,
                 overlay: "netbird".to_owned(),
                 peer_id: None,
+                local: false,
                 class: HostClass::Candidate,
             },
         ];
-        let output = render_records_human(&[], &records);
+        let output = render_records_human(&records);
         let header = output.lines().next().expect("header");
         for column in ["NAME", "ROUTE", "STATUS", "VERSION"] {
             assert!(header.contains(column), "header missing {column}: {header}");

@@ -399,7 +399,7 @@ fn is_remote(config: &HostConfig) -> bool {
 fn host_label(config: &HostConfig) -> String {
     match &config.transport {
         HostTransport::Local { .. } => "local".to_owned(),
-        HostTransport::Remote { host, .. } => host.clone(),
+        HostTransport::Remote { host, .. } | HostTransport::Pinned { host, .. } => host.clone(),
         HostTransport::Tcp { .. } => config.id.as_str().to_owned(),
     }
 }

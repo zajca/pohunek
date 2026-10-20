@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::CliError;
 
 /// Cache format revision; changing it invalidates incompatible derived data.
-const CACHE_SCHEMA: u32 = 3;
+const CACHE_SCHEMA: u32 = 4;
 /// Cache directory under the pohunek XDG cache root.
 const CACHE_SUBDIR: &str = "host-discovery";
 /// Completed cache filename.
@@ -314,6 +314,7 @@ mod tests {
             port: TEST_PORT,
             overlay: "netbird".to_owned(),
             peer_id: Some("100.64.0.1".to_owned()),
+            local: false,
             class: protocol::HostClass::Unreachable,
         }
     }
