@@ -42,6 +42,9 @@ use crate::target::{is_local_host, Target};
 ///
 /// Matches `session new`'s CLI default so non-interactive fork callers get the
 /// same baseline terminal geometry unless a richer surface supplies live size.
+/// How long a resume runs before the CLI tells the operator it is still
+/// waiting for the daemon (the ordinary request timeout of other commands).
+const RESUME_PROGRESS_NOTICE_AFTER: Duration = Duration::from_secs(5);
 const DEFAULT_FORK_COLS: u16 = 80;
 /// Default fork PTY height when the command is not launched from an attach view.
 ///
@@ -1296,10 +1299,21 @@ pub(crate) async fn run_resume(
     json: bool,
 ) -> Result<(), CliError> {
     let client = Client::connect(host, paths).await?;
-    let result = client
-        .into_sdk()
-        .session_resume_with(resume_params(target, accept_profile_change))
-        .await?;
+    let mut sdk = client.into_sdk();
+    let resume = sdk.session_resume_with(resume_params(target, accept_profile_change));
+    tokio::pin!(resume);
+    let result = tokio::select! {
+        result = &mut resume => result,
+        () = tokio::time::sleep(RESUME_PROGRESS_NOTICE_AFTER) => {
+            if !json {
+                eprintln!(
+                    "waiting for the daemon to resume {}: it first proves the previous runtime ended",
+                    target.session_id
+                );
+            }
+            resume.await
+        }
+    }?;
     if json {
         print!(
             "{}",

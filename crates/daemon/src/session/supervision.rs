@@ -1775,6 +1775,25 @@ fn warn_unmarked(session_id: &str, worker_instance_id: &str, skipped: &[Skipped]
 mod tests {
     use super::*;
 
+    /// The SDK's resume budget is built from the daemon's validation maximum
+    /// of one lifecycle step and from the sweep's pass limit; the budget
+    /// follows when either daemon bound changes.
+    #[test]
+    fn the_sdk_resume_budget_follows_the_daemon_bounds() {
+        assert_eq!(
+            u128::from(pohunek_client::LIFECYCLE_STEP_BOUND_MS),
+            pohunek_platform::supervisor::MAX_JOB_TIMEOUT.as_millis()
+        );
+        assert_eq!(
+            pohunek_service_config::MAX_DEADLINE,
+            pohunek_platform::supervisor::MAX_JOB_TIMEOUT
+        );
+        assert_eq!(
+            usize::try_from(pohunek_client::RESUME_SWEEP_PASSES).expect("pass count"),
+            MAX_SWEEP_PASSES
+        );
+    }
+
     #[test]
     fn command_names_are_escaped_before_reaching_a_refusal() {
         // A backtick would close the quoting, a newline or comma could open a

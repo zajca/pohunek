@@ -43,15 +43,19 @@ const SESSION_NEW_REQUEST_BUDGET_MS: u32 = 60 * 60 * 1_000;
 /// Longest valid daemon bound of one lifecycle step, in milliseconds.
 ///
 /// Worker connection, worker initialization, a job's exit timeout, and the
-/// marker sweep's grace are each validated up to 10 minutes.
-const LIFECYCLE_STEP_BOUND_MS: u32 = 10 * 60 * 1_000;
+/// marker sweep's grace are each validated up to 10 minutes. A daemon test
+/// ties this value to the daemon's validation maximum.
+pub const LIFECYCLE_STEP_BOUND_MS: u32 = 10 * 60 * 1_000;
+/// Signalling passes the daemon's marker sweep makes at most. A daemon test
+/// ties this value to the sweep's pass limit.
+pub const RESUME_SWEEP_PASSES: u32 = 3;
 /// Lifecycle steps of a resume whose daemon bound is [`LIFECYCLE_STEP_BOUND_MS`]:
-/// retiring the lost generation's job (1), the cleanup sweep (up to three
-/// signalling passes of a `SIGTERM` grace and a `SIGKILL` grace each, plus one
-/// settle window: 7), the new worker's connection and initialization (2), and
-/// the rest of the resume, such as the supervisor calls, the version probe and
-/// the native store check (1).
-const SESSION_RESUME_STEPS: u32 = 11;
+/// retiring the lost generation's job (1), the cleanup sweep (each signalling
+/// pass waits a `SIGTERM` grace and a `SIGKILL` grace, plus one settle window),
+/// the new worker's connection and initialization (2), and the rest of the
+/// resume, such as the supervisor calls, the version probe and the native
+/// store check (1).
+const SESSION_RESUME_STEPS: u32 = 1 + (2 * RESUME_SWEEP_PASSES + 1) + 2 + 1;
 /// A resume of a lost runtime waits for the previous generation's retirement,
 /// a fresh marker sweep, and bounded worker startup, so its response budget
 /// covers every step at its longest valid daemon bound rather than the
