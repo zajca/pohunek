@@ -24,8 +24,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use pohunek_platform::supervisor::systemd::{
-    render_daemon_unit, render_sessions_slice, user_manager_environment, SystemdDaemon,
-    SystemdPluginUnits, SystemdSupervisor,
+    render_daemon_unit, render_sessions_slice, unit_environment, user_manager_environment,
+    SystemdDaemon, SystemdPluginUnits, SystemdSupervisor,
 };
 use pohunek_platform::supervisor::{
     Activation, DaemonSupervisor, Error, ExitEvidence, JobDefinition, JobExit, JobSpec, Namespace,
@@ -2113,6 +2113,76 @@ async fn dollar_signs_reach_a_plugin_unit_verbatim() {
     );
 
     plugin.units.remove(&key).await.expect("remove plugin job");
+}
+
+/// Removes the unit and drop-in directory a test wrote and reloads the manager.
+struct UnitFiles {
+    directory: PathBuf,
+    unit: String,
+}
+
+impl Drop for UnitFiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(self.directory.join(format!("{}.d", self.unit)));
+        let _ = std::fs::remove_file(self.directory.join(&self.unit));
+        systemctl(&["daemon-reload"]);
+    }
+}
+
+/// The real user manager reports the environment a unit and its drop-ins give a
+/// job: the merged `Environment=`, the `EnvironmentFile=`, `PassEnvironment=` and
+/// `UnsetEnvironment=` settings, and a drop-in on a unit with no file.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_reports_a_units_environment_settings_with_drop_ins() {
+    require_e2e();
+    let directory = user_unit_dir();
+    std::fs::create_dir_all(&directory).expect("user unit directory");
+    let unit = format!("pohunek-e2e-env-{}.service", std::process::id());
+    let _files = UnitFiles {
+        directory: directory.clone(),
+        unit: unit.clone(),
+    };
+
+    // No file and no drop-in: not found, nothing configured.
+    let absent = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("absent unit");
+    assert_eq!(absent.load_state, "not-found");
+    assert!(absent.drop_in_paths.is_empty() && absent.environment.is_empty());
+
+    std::fs::write(
+        directory.join(&unit),
+        "[Service]\nExecStart=/bin/true\nEnvironment=PATH=/unit/bin\nEnvironmentFile=-/nonexistent/pohunek-e2e.env\nPassEnvironment=HOME\nUnsetEnvironment=GONE\n",
+    )
+    .expect("unit file");
+    let drop_ins = directory.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&drop_ins).expect("drop-in directory");
+    std::fs::write(
+        drop_ins.join("path.conf"),
+        "[Service]\nEnvironment=PATH=/drop-in/bin\n",
+    )
+    .expect("drop-in");
+    systemctl(&["daemon-reload"]);
+
+    let loaded = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded unit");
+    assert_eq!(loaded.load_state, "loaded");
+    assert_eq!(
+        loaded.environment.last().map(String::as_str),
+        Some("PATH=/drop-in/bin")
+    );
+    assert!(
+        loaded
+            .drop_in_paths
+            .iter()
+            .any(|path| path.ends_with("path.conf")),
+        "{:?}",
+        loaded.drop_in_paths
+    );
+    assert_eq!(
+        loaded.environment_files,
+        [("/nonexistent/pohunek-e2e.env".to_owned(), true)]
+    );
+    assert_eq!(loaded.pass_environment, ["HOME"]);
+    assert_eq!(loaded.unset_environment, ["GONE"]);
 }
 
 /// The real user manager reports the `KEY=VALUE` environment its units get,

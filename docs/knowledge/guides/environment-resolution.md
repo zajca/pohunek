@@ -128,7 +128,12 @@ job as `PATH` (the launchd plist `EnvironmentVariables`). The daemon forwards
 `PATH` to workers and agents through the existing `[environment] allowlist`,
 which stays the only channel: no other variable is added, and no secret or
 interactive environment is captured. Linux and systemd keep `search_path = []`:
-the daemon inherits the user manager's environment and no `PATH` is written.
+the daemon inherits the user manager's environment and no `PATH` is written. The
+install, upgrade and rollback judge that job with the `PATH` the unit really gets: the
+user manager's, replaced by an `Environment=PATH=` of the daemon unit or its drop-ins.
+A unit setting the CLI cannot read (an `EnvironmentFile=` that sets `PATH`,
+`PassEnvironment=PATH`, `UnsetEnvironment=PATH`) is refused with the file or directive to
+change, instead of judging a `PATH` the job does not get.
 
 The install result reports how the path was obtained: `search_path.source`
 (`login_shell`, `fallback`, `recorded` for a resumed install, or `unmanaged`),
