@@ -640,6 +640,18 @@ struct SessionRegistryInner {
     /// Sessions shown only by an in-memory placeholder because the write of
     /// their classification failed, with the state and reason shown.
     unpersisted_classifications: std::sync::Mutex<HashMap<String, (RuntimeState, String)>>,
+    /// The verdict read from the failed job of a session's worker whose `Lost`
+    /// classification is not committed yet. Retiring the job destroys the
+    /// service manager's copy, so a repeated classification takes it from here.
+    unrecorded_exits: std::sync::Mutex<
+        HashMap<
+            String,
+            (
+                pohunek_platform::supervisor::ServiceId,
+                protocol::RuntimeExit,
+            ),
+        >,
+    >,
     pending_attaches: Mutex<HashMap<String, PendingAttach>>,
     active_attaches: Mutex<HashMap<String, ActiveAttach>>,
     recent_attach_failures: Mutex<VecDeque<attach::RecentAttachFailure>>,
@@ -2069,6 +2081,7 @@ impl SessionRegistry {
                 sessions: Mutex::new(HashMap::new()),
                 runtime_inventory: Mutex::new(Vec::new()),
                 unpersisted_classifications: std::sync::Mutex::new(HashMap::new()),
+                unrecorded_exits: std::sync::Mutex::new(HashMap::new()),
                 pending_attaches: Mutex::new(HashMap::new()),
                 active_attaches: Mutex::new(HashMap::new()),
                 recent_attach_failures: Mutex::new(VecDeque::new()),

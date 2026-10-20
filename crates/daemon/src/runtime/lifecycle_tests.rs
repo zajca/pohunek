@@ -2548,3 +2548,37 @@ async fn recovery_refuses_a_journal_missing_its_generation_without_a_schema_reas
     );
     assert!(harness.supervisor.retired().is_empty());
 }
+
+#[test]
+fn every_documented_result_maps_to_its_cause_and_the_exit_rides_along() {
+    use pohunek_platform::supervisor::{ExitEvidence, JobExit};
+
+    let cases = [
+        ("oom-kill", "oom_kill"),
+        ("signal", "signal"),
+        ("exit-code", "exit_code"),
+        ("core-dump", "core_dump"),
+        ("timeout", "timeout"),
+        ("watchdog", "watchdog"),
+        ("resources", "resources"),
+        ("protocol", "other"),
+        ("start-limit-hit", "other"),
+    ];
+    for (result, cause) in cases {
+        let exit = super::runtime_exit(&ExitEvidence::new(result.to_owned(), None));
+        assert_eq!(exit.cause, cause, "{result}");
+        assert_eq!((exit.signal, exit.code), (None, None), "{result}");
+    }
+    // An OOM kill reports the stop signal as the main status: the cause stays.
+    let killed = super::runtime_exit(&ExitEvidence::new(
+        "oom-kill".to_owned(),
+        Some(JobExit::Signal(15)),
+    ));
+    assert_eq!(killed.cause, "oom_kill");
+    assert_eq!(killed.signal, Some(15));
+    let exited = super::runtime_exit(&ExitEvidence::new(
+        "exit-code".to_owned(),
+        Some(JobExit::Code(3)),
+    ));
+    assert_eq!((exited.signal, exited.code), (None, Some(3)));
+}
