@@ -3075,3 +3075,42 @@ fn an_ambiguous_name_is_refused_before_any_connection() {
         assert!(run.requests.is_empty(), "{command:?}");
     }
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn pinned_operations_of_the_machines_own_overlay_name_stay_on_the_local_daemon() {
+    let home = TestHome::new();
+    let local_fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+    let tcp_fixture = TcpFixtureDaemon::start(Ipv4Addr::LOCALHOST, Scenario::Success);
+    let remote_port = tcp_fixture.address.port();
+    let (connect_redirect, connect_capture) = connect_redirect::build(&home.root);
+    let netbird = SelfNetbird::install(&home.root);
+    for command in PINNED_SESSION_COMMANDS {
+        for host in ["local", SELF_FQDN] {
+            let output = home
+                .command()
+                .env("PATH", &netbird.path)
+                .env("LD_PRELOAD", &connect_redirect)
+                .env("POHUNEK_TEST_CONNECT_CAPTURE", &connect_capture)
+                .env("POHUNEK_REMOTE_PORT", remote_port.to_string())
+                .args(["--host", host])
+                .args(command)
+                .output()
+                .expect("run pohunek");
+            assert_json_success(&output);
+        }
+    }
+    let local_requests = local_fixture.finish();
+    for command in PINNED_SESSION_COMMANDS {
+        assert!(
+            local_requests
+                .iter()
+                .any(|request| request.method() == command_method(command)),
+            "{command:?} reached the local daemon"
+        );
+    }
+    assert!(
+        tcp_fixture.finish().is_empty(),
+        "an own-name operation never dials the overlay"
+    );
+}
