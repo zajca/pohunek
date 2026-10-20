@@ -987,7 +987,22 @@ impl Bus {
             .get_property("ExecStart")
             .await
             .map_err(|source| snapshot_error("inspect_exec_start", source))?;
-        let definition = parse_exec_start(commands)?;
+        let definition = match parse_exec_start(commands) {
+            Ok(definition) => definition,
+            Err(error) => {
+                // A unit being unloaded reports no `ExecStart`; only a unit
+                // that is still loaded and unchanged is a broken definition.
+                let load_state: String = unit
+                    .get_property("LoadState")
+                    .await
+                    .map_err(|source| snapshot_error("inspect_load_state", source))?;
+                let after = read_snapshot(&unit, &service, "reinspect_snapshot").await?;
+                if load_state != "loaded" || before != after {
+                    return Err(inspect_race());
+                }
+                return Err(error);
+            }
+        };
         let inspector = LinuxInspector::new();
         let process = if before.main_pid == 0 {
             None

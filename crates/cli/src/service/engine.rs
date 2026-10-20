@@ -2263,11 +2263,25 @@ impl<'a> Engine<'a> {
     /// The strict discovery refuses a result that may omit a raced job, so
     /// an uninstall never retires around a job it cannot see.
     async fn discover(&self) -> Result<Vec<ServiceObservation>, Error> {
-        self.backend
-            .workers()
-            .discover_strict()
+        self.discover_strict_settled()
             .await
             .map_err(|source| supervisor_error("discover workers", source))
+    }
+
+    /// Strict discovery that retries a raced job until the stop timeout.
+    ///
+    /// A job being unloaded or removed while it is inspected is a transient
+    /// race; every other failure is returned at once.
+    async fn discover_strict_settled(&self) -> Result<Vec<ServiceObservation>, supervisor::Error> {
+        let deadline = Instant::now() + self.stop_timeout;
+        loop {
+            match self.backend.workers().discover_strict().await {
+                Err(supervisor::Error::Race { .. }) if Instant::now() < deadline => {
+                    tokio::time::sleep(settings::POLL_INTERVAL).await;
+                }
+                result => return result,
+            }
+        }
     }
 
     /// Removes backend directories, the CLI copy, unreferenced versions, and
@@ -2446,7 +2460,7 @@ impl<'a> Engine<'a> {
     /// discovery is recorded in the result, which then keeps every version.
     async fn usage(&self, layout: &InstallLayout) -> Result<Usage, Error> {
         let journals = Journals::scan(self.context.paths())?;
-        let discovered = self.backend.workers().discover_strict().await;
+        let discovered = self.discover_strict_settled().await;
         Ok(self.collect_usage(
             layout,
             &journals,

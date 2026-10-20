@@ -496,6 +496,9 @@ struct World {
     /// Registered jobs whose observation raced; the lenient discovery omits
     /// them the way the systemd backend does, the strict one refuses.
     raced_workers: Vec<ServiceObservation>,
+    /// Strict discoveries that still race before one completes, as when a
+    /// worker job is being unloaded while it is inspected.
+    transient_races: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -653,14 +656,15 @@ impl Supervisor for Fake {
     /// discovery failure fails both discoveries.
     fn discover_strict(&self) -> Pending<'_, Vec<ServiceObservation>> {
         Box::pin(async move {
-            let world = self.world();
+            let mut world = self.world();
             if world.fail_discover {
                 return Err(supervisor::Error::Operation {
                     operation: "discover",
                     source: "injected failure".into(),
                 });
             }
-            if !world.raced_workers.is_empty() {
+            if !world.raced_workers.is_empty() || world.transient_races > 0 {
+                world.transient_races = world.transient_races.saturating_sub(1);
                 return Err(supervisor::Error::Race {
                     operation: "discover",
                 });
@@ -5038,6 +5042,18 @@ async fn upgrade_keeps_every_version_when_worker_discovery_is_incomplete() {
         .expect("the raced job's version is kept");
     assert!(kept.reason.contains("changed during"), "{kept:?}");
     assert!(worker_exe.is_file(), "the job can still exec");
+}
+
+#[tokio::test]
+async fn upgrade_discovers_workers_again_when_a_job_is_unloaded_during_the_inspection() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.fake.world().transient_races = 2;
+
+    let report = harness.upgrade(V2).await.expect("upgrade");
+    assert_eq!(harness.fake.world().transient_races, 0);
+    assert_eq!(report.removed_versions, [V1]);
+    harness.assert_installed(V2);
 }
 
 #[tokio::test]
