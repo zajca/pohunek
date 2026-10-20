@@ -25,6 +25,14 @@ workspace (rooted at the repository root, spanning `sdk/ts/*`) for the TypeScrip
 | `crates/overlay` | Provider-neutral overlay contract, configured registry, and per-overlay routing. |
 | `crates/paths` / `crates/hostcheck` | XDG/socket contract; host environment probes. |
 | `crates/xtask` | Workspace automation: docs build/check, TS type generation. |
+| `crates/assistant` | Assistant launch orchestration: selects a runtime, materializes the knowledge bundle and a redacted live snapshot, and calls `session.new` over ordinary protocol requests. |
+| `crates/logging` | Bounded owner-private JSON-lines file logging with rotation shared by the processes of one family. |
+| `crates/platform` | Narrow operating-system contracts shared by the daemon and the session worker: process facts and kernel peer identity. |
+| `crates/service-config` | Typed owner-private `service.toml` and the upgrade preflight and runtime-plan reports shared by the installer, daemon, and worker. |
+| `crates/relay-protocol` | Typed public API contract of the optional team relay, with redacted secret diagnostics. |
+| `crates/relay` | `pohunek-relayd`: the optional team relay process and service composition. |
+| `crates/relay-client` | HTTPS-only native relay authentication client without a daemon dependency. |
+| `crates/test-support` | Test-only helpers: trusted-filesystem fixture roots, hermetic per-test environment, test binary resolution, and bounded readiness waits. |
 | `sdk/ts/` | `@pohunek/protocol` (`sdk/ts/protocol`), `@pohunek/sdk` (`sdk/ts/sdk`), `@pohunek/testkit` (`sdk/ts/testkit`). |
 
 Read **[AGENTS.md](../AGENTS.md)** first, then follow its task-specific
@@ -106,7 +114,7 @@ cargo build -p pohunek-session-worker --bin pohunek-sessiond  # daemon tests spa
 cargo nextest run --profile ci --test-threads 4 --workspace --all-features
 cargo test --doc --workspace --all-features  # nextest excludes doctests
 cargo build --workspace --release
-cargo xtask docs check          # knowledge bundle: schema/drift/secrets/runbooks
+cargo xtask docs check          # knowledge bundle: schema/drift/secrets/runbooks, doc commands vs the clap tree, crate table, package lists, doc index
 ```
 
 Routine loops (cargo-nextest profiles live in `.config/nextest.toml`; see the
@@ -578,7 +586,7 @@ the extracted binaries and that package, and executes the packaged smoke
 script. The smoke takes the extracted daemon archive, the package archive, a
 signed catalog that authorizes it, and the anchor that trusts the catalog's
 signer; these archives are smoked before assembly adds the signed release
-catalog, and the macOS archive never carries a package, so `cargo xtask hermes
+catalog and the packages, so `cargo xtask hermes
 throwaway-catalog` writes that catalog and anchor with a random signing key
 that is never stored. Operators can repeat the same
 script with an explicitly supplied, preinstalled pinned Hermes executable. It

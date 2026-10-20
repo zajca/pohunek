@@ -8,8 +8,11 @@ agent-facing operating guide for the same commands.
 ## Commands
 
 Every command accepts `--host <name>` (default `local`), and nearly all of
-them `--json` for machine-readable output (the exceptions are `attach`,
-`daemon start`, and `prompt render`). Session targets are `<session-id>` or
+them `--json` for machine-readable output.
+
+The commands without `--json` are `attach`, `completions`, `daemon start`, `prompt render`, `relay login`, `relay logout`, `relay resume-rotation`, `relay rotate` and `service lock`.
+
+Session targets are `<session-id>` or
 `<host>/<session-id>`. A discovered route uses
 `<overlay>:<canonical-identity>@<port>`. Canonical identities are typed
 `peer~<base64url>` or `fqdn~<base64url>` selectors without padding, so provider
@@ -72,13 +75,22 @@ discovered records still print. The `--json` records list peers only.
 | `pohunek workflow run [--json] <id> <action> [<args>...]` | Run one declared action of an installed, enabled plugin after re-verifying its files: no shell, the plugin's `files/` directory as cwd, stdin from `/dev/null`, its own process group, and an environment of exactly the plugin variables, `POHUNEK_CLI`, the set `HOME`/XDG roots and the complete `POHUNEK_SESSION_ID`/`POHUNEK_DAEMON_ID` pair (one marker alone refuses the run with `workflow_origin_incomplete`). Every argument after `<action>` (including `--json`, `--`, `-h` and empty strings) goes verbatim to an action declaring `args = "passthrough"`, so pohunek's own `--json` and `--host` go before `<id>`. Stdout and stderr stream here up to their caps; with `--json` stdout is captured instead and printed as `ok` byte for byte when the action exits 0 with exactly one JSON document, otherwise one error envelope with no output bytes: `workflow_action_failed` (with `exit_code`, and `signal` when a signal ended the action) for a failed action, `workflow_output_invalid` or `workflow_output_incomplete` (exit 1) for unusable stdout. Exits with the action's status, 124 at the deadline (`workflow_action_timeout`), 125 over an output cap (`workflow_output_limit`), or 128 plus the signal number when the CLI was signalled (`workflow_action_interrupted`); the group is stopped with `SIGTERM`, a grace, then `SIGKILL`. Limits come from `<config>/pohunek/workflow.toml` (`workflow_config_invalid` when it is unsafe or invalid), and every run of an installed plugin, refused or not, appends a content-free record to the plugin's `logs/runs.jsonl` (except runs that fail before the run log is opened, such as invalid knobs or an unknown plugin). |
 | `pohunek workflow` event reactions | A plugin's `[reactions.<name>]` tables run for daemon events through one dispatcher unit that the CLI installs while an enabled plugin declares reactions; `workflow enable`, `disable` and `uninstall` keep it in step. The hidden `__dispatch` entry point is not typed by hand. See the guide's [Event reactions](knowledge/guides/workflow-plugins.md#event-reactions). |
 | `pohunek daemon start [--detach] [--dev-subprocess]` | Run the installed daemon by hand (needs `service.toml`), or with `--dev-subprocess` a development daemon with plain subprocess workers. |
-| `pohunek health` / `status` | Daemon liveness, build, and protocol version. |
+| `pohunek health [--json]` | Daemon liveness, build, and protocol version. |
+| `pohunek status [--json]` | Alias for `health`. |
+| `pohunek subscribe [--json]` | Stream daemon events as newline-delimited JSON. The stream is JSON with or without `--json`; the flag keeps error rendering in JSON. |
 | `pohunek session new` | Start a session: `--agent`, `--name`, `--project`/`--repo`, `--branch`, `--base-branch`, `--cwd`, `--input`, `--request-timeout-ms`, `--meta k=v`. An existing local `--branch` is checked out as it is; an explicit `--base-branch` it ignores at another commit is reported as a `base_branch_fallback` warning ([Worktrees](knowledge/concepts/worktrees.md)). A `request_timeout` leaves the outcome unknown ([CLI Process API](public-api.md#cli-process-api)). |
 | `pohunek session list` | List sessions, including a `running/recent` subagent count and a `BACKGROUND` column of compact per-kind counts of the latest background snapshot (`a` subagent, `s` shell, `m` monitor, `w` workflow, `t` teammate, `o` every other kind; zero kinds omitted; `-` when no snapshot has been reported, `0` when the latest snapshot lists no task). Example row: `2a 2s 1m`. Repeat `--filter state=running`, `--meta-eq key=value`, and `--meta-has key` to combine predicates with AND. Metadata values split at the first `=` and may be empty; keys are opaque. `-q` prints ids only. |
 | `pohunek session inspect <target>` | Full logical session record: agent state, current/recent subagents, runtime state and generation, cwd, project, branch, worktree, recovery binding. Adds `background_items` (`<none>` without a snapshot, `0` for an empty one) and `background_observed` (age of the snapshot, `<none>` without one), then one line per subagent with its background label and age, and one `background [<kind>]: <status> <program> <label> first seen >= <age>` line per other background item. An absent program or label prints `-`. Labels and programs are escaped for the terminal. |
 | `pohunek attach <target>` | Attach the current terminal; `Ctrl-]` detaches. |
 | `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing; use `--stdin` for non-argv input. `--until <activity>` (repeatable) and `--timeout <ms>` wait for the agent's reaction in the same call, for zero-delay profiles only. |
 | `pohunek session screen <target>` | Read the current rendered terminal; `--json` preserves runtime identity, watermark, geometry, cursor, and visible lines. |
+| `pohunek session read <target> [--source <source>] [--lines <n>] [--format <format>] [--json]` | Read a bounded terminal capture; the source defaults to the current visible screen. |
+| `pohunek session resize <target> --cols <n> --rows <n> [--json]` | Resize a managed session terminal. |
+| `pohunek session metadata <target> [--set k=v] [--clear k] [--json]` | Merge or clear owner-controlled session metadata (both flags repeat). |
+| `pohunek session runtime-inventory [--json]` | List the durable worker runtime endpoints of the host. |
+| `pohunek session policy get [--json]` | Show the session retention policy. |
+| `pohunek session policy set [--enabled \| --disabled] [--sweep-interval-secs <n>] [--terminal-ttl-secs <n>] [--lost-ttl-secs <n>] [--max-removals-per-sweep <n>] [--json]` | Update the given retention policy fields; unspecified fields keep their value, and the daemon applies the policy on its next sweep. |
+| `pohunek session retention sweep [--dry-run \| --apply] [--limit <n>] [--json]` | Run one retention sweep now with the current policy TTLs: `--dry-run` reports the selected sessions, `--apply` removes them with their owned worktrees, never beyond the policy's per-sweep cap. |
 | `pohunek session detection <target>` | Preview the active detection manifest regions; `--json` also lists every supported region kind. |
 | `pohunek session output <target>` | Read a newest retained tail or continue with `--worker-instance-id` (the session's `worker_instance_id`), `--runtime-generation`, and `--after-offset`; `--wait-ms` performs a bounded wait. |
 | `pohunek session wait <target>...` | Wait for the next turn event (`turn_completed`, `agent_blocked`, `approval_required`, `exited`) of one or more sessions on one host: `--until`, `--after <cursor>`, `--timeout <duration>`; this is the mode with no flags. Any legacy flag (`--state`, `--activity`, the `--after-*` cursors, the runtime identity, `--timeout-ms`) selects a single-target long-poll of up to 8000 ms for explicit predicates. |
@@ -94,6 +106,7 @@ discovered records still print. The `--json` records list peers only.
 | `pohunek completions <bash\|zsh\|fish>` | Print static shell completion; add `--dynamic` for bounded host/session, package and workflow plugin candidates. |
 | `pohunek notifications list / watch` | Inspect or stream the durable inbox; `--all-hosts` fans out. |
 | `pohunek notifications read / ack / archive / delete` | Drive one record's lifecycle (`host/id` targets a specific host). |
+| `pohunek notifications policy get [--all-hosts] [--json]` | Show the notification policy. |
 | `pohunek notifications policy / retention` | Per-kind policy for the default flags or any runtime id (`--provider default\|<runtime-id>`; `default` is always the base flags, even if a runtime is named `default`), retention pruning (`--dry-run` / `--apply`). |
 | `pohunek integration install` | Install Codex/Claude hooks into the runtime's own config home, one host profile's home (`--profile NAME`) or every distinct home (`--all-profiles`), or install a selected Hermes profile's managed plugin from the installed Hermes package with explicit access mode and host allowlist. |
 | `pohunek integration status` | Inspect daemon-managed Codex/Claude hooks on the effective `--host` (`--profile` and `--all-profiles` select profile config homes and are local-only), or one explicitly selected local Hermes target. |
@@ -102,8 +115,15 @@ discovered records still print. The `--json` records list peers only.
 | `pohunek setup [--yes \| --dry-run] [--json]` | The one host setup: installs the service from this release, applies the official runtime packages, profile pins and hooks for the runtimes this host has, and writes the missing config files. It previews every change and asks once; `--yes` applies without asking, and without a terminal or with `--json` it needs `--yes`. `--dry-run` prints the plan and changes nothing. It never upgrades an installed service. |
 | `pohunek setup config [--force] [--json]` | Install the default `attach.conf` and prompt templates; existing files are kept unless `--force`. |
 | `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
+| `pohunek assistant project / update [request…]` | Steer the assistant toward project configuration or toward reconciling an update; the flags are those of `pohunek assistant`. |
 | `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot; `--request-stdin` reads the request from stdin, `--request-timeout-ms` and `--meta k=v` as on `session new`. |
 | `pohunek agent-skill` | Print the complete bundled agent skill; `--json` wraps the skill text and its `content_sha256` in the process envelope. Fully local — `--host` is accepted and ignored. |
+| `pohunek migration preflight [--accept-runtime-loss] [--socket <path>] [--json]` | Snapshot legacy sessions and refuse replacement while live PTYs exist; the daemon installer runs it at the one-time daemon-owned to worker-owned PTY boundary, with `--socket` naming the legacy socket moved aside. `--accept-runtime-loss` records consent to import live legacy sessions as runtime-lost. |
+| `pohunek relay login --origin <origin> [--ca-file <file>]` | Sign in to an optional team relay with the OIDC device flow and store the credential in the OS keyring. `--origin` is the exact HTTPS origin; `--ca-file` adds a public CA certificate for a privately operated relay. |
+| `pohunek relay status --origin <origin> [--ca-file <file>] [--json]` | Show the account that the stored credential of that origin authenticates. |
+| `pohunek relay logout --origin <origin> [--ca-file <file>]` | Revoke the stored credential, then delete it from the keyring. |
+| `pohunek relay rotate --origin <origin> [--ca-file <file>] [--expires-in-seconds <n>] [--overlap-seconds <n>]` | Replace the stored credential with explicit expiry and overlap limits. |
+| `pohunek relay resume-rotation --origin <origin> [--ca-file <file>]` | Reconcile an interrupted rotation using its original policy and request. |
 | `pohunek prompt render / link` | Render provider prompt templates and work-item link metadata (called by external launchers). |
 
 `--preflight-budget <SECONDS>` (1 to 300, default 20) sets the probe and reference-check budget of this release's upgrade preflight only. A rollback judges with the previous release's daemon, which does not take the flag, so the rollback's preflight always uses the default budget.
@@ -181,8 +201,9 @@ upgrade of the release files. It runs in this order:
    without a write. Setup runs the `hermes` executable on the daemon job's
    `PATH`, the one the plan detects Hermes with. A home without the marker
    is a gap: setup
-   does not choose a Hermes access policy for you, so it names the
-   `pohunek integration hermes install` command for such a home and writes
+   does not choose a Hermes access policy for you, so it names the Hermes
+   install command for such a home (`pohunek integration install --agent
+   hermes` with the home and an explicit access policy) and writes
    nothing into it. A home that appears after the preview is not touched; a
    listed home that has gone is reported. A profiles directory that cannot be
    read is reported as a failure. A gap does not fail the run.

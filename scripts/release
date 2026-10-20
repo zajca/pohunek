@@ -1,9 +1,10 @@
 #!/bin/sh
 
 # Cut a new release: bump the workspace version, refresh the lockfile, file the
-# knowledge-log fragments under the release heading, commit, push the candidate
-# to main, require CI evidence for that commit (a run on it, or a dispatch run
-# of the same tree; see scripts/ci-evidence), then tag it.
+# knowledge-log fragments under the release heading, run `cargo xtask docs
+# check` on that folded tree, commit, push the candidate to main, require CI
+# evidence for that commit (a run on it, or a dispatch run of the same tree;
+# see scripts/ci-evidence), then tag it.
 # Pushing the tag triggers .github/workflows/release.yml,
 # which builds the binaries, runs the compatibility rows, signs the runtime
 # catalog and publishes the GitHub Release as a draft that becomes visible only
@@ -16,7 +17,9 @@
 #   scripts/release 1.4.2        # explicit version
 #
 # Options:
-#   --dry-run    Show what would happen without changing anything.
+#   --dry-run    Show what would happen without changing anything. The fold,
+#                the version bump and the docs check run on a temporary copy
+#                of HEAD, so a defect the fold causes shows up here.
 #   --no-push    Commit and tag locally only when CI evidence for the commit exists.
 #   --notes FILE Release-notes file with one line naming each schema or protocol
 #                constant that changed since the previous tag (required when
@@ -60,7 +63,7 @@ for arg in "$@"; do
     patch | minor | major) bump="$arg" ;;
     [0-9]*.[0-9]*.[0-9]*) bump="$arg" ;;
     -h | --help)
-      sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '3,21p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) pohunek_fail "unknown argument: $arg (use patch|minor|major|X.Y.Z, --dry-run, --no-push, --notes FILE)" ;;
@@ -215,11 +218,61 @@ pohunek_check_compat_notes
 
 # The unreleased knowledge-log fragments (docs/knowledge/log.d) are filed under
 # the release heading of docs/knowledge/log.md and removed in the release commit.
-knowledge_dir="$repo_root/docs/knowledge"
-fragment_dir="$knowledge_dir/log.d"
-
 pohunek_fold_knowledge_log() {
   ( cd "$repo_root" && cargo xtask docs log fold --version "$next" "$@" )
+}
+
+# Folds the fragments, bumps the version and refreshes Cargo.lock in the tree
+# rooted at $1, the way the release commit holds them.
+pohunek_apply_release_edits() {
+  ( cd "$1" && cargo xtask docs log fold --version "$next" )
+
+  # Bump the version in [workspace.package] (only that table's `version` line).
+  tree_manifest="$1/Cargo.toml"
+  tmp="$tree_manifest.tmp"
+  awk -v nextver="$next" '
+    /^\[workspace\.package\]/ { in_pkg = 1; print; next }
+    /^\[/ { in_pkg = 0 }
+    in_pkg && /^version[[:space:]]*=/ {
+      print "version = \"" nextver "\""
+      in_pkg = 0
+      next
+    }
+    { print }
+  ' "$tree_manifest" > "$tmp"
+  mv "$tmp" "$tree_manifest"
+
+  # Refresh Cargo.lock so the workspace members record the new version.
+  ( cd "$1" && cargo update --workspace --offline >/dev/null 2>&1 || cargo update --workspace >/dev/null )
+}
+
+# Runs the docs check, which includes the knowledge-log check, on the tree
+# rooted at $1. A path the fold removes, such as docs/knowledge/log.d, fails
+# here instead of on main after the push.
+pohunek_require_folded_candidate() {
+  if [ -d "$1/docs/knowledge/log.d" ] && [ -n "$(ls -A "$1/docs/knowledge/log.d")" ]; then
+    pohunek_fail "the candidate still has knowledge-log fragments in docs/knowledge/log.d; fold them with 'cargo xtask docs log fold --version $next' and commit"
+  fi
+}
+
+pohunek_check_release_docs() {
+  ( cd "$1" && cargo xtask docs check ) || pohunek_fail "cargo xtask docs check failed on the release tree ($2); nothing was committed or pushed"
+}
+
+# A dry run checks a temporary export of HEAD, so the working tree stays
+# untouched. Builds reuse the checkout's target directory unless
+# CARGO_TARGET_DIR names another one.
+dry_tree=""
+pohunek_dry_run_check() {
+  dry_tree="$(mktemp -d "${TMPDIR:-/tmp}/pohunek-release-dry.XXXXXX")"
+  git -C "$repo_root" archive HEAD | tar -x -C "$dry_tree"
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/target}"
+  if [ "$version_already_bumped" = false ]; then
+    pohunek_apply_release_edits "$dry_tree"
+  else
+    pohunek_require_folded_candidate "$dry_tree"
+  fi
+  pohunek_check_release_docs "$dry_tree" "dry run copy of HEAD"
 }
 
 # Between the fold and the release commit the script edits tracked files of a
@@ -229,6 +282,7 @@ pohunek_fold_knowledge_log() {
 # the same commit; a path that cannot be restored is named.
 release_edits_pending=false
 pohunek_restore_release_edits() {
+  [ -z "$dry_tree" ] || rm -rf "$dry_tree"
   [ "$release_edits_pending" = true ] || return 0
   unrestored=""
   rm -f "$manifest.tmp" || unrestored=" Cargo.toml.tmp"
@@ -246,6 +300,8 @@ trap pohunek_restore_release_edits EXIT
 
 if [ "$dry_run" = true ]; then
   pohunek_fold_knowledge_log --dry-run
+  pohunek_dry_run_check
+  pohunek_info "dry run: the folded and bumped tree passes cargo xtask docs check"
   pohunek_info "dry run: would bump $manifest to $next, refresh Cargo.lock, fold the knowledge-log fragments, commit, push the candidate, verify main and nightly CI evidence for the candidate (by commit or by tree), then tag $tag$( [ "$push" = true ] && printf ' and push the tag' )"
   exit 0
 fi
@@ -263,32 +319,15 @@ if git -C "$repo_root" rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
 fi
 
 if [ "$version_already_bumped" = true ]; then
-  if [ -d "$fragment_dir" ] && [ -n "$(ls -A "$fragment_dir")" ]; then
-    pohunek_fail "the candidate still has knowledge-log fragments in docs/knowledge/log.d; fold them with 'cargo xtask docs log fold --version $next' and commit"
-  fi
+  pohunek_require_folded_candidate "$repo_root"
   pohunek_info "workspace is already at $next; checking this commit as the release candidate"
+  pohunek_check_release_docs "$repo_root" "release candidate"
 else
   # Fold first: it validates every fragment before it writes, so a refused
   # fragment stops the release with the tree unchanged.
   release_edits_pending=true
-  pohunek_fold_knowledge_log
-
-  # Bump the version in [workspace.package] (only that table's `version` line).
-  tmp="$manifest.tmp"
-  awk -v nextver="$next" '
-    /^\[workspace\.package\]/ { in_pkg = 1; print; next }
-    /^\[/ { in_pkg = 0 }
-    in_pkg && /^version[[:space:]]*=/ {
-      print "version = \"" nextver "\""
-      in_pkg = 0
-      next
-    }
-    { print }
-  ' "$manifest" > "$tmp"
-  mv "$tmp" "$manifest"
-
-  # Refresh Cargo.lock so the workspace members record the new version.
-  ( cd "$repo_root" && cargo update --workspace --offline >/dev/null 2>&1 || cargo update --workspace >/dev/null )
+  pohunek_apply_release_edits "$repo_root"
+  pohunek_check_release_docs "$repo_root" "folded and bumped"
 
   git -C "$repo_root" add Cargo.toml Cargo.lock
   for path in docs/knowledge/log.md docs/knowledge/log.d; do

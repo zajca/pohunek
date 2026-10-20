@@ -16,7 +16,7 @@ positioning; [architecture.md](architecture.md) is the authoritative design.
   only by its official runtime package (`pohunek.runtime.codex`,
   `pohunek.runtime.claude`, `pohunek.runtime.hermes`) installed from the signed
   release catalog with `pohunek plugin install`; only plain `shell` is built
-  in. The Linux x86_64 and Apple Silicon daemon archives ship the three packages. Without its package a
+  in. The Linux x86_64 and Apple Silicon daemon archives ship the official packages (`runtime-packages/*`, Pi included). Without its package a
   bare `codex`, `claude` or `hermes` is `agent_profile_not_found` and a host
   profile over it is `runtime_not_installed`. Per-host **agent profiles**
   define the program, arguments, environment, and input rules for custom

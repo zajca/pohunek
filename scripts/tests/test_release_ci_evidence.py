@@ -50,10 +50,20 @@ os.execv(real, [real, *args])
 
 FAKE_CARGO = "#!/bin/sh\nexit 0\n"
 
-# Stands in for `cargo xtask docs log fold`: records the call, and outside a dry
-# run files the fragments the way the real fold does (log written, log.d gone).
+# Stands in for `cargo xtask`: records a fold and a docs check. Outside a dry
+# run the fold files the fragments the way the real fold does (log written,
+# log.d gone). The docs check fails like the source-map path check when a path
+# the source map cites is missing from the tree it runs in.
 FOLDING_CARGO = r'''#!/bin/sh
 case "$*" in
+  "xtask docs check")
+    printf '%s\n' "cargo $*" >> "$EVENTS"
+    if [ -f docs/knowledge/assistant/source-map.md ]; then
+      for cited in $(grep -o '`docs/[^`]*`' docs/knowledge/assistant/source-map.md | tr -d '`'); do
+        [ -e "$cited" ] || { printf 'source-map-paths: missing %s\n' "$cited" >&2; exit 1; }
+      done
+    fi
+    ;;
   "xtask docs log fold "*)
     printf '%s\n' "cargo $*" >> "$EVENTS"
     case "$*" in
@@ -71,6 +81,8 @@ case "$*" in
 esac
 exit 0
 '''
+
+SOURCE_MAP_CITING_FRAGMENTS = "# Source map\n\nFragments live in `docs/knowledge/log.d/`.\n"
 
 LOG = "# Knowledge Bundle Log\n\n## 0.1.0\n\n- First release.\n"
 FRAGMENT = "## Unreleased (2026-10-14, a change, #1)\n\n- A change.\n"
@@ -157,6 +169,8 @@ class ReleaseEvidenceTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.repo = self.root / "repo"
         self.repo.mkdir()
+        self.scratch = self.root / "scratch"
+        self.scratch.mkdir()
         self.bin = self.repo / "bin"
         self.bin.mkdir()
         self.events = self.root / "events.jsonl"
@@ -210,6 +224,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
             "EVENTS": str(self.events),
             "GH_STATE": str(self.state),
             "EVIDENCE_CONFIG": str(self.repo / "scripts/ci-evidence.json"),
+            "TMPDIR": str(self.scratch),
         })
         if remote_sha is not None:
             env["REMOTE_SHA"] = remote_sha
@@ -357,6 +372,85 @@ class ReleaseEvidenceTests(unittest.TestCase):
         result = self.run_release("0.1.1", "--no-push")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("still has knowledge-log fragments", result.stderr)
+        self.assertFalse((self.repo / ".git/refs/tags/v0.1.1").exists())
+
+    def add_source_map_citing_fragments(self):
+        self.write_copy("docs/knowledge/assistant/source-map.md", SOURCE_MAP_CITING_FRAGMENTS)
+        self.git("add", "docs")
+        self.git("commit", "-m", "Cite the fragment directory in the source map")
+
+    def head(self):
+        return subprocess.check_output(
+            [shutil.which("git"), "-C", str(self.repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+
+    def assert_tree_untouched(self, head):
+        self.assertEqual(self.head(), head, "no release commit was made")
+        status = subprocess.check_output(
+            [shutil.which("git"), "-C", str(self.repo), "status", "--porcelain"], text=True
+        )
+        self.assertEqual(status, "", "the tree is as the release found it")
+        self.assertTrue((self.repo / "docs/knowledge/log.d/1-a-change.md").exists())
+        self.assertEqual(list(self.scratch.iterdir()), [], "the temporary copy is removed")
+        self.assertFalse(any(event.startswith('["git", "push"') for event in self.read_events()))
+
+    def test_docs_check_runs_on_the_folded_tree_before_the_push(self):
+        self.add_knowledge_log()
+        result = self.run_release()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = self.read_events()
+        self.assertIn("cargo xtask docs check", events)
+        self.assertLess(
+            events.index("cargo xtask docs check"),
+            events.index(json.dumps(["git", "push", "push", "origin", "main"])),
+        )
+
+    def test_fold_that_removes_a_cited_path_stops_the_release_before_the_commit(self):
+        self.add_knowledge_log()
+        self.add_source_map_citing_fragments()
+        head = self.head()
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("docs/knowledge/log.d/", result.stderr)
+        self.assertIn("cargo xtask docs check failed on the release tree", result.stderr)
+        self.assertIn("were undone", result.stderr)
+        self.assert_tree_untouched(head)
+
+    def test_dry_run_reports_the_failure_a_fold_causes_and_changes_nothing(self):
+        self.add_knowledge_log()
+        self.add_source_map_citing_fragments()
+        head = self.head()
+        result = self.run_release("--dry-run")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("docs/knowledge/log.d/", result.stderr)
+        self.assertIn("dry run copy of HEAD", result.stderr)
+        self.assert_tree_untouched(head)
+
+    def test_dry_run_checks_the_folded_tree_and_removes_its_copy(self):
+        self.add_knowledge_log()
+        head = self.head()
+        result = self.run_release("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cargo xtask docs check", self.read_events())
+        self.assert_tree_untouched(head)
+
+    def test_dry_run_refuses_an_already_versioned_candidate_with_unfolded_fragments(self):
+        self.add_knowledge_log()
+        self.prepare_existing_candidate()
+        result = self.run_release("0.1.1", "--dry-run")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("still has knowledge-log fragments", result.stderr)
+        self.assertEqual(list(self.scratch.iterdir()), [], "the temporary copy is removed")
+
+    def test_already_versioned_candidate_is_docs_checked_before_the_push(self):
+        self.add_knowledge_log()
+        self.add_source_map_citing_fragments()
+        self.git("rm", "-r", "-q", "docs/knowledge/log.d")
+        self.git("commit", "-m", "Fold the fragments")
+        self.prepare_existing_candidate()
+        result = self.run_release("0.1.1", "--no-push")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cargo xtask docs check failed on the release tree", result.stderr)
         self.assertFalse((self.repo / ".git/refs/tags/v0.1.1").exists())
 
     def test_push_checks_both_tiers_before_tag_and_tag_push(self):

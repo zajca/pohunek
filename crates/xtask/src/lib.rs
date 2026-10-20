@@ -6,6 +6,7 @@ mod attestation;
 mod catalog;
 mod catalog_key;
 mod checks;
+mod doc_drift;
 mod eval;
 mod generators;
 mod hermes;
@@ -344,6 +345,20 @@ pub fn check_docs(
     output_root: impl AsRef<Path>,
 ) -> Result<bool, XtaskError> {
     checks::check_docs(source_dir, output_root)
+}
+
+/// Runs the drift checks between the docs and their sources of truth (the
+/// clap command tree, the workspace members, `runtime-packages/`, the
+/// documentation indexes) against the checkout at `repo`, printing one
+/// `[PASS]`/`[FAIL]` line per check, and returns the names of the failed ones.
+///
+/// # Errors
+///
+/// Returns [`XtaskError::Io`] when a page cannot be read, and
+/// [`XtaskError::UnsupportedFileType`] for a symbolic link where a documentation
+/// root is expected.
+pub fn check_doc_drift(repo: impl AsRef<Path>) -> Result<Vec<&'static str>, XtaskError> {
+    doc_drift::check(repo.as_ref())
 }
 
 pub fn run<I, S>(args: I) -> Result<(), XtaskError>
