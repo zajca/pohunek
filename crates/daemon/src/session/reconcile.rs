@@ -2714,6 +2714,7 @@ impl SessionRegistry {
                 None,
             )
         };
+        self.clear_unreadable_blockers(id);
         // The marker requirement applies only to a runtime no journal names.
         let mut runtimes: Vec<(String, WorkerBounds, bool)> = Vec::new();
         if let Some(generation) = generation {

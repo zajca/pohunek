@@ -974,8 +974,9 @@ impl SessionRegistry {
     ///
     /// The wait covers a process caught between images or about to follow its
     /// creator out. A candidate that has run longer than `grace` is neither,
-    /// so it keeps the cleanup unconfirmed without a wait. A candidate whose
-    /// age the host cannot tell keeps the wait.
+    /// so it keeps the cleanup unconfirmed without a wait; a retry decides it
+    /// later. The age counts from the process start, which an `exec` does not
+    /// reset. A candidate whose age the host cannot tell keeps the wait.
     fn candidates_may_still_settle(&self, candidates: &[Skipped], grace: Duration) -> bool {
         candidates.iter().any(|candidate| {
             !matches!(
@@ -1104,6 +1105,18 @@ impl SessionRegistry {
             }
         }
         (orphans, None)
+    }
+
+    /// Forgets the blockers recorded for `id`; every removal sweep starts from
+    /// none, and a refusal records its own.
+    pub(super) fn clear_unreadable_blockers(&self, id: &SessionId) {
+        self.inner
+            .supervision_retries
+            .state
+            .lock()
+            .expect("supervision retry state is never poisoned")
+            .blocked
+            .remove(&id.0);
     }
 
     /// Records the unreadable-marker `candidates` that alone keep the removal
