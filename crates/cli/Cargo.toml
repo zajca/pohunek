@@ -93,6 +93,9 @@ pohunek-daemon = { path = "../daemon" }
 # `session_process_api.rs` asserts the real remote-port contract through the
 # process boundary, using the netbird crate's public constants.
 netbird = { workspace = true }
+# `host_pin_assistant.rs` answers `assistant.materialize` with the bundle identity
+# the assistant verifies.
+pohunek-knowledge = { workspace = true }
 # `plugin_catalog_install.rs` signs catalogs with a key generated in the test.
 ed25519-dalek = { workspace = true }
 # `release_upgrade.rs` reads the previous release's archive, whose frame the
