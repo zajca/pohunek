@@ -44,6 +44,7 @@ use crate::procwatch::{
 };
 use crate::project::detect::project_id;
 use crate::runtime::{Worker, WorkerError};
+use crate::session::event_concerns_other_session;
 use pohunek_test_support::wait::{guard, wait_until, HANG_GUARD};
 
 use super::{
@@ -8436,6 +8437,241 @@ async fn session_input_wait_uses_rapid_target_event_after_latest_state_changes()
     assert_eq!(result.runtime.as_ref(), Some(&submitted.runtime));
     assert!(result.activity_revision > Some(submitted.revision));
     let _ = registry.stop(&created.id).await;
+}
+
+fn drain_agent_state(events: &mut tokio::sync::broadcast::Receiver<protocol::Event>) -> usize {
+    let mut count = 0;
+    while let Ok(event) = events.try_recv() {
+        if event.event() == protocol::event::AGENT_STATE {
+            count += 1;
+        }
+    }
+    count
+}
+
+async fn shell_session(registry: &SessionRegistry) -> protocol::SessionInfo {
+    registry
+        .create(params())
+        .await
+        .expect("create shell session")
+}
+
+fn sleeping_registry() -> SessionRegistry {
+    SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    })
+}
+
+#[tokio::test]
+async fn a_restated_detector_activity_neither_advances_the_revision_nor_publishes() {
+    let registry = sleeping_registry();
+    let created = shell_session(&registry).await;
+    let mut events = registry.subscribe();
+
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    let first = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("snapshot after the first report");
+    assert_eq!(drain_agent_state(&mut events), 1);
+
+    for _ in 0..3 {
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Idle))
+            .await;
+    }
+    let after = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("snapshot after the restatements");
+    assert_eq!(after.revision, first.revision);
+    assert_eq!(drain_agent_state(&mut events), 0);
+
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    let changed = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("snapshot after a real change");
+    assert!(changed.revision > first.revision);
+    assert_eq!(drain_agent_state(&mut events), 1);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn an_outstanding_output_or_session_wait_does_not_keep_an_idle_session_publishing() {
+    let registry = sleeping_registry();
+    let created = shell_session(&registry).await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    let mut events = registry.subscribe();
+    let first = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("snapshot after the idle report");
+    // `session.output` and `session.wait` hold a bounded-wait permit.
+    let _permit = registry
+        .acquire_waiter(&created.id)
+        .expect("waiter slot for a long poll");
+
+    for _ in 0..3 {
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Idle))
+            .await;
+    }
+
+    let after = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("snapshot after the restatements");
+    assert_eq!(after.revision, first.revision);
+    assert_eq!(drain_agent_state(&mut events), 0);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn an_input_wait_into_an_idle_session_settles_on_the_restated_idle() {
+    let registry = sleeping_registry();
+    let created = shell_session(&registry).await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    let mut events = registry.subscribe();
+    let _watch = registry.watch_activity_evidence(&created.id);
+    let boundary = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("capture the submit boundary");
+    let submission = InputSubmission {
+        runtime: boundary.runtime.clone(),
+        activity_epoch: registry.daemon_instance_id().to_owned(),
+        after_revision: boundary.revision,
+        deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+    };
+
+    let waiting = {
+        let registry = registry.clone();
+        let id = created.id.clone();
+        tokio::spawn(async move {
+            registry
+                .await_input_settled(
+                    &id,
+                    protocol::SessionInputWait {
+                        until: Some(vec![AgentActivity::Idle]),
+                        timeout_ms: Some(5_000),
+                    },
+                    submission,
+                    &mut events,
+                )
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+
+    let result = waiting
+        .await
+        .expect("wait task joins")
+        .expect("the restated idle settles the wait");
+    assert_eq!(result.activity, Some(AgentActivity::Idle));
+    assert!(result.activity_revision > Some(boundary.revision));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_wait_on_one_session_settles_through_a_burst_of_another_sessions_events() {
+    let registry = sleeping_registry();
+    let waited = shell_session(&registry).await;
+    let other = shell_session(&registry).await;
+    let mut events = registry.subscribe();
+    let _watch = registry.watch_activity_evidence(&waited.id);
+    let boundary = registry
+        .input_activity_snapshot(&waited.id, None)
+        .await
+        .expect("capture the submit boundary");
+    let submission = InputSubmission {
+        runtime: boundary.runtime.clone(),
+        activity_epoch: registry.daemon_instance_id().to_owned(),
+        after_revision: boundary.revision,
+        deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+    };
+    let waiting = {
+        let registry = registry.clone();
+        let id = waited.id.clone();
+        tokio::spawn(async move {
+            registry
+                .await_input_settled(
+                    &id,
+                    protocol::SessionInputWait {
+                        until: Some(vec![AgentActivity::Idle]),
+                        timeout_ms: Some(5_000),
+                    },
+                    submission,
+                    &mut events,
+                )
+                .await
+        })
+    };
+
+    for index in 0..20 {
+        let activity = if index % 2 == 0 {
+            AgentActivity::Working
+        } else {
+            AgentActivity::Idle
+        };
+        registry
+            .record_activity(&other.id, transition(activity))
+            .await;
+    }
+    registry
+        .record_activity(&waited.id, transition(AgentActivity::Idle))
+        .await;
+
+    let result = waiting
+        .await
+        .expect("wait task joins")
+        .expect("the waited session's own event settles the wait");
+    assert_eq!(result.activity, Some(AgentActivity::Idle));
+    let _ = registry.stop(&waited.id).await;
+    let _ = registry.stop(&other.id).await;
+}
+
+#[test]
+fn only_events_naming_another_session_are_filtered_out_of_a_wait() {
+    let mine = SessionId("s-mine".to_owned());
+    let event = |payload: serde_json::Value| {
+        protocol::Event::new(protocol::PROTOCOL_VERSION, "agent_state", payload)
+            .expect("valid event")
+    };
+
+    assert!(event_concerns_other_session(
+        &event(serde_json::json!({"session_id": "s-other"})),
+        &mine
+    ));
+    assert!(event_concerns_other_session(
+        &event(serde_json::json!({"session": {"id": "s-other"}})),
+        &mine
+    ));
+    assert!(!event_concerns_other_session(
+        &event(serde_json::json!({"session_id": "s-mine"})),
+        &mine
+    ));
+    assert!(!event_concerns_other_session(
+        &event(serde_json::json!({"session": {"id": "s-mine"}})),
+        &mine
+    ));
+    assert!(!event_concerns_other_session(
+        &event(serde_json::json!({"record": {}})),
+        &mine
+    ));
 }
 
 #[tokio::test]

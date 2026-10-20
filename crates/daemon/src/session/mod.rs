@@ -597,6 +597,9 @@ struct SessionRegistryInner {
     observation_waiters: AtomicUsize,
     /// Per-session active bounded observation waits.
     observation_session_waiters: std::sync::Mutex<HashMap<SessionId, usize>>,
+    /// Sessions with a bounded input wait, which needs unchanged activity
+    /// restated as evidence newer than its submit boundary.
+    activity_evidence_waiters: std::sync::Mutex<HashMap<SessionId, usize>>,
     /// Turn-event journal, per-session turn progress, and turn waiter pool.
     turns: TurnEvents,
     /// Set when daemon process shutdown starts. Natural PTY exits observed after
@@ -888,6 +891,48 @@ impl ActivityEvidence {
     }
 }
 
+/// Whether `event` names a session other than `id`.
+///
+/// Session events carry the id as `session_id` or as `session.id`. An event
+/// naming no session (notifications, inventory) is not claimed to concern
+/// another session, so a waiter still re-checks its own state for it.
+fn event_concerns_other_session(event: &protocol::Event, id: &SessionId) -> bool {
+    let payload = event.payload();
+    let named = payload
+        .get("session_id")
+        .or_else(|| payload.get("session").and_then(|session| session.get("id")))
+        .and_then(serde_json::Value::as_str);
+    named.is_some_and(|named| named != id.0)
+}
+
+fn live_runtime_identity(entry: &SessionEntry) -> Option<SessionRuntimeIdentity> {
+    entry.info.runtime.as_ref().and_then(|runtime| {
+        if runtime.state != RuntimeState::Live {
+            return None;
+        }
+        SessionRuntimeIdentity::new(
+            runtime.worker_instance_id.clone()?,
+            runtime.runtime_generation,
+        )
+        .ok()
+    })
+}
+
+/// Whether the newest activity evidence of the live runtime already states
+/// `activity` from `source`.
+fn activity_already_recorded(
+    entry: &SessionEntry,
+    activity: AgentActivity,
+    source: StateSource,
+) -> bool {
+    let Some(runtime) = live_runtime_identity(entry) else {
+        return false;
+    };
+    entry.activity_evidence.back().is_some_and(|latest| {
+        latest.activity == activity && latest.source == source && latest.runtime == runtime
+    })
+}
+
 fn record_activity_evidence(
     entry: &mut SessionEntry,
     activity: AgentActivity,
@@ -898,16 +943,7 @@ fn record_activity_evidence(
         .activity_revision
         .checked_add(1)
         .expect("session activity revision overflowed");
-    let runtime = entry.info.runtime.as_ref().and_then(|runtime| {
-        if runtime.state != RuntimeState::Live {
-            return None;
-        }
-        SessionRuntimeIdentity::new(
-            runtime.worker_instance_id.clone()?,
-            runtime.runtime_generation,
-        )
-        .ok()
-    })?;
+    let runtime = live_runtime_identity(entry)?;
     let evidence = ActivityEvidence {
         activity,
         source,
@@ -1838,6 +1874,7 @@ impl SessionRegistry {
                 next_resize_sequence: AtomicU64::new(1),
                 observation_waiters: AtomicUsize::new(0),
                 observation_session_waiters: std::sync::Mutex::new(HashMap::new()),
+                activity_evidence_waiters: std::sync::Mutex::new(HashMap::new()),
                 turns,
                 daemon_shutdown_started: AtomicBool::new(false),
                 legacy_migration_pending: AtomicBool::new(false),

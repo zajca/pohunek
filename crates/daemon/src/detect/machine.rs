@@ -173,6 +173,12 @@ impl StateMachine {
         None
     }
 
+    /// Whether a debounced candidate is waiting for further confirmations.
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
     /// Drops any candidate that is waiting for debounce confirmation.
     pub fn clear_pending(&mut self) {
         self.pending = None;

@@ -13,8 +13,8 @@ use protocol::{
 use tokio::sync::broadcast;
 
 use super::{
-    runtime_error, session_not_found, RuntimeHandle, SessionId, SessionRegistry, Worker,
-    WorkerError,
+    event_concerns_other_session, runtime_error, session_not_found, RuntimeHandle, SessionId,
+    SessionRegistry, Worker, WorkerError,
 };
 
 pub(super) struct ManagedSession {
@@ -53,6 +53,30 @@ impl Drop for WaitPermit {
             *count -= 1;
             if *count == 0 {
                 per_session.remove(&self.session_id);
+            }
+        }
+    }
+}
+
+/// Keeps a session's activity restated as evidence while it lives.
+#[derive(Debug)]
+pub(super) struct EvidenceWatch {
+    registry: SessionRegistry,
+    session_id: SessionId,
+}
+
+impl Drop for EvidenceWatch {
+    fn drop(&mut self) {
+        let mut waiters = self
+            .registry
+            .inner
+            .activity_evidence_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = waiters.get_mut(&self.session_id) {
+            *count -= 1;
+            if *count == 0 {
+                waiters.remove(&self.session_id);
             }
         }
     }
@@ -266,6 +290,9 @@ impl SessionRegistry {
                 }
                 received = events.recv() => {
                     match received {
+                        Ok(event) if event_concerns_other_session(&event, params.session_id()) => {
+                            continue;
+                        }
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                         Err(broadcast::error::RecvError::Closed) => {
                             tracing::warn!(
@@ -457,6 +484,33 @@ impl SessionRegistry {
     ) -> Result<SessionWaitResult, ProtocolError> {
         let snapshot = self.wait_snapshot(params).await?;
         Ok(wait_result(SessionWaitReason::Timeout, snapshot))
+    }
+
+    /// Whether a bounded input wait needs activity evidence for the session.
+    pub(super) fn has_evidence_waiter(&self, id: &SessionId) -> bool {
+        self.inner
+            .activity_evidence_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .is_some_and(|count| *count > 0)
+    }
+
+    /// Registers a bounded input wait that needs unchanged activity restated
+    /// as evidence until the guard drops. Output polls and activity waits
+    /// read current state and never register.
+    pub(super) fn watch_activity_evidence(&self, id: &SessionId) -> EvidenceWatch {
+        *self
+            .inner
+            .activity_evidence_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(id.clone())
+            .or_default() += 1;
+        EvidenceWatch {
+            registry: self.clone(),
+            session_id: id.clone(),
+        }
     }
 
     pub(super) fn acquire_waiter(&self, id: &SessionId) -> Result<WaitPermit, ProtocolError> {
