@@ -146,6 +146,23 @@ fn the_local_record_is_not_contacted_a_second_time_through_the_overlay() {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    let document: Value = serde_json::from_slice(&output.stdout).expect("versioned JSON envelope");
+    let hosts: Vec<(&str, bool)> = document["ok"]["hosts"]
+        .as_array()
+        .expect("per-host results")
+        .iter()
+        .map(|host| {
+            (
+                host["host_id"].as_str().expect("host id"),
+                host["ok"].as_bool().expect("host outcome"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        hosts,
+        [("local", true), ("netbird:peer~cmVtb3RlLWtleQ", true)],
+        "the fan-out targets this machine once and the peer once, without an error row"
+    );
     assert_eq!(
         count(&local_served, protocol::method::NOTIFICATION_LIST),
         1,
