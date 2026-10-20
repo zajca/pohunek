@@ -10181,6 +10181,7 @@ async fn a_working_transition_rescans_a_backed_off_session_at_once() {
     })
     .await;
     tokio::time::pause();
+    settle_procwatch_scans(&registry).await;
     advance_settling(&registry, &inspector, 1, 0, BACKOFF_SETTLE_SECS).await;
     let before = inspector.descendant_scans().0;
     let paused_at = tokio::time::Instant::now();
@@ -10211,6 +10212,7 @@ async fn a_child_of_a_backed_off_session_is_observed_within_the_ceiling() {
     })
     .await;
     tokio::time::pause();
+    settle_procwatch_scans(&registry).await;
     advance_settling(&registry, &inspector, 1, 0, BACKOFF_SETTLE_SECS).await;
     let observed = |registry: &SessionRegistry| {
         let registry = registry.clone();
