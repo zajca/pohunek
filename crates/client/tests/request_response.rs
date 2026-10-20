@@ -840,12 +840,8 @@ fn spawn_lifecycle_daemon(
             .send((resume, dedicated))
             .expect("report resume request");
         reply.await.expect("the test releases the resume reply");
-        let response = Response::ok(
-            protocol::PROTOCOL_VERSION,
-            resume_id,
-            result,
-        )
-        .expect("lifecycle fixture response");
+        let response = Response::ok(protocol::PROTOCOL_VERSION, resume_id, result)
+            .expect("lifecycle fixture response");
         // The client may have given up already; the reply is best effort.
         let _ = stream
             .get_mut()
@@ -1047,7 +1043,10 @@ async fn generic_fork_call_takes_the_dedicated_budget() {
             .await
     });
     let (_request, dedicated) = fixture.request().await;
-    assert!(dedicated, "the generic fork call runs on a dedicated connection");
+    assert!(
+        dedicated,
+        "the generic fork call runs on a dedicated connection"
+    );
     tokio::time::advance(SLOW_LIFECYCLE).await;
     fixture.release();
     let forked = fork
@@ -1140,7 +1139,10 @@ async fn generic_stop_call_takes_the_dedicated_budget() {
             .await
     });
     let (_request, dedicated) = fixture.request().await;
-    assert!(dedicated, "the generic stop call runs on a dedicated connection");
+    assert!(
+        dedicated,
+        "the generic stop call runs on a dedicated connection"
+    );
     tokio::time::advance(SLOW_LIFECYCLE).await;
     fixture.release();
     stop.await
@@ -1210,7 +1212,10 @@ async fn session_remove_accepting_unconfirmed_has_the_same_budget() {
         request.method(),
         protocol::method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED
     );
-    assert!(dedicated, "the consenting remove runs on a dedicated connection");
+    assert!(
+        dedicated,
+        "the consenting remove runs on a dedicated connection"
+    );
     tokio::time::advance(SLOW_LIFECYCLE).await;
     fixture.release();
     let removed = remove

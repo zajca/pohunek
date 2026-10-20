@@ -3723,7 +3723,14 @@ mod tests {
             let target: Target = "local/s-42".parse().expect("target");
 
             let remove = tokio::spawn(async move {
-                run_remove(LOCAL_HOST, &paths, &target, accept_unconfirmed_cleanup, true).await
+                run_remove(
+                    LOCAL_HOST,
+                    &paths,
+                    &target,
+                    accept_unconfirmed_cleanup,
+                    true,
+                )
+                .await
             });
             let received = pohunek_test_support::wait::guard(
                 "the fixture to record the request",
@@ -3783,9 +3790,7 @@ mod tests {
                 "remove",
                 pohunek_client::SESSION_REMOVE_REQUEST_BUDGET_MS,
                 "session_remove_outcome_unknown",
-                |paths, target, json| {
-                    Box::pin(run_remove(LOCAL_HOST, paths, target, false, json))
-                },
+                |paths, target, json| Box::pin(run_remove(LOCAL_HOST, paths, target, false, json)),
             ),
         ];
         let inhibitor = AutoAdvanceInhibitor::new();
@@ -3796,8 +3801,10 @@ mod tests {
                 let target: Target = "local/s-42".parse().expect("target");
                 let run = tokio::spawn(async move { command(&paths, &target, json).await });
                 daemon.request().await;
-                tokio::time::advance(Duration::from_millis(u64::from(budget_ms)) + BUDGET_MARGIN + TIMER_TICK)
-                    .await;
+                tokio::time::advance(
+                    Duration::from_millis(u64::from(budget_ms)) + BUDGET_MARGIN + TIMER_TICK,
+                )
+                .await;
 
                 let error = run
                     .await

@@ -405,7 +405,8 @@ mod tests {
         use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
 
         let inhibitor = AutoAdvanceInhibitor::new();
-        let mut daemon = crate::test_daemon::HeldDaemon::start(serde_json::json!({"stopped": true}));
+        let mut daemon =
+            crate::test_daemon::HeldDaemon::start(serde_json::json!({"stopped": true}));
         let control = SocketControl::new(daemon.paths.socket.clone())
             .with_origin_source(OriginSource::Omitted);
         let stop = tokio::spawn(async move { control.stop("s-42").await });

@@ -161,9 +161,12 @@ async fn a_stop_of_a_frozen_worker_is_a_typed_error_and_retryable() {
     }
     let frozen = Frozen::start().await;
 
-    let error = guard("a stop of a frozen worker", frozen.registry.stop(&frozen.id))
-        .await
-        .expect_err("a frozen worker cannot answer the stop");
+    let error = guard(
+        "a stop of a frozen worker",
+        frozen.registry.stop(&frozen.id),
+    )
+    .await
+    .expect_err("a frozen worker cannot answer the stop");
 
     assert_eq!(error.code, "worker_operation_failed", "{error:?}");
     assert!(error.msg.contains(NO_ANSWER), "{error:?}");

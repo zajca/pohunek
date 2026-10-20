@@ -117,7 +117,11 @@ fn run_scenario(scenario: &Scenario) {
         let plain = plain_stderr.finish();
         let json = json_run.wait_with_output().expect("wait for the json run");
 
-        assert!(plain.status.success(), "{:?}: {plain:?}", scenario.arguments);
+        assert!(
+            plain.status.success(),
+            "{:?}: {plain:?}",
+            scenario.arguments
+        );
         assert!(
             plain_notices.contains(scenario.notice),
             "{:?}: {plain_notices}",
@@ -275,7 +279,11 @@ fn serve_connection(
             // Target resolution finds no session by that name and keeps the id.
             json!([])
         } else {
-            assert_eq!(request.method(), method, "the CLI sent an unexpected request");
+            assert_eq!(
+                request.method(),
+                method,
+                "the CLI sent an unexpected request"
+            );
             let _ = request_tx.send(());
             release_rx
                 .lock()

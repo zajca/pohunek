@@ -14,11 +14,12 @@ use protocol::compat::{self, CompatError};
 use protocol::{
     AttachHeader, DoctorReport, Event, HostGovernanceStatus, Method, ProtocolError,
     ProtocolVersion, ProtocolVersionRange, Request, Response, SessionDetectionParams,
-    SessionDetectionResult, SessionForkParams, SessionForkResult, SessionId, SessionInputParams, SessionInputResult, SessionNewParams,
-    SessionNewResult, SessionOutputParams, SessionOutputResult, SessionReadParams,
-    SessionReadResult, SessionRemoveResult, SessionResizeParams, SessionResizeResult,
-    SessionResumeParams, SessionResumeResult, SessionScreenParams, SessionScreenResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult, SessionWaitParams, SessionWaitResult, SessionWaitTurnParams,
+    SessionDetectionResult, SessionForkParams, SessionForkResult, SessionId, SessionInputParams,
+    SessionInputResult, SessionNewParams, SessionNewResult, SessionOutputParams,
+    SessionOutputResult, SessionReadParams, SessionReadResult, SessionRemoveResult,
+    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionResumeResult,
+    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
+    SessionStopResult, SessionWaitParams, SessionWaitResult, SessionWaitTurnParams,
     SessionWaitTurnResult, ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION,
 };
 use serde_json::Value;
@@ -678,25 +679,24 @@ impl Client {
             )?)?);
         }
         if M::NAME == protocol::method::SESSION_STOP {
-            let session_id =
-                serde_json::from_value::<SessionId>(serde_json::to_value(params)?)?;
+            let session_id = serde_json::from_value::<SessionId>(serde_json::to_value(params)?)?;
             let result = self.session_stop(session_id).await?;
             return Ok(protocol::tolerant::from_value(serde_json::to_value(
                 result,
             )?)?);
         }
         if M::NAME == protocol::method::SESSION_REMOVE {
-            let session_id =
-                serde_json::from_value::<SessionId>(serde_json::to_value(params)?)?;
+            let session_id = serde_json::from_value::<SessionId>(serde_json::to_value(params)?)?;
             let result = self.session_remove(session_id).await?;
             return Ok(protocol::tolerant::from_value(serde_json::to_value(
                 result,
             )?)?);
         }
         if M::NAME == protocol::method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED {
-            let session_id =
-                serde_json::from_value::<SessionId>(serde_json::to_value(params)?)?;
-            let result = self.session_remove_accepting_unconfirmed(session_id).await?;
+            let session_id = serde_json::from_value::<SessionId>(serde_json::to_value(params)?)?;
+            let result = self
+                .session_remove_accepting_unconfirmed(session_id)
+                .await?;
             return Ok(protocol::tolerant::from_value(serde_json::to_value(
                 result,
             )?)?);

@@ -4143,7 +4143,10 @@ mod tests {
         let cases = [
             (
                 MenuTaskAction::Fork,
-                MenuTaskArgs::Fork { cols: 100, rows: 30 },
+                MenuTaskArgs::Fork {
+                    cols: 100,
+                    rows: 30,
+                },
                 method::SESSION_FORK,
                 session_info,
                 MenuOutcome::Forked {

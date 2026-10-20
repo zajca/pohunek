@@ -154,7 +154,11 @@ async fn a_queued_removal_still_completes_after_its_caller_gave_up() {
         .expect("first stop joins")
         .expect("first stop succeeds");
     wait_until("the daemon to finish the abandoned removal", || async {
-        rig.registry.inspect(&created.id).await.is_err().then_some(())
+        rig.registry
+            .inspect(&created.id)
+            .await
+            .is_err()
+            .then_some(())
     })
     .await;
     rig.finish().await;
