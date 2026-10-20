@@ -589,12 +589,21 @@ async fn lost_acknowledgement_reply_still_retires_the_job() {
 /// terminal runtime under the retention fallback and its job stays registered.
 #[tokio::test]
 async fn a_worker_without_the_stream_drain_is_not_acknowledged() {
+    let capture = LogCapture::default();
+    let _logs = capture.install();
     let rig = Rig::sleeping("ack-old-worker").await;
     rig.registry.model_worker_without_stream_drain();
     rig.registry.stop(&rig.created.id).await.expect("stop");
 
-    // A sent acknowledgement would end the worker; give the task time to act.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The task decided to leave the worker alone, so no acknowledgement
+    // follows.
+    wait_until("the daemon to skip the acknowledgement", || async {
+        capture
+            .text()
+            .contains("does not drain streams on acknowledgement")
+            .then_some(())
+    })
+    .await;
     let worker = {
         let sessions = rig.registry.inner.sessions.lock().await;
         let RuntimeHandle::Worker(worker) = &sessions[&rig.created.id].runtime else {

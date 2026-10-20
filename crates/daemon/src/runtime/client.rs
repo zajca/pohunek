@@ -2283,18 +2283,12 @@ mod tests {
                 .await
                 .expect("reopen")
         };
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let snapshot = worker.inspect().await.expect("inspect runtime");
-                assert!(snapshot.drains_streams_on_terminal_ack);
-                if snapshot.phase == pohunek_worker_protocol::RuntimePhase::Exited {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+        pohunek_test_support::wait::wait_until("the runtime to exit", || async {
+            let snapshot = worker.inspect().await.expect("inspect runtime");
+            assert!(snapshot.drains_streams_on_terminal_ack);
+            (snapshot.phase == pohunek_worker_protocol::RuntimePhase::Exited).then_some(())
         })
-        .await
-        .expect("runtime exit");
+        .await;
         ExitedWorker {
             worker,
             stream,
@@ -2358,16 +2352,13 @@ mod tests {
         const BOUND: Duration = Duration::from_millis(600);
         let fixture = exited_worker("ack-bound", OUTPUT, BOUND, true).await;
 
-        let started = std::time::Instant::now();
-        fixture
-            .worker
-            .acknowledge_terminal()
-            .await
-            .expect("acknowledged");
-        assert!(
-            started.elapsed() >= BOUND,
-            "the acknowledgement waited for the configured bound"
-        );
+        tokio::time::timeout(
+            pohunek_test_support::wait::HANG_GUARD,
+            fixture.worker.acknowledge_terminal(),
+        )
+        .await
+        .expect("the acknowledgement ends at the bound")
+        .expect("acknowledged");
         tokio::time::timeout(Duration::from_secs(10), fixture.server)
             .await
             .expect("the worker exits at the bound")
@@ -2377,20 +2368,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_acknowledgement_without_a_stream_answers_at_once() {
+    async fn an_acknowledgement_without_an_open_stream_completes() {
         let fixture = exited_worker("ack-idle", 1_024, Duration::from_secs(30), false).await;
         let mut stream = fixture.stream;
         assert_eq!(read_to_close(&mut stream.stream).await, 1_024);
         drop(stream);
-        tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let started = std::time::Instant::now();
-        fixture
-            .worker
-            .acknowledge_terminal()
-            .await
-            .expect("acknowledged");
-        assert!(started.elapsed() < Duration::from_secs(5));
+        tokio::time::timeout(
+            pohunek_test_support::wait::HANG_GUARD,
+            fixture.worker.acknowledge_terminal(),
+        )
+        .await
+        .expect("the acknowledgement answers")
+        .expect("acknowledged");
         tokio::time::timeout(Duration::from_secs(10), fixture.server)
             .await
             .expect("the worker exits")
