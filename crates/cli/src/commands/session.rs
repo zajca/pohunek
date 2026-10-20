@@ -1299,13 +1299,7 @@ pub(crate) async fn run_resume(
     let result = client
         .into_sdk()
         .session_resume_with(resume_params(target, accept_profile_change))
-        .await
-        .map_err(|error| match error {
-            pohunek_client::ClientError::RequestTimeout { .. } => {
-                CliError::SessionResumeOutcomeUnknown(error)
-            }
-            other => CliError::Client(other),
-        })?;
+        .await?;
     if json {
         print!(
             "{}",

@@ -46,10 +46,12 @@ const SESSION_NEW_REQUEST_BUDGET_MS: u32 = 60 * 60 * 1_000;
 /// marker sweep's grace are each validated up to 10 minutes.
 const LIFECYCLE_STEP_BOUND_MS: u32 = 10 * 60 * 1_000;
 /// Lifecycle steps of a resume whose daemon bound is [`LIFECYCLE_STEP_BOUND_MS`]:
-/// retiring the lost generation's job (1), the cleanup sweep (its signalling
-/// passes plus one settle window: 4), and the new worker's connection and
-/// initialization (2).
-const SESSION_RESUME_STEPS: u32 = 7;
+/// retiring the lost generation's job (1), the cleanup sweep (up to three
+/// signalling passes of a `SIGTERM` grace and a `SIGKILL` grace each, plus one
+/// settle window: 7), the new worker's connection and initialization (2), and
+/// the rest of the resume, such as the supervisor calls, the version probe and
+/// the native store check (1).
+const SESSION_RESUME_STEPS: u32 = 11;
 /// A resume of a lost runtime waits for the previous generation's retirement,
 /// a fresh marker sweep, and bounded worker startup, so its response budget
 /// covers every step at its longest valid daemon bound rather than the
@@ -795,8 +797,9 @@ impl Client {
     ///
     /// Runs on a dedicated connection whose response budget covers the
     /// daemon's bounded retirement, cleanup sweep, and worker startup; an
-    /// explicit request timeout overrides it. After a
-    /// [`ClientError::RequestTimeout`] the resume may still complete.
+    /// explicit request timeout overrides it. An elapsed deadline returns
+    /// [`ClientError::SessionResumeOutcomeUnknown`]: the resume may still
+    /// complete.
     pub async fn session_resume_with(
         &mut self,
         params: SessionResumeParams,
@@ -808,6 +811,12 @@ impl Client {
         client
             .call_direct::<protocol::method::SessionResume>(params)
             .await
+            .map_err(|error| match error {
+                ClientError::RequestTimeout { host, timeout } => {
+                    ClientError::SessionResumeOutcomeUnknown { host, timeout }
+                }
+                other => other,
+            })
     }
 
     /// Resize one managed terminal through the typed lifecycle API.

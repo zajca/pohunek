@@ -764,8 +764,8 @@ async fn session_creation_without_input_outlasts_the_default_request_timeout() {
 const SLOW_RESUME: Duration = Duration::from_secs(30);
 
 /// Serves one `session.resume`: a health reply on the shared connection, then
-/// the resume request on whichever connection it arrives, answered with a
-/// typed refusal once the test releases `reply`. `request_tx` reports the
+/// the resume request on whichever connection it arrives, answered with the
+/// resumed session once the test releases `reply`. `request_tx` reports the
 /// request and whether it arrived on a dedicated connection.
 fn spawn_resume_daemon(
     listener: UnixListener,
@@ -807,15 +807,23 @@ fn spawn_resume_daemon(
             .send((resume, dedicated))
             .expect("report resume request");
         reply.await.expect("the test releases the resume reply");
-        let response = Response::err(
+        let response = Response::ok(
             protocol::PROTOCOL_VERSION,
             resume_id,
-            ProtocolError::new(
-                ErrorClass::Runtime,
-                "fixture_resume_finished",
-                "the fixture daemon finished the resume",
-                None,
-            ),
+            json!({"session": {
+                "id": "s-resume",
+                "agent": "codex",
+                "agent_base": "codex",
+                "capabilities": {"fork": false, "resume": true},
+                "cwd": "/workspace/pohunek",
+                "pid": 42424,
+                "state": "running",
+                "state_source": "process",
+                "cols": 80,
+                "rows": 24,
+                "created_at": "2026-07-08T00:00:00Z",
+                "updated_at": "2026-07-08T00:01:00Z",
+            }}),
         )
         .expect("resume fixture response");
         // The client may have given up already; the reply is best effort.
@@ -853,20 +861,17 @@ async fn session_resume_outlasts_the_default_request_timeout() {
     tokio::time::advance(SLOW_RESUME).await;
     reply_tx.send(()).expect("release the resume reply");
 
-    let error = resume
+    let resumed = resume
         .await
         .expect("resume task completed")
-        .expect_err("the fixture daemon reports a typed refusal");
-    assert!(
-        matches!(&error, ClientError::Protocol(source) if source.code == "fixture_resume_finished"),
-        "the client waits for the daemon's reply instead of timing out: {error:?}"
-    );
+        .expect("the client waits for the daemon's reply instead of timing out");
+    assert_eq!(resumed.session.id.0, "s-resume");
     server.await.expect("fixture daemon completed");
     inhibitor.release().await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn session_resume_with_an_explicit_timeout_below_the_daemon_duration_times_out() {
+async fn session_resume_past_its_deadline_reports_an_unknown_outcome() {
     let inhibitor = AutoAdvanceInhibitor::new();
     let socket_file = SocketFile::new();
     let listener = UnixListener::bind(socket_file.path()).expect("bind fixture daemon");
@@ -892,8 +897,16 @@ async fn session_resume_with_an_explicit_timeout_below_the_daemon_duration_times
         .expect("resume task completed")
         .expect_err("the explicit deadline elapses before the daemon answers");
     assert!(
-        matches!(error, ClientError::RequestTimeout { timeout, .. } if timeout == explicit),
+        matches!(&error, ClientError::SessionResumeOutcomeUnknown { timeout, .. } if *timeout == explicit),
         "{error:?}"
+    );
+    let structured = error.to_protocol_error();
+    assert_eq!(structured.code, "session_resume_outcome_unknown");
+    assert!(
+        structured.recover.as_deref().is_some_and(
+            |hint| hint.contains("may still complete") && hint.contains("session inspect")
+        ),
+        "{structured:?}"
     );
     reply_tx.send(()).expect("release the resume reply");
     server.await.expect("fixture daemon completed");

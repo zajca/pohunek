@@ -3142,7 +3142,7 @@ Canonical public codes currently emitted include:
 |---|---|
 | `configuration` | `paths_unavailable`, `netbird_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted`, `integration_trust_conflict`, `integration_home_ambiguous_owner` |
 | `daemon` | `version_mismatch`, `native_store_check_task_panicked`, `version_adapter_failed`, `daemon_protocol_too_old`, `version_translation_failed`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down` |
-| `transport` | `framing`, `host_unreachable`, `request_timeout` |
+| `transport` | `framing`, `host_unreachable`, `request_timeout`, `session_resume_outcome_unknown` |
 | `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `remote_discovery_failed` |
 | `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `agent_native_reference_missing`, `agent_native_store_relocated`, `native_identity_missing`, `native_identity_unverified`, `native_identity_uncertain`, `native_identity_evidence_unavailable`, `native_report_unattested`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `integration_no_managed_runtime`, `bundle_unavailable`,`assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `migration_manifest_missing`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `session_input_stalled`, `session_cwd_missing`, `session_tmpdir_unsafe`, `session_tmpdir_failed`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `base_branch_fetch_failed`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required`, `integration_update_incompatible` |
 
@@ -3912,13 +3912,18 @@ Public exports:
   layer capped at 5 minutes. The rest is room for other creation work.
   `Client::session_resume` and `session_resume_with` (and the generic
   `call::<SessionResume>`) also use a dedicated connection, with a response
-  budget of 70 minutes plus 1 second of transport headroom: seven lifecycle
+  budget of 110 minutes plus 1 second of transport headroom: eleven lifecycle
   steps at the longest valid daemon bound of 10 minutes each. They are the
   retirement of the lost generation's job (the worker exit timeout), the
-  cleanup sweep (up to three signalling passes plus one settle window of the
-  sweep grace), and the new worker's connection and initialization. A resume
-  that outlasts the ordinary 5-second timeout therefore returns its real
-  result or refusal. `with_request_timeout` explicitly overrides
+  cleanup sweep (up to three signalling passes, each waiting out the sweep
+  grace after `SIGTERM` and again after `SIGKILL`, plus one settle window), the
+  new worker's connection and initialization, and one step for the rest of the
+  resume. A resume that outlasts the ordinary 5-second timeout therefore returns its real
+  result or refusal. A deadline that still elapses returns
+  `ClientError::SessionResumeOutcomeUnknown` (`session_resume_outcome_unknown`,
+  transport class) instead of `request_timeout`: the daemon does not cancel the
+  resume when the client leaves, so inspect the session before retrying.
+  `with_request_timeout` explicitly overrides
   these budgets, including with a shorter deadline; assigning a nondefault value
   to the public `ClientOptions.request_timeout` field has the same effect.
   Dropping the Rust request
@@ -3940,8 +3945,8 @@ Public exports:
 - `ClientError`: SDK error enum with `to_protocol_error()` for structured
   rendering. An elapsed response deadline maps to `request_timeout`, distinct
   from connection and daemon-discovery failures; the timed-out mutation may
-  still have completed remotely. A `session_resume` that times out leaves the
-  resume running in the daemon: inspect the session before retrying.
+  still have completed remotely. A `session_resume` whose deadline elapses is
+  `SessionResumeOutcomeUnknown` instead; see `ClientOptions` above.
 - `next_request_id(method)`: shared correlation-id generator used by SDK-backed
   clients.
 - `remote_host_with_port(host, port)`: formats a provider-resolved selector

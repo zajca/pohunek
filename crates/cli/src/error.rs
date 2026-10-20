@@ -65,11 +65,6 @@ pub(crate) enum CliError {
     #[error(transparent)]
     SessionNewOutcomeUnknown(SdkClientError),
 
-    /// `session resume` got no reply before its deadline, so the daemon may
-    /// still finish the resume.
-    #[error(transparent)]
-    SessionResumeOutcomeUnknown(SdkClientError),
-
     /// Prompt rendering failed before any daemon request was made.
     #[error(transparent)]
     Prompt(#[from] pohunek_prompt::Error),
@@ -285,15 +280,6 @@ impl CliError {
                      --meta-eq <key>=<value>` before retrying; an empty list does not prove that \
                      nothing was created, and a retry can create a second session, which the \
                      same key shows"
-                        .to_owned(),
-                );
-                error
-            }
-            CliError::SessionResumeOutcomeUnknown(err) => {
-                let mut error = err.to_protocol_error();
-                error.recover = Some(
-                    "the resume may still complete: run `pohunek session inspect <session>` and \
-                     read its runtime state before retrying"
                         .to_owned(),
                 );
                 error
@@ -812,21 +798,5 @@ mod tests {
         assert!(text.contains('1') && text.contains('2'), "text: {text}");
         assert!(text.contains("hint:"), "text: {text}");
         assert!(text.contains("upgrade"), "text: {text}");
-    }
-
-    #[test]
-    fn an_elapsed_resume_deadline_says_the_resume_may_still_complete() {
-        let err =
-            CliError::SessionResumeOutcomeUnknown(pohunek_client::ClientError::RequestTimeout {
-                host: None,
-                timeout: std::time::Duration::from_secs(5),
-            });
-
-        let error = err.to_protocol_error();
-
-        assert_eq!(error.code, "request_timeout");
-        let recover = error.recover.expect("a recovery hint");
-        assert!(recover.contains("may still complete"), "{recover}");
-        assert!(recover.contains("session inspect"), "{recover}");
     }
 }
