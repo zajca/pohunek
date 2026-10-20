@@ -303,7 +303,12 @@ pub const DEFAULT_WORKER_STOP_HEADROOM: Duration = Duration::from_secs(2);
 /// [`MAX_DEADLINE`] steps leave the SDK's stop budget (nine steps) room for the
 /// stop itself; a worker frozen mid-input ends the stop with a typed error at
 /// this bound instead of waiting for the caller's budget.
-pub const DEFAULT_WORKER_INPUT_STOP_WAIT: Duration = MAX_DEADLINE.saturating_mul(8);
+pub const DEFAULT_WORKER_INPUT_STOP_WAIT: Duration =
+    MAX_DEADLINE.saturating_mul(WORKER_INPUT_STOP_WAIT_STEPS);
+
+/// [`MAX_DEADLINE`] steps a stop may wait behind an input write: the SDK's stop
+/// budget has nine steps and the stop itself needs one.
+const WORKER_INPUT_STOP_WAIT_STEPS: u32 = 8;
 
 /// Longest accepted path in bytes.
 ///
