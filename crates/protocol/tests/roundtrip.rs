@@ -4744,3 +4744,120 @@ fn worker_instance_fields_are_written_and_read_under_one_name() {
     .expect("an unknown key is ignored on this open object");
     assert_eq!(stale.worker_instance_id, None);
 }
+
+/// One tolerant enum: its known wire values, the value its hidden `Unknown`
+/// variant takes, and a value no build defines.
+struct TolerantEnum<T> {
+    known: Vec<(&'static str, T)>,
+    unknown: T,
+}
+
+impl<T> TolerantEnum<T>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug + Copy,
+{
+    fn check(&self, name: &str) {
+        let newer = json!("a_value_from_a_newer_daemon");
+        for (wire, value) in &self.known {
+            let wire = json!(wire);
+            assert_eq!(serde_json::to_value(value).expect("serialize"), wire);
+            assert_eq!(
+                serde_json::from_value::<T>(wire.clone()).expect("strict decode"),
+                *value,
+                "{name}: strict decode of a known value"
+            );
+            assert_eq!(
+                protocol::tolerant::from_value::<T>(wire).expect("tolerant decode"),
+                *value,
+                "{name}: tolerant decode of a known value"
+            );
+        }
+
+        serde_json::from_value::<T>(newer.clone())
+            .expect_err("plain decoding rejects an unknown value");
+        serde_json::from_value::<T>(json!("unknown"))
+            .expect_err("plain decoding rejects the Unknown token itself");
+        assert_eq!(
+            protocol::tolerant::from_value::<T>(newer.clone()).expect("tolerant decode"),
+            self.unknown,
+            "{name}: tolerant decoding maps an unknown value to Unknown"
+        );
+        assert_eq!(
+            protocol::tolerant::from_str::<T>(&newer.to_string()).expect("tolerant decode"),
+            self.unknown
+        );
+        assert_eq!(
+            protocol::tolerant::from_slice::<T>(newer.to_string().as_bytes())
+                .expect("tolerant decode"),
+            self.unknown
+        );
+        protocol::tolerant::from_value::<T>(json!(7))
+            .expect_err("tolerance covers unknown strings only");
+
+        let token = serde_json::to_value(self.unknown).expect("serialize Unknown");
+        assert_eq!(token, json!("unknown"), "{name}: Unknown serializes");
+        assert_eq!(
+            protocol::tolerant::from_value::<T>(token).expect("tolerant round trip"),
+            self.unknown,
+            "{name}: the Unknown token survives a client round trip"
+        );
+
+        // The mode ends with the call, also when the call fails.
+        let _failed = protocol::tolerant::from_value::<T>(json!(7));
+        serde_json::from_value::<T>(newer)
+            .expect_err("plain decoding is strict again after a tolerant call");
+    }
+}
+
+#[test]
+fn a_tolerant_enum_rejects_unknown_values_unless_the_client_decodes_it() {
+    TolerantEnum {
+        known: vec![
+            ("configuration", ErrorClass::Configuration),
+            ("daemon", ErrorClass::Daemon),
+            ("transport", ErrorClass::Transport),
+            ("runtime", ErrorClass::Runtime),
+            ("discovery", ErrorClass::Discovery),
+        ],
+        unknown: ErrorClass::Unknown,
+    }
+    .check("ErrorClass");
+    assert_eq!(ErrorClass::Unknown.to_string(), "unknown");
+}
+
+#[test]
+fn an_error_with_a_class_from_a_newer_daemon_keeps_its_code_message_and_hint() {
+    let document = json!({
+        "class": "a_class_from_a_newer_daemon",
+        "code": "quota_exhausted",
+        "msg": "the quota is used up",
+        "recover": "free some space",
+    });
+
+    serde_json::from_value::<ProtocolError>(document.clone())
+        .expect_err("plain decoding rejects the unknown class");
+
+    let error = protocol::tolerant::from_value::<ProtocolError>(document).expect("tolerant decode");
+    assert_eq!(error.class, ErrorClass::Unknown);
+    assert_eq!(error.code, "quota_exhausted");
+    assert_eq!(error.msg, "the quota is used up");
+    assert_eq!(error.recover.as_deref(), Some("free some space"));
+    assert_eq!(
+        error.to_string(),
+        "unknown/quota_exhausted: the quota is used up"
+    );
+    let line = serde_json::to_string(&error).expect("serialize");
+    assert_eq!(
+        protocol::tolerant::from_str::<ProtocolError>(&line).expect("tolerant round trip"),
+        error
+    );
+
+    let line = json!({
+        "v": PROTOCOL_VERSION.get(),
+        "id": "r1",
+        "err": serde_json::to_value(&error).expect("serialize"),
+    })
+    .to_string();
+    let response = protocol::tolerant::from_str::<protocol::Response>(&line).expect("response");
+    assert_eq!(response.into_result().expect_err("error response"), error);
+}

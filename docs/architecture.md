@@ -1691,6 +1691,82 @@ health for humans and operator agents.
   (agent binary missing, PTY allocation, process exit, worktree conflict), and
   discovery (NetBird CLI missing, local state unavailable).
 
+### Unknown enum values from a newer daemon
+
+A daemon of a newer build can answer on the same protocol version with an enum
+value an older Rust client does not know. The mechanism is strict by default and
+tolerant only where the client opts in:
+
+- Plain `serde_json::from_*` rejects an unknown value everywhere: daemon
+  params, the session store, the notification store, governance state and
+  config files.
+- A tolerant enum has a hidden `Unknown` variant (`ts(skip)`, so the generated
+  TypeScript types do not change). Only the entry points `protocol::tolerant::
+  from_value`, `from_str` and `from_slice` map an unknown string to it. They set
+  a thread-local flag for one synchronous decode call and restore it on exit,
+  so the mode can never be held across an `.await`.
+- `Unknown` serializes as the fixed token `"unknown"`, so `--json` output and
+  the `Client::call` round trip keep working. Plain decoding rejects that token
+  too. The daemon never decodes in the tolerant mode, so it never holds or emits
+  an `Unknown`.
+- The enum's serde derive is the only definition of its wire names; the
+  `tolerant_enum!` macro adds the strict-or-tolerant `Deserialize` around it.
+- The Rust client, the CLI and the assistant decode every daemon response and
+  event through the tolerant entry points.
+- `SessionWarningKind` keeps its own mechanism: an unknown warning is dropped on
+  decode.
+
+Rejected alternatives: a derive-level `#[serde(other)]` makes persisted and
+param decoding fail open; a Cargo feature is switched on in the daemon too by
+workspace feature unification; opt-in strictness at daemon sites fails open when
+a site is missed; a raw-string-preserving `Other(String)` costs `Copy` on about
+45 enums.
+
+Each enum has one policy category:
+
+- **display**: shown or emitted as `unknown`.
+- **drop**: the element is removed from its collection on decode.
+- **safe**: `unknown` plus a defined conservative branch.
+- **bump-only**: stays strict. A new value needs a protocol bump: the N-1
+  adapter maps or withholds it, or `MIN_PROTOCOL_VERSION` rises.
+- **n/a**: not decoded by the Rust client from the daemon wire.
+
+An `Unknown` never triggers an effect: no reinstall, no downgrade, no
+auto-select, no consent skip, and no "free to remove" or "not running" verdict.
+It never skips a guard, consent or check, and never asserts a safe or finished
+state. A daemon-side `match` arm for `Unknown` takes the conservative arm and
+never `unreachable!()`.
+
+| Enum | Policy | Behaviour of `Unknown` | Slice |
+|---|---|---|---|
+| `ErrorClass` | display | `code`, `msg` and `recover` survive; `--json` keeps the envelope | done |
+| `DoctorStatus` | safe | ranks as warn in `worse()`, never `ok` | [#1335](https://github.com/zajca/pohunek/issues/1335) |
+| `IntegrationFindingCode`, `IntegrationFindingSeverity`, `IntegrationUninstallState` | display | | [#1335](https://github.com/zajca/pohunek/issues/1335) |
+| `IntegrationInstallState` | safe | never `Current` | [#1335](https://github.com/zajca/pohunek/issues/1335) |
+| `IntegrationRecovery` | safe | never `None`; generic hint | [#1335](https://github.com/zajca/pohunek/issues/1335) |
+| `AgentActivity` | display, safe | an input-wait miss is the existing typed error | [#1334](https://github.com/zajca/pohunek/issues/1334) |
+| `StateSource`, `CwdSource`, `SubagentLifecycle` | display | a lifecycle `unknown` is not counted as running | [#1334](https://github.com/zajca/pohunek/issues/1334) |
+| `BackgroundKind`, `BackgroundStatus` | display | maps to the existing `Other` | [#1334](https://github.com/zajca/pohunek/issues/1334) |
+| `RuntimeState` | safe | may own a runtime, cannot be stopped or removed, blocks upgrade | [#1336](https://github.com/zajca/pohunek/issues/1336) |
+| `RuntimeInventoryStatus`, `SessionRetentionReason`, `SessionWaitTurnReason`, `SessionReadSource` | display | | [#1337](https://github.com/zajca/pohunek/issues/1337) |
+| `SessionRetentionHold` | safe | never `None` (free to remove) | [#1337](https://github.com/zajca/pohunek/issues/1337) |
+| `SessionWaitReason` | safe | reported like a timeout, non-zero exit | [#1337](https://github.com/zajca/pohunek/issues/1337) |
+| `DetectionRegionKind` | drop, display | dropped from `supported_regions` | [#1337](https://github.com/zajca/pohunek/issues/1337) |
+| `PackageOrigin` | safe | the downgrade guard stays engaged | [#1338](https://github.com/zajca/pohunek/issues/1338) |
+| `PackageBindStatus` | safe | never `Unchanged`; consent is still asked | [#1338](https://github.com/zajca/pohunek/issues/1338) |
+| `PackageFault`, `PackageSelectionBlockReason`, `PackageInstallStatus` | display | | [#1338](https://github.com/zajca/pohunek/issues/1338) |
+| `PackageFindingKind` | display | the finding is kept, so the doctor exit stays non-zero | [#1338](https://github.com/zajca/pohunek/issues/1338) |
+| `NotificationSeverity`, `ProjectSource`, `ProviderKind`, `PromptLayer`, `ConceptType`, `QuarantineReason` | display | | [#1339](https://github.com/zajca/pohunek/issues/1339) |
+| `NotificationStatus` | safe | never matches `--unread` or `--status` filters | [#1339](https://github.com/zajca/pohunek/issues/1339) |
+| `ConceptIntent` | drop | | [#1339](https://github.com/zajca/pohunek/issues/1339) |
+| `SessionWarningKind` | drop | own mechanism | done |
+| `SessionState` | bump-only | drives live and terminal decisions; no safe default | |
+| `SessionTurnEventKind` | bump-only | the daemon emits only the kinds the client asked for | |
+| `NotificationKind` | bump-only | a field of the `deny_unknown_fields` struct `NotificationKindPolicy` ([#1332](https://github.com/zajca/pohunek/issues/1332)) | |
+| `EnrollmentStatus`, `HostOwner` | bump-only | cross-validated with quarantine; an identity coordinate covered by a signed outcome | |
+| `ConceptDeprecation` | bump-only | untagged; any new version string already decodes | |
+| `HostOwnerKind`, `ShareSuspensionIntent`, `TransferOutcomeError`, `PackageTrust`, `BindingProvenance`, `HostClass` | n/a | not decoded from the daemon wire by the Rust client; must stay strict | |
+
 ## Testing Strategy
 
 Tests protect externally meaningful behavior by driving cooperating

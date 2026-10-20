@@ -25,7 +25,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "ErrorClass.ts"))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum ErrorClass {
     /// Missing or invalid required configuration.
     Configuration,
@@ -38,7 +38,16 @@ pub enum ErrorClass {
     Runtime,
     /// Discovery failures: `NetBird` CLI missing, local state unavailable.
     Discovery,
+    /// A class a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(ErrorClass);
 
 impl std::fmt::Display for ErrorClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -48,6 +57,7 @@ impl std::fmt::Display for ErrorClass {
             ErrorClass::Transport => "transport",
             ErrorClass::Runtime => "runtime",
             ErrorClass::Discovery => "discovery",
+            ErrorClass::Unknown => "unknown",
         };
         f.write_str(s)
     }

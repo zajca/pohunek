@@ -642,7 +642,7 @@ async fn run_attach_once(
     )?;
     let mut client = Client::connect(host, paths).await?;
     let result = client.request(&attach_request).await?;
-    let attach: SessionAttachResult = serde_json::from_value(result)?;
+    let attach: SessionAttachResult = protocol::tolerant::from_value(result)?;
 
     // Open the raw second connection over the same transport as the control
     // connection. The SDK writes the daemon attach prelude before returning, so
@@ -2021,7 +2021,7 @@ async fn probe_attach_reconnect(
     let mut client = Client::connect(host, paths).await?;
     let request = build_inspect_request(target)?;
     let result = client.request(&request).await?;
-    let session: SessionInfo = serde_json::from_value(result)?;
+    let session: SessionInfo = protocol::tolerant::from_value(result)?;
     Ok(reconnect_decision_from_state(session.state))
 }
 
@@ -2299,7 +2299,7 @@ async fn send_detach(
 ) -> Result<SessionDetachResult, CliError> {
     let request = build_detach_request(stream_id)?;
     let value = client.request(&request).await?;
-    Ok(serde_json::from_value(value)?)
+    Ok(protocol::tolerant::from_value(value)?)
 }
 
 async fn send_menu_new_session(
@@ -2310,10 +2310,10 @@ async fn send_menu_new_session(
 ) -> Result<SessionNewResult, CliError> {
     let inspect = build_inspect_request(target)?;
     let value = client.request(&inspect).await?;
-    let source: SessionInfo = serde_json::from_value(value)?;
+    let source: SessionInfo = protocol::tolerant::from_value(value)?;
     let request = build_menu_new_session_request(target, &source, cols, rows)?;
     let value = client.request(&request).await?;
-    Ok(serde_json::from_value(value)?)
+    Ok(protocol::tolerant::from_value(value)?)
 }
 
 async fn send_menu_rename(
@@ -2323,7 +2323,7 @@ async fn send_menu_rename(
 ) -> Result<SessionRenameResult, CliError> {
     let request = build_menu_rename_request(target, &name)?;
     let value = client.request(&request).await?;
-    Ok(serde_json::from_value(value)?)
+    Ok(protocol::tolerant::from_value(value)?)
 }
 
 async fn send_menu_fork(
@@ -2334,7 +2334,7 @@ async fn send_menu_fork(
 ) -> Result<SessionForkResult, CliError> {
     let request = build_menu_fork_request(target, cols, rows)?;
     let value = client.request(&request).await?;
-    Ok(serde_json::from_value(value)?)
+    Ok(protocol::tolerant::from_value(value)?)
 }
 
 fn spawn_menu_task(
@@ -2420,7 +2420,7 @@ async fn send_remove(
 ) -> Result<SessionRemoveResult, CliError> {
     let request = build_remove_request(target)?;
     let value = client.request(&request).await?;
-    Ok(serde_json::from_value(value)?)
+    Ok(protocol::tolerant::from_value(value)?)
 }
 
 fn build_remove_request(target: &Target) -> Result<Request, CliError> {
