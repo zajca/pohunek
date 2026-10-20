@@ -267,8 +267,8 @@ pub const DEFAULT_STOP_GRACE: Duration = Duration::from_millis(500);
 /// for that on a busy CI runner. Three seconds covers such a host many times
 /// over; a root still alive after it is stuck in the kernel, and the stop
 /// reports it with the state it is in. Together with the grace before
-/// `SIGKILL` that report still arrives within the five-second default request
-/// deadline of the public clients, instead of a client timeout.
+/// `SIGKILL` that report arrives well inside the daemon's bound on a worker's
+/// stop answer.
 ///
 /// Like the grace, this is not a `service.toml` key: the daemon sends it to
 /// each worker in the `Initialize` stop policy, and a worker falls back to this

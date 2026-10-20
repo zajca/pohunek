@@ -323,6 +323,10 @@ pohunek session rm <target> --json
 pohunek session fork <target> --name <fork-name> --json
 ```
 
+`session stop`, `session rm` and `session fork` can take longer than 5 seconds; they
+print a waiting notice on stderr (never with `--json`) and return the daemon's
+result.
+
 `session rm` removes the logical session from the daemon and stops it first if
 it is still live. A `reconnecting`, `incompatible`, or ambiguous `conflict`
 session is unreachable but may still run its agent: `session rm` retires that
