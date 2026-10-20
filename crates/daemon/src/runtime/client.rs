@@ -1,7 +1,7 @@
 //! Private client for one durable session worker.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -126,6 +126,39 @@ pub struct Worker {
     socket_path: PathBuf,
     request_sequence: Arc<AtomicU64>,
     dimension_order: Arc<Mutex<()>>,
+    /// Input writes holding the control connection. An input exchange lasts as
+    /// long as the worker needs to deliver the plan and is bounded by the
+    /// worker's own stall policy, so a stop queued behind one keeps waiting;
+    /// any other holder is bounded by the stop's exchange wait.
+    input_holds: Arc<AtomicUsize>,
+}
+
+/// How long a stop waits at each stage of reaching a worker.
+#[derive(Debug, Clone, Copy)]
+pub struct StopWaits {
+    /// Wait for an earlier exchange on the control connection.
+    pub exchange: Duration,
+    /// Wait behind an input write that holds the control connection.
+    pub input: Duration,
+    /// Wait for the worker's answer once the request is sent.
+    pub answer: Duration,
+}
+
+/// Marks the control connection as held by an input write while it lives.
+#[derive(Debug)]
+struct InputHold(Arc<AtomicUsize>);
+
+impl InputHold {
+    fn take(holds: &Arc<AtomicUsize>) -> Self {
+        holds.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(holds))
+    }
+}
+
+impl Drop for InputHold {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Prepared exclusive input write that has not started transport delivery.
@@ -133,6 +166,7 @@ pub struct Worker {
 pub(crate) struct WriteReservation {
     inner: OwnedMutexGuard<Inner>,
     request: ControlRequest,
+    _hold: InputHold,
 }
 
 #[derive(Debug)]
@@ -402,6 +436,7 @@ impl Worker {
             socket_path,
             request_sequence: Arc::new(AtomicU64::new(1)),
             dimension_order: Arc::new(Mutex::new(())),
+            input_holds: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -604,6 +639,7 @@ impl Worker {
         fragments: Vec<InputFragment>,
     ) -> Result<WriteReservation, WorkerError> {
         let mut inner = Arc::clone(&self.inner).lock_owned().await;
+        let hold = InputHold::take(&self.input_holds);
         // A torn stream cannot carry the prepared plan; fail before the
         // caller starts waiting for its acknowledgement.
         reconcile_interrupted_send(&mut inner);
@@ -624,6 +660,7 @@ impl Worker {
                 request_id: self.next_request_id("write")?,
                 kind: RequestKind::WritePlan { scope, plan },
             },
+            _hold: hold,
         })
     }
 
@@ -712,28 +749,43 @@ impl Worker {
 
     /// Stops like [`Self::stop`], giving up on a worker that does not answer.
     ///
-    /// An earlier exchange on the control connection gets `lock_wait` to
-    /// finish, so a legitimately long one (a delayed input write) is not
-    /// mistaken for a frozen worker; once this caller holds the connection,
-    /// the worker gets `bound` to answer. The abandoned exchange is drained by
-    /// the next caller.
+    /// An earlier exchange on the control connection gets `waits.exchange` to
+    /// finish, so a legitimately long one is not mistaken for a frozen worker.
+    /// An input write holding the connection is delivered on the worker's own
+    /// stall policy and gets `waits.input` instead. Once this caller holds
+    /// the connection, the worker gets `waits.answer` to answer. The abandoned
+    /// exchange is drained by the next caller.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::StopUnanswered`] when either wait elapses, and
+    /// Returns [`WorkerError::StopUnanswered`] when a wait elapses, and
     /// otherwise the errors of [`Self::stop`].
     pub async fn stop_within(
         &self,
         transaction_id: TransactionId,
-        lock_wait: Duration,
-        bound: Duration,
+        waits: StopWaits,
     ) -> Result<Option<ExitStatus>, WorkerError> {
-        let mut inner = tokio::time::timeout(lock_wait, self.inner.lock())
-            .await
-            .map_err(|_elapsed| WorkerError::StopUnanswered {
-                bound: lock_wait,
-                stage: "because an earlier exchange kept the control connection busy",
-            })?;
+        let bound = waits.answer;
+        let started = tokio::time::Instant::now();
+        let mut inner = loop {
+            match tokio::time::timeout(waits.exchange, self.inner.lock()).await {
+                Ok(inner) => break inner,
+                Err(_elapsed) if self.input_holds.load(Ordering::Acquire) > 0 => {
+                    if started.elapsed() >= waits.input {
+                        return Err(WorkerError::StopUnanswered {
+                            bound: waits.input,
+                            stage: "because an input write kept the control connection busy",
+                        });
+                    }
+                }
+                Err(_elapsed) => {
+                    return Err(WorkerError::StopUnanswered {
+                        bound: waits.exchange,
+                        stage: "because an earlier exchange kept the control connection busy",
+                    });
+                }
+            }
+        };
         let scope = scope(&inner)?;
         let exchange = request_locked(
             &mut inner,
