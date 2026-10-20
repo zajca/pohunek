@@ -272,6 +272,12 @@ impl Worker {
         &self.socket_path
     }
 
+    /// Returns how many input writes currently hold the control connection.
+    #[must_use]
+    pub fn input_writes_in_flight(&self) -> usize {
+        self.counters.input_holds.load(Ordering::Acquire)
+    }
+
     /// Connects, negotiates, and acquires the sole controller lease.
     ///
     /// # Errors

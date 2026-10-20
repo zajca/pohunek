@@ -4217,6 +4217,22 @@ impl SessionRegistry {
             .ok_or_else(|| session_not_found(&id.0))
     }
 
+    /// Returns how many input writes of session `id` hold its worker's control
+    /// connection, for integration assertions on the order of lifecycle waits.
+    pub async fn input_writes_in_flight(&self, id: &SessionId) -> usize {
+        match self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|e| e.runtime.clone())
+        {
+            Some(RuntimeHandle::Worker(worker)) => worker.input_writes_in_flight(),
+            _ => 0,
+        }
+    }
+
     /// Whether the registry holds a managed session `id`.
     pub(crate) async fn holds(&self, id: &SessionId) -> bool {
         self.inner.sessions.lock().await.contains_key(id)

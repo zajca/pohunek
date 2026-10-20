@@ -25,7 +25,7 @@ use pohunek_daemon::runtime::{
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::process_env::ProcessEnv;
-use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
+use pohunek_test_support::time::AutoAdvanceInhibitor;
 use pohunek_test_support::wait::{guard, wait_until};
 use pohunek_test_support::worker_binary;
 use protocol::{
@@ -68,6 +68,9 @@ const BLOCKING_INPUT_BYTES: usize = 200 * 1024;
 
 /// Scheduler yields that let spawned tasks reach their next await.
 const SETTLE_YIELDS: usize = 256;
+
+/// Clock steps a scenario takes before it concludes a task will never finish.
+const ADVANCE_STEPS_LIMIT: usize = 10_000;
 
 /// Text the typed error carries.
 const NO_ANSWER: &str = "did not answer the stop";
@@ -280,8 +283,30 @@ async fn hold_the_connection_with_input(
             })
             .await
     });
-    settle().await;
+    // The input holds the connection once the daemon counts it; settling by
+    // yields alone could let a later stop reach the worker first.
+    wait_until("the input to hold the control connection", || async {
+        (frozen.registry.input_writes_in_flight(&frozen.id).await == 1).then_some(())
+    })
+    .await;
     input
+}
+
+/// Advances the paused clock by `step` until `task` finishes, handing the
+/// scheduler to the blocking pool between steps so work the task still waits
+/// for on other threads can complete.
+async fn advance_until_finished<T>(what: &str, task: &tokio::task::JoinHandle<T>, step: Duration) {
+    for _ in 0..ADVANCE_STEPS_LIMIT {
+        if task.is_finished() {
+            return;
+        }
+        tokio::time::advance(step).await;
+        settle().await;
+        tokio::task::spawn_blocking(std::thread::yield_now)
+            .await
+            .expect("the blocking pool yields");
+    }
+    panic!("{what} did not finish within {ADVANCE_STEPS_LIMIT} clock steps");
 }
 
 #[tokio::test]
@@ -300,9 +325,11 @@ async fn a_stop_behind_an_input_outlasts_the_exchange_wait_and_proceeds_once_it_
     // still holds the connection; the stop keeps waiting.
     tokio::time::pause();
     let inhibitor = AutoAdvanceInhibitor::new();
-    tokio::time::advance(EXCHANGE_WAIT * 2 + TIMER_TICK).await;
-    settle().await;
-    assert!(!stopping.is_finished(), "the stop waits behind the input");
+    for _ in 0..3 {
+        tokio::time::advance(EXCHANGE_WAIT).await;
+        settle().await;
+        assert!(!stopping.is_finished(), "the stop waits behind the input");
+    }
 
     // The input ends on the worker (acknowledged or failed by its stall
     // policy) and the stop runs.
@@ -331,7 +358,7 @@ async fn a_worker_frozen_during_an_input_ends_the_stop_at_the_input_wait() {
 
     tokio::time::pause();
     let inhibitor = AutoAdvanceInhibitor::new();
-    tokio::time::advance(INPUT_STOP_WAIT + EXCHANGE_WAIT + TIMER_TICK).await;
+    advance_until_finished("the stop behind a frozen input", &stopping, EXCHANGE_WAIT).await;
     let error = guard("the stop behind a frozen input", stopping)
         .await
         .expect("stop task joins")
