@@ -453,6 +453,25 @@ pub enum HostTarget {
     Remote(OverlayRoute),
 }
 
+/// One provider read: the visible peers and this machine's own identity, both
+/// taken from the same provider state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlaySnapshot {
+    /// Visible remote peers, address-less candidates included.
+    pub peers: Vec<DiscoveredPeer>,
+    /// This machine's own identity, when the provider reports one.
+    pub local: Option<LocalIdentity>,
+}
+
+/// [`OverlaySnapshot`] with the peers attached to their configured route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedSnapshot {
+    /// Visible remote peers with their overlay routes.
+    pub peers: Vec<RoutedPeer>,
+    /// This machine's own identity, when the provider reports one.
+    pub local: Option<LocalIdentity>,
+}
+
 /// A discovered peer with its configured overlay route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutedPeer {
@@ -528,6 +547,20 @@ pub trait OverlayTransport: Send + Sync + fmt::Debug {
     /// Enumerate visible remote peers while preserving address-less candidates.
     fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>>;
 
+    /// Read the visible peers and this machine's own identity in one pass.
+    ///
+    /// A provider that derives both from one state read overrides this, so the
+    /// two cannot disagree and the state is read once. The default reports the
+    /// peers only: a separate identity read could stall the peer enumeration
+    /// that already finished, so a provider without the override contributes
+    /// no local host record.
+    fn discover_snapshot(&self) -> OverlayFuture<'_, OverlaySnapshot> {
+        Box::pin(async move {
+            let peers = self.discover_peers().await?;
+            Ok(OverlaySnapshot { peers, local: None })
+        })
+    }
+
     /// Resolve a user selector to this machine or to one exact peer.
     ///
     /// A provider that knows its own identity matches it at the same steps as a
@@ -587,21 +620,40 @@ impl ConfiguredTransport {
     ///
     /// Returns the provider's typed discovery error unchanged.
     pub async fn discover_peers(&self) -> Result<Vec<RoutedPeer>, OverlayError> {
-        self.transport.discover_peers().await.map(|peers| {
-            peers
-                .into_iter()
-                .map(|peer| RoutedPeer {
-                    overlay: self.id().clone(),
-                    peer_id: peer.peer_id,
-                    display_name: peer.display_name,
-                    fqdn: peer.fqdn,
-                    addr: peer
-                        .address
-                        .map(|address| SocketAddr::new(address, self.port())),
-                    port: self.port(),
-                })
-                .collect()
+        self.transport
+            .discover_peers()
+            .await
+            .map(|peers| self.route_peers(peers))
+    }
+
+    /// Enumerate the peers and this machine's own identity from one provider
+    /// read.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider's typed discovery error unchanged.
+    pub async fn discover_snapshot(&self) -> Result<RoutedSnapshot, OverlayError> {
+        let snapshot = self.transport.discover_snapshot().await?;
+        Ok(RoutedSnapshot {
+            peers: self.route_peers(snapshot.peers),
+            local: snapshot.local,
         })
+    }
+
+    fn route_peers(&self, peers: Vec<DiscoveredPeer>) -> Vec<RoutedPeer> {
+        peers
+            .into_iter()
+            .map(|peer| RoutedPeer {
+                overlay: self.id().clone(),
+                peer_id: peer.peer_id,
+                display_name: peer.display_name,
+                fqdn: peer.fqdn,
+                addr: peer
+                    .address
+                    .map(|address| SocketAddr::new(address, self.port())),
+                port: self.port(),
+            })
+            .collect()
     }
 
     /// Return this entry's current listener diagnostic.

@@ -859,6 +859,13 @@ wire shapes are the exported `crates/protocol` structs.
 - `address`: optional dialable IP address without a port. `null` keeps an
   address-less or rejected-spoof candidate visible but non-dialable.
 - `port`: required effective daemon port for this overlay route.
+- `local`: optional boolean, serialized only when `true`. The record is the
+  machine that enumerated the hosts, not a peer; its `peer_id` is `null` and its
+  class comes from a health probe of its own overlay address. A reader that
+  predates the field ignores it and shows the record as one more host.
+- `reason`: optional string, serialized only when set. A `local` record whose
+  probe failed carries the probe error next to `unreachable`; it is never set on
+  a peer record.
 - `name` and `fqdn`: optional display selectors, never sufficient by themselves
   to bypass collision checks.
 - The flattened host class remains `candidate`, `reachable_daemon`,
@@ -3154,7 +3161,7 @@ Canonical public codes currently emitted include:
 | `configuration` | `paths_unavailable`, `netbird_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted`, `integration_trust_conflict`, `integration_home_ambiguous_owner` |
 | `daemon` | `version_mismatch`, `native_store_check_task_panicked`, `version_adapter_failed`, `daemon_protocol_too_old`, `version_translation_failed`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down` |
 | `transport` | `framing`, `host_unreachable`, `request_timeout`, `session_resume_outcome_unknown` |
-| `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `remote_discovery_failed` |
+| `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `host_identity_unpinnable`, `remote_discovery_failed` |
 | `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `agent_native_reference_missing`, `agent_native_store_relocated`, `native_identity_missing`, `native_identity_unverified`, `native_identity_uncertain`, `native_identity_evidence_unavailable`, `native_report_unattested`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `integration_no_managed_runtime`, `bundle_unavailable`,`assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `migration_manifest_missing`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `session_input_stalled`, `session_cwd_missing`, `session_tmpdir_unsafe`, `session_tmpdir_failed`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `base_branch_fetch_failed`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required`, `integration_update_incompatible` |
 
 Protocol v4 emits these runtime codes for provider-neutral agent and
@@ -3892,8 +3899,11 @@ called by the CLI (`pohunek subscribe`, `pohunek attach`, `pohunek notifications
 
 - `host.discover`: socket-level coverage in
   `crates/daemon/tests/health_socket.rs`
-  (`public_bind_serves_host_discover_with_supplied_registry`) and the
-  version-mismatch contract test in `crates/daemon/tests/remote_tcp.rs`.
+  (`public_bind_serves_host_discover_with_supplied_registry`,
+  `host_discover_lists_this_machine_as_one_local_record`) and the
+  version-mismatch contract test in `crates/daemon/tests/remote_tcp.rs`. The
+  previous release's record shape decoding a `local` record is covered by
+  `crates/protocol/tests/host_record_previous.rs`.
 - `subscribe`: socket-level coverage in `crates/daemon/tests/health_socket.rs`
   (`subscribe_streams_session_created_event` and the notification and
   agent-state subscribe tests) and the client subscription tests in
@@ -3967,13 +3977,18 @@ Public exports:
 - `OverlayTransport`: provider contract whose required typed identity resolver
   must match only the requested peer-ID or FQDN field; implementations cannot
   inherit an untyped selector fallback.
+  `discover_snapshot` reads the visible peers and this machine's own identity in
+  one pass; a provider that derives both from one state read overrides it, so
+  discovery runs the provider once and the `local` record and the peers cannot
+  disagree (the default reports the peers only, so a provider without the override adds no local record).
 - `discover_hosts(registry)`: aggregated configured-overlay discovery with
   default bounded probes.
 - `discover_hosts_with_options(registry, options)`: the same discovery with an
   explicit per-probe timeout, overall deadline, and concurrency bound. Provider
   failures are isolated unless every configured overlay fails. Providers return
-  remote peers only; clients that need a local entry add their Unix-socket target
-  explicitly.
+  remote peers; the machine itself is added as a `local: true` record for each
+  overlay that reports its identity, and clients that fan out add their
+  Unix-socket target explicitly and skip that record.
 - Raw and attach helpers: `connect_raw*` and `attach_raw*`.
 
 Public daemon construction is registry-explicit. `DaemonState::new` and
@@ -3985,8 +4000,10 @@ registry-less state.
 Connection APIs:
 
 - `Client::connect(host, socket_path)`: `""` and `"local"` use the Unix socket;
-  any other host is resolved through the default configured overlay registry
-  and dialed over its exact per-overlay route. `<overlay>:<selector>` restricts
+  any other host is resolved through the default configured overlay registry.
+  This machine's own overlay name selects the Unix socket like `local`, a name
+  it shares with a peer is `overlay_host_ambiguous`, and an explicit `@<port>`
+  route always names a peer. A peer is dialed over its exact per-overlay route. `<overlay>:<selector>` restricts
   resolution to one configured provider. The optional
   `<overlay>:<selector>@<port>` form retains an explicit discovered daemon
   port while still resolving the selector through current provider state. The
@@ -4009,9 +4026,23 @@ Connection APIs:
   lists every matching host and whose `recover` text names the
   selector of each: provider-qualified for a peer, `local` for this machine. `local`, an
   unknown name, an unavailable provider, and a `@<port>` route answer `false`.
-  `Client::connect` itself still treats only `""` and `"local"` as local; the
-  CLI applies this check before it connects (see `docs/cli.md`, host
-  resolution).
+  `Client::connect` applies the same rule, so the CLI's alias table only saves
+  a lookup (see `docs/cli.md`, host resolution).
+- `resolve_host_target(host, connect_timeout)` and `resolve_host_target_in(host,
+  connect_timeout, &registry)`: resolve a host once to a `ResolvedHost`, which is
+  `Local` or `Remote { pinned_route, display }`. `pinned_route` is
+  `<overlay>:peer~<id>@<port>` (`fqdn~` when the provider reports no peer id), so
+  connecting to it looks the peer up by identity and a renamed or reassigned
+  short name cannot select another peer; the address may change. `display` is the
+  name the caller typed. A peer with neither a peer id nor an FQDN fails with
+  `host_identity_unpinnable`. `pinned_host_id(overlay, peer_id, fqdn)` builds the
+  `<overlay>:<selector>` part that fan-out targets share.
+- `Client::connect_resolved_with_options(&resolved, socket_path, options)`:
+  connects to a `ResolvedHost`; lookup failures and connection errors name
+  `display`. Use it for every connection of one logical operation.
+- Assistant: `HostConfig::pinned(id, host, pinned_route)` carries a pinned
+  remote host through `prepare_with_options` and `start_prepared_with_options`;
+  its `attach_host()` is the pinned route.
 - `Client::connect_local(socket_path)`: direct Unix socket.
 - `Client::connect_trusted_tcp_addr(host, addr)`: direct TCP for a route already
   validated by configured overlay discovery, with host context preserved for

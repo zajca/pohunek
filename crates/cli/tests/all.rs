@@ -34,6 +34,12 @@ mod hermes_package;
 mod hermes_plugin_argv;
 #[path = "hermes_plugin_suites.rs"]
 mod hermes_plugin_suites;
+#[path = "host_fanout_local_record.rs"]
+mod host_fanout_local_record;
+#[path = "host_pin_assistant.rs"]
+mod host_pin_assistant;
+#[path = "host_pin_attach.rs"]
+mod host_pin_attach;
 #[path = "integration_hooks.rs"]
 mod integration_hooks;
 #[path = "json_usage_errors.rs"]

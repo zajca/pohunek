@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use overlay::{
     BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, LocalIdentity,
-    OverlayError, OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, ResolvedPeer,
-    ResolvedSelector,
+    OverlayError, OverlayFuture, OverlayId, OverlayRegistry, OverlaySnapshot, OverlayTransport,
+    ResolvedPeer, ResolvedSelector,
 };
 
 use crate::{NetbirdError, NetbirdStatus, Peer};
@@ -79,6 +79,16 @@ impl OverlayTransport for NetbirdTransport {
         Box::pin(async move {
             let status = load_status(self.id()).await?;
             Ok(discover_from_status(&status))
+        })
+    }
+
+    fn discover_snapshot(&self) -> OverlayFuture<'_, OverlaySnapshot> {
+        Box::pin(async move {
+            let status = load_status(self.id()).await?;
+            Ok(OverlaySnapshot {
+                peers: discover_from_status(&status),
+                local: local_identity_from_status(&status, self.id()),
+            })
         })
     }
 

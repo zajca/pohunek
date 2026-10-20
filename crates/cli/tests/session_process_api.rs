@@ -31,6 +31,9 @@ use serde_json::{json, Value};
 #[cfg(target_os = "linux")]
 #[path = "support/connect_redirect.rs"]
 mod connect_redirect;
+#[cfg(target_os = "linux")]
+#[path = "support/pin_overlay.rs"]
+mod pin_overlay;
 
 const SESSION_ID: &str = "s-fixture-1";
 const SESSION_NAME: &str = "fixture-session";
@@ -2177,8 +2180,8 @@ fn host_commands_treat_the_machines_own_overlay_name_as_local() {
         "{table}"
     );
 
-    // With a stuck overlay CLI, the cached records still print without this
-    // machine's row once the lookup's deadline passes.
+    // With a stuck overlay CLI, the cached records, this machine's included,
+    // print without waiting for it.
     netbird.stall();
     let started = std::time::Instant::now();
     let listed = run(&["host", "list"]);
@@ -2193,9 +2196,11 @@ fn host_commands_treat_the_machines_own_overlay_name_as_local() {
     );
     let table = utf8(&listed.stdout);
     assert!(
-        table
-            .lines()
-            .all(|row| row.split_whitespace().nth(1) != Some("local")),
+        table.lines().any(|row| row.split_whitespace().take(3).eq([
+            "fixture-self",
+            "local",
+            "local"
+        ])),
         "{table}"
     );
     assert!(
@@ -2797,5 +2802,400 @@ fn an_assistant_launch_with_an_unknown_outcome_is_found_by_its_key_instead_of_re
         creations[0].params()["metadata"],
         json!({LAUNCH_KEY.0: LAUNCH_KEY.1}),
         "the caller's key travels with the one creation"
+    );
+}
+
+/// Peer the name `peer-a` selects before the first connection of an operation.
+#[cfg(target_os = "linux")]
+const PIN_FIRST_IP: &str = "100.64.0.11";
+
+/// Peer the name `peer-a` selects once the first connection was dialed.
+#[cfg(target_os = "linux")]
+const PIN_SECOND_IP: &str = "100.64.0.12";
+
+/// Address the first peer moves to in the address-change scenario.
+#[cfg(target_os = "linux")]
+const PIN_MOVED_IP: &str = "100.64.0.13";
+
+/// Remote port the environment configures when a scenario names the port in
+/// the route; no daemon listens there, so a pin that loses the route's port
+/// fails to connect.
+#[cfg(target_os = "linux")]
+const PIN_WRONG_PORT: &str = "1";
+
+/// `after` table of [`run_pinned`] that makes every lookup after the first
+/// dialed connection hang.
+#[cfg(target_os = "linux")]
+const PIN_STALL: &str = "stall";
+
+/// How long a stalled fake `netbird` hangs: beyond the client's 5 s connect
+/// timeout, so only a bounded lookup finishes.
+#[cfg(target_os = "linux")]
+const PIN_STALL_SECONDS: u32 = 30;
+
+/// Placeholder of the fixture daemon's port in a host selector template.
+#[cfg(target_os = "linux")]
+const PORT_PLACEHOLDER: &str = "{port}";
+
+#[cfg(target_os = "linux")]
+fn pin_first_peer(fqdn: &'static str, ip: &'static str) -> pin_overlay::Peer {
+    pin_overlay::Peer::new(fqdn, ip, "key-first")
+}
+
+#[cfg(target_os = "linux")]
+fn pin_second_peer(fqdn: &'static str) -> pin_overlay::Peer {
+    pin_overlay::Peer::new(fqdn, PIN_SECOND_IP, "key-second")
+}
+
+/// The table before the first connection: `peer-a` is the first peer.
+#[cfg(target_os = "linux")]
+fn pin_before() -> String {
+    pin_overlay::status(
+        None,
+        &[
+            pin_first_peer("peer-a.netbird.test", PIN_FIRST_IP),
+            pin_second_peer("peer-y.netbird.test"),
+        ],
+    )
+}
+
+/// The table after the first connection: the name `peer-a` moved to the
+/// second peer, and the first peer was renamed.
+#[cfg(target_os = "linux")]
+fn pin_after_rename() -> String {
+    pin_overlay::status(
+        None,
+        &[
+            pin_first_peer("peer-x-old.netbird.test", PIN_FIRST_IP),
+            pin_second_peer("peer-a.netbird.test"),
+        ],
+    )
+}
+
+/// What an operation observed: the CLI output, the `NetBird` addresses it
+/// dialed in order, and the requests the fixture daemon served.
+#[cfg(target_os = "linux")]
+struct PinnedRun {
+    output: Output,
+    dialed: Vec<String>,
+    requests: Vec<Request>,
+}
+
+/// Runs `pohunek --host <host> <args>` against a fake `NetBird` whose table
+/// changes from `before` to `after` once the first connection was dialed.
+/// `host` may contain [`PORT_PLACEHOLDER`]; `env_port` is the configured
+/// remote port, the fixture daemon's own port when `None`.
+#[cfg(target_os = "linux")]
+fn run_pinned(
+    host: &str,
+    args: &[&str],
+    before: &str,
+    after: &str,
+    env_port: Option<&str>,
+) -> PinnedRun {
+    let home = TestHome::new();
+    let local_fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+    let tcp_fixture = TcpFixtureDaemon::start(Ipv4Addr::LOCALHOST, Scenario::Success);
+    let fixture_port = tcp_fixture.address.port().to_string();
+    let (connect_redirect, connect_capture) = connect_redirect::build(&home.root);
+    let bin = home.root.join("bin");
+    let path = if after == PIN_STALL {
+        pin_overlay::install_stalling(&bin, &connect_capture, before, PIN_STALL_SECONDS)
+    } else {
+        pin_overlay::install(&bin, &connect_capture, before, after)
+    };
+    let output = home
+        .command()
+        .env("PATH", &path)
+        .env("LD_PRELOAD", &connect_redirect)
+        .env("POHUNEK_TEST_CONNECT_CAPTURE", &connect_capture)
+        .env("POHUNEK_REMOTE_PORT", env_port.unwrap_or(&fixture_port))
+        .arg("--host")
+        .arg(host.replace(PORT_PLACEHOLDER, &fixture_port))
+        .args(args)
+        .output()
+        .expect("run pinned pohunek");
+    let requests = tcp_fixture.finish();
+    assert!(
+        local_fixture.finish().is_empty(),
+        "a remote operation never uses the local socket"
+    );
+    PinnedRun {
+        output,
+        dialed: pin_overlay::dialed_ips(&connect_capture),
+        requests,
+    }
+}
+
+/// Commands that resolve the session on one connection and act on another.
+#[cfg(target_os = "linux")]
+const PINNED_SESSION_COMMANDS: [&[&str]; 2] = [
+    &["session", "output", SESSION_ID, "--json"],
+    &[
+        "session",
+        "wait",
+        SESSION_ID,
+        "--state",
+        "done",
+        "--timeout-ms",
+        "200",
+        "--json",
+    ],
+];
+
+#[cfg(target_os = "linux")]
+fn command_method(command: &[&str]) -> &'static str {
+    match command[1] {
+        "output" => protocol::method::SESSION_OUTPUT,
+        "wait" => protocol::method::SESSION_WAIT,
+        other => panic!("unexpected pinned command {other}"),
+    }
+}
+
+/// Selector forms that pin to the first peer: a short name, a
+/// provider-qualified name and a name with the daemon port in the route.
+#[cfg(target_os = "linux")]
+const PIN_SELECTORS: [(&str, Option<&str>); 3] = [
+    ("peer-a", None),
+    ("netbird:peer-a", None),
+    ("peer-a@{port}", Some(PIN_WRONG_PORT)),
+];
+
+#[test]
+#[cfg(target_os = "linux")]
+fn session_output_and_wait_stay_on_the_peer_the_name_first_selected() {
+    for command in PINNED_SESSION_COMMANDS {
+        for (selector, env_port) in PIN_SELECTORS {
+            let run = run_pinned(
+                selector,
+                command,
+                &pin_before(),
+                &pin_after_rename(),
+                env_port,
+            );
+            assert_json_success(&run.output);
+            assert!(
+                run.dialed.len() >= 2,
+                "{selector} {command:?}: one connection resolves the session, one acts: {:?}",
+                run.dialed
+            );
+            assert!(
+                run.dialed.iter().all(|ip| ip == PIN_FIRST_IP),
+                "{selector} {command:?}: every connection reaches the first peer: {:?}",
+                run.dialed
+            );
+            assert!(
+                run.requests
+                    .iter()
+                    .any(|request| request.method() == command_method(command)),
+                "{selector} {command:?}: the action reached the first peer's daemon"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_pinned_peer_that_changes_address_is_followed_by_identity() {
+    let moved = pin_overlay::status(
+        None,
+        &[
+            pin_first_peer("peer-x-old.netbird.test", PIN_MOVED_IP),
+            pin_second_peer("peer-a.netbird.test"),
+        ],
+    );
+    for command in PINNED_SESSION_COMMANDS {
+        let run = run_pinned("peer-a", command, &pin_before(), &moved, None);
+        assert_json_success(&run.output);
+        assert_eq!(
+            run.dialed.first().map(String::as_str),
+            Some(PIN_FIRST_IP),
+            "{command:?}"
+        );
+        assert!(
+            run.dialed.iter().skip(1).all(|ip| ip == PIN_MOVED_IP),
+            "{command:?}: the later connection follows the pinned peer to its new address: {:?}",
+            run.dialed
+        );
+        assert!(
+            !run.dialed.iter().any(|ip| ip == PIN_SECOND_IP),
+            "{command:?}"
+        );
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_pinned_peer_that_vanishes_fails_closed_under_the_typed_name() {
+    let vanished = pin_overlay::status(None, &[pin_second_peer("peer-a.netbird.test")]);
+    for command in PINNED_SESSION_COMMANDS {
+        let run = run_pinned("peer-a", command, &pin_before(), &vanished, None);
+        let document = assert_json_error(&run.output, "host_unknown");
+        let message = document["err"]["msg"].as_str().expect("error message");
+        assert!(message.contains("peer-a"), "{command:?}: {message}");
+        assert!(!message.contains("peer~"), "{command:?}: {message}");
+        assert!(
+            run.dialed.iter().all(|ip| ip == PIN_FIRST_IP),
+            "{command:?}: the second peer is never contacted: {:?}",
+            run.dialed
+        );
+        assert!(
+            !run.requests
+                .iter()
+                .any(|request| request.method() == command_method(command)),
+            "{command:?}: no action reached any daemon"
+        );
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_host_without_a_peer_id_or_fqdn_cannot_be_pinned() {
+    let unnamed = pin_overlay::status(
+        None,
+        &[pin_overlay::Peer {
+            fqdn: None,
+            ip: "100.64.0.9",
+            key: None,
+        }],
+    );
+    for command in PINNED_SESSION_COMMANDS {
+        let run = run_pinned("100.64.0.9", command, &unnamed, &unnamed, None);
+        let document = assert_json_error(&run.output, "host_identity_unpinnable");
+        assert!(
+            document["err"]["msg"]
+                .as_str()
+                .is_some_and(|message| message.contains("100.64.0.9")),
+            "{document}"
+        );
+        assert!(run.dialed.is_empty(), "{command:?}: {:?}", run.dialed);
+        assert!(run.requests.is_empty(), "{command:?}: no daemon was asked");
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn an_ambiguous_name_is_refused_before_any_connection() {
+    let ambiguous = pin_overlay::status(
+        None,
+        &[
+            pin_first_peer("build.one.netbird.test", PIN_FIRST_IP),
+            pin_second_peer("build.two.netbird.test"),
+        ],
+    );
+    for command in PINNED_SESSION_COMMANDS {
+        let run = run_pinned("build", command, &ambiguous, &ambiguous, None);
+        assert_json_error(&run.output, "overlay_host_ambiguous");
+        assert!(run.dialed.is_empty(), "{command:?}: {:?}", run.dialed);
+        assert!(run.requests.is_empty(), "{command:?}");
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn pinned_operations_of_the_machines_own_overlay_name_stay_on_the_local_daemon() {
+    let home = TestHome::new();
+    let local_fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+    let tcp_fixture = TcpFixtureDaemon::start(Ipv4Addr::LOCALHOST, Scenario::Success);
+    let remote_port = tcp_fixture.address.port();
+    let (connect_redirect, connect_capture) = connect_redirect::build(&home.root);
+    let netbird = SelfNetbird::install(&home.root);
+    for command in PINNED_SESSION_COMMANDS {
+        for host in ["local", SELF_FQDN] {
+            let output = home
+                .command()
+                .env("PATH", &netbird.path)
+                .env("LD_PRELOAD", &connect_redirect)
+                .env("POHUNEK_TEST_CONNECT_CAPTURE", &connect_capture)
+                .env("POHUNEK_REMOTE_PORT", remote_port.to_string())
+                .args(["--host", host])
+                .args(command)
+                .output()
+                .expect("run pohunek");
+            assert_json_success(&output);
+        }
+    }
+    let local_requests = local_fixture.finish();
+    for command in PINNED_SESSION_COMMANDS {
+        assert!(
+            local_requests
+                .iter()
+                .any(|request| request.method() == command_method(command)),
+            "{command:?} reached the local daemon"
+        );
+    }
+    assert!(
+        tcp_fixture.finish().is_empty(),
+        "an own-name operation never dials the overlay"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_stalled_lookup_of_a_pinned_peer_fails_under_the_typed_name() {
+    for command in PINNED_SESSION_COMMANDS {
+        let run = run_pinned("peer-a", command, &pin_before(), PIN_STALL, None);
+        let document = assert_json_error(&run.output, "remote_discovery_failed");
+        let message = document["err"]["msg"].as_str().expect("error message");
+        assert!(message.contains("peer-a"), "{command:?}: {message}");
+        assert!(!message.contains("peer~"), "{command:?}: {message}");
+        assert!(
+            run.dialed.iter().all(|ip| ip == PIN_FIRST_IP),
+            "{command:?}: {:?}",
+            run.dialed
+        );
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn the_names_of_the_local_record_select_the_local_daemon() {
+    let home = TestHome::new();
+    let local_fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+    let tcp_fixture = TcpFixtureDaemon::start(Ipv4Addr::LOCALHOST, Scenario::Success);
+    let remote_port = tcp_fixture.address.port();
+    let (connect_redirect, connect_capture) = connect_redirect::build(&home.root);
+    let netbird = SelfNetbird::install(&home.root);
+    let run = |args: &[&str]| {
+        home.command()
+            .env("PATH", &netbird.path)
+            .env("LD_PRELOAD", &connect_redirect)
+            .env("POHUNEK_TEST_CONNECT_CAPTURE", &connect_capture)
+            .env("POHUNEK_REMOTE_PORT", remote_port.to_string())
+            .args(args)
+            .output()
+            .expect("run pohunek")
+    };
+    let records = assert_json_success(&run(&["host", "discover", "--refresh", "--json"]));
+    let local = records
+        .as_array()
+        .expect("host records")
+        .iter()
+        .find(|record| record["local"] == true)
+        .expect("the local record");
+    // A consumer feeds the record's own names back as `--host`; a release
+    // that predates the record maps them to the local daemon the same way.
+    for field in ["fqdn", "address"] {
+        let host = local[field].as_str().expect("record field");
+        let ok = assert_json_success(&run(&[
+            "--host", host, "session", "screen", SESSION_ID, "--json",
+        ]));
+        assert_eq!(ok["session_id"], SESSION_ID, "{field}");
+    }
+    let screens = |requests: Vec<Request>| {
+        requests
+            .iter()
+            .filter(|request| request.method() == protocol::method::SESSION_SCREEN)
+            .count()
+    };
+    assert_eq!(
+        screens(local_fixture.finish()),
+        2,
+        "both reached the local daemon"
+    );
+    assert_eq!(
+        screens(tcp_fixture.finish()),
+        0,
+        "neither dialed the overlay"
     );
 }

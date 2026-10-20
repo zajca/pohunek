@@ -1007,6 +1007,8 @@ mod tests {
             port: 18_722,
             overlay: "netbird".to_owned(),
             peer_id: Some(format!("peer-{name}")),
+            local: false,
+            reason: None,
             class,
         }
     }

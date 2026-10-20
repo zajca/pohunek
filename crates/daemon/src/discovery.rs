@@ -111,6 +111,8 @@ mod tests {
             port: 18722,
             overlay: "netbird".to_owned(),
             peer_id: Some("100.92.30.40".to_owned()),
+            local: false,
+            reason: None,
             class: HostClass::Unreachable,
         }];
         let cache = DiscoveryCache::new(crate::test_support::overlay_registry());

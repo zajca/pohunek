@@ -112,6 +112,10 @@ async fn concurrent_discovery_calls_complete_through_one_netbird_provider() {
         discover_hosts_with_options(&registry, options),
     );
     for result in [first, second, third, fourth] {
-        assert!(result.expect("concurrent discovery completed").is_empty());
+        // The status reports this machine and no peer: only its own record.
+        assert!(result
+            .expect("concurrent discovery completed")
+            .iter()
+            .all(|record| record.local));
     }
 }

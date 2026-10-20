@@ -203,7 +203,7 @@ async fn run_prepared(
     paths: &Paths,
     auto_started: bool,
 ) -> Result<(), CliError> {
-    let host = assistant_host_config(&opts, paths);
+    let host = assistant_host_config(&opts, paths).await?;
     let assistant_paths = assistant_paths(paths);
     let params = assistant_params(&opts, auto_started);
     let mut prepared = core_assistant::prepare_with_options(
@@ -371,11 +371,28 @@ fn emit_launch_output(
     Ok(())
 }
 
-fn assistant_host_config(opts: &AssistantOptions, paths: &Paths) -> HostConfig {
+/// Build the host config of one launch, pinning a remote host once so
+/// preparation and launch reach the same peer.
+async fn assistant_host_config(
+    opts: &AssistantOptions,
+    paths: &Paths,
+) -> Result<HostConfig, CliError> {
     if crate::target::is_local_host(&opts.host) {
-        HostConfig::local(LOCAL_HOST, paths.socket.clone())
-    } else {
-        HostConfig::remote(opts.host.clone(), opts.host.clone(), paths.socket.clone())
+        return Ok(HostConfig::local(LOCAL_HOST, paths.socket.clone()));
+    }
+    let timeout = pohunek_client::ClientOptions::default().connect_timeout;
+    match pohunek_client::resolve_host_target(&opts.host, timeout)
+        .await
+        .map_err(crate::client::map_client_error)?
+    {
+        pohunek_client::ResolvedHost::Local => {
+            Ok(HostConfig::local(LOCAL_HOST, paths.socket.clone()))
+        }
+        pohunek_client::ResolvedHost::Remote { pinned_route, .. } => Ok(HostConfig::pinned(
+            opts.host.clone(),
+            opts.host.clone(),
+            pinned_route,
+        )),
     }
 }
 

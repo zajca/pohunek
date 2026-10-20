@@ -156,6 +156,14 @@ pub enum ClientError {
         detail: &'static str,
     },
 
+    /// A remote host has neither a provider peer id nor an FQDN, so no stable
+    /// identity can pin the connections of one operation to it.
+    #[error("host '{host}' cannot be pinned to one peer identity")]
+    HostIdentityUnpinnable {
+        /// Host name as the caller typed it.
+        host: String,
+    },
+
     /// A `NetBird` TCP connection to the host's daemon port could not be opened.
     #[error("could not open a NetBird connection to host '{host}': {source}")]
     HostUnreachable {
@@ -347,6 +355,15 @@ impl ClientError {
                 "invalid_discovery_options",
                 format!("invalid discovery options: {detail}"),
                 Some("fix the invalid discovery option before running discovery".to_owned()),
+            ),
+            ClientError::HostIdentityUnpinnable { host } => ProtocolError::new(
+                ErrorClass::Discovery,
+                "host_identity_unpinnable",
+                format!("host '{host}' reports neither a peer id nor an FQDN, so it cannot be pinned to one peer for this operation"),
+                Some(
+                    "use the provider-qualified selector from `pohunek host list`, or run a command that opens one connection"
+                        .to_owned(),
+                ),
             ),
             ClientError::InvalidRemoteRoute { route, detail } => ProtocolError::new(
                 ErrorClass::Configuration,

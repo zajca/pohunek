@@ -11,6 +11,49 @@ use crate::paths::Paths;
 
 pub(crate) use pohunek_client::RawStream;
 
+/// A host resolved once for every connection of one CLI operation.
+///
+/// A remote host is pinned to the peer identity its name selected when the
+/// operation started; `label` keeps the name the user typed for errors and
+/// output.
+#[derive(Debug, Clone)]
+pub(crate) struct PinnedHost {
+    resolved: pohunek_client::ResolvedHost,
+    label: String,
+}
+
+impl PinnedHost {
+    /// Resolve `host` once. This machine's own names and `local` need no lookup.
+    pub(crate) async fn resolve(host: &str) -> Result<Self, CliError> {
+        let resolved = if crate::target::is_local_host(host) {
+            pohunek_client::ResolvedHost::Local
+        } else {
+            let timeout = pohunek_client::ClientOptions::default().connect_timeout;
+            pohunek_client::resolve_host_target(host, timeout)
+                .await
+                .map_err(map_connect_error)?
+        };
+        Ok(Self {
+            resolved,
+            label: host.to_owned(),
+        })
+    }
+
+    /// The local daemon.
+    #[cfg(test)]
+    pub(crate) fn local() -> Self {
+        Self {
+            resolved: pohunek_client::ResolvedHost::Local,
+            label: crate::target::LOCAL_HOST.to_owned(),
+        }
+    }
+
+    /// The host name as the user typed it.
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+}
+
 /// A connected control client used by CLI commands.
 #[derive(Debug)]
 pub(crate) struct Client {
@@ -21,6 +64,18 @@ impl Client {
     /// Connect to the daemon for `host`.
     pub(crate) async fn connect(host: &str, paths: &Paths) -> Result<Self, CliError> {
         Self::connect_with_options(host, paths, options_for(paths)).await
+    }
+
+    /// Connect to a host resolved once for the whole operation.
+    pub(crate) async fn connect_pinned(host: &PinnedHost, paths: &Paths) -> Result<Self, CliError> {
+        let inner = pohunek_client::Client::connect_resolved_with_options(
+            &host.resolved,
+            &paths.socket,
+            options_for(paths),
+        )
+        .await
+        .map_err(map_connect_error)?;
+        Ok(Self { inner })
     }
 
     /// Connect to an explicit local daemon socket.

@@ -64,6 +64,18 @@ pub struct HostRecord {
     pub overlay: String,
     /// The overlay's stable provider peer identity (e.g. a `NetBird` public key).
     pub peer_id: Option<String>,
+    /// Whether this record is the machine that enumerated the hosts rather than
+    /// a peer. Omitted when `false`, so a peer record is unchanged on the wire
+    /// and an older reader decodes the field as absent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub local: bool,
+    /// Why the probe of this record failed, set only on the local record when
+    /// its own daemon did not answer. Omitted otherwise, so a peer record is
+    /// unchanged on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub reason: Option<String>,
     /// Classification (flattened so its fields sit alongside the record).
     #[serde(flatten)]
     pub class: HostClass,

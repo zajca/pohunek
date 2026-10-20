@@ -248,15 +248,18 @@ async fn spawn_server(
     socket: &std::path::Path,
     version: &str,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    spawn_server_with_overlay(socket, version, support::overlay_registry()).await
+}
+
+async fn spawn_server_with_overlay(
+    socket: &std::path::Path,
+    version: &str,
+    overlay: overlay::OverlayRegistry,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let health = HealthInfo::new(version);
-    let server = ControlServer::bind(
-        socket,
-        health,
-        governance_service(socket).await,
-        support::overlay_registry(),
-    )
-    .await
-    .expect("server binds");
+    let server = ControlServer::bind(socket, health, governance_service(socket).await, overlay)
+        .await
+        .expect("server binds");
     let (tx, rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
         server
@@ -1864,6 +1867,45 @@ async fn public_bind_serves_host_discover_with_supplied_registry() {
     let default_records: Vec<HostRecord> =
         serde_json::from_value(ok_payload(default_resp)).expect("default host records deserialize");
     assert!(default_records.is_empty());
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn host_discover_lists_this_machine_as_one_local_record() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let mut origin_env = ProcessEnv::lock();
+    origin_env.remove(ENV_DAEMON_ID).remove(ENV_SESSION_ID);
+    let socket = temp_socket("host-discover-local-record");
+    let (shutdown, handle) = spawn_server_with_overlay(
+        &socket,
+        "9.9.9-test",
+        support::overlay_registry_with_own_name("self-box.overlay.test"),
+    )
+    .await;
+
+    let mut client = connect(&socket).await;
+    let req = Request::make(
+        "host-discover-local",
+        method::HOST_DISCOVER,
+        serde_json::to_value(HostDiscoverParams { force: true }).expect("params serialize"),
+    );
+    let payload = ok_payload(exchange(&mut client, &req).await);
+    let records: Vec<HostRecord> =
+        serde_json::from_value(payload.clone()).expect("host records deserialize");
+    assert_eq!(records.len(), 1, "{payload}");
+    let local = &records[0];
+    assert!(local.local);
+    assert_eq!(local.name.as_deref(), Some("self-box"));
+    assert_eq!(local.fqdn.as_deref(), Some("self-box.overlay.test"));
+    assert_eq!(local.overlay, "test");
+    assert_eq!(local.peer_id, None);
+    assert_eq!(local.class, protocol::HostClass::Candidate);
+    // The wire shape carries `local` only for this machine.
+    assert_eq!(payload[0]["local"], Value::Bool(true));
 
     let _ = shutdown.send(());
     let _ = handle.await;

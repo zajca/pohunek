@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 
 use self::shortcut::{MenuInputMode, Shortcut, ShortcutDecoder};
-use crate::client::{Client, RawStream};
+use crate::client::{Client, PinnedHost, RawStream};
 use crate::commands::{request_id, request_with_params};
 use crate::error::CliError;
 use crate::paths::Paths;
@@ -365,7 +365,7 @@ struct MenuRuntime {
 
 #[derive(Debug, Clone)]
 struct AttachControlContext {
-    host: String,
+    host: PinnedHost,
     paths: Paths,
     target: Target,
 }
@@ -558,6 +558,9 @@ fn status_agent_label(value: &serde_json::Value, current: &str) -> String {
 /// resolved, attach negotiation fails, terminal raw mode cannot be configured, or
 /// raw I/O fails.
 pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Result<(), CliError> {
+    // Every connection of this attach, retries and menu actions included, goes
+    // to the peer the name selects now.
+    let host = &PinnedHost::resolve(host).await?;
     // Tell the daemon which session+instance this client is itself running inside,
     // so it can refuse a self-feeding attach loop before it starts. Reported for
     // every transport: the loop is reachable even over a same-host loopback TCP
@@ -625,7 +628,7 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
 }
 
 async fn run_attach_once(
-    host: &str,
+    host: &PinnedHost,
     paths: &Paths,
     target: &Target,
     origin_session_id: Option<SessionId>,
@@ -640,7 +643,7 @@ async fn run_attach_once(
         origin_daemon_id,
         origin_worker_id,
     )?;
-    let mut client = Client::connect(host, paths).await?;
+    let mut client = Client::connect_pinned(host, paths).await?;
     let result = client.request(&attach_request).await?;
     let attach: SessionAttachResult = protocol::tolerant::from_value(result)?;
 
@@ -694,7 +697,7 @@ async fn attach_over_stream<S>(
     stream: S,
     mut client: Client,
     stream_id: &str,
-    host: &str,
+    host: &PinnedHost,
     paths: &Paths,
     target: &Target,
     initial_dimensions: Option<TerminalDimensions>,
@@ -705,12 +708,13 @@ where
     let (modal, status_updates) = if let Some((cols, rows)) =
         terminal_size(libc::STDOUT_FILENO).filter(|&(_, rows)| rows >= MIN_ROWS_FOR_MENU)
     {
-        let snapshot = load_initial_status_snapshot(&mut client, host, &target.session_id).await;
+        let snapshot =
+            load_initial_status_snapshot(&mut client, host.label(), &target.session_id).await;
         // Best-effort live status updates keep the transient modal current. A
         // dropped subscription leaves the last snapshot available without
         // interrupting raw terminal passthrough.
         let updates = spawn_status_updates(
-            host.to_owned(),
+            host.clone(),
             paths.clone(),
             target.session_id.clone(),
             snapshot.clone(),
@@ -735,7 +739,7 @@ where
         client,
         stream_id.to_owned(),
         AttachControlContext {
-            host: host.to_owned(),
+            host: host.clone(),
             paths: paths.clone(),
             target: target.clone(),
         },
@@ -929,7 +933,7 @@ fn status_host_label(host: &str) -> String {
 }
 
 fn spawn_status_updates(
-    host: String,
+    host: PinnedHost,
     paths: Paths,
     session_id: String,
     initial: AttachStatusSnapshot,
@@ -950,13 +954,13 @@ fn spawn_status_updates(
 }
 
 async fn run_status_updates(
-    host: String,
+    host: PinnedHost,
     paths: Paths,
     session_id: String,
     mut snapshot: AttachStatusSnapshot,
     tx: mpsc::UnboundedSender<AttachStatusSnapshot>,
 ) {
-    let Ok(mut client) = Client::connect(&host, &paths).await else {
+    let Ok(mut client) = Client::connect_pinned(&host, &paths).await else {
         return;
     };
 
@@ -1958,7 +1962,7 @@ enum AttachReconnectDecision {
 }
 
 async fn wait_for_attach_reconnect(
-    host: &str,
+    host: &PinnedHost,
     paths: &Paths,
     target: &Target,
     config: &AttachReconnectConfig,
@@ -2014,11 +2018,11 @@ fn reconnect_attempt_delay(interval: Duration, attempt: usize, remaining: Durati
 }
 
 async fn probe_attach_reconnect(
-    host: &str,
+    host: &PinnedHost,
     paths: &Paths,
     target: &Target,
 ) -> Result<AttachReconnectDecision, CliError> {
-    let mut client = Client::connect(host, paths).await?;
+    let mut client = Client::connect_pinned(host, paths).await?;
     let request = build_inspect_request(target)?;
     let result = client.request(&request).await?;
     let session: SessionInfo = protocol::tolerant::from_value(result)?;
@@ -2345,7 +2349,7 @@ fn spawn_menu_task(
 ) -> MenuTask {
     let control = control.clone();
     let handle = tokio::spawn(async move {
-        let mut client = Client::connect(&control.host, &control.paths)
+        let mut client = Client::connect_pinned(&control.host, &control.paths)
             .await
             .map_err(|err| err.to_string())?;
         match args {
@@ -2654,7 +2658,7 @@ mod tests {
                 shortcuts: ShortcutDecoder::new(),
                 shortcut_deadline: None,
                 control: AttachControlContext {
-                    host: "local".to_owned(),
+                    host: PinnedHost::local(),
                     paths,
                     target: "local/s-42".parse().expect("test target"),
                 },
@@ -2875,7 +2879,7 @@ mod tests {
             .await
             .expect("type the input and the detach shortcut");
         let control_context = AttachControlContext {
-            host: "local".to_owned(),
+            host: PinnedHost::local(),
             paths,
             target: "local/s-42".parse().expect("test target"),
         };
@@ -3541,7 +3545,7 @@ mod tests {
 
         for _ in 0..ATTEMPTS {
             let updates = spawn_status_updates(
-                "local".to_owned(),
+                PinnedHost::local(),
                 daemon.paths.clone(),
                 "s-42".to_owned(),
                 AttachStatusSnapshot::unknown("local", "s-42"),
@@ -3570,7 +3574,7 @@ mod tests {
     async fn dropping_status_receiver_terminates_subscription_task() {
         let mut daemon = spawn_status_test_daemon(1);
         let updates = spawn_status_updates(
-            "local".to_owned(),
+            PinnedHost::local(),
             daemon.paths.clone(),
             "s-42".to_owned(),
             AttachStatusSnapshot::unknown("local", "s-42"),

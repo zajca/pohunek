@@ -4,6 +4,13 @@ use std::os::unix::fs::PermissionsExt as _;
 
 use pohunek_test_support::env::TestEnv;
 
+#[cfg(target_os = "linux")]
+#[path = "support/connect_redirect.rs"]
+mod connect_redirect;
+#[cfg(target_os = "linux")]
+#[path = "support/pin_overlay.rs"]
+mod pin_overlay;
+
 fn fake_netbird(bin: &std::path::Path) {
     let path = bin.join("netbird");
     pohunek_test_support::fs::write_executable(
@@ -30,7 +37,16 @@ fn discover_output(status: &str) -> std::process::Output {
         .expect("run CLI discovery")
 }
 
+/// The peer records of a discovery run; this machine's own record is left to
+/// the scenarios that look for it.
 fn discover_with_status(status: &str) -> Vec<serde_json::Value> {
+    discover_all_with_status(status)
+        .into_iter()
+        .filter(|record| record.get("local").is_none())
+        .collect()
+}
+
+fn discover_all_with_status(status: &str) -> Vec<serde_json::Value> {
     let output = discover_output(status);
     assert!(
         output.status.success(),
@@ -443,4 +459,245 @@ fn discovery_creates_the_pohunek_cache_directory_owner_private() {
             & 0o777;
         assert_eq!(mode, 0o700, "{}", directory.display());
     }
+}
+
+/// This machine's own `NetBird` name and address in the local-record scenarios.
+#[cfg(target_os = "linux")]
+const SELF_FQDN: &str = "fixture-self.netbird.test";
+#[cfg(target_os = "linux")]
+const SELF_IP: &str = "100.64.0.7";
+
+/// Runs `host discover --refresh --json` against a fake `netbird` reporting
+/// `status`; every `NetBird` address is redirected to loopback `port`.
+#[cfg(target_os = "linux")]
+fn discover_redirected(status: &str, port: u16) -> Vec<serde_json::Value> {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let bin = env.root().join("bin");
+    fs::create_dir_all(&bin).expect("create bin");
+    pohunek_test_support::fs::write_executable(
+        bin.join("netbird"),
+        format!("#!/bin/sh\ncat <<'EOF'\n{status}\nEOF\n"),
+    )
+    .expect("write fake netbird");
+    let (library, capture) = connect_redirect::build(env.root());
+    let inherited_path = std::env::var("PATH").expect("PATH");
+    let output = env
+        .command(pohunek_test_support::bin_exe("pohunek"))
+        .args(["host", "discover", "--refresh", "--json"])
+        .env("PATH", format!("{}:{inherited_path}", bin.display()))
+        .env("LD_PRELOAD", &library)
+        .env("POHUNEK_TEST_CONNECT_CAPTURE", &capture)
+        .env("POHUNEK_REMOTE_PORT", port.to_string())
+        .output()
+        .expect("run CLI discovery");
+    assert!(
+        output.status.success(),
+        "discovery failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("versioned JSON envelope");
+    document["ok"].as_array().expect("host records").clone()
+}
+
+#[cfg(target_os = "linux")]
+fn status_with_self(self_address: Option<&str>) -> String {
+    let mut document = serde_json::json!({
+        "fqdn": SELF_FQDN,
+        "peers": {"details": [{
+            "fqdn": "fixture-remote.netbird.test",
+            "netbirdIp": "100.64.0.42",
+            "publicKey": "remote-key",
+            "status": "Connected"
+        }]}
+    });
+    if let Some(address) = self_address {
+        document["netbirdIp"] = serde_json::json!(address);
+    }
+    document.to_string()
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn this_machine_is_listed_first_as_one_local_record() {
+    let port = pin_overlay::serve_health();
+    let records = discover_redirected(&status_with_self(Some(SELF_IP)), port);
+    assert_eq!(records.len(), 2, "{records:?}");
+    let locals = records
+        .iter()
+        .filter(|record| record.get("local").is_some())
+        .count();
+    assert_eq!(locals, 1, "exactly one local record: {records:?}");
+    let local = &records[0];
+    assert_eq!(local["local"], true);
+    assert_eq!(local["name"], "fixture-self");
+    assert_eq!(local["fqdn"], SELF_FQDN);
+    assert_eq!(local["address"], SELF_IP);
+    assert_eq!(local["port"], port);
+    assert_eq!(local["overlay"], "netbird");
+    assert!(local["peer_id"].is_null());
+    assert_eq!(local["classification"], "reachable_daemon");
+    assert_eq!(local["daemon_version"], "fixture");
+    let peer = &records[1];
+    assert_eq!(peer["peer_id"], "remote-key");
+    assert!(
+        peer.get("local").is_none(),
+        "a peer record is unchanged on the wire: {peer}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_failed_probe_of_this_machine_reads_unreachable() {
+    let records = discover_redirected(
+        &status_with_self(Some(SELF_IP)),
+        pin_overlay::serve_unresponsive(),
+    );
+    let local = records
+        .iter()
+        .find(|record| record.get("local").is_some())
+        .expect("the local record");
+    assert_eq!(
+        local["classification"], "unreachable",
+        "a failed self-probe is never a healthy default: {local}"
+    );
+    assert!(
+        local["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "the record says why the probe failed: {local}"
+    );
+    let reachable = discover_redirected(
+        &status_with_self(Some(SELF_IP)),
+        pin_overlay::serve_health(),
+    );
+    assert!(
+        reachable
+            .iter()
+            .all(|record| record.get("reason").is_none()),
+        "no record carries a reason when the probe succeeds: {reachable:?}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn this_machine_without_an_address_is_a_candidate() {
+    let records = discover_redirected(&status_with_self(None), pin_overlay::serve_unresponsive());
+    let local = &records[0];
+    assert_eq!(local["local"], true);
+    assert!(local["address"].is_null());
+    assert_eq!(local["classification"], "candidate");
+}
+
+#[test]
+fn no_local_record_without_an_own_identity() {
+    let records = discover_all_with_status(
+        r#"{"peers":[{"publicKey":"safe-key","fqdn":"safe.example","netbirdIp":"100.64.0.2"}]}"#,
+    );
+    assert_eq!(records.len(), 1);
+    assert!(records.iter().all(|record| record.get("local").is_none()));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_cache_of_the_previous_schema_is_discarded_not_read() {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let bin = env.root().join("bin");
+    fs::create_dir_all(&bin).expect("create bin");
+    pohunek_test_support::fs::write_executable(
+        bin.join("netbird"),
+        format!(
+            "#!/bin/sh\ncat <<'EOF'\n{}\nEOF\n",
+            r#"{"peers":[{"publicKey":"fresh-key","fqdn":"fresh.example","netbirdIp":"100.64.0.2"}]}"#
+        ),
+    )
+    .expect("write fake netbird");
+    let inherited_path = std::env::var("PATH").expect("PATH");
+    let run = || {
+        env.command(pohunek_test_support::bin_exe("pohunek"))
+            .args(["host", "list", "--json"])
+            .env("PATH", format!("{}:{inherited_path}", bin.display()))
+            .output()
+            .expect("run CLI")
+    };
+    // A current cache is written first, then its schema number is set back to
+    // the previous revision, as an older CLI left it.
+    assert!(run().status.success());
+    let cache = env.cache_home().join("pohunek/host-discovery/records.json");
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cache).expect("read the cache")).expect("cache JSON");
+    snapshot["schema"] = serde_json::json!(3);
+    snapshot["records"] = serde_json::json!([{
+        "name": "stale", "fqdn": null, "address": null, "port": 1,
+        "overlay": "netbird", "peer_id": "stale-key", "classification": "candidate"
+    }]);
+    fs::write(&cache, snapshot.to_string()).expect("write the old cache");
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o600)).expect("private cache");
+
+    let output = run();
+    assert!(output.status.success());
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("versioned JSON envelope");
+    let names: Vec<&str> = document["ok"]
+        .as_array()
+        .expect("records")
+        .iter()
+        .filter_map(|record| record["peer_id"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["fresh-key"],
+        "the old cache is refreshed: {document}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn this_machine_and_its_peers_come_from_one_netbird_run() {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let bin = env.root().join("bin");
+    fs::create_dir_all(&bin).expect("create bin");
+    let runs = env.root().join("netbird-runs");
+    // The first run answers with this machine and a peer; any later run would
+    // answer with a machine of another name and no peer.
+    let later =
+        serde_json::json!({"fqdn": "renamed.netbird.test", "netbirdIp": SELF_IP, "peers": []});
+    pohunek_test_support::fs::write_executable(
+        bin.join("netbird"),
+        format!(
+            "#!/bin/sh\nprintf x >> '{runs}'\nif [ \"$(wc -c < '{runs}')\" -gt 1 ]; then\ncat <<'EOF'\n{later}\nEOF\nexit 0\nfi\ncat <<'EOF'\n{first}\nEOF\n",
+            runs = runs.display(),
+            first = status_with_self(Some(SELF_IP)),
+        ),
+    )
+    .expect("write fake netbird");
+    let port = pin_overlay::serve_health();
+    let (library, capture) = connect_redirect::build(env.root());
+    let inherited_path = std::env::var("PATH").expect("PATH");
+    let output = env
+        .command(pohunek_test_support::bin_exe("pohunek"))
+        .args(["host", "discover", "--refresh", "--json"])
+        .env("PATH", format!("{}:{inherited_path}", bin.display()))
+        .env("LD_PRELOAD", &library)
+        .env("POHUNEK_TEST_CONNECT_CAPTURE", &capture)
+        .env("POHUNEK_REMOTE_PORT", port.to_string())
+        .output()
+        .expect("run CLI discovery");
+    assert!(
+        output.status.success(),
+        "discovery failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&runs).expect("netbird ran"),
+        "x",
+        "one netbird run serves the peers and this machine's own identity"
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("versioned JSON envelope");
+    let records = document["ok"].as_array().expect("host records");
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0]["local"], true);
+    assert_eq!(records[0]["fqdn"], SELF_FQDN);
+    assert_eq!(records[1]["peer_id"], "remote-key");
 }

@@ -4,8 +4,9 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use overlay::{
-    BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, OverlayError,
-    OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, ResolvedPeer,
+    BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, LocalIdentity,
+    OverlayError, OverlayFuture, OverlayId, OverlayRegistry, OverlaySnapshot, OverlayTransport,
+    ResolvedPeer,
 };
 use pohunek_daemon::runtime::EnvironmentSource;
 use pohunek_daemon::session::{SessionRegistryConfig, ShellCommand};
@@ -31,6 +32,18 @@ pub(crate) fn hermetic_environment_source() -> EnvironmentSource {
 #[derive(Debug)]
 struct EmptyTransport {
     id: OverlayId,
+    /// Own overlay name the provider reports, when it knows one.
+    own_fqdn: Option<&'static str>,
+}
+
+impl EmptyTransport {
+    fn identity(&self) -> Option<LocalIdentity> {
+        self.own_fqdn.map(|fqdn| LocalIdentity {
+            overlay: self.id.clone(),
+            fqdn: Some(fqdn.to_owned()),
+            address: None,
+        })
+    }
 }
 
 impl OverlayTransport for EmptyTransport {
@@ -72,6 +85,21 @@ impl OverlayTransport for EmptyTransport {
     fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>> {
         Box::pin(async { Ok(Vec::new()) })
     }
+
+    fn local_identity(&self) -> OverlayFuture<'_, Option<LocalIdentity>> {
+        let identity = self.identity();
+        Box::pin(async move { Ok(identity) })
+    }
+
+    fn discover_snapshot(&self) -> OverlayFuture<'_, OverlaySnapshot> {
+        let local = self.identity();
+        Box::pin(async move {
+            Ok(OverlaySnapshot {
+                peers: Vec::new(),
+                local,
+            })
+        })
+    }
 }
 
 /// Shell that a registry fixture pins instead of the host user's `$SHELL`.
@@ -92,8 +120,22 @@ pub(crate) fn hermetic_registry_config() -> SessionRegistryConfig {
 }
 
 pub(crate) fn overlay_registry() -> OverlayRegistry {
+    registry_reporting(None)
+}
+
+/// A registry whose provider reports `own_fqdn` as this machine's own name.
+#[allow(
+    dead_code,
+    reason = "each test binary using this module needs a different subset of its helpers"
+)]
+pub(crate) fn overlay_registry_with_own_name(own_fqdn: &'static str) -> OverlayRegistry {
+    registry_reporting(Some(own_fqdn))
+}
+
+fn registry_reporting(own_fqdn: Option<&'static str>) -> OverlayRegistry {
     let transport = Arc::new(EmptyTransport {
         id: OverlayId::new("test").expect("overlay id"),
+        own_fqdn,
     });
     let configured = ConfiguredTransport::new(transport, 18_722).expect("configured overlay");
     OverlayRegistry::new(vec![configured]).expect("registry")

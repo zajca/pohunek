@@ -232,7 +232,7 @@ async fn discover_with_registry(
     let mut pending = stream::iter(registry.entries().iter().cloned().enumerate())
         .map(|(index, configured)| async move {
             let overlay = configured.id().clone();
-            let result = configured.discover_peers().await;
+            let result = configured.discover_snapshot().await;
             (index, overlay, result)
         })
         .buffer_unordered(registry.entries().len());
@@ -261,13 +261,15 @@ async fn discover_with_registry(
 
     results.sort_by_key(|(index, _, _)| *index);
     let mut snapshots = Vec::new();
+    let mut identities = Vec::new();
     let mut failures = Vec::new();
     let mut healthy_overlays = 0_usize;
     for (_, overlay, result) in results {
         match result {
-            Ok(peers) => {
+            Ok(snapshot) => {
                 healthy_overlays += 1;
-                snapshots.extend(peers);
+                snapshots.extend(snapshot.peers);
+                identities.extend(snapshot.local);
             }
             Err(error) => {
                 tracing::debug!(
@@ -287,7 +289,96 @@ async fn discover_with_registry(
         }
         return Err(crate::ClientError::OverlayDiscoveryFailed { failures });
     }
-    Ok(discover_peers(snapshots, options, origin.as_ref(), Some(deadline)).await)
+    // Probed concurrently: the local daemon's probe must not take time from the
+    // peer probes.
+    let (mut records, peers) = tokio::join!(
+        local_records(registry, identities, options, origin.as_ref(), deadline),
+        discover_peers(snapshots, options, origin.as_ref(), Some(deadline)),
+    );
+    records.extend(peers);
+    Ok(records)
+}
+
+/// One record per overlay that reported this machine's own identity in the same
+/// provider read as the peers.
+///
+/// The record is probed like a peer, at the overlay address the daemon listens
+/// on. A failed probe is logged and reported as [`HostClass::Unreachable`],
+/// never defaulted to a healthy class; an overlay that reports no address
+/// leaves a [`HostClass::Candidate`].
+async fn local_records(
+    registry: &OverlayRegistry,
+    identities: Vec<overlay::LocalIdentity>,
+    options: DiscoveryOptions,
+    origin: Option<&RequestOrigin>,
+    deadline: tokio::time::Instant,
+) -> Vec<HostRecord> {
+    let records = identities.into_iter().filter_map(|identity| {
+        let port = registry
+            .entries()
+            .iter()
+            .find(|entry| entry.id() == &identity.overlay)?
+            .port();
+        Some(async move {
+            let addr = identity.address.map(|ip| SocketAddr::new(ip, port));
+            let probe_timeout = options
+                .probe_timeout()
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            let (class, reason) = match addr {
+                Some(addr) => {
+                    classify_local(
+                        &identity.overlay,
+                        addr,
+                        probe_timeout,
+                        origin,
+                        options.protocol_range(),
+                    )
+                    .await
+                }
+                None => (HostClass::Candidate, None),
+            };
+            HostRecord {
+                name: identity
+                    .fqdn
+                    .as_deref()
+                    .map(short_hostname)
+                    .map(str::to_owned),
+                fqdn: identity.fqdn,
+                address: addr.map(|addr| addr.ip().to_string()),
+                port,
+                overlay: identity.overlay.to_string(),
+                peer_id: None,
+                local: true,
+                reason,
+                class,
+            }
+        })
+    });
+    futures::future::join_all(records).await
+}
+
+async fn classify_local(
+    overlay: &overlay::OverlayId,
+    addr: SocketAddr,
+    timeout: Duration,
+    origin: Option<&RequestOrigin>,
+    range: ProtocolVersionRange,
+) -> (HostClass, Option<String>) {
+    let reason = match tokio::time::timeout(timeout, probe_health(addr, origin, range)).await {
+        Ok(Ok(response)) => match classify_response(&response, range) {
+            HostClass::Unreachable => "the daemon answered with an error".to_owned(),
+            class => return (class, None),
+        },
+        Ok(Err(error)) => error.to_string(),
+        Err(_elapsed) => format!("no answer within {timeout:?}"),
+    };
+    tracing::warn!(
+        overlay = %overlay,
+        %addr,
+        reason = %reason,
+        "the local daemon did not answer its own overlay probe"
+    );
+    (HostClass::Unreachable, Some(reason))
 }
 
 /// Classify aggregated overlay peer snapshots.
@@ -323,6 +414,8 @@ async fn discover_peers(
                 port,
                 overlay: peer.overlay.to_string(),
                 peer_id: peer.peer_id,
+                local: false,
+                reason: None,
                 class,
             }
         })

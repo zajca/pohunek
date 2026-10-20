@@ -31,6 +31,18 @@ export type HostRecord =
      * The overlay's stable provider peer identity (e.g. a `NetBird` public key).
      */
     peer_id: string | null;
+    /**
+     * Whether this record is the machine that enumerated the hosts rather than
+     * a peer. Omitted when `false`, so a peer record is unchanged on the wire
+     * and an older reader decodes the field as absent.
+     */
+    local?: boolean;
+    /**
+     * Why the probe of this record failed, set only on the local record when
+     * its own daemon did not answer. Omitted otherwise, so a peer record is
+     * unchanged on the wire.
+     */
+    reason?: string;
   }
   & (
     | {
