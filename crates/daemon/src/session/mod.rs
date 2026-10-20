@@ -356,6 +356,15 @@ pub struct SessionRegistryConfig {
     /// How long after the hard kill a worker waits for the root's death before
     /// the stop fails; never shorter than [`Self::stop_grace`].
     pub kill_reap_deadline: Duration,
+    /// How long a worker waits for the durable commit of a stopped session
+    /// before it refuses the stop as retryable. A worker fixes its own value
+    /// at [`pohunek_service_config::DEFAULT_TERMINAL_COMMIT_WAIT`], so this
+    /// field only differs from it in tests that run a worker with another
+    /// wait.
+    pub terminal_commit_wait: Duration,
+    /// Margin added to the worker's own stop bounds before the daemon gives up
+    /// on a worker that has not answered a stop.
+    pub worker_stop_headroom: Duration,
     /// How long a one-shot attach token may remain pending before redemption.
     pub attach_token_ttl: Duration,
     /// How long a failed attach outcome remains available to `session.detach`.
@@ -523,12 +532,30 @@ pub struct SessionRegistryConfig {
     pub create_drain_timeout: Duration,
 }
 
+impl SessionRegistryConfig {
+    /// Longest the daemon waits for a worker to answer a stop.
+    ///
+    /// A worker answers within its stop grace before `SIGKILL`, the kill reap
+    /// deadline, a second grace for the marker sweep's re-read and its
+    /// terminal-commit wait; a worker silent past those and the headroom is
+    /// frozen.
+    pub(crate) fn worker_stop_bound(&self) -> Duration {
+        self.stop_grace
+            .saturating_mul(2)
+            .saturating_add(self.kill_reap_deadline)
+            .saturating_add(self.terminal_commit_wait)
+            .saturating_add(self.worker_stop_headroom)
+    }
+}
+
 impl Default for SessionRegistryConfig {
     fn default() -> Self {
         Self {
             shell_command: ShellCommand::default(),
             stop_grace: pohunek_service_config::DEFAULT_STOP_GRACE,
             kill_reap_deadline: pohunek_service_config::DEFAULT_KILL_REAP_DEADLINE,
+            terminal_commit_wait: pohunek_service_config::DEFAULT_TERMINAL_COMMIT_WAIT,
+            worker_stop_headroom: pohunek_service_config::DEFAULT_WORKER_STOP_HEADROOM,
             attach_token_ttl: DEFAULT_ATTACH_TOKEN_TTL,
             attach_result_ttl: DEFAULT_ATTACH_RESULT_TTL,
             attach_result_capacity: DEFAULT_ATTACH_RESULT_CAPACITY,
@@ -4626,9 +4653,10 @@ impl SessionRegistry {
                 let transaction =
                     pohunek_worker_protocol::TransactionId::new(transaction_id.clone())
                         .map_err(|error| runtime_error("worker_stop_invalid", error.to_string()))?;
-                let status = match worker.stop(transaction).await {
-                    Ok(Some(status)) => status,
-                    Ok(None) => {
+                let bound = self.inner.config.worker_stop_bound();
+                let status = match tokio::time::timeout(bound, worker.stop(transaction)).await {
+                    Ok(Ok(Some(status))) => status,
+                    Ok(Ok(None)) => {
                         self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
                             .await;
                         return Err(runtime_error(
@@ -4636,10 +4664,26 @@ impl SessionRegistry {
                             format!("worker for {} did not return a terminal outcome", id.0),
                         ));
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
                             .await;
                         return Err(worker_error_to_protocol(error));
+                    }
+                    Err(_elapsed) => {
+                        self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
+                            .await;
+                        return Err(ProtocolError::new(
+                            ErrorClass::Runtime,
+                            "worker_operation_failed",
+                            format!(
+                                "worker for {} did not answer the stop within {bound:?}",
+                                id.0
+                            ),
+                            Some(
+                                "the worker is not responding: inspect the session and retry the stop once the worker answers"
+                                    .to_owned(),
+                            ),
+                        ));
                     }
                 };
                 ObservedExit::from_status(&status)

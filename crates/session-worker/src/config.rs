@@ -28,8 +28,10 @@ pub(crate) const DEFAULT_KILL_REAP_DEADLINE: Duration =
     pohunek_service_config::DEFAULT_KILL_REAP_DEADLINE;
 /// Default window for descendants to finish writing after the root exits.
 pub(crate) const DEFAULT_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-/// Default wait for a durable terminal commit before acknowledging stop.
-pub(crate) const DEFAULT_TERMINAL_COMMIT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default wait for a durable terminal commit before acknowledging stop,
+/// shared with the daemon.
+pub(crate) const DEFAULT_TERMINAL_COMMIT_WAIT_TIMEOUT: Duration =
+    pohunek_service_config::DEFAULT_TERMINAL_COMMIT_WAIT;
 /// Default final-screen retention while the daemon is unavailable.
 pub(crate) const DEFAULT_TERMINAL_RETENTION: Duration = Duration::from_hours(24);
 /// Default maximum time occupied by one stalled observation request.

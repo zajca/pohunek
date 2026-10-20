@@ -276,6 +276,24 @@ pub const DEFAULT_STOP_GRACE: Duration = Duration::from_millis(500);
 /// [`DEFAULT_STOP_GRACE`] and stays below [`MAX_DEADLINE`].
 pub const DEFAULT_KILL_REAP_DEADLINE: Duration = Duration::from_secs(3);
 
+/// Default wait of a session worker for the durable commit of a stopped
+/// session's terminal outcome before it answers a stop with a retryable
+/// refusal.
+///
+/// The daemon bounds its own wait for the worker's stop answer by this value
+/// ([`DEFAULT_WORKER_STOP_HEADROOM`] on top of the worker's grace, kill reap
+/// and sweep waits), so the two sides share one constant. Like the grace, it is
+/// not a `service.toml` key.
+pub const DEFAULT_TERMINAL_COMMIT_WAIT: Duration = Duration::from_secs(10);
+
+/// Margin the daemon adds to the worker's own stop bounds before it gives up on
+/// a worker that has not answered a stop.
+///
+/// It covers the control-connection round trip and scheduling on a loaded
+/// host; a worker that is still silent after every bound of its own plus this
+/// margin is frozen, not slow.
+pub const DEFAULT_WORKER_STOP_HEADROOM: Duration = Duration::from_secs(2);
+
 /// Longest accepted path in bytes.
 ///
 /// Equal to the supervisor's job value limit, because the prefix and roots

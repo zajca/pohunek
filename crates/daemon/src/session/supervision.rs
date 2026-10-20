@@ -1935,11 +1935,14 @@ fn warn_unmarked(session_id: &str, worker_instance_id: &str, skipped: &[Skipped]
 mod tests {
     use super::*;
 
-    /// The SDK's resume budget is built from the daemon's validation maximum
-    /// of one lifecycle step and from the sweep's pass limit; the budget
-    /// follows when either daemon bound changes.
+    /// The SDK's lifecycle budgets are built from the daemon's validation
+    /// maximum of one lifecycle step and from the sweep's pass limit; the
+    /// budgets follow when either daemon bound changes. Worker connection and
+    /// initialization are validated up to the same maximum, and the daemon's
+    /// bound on a worker's stop answer fits the single step the budgets give a
+    /// worker stop.
     #[test]
-    fn the_sdk_resume_budget_follows_the_daemon_bounds() {
+    fn the_sdk_lifecycle_budgets_follow_the_daemon_bounds() {
         assert_eq!(
             u128::from(pohunek_client::LIFECYCLE_STEP_BOUND_MS),
             pohunek_platform::supervisor::MAX_JOB_TIMEOUT.as_millis()
@@ -1951,6 +1954,10 @@ mod tests {
         assert_eq!(
             usize::try_from(pohunek_client::RESUME_SWEEP_PASSES).expect("pass count"),
             MAX_SWEEP_PASSES
+        );
+        assert!(
+            crate::session::SessionRegistryConfig::default().worker_stop_bound()
+                <= pohunek_service_config::MAX_DEADLINE
         );
     }
 
