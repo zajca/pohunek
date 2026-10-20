@@ -14,6 +14,8 @@ This directory turns the product idea into implementation-oriented planning.
   examples.
 - [Development](development.md) — workspace layout, gates, fast loops, and
   release.
+- [Roadmap](ROADMAP.md) — the reconciled index of tracks, epics, and
+  milestones; GitHub holds the scope and status.
 
 ## Source of Truth
 
@@ -114,3 +116,14 @@ multi-team control plane without replacing either owner path.
   start or manual via CLI, no filesystem scan.
   - [Implementation plan](design/projects-plan.md) — milestones M1–M5, code
     touch-points, protocol compatibility.
+
+## Dated Reviews and Audits (records, not current direction)
+
+- [Architecture review 2026-07-04](architecture-review-2026-07-04.md) — the
+  full-codebase review of v0.15.1.
+  - [Remaining work](architecture-review-2026-07-04-remaining.md) — the items
+    that stayed open after its fixup branch.
+  - [Follow-up prompt](architecture-review-2026-07-04-codex-prompt.md) — the
+    session prompt for that remaining work.
+- [Rust guidelines audit 2026-06-26](refactor-ms-rust-guidelines-audit.md) —
+  the audit and refactoring plan of the Rust guidelines pass.

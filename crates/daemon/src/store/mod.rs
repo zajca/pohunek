@@ -8,7 +8,8 @@
 //! `rename`, so a write of one record kind can never corrupt or drop a record of
 //! another kind, and any single update is crash-atomic (one `rename(2)` commits
 //! it). This is the transactional consistency a `SQLite` store would have given,
-//! without the dependency (see `docs/ROADMAP.md`).
+//! without the dependency (see `docs/architecture.md`, "Configuration, State,
+//! and Log Storage").
 //!
 //! This is a consistency guarantee about the *write path*, not a lifecycle
 //! pairing: the records are written by independent triggers (a worktree binding

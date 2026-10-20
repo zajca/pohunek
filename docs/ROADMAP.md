@@ -27,7 +27,7 @@ mesh-local browser control center, the rofi/sway launchers, and issue/PR
 providers live in [`zajca/pohunek-work`](https://github.com/zajca/pohunek-work)
 and consume core only through public contracts.
 
-Last reconciled: 2026-10-12.
+Last reconciled: 2026-10-14. A section that names an earlier date was last checked on that date.
 
 ---
 

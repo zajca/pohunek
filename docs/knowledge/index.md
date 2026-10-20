@@ -73,6 +73,7 @@ Start here:
   operational runbooks.
 - [Trust model](safety/trust-model.md), [secrets](safety/secrets.md), and
   [repo `.pohunek/`](safety/repo-pohunek.md) are safety rules.
+- The [knowledge log](log.md) lists the changes of this bundle per release.
 - [Assistant system prompt](assistant/system.md) and
   [source map](assistant/source-map.md) define assistant navigation and source
   verification.

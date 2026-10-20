@@ -60,6 +60,7 @@ pub(crate) fn check_docs(
     all_pass &= check_runbook_commands(source_dir)?;
     all_pass &= check_secret_scan(source_dir, output_root)?;
     all_pass &= check_release_extras(&repo);
+    all_pass &= crate::doc_drift::check(&repo)?.is_empty();
 
     Ok(all_pass)
 }
@@ -366,7 +367,7 @@ fn check_agent_skill_commands(repo: &Path) -> Result<bool, XtaskError> {
 /// Renders one example parse failure for report output. Only the source
 /// position and the clap error kind are echoed: the command text may hold
 /// sensitive values and must never reach CI logs.
-fn parse_failure_message(location: &str, message: &str) -> String {
+pub(crate) fn parse_failure_message(location: &str, message: &str) -> String {
     format!("{location}: example failed to parse: {message}")
 }
 
@@ -381,12 +382,12 @@ fn parse_failure_message(location: &str, message: &str) -> String {
 /// Each example carries the 1-based line where its span opened so validation
 /// failures can be located without echoing command text, which may hold
 /// sensitive values.
-struct ExampleCommand {
-    line: usize,
-    command: String,
+pub(crate) struct ExampleCommand {
+    pub(crate) line: usize,
+    pub(crate) command: String,
 }
 
-fn collect_pohunek_examples(content: &str) -> Vec<ExampleCommand> {
+pub(crate) fn collect_pohunek_examples(content: &str) -> Vec<ExampleCommand> {
     let mut examples = Vec::new();
     let mut in_fence = false;
     let mut open_span: Option<(usize, String)> = None;

@@ -301,7 +301,7 @@ host profile with `base = "hermes"` and no package pin with
 lifecycle (`pohunek integration ... --agent hermes`) runs in the CLI against a
 named Hermes profile; see the
 [Hermes operator](knowledge/guides/hermes-operator.md) guide. The catalog lists
-the three packages for the Linux x86_64 targets and the Apple Silicon target.
+the official packages (`runtime-packages/*`) for the Linux x86_64 targets and the Apple Silicon target.
 A `claude`, `codex` or
 `hermes` started in a shell session or outside pohunek is not recognized as that
 agent without its package.
