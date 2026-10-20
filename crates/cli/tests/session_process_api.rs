@@ -2683,6 +2683,50 @@ fn an_unusable_assistant_stdin_request_is_refused_before_any_daemon_request() {
     );
 }
 
+#[test]
+fn a_remote_session_new_from_stdin_without_yes_is_refused_before_any_daemon_request() {
+    let home = TestHome::new();
+    let fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+    let remote_args = [
+        "--host",
+        "fixture-remote",
+        "session",
+        "new",
+        "--agent",
+        "codex",
+        "--project",
+        "ui",
+        "--input-stdin",
+    ];
+
+    // Stdin holds the input, so the prompt would read EOF: both the machine and
+    // the human path fail with `confirmation_required` instead of a decline.
+    let machine = run_piping_stdin(
+        &home,
+        &[remote_args.as_slice(), &["--json"]].concat(),
+        "review",
+    );
+    let document = assert_json_error(&machine, "confirmation_required");
+    assert_eq!(document["err"]["class"], "configuration", "{document}");
+    let human = run_piping_stdin(&home, &remote_args, "review");
+    assert_eq!(human.status.code(), Some(1), "{human:?}");
+    assert!(
+        utf8(&human.stderr).contains("--yes"),
+        "{}",
+        utf8(&human.stderr)
+    );
+    assert!(
+        !utf8(&human.stderr).contains("was not confirmed"),
+        "{}",
+        utf8(&human.stderr)
+    );
+
+    assert!(
+        fixture.finish().is_empty(),
+        "a refused request reaches no daemon"
+    );
+}
+
 /// Creation deadline of the unanswered-creation scenario: the fixture never
 /// replies, so any deadline expires, and a short one keeps the scenario fast.
 const UNANSWERED_CREATION_DEADLINE_MS: &str = "50";

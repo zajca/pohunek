@@ -568,6 +568,23 @@ pub(crate) fn confirmation_decision(host: &str, json: bool, yes: bool) -> Confir
     }
 }
 
+/// Refuse a remote `session new --input-stdin` that lacks `--yes`.
+///
+/// Stdin carries the input, so the confirmation prompt would read EOF and report
+/// a decline. The call takes the machine path's rule instead, before stdin is
+/// read and before any connection is opened.
+///
+/// # Errors
+///
+/// Returns [`CliError::RemoteConfirmationRequired`] for a remote `host` without
+/// `yes`.
+pub(crate) fn require_confirmation_for_stdin_input(host: &str, yes: bool) -> Result<(), CliError> {
+    match confirmation_decision(host, true, yes) {
+        ConfirmDecision::RequireYes => Err(CliError::RemoteConfirmationRequired),
+        ConfirmDecision::Proceed | ConfirmDecision::Prompt => Ok(()),
+    }
+}
+
 /// Run `session new` on `host`.
 ///
 /// Remote starts pass through the confirmation gate ([`confirmation_decision`])

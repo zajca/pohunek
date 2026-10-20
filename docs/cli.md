@@ -284,6 +284,11 @@ printf '%s' 'Run the focused tests.' \
   | pohunek session input s-01J00000000000000000000000 --stdin --json
 ```
 
+Stdin holds the input, so a remote `session new --input-stdin` cannot prompt for
+confirmation. Without `--yes` it fails with `confirmation_required` before it
+reads stdin or contacts the daemon, as `pohunek assistant --request-stdin`
+does.
+
 `session input` can also wait for the agent's reaction in the same call:
 `--until` names the activities that end the wait (repeatable, default `idle`
 and `blocked`) and `--timeout` bounds it to `1..8000` ms (default 8000). The

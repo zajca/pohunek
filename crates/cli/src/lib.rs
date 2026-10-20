@@ -1976,6 +1976,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 } => {
                     let host = effective_host(&global_host, None);
                     let input = if input_stdin {
+                        commands::session::require_confirmation_for_stdin_input(&host, yes)?;
                         Some(commands::session::read_stdin_input()?)
                     } else {
                         input
