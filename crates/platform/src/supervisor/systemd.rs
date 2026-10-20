@@ -956,6 +956,18 @@ pub async fn unit_environment(
     read_unit_environment(None, unit, call_timeout).await
 }
 
+/// Whether `<fragment>.d` holds a `*.conf` file; a unit without a file has none.
+fn fragment_drop_ins_exist(fragment: &str) -> bool {
+    if fragment.is_empty() {
+        return false;
+    }
+    std::fs::read_dir(format!("{fragment}.d")).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "conf"))
+    })
+}
+
 /// [`unit_environment`] over the bus at `address`, or over the session bus the
 /// environment names when `address` is `None`.
 async fn read_unit_environment(
@@ -981,16 +993,23 @@ async fn read_unit_environment(
         .await
         .map_err(read)?;
     let drop_in_paths: Vec<String> = unit_proxy.get_property("DropInPaths").await.map_err(read)?;
+    let fragment: String = unit_proxy
+        .get_property("FragmentPath")
+        .await
+        .map_err(read)?;
+    let fragment_drop_ins_on_disk = fragment_drop_ins_exist(&fragment);
     if load_state == "not-found" && drop_in_paths.is_empty() {
         return Ok(UnitEnvironment {
             load_state,
             need_daemon_reload,
+            fragment_drop_ins_on_disk,
             ..UnitEnvironment::default()
         });
     }
     Ok(UnitEnvironment {
         load_state,
         need_daemon_reload,
+        fragment_drop_ins_on_disk,
         drop_in_paths,
         environment: service.get_property("Environment").await.map_err(read)?,
         environment_files: service

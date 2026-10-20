@@ -2167,6 +2167,7 @@ fn the_real_user_manager_reports_a_units_environment_settings_with_drop_ins() {
     let loaded = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded unit");
     assert_eq!(loaded.load_state, "loaded");
     assert!(!loaded.need_daemon_reload);
+    assert!(loaded.fragment_drop_ins_on_disk);
     assert_eq!(
         loaded.environment.last().map(String::as_str),
         Some("PATH=/drop-in/bin")
@@ -2196,6 +2197,7 @@ fn the_real_user_manager_reports_a_units_environment_settings_with_drop_ins() {
     .expect("edited drop-in");
     let stale = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("stale unit");
     assert!(stale.need_daemon_reload, "{stale:?}");
+    assert!(stale.fragment_drop_ins_on_disk, "{stale:?}");
 }
 
 /// The real user manager reports the `KEY=VALUE` environment its units get,

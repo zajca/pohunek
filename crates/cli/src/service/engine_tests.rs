@@ -9985,6 +9985,8 @@ async fn unrecorded_job_path(
         .context
         .clone()
         .with_user_manager(Arc::new(UnitManager { unit }));
+    // The daemon unit's name derives from the application roots.
+    context.namespace().expect("the roots exist");
     crate::service::engine::recorded_job_search_path(
         &context,
         &pohunek_platform::shell_env::SearchPath::empty(),
@@ -10067,13 +10069,30 @@ async fn a_path_set_only_by_the_replaced_unit_file_does_not_apply() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn a_unit_changed_on_disk_since_it_was_loaded_is_refused() {
+async fn a_unit_changed_on_disk_since_it_was_loaded_is_refused_only_with_drop_ins() {
+    // Only the unit file changed: the install replaces it, so the snapshot holds.
     let unit = UnitEnvironment {
         need_daemon_reload: true,
         ..loaded_unit()
     };
-    let text = refusal(unrecorded_job_path(Ok(unit)).await);
-    assert!(text.contains("systemctl --user daemon-reload"), "{text}");
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, MANAGER_PATH);
+
+    for unit in [
+        UnitEnvironment {
+            need_daemon_reload: true,
+            drop_in_paths: vec!["/nonexistent/loaded.conf".to_owned()],
+            ..loaded_unit()
+        },
+        UnitEnvironment {
+            need_daemon_reload: true,
+            fragment_drop_ins_on_disk: true,
+            ..loaded_unit()
+        },
+    ] {
+        let text = refusal(unrecorded_job_path(Ok(unit)).await);
+        assert!(text.contains("systemctl --user daemon-reload"), "{text}");
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -10624,4 +10643,34 @@ async fn a_loaded_job_ignores_the_journal_and_its_boot_marker() {
         .expect("rolled back");
     let judged = judged.lock().expect("search path lock").clone();
     assert!(judged.iter().all(|path| path == CURRENT_PATH), "{judged:?}");
+}
+
+/// A preview on a host without the application roots asks no unit and creates
+/// no directory: no daemon unit of that namespace can exist yet.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn judging_the_path_before_the_application_roots_exist_creates_nothing() {
+    let harness = Harness::new();
+    let context = harness
+        .context
+        .clone()
+        .with_user_manager(Arc::new(UnitManager {
+            unit: Err(EnvironmentFailure::Unusable("must not be asked".to_owned())),
+        }));
+    let (state, runtime) = (
+        context.paths().state_dir.clone(),
+        context.paths().runtime_dir.clone(),
+    );
+    for root in [&state, &runtime] {
+        let _ = std::fs::remove_dir_all(root);
+    }
+    let job = crate::service::engine::recorded_job_search_path(
+        &context,
+        &pohunek_platform::shell_env::SearchPath::empty(),
+        None,
+    )
+    .await
+    .expect("path");
+    assert_eq!(job.value, MANAGER_PATH);
+    assert!(!state.exists() && !runtime.exists(), "nothing was created");
 }

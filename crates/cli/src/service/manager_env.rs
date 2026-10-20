@@ -275,7 +275,10 @@ pub async fn effective_search_path(
     unit_name: &str,
 ) -> Result<Option<String>, Error> {
     let refuse = |detail: String| Error::ManagerEnvironment { detail };
-    if unit.need_daemon_reload {
+    // The unit file changing on disk is routine: the install replaces it. Only
+    // drop-ins make a stale snapshot misleading, because they are kept.
+    if unit.need_daemon_reload && (!unit.drop_in_paths.is_empty() || unit.fragment_drop_ins_on_disk)
+    {
         return Err(refuse(format!(
             "{unit_name} or one of its drop-ins changed on disk after the service manager loaded it, so the PATH the manager reports may not be the one its job gets. Run `systemctl --user daemon-reload` and retry"
         )));

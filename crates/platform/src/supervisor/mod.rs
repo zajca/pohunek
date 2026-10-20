@@ -43,6 +43,9 @@ pub struct UnitEnvironment {
     /// Whether the unit file or a drop-in changed on disk after the manager
     /// loaded it, so the properties below are stale until a `daemon-reload`.
     pub need_daemon_reload: bool,
+    /// Whether the directory of drop-ins next to the unit file holds a `*.conf`
+    /// on disk now, whatever the manager has loaded.
+    pub fragment_drop_ins_on_disk: bool,
     /// The drop-in files the manager read for the unit.
     pub drop_in_paths: Vec<String>,
     /// The merged `Environment=` entries, in order; a later entry wins.

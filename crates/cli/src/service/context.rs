@@ -320,6 +320,29 @@ impl Context {
         Ok(Namespace::derive(self.uid, &state, &runtime))
     }
 
+    /// Derives the namespace like [`Self::namespace`] without creating any
+    /// directory: `None` while the state or runtime root does not exist yet. A
+    /// read-only caller uses it, because a preview must change nothing; without
+    /// the roots no daemon unit of this namespace can exist either.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem error when a root cannot be resolved.
+    pub fn existing_namespace(&self) -> Result<Option<Namespace>, Error> {
+        let resolve = |path: &Path| match std::fs::canonicalize(path) {
+            Ok(canonical) => Ok(Some(canonical)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(io_error("canonicalize", path)(error)),
+        };
+        let (Some(state), Some(runtime)) = (
+            resolve(&self.paths.state_dir)?,
+            resolve(&self.paths.runtime_dir)?,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(Namespace::derive(self.uid, &state, &runtime)))
+    }
+
     /// Resolves the executable search path a fresh install records.
     ///
     /// Empty for [`PathDiscovery::Unmanaged`]. Otherwise the tier order of
