@@ -814,7 +814,7 @@ Control operations are:
 | `WritePlan` | execute deduplicated ordered input fragments |
 | `Resize` | idempotently resize the PTY and terminal tracker |
 | `Stop` | idempotently terminate the retained process group |
-| `AcknowledgeTerminal` | confirm daemon imported final state |
+| `AcknowledgeTerminal` | confirm daemon imported final state; the worker first lets every attached data stream deliver its remaining output and close frame, bounded by `post_exit_drain_timeout` |
 | `ReleaseController` | gracefully release the lease |
 
 Worker events on the control connection are:
@@ -1273,12 +1273,28 @@ When the child exits, the worker drains PTY EOF, reaps the child, finalizes the
 terminal tracker, and atomically records exit code, signal, success, and
 timestamp. It enters terminal-retention mode.
 
-While retained, the worker serves final history and terminal snapshot. Once a
-daemon imports and durably commits the outcome, it sends
-`AcknowledgeTerminal`; the worker marks the acknowledgement and exits. If the
-daemon remains absent, the worker retains state for the configured terminal
-retention period, then exits with the journal still present. Raw output and the
-rendered screen disappear when the process exits and are never written to disk.
+While retained, the worker holds the terminal journal. Once a daemon imports
+and durably commits the outcome, it sends `AcknowledgeTerminal`; the worker
+marks the acknowledgement and exits, and the daemon then retires the supervisor
+job of that exact generation after proving that the job is that generation's. The daemon sends the acknowledgement after every
+terminal commit of a worker runtime: a natural exit and a user stop alike, and
+for a drain-capable worker that still answers when a restarted daemon imports its outcome. A
+removal retires the job itself and sends none. If the daemon remains absent, the
+worker retains state for the configured terminal retention period, then exits
+with the journal still present; the next reconciliation retires its job. Raw
+output and the rendered screen disappear when the process exits and are never
+written to disk. A terminal session answers `session screen` and
+`session output` with `session_terminal_unavailable` whether or not its worker
+is still retained, because both require a live runtime.
+
+The worker answers `AcknowledgeTerminal` only after every attached data stream
+has delivered its remaining output and its `RuntimeExited` close frame, so an
+attached client never loses the tail of the output; a stream that does not
+finish within `post_exit_drain_timeout` is cut off. A worker reports this in
+`drains_streams_on_terminal_ack` of the inspect snapshot (absent means false,
+and a reader that does not know the field ignores it). A daemon acknowledges
+only a worker that reports it; a worker of an earlier release exits at once on
+the acknowledgement, so it keeps the terminal retention above.
 
 ### 16.2 Durable stop intent
 

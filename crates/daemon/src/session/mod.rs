@@ -92,6 +92,7 @@ mod resume;
 mod retention;
 mod supervision;
 mod target;
+mod terminal_ack;
 mod tmpdir;
 mod turn_events;
 mod turn_wait;
@@ -740,6 +741,22 @@ struct SessionRegistryInner {
     /// its commit.
     #[cfg(test)]
     exit_commit_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Set by a test that models a daemon lost before it acknowledged a
+    /// committed terminal outcome.
+    #[cfg(test)]
+    terminal_acknowledgement_suppressed: AtomicBool,
+    /// Makes the next terminal acknowledgement fail as if its answer was lost.
+    #[cfg(test)]
+    terminal_acknowledgement_fails: AtomicBool,
+    /// Makes the inspected worker report no stream drain, as a worker of a
+    /// release that exits at once on the acknowledgement does.
+    #[cfg(test)]
+    terminal_acknowledgement_old_worker: AtomicBool,
+    /// Parks the next terminal acknowledgement before it takes the lifecycle
+    /// lock.
+    #[cfg(test)]
+    terminal_acknowledgement_hold:
+        std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     /// Holds the next stop between its in-memory intent and its durable
     /// intent commit.
     #[cfg(test)]
@@ -1317,6 +1334,9 @@ struct ExitTransition {
     expected: RuntimeWatchIdentity,
     base: SessionRecord,
     candidate: SessionEntry,
+    /// Set when this commit makes a worker runtime terminal and no removal
+    /// owns its retirement.
+    acknowledge: Option<terminal_ack::TerminalAcknowledgement>,
 }
 
 fn exit_transition(
@@ -1366,6 +1386,16 @@ fn exit_transition(
         candidate.runtime = RuntimeHandle::Unavailable(RuntimeState::Terminal);
     }
     candidate.info.updated_at = timestamp_now();
+    let acknowledge = match &candidate.runtime {
+        RuntimeHandle::Worker(worker) if candidate.desired_state != DesiredState::Removed => {
+            Some(terminal_ack::TerminalAcknowledgement {
+                worker: worker.clone(),
+                expected: expected.clone(),
+                generation: candidate.job.clone(),
+            })
+        }
+        _ => None,
+    };
     ExitTransition {
         event: if stopped {
             event::SESSION_STOPPED
@@ -1379,6 +1409,7 @@ fn exit_transition(
         expected,
         base,
         candidate,
+        acknowledge,
     }
 }
 
@@ -2031,6 +2062,14 @@ impl SessionRegistry {
                 exit_announce_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 exit_commit_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                terminal_acknowledgement_suppressed: AtomicBool::new(false),
+                #[cfg(test)]
+                terminal_acknowledgement_fails: AtomicBool::new(false),
+                #[cfg(test)]
+                terminal_acknowledgement_old_worker: AtomicBool::new(false),
+                #[cfg(test)]
+                terminal_acknowledgement_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 stop_intent_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
@@ -4508,15 +4547,7 @@ impl SessionRegistry {
             TransactionKind::Recover => "recover",
         };
         let transaction_id = format!("{operation}-{sequence}");
-        let (
-            runtime,
-            detector_cancel,
-            procwatch_cancel,
-            runtime_watch_cancel,
-            previous_desired_state,
-            stop_runtime,
-            durable_intent,
-        ) = {
+        let (runtime, runtime_watch_cancel, previous_desired_state, stop_runtime, durable_intent) = {
             let mut sessions = self.inner.sessions.lock().await;
             let entry = sessions
                 .get_mut(id)
@@ -4532,8 +4563,6 @@ impl SessionRegistry {
             entry.desired_state = desired_state;
             (
                 entry.runtime.clone(),
-                entry.detector_cancel.clone(),
-                entry.procwatch_cancel.clone(),
                 entry.runtime_watch_cancel.clone(),
                 previous_desired_state,
                 stop_runtime,
@@ -4586,8 +4615,9 @@ impl SessionRegistry {
             }
         };
 
-        detector_cancel.cancel();
-        procwatch_cancel.cancel();
+        // The detector and the process watch keep running through the stop and
+        // no-op while `stopping`; only the terminal commit cancels them, so a
+        // stop that fails leaves the session monitored.
         self.remove_pending_attaches_for_session(id).await;
         self.cancel_session_attaches(id).await;
 
@@ -5775,7 +5805,8 @@ impl SessionRegistry {
             &loaded_durable_base
         };
         let had_background = updated.base.info.background.is_some();
-        let updated = *updated;
+        let mut updated = *updated;
+        let acknowledge = updated.acknowledge.take();
         let committed_info = match Box::pin(self.commit_runtime_transition(
             id,
             &updated.expected,
@@ -5825,6 +5856,9 @@ impl SessionRegistry {
         if had_background {
             self.emit_background_state(committed_info.as_ref());
         }
+        if let Some(acknowledge) = acknowledge {
+            self.spawn_terminal_acknowledgement(id.clone(), acknowledge);
+        }
         Ok(true)
     }
 
@@ -5846,6 +5880,9 @@ impl SessionRegistry {
             {
                 entry.stopping = false;
                 entry.stop_transaction_id = None;
+                // The process watch paused for the stop and waits for this
+                // wakeup; the permit is kept when it is mid-scan.
+                entry.procwatch_rescan.notify_one();
             }
         }
     }
@@ -5907,6 +5944,7 @@ impl SessionRegistry {
             entry.stopping = false;
             entry.stop_transaction_id = None;
             entry.desired_state = previous_desired_state;
+            entry.procwatch_rescan.notify_one();
         }
     }
 

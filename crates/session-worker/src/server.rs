@@ -465,6 +465,7 @@ impl Server {
             started: Instant::now(),
             initialized_tx,
             lease_epoch_tx,
+            data_streams: watch::channel(0).0,
             state_changed: Notify::new(),
             shutdown: CancellationToken::new(),
             #[cfg(test)]
@@ -572,6 +573,8 @@ struct Shared {
     started: Instant,
     initialized_tx: watch::Sender<bool>,
     lease_epoch_tx: watch::Sender<u64>,
+    /// Attach, output and observation data streams currently being served.
+    data_streams: watch::Sender<usize>,
     state_changed: Notify,
     shutdown: CancellationToken,
     /// Pauses `initialize` between the `Starting` commit and the child spawn.
@@ -614,6 +617,22 @@ impl Shared {
     fn bump_lease_epoch(&self) {
         let next = self.lease_epoch_tx.borrow().saturating_add(1);
         self.lease_epoch_tx.send_replace(next);
+    }
+}
+
+/// Counts one served data stream until it is dropped.
+struct DataStreamGuard<'a>(&'a watch::Sender<usize>);
+
+impl<'a> DataStreamGuard<'a> {
+    fn enter(streams: &'a watch::Sender<usize>) -> Self {
+        streams.send_modify(|count| *count += 1);
+        Self(streams)
+    }
+}
+
+impl Drop for DataStreamGuard<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count -= 1);
     }
 }
 
@@ -1913,6 +1932,14 @@ async fn acknowledge_request(
         state.journal.updated_at = timestamp();
         persist_control(shared.journal.clone(), state.journal.clone()).await?;
     };
+    // Attached streams deliver their remaining output and close frame before
+    // the worker exits; a client that never reads is cut off at the bound.
+    let mut streams = shared.data_streams.subscribe();
+    let _ = tokio::time::timeout(
+        shared.config.post_exit_drain_timeout,
+        streams.wait_for(|count| *count == 0),
+    )
+    .await;
     shared.shutdown.cancel();
     Ok(ResponseKind::TerminalAcknowledged)
 }
@@ -2049,6 +2076,7 @@ async fn inspect_snapshot(
         hook_schema: state.journal.hook_schema.clone(),
         background: state.journal.background.clone(),
         active_identity_revision: forwarding.then_some(state.journal.active_identity_revision),
+        drains_streams_on_terminal_ack: true,
     })
 }
 
@@ -2822,6 +2850,7 @@ async fn serve_data(
             .clone()
             .ok_or_else(|| WorkerError::Protocol("runtime is not live".to_owned()))?
     };
+    let _stream = DataStreamGuard::enter(&shared.data_streams);
     if mode == StreamMode::Observation {
         let observation = grant.observation.ok_or_else(|| {
             WorkerError::Protocol("observation data grant is incomplete".to_owned())

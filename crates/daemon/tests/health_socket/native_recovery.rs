@@ -265,6 +265,27 @@ impl ClaudeRig {
             serde_json::to_value(id).expect("serialize session id"),
         );
         ok_payload(exchange(&mut self.control, &request).await);
+        // The worker persists its acknowledged journal after the stop answer;
+        // a later journal edit must not race that write.
+        let session_dir = self.worker_state_root.join(id.0.as_str());
+        wait_until("every worker journal to be acknowledged", || async {
+            let journals = std::fs::read_dir(&session_dir)
+                .ok()?
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|name| name == "json"))
+                .collect::<Vec<_>>();
+            journals
+                .iter()
+                .all(|path| {
+                    std::fs::read(path)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        .is_some_and(|journal| journal["terminal_acknowledged"] == true)
+                })
+                .then_some(())
+        })
+        .await;
         inspect_session(&mut self.control, id).await
     }
 

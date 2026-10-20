@@ -1126,14 +1126,12 @@ async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
     fixture.start_daemon().await;
     let namespace = fixture.namespace();
     let mut generations = BTreeSet::new();
-    // A stopped session keeps its current generation's job, which holds the
-    // final output; every other generation must be gone after each round.
-    let mut kept = BTreeMap::<String, Snapshot>::new();
+    // A stopped session's worker is acknowledged and its job retired, so no
+    // generation outlives its session's stop.
     let mut stopped_sessions = Vec::new();
     for round in 0..CYCLE_ROUNDS {
         let stopped = fixture.new_session(&format!("stopped-{round}")).await.id.0;
         let removed = fixture.new_session(&format!("removed-{round}")).await.id.0;
-        let previous = kept.remove(recovered);
         let resumed = fixture
             .client()
             .await
@@ -1151,11 +1149,6 @@ async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
             generations.insert(snapshots[2].generation.clone()),
             "every recovery mints a new generation"
         );
-        if let Some(previous) = previous {
-            fixture
-                .wait_gone(previous.worker, "superseded recovered worker")
-                .await;
-        }
 
         bystanders.start(&mut fixture, round).await;
 
@@ -1175,20 +1168,22 @@ async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
         } else {
             fixture.kill_daemon().await;
         }
-        kept.insert(stopped.clone(), snapshots[0].clone());
-        kept.insert(recovered.to_owned(), snapshots[2].clone());
         stopped_sessions.push(stopped);
-        fixture
-            .wait_gone(snapshots[1].worker, "removed session's worker")
-            .await;
-        assert_only_current_jobs(&fixture, &namespace, kept.values(), round).await;
+        for (snapshot, what) in [
+            (&snapshots[0], "stopped session's worker"),
+            (&snapshots[1], "removed session's worker"),
+            (&snapshots[2], "stopped recovered session's worker"),
+        ] {
+            fixture.wait_gone(snapshot.worker, what).await;
+        }
+        assert_only_current_jobs(&fixture, &namespace, std::iter::empty(), round).await;
         bystanders.assert_alive(
             &fixture,
             &format!("the daemon restart or kill of round {round}"),
         );
     }
     stays("no orphan job reappears", SETTLED, || async {
-        fixture.job_ids().await == sorted_ids(&kept.values().cloned().collect::<Vec<_>>())
+        fixture.job_ids().await.is_empty()
     })
     .await;
     assert_eq!(generations.len(), CYCLE_ROUNDS);
@@ -1205,11 +1200,6 @@ async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
             .unwrap_or_else(|error| panic!("remove {session}: {error}"));
     }
     assert_only_current_jobs(&fixture, &namespace, std::iter::empty(), CYCLE_ROUNDS).await;
-    for snapshot in kept.values() {
-        fixture
-            .wait_gone(snapshot.worker, "removed session's worker")
-            .await;
-    }
 }
 
 /// Waits until the namespace holds exactly the jobs (and, on launchd, the

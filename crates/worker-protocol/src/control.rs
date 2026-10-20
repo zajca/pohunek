@@ -1142,6 +1142,12 @@ pub struct InspectSnapshot {
     /// that negotiated below [`crate::ACTIVE_IDENTITY_FORWARD_VERSION`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_identity_revision: Option<u64>,
+    /// Whether `AcknowledgeTerminal` first lets every attached data stream
+    /// deliver its remaining output and close frame. A worker that does not
+    /// report this exits at once on the acknowledgement, so a daemon sends it
+    /// only to a worker that reports it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub drains_streams_on_terminal_ack: bool,
 }
 
 /// Defines one daemon-to-worker request.

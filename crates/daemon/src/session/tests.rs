@@ -60,6 +60,8 @@ mod conflict_cleanup;
 mod native_recovery;
 mod native_supersede;
 mod stale_worker_metadata;
+mod stop_monitoring;
+mod terminal_acknowledgement;
 
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.
 const CONCURRENT_TRANSITION_RETRY_LIMIT: usize = 32;
@@ -7817,6 +7819,7 @@ fn a_journaled_native_reference_alone_changes_the_worker_metadata_fingerprint() 
         hook_schema: None,
         background: None,
         active_identity_revision: None,
+        drains_streams_on_terminal_ack: false,
     };
     let (first, second) = (
         super::worker_metadata_fingerprint(&snapshot(Some("a"))),
@@ -17823,6 +17826,26 @@ async fn record_only_session_in(registry: &SessionRegistry, repo: Option<&PathBu
         .as_ref()
         .expect("worker state root")
         .join(&session.id.0);
+    // The worker persists its acknowledged journal after the terminal commit;
+    // removing the journals first would let that write bring one back.
+    wait_until("the worker journal to be acknowledged", || async {
+        let acknowledged = fs::read_dir(&journals)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .all(|path| {
+                fs::read(path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .is_some_and(|journal| journal["terminal_acknowledged"] == true)
+            });
+        acknowledged.then_some(())
+    })
+    .await;
     let mut removed_journals = 0;
     for journal in fs::read_dir(&journals).expect("read the session's journals") {
         let journal = journal.expect("journal entry").path();
@@ -19694,6 +19717,9 @@ async fn reconciled_create_whose_worker_ended_is_retired_then_compensated() {
         .expect("create session");
     let launched = stored_record(&daemon.store_path, &created.id).runtime;
     let mut events = registry.subscribe();
+    // The daemon ends before it acknowledges the stop, so the worker keeps
+    // serving the ended runtime.
+    registry.suppress_terminal_acknowledgement();
     registry.stop(&created.id).await.expect("stop session");
     let worktree = created.worktree_path.clone().expect("bound worktree");
     registry.begin_daemon_shutdown();
@@ -19768,10 +19794,11 @@ async fn reconciled_create_whose_worker_ended_is_retired_then_compensated() {
             &calls[before_restart..],
             [
                 crate::runtime::lifecycle::tests::Call::Inspect(_),
+                crate::runtime::lifecycle::tests::Call::Inspect(_),
                 crate::runtime::lifecycle::tests::Call::Retire(_),
             ]
         ),
-        "the answering worker's job is inspected, then retired: {calls:?}"
+        "the answering worker's job is inspected, verified, then retired: {calls:?}"
     );
     assert_eq!(
         supervisor.retired(),
@@ -20786,10 +20813,12 @@ async fn concurrent_recoveries_of_one_session_start_exactly_one_generation() {
     assert_eq!(refused.code, "session_runtime_not_recoverable");
     let started = supervisor.started();
     assert_eq!(started.len(), 2, "create plus one recovery: {started:?}");
-    assert_eq!(
-        supervisor.retired(),
-        [first_job],
-        "the superseded generation is retired exactly"
+    // The acknowledgement of the finished generation and the recovery may both
+    // retire it; retiring an absent job is a no-op.
+    let retired = supervisor.retired();
+    assert!(
+        !retired.is_empty() && retired.iter().all(|job| *job == first_job),
+        "only the superseded generation is retired: {retired:?}"
     );
     assert_eq!(supervisor.live_jobs().await, [started[1].clone()]);
     registry
