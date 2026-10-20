@@ -1725,6 +1725,7 @@ struct MockInspectorState {
     foreground_groups: HashMap<Pid, Option<Pid>>,
     foreground_error: Option<std::io::ErrorKind>,
     foreground_block: Option<Arc<ForegroundBlock>>,
+    foreground_probes: usize,
     cwd: HashMap<Pid, PathBuf>,
     identity_overrides: HashMap<Pid, Option<ProcessIdentity>>,
     identity_after_descendants: HashMap<Pid, ProcessIdentity>,
@@ -1822,6 +1823,13 @@ impl MockInspector {
             .lock()
             .expect("mock inspector lock")
             .foreground_error = None;
+    }
+
+    fn foreground_probes(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .foreground_probes
     }
 
     fn block_foreground(&self) -> Arc<ForegroundBlock> {
@@ -2127,6 +2135,7 @@ impl ProcessInspector for MockInspector {
     ) -> Result<Option<Pid>, crate::procwatch::Error> {
         let (kind, foreground, block) = {
             let mut inner = self.inner.lock().expect("mock inspector lock");
+            inner.foreground_probes += 1;
             (
                 inner.foreground_error,
                 inner.foreground_groups.get(&root_pid).copied().flatten(),
@@ -9671,6 +9680,21 @@ const PID_REUSE_AGENT_PID: Pid = 225;
 const FOREIGN_AGENT_PID: Pid = 240;
 /// Delay separating pid-reuse observations so `first_seen` changes if reset.
 const PID_REUSE_RESCAN_DELAY: Duration = Duration::from_millis(5);
+/// Stops the session's own procwatch loop once its first scan has reached the
+/// foreground probe, so no scan of the loop overlaps what the test drives.
+async fn stop_procwatch_loop(
+    registry: &SessionRegistry,
+    inspector: &MockInspector,
+    id: &SessionId,
+) {
+    wait_until("the loop's first scan probed the foreground", || async {
+        (inspector.foreground_probes() > 0).then_some(())
+    })
+    .await;
+    let sessions = registry.inner.sessions.lock().await;
+    sessions[id].procwatch_cancel.cancel();
+}
+
 async fn mock_procwatch_registry(tag: &str) -> (SessionRegistry, Arc<MockInspector>, SessionInfo) {
     let inspector = Arc::new(MockInspector::default());
     let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
@@ -10103,6 +10127,16 @@ async fn report_descendant_claim(registry: &SessionRegistry, created: &SessionIn
 /// Admits the descendant reporter's claim directly, without the report path's
 /// request for a rescan, so only the scans a test runs observe it.
 async fn admit_descendant_claim_unannounced(registry: &SessionRegistry, id: &SessionId) {
+    admit_descendant_claim_unannounced_at(registry, id, None).await;
+}
+
+/// [`admit_descendant_claim_unannounced`] with the reporter's attested start
+/// identity.
+async fn admit_descendant_claim_unannounced_at(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    start_identity: Option<u64>,
+) {
     let mut sessions = registry.inner.sessions.lock().await;
     let entry = sessions.get_mut(id).expect("live session entry");
     let report = ActiveAgentReport {
@@ -10110,7 +10144,7 @@ async fn admit_descendant_claim_unannounced(registry: &SessionRegistry, id: &Ses
         agent: CODEX_HOOK_AGENT.to_owned(),
         seq: Some(DIRECT_AGENT_REPORT_SEQ),
         pid: Some(DESCENDANT_REPORTER_PID),
-        start_identity: None,
+        start_identity,
         reported_at: Instant::now(),
         activity_reported: false,
         observed: false,
@@ -11535,11 +11569,11 @@ async fn foreground_return_to_the_shell_root_clears_a_descendant_claim() {
     let _ = registry.stop(&created.id).await;
 }
 
-/// A scan collected before a claim was admitted and applied after it carries
-/// no proof for that claim: the wrapper replaces it as it does without the
-/// descendant rule.
+/// A scan collected before a claim was admitted and applied after it neither
+/// refutes nor proves that claim: the rescan the admission requests decides
+/// (O1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pre_admission_scan_does_not_preserve_a_descendant_claim() {
+async fn pre_admission_scan_does_not_refute_a_descendant_claim() {
     let (registry, inspector, created) = mock_procwatch_registry("descendant-pre-admission").await;
     inspector.set_descendants(
         created.pid,
@@ -11550,10 +11584,7 @@ async fn pre_admission_scan_does_not_preserve_a_descendant_claim() {
     );
     // Only this test's scan may take the foreground block: stop the session's
     // own procwatch loop.
-    let () = {
-        let sessions = registry.inner.sessions.lock().await;
-        sessions[&created.id].procwatch_cancel.cancel();
-    };
+    stop_procwatch_loop(&registry, &inspector, &created.id).await;
     let block = inspector.block_foreground();
     let _release_guard = ForegroundReleaseGuard(Arc::clone(&block));
     let scan_registry = registry.clone();
@@ -11578,14 +11609,59 @@ async fn pre_admission_scan_does_not_preserve_a_descendant_claim() {
     block.release();
     scan.join().expect("pre-admission scan thread");
 
-    assert_descendant_claim_replaced(
-        &registry,
-        &created.id,
-        DESCENDANT_WRAPPER_PID,
-        RuntimeRef::codex(),
-        "pre-admission scan",
-    )
-    .await;
+    assert_descendant_claim_kept(&registry, &created.id, "pre-admission scan").await;
+    assert!(
+        !reporter_is_bound(&registry, &created.id).await,
+        "the pre-admission scan proves nothing"
+    );
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    assert_descendant_claim_kept(&registry, &created.id, "rescan after admission").await;
+    assert!(reporter_is_bound(&registry, &created.id).await);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A report admitted during a scan for a reused reporter pid carries another
+/// process generation than the claim the scan read: the scan's evidence is
+/// not applied to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reused_pid_report_admitted_during_a_scan_is_not_refuted_by_it() {
+    let (registry, inspector, created) = mock_procwatch_registry("descendant-reused-pid").await;
+    let reporter = fixture_reporter_fact();
+    let old_generation = reporter.start_identity.get();
+    inspector.set_descendants(
+        created.pid,
+        vec![codex_fact(DESCENDANT_WRAPPER_PID, created.pid), reporter],
+    );
+    stop_procwatch_loop(&registry, &inspector, &created.id).await;
+    admit_descendant_claim_unannounced_at(&registry, &created.id, Some(old_generation)).await;
+    let block = inspector.block_foreground();
+    let _release_guard = ForegroundReleaseGuard(Arc::clone(&block));
+    let scan_registry = registry.clone();
+    let scan_id = created.id.clone();
+    let root_pid = created.pid;
+    let runtime = tokio::runtime::Handle::current();
+    let scan = std::thread::spawn(move || {
+        runtime.block_on(scan_registry.rescan_procwatch_at(&scan_id, root_pid, Instant::now()));
+    });
+    tokio::time::timeout(HANG_GUARD, async {
+        while !block.entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the scan collected its descendants");
+
+    admit_descendant_claim_unannounced_at(&registry, &created.id, Some(old_generation + 1)).await;
+    block.release();
+    scan.join().expect("reused-pid scan thread");
+
+    assert_descendant_claim_kept(&registry, &created.id, "reused-pid report").await;
+    assert!(
+        !reporter_is_bound(&registry, &created.id).await,
+        "the scan proves nothing for the new generation"
+    );
     let _ = registry.stop(&created.id).await;
 }
 
@@ -11645,6 +11721,150 @@ async fn journal_projected_descendant_claim_survives_a_successful_scan() {
             Some(crate::store::ActiveAgentOrigin::Reported)
         );
     }
+    let _ = registry.stop(&created.id).await;
+}
+
+/// Projects the descendant reporter's claim the way the worker journal does.
+async fn project_journal_descendant_claim(registry: &SessionRegistry, id: &SessionId) {
+    let (worker, _identity) = live_worker_and_identity(registry, id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    let reporter = fixture_reporter_fact();
+    snapshot.active_identity = Some(pohunek_worker_protocol::ActiveIdentityClaim {
+        provider: "codex".to_owned(),
+        process: pohunek_worker_protocol::ProcessIdentity {
+            pid: reporter.pid,
+            start_identity: reporter.start_identity.get(),
+        },
+        sequence: 1,
+        expires_at: native_report_expiry(),
+        reference_kind: None,
+        native_reference: None,
+        agent: None,
+        origin: None,
+        reported_session: None,
+    });
+    assert_eq!(
+        registry.apply_worker_metadata_snapshot(id, &snapshot).await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+}
+
+/// A new journal claim asks for a rescan (E24), which then binds its reporter.
+#[tokio::test]
+async fn journal_projected_claim_requests_a_rescan_that_binds_it() {
+    let (registry, inspector, created) = mock_procwatch_registry("journal-rescan").await;
+    inspector.set_descendants(
+        created.pid,
+        vec![
+            codex_fact(DESCENDANT_WRAPPER_PID, created.pid),
+            fixture_reporter_fact(),
+        ],
+    );
+    // Only the requested rescan may reach the scan: stop the session's own loop
+    // and drain what it left pending.
+    stop_procwatch_loop(&registry, &inspector, &created.id).await;
+    let rescan = Arc::clone(&registry.inner.sessions.lock().await[&created.id].procwatch_rescan);
+    let _ = tokio::time::timeout(Duration::ZERO, rescan.notified()).await;
+
+    project_journal_descendant_claim(&registry, &created.id).await;
+    guard("the projection requested a rescan", rescan.notified()).await;
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    assert!(reporter_is_bound(&registry, &created.id).await);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A new journal claim survives a failed collection within the claim TTL and
+/// follows main afterwards (round-8 shape).
+#[tokio::test]
+async fn new_journal_claim_survives_a_failed_collection_until_the_claim_ttl() {
+    let (registry, inspector, created) = mock_procwatch_registry("journal-failed-collection").await;
+    inspector.set_descendants(
+        created.pid,
+        vec![
+            codex_fact(DESCENDANT_WRAPPER_PID, created.pid),
+            fixture_reporter_fact(),
+        ],
+    );
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    project_journal_descendant_claim(&registry, &created.id).await;
+    let reported_at = {
+        let sessions = registry.inner.sessions.lock().await;
+        sessions[&created.id]
+            .active_agent
+            .as_ref()
+            .expect("projected claim")
+            .reported_at
+    };
+    inspector.fail_descendants_with(std::io::ErrorKind::Interrupted);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, reported_at)
+        .await;
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect")
+            .active_agent_pid,
+        Some(DESCENDANT_REPORTER_PID),
+        "journal claim, failed collection"
+    );
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, reported_at + UNBOUND_CLAIM_EXPIRY)
+        .await;
+    assert_ne!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect")
+            .active_agent_pid,
+        Some(DESCENDANT_REPORTER_PID),
+        "after the claim TTL"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A claim adopted from the persisted record carries no start identity and no
+/// binding; the first scan that proves it binds it (O7).
+#[tokio::test]
+async fn adopted_claim_binds_at_the_first_scan() {
+    let (registry, inspector, created) = mock_procwatch_registry("adopted-claim").await;
+    inspector.set_descendants(
+        created.pid,
+        vec![
+            codex_fact(DESCENDANT_WRAPPER_PID, created.pid),
+            fixture_reporter_fact(),
+        ],
+    );
+    let () = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("live session entry");
+        let report = ActiveAgentReport {
+            source: "persisted".to_owned(),
+            agent: CODEX_HOOK_AGENT.to_owned(),
+            seq: None,
+            pid: Some(DESCENDANT_REPORTER_PID),
+            start_identity: None,
+            reported_at: Instant::now(),
+            activity_reported: false,
+            observed: false,
+        };
+        entry.active_agent = Some(report.clone());
+        entry.last_agent_report = Some(report);
+        entry.info.active_agent = Some(CODEX_HOOK_AGENT.to_owned());
+        entry.info.active_agent_base = Some(RuntimeRef::codex());
+        entry.info.active_agent_pid = Some(DESCENDANT_REPORTER_PID);
+        entry.info.active_agent_session_id = Some(DESCENDANT_NATIVE_SESSION_ID.to_owned());
+        entry.info.state_source = StateSource::Report;
+    };
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    assert!(reporter_is_bound(&registry, &created.id).await);
+    assert_descendant_claim_kept(&registry, &created.id, "adopted claim").await;
     let _ = registry.stop(&created.id).await;
 }
 

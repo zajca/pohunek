@@ -262,7 +262,10 @@ impl SessionRegistry {
             let mut tick = tokio::time::interval(registry.inner.config.procwatch_poll);
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
+                // Cancellation wins over a ready tick or rescan so a stopped
+                // loop never starts another scan.
                 tokio::select! {
+                    biased;
                     () = cancel.cancelled() => break,
                     _ = tick.tick() => {
                         if !registry.rescan_live_root(&id, &expected, root, crate::time::now()).await {
@@ -368,7 +371,7 @@ impl SessionRegistry {
         // The claim a scan may prove is the one current before it collects: a
         // claim admitted during or after collection gets no proof from it. A
         // bound claim needs none.
-        let (claimed_reporter, unwatched_reporter) = self
+        let (claim_before_scan, claimed_reporter, unwatched_reporter) = self
             .inner
             .sessions
             .lock()
@@ -377,6 +380,7 @@ impl SessionRegistry {
             .map(|entry| {
                 let bound = bound_reporter_of(entry);
                 (
+                    claim_key(entry),
                     bound
                         .is_none()
                         .then(|| reported_descendant_pid(entry))
@@ -491,6 +495,10 @@ impl SessionRegistry {
             };
             let lineage = lineage.or(collection_failed);
             let to_spawn = apply_observed_refresh(entry, agents, &mut exit_watches);
+            // A claim admitted after this scan began was not observed by it:
+            // the scan neither refutes nor proves it, and the rescan its
+            // admission requested decides.
+            let claim_admitted_during_scan = claim_key(entry) != claim_before_scan;
             // A reporter read gone ends its claim here, whatever the
             // foreground probe says.
             let dead_reporter = bound_reporter_of(entry)
@@ -503,16 +511,22 @@ impl SessionRegistry {
                 forget_observed_generation(entry, identity);
                 self.reconcile_active_agent(entry, now, None)
             });
-            self.bind_proven_reporter(id, entry, lineage.as_ref());
+            if !claim_admitted_during_scan {
+                self.bind_proven_reporter(id, entry, lineage.as_ref());
+            }
 
             let foreground_changed = apply_foreground_probe(entry, foreground_probe);
-            let decision = self.reconcile_foreground_agent(
-                entry,
-                root_pid,
-                now,
-                foreground_probe,
-                lineage.as_ref(),
-            );
+            let decision = if claim_admitted_during_scan {
+                ForegroundDecision::Preserve
+            } else {
+                self.reconcile_foreground_agent(
+                    entry,
+                    root_pid,
+                    now,
+                    foreground_probe,
+                    lineage.as_ref(),
+                )
+            };
             let updated = match decision {
                 ForegroundDecision::Fallback => {
                     self.reconcile_active_agent(entry, now, lineage.as_ref())
@@ -1419,6 +1433,23 @@ fn forget_observed_generation(entry: &mut SessionEntry, identity: ProcessIdentit
     entry.observed_agents.retain(|observed| {
         (observed.pid, observed.start_identity) != (identity.pid, identity.start_identity.get())
     });
+}
+
+/// The identity of the claim a scan reads: its source, agent, sequence,
+/// process, the process generation and origin.
+type ClaimKey = (String, String, Option<u64>, Option<Pid>, Option<u64>, bool);
+
+fn claim_key(entry: &SessionEntry) -> Option<ClaimKey> {
+    entry.active_agent.as_ref().map(|active| {
+        (
+            active.source.clone(),
+            active.agent.clone(),
+            active.seq,
+            active.pid,
+            active.start_identity,
+            active.observed,
+        )
+    })
 }
 
 fn unbound_claim_is_current(
