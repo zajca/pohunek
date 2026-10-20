@@ -9012,6 +9012,41 @@ async fn a_check_of_a_pending_rollback_runs_nothing_from_a_previous_version_dire
     }
 }
 
+#[tokio::test]
+async fn an_upgrade_or_check_from_a_retained_version_directory_verifies_it_first() {
+    for tamper in Tamper::ALL {
+        let harness = Harness::new();
+        harness.install(V1).await.expect("install");
+        let retained = harness.layout().version_dir(V1).expect("version dir");
+        let named = tamper.apply(&retained);
+        let preflight = ScriptedPreflight::default();
+        let judged = Arc::clone(&preflight.search_paths);
+
+        let upgrade = harness
+            .engine()
+            .with_adoption_preflight(Box::new(preflight))
+            .upgrade(&retained, V2)
+            .await
+            .expect_err("an untrusted retained directory is refused");
+        assert_untrusted_version(&upgrade, &named);
+
+        let check = super::super::check_with_preflight(
+            &harness.context,
+            &retained,
+            &ScriptedPreflight::default(),
+            V2,
+            false,
+        )
+        .await
+        .expect_err("an untrusted retained directory is refused");
+        assert_untrusted_version(&check, &named);
+        assert!(
+            judged.lock().expect("search path lock").is_empty(),
+            "{tamper:?}: nothing was judged"
+        );
+    }
+}
+
 /// Counts the plans the setup asks the release daemon for.
 #[derive(Debug, Default)]
 struct CountingPlanner(AtomicUsize);

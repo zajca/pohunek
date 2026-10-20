@@ -278,10 +278,12 @@ async fn finish_check(
             }
             None => ledger::Acceptance::none(),
         };
+        let release =
+            layout::operator_release(&engine::install_layout(&checked.report.prefix)?, daemon_dir)?;
         let gated = preflight::gate_upgrade(
             preflight,
             context,
-            &layout::trust_release_source(daemon_dir, layout::ReleaseSource::Operator),
+            &release,
             version,
             &job.value,
             &job.variables,

@@ -584,8 +584,42 @@ pub fn verify_installed(layout: &InstallLayout, dir: &Path) -> Result<VerifiedVe
     })
 }
 
+/// Classifies the release directory an operator names (`--from`, or the one
+/// holding the running CLI) by where it is.
+///
+/// A directory inside the installed versions directory, reached by its own
+/// path or through a link, is an installed version and goes through
+/// [`verify_installed`]; any other directory is the operator's own release.
+///
+/// # Errors
+///
+/// Returns the errors of [`verify_installed`] for a directory inside the
+/// versions directory.
+pub fn operator_release(layout: &InstallLayout, dir: &Path) -> Result<VerifiedVersionDir, Error> {
+    if version_of(layout, dir).is_some() {
+        return verify_installed(layout, dir);
+    }
+    let resolved = std::fs::canonicalize(dir).ok();
+    let versions = std::fs::canonicalize(layout.versions_dir()).ok();
+    if let (Some(resolved), Some(versions)) = (resolved, versions) {
+        if let Some(name) = resolved
+            .strip_prefix(&versions)
+            .ok()
+            .and_then(|relative| relative.components().next())
+            .and_then(|first| first.as_os_str().to_str())
+            .and_then(valid_install_version)
+        {
+            let installed = layout.version_dir(name).expect("a validated version name");
+            return verify_installed(layout, &installed);
+        }
+    }
+    Ok(trust_release_source(dir, ReleaseSource::Operator))
+}
+
 /// Trusts a release directory outside the versions directory for the stated
-/// `source`.
+/// `source`. [`operator_release`] is the entry point for an operator's
+/// directory; this one is for callers that know the directory is not inside
+/// the versions directory.
 #[must_use]
 pub fn trust_release_source(dir: &Path, _source: ReleaseSource) -> VerifiedVersionDir {
     VerifiedVersionDir {

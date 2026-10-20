@@ -176,7 +176,7 @@ use super::definition::{
     config_with_search_path, daemon_definition, identity_config, with_version,
 };
 use super::error::{supervisor_error, Error, LiveSession, OutdatedWorker};
-use super::layout::{self, ReleaseSource, Staged};
+use super::layout::{self, Staged};
 use pohunek_platform::shell_env::SearchPath;
 
 use super::ledger::{Acceptance, Ledger};
@@ -819,10 +819,20 @@ impl<'a> Engine<'a> {
             }
         };
         let acceptance = self.acceptance(&basis)?;
+        let layout = match (&installed, plan) {
+            (Some(config), _) => config.layout().clone(),
+            (None, Plan::Resume(record) | Plan::RollBack(record)) => {
+                install_layout(&record.prefix)?
+            }
+            (None, Plan::Fresh) => {
+                unreachable!("a fresh plan loads the installed configuration")
+            }
+        };
+        let release = layout::operator_release(&layout, from)?;
         let gated = preflight::gate_upgrade(
             &*self.preflight,
             self.context,
-            &layout::trust_release_source(from, ReleaseSource::Operator),
+            &release,
             self.reported(version),
             &job.value,
             &job.variables,
