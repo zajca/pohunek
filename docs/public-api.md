@@ -2238,7 +2238,11 @@ and prints one JSON document (`PreflightReport` in `crates/service-config`,
 `refused`, with `schema_from`, `schema_to`, `records`, `error_code`, `error`) and
 `sessions` (per live session `session_id`, `verdict` `adoptable`,
 `would_lose_recovery` or `would_not_be_adopted`, a stable `code`, and a human
-`detail`, plus the owner-set `name` when there is one), `stopped_sessions` (the
+`detail`, plus the owner-set `name` when there is one, and, for an at-risk
+verdict of a loaded record whose code the daemon proves stable across its
+startup, `acceptance_scope`: `v1:` and a SHA-256 digest of the facts a durable
+acceptance stays bound to; it is absent for every other verdict and a reader
+treats an absent or unknown scope as not accepted), `stopped_sessions` (the
 same verdicts, plus `already_not_resumable`, for sessions whose runtime has ended
 but that keep native resume or fork; at risk under the same flag), `runtimes` (absent when the release carries no
 `runtime/` tree; otherwise the `EnsureReport` of the release's official runtime
@@ -2256,7 +2260,15 @@ that cannot run or be parsed with `service_upgrade_preflight_failed`, neither of
 which the flag overrides. The official runtime step adds five codes, none overridden by `--accept-runtime-loss`: `service_upgrade_runtimes_refused` (the release's plan cannot be applied; nothing was stopped), `service_upgrade_runtimes_failed` (the release's runtime step did not produce a finished report), `service_runtime_backup_invalid` (a registry, catalog state or host profile cannot be backed up exactly), `service_staged_runtime_invalid` (the release's `runtime/` tree is not the layout the release assembles, or a sealed release lists a `runtime/` file it does not carry), and `service_upgrade_runtimes_unconfirmed` (the step's daemon run could not be ended and its exit confirmed, so the upgrade is kept and not rolled back). The `--json` success reports of both commands carry
 `preflight` (the report, or `null` when no preflight ran) and
 `accepted_runtime_loss` (boolean, true only when sessions were at risk and the
-flag accepted them). The preflight reads the store, the worker
+flag accepted them), and the omitted-when-empty groups `previously_accepted`
+(at-risk verdicts an earlier upgrade accepted with the identical scope, which do
+not block) with `previously_accepted_at` (that upgrade's version),
+`durable_acceptance` (accepted now and recorded for the next upgrade) and
+`one_time_acceptance` (accepted now, with no scope to bind them). The completed
+upgrade replaces `<state>/pohunek/service-accepted-risks.json` with the scoped
+verdicts of its final gate; `service check`, a refusal, a failure and a rollback
+never write it, and an unreadable or unsafe file fails with
+`service_accepted_risks_invalid`. The preflight reads the store, the worker
 journals and the process table only; it never connects to a worker socket. A
 live session whose worker journal names a release before 0.33.1, or no release,
 is `would_not_be_adopted` with code `worker_marker_legacy`. A live session that

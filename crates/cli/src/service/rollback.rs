@@ -74,7 +74,11 @@ pub(super) async fn gate(
                 detail: error.to_string(),
             })?;
         let report = legacy_report(&inputs, previous, reader).await?;
-        preflight::decide(report, accept_runtime_loss)
+        preflight::decide(
+            report,
+            accept_runtime_loss,
+            &super::ledger::Acceptance::none(),
+        )
     } else {
         preflight::gate(
             inputs.preflight,
@@ -98,6 +102,7 @@ pub(super) async fn gate(
             sessions,
             stopped_sessions,
             warnings,
+            ..
         } => Error::RollbackAtRisk {
             version: previous.to_owned(),
             sessions,

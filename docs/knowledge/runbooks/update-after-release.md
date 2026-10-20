@@ -677,6 +677,28 @@ proceeds, and the `--json` report carries the full `preflight` object and
 failing `pohunekd`, an unparsable report) fails with
 `service_upgrade_preflight_failed`, which the flag does not override.
 
+The flag also records what it accepted. When the upgrade completes, every
+at-risk verdict the daemon binds to an acceptance scope (`acceptance_scope`,
+`v1:` and a digest of the session, its generation, worker instance, launch pin,
+native reference and capabilities) is written to
+`<state>/pohunek/service-accepted-risks.json`, replacing the file of the
+previous upgrade. At the next upgrade the same session, list, verdict, code and
+scope is reported as previously accepted at upgrade to that version and does not
+block, so the flag is needed again only for what is new. Nothing about a session
+changes: the recovery that still works keeps working, and accepting never
+retires it. The upgrade and `check` output group the verdicts as
+`previously_accepted`, `durable_acceptance` (accepted now and recorded) and
+`one_time_acceptance` (accepted now, but the verdict carries no scope, such as a
+probe-budget verdict, so the next upgrade asks again); `accepted_runtime_loss`
+still means the flag accepted a remainder. `service check` reads the file and
+never writes it, and a rollback, a refusal or a failed upgrade leave it as it
+was. A ledger for another version, namespace, metadata store, scope scheme or
+schema (for example after a rollback or a downgrade) is ignored with a warning
+and the sessions need the flag again; a corrupt or unsafe file fails with
+`service_accepted_risks_invalid`, which names it. Remove the file to forget every
+acceptance. The first upgrade judged by a daemon that reports scopes still needs
+the flag once.
+
 On Linux the preflight and the runtime step run with the `PATH` of the systemd
 user manager, read from its `Environment` property over the session bus, unless
 the recorded daemon job carries its own `PATH`, because the daemon job inherits

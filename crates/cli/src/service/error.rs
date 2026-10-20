@@ -11,6 +11,8 @@ use pohunek_platform::supervisor;
 use pohunek_service_config::preflight::SessionVerdict;
 use pohunek_service_config::runtimes::Refusal;
 
+use super::report::AcceptanceGroups;
+
 /// One session that blocks an uninstall.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LiveSession {
@@ -442,12 +444,19 @@ pub enum Error {
 
     /// The new daemon would not adopt, or would adopt without native
     /// recovery, live or stopped sessions of the installed state.
-    #[error("{}", at_risk_summary("upgrade", sessions, stopped_sessions, warnings))]
+    #[error(
+        "{}",
+        at_risk_summary("upgrade", sessions, stopped_sessions, acceptance, warnings)
+    )]
     UpgradeAtRisk {
-        /// Live sessions the preflight judged at risk, ordered by id.
+        /// Live sessions the preflight judged at risk and no earlier upgrade
+        /// accepted, ordered by id.
         sessions: Vec<SessionVerdict>,
-        /// Stopped sessions whose retained native recovery is at risk.
+        /// Stopped sessions whose retained native recovery is at risk and no
+        /// earlier upgrade accepted.
         stopped_sessions: Vec<SessionVerdict>,
+        /// The at-risk verdicts an earlier upgrade accepted, which do not block.
+        acceptance: Box<AcceptanceGroups>,
         /// Warnings of the judgement, so a refusal explains a degraded verdict.
         warnings: Vec<String>,
     },
@@ -548,7 +557,7 @@ pub enum Error {
     },
 
     /// The previous daemon may lose live runtime or retained native recovery.
-    #[error("{}", at_risk_summary(&format!("rollback to {version}"), sessions, stopped_sessions, warnings))]
+    #[error("{}", at_risk_summary(&format!("rollback to {version}"), sessions, stopped_sessions, &AcceptanceGroups::default(), warnings))]
     RollbackAtRisk {
         /// Version that would be restored.
         version: String,
@@ -580,6 +589,15 @@ pub enum Error {
     #[error("install transaction record {} is invalid: {detail}", path.display())]
     Record {
         /// The record file.
+        path: PathBuf,
+        /// Why it was rejected.
+        detail: String,
+    },
+
+    /// The accepted-risk ledger cannot be read safely.
+    #[error("accepted-risk ledger {} is invalid: {detail}", path.display())]
+    AcceptedRisks {
+        /// The ledger file.
         path: PathBuf,
         /// Why it was rejected.
         detail: String,
@@ -753,6 +771,7 @@ impl Error {
             Self::RollbackPreflightFailed { .. } => "service_rollback_preflight_failed",
             Self::OrphanWorkers { .. } => "service_orphan_workers",
             Self::Record { .. } => "service_record_invalid",
+            Self::AcceptedRisks { .. } => "service_accepted_risks_invalid",
             Self::ConfigBackup { .. } => "service_config_backup_invalid",
             Self::TransactionInProgress { .. } => "service_transaction_in_progress",
             Self::InheritedLock { .. } => "service_inherited_lock_invalid",
@@ -798,7 +817,10 @@ impl Error {
                 Some("inspect the listed sessions with `pohunek session list` and retry")
             }
             Self::UpgradeAtRisk { .. } => Some(
-                "preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery",
+                "preserve the required runtime or native recovery for the listed sessions, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery; the accepted risks are recorded so the identical risk is not asked about again, and no session is changed",
+            ),
+            Self::AcceptedRisks { .. } => Some(
+                "remove the ledger file and rerun with --accept-runtime-loss to accept the listed sessions again; the file only records what an earlier upgrade accepted",
             ),
             Self::UpgradeStoreUnusable { .. } => Some(
                 "--accept-runtime-loss does not apply: install a pohunek release that reads this store, or restore the store's .pre-schema-<n> backup",
@@ -905,6 +927,7 @@ fn at_risk_summary(
     action: &str,
     sessions: &[SessionVerdict],
     stopped_sessions: &[SessionVerdict],
+    acceptance: &AcceptanceGroups,
     warnings: &[String],
 ) -> String {
     let mut text = format!(
@@ -927,6 +950,20 @@ fn at_risk_summary(
             "\n  {kind} {}{name}: {} [{}] {}",
             session.session_id, session.verdict, session.code, session.detail
         );
+    }
+    if let Some(version) = &acceptance.previously_accepted_at {
+        let _ = write!(
+            text,
+            "\n  previously accepted at upgrade to {version} (not blocking): {} session(s)",
+            acceptance.previously_accepted.len()
+        );
+        for session in &acceptance.previously_accepted {
+            let _ = write!(
+                text,
+                "\n    {}: {} [{}]",
+                session.session_id, session.verdict, session.code
+            );
+        }
     }
     for warning in warnings {
         let _ = write!(text, "\n  warning: {warning}");

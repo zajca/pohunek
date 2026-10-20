@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use pohunek_platform::supervisor::{ServiceObservation, ServiceState};
-use pohunek_service_config::preflight::PreflightReport;
+use pohunek_service_config::preflight::{PreflightReport, SessionVerdict};
 use pohunek_service_config::runtimes::EnsureReport;
 use serde::ser::SerializeSeq as _;
 use serde::{Serialize, Serializer};
@@ -108,6 +108,9 @@ pub struct UpgradeReport {
     /// Whether `--accept-runtime-loss` accepted at-risk sessions in the
     /// upgrade or a preceding rollback.
     pub accepted_runtime_loss: bool,
+    /// How the at-risk sessions of the final gate were accepted.
+    #[serde(flatten)]
+    pub acceptance: AcceptanceGroups,
     /// The `service.toml` schema the transaction migrates from, when it does.
     ///
     /// A migration stops the daemon before it rewrites `service.toml` and
@@ -212,6 +215,9 @@ pub struct CheckReport {
     /// Whether `--accept-runtime-loss` would accept at-risk sessions in the
     /// upgrade or a preceding rollback.
     pub accepted_runtime_loss: bool,
+    /// How the at-risk sessions of the checked gate would be accepted.
+    #[serde(flatten)]
+    pub acceptance: AcceptanceGroups,
     /// The `service.toml` schema the checked transaction would migrate from,
     /// when it would.
     ///
@@ -222,6 +228,30 @@ pub struct CheckReport {
     /// a service manager whose environment was not read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+/// How the at-risk verdicts of an adoption gate were, or would be, accepted.
+///
+/// Every group is empty and omitted unless the gate had at-risk verdicts of
+/// that kind. `accepted_runtime_loss` keeps meaning that the flag accepted a
+/// remainder.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AcceptanceGroups {
+    /// At-risk verdicts an earlier upgrade accepted and the daemon still
+    /// reports with the identical scope; they do not block.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previously_accepted: Vec<SessionVerdict>,
+    /// The version of the upgrade that accepted them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previously_accepted_at: Option<String>,
+    /// Verdicts the flag accepts now, which the completed upgrade records so
+    /// the identical risk is not asked about again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub durable_acceptance: Vec<SessionVerdict>,
+    /// Verdicts the flag accepts now that no scope can bind, so the next
+    /// upgrade asks about them again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub one_time_acceptance: Vec<SessionVerdict>,
 }
 
 /// A version directory garbage collection kept.

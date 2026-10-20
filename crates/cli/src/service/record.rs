@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use super::error::{fs_error, replace_error, Error};
 use super::inherited::Token;
-use super::settings::{LOCK_POLL, LOCK_WAIT, MAX_HOLDER_BYTES, MAX_RECORD_BYTES};
+use super::ledger::{self, AcceptedSet, Ledger};
+use super::settings::{LOCK_POLL, LOCK_WAIT, MAX_HOLDER_BYTES, MAX_LEDGER_BYTES, MAX_RECORD_BYTES};
 
 /// Largest accepted backup file in bytes.
 ///
@@ -33,19 +34,21 @@ const MAX_CONFIG_BACKUP_BYTES: usize = pohunek_service_config::MAX_CONFIG_BYTES;
 
 /// Version of the record schema; any other version is rejected.
 ///
+/// Version 5 carries the gate's accepted set, [`Record::accepted_risks`].
 /// Version 4 carries the runtime step's journal, [`Record::runtime_stop`] and
 /// [`Record::runtime_backup`], and [`Step::Runtimes`]. Version 3 carries
 /// [`Record::config_backup`], the migration transaction's backup description.
 /// A record of an earlier version cannot say whether its `service.toml` was
 /// rewritten from the previous release's schema, so it is refused rather than
 /// guessed at. Version 2 carried [`Record::rolling_back`], which stays.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
-/// The record schema before [`SCHEMA_VERSION`].
+/// The record schemas before [`SCHEMA_VERSION`] that still load.
 ///
-/// A record of this version has no runtime journal, so it loads with the
-/// journal empty; its steps keep their meaning under the new step order.
-const PREVIOUS_SCHEMA_VERSION: u32 = 3;
+/// A record of version 4 has no accepted set and one of version 3 has no
+/// runtime journal either, so they load with those empty; their steps keep
+/// their meaning under the new step order.
+const PREVIOUS_SCHEMA_VERSIONS: [u32; 2] = [4, 3];
 
 /// Directory of the runtime backup inside the application state directory.
 ///
@@ -296,6 +299,13 @@ pub struct Record {
     /// never written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launchd_default_path: Option<String>,
+    /// The at-risk verdicts the last adoption gate of this transaction passed.
+    ///
+    /// Written before the transaction advances past the gate, so a resume past
+    /// it knows what the gate accepted. The accepted-risk ledger is written
+    /// from it when the transaction completes; a rollback discards it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_risks: Option<AcceptedSet>,
 }
 
 /// Exclusive ownership of the install transaction, released on drop.
@@ -483,6 +493,70 @@ impl Store {
             .map_err(|source| fs_error("read the pre-upgrade service.toml backup", source))
     }
 
+    /// Returns the accepted-risk ledger path.
+    #[must_use]
+    pub fn ledger_path(&self) -> PathBuf {
+        self.state_dir.join(ledger::FILE_NAME)
+    }
+
+    /// Reads the bytes of the accepted-risk ledger, if there is one.
+    ///
+    /// Nothing is created or changed, so a check can call it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem error when the state directory or the file is
+    /// unsafe (a symlink, a foreign owner, a wrong mode, too large).
+    pub fn read_ledger(&self) -> Result<Option<Vec<u8>>, Error> {
+        let Some(directory) = self.open(false)? else {
+            return Ok(None);
+        };
+        if directory
+            .entry_identity(ledger::FILE_NAME, EntryKind::RegularFile)
+            .map_err(|source| ledger_error(&self.ledger_path(), &source))?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        directory
+            .read_file(ledger::FILE_NAME, FILE_MODE, MAX_LEDGER_BYTES)
+            .map(Some)
+            .map_err(|source| ledger_error(&self.ledger_path(), &source))
+    }
+
+    /// Replaces the accepted-risk ledger, atomically and owner-private.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem error when the state directory is unsafe or the
+    /// write fails.
+    pub fn write_ledger(&self, ledger: &Ledger) -> Result<(), Error> {
+        let directory = self
+            .open(true)?
+            .expect("open(create = true) always yields a directory");
+        let mut bytes = serde_json::to_vec_pretty(ledger)
+            .expect("the ledger holds only strings, paths, booleans, and enums");
+        bytes.push(b'\n');
+        if bytes.len() > MAX_LEDGER_BYTES {
+            return Err(Error::AcceptedRisks {
+                path: self.ledger_path(),
+                detail: format!(
+                    "it would be {} bytes, over the {MAX_LEDGER_BYTES} byte limit",
+                    bytes.len()
+                ),
+            });
+        }
+        let temporary = format!(
+            ".{}.{}.{}.tmp",
+            ledger::FILE_NAME,
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        directory
+            .replace_file(ledger::FILE_NAME, temporary, &bytes, FILE_MODE)
+            .map_err(|source| replace_error("write the accepted-risk ledger", source))
+    }
+
     /// Loads the pending record, if any.
     ///
     /// # Errors
@@ -513,8 +587,8 @@ impl Store {
         let version = value
             .get("schema_version")
             .and_then(serde_json::Value::as_u64);
-        let supported = [SCHEMA_VERSION, PREVIOUS_SCHEMA_VERSION]
-            .into_iter()
+        let supported = std::iter::once(SCHEMA_VERSION)
+            .chain(PREVIOUS_SCHEMA_VERSIONS)
             .any(|known| version == Some(u64::from(known)));
         if !supported {
             return Err(Error::Record {
@@ -547,6 +621,15 @@ impl Store {
         let mut bytes = serde_json::to_vec_pretty(record)
             .expect("the record holds only strings, paths, booleans, and enums");
         bytes.push(b'\n');
+        if bytes.len() > MAX_RECORD_BYTES {
+            return Err(Error::Record {
+                path: self.path(),
+                detail: format!(
+                    "it would be {} bytes, over the {MAX_RECORD_BYTES} byte limit",
+                    bytes.len()
+                ),
+            });
+        }
         let temporary = format!(
             ".{FILE_NAME}.{}.{}.tmp",
             std::process::id(),
@@ -838,6 +921,14 @@ impl Store {
     }
 }
 
+/// The typed error of an accepted-risk ledger that is unsafe to read.
+fn ledger_error(path: &Path, source: &FsError) -> Error {
+    Error::AcceptedRisks {
+        path: path.to_path_buf(),
+        detail: source.to_string(),
+    }
+}
+
 /// Tries the transaction lock once; `None` means another process holds it.
 ///
 /// An adopter left running after its `pohunek service lock` holder died
@@ -1002,6 +1093,7 @@ mod tests {
             runtime_stop: false,
             runtime_backup: None,
             launchd_default_path: None,
+            accepted_risks: None,
         }
     }
 
@@ -1105,6 +1197,130 @@ mod tests {
         assert_eq!(store.load().expect("load cleared"), None);
     }
 
+    fn accepted_set(sessions: usize) -> ledger::AcceptedSet {
+        ledger::AcceptedSet {
+            store_path: PathBuf::from("/store"),
+            recorded_at: "2026-10-19T00:00:00Z".to_owned(),
+            entries: (0..sessions)
+                .map(|index| ledger::Entry {
+                    session_id: format!("s-{index:05}"),
+                    list: ledger::List::Live,
+                    verdict: pohunek_service_config::preflight::Verdict::WouldNotBeAdopted,
+                    code: "worker_generation_missing".to_owned(),
+                    scope: format!("v1:{}", "ab".repeat(32)),
+                })
+                .collect(),
+            one_time: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_record_and_a_ledger_of_thousands_of_accepted_risks_round_trip() {
+        let (_root, root) = temp_root();
+        let store = Store::new(root.as_path().join("state"));
+        // Far past the former 64 KiB record and 1 MiB ledger limits.
+        let set = accepted_set(9_000);
+        let saved = Record {
+            accepted_risks: Some(set.clone()),
+            ..record(Step::Runtimes)
+        };
+        store.save(&saved).expect("a large journal is saved");
+        assert_eq!(store.load().expect("and read back"), Some(saved));
+
+        let written = Ledger::of("ns", "1.0.0", None, &set);
+        store
+            .write_ledger(&written)
+            .expect("a large ledger is written");
+        let bytes = store.read_ledger().expect("read").expect("present");
+        assert_eq!(
+            serde_json::from_slice::<Ledger>(&bytes).expect("parse"),
+            written
+        );
+    }
+
+    #[test]
+    fn a_record_or_ledger_over_its_read_limit_is_refused_when_written() {
+        let (_root, root) = temp_root();
+        let state = root.as_path().join("state");
+        let store = Store::new(state.clone());
+        let huge = accepted_set(MAX_RECORD_BYTES / 100);
+        let record = Record {
+            accepted_risks: Some(huge.clone()),
+            ..record(Step::Runtimes)
+        };
+        assert!(matches!(store.save(&record), Err(Error::Record { .. })));
+        assert!(!state.join(FILE_NAME).exists(), "nothing was written");
+        assert!(matches!(
+            store.write_ledger(&Ledger::of("ns", "1.0.0", None, &huge)),
+            Err(Error::AcceptedRisks { .. })
+        ));
+        assert!(!state.join(ledger::FILE_NAME).exists());
+    }
+
+    /// Pads the last entry's code until `size_of` reports exactly `target` bytes.
+    fn padded_to(
+        mut set: ledger::AcceptedSet,
+        target: usize,
+        size_of: impl Fn(&ledger::AcceptedSet) -> usize,
+    ) -> ledger::AcceptedSet {
+        let missing = target - size_of(&set);
+        set.entries
+            .last_mut()
+            .expect("an entry")
+            .code
+            .push_str(&"x".repeat(missing));
+        assert_eq!(size_of(&set), target);
+        set
+    }
+
+    #[test]
+    fn a_record_and_a_ledger_exactly_at_the_limit_are_written_and_read() {
+        let (_root, root) = temp_root();
+        let store = Store::new(root.as_path().join("state"));
+        // `to_vec_pretty` plus the trailing newline is what is written.
+        let record_size = |set: &ledger::AcceptedSet| {
+            let record = Record {
+                accepted_risks: Some(set.clone()),
+                ..record(Step::Runtimes)
+            };
+            serde_json::to_vec_pretty(&record).expect("json").len() + 1
+        };
+        let ledger_size = |set: &ledger::AcceptedSet| {
+            serde_json::to_vec_pretty(&Ledger::of("ns", "1.0.0", None, set))
+                .expect("json")
+                .len()
+                + 1
+        };
+
+        let set = padded_to(accepted_set(100), MAX_RECORD_BYTES, record_size);
+        let saved = Record {
+            accepted_risks: Some(set),
+            ..record(Step::Runtimes)
+        };
+        store.save(&saved).expect("a record at the limit is saved");
+        assert_eq!(store.load().expect("and read"), Some(saved));
+
+        let set = padded_to(accepted_set(100), MAX_LEDGER_BYTES, ledger_size);
+        store
+            .write_ledger(&Ledger::of("ns", "1.0.0", None, &set))
+            .expect("a ledger at the limit is written");
+        assert_eq!(
+            store.read_ledger().expect("read").expect("present").len(),
+            MAX_LEDGER_BYTES
+        );
+
+        let over = padded_to(accepted_set(100), MAX_LEDGER_BYTES + 1, ledger_size);
+        assert!(store
+            .write_ledger(&Ledger::of("ns", "1.0.0", None, &over))
+            .is_err());
+        let over = padded_to(accepted_set(100), MAX_RECORD_BYTES + 1, record_size);
+        let over = Record {
+            accepted_risks: Some(over),
+            ..record(Step::Runtimes)
+        };
+        assert!(store.save(&over).is_err());
+    }
+
     #[test]
     fn a_record_of_a_future_schema_is_refused_by_name() {
         let (_root, root) = temp_root();
@@ -1114,13 +1330,14 @@ mod tests {
             .save(&record(Step::Started))
             .expect("create directory");
         let mut value = serde_json::to_value(record(Step::Started)).expect("value");
-        value["schema_version"] = 5.into();
+        let future = SCHEMA_VERSION + 1;
+        value["schema_version"] = future.into();
         std::fs::write(state.join(FILE_NAME), value.to_string()).expect("write record");
         let Err(Error::Record { detail, .. }) = store.load() else {
-            panic!("a schema 5 record is refused");
+            panic!("a record of schema {future} is refused");
         };
         assert!(
-            detail.contains("schema_version 5 is unsupported"),
+            detail.contains(&format!("schema_version {future} is unsupported")),
             "{detail}"
         );
     }
