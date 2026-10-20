@@ -74,7 +74,7 @@ pub(crate) struct ValidatedLaunchProgram(PathBuf);
 impl ValidatedLaunchProgram {
     /// Resolve one configured program and canonicalize its first executable match.
     pub(crate) fn resolve(program: &str) -> Option<Self> {
-        let path = std::env::var_os("PATH");
+        let path = executable_search_path();
         Self::resolve_with_path(program, path.as_deref())
     }
 
@@ -459,8 +459,16 @@ fn resolve_program(program: &str, path: Option<&OsStr>) -> Option<PathBuf> {
     shell_env::resolve_executable_in_path_value(OsStr::new(program), path).ok()
 }
 
-fn resolve_binary(name: &str) -> Result<String, ProtocolError> {
+/// The `PATH` agent executables are resolved on: the daemon's own.
+fn executable_search_path() -> Option<std::ffi::OsString> {
     let path = std::env::var_os("PATH");
+    #[cfg(test)]
+    let path = crate::test_support::with_thread_launch_path(path);
+    path
+}
+
+fn resolve_binary(name: &str) -> Result<String, ProtocolError> {
+    let path = executable_search_path();
     resolve_program(name, path.as_deref())
         .and_then(|resolved| resolved.to_str().map(str::to_owned))
         .ok_or_else(|| missing_binary(name))
@@ -471,7 +479,7 @@ fn resolve_binary(name: &str) -> Result<String, ProtocolError> {
 /// "available" in a capability snapshot agrees with what the launch path would
 /// accept. Returns the resolved path, or `None` when nothing executable matches.
 pub(crate) fn which_executable(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH");
+    let path = executable_search_path();
     resolve_program(name, path.as_deref())
 }
 

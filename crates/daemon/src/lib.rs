@@ -162,21 +162,10 @@ pub(crate) mod test_support {
                     .expect("create the thread-scoped test environment")
             });
             let mut variables = env.environment().clone();
-            THREAD_PATH_PREFIX.with(|prefix| {
-                let prefix = prefix.borrow();
-                if prefix.is_empty() {
-                    return;
-                }
-                let inherited = variables.get(std::ffi::OsStr::new("PATH")).cloned();
-                let joined = std::env::join_paths(
-                    prefix
-                        .iter()
-                        .cloned()
-                        .chain(inherited.iter().flat_map(std::env::split_paths)),
-                )
-                .expect("the launch path joins");
-                variables.insert("PATH".into(), joined);
-            });
+            let inherited = variables.get(std::ffi::OsStr::new("PATH")).cloned();
+            if let Some(path) = with_thread_launch_path(inherited) {
+                variables.insert("PATH".into(), path);
+            }
             crate::runtime::EnvironmentSource::fixed(variables)
         })
     }
@@ -188,9 +177,31 @@ pub(crate) mod test_support {
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
+    /// `inherited` with the directories of [`prepend_thread_launch_path`] in
+    /// front, or `inherited` itself when this thread registered none.
+    pub(crate) fn with_thread_launch_path(
+        inherited: Option<std::ffi::OsString>,
+    ) -> Option<std::ffi::OsString> {
+        THREAD_PATH_PREFIX.with(|prefix| {
+            let prefix = prefix.borrow();
+            if prefix.is_empty() {
+                return inherited;
+            }
+            let joined = std::env::join_paths(
+                prefix
+                    .iter()
+                    .cloned()
+                    .chain(inherited.iter().flat_map(std::env::split_paths)),
+            )
+            .expect("the launch path joins");
+            Some(joined)
+        })
+    }
+
     /// Puts `directory` first in the `PATH` that
-    /// [`thread_environment_source`] hands out on this test thread. Call it
-    /// before the registry under test is built.
+    /// [`thread_environment_source`] hands out on this test thread, and in the
+    /// search path the daemon resolves agent executables on. Call it before the
+    /// registry under test is built.
     pub(crate) fn prepend_thread_launch_path(directory: &std::path::Path) {
         THREAD_PATH_PREFIX.with(|prefix| prefix.borrow_mut().insert(0, directory.to_path_buf()));
     }
