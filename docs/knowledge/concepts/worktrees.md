@@ -115,6 +115,16 @@ that starts long-lived processes can still redirect their stderr
 (`>/dev/null 2>&1` or a log file); `hooks.stderr_tail_bytes = 0` keeps hook
 stderr on `/dev/null`.
 
+A host or repository `pre-remove` hook runs inside the worktree before
+`pohunek session rm` deletes it, and `post-remove` runs in the repository
+afterwards, so a project can release what its `post-create` hook provisioned
+for that worktree (containers, networks, ports). The same pair also runs when a
+failed create is rolled back, right after `post-create`, so both hooks must be
+idempotent. A failing or timed-out remove hook never blocks the removal: the
+`session rm` result carries a `hook` warning that names the event, printed by
+the CLI and present in `--json` as `warnings`, since the session record no
+longer exists to hold it.
+
 Removing a worktree that a live session still uses is refused with the typed
 `worktree_in_use` error; the same code is reserved for `session.remove` when
 other active delegated tasks use the session's worktree. Stop the sessions or

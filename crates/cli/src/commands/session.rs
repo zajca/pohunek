@@ -1845,25 +1845,7 @@ fn render_new_human(info: &SessionInfo) -> String {
             .unwrap_or_default();
         let _ = writeln!(output, "  worktree: {}{branch}", path.display());
     }
-    for warning in &info.warnings {
-        let _ = writeln!(
-            output,
-            "  warning [{}]: {}",
-            warning_kind_label(warning.kind),
-            warning.message
-        );
-        // A failing create hook's stderr tail is only in this result, so its
-        // multi-line detail is shown here, indented under the warning.
-        if let Some(detail) = &warning.detail {
-            let mut lines = detail.lines();
-            if let Some(first) = lines.next() {
-                let _ = writeln!(output, "    detail: {first}");
-            }
-            for line in lines {
-                let _ = writeln!(output, "      {line}");
-            }
-        }
-    }
+    write_warnings(&mut output, &info.warnings);
     output
 }
 
@@ -2446,6 +2428,29 @@ fn render_stop_human(session_id: &str, result: &SessionStopResult) -> String {
     format!("session {session_id}: stopped={}\n", result.stopped)
 }
 
+/// Append `warnings` to `output`, one `warning [kind]: message` line each.
+fn write_warnings(output: &mut String, warnings: &[protocol::SessionWarning]) {
+    for warning in warnings {
+        let _ = writeln!(
+            output,
+            "  warning [{}]: {}",
+            warning_kind_label(warning.kind),
+            warning.message
+        );
+        // A failing hook's stderr tail is only in this result, so its
+        // multi-line detail is shown here, indented under the warning.
+        if let Some(detail) = &warning.detail {
+            let mut lines = detail.lines();
+            if let Some(first) = lines.next() {
+                let _ = writeln!(output, "    detail: {first}");
+            }
+            for line in lines {
+                let _ = writeln!(output, "      {line}");
+            }
+        }
+    }
+}
+
 fn render_remove_human(session_id: &str, result: &SessionRemoveResult) -> String {
     let mut output = format!(
         "session {session_id}: removed={} stopped={}\n",
@@ -2477,6 +2482,7 @@ fn render_remove_human(session_id: &str, result: &SessionRemoveResult) -> String
             output.push_str(")\n");
         }
     }
+    write_warnings(&mut output, &result.warnings);
     output
 }
 
@@ -3501,6 +3507,7 @@ mod tests {
                         command: None,
                     },
                 ],
+                warnings: Vec::new(),
             },
         );
 
@@ -3525,12 +3532,43 @@ mod tests {
                 worktrees_removed: 1,
                 worktrees_failed: 2,
                 accepted_unconfirmed_processes: Vec::new(),
+                warnings: Vec::new(),
             },
         );
 
         assert_eq!(
             output,
             "session s-42: removed=true stopped=false\n  worktrees: removed=1 failed=2\n"
+        );
+    }
+
+    #[test]
+    fn renders_remove_result_hook_warnings() {
+        let output = render_remove_human(
+            "s-42",
+            &SessionRemoveResult {
+                removed: true,
+                stopped: false,
+                worktrees_removed: 1,
+                worktrees_failed: 0,
+                accepted_unconfirmed_processes: Vec::new(),
+                warnings: vec![protocol::SessionWarning {
+                    kind: protocol::SessionWarningKind::Hook,
+                    message: "pre-remove hook failed".to_owned(),
+                    detail: Some("exit status 1\nnetwork busy".to_owned()),
+                }],
+            },
+        );
+
+        assert_eq!(
+            output,
+            concat!(
+                "session s-42: removed=true stopped=false\n",
+                "  worktrees: removed=1 failed=0\n",
+                "  warning [hook]: pre-remove hook failed\n",
+                "    detail: exit status 1\n",
+                "      network busy\n"
+            )
         );
     }
 
@@ -3767,6 +3805,7 @@ mod tests {
                 start_identity: protocol::ProcessStartIdentity::new(99),
                 command: Some("gpg-agent".to_owned()),
             }],
+            warnings: Vec::new(),
         };
 
         let rendered = crate::commands::render_json(&result).expect("render json");

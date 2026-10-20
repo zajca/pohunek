@@ -6553,6 +6553,131 @@ async fn a_failing_post_create_hook_keeps_the_session_in_its_worktree() {
     let _ = handle.await;
 }
 
+/// Writes executable host-global hooks named in `hooks` into `config_dir` and
+/// returns the config directory for [`SessionRegistryConfig::config_dir`].
+fn host_hooks(socket: &TestSocket, hooks: &[(&str, &str)]) -> PathBuf {
+    let config_dir = socket.dir.join("config");
+    std::fs::create_dir_all(config_dir.join("hooks")).expect("create host hook directory");
+    for (name, body) in hooks {
+        write_executable(&config_dir.join("hooks").join(name), body);
+    }
+    config_dir
+}
+
+/// Creates a worktree session on a fresh repository, removes it, and returns
+/// the `session.remove` result. `hooks` are the host hooks installed first.
+async fn remove_worktree_session_with_hooks(
+    label: &str,
+    hooks: impl FnOnce(&TestSocket) -> Vec<(&'static str, String)>,
+) -> (SessionRemoveResult, TestSocket, PathBuf) {
+    let repo = init_git_repo();
+    let worktree_root = temp_dir(&format!("{label}-wt-root"));
+    let socket = temp_socket(label);
+    let hook_bodies = hooks(&socket);
+    let hook_refs = hook_bodies
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect::<Vec<_>>();
+    let config_dir = host_hooks(&socket, &hook_refs);
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "exec sleep 30"]),
+        worktree_root: Some(worktree_root.to_path_buf()),
+        store_path: Some(temp_dir(&format!("{label}-store")).join("metadata.jsonl")),
+        config_dir: Some(config_dir),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    let created: SessionInfo = serde_json::from_value(ok_payload(
+        create_worktree_session(
+            &mut control,
+            RuntimeRef::shell(),
+            repo.cwd().to_path_buf(),
+            "b",
+        )
+        .await,
+    ))
+    .expect("session info");
+    let worktree = created.worktree_path.clone().expect("worktree bound");
+    let remove = Request::make(
+        &format!("{label}-remove"),
+        method::SESSION_REMOVE,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let removed: SessionRemoveResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &remove).await))
+            .expect("remove result");
+    let _ = shutdown.send(());
+    let _ = handle.await;
+    (removed, socket, worktree)
+}
+
+/// `pre-remove` runs inside the worktree before it is deleted and `post-remove`
+/// runs after it is gone; a clean removal reports no warnings.
+#[tokio::test]
+async fn session_remove_runs_pre_remove_in_the_worktree_and_reports_a_clean_result() {
+    let (removed, socket, worktree) = remove_worktree_session_with_hooks("rm-hooks-ok", |socket| {
+        let pre = socket.dir.join("pre-remove-ran");
+        let post = socket.dir.join("post-remove-ran");
+        vec![
+            (
+                "pre-remove",
+                format!("#!/bin/sh\npwd -P > '{}'\n", pre.display()),
+            ),
+            (
+                "post-remove",
+                format!("#!/bin/sh\npwd -P > '{}'\n", post.display()),
+            ),
+        ]
+    })
+    .await;
+
+    assert!(removed.removed);
+    assert_eq!(removed.worktrees_removed, 1);
+    assert!(removed.warnings.is_empty(), "{:?}", removed.warnings);
+    assert!(!worktree.exists(), "the worktree is deleted");
+    let pre = std::fs::read_to_string(socket.dir.join("pre-remove-ran")).expect("pre-remove ran");
+    assert!(
+        pre.trim_end().ends_with(
+            worktree
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("worktree directory name")
+        ),
+        "pre-remove ran inside the worktree: {pre}"
+    );
+    assert!(
+        socket.dir.join("post-remove-ran").exists(),
+        "post-remove ran after the worktree was removed"
+    );
+}
+
+/// A failing `pre-remove` hook does not block the removal: the result carries a
+/// `hook` warning that names the event, since the session record is gone.
+#[tokio::test]
+async fn a_failing_pre_remove_hook_is_reported_in_the_session_remove_result() {
+    let (removed, _socket, worktree) = remove_worktree_session_with_hooks("rm-hooks-fail", |_| {
+        vec![("pre-remove", "#!/bin/sh\nexit 1\n".to_owned())]
+    })
+    .await;
+
+    assert!(removed.removed);
+    assert_eq!(removed.worktrees_removed, 1);
+    assert!(
+        !worktree.exists(),
+        "the failed hook does not keep the worktree"
+    );
+    let [warning] = removed.warnings.as_slice() else {
+        panic!("exactly one hook warning expected: {:?}", removed.warnings);
+    };
+    assert_eq!(warning.kind, SessionWarningKind::Hook);
+    assert!(
+        warning.message.contains("pre-remove"),
+        "warning names the failing event: {}",
+        warning.message
+    );
+}
+
 /// Bytes the chatty failing hook writes to stderr before its last line, far
 /// more than the default tail and more than one pipe buffer, so the capture
 /// must both drain concurrently and cut.

@@ -480,6 +480,7 @@ impl SessionRegistry {
             worktrees_removed: u32::try_from(released.worktrees.removed).unwrap_or(u32::MAX),
             worktrees_failed: u32::try_from(released.worktrees.failed).unwrap_or(u32::MAX),
             accepted_unconfirmed_processes: released.accepted_unconfirmed,
+            warnings: released.warnings,
         })
     }
 
@@ -599,6 +600,7 @@ impl SessionRegistry {
             worktrees_removed: u32::try_from(released.worktrees.removed).unwrap_or(u32::MAX),
             worktrees_failed: u32::try_from(released.worktrees.failed).unwrap_or(u32::MAX),
             accepted_unconfirmed_processes: released.accepted_unconfirmed,
+            warnings: released.warnings,
         })
     }
 
