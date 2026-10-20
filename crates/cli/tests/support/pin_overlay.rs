@@ -161,4 +161,3 @@ pub(crate) fn closed_port() -> u16 {
         .expect("port address")
         .port()
 }
-

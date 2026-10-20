@@ -670,7 +670,11 @@ fn a_stuck_lookup_of_this_machine_does_not_starve_the_peer_probes() {
     let document: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("versioned JSON envelope");
     let records = document["ok"].as_array().expect("host records");
-    assert_eq!(records.len(), 1, "no local record without the lookup: {records:?}");
+    assert_eq!(
+        records.len(),
+        1,
+        "no local record without the lookup: {records:?}"
+    );
     assert_eq!(records[0]["peer_id"], "remote-key");
     assert_eq!(
         records[0]["classification"], "reachable_daemon",
