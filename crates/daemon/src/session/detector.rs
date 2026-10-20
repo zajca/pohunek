@@ -1,10 +1,10 @@
 //! Per-session activity detector task and activity recording.
 
 use super::{
-    broadcast, debug, event, event_payload, is_terminal, log_lag_warn, record_activity_evidence,
-    timestamp_now, ActivityTransition, AgentActivity, DetectionPreviewRequest, Detector,
-    DetectorConfig, DetectorConfigUpdate, DetectorInputs, DetectorScope, LagWarnThrottle,
-    RuntimeWatchIdentity, SessionId, SessionRegistry,
+    activity_already_recorded, broadcast, debug, event, event_payload, is_terminal, log_lag_warn,
+    record_activity_evidence, timestamp_now, ActivityTransition, AgentActivity,
+    DetectionPreviewRequest, Detector, DetectorConfig, DetectorConfigUpdate, DetectorInputs,
+    DetectorScope, LagWarnThrottle, RuntimeWatchIdentity, SessionId, SessionRegistry,
 };
 
 fn detection_interval(config: &DetectorConfig) -> tokio::time::Interval {
@@ -269,6 +269,19 @@ impl SessionRegistry {
                 return;
             }
 
+            // A restated activity is neither a new revision nor an event. A
+            // waiter still gets it as evidence newer than its boundary. The
+            // waiter is looked up under the session lock: a wait registers
+            // before it takes its boundary under that lock, so a boundary this
+            // restatement follows always finds its waiter.
+            if !self.has_evidence_waiter(id)
+                && entry.info.activity == Some(transition.activity)
+                && entry.info.state_source == transition.source
+                && activity_already_recorded(entry, transition.activity, transition.source)
+            {
+                return;
+            }
+
             self.inner
                 .turns
                 .note_activity(id, entry.info.activity, transition.activity);
@@ -407,8 +420,13 @@ mod tests {
             loop {
                 let event = events.recv().await.expect("event stream stays open");
                 if event.event() == protocol::event::AGENT_STATE {
-                    return serde_json::from_value(event.payload().clone())
-                        .expect("valid agent state event");
+                    let state: protocol::AgentStateEvent =
+                        serde_json::from_value(event.payload().clone())
+                            .expect("valid agent state event");
+                    // Only the detector under test reports from the screen.
+                    if state.source == StateSource::Screen {
+                        return state;
+                    }
                 }
             }
         })
@@ -416,103 +434,217 @@ mod tests {
         .expect("an agent state event arrives before the virtual-time ceiling")
     }
 
-    /// The loop must read tokio's clock: a refresh that is due only because
-    /// paused time was advanced reaches the session, which a detector reading
-    /// `std::time::Instant::now()` never observes.
-    #[tokio::test]
-    async fn detector_loop_refreshes_a_stable_state_after_virtual_time_advances() {
-        let registry = SessionRegistry::new(SessionRegistryConfig {
-            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-            stop_grace: Duration::from_millis(50),
-            ..SessionRegistryConfig::default()
-        });
-        let cwd = pohunek_test_support::tempdir().expect("private session cwd");
-        let created = registry
-            .create(SessionNewParams {
-                name: None,
-                agent: "shell".to_owned(),
-                cwd: Some(cwd.path().to_path_buf()),
-                cols: 80,
-                rows: 24,
-                project: None,
-                repo: None,
-                branch: None,
-                base_branch: None,
-                input: None,
-                extended_input_ready_wait: None,
-                metadata: BTreeMap::new(),
-            })
-            .await
-            .expect("create shell session");
-        let mut events = registry.subscribe();
+    struct StableDetector {
+        registry: SessionRegistry,
+        session: protocol::SessionInfo,
+        events: broadcast::Receiver<protocol::Event>,
+        output: broadcast::Sender<Vec<u8>>,
+        cancel: CancellationToken,
+        // Held so the detector loop's resize, config and preview channels stay open.
+        _channels: (
+            watch::Sender<(u16, u16)>,
+            watch::Sender<DetectorConfigUpdate>,
+            mpsc::Sender<DetectionPreviewRequest>,
+        ),
+    }
 
-        let config = DetectorConfig {
-            input_readiness: crate::agent::host::InputReadiness::default(),
-            detection: DetectionConfig {
-                recheck_after: TEST_RECHECK_AFTER,
-                confirmations: 1,
-                cap: TEST_EVENT_CEILING,
-                stable_visible_refresh: TEST_STABLE_VISIBLE_REFRESH,
-                startup_grace: Duration::ZERO,
-            },
-            manifest: Some(Arc::new(
-                Manifest::parse_str(
-                    r#"
-                    [[rules]]
-                    id = "visible-working"
-                    state = "working"
-                    priority = 1
-                    region = "whole_recent"
-                    contains = "compiling workspace"
-                    "#,
-                )
-                .expect("manifest parses"),
-            )),
-        };
-        let (output_tx, output_rx) = broadcast::channel(8);
-        let (_resize_tx, resize_rx) = watch::channel((24, 80));
-        let (_config_tx, config_rx) = watch::channel(DetectorConfigUpdate {
-            generation: 0,
-            config,
-        });
-        let (_preview_tx, preview_rx) = mpsc::channel(1);
-        let (input_ready, _ready_rx) = watch::channel(false);
-        let cancel = CancellationToken::new();
-        registry.spawn_detector(DetectorInputs {
-            scope: DetectorScope {
-                id: created.id.clone(),
-                runtime: RuntimeWatchIdentity::from_info(&created)
-                    .expect("created session has a live runtime identity"),
-            },
-            output: output_rx,
-            initial_size: (24, 80),
-            cancel: cancel.clone(),
-            resize: resize_rx,
-            config: config_rx,
-            preview: preview_rx,
-            input_ready,
-            initial_input_done: super::super::CancellationToken::new(),
-        });
+    impl StableDetector {
+        async fn start(manifest: &str) -> Self {
+            let registry = SessionRegistry::new(SessionRegistryConfig {
+                shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+                stop_grace: Duration::from_millis(50),
+                ..SessionRegistryConfig::default()
+            });
+            let cwd = pohunek_test_support::tempdir().expect("private session cwd");
+            let session = registry
+                .create(SessionNewParams {
+                    name: None,
+                    agent: "shell".to_owned(),
+                    cwd: Some(cwd.path().to_path_buf()),
+                    cols: 80,
+                    rows: 24,
+                    project: None,
+                    repo: None,
+                    branch: None,
+                    base_branch: None,
+                    input: None,
+                    extended_input_ready_wait: None,
+                    metadata: BTreeMap::new(),
+                })
+                .await
+                .expect("create shell session");
+            // The session's own detector would add process-sourced events of
+            // its own; the detector under test is the only one.
+            registry.inner.sessions.lock().await[&session.id]
+                .detector_cancel
+                .cancel();
+            let events = registry.subscribe();
+
+            let config = DetectorConfig {
+                input_readiness: crate::agent::host::InputReadiness::default(),
+                detection: DetectionConfig {
+                    recheck_after: TEST_RECHECK_AFTER,
+                    confirmations: 1,
+                    cap: TEST_EVENT_CEILING,
+                    stable_visible_refresh: TEST_STABLE_VISIBLE_REFRESH,
+                    startup_grace: Duration::ZERO,
+                },
+                manifest: Some(Arc::new(
+                    Manifest::parse_str(manifest).expect("manifest parses"),
+                )),
+            };
+            let (output, output_rx) = broadcast::channel(8);
+            let (resize_tx, resize_rx) = watch::channel((24, 80));
+            let (config_tx, config_rx) = watch::channel(DetectorConfigUpdate {
+                generation: 0,
+                config,
+            });
+            let (preview_tx, preview_rx) = mpsc::channel(1);
+            let (input_ready, _ready_rx) = watch::channel(false);
+            let cancel = CancellationToken::new();
+            registry.spawn_detector(DetectorInputs {
+                scope: DetectorScope {
+                    id: session.id.clone(),
+                    runtime: RuntimeWatchIdentity::from_info(&session)
+                        .expect("created session has a live runtime identity"),
+                },
+                output: output_rx,
+                initial_size: (24, 80),
+                cancel: cancel.clone(),
+                resize: resize_rx,
+                config: config_rx,
+                preview: preview_rx,
+                input_ready,
+                initial_input_done: super::super::CancellationToken::new(),
+            });
+            Self {
+                registry,
+                session,
+                events,
+                output,
+                cancel,
+                _channels: (resize_tx, config_tx, preview_tx),
+            }
+        }
+
+        async fn revision(&self) -> u64 {
+            self.registry.inner.sessions.lock().await[&self.session.id].activity_revision
+        }
+
+        async fn finish(self) {
+            tokio::time::resume();
+            self.cancel.cancel();
+            let _ = self.registry.stop(&self.session.id).await;
+        }
+    }
+
+    const WORKING_MANIFEST: &str = r#"
+        [[rules]]
+        id = "visible-working"
+        state = "working"
+        priority = 1
+        region = "whole_recent"
+        contains = "compiling workspace"
+    "#;
+
+    const IDLE_MANIFEST: &str = r#"
+        [[rules]]
+        id = "visible-idle"
+        state = "idle"
+        priority = 1
+        region = "whole_recent"
+        contains = "ready for input"
+    "#;
+
+    /// Whether another `agent_state` event arrives within `window` of virtual time.
+    async fn agent_state_within(
+        events: &mut broadcast::Receiver<protocol::Event>,
+        window: Duration,
+    ) -> bool {
+        tokio::time::timeout(window, async {
+            loop {
+                let event = events.recv().await.expect("event stream stays open");
+                if event.event() == protocol::event::AGENT_STATE
+                    && event.payload()["source"] == "screen"
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// The loop must read tokio's clock: the refresh interval only elapses
+    /// because paused time was advanced, and a stable state restated across
+    /// it is neither a new event nor a new revision.
+    #[tokio::test]
+    async fn an_idle_session_left_alone_emits_no_further_agent_state() {
+        let mut detector = StableDetector::start(IDLE_MANIFEST).await;
 
         tokio::time::pause();
-        output_tx
-            .send(b"Compiling workspace".to_vec())
+        detector
+            .output
+            .send(b"ready for input".to_vec())
             .expect("detector holds the output receiver");
-        let first = next_agent_state(&mut events).await;
-        assert_eq!(first.activity, AgentActivity::Working);
+        let first = next_agent_state(&mut detector.events).await;
+        assert_eq!(first.activity, AgentActivity::Idle);
         assert_eq!(first.source, StateSource::Screen);
+        let revision = detector.revision().await;
+
+        assert!(
+            !agent_state_within(&mut detector.events, TEST_STABLE_VISIBLE_REFRESH * 5).await,
+            "an unchanged idle state is not restated"
+        );
+        assert_eq!(detector.revision().await, revision);
+
+        detector.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_waiting_input_still_gets_the_idle_state_restated_after_its_boundary() {
+        let mut detector = StableDetector::start(IDLE_MANIFEST).await;
+
+        tokio::time::pause();
+        detector
+            .output
+            .send(b"ready for input".to_vec())
+            .expect("detector holds the output receiver");
+        let first = next_agent_state(&mut detector.events).await;
+        let _waiter = detector
+            .registry
+            .watch_activity_evidence(&detector.session.id);
 
         tokio::time::advance(TEST_STABLE_VISIBLE_REFRESH).await;
-        let refreshed = next_agent_state(&mut events).await;
-        assert_eq!(refreshed.activity, AgentActivity::Working);
-        assert_eq!(refreshed.source, StateSource::Screen);
+        let restated = next_agent_state(&mut detector.events).await;
+        assert_eq!(restated.activity, AgentActivity::Idle);
         assert!(
-            refreshed.revision > first.revision,
-            "the tick re-emits the stable state as a new activity revision"
+            restated.revision > first.revision,
+            "a registered waiter receives newer evidence of the unchanged state"
         );
 
-        tokio::time::resume();
-        cancel.cancel();
-        let _ = registry.stop(&created.id).await;
+        detector.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_changed_state_still_publishes_a_new_revision() {
+        let mut detector =
+            StableDetector::start(&format!("{IDLE_MANIFEST}{WORKING_MANIFEST}")).await;
+
+        tokio::time::pause();
+        detector
+            .output
+            .send(b"ready for input".to_vec())
+            .expect("detector holds the output receiver");
+        let idle = next_agent_state(&mut detector.events).await;
+        detector
+            .output
+            .send(b"\x1b[2J\x1b[HCompiling workspace".to_vec())
+            .expect("detector holds the output receiver");
+        let working = next_agent_state(&mut detector.events).await;
+        assert_eq!(working.activity, AgentActivity::Working);
+        assert!(working.revision > idle.revision);
+
+        detector.finish().await;
     }
 }

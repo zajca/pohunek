@@ -8,12 +8,12 @@ use crate::agent::host::{RuntimeDefinition, RuntimeHost};
 use crate::runtime::WriteReservation;
 
 use super::{
-    broadcast, runtime_loss_reason, session_not_found, session_not_running,
-    unavailable_runtime_error, warn, worker_error_to_protocol, ActivityEvidence, AgentActivity,
-    Duration, ErrorClass, InputRules, LaunchCommand, LaunchCommandPlan, ProtocolError,
-    ResolvedAgent, RuntimeHandle, RuntimeRef, SessionEntry, SessionId, SessionInputParams,
-    SessionInputResult, SessionInputWait, SessionRegistry, SessionRegistryConfig, SessionState,
-    Worker,
+    broadcast, event_concerns_other_session, runtime_loss_reason, session_not_found,
+    session_not_running, unavailable_runtime_error, warn, worker_error_to_protocol,
+    ActivityEvidence, AgentActivity, Duration, ErrorClass, InputRules, LaunchCommand,
+    LaunchCommandPlan, ProtocolError, ResolvedAgent, RuntimeHandle, RuntimeRef, SessionEntry,
+    SessionId, SessionInputParams, SessionInputResult, SessionInputWait, SessionRegistry,
+    SessionRegistryConfig, SessionState, Worker,
 };
 
 pub(super) const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
@@ -84,6 +84,7 @@ impl SessionRegistry {
         self.ensure_not_external(&params.session_id).await?;
         let mut events = self.subscribe();
         let _waiter_permit = self.acquire_waiter(&params.session_id)?;
+        let _evidence_watch = self.watch_activity_evidence(&params.session_id);
         if self
             .input_activity_snapshot(&params.session_id, None)
             .await?
@@ -436,6 +437,9 @@ impl SessionRegistry {
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Ok(event) => {
+                        if event_concerns_other_session(&event, session_id) {
+                            continue;
+                        }
                         self.input_activity_snapshot(session_id, Some(&submission.runtime)).await?;
                         if event.event() == protocol::event::AGENT_STATE {
                             let state: AgentStateEvent = serde_json::from_value(event.payload().clone())

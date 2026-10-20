@@ -232,6 +232,10 @@ const DEFAULT_DETECTOR_LAG_WARN_INTERVAL: Duration = Duration::from_secs(5);
 /// immediate stop detection after a process has been observed. One second keeps
 /// launch detection responsive without continuously scanning procfs.
 const DEFAULT_PROCWATCH_POLL: Duration = Duration::from_secs(1);
+/// Backoff ceiling for a quiet session with a stable process tree: a scan
+/// every 5 s keeps new children visible within seconds while cutting the idle
+/// scan rate fivefold.
+const DEFAULT_PROCWATCH_IDLE_POLL_MAX: Duration = Duration::from_secs(5);
 /// Default maximum age for an unbound active-agent hook claim.
 ///
 /// Hooks are rich but lossy claims. Thirty seconds gives procwatch enough time
@@ -484,6 +488,11 @@ pub struct SessionRegistryConfig {
     pub detector_lag_warn_interval: Duration,
     /// Poll interval for per-session process discovery and fallback cleanup.
     pub procwatch_poll: Duration,
+    /// Longest poll interval of a quiet session whose process tree has not
+    /// changed. A rescan trigger (a working transition, a hook, an exit watch)
+    /// or a changed tree returns the session to [`Self::procwatch_poll`], so
+    /// this also bounds how long a new child of a quiet session goes unseen.
+    pub procwatch_idle_poll_max: Duration,
     /// Maximum age for an active-agent claim with no backing observed process.
     pub active_agent_claim_ttl: Duration,
     /// Whether to observe same-user agents started outside pohunek-owned PTYs.
@@ -562,6 +571,7 @@ impl Default for SessionRegistryConfig {
             catalog_trust: CatalogTrust::Absent,
             detector_lag_warn_interval: DEFAULT_DETECTOR_LAG_WARN_INTERVAL,
             procwatch_poll: DEFAULT_PROCWATCH_POLL,
+            procwatch_idle_poll_max: DEFAULT_PROCWATCH_IDLE_POLL_MAX,
             active_agent_claim_ttl: DEFAULT_ACTIVE_AGENT_CLAIM_TTL,
             observe_external_agents: false,
             worker_runtime_root: None,
@@ -597,6 +607,9 @@ struct SessionRegistryInner {
     observation_waiters: AtomicUsize,
     /// Per-session active bounded observation waits.
     observation_session_waiters: std::sync::Mutex<HashMap<SessionId, usize>>,
+    /// Sessions with a bounded input wait, which needs unchanged activity
+    /// restated as evidence newer than its submit boundary.
+    activity_evidence_waiters: std::sync::Mutex<HashMap<SessionId, usize>>,
     /// Turn-event journal, per-session turn progress, and turn waiter pool.
     turns: TurnEvents,
     /// Set when daemon process shutdown starts. Natural PTY exits observed after
@@ -798,6 +811,9 @@ struct SessionEntry {
     procwatch_cancel: CancellationToken,
     runtime_watch_cancel: CancellationToken,
     procwatch_rescan: Arc<Notify>,
+    /// Serializes this session's procwatch scans: a scan collects, then applies
+    /// against the state the previous scan left.
+    procwatch_scan: Arc<Mutex<()>>,
     stopping: bool,
     stop_transaction_id: Option<String>,
     /// Resolved input-framing rules (base-kind defaults, profile-overridden), used
@@ -888,6 +904,48 @@ impl ActivityEvidence {
     }
 }
 
+/// Whether `event` names a session other than `id`.
+///
+/// Session events carry the id as `session_id` or as `session.id`. An event
+/// naming no session (notifications, inventory) is not claimed to concern
+/// another session, so a waiter still re-checks its own state for it.
+fn event_concerns_other_session(event: &protocol::Event, id: &SessionId) -> bool {
+    let payload = event.payload();
+    let named = payload
+        .get("session_id")
+        .or_else(|| payload.get("session").and_then(|session| session.get("id")))
+        .and_then(serde_json::Value::as_str);
+    named.is_some_and(|named| named != id.0)
+}
+
+fn live_runtime_identity(entry: &SessionEntry) -> Option<SessionRuntimeIdentity> {
+    entry.info.runtime.as_ref().and_then(|runtime| {
+        if runtime.state != RuntimeState::Live {
+            return None;
+        }
+        SessionRuntimeIdentity::new(
+            runtime.worker_instance_id.clone()?,
+            runtime.runtime_generation,
+        )
+        .ok()
+    })
+}
+
+/// Whether the newest activity evidence of the live runtime already states
+/// `activity` from `source`.
+fn activity_already_recorded(
+    entry: &SessionEntry,
+    activity: AgentActivity,
+    source: StateSource,
+) -> bool {
+    let Some(runtime) = live_runtime_identity(entry) else {
+        return false;
+    };
+    entry.activity_evidence.back().is_some_and(|latest| {
+        latest.activity == activity && latest.source == source && latest.runtime == runtime
+    })
+}
+
 fn record_activity_evidence(
     entry: &mut SessionEntry,
     activity: AgentActivity,
@@ -898,16 +956,7 @@ fn record_activity_evidence(
         .activity_revision
         .checked_add(1)
         .expect("session activity revision overflowed");
-    let runtime = entry.info.runtime.as_ref().and_then(|runtime| {
-        if runtime.state != RuntimeState::Live {
-            return None;
-        }
-        SessionRuntimeIdentity::new(
-            runtime.worker_instance_id.clone()?,
-            runtime.runtime_generation,
-        )
-        .ok()
-    })?;
+    let runtime = live_runtime_identity(entry)?;
     let evidence = ActivityEvidence {
         activity,
         source,
@@ -1838,6 +1887,7 @@ impl SessionRegistry {
                 next_resize_sequence: AtomicU64::new(1),
                 observation_waiters: AtomicUsize::new(0),
                 observation_session_waiters: std::sync::Mutex::new(HashMap::new()),
+                activity_evidence_waiters: std::sync::Mutex::new(HashMap::new()),
                 turns,
                 daemon_shutdown_started: AtomicBool::new(false),
                 legacy_migration_pending: AtomicBool::new(false),

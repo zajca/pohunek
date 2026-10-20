@@ -233,6 +233,10 @@ pub struct Detector {
     latest_cwd_hint: Option<String>,
     process_activity: ProcessActivityScanner,
     needs_visible_recheck: bool,
+    /// Whether terminal context or the active manifest changed since the last
+    /// tick evaluated it. A tick over unchanged context yields the same
+    /// evidence, so it skips the manifest evaluation.
+    context_dirty: bool,
     /// Monotonic sequence of evidence arrivals that the strict `manifest_idle`
     /// latch judges freshness with: every received OSC title (even one that
     /// repeats its value) and every screen text change or character redraw
@@ -266,6 +270,7 @@ impl Detector {
             latest_cwd_hint: None,
             process_activity: ProcessActivityScanner::default(),
             needs_visible_recheck: false,
+            context_dirty: true,
             strict_seq: 0,
             title_seq: 0,
             screen_seq: 0,
@@ -277,14 +282,19 @@ impl Detector {
     ///
     /// Reconfiguration never re-arms a completed wait.
     pub fn finish_initial_input(&mut self) {
+        if !self.initial_input_pending {
+            return;
+        }
         self.initial_input_pending = false;
         self.screen.finish_observation();
+        self.context_dirty = true;
     }
 
     pub fn feed(&mut self, now: Instant, bytes: &[u8]) -> Vec<ActivityTransition> {
         // A reconfigure or resize may expose a blocker before the next
         // output clears it. Observe that context before consuming new bytes.
         self.sight_full_context();
+        self.context_dirty = true;
 
         let has_process_activity = self.process_activity.observe(bytes);
         let recent_before = self.screen.recent_text();
@@ -427,14 +437,19 @@ impl Detector {
         // debounced idle/blocked states and refreshes stable visible states. A
         // runtime reconfigure asks for one full visible-context recheck so cached
         // screen/OSC context can publish under the newly active manifest.
-        if let Some(hit) = self.manifest_evidence(ContextFreshness::all()) {
-            self.sight_visible_blocker(&hit);
-            if hit.evidence.activity != AgentActivity::Working || self.needs_visible_recheck {
-                push_transition(
-                    &mut transitions,
-                    self.state.observe_evidence(now, hit.evidence),
-                );
+        // A pending candidate needs repeated observations to confirm, so it
+        // keeps evaluating even over unchanged context.
+        if self.context_dirty || self.needs_visible_recheck || self.state.has_pending() {
+            if let Some(hit) = self.manifest_evidence(ContextFreshness::all()) {
+                self.sight_visible_blocker(&hit);
+                if hit.evidence.activity != AgentActivity::Working || self.needs_visible_recheck {
+                    push_transition(
+                        &mut transitions,
+                        self.state.observe_evidence(now, hit.evidence),
+                    );
+                }
             }
+            self.context_dirty = false;
         }
         self.needs_visible_recheck = false;
         push_transition(&mut transitions, self.state.tick(now));
@@ -471,12 +486,14 @@ impl Detector {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
+        self.context_dirty = true;
         self.screen.resize(rows, cols);
         self.sight_full_context();
     }
 
     /// Switches detector tuning and manifest without clearing terminal context.
     pub fn reconfigure(&mut self, now: Instant, config: DetectorConfig) {
+        self.context_dirty = true;
         self.state = StateMachine::new(now, config.detection);
         self.manifest = config.manifest;
         self.input_readiness = config.input_readiness;
@@ -497,6 +514,7 @@ impl Detector {
         self.osc.reset();
         self.process_activity.reset();
         self.state.clear_pending();
+        self.context_dirty = true;
         self.latest_title = None;
         self.latest_progress = None;
         self.latest_cwd_hint = None;
@@ -1658,6 +1676,59 @@ mod tests {
         assert_eq!(
             detector.tick(started_at + Duration::from_millis(800)),
             vec![transition(AgentActivity::Working, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn a_tick_over_unchanged_context_skips_the_manifest_evaluation() {
+        let started_at = instant();
+        let mut detector_config = config();
+        detector_config.manifest = Some(shared_manifest(
+            r#"
+            [[rules]]
+            id = "visible-idle"
+            state = "idle"
+            priority = 1
+            region = "whole_recent"
+            contains = "ready for input"
+            "#,
+        ));
+        let mut detector = Detector::new(3, 80, started_at, detector_config);
+        detector.feed(started_at, b"ready for input");
+        assert!(detector.context_dirty, "output marks the context dirty");
+
+        detector.tick(started_at + Duration::from_millis(100));
+        detector.tick(started_at + Duration::from_millis(200));
+        detector.tick(started_at + Duration::from_millis(300));
+        assert!(!detector.state.has_pending());
+        assert!(
+            !detector.context_dirty,
+            "the evaluating tick consumed the change"
+        );
+
+        assert!(
+            detector
+                .tick(started_at + Duration::from_millis(400))
+                .is_empty(),
+            "a stable idle state within the refresh interval emits nothing"
+        );
+        detector.resize(3, 100);
+        assert!(detector.context_dirty, "a resize marks the context dirty");
+    }
+
+    #[test]
+    fn repeated_startup_completion_does_not_invalidate_the_evaluated_context() {
+        let started_at = instant();
+        let mut detector = Detector::new(3, 80, started_at, config());
+        detector.finish_initial_input();
+        detector.tick(started_at + Duration::from_millis(100));
+        assert!(!detector.context_dirty);
+
+        // The detector loop calls this before every iteration once startup ended.
+        detector.finish_initial_input();
+        assert!(
+            !detector.context_dirty,
+            "a completed startup does not force the next tick to re-evaluate"
         );
     }
 
