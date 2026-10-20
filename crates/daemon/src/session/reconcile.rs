@@ -110,6 +110,18 @@ const RECONNECTING: Unavailability = Unavailability::Other(RuntimeState::Reconne
 /// The classification of a worker or job that may still be live.
 const CONFLICT: Unavailability = Unavailability::Other(RuntimeState::Conflict);
 
+/// The proof and loss reason of a worker whose job ended and was retired.
+///
+/// A sweep that could not confirm every marked process gone leaves processes
+/// that may survive, so that loss is not proven to end the session.
+fn ended_loss(journaled: bool, cleanup: Cleanup) -> (LossProof, &'static str) {
+    match (journaled, cleanup) {
+        (false, _) => (LossProof::Ended, "worker_unavailable"),
+        (true, Cleanup::Complete) => (LossProof::Ended, RUNTIME_LOST),
+        (true, Cleanup::Unconfirmed) => (LossProof::Unproven, RUNTIME_LOST_CLEANUP_UNCONFIRMED),
+    }
+}
+
 /// Whether classifying an unreachable running worker finished its watch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LossClassification {
@@ -1731,14 +1743,8 @@ impl SessionRegistry {
                     return Box::pin(self.settle_ended_stop(record, Some(&generation), retry))
                         .await;
                 }
-                let reason = match (journaled, cleanup) {
-                    (false, _) => "worker_unavailable",
-                    (true, Cleanup::Complete) => RUNTIME_LOST,
-                    (true, Cleanup::Unconfirmed) => RUNTIME_LOST_CLEANUP_UNCONFIRMED,
-                };
-                !self
-                    .insert_lost_record(record, reason, LossProof::Ended)
-                    .await
+                let (proof, reason) = ended_loss(journaled, cleanup);
+                !self.insert_lost_record(record, reason, proof).await
             }
         }
     }
@@ -2184,12 +2190,8 @@ impl SessionRegistry {
                 if retired.is_err() {
                     (RECONNECTING, SUPERVISION_UNAVAILABLE)
                 } else {
-                    let reason = match (journaled, cleanup) {
-                        (false, _) => "worker_unavailable",
-                        (true, Cleanup::Complete) => RUNTIME_LOST,
-                        (true, Cleanup::Unconfirmed) => RUNTIME_LOST_CLEANUP_UNCONFIRMED,
-                    };
-                    (Unavailability::Lost(LossProof::Ended), reason)
+                    let (proof, reason) = ended_loss(journaled, cleanup);
+                    (Unavailability::Lost(proof), reason)
                 }
             }
         };
@@ -13890,6 +13892,14 @@ generation "$1"
                 runtime.loss_reason.as_deref(),
                 Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED)
             );
+            // Processes that may survive keep the session from ending.
+            let info = fixture
+                .registry
+                .inspect(&SessionId("s-306".to_owned()))
+                .await
+                .expect("inspect");
+            assert_eq!(info.state, protocol::SessionState::Running);
+            assert_eq!(info.activity, None);
             assert!(
                 marked.alive(),
                 "an unreadable marker is never a signal permit"

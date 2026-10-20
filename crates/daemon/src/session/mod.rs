@@ -2250,7 +2250,7 @@ impl SessionRegistry {
             self.list_raw()
                 .await
                 .into_iter()
-                .filter(holds_worktree)
+                .filter(|session| !session.state.is_terminal())
                 .filter_map(|session| {
                     session
                         .worktree_path
@@ -2353,7 +2353,7 @@ impl SessionRegistry {
             .list_raw()
             .await
             .into_iter()
-            .filter(holds_worktree)
+            .filter(|session| !session.state.is_terminal())
             .filter_map(|session| session.worktree_path)
             .any(|worktree_path| canonical_or_original(&worktree_path) == target);
         if in_use {
@@ -7376,20 +7376,6 @@ fn session_not_found(id: &str) -> ProtocolError {
         format!("session not found: {id}"),
         None,
     )
-}
-
-/// Whether `session` still holds its worktree.
-///
-/// A session that has not ended does. So does a session whose runtime was lost
-/// with a cleanup the daemon could not confirm: marked processes may still run
-/// in its checkout, whatever state the session presents.
-pub(crate) fn holds_worktree(session: &SessionInfo) -> bool {
-    !session.state.is_terminal()
-        || session.runtime.as_ref().is_some_and(|runtime| {
-            runtime.state == RuntimeState::Lost
-                && runtime.loss_reason.as_deref()
-                    == Some(supervision::RUNTIME_LOST_CLEANUP_UNCONFIRMED)
-        })
 }
 
 /// The refusal for an operation that needs a running session.

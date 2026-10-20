@@ -287,8 +287,8 @@ Interpret runtime states as follows:
   retained or has been imported.
 - `lost`: no live PTY generation remains. When the daemon observed the end
   (the worker job ended and was retired, a host restart) the session shows
-  `failed` with no activity; a loss without that proof (a record that names no
-  generation, a recovery whose previous worker still answers, an unreachable
+  `failed` with no activity; a loss without that proof (reason
+  `runtime_lost_cleanup_unconfirmed`, a record that names no generation, a recovery whose previous worker still answers, an unreachable
   socket) keeps the session state and shows no activity. The logical record is
   intentionally retained; explicit native recovery is possible only with a valid launch
   recovery reference. Reason `runtime_lost` means the worker job ended while its

@@ -1477,7 +1477,8 @@ Important fields:
   observed (the worker's job ended and was retired, a host restart, or an
   answering worker whose child process is gone) belongs to a `failed` session with no `activity`
   and no `exit_code`; a `lost` runtime without that proof leaves the session's
-  `state` as it was and has no `activity`. Operations that need a running
+  `state` as it was and has no `activity` (always the case for
+  `runtime_lost_cleanup_unconfirmed`, whose processes may survive). Operations that need a running
   session (`session.input`, `session.resize`, attach) answer a lost runtime
   with `session_runtime_lost` and its recovery hint, whatever the session
   `state`. N-1 (0.35) clients read `failed` with `lost` as an ended session
