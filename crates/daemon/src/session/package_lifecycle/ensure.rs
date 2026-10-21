@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use package::catalog_state::CatalogState;
 use package::registry::{PackageSource, RegistryState, RetainedDigests};
 use package::verify::VerifyError;
-use package::{PackageDigest, VerifiedCatalog, VerifiedEntry, MAX_CATALOG_BYTES};
+use package::{PackageDigest, VerifiedCatalog, MAX_CATALOG_BYTES};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Gap, IntegrationAction, PackageAction, PackageStatus,
     ProfileAction, ProfileStatus, Refusal, SelectedPackage, UseReason, CODE_GAP_AGENT_NOT_ON_PATH,
@@ -143,8 +143,9 @@ enum Action {
 enum Health {
     /// Enabled, selected, and its root verifies and loads.
     Present,
-    /// Not installed, or not serving, or its root is missing: the archive
-    /// installs, enables and selects it again.
+    /// Not installed, not selected, not enabled, or its root is missing: the
+    /// archive installs, enables and selects it again. A selected package the
+    /// operator disabled never reaches this plan.
     Install,
     /// The root is present and fails verification or loading; the reason
     /// names the stable error kind.
@@ -291,6 +292,9 @@ struct Report {
     integrations: Vec<IntegrationAction>,
     refusals: Vec<Refusal>,
     gaps: Vec<Gap>,
+    /// Runtimes the detecting plan dropped: nothing uses them and their
+    /// program is off the search path.
+    undetected: Vec<String>,
 }
 
 impl Report {
@@ -306,7 +310,17 @@ impl Report {
             integrations: Vec::new(),
             refusals: Vec::new(),
             gaps: Vec::new(),
+            undetected: Vec::new(),
         }
+    }
+
+    /// Drops the not-serving gaps of the runtimes the detecting plan dropped,
+    /// which a step before the use of the runtimes was known may have reported.
+    fn forget_undetected_gaps(&mut self) {
+        let undetected = std::mem::take(&mut self.undetected);
+        self.gaps.retain(|gap| {
+            gap.code != CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING || !undetected.contains(&gap.runtime)
+        });
     }
 
     fn refuse(&mut self, subject: &str, code: &str, detail: &str) {
@@ -580,6 +594,7 @@ fn compute(inputs: &EnsureInputs, detect: bool) -> Result<Computed, EnsureError>
         detect_targets(release.as_ref(), &mut uses, &mut report)?;
     }
     let planned = plan_packages(&uses, release.as_ref(), &plan, &mut report)?;
+    report.forget_undetected_gaps();
     let binds = plan_binds(
         &profiles,
         &plan,
@@ -1032,7 +1047,8 @@ fn update_command(package: &PackageId, runtime: &RuntimeId) -> String {
 /// The step never installs a package that is absent and never selects or
 /// enables one the operator turned off. An official package that is installed
 /// but not serving, or that the release does not list for this platform, is
-/// reported as a gap with the command that updates it by hand. Without a usable
+/// reported as a gap with the command that updates, enables or diagnoses it by
+/// hand, by its state. Without a usable
 /// release catalog every such serving package is kept as it is.
 fn managed_runtimes(
     release: Option<&Release<'_>>,
@@ -1119,8 +1135,12 @@ fn managed_runtimes(
                 && record.identity().id == *entry.package_id()
         });
         if installed {
-            let detail = match disabled_unordered_selection(state, entry) {
-                Some(selected) => disabled_selection_detail(entry.package_id(), &selected),
+            let detail = match disabled_selected_package(state, entry.package_id()) {
+                Some(disabled) => disabled_package_detail(
+                    entry.package_id(),
+                    &disabled,
+                    disabled_state(plan, &disabled),
+                ),
                 None => format!(
                     "an official package of this runtime is installed but not selected and \
                      enabled, so the upgrade leaves it as you set it; update it with: {}",
@@ -1322,11 +1342,11 @@ fn plan_runtime(
     }
     if !matches!(health, Health::Present) {
         if let Some(kind) = claim_refusal(plan, &prepared) {
-            report_claim_refusal(report, &subject, kind);
+            report_claim_refusal(report, &subject, kind, RELEASE_CLAIM_DETAIL);
             return Ok(None);
         }
         // The apply judges the retained set only where it selects the package:
-        // a package that is already the selected version is only enabled, and
+        // a package that is already the selected version is only repaired, and
         // a new or unselected one is selected over every retained digest.
         if selection_pending(plan, &prepared.identity.id, &prepared.digest)
             && coexistence_blocked(plan, &prepared)
@@ -1374,15 +1394,16 @@ fn decide_selection(
     report: &mut Report,
     reserved: bool,
 ) -> Selection {
-    if report.detect && !passes_detect_gate_before_leaving(plan, prepared, subject, reasons, report)
+    if report.detect
+        && !passes_detect_gate_before_leaving(plan, prepared, subject, reasons, report, reserved)
     {
         return Selection::Leave;
     }
     selection_outcome(plan, prepared, subject, report, reserved)
 }
 
-/// Under `--detect`, a runtime the plan would leave untouched (its unordered
-/// selection is disabled, does not load or is altered) is first judged by the
+/// Under `--detect`, a runtime the plan would leave untouched (its package is
+/// disabled, or its unordered selection does not load or is altered) is first judged by the
 /// release package's search-path gate, as a replacing plan is: a runtime
 /// nothing uses and whose program is off the search path is dropped, not
 /// reported or refused. `false` drops the runtime.
@@ -1392,18 +1413,21 @@ fn passes_detect_gate_before_leaving(
     subject: &str,
     reasons: &mut Vec<UseReason>,
     report: &mut Report,
+    reserved: bool,
 ) -> bool {
-    match unordered_selection(plan, prepared) {
-        Some((Serving::Disabled | Serving::Broken | Serving::Damaged(_), _)) => {
-            detect_on_search_path(
-                report,
-                subject,
-                prepared.definition.program().as_str(),
-                reasons,
-            )
-        }
-        _ => true,
-    }
+    let left = disabled_package(plan, prepared).is_some()
+        || disabled_release_package(plan, prepared, reserved).is_some()
+        || matches!(
+            unordered_selection(plan, prepared),
+            Some((Serving::Broken | Serving::Damaged(_), _))
+        );
+    !left
+        || detect_on_search_path(
+            report,
+            subject,
+            prepared.definition.program().as_str(),
+            reasons,
+        )
 }
 
 /// How the selected version of a runtime stays.
@@ -1502,15 +1526,18 @@ fn detect_on_search_path(
             "`{program}` is not on the search path; put the agent on it, then run setup again"
         ),
     );
-    !reasons.is_empty()
+    let planned = !reasons.is_empty();
+    if !planned {
+        report.undetected.push(subject.to_owned());
+    }
+    planned
 }
 
 /// Reports a release package the claim rules refuse: a conflict with another
 /// package that serves the runtime id is a gap under `--detect`, every other
 /// refusal stays a refusal.
-fn report_claim_refusal(report: &mut Report, subject: &str, kind: PackageErrorKind) {
+fn report_claim_refusal(report: &mut Report, subject: &str, kind: PackageErrorKind, detail: &str) {
     let refusal_code = ProtocolError::from(kind).code;
-    let detail = "the release package cannot take this runtime id alongside the installed runtimes";
     if kind == PackageErrorKind::RuntimeConflict {
         report.gap_or_refuse(
             subject,
@@ -1945,22 +1972,16 @@ fn classify_pin<'a>(
     let keep = |reason: &str, previous_version: Option<&str>| {
         Pinning::Keep(kept_action(profile, previous_version, reason))
     };
-    if matches!(entry.action, Action::Kept) {
-        // Only a kept selection that has no order against the release's
-        // version is reported: the pin stays and differs from what serves the
-        // runtime.
-        let unordered = entry.release_version.as_deref().is_some_and(|release| {
+    let kept_selection = matches!(entry.action, Action::Kept);
+    // Only a kept selection that has no order against the release's version is
+    // reported: the pin stays and differs from what serves the runtime.
+    if kept_selection
+        && !entry.release_version.as_deref().is_some_and(|release| {
             semver::Version::parse(entry.identity.version.as_str()).is_err()
                 || semver::Version::parse(release).is_err()
-        });
-        if !unordered {
-            return Pinning::Untouched;
-        }
-        let version = plan
-            .state
-            .and_then(|state| state.package(&profile.pin.digest))
-            .map(|record| record.identity().version.as_str().to_owned());
-        return keep(CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION, version.as_deref());
+        })
+    {
+        return Pinning::Untouched;
     }
     let Some(record) = plan
         .state
@@ -1976,6 +1997,9 @@ fn classify_pin<'a>(
     // package key and digest record disagree is anomalous and kept.
     if record.identity().id != entry.identity.id || profile.pin.package != entry.identity.id {
         return keep(CODE_PINNED_TO_OTHER_PACKAGE, Some(&version));
+    }
+    if kept_selection {
+        return keep(CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION, Some(&version));
     }
     let target_is_official = plan
         .state
@@ -2271,16 +2295,75 @@ fn replaces_newer(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<Selected
     })
 }
 
-/// The digest, as the `--digest` selector spells it, of the disabled selected
-/// official version of `entry`'s package when it has no order against the
-/// entry's version.
-fn disabled_unordered_selection(state: &RegistryState, entry: &VerifiedEntry) -> Option<String> {
-    let selected = state.selected(entry.package_id())?;
+/// The selected official version of package `id` when the operator disabled
+/// it. Whatever its version, only the operator leaves a selected package
+/// disabled: an install records the enabled flag and the selection in one
+/// registry commit.
+fn disabled_selected_package(state: &RegistryState, id: &PackageId) -> Option<PackageDigest> {
+    let selected = state.selected(id)?;
     let record = state.package(selected)?;
-    (record.source() == PackageSource::Official
-        && !record.enabled()
-        && version_order(&record.identity().version, entry.version()).is_none())
-    .then(|| selector_digest(selected))
+    (record.source() == PackageSource::Official && !record.enabled()).then(|| selected.clone())
+}
+
+/// [`disabled_selected_package`] over the plan's registry and the prepared
+/// release package's id.
+fn disabled_package(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<PackageDigest> {
+    disabled_selected_package(plan.state?, &prepared.identity.id)
+}
+
+/// Why a refused release package cannot take its runtime id.
+const RELEASE_CLAIM_DETAIL: &str =
+    "the release package cannot take this runtime id alongside the installed runtimes";
+
+/// The release's own package when it is recorded, official and disabled, and
+/// the selection would otherwise be replaced by it: an enabled selection that
+/// is kept is not affected. Only the operator leaves a package disabled and
+/// unselected (`plugin disable`, `plugin install --no-enable`): an install
+/// records the enabled flag and the selection in one registry commit.
+fn disabled_release_package(
+    plan: &PlanInputs<'_>,
+    prepared: &Prepared,
+    reserved: bool,
+) -> Option<PackageDigest> {
+    if unordered_selection(plan, prepared).is_some()
+        || (!reserved && replaces_newer(plan, prepared).is_some())
+    {
+        return None;
+    }
+    let record = plan.state?.package(&prepared.digest)?;
+    (record.source() == PackageSource::Official && !record.enabled())
+        .then(|| prepared.digest.clone())
+}
+
+/// Whether `plugin enable` succeeds for a disabled package.
+#[derive(Clone, Copy)]
+enum DisabledState {
+    /// Its root loads and it may serve its runtime id.
+    Enableable,
+    /// Its root is missing.
+    RootMissing,
+    /// Its root is present and fails verification or loading.
+    Damaged(PackageErrorKind),
+    /// Another package serves its runtime id.
+    Claimed(PackageErrorKind),
+}
+
+/// The state of the disabled package `digest`, judged as `plugin enable` does.
+fn disabled_state(plan: &PlanInputs<'_>, digest: &PackageDigest) -> DisabledState {
+    let (Some(context), Some(record)) = (
+        plan.planning,
+        plan.state.and_then(|state| state.package(digest)),
+    ) else {
+        return DisabledState::Enableable;
+    };
+    match context.store.read_definition(digest, record.identity()) {
+        Ok(_definition) => match prove_loadable(context, digest) {
+            Ok(_definition) => DisabledState::Enableable,
+            Err(kind) => DisabledState::Claimed(kind),
+        },
+        Err(PackageRejection::Root(VerifyError::RootMissing)) => DisabledState::RootMissing,
+        Err(rejection) => DisabledState::Damaged(rejection_kind(&rejection)),
+    }
 }
 
 /// A digest without its `sha256:` prefix, as the `--digest` selector spells it.
@@ -2289,14 +2372,31 @@ fn selector_digest(digest: &PackageDigest) -> String {
     text.strip_prefix(DIGEST_PREFIX).unwrap_or(text).to_owned()
 }
 
-/// The gap detail for a disabled selected version that cannot be ordered
-/// against the release's; `plugin update` refuses to replace it.
-fn disabled_selection_detail(package: &PackageId, digest: &str) -> String {
-    format!(
-        "the selected version cannot be ordered against the release's and is disabled, so \
-         the upgrade leaves it as you set it; enable it with: \
-         pohunek plugin enable {package} --digest {digest}"
-    )
+/// The gap detail for a disabled package the upgrade leaves as the operator
+/// set it. `plugin update` would re-enable it, or refuse it as a downgrade, so
+/// the hint is `plugin enable`, after the repair its state needs.
+fn disabled_package_detail(
+    package: &PackageId,
+    digest: &PackageDigest,
+    state: DisabledState,
+) -> String {
+    let selector = selector_digest(digest);
+    let enable = format!("pohunek plugin enable {package} --digest {selector}");
+    match state {
+        DisabledState::Enableable => format!(
+            "the package is disabled, so the upgrade leaves it as you set it; enable it with: \
+             {enable}"
+        ),
+        DisabledState::RootMissing => format!(
+            "the package is disabled and its root is missing, so the upgrade leaves it; restore \
+             it with `pohunek plugin install` of that version's archive, then enable it with: \
+             {enable}"
+        ),
+        DisabledState::Damaged(_) | DisabledState::Claimed(_) => "the package is disabled and \
+             cannot be enabled as it is, so the upgrade leaves it; `pohunek plugin doctor` names \
+             the cause"
+            .to_owned(),
+    }
 }
 
 /// Prefix of a package digest; the `--digest` selector spells it without.
@@ -2315,11 +2415,14 @@ enum Selection {
 
 /// Decides what happens to the selected official version of a runtime.
 ///
-/// A version that cannot be ordered against the release's is never replaced,
-/// for any runtime: it is kept and reported when it serves, and left as the
-/// operator set it, with a gap, when it is disabled or cannot load. A
-/// newer ordered version is kept only for a runtime that is not reserved (Pi);
-/// a reserved runtime's is replaced and reported through `replaces_newer`.
+/// A selected package the operator disabled is never replaced, selected or
+/// enabled, whatever its version, and neither is a disabled release package
+/// that a replacement would enable: the runtime is left as set, with a gap. A version that
+/// cannot be ordered against the release's is never replaced either, for any
+/// runtime: it is kept and reported when it serves, and left, with a gap, when
+/// it cannot load. A newer ordered version is kept only for a runtime that is
+/// not reserved (Pi); a reserved runtime's is replaced and reported through
+/// `replaces_newer`.
 fn selection_outcome(
     plan: &PlanInputs<'_>,
     prepared: &Prepared,
@@ -2327,45 +2430,89 @@ fn selection_outcome(
     report: &mut Report,
     reserved: bool,
 ) -> Selection {
+    let id = &prepared.identity.id;
+    if let Some(digest) = disabled_package(plan, prepared) {
+        leave_disabled(plan, report, subject, id, &digest);
+        return Selection::Leave;
+    }
     match unordered_selection(plan, prepared) {
         Some((Serving::Loadable, _)) => return Selection::Keep { unordered: true },
         Some((Serving::Damaged(kind), selected)) => {
             refuse_damaged(report, subject, kind, &selected);
             return Selection::Leave;
         }
-        Some((state, selected)) => {
-            let id = &prepared.identity.id;
-            let detail = match state {
-                Serving::Disabled => disabled_selection_detail(id, &selector_digest(&selected)),
-                _ => format!(
+        Some((Serving::Broken, _)) => {
+            report_not_serving(
+                report,
+                subject,
+                format!(
                     "the selected version cannot be ordered against the release's and its \
                      package root is missing or does not load, so the upgrade leaves it; \
                      restore it with `pohunek plugin install` of that version's archive, or \
                      select another installed version with: pohunek plugin select {id} \
                      --digest <digest>"
                 ),
-            };
-            // `managed_runtimes` may already report a non-reserved runtime's
-            // package; its `plugin update` hint is refused for this selection,
-            // so this detail replaces it.
-            match report.gaps.iter_mut().find(|gap| {
-                gap.runtime == subject && gap.code == CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING
-            }) {
-                Some(gap) => gap.detail = detail,
-                None => report.gap(subject, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING, &detail),
-            }
-            report
-                .integrations
-                .retain(|action| action.runtime != subject);
+            );
             return Selection::Leave;
         }
         None => {}
+    }
+    if let Some(digest) = disabled_release_package(plan, prepared, reserved) {
+        leave_disabled(plan, report, subject, id, &digest);
+        return Selection::Leave;
     }
     if !reserved && replaces_newer(plan, prepared).is_some() {
         Selection::Keep { unordered: false }
     } else {
         Selection::Replace
     }
+}
+
+/// Reports a runtime whose disabled package `digest` the upgrade leaves as the
+/// operator set it, with what the package's state needs before it is enabled.
+fn leave_disabled(
+    plan: &PlanInputs<'_>,
+    report: &mut Report,
+    subject: &str,
+    id: &PackageId,
+    digest: &PackageDigest,
+) {
+    let state = disabled_state(plan, digest);
+    if matches!(state, DisabledState::Damaged(_) | DisabledState::Claimed(_)) {
+        // The refusal or the claim gap below supersedes the gap that
+        // `managed_runtimes` reported for the package.
+        report.gaps.retain(|gap| {
+            gap.runtime != subject || gap.code != CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING
+        });
+    }
+    match state {
+        DisabledState::Damaged(kind) => refuse_damaged(report, subject, kind, digest),
+        DisabledState::Claimed(kind) => report_claim_refusal(
+            report,
+            subject,
+            kind,
+            "the disabled package cannot be enabled while another package serves this runtime id",
+        ),
+        state => report_not_serving(report, subject, disabled_package_detail(id, digest, state)),
+    }
+}
+
+/// Reports a runtime the upgrade leaves as it is because its package is not
+/// serving, and lists none of its integrations.
+fn report_not_serving(report: &mut Report, subject: &str, detail: String) {
+    // `managed_runtimes` may already report a non-reserved runtime's package;
+    // this detail replaces it.
+    match report
+        .gaps
+        .iter_mut()
+        .find(|gap| gap.runtime == subject && gap.code == CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)
+    {
+        Some(gap) => gap.detail = detail,
+        None => report.gap(subject, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING, &detail),
+    }
+    report
+        .integrations
+        .retain(|action| action.runtime != subject);
 }
 
 /// The state of a selected official version that has no order against the
@@ -2377,13 +2524,11 @@ enum Serving {
     Broken,
     /// Enabled, and its root is present but altered or damaged.
     Damaged(PackageErrorKind),
-    /// Turned off by the operator.
-    Disabled,
 }
 
-/// The state of the selected official version of the package when it differs
-/// from the prepared one and the two versions have no order, with its digest;
-/// `None` otherwise.
+/// The state of the enabled selected official version of the package when it
+/// differs from the prepared one and the two versions have no order, with its
+/// digest; `None` otherwise.
 fn unordered_selection(
     plan: &PlanInputs<'_>,
     prepared: &Prepared,
@@ -2399,14 +2544,13 @@ fn unordered_selection(
     {
         return None;
     }
-    let serving = if record.enabled() {
-        match health_of(plan, selected) {
-            Health::Present => Serving::Loadable,
-            Health::Install => Serving::Broken,
-            Health::Damaged(kind) => Serving::Damaged(kind),
-        }
-    } else {
-        Serving::Disabled
+    if !record.enabled() {
+        return None;
+    }
+    let serving = match health_of(plan, selected) {
+        Health::Present => Serving::Loadable,
+        Health::Install => Serving::Broken,
+        Health::Damaged(kind) => Serving::Damaged(kind),
     };
     Some((serving, selected.clone()))
 }

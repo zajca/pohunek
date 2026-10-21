@@ -1043,7 +1043,7 @@ async fn assert_release_step_of(kind: &Kind, tag: &str, new: Package, adopts: bo
 /// Records `package` of `kind` in the registry of `session`'s host with
 /// `source`, as a registry written outside the daemon's install path would
 /// hold it (the install path refuses a reserved runtime id for a local
-/// package). The package is neither enabled nor selected.
+/// package). The package is enabled and not selected.
 fn seed_record(
     session: &Stopped,
     package: &Package,
@@ -1072,7 +1072,7 @@ fn seed_record(
             expected: &package.digest,
             identity,
             source,
-            enabled: false,
+            enabled: true,
             select: false,
             installed_at_unix_seconds: 1,
         })

@@ -818,7 +818,9 @@ version and digest. A pinned profile the step does not move is listed as
 - `pinned_to_same_version`: another digest of the release's version;
 - `pinned_differs_from_kept_selection`: the step keeps a selected version of
   the runtime that cannot be ordered against the release's, and the profile is
-  pinned to another digest; it is never repinned;
+  pinned to another official version of the same package; it is never repinned.
+  Beside a kept selection a pin with one of the reasons above (unknown digest,
+  non-official or other package) reports that reason instead;
 - `pinned_target_not_official`: the release's package is recorded as not
   official on this host.
 
@@ -843,9 +845,21 @@ When the selected official version of any runtime, `claude`, `codex` and
 `1.0.3`), the upgrade keeps the selected version, installs nothing for that
 runtime and reports the gap `plugin_update_version_unordered`. The plan names
 the retained package and the version the release offers, as it does for Pi.
-A selected version you disabled is never replaced, selected or enabled: the
-plan plans nothing for that runtime and reports the gap
-`official_package_not_serving`. The same holds for a selected version that is enabled but
+A selected package you disabled is never replaced, selected or enabled, whatever its
+version is (older, newer, equal under another digest or unordered; the release's own
+package counts too): the plan plans nothing for that runtime and reports the gap
+`official_package_not_serving` with `pohunek plugin enable <package> --digest <digest>`.
+Enable it and the next upgrade proceeds as for any enabled package. A disabled
+package whose root is missing gets `plugin install` of that version's archive in the
+hint before the enable, one whose root is altered is refused with
+`plugin uninstall --remove-modified`, and one that cannot be enabled because another
+package serves the runtime id is the gap `runtime_served_by_other_package` (a refusal
+without `--detect`); a Pi runtime the plan does not judge gets only a gap that points to
+`pohunek plugin doctor` in those states. The release's own package, recorded and
+disabled while another enabled version is selected, is not enabled or selected by the
+upgrade either: the gap names `plugin enable` for its digest. Under
+`service check --detect` the gap is dropped with a Pi runtime whose package is disabled and whose program
+is off the search path. The same holds for a selected version that is enabled but
 cannot be loaded: the plan names the repair (`plugin install` of that version, or
 `plugin select` of another). A selected version whose root is present but altered
 is refused, and the refusal names `plugin uninstall --remove-modified`. Unpinned profiles
@@ -876,10 +890,11 @@ This covers Pi too. The upgrade's runtime step manages `claude`, `codex` and
 `hermes`, and also an official Pi package that is installed, selected and
 enabled: it installs and selects the release's Pi version and repins a Pi
 profile pinned to the older official version. An unpinned Pi profile follows the
-selection. An absent, disabled or deselected Pi package is not changed; the plan
-lists a gap with the `pohunek plugin update pohunek.runtime.pi
+selection. An absent or deselected Pi package is not changed; the plan lists
+a gap with the `pohunek plugin update pohunek.runtime.pi
 runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json --yes`
-command, after which `pohunek plugin profile migrate <name> --yes` moves a Pi
+command. A disabled one is not changed either, and its gap names
+`pohunek plugin enable pohunek.runtime.pi --digest <digest>` instead. After the update `pohunek plugin profile migrate <name> --yes` moves a Pi
 profile. A selected Pi version newer than the release's is kept. Its stopped
 sessions are adopted on their next resume or fork. A session
 launched as the bare `pi` runtime follows the selected version.

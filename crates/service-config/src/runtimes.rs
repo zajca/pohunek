@@ -56,21 +56,24 @@ pub const CODE_SERVICE_CONFIG_UNREADABLE: &str = "service_config_unreadable";
 /// release package. The step keeps the pin, so a downgrade is never applied
 /// to it.
 pub const CODE_PINNED_TO_NEWER_VERSION: &str = "pinned_to_newer_version";
-/// A host profile is pinned to a digest other than the selected version the
-/// step keeps for its runtime. The step keeps the pin and repins nothing.
+/// A host profile is pinned to another official version of the package whose
+/// selected version the step keeps for its runtime. The step keeps the pin and
+/// repins nothing.
 pub const CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION: &str = "pinned_differs_from_kept_selection";
 /// A host profile is pinned to a different package of the same version as the
 /// release package. Such a pin is anomalous, so the step keeps it.
 pub const CODE_PINNED_TO_SAME_VERSION: &str = "pinned_to_same_version";
 /// A host profile is pinned to a package that is not an official one, such as
 /// a local package installed by explicit digest. The step never repins it.
+/// Beside a kept selection it names the pin instead of the difference.
 pub const CODE_PINNED_TO_NON_OFFICIAL_PACKAGE: &str = "pinned_to_non_official_package";
 /// A host profile is pinned to a package with another package id than the
-/// release package of its runtime. The step never repins it.
+/// release package of its runtime. The step never repins it. Beside a kept
+/// selection it names the pin instead of the difference.
 pub const CODE_PINNED_TO_OTHER_PACKAGE: &str = "pinned_to_other_package";
 /// A host profile is pinned to a digest the registry has no record of, or to a
 /// version that cannot be ordered against the release package. The step keeps
-/// the pin.
+/// the pin. Beside a kept selection it names the pin instead of the difference.
 pub const CODE_PINNED_VERSION_UNKNOWN: &str = "pinned_version_unknown";
 /// The release package of a host profile's runtime is recorded as a package
 /// that is not official, so a repin cannot target it. The step keeps the pin.
@@ -87,9 +90,11 @@ pub const CODE_GAP_CONFIG_HOME_MISSING: &str = "config_home_missing";
 pub const CODE_GAP_CONFIG_HOME_SYMLINK: &str = "config_home_is_symlink";
 /// Another package already serves the runtime id. It is left untouched.
 pub const CODE_GAP_SERVED_BY_OTHER_PACKAGE: &str = "runtime_served_by_other_package";
-/// An official package of a runtime that is not reserved (Pi) is installed but
-/// not selected and enabled, so the step does not change it. The operator
-/// updates it with `plugin update`.
+/// An official package is installed but the step does not serve its runtime
+/// with it and does not change it: it is not selected (the operator updates it
+/// with `plugin update`), or the selected package is disabled (the
+/// operator enables it with `plugin enable`), or the selected version cannot
+/// be ordered against the release's and does not load.
 pub const CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING: &str = "official_package_not_serving";
 /// The selected official package of a runtime that is not reserved (Pi) has a
 /// version that cannot be ordered against the release's, so it is kept. The
