@@ -2676,7 +2676,21 @@ pub(crate) fn pending_report(record: &Record) -> PendingReport {
 pub(crate) fn job_warnings(context: &Context, job: &JobPath) -> Vec<String> {
     let mut warnings = persisted_path_warnings(context, job);
     warnings.extend(manager_warnings(job));
+    warnings.extend(drop_in_path_warnings(job));
     warnings
+}
+
+/// The warning of a recorded `PATH` that a drop-in of the daemon unit replaces:
+/// the job runs with the drop-in's value, and the judgement uses it.
+fn drop_in_path_warnings(job: &JobPath) -> Vec<String> {
+    let Some(drop_in) = &job.path_drop_in else {
+        return Vec::new();
+    };
+    let warning = format!(
+        "the drop-in {drop_in} of the daemon unit sets PATH and replaces the PATH service.toml records, so the daemon job runs with the drop-in's PATH and this judgement uses it. Remove the PATH assignment from the drop-in to run with the recorded one"
+    );
+    tracing::warn!(drop_in = %drop_in, "{warning}");
+    vec![warning]
 }
 
 /// Refuses a transaction gate's judgement that ran without the service
@@ -3091,6 +3105,8 @@ impl Record {
 pub(crate) enum PathSource {
     /// The `PATH` `service.toml` records for the job.
     Recorded,
+    /// A drop-in of the daemon unit (Linux), which replaces the recorded `PATH`.
+    DropIn,
     /// The systemd user manager's `Environment`, read now (Linux).
     UserManager,
     /// The launchd domain's `environment`, set by `launchctl setenv`.
@@ -3114,6 +3130,9 @@ pub(crate) struct JobPath {
     pub(crate) value: String,
     /// Where the value came from.
     pub(crate) source: PathSource,
+    /// The drop-in of the daemon unit that replaces the `PATH` `service.toml`
+    /// records, when one does (Linux).
+    pub(crate) path_drop_in: Option<String>,
     /// The launchd `default environment` `PATH` of the loaded job, whatever
     /// `value` is. An upgrade journals it; `None` when the job is not loaded and
     /// always on Linux.
@@ -3134,6 +3153,7 @@ impl std::fmt::Debug for JobPath {
         f.debug_struct("JobPath")
             .field("value", &self.value)
             .field("source", &self.source)
+            .field("path_drop_in", &self.path_drop_in)
             .field("loaded_default", &self.loaded_default)
             .field("variables", &self.variables.keys().collect::<Vec<_>>())
             .field("manager_unreachable", &self.manager_unreachable)
@@ -3219,7 +3239,7 @@ pub(crate) async fn job_search_path(
 }
 
 /// The `PATH` of a daemon job that records `recorded`, as [`job_search_path`]
-/// gives it. Only a job that records no `PATH` reads the manager, for its `PATH`.
+/// gives it. Off Linux a recorded `PATH` reads no service manager at all.
 ///
 /// # Errors
 ///
@@ -3229,10 +3249,13 @@ pub(crate) async fn recorded_job_search_path(
     recorded: &SearchPath,
     journal_default: Option<JournalDefault<'_>>,
 ) -> Result<JobPath, Error> {
-    if !recorded.is_empty() {
+    // On Linux the daemon unit's drop-ins can replace even a recorded `PATH`, so
+    // the same resolver answers every caller.
+    if !cfg!(target_os = "linux") && !recorded.is_empty() {
         return Ok(JobPath {
             value: recorded.to_env_value(),
             source: PathSource::Recorded,
+            path_drop_in: None,
             loaded_default: None,
             variables: BTreeMap::new(),
             manager_unreachable: None,
@@ -3256,6 +3279,9 @@ pub(crate) async fn recorded_job_path(
     allowlist: &[String],
     journal_default: Option<JournalDefault<'_>>,
 ) -> Result<JobPath, Error> {
+    if cfg!(target_os = "linux") {
+        return linux_job_path(context, recorded, allowlist).await;
+    }
     if !recorded.is_empty() {
         // The recorded `PATH` does not depend on the manager, so an unreachable
         // manager only means its variables are not applied; see `manager_warnings`.
@@ -3266,41 +3292,66 @@ pub(crate) async fn recorded_job_path(
         return Ok(JobPath {
             value: recorded.to_env_value(),
             source: PathSource::Recorded,
+            path_drop_in: None,
             loaded_default: None,
             variables,
             manager_unreachable: unreachable,
         });
     }
-    if cfg!(target_os = "linux") {
-        let environment =
-            manager_env::user_manager_environment(context.user_manager(), allowlist).await?;
-        // The daemon unit's own settings and drop-ins can replace the manager's
-        // `PATH`, so the job's value is resolved from both. The unit's name is
-        // derived without creating the application roots: a preview changes nothing.
-        let unit_name = context.namespace_without_creating()?.daemon_unit();
-        let unit = context
-            .user_manager()
-            .unit_environment(&unit_name)
-            .await
-            .map_err(|failure| {
-                let (manager_env::EnvironmentFailure::Unreachable(detail)
-                | manager_env::EnvironmentFailure::Unusable(detail)) = failure;
-                Error::ManagerEnvironment { detail }
-            })?;
-        let value = manager_env::effective_search_path(environment.search_path, &unit, &unit_name)
-            .await?
-            .ok_or_else(|| Error::ManagerEnvironment {
-                detail: "it sets no PATH entry".to_owned(),
-            })?;
-        return Ok(JobPath {
-            value,
-            source: PathSource::UserManager,
-            loaded_default: None,
-            variables: environment.variables,
-            manager_unreachable: None,
-        });
-    }
     launchd_job_path(context, journal_default, allowlist).await
+}
+
+/// The `PATH` and the allowlisted variables of a daemon job on Linux, from the
+/// systemd user manager's environment and the daemon unit's own settings and
+/// drop-ins (see [`manager_env::effective_job_environment`]).
+///
+/// The manager and the unit are read now, once per call: a restored or new job
+/// gets exactly what they report, so no journal value applies, and no gate
+/// reuses another gate's reading. A manager that cannot answer is an error,
+/// whether or not the job records a `PATH`: its unit's drop-ins could replace
+/// either. The unit's name is derived without creating the application roots: a
+/// preview changes nothing.
+async fn linux_job_path(
+    context: &Context,
+    recorded: &SearchPath,
+    allowlist: &[String],
+) -> Result<JobPath, Error> {
+    fn failed(failure: manager_env::EnvironmentFailure) -> Error {
+        let (manager_env::EnvironmentFailure::Unreachable(detail)
+        | manager_env::EnvironmentFailure::Unusable(detail)) = failure;
+        Error::ManagerEnvironment { detail }
+    }
+    let entries = manager_env::read_user_manager_entries(context.user_manager())
+        .await
+        .map_err(failed)?;
+    let unit_name = context.namespace_without_creating()?.daemon_unit();
+    let unit = context
+        .user_manager()
+        .unit_environment(&unit_name)
+        .await
+        .map_err(failed)?;
+    let recorded_value = (!recorded.is_empty()).then(|| recorded.to_env_value());
+    let environment = manager_env::effective_job_environment(
+        &entries,
+        &unit,
+        &unit_name,
+        allowlist,
+        recorded_value.as_deref(),
+    )
+    .await?;
+    let source = match (&recorded_value, &environment.search_path_drop_in) {
+        (Some(_), None) => PathSource::Recorded,
+        (Some(_), Some(_)) => PathSource::DropIn,
+        (None, _) => PathSource::UserManager,
+    };
+    Ok(JobPath {
+        value: environment.search_path,
+        source,
+        path_drop_in: environment.search_path_drop_in,
+        loaded_default: None,
+        variables: environment.variables,
+        manager_unreachable: None,
+    })
 }
 
 /// The allowlisted variables a recorded-`PATH` job takes from its service
@@ -3313,35 +3364,14 @@ pub(crate) struct ManagerVariables {
 }
 
 /// The allowlisted variables the service manager gives the job when the job
-/// records its `PATH`: the user manager's environment on Linux, the launchd
-/// domain's environment on macOS, and none where no service manager exists.
+/// records its `PATH`: the launchd domain's environment on macOS, and none where
+/// no service manager exists. Linux reads its unit as well; see
+/// [`linux_job_path`].
 ///
-/// An unreachable user manager yields no variables and a reason; every other
-/// failure to read or select them is an error.
-#[cfg(target_os = "linux")]
-async fn manager_variables(
-    context: &Context,
-    allowlist: &[String],
-) -> Result<ManagerVariables, Error> {
-    match manager_env::read_user_manager_entries(context.user_manager()).await {
-        Ok(entries) => Ok(ManagerVariables {
-            variables: manager_env::selected_environment(&entries, allowlist)?.variables,
-            unreachable: None,
-        }),
-        Err(manager_env::EnvironmentFailure::Unreachable(detail)) => Ok(ManagerVariables {
-            variables: BTreeMap::new(),
-            unreachable: Some(detail),
-        }),
-        Err(manager_env::EnvironmentFailure::Unusable(detail)) => {
-            Err(Error::ManagerEnvironment { detail })
-        }
-    }
-}
-
-/// See the Linux variant. Only the domain is read: the job's label would derive
-/// the namespace, which creates the state and runtime roots, and a recorded
-/// `PATH` needs none of that. A launchd domain without a GUI session reports no
-/// environment, which is not a failure; a launchctl that cannot run is one.
+/// A launchd domain without a GUI session reports no environment, which is not a
+/// failure; a launchctl that cannot run is one.
+/// Only the domain is read: the job's label would derive the namespace, which
+/// creates the state and runtime roots, and a recorded `PATH` needs none of that.
 #[cfg(target_os = "macos")]
 async fn manager_variables(
     context: &Context,
@@ -3366,8 +3396,9 @@ async fn manager_variables(
     }
 }
 
-/// See the Linux variant.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Linux resolves its unit in [`linux_job_path`], and no other host has a
+/// service manager that gives a job variables.
+#[cfg(not(target_os = "macos"))]
 async fn manager_variables(
     _context: &Context,
     _allowlist: &[String],
@@ -3416,6 +3447,7 @@ async fn launchd_job_path(
     Ok(JobPath {
         value,
         source,
+        path_drop_in: None,
         loaded_default,
         variables,
         manager_unreachable: unreachable,

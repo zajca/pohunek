@@ -1,0 +1,344 @@
+//! The variables a daemon job gets besides its `PATH`.
+//!
+//! The daemon unit file the install writes sets the bootstrap keys (`HOME`,
+//! `XDG_*`, `PATH`), and a drop-in applies after it: its `Environment=` lines
+//! come after the unit file's, and `UnsetEnvironment=` removes last. The store
+//! variables an allowlist names (`CLAUDE_CONFIG_DIR`, ...) come from the user
+//! manager's environment, which the unit's `Environment=` replaces. A judgement
+//! made with other values than the job gets can pass what loses a conversation
+//! or fail one that is safe, so a drop-in's effect is applied for a store
+//! variable and refused for a bootstrap key. The drop-in files are read with the
+//! reader of a removed unit's drop-ins, which is also what a recovery that
+//! removes the unit sees. Values are never part of an error.
+
+// Rust guideline compliant 2026-10-14
+
+use std::collections::BTreeMap;
+
+use pohunek_platform::supervisor::{
+    UnitEnvironment, BOOTSTRAP_ENV_ALLOWLIST, SEARCH_PATH_VARIABLE,
+};
+
+use super::{
+    allowlisted_variables, drop_in_files_of, drop_ins_by_priority, environment_file_keys,
+    names_variable, read_drop_ins, refuse_unfollowed_syntax, service_lines,
+    split_environment_words, split_words, unit_state_check, without_specifiers, UnitFileReader,
+    SYSTEMD_WHITESPACE,
+};
+use crate::service::error::Error;
+
+/// An `Environment=` or filter line whose effect is not read here.
+#[derive(Debug)]
+struct UnclearLine {
+    file: String,
+    text: String,
+    /// An escape ahead of the first `=` of a word, which can spell a name.
+    name_escaped: bool,
+    /// Bytes that are not UTF-8: the line is judged by its lossy text.
+    lossy: bool,
+}
+
+impl UnclearLine {
+    /// Whether the line may set or remove a variable that `pred` accepts.
+    fn mentions(&self, pred: impl Fn(&str) -> bool) -> bool {
+        if self.name_escaped || (self.lossy && self.text.contains("Environment")) {
+            return true;
+        }
+        self.text
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|token| !token.is_empty() && pred(token))
+    }
+}
+
+/// What the enabled drop-ins of a unit say about its environment.
+#[derive(Debug, Default)]
+struct DropInEnvironment {
+    /// The plain assignments in force: name to the drop-in and the raw value.
+    assigned: BTreeMap<String, (String, String)>,
+    /// The first drop-in that resets `Environment=`.
+    reset: Option<String>,
+    /// `Environment=` lines not read here.
+    unclear: Vec<UnclearLine>,
+    /// The `UnsetEnvironment=` names in force, with the value they require.
+    unset: Vec<(String, Option<String>)>,
+    /// `PassEnvironment=` names in force.
+    pass: Vec<String>,
+    /// `PassEnvironment=` and `UnsetEnvironment=` lines not read here.
+    unclear_filters: Vec<UnclearLine>,
+}
+
+async fn scan_drop_ins(
+    unit: &UnitEnvironment,
+    unit_name: &str,
+    reader: &mut UnitFileReader,
+) -> Result<DropInEnvironment, Error> {
+    let mut facts = DropInEnvironment::default();
+    for path in drop_ins_by_priority(&drop_in_files_of(unit), unit_name)? {
+        let Some(bytes) = reader.drop_in(&path, unit_name).await? else {
+            continue;
+        };
+        refuse_unfollowed_syntax(&bytes, &path, unit_name)?;
+        for line in service_lines(&bytes) {
+            let line = match line {
+                Ok(line) => line,
+                Err(text) => {
+                    facts.unclear.push(UnclearLine {
+                        file: path.clone(),
+                        text,
+                        name_escaped: false,
+                        lossy: true,
+                    });
+                    continue;
+                }
+            };
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let empty = value.trim_matches(SYSTEMD_WHITESPACE).is_empty();
+            match key.trim_end_matches(SYSTEMD_WHITESPACE) {
+                "Environment" if empty => {
+                    facts.assigned.clear();
+                    facts.reset.get_or_insert_with(|| path.clone());
+                }
+                "Environment" => {
+                    let split = split_environment_words(value);
+                    if split.open_quote || split.escaped {
+                        facts.unclear.push(UnclearLine {
+                            file: path.clone(),
+                            text: value.to_owned(),
+                            name_escaped: split.name_escaped,
+                            lossy: false,
+                        });
+                        continue;
+                    }
+                    for word in split.words {
+                        let Some((name, assigned)) = word.split_once('=') else {
+                            continue;
+                        };
+                        if without_specifiers(name).is_err() {
+                            // A specifier in a name can spell any variable.
+                            facts.unclear.push(UnclearLine {
+                                file: path.clone(),
+                                text: value.to_owned(),
+                                name_escaped: true,
+                                lossy: false,
+                            });
+                            continue;
+                        }
+                        facts
+                            .assigned
+                            .insert(name.to_owned(), (path.clone(), assigned.to_owned()));
+                    }
+                }
+                directive @ ("UnsetEnvironment" | "PassEnvironment") if empty => {
+                    if directive == "UnsetEnvironment" {
+                        facts.unset.clear();
+                    } else {
+                        facts.pass.clear();
+                    }
+                }
+                directive @ ("UnsetEnvironment" | "PassEnvironment") => {
+                    let split = split_words(value);
+                    if split.open_quote || split.escaped || value.contains('%') {
+                        facts.unclear_filters.push(UnclearLine {
+                            file: path.clone(),
+                            text: value.to_owned(),
+                            name_escaped: true,
+                            lossy: false,
+                        });
+                        continue;
+                    }
+                    for word in split.words {
+                        if directive == "UnsetEnvironment" {
+                            facts.unset.push(match word.split_once('=') {
+                                Some((name, wanted)) => (name.to_owned(), Some(wanted.to_owned())),
+                                None => (word, None),
+                            });
+                        } else {
+                            facts.pass.push(word);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(facts)
+}
+
+fn refuse(detail: String) -> Error {
+    Error::ManagerEnvironment { detail }
+}
+
+/// The value of a drop-in assignment: its specifiers are not expanded here.
+fn plain_value(name: &str, file: &str, raw: &str, unit_name: &str) -> Result<String, Error> {
+    without_specifiers(raw).map_err(|specifier| {
+        refuse(format!(
+            "{unit_name}: the drop-in {file} uses the specifier {specifier} in the value of {name}, which is not expanded here: a recovery that removes the unit resolves its drop-ins without the service manager. Write the value out and retry"
+        ))
+    })
+}
+
+/// The variables of the daemon job: the allowlisted ones, with the unit's
+/// drop-ins applied over the user manager's `entries`, after the bootstrap keys
+/// and the job's `PATH` are checked against the unit's drop-ins.
+///
+/// # Errors
+///
+/// Returns [`Error::ManagerEnvironment`] when a drop-in or an `EnvironmentFile=`
+/// sets or removes a bootstrap key, an `EnvironmentFile=` assigns a variable the
+/// allowlist selects, `PassEnvironment=` names one that no drop-in assigns, a
+/// drop-in line that may set or remove one is not read here, or a value cannot be
+/// carried.
+pub async fn unit_job_variables(
+    entries: &[String],
+    unit: &UnitEnvironment,
+    unit_name: &str,
+    allowlist: &[String],
+    reader: &mut UnitFileReader,
+) -> Result<BTreeMap<String, String>, Error> {
+    let mut manager: BTreeMap<String, String> = entries
+        .iter()
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+    let has_drop_ins = !unit.drop_in_paths.is_empty() || !unit.drop_ins_on_disk.is_empty();
+    if !has_drop_ins && unit.load_state == "not-found" {
+        return allowlisted_variables(manager, allowlist);
+    }
+    unit_state_check(unit, unit_name)?;
+    if !has_drop_ins {
+        // Whatever the replaced unit file sets is replaced with it.
+        return allowlisted_variables(manager, allowlist);
+    }
+    let loaded = unit.load_state == "loaded";
+    let facts = scan_drop_ins(unit, unit_name, reader).await?;
+    let reading = read_drop_ins(unit, unit_name, reader).await?;
+    let environment_files = if loaded {
+        unit.environment_files.clone()
+    } else {
+        reading.environment_files
+    };
+    let mut file_keys: Vec<(String, String)> = Vec::new();
+    for (file, optional) in &environment_files {
+        for key in environment_file_keys(file, *optional, unit_name, reader).await? {
+            file_keys.push((key, file.clone()));
+        }
+    }
+    let selects = |name: &str| -> bool {
+        name != SEARCH_PATH_VARIABLE
+            && !BOOTSTRAP_ENV_ALLOWLIST.contains(&name)
+            && allowlisted_variables([(name.to_owned(), String::new())], allowlist)
+                .is_ok_and(|selected| !selected.is_empty())
+    };
+
+    if let Some(file) = &facts.reset {
+        return Err(refuse(format!(
+            "{unit_name}: the drop-in {file} resets Environment=, which removes the bootstrap environment (HOME, XDG_*) that the unit file the install writes gives its job. Remove the empty `Environment=` line and retry"
+        )));
+    }
+    for key in BOOTSTRAP_ENV_ALLOWLIST {
+        let named = |token: &str| token == key;
+        let place = if let Some((file, _)) = facts.assigned.get(key) {
+            Some(format!("the drop-in {file} sets {key}"))
+        } else if let Some(line) = facts
+            .unclear
+            .iter()
+            .chain(&facts.unclear_filters)
+            .find(|line| line.mentions(named))
+        {
+            Some(format!(
+                "the drop-in {} has an Environment=, PassEnvironment= or UnsetEnvironment= line that may set or remove {key} in a form not read here",
+                line.file
+            ))
+        } else if facts.unset.iter().any(|(name, _)| name == key)
+            || unit
+                .unset_environment
+                .iter()
+                .any(|name| names_variable(name, key))
+        {
+            Some(format!("the unit sets UnsetEnvironment= for {key}"))
+        } else {
+            file_keys
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, file)| format!("the EnvironmentFile= {file} assigns {key}"))
+        };
+        if let Some(place) = place {
+            return Err(refuse(format!(
+                "{unit_name}: {place}, but the unit file the install writes gives the daemon job its {key}, so the preflight would judge another {key} than its job gets. Remove it (`systemctl --user cat {unit_name}`) and retry"
+            )));
+        }
+    }
+
+    if let Some((name, file)) = file_keys.iter().find(|(name, _)| selects(name)) {
+        return Err(refuse(format!(
+            "{unit_name}: the EnvironmentFile= {file} assigns {name}, which the daemon reads from its environment, and the value it gets is not re-parsed here. Move the assignment to an Environment= line of a drop-in and retry"
+        )));
+    }
+    for name in &facts.pass {
+        if selects(name) && !facts.assigned.contains_key(name) {
+            return Err(refuse(format!(
+                "{unit_name} sets PassEnvironment= with {name}, whose value is the service manager process's own and cannot be read here. Remove {name} from PassEnvironment= or set it in an Environment= line of a drop-in, and retry"
+            )));
+        }
+    }
+
+    // A variable a drop-in line may set or remove in a form not read here is
+    // refused when the allowlist selects it.
+    let merged_names: Vec<&str> = unit
+        .environment
+        .iter()
+        .filter_map(|entry| entry.split_once('=').map(|(name, _)| name))
+        .collect();
+    // For a loaded unit the manager's list says which names are set at all, so a
+    // line only matters when it may touch a name that is set somewhere.
+    let touches = |token: &str| {
+        selects(token) && (!loaded || merged_names.contains(&token) || manager.contains_key(token))
+    };
+    if let Some(line) = facts
+        .unclear
+        .iter()
+        .chain(&facts.unclear_filters)
+        .find(|line| line.mentions(touches))
+    {
+        return Err(refuse(format!(
+            "{unit_name}: the drop-in {} has an Environment=, PassEnvironment= or UnsetEnvironment= line that may set or remove a variable the daemon reads from its environment, in a form not read here (an escape sequence, a quote never closed, a specifier, or bytes that are not UTF-8). Write a plain assignment and retry",
+            line.file
+        )));
+    }
+
+    for (name, (file, raw)) in &facts.assigned {
+        if !selects(name) {
+            continue;
+        }
+        let value = plain_value(name, file, raw, unit_name)?;
+        if loaded {
+            let prefix = format!("{name}=");
+            let merged = unit
+                .environment
+                .iter()
+                .rev()
+                .find_map(|entry| entry.strip_prefix(prefix.as_str()));
+            if merged != Some(value.as_str()) {
+                return Err(refuse(format!(
+                    "{unit_name}: the {name} that the service manager reports for the unit differs from the one the drop-in {file} sets, so what its job gets is not derived here. Write the value as a plain assignment and retry"
+                )));
+            }
+        }
+        manager.insert(name.clone(), value);
+    }
+    for (name, wanted) in &facts.unset {
+        if !selects(name) {
+            continue;
+        }
+        let remove = match wanted {
+            None => true,
+            Some(wanted) => manager.get(name).is_some_and(|value| value == wanted),
+        };
+        if remove {
+            manager.remove(name);
+        }
+    }
+    allowlisted_variables(manager, allowlist)
+}

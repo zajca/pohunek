@@ -2862,6 +2862,95 @@ fn the_real_user_manager_reads_tolerated_drop_in_forms_as_the_cli_does() {
     assert!(dash.environment_files.is_empty(), "{dash:?}");
 }
 
+/// How systemd joins lines that end in a backslash: a run of an odd length
+/// continues the line, an even run does not, a comment line ending in a
+/// backslash swallows nothing, and a continuation that runs into a `[Service]`
+/// header joins the header text to the line.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_joins_lines_by_the_odd_backslash_rule() {
+    require_e2e();
+    let directory = user_unit_dir();
+    std::fs::create_dir_all(&directory).expect("user unit directory");
+    let unit = format!("pohunek-e2ebs-{}.service", std::process::id());
+    let _files = UnitFiles {
+        directory: directory.clone(),
+        unit: unit.clone(),
+    };
+    std::fs::write(
+        directory.join(&unit),
+        "[Service]\nExecStart=/bin/sleep 300\n",
+    )
+    .expect("unit file");
+    let own = directory.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&own).expect("drop-in directory");
+    let loaded_with = |content: &[u8]| {
+        std::fs::write(own.join("10-case.conf"), content).expect("drop-in");
+        systemctl(&["daemon-reload"]);
+        async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded")
+    };
+    // (drop-in, merged `Environment=` entries).
+    let cases: [(&[u8], &[&str]); 8] = [
+        // One backslash continues: the next line is words of the same value.
+        (
+            b"[Service]\nEnvironment=EV=a \\\nEnvironment=NEXT=1\n",
+            &["EV=a", "Environment=NEXT=1"],
+        ),
+        // Two backslashes are an escaped backslash: the line ends.
+        (
+            b"[Service]\nEnvironment=EV=a \\\\\nEnvironment=NEXT=1\n",
+            &["EV=a", "NEXT=1"],
+        ),
+        // Three continue.
+        (
+            b"[Service]\nEnvironment=EV=a \\\\\\\nEnvironment=NEXT=1\n",
+            &["EV=a", "Environment=NEXT=1"],
+        ),
+        // A comment ending in a backslash swallows nothing.
+        (b"[Service]\n# note \\\nEnvironment=NEXT=1\n", &["NEXT=1"]),
+        // A comment inside a continuation is skipped and the continuation goes on.
+        (
+            b"[Service]\nEnvironment=EV=a \\\n# note\nEnvironment=NEXT=1\n",
+            &["EV=a", "Environment=NEXT=1"],
+        ),
+        // A header joined into a continuation is a word, not a header.
+        (
+            b"[Service]\nEnvironment=EV=a \\\n[Service]\nEnvironment=NEXT=1\n",
+            &["EV=a", "NEXT=1"],
+        ),
+        // An empty line ends the continuation.
+        (
+            b"[Service]\nEnvironment=EV=a \\\n\nEnvironment=NEXT=1\n",
+            &["EV=a", "NEXT=1"],
+        ),
+        // A trailing backslash at the end of the file.
+        (b"[Service]\nEnvironment=EV=a \\", &["EV=a"]),
+    ];
+    // An escaped backslash is one backslash, in a quoted word too.
+    for (content, expected) in [
+        (&b"[Service]\nEnvironment=PATH=/a\\\\b\n"[..], "PATH=/a\\b"),
+        (b"[Service]\nEnvironment=PATH=/a\\\\\n", "PATH=/a\\"),
+        (b"[Service]\nEnvironment=\"PATH=/a\\\\b\"\n", "PATH=/a\\b"),
+    ] {
+        let loaded = loaded_with(content);
+        assert_eq!(
+            loaded.environment,
+            [expected],
+            "{:?}",
+            String::from_utf8_lossy(content)
+        );
+    }
+    for (content, expected) in cases {
+        let loaded = loaded_with(content);
+        assert_eq!(
+            loaded.environment,
+            expected,
+            "{:?}",
+            String::from_utf8_lossy(content)
+        );
+    }
+}
+
 /// A drop-in directory the scan cannot read is an error, never "no drop-ins".
 fn assert_unreadable_drop_in_directory_is_an_error(own: &std::path::Path, unit: &str) {
     use std::os::unix::fs::PermissionsExt;

@@ -21,6 +21,10 @@ use pohunek_worker_protocol::BaseEnv;
 
 use super::error::Error;
 
+mod job_variables;
+
+pub use job_variables::unit_job_variables;
+
 /// Why the service manager's environment was not read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentFailure {
@@ -235,6 +239,16 @@ pub fn allowlisted_variables(
     Ok(base.into_inner())
 }
 
+/// The unit setting files read while one judgement resolves a daemon job's
+/// environment, each at most once, so every part of the judgement sees the same
+/// bytes.
+#[derive(Debug, Default)]
+pub struct UnitFileReader {
+    unit_files: BTreeMap<String, Vec<u8>>,
+    drop_ins: BTreeMap<String, Option<Vec<u8>>>,
+    environment_files: BTreeMap<String, Result<Vec<u8>, (std::io::ErrorKind, String)>>,
+}
+
 /// The `PATH` value of a job, if a process environment can carry it.
 ///
 /// A value with a NUL byte cannot be placed in a process environment. Every
@@ -294,16 +308,17 @@ pub async fn effective_search_path(
     manager_path: Option<String>,
     unit: &UnitEnvironment,
     unit_name: &str,
+    reader: &mut UnitFileReader,
 ) -> Result<Option<String>, Error> {
     if unit.load_state == "not-found"
         && (!unit.drop_in_paths.is_empty() || !unit.drop_ins_on_disk.is_empty())
     {
-        return path_from_orphan_drop_ins(manager_path, unit, unit_name).await;
+        return path_from_orphan_drop_ins(manager_path, unit, unit_name, reader).await;
     }
-    if !unit_can_set_path(unit, unit_name).await? {
+    if !unit_can_set_path(unit, unit_name, reader, true).await? {
         return Ok(manager_path);
     }
-    let loaded = loaded_search_path(manager_path.clone(), unit, unit_name).await?;
+    let loaded = loaded_search_path(manager_path.clone(), unit, unit_name, reader).await?;
     if !unit.drop_in_paths.is_empty() || !unit.drop_ins_on_disk.is_empty() {
         // A rollback or a config migration removes the unit and resolves again from
         // its drop-in files alone. Resolve that way now, before anything is
@@ -315,7 +330,7 @@ pub async fn effective_search_path(
             drop_ins_on_disk: unit.drop_ins_on_disk.clone(),
             ..UnitEnvironment::default()
         };
-        let after = path_from_orphan_drop_ins(manager_path, &removed, unit_name).await?;
+        let after = path_from_orphan_drop_ins(manager_path, &removed, unit_name, reader).await?;
         if after != loaded {
             return Err(Error::ManagerEnvironment {
                 detail: format!(
@@ -327,11 +342,76 @@ pub async fn effective_search_path(
     Ok(loaded)
 }
 
+/// The environment the daemon job gets from the unit and the user manager.
+#[derive(Clone, PartialEq, Eq)]
+pub struct JobEnvironment {
+    /// The job's `PATH`.
+    pub search_path: String,
+    /// The drop-in that replaces a recorded `PATH`, when one does.
+    pub search_path_drop_in: Option<String>,
+    /// The allowlisted variables, `PATH` excluded.
+    pub variables: BTreeMap<String, String>,
+}
+
+// Variables are printed by name only: their values may be secrets.
+impl Debug for JobEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobEnvironment")
+            .field("search_path", &self.search_path)
+            .field("search_path_drop_in", &self.search_path_drop_in)
+            .field("variables", &self.variables.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// The environment the daemon job `unit_name` gets: its `PATH` and its
+/// allowlisted variables, from the user manager's `entries` and the unit the
+/// manager reports. `recorded` is the `PATH` `service.toml` records, which the
+/// unit file the install writes carries; without one the job inherits the
+/// manager's. Each unit setting file is read once.
+///
+/// # Errors
+///
+/// Returns [`Error::ManagerEnvironment`] for everything
+/// [`effective_search_path`], [`recorded_search_path`] and
+/// [`unit_job_variables`] refuse.
+pub async fn effective_job_environment(
+    entries: &[String],
+    unit: &UnitEnvironment,
+    unit_name: &str,
+    allowlist: &[String],
+    recorded: Option<&str>,
+) -> Result<JobEnvironment, Error> {
+    let mut reader = UnitFileReader::default();
+    let manager = selected_environment(entries, allowlist)?;
+    let (search_path, search_path_drop_in) = match recorded {
+        Some(recorded) => {
+            let path = recorded_search_path(recorded, unit, unit_name, &mut reader).await?;
+            (path.value, path.drop_in)
+        }
+        None => {
+            let path = effective_search_path(manager.search_path, unit, unit_name, &mut reader)
+                .await?
+                .ok_or_else(|| Error::ManagerEnvironment {
+                    detail: "it sets no PATH entry".to_owned(),
+                })?;
+            (path, None)
+        }
+    };
+    let variables = unit_job_variables(entries, unit, unit_name, allowlist, &mut reader).await?;
+    Ok(JobEnvironment {
+        search_path,
+        search_path_drop_in,
+        variables,
+    })
+}
+
 /// The job's `PATH` from the manager's merged properties of a loaded unit.
 async fn loaded_search_path(
     manager_path: Option<String>,
     unit: &UnitEnvironment,
     unit_name: &str,
+    reader: &mut UnitFileReader,
 ) -> Result<Option<String>, Error> {
     let refuse = |detail: String| Error::ManagerEnvironment { detail };
     let prefix = format!("{SEARCH_PATH_VARIABLE}=");
@@ -348,13 +428,13 @@ async fn loaded_search_path(
     let unit_file = if unit.fragment_path.is_empty() {
         Vec::new()
     } else {
-        read_unit_setting_file(&unit.fragment_path, unit_name, "unit file").await?
+        reader.unit_file(&unit.fragment_path, unit_name).await?
     };
     let mut drop_ins = Vec::with_capacity(unit.drop_in_paths.len());
     for path in &unit.drop_in_paths {
         // The manager keeps a link to `/dev/null` in its list, and it disables
         // the drop-in of that name.
-        if let Some(bytes) = read_enabled_drop_in(path, unit_name).await? {
+        if let Some(bytes) = reader.drop_in(path, unit_name).await? {
             drop_ins.push((path, bytes));
         }
     }
@@ -409,15 +489,54 @@ async fn loaded_search_path(
     Ok(manager_path)
 }
 
-/// Reads a drop-in, or `None` for one linked to `/dev/null`, which disables the
-/// drop-in of that name.
-async fn read_enabled_drop_in(path: &str, unit_name: &str) -> Result<Option<Vec<u8>>, Error> {
-    if std::fs::canonicalize(path).is_ok_and(|target| target == std::path::Path::new("/dev/null")) {
-        return Ok(None);
+impl UnitFileReader {
+    /// Reads a drop-in, or `None` for one linked to `/dev/null`, which disables
+    /// the drop-in of that name.
+    async fn drop_in(&mut self, path: &str, unit_name: &str) -> Result<Option<Vec<u8>>, Error> {
+        if let Some(read) = self.drop_ins.get(path) {
+            return Ok(read.clone());
+        }
+        let read = if std::fs::canonicalize(path)
+            .is_ok_and(|target| target == std::path::Path::new("/dev/null"))
+        {
+            None
+        } else {
+            Some(read_unit_setting_file(path, unit_name, "drop-in").await?)
+        };
+        self.drop_ins.insert(path.to_owned(), read.clone());
+        Ok(read)
     }
-    read_unit_setting_file(path, unit_name, "drop-in")
-        .await
-        .map(Some)
+
+    /// Reads the unit file the manager loaded.
+    async fn unit_file(&mut self, path: &str, unit_name: &str) -> Result<Vec<u8>, Error> {
+        if let Some(bytes) = self.unit_files.get(path) {
+            return Ok(bytes.clone());
+        }
+        let bytes = read_unit_setting_file(path, unit_name, "unit file").await?;
+        self.unit_files.insert(path.to_owned(), bytes.clone());
+        Ok(bytes)
+    }
+
+    /// Reads an `EnvironmentFile=`; the read failure is the inner error.
+    async fn environment_file(
+        &mut self,
+        path: &str,
+        unit_name: &str,
+    ) -> Result<std::io::Result<Vec<u8>>, Error> {
+        if let Some(read) = self.environment_files.get(path) {
+            return Ok(read
+                .clone()
+                .map_err(|(kind, message)| std::io::Error::new(kind, message)));
+        }
+        let read = read_unit_settings_file(path, unit_name, "EnvironmentFile=").await?;
+        self.environment_files.insert(
+            path.to_owned(),
+            read.as_ref()
+                .map(Clone::clone)
+                .map_err(|error| (error.kind(), error.to_string())),
+        );
+        Ok(read)
+    }
 }
 
 /// The drop-ins that apply, in file-name order (the order systemd applies them
@@ -478,36 +597,38 @@ fn is_usable_search_entry(entry: &str) -> bool {
         && entry.split('/').all(|part| part.len() <= 255)
 }
 
-/// Whether a `PassEnvironment=` or `UnsetEnvironment=` value names `PATH`: a
-/// word that is exactly `PATH` (or `PATH=...`) once unquoted. An escape sequence
-/// can spell the name, and so can a specifier systemd expands, so both count as
-/// naming it; an open quote only when the value mentions `PATH`.
+/// Whether a `PassEnvironment=` or `UnsetEnvironment=` value names `PATH`.
 fn names_search_path(value: &str) -> bool {
+    names_variable(value, SEARCH_PATH_VARIABLE)
+}
+
+/// Whether a `PassEnvironment=` or `UnsetEnvironment=` value names `name`: a
+/// word that is exactly `name` (or `name=...`) once unquoted. An escape sequence
+/// can spell the name, and so can a specifier systemd expands, so both count as
+/// naming it; an open quote only when the value mentions `name`.
+fn names_variable(value: &str, name: &str) -> bool {
     let split = split_words(value);
     if split.escaped
         || value.replace("%%", "").contains('%')
-        || (split.open_quote && value.contains(SEARCH_PATH_VARIABLE))
+        || (split.open_quote && value.contains(name))
     {
         return true;
     }
     split.words.iter().any(|word| {
-        word == SEARCH_PATH_VARIABLE
+        word == name
             || word
-                .strip_prefix(SEARCH_PATH_VARIABLE)
+                .strip_prefix(name)
                 .is_some_and(|rest| rest.starts_with('='))
     })
 }
 
-/// Refuses a drop-in whose syntax is not followed here: a line ending in a
-/// backslash (systemd joins it by a rule not reproduced), a line opening like a
-/// section header without closing it (systemd stops reading the file there), and
-/// a byte order mark after the start of the file.
+/// Refuses a drop-in whose syntax is not followed here: a line opening like a
+/// section header without closing it (systemd stops reading the file there), a
+/// byte order mark after the start of the file.
 fn refuse_unfollowed_syntax(bytes: &[u8], path: &str, unit_name: &str) -> Result<(), Error> {
     let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     let lines = physical_lines(body);
-    let reason = if lines.iter().any(|line| line.ends_with(b"\\")) {
-        "a line ending in a backslash, whose continuation is not followed here"
-    } else if body.windows(3).any(|window| window == [0xEF, 0xBB, 0xBF]) {
+    let reason = if body.windows(3).any(|window| window == [0xEF, 0xBB, 0xBF]) {
         "a byte order mark after the start of the file, which is not followed here"
     } else if lines.iter().any(|line| {
         let line = String::from_utf8_lossy(line);
@@ -547,25 +668,36 @@ fn refuse_path_filter(key: &str, path: &str, unit_name: &str) -> Error {
     }
 }
 
-/// The job's `PATH` for a unit with no unit file whose drop-in files exist
-/// (before the first install, or after a rollback or migration removed the unit):
-/// systemd reads none of them now, but the install keeps and applies them, so
-/// they are read here, in file-name order (a name in directories of different
-/// names is ambiguous). Refuses what it cannot read as plain `Environment=PATH=` lines,
-/// and every directive whose effect on `PATH` the manager cannot report for an
-/// unloaded unit.
-async fn path_from_orphan_drop_ins(
-    manager_path: Option<String>,
+/// What the drop-in files of a unit say about the job's environment, read in
+/// the order systemd applies them (file-name order across lookup directories).
+#[derive(Debug, Default)]
+struct DropInReading {
+    /// The `EnvironmentFile=` paths in force, with their optional (`-`) flag.
+    environment_files: Vec<(String, bool)>,
+    /// The `ExecSearchPath=` entries in force.
+    search_path: Vec<String>,
+    /// The last `Environment=` event for `PATH`: the drop-in and its value, or
+    /// `None` as the value for a reset.
+    path_event: Option<(String, Option<String>)>,
+    /// The `PassEnvironment=` and `UnsetEnvironment=` lines naming `PATH`, as the
+    /// directive and the drop-in.
+    path_filters: Vec<(String, String)>,
+}
+
+/// Reads the drop-in files of `unit` for the settings that can change the job's
+/// `PATH`: they are the files an install keeps and applies. Refuses what it
+/// cannot read as plain assignments, and every directive whose effect the
+/// manager cannot report for an unloaded unit.
+async fn read_drop_ins(
     unit: &UnitEnvironment,
     unit_name: &str,
-) -> Result<Option<String>, Error> {
+    reader: &mut UnitFileReader,
+) -> Result<DropInReading, Error> {
     let refuse = |detail: String| Error::ManagerEnvironment { detail };
     let files = drop_ins_by_priority(&drop_in_files_of(unit), unit_name)?;
-    let mut current: Option<String> = None;
-    let mut search_path: Vec<String> = Vec::new();
-    let mut environment_files: Vec<(String, bool)> = Vec::new();
+    let mut reading = DropInReading::default();
     for path in &files {
-        let Some(bytes) = read_enabled_drop_in(path, unit_name).await? else {
+        let Some(bytes) = reader.drop_in(path, unit_name).await? else {
             continue;
         };
         refuse_unfollowed_syntax(&bytes, path, unit_name)?;
@@ -591,9 +723,9 @@ async fn path_from_orphan_drop_ins(
                 "EnvironmentFile" | "ExecSearchPath" => {
                     if value.trim_matches(SYSTEMD_WHITESPACE).is_empty() {
                         if key == "EnvironmentFile" {
-                            environment_files.clear();
+                            reading.environment_files.clear();
                         } else {
-                            search_path.clear();
+                            reading.search_path.clear();
                         }
                         continue;
                     }
@@ -620,7 +752,7 @@ async fn path_from_orphan_drop_ins(
                         // is not reproduced here.
                         if file.starts_with('/') {
                             refuse_unnormalized_path(&file, path, unit_name)?;
-                            environment_files.push((file, optional));
+                            reading.environment_files.push((file, optional));
                         }
                     } else {
                         let list = without_specifiers(&split.words[0])
@@ -631,12 +763,12 @@ async fn path_from_orphan_drop_ins(
                                     "{unit_name}: the drop-in {path} has an entry in ExecSearchPath= that is empty, not a normalized absolute path or too long, which systemd ignores or simplifies (dropping the entries after it), so the list is not followed here. Write normalized absolute entries of at most 4095 bytes, with no component over 255 bytes, and retry"
                                 )));
                             }
-                            search_path.push(entry.to_owned());
+                            reading.search_path.push(entry.to_owned());
                         }
                     }
                 }
                 "PassEnvironment" | "UnsetEnvironment" if names_search_path(value) => {
-                    return Err(refuse_path_filter(key, path, unit_name));
+                    reading.path_filters.push((key.to_owned(), path.clone()));
                 }
                 _ => {}
             }
@@ -647,23 +779,132 @@ async fn path_from_orphan_drop_ins(
             Err(None) => return Err(unreadable("Environment=")),
         };
         if let Some(last) = events.into_iter().last() {
-            current = last;
+            reading.path_event = Some((path.clone(), last));
         }
     }
-    for (file, optional) in &environment_files {
-        check_environment_file(file, *optional, unit_name).await?;
+    Ok(reading)
+}
+
+/// The job's `PATH` for a unit with no unit file whose drop-in files exist
+/// (before the first install, or after a rollback or migration removed the unit):
+/// systemd reads none of them now, but the install keeps and applies them, so
+/// they are read here, in file-name order (a name in directories of different
+/// names is ambiguous). Refuses what it cannot read as plain `Environment=PATH=` lines,
+/// and every directive whose effect on `PATH` the manager cannot report for an
+/// unloaded unit.
+async fn path_from_orphan_drop_ins(
+    manager_path: Option<String>,
+    unit: &UnitEnvironment,
+    unit_name: &str,
+    reader: &mut UnitFileReader,
+) -> Result<Option<String>, Error> {
+    let refuse = |detail: String| Error::ManagerEnvironment { detail };
+    let reading = read_drop_ins(unit, unit_name, reader).await?;
+    if let Some((key, path)) = reading.path_filters.first() {
+        return Err(refuse_path_filter(key, path, unit_name));
     }
-    let value = current.or_else(|| (!search_path.is_empty()).then(|| search_path.join(":")));
+    for (file, optional) in &reading.environment_files {
+        check_environment_file(file, *optional, unit_name, reader).await?;
+    }
+    let current = reading.path_event.and_then(|(_, value)| value);
+    let value = current
+        .or_else(|| (!reading.search_path.is_empty()).then(|| reading.search_path.join(":")));
     match value {
         Some(value) => carry(&value).map(Some).map_err(refuse),
         None => Ok(manager_path),
     }
 }
 
-/// Refuses the unit states and settings that make the job's `PATH` unreadable
-/// here, and says whether the unit can give the job a `PATH` at all: `false` for
-/// a unit that is not written yet.
-async fn unit_can_set_path(unit: &UnitEnvironment, unit_name: &str) -> Result<bool, Error> {
+/// The `PATH` of a job whose unit file the install writes with
+/// `Environment=PATH=<recorded>`, given the unit the manager reports: `recorded`
+/// unless a drop-in replaces it, and the drop-in that did.
+///
+/// The drop-in files are read as a removed unit's are, which is also how a
+/// recovery that removes the unit reads them, so every moment of an operation
+/// judges the same value. For a loaded unit the value is checked against the
+/// manager's merged `Environment`.
+///
+/// # Errors
+///
+/// Returns [`Error::ManagerEnvironment`] for the unit states and drop-in forms
+/// [`effective_search_path`] refuses, an `Environment=` reset or
+/// `UnsetEnvironment=` that removes the recorded `PATH`, and a drop-in value the
+/// manager does not report.
+pub async fn recorded_search_path(
+    recorded: &str,
+    unit: &UnitEnvironment,
+    unit_name: &str,
+    reader: &mut UnitFileReader,
+) -> Result<RecordedPath, Error> {
+    let refuse = |detail: String| Error::ManagerEnvironment { detail };
+    let unchanged = || RecordedPath {
+        value: recorded.to_owned(),
+        drop_in: None,
+    };
+    let has_drop_ins = !unit.drop_in_paths.is_empty() || !unit.drop_ins_on_disk.is_empty();
+    let loaded = unit.load_state == "loaded";
+    if !has_drop_ins {
+        // The install replaces the unit file, so nothing else sets the job's
+        // environment. Only a unit in a state that cannot be judged is refused.
+        if !loaded && unit.load_state != "not-found" {
+            unit_can_set_path(unit, unit_name, reader, false).await?;
+        }
+        return Ok(unchanged());
+    }
+    if unit.load_state != "not-found" {
+        // A loaded unit's stale snapshot, merged `UnsetEnvironment=` and
+        // `EnvironmentFile=`; a masked or failed one is refused here.
+        unit_can_set_path(unit, unit_name, reader, false).await?;
+    }
+    let reading = read_drop_ins(unit, unit_name, reader).await?;
+    if let Some((key, path)) = reading
+        .path_filters
+        .iter()
+        .find(|(key, _)| key == "UnsetEnvironment")
+    {
+        return Err(refuse_path_filter(key, path, unit_name));
+    }
+    for (file, optional) in &reading.environment_files {
+        check_environment_file(file, *optional, unit_name, reader).await?;
+    }
+    match reading.path_event {
+        None => Ok(unchanged()),
+        Some((drop_in, None)) => Err(refuse(format!(
+            "{unit_name}: the drop-in {drop_in} resets Environment=, which removes the {SEARCH_PATH_VARIABLE} that the unit file the install writes gives its job. Remove the empty `Environment=` line or set {SEARCH_PATH_VARIABLE} after it, and retry"
+        ))),
+        Some((drop_in, Some(value))) => {
+            let value = carry(&value).map_err(refuse)?;
+            let prefix = format!("{SEARCH_PATH_VARIABLE}=");
+            let merged = unit
+                .environment
+                .iter()
+                .rev()
+                .find_map(|entry| entry.strip_prefix(prefix.as_str()));
+            if loaded && merged != Some(value.as_str()) {
+                return Err(refuse(format!(
+                    "{unit_name}: the {SEARCH_PATH_VARIABLE} that the service manager reports for the unit differs from the one the drop-in {drop_in} sets, so what its job gets is not derived here. Write the value as a plain assignment and retry"
+                )));
+            }
+            Ok(RecordedPath {
+                value,
+                drop_in: Some(drop_in),
+            })
+        }
+    }
+}
+
+/// The `PATH` a job with a recorded one gets, and the drop-in that replaced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedPath {
+    /// The job's `PATH`.
+    pub value: String,
+    /// The drop-in that sets `value` instead of the recorded one.
+    pub drop_in: Option<String>,
+}
+
+/// Refuses a unit whose state the manager's answer cannot be trusted in: a
+/// stale snapshot next to drop-ins, and a unit that is masked or failed to load.
+fn unit_state_check(unit: &UnitEnvironment, unit_name: &str) -> Result<(), Error> {
     let refuse = |detail: String| Error::ManagerEnvironment { detail };
     // The unit file changing on disk is routine: the install replaces it. Only
     // drop-ins make a stale snapshot misleading, because they are kept.
@@ -675,15 +916,32 @@ async fn unit_can_set_path(unit: &UnitEnvironment, unit_name: &str) -> Result<bo
         )));
     }
     match unit.load_state.as_str() {
-        "loaded" => {}
-        "not-found" if unit.drop_in_paths.is_empty() && unit.drop_ins_on_disk.is_empty() => {
-            return Ok(false);
-        }
-        other => {
-            return Err(refuse(format!(
-                "{unit_name} is {other}, so the PATH its job gets cannot be determined. Fix the unit (`systemctl --user status {unit_name}`) and retry"
-            )))
-        }
+        "loaded" | "not-found" => Ok(()),
+        other => Err(refuse(format!(
+            "{unit_name} is {other}, so the PATH its job gets cannot be determined. Fix the unit (`systemctl --user status {unit_name}`) and retry"
+        ))),
+    }
+}
+
+/// Refuses the unit states and settings that make the job's `PATH` unreadable
+/// here, and says whether the unit can give the job a `PATH` at all: `false` for
+/// a unit that is not written yet.
+///
+/// `pass_environment_matters` is `false` for a job whose unit file sets `PATH`
+/// itself, where `PassEnvironment=` has no effect because `Environment=` wins.
+async fn unit_can_set_path(
+    unit: &UnitEnvironment,
+    unit_name: &str,
+    reader: &mut UnitFileReader,
+    pass_environment_matters: bool,
+) -> Result<bool, Error> {
+    let refuse = |detail: String| Error::ManagerEnvironment { detail };
+    unit_state_check(unit, unit_name)?;
+    if unit.load_state == "not-found"
+        && unit.drop_in_paths.is_empty()
+        && unit.drop_ins_on_disk.is_empty()
+    {
+        return Ok(false);
     }
     let names_path = |entry: &String| {
         entry == SEARCH_PATH_VARIABLE
@@ -691,10 +949,11 @@ async fn unit_can_set_path(unit: &UnitEnvironment, unit_name: &str) -> Result<bo
                 .strip_prefix(SEARCH_PATH_VARIABLE)
                 .is_some_and(|rest| rest.starts_with('='))
     };
-    if unit
-        .pass_environment
-        .iter()
-        .any(|name| name == SEARCH_PATH_VARIABLE)
+    if pass_environment_matters
+        && unit
+            .pass_environment
+            .iter()
+            .any(|name| name == SEARCH_PATH_VARIABLE)
     {
         return Err(refuse(format!(
             "{unit_name} sets PassEnvironment= with {SEARCH_PATH_VARIABLE}, whose value is the service manager process's own and cannot be read here. Remove {SEARCH_PATH_VARIABLE} from PassEnvironment= in the unit or its drop-ins (`systemctl --user cat {unit_name}`) and retry"
@@ -706,7 +965,7 @@ async fn unit_can_set_path(unit: &UnitEnvironment, unit_name: &str) -> Result<bo
         )));
     }
     for (file, optional) in &unit.environment_files {
-        check_environment_file(file, *optional, unit_name).await?;
+        check_environment_file(file, *optional, unit_name, reader).await?;
     }
     Ok(true)
 }
@@ -767,16 +1026,46 @@ async fn read_unit_setting_file(path: &str, unit_name: &str, kind: &str) -> Resu
 }
 
 /// Refuses an `EnvironmentFile=` that sets `PATH` or cannot be shown not to.
-async fn check_environment_file(file: &str, optional: bool, unit_name: &str) -> Result<(), Error> {
+async fn check_environment_file(
+    file: &str,
+    optional: bool,
+    unit_name: &str,
+    reader: &mut UnitFileReader,
+) -> Result<(), Error> {
+    let keys = environment_file_keys(file, optional, unit_name, reader).await?;
+    if keys
+        .iter()
+        .any(|key| key.trim_matches(SYSTEMD_WHITESPACE) == SEARCH_PATH_VARIABLE)
+    {
+        return Err(Error::ManagerEnvironment {
+            detail: format!(
+                "the EnvironmentFile= {file} of {unit_name} sets {SEARCH_PATH_VARIABLE}, and its quoting is not re-parsed here. Move the {SEARCH_PATH_VARIABLE} assignment to an Environment= line of a drop-in, or record the PATH in service.toml, and retry"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The names an `EnvironmentFile=` assigns; none for an optional file that does
+/// not exist. Refuses a file that cannot be listed or read, or whose quoting is
+/// not followed, because what it assigns cannot then be told.
+pub(super) async fn environment_file_keys(
+    file: &str,
+    optional: bool,
+    unit_name: &str,
+    reader: &mut UnitFileReader,
+) -> Result<Vec<String>, Error> {
     let refuse = |detail: String| Error::ManagerEnvironment { detail };
     if file.contains(['*', '?', '[']) {
         return Err(refuse(format!(
             "{unit_name} names the EnvironmentFile= pattern {file}, whose files cannot be listed here. Replace it with plain paths in the unit or its drop-ins (`systemctl --user cat {unit_name}`) and retry"
         )));
     }
-    let bytes = match read_unit_settings_file(file, unit_name, "EnvironmentFile=").await? {
+    let bytes = match reader.environment_file(file, unit_name).await? {
         Ok(bytes) => bytes,
-        Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new())
+        }
         Err(error) => {
             return Err(refuse(format!(
                 "{unit_name} names the EnvironmentFile= {file}, which cannot be read ({error}), so its PATH cannot be judged. Make it a readable regular file of at most {} bytes, or prefix the path with `-` if it may be absent, and retry",
@@ -784,15 +1073,11 @@ async fn check_environment_file(file: &str, optional: bool, unit_name: &str) -> 
             )))
         }
     };
-    match environment_file_sets_path(&String::from_utf8_lossy(&bytes)) {
-        Some(false) => Ok(()),
-        Some(true) => Err(refuse(format!(
-            "the EnvironmentFile= {file} of {unit_name} sets {SEARCH_PATH_VARIABLE}, and its quoting is not re-parsed here. Move the {SEARCH_PATH_VARIABLE} assignment to an Environment= line of a drop-in, or record the PATH in service.toml, and retry"
-        ))),
-        None => Err(refuse(format!(
+    environment_file_assigned_keys(&String::from_utf8_lossy(&bytes)).ok_or_else(|| {
+        refuse(format!(
             "the EnvironmentFile= {file} of {unit_name} has quoting that is not followed here (a quote never closed, or another quote after a closed one in the same value), so whether it sets {SEARCH_PATH_VARIABLE} cannot be told. Use one quoted or unquoted value per line and retry"
-        ))),
-    }
+        ))
+    })
 }
 
 /// Whether `c` ends a line of an `EnvironmentFile=`; systemd ends it at `\n` and `\r`.
@@ -800,19 +1085,19 @@ fn is_env_line_end(c: char) -> bool {
     c == '\n' || c == '\r'
 }
 
-/// Whether an `EnvironmentFile=` assigns `PATH`, or `None` when a quote is not
-/// closed or quoting follows a closed quote.
+/// The names an `EnvironmentFile=` assigns, or `None` when a quote is not closed
+/// or quoting follows a closed quote.
 ///
 /// Follows the file format: `KEY=VALUE` assignments, `#` and `;` comment lines,
 /// values that may be quoted with `'` or `"` or continue after a trailing
 /// backslash, so text inside such a value is never taken for a key.
-fn environment_file_sets_path(text: &str) -> Option<bool> {
+fn environment_file_assigned_keys(text: &str) -> Option<Vec<String>> {
     let mut chars = text.chars().peekable();
-    let mut sets_path = false;
+    let mut keys: Vec<String> = Vec::new();
     loop {
         while chars.next_if(|c| SYSTEMD_WHITESPACE.contains(c)).is_some() {}
         let Some(first) = chars.peek().copied() else {
-            return Some(sets_path);
+            return Some(keys);
         };
         if first == '#' || first == ';' {
             for c in chars.by_ref() {
@@ -835,9 +1120,7 @@ fn environment_file_sets_path(text: &str) -> Option<bool> {
             // a continuation after one is not followed here.
             return None;
         }
-        if key.trim_matches(SYSTEMD_WHITESPACE) == SEARCH_PATH_VARIABLE {
-            sets_path = true;
-        }
+        keys.push(key.trim_matches(SYSTEMD_WHITESPACE).to_owned());
         // A value that opens with a quote ends at the matching one; quotes
         // anywhere else are literal. A trailing backslash continues the line.
         while chars.next_if(|c| *c == ' ' || *c == '\t').is_some() {}
@@ -857,7 +1140,7 @@ fn environment_file_sets_path(text: &str) -> Option<bool> {
         }
         loop {
             match chars.next() {
-                None => return Some(sets_path),
+                None => return Some(keys),
                 Some(c) if is_env_line_end(c) => break,
                 Some('\\') => {
                     chars.next();
@@ -873,8 +1156,8 @@ fn environment_file_sets_path(text: &str) -> Option<bool> {
 
 /// The logical lines of a unit file, as systemd's reader sees them: a leading
 /// UTF-8 byte order mark is dropped, a line ends at `\n`, `\r` or NUL, a
-/// trailing backslash joins the next line, and comment lines are skipped, also
-/// inside a continuation. A line holding bytes that are not UTF-8 is `Err`.
+/// trailing run of an odd number of backslashes joins the next line, and comment
+/// lines are skipped, also inside a continuation. A line holding bytes that are not UTF-8 is `Err`.
 fn logical_lines(bytes: &[u8]) -> Vec<Result<String, String>> {
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     let mut lines = Vec::new();
@@ -884,9 +1167,17 @@ fn logical_lines(bytes: &[u8]) -> Vec<Result<String, String>> {
         if trimmed.starts_with(b"#") || trimmed.starts_with(b";") {
             continue;
         }
-        let (content, continues) = match physical.strip_suffix(b"\\") {
-            Some(content) => (content, true),
-            None => (physical, false),
+        // A run of backslashes continues the line only when its length is odd;
+        // an even run is escaped backslashes and the line ends.
+        let backslashes = physical
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'\\')
+            .count();
+        let (content, continues) = if backslashes % 2 == 1 {
+            (&physical[..physical.len() - 1], true)
+        } else {
+            (physical, false)
         };
         match current.as_mut() {
             Some(line) => {
@@ -1017,6 +1308,17 @@ struct Tokens {
 }
 
 fn split_words(value: &str) -> Tokens {
+    split_words_decoding(value, false)
+}
+
+/// [`split_words`] for an `Environment=` value, where an escaped backslash
+/// (`\\\\`) is one backslash, as systemd reads it (pinned on the real manager);
+/// every other escape sequence stays undecoded.
+fn split_environment_words(value: &str) -> Tokens {
+    split_words_decoding(value, true)
+}
+
+fn split_words_decoding(value: &str, decode_backslash: bool) -> Tokens {
     let mut word = String::new();
     let mut quote: Option<char> = None;
     let mut out = Tokens {
@@ -1028,6 +1330,10 @@ fn split_words(value: &str) -> Tokens {
     let mut chars = value.chars();
     while let Some(c) = chars.next() {
         match (c, quote) {
+            ('\\', _) if decode_backslash && chars.as_str().starts_with('\\') => {
+                word.push('\\');
+                chars.next();
+            }
             ('\\', _) => {
                 out.escaped = true;
                 out.name_escaped |= !word.contains('=');
@@ -1067,7 +1373,10 @@ fn unit_setting(bytes: &[u8], setting: Setting) -> Assignment {
         if key.trim_end_matches(SYSTEMD_WHITESPACE) != setting.key() {
             continue;
         }
-        let split = split_words(value);
+        let split = match setting {
+            Setting::EnvironmentPath => split_environment_words(value),
+            Setting::ExecSearchPath => split_words(value),
+        };
         let assignment = format!("{SEARCH_PATH_VARIABLE}=");
         let relevant = |word: &String| match setting {
             Setting::EnvironmentPath => word.starts_with(&assignment),
@@ -1142,7 +1451,7 @@ fn path_events(bytes: &[u8]) -> Result<Vec<Option<String>>, Option<String>> {
             events.push(None);
             continue;
         }
-        let split = split_words(value);
+        let split = split_environment_words(value);
         if split.open_quote
             || split.name_escaped
             || (split.escaped && value.contains(SEARCH_PATH_VARIABLE))
