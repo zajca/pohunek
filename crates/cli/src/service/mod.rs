@@ -298,7 +298,7 @@ async fn finish_check(
         checked.report.accepted_runtime_loss |= gated.accepted;
         checked.report.acceptance = gated.acceptance;
         checked.report.preflight = Some(gated.report);
-        checked.report.warnings = warnings;
+        checked.report.warnings.extend(warnings);
         checked.report.warnings.extend(gated.warnings);
     }
     Ok(checked.report)
@@ -936,7 +936,7 @@ pub(crate) fn check_local(
     let pending_install = pending
         .as_ref()
         .is_some_and(|record| record.operation == record::Operation::Install);
-    let (operation, prefix, namespace, plan, config_schema_migration) =
+    let (operation, prefix, namespace, plan, config_schema_migration, config_warnings) =
         if pending_install || !exists(&config_path)? {
             let prefix = match prefix {
                 Some(prefix) => prefix,
@@ -957,7 +957,7 @@ pub(crate) fn check_local(
             }
             let namespace = context.namespace()?;
             layout::verify_claim(&layout, &namespace)?;
-            (record::Operation::Install, prefix, namespace, plan, None)
+            (record::Operation::Install, prefix, namespace, plan, None, None)
         } else {
             let config_source = verified_config_source(context)?;
             engine::upgrade_preflight(context)?;
@@ -992,6 +992,7 @@ pub(crate) fn check_local(
                 config.namespace(),
                 plan,
                 config_schema_migration,
+                definition::unknown_keys_warning(config),
             )
         };
     let fresh_install =
@@ -1002,6 +1003,7 @@ pub(crate) fn check_local(
         }
         _ => None,
     };
+    let warnings = config_warnings.into_iter().collect();
     let report = report::CheckReport {
         operation: operation.as_str(),
         version: version.to_owned(),
@@ -1019,7 +1021,7 @@ pub(crate) fn check_local(
         accepted_runtime_loss: false,
         acceptance: report::AcceptanceGroups::default(),
         config_schema_migration,
-        warnings: Vec::new(),
+        warnings,
     };
     Ok(Checked {
         report,
@@ -1169,6 +1171,7 @@ async fn status_of(context: &Context) -> Result<report::StatusReport, Error> {
             pending_transaction: store
                 .load()?
                 .map(|pending| engine::pending_report(&pending)),
+            warnings: Vec::new(),
         });
     }
     let config = verified_config(context)?;

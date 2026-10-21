@@ -1025,6 +1025,35 @@ disk, over the planned package when its pin names a digest the release installs.
 To get prompt-box readiness, add an idle rule on the `prompt_box_body` region to
 the override, copying the package's `live_prompt_box` rule.
 
+## Unknown keys in `service.toml`
+
+`service.toml` is tolerant of keys this version does not know (#1401). A typo
+or a setting written by a newer release is ignored, not fatal:
+
+- The daemon logs one `service_config.unknown_key` warning per key at start,
+  with the key path, line and file, never the value.
+- `pohunek service status`, the `warnings` of `pohunek service check` and
+  `pohunek service upgrade`, and the `service_config_unknown_keys` check of
+  `pohunek doctor` list them with a "did you mean" hint where a known key is
+  close. Fix a typo by renaming the key; a typo of a required key still fails
+  the load, naming the key it was probably meant to be.
+- An upgrade, a reinstall and a same-schema rollback keep the unknown keys of
+  the tolerant tables and sections at their paths, and say so in a warning.
+  A migration rollback restores the exact pre-upgrade bytes as before.
+- An unknown key in `[namespace]` or `[environment]` is still refused, naming
+  the key: an older binary must not ignore a setting that moves a root or
+  narrows the environment. Remove the key, or install the release that
+  understands it.
+
+`schema_version` changes only for a breaking change: a removed or renamed key,
+a changed meaning or unit, or validation that rejects a file that was valid
+before. An additive optional key does not change it and is omitted from the
+file while it has its default, so rolling back to the previous release after
+an upgrade leaves a file the previous release reads, unless the operator set
+the new key. A previous release that is still strict refuses a file with any
+unknown key, so remove hand-added keys before a rollback to a release older
+than #1401.
+
 ## Configuration migration from schemas 2, 3, 4 and 5
 
 When the installed `service.toml` was written by release 0.33.x (schema 2, no

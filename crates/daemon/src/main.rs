@@ -29,7 +29,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -768,6 +768,23 @@ fn apply_wait_timing(config: &mut SessionRegistryConfig, timing: WaitTiming) {
     config.turn_wait_max = timing.turn_max;
 }
 
+/// Logs one warning per key of `service.toml` this version does not know.
+///
+/// The key path and line identify the key; the value is never logged because a
+/// hand-edited file may hold a secret there.
+fn warn_unknown_service_keys(service: &ServiceConfig, path: &Path) {
+    for key in service.unknown_keys() {
+        warn!(
+            event = "service_config.unknown_key",
+            service.config = %path.display(),
+            key.path = %key.path,
+            key.line = key.line,
+            key.suggestion = key.suggestion.as_deref().unwrap_or(""),
+            "service.toml holds a key this version does not know; it is ignored"
+        );
+    }
+}
+
 /// Builds the session registry with the worker supervisor of `mode`.
 async fn build_session_registry(
     mut config: SessionRegistryConfig,
@@ -779,6 +796,7 @@ async fn build_session_registry(
     let (supervision, supervisor): (SupervisionConfig, Arc<dyn WorkerLauncher>) = match mode {
         SupervisionMode::Native(path) => {
             let service = ServiceConfig::load(&path)?;
+            warn_unknown_service_keys(&service, &path);
             service.verify_installation(
                 nix::unistd::Uid::effective().as_raw(),
                 &paths.state_dir,
@@ -1784,12 +1802,86 @@ mod supervision_tests {
     use pohunek_test_support::process_env::ProcessEnv;
 
     use super::{
-        env_bool, parse_service_config, select_supervision, worker_working_directory,
-        SupervisionMode, OBSERVE_EXTERNAL_AGENTS_ENV,
+        env_bool, parse_service_config, select_supervision, warn_unknown_service_keys,
+        worker_working_directory, SupervisionMode, OBSERVE_EXTERNAL_AGENTS_ENV,
     };
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    /// Shared buffer a test subscriber writes its formatted events to.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log capture").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn the_daemon_warns_once_per_unknown_service_key_without_its_value() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use pohunek_service_config::ServiceConfig;
+
+        const SECRET: &str = "PH-DAEMON-sentinel-4a17-d2b8";
+        let dir = pohunek_test_support::tempdir().expect("config directory");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod config directory");
+        let file = dir.path().join(pohunek_service_config::FILE_NAME);
+        let text = format!(
+            "schema_version = 6\nprefix = \"/home/u/.local\"\nactive_version = \"0.35.2\"\n\
+             future_top = \"{SECRET}\"\n\
+             [namespace]\nuid = 1000\nstate_root = \"/home/u/.local/state/pohunek\"\n\
+             runtime_root = \"/run/user/1000/pohunek\"\n\
+             [deadlines]\nworker_connect_ms = 10000\nworker_initialize_ms = 45000\n\
+             launchctl_command_ms = 10000\nworker_exit_timeout_ms = 30000\n\
+             daemon_exit_timeout_ms = 30000\ndaemon_restart_throttle_ms = 5000\n\
+             [environment]\nsearch_path = []\nallowlist = [\"PATH\"]\n\
+             [sweep]\ngrace_ms = 5000\n\
+             [input]\ninitial_startup_grace_ms = 5000\nsubmit_delay_ms = 150\n\
+             write_stall_timeout_ms = 3000\n\
+             [waits]\nturn_default_ms = 300000\nturn_max_ms = 1800000\n\
+             [hooks]\nstderr_tail_bytes = 4096\n\
+             [limits]\nopen_files = 8192\nopen_file = \"{SECRET}\"\n"
+        );
+        std::fs::write(&file, text).expect("write service.toml");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod service.toml");
+        let service = ServiceConfig::load(&file).expect("a newer-minor file loads");
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            warn_unknown_service_keys(&service, &file);
+        });
+
+        let logged = String::from_utf8_lossy(&capture.0.lock().expect("log capture")).into_owned();
+        assert_eq!(logged.matches("service_config.unknown_key").count(), 2, "{logged}");
+        assert!(logged.contains("WARN"), "{logged}");
+        assert!(logged.contains("future_top"), "{logged}");
+        assert!(logged.contains("limits.open_file"), "{logged}");
+        assert!(logged.contains("limits.open_files"), "{logged}");
+        assert!(logged.contains(&file.display().to_string()), "{logged}");
+        assert!(!logged.contains(SECRET), "{logged}");
     }
 
     #[test]

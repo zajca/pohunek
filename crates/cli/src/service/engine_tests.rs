@@ -2243,6 +2243,136 @@ async fn an_upgrade_refuses_a_pending_install_and_install_finishes_it() {
     }
 }
 
+/// Value that stands in for a secret a hand-edited `service.toml` holds under
+/// a key this version does not know.
+const UNKNOWN_KEY_SECRET: &str = "PH-UNKNOWN-sentinel-8d41-c3e7";
+
+/// Adds one unknown key to `[limits]` and one unknown section to the
+/// installed `service.toml`, as a newer release or an operator would.
+fn add_unknown_keys(harness: &Harness) {
+    let path = harness.context.config_path();
+    let text = std::fs::read_to_string(&path).expect("read service.toml");
+    let text = text.replacen(
+        "[limits]\n",
+        &format!("[limits]\nfuture_limit = \"{UNKNOWN_KEY_SECRET}\"\n"),
+        1,
+    );
+    assert!(text.contains("future_limit"), "the fixture has a [limits] table");
+    // Writing in place keeps the owner-private mode of the existing file.
+    std::fs::write(&path, format!("{text}\n[future]\nname = \"{UNKNOWN_KEY_SECRET}\"\n"))
+        .expect("write service.toml");
+}
+
+fn assert_names_unknown_keys(warnings: &[String], context: &str) {
+    let joined = warnings.join("\n");
+    assert!(joined.contains("limits.future_limit"), "{context}: {joined}");
+    assert!(joined.contains("future.name"), "{context}: {joined}");
+    assert!(!joined.contains(UNKNOWN_KEY_SECRET), "{context}: {joined}");
+}
+
+#[tokio::test]
+async fn service_commands_report_unknown_keys() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+
+    let clean = harness.config().expect("config");
+    let status = harness
+        .engine()
+        .status(Some(&clean))
+        .await
+        .expect("clean status");
+    assert!(status.warnings.is_empty(), "{:?}", status.warnings);
+    let clean_check = crate::service::check_with(
+        &harness.context,
+        &harness.backend,
+        Some(harness.prefix()),
+        V2,
+        false,
+    )
+    .await
+    .expect("clean check");
+    assert!(clean_check.warnings.is_empty(), "{:?}", clean_check.warnings);
+
+    add_unknown_keys(&harness);
+    let config = harness.config().expect("config with unknown keys");
+    let status = harness
+        .engine()
+        .status(Some(&config))
+        .await
+        .expect("status");
+    assert_names_unknown_keys(&status.warnings, "status");
+    let json = serde_json::to_string(&status).expect("status JSON");
+    assert!(json.contains("future_limit") && !json.contains(UNKNOWN_KEY_SECRET), "{json}");
+
+    let checked = crate::service::check_with(
+        &harness.context,
+        &harness.backend,
+        Some(harness.prefix()),
+        V2,
+        false,
+    )
+    .await
+    .expect("check");
+    assert_names_unknown_keys(&checked.warnings, "check");
+    let json = serde_json::to_string(&checked).expect("check JSON");
+    assert!(!json.contains(UNKNOWN_KEY_SECRET), "{json}");
+
+    let unchanged = harness.upgrade(V1).await.expect("same-version upgrade");
+    assert!(unchanged.unchanged);
+    assert_names_unknown_keys(&unchanged.warnings, "same-version upgrade");
+}
+
+#[tokio::test]
+async fn an_upgrade_keeps_unknown_keys_it_does_not_own() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    add_unknown_keys(&harness);
+
+    let report = harness.upgrade(V2).await.expect("upgrade");
+
+    assert_names_unknown_keys(&report.warnings, "upgrade");
+    assert!(
+        report.warnings.iter().any(|warning| warning.contains("kept")),
+        "{:?}",
+        report.warnings
+    );
+    let json = serde_json::to_string(&report).expect("upgrade JSON");
+    assert!(!json.contains(UNKNOWN_KEY_SECRET), "{json}");
+    harness.assert_installed(V2);
+    let text = std::fs::read_to_string(harness.context.config_path()).expect("read service.toml");
+    assert!(text.contains(&format!("future_limit = \"{UNKNOWN_KEY_SECRET}\"")), "{text}");
+    assert!(text.contains("[future]"), "{text}");
+    let reloaded = harness.config().expect("the new daemon's file loads");
+    assert_eq!(reloaded.active_version(), V2);
+    assert_eq!(reloaded.unknown_keys().len(), 3);
+}
+
+#[tokio::test]
+async fn a_rollback_restores_the_source_config_with_its_unknown_keys() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    add_unknown_keys(&harness);
+    let source = std::fs::read_to_string(harness.context.config_path()).expect("read");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Config);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after the config write");
+    let written = harness.config().expect("config after the interrupted step");
+    assert_eq!(written.active_version(), V2);
+
+    // Asking for the active version rolls the interrupted upgrade back first.
+    let report = harness.upgrade(V1).await.expect("roll back");
+
+    assert!(report.unchanged);
+    harness.assert_installed(V1);
+    let restored = std::fs::read_to_string(harness.context.config_path()).expect("read");
+    let table = |text: &str| -> toml::Table { toml::from_str(text).expect("TOML") };
+    assert_eq!(table(&restored), table(&source), "{restored}");
+    assert_eq!(harness.config().expect("loads").unknown_keys().len(), 3);
+}
+
 #[tokio::test]
 async fn an_upgrade_interrupted_after_every_step_resumes_or_rolls_back() {
     for step in STEPS {

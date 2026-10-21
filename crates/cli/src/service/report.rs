@@ -311,6 +311,10 @@ pub struct StatusReport {
     /// Whether another `pohunek service` command is running right now; its
     /// record is then in flight rather than interrupted.
     pub transaction_in_progress: bool,
+    /// Conditions of the installation that the operator must be told, such as
+    /// keys of `service.toml` this version does not know.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// One service-manager job.

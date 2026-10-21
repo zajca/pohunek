@@ -851,6 +851,9 @@ fn render_status(report: &report::StatusReport) -> String {
     for path in &report.unreadable_journals {
         let _ = writeln!(text, "warning: unreadable journal {}", path.display());
     }
+    for warning in &report.warnings {
+        let _ = writeln!(text, "warning: {warning}");
+    }
     text
 }
 
@@ -1394,6 +1397,7 @@ mod tests {
             workers_error: None,
             unreadable_journals: Vec::new(),
             transaction_in_progress: false,
+            warnings: Vec::new(),
             pending_transaction: Some(report::PendingReport {
                 operation: "install",
                 version: "1.0.0".to_owned(),
@@ -1507,6 +1511,7 @@ mod tests {
             workers_error: None,
             unreadable_journals: Vec::new(),
             transaction_in_progress: false,
+            warnings: Vec::new(),
             pending_transaction: Some(report::PendingReport {
                 operation: "install",
                 version: "1.0.0".to_owned(),

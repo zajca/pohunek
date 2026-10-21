@@ -4,8 +4,10 @@
 //! needs in `<config>/pohunek/service.toml`. The daemon (`pohunekd
 //! --service-config <abs>`) and each worker generation (`pohunek-sessiond
 //! --service-config <abs>`) load the same file and fail fast when it is
-//! missing or invalid. There are no defaults: every key is required, unknown
-//! keys are rejected, and each value is checked against a documented bound.
+//! missing or invalid. There are no defaults: every key of the current schema
+//! is required, and each value is checked against a documented bound. Unknown
+//! keys are tolerated outside the security tables (see
+//! [Compatibility](#compatibility)).
 //!
 //! # Schema
 //!
@@ -61,6 +63,39 @@
 //! daemon keeps for the `session.new` warning. See
 //! [`DEFAULT_HOOK_STDERR_TAIL_BYTES`] and [`MAX_HOOK_STDERR_TAIL_BYTES`].
 //!
+//! # Compatibility
+//!
+//! `schema_version` changes only for a breaking change: a removed or renamed
+//! key, a changed meaning or unit, or validation that rejects a file that was
+//! valid before. A normal load accepts only [`SCHEMA_VERSION`].
+//!
+//! Unknown keys and tables do not break a load:
+//!
+//! - They are ignored and reported by [`ServiceConfig::unknown_keys`] with the
+//!   key path, the line, and a "did you mean" hint when a known sibling key is
+//!   within two edits. The daemon logs one warning per key at
+//!   start; `pohunek service status`, `check` and `upgrade` and `pohunek
+//!   doctor` report them. Their values are never read into a message, a log
+//!   line, or `Debug` output, because a hand-edited file may hold a secret
+//!   there.
+//! - [`ServiceConfig::to_toml`] and [`ServiceConfig::write`] keep them at the
+//!   same paths, after the typed values, so an upgrade, a reinstall or a
+//!   rollback does not drop a setting this version does not own. A key this
+//!   version writes is always rendered from its typed value.
+//! - `[namespace]` and `[environment]` stay strict: an unknown key there is a
+//!   [`ConfigError::Parse`] naming the key, because an older binary must never
+//!   skip a setting that moves a root or narrows the environment. A new
+//!   setting in those tables or among the top-level identity keys (`prefix`,
+//!   `active_version`) therefore needs a new schema version.
+//! - A required key that is missing stays an error; when an unknown key of
+//!   the same table resembles it the error names it. An invalid value of a
+//!   known key fails as before, whatever unknown keys surround it.
+//!
+//! An additive setting elsewhere is an optional key with a documented
+//! default and needs no schema bump. The writer omits it while it equals that
+//! default, so a release that adds one still writes files the previous
+//! release can read, unless the operator set the new key.
+//!
 //! # Upgrades
 //!
 //! A normal load accepts only [`SCHEMA_VERSION`]. The installer reads the
@@ -69,7 +104,9 @@
 //! has neither `[input]` nor `[waits]`, schema 3 has no `[waits]` and no
 //! `input.write_stall_timeout_ms`, schema 4 has no
 //! `input.write_stall_timeout_ms`, and none of them nor schema 5 has
-//! `[hooks]`. Every value a previous file records is kept.
+//! `[hooks]`. Every value a previous file records is kept. The previous
+//! schemas are read in their exact shapes: no release that wrote one could
+//! write an unknown key, so an unknown key in such a file is refused.
 //!
 //! `environment.search_path` is the executable search path the installer
 //! resolved (see `pohunek_platform::shell_env`) and hands to the daemon job as
@@ -131,6 +168,7 @@ use pohunek_platform::supervisor::{
     Namespace, MAX_JOB_TIMEOUT, MAX_JOB_VALUE_BYTES, MAX_OPEN_FILES, MIN_OPEN_FILES,
 };
 use serde::{Deserialize, Serialize};
+use toml_edit::{DocumentMut, ImDocument, Item, Table, TableLike};
 
 mod error;
 pub mod preflight;
@@ -356,6 +394,14 @@ const FILE_HEADER: &str =
     "# Pohunek service configuration, written by `pohunek service install`.\n\
 # Every key is required; unknown keys are rejected.\n\n";
 
+/// Largest edit distance at which an unknown key is offered a known key as a
+/// "did you mean" hint.
+const MAX_SUGGESTION_DISTANCE: usize = 2;
+
+/// Longest unknown key path, in bytes, that a warning repeats; longer paths
+/// are cut so one hostile key cannot flood a log line or an error envelope.
+const MAX_REPORTED_PATH_BYTES: usize = 128;
+
 /// Per-process sequence making temporary file names unique between writes.
 ///
 /// It only disambiguates names: the temporary file is created exclusively, so
@@ -412,6 +458,49 @@ pub struct WaitTiming {
     pub turn_default: Duration,
     /// Longest timeout a `session.wait_turn` call may request.
     pub turn_max: Duration,
+}
+
+/// A key or table of `service.toml` that this version does not know.
+///
+/// The value never enters this type, so no warning built from it can leak a
+/// secret a hand-edited file holds. The path is escaped and bounded, so it is
+/// safe to print.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownKey {
+    /// Dotted path of the key, such as `limits.open_file`.
+    pub path: String,
+    /// 1-based line of the key in the file it was read from.
+    pub line: usize,
+    /// Dotted path of the known key this one resembles, if any.
+    pub suggestion: Option<String>,
+}
+
+impl std::fmt::Display for UnknownKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown key `{}` (line {})", self.path, self.line)?;
+        match &self.suggestion {
+            Some(known) => write!(f, "; did you mean `{known}`?"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The unknown keys of one loaded file and the subtree needed to write them back.
+///
+/// `kept` is TOML text of only the unknown items at their original paths. Its
+/// `Debug` shows paths only, because the text holds the values.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct UnknownKeys {
+    keys: Vec<UnknownKey>,
+    kept: String,
+}
+
+impl std::fmt::Debug for UnknownKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.keys.iter().map(|key| &key.path))
+            .finish()
+    }
 }
 
 /// A validated service file read for an installer upgrade.
@@ -512,6 +601,7 @@ pub struct ServiceConfig {
     wait_timing: WaitTiming,
     hook_stderr_tail_bytes: u32,
     open_files: u64,
+    unknown: UnknownKeys,
 }
 
 impl ServiceConfig {
@@ -604,6 +694,7 @@ impl ServiceConfig {
             wait_timing: spec.wait_timing,
             hook_stderr_tail_bytes: spec.hook_stderr_tail_bytes,
             open_files: spec.open_files,
+            unknown: UnknownKeys::default(),
         })
     }
 
@@ -697,7 +788,38 @@ impl ServiceConfig {
         write_config_text(path, &self.to_toml())
     }
 
+    /// Returns this configuration with only its active version changed.
+    ///
+    /// Everything else is kept, including the unknown keys of the file this
+    /// value was loaded from, so a version change never drops a setting this
+    /// version does not own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidVersion`] for an invalid version.
+    pub fn with_active_version(&self, version: &str) -> Result<Self, ConfigError> {
+        let mut spec = self.to_spec();
+        version.clone_into(&mut spec.active_version);
+        let mut config = Self::new(spec)?;
+        config.unknown = self.unknown.clone();
+        Ok(config)
+    }
+
+    /// Returns the keys and tables of the loaded file that this version does
+    /// not know, in file order.
+    ///
+    /// They were ignored when the file was loaded and are written back by
+    /// [`to_toml`](Self::to_toml). A value built by [`ServiceConfig::new`] has none.
+    #[must_use]
+    pub fn unknown_keys(&self) -> &[UnknownKey] {
+        &self.unknown.keys
+    }
+
     /// Renders the configuration as the TOML document [`load`](Self::load) accepts.
+    ///
+    /// The unknown keys of the loaded file are merged back at their original
+    /// paths after the typed values; a key this version writes is always
+    /// rendered from its typed value.
     #[must_use]
     pub fn to_toml(&self) -> String {
         let raw = RawConfig {
@@ -744,7 +866,11 @@ impl ServiceConfig {
         };
         let body = toml::to_string(&raw)
             .expect("validated strings, bounded integers, and tables always serialize as TOML");
-        format!("{FILE_HEADER}{body}")
+        let typed = format!("{FILE_HEADER}{body}");
+        if self.unknown.kept.is_empty() {
+            return typed;
+        }
+        merge_kept_keys(&typed, &self.unknown.kept)
     }
 
     /// Returns the values this configuration was built from.
@@ -950,8 +1076,12 @@ fn write_config_text(path: &Path, text: &str) -> Result<(), ConfigError> {
 }
 
 /// On-disk form of the whole file.
+///
+/// Unknown keys are ignored by serde here and reported by [`scan_unknown`];
+/// `[namespace]` and `[environment]` keep `deny_unknown_fields` because an
+/// older binary must never skip a setting that moves a root or narrows the
+/// environment.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawConfig {
     schema_version: u32,
     prefix: String,
@@ -1038,7 +1168,6 @@ struct RawNamespace {
 
 /// On-disk `[deadlines]` table in milliseconds.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 #[expect(
     clippy::struct_field_names,
     reason = "the `_ms` suffix is the documented on-disk unit of every key"
@@ -1062,14 +1191,12 @@ struct RawEnvironment {
 
 /// On-disk `[sweep]` table.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawSweep {
     grace_ms: u64,
 }
 
 /// On-disk `[input]` table in milliseconds.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 #[expect(
     clippy::struct_field_names,
     reason = "the `_ms` suffix is the documented on-disk unit of every key"
@@ -1090,7 +1217,6 @@ struct RawInputWithoutStall {
 
 /// On-disk `[waits]` table in milliseconds.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawWaits {
     turn_default_ms: u64,
     turn_max_ms: u64,
@@ -1107,7 +1233,6 @@ impl From<WaitTiming> for RawWaits {
 
 /// On-disk `[hooks]` table.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawHooks {
     stderr_tail_bytes: u32,
 }
@@ -1121,7 +1246,6 @@ impl RawHooks {
 
 /// On-disk `[limits]` table.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawLimits {
     open_files: u64,
 }
@@ -1130,7 +1254,7 @@ struct RawLimits {
 fn parse(path: &Path, text: &str) -> Result<ServiceConfig, ConfigError> {
     let parse_error = |error: toml::de::Error| ConfigError::Parse {
         path: path.to_path_buf(),
-        message: diagnostic(text, &error),
+        message: diagnostic_with_hint(path, text, &error),
     };
     // The schema version is checked before the typed parse, so a newer file
     // reports its version instead of its first key this schema does not know.
@@ -1146,7 +1270,9 @@ fn parse(path: &Path, text: &str) -> Result<ServiceConfig, ConfigError> {
             found: i64::from(raw.schema_version),
         });
     }
-    config_from_raw(raw)
+    let mut config = config_from_raw(raw)?;
+    config.unknown = scan_unknown(path, text)?;
+    Ok(config)
 }
 
 /// Parses the current or an exact previous schema at the installer upgrade boundary.
@@ -1180,6 +1306,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 2);
+            refuse_unknown_keys(path, text, 2)?;
             Ok((config_from_raw(raw)?, 2))
         }
         Some(toml::Value::Integer(4)) => {
@@ -1202,6 +1329,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 4);
+            refuse_unknown_keys(path, text, 4)?;
             Ok((config_from_raw(raw)?, 4))
         }
         Some(toml::Value::Integer(5)) => {
@@ -1220,6 +1348,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 5);
+            refuse_unknown_keys(path, text, 5)?;
             Ok((config_from_raw(raw)?, 5))
         }
         Some(toml::Value::Integer(3)) => {
@@ -1242,10 +1371,334 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 3);
+            refuse_unknown_keys(path, text, 3)?;
             Ok((config_from_raw(raw)?, 3))
         }
         _ => Ok((parse(path, text)?, SCHEMA_VERSION)),
     }
+}
+
+/// Fails when a previous-schema file holds a key outside its exact shape.
+///
+/// The top level and the version-specific tables are rejected by their strict
+/// raw types; this covers the tables the previous schemas share with the
+/// current one, which ignore unknown keys.
+fn refuse_unknown_keys(path: &Path, text: &str, schema: u32) -> Result<(), ConfigError> {
+    match scan_unknown(path, text)?.keys.first() {
+        None => Ok(()),
+        Some(key) => Err(ConfigError::Parse {
+            path: path.to_path_buf(),
+            message: format!(
+                "unknown field `{}` (line {}); a schema {schema} file is read in its exact shape",
+                key.path, key.line
+            ),
+        }),
+    }
+}
+
+impl RawConfig {
+    /// A value of every key the current schema writes, used only to derive
+    /// the set of known keys.
+    ///
+    /// A key that is omitted from the rendered file while it equals its
+    /// default must still serialize here, or it would be reported as unknown.
+    fn known_keys_sample() -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            prefix: String::new(),
+            active_version: String::new(),
+            namespace: RawNamespace {
+                uid: 0,
+                state_root: String::new(),
+                runtime_root: String::new(),
+            },
+            deadlines: RawDeadlines {
+                worker_connect_ms: 0,
+                worker_initialize_ms: 0,
+                launchctl_command_ms: 0,
+                worker_exit_timeout_ms: 0,
+                daemon_exit_timeout_ms: 0,
+                daemon_restart_throttle_ms: 0,
+            },
+            environment: RawEnvironment {
+                search_path: Vec::new(),
+                allowlist: Vec::new(),
+            },
+            sweep: RawSweep { grace_ms: 0 },
+            input: RawInput {
+                initial_startup_grace_ms: 0,
+                submit_delay_ms: 0,
+                write_stall_timeout_ms: 0,
+            },
+            waits: RawWaits {
+                turn_default_ms: 0,
+                turn_max_ms: 0,
+            },
+            hooks: RawHooks::DEFAULT,
+            limits: RawLimits { open_files: 0 },
+        }
+    }
+}
+
+/// Finds every key or table of `text` that the current schema does not know.
+///
+/// The known set is the serialized shape of [`RawConfig`], so it cannot drift
+/// from the typed parse. The text has already parsed as the current schema, so
+/// the strict tables hold no unknown key here.
+fn scan_unknown(path: &Path, text: &str) -> Result<UnknownKeys, ConfigError> {
+    let document = ImDocument::parse(text).map_err(|_error| ConfigError::Parse {
+        path: path.to_path_buf(),
+        message: "TOML parse error".to_owned(),
+    })?;
+    let shape = toml::Table::try_from(RawConfig::known_keys_sample())
+        .expect("the current shape always serializes as a TOML table");
+    let mut scan = UnknownScan {
+        text,
+        keys: Vec::new(),
+        kept: DocumentMut::new(),
+    };
+    scan.walk(document.as_table(), Some(&shape), &mut Vec::new(), 1);
+    let kept = if scan.keys.is_empty() {
+        String::new()
+    } else {
+        scan.kept.to_string()
+    };
+    Ok(UnknownKeys {
+        keys: scan.keys,
+        kept,
+    })
+}
+
+/// State of one [`scan_unknown`] walk over a parsed document.
+struct UnknownScan<'a> {
+    text: &'a str,
+    keys: Vec<UnknownKey>,
+    kept: DocumentMut,
+}
+
+impl UnknownScan<'_> {
+    /// Visits `table`. `shape` is the known counterpart, or `None` inside an
+    /// unknown subtree, where every key is unknown and is only reported.
+    fn walk(
+        &mut self,
+        table: &dyn TableLike,
+        shape: Option<&toml::Table>,
+        parents: &mut Vec<String>,
+        parent_line: usize,
+    ) {
+        for (name, item) in table.iter() {
+            let line = table
+                .get_key_value(name)
+                .and_then(|(key, _item)| key.span())
+                .or_else(|| item.span())
+                .map_or(parent_line, |span| position(self.text, span.start).0);
+            let known = shape.and_then(|shape| shape.get(name));
+            let reported = display_key(name);
+            match known {
+                Some(toml::Value::Table(known_table)) => {
+                    if let Some(child) = item.as_table_like() {
+                        parents.push(name.to_owned());
+                        self.walk(child, Some(known_table), parents, line);
+                        parents.pop();
+                    }
+                }
+                Some(_leaf) => {}
+                None => {
+                    let path = join_path(parents, &reported);
+                    let suggestion = shape
+                        .and_then(|shape| closest_known_key(shape, name))
+                        .map(|known| join_path(parents, known));
+                    self.keys.push(UnknownKey {
+                        path,
+                        line,
+                        suggestion,
+                    });
+                    if shape.is_some() {
+                        self.keep(parents, name, item);
+                    }
+                    if let Some(child) = item.as_table_like() {
+                        parents.push(reported);
+                        self.walk(child, None, parents, line);
+                        parents.pop();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Records `item` at `parents/name` in the subtree written back on render.
+    fn keep(&mut self, parents: &[String], name: &str, item: &Item) {
+        let mut cursor = self.kept.as_table_mut();
+        for parent in parents {
+            cursor = cursor
+                .entry(parent)
+                .or_insert_with(|| {
+                    let mut table = Table::new();
+                    table.set_implicit(true);
+                    Item::Table(table)
+                })
+                .as_table_mut()
+                .expect("the parents of a kept key are tables built here");
+        }
+        cursor.insert(name, item.clone());
+    }
+}
+
+/// Joins a parent path and a key name with a dot.
+fn join_path(parents: &[String], name: &str) -> String {
+    let mut path = parents.join(".");
+    if !path.is_empty() {
+        path.push('.');
+    }
+    path.push_str(name);
+    path
+}
+
+/// Escapes control characters of a key name and bounds its length, so a
+/// hostile key cannot inject terminal escapes or flood a log line.
+fn display_key(name: &str) -> String {
+    let escaped: String = name.escape_debug().collect();
+    if escaped.len() <= MAX_REPORTED_PATH_BYTES {
+        return escaped;
+    }
+    let mut end = MAX_REPORTED_PATH_BYTES;
+    while !escaped.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &escaped[..end])
+}
+
+/// Returns the known sibling key closest to the unknown `name`, if any is
+/// within [`MAX_SUGGESTION_DISTANCE`].
+fn closest_known_key<'a>(shape: &'a toml::Table, name: &str) -> Option<&'a str> {
+    let length = name.chars().count();
+    shape
+        .keys()
+        .filter_map(|known| {
+            let distance = edit_distance(known, name)?;
+            (distance < length).then_some((distance, known.as_str()))
+        })
+        .min_by_key(|(distance, _known)| *distance)
+        .map(|(_distance, known)| known)
+}
+
+/// Levenshtein distance between two names, or `None` above
+/// [`MAX_SUGGESTION_DISTANCE`].
+fn edit_distance(known: &str, name: &str) -> Option<usize> {
+    let known: Vec<char> = known.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    if known.len().abs_diff(name.len()) > MAX_SUGGESTION_DISTANCE {
+        return None;
+    }
+    let mut previous: Vec<usize> = (0..=name.len()).collect();
+    for (row, known_char) in known.iter().enumerate() {
+        let mut current = vec![row + 1];
+        for (column, name_char) in name.iter().enumerate() {
+            let substitution = previous[column] + usize::from(known_char != name_char);
+            current.push(
+                substitution
+                    .min(previous[column + 1] + 1)
+                    .min(current[column] + 1),
+            );
+        }
+        previous = current;
+    }
+    let distance = previous[name.len()];
+    (distance <= MAX_SUGGESTION_DISTANCE).then_some(distance)
+}
+
+/// Merges the kept unknown items into the rendered typed document.
+///
+/// A key present in the typed document is never overridden. Kept tables are
+/// placed after every typed table.
+fn merge_kept_keys(typed: &str, kept: &str) -> String {
+    let mut document: DocumentMut = typed
+        .parse()
+        .expect("the typed rendering is a valid TOML document");
+    let kept: DocumentMut = kept
+        .parse()
+        .expect("the kept subtree was rendered from a parsed TOML document");
+    let base = max_position(document.as_table()).map_or(0, |last| last + 1);
+    merge_table(document.as_table_mut(), kept.as_table(), base);
+    document.to_string()
+}
+
+fn merge_table(typed: &mut Table, kept: &Table, base: usize) {
+    for (name, item) in kept {
+        match typed.get_mut(name) {
+            Some(existing) => {
+                if let (Some(typed_child), Some(kept_child)) =
+                    (existing.as_table_mut(), item.as_table())
+                {
+                    merge_table(typed_child, kept_child, base);
+                }
+            }
+            None => {
+                let mut item = item.clone();
+                shift_positions(&mut item, base);
+                typed.insert(name, item);
+            }
+        }
+    }
+}
+
+/// Largest document position among the tables below `table`.
+fn max_position(table: &Table) -> Option<usize> {
+    table
+        .iter()
+        .filter_map(|(_name, item)| match item {
+            Item::Table(child) => max_position(child).max(child.position()),
+            _other => None,
+        })
+        .max()
+}
+
+/// Moves every table position below `item` by `base`, keeping their order.
+fn shift_positions(item: &mut Item, base: usize) {
+    match item {
+        Item::Table(table) => {
+            if let Some(position) = table.position() {
+                table.set_position(base + position);
+            }
+            for (_name, child) in table.iter_mut() {
+                shift_positions(child, base);
+            }
+        }
+        Item::ArrayOfTables(tables) => {
+            for table in tables.iter_mut() {
+                if let Some(position) = table.position() {
+                    table.set_position(base + position);
+                }
+                for (_name, child) in table.iter_mut() {
+                    shift_positions(child, base);
+                }
+            }
+        }
+        Item::Value(_) | Item::None => {}
+    }
+}
+
+/// Like [`diagnostic`], and names the unknown key a missing required key was
+/// probably meant to be.
+fn diagnostic_with_hint(path: &Path, text: &str, error: &toml::de::Error) -> String {
+    let mut message = diagnostic(text, error);
+    let missing = error
+        .message()
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.strip_suffix('`'));
+    if let (Some(missing), Ok(unknown)) = (missing, scan_unknown(path, text)) {
+        let hinted = unknown.keys.iter().find_map(|key| {
+            let known = key.suggestion.as_deref()?;
+            (known == missing || known.ends_with(&format!(".{missing}")))
+                .then_some((known, key.path.as_str()))
+        });
+        if let Some((known, unknown_path)) = hinted {
+            message.push_str(&format!(
+                "; did you mean `{known}`? `{unknown_path}` is not a key"
+            ));
+        }
+    }
+    message
 }
 
 /// Converts the parsed current shape into validated typed values.

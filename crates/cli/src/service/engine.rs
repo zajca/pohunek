@@ -173,7 +173,7 @@ use protocol::SessionInfo;
 use super::backend::Backend;
 use super::context::Context;
 use super::definition::{
-    config_with_search_path, daemon_definition, identity_config, with_version,
+    config_with_search_path, daemon_definition, identity_config, unknown_keys_warning, with_version,
 };
 use super::error::{supervisor_error, Error, LiveSession, OutdatedWorker};
 use super::layout::{self, Staged, VerifiedVersionDir};
@@ -672,7 +672,7 @@ impl<'a> Engine<'a> {
                 .refresh_active_version(staged, &layout, version)
                 .await?;
             return Ok(UpgradeReport {
-                warnings: Vec::new(),
+                warnings: unknown_keys_warning(config).into_iter().collect(),
                 from_version,
                 to_version: version.to_owned(),
                 unchanged: true,
@@ -753,6 +753,7 @@ impl<'a> Engine<'a> {
         if let Some(gated) = &gated {
             warnings.extend(gated.warnings.iter().cloned());
         }
+        warnings.extend(unknown_keys_warning(&target));
         let (removed_versions, kept_versions, gc_error) =
             self.collect_garbage_reported(&layout, version).await;
         Ok(UpgradeReport {
@@ -1041,10 +1042,12 @@ impl<'a> Engine<'a> {
             unreadable_journals: Vec::new(),
             pending_transaction,
             transaction_in_progress,
+            warnings: Vec::new(),
         };
         let Some(config) = config else {
             return Ok(report);
         };
+        report.warnings.extend(unknown_keys_warning(config));
         let layout = config.layout();
         report.namespace = Some(config.namespace().as_str().to_owned());
         report.prefix = Some(layout.prefix().to_path_buf());
