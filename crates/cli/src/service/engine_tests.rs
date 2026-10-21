@@ -10729,7 +10729,7 @@ async fn a_rollback_gate_before_the_stop_judges_the_unloaded_job() {
     assert_eq!(
         harness.fake.world().uninstalls,
         uninstalls,
-        "refused before the stop"
+        "refused before the stop: {error}"
     );
     assert!(harness.pending().is_some(), "the transaction is kept");
 }
