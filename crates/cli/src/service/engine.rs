@@ -660,13 +660,7 @@ impl<'a> Engine<'a> {
             verify_pending_migration(self.context, &self.store, record, &source)?;
         }
         let config = &source.config;
-        if resume.is_some() || config.active_version() != version {
-            // Kept unknown keys can make a rendering larger than the load
-            // bound. Both renderings are checked before the first effect, so
-            // neither the upgrade nor its rollback can hit the bound later.
-            check_rendering_size(config, &config_path)?;
-            check_rendering_size(&with_version(config, version)?, &config_path)?;
-        }
+        check_upgrade_renderings(config, version, resume.is_some(), &config_path)?;
         let layout = config.layout().clone();
         check_layout_dirs(self.context, &layout)?;
         layout::claim_prefix(&layout, &config.namespace())?;
@@ -3343,18 +3337,33 @@ fn launchd_job_path<'a>(
     })))
 }
 
-/// Refuses a configuration whose rendering exceeds the load bound.
+/// Refuses an upgrade whose configuration rendering exceeds the load bound.
+///
+/// Kept unknown keys can make a rendering larger than the file it came from.
+/// Both the current and the target rendering are checked before the first
+/// effect, so neither the upgrade nor its rollback can hit the bound later.
+/// An upgrade to the active version rewrites nothing and is not checked.
 ///
 /// # Errors
 ///
 /// Returns [`ConfigError::TooLarge`] without changing anything.
-fn check_rendering_size(config: &ServiceConfig, path: &Path) -> Result<(), Error> {
-    if config.to_toml().len() > MAX_CONFIG_BYTES {
-        return Err(ConfigError::TooLarge {
-            path: path.to_path_buf(),
-            max_bytes: MAX_CONFIG_BYTES,
+pub(crate) fn check_upgrade_renderings(
+    config: &ServiceConfig,
+    version: &str,
+    resuming: bool,
+    path: &Path,
+) -> Result<(), Error> {
+    if !resuming && config.active_version() == version {
+        return Ok(());
+    }
+    for rendering in [config.clone(), with_version(config, version)?] {
+        if rendering.to_toml().len() > MAX_CONFIG_BYTES {
+            return Err(ConfigError::TooLarge {
+                path: path.to_path_buf(),
+                max_bytes: MAX_CONFIG_BYTES,
+            }
+            .into());
         }
-        .into());
     }
     Ok(())
 }

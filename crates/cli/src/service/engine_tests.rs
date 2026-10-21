@@ -2439,6 +2439,16 @@ async fn an_upgrade_whose_rendering_outgrows_the_bound_is_refused_before_any_eff
         ),
         "{error:?}"
     );
+    // `service check` judges the same rendering and reports the same refusal.
+    let checked = check_local_report(&harness.context, None, V2, false)
+        .expect_err("the check refuses what the upgrade refuses");
+    assert!(
+        matches!(
+            checked,
+            Error::Config(pohunek_service_config::ConfigError::TooLarge { .. })
+        ),
+        "{checked:?}"
+    );
     assert!(harness.pending().is_none(), "no transaction was started");
     assert!(
         harness.runtimes.calls().is_empty(),
