@@ -88,6 +88,9 @@ pub(super) struct PtySessionSpec {
     /// Whether an initial input follows the commit; the committed record
     /// then carries the `initial_input` marker until it is delivered.
     pub(super) initial_input_pending: bool,
+    /// Whether the launch command line carries the first prompt, which the
+    /// agent answers without any later input.
+    pub(super) prompt_in_argv: bool,
     /// Shared package authority a launch holds until its registration ends,
     /// for launches that pin a package outside the create transaction.
     pub(super) package_authority: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
@@ -150,6 +153,8 @@ pub(super) enum PtyRegistration {
 pub(super) struct LaunchCommandPlan {
     pub(super) command: LaunchCommand,
     pub(super) pending_initial_input: Option<String>,
+    /// Whether the first prompt is part of `command`.
+    pub(super) prompt_in_argv: bool,
 }
 
 /// The resolved launch target for a `session.new`: where the agent runs and the
@@ -638,6 +643,7 @@ impl SessionRegistry {
             metadata,
             warnings,
             initial_input_pending,
+            prompt_in_argv,
             package_authority: _package_authority,
         } = spec;
 
@@ -982,6 +988,9 @@ impl SessionRegistry {
                     LaunchFailure::Unavailable(error)
                 }
             });
+        }
+        if prompt_in_argv {
+            self.inner.turns.note_input(&id);
         }
         match registration {
             PtyRegistration::Create => self.emit(event::SESSION_CREATED, &info),

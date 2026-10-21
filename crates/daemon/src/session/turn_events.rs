@@ -259,10 +259,11 @@ pub(crate) struct TurnProgress {
     /// Unix nanoseconds of the last transition into `working`; what
     /// `session.wait_turn` reports as the turn start.
     turn_started_nanos: AtomicU64,
-    /// Whether the session was seen ready (idle) or an agent reported its
-    /// activity: until then the detector's `working` is start-up output, not
-    /// a turn.
-    ready: AtomicBool,
+    /// Whether input reached the session's current runtime, or an agent
+    /// reported its activity, since the last turn the detector opened: until
+    /// then the detector's `working` is output nobody asked for (start-up
+    /// banner, repaint), not a turn.
+    input_seen: AtomicBool,
     table: Mutex<TurnTable>,
 }
 
@@ -301,9 +302,9 @@ impl TurnProgress {
         let now = Instant::now();
         let mut table = self.table();
         table.depart_changed(owner);
-        if !detector_observed || next == AgentActivity::Idle {
-            self.ready.store(true, Ordering::Relaxed);
-        } else if next == AgentActivity::Working && !self.ready.load(Ordering::Relaxed) {
+        if !detector_observed {
+            self.input_seen.store(true, Ordering::Relaxed);
+        } else if next == AgentActivity::Working && !self.input_seen.load(Ordering::Relaxed) {
             return TurnChange::default();
         }
         // A working report of a new owner opens its own turn even when the
@@ -315,6 +316,9 @@ impl TurnProgress {
         {
             // The start orders turns for `session.wait_turn`, so a wall clock
             // that stepped back must not give a new turn a smaller one.
+            if detector_observed {
+                self.input_seen.store(false, Ordering::Relaxed);
+            }
             let nanos = wall_nanos.max(self.turn_started_nanos.load(Ordering::Relaxed) + 1);
             self.turn_started_nanos.store(nanos, Ordering::Relaxed);
             let started = enter_working(&mut table, owner, previous, non_zero(nanos), now);
@@ -383,6 +387,14 @@ impl TurnProgress {
 
     fn depart(&self, owner: TurnOwner) {
         self.table().depart_changed(owner);
+    }
+
+    fn note_input(&self) {
+        self.input_seen.store(true, Ordering::Relaxed);
+    }
+
+    fn forget_input(&self) {
+        self.input_seen.store(false, Ordering::Relaxed);
     }
 
     fn abandon_all(&self) {
@@ -588,6 +600,20 @@ impl TurnEvents {
     pub(crate) fn depart(&self, session_id: &SessionId, owner: TurnOwner) {
         if let Some(progress) = self.existing_progress(session_id) {
             progress.depart(owner);
+        }
+    }
+
+    /// Input reached the runtime of `session_id`: its next detector-observed
+    /// `working` is the answer to it, a turn.
+    pub(crate) fn note_input(&self, session_id: &SessionId) {
+        self.progress(session_id).note_input();
+    }
+
+    /// The session runs on a new runtime generation (a launch, a resume, an
+    /// adoption): input given to the previous one proves nothing about it.
+    pub(crate) fn new_generation(&self, session_id: &SessionId) {
+        if let Some(progress) = self.existing_progress(session_id) {
+            progress.forget_input();
         }
     }
 

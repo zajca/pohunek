@@ -3509,6 +3509,7 @@ impl SessionRegistry {
             metadata: params.metadata.clone(),
             warnings,
             initial_input_pending: plan.pending_initial_input.is_some(),
+            prompt_in_argv: plan.prompt_in_argv,
             package_authority: None,
         };
         Ok((spec, plan.pending_initial_input))
@@ -4684,6 +4685,11 @@ impl SessionRegistry {
     /// Whether the registry holds a managed session `id`.
     pub(crate) async fn holds(&self, id: &SessionId) -> bool {
         self.inner.sessions.lock().await.contains_key(id)
+    }
+
+    /// Records that input reached the runtime of session `id`.
+    pub(crate) fn note_input(&self, id: &SessionId) {
+        self.inner.turns.note_input(id);
     }
 
     /// Who runs the session's turns now, or `None` when the session is gone.
@@ -6275,6 +6281,7 @@ impl SessionRegistry {
             let mut sessions = self.inner.sessions.lock().await;
             self.set_unpersisted(&id.0, None);
             self.inner.turns.observe_state(id, entry.info.state);
+            self.inner.turns.new_generation(id);
             self.inner.turns.depart(id, entry.turn_owner());
             if entry.info.activity == Some(AgentActivity::Working) {
                 self.inner.turns.adopt(id, entry.turn_owner());

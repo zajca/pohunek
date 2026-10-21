@@ -120,6 +120,7 @@ impl SessionRegistry {
         };
 
         let writes = build_input_writes(text, rules)?;
+        self.inner.turns.note_input(session_id);
         match runtime {
             RuntimeHandle::Worker(worker) => {
                 worker
@@ -228,6 +229,7 @@ impl SessionRegistry {
             (worker, entry.input_rules, runtime)
         };
         let writes = build_input_writes(text, rules)?;
+        self.inner.turns.note_input(session_id);
         validate_wait_framing(writes.submit_delay)?;
         let reservation = self
             .reserve_worker_before_deadline(
@@ -628,18 +630,21 @@ pub(super) fn plan_initial_input_delivery(
     initial_input: Option<String>,
 ) -> LaunchCommandPlan {
     if resolved.profile.is_none() && resolved.definition.prompt_arg() {
+        let prompt_in_argv = initial_input.is_some();
         if let Some(input) = initial_input {
             command.args.push(input);
         }
         return LaunchCommandPlan {
             command,
             pending_initial_input: None,
+            prompt_in_argv,
         };
     }
 
     LaunchCommandPlan {
         command,
         pending_initial_input: initial_input,
+        prompt_in_argv: false,
     }
 }
 

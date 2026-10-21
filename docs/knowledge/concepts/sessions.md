@@ -63,6 +63,13 @@ earlier than that after the agent stops. A `turn_completed` whose window ends
 while the session is `working` is a stale stop and is dropped; a short turn
 that starts and stops inside one window is still recorded once.
 
+For a runtime without agent reports, the daemon opens a turn on a `working`
+it infers from terminal output only when input reached that runtime
+(`session.input`, a line an attached client submitted, an initial prompt) or
+an agent reported activity. The start-up banner, or the repaint of a resumed
+or re-adopted session, is therefore no turn; a turn uses up the input it
+started on.
+
 The CLI turn mode takes up to 32 targets that must all be on one host (targets
 on different hosts are a usage error before any request; run one wait per
 host). `--until` is a comma list or repeated flag and defaults to all four

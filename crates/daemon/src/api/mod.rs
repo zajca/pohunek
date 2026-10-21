@@ -764,7 +764,14 @@ where
 
     let parts = framed.into_parts();
     let mut stream = parts.io;
-    let bridge_result = run_attach_bridge(&mut stream, &mut attach, parts.read_buf.to_vec()).await;
+    let submitted = attach.session_id.clone();
+    let bridge_result = run_attach_bridge(
+        &mut stream,
+        &mut attach,
+        parts.read_buf.to_vec(),
+        &|| registry.note_input(&submitted),
+    )
+    .await;
     let failure = bridge_result
         .as_ref()
         .err()
@@ -777,6 +784,7 @@ async fn run_attach_bridge<S>(
     stream: &mut S,
     attach: &mut RedeemedAttach,
     initial_input: Vec<u8>,
+    on_submit: &(dyn Fn() + Sync),
 ) -> Result<(), AttachBridgeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -793,6 +801,7 @@ where
                 &cancel,
                 data,
                 initial_input,
+                on_submit,
             )
             .await
         }
@@ -806,6 +815,7 @@ async fn run_worker_attach_bridge<S>(
     cancel: &tokio_util::sync::CancellationToken,
     data: &mut crate::runtime::DataStream,
     initial_input: Vec<u8>,
+    on_submit: &(dyn Fn() + Sync),
 ) -> Result<(), AttachBridgeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -823,6 +833,7 @@ where
         session_id,
         cancel,
         initial_input,
+        on_submit,
     )
     .await
 }
@@ -854,6 +865,7 @@ async fn bridge_worker_frames<S, W>(
     session_id: &protocol::SessionId,
     cancel: &tokio_util::sync::CancellationToken,
     initial_input: Vec<u8>,
+    on_submit: &(dyn Fn() + Sync),
 ) -> Result<(), AttachBridgeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -863,6 +875,7 @@ where
     let mut worker_write = Some(worker_write);
     let mut write_sequence = 1_u64;
     if !initial_input.is_empty() {
+        note_submission(&initial_input, on_submit);
         let writer = worker_write.as_mut().expect("the worker writer is idle");
         send_worker_attach_input(writer, identity, write_sequence, initial_input)
             .await
@@ -945,6 +958,7 @@ where
                 if count == 0 {
                     break;
                 }
+                note_submission(&input[..count], on_submit);
                 let writer = worker_write.take().expect("the worker writer is idle");
                 pending_send = Some(Box::pin(send_owned_attach_input(
                     writer,
@@ -957,6 +971,15 @@ where
         }
     }
     Ok(())
+}
+
+/// Calls `on_submit` when the attached client's `bytes` carry a line end: a
+/// submitted line is input the agent answers, while terminal replies and
+/// lone keystrokes are not.
+fn note_submission(bytes: &[u8], on_submit: &(dyn Fn() + Sync)) {
+    if bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n')) {
+        on_submit();
+    }
 }
 
 /// Reads one worker frame and hands the reader back with the result.
@@ -1432,6 +1455,7 @@ mod tests {
             &CancellationToken::new(),
             &mut data,
             Vec::new(),
+            &|| {},
         )
         .await
         .expect_err("worker error frame must fail the raw bridge");
@@ -1464,6 +1488,7 @@ mod tests {
             &CancellationToken::new(),
             &mut data,
             Vec::new(),
+            &|| {},
         )
         .await
         .expect_err("partial worker frame must fail the raw bridge");
@@ -1548,6 +1573,7 @@ mod tests {
                 &protocol::SessionId("s-partial".to_owned()),
                 &CancellationToken::new(),
                 Vec::new(),
+                &|| {},
             )
             .await
         });
@@ -1583,6 +1609,73 @@ mod tests {
         assert_eq!(delivered, b"repaint-before-input");
     }
 
+    /// A client write that carries a line end is a submitted line the agent
+    /// answers; terminal replies and lone keystrokes are not.
+    #[tokio::test]
+    async fn worker_attach_bridge_reports_only_submitted_lines_as_input() {
+        let identity = WorkerFrameIdentity {
+            version: Version::new(1).expect("version"),
+            stream_id: StreamId::new("a-submit").expect("stream id"),
+            worker_instance_id: WorkerInstanceId::new("runtime-submit").expect("runtime id"),
+        };
+        let mut close = Vec::new();
+        write_frame(
+            &mut close,
+            &DataFrame::new(
+                FrameHeader {
+                    version: identity.version,
+                    stream_id: identity.stream_id.clone(),
+                    worker_instance_id: identity.worker_instance_id.clone(),
+                    kind: FrameKind::Close {
+                        reason: CloseReason::RuntimeExited,
+                    },
+                },
+                Vec::new(),
+            )
+            .expect("close frame"),
+        )
+        .await
+        .expect("encode close frame");
+
+        let submitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut daemon_worker, mut fake_worker) = tokio::io::duplex(PUBLIC_BUFFER);
+        let (mut public_stream, mut public_peer) = tokio::io::duplex(PUBLIC_BUFFER);
+        let bridge = tokio::spawn({
+            let submitted = std::sync::Arc::clone(&submitted);
+            async move {
+                bridge_worker_frames(
+                    &mut public_stream,
+                    &mut daemon_worker,
+                    &identity,
+                    "a-submit",
+                    &protocol::SessionId("s-submit".to_owned()),
+                    &CancellationToken::new(),
+                    Vec::new(),
+                    &|| {
+                        submitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    },
+                )
+                .await
+            }
+        });
+
+        for (typed, expected) in [(&b"\x1b[1;1R"[..], 0), (b"\x1b[I", 0), (b"ls\r", 1)] {
+            public_peer.write_all(typed).await.expect("send input");
+            let forwarded = read_frame(&mut fake_worker)
+                .await
+                .expect("read forwarded input")
+                .expect("bridge forwards public input");
+            assert_eq!(forwarded.payload(), typed);
+            assert_eq!(
+                submitted.load(std::sync::atomic::Ordering::SeqCst),
+                expected,
+                "after {typed:?}"
+            );
+        }
+        fake_worker.write_all(&close).await.expect("close");
+        bridge.await.expect("bridge task").expect("bridge ends");
+    }
+
     #[tokio::test]
     async fn worker_attach_bridge_rejects_historical_replay() {
         let (daemon_worker, mut fake_worker) = UnixStream::pair().expect("worker stream pair");
@@ -1609,6 +1702,7 @@ mod tests {
             &CancellationToken::new(),
             &mut data,
             Vec::new(),
+            &|| {},
         )
         .await
         .expect_err("fresh attach must reject retained history replay");

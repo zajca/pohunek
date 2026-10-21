@@ -2144,7 +2144,13 @@ Event sources:
 - A turn ends, for the projector, when activity goes `working` to `idle`; a
   turn that ends `blocked`, an idle that no `working` preceded (start-up, an
   empty prompt) and a session whose runtime was replaced mid-turn report no
-  `turn_completed`. The report is held for the debounce window, so an idle that
+  `turn_completed`. A `working` the daemon infers from terminal output opens a
+  turn only when input reached the session's current runtime (`session.input`,
+  a line submitted by an attached client, an initial prompt, including one
+  in the launch arguments) or an agent reported activity: the start-up banner,
+  or the repaint of a resumed or re-adopted session, is no turn. A turn uses
+  up the input it started on, and a resume, replacement or re-adoption starts
+  without any. The report is held for the debounce window, so an idle that
   lasts less than `attention_debounce_secs` before the session works again
   reports nothing. A hook `Stop` and the projector's idle edge of one turn are
   one inbox record; a hook report that arrives after its turn was reported adds

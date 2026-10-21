@@ -14,3 +14,7 @@
   from an internal edge, and a turn whose agent or runtime leaves while it
   works is never reported. `session.wait_turn` is at-least-once for turns the daemon did not
   observe.
+- A `working` inferred from terminal output opens a turn only when input
+  reached the session's current runtime or an agent reported activity; the
+  evidence is used up by the turn it starts and reset by a resume, replacement
+  or re-adoption, so start-up output is never a turn.
