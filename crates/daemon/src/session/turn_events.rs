@@ -295,8 +295,7 @@ impl TurnProgress {
         previous: Option<AgentActivity>,
         next: AgentActivity,
         metadata: &BTreeMap<String, String>,
-        wall_nanos: u64,
-        window: Duration,
+        (wall_nanos, window): (u64, Duration),
         detector_observed: bool,
     ) -> TurnChange {
         let now = Instant::now();
@@ -774,8 +773,7 @@ impl TurnEvents {
             previous,
             next,
             metadata,
-            self.wall_nanos(),
-            window,
+            (self.wall_nanos(), window),
             detector_observed,
         );
         if let Some(id) = change.started {

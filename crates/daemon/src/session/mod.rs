@@ -5779,16 +5779,15 @@ impl SessionRegistry {
                         }
                     }
                     Err(error) => {
-                        let Some(reconnected) = registry
-                            .reconnect_worker(
-                                &id,
-                                &expected,
-                                &socket_path,
-                                &cancel,
-                                &error,
-                                registry.inner.config.worker_connect_deadline,
-                            )
-                            .await
+                        let Some(reconnected) = Box::pin(registry.reconnect_worker(
+                            &id,
+                            &expected,
+                            &socket_path,
+                            &cancel,
+                            &error,
+                            registry.inner.config.worker_connect_deadline,
+                        ))
+                        .await
                         else {
                             return;
                         };
@@ -5975,7 +5974,6 @@ impl SessionRegistry {
     ) -> RuntimeTransitionOutcome {
         let state = classification.state();
         let activity_is_lost = classification.proof().is_some();
-        let mut lost_owner = None;
         let (base, candidate) = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(id) else {
@@ -5985,7 +5983,6 @@ impl SessionRegistry {
                 return RuntimeTransitionOutcome::IdentityMismatch;
             }
             let base = Self::session_record(id, entry, entry.desired_state, None);
-            lost_owner = Some(entry.turn_owner());
             let mut candidate = entry.clone();
             candidate.runtime = RuntimeHandle::Unavailable(state);
             candidate.info.background = None;
@@ -6003,6 +6000,7 @@ impl SessionRegistry {
             candidate.info.updated_at = timestamp_now();
             (base, candidate)
         };
+        let lost_owner = candidate.turn_owner();
         let durable_base = match self.load_durable_session_record(id).await {
             Ok(Some(record)) => record,
             Ok(None) => base.clone(),
@@ -6013,9 +6011,15 @@ impl SessionRegistry {
         } else {
             RuntimeMetadataPolicy::Live
         };
-        let outcome = self
-            .commit_runtime_transition(id, expected, &base, &durable_base, candidate, policy)
-            .await;
+        let outcome = Box::pin(self.commit_runtime_transition(
+            id,
+            expected,
+            &base,
+            &durable_base,
+            candidate,
+            policy,
+        ))
+        .await;
         if let RuntimeTransitionOutcome::RetryablePersistenceFailure(store_error) = &outcome {
             warn!(
                 session_id = %id.0,
@@ -6024,7 +6028,7 @@ impl SessionRegistry {
             );
         }
         if let RuntimeTransitionOutcome::Applied(info) = &outcome {
-            if let (true, Some(lost_owner)) = (activity_is_lost, lost_owner) {
+            if activity_is_lost {
                 // The session shows no activity now, so a running turn can no
                 // longer be seen to end.
                 self.inner.turns.abandon_running(id, lost_owner);
