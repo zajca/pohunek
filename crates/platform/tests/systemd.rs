@@ -2218,8 +2218,6 @@ fn the_real_user_manager_reports_a_units_environment_settings_with_drop_ins() {
 #[test]
 #[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
 fn the_real_user_manager_agrees_with_the_unit_setting_readers() {
-    use std::os::unix::fs::PermissionsExt;
-
     require_e2e();
     let directory = user_unit_dir();
     std::fs::create_dir_all(&directory).expect("user unit directory");
@@ -2270,6 +2268,12 @@ fn the_real_user_manager_agrees_with_the_unit_setting_readers() {
     )
     .expect("bom drop-in");
     std::fs::write(own.join("cr.conf"), b"[Service]\rEnvironment=CRVAR=1\r").expect("cr drop-in");
+    // CRLF is one line end, so the continuation joins the next line.
+    std::fs::write(
+        own.join("crlf.conf"),
+        b"[Service]\r\nEnvironment=CRLF1=1 \\\r\nCRLF2=2\r\n",
+    )
+    .expect("crlf drop-in");
     let shared = directory.join(&truncated);
     std::fs::create_dir_all(&shared).expect("truncated drop-in directory");
     std::fs::write(
@@ -2290,6 +2294,9 @@ fn the_real_user_manager_agrees_with_the_unit_setting_readers() {
     );
     // The directive appends across files: the unit file's entry stays in the
     // merged list next to the drop-in's.
+    for entry in ["CRLF1=1", "CRLF2=2"] {
+        assert!(loaded.environment.contains(&entry.to_owned()), "{loaded:?}");
+    }
     assert_eq!(
         loaded.exec_search_path,
         ["/unit-file/bin", "/opt/tools/bin"]
@@ -2319,10 +2326,16 @@ fn the_real_user_manager_agrees_with_the_unit_setting_readers() {
         );
     }
 
-    // A drop-in directory the scan cannot read is an error, never "no drop-ins".
-    std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o000)).expect("lock");
-    let unreadable = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT));
-    std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+    assert_unreadable_drop_in_directory_is_an_error(&own, &unit);
+}
+
+/// A drop-in directory the scan cannot read is an error, never "no drop-ins".
+fn assert_unreadable_drop_in_directory_is_an_error(own: &std::path::Path, unit: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(own, std::fs::Permissions::from_mode(0o000)).expect("lock");
+    let unreadable = async_io::block_on(unit_environment(unit, CALL_TIMEOUT));
+    std::fs::set_permissions(own, std::fs::Permissions::from_mode(0o755)).expect("unlock");
     assert!(
         matches!(unreadable, Err(Error::Operation { .. })),
         "{unreadable:?}"

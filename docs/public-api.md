@@ -2471,7 +2471,7 @@ manager's `Environment` `PATH`, replaced by an `ExecSearchPath=` and then an `En
 drop-in of the daemon unit (the install replaces the unit file itself) and refused (`service_manager_environment_unavailable`, naming the file or
 directive) when the unit has an `EnvironmentFile=` that sets `PATH`, a wildcard, unreadable or non-regular
 required `EnvironmentFile=`, `PassEnvironment=PATH`, `UnsetEnvironment=PATH`, is masked or broken,
-or has drop-ins but no unit file yet; else, on macOS, launchd's active `PATH` of the job:
+or has drop-ins but no unit file yet that set one of those or an unreadable `PATH` (plain `Environment=PATH=` lines of such drop-ins give the `PATH`); else, on macOS, launchd's active `PATH` of the job:
 the domain's `environment` `PATH` (`launchctl print gui/<uid>`, set by `launchctl
 setenv`), else the `default environment` of the loaded job (`launchctl print
 gui/<uid>/<label>`), else, for a job that is not loaded, the launchd default an

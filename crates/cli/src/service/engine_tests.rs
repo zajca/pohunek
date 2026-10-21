@@ -9961,6 +9961,38 @@ impl UserManager for UnitManager {
     }
 }
 
+/// A user manager that reports the daemon unit as `present` while the fake
+/// service manager holds the daemon job, and as `removed` once it does not.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct LifecycleUnitManager {
+    fake: Fake,
+    present: UnitEnvironment,
+    removed: UnitEnvironment,
+}
+
+#[cfg(target_os = "linux")]
+impl UserManager for LifecycleUnitManager {
+    fn environment(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, EnvironmentFailure>> + Send + '_>> {
+        Box::pin(async { Ok(vec![format!("PATH={MANAGER_PATH}")]) })
+    }
+
+    fn unit_environment<'a>(
+        &'a self,
+        _unit: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<UnitEnvironment, EnvironmentFailure>> + Send + 'a>>
+    {
+        let unit = if self.fake.world().registered.is_some() {
+            self.present.clone()
+        } else {
+            self.removed.clone()
+        };
+        Box::pin(async move { Ok(unit) })
+    }
+}
+
 /// The `PATH` the fake user manager itself reports.
 #[cfg(target_os = "linux")]
 const MANAGER_PATH: &str = "/manager/bin";
@@ -10268,23 +10300,13 @@ async fn pass_environment_and_unset_environment_naming_path_are_refused() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn a_unit_not_yet_written_is_judged_by_the_manager_unless_a_drop_in_exists() {
+async fn a_unit_not_yet_written_without_drop_ins_is_judged_by_the_manager() {
     let fresh = UnitEnvironment {
         load_state: "not-found".to_owned(),
         ..UnitEnvironment::default()
     };
     let job = unrecorded_job_path(Ok(fresh.clone())).await.expect("path");
     assert_eq!(job.value, MANAGER_PATH);
-
-    let with_drop_in = UnitEnvironment {
-        drop_in_paths: vec!["/home/u/.config/systemd/user/x.service.d/p.conf".to_owned()],
-        ..fresh
-    };
-    let text = refusal(unrecorded_job_path(Ok(with_drop_in)).await);
-    assert!(
-        text.contains("p.conf") && text.contains("Remove or move the drop-ins"),
-        "{text}"
-    );
 }
 
 #[cfg(target_os = "linux")]
@@ -10344,6 +10366,52 @@ async fn the_upgrade_judges_and_runs_with_the_drop_in_path_not_the_managers() {
         runtime_paths.iter().all(|path| path == "/drop-in/bin"),
         "{runtime_paths:?}"
     );
+}
+
+/// A rollback and a config migration remove the daemon unit and judge again
+/// before installing it back: with a drop-in `PATH` the unit file never held,
+/// each step resolves it from the surviving drop-in and completes.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_rollback_whose_unit_was_removed_still_judges_by_the_surviving_drop_in() {
+    let mut harness = Harness::new();
+    interrupted_upgrade_journal(&mut harness).await;
+    let (_keep, present) = unit_with_files(
+        b"[Service]\nExecStart=/bin/true\n",
+        &[b"[Service]\nEnvironment=PATH=/drop-in/bin\n"],
+        &["PATH=/drop-in/bin"],
+    );
+    let (_keep_removed, removed) = orphan_drop_ins(&[(
+        "a.service.d",
+        "10-path.conf",
+        b"[Service]\nEnvironment=PATH=/drop-in/bin\n",
+    )]);
+    harness.context = harness
+        .context
+        .clone()
+        .with_user_manager(Arc::new(LifecycleUnitManager {
+            fake: harness.fake.clone(),
+            present,
+            removed,
+        }));
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+    let uninstalls = harness.fake.world().uninstalls;
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V1), V1)
+        .await
+        .expect("the pending upgrade is rolled back");
+
+    let judged = judged.lock().expect("search path lock").clone();
+    assert!(!judged.is_empty() && judged.iter().all(|path| path == "/drop-in/bin"));
+    assert!(
+        harness.fake.world().uninstalls > uninstalls,
+        "the daemon job was removed during the rollback"
+    );
+    harness.assert_installed(V1);
 }
 
 #[cfg(target_os = "linux")]
@@ -10899,27 +10967,174 @@ async fn exec_search_path_from_a_drop_in_sets_the_job_path_below_environment() {
     assert_eq!(job.value, MANAGER_PATH);
 }
 
-/// Drop-ins on disk of a unit that is not written yet, in any directory of the
-/// manager's lookup path, refuse; a stale snapshot refuses on any of them.
+/// A unit with no unit file whose drop-in files exist on disk only: `(directory
+/// tag, file name, text)` per file.
+#[cfg(target_os = "linux")]
+fn orphan_drop_ins(files: &[(&str, &str, &[u8])]) -> (Vec<tempfile::TempDir>, UnitEnvironment) {
+    let mut guards = Vec::new();
+    let mut on_disk = Vec::new();
+    for (tag, name, text) in files {
+        let dir = pohunek_test_support::tempdir().expect("scratch directory");
+        let directory = dir.path().join(tag);
+        std::fs::create_dir_all(&directory).expect("drop-in directory");
+        let path = directory.join(name);
+        std::fs::write(&path, text).expect("drop-in");
+        on_disk.push(path.display().to_string());
+        guards.push(dir);
+    }
+    (
+        guards,
+        UnitEnvironment {
+            load_state: "not-found".to_owned(),
+            drop_ins_on_disk: on_disk,
+            ..UnitEnvironment::default()
+        },
+    )
+}
+
+/// Rollback and migration remove the unit and judge again before reinstalling it:
+/// the drop-ins that survive are what the new job gets, so a missing unit with
+/// plain drop-ins resolves instead of blocking the recovery.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn drop_ins_on_disk_refuse_a_missing_unit_and_a_stale_snapshot() {
-    let on_disk = vec!["/etc/systemd/user/pohunek-.service.d/p.conf".to_owned()];
-    let missing = UnitEnvironment {
-        load_state: "not-found".to_owned(),
-        drop_ins_on_disk: on_disk.clone(),
-        ..UnitEnvironment::default()
-    };
-    let text = refusal(unrecorded_job_path(Ok(missing)).await);
-    assert!(text.contains("pohunek-.service.d/p.conf"), "{text}");
+async fn a_removed_unit_with_surviving_drop_ins_is_judged_by_them() {
+    let (_keep, unit) = orphan_drop_ins(&[
+        (
+            "a.service.d",
+            "10-first.conf",
+            b"[Service]\nEnvironment=PATH=/first/bin\n",
+        ),
+        (
+            "a-.service.d",
+            "20-second.conf",
+            b"[Service]\nEnvironment=OTHER=1 PATH=/second/bin\n",
+        ),
+    ]);
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, "/second/bin", "the later file name wins");
 
+    let (_keep, unit) = orphan_drop_ins(&[
+        (
+            "a.service.d",
+            "10-first.conf",
+            b"[Service]\nEnvironment=PATH=/first/bin\n",
+        ),
+        ("a.service.d", "20-reset.conf", b"[Service]\nEnvironment=\n"),
+    ]);
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, MANAGER_PATH, "an empty assignment resets");
+
+    let (_keep, unit) = orphan_drop_ins(&[(
+        "a.service.d",
+        "10-other.conf",
+        b"[Service]\nEnvironment=STORE=/x\n",
+    )]);
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, MANAGER_PATH, "no PATH in the drop-ins");
+}
+
+/// What cannot be read from drop-ins of an unloaded unit is refused with the
+/// file and the fix.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_removed_unit_with_drop_ins_that_cannot_be_read_is_refused() {
+    for (name, text, expect) in [
+        (
+            "p.conf",
+            &b"[Service]\nEnvironmentFile=/etc/x.env\n"[..],
+            "EnvironmentFile=",
+        ),
+        (
+            "p.conf",
+            &b"[Service]\nExecSearchPath=/opt/bin\n"[..],
+            "ExecSearchPath=",
+        ),
+        (
+            "p.conf",
+            &b"[Service]\nPassEnvironment=PATH\n"[..],
+            "PassEnvironment=",
+        ),
+        (
+            "p.conf",
+            &b"[Service]\nEnvironment=\"\\x50ATH=/a\"\n"[..],
+            "form not read here",
+        ),
+        (
+            "p.conf",
+            &b"[Service]\nEnvironment=PATH=%h/bin\n"[..],
+            "form not read here",
+        ),
+    ] {
+        let (_keep, unit) = orphan_drop_ins(&[("a.service.d", name, text)]);
+        let text = refusal(unrecorded_job_path(Ok(unit)).await);
+        assert!(text.contains(expect) && text.contains("p.conf"), "{text}");
+    }
+    let (_keep, unit) = orphan_drop_ins(&[
+        ("a.service.d", "p.conf", b"[Service]\nEnvironment=PATH=/a\n"),
+        ("b.service.d", "p.conf", b"[Service]\nEnvironment=PATH=/b\n"),
+    ]);
+    let text = refusal(unrecorded_job_path(Ok(unit)).await);
+    assert!(text.contains("two directories"), "{text}");
+}
+
+/// A stale snapshot next to drop-ins refuses with the reload fix.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_stale_snapshot_next_to_drop_ins_on_disk_asks_for_a_reload() {
     let stale = UnitEnvironment {
         need_daemon_reload: true,
-        drop_ins_on_disk: on_disk,
+        drop_ins_on_disk: vec!["/etc/systemd/user/pohunek-.service.d/p.conf".to_owned()],
         ..loaded_unit()
     };
     let text = refusal(unrecorded_job_path(Ok(stale)).await);
     assert!(text.contains("systemctl --user daemon-reload"), "{text}");
+}
+
+/// A merged `PATH` of a stale snapshot whose unit file no longer sets it, with
+/// no drop-in, is not attributed to a drop-in.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_stale_fragment_only_path_without_drop_ins_is_not_attributed_to_one() {
+    let (_keep, mut unit) =
+        unit_with_files(b"[Service]\nExecStart=/bin/true\n", &[], &["PATH=/old/bin"]);
+    unit.need_daemon_reload = true;
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, MANAGER_PATH);
+}
+
+/// CRLF is one line end: a continuation across it joins the next line, and an
+/// assignment after it is a line of its own.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn crlf_line_ends_keep_a_continuation_intact() {
+    let unit_file: &[u8] =
+        b"[Service]\r\nEnvironment=OTHER=1 \\\r\n  MORE=2\r\nEnvironment=PATH=/unit-file/bin\r\n";
+    let (_keep, unit) = unit_with_files(
+        unit_file,
+        &[b"[Service]\r\nEnvironment=PATH=/drop-in/bin\r\n"],
+        &["PATH=/drop-in/bin"],
+    );
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, "/drop-in/bin");
+    // The continued assignment of the unit file carries PATH, which the install
+    // removes: an unrelated drop-in does not claim it.
+    let continued: &[u8] = b"[Service]\r\nEnvironment=OTHER=1 \\\r\nPATH=/unit-file/bin\r\n";
+    let (_keep, unit) = unit_with_files(
+        continued,
+        &[b"[Service]\r\nEnvironment=STORE=/x\r\n"],
+        &["PATH=/unit-file/bin"],
+    );
+    let text = refusal(unrecorded_job_path(Ok(unit)).await);
+    assert!(text.contains("could be recognized as keeping it"), "{text}");
+
+    // is refused instead of attributed.
+    let (_keep, unit) = unit_with_files(
+        unit_file,
+        &[b"[Service]\r\nEnvironment=\"PATH\\x3d/x\"\r\n"],
+        &["PATH=/unit-file/bin"],
+    );
+    let text = refusal(unrecorded_job_path(Ok(unit)).await);
+    assert!(text.contains("in a form not read here"), "{text}");
 }
 
 /// systemd ends an `EnvironmentFile=` line at `\r` as well as `\n`.

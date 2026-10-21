@@ -963,10 +963,16 @@ same code, and the message names the file or directive to change:
   is a wildcard, or is a required file that cannot be read as a regular file of at
   most 1 MiB;
 - `PassEnvironment=PATH` or `UnsetEnvironment=PATH`, and a masked or broken unit;
-- drop-in files in any directory of the manager's own `UnitPath` for a unit that
-  has no unit file yet, and a snapshot made stale by a change on disk while any
-  drop-in exists (run `systemctl --user daemon-reload`); a drop-in directory that
-  cannot be read;
+- a unit with no unit file (not installed yet, or removed by a rollback or a
+  config migration) whose drop-in files in the manager's own `UnitPath`
+  directories set `EnvironmentFile=`, `ExecSearchPath=`, `PassEnvironment=` or
+  `UnsetEnvironment=` naming `PATH`, or an `Environment=` `PATH` in a form the CLI
+  does not read, or share a file name between two directories; plain
+  `Environment=PATH=` lines of those drop-ins are read in file-name order (an
+  empty `Environment=` resets) and give the job's `PATH`, so a rollback or
+  migration that removed the unit still completes;
+- a snapshot made stale by a change on disk while any drop-in exists (run
+  `systemctl --user daemon-reload`); a drop-in directory that cannot be read;
 - an `ExecSearchPath=` that the unit file and a drop-in both feed (the directive
   appends, so the merged list cannot be split into the part the install keeps);
 - a unit file that also sets the value, with a drop-in `Environment=` or
