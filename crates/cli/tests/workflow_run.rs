@@ -918,7 +918,7 @@ const AGENT: &str = "wfagent";
 /// A real `pohunekd` with subprocess workers, stopped and reaped on drop.
 struct Daemon {
     // Declared before `child`, so leftover workers are reaped first.
-    _workers: WorkerGuard,
+    workers: WorkerGuard,
     child: Child,
 }
 
@@ -940,10 +940,7 @@ impl Daemon {
         poll_until("the daemon control socket accepts connections", || {
             UnixStream::connect(&socket).ok().map(drop)
         });
-        Self {
-            _workers: workers,
-            child,
-        }
+        Self { workers, child }
     }
 }
 
@@ -953,6 +950,9 @@ impl Drop for Daemon {
             let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
         }
         let _ = self.child.wait();
+        // The daemon's exit signals its workers; the guard below fails the
+        // test only for one that is still listed after the wait.
+        let _ = self.workers.wait_for_exit();
     }
 }
 

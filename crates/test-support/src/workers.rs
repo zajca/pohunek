@@ -644,6 +644,8 @@ pub struct WorkerGuard {
     root: PathBuf,
     /// Sessions seen as the workload of a worker in an earlier scan.
     retained_sessions: Mutex<Vec<ProcessId>>,
+    /// Workload processes seen in an earlier scan, for [`Self::wait_for_exit`].
+    seen_workload: Mutex<Vec<ProcessId>>,
 }
 
 impl WorkerGuard {
@@ -656,6 +658,7 @@ impl WorkerGuard {
         Self {
             root: root.into(),
             retained_sessions: Mutex::new(Vec::new()),
+            seen_workload: Mutex::new(Vec::new()),
         }
     }
 
@@ -677,7 +680,51 @@ impl WorkerGuard {
             panic!("cannot read the process table to look for leaked workers: {error}")
         });
         retain_sessions(&mut retained, &workers);
+        let mut seen = self
+            .seen_workload
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for worker in &workers {
+            for process in &worker.workload {
+                if !seen.contains(process) {
+                    seen.push(process.clone());
+                }
+            }
+        }
         workers
+    }
+
+    /// Waits until no worker below the root is listed, bounded by
+    /// [`HANG_GUARD`](crate::wait::HANG_GUARD).
+    ///
+    /// For a fixture that stopped its daemon: the daemon signals its workers
+    /// as it exits, and the kernel may still be tearing them down when the
+    /// daemon's exit is observed. The workload of every worker any scan of
+    /// this guard has listed is killed once the workers are gone, since the drop
+    /// of the guard can only reach a workload through a listed worker. Returns whether no worker is
+    /// left; it never panics, so a worker that outlives the bound is reaped and
+    /// reported by the drop of the guard.
+    #[must_use]
+    pub fn wait_for_exit(&self) -> bool {
+        let deadline = Instant::now() + crate::wait::HANG_GUARD;
+        while !self.survivors().is_empty() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let retained = self
+            .retained_sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let seen = self
+            .seen_workload
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for process in seen.iter().chain(retained.iter()) {
+            signal_process(process.pid, &process.start, Stop::Kill);
+        }
+        true
     }
 }
 
@@ -1092,6 +1139,15 @@ mod tests {
             .is_ok_and(|stat| !stat.contains(") Z "))
     }
 
+    /// Whether `pid` names a process: `ESRCH` means gone, `EPERM` means it exists.
+    fn process_alive(pid: u32) -> bool {
+        let pid = rustix::process::Pid::from_raw(i32::try_from(pid).expect("pid")).expect("pid");
+        !matches!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH)
+        )
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_signal_resistant_workload_in_its_own_session_is_stopped_with_its_worker() {
@@ -1311,6 +1367,65 @@ mod tests {
         assert!(message.contains(&worker.pid.to_string()), "{message}");
         assert!(message.contains("pohunek-sessiond"), "{message}");
         assert!(workers_under(root.path()).is_empty());
+    }
+
+    #[test]
+    fn a_worker_that_is_still_ending_passes_after_the_guard_waited_for_it() {
+        let root = tempdir().expect("root");
+        let gate = root.path().join("release");
+        // Ends once the gate file exists.
+        spawn_orphan_at(
+            root.path(),
+            &root.path().join("pohunek-sessiond"),
+            &root.path().join("r/pohunek/daemon.sock"),
+            &format!(
+                "while [ ! -e {} ]; do sleep 0.1; done; true",
+                gate.display()
+            ),
+        );
+        let guard = WorkerGuard::watch(root.path());
+        std::thread::scope(|scope| {
+            scope.spawn(|| std::fs::write(&gate, b"").expect("release the worker"));
+            assert!(guard.wait_for_exit(), "the worker ended");
+        });
+        drop(guard);
+    }
+
+    #[test]
+    fn waiting_for_a_worker_to_end_kills_the_workload_it_leaves_behind() {
+        let root = tempdir().expect("root");
+        let gate = root.path().join("release");
+        let pid_file = root.path().join("workload.pid");
+        // The worker's child records its PID and idles; the worker ends at the gate.
+        let worker = spawn_orphan_at(
+            root.path(),
+            &root.path().join("pohunek-sessiond"),
+            &root.path().join("r/pohunek/daemon.sock"),
+            &format!(
+                "sh -c 'echo $$ > {}; exec sleep 613' & while [ ! -e {} ]; do sleep 0.1; done; true",
+                pid_file.display(),
+                gate.display()
+            ),
+        );
+        let workload: u32 = poll_until("the workload records its PID", || {
+            std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+        });
+        let guard = WorkerGuard::watch(root.path());
+        poll_until("the guard lists the workload", || {
+            guard
+                .survivors()
+                .iter()
+                .any(|listed| listed.workload.iter().any(|p| p.pid == workload))
+                .then_some(())
+        });
+        std::fs::write(&gate, b"").expect("release the worker");
+        assert!(guard.wait_for_exit(), "the worker ended");
+        poll_until("the workload is killed", || {
+            (!process_alive(workload) && !process_alive(worker.pid)).then_some(())
+        });
+        drop(guard);
     }
 
     #[test]
