@@ -977,12 +977,7 @@ pub(crate) fn check_local(
                 engine::verify_pending_migration(context, &store, record, &config_source)?;
             }
             let config = &config_source.config;
-            engine::check_upgrade_renderings(
-                config,
-                version,
-                matches!(plan, engine::Plan::Resume(_)),
-                &config_path,
-            )?;
+            engine::check_planned_renderings(config, version, &plan, &config_path)?;
             if engine::swaps_daemon(&plan, Some(config.active_version()), version) {
                 adoption = Adoption::Required;
             }

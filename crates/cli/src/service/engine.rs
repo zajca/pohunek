@@ -3340,13 +3340,39 @@ fn launchd_job_path<'a>(
 /// Refuses an upgrade whose configuration rendering exceeds the load bound.
 ///
 /// Kept unknown keys can make a rendering larger than the file it came from.
-/// Both the current and the target rendering are checked before the first
-/// effect, so neither the upgrade nor its rollback can hit the bound later.
-/// An upgrade to the active version rewrites nothing and is not checked.
+/// Every rendering the plan writes is checked before the first effect, so
+/// neither the upgrade nor its rollback can hit the bound later. A rollback
+/// writes only when the file already left the previous version, and writes the
+/// journaled original bytes for a schema migration; an upgrade to the active
+/// version rewrites nothing.
 ///
 /// # Errors
 ///
 /// Returns [`ConfigError::TooLarge`] without changing anything.
+pub(crate) fn check_planned_renderings(
+    config: &ServiceConfig,
+    version: &str,
+    plan: &Plan,
+    path: &Path,
+) -> Result<(), Error> {
+    let mut resuming = false;
+    let mut after_rollback = config.clone();
+    match plan {
+        Plan::Fresh => {}
+        Plan::Resume(_) => resuming = true,
+        Plan::RollBack(record) => {
+            if let Some(previous) = &record.previous_version {
+                after_rollback = with_version(config, previous)?;
+                if record.config_backup.is_none() && config.active_version() != previous {
+                    check_rendering_size(&after_rollback, path)?;
+                }
+            }
+        }
+    }
+    check_upgrade_renderings(&after_rollback, version, resuming, path)
+}
+
+/// Refuses an upgrade whose current or target rendering exceeds the bound.
 pub(crate) fn check_upgrade_renderings(
     config: &ServiceConfig,
     version: &str,
@@ -3356,14 +3382,17 @@ pub(crate) fn check_upgrade_renderings(
     if !resuming && config.active_version() == version {
         return Ok(());
     }
-    for rendering in [config.clone(), with_version(config, version)?] {
-        if rendering.to_toml().len() > MAX_CONFIG_BYTES {
-            return Err(ConfigError::TooLarge {
-                path: path.to_path_buf(),
-                max_bytes: MAX_CONFIG_BYTES,
-            }
-            .into());
+    check_rendering_size(config, path)?;
+    check_rendering_size(&with_version(config, version)?, path)
+}
+
+fn check_rendering_size(config: &ServiceConfig, path: &Path) -> Result<(), Error> {
+    if config.to_toml().len() > MAX_CONFIG_BYTES {
+        return Err(ConfigError::TooLarge {
+            path: path.to_path_buf(),
+            max_bytes: MAX_CONFIG_BYTES,
         }
+        .into());
     }
     Ok(())
 }

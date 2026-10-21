@@ -2505,6 +2505,41 @@ async fn a_rollback_after_the_daemon_stop_does_not_rewrite_an_untouched_config()
 }
 
 #[tokio::test]
+async fn a_check_refuses_a_rollback_that_has_to_rewrite_an_oversized_config() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Config);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after the config write");
+    grow_rendering_past_the_bound(&harness);
+
+    let checked = check_local_report(&harness.context, None, V1, false)
+        .expect_err("the rollback must rewrite the file, which no longer fits");
+    assert!(
+        matches!(
+            checked,
+            Error::Config(pohunek_service_config::ConfigError::TooLarge { .. })
+        ),
+        "{checked:?}"
+    );
+    // The command refuses the same way.
+    let error = harness
+        .upgrade(V1)
+        .await
+        .expect_err("the rollback is refused");
+    assert!(
+        matches!(
+            error,
+            Error::Config(pohunek_service_config::ConfigError::TooLarge { .. })
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
 async fn an_upgrade_interrupted_after_every_step_resumes_or_rolls_back() {
     for step in STEPS {
         let harness = Harness::new();
