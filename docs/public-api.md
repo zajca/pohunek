@@ -2442,7 +2442,7 @@ How to read it:
   that names `plugin enable` (rows 1-6). Pi keeps a newer S that loads silently and
   does not examine R beside it (rows 2, 4 and 6). When S cannot load, or there is none,
   R decides alone (rows 10-17 for a reserved runtime, rows 10, 11, 14 and 15 for Pi,
-  and rows 21-23); Pi keeps a newer S that cannot load and then refuses it because no
+  and rows 21-23 for a reserved runtime and for Pi under `--detect`); Pi keeps a newer S that cannot load and then refuses it because no
   package serves the runtime id (rows 12, 13, 16 and 17).
 - A disabled package the plan examines (R, or a disabled S) is refused when its root
   is altered, gets the restore-then-enable hint when its root is missing, and the

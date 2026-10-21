@@ -4465,7 +4465,7 @@ const MATRIX: &[MatrixRow] = &[
 
 /// Runs every [`MATRIX`] row for each of `runtimes`: the plan and the apply
 /// must say `without_detect`'s line of the row, the `--detect` plan `with_detect`'s, and the
-/// registry and the profile stay as staged.
+/// registry stays as staged and the profile is pinned only in the kept rows.
 async fn assert_matrix(
     runtimes: &[&str],
     without_detect: fn(&MatrixRow) -> &'static str,

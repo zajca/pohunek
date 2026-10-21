@@ -869,7 +869,7 @@ table "Disabled release package: case table" in `docs/public-api.md` gives the o
 every state of the selected version and of that package's root, including when an
 altered root is refused with `plugin uninstall --remove-modified`; a selected Pi version
 newer than the release's that loads is kept silently, with no gap, and a selected version that
-cannot be ordered against the release's is kept with the gap `plugin_update_version_unordered`. The
+cannot be ordered against the release's and loads is kept with the gap `plugin_update_version_unordered`. The
 detecting plan of `pohunek setup` drops `official_package_not_serving` together with a
 runtime it drops (nothing uses it, no profile has it as its base, and its program is
 off the search path), whatever the state of its package. The same holds for a selected version that is enabled but
