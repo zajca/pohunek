@@ -679,6 +679,19 @@ impl WorkerGuard {
         retain_sessions(&mut retained, &workers);
         workers
     }
+
+    /// Waits until no worker below the root is listed, bounded by
+    /// [`HANG_GUARD`](crate::wait::HANG_GUARD).
+    ///
+    /// For a fixture that stopped its daemon: the daemon signals its workers
+    /// as it exits, and the kernel may still be tearing them down when the
+    /// daemon's exit is observed. Returns whether none is left; it never
+    /// panics, so a worker that outlives the bound is reaped and reported by
+    /// the drop of the guard.
+    #[must_use]
+    pub fn wait_for_exit(&self) -> bool {
+        wait_for_none(&self.root, crate::wait::HANG_GUARD)
+    }
 }
 
 impl Drop for WorkerGuard {
@@ -1311,6 +1324,21 @@ mod tests {
         assert!(message.contains(&worker.pid.to_string()), "{message}");
         assert!(message.contains("pohunek-sessiond"), "{message}");
         assert!(workers_under(root.path()).is_empty());
+    }
+
+    #[test]
+    fn a_worker_that_is_still_ending_passes_after_the_guard_waited_for_it() {
+        let root = tempdir().expect("root");
+        // Ends by itself shortly after the detach shell returns.
+        spawn_orphan_at(
+            root.path(),
+            &root.path().join("pohunek-sessiond"),
+            &root.path().join("r/pohunek/daemon.sock"),
+            "sleep 1; true",
+        );
+        let guard = WorkerGuard::watch(root.path());
+        assert!(guard.wait_for_exit(), "the worker ended");
+        drop(guard);
     }
 
     #[test]
