@@ -275,12 +275,21 @@ impl SessionRegistry {
             // before it takes its boundary under that lock, so a boundary this
             // restatement follows always finds its waiter.
             if !self.has_evidence_waiter(id)
-                && (transition.activity != AgentActivity::Working
-                    || !self.inner.turns.lacks_running_turn(id, entry.turn_owner()))
                 && entry.info.activity == Some(transition.activity)
                 && entry.info.state_source == transition.source
                 && activity_already_recorded(entry, transition.activity, transition.source)
             {
+                // A turn that gave its input evidence back opens here.
+                if transition.activity == AgentActivity::Working {
+                    self.inner.turns.note_activity(
+                        id,
+                        entry.turn_owner(),
+                        entry.info.activity,
+                        transition.activity,
+                        &entry.info.metadata,
+                        true,
+                    );
+                }
                 return;
             }
 

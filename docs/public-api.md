@@ -2145,12 +2145,16 @@ Event sources:
   turn that ends `blocked`, an idle that no `working` preceded (start-up, an
   empty prompt) and a session whose runtime was replaced mid-turn report no
   `turn_completed`. A `working` the daemon infers from terminal output opens a
-  turn only when input reached the session's current runtime (`session.input`,
-  a line submitted by an attached client, an initial prompt, including one
-  in the launch arguments) or an agent reported activity: the start-up banner,
-  or the repaint of a resumed or re-adopted session, is no turn. Output without input still continues a turn that is settling or waiting for approval. A turn uses
-  up the input it started on, and a resume, replacement or re-adoption starts
-  without any. The report is held for the debounce window, so an idle that
+  turn only while the session's current runtime holds input evidence:
+  `session.input`, a line submitted by an attached client, or an initial
+  prompt (including one in the launch arguments) arms it, and an agent report
+  does not. The turn that opens takes the evidence; if that turn is abandoned
+  (its agent or process changed, it ended `blocked`) the evidence goes back
+  and the next turn takes it, with the abandoned turn's start. The start-up
+  banner, or the repaint of a resumed or re-adopted session, is no turn: a
+  resume, replacement or re-adoption starts without any evidence. A report
+  of `working` opens its turn with or without evidence. Output without
+  evidence still continues a turn that is settling or waiting for approval. The report is held for the debounce window, so an idle that
   lasts less than `attention_debounce_secs` before the session works again
   reports nothing. A hook `Stop` and the projector's idle edge of one turn are
   one inbox record; a hook report that arrives after its turn was reported adds

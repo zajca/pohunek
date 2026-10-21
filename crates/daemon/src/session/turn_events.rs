@@ -11,7 +11,7 @@
 // Rust guideline compliant 2026-10-12
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -117,8 +117,20 @@ struct TurnRecord {
     /// The session's metadata when the turn left `working`.
     ended_metadata: Option<BTreeMap<String, String>>,
     state: TurnState,
+    /// Whether the turn took the session's input evidence when it opened.
+    holds_input: bool,
+    /// When the turn's record reached the inbox.
+    inbox_reported_at: Option<Instant>,
     inbox_reported: bool,
     signal_reported: bool,
+}
+
+/// What an abandoned turn hands back to the session: the input evidence it
+/// held, and the start it had observed.
+#[derive(Debug, Clone, Copy)]
+struct Handback {
+    started_nanos: Option<u64>,
+    started: Option<Instant>,
 }
 
 /// How many turns of a session stay known; an older id counts as reported.
@@ -129,6 +141,12 @@ struct TurnTable {
     next_id: u64,
     newest: Option<TurnId>,
     records: BTreeMap<TurnId, TurnRecord>,
+    /// The input evidence of the session's current runtime generation: one
+    /// token, taken by the turn that answers the input.
+    token: bool,
+    /// The start of the turn that gave the token back, for the turn that
+    /// takes it next.
+    returned_start: Option<Handback>,
 }
 
 impl TurnTable {
@@ -144,6 +162,8 @@ impl TurnTable {
                 ended: None,
                 ended_metadata: None,
                 state: TurnState::Open,
+                holds_input: false,
+                inbox_reported_at: None,
                 inbox_reported: false,
                 signal_reported: false,
             },
@@ -163,28 +183,71 @@ impl TurnTable {
     /// A turn whose owner is not `owner` departs: an open or paused one is
     /// abandoned, a settling one ends for good.
     fn depart_changed(&mut self, owner: TurnOwner) {
-        if let Some((_, record)) = self.newest_mut() {
-            if record.owner != owner {
-                depart(record);
-            }
-        }
+        let handback = self
+            .newest_mut()
+            .filter(|(_, record)| record.owner != owner)
+            .and_then(|(_, record)| depart(record));
+        self.give_back(handback);
     }
 
+    /// The session ended: no turn answers its input any more.
     fn abandon_all(&mut self) {
         for record in self.records.values_mut() {
             if record.state != TurnState::Closed {
                 record.state = TurnState::Abandoned;
             }
+            record.holds_input = false;
+        }
+        self.token = false;
+        self.returned_start = None;
+    }
+
+    /// Returns the input evidence an abandoned turn held to the session.
+    fn give_back(&mut self, handback: Option<Handback>) {
+        if let Some(handback) = handback {
+            self.token = true;
+            self.returned_start = Some(handback);
+        }
+    }
+
+    /// The turn `id`, just opened, takes the input evidence when it is armed,
+    /// and the start of the turn that gave it back.
+    fn take_token(&mut self, id: TurnId) {
+        if !self.token {
+            return;
+        }
+        self.token = false;
+        let returned = self.returned_start.take();
+        if let Some(record) = self.records.get_mut(&id) {
+            record.holds_input = true;
+            if let Some(returned) = returned.filter(|returned| returned.started.is_some()) {
+                record.started_nanos = returned.started_nanos;
+                record.started = returned.started;
+            }
         }
     }
 }
 
-fn depart(record: &mut TurnRecord) {
-    record.state = match record.state {
-        TurnState::Settling { .. } => TurnState::Closed,
-        TurnState::Open | TurnState::Paused => TurnState::Abandoned,
-        state @ (TurnState::Closed | TurnState::Abandoned) => state,
-    };
+/// A turn that did not complete: it hands back the input evidence it held.
+fn abandon(record: &mut TurnRecord) -> Option<Handback> {
+    record.state = TurnState::Abandoned;
+    std::mem::take(&mut record.holds_input).then_some(Handback {
+        started_nanos: record.started_nanos,
+        started: record.started,
+    })
+}
+
+/// The owner of a turn left: an open or paused one is abandoned, a settling
+/// one ends for good.
+fn depart(record: &mut TurnRecord) -> Option<Handback> {
+    match record.state {
+        TurnState::Settling { .. } => {
+            record.state = TurnState::Closed;
+            None
+        }
+        TurnState::Open | TurnState::Paused => abandon(record),
+        TurnState::Closed | TurnState::Abandoned => None,
+    }
 }
 
 /// A change of the turns of a session, in the order it happened.
@@ -259,11 +322,6 @@ pub(crate) struct TurnProgress {
     /// Unix nanoseconds of the last transition into `working`; what
     /// `session.wait_turn` reports as the turn start.
     turn_started_nanos: AtomicU64,
-    /// Whether input reached the session's current runtime, or an agent
-    /// reported its activity, since the last turn the detector opened: until
-    /// then the detector's `working` is output nobody asked for (start-up
-    /// banner, repaint), not a turn.
-    input_seen: AtomicBool,
     table: Mutex<TurnTable>,
 }
 
@@ -302,9 +360,6 @@ impl TurnProgress {
         let now = Instant::now();
         let mut table = self.table();
         table.depart_changed(owner);
-        if !detector_observed {
-            self.input_seen.store(true, Ordering::Relaxed);
-        }
         // A working report of a new owner opens its own turn even when the
         // session was already working, because the previous turn departed.
         let running = table
@@ -314,10 +369,7 @@ impl TurnProgress {
         {
             // Output nobody asked for opens no turn; it still continues one
             // that is paused or settling.
-            if detector_observed
-                && !self.input_seen.load(Ordering::Relaxed)
-                && !continues_turn(&mut table, previous, now)
-            {
+            if detector_observed && !table.token && !continues_turn(&mut table, previous, now) {
                 return TurnChange::default();
             }
             // The start orders turns for `session.wait_turn`, so a wall clock
@@ -325,8 +377,8 @@ impl TurnProgress {
             let nanos = wall_nanos.max(self.turn_started_nanos.load(Ordering::Relaxed) + 1);
             self.turn_started_nanos.store(nanos, Ordering::Relaxed);
             let started = enter_working(&mut table, owner, previous, non_zero(nanos), now);
-            if started.is_some() && detector_observed {
-                self.input_seen.store(false, Ordering::Relaxed);
+            if let Some(id) = started {
+                table.take_token(id);
             }
             return TurnChange {
                 started,
@@ -336,6 +388,7 @@ impl TurnProgress {
         let Some((id, record)) = table.newest_mut() else {
             return TurnChange::default();
         };
+        let mut handback = None;
         let ended = match (previous, next) {
             // A repeated `working` of the running turn changes nothing.
             (Some(AgentActivity::Working), AgentActivity::Working) => None,
@@ -356,29 +409,22 @@ impl TurnProgress {
                 Some(id)
             }
             (Some(AgentActivity::Working), _) if record.state == TurnState::Open => {
-                record.state = TurnState::Abandoned;
+                handback = abandon(record);
                 None
             }
             (Some(AgentActivity::Blocked), AgentActivity::Idle)
                 if record.state == TurnState::Paused =>
             {
-                record.state = TurnState::Abandoned;
+                handback = abandon(record);
                 None
             }
             _ => None,
         };
+        table.give_back(handback);
         TurnChange {
             started: None,
             ended,
         }
-    }
-
-    fn lacks_running_turn(&self, owner: TurnOwner) -> bool {
-        let mut table = self.table();
-        table.depart_changed(owner);
-        !table
-            .newest_mut()
-            .is_some_and(|(_, record)| record.state == TurnState::Open)
     }
 
     /// Opens a turn of unobserved start for an entry adopted while working.
@@ -396,11 +442,15 @@ impl TurnProgress {
     }
 
     fn note_input(&self) {
-        self.input_seen.store(true, Ordering::Relaxed);
+        let mut table = self.table();
+        table.token = true;
+        table.returned_start = None;
     }
 
     fn forget_input(&self) {
-        self.input_seen.store(false, Ordering::Relaxed);
+        let mut table = self.table();
+        table.token = false;
+        table.returned_start = None;
     }
 
     fn abandon_all(&self) {
@@ -408,12 +458,14 @@ impl TurnProgress {
     }
 
     fn abandon_running(&self, owner: TurnOwner) {
-        if let Some((_, record)) = self.table().newest_mut() {
-            if record.owner == owner && matches!(record.state, TurnState::Open | TurnState::Paused)
-            {
-                record.state = TurnState::Abandoned;
-            }
-        }
+        let mut table = self.table();
+        let handback = table
+            .newest_mut()
+            .filter(|(_, record)| {
+                record.owner == owner && matches!(record.state, TurnState::Open | TurnState::Paused)
+            })
+            .and_then(|(_, record)| abandon(record));
+        table.give_back(handback);
     }
 
     /// The turn a provider report that carries no identity belongs to: the
@@ -444,15 +496,18 @@ impl TurnProgress {
         if owner.is_none() {
             table.abandon_all();
         }
-        let Some(record) = table.records.get_mut(&id) else {
-            return TurnVerdict::Drop;
-        };
         // Only the settled turn departs: an owner read before the registry
         // lock was released may already be stale, and the turn a newer owner
         // opened is not this report's to abandon.
-        if owner.is_some_and(|owner| record.owner != owner) {
-            depart(record);
-        }
+        let handback = table
+            .records
+            .get_mut(&id)
+            .filter(|record| owner.is_some_and(|owner| record.owner != owner))
+            .and_then(depart);
+        table.give_back(handback);
+        let Some(record) = table.records.get_mut(&id) else {
+            return TurnVerdict::Drop;
+        };
         match record.state {
             TurnState::Abandoned => TurnVerdict::Drop,
             TurnState::Open | TurnState::Paused => TurnVerdict::Hold(None),
@@ -467,17 +522,23 @@ impl TurnProgress {
         }
     }
 
-    /// Whether the newest turn reached the inbox and ended within `within`.
+    /// Whether the record of the newest turn reached the inbox within
+    /// `within`.
     fn recently_reported(&self, within: Duration) -> bool {
         let mut table = self.table();
         table.newest_mut().is_some_and(|(_, record)| {
-            record.inbox_reported && record.ended.is_some_and(|ended| ended.elapsed() <= within)
+            record
+                .inbox_reported_at
+                .is_some_and(|reported| reported.elapsed() <= within)
         })
     }
 
     /// Records what the flush of turn `id` delivered.
     pub(crate) fn mark_reported(&self, id: TurnId, inbox: bool, signal: bool) {
         if let Some(record) = self.table().records.get_mut(&id) {
+            if inbox && !record.inbox_reported {
+                record.inbox_reported_at = Some(Instant::now());
+            }
             record.inbox_reported |= inbox;
             record.signal_reported |= signal;
         }
@@ -505,6 +566,7 @@ fn enter_working(
     started_nanos: Option<u64>,
     now: Instant,
 ) -> Option<TurnId> {
+    let mut handback = None;
     if let Some((_, record)) = table.newest_mut() {
         match record.state {
             TurnState::Paused if previous == Some(AgentActivity::Blocked) => {
@@ -518,10 +580,11 @@ fn enter_working(
                 return None;
             }
             TurnState::Settling { .. } => record.state = TurnState::Closed,
-            TurnState::Open | TurnState::Paused => record.state = TurnState::Abandoned,
+            TurnState::Open | TurnState::Paused => handback = abandon(record),
             TurnState::Closed | TurnState::Abandoned => {}
         }
     }
+    table.give_back(handback);
     Some(table.open(owner, started_nanos, now))
 }
 
@@ -832,13 +895,6 @@ impl TurnEvents {
                 .edges
                 .send(TurnEdge::Ended(session_id.clone(), id));
         }
-    }
-
-    /// Whether `owner` has no running turn, so that a `working` report of it
-    /// has a turn to open even when the session already shows `working`.
-    pub(crate) fn lacks_running_turn(&self, session_id: &SessionId, owner: TurnOwner) -> bool {
-        self.existing_progress(session_id)
-            .is_none_or(|progress| progress.lacks_running_turn(owner))
     }
 
     /// Subscribes to journal changes; the current version counts as seen.

@@ -823,7 +823,6 @@ where
         stream_id: data.stream_id.clone(),
         worker_instance_id: data.worker_instance_id.clone(),
     };
-    note_submission(&initial_input, on_submit);
     bridge_worker_frames(
         stream,
         &mut data.stream,
@@ -879,9 +878,14 @@ where
     let mut write_sequence = 1_u64;
     if !initial_input.is_empty() {
         let writer = worker_write.as_mut().expect("the worker writer is idle");
-        send_worker_attach_input(writer, identity, write_sequence, initial_input)
-            .await
-            .map_err(AttachBridgeError::worker_stream)?;
+        send_worker_attach_input(
+            writer,
+            identity,
+            (write_sequence, control.on_submit),
+            initial_input,
+        )
+        .await
+        .map_err(AttachBridgeError::worker_stream)?;
         write_sequence = next_attach_sequence(write_sequence)?;
     }
     let mut pending_send: Option<PendingWorkerSend<'_, W>> = None;
@@ -960,12 +964,11 @@ where
                 if count == 0 {
                     break;
                 }
-                note_submission(&input[..count], control.on_submit);
                 let writer = worker_write.take().expect("the worker writer is idle");
                 pending_send = Some(Box::pin(send_owned_attach_input(
                     writer,
                     identity,
-                    write_sequence,
+                    (write_sequence, control.on_submit),
                     input[..count].to_vec(),
                 )));
             }
@@ -1085,7 +1088,7 @@ type PendingWorkerSend<'a, W> = Pin<
 async fn send_owned_attach_input<'a, W>(
     mut writer: tokio::io::WriteHalf<&'a mut W>,
     identity: &'a WorkerFrameIdentity,
-    sequence: u64,
+    sequence: (u64, &'a (dyn Fn() + Sync)),
     bytes: Vec<u8>,
 ) -> (tokio::io::WriteHalf<&'a mut W>, Result<(), io::Error>)
 where
@@ -1098,7 +1101,7 @@ where
 async fn send_worker_attach_input<W>(
     writer: &mut W,
     identity: &WorkerFrameIdentity,
-    sequence: u64,
+    (sequence, on_submit): (u64, &(dyn Fn() + Sync)),
     bytes: Vec<u8>,
 ) -> Result<(), io::Error>
 where
@@ -1122,6 +1125,8 @@ where
         bytes,
     )
     .map_err(io::Error::other)?;
+    // The send starts here: a line the client submitted is input from now on.
+    note_submission(frame.payload(), on_submit);
     write_frame(writer, &frame).await.map_err(io::Error::other)
 }
 
@@ -1349,7 +1354,7 @@ mod tests {
 
     use super::{
         bridge_worker_frames, enforce_connection_version, read_frame, run_worker_attach_bridge,
-        write_frame, AttachControl, WorkerFrameIdentity,
+        send_owned_attach_input, write_frame, AttachControl, WorkerFrameIdentity,
     };
     use crate::runtime::DataStream;
 
@@ -1680,6 +1685,33 @@ mod tests {
         }
         fake_worker.write_all(&close).await.expect("close");
         bridge.await.expect("bridge task").expect("bridge ends");
+    }
+
+    /// The client's line counts as input when its send starts, not when the
+    /// send is prepared: a send dropped before it is polled arms nothing.
+    #[tokio::test]
+    async fn an_attach_send_that_never_starts_reports_no_input() {
+        let identity = WorkerFrameIdentity {
+            version: Version::new(1).expect("version"),
+            stream_id: StreamId::new("a-unstarted").expect("stream id"),
+            worker_instance_id: WorkerInstanceId::new("runtime-unstarted").expect("runtime id"),
+        };
+        let submitted = std::sync::atomic::AtomicUsize::new(0);
+        let on_submit = || {
+            submitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
+        let (mut worker, _peer) = tokio::io::duplex(PUBLIC_BUFFER);
+        let (_read, writer) = tokio::io::split(&mut worker);
+
+        let send = send_owned_attach_input(writer, &identity, (1, &on_submit), b"ls\r".to_vec());
+        drop(send);
+        assert_eq!(submitted.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let (_read, writer) = tokio::io::split(&mut worker);
+        let (_writer, sent) =
+            send_owned_attach_input(writer, &identity, (2, &on_submit), b"ls\r".to_vec()).await;
+        sent.expect("the send completes");
+        assert_eq!(submitted.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

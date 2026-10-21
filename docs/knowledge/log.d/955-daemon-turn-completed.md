@@ -14,7 +14,9 @@
   from an internal edge, and a turn whose agent or runtime leaves while it
   works is never reported. `session.wait_turn` is at-least-once for turns the daemon did not
   observe.
-- A `working` inferred from terminal output opens a turn only when input
-  reached the session's current runtime or an agent reported activity; the
-  evidence is used up by the turn it starts and reset by a resume, replacement
-  or re-adoption, so start-up output is never a turn.
+- A `working` inferred from terminal output opens a turn only while the
+  session's runtime holds input evidence (delivered input, never an agent
+  report). The turn takes the evidence and gives it back when abandoned, with
+  its start; a new runtime generation or the end of the session discards it.
+  The repeat window of an unstamped hook report is anchored at the inbox commit
+  of the newest turn.

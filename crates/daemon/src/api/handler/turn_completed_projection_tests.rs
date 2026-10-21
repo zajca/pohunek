@@ -369,6 +369,30 @@ async fn a_hook_report_of_a_turn_already_reported_adds_nothing() {
 }
 
 #[tokio::test]
+async fn a_hook_report_after_a_slow_flush_still_repeats_the_reported_turn() {
+    let fixture = enabled_fixture();
+    let session = fixture.session("late-hook-slow").await;
+    fixture.activity(&session, "idle").await;
+    let inhibitor = pause_clock().await;
+
+    turn(&fixture, &session, Duration::from_secs(2)).await;
+    flush_window().await;
+    assert_eq!(turn_records(&fixture).await.len(), 1);
+
+    // The repeat window of ruling B runs from the moment the record reached
+    // the inbox, not from the idle edge: this hook is later than twice the
+    // debounce after the turn ended, and inside it after the commit.
+    tokio::time::advance(debounce() + Duration::from_secs(2)).await;
+    settle().await;
+    ok(fixture.turn_completed(&session, 1).await);
+    flush_window().await;
+    let records = turn_records(&fixture).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["turn_duration_ms"], 2_000);
+    finish(&fixture, inhibitor, &session).await;
+}
+
+#[tokio::test]
 async fn a_disabled_kind_still_records_the_turn_event_for_waits() {
     let fixture = Fixture::new(SessionRegistryConfig::default());
     let session = fixture.session("disabled").await;
