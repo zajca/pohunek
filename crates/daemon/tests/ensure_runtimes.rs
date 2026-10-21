@@ -2277,6 +2277,85 @@ fn a_disabled_release_package_with_an_altered_root_beside_a_serving_selection_is
     }
 }
 
+/// A host whose enabled Pi package `selected_version` serves the runtime
+/// beside the release's own Pi package `release_version`, installed, disabled
+/// and altered at its root.
+async fn pi_serving_beside_an_altered_disabled_release(
+    selected_version: &str,
+    release_version: &str,
+) -> (Host, PackageDigest) {
+    let host = Host::with_installed_pi().await;
+    let release = host.publish_pi(release_version, 1);
+    let installed = host.step(false);
+    assert!(installed.refusals.is_empty(), "{installed:?}");
+    let selected = official_runtimes::variant_archive("pi", selected_version).1;
+    if host
+        .pi_registry()
+        .0
+        .iter()
+        .all(|version| version != selected_version)
+    {
+        host.publish_pi(selected_version, 2);
+        let swapped = host.step(false);
+        assert!(swapped.refusals.is_empty(), "{swapped:?}");
+        host.publish_pi(release_version, 3);
+    }
+    pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+        .expect("the package store")
+        .registry()
+        .select(&selected)
+        .expect("select the serving version");
+    host.disable_package(&release);
+    host.alter_package_root(&release);
+    (host, release)
+}
+
+/// For Pi the altered root of the disabled release package is refused beside an
+/// older enabled selection, which the release would update, and ignored beside
+/// a newer one, which is kept silently.
+#[tokio::test]
+async fn a_disabled_pi_release_package_with_an_altered_root_is_refused_only_beside_an_older_selection(
+) {
+    let (host, release) =
+        pi_serving_beside_an_altered_disabled_release(PI_INSTALLED_VERSION, PI_NEWER_VERSION).await;
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
+    for report in [host.step(true), host.step(false)] {
+        assert_eq!(
+            refusal_codes(&report),
+            [root_refusal.as_str()],
+            "{:?}",
+            report.refusals
+        );
+        assert!(
+            report.refusals[0].detail.contains(&format!(
+                "pohunek plugin uninstall {PI_PACKAGE} --digest {} --remove-modified --yes",
+                release.as_str()
+            )),
+            "{}",
+            report.refusals[0].detail
+        );
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+
+    let (host, _release) =
+        pi_serving_beside_an_altered_disabled_release(PI_NEWER_VERSION, PI_INSTALLED_VERSION).await;
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    for report in [host.step(true), host.step(false)] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert_eq!(pi_package(&report).status, PackageStatus::Kept);
+        assert_eq!(pi_package(&report).version, PI_NEWER_VERSION);
+        assert!(report.gaps.is_empty(), "{:?}", report.gaps);
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+}
+
 /// A detecting plan drops a runtime nothing uses whose program is off the
 /// search path before it judges the altered root of the disabled release
 /// package, so the plan is not refused for an agent that is not there.
@@ -3701,6 +3780,99 @@ async fn a_rootless_disabled_pi_selection_beside_a_third_party_server_is_reporte
         "{:?}",
         detected.gaps
     );
+}
+
+/// Without detection, a disabled selected Pi package that a third-party package
+/// shadows is left with the `plugin doctor` pointer even when a profile is over
+/// `pi`: the plan and the apply report the gap, print no enable hint, refuse
+/// nothing and change nothing.
+#[tokio::test]
+async fn a_disabled_pi_selection_beside_a_third_party_server_is_a_gap_without_detect() {
+    let host = Host::with_installed_pi().await;
+    host.publish_pi(PI_NEWER_VERSION, 1);
+    host.disable_package(&Host::installed_pi_digest());
+    official_runtimes::preinstall_third_party(
+        &host.plugins_dir(),
+        host.env.root(),
+        "pi",
+        "acme.runtime.pi",
+    )
+    .await;
+    host.write_profile("work", "base = \"pi\"\n");
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let profile = host.profile_text_of("work");
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert_eq!(
+            gap_codes(report),
+            [("pi", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)],
+            "{:?}",
+            report.gaps
+        );
+        let detail = &report.gaps[0].detail;
+        assert!(detail.contains("pohunek plugin doctor"), "{detail}");
+        assert!(!detail.contains("plugin enable"), "{detail}");
+        assert!(report.packages.is_empty(), "{:?}", report.packages);
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+    assert_eq!(host.profile_text_of("work"), profile);
+}
+
+/// Without detection, the release's Pi package is refused with the
+/// runtime-conflict code while a third-party package serves `pi`, which the
+/// installed Pi package, whose root is missing, no longer shadows. The plan and
+/// the apply both refuse and change nothing.
+#[tokio::test]
+async fn a_rootless_selected_pi_package_beside_a_third_party_server_is_refused_without_detect() {
+    let host = Host::with_installed_pi().await;
+    host.publish_pi(PI_NEWER_VERSION, 1);
+    host.remove_package_root(Host::installed_pi_digest().as_str());
+    official_runtimes::preinstall_third_party(
+        &host.plugins_dir(),
+        host.env.root(),
+        "pi",
+        "acme.runtime.pi",
+    )
+    .await;
+    host.write_profile("work", "base = \"pi\"\n");
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let profile = host.profile_text_of("work");
+    let conflict = ProtocolError::from(PackageErrorKind::RuntimeConflict).code;
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert_eq!(
+            refusal_codes(report),
+            [conflict.as_str()],
+            "{:?}",
+            report.refusals
+        );
+        assert_eq!(report.refusals[0].subject, "pi");
+        assert_eq!(
+            report.refusals[0].detail,
+            "the release package cannot take this runtime id alongside the installed runtimes"
+        );
+        assert!(
+            !gap_codes(report).contains(&("pi", CODE_GAP_SERVED_BY_OTHER_PACKAGE)),
+            "{:?}",
+            report.gaps
+        );
+        assert!(report.packages.is_empty(), "{:?}", report.packages);
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+    assert_eq!(host.profile_text_of("work"), profile);
 }
 
 /// A disabled Pi selection nothing uses, whose root is altered or whose id

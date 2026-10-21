@@ -2346,8 +2346,8 @@ Pi included; `plugin update` would refuse a newer selection as a downgrade), and
 `pohunek plugin install` or `plugin select` for an unordered selection that does not
 load; when an enabled version still serves the runtime beside a disabled release
 package it keeps serving and the gap names the release package, except that a release
-package with an altered root is refused with its uninstall command (beside an older
-ordered selection, the case where it would otherwise update the runtime), a selected Pi
+package with an altered root is refused with its uninstall command (beside any ordered enabled selection for claude, codex and hermes, beside an older
+one only for Pi, and when no enabled selection serves the runtime (for Pi that is an enabled selection that cannot load; a Pi without an enabled selection is judged only under `--detect`, which drops a Pi nothing uses first)), a selected Pi
 version newer than the release's is kept silently and a selected version that cannot be
 ordered against the release's reports `plugin_update_version_unordered`; under `--detect`
 the gap is dropped with a runtime the detecting plan drops, that is one nothing uses,
