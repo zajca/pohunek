@@ -75,7 +75,7 @@ const SETTLE_YIELDS: usize = 64;
 /// Daemon state, its registry, inbox, and the owning task handles.
 pub(super) struct Fixture {
     state: DaemonState,
-    sessions: SessionRegistry,
+    pub(super) sessions: SessionRegistry,
     root: tempfile::TempDir,
     _projector: NotificationProjector,
     _coordinator: AttentionCoordinatorTask,

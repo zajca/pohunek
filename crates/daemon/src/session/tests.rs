@@ -2417,6 +2417,26 @@ async fn the_input_a_running_turn_held_does_not_outlive_its_runtime() {
     let _ = registry.stop(&created.id).await;
 }
 
+/// The input evidence is armed when the send starts and nothing takes it back
+/// when the write then fails: the bytes may have reached the PTY, and the
+/// agent's answer is still a turn.
+#[tokio::test]
+async fn input_whose_write_failed_after_it_started_is_still_evidence() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+
+    // The send-start callback of the worker write is `note_input`; a failed
+    // exchange afterwards has no path back to the evidence.
+    registry.note_input(&created.id);
+    work_then_idle(&registry, &created.id).await;
+    assert_eq!(started_turns_and_ends(&mut edges), (1, 1));
+    let _ = registry.stop(&created.id).await;
+}
+
 #[tokio::test]
 async fn a_resumed_runtime_banner_is_not_a_turn_until_input_reaches_it() {
     let registry = turn_registry();

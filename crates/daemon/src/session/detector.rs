@@ -225,6 +225,16 @@ impl SessionRegistry {
         self.record_activity_scoped(id, None, transition).await;
     }
 
+    /// Feeds one detector transition, as the detector task does.
+    #[cfg(test)]
+    pub(crate) async fn feed_detector_activity(&self, id: &SessionId, activity: AgentActivity) {
+        let transition = ActivityTransition {
+            activity,
+            source: protocol::StateSource::Process,
+        };
+        self.record_activity(id, transition).await;
+    }
+
     pub(super) async fn record_detector_activity(
         &self,
         id: &SessionId,

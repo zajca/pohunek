@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use pohunek_test_support::time::AutoAdvanceInhibitor;
-use protocol::{method, NotificationKindPolicy};
+use protocol::{method, AgentActivity, NotificationKindPolicy, SessionId};
 use serde_json::{json, Value};
 
 use super::turn_wait_tests::{
@@ -1021,6 +1021,45 @@ async fn a_turn_stays_unread_when_its_start_and_end_wait_in_the_projector_togeth
         tokio::time::advance(Duration::from_millis(50)).await;
         settle().await;
     }
+    let records = turn_records(&fixture).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["status"], "unread", "{records:?}");
+    finish(&fixture, inhibitor, &session).await;
+}
+
+#[tokio::test]
+async fn a_record_stays_unread_when_the_screen_works_again_without_input() {
+    let fixture = enabled_fixture();
+    let session = fixture.session("repaint-after-record").await;
+    fixture.activity(&session, "idle").await;
+    let inhibitor = pause_clock().await;
+
+    turn(&fixture, &session, Duration::from_secs(1)).await;
+    flush_window().await;
+    let records = turn_records(&fixture).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["status"], "unread");
+
+    // The reporting agent leaves; the screen then works again with no input
+    // behind it. That is no turn, so it acknowledges nothing.
+    ok(fixture
+        .call(
+            method::SESSION_RELEASE_AGENT,
+            json!({"session_id": session, "source": "pohunek:claude", "agent": "turn-agent"}),
+        )
+        .await);
+    settle().await;
+    let id = SessionId(session.clone());
+    fixture
+        .sessions
+        .feed_detector_activity(&id, AgentActivity::Working)
+        .await;
+    settle().await;
+    fixture
+        .sessions
+        .feed_detector_activity(&id, AgentActivity::Idle)
+        .await;
+    flush_window().await;
     let records = turn_records(&fixture).await;
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0]["status"], "unread", "{records:?}");
