@@ -1365,6 +1365,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-cli --test all -- --ignored --test-threads 1 'setup_host::'
 
+      # The configuration-migration checks run the real CLI; on Linux the check
+      # needs the user manager, so this lane gives it the real bus (the hermetic
+      # lanes assert the refusal instead).
+      - name: pohunek service check of an older configuration
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-cli --test all -- --test-threads 1 'service_config_migration::'
+
       - name: Supervised worker lifecycle
         if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-daemon --test supervised_lifecycle -- --ignored --test-threads 1
