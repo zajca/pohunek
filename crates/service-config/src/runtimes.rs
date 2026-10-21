@@ -84,6 +84,10 @@ pub const CODE_GAP_CONFIG_HOME_MISSING: &str = "config_home_missing";
 pub const CODE_GAP_CONFIG_HOME_SYMLINK: &str = "config_home_is_symlink";
 /// Another package already serves the runtime id. It is left untouched.
 pub const CODE_GAP_SERVED_BY_OTHER_PACKAGE: &str = "runtime_served_by_other_package";
+/// An official package of a runtime that is not reserved (Pi) is installed but
+/// not selected and enabled, so the step does not change it. The operator
+/// updates it with `plugin update`.
+pub const CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING: &str = "official_package_not_serving";
 
 /// What the step found, planned and (unless a dry run) did.
 ///
@@ -117,8 +121,9 @@ pub struct EnsureReport {
     /// Why the plan cannot be applied; empty when it can.
     pub refusals: Vec<Refusal>,
     /// What `--detect` found that the setup must resolve or accept, one next
-    /// step each. Always empty without `--detect`, and a gap never blocks an
-    /// apply that has no refusal.
+    /// step each. Without `--detect` only the gaps of an installed official
+    /// package of a runtime that is not reserved (Pi) appear. A gap never
+    /// blocks an apply that has no refusal.
     #[serde(default)]
     pub gaps: Vec<Gap>,
 }
@@ -135,6 +140,9 @@ pub enum UseReason {
     Integration,
     /// Its program is on the search path, found by `--detect`.
     Detected,
+    /// An official package of it that is not reserved (Pi) is installed,
+    /// selected and enabled, so the step keeps it current.
+    Installed,
 }
 
 /// A condition `--detect` reports without refusing the plan.
@@ -202,6 +210,12 @@ pub struct PackageAction {
     /// operator can select again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaces_newer: Option<SelectedPackage>,
+    /// Set when the status is `kept` because the registry selects a newer
+    /// official version than the release carries: the release's version. The
+    /// fields above then name the selected package, which the step never
+    /// downgrades.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_version: Option<String>,
 }
 
 /// A package the registry selects, named by its digest and version.

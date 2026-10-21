@@ -359,16 +359,20 @@ To prepare first, install with `--no-enable` and run
 plugin disable` or `pohunek plugin uninstall` leaves `claude`, `codex` or
 `hermes` unserved. The upgrade installs and selects the release's package for
 every official runtime the host uses. It repins the host profiles pinned to an
-older version of that package and lists the pinned profiles it keeps. Outside
+older version of that package and lists the pinned profiles it keeps. An official
+Pi package that is installed, selected and enabled is updated the same way; an
+absent Pi package is never installed, a Pi package you disabled or deselected is
+left as it is (the plan names the `pohunek plugin update` command), and a
+selected version newer than the release's is kept, never downgraded. Outside
 an upgrade, `pohunek plugin update <package> runtime/packages/<runtime>.tar.zst
 --catalog runtime/runtime-catalog.json` installs and selects a newer release's
 version. It refuses a version lower than the selected official one
 (`plugin_update_downgrade`), and a version that cannot be ordered against it
 (`plugin_update_version_unordered`); `pohunek plugin select` rolls back on
 purpose. When
-the selected version is newer than the release's, for example after a
-`plugin update` from a later archive, the upgrade plan says that the upgrade
-re-selects the release's version. Select the newer one again afterwards. A plain
+the selected version of `claude`, `codex` or `hermes` is newer than the release's,
+for example after a `plugin update` from a later archive, the upgrade plan says
+that the upgrade re-selects the release's version. Select the newer one again afterwards. A plain
 `install` of another version leaves it installed but unselected.
 The trust model and the package classes are described
 in [the architecture](architecture.md#runtime-packages-and-trust) and the

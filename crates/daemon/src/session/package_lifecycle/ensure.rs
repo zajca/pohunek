@@ -24,7 +24,8 @@ use package::{PackageDigest, VerifiedCatalog, MAX_CATALOG_BYTES};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Gap, IntegrationAction, PackageAction, PackageStatus,
     ProfileAction, ProfileStatus, Refusal, SelectedPackage, UseReason, CODE_GAP_AGENT_NOT_ON_PATH,
-    CODE_GAP_CONFIG_HOME_MISSING, CODE_GAP_CONFIG_HOME_SYMLINK, CODE_GAP_SERVED_BY_OTHER_PACKAGE,
+    CODE_GAP_CONFIG_HOME_MISSING, CODE_GAP_CONFIG_HOME_SYMLINK,
+    CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING, CODE_GAP_SERVED_BY_OTHER_PACKAGE,
     CODE_PACKAGE_ARCHIVE_INVALID, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
     CODE_PINNED_TARGET_NOT_OFFICIAL, CODE_PINNED_TO_NEWER_VERSION,
     CODE_PINNED_TO_NON_OFFICIAL_PACKAGE, CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_TO_SAME_VERSION,
@@ -159,6 +160,9 @@ struct Planned {
     /// The newer official package the registry selects, which installing and
     /// selecting this release package replaces.
     replaces_newer: Option<SelectedPackage>,
+    /// The release's version when the entry keeps a newer selected package
+    /// instead of installing it.
+    release_version: Option<String>,
 }
 
 /// One host profile over an official runtime that pins no package.
@@ -546,12 +550,6 @@ fn compute(inputs: &EnsureInputs, detect: bool) -> Result<Computed, EnsureError>
     });
 
     let mut report = Report::new(inputs, detect);
-    let Gathered {
-        mut uses,
-        unpinned,
-        pinned,
-        official,
-    } = gather(inputs, launch, &profiles, &mut report)?;
     let base = launch
         .base()
         .map_err(|error| EnsureError::Registry(error.to_string()))?;
@@ -563,6 +561,16 @@ fn compute(inputs: &EnsureInputs, detect: bool) -> Result<Computed, EnsureError>
         base: &base,
     };
     let release = load_release(inputs, &catalog_state);
+    let managed = managed_runtimes(release.as_ref(), &plan, &mut report)?;
+    let Gathered {
+        mut uses,
+        unpinned,
+        pinned,
+        official,
+    } = gather(inputs, launch, &profiles, &managed, &mut report)?;
+    for runtime in &managed {
+        uses.add(runtime, UseReason::Installed);
+    }
     let catalog = catalog_plan(release.as_ref(), &catalog_state);
     report.catalog = catalog.status;
     if detect {
@@ -598,6 +606,7 @@ fn gather(
     inputs: &EnsureInputs,
     launch: &crate::runtime::LaunchEnvironment,
     profiles: &ProfileRegistry,
+    managed: &[RuntimeId],
     report: &mut Report,
 ) -> Result<Gathered, EnsureError> {
     let mut uses = Uses::default();
@@ -638,7 +647,8 @@ fn gather(
                 continue;
             }
         };
-        if !is_official(&head.base) {
+        let managed_base = managed.contains(&head.base);
+        if !is_official(&head.base) && !managed_base {
             continue;
         }
         // A pinned profile still uses its runtime: the release package must be
@@ -650,6 +660,9 @@ fn gather(
             digest: head.pin().map(|pin| pin.digest),
         });
         match head.pin() {
+            // An unpinned profile over a managed runtime follows the selection
+            // of its package; the step binds only the reserved runtimes.
+            None if managed_base => {}
             None => unpinned.push(Unpinned {
                 name,
                 base: head.base,
@@ -1000,6 +1013,123 @@ fn catalog_plan(release: Option<&Release<'_>>, state: &CatalogState) -> CatalogP
     }
 }
 
+/// The `plugin update` command that installs the release's package of
+/// `runtime` from the extracted release archive.
+fn update_command(package: &PackageId, runtime: &RuntimeId) -> String {
+    format!(
+        "pohunek plugin update {package} runtime/{PACKAGES_DIR}/{runtime}{ARCHIVE_SUFFIX} \
+         --catalog runtime/{CATALOG_FILE} --yes"
+    )
+}
+
+/// The runtimes that are not reserved (Pi) whose official package the step
+/// keeps current: one is installed from the official catalog, selected and
+/// enabled, and the release catalog lists a package of the same id for it.
+///
+/// The step never installs a package that is absent and never selects or
+/// enables one the operator turned off. An official package that is installed
+/// but not serving, or that the release does not list for this platform, is
+/// reported as a gap with the command that updates it by hand. Without a usable
+/// release catalog every such serving package is kept as it is.
+fn managed_runtimes(
+    release: Option<&Release<'_>>,
+    plan: &PlanInputs<'_>,
+    report: &mut Report,
+) -> Result<Vec<RuntimeId>, EnsureError> {
+    let (Some(state), Some(context)) = (plan.state, plan.planning) else {
+        return Ok(Vec::new());
+    };
+    let platform = trust::host_platform().map_err(kind_error)?;
+    let core = trust::core_version().map_err(kind_error)?;
+    let listed = |runtime: &RuntimeId| {
+        release
+            .into_iter()
+            .flat_map(|release| release.catalog.entries())
+            .filter(|entry| {
+                entry.runtime_id() == runtime
+                    && entry.supports_platform(&platform)
+                    && entry.supports_core(&core)
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut serving: BTreeMap<String, (RuntimeId, PackageId)> = BTreeMap::new();
+    for record in state.packages() {
+        let id = &record.identity().id;
+        if record.source() != PackageSource::Official
+            || !record.enabled()
+            || state.selected(id) != Some(record.digest())
+        {
+            continue;
+        }
+        // The descriptor names the runtime. A root that does not load still
+        // serves the runtime the release catalog lists the package for, so the
+        // plan reports its damage instead of skipping it.
+        let runtime = context
+            .store
+            .read_definition(record.digest(), record.identity())
+            .map(|definition| definition.runtime_id().clone())
+            .ok()
+            .or_else(|| {
+                release.and_then(|release| {
+                    release
+                        .catalog
+                        .entries()
+                        .iter()
+                        .find(|entry| entry.package_id() == id)
+                        .map(|entry| entry.runtime_id().clone())
+                })
+            });
+        if let Some(runtime) = runtime.filter(|runtime| !is_reserved(runtime)) {
+            serving.insert(runtime.as_str().to_owned(), (runtime, id.clone()));
+        }
+    }
+    let Some(release) = release else {
+        return Ok(serving.into_values().map(|(runtime, _)| runtime).collect());
+    };
+    let mut managed = Vec::new();
+    for (runtime, package) in serving.values() {
+        match listed(runtime).as_slice() {
+            [entry] if entry.package_id() == package => managed.push(runtime.clone()),
+            _ => report.gap(
+                runtime.as_str(),
+                CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
+                &format!(
+                    "the release catalog lists no single package {package} of this runtime for \
+                     this platform, so the installed package stays as it is; update it from a \
+                     release that lists it: {}",
+                    update_command(package, runtime)
+                ),
+            ),
+        }
+    }
+    for entry in release.catalog.entries() {
+        let runtime = entry.runtime_id();
+        if is_reserved(runtime)
+            || !entry.supports_platform(&platform)
+            || !entry.supports_core(&core)
+            || serving.contains_key(runtime.as_str())
+        {
+            continue;
+        }
+        let installed = state.packages().iter().any(|record| {
+            record.source() == PackageSource::Official
+                && record.identity().id == *entry.package_id()
+        });
+        if installed {
+            report.gap(
+                runtime.as_str(),
+                CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
+                &format!(
+                    "an official package of this runtime is installed but not selected and \
+                     enabled, so the upgrade leaves it as you set it; update it with: {}",
+                    update_command(entry.package_id(), runtime)
+                ),
+            );
+        }
+    }
+    Ok(managed)
+}
+
 /// Plans the package of every used runtime.
 fn plan_packages(
     uses: &Uses,
@@ -1096,6 +1226,7 @@ fn plan_installed(
         definition: (*definition).clone(),
         action: Action::Kept,
         replaces_newer: None,
+        release_version: None,
     })
 }
 
@@ -1141,6 +1272,18 @@ fn plan_runtime(
             "the release archive serves another runtime than the catalog lists it for",
         );
         return Ok(None);
+    }
+    // A runtime that is not reserved (Pi) was installed on purpose, possibly
+    // from a later archive than this release's, so a newer selected official
+    // version is kept and never replaced by the release's.
+    if !is_reserved(&runtime) && replaces_newer(plan, &prepared).is_some() {
+        let release_version = prepared.identity.version.as_str().to_owned();
+        return Ok(
+            plan_installed(plan, runtime, reasons, report).map(|mut kept| {
+                kept.release_version = Some(release_version);
+                kept
+            }),
+        );
     }
     if report.detect
         && !detect_on_search_path(
@@ -1196,6 +1339,7 @@ fn plan_runtime(
         definition,
         action,
         replaces_newer,
+        release_version: None,
     }))
 }
 
@@ -1976,6 +2120,7 @@ fn package_action(plan: &Planned, applied: bool) -> PackageAction {
         status,
         reasons: plan.reasons.clone(),
         replaces_newer: plan.replaces_newer.clone(),
+        release_version: plan.release_version.clone(),
     }
 }
 

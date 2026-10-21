@@ -854,11 +854,16 @@ sessions launched before it. All of these must hold:
   version (the upgrade repins it, see above). A profile still pinned to the
   older version keeps the session on it.
 
-This covers Pi too. `service upgrade` does not repin Pi profiles, because the
-upgrade's runtime step manages only `claude`, `codex` and `hermes`. After
-`pohunek plugin update pohunek.runtime.pi <archive> --catalog <catalog> --yes`,
-move a Pi profile with `pohunek plugin profile migrate <name> --yes`. Its
-stopped sessions are then adopted on their next resume or fork. A session
+This covers Pi too. The upgrade's runtime step manages `claude`, `codex` and
+`hermes`, and also an official Pi package that is installed, selected and
+enabled: it installs and selects the release's Pi version and repins a Pi
+profile pinned to the older official version. An unpinned Pi profile follows the
+selection. An absent, disabled or deselected Pi package is not changed; the plan
+lists a gap with the `pohunek plugin update pohunek.runtime.pi
+runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json --yes`
+command, after which `pohunek plugin profile migrate <name> --yes` moves a Pi
+profile. A selected Pi version newer than the release's is kept. Its stopped
+sessions are adopted on their next resume or fork. A session
 launched as the bare `pi` runtime follows the selected version.
 
 A newer version that fails one of these checks does not break the session.
