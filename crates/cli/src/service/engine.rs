@@ -1494,6 +1494,11 @@ impl<'a> Engine<'a> {
         // The stop intent is journaled first, so a rollback that finds it
         // restarts the previous daemon even if the stop did not return.
         if !record.runtime_stop {
+            if record.config_backup.is_none() {
+                // A failed apply rolls back with the daemon down: refuse now,
+                // while it still runs, a job the rollback could not judge then.
+                journal_job_path(self.context, record, true).await?;
+            }
             record.runtime_stop = true;
             self.store.save(record)?;
         }

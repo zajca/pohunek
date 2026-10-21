@@ -10734,6 +10734,53 @@ async fn a_rollback_gate_before_the_stop_judges_the_unloaded_job() {
     assert!(harness.pending().is_some(), "the transaction is kept");
 }
 
+/// The runtime step stops the daemon to apply: with the job undecidable once it
+/// is unloaded, the step refuses before the stop.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn the_runtime_step_judges_the_unloaded_job_before_it_stops_the_daemon() {
+    const LATER: &str = "/opt/later/bin:/usr/bin";
+    let mut harness = Harness::new();
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(PENDING_PATH)).expect("domain configuration");
+    harness.context = harness.context.clone().with_launchd_domain_config(&domain);
+    set_job_path(&mut harness, JOURNALED_PATH);
+    harness.install(V1).await.expect("install");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Definition);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted before the runtime step");
+    std::fs::write(&domain, launchd_domain_xml(LATER)).expect("domain configuration");
+    harness.context = harness
+        .context
+        .clone()
+        .with_launchd_job(Arc::new(FlipLaunchd {
+            fake: harness.fake.clone(),
+            loaded: loaded_job(LATER),
+            unloaded: not_loaded(),
+            boot: SECOND_BOOT.to_owned(),
+        }));
+    harness.runtimes.plan(installing_plan());
+    let uninstalls = harness.fake.world().uninstalls;
+
+    // Resuming the same upgrade reaches the runtime step with the daemon loaded.
+    let error = harness
+        .engine()
+        .with_adoption_preflight(Box::new(ScriptedPreflight::default()))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("the unloaded job cannot be judged");
+
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    assert_eq!(
+        harness.fake.world().uninstalls,
+        uninstalls,
+        "refused before the stop"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn the_same_boot_keeps_the_journaled_default_over_a_pending_persisted_change() {
