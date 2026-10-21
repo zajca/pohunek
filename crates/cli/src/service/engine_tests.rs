@@ -2482,6 +2482,9 @@ async fn a_rollback_after_the_daemon_stop_does_not_rewrite_an_untouched_config()
     grow_rendering_past_the_bound(&harness);
     let before = std::fs::read(harness.context.config_path()).expect("read");
 
+    // The check of the same request passes: it rewrites nothing.
+    check_local_report(&harness.context, None, V1, false)
+        .expect("the check of a rollback that leaves the file alone passes");
     let report = harness.upgrade(V1).await.expect("the rollback succeeds");
 
     assert!(report.unchanged);

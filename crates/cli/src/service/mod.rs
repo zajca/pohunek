@@ -980,7 +980,7 @@ pub(crate) fn check_local(
             engine::check_upgrade_renderings(
                 config,
                 version,
-                plan.record().is_some(),
+                matches!(plan, engine::Plan::Resume(_)),
                 &config_path,
             )?;
             if engine::swaps_daemon(&plan, Some(config.active_version()), version) {
