@@ -2788,6 +2788,49 @@ impl LaunchdJob for FakeLaunchd {
     }
 }
 
+/// A launchd that reports `loaded` while the fake service manager holds the
+/// daemon job and `unloaded` once the job is removed, as a real stop does.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct FlipLaunchd {
+    fake: Fake,
+    loaded: ActiveJob,
+    unloaded: ActiveJob,
+    boot: String,
+}
+
+#[cfg(target_os = "macos")]
+impl FlipLaunchd {
+    fn state(&self) -> ActiveJob {
+        if self.fake.world().registered.is_some() {
+            self.loaded.clone()
+        } else {
+            self.unloaded.clone()
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl LaunchdJob for FlipLaunchd {
+    fn active_path<'a>(
+        &'a self,
+        _uid: u32,
+        _label: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<ActiveJob, String>> + Send + 'a>> {
+        let value = self.state();
+        Box::pin(async move { Ok(value) })
+    }
+
+    fn domain_environment(&self, _uid: u32) -> crate::service::manager_env::DomainEnvironment<'_> {
+        let value = self.state().domain_environment;
+        Box::pin(async move { Ok(value) })
+    }
+
+    fn boot_identity(&self) -> Result<String, String> {
+        Ok(self.boot.clone())
+    }
+}
+
 /// The boot identity a fake launchd host starts with.
 #[cfg(target_os = "macos")]
 const FIRST_BOOT: &str = "6D0CBE3B-5C31-4E4B-A1B0-0F2B6A4D5A11";
@@ -10648,6 +10691,47 @@ fn assert_rollback_refused(result: &Result<Vec<String>, Error>, reason: &str) {
         !text.contains(PENDING_PATH) && !text.contains(JOURNALED_PATH),
         "values stay out: {text}"
     );
+}
+
+/// The gate before the rollback's stop judges the unloaded job, not the loaded
+/// one it can read: a journal that cannot be decided is refused with the daemon
+/// still running, instead of after the stop with it down.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_rollback_gate_before_the_stop_judges_the_unloaded_job() {
+    const LATER: &str = "/opt/later/bin:/usr/bin";
+    let mut harness = Harness::new();
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(PENDING_PATH)).expect("domain configuration");
+    harness.context = harness.context.clone().with_launchd_domain_config(&domain);
+    interrupted_upgrade_journal(&mut harness).await;
+    // A reboot happened and the persisted configuration changed again since.
+    std::fs::write(&domain, launchd_domain_xml(LATER)).expect("domain configuration");
+    harness.context = harness
+        .context
+        .clone()
+        .with_launchd_job(Arc::new(FlipLaunchd {
+            fake: harness.fake.clone(),
+            loaded: loaded_job(LATER),
+            unloaded: not_loaded(),
+            boot: SECOND_BOOT.to_owned(),
+        }));
+    let uninstalls = harness.fake.world().uninstalls;
+
+    let error = harness
+        .engine()
+        .with_adoption_preflight(Box::new(ScriptedPreflight::default()))
+        .upgrade(&harness.staged(V1), V1)
+        .await
+        .expect_err("which PATH is active cannot be told");
+
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    assert_eq!(
+        harness.fake.world().uninstalls,
+        uninstalls,
+        "refused before the stop"
+    );
+    assert!(harness.pending().is_some(), "the transaction is kept");
 }
 
 #[cfg(target_os = "macos")]

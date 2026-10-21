@@ -1430,7 +1430,9 @@ impl<'a> Engine<'a> {
         if let Some(hook) = &self.before_swap {
             (hook.0)();
         }
-        let job = job_path(self.context, config, record.journal_default()).await?;
+        // The daemon is stopped right after this gate, so it judges the state
+        // after the stop.
+        let job = job_path_after_stop(self.context, config, record.journal_default()).await?;
         let warnings = job_warnings(self.context, &job);
         late.warnings.extend(warnings.iter().cloned());
         if let Some(dir) = config.daemon_executable().parent() {
@@ -1706,14 +1708,12 @@ impl<'a> Engine<'a> {
                 if restarts_previous && new_daemon_may_run && record.runtime_backup.is_none() {
                     gated = Some(self.rollback_gate(&layout, previous, record).await?);
                 }
-                let stops_daemon = record.step >= Step::Registering
-                    || record.runtime_stop
-                    || (record.config_backup.is_some() && record.step >= Step::StopDaemon);
+                let stops_daemon = rollback_stops_daemon(record);
                 if restarts_previous && stops_daemon && record.runtime_backup.is_some() {
                     // The gate waits for the restore, but the job's `PATH` must be
                     // resolvable before the daemon is stopped: the gate after the
                     // stop would otherwise refuse with the daemon down.
-                    journal_job_path(self.context, record).await?;
+                    journal_job_path(self.context, record, true).await?;
                 }
                 self.mark_rolling_back(record)?;
                 if stops_daemon {
@@ -1813,7 +1813,7 @@ impl<'a> Engine<'a> {
                     detail: "previous version has no valid installation directory".to_owned(),
                 })?;
         let daemon_dir = layout::verify_installed(layout, &daemon_dir)?;
-        let job = journal_job_path(self.context, record).await?;
+        let job = journal_job_path(self.context, record, rollback_stops_daemon(record)).await?;
         let warnings = job_warnings(self.context, &job);
         let mut gated = rollback::gate(
             rollback::Inputs {
@@ -2656,11 +2656,33 @@ fn persisted_path_warnings(_context: &Context, _job: &JobPath) -> Vec<String> {
 /// The `PATH` a rollback of `record` judges with: the one the installed
 /// configuration gives the job, with the launchd default the upgrade journaled
 /// while the previous job was loaded standing in when the job is not loaded.
-pub(crate) async fn journal_job_path(context: &Context, record: &Record) -> Result<JobPath, Error> {
+///
+/// `stopped` says the rollback stops the daemon first: the gate then judges the
+/// state that exists after the stop (an unloaded job, a removed unit), which is
+/// what the gate after the stop will see, not the loaded one it can read now.
+pub(crate) async fn journal_job_path(
+    context: &Context,
+    record: &Record,
+    stopped: bool,
+) -> Result<JobPath, Error> {
     let source = load_config_for_upgrade(&context.config_path())?.ok_or(Error::NotInstalled {
         path: context.config_path(),
     })?;
-    job_path(context, &source.config, record.journal_default()).await
+    recorded_job_path_in(
+        context,
+        source.config.search_path(),
+        source.config.environment_allowlist(),
+        record.journal_default(),
+        stopped,
+    )
+    .await
+}
+
+/// Whether rolling back `record` stops the daemon job before restoring.
+pub(crate) fn rollback_stops_daemon(record: &Record) -> bool {
+    record.step >= Step::Registering
+        || record.runtime_stop
+        || (record.config_backup.is_some() && record.step >= Step::StopDaemon)
 }
 
 /// What an install or upgrade does with the pending transaction record.
@@ -3130,6 +3152,27 @@ pub(crate) async fn job_path(
     .await
 }
 
+/// [`job_path`] for a gate that runs before the daemon is stopped: it judges the
+/// state after the stop.
+///
+/// # Errors
+///
+/// See [`job_path`].
+pub(crate) async fn job_path_after_stop(
+    context: &Context,
+    config: &ServiceConfig,
+    journal_default: Option<JournalDefault<'_>>,
+) -> Result<JobPath, Error> {
+    recorded_job_path_in(
+        context,
+        config.search_path(),
+        config.environment_allowlist(),
+        journal_default,
+        true,
+    )
+    .await
+}
+
 /// The `PATH` a daemon job whose `service.toml` records `config`'s search path
 /// gets, without the manager variables. Callers that need only the `PATH` use
 /// this: a recorded `PATH` reads no service manager at all.
@@ -3183,6 +3226,19 @@ pub(crate) async fn recorded_job_path(
     allowlist: &[String],
     journal_default: Option<JournalDefault<'_>>,
 ) -> Result<JobPath, Error> {
+    recorded_job_path_in(context, recorded, allowlist, journal_default, false).await
+}
+
+/// [`recorded_job_path`] for the state before (`stopped` false) or after the
+/// daemon job is stopped. Only launchd's answer depends on it: a loaded job
+/// reports its default environment, an unloaded one falls back to the journal.
+async fn recorded_job_path_in(
+    context: &Context,
+    recorded: &SearchPath,
+    allowlist: &[String],
+    journal_default: Option<JournalDefault<'_>>,
+    stopped: bool,
+) -> Result<JobPath, Error> {
     if !recorded.is_empty() {
         // The recorded `PATH` does not depend on the manager, so an unreachable
         // manager only means its variables are not applied; see `manager_warnings`.
@@ -3227,7 +3283,7 @@ pub(crate) async fn recorded_job_path(
             manager_unreachable: None,
         });
     }
-    launchd_job_path(context, journal_default, allowlist).await
+    launchd_job_path(context, journal_default, allowlist, stopped).await
 }
 
 /// The allowlisted variables a recorded-`PATH` job takes from its service
@@ -3314,14 +3370,19 @@ async fn launchd_job_path(
     context: &Context,
     journal_default: Option<JournalDefault<'_>>,
     allowlist: &[String],
+    stopped: bool,
 ) -> Result<JobPath, Error> {
     use super::manager_env::ActiveJob;
 
     let ActiveJob {
         domain,
-        loaded_default,
+        mut loaded_default,
         domain_environment,
     } = active_launchd_job(context).await?;
+    if stopped {
+        // The stop unloads the job, so its loaded default will not exist.
+        loaded_default = None;
+    }
     let (variables, unreachable) = match domain_environment {
         Some(entries) => (
             manager_env::allowlisted_variables(entries, allowlist)?,
@@ -3488,6 +3549,7 @@ fn launchd_job_path<'a>(
     _context: &'a Context,
     _journal_default: Option<JournalDefault<'a>>,
     _allowlist: &'a [String],
+    _stopped: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<JobPath, Error>> + Send + 'a>> {
     Box::pin(std::future::ready(Err(Error::ManagerEnvironment {
         detail: "a launchd job exists only on macOS".to_owned(),
