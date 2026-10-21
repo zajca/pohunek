@@ -11191,16 +11191,30 @@ async fn the_loaded_gate_validates_the_removed_resolution_before_anything_is_sto
     assert_eq!(harness.fake.world().replaces, 0);
     harness.assert_installed(V1);
 
+    // A value the manager expanded differently from the CLI is refused too.
     let (_keep, unit) = unit_with_files(
         b"[Service]\nExecStart=/bin/true\n",
         &[b"[Service]\nEnvironment=PATH=%h/bin\n"],
-        &["PATH=/expanded/bin"],
+        &["PATH=/other-home/bin"],
     );
-    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
-    assert_eq!(
-        job.value, "/expanded/bin",
-        "the loaded value is the manager's"
+    let text = refusal(unrecorded_job_path(Ok(unit)).await);
+    assert!(text.contains("differs from the one resolved"), "{text}");
+
+    // So is a same-named drop-in shadowed in another directory.
+    let (_keep, mut unit) = unit_with_files(
+        b"[Service]\nExecStart=/bin/true\n",
+        &[b"[Service]\nEnvironment=PATH=/a/bin\n"],
+        &["PATH=/a/bin"],
     );
+    let shadow = pohunek_test_support::tempdir().expect("scratch directory");
+    let shadowed = shadow.path().join("00-setting.conf");
+    std::fs::write(&shadowed, "[Service]\nEnvironment=PATH=/b/bin\n").expect("shadowed drop-in");
+    unit.drop_ins_on_disk = vec![
+        unit.drop_in_paths[0].clone(),
+        shadowed.display().to_string(),
+    ];
+    let text = refusal(unrecorded_job_path(Ok(unit)).await);
+    assert!(text.contains("two directories"), "{text}");
 }
 
 /// A rollback whose removed unit keeps a `%h` drop-in resolves it.

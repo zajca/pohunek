@@ -328,17 +328,37 @@ pub async fn effective_search_path(
     if !unit_can_set_path(unit, unit_name).await? {
         return Ok(manager_path);
     }
-    if !unit.drop_in_paths.is_empty() {
+    let loaded = loaded_search_path(manager_path.clone(), unit, unit_name).await?;
+    if !unit.drop_in_paths.is_empty() || !unit.drop_ins_on_disk.is_empty() {
         // A rollback or a config migration removes the unit and resolves again from
-        // its drop-ins alone: refuse now, before anything is stopped, what that
-        // second resolution could not read.
+        // its drop-in files alone. Resolve that way now, before anything is
+        // stopped, and refuse what it cannot read or resolves differently (for
+        // instance a specifier the manager and the CLI expand differently).
         let removed = UnitEnvironment {
             load_state: "not-found".to_owned(),
             drop_in_paths: unit.drop_in_paths.clone(),
+            drop_ins_on_disk: unit.drop_ins_on_disk.clone(),
             ..UnitEnvironment::default()
         };
-        path_from_orphan_drop_ins(manager_path.clone(), &removed, unit_name, specifiers).await?;
+        let after =
+            path_from_orphan_drop_ins(manager_path, &removed, unit_name, specifiers).await?;
+        if after != loaded {
+            return Err(Error::ManagerEnvironment {
+                detail: format!(
+                    "the {SEARCH_PATH_VARIABLE} that {unit_name} gets from its drop-ins differs from the one resolved from the same files once the unit is removed (a rollback or config migration removes it), so a recovery would judge another {SEARCH_PATH_VARIABLE}. Write the drop-in settings without specifiers or file overrides that differ between the two (`systemctl --user cat {unit_name}`) and retry"
+                ),
+            });
+        }
     }
+    Ok(loaded)
+}
+
+/// The job's `PATH` from the manager's merged properties of a loaded unit.
+async fn loaded_search_path(
+    manager_path: Option<String>,
+    unit: &UnitEnvironment,
+    unit_name: &str,
+) -> Result<Option<String>, Error> {
     let refuse = |detail: String| Error::ManagerEnvironment { detail };
     let prefix = format!("{SEARCH_PATH_VARIABLE}=");
     let merged_env = unit
