@@ -88,6 +88,10 @@ pub const CODE_GAP_SERVED_BY_OTHER_PACKAGE: &str = "runtime_served_by_other_pack
 /// not selected and enabled, so the step does not change it. The operator
 /// updates it with `plugin update`.
 pub const CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING: &str = "official_package_not_serving";
+/// The selected official package of a runtime that is not reserved (Pi) has a
+/// version that cannot be ordered against the release's, so it is kept. The
+/// code is the one `plugin update` reports for the same condition.
+pub const CODE_GAP_UPDATE_VERSION_UNORDERED: &str = "plugin_update_version_unordered";
 
 /// What the step found, planned and (unless a dry run) did.
 ///

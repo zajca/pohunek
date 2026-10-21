@@ -26,10 +26,11 @@ use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, PackageStatus, ProfileAction, ProfileStatus, SelectedPackage,
     UseReason, CODE_DAEMON_RUNNING, CODE_GAP_AGENT_NOT_ON_PATH, CODE_GAP_CONFIG_HOME_MISSING,
     CODE_GAP_CONFIG_HOME_SYMLINK, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
-    CODE_GAP_SERVED_BY_OTHER_PACKAGE, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
-    CODE_PINNED_TO_NEWER_VERSION, CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_VERSION_UNKNOWN,
-    CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE,
-    DETECT_FLAG, DRY_RUN_FLAG, ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
+    CODE_GAP_SERVED_BY_OTHER_PACKAGE, CODE_GAP_UPDATE_VERSION_UNORDERED,
+    CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PINNED_TO_NEWER_VERSION,
+    CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_VERSION_UNKNOWN, CODE_PROFILE_NOT_MIGRATABLE,
+    CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE, DETECT_FLAG, DRY_RUN_FLAG,
+    ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
 };
 use pohunek_test_support::bin_exe;
 use pohunek_test_support::env::TestEnv;
@@ -2261,6 +2262,36 @@ async fn a_newer_selected_pi_package_is_never_downgraded() {
         registry
     );
     assert_eq!(host.profile_text_of("work"), profile);
+}
+
+#[tokio::test]
+async fn a_selected_pi_version_without_an_order_against_the_release_is_kept() {
+    for release_version in ["2.0", "1.0"] {
+        let host = Host::with_installed_pi().await;
+        host.publish_pi(release_version, 1);
+        let registry = fs::read(host.registry_path()).expect("the registry record");
+
+        let plan = host.step(true);
+        let applied = host.step(false);
+
+        for report in [&plan, &applied] {
+            assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+            let pi = pi_package(report);
+            assert_eq!(pi.status, PackageStatus::Kept, "{release_version}");
+            assert_eq!(pi.version, PI_INSTALLED_VERSION);
+            assert_eq!(pi.release_version.as_deref(), Some(release_version));
+            assert_eq!(
+                gap_codes(report),
+                [("pi", CODE_GAP_UPDATE_VERSION_UNORDERED)],
+                "{release_version}"
+            );
+        }
+        assert_eq!(
+            fs::read(host.registry_path()).expect("the registry record"),
+            registry,
+            "{release_version}"
+        );
+    }
 }
 
 #[tokio::test]

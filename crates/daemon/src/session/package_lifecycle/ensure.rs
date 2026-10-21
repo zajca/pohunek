@@ -26,11 +26,12 @@ use pohunek_service_config::runtimes::{
     ProfileAction, ProfileStatus, Refusal, SelectedPackage, UseReason, CODE_GAP_AGENT_NOT_ON_PATH,
     CODE_GAP_CONFIG_HOME_MISSING, CODE_GAP_CONFIG_HOME_SYMLINK,
     CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING, CODE_GAP_SERVED_BY_OTHER_PACKAGE,
-    CODE_PACKAGE_ARCHIVE_INVALID, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
-    CODE_PINNED_TARGET_NOT_OFFICIAL, CODE_PINNED_TO_NEWER_VERSION,
-    CODE_PINNED_TO_NON_OFFICIAL_PACKAGE, CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_TO_SAME_VERSION,
-    CODE_PINNED_VERSION_UNKNOWN, CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE,
-    CODE_SERVICE_CONFIG_UNREADABLE, ENSURE_REPORT_VERSION,
+    CODE_GAP_UPDATE_VERSION_UNORDERED, CODE_PACKAGE_ARCHIVE_INVALID,
+    CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PINNED_TARGET_NOT_OFFICIAL,
+    CODE_PINNED_TO_NEWER_VERSION, CODE_PINNED_TO_NON_OFFICIAL_PACKAGE,
+    CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_TO_SAME_VERSION, CODE_PINNED_VERSION_UNKNOWN,
+    CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE,
+    ENSURE_REPORT_VERSION,
 };
 use pohunek_worker_protocol::BaseEnv;
 use protocol::{
@@ -1274,9 +1275,18 @@ fn plan_runtime(
         return Ok(None);
     }
     // A runtime that is not reserved (Pi) was installed on purpose, possibly
-    // from a later archive than this release's, so a newer selected official
-    // version is kept and never replaced by the release's.
-    if !is_reserved(&runtime) && replaces_newer(plan, &prepared).is_some() {
+    // from a later archive than this release's, so a selected official version
+    // that is newer, or that cannot be ordered against the release's, is kept
+    // and never replaced by the release's.
+    let unordered = !is_reserved(&runtime) && selection_unordered(plan, &prepared);
+    if unordered {
+        report.gap(
+            &subject,
+            CODE_GAP_UPDATE_VERSION_UNORDERED,
+            "the selected version cannot be ordered against the release's, so it is kept",
+        );
+    }
+    if unordered || (!is_reserved(&runtime) && replaces_newer(plan, &prepared).is_some()) {
         let release_version = prepared.identity.version.as_str().to_owned();
         return Ok(
             plan_installed(plan, runtime, reasons, report).map(|mut kept| {
@@ -2142,6 +2152,24 @@ fn replaces_newer(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<Selected
     .then(|| SelectedPackage {
         digest: selected.as_str().to_owned(),
         version: record.identity().version.as_str().to_owned(),
+    })
+}
+
+/// Whether the selected official version of the package differs from the
+/// prepared one and the two versions have no order.
+fn selection_unordered(plan: &PlanInputs<'_>, prepared: &Prepared) -> bool {
+    let Some(state) = plan.state else {
+        return false;
+    };
+    let Some(selected) = state.selected(&prepared.identity.id) else {
+        return false;
+    };
+    if selected == &prepared.digest {
+        return false;
+    }
+    state.package(selected).is_some_and(|record| {
+        record.source() == PackageSource::Official
+            && version_order(&record.identity().version, &prepared.identity.version).is_none()
     })
 }
 
