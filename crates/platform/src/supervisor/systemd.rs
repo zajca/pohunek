@@ -956,16 +956,55 @@ pub async fn unit_environment(
     read_unit_environment(None, unit, call_timeout).await
 }
 
-/// Whether `<fragment>.d` holds a `*.conf` file; a unit without a file has none.
-fn fragment_drop_ins_exist(fragment: &str) -> bool {
-    if fragment.is_empty() {
-        return false;
+/// The `*.conf` drop-in files on disk that apply to `unit` in the manager's own
+/// lookup directories (`unit_paths`, from its `UnitPath` property), sorted.
+///
+/// A unit `a-b-c.service` takes drop-ins from `a-b-c.service.d`, then the
+/// dash-truncated `a-b-.service.d` and `a-.service.d`, then `service.d`. A
+/// directory that is absent has none; any other failure to read one is an error,
+/// because a guess of "none" would let an override through.
+fn drop_in_files_on_disk(unit: &str, unit_paths: &[String]) -> Result<Vec<String>, Error> {
+    const OPERATION: &str = "read_unit_drop_ins";
+
+    let stem = unit.strip_suffix(".service").unwrap_or(unit);
+    let mut names = vec![unit.to_owned()];
+    let mut prefix = stem;
+    while let Some(dash) = prefix.rfind('-') {
+        prefix = &prefix[..dash];
+        names.push(format!("{prefix}-.service"));
     }
-    std::fs::read_dir(format!("{fragment}.d")).is_ok_and(|entries| {
-        entries
-            .flatten()
-            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "conf"))
-    })
+    names.push("service".to_owned());
+
+    let failed = |source: io::Error| Error::Operation {
+        operation: OPERATION,
+        source: Box::new(source),
+    };
+    let mut files = Vec::new();
+    for directory in unit_paths {
+        for name in &names {
+            let entries = match std::fs::read_dir(Path::new(directory).join(format!("{name}.d"))) {
+                Ok(entries) => entries,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(failed(error)),
+            };
+            for entry in entries {
+                let path = entry.map_err(failed)?.path();
+                if path.extension().is_some_and(|ext| ext == "conf") {
+                    files.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
 }
 
 /// [`unit_environment`] over the bus at `address`, or over the session bus the
@@ -978,40 +1017,42 @@ async fn read_unit_environment(
     const OPERATION: &str = "read_unit_environment";
 
     let bus = Bus::connect_to(address, call_timeout).await?;
-    let path: OwnedObjectPath = bus
-        .manager(OPERATION)
-        .await?
+    let manager = bus.manager(OPERATION).await?;
+    let read = |source| bus_error(OPERATION, source);
+    let path: OwnedObjectPath = manager
         .call("LoadUnit", &(unit,))
         .await
         .map_err(|source| bus_error(OPERATION, source))?;
+    let unit_paths: Vec<String> = manager.get_property("UnitPath").await.map_err(read)?;
     let unit_proxy = bus.proxy(path.clone(), UNIT_INTERFACE, OPERATION).await?;
     let service = bus.proxy(path, SERVICE_INTERFACE, OPERATION).await?;
-    let read = |source| bus_error(OPERATION, source);
     let load_state: String = unit_proxy.get_property("LoadState").await.map_err(read)?;
     let need_daemon_reload: bool = unit_proxy
         .get_property("NeedDaemonReload")
         .await
         .map_err(read)?;
     let drop_in_paths: Vec<String> = unit_proxy.get_property("DropInPaths").await.map_err(read)?;
-    let fragment: String = unit_proxy
+    let fragment_path: String = unit_proxy
         .get_property("FragmentPath")
         .await
         .map_err(read)?;
-    let fragment_drop_ins_on_disk = fragment_drop_ins_exist(&fragment);
+    let drop_ins_on_disk = drop_in_files_on_disk(unit, &unit_paths)?;
     if load_state == "not-found" && drop_in_paths.is_empty() {
         return Ok(UnitEnvironment {
             load_state,
             need_daemon_reload,
-            fragment_drop_ins_on_disk,
+            drop_ins_on_disk,
             ..UnitEnvironment::default()
         });
     }
     Ok(UnitEnvironment {
         load_state,
         need_daemon_reload,
-        fragment_drop_ins_on_disk,
+        fragment_path,
+        drop_ins_on_disk,
         drop_in_paths,
         environment: service.get_property("Environment").await.map_err(read)?,
+        exec_search_path: service.get_property("ExecSearchPath").await.map_err(read)?,
         environment_files: service
             .get_property("EnvironmentFiles")
             .await

@@ -299,7 +299,7 @@ pub struct Record {
     /// never written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launchd_default_path: Option<String>,
-    /// The boot identity (`kern.boottime`) read when `launchd_default_path` was
+    /// The boot identity (`kern.bootsessionuuid`) read when `launchd_default_path` was
     /// journaled.
     ///
     /// A `launchctl config user path` change takes effect at the next boot, so a
@@ -308,6 +308,15 @@ pub struct Record {
     /// read) cannot prove that. Never written on Linux.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launchd_boot_identity: Option<String>,
+    /// The `PATH` of the persisted launchd user-domain configuration read when
+    /// `launchd_default_path` was journaled.
+    ///
+    /// After a reboot that configuration is what launchd applied, provided it
+    /// still holds this value; a different value was written (or the file
+    /// removed) at an unknown time since, which no clock can date. Never written
+    /// on Linux.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launchd_persisted_path: Option<String>,
     /// The at-risk verdicts the last adoption gate of this transaction passed.
     ///
     /// Written before the transaction advances past the gate, so a resume past
@@ -1103,6 +1112,7 @@ mod tests {
             runtime_backup: None,
             launchd_default_path: None,
             launchd_boot_identity: None,
+            launchd_persisted_path: None,
             accepted_risks: None,
         }
     }
@@ -1185,6 +1195,7 @@ mod tests {
             runtime_backup: Some(journal.clone()),
             launchd_default_path: None,
             launchd_boot_identity: None,
+            launchd_persisted_path: None,
             step: Step::Runtimes,
             ..record(Step::Runtimes)
         };

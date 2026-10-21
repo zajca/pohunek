@@ -2467,8 +2467,8 @@ upgrade's own gates and `service check` of an upgrade); without it, as for a
 rollback, which never applies the plan, the preflight judges the installed
 packages only. The preflight runs with the `PATH` the daemon job runs with, byte
 for byte: the one `service.toml` records; else, on Linux, the systemd user
-manager's `Environment` `PATH`, replaced by an `Environment=PATH=` entry of a drop-in of the daemon unit
-(the install replaces the unit file itself) and refused (`service_manager_environment_unavailable`, naming the file or
+manager's `Environment` `PATH`, replaced by an `ExecSearchPath=` and then an `Environment=PATH=` entry of a
+drop-in of the daemon unit (the install replaces the unit file itself) and refused (`service_manager_environment_unavailable`, naming the file or
 directive) when the unit has an `EnvironmentFile=` that sets `PATH`, a wildcard, unreadable or non-regular
 required `EnvironmentFile=`, `PassEnvironment=PATH`, `UnsetEnvironment=PATH`, is masked or broken,
 or has drop-ins but no unit file yet; else, on macOS, launchd's active `PATH` of the job:
@@ -2476,8 +2476,9 @@ the domain's `environment` `PATH` (`launchctl print gui/<uid>`, set by `launchct
 setenv`), else the `default environment` of the loaded job (`launchctl print
 gui/<uid>/<label>`), else, for a job that is not loaded, the launchd default an
 upgrade journaled while the job was loaded and the host has not rebooted since (the
-journal records the boot identity; after a reboot, or without one, the persisted configuration
-decides, and a journal and persisted configuration that differ without a boot marker are refused),
+journal records the boot session UUID and a snapshot of the persisted configuration; after a
+reboot the persisted configuration decides while it still equals the snapshot, and an undecidable
+difference, also without a marker or snapshot, is refused),
 else the persisted launchd configuration, the best evidence available. A rollback judges with the same order,
 so the `PATH` it uses is the one the restored job gets where launchd can still
 report it; a `warning:` line names a journal that gave no default. An

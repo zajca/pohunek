@@ -924,33 +924,53 @@ other apply.
 An interrupted upgrade leaves its transaction journal, `service-install.json` in
 the CLI's state directory. On macOS it holds the launchd default `PATH` of the
 previous daemon job, in the optional `launchd_default_path` field, read from the
-loaded job when the upgrade started, and the boot identity (`kern.boottime`) of
-that moment in the optional `launchd_boot_identity` field. Linux never writes
-either field, and a journal written without them has none.
+loaded job when the upgrade started; the boot session UUID of that moment
+(`kern.bootsessionuuid`, which only a reboot changes) in `launchd_boot_identity`;
+and the `PATH` of the persisted launchd user-domain configuration at that moment
+in `launchd_persisted_path`. Linux never writes these fields, and a journal
+written without them has none.
 
 A job without a recorded `PATH` gets, in launchd's order: the domain's `PATH` (set
 with `launchctl setenv`, readable whether or not the job is loaded); the loaded
 job's default; for a job that is not loaded, the journaled default of the
 transaction while the host has not rebooted since; and only when none of these is
-available, the persisted launchd configuration. A rollback therefore judges with the `PATH` the restored job gets
-where launchd can still say so. The persisted-configuration case is reported as a
-`warning:` line that names the journal, because it is the best evidence available
-and not launchd's answer. A reboot after the journal write makes a pending
-`launchctl config user path` active, so a journal whose boot identity differs from
-the current one is not used: the persisted configuration is. A journal without a
-boot identity, or a host whose boot time cannot be read, cannot show that no
-reboot happened: the journaled default is used only when the persisted
-configuration gives the same `PATH`; when they differ the call is refused with
-`service_manager_environment_unavailable`, and the message names the fix (set the
-`PATH` with `launchctl setenv PATH <directories>` in the GUI session, or make
-`launchctl config user path` match the journaled value). On Linux a job gets the
-systemd user manager's `Environment` `PATH`, replaced by an `Environment=PATH=` of
-a drop-in of the daemon unit (the install replaces the unit file itself); the journal does not change that. A unit setting
-that changes `PATH` in a way the CLI cannot read is refused with the same code,
-and the message names the file or directive to change: an `EnvironmentFile=` that
-sets `PATH` (or is a wildcard, or a required file that cannot be read),
-`PassEnvironment=PATH`, `UnsetEnvironment=PATH`, a masked or broken unit, and a
-drop-in of a unit that has no unit file yet, a unit or drop-in changed on disk since the manager loaded it (run `systemctl --user daemon-reload`), and a drop-in `Environment=` line that may set `PATH` in a form the CLI does not read (an escape sequence or a lookalike name) while the unit file also sets `PATH`. The CLI reads each named `EnvironmentFile=` and drop-in once, as a regular file of at most 1 MiB.
+available, the persisted launchd configuration. A rollback therefore judges with
+the `PATH` the restored job gets where launchd can still say so. The
+persisted-configuration case is reported as a `warning:` line that names the
+journal, because it is the best evidence available and not launchd's answer.
+
+A reboot after the journal write makes a pending `launchctl config user path`
+active, so a journal whose boot session UUID differs from the current one is not
+used: the persisted configuration is, provided it still equals the journaled
+snapshot. A different value (changed, or the file removed, after the journal
+write) cannot be dated by any clock, so what launchd applied is unknown. A
+journal without a boot UUID or a snapshot, or a host whose boot UUID cannot be
+read, cannot tell either: the journaled default is then used only when the
+persisted configuration gives the same `PATH`. In every undecidable case the call
+is refused with `service_manager_environment_unavailable`, and the message names
+the fix (set the `PATH` with `launchctl setenv PATH <directories>` in the GUI
+session, or make `launchctl config user path` match the journaled value).
+
+On Linux a job gets the systemd user manager's `Environment` `PATH`, replaced by
+`ExecSearchPath=` (joined with `:`) and then by an `Environment=PATH=`, both only
+when a drop-in of the daemon unit gives them (the install replaces the unit file
+itself, so a setting only there does not count); the journal does not change
+that. The CLI attributes the manager's merged value by reading the unit file and
+the drop-ins as systemd does (byte order mark dropped, lines ended by `\n`, `\r` or
+NUL, `[Service]` only). Whatever it cannot attribute or read is refused with the
+same code, and the message names the file or directive to change:
+- an `EnvironmentFile=` that sets `PATH`, uses quoting the check does not follow,
+  is a wildcard, or is a required file that cannot be read as a regular file of at
+  most 1 MiB;
+- `PassEnvironment=PATH` or `UnsetEnvironment=PATH`, and a masked or broken unit;
+- drop-in files in any directory of the manager's own `UnitPath` for a unit that
+  has no unit file yet, and a snapshot made stale by a change on disk while any
+  drop-in exists (run `systemctl --user daemon-reload`); a drop-in directory that
+  cannot be read;
+- a unit file that also sets the value, with a drop-in `Environment=` or
+  `ExecSearchPath=` line that may set it in a form the CLI does not read (an
+  escape sequence, a specifier systemd drops, bytes that are not UTF-8, a quote
+  never closed), or with no recognizable drop-in at all.
 
 A journal written by an older CLI, or one whose job was not loaded when the upgrade
 started, has no journaled default; its rollback of a job that is not loaded reads

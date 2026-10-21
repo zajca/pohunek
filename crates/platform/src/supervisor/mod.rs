@@ -43,15 +43,22 @@ pub struct UnitEnvironment {
     /// Whether the unit file or a drop-in changed on disk after the manager
     /// loaded it, so the properties below are stale until a `daemon-reload`.
     pub need_daemon_reload: bool,
-    /// Whether the directory of drop-ins next to the unit file holds a `*.conf`
-    /// on disk now, whatever the manager has loaded.
-    pub fragment_drop_ins_on_disk: bool,
+    /// The `*.conf` drop-in files on disk now in the standard user-unit
+    /// directories of the manager's `UnitPath` that apply to the unit (its own `<unit>.d`, the dash-truncated
+    /// `<prefix>-.service.d` forms and `service.d`), whatever the manager has
+    /// loaded. systemd reads none of them for a unit whose file is missing.
+    pub drop_ins_on_disk: Vec<String>,
+    /// The unit file the manager read, empty when it found none.
+    pub fragment_path: String,
     /// The drop-in files the manager read for the unit.
     pub drop_in_paths: Vec<String>,
     /// The merged `Environment=` entries, in order; a later entry wins.
     pub environment: Vec<String>,
     /// The `EnvironmentFile=` paths with their optional (`-`) flag.
     pub environment_files: Vec<(String, bool)>,
+    /// The merged `ExecSearchPath=` entries; they become the job's `PATH` unless
+    /// an `Environment=` or `EnvironmentFile=` sets one.
+    pub exec_search_path: Vec<String>,
     /// The variable names `PassEnvironment=` copies from the manager.
     pub pass_environment: Vec<String>,
     /// The `UnsetEnvironment=` names or assignments.

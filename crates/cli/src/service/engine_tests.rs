@@ -2790,10 +2790,10 @@ impl LaunchdJob for FakeLaunchd {
 
 /// The boot identity a fake launchd host starts with.
 #[cfg(target_os = "macos")]
-const FIRST_BOOT: &str = "1700000000.000000";
+const FIRST_BOOT: &str = "6D0CBE3B-5C31-4E4B-A1B0-0F2B6A4D5A11";
 /// The boot identity after a reboot.
 #[cfg(target_os = "macos")]
-const SECOND_BOOT: &str = "1700009999.000000";
+const SECOND_BOOT: &str = "A94F0E57-77C2-4B61-9D3F-2C6E8B1A7F42";
 
 /// On macOS, a recorded-`PATH` job without a launchd user domain (no GUI session,
 /// for example an upgrade over SSH) is degraded like a bus that cannot be
@@ -10029,44 +10029,6 @@ async fn a_drop_in_environment_path_replaces_the_managers_path_and_the_last_one_
     assert_eq!(job.value, "/drop-in/bin");
 }
 
-/// The install replaces the unit file and keeps its drop-ins, so a `PATH` that
-/// only the unit file sets does not reach the job.
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn a_path_set_only_by_the_replaced_unit_file_does_not_apply() {
-    let unit = UnitEnvironment {
-        environment: vec!["PATH=/unit-file/bin".to_owned()],
-        ..loaded_unit()
-    };
-    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
-    assert_eq!(job.value, MANAGER_PATH, "no drop-in");
-
-    let (_dir, drop_in) = environment_file(
-        "# Environment=PATH=/commented\n[Service]\nEnvironment=STORE=/x \\\n  OTHER=2\nEnvironment=\n",
-    );
-    let unit = UnitEnvironment {
-        drop_in_paths: vec![drop_in],
-        environment: vec!["PATH=/unit-file/bin".to_owned()],
-        ..loaded_unit()
-    };
-    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
-    assert_eq!(
-        job.value, MANAGER_PATH,
-        "a drop-in without a PATH assignment"
-    );
-
-    let (_dir, drop_in) = environment_file(
-        "[Service]\nEnvironment=OTHER=v \\\n# PATH=/commented\n; PATH=/commented\n  FOO=bar\n",
-    );
-    let unit = UnitEnvironment {
-        drop_in_paths: vec![drop_in],
-        environment: vec!["PATH=/unit-file/bin".to_owned()],
-        ..loaded_unit()
-    };
-    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
-    assert_eq!(job.value, MANAGER_PATH, "a comment inside a continuation");
-}
-
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_unit_changed_on_disk_since_it_was_loaded_is_refused_only_with_drop_ins() {
@@ -10086,7 +10048,7 @@ async fn a_unit_changed_on_disk_since_it_was_loaded_is_refused_only_with_drop_in
         },
         UnitEnvironment {
             need_daemon_reload: true,
-            fragment_drop_ins_on_disk: true,
+            drop_ins_on_disk: vec!["/home/u/.config/systemd/user/service.d/x.conf".to_owned()],
             ..loaded_unit()
         },
     ] {
@@ -10106,45 +10068,6 @@ async fn a_drop_in_with_spaces_around_the_equals_sign_still_sets_the_path() {
     };
     let job = unrecorded_job_path(Ok(unit)).await.expect("path");
     assert_eq!(job.value, "/drop-in/bin");
-}
-
-/// An escaped or lookalike `PATH` in a drop-in, next to a `PATH` of the replaced
-/// unit file, is refused instead of guessed.
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn a_drop_in_path_in_an_unreadable_form_is_refused() {
-    for content in [
-        "[Service]\nEnvironment=\"PATH\\x3d/drop-in/bin\"\n",
-        "[Service]\nEnvironment=MYPATH=/x\n",
-    ] {
-        let (_dir, drop_in) = environment_file(content);
-        let unit = UnitEnvironment {
-            drop_in_paths: vec![drop_in.clone()],
-            environment: vec!["PATH=/unit-file/bin".to_owned()],
-            ..loaded_unit()
-        };
-        let text = refusal(unrecorded_job_path(Ok(unit)).await);
-        assert!(
-            text.contains(&drop_in) && text.contains("plain `Environment=PATH=...`"),
-            "{text}"
-        );
-        assert!(!text.contains("/unit-file/bin"), "values stay out: {text}");
-    }
-}
-
-/// systemd ignores an `Environment=` outside `[Service]`, so it is not a drop-in
-/// override of the unit file's `PATH`.
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn an_environment_line_outside_the_service_section_does_not_count() {
-    let (_dir, drop_in) = environment_file("[Unit]\nEnvironment=PATH=/ignored/bin\n");
-    let unit = UnitEnvironment {
-        drop_in_paths: vec![drop_in],
-        environment: vec!["PATH=/unit-file/bin".to_owned()],
-        ..loaded_unit()
-    };
-    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
-    assert_eq!(job.value, MANAGER_PATH);
 }
 
 #[cfg(target_os = "linux")]
@@ -10244,7 +10167,7 @@ async fn path_text_inside_values_and_comments_of_an_environment_file_is_not_an_a
         ..loaded_unit()
     };
     let text = refusal(unrecorded_job_path(Ok(unit)).await);
-    assert!(text.contains("unterminated quote"), "{text}");
+    assert!(text.contains("quoting that is not followed"), "{text}");
 }
 
 /// An `EnvironmentFile=` that is not a plain readable file never blocks or
@@ -10359,7 +10282,7 @@ async fn a_unit_not_yet_written_is_judged_by_the_manager_unless_a_drop_in_exists
     };
     let text = refusal(unrecorded_job_path(Ok(with_drop_in)).await);
     assert!(
-        text.contains("p.conf") && text.contains("Remove the drop-ins"),
+        text.contains("p.conf") && text.contains("Remove or move the drop-ins"),
         "{text}"
     );
 }
@@ -10446,46 +10369,6 @@ async fn the_upgrade_refuses_before_any_effect_when_a_unit_override_cannot_be_re
     harness.assert_installed(V1);
 }
 
-/// The pending upgrade of [`interrupted_upgrade_journal`] with a launchd that
-/// does not have the job loaded and a persisted user-domain `PATH`; returns the
-/// launchd fake and the paths the rollback's gates judged.
-#[cfg(target_os = "macos")]
-async fn rollback_after_journal(
-    harness: &mut Harness,
-    persisted: &str,
-    edit_journal: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
-    boot: Result<String, String>,
-) -> Result<Vec<String>, Error> {
-    interrupted_upgrade_journal(harness).await;
-    let journal = harness.context.paths().state_dir.join(record::FILE_NAME);
-    let mut document: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&journal).expect("journal")).expect("journal JSON");
-    edit_journal(document.as_object_mut().expect("journal object"));
-    std::fs::write(
-        &journal,
-        serde_json::to_vec(&document).expect("journal bytes"),
-    )
-    .expect("rewrite journal");
-    let domain = harness.root.join("user.plist");
-    std::fs::write(&domain, launchd_domain_xml(persisted)).expect("domain configuration");
-    let launchd = FakeLaunchd::new(Ok(not_loaded()));
-    launchd.set_boot(boot);
-    harness.context = harness
-        .context
-        .clone()
-        .with_launchd_job(Arc::new(launchd))
-        .with_launchd_domain_config(&domain);
-    let preflight = ScriptedPreflight::default();
-    let judged = Arc::clone(&preflight.search_paths);
-    harness
-        .engine()
-        .with_adoption_preflight(Box::new(preflight))
-        .upgrade(&harness.staged(V1), V1)
-        .await?;
-    let judged = judged.lock().expect("search path lock").clone();
-    Ok(judged)
-}
-
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn the_upgrade_journals_the_boot_identity_with_the_launchd_default() {
@@ -10519,110 +10402,6 @@ async fn an_unreadable_boot_time_journals_the_default_without_a_marker() {
     let record = harness.pending().expect("pending");
     assert_eq!(record.launchd_default_path.as_deref(), Some(JOURNALED_PATH));
     assert_eq!(record.launchd_boot_identity, None);
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn the_same_boot_keeps_the_journaled_default_over_a_pending_persisted_change() {
-    const PERSISTED: &str = "/opt/pending/bin:/usr/bin";
-    let mut harness = Harness::new();
-    let judged = rollback_after_journal(&mut harness, PERSISTED, |_| {}, Ok(FIRST_BOOT.to_owned()))
-        .await
-        .expect("rolled back");
-    assert!(
-        !judged.is_empty() && judged.iter().all(|path| path == JOURNALED_PATH),
-        "no reboot: the pending change is not active yet: {judged:?}"
-    );
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn a_reboot_after_the_journal_write_prefers_the_persisted_configuration() {
-    const PERSISTED: &str = "/opt/pending/bin:/usr/bin";
-    let mut harness = Harness::new();
-    let judged =
-        rollback_after_journal(&mut harness, PERSISTED, |_| {}, Ok(SECOND_BOOT.to_owned()))
-            .await
-            .expect("rolled back");
-    assert!(
-        !judged.is_empty() && judged.iter().all(|path| path == PERSISTED),
-        "the pending change became active at the reboot: {judged:?}"
-    );
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn a_journal_without_a_boot_marker_is_used_only_when_the_persisted_value_agrees() {
-    let drop_marker = |journal: &mut serde_json::Map<String, serde_json::Value>| {
-        journal.remove("launchd_boot_identity");
-    };
-    let mut harness = Harness::new();
-    let judged = rollback_after_journal(
-        &mut harness,
-        JOURNALED_PATH,
-        drop_marker,
-        Ok(SECOND_BOOT.to_owned()),
-    )
-    .await
-    .expect("both sources agree");
-    assert!(
-        !judged.is_empty() && judged.iter().all(|path| path == JOURNALED_PATH),
-        "{judged:?}"
-    );
-
-    let mut harness = Harness::new();
-    let error = rollback_after_journal(
-        &mut harness,
-        "/opt/pending/bin:/usr/bin",
-        drop_marker,
-        Ok(FIRST_BOOT.to_owned()),
-    )
-    .await
-    .expect_err("whether the host rebooted cannot be told");
-    assert_eq!(error.code(), "service_manager_environment_unavailable");
-    let text = error.to_string();
-    assert!(
-        text.contains("no boot marker") && text.contains("launchctl setenv PATH"),
-        "{text}"
-    );
-    assert!(
-        !text.contains("/opt/pending/bin") && !text.contains(JOURNALED_PATH),
-        "values stay out: {text}"
-    );
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn an_unreadable_current_boot_time_is_judged_like_a_missing_marker() {
-    let mut harness = Harness::new();
-    let judged = rollback_after_journal(
-        &mut harness,
-        JOURNALED_PATH,
-        |_| {},
-        Err("sysctl failed".to_owned()),
-    )
-    .await
-    .expect("both sources agree");
-    assert!(
-        judged.iter().all(|path| path == JOURNALED_PATH),
-        "{judged:?}"
-    );
-
-    let mut harness = Harness::new();
-    let error = rollback_after_journal(
-        &mut harness,
-        "/opt/pending/bin:/usr/bin",
-        |_| {},
-        Err("sysctl failed".to_owned()),
-    )
-    .await
-    .expect_err("the sources differ and the boot cannot be compared");
-    assert!(
-        error
-            .to_string()
-            .contains("current boot time cannot be read"),
-        "{error}"
-    );
 }
 
 #[cfg(target_os = "macos")]
@@ -10687,4 +10466,447 @@ async fn judging_the_path_before_the_application_roots_exist_creates_nothing() {
         "the unit was judged: {text}"
     );
     assert!(!state.exists() && !runtime.exists(), "nothing was created");
+}
+
+/// The pending upgrade of [`interrupted_upgrade_journal`], rolled back on a host
+/// whose launchd does not have the job loaded.
+///
+/// `plist_at_journal` is the persisted user-domain `PATH` when the upgrade
+/// journals; `plist_now` is what it holds at the rollback (`None`: the file was
+/// removed). Returns the paths the rollback's gates judged.
+#[cfg(target_os = "macos")]
+async fn rollback_after_journal(
+    harness: &mut Harness,
+    plist_at_journal: &str,
+    plist_now: Option<&str>,
+    edit_journal: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    boot: Result<String, String>,
+) -> Result<Vec<String>, Error> {
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(plist_at_journal)).expect("domain configuration");
+    harness.context = harness.context.clone().with_launchd_domain_config(&domain);
+    interrupted_upgrade_journal(harness).await;
+    let journal = harness.context.paths().state_dir.join(record::FILE_NAME);
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&journal).expect("journal")).expect("journal JSON");
+    edit_journal(document.as_object_mut().expect("journal object"));
+    std::fs::write(
+        &journal,
+        serde_json::to_vec(&document).expect("journal bytes"),
+    )
+    .expect("rewrite journal");
+    match plist_now {
+        Some(value) => std::fs::write(&domain, launchd_domain_xml(value)).expect("domain"),
+        None => std::fs::remove_file(&domain).expect("remove the configuration"),
+    }
+    let launchd = FakeLaunchd::new(Ok(not_loaded()));
+    launchd.set_boot(boot);
+    harness.context = harness.context.clone().with_launchd_job(Arc::new(launchd));
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V1), V1)
+        .await?;
+    let judged = judged.lock().expect("search path lock").clone();
+    Ok(judged)
+}
+
+/// The journal of a pending upgrade holds the persisted `PATH` next to the default.
+#[cfg(target_os = "macos")]
+const PENDING_PATH: &str = "/opt/pending/bin:/usr/bin";
+
+#[cfg(target_os = "macos")]
+fn assert_judged(judged: &Result<Vec<String>, Error>, expected: &str) {
+    let judged = judged.as_ref().expect("rolled back");
+    assert!(
+        !judged.is_empty() && judged.iter().all(|path| path == expected),
+        "{judged:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn assert_rollback_refused(result: &Result<Vec<String>, Error>, reason: &str) {
+    let error = result
+        .as_ref()
+        .expect_err("which PATH is active cannot be told");
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    let text = error.to_string();
+    assert!(
+        text.contains(reason) && text.contains("launchctl setenv PATH"),
+        "{text}"
+    );
+    assert!(
+        !text.contains(PENDING_PATH) && !text.contains(JOURNALED_PATH),
+        "values stay out: {text}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn the_same_boot_keeps_the_journaled_default_over_a_pending_persisted_change() {
+    // Also the case of a clock change: the boot session is the same.
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        Some(PENDING_PATH),
+        |_| {},
+        Ok(FIRST_BOOT.to_owned()),
+    )
+    .await;
+    assert_judged(&judged, JOURNALED_PATH);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_reboot_after_the_journal_write_prefers_the_persisted_configuration_it_journaled() {
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        Some(PENDING_PATH),
+        |_| {},
+        Ok(SECOND_BOOT.to_owned()),
+    )
+    .await;
+    assert_judged(&judged, PENDING_PATH);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_persisted_change_or_removal_after_the_journal_write_is_refused_unless_it_agrees() {
+    const LATER: &str = "/opt/later/bin:/usr/bin";
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        Some(LATER),
+        |_| {},
+        Ok(SECOND_BOOT.to_owned()),
+    )
+    .await;
+    assert_rollback_refused(&judged, "changed since the upgrade journaled it");
+
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        None,
+        |_| {},
+        Ok(SECOND_BOOT.to_owned()),
+    )
+    .await;
+    assert_rollback_refused(&judged, "changed since the upgrade journaled it");
+
+    // A change back to the journaled default needs no decision.
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        Some(JOURNALED_PATH),
+        |_| {},
+        Ok(SECOND_BOOT.to_owned()),
+    )
+    .await;
+    assert_judged(&judged, JOURNALED_PATH);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_journal_without_a_boot_marker_or_snapshot_is_used_only_when_the_values_agree() {
+    let drop_marker = |journal: &mut serde_json::Map<String, serde_json::Value>| {
+        journal.remove("launchd_boot_identity");
+    };
+    let drop_snapshot = |journal: &mut serde_json::Map<String, serde_json::Value>| {
+        journal.remove("launchd_persisted_path");
+    };
+    // No marker: equal values pass.
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        JOURNALED_PATH,
+        Some(JOURNALED_PATH),
+        drop_marker,
+        Ok(SECOND_BOOT.to_owned()),
+    )
+    .await;
+    assert_judged(&judged, JOURNALED_PATH);
+    // No marker: different values are refused.
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        Some(PENDING_PATH),
+        drop_marker,
+        Ok(FIRST_BOOT.to_owned()),
+    )
+    .await;
+    assert_rollback_refused(&judged, "no boot marker");
+    // A marker for another boot but no snapshot: refused too.
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        Some(PENDING_PATH),
+        drop_snapshot,
+        Ok(SECOND_BOOT.to_owned()),
+    )
+    .await;
+    assert_rollback_refused(&judged, "no snapshot of the persisted configuration");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn an_unreadable_current_boot_identity_is_judged_like_a_missing_marker() {
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        JOURNALED_PATH,
+        Some(JOURNALED_PATH),
+        |_| {},
+        Err("sysctl failed".to_owned()),
+    )
+    .await;
+    assert_judged(&judged, JOURNALED_PATH);
+
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        Some(PENDING_PATH),
+        |_| {},
+        Err("sysctl failed".to_owned()),
+    )
+    .await;
+    assert_rollback_refused(&judged, "current boot identity cannot be read");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn the_upgrade_journals_the_persisted_path_next_to_the_default() {
+    let mut harness = Harness::new();
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(PENDING_PATH)).expect("domain configuration");
+    harness.context = harness.context.clone().with_launchd_domain_config(&domain);
+    interrupted_upgrade_journal(&mut harness).await;
+    let record = harness.pending().expect("pending");
+    assert_eq!(record.launchd_persisted_path.as_deref(), Some(PENDING_PATH));
+}
+
+/// A unit as the manager reports it: the unit file at `FragmentPath` with the
+/// given text, one drop-in per text, and the merged `Environment` list.
+/// Returns the scratch directories to keep alive.
+#[cfg(target_os = "linux")]
+fn unit_with_files(
+    unit_file: &[u8],
+    drop_ins: &[&[u8]],
+    environment: &[&str],
+) -> (Vec<tempfile::TempDir>, UnitEnvironment) {
+    let mut guards = Vec::new();
+    let mut write = |content: &[u8]| {
+        let dir = pohunek_test_support::tempdir().expect("scratch directory");
+        let file = dir.path().join("setting.conf");
+        std::fs::write(&file, content).expect("setting file");
+        let path = file.display().to_string();
+        guards.push(dir);
+        path
+    };
+    let fragment_path = write(unit_file);
+    let drop_in_paths = drop_ins.iter().map(|content| write(content)).collect();
+    (
+        guards,
+        UnitEnvironment {
+            fragment_path,
+            drop_in_paths,
+            environment: environment
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
+            ..loaded_unit()
+        },
+    )
+}
+
+/// The install replaces the unit file and keeps its drop-ins: a `PATH` that only
+/// the unit file sets does not reach the job, and one that a drop-in also sets
+/// does.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_path_set_only_by_the_replaced_unit_file_does_not_apply() {
+    let unit_file = b"[Service]\nEnvironment=PATH=/unit-file/bin\n";
+    let (_keep, unit) = unit_with_files(unit_file, &[], &["PATH=/unit-file/bin"]);
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, MANAGER_PATH, "no drop-in");
+
+    let (_keep, unit) = unit_with_files(
+        unit_file,
+        &[b"[Service]\nEnvironment=PATH=/drop-in/bin\n"],
+        &["PATH=/unit-file/bin", "PATH=/drop-in/bin"],
+    );
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, "/drop-in/bin");
+}
+
+/// With the unit file also setting `PATH`, a drop-in that no reading recognizes
+/// as keeping it cannot be attributed: refuse instead of guessing.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_merged_path_no_drop_in_claims_is_refused_when_the_unit_file_sets_it_too() {
+    let unit_file: &[u8] = b"[Service]\nEnvironment=PATH=/unit-file/bin\n";
+    for drop_in in [
+        &b"[Unit]\nEnvironment=PATH=/ignored/bin\n"[..],
+        &b"[Service]\nEnvironment=STORE=/x\n"[..],
+        &b"# Environment=PATH=/commented\n[Service]\nEnvironment=OTHER=v \\\n# PATH=/commented\n  FOO=bar\n"[..],
+    ] {
+        let (_keep, unit) = unit_with_files(unit_file, &[drop_in], &["PATH=/unit-file/bin"]);
+        let text = refusal(unrecorded_job_path(Ok(unit)).await);
+        assert!(text.contains("could be recognized as keeping it"), "{text}");
+        assert!(!text.contains("/unit-file/bin"), "values stay out: {text}");
+    }
+}
+
+/// Forms of a drop-in `PATH` that only a different reader sees: refuse (unit
+/// file also sets it) or use the merged value (it does not).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_drop_in_path_in_an_unreadable_form_is_refused_or_attributed_by_the_unit_file() {
+    let unit_file: &[u8] = b"[Service]\nEnvironment=PATH=/unit-file/bin\n";
+    for drop_in in [
+        &b"[Service]\nEnvironment=\"PATH\\x3d/drop-in/bin\"\n"[..],
+        &b"[Service]\nEnvironment=MYPATH=/x\n"[..],
+        &b"[Service]\nEnvironment=PATH=%Z/bin\n"[..],
+        &b"[Service]\nEnvironment=\"PATH=/ignored\n"[..],
+        &b"[Service]\nEnvironment=PATH=/\xff/bin\n"[..],
+    ] {
+        let (_keep, unit) = unit_with_files(unit_file, &[drop_in], &["PATH=/unit-file/bin"]);
+        let text = refusal(unrecorded_job_path(Ok(unit)).await);
+        assert!(text.contains("in a form not read here"), "{text}");
+        assert!(!text.contains("/unit-file/bin"), "values stay out: {text}");
+    }
+    // The unit file sets no PATH, so the merged one is a drop-in's, however it
+    // is written.
+    let (_keep, unit) = unit_with_files(
+        b"[Service]\nExecStart=/bin/true\n",
+        &[&b"[Service]\nEnvironment=\"PATH\\x3d/drop-in/bin\"\n"[..]],
+        &["PATH=/drop-in/bin"],
+    );
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, "/drop-in/bin");
+}
+
+/// A drop-in saved with a byte order mark or CR line ends is read as systemd
+/// reads it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_drop_in_with_a_byte_order_mark_or_carriage_returns_still_sets_the_path() {
+    let unit_file: &[u8] = b"[Service]\nEnvironment=PATH=/unit-file/bin\n";
+    for drop_in in [
+        &b"\xef\xbb\xbf[Service]\nEnvironment=PATH=/drop-in/bin\n"[..],
+        &b"[Service]\rEnvironment=PATH=/drop-in/bin\r"[..],
+        &b"[Service]\r\nEnvironment=PATH=/drop-in/bin\r\n"[..],
+        &b"[Service]\0Environment=PATH=/drop-in/bin\0"[..],
+    ] {
+        let (_keep, unit) = unit_with_files(
+            unit_file,
+            &[drop_in],
+            &["PATH=/unit-file/bin", "PATH=/drop-in/bin"],
+        );
+        let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+        assert_eq!(job.value, "/drop-in/bin", "{drop_in:?}");
+    }
+}
+
+/// `ExecSearchPath=` replaces the manager's `PATH`; an `Environment=` `PATH`
+/// replaces it in turn.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn exec_search_path_from_a_drop_in_sets_the_job_path_below_environment() {
+    let drop_in: &[u8] = b"[Service]\nExecSearchPath=/opt/tools/bin /opt/more/bin\n";
+    let (_keep, mut unit) = unit_with_files(b"[Service]\nExecStart=/bin/true\n", &[drop_in], &[]);
+    unit.exec_search_path = vec!["/opt/tools/bin".to_owned(), "/opt/more/bin".to_owned()];
+    let job = unrecorded_job_path(Ok(unit.clone())).await.expect("path");
+    assert_eq!(job.value, "/opt/tools/bin:/opt/more/bin");
+
+    // Environment=PATH wins over ExecSearchPath.
+    let env_drop_in: &[u8] = b"[Service]\nEnvironment=PATH=/env/bin\n";
+    let (_keep2, mut both) = unit_with_files(
+        b"[Service]\nExecStart=/bin/true\n",
+        &[drop_in, env_drop_in],
+        &["PATH=/env/bin"],
+    );
+    both.exec_search_path = unit.exec_search_path.clone();
+    let job = unrecorded_job_path(Ok(both)).await.expect("path");
+    assert_eq!(job.value, "/env/bin");
+
+    // An ExecSearchPath that only the replaced unit file sets does not apply.
+    let (_keep3, mut file_only) =
+        unit_with_files(b"[Service]\nExecSearchPath=/opt/tools/bin\n", &[], &[]);
+    file_only.exec_search_path = vec!["/opt/tools/bin".to_owned()];
+    let job = unrecorded_job_path(Ok(file_only)).await.expect("path");
+    assert_eq!(job.value, MANAGER_PATH);
+}
+
+/// Drop-ins on disk of a unit that is not written yet, in any directory of the
+/// manager's lookup path, refuse; a stale snapshot refuses on any of them.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn drop_ins_on_disk_refuse_a_missing_unit_and_a_stale_snapshot() {
+    let on_disk = vec!["/etc/systemd/user/pohunek-.service.d/p.conf".to_owned()];
+    let missing = UnitEnvironment {
+        load_state: "not-found".to_owned(),
+        drop_ins_on_disk: on_disk.clone(),
+        ..UnitEnvironment::default()
+    };
+    let text = refusal(unrecorded_job_path(Ok(missing)).await);
+    assert!(text.contains("pohunek-.service.d/p.conf"), "{text}");
+
+    let stale = UnitEnvironment {
+        need_daemon_reload: true,
+        drop_ins_on_disk: on_disk,
+        ..loaded_unit()
+    };
+    let text = refusal(unrecorded_job_path(Ok(stale)).await);
+    assert!(text.contains("systemctl --user daemon-reload"), "{text}");
+}
+
+/// systemd ends an `EnvironmentFile=` line at `\r` as well as `\n`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn carriage_returns_end_environment_file_lines_like_newlines() {
+    for content in [
+        "FOO=1\rPATH=/file/bin\n",
+        "# note\rPATH=/file/bin\n",
+        "FOO=1\r\nPATH=/file/bin\r\n",
+    ] {
+        let (_dir, file) = environment_file(content);
+        let unit = UnitEnvironment {
+            environment_files: vec![(file, false)],
+            ..loaded_unit()
+        };
+        let text = refusal(unrecorded_job_path(Ok(unit)).await);
+        assert!(text.contains("sets PATH"), "{content:?}: {text}");
+    }
+}
+
+/// Another quoted segment after a closed one is not followed: refuse.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_environment_file_with_successive_quoted_segments_is_refused() {
+    for content in [
+        "OTHER='first' 'second\nX=\"still-other'\nPATH=/actual/bin\nY=\"\"\n",
+        "OTHER=\"a\"\"b\"\nSTORE=/s\n",
+    ] {
+        let (_dir, file) = environment_file(content);
+        let unit = UnitEnvironment {
+            environment_files: vec![(file, false)],
+            ..loaded_unit()
+        };
+        let text = refusal(unrecorded_job_path(Ok(unit)).await);
+        assert!(
+            text.contains("quoting that is not followed"),
+            "{content:?}: {text}"
+        );
+    }
 }

@@ -360,6 +360,7 @@ fn pending_migration(
         runtime_backup: None,
         launchd_default_path: None,
         launchd_boot_identity: None,
+        launchd_persisted_path: None,
         accepted_risks: None,
     };
     store.save(&record).expect("journal interrupted migration");

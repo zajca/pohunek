@@ -2167,7 +2167,19 @@ fn the_real_user_manager_reports_a_units_environment_settings_with_drop_ins() {
     let loaded = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded unit");
     assert_eq!(loaded.load_state, "loaded");
     assert!(!loaded.need_daemon_reload);
-    assert!(loaded.fragment_drop_ins_on_disk);
+    assert!(
+        loaded
+            .drop_ins_on_disk
+            .iter()
+            .any(|path| path.ends_with("path.conf")),
+        "{:?}",
+        loaded.drop_ins_on_disk
+    );
+    assert!(
+        loaded.fragment_path.ends_with(&unit),
+        "{:?}",
+        loaded.fragment_path
+    );
     assert_eq!(
         loaded.environment.last().map(String::as_str),
         Some("PATH=/drop-in/bin")
@@ -2197,7 +2209,119 @@ fn the_real_user_manager_reports_a_units_environment_settings_with_drop_ins() {
     .expect("edited drop-in");
     let stale = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("stale unit");
     assert!(stale.need_daemon_reload, "{stale:?}");
-    assert!(stale.fragment_drop_ins_on_disk, "{stale:?}");
+    assert!(!stale.drop_ins_on_disk.is_empty(), "{stale:?}");
+}
+
+/// What systemd itself does with the forms the resolver has to agree with: an
+/// orphan drop-in, a dash-truncated drop-in directory, `ExecSearchPath=`, a byte
+/// order mark, CR line ends and a word with an unknown specifier.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_agrees_with_the_unit_setting_readers() {
+    use std::os::unix::fs::PermissionsExt;
+
+    require_e2e();
+    let directory = user_unit_dir();
+    std::fs::create_dir_all(&directory).expect("user unit directory");
+    let id = std::process::id();
+    let unit = format!("pohunek-e2eform-{id}.service");
+    let truncated = "pohunek-e2eform-.service.d".to_owned();
+    let _files = UnitFiles {
+        directory: directory.clone(),
+        unit: unit.clone(),
+    };
+    let _truncated = UnitFiles {
+        directory: directory.clone(),
+        unit: truncated.trim_end_matches(".d").to_owned(),
+    };
+
+    // An orphan drop-in: the manager reports no file and no drop-in, the scan
+    // of the manager's own lookup directories finds it.
+    let own = directory.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&own).expect("drop-in directory");
+    std::fs::write(
+        own.join("orphan.conf"),
+        "[Service]\nEnvironment=PATH=/orphan/bin\n",
+    )
+    .expect("orphan drop-in");
+    systemctl(&["daemon-reload"]);
+    let orphan = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("orphan");
+    assert_eq!(orphan.load_state, "not-found");
+    assert!(orphan.drop_in_paths.is_empty(), "{orphan:?}");
+    assert!(
+        orphan
+            .drop_ins_on_disk
+            .iter()
+            .any(|path| path.ends_with("orphan.conf")),
+        "{orphan:?}"
+    );
+
+    // Now with a unit file: a BOM, CR line ends, a dash-truncated directory,
+    // ExecSearchPath= and a dropped word.
+    std::fs::write(
+        directory.join(&unit),
+        "[Service]\nExecStart=/bin/sleep 300\n",
+    )
+    .expect("unit");
+    std::fs::remove_file(own.join("orphan.conf")).expect("remove orphan");
+    std::fs::write(
+        own.join("bom.conf"),
+        b"\xef\xbb\xbf[Service]\nEnvironment=PATH=/bom/bin\nExecSearchPath=/opt/tools/bin\n",
+    )
+    .expect("bom drop-in");
+    std::fs::write(own.join("cr.conf"), b"[Service]\rEnvironment=CRVAR=1\r").expect("cr drop-in");
+    let shared = directory.join(&truncated);
+    std::fs::create_dir_all(&shared).expect("truncated drop-in directory");
+    std::fs::write(
+        shared.join("dropped.conf"),
+        "[Service]\nEnvironment=PATH=%Z/bin DROPPED=1 KEPT=1\n",
+    )
+    .expect("dropped drop-in");
+    systemctl(&["daemon-reload"]);
+    let loaded = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded");
+    assert_eq!(loaded.load_state, "loaded");
+    assert!(
+        loaded.environment.contains(&"PATH=/bom/bin".to_owned()),
+        "{loaded:?}"
+    );
+    assert!(
+        loaded.environment.contains(&"CRVAR=1".to_owned()),
+        "{loaded:?}"
+    );
+    assert_eq!(loaded.exec_search_path, ["/opt/tools/bin"]);
+    // The word with the unknown specifier is dropped, its neighbours are kept.
+    assert!(
+        !loaded.environment.iter().any(|entry| entry.contains("%Z")),
+        "{loaded:?}"
+    );
+    assert!(
+        loaded.environment.contains(&"KEPT=1".to_owned()),
+        "{loaded:?}"
+    );
+    for name in ["bom.conf", "cr.conf", "dropped.conf"] {
+        assert!(
+            loaded.drop_in_paths.iter().any(|path| path.ends_with(name)),
+            "{name}: {:?}",
+            loaded.drop_in_paths
+        );
+        assert!(
+            loaded
+                .drop_ins_on_disk
+                .iter()
+                .any(|path| path.ends_with(name)),
+            "{name}: {:?}",
+            loaded.drop_ins_on_disk
+        );
+    }
+
+    // A drop-in directory the scan cannot read is an error, never "no drop-ins".
+    std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o000)).expect("lock");
+    let unreadable = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT));
+    std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+    assert!(
+        matches!(unreadable, Err(Error::Operation { .. })),
+        "{unreadable:?}"
+    );
 }
 
 /// The real user manager reports the `KEY=VALUE` environment its units get,

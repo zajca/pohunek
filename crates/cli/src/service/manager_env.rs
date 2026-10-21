@@ -255,29 +255,104 @@ pub(crate) fn carry(value: &str) -> Result<String, String> {
 /// The `PATH` the daemon job gets from the user manager and its own unit.
 ///
 /// `manager_path` is the manager's `PATH`; `unit` is what the manager holds for
-/// the daemon unit (`unit_name`), drop-ins merged. The install replaces the unit
-/// file itself and keeps its drop-ins, so only an `Environment=` entry for `PATH`
-/// that a drop-in sets applies to the job; the last one wins. Every setting that
-/// could change `PATH` but whose result is not derivable here is refused, with
-/// the cause and the directive to change, so the caller never judges a `PATH` the
-/// job does not get. Each `EnvironmentFile=` and drop-in is read once, bounded;
-/// values are never part of an error.
+/// the daemon unit (`unit_name`), drop-ins merged. The job's `PATH` is, in
+/// systemd's order, the manager's, replaced by `ExecSearchPath=` (joined with
+/// `:`), replaced by an `Environment=` entry for `PATH`; the last entry wins.
+/// The install replaces the unit file itself and keeps its drop-ins, so a
+/// setting counts only when a drop-in gives it: the merged property is attributed
+/// by reading the unit file, and when the unit file sets the same key the
+/// drop-ins are read to find one that does too. Every setting that could change
+/// `PATH` but whose result is not derivable here is refused, with the cause and
+/// the directive to change, so the caller never judges a `PATH` the job does not
+/// get. Each file is read once, bounded; values are never part of an error.
 ///
 /// # Errors
 ///
-/// Returns [`Error::ManagerEnvironment`] for a unit that is masked or failed to
-/// load, a drop-in on a unit with no file, an `EnvironmentFile=` that sets
-/// `PATH`, cannot be read, is not a regular file or is a wildcard, a drop-in that
-/// cannot be read, and `PassEnvironment=` or `UnsetEnvironment=` naming `PATH`.
+/// Returns [`Error::ManagerEnvironment`] for a stale snapshot next to drop-ins,
+/// a unit that is masked or failed to load, drop-ins of a unit with no file, an
+/// `EnvironmentFile=` that sets `PATH` or cannot be followed, a unit file or
+/// drop-in that cannot be read or attributed, and `PassEnvironment=` or
+/// `UnsetEnvironment=` naming `PATH`.
 pub async fn effective_search_path(
     manager_path: Option<String>,
     unit: &UnitEnvironment,
     unit_name: &str,
 ) -> Result<Option<String>, Error> {
+    if !unit_can_set_path(unit, unit_name).await? {
+        return Ok(manager_path);
+    }
+    let refuse = |detail: String| Error::ManagerEnvironment { detail };
+    let prefix = format!("{SEARCH_PATH_VARIABLE}=");
+    let merged_env = unit
+        .environment
+        .iter()
+        .rev()
+        .find_map(|entry| entry.strip_prefix(prefix.as_str()));
+    let merged_exec = (!unit.exec_search_path.is_empty()).then(|| unit.exec_search_path.join(":"));
+    if merged_env.is_none() && merged_exec.is_none() {
+        return Ok(manager_path);
+    }
+
+    let unit_file = if unit.fragment_path.is_empty() {
+        Vec::new()
+    } else {
+        read_unit_setting_file(&unit.fragment_path, unit_name, "unit file").await?
+    };
+    let mut drop_ins = Vec::with_capacity(unit.drop_in_paths.len());
+    for path in &unit.drop_in_paths {
+        drop_ins.push((
+            path,
+            read_unit_setting_file(path, unit_name, "drop-in").await?,
+        ));
+    }
+    let given_by_drop_in = |setting: Setting| -> Result<bool, Error> {
+        if unit_setting(&unit_file, setting) == Assignment::No {
+            // The unit file does not set it, so the merged value is a drop-in's.
+            return Ok(true);
+        }
+        let mut unclear = None;
+        for (path, text) in &drop_ins {
+            match unit_setting(text, setting) {
+                Assignment::Sets => return Ok(true),
+                Assignment::Unclear => unclear = Some(path),
+                Assignment::No => {}
+            }
+        }
+        match (unclear, drop_ins.is_empty()) {
+            (Some(path), _) => Err(refuse(format!(
+                "the drop-in {path} of {unit_name} has a {} line that may set it in a form not read here (an escape sequence, a specifier systemd drops, bytes that are not UTF-8, or a quote never closed), while {unit_name} also gets it from its unit file, which the install replaces. Write a plain assignment or remove the other entry, and retry",
+                setting.directive()
+            ))),
+            (None, true) => Ok(false),
+            (None, false) => Err(refuse(format!(
+                "{unit_name} sets {} in its unit file, which the install replaces, and none of its {} drop-in file(s) could be recognized as keeping it, so the {SEARCH_PATH_VARIABLE} its job gets cannot be attributed. Write the setting as a plain line in one drop-in and retry",
+                setting.directive(),
+                drop_ins.len()
+            ))),
+        }
+    };
+    if let Some(merged) = merged_env {
+        if given_by_drop_in(Setting::EnvironmentPath)? {
+            return carry(merged).map(Some).map_err(refuse);
+        }
+    }
+    if let Some(merged) = merged_exec {
+        if given_by_drop_in(Setting::ExecSearchPath)? {
+            return carry(&merged).map(Some).map_err(refuse);
+        }
+    }
+    Ok(manager_path)
+}
+
+/// Refuses the unit states and settings that make the job's `PATH` unreadable
+/// here, and says whether the unit can give the job a `PATH` at all: `false` for
+/// a unit that is not written yet.
+async fn unit_can_set_path(unit: &UnitEnvironment, unit_name: &str) -> Result<bool, Error> {
     let refuse = |detail: String| Error::ManagerEnvironment { detail };
     // The unit file changing on disk is routine: the install replaces it. Only
     // drop-ins make a stale snapshot misleading, because they are kept.
-    if unit.need_daemon_reload && (!unit.drop_in_paths.is_empty() || unit.fragment_drop_ins_on_disk)
+    if unit.need_daemon_reload
+        && (!unit.drop_in_paths.is_empty() || !unit.drop_ins_on_disk.is_empty())
     {
         return Err(refuse(format!(
             "{unit_name} or one of its drop-ins changed on disk after the service manager loaded it, so the PATH the manager reports may not be the one its job gets. Run `systemctl --user daemon-reload` and retry"
@@ -285,12 +360,16 @@ pub async fn effective_search_path(
     }
     match unit.load_state.as_str() {
         "loaded" => {}
-        "not-found" if unit.drop_in_paths.is_empty() => return Ok(manager_path),
+        "not-found" if unit.drop_in_paths.is_empty() && unit.drop_ins_on_disk.is_empty() => {
+            return Ok(false);
+        }
         "not-found" => {
+            let mut files = unit.drop_in_paths.clone();
+            files.extend(unit.drop_ins_on_disk.iter().cloned());
             return Err(refuse(format!(
-                "{unit_name} has drop-in files ({}) but no unit file yet, so the PATH they set cannot be read before the unit is written. Remove the drop-ins, or install the unit first and retry",
-                unit.drop_in_paths.join(", ")
-            )))
+                "{unit_name} has no unit file yet but drop-in files exist ({}), and systemd reads none of them until the unit is written, so the PATH they set cannot be read now. Remove or move the drop-ins, or install the unit first and retry",
+                files.join(", ")
+            )));
         }
         other => {
             return Err(refuse(format!(
@@ -321,39 +400,7 @@ pub async fn effective_search_path(
     for (file, optional) in &unit.environment_files {
         check_environment_file(file, *optional, unit_name).await?;
     }
-    let prefix = format!("{SEARCH_PATH_VARIABLE}=");
-    let merged = unit
-        .environment
-        .iter()
-        .rev()
-        .find_map(|entry| entry.strip_prefix(prefix.as_str()));
-    let Some(merged) = merged else {
-        return Ok(manager_path);
-    };
-    // The merged list also holds the unit file's own entries, which the install
-    // replaces; the entry applies only when a drop-in sets `PATH`.
-    let mut unclear: Option<&str> = None;
-    for drop_in in &unit.drop_in_paths {
-        let text = read_unit_settings_file(drop_in, unit_name, "drop-in")
-            .await?
-            .map_err(|error| {
-                refuse(format!(
-                    "the drop-in {drop_in} of {unit_name} cannot be read ({error}), so the PATH it may set cannot be judged. Make it a readable regular file of at most {} bytes and retry",
-                    super::settings::UNIT_SETTINGS_FILE_LIMIT
-                ))
-            })?;
-        match drop_in_path_assignment(&text) {
-            PathAssignment::Sets => return carry(merged).map(Some).map_err(refuse),
-            PathAssignment::Unclear => unclear = Some(drop_in),
-            PathAssignment::No => {}
-        }
-    }
-    if let Some(drop_in) = unclear {
-        return Err(refuse(format!(
-            "the drop-in {drop_in} of {unit_name} has an Environment= line that may set {SEARCH_PATH_VARIABLE} in a form not read here (an escape sequence or a name containing {SEARCH_PATH_VARIABLE}), while {unit_name} also gets {SEARCH_PATH_VARIABLE} from its unit file, which the install replaces. Write it as a plain `Environment={SEARCH_PATH_VARIABLE}=...` assignment or remove the other {SEARCH_PATH_VARIABLE} entry, and retry"
-        )));
-    }
-    Ok(manager_path)
+    Ok(true)
 }
 
 /// Reads a unit setting file: a regular file of at most
@@ -365,12 +412,12 @@ async fn read_unit_settings_file(
     path: &str,
     unit_name: &str,
     kind: &str,
-) -> Result<std::io::Result<String>, Error> {
+) -> Result<std::io::Result<Vec<u8>>, Error> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
 
     let owned = path.to_owned();
-    let read = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+    let read = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
@@ -390,13 +437,25 @@ async fn read_unit_settings_file(
                 "larger than the read limit",
             ));
         }
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        Ok(bytes)
     })
     .await
     .map_err(|error| Error::ManagerEnvironment {
         detail: format!("reading the {kind} {path} of {unit_name} did not finish: {error}"),
     })?;
     Ok(read)
+}
+
+/// Reads a unit file or drop-in that must be readable, or refuses.
+async fn read_unit_setting_file(path: &str, unit_name: &str, kind: &str) -> Result<Vec<u8>, Error> {
+    read_unit_settings_file(path, unit_name, kind)
+        .await?
+        .map_err(|error| Error::ManagerEnvironment {
+            detail: format!(
+                "the {kind} {path} of {unit_name} cannot be read ({error}), so the PATH it may set cannot be judged. Make it a readable regular file of at most {} bytes and retry",
+                super::settings::UNIT_SETTINGS_FILE_LIMIT
+            ),
+        })
 }
 
 /// Refuses an `EnvironmentFile=` that sets `PATH` or cannot be shown not to.
@@ -407,8 +466,8 @@ async fn check_environment_file(file: &str, optional: bool, unit_name: &str) -> 
             "{unit_name} names the EnvironmentFile= pattern {file}, whose files cannot be listed here. Replace it with plain paths in the unit or its drop-ins (`systemctl --user cat {unit_name}`) and retry"
         )));
     }
-    let text = match read_unit_settings_file(file, unit_name, "EnvironmentFile=").await? {
-        Ok(text) => text,
+    let bytes = match read_unit_settings_file(file, unit_name, "EnvironmentFile=").await? {
+        Ok(bytes) => bytes,
         Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
             return Err(refuse(format!(
@@ -417,19 +476,24 @@ async fn check_environment_file(file: &str, optional: bool, unit_name: &str) -> 
             )))
         }
     };
-    match environment_file_sets_path(&text) {
+    match environment_file_sets_path(&String::from_utf8_lossy(&bytes)) {
         Some(false) => Ok(()),
         Some(true) => Err(refuse(format!(
             "the EnvironmentFile= {file} of {unit_name} sets {SEARCH_PATH_VARIABLE}, and its quoting is not re-parsed here. Move the {SEARCH_PATH_VARIABLE} assignment to an Environment= line of a drop-in, or record the PATH in service.toml, and retry"
         ))),
         None => Err(refuse(format!(
-            "the EnvironmentFile= {file} of {unit_name} has an unterminated quote, so whether it sets {SEARCH_PATH_VARIABLE} cannot be told. Fix the file and retry"
+            "the EnvironmentFile= {file} of {unit_name} has quoting that is not followed here (a quote never closed, or another quote after a closed one in the same value), so whether it sets {SEARCH_PATH_VARIABLE} cannot be told. Use one quoted or unquoted value per line and retry"
         ))),
     }
 }
 
+/// Whether `c` ends a line of an `EnvironmentFile=`; systemd ends it at `\n` and `\r`.
+fn is_env_line_end(c: char) -> bool {
+    c == '\n' || c == '\r'
+}
+
 /// Whether an `EnvironmentFile=` assigns `PATH`, or `None` when a quote is not
-/// closed.
+/// closed or quoting follows a closed quote.
 ///
 /// Follows the file format: `KEY=VALUE` assignments, `#` and `;` comment lines,
 /// values that may be quoted with `'` or `"` or continue after a trailing
@@ -444,14 +508,14 @@ fn environment_file_sets_path(text: &str) -> Option<bool> {
         };
         if first == '#' || first == ';' {
             for c in chars.by_ref() {
-                if c == '\n' {
+                if is_env_line_end(c) {
                     break;
                 }
             }
             continue;
         }
         let mut key = String::new();
-        while let Some(c) = chars.next_if(|c| *c != '=' && *c != '\n') {
+        while let Some(c) = chars.next_if(|c| *c != '=' && !is_env_line_end(*c)) {
             key.push(c);
         }
         if chars.next_if_eq(&'=').is_none() {
@@ -464,7 +528,9 @@ fn environment_file_sets_path(text: &str) -> Option<bool> {
         // A value that opens with a quote ends at the matching one; quotes
         // anywhere else are literal. A trailing backslash continues the line.
         while chars.next_if(|c| *c == ' ' || *c == '\t').is_some() {}
+        let mut closed_quote = false;
         if let Some(quote) = chars.next_if(|c| *c == '\'' || *c == '"') {
+            closed_quote = true;
             loop {
                 match chars.next() {
                     None => return None,
@@ -479,36 +545,42 @@ fn environment_file_sets_path(text: &str) -> Option<bool> {
         loop {
             match chars.next() {
                 None => return Some(sets_path),
-                Some('\n') => break,
+                Some(c) if is_env_line_end(c) => break,
                 Some('\\') => {
                     chars.next();
                 }
+                // systemd continues the value with another quoted segment here;
+                // the scan does not follow that, so it gives up.
+                Some('\'' | '"') if closed_quote => return None,
                 Some(_) => {}
             }
         }
     }
 }
 
-/// The logical lines of a unit file: a trailing backslash joins the next line,
-/// and comment lines are skipped, also inside a continuation.
-fn logical_lines(text: &str) -> Vec<String> {
+/// The logical lines of a unit file, as systemd's reader sees them: a leading
+/// UTF-8 byte order mark is dropped, a line ends at `\n`, `\r` or NUL, a
+/// trailing backslash joins the next line, and comment lines are skipped, also
+/// inside a continuation. A line holding bytes that are not UTF-8 is `Err`.
+fn logical_lines(bytes: &[u8]) -> Vec<Result<String, String>> {
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     let mut lines = Vec::new();
-    let mut current: Option<String> = None;
-    for physical in text.lines() {
-        let trimmed = physical.trim_start();
-        if trimmed.starts_with('#') || trimmed.starts_with(';') {
+    let mut current: Option<Vec<u8>> = None;
+    for physical in bytes.split(|byte| matches!(byte, b'\n' | b'\r' | 0)) {
+        let trimmed = physical.trim_ascii_start();
+        if trimmed.starts_with(b"#") || trimmed.starts_with(b";") {
             continue;
         }
-        let (content, continues) = match physical.strip_suffix('\\') {
+        let (content, continues) = match physical.strip_suffix(b"\\") {
             Some(content) => (content, true),
             None => (physical, false),
         };
         match current.as_mut() {
             Some(line) => {
-                line.push(' ');
-                line.push_str(content);
+                line.push(b' ');
+                line.extend_from_slice(content);
             }
-            None => current = Some(content.to_owned()),
+            None => current = Some(content.to_vec()),
         }
         if !continues {
             lines.extend(current.take());
@@ -516,29 +588,88 @@ fn logical_lines(text: &str) -> Vec<String> {
     }
     lines.extend(current);
     lines
+        .into_iter()
+        .map(|line| {
+            String::from_utf8(line)
+                .map_err(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+        })
+        .collect()
 }
 
-/// What a unit drop-in says about `PATH` in its `Environment=` lines.
+/// A setting of the unit's `[Service]` section that changes the job's `PATH`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PathAssignment {
-    /// A plain `PATH=` assignment.
+enum Setting {
+    /// An `Environment=` word that assigns `PATH`.
+    EnvironmentPath,
+    /// An `ExecSearchPath=` entry.
+    ExecSearchPath,
+}
+
+impl Setting {
+    /// The directive that carries the setting.
+    fn directive(self) -> &'static str {
+        match self {
+            Self::EnvironmentPath => "Environment=PATH=",
+            Self::ExecSearchPath => "ExecSearchPath=",
+        }
+    }
+
+    /// The key of the unit file line.
+    fn key(self) -> &'static str {
+        match self {
+            Self::EnvironmentPath => "Environment",
+            Self::ExecSearchPath => "ExecSearchPath",
+        }
+    }
+}
+
+/// What a unit file or drop-in says about a [`Setting`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Assignment {
+    /// A plain assignment systemd applies.
     Sets,
-    /// No plain assignment, but an escape sequence or a name containing `PATH`
-    /// that could still decode to one.
+    /// No plain assignment, but a form that could still be one: an escape
+    /// sequence, a specifier systemd drops, bytes that are not UTF-8 or a quote
+    /// that never closes.
     Unclear,
-    /// Nothing that can set `PATH`.
+    /// Nothing that can give the setting.
     No,
 }
 
-/// Classifies the `Environment=` lines of a unit drop-in.
-///
-/// Joins continuation lines, skips comment lines, reads only the `[Service]`
-/// section, and splits each value into words outside quotes, as the unit file
-/// syntax does.
-fn drop_in_path_assignment(text: &str) -> PathAssignment {
-    let mut result = PathAssignment::No;
+/// The specifier letters systemd resolves in a user unit's settings; `%%` is a
+/// percent sign. An unknown one makes systemd drop the whole word.
+const SPECIFIER_LETTERS: &str = "aAbBCdEfgGhHiIjJlLmMnNopPqsStTuUvVwWyY%";
+
+/// Whether every `%` sequence of `word` is a specifier systemd resolves.
+fn specifiers_resolve(word: &str) -> bool {
+    let mut chars = word.chars();
+    while let Some(c) = chars.next() {
+        if c == '%'
+            && !chars
+                .next()
+                .is_some_and(|next| SPECIFIER_LETTERS.contains(next))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Classifies `bytes`, a unit file or drop-in, for `setting` in its `[Service]`
+/// section.
+fn unit_setting(bytes: &[u8], setting: Setting) -> Assignment {
+    let mut result = Assignment::No;
     let mut in_service = false;
-    for line in logical_lines(text) {
+    for line in logical_lines(bytes) {
+        let line = match line {
+            Ok(line) => line,
+            Err(lossy) => {
+                if lossy.contains(setting.key()) || lossy.contains(SEARCH_PATH_VARIABLE) {
+                    result = Assignment::Unclear;
+                }
+                continue;
+            }
+        };
         let trimmed = line.trim();
         if let Some(section) = trimmed
             .strip_prefix('[')
@@ -550,10 +681,10 @@ fn drop_in_path_assignment(text: &str) -> PathAssignment {
         if !in_service {
             continue;
         }
-        let Some((key, value)) = line.trim_start().split_once('=') else {
+        let Some((key, value)) = trimmed.split_once('=') else {
             continue;
         };
-        if key.trim_end() != "Environment" {
+        if key.trim_end() != setting.key() {
             continue;
         }
         let mut word = String::new();
@@ -574,12 +705,31 @@ fn drop_in_path_assignment(text: &str) -> PathAssignment {
             }
         }
         words.push(word);
+        words.retain(|word| !word.is_empty());
         let assignment = format!("{SEARCH_PATH_VARIABLE}=");
-        if !escaped && words.iter().any(|word| word.starts_with(&assignment)) {
-            return PathAssignment::Sets;
+        let relevant = |word: &String| match setting {
+            Setting::EnvironmentPath => word.starts_with(&assignment),
+            Setting::ExecSearchPath => true,
+        };
+        let mentions = value.contains(SEARCH_PATH_VARIABLE)
+            || matches!(setting, Setting::ExecSearchPath) && !words.is_empty();
+        if quote.is_some() || escaped {
+            // systemd ignores an assignment whose quote never closes, and an
+            // escape sequence is not decoded here.
+            if mentions {
+                result = Assignment::Unclear;
+            }
+            continue;
         }
-        if escaped || value.contains(SEARCH_PATH_VARIABLE) {
-            result = PathAssignment::Unclear;
+        if words
+            .iter()
+            .any(|word| relevant(word) && specifiers_resolve(word))
+        {
+            return Assignment::Sets;
+        }
+        if words.iter().any(relevant) || mentions {
+            // A word with a specifier systemd drops, or a lookalike name.
+            result = Assignment::Unclear;
         }
     }
     result
@@ -627,8 +777,9 @@ pub trait LaunchdJob: Debug + Send + Sync {
     /// Reads no state the install or upgrade has to create.
     fn domain_environment(&self, uid: u32) -> DomainEnvironment<'_>;
 
-    /// Returns the current boot identity (`kern.boottime`), or why it cannot be
-    /// read. Two equal values mean no reboot happened between the reads.
+    /// Returns the current boot identity (`kern.bootsessionuuid`), or why it
+    /// cannot be read. Two equal values mean no reboot happened between the
+    /// reads, whatever the clock did.
     fn boot_identity(&self) -> Result<String, String>;
 }
 
@@ -699,8 +850,7 @@ impl LaunchdJob for SystemLaunchd {
     #[cfg(target_os = "macos")]
     fn boot_identity(&self) -> Result<String, String> {
         pohunek_platform::process::DarwinInspector::new()
-            .boot_identity()
-            .map(|identity| identity.as_str().to_owned())
+            .boot_session_uuid()
             .map_err(|error| error.to_string())
     }
 

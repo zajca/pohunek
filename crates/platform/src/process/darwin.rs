@@ -66,6 +66,22 @@ impl DarwinInspector {
     }
 }
 
+impl DarwinInspector {
+    /// Returns the kernel's boot session UUID (`kern.bootsessionuuid`).
+    ///
+    /// Unlike `kern.boottime`, which the kernel shifts whenever the calendar
+    /// clock is set, it changes only at a reboot.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed inspection failures.
+    pub fn boot_session_uuid(&self) -> Result<String, Error> {
+        const OPERATION: &str = "read_boot_session_uuid";
+
+        native::boot_session_uuid().map_err(|source| facility_error(OPERATION, source))
+    }
+}
+
 impl ProcessInspector for DarwinInspector {
     fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, Error> {
         read_identity(pid, native::effective_uid(), "inspect_process_identity")
@@ -1173,6 +1189,40 @@ mod native {
         }
         buffer.truncate(written);
         Ok(buffer)
+    }
+
+    /// Reads `kern.bootsessionuuid`, the UUID the kernel assigns at each boot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error, or `InvalidData` when the value is
+    /// not UTF-8 text.
+    pub(super) fn boot_session_uuid() -> io::Result<String> {
+        const NAME: &[u8] = b"kern.bootsessionuuid\0";
+        // A UUID is 36 characters plus the terminator.
+        let mut buffer = [0_u8; 64];
+        let mut length: libc::size_t = buffer.len();
+        // SAFETY: `NAME` is NUL-terminated, `buffer` is a live allocation of
+        // `length` bytes, and `sysctlbyname` writes at most that many and
+        // reports the count back through `length`.
+        let result = unsafe {
+            libc::sysctlbyname(
+                NAME.as_ptr().cast::<libc::c_char>(),
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                &raw mut length,
+                ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return Err(last_os_error());
+        }
+        let written = &buffer[..length.min(buffer.len())];
+        let text = written.split(|byte| *byte == 0).next().unwrap_or_default();
+        String::from_utf8(text.to_vec())
+            .ok()
+            .filter(|uuid| !uuid.is_empty())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty boot session uuid"))
     }
 
     /// Reads `kern.boottime` as whole seconds and microseconds.
