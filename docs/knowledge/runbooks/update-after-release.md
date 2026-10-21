@@ -971,9 +971,11 @@ same code, and the message names the file or directive to change:
   rollback or config migration removes the unit and resolves again from its
   drop-ins alone, so the first resolution refuses upfront, before anything is
   stopped, what the second could not read or resolves to a different `PATH`
-  (the drop-in files on disk are the same in both). `%h`, `%U`, `%t` and `%%` are
-  expanded in those drop-ins (`%h` and `%t` only while the manager's reported `HOME` and `XDG_RUNTIME_DIR` equal the CLI's: the manager's own process environment cannot be read, so a manager that reports another value or none makes the expansion unverifiable and it is refused; a manager whose process environment differs while its reported one equals the CLI's is not detectable, tracked in #1421);
-  every other specifier is refused with its key named;
+  (the drop-in files on disk are the same in both). The manager expands a loaded
+  unit's specifiers itself, but for a unit it has not loaded their values cannot
+  be read, so no specifier (`%h`, `%t`, `%%`, ...) is expanded there and a
+  drop-in `Environment=PATH=`, `ExecSearchPath=` or `EnvironmentFile=` that uses
+  one is refused with its key and the specifier named; write the value out;
 - a unit with no unit file (not installed yet, or removed by a rollback or a
   config migration) whose drop-in files in the manager's own `UnitPath`
   directories hold a `PATH`-affecting line the CLI does not read: an

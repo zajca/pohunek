@@ -3208,30 +3208,11 @@ pub(crate) async fn recorded_job_path(
                 | manager_env::EnvironmentFailure::Unusable(detail)) = failure;
                 Error::ManagerEnvironment { detail }
             })?;
-        // `%h` and `%t` come from the manager's own process, which is not readable
-        // here: the manager's reported `HOME` and `XDG_RUNTIME_DIR` stand in only
-        // when they equal the CLI's, and are otherwise left unexpanded (refused).
-        let agreed = |reported: &Option<String>, own: Option<&std::path::Path>| {
-            let own = own.map(|path| path.display().to_string());
-            (reported.is_some() && *reported == own)
-                .then_some(own)
-                .flatten()
-        };
-        let specifiers = manager_env::Specifiers {
-            home: agreed(&environment.home, context.home()),
-            uid: context.uid(),
-            runtime_dir: agreed(&environment.runtime_dir, context.runtime_base()),
-        };
-        let value = manager_env::effective_search_path(
-            environment.search_path,
-            &unit,
-            &unit_name,
-            &specifiers,
-        )
-        .await?
-        .ok_or_else(|| Error::ManagerEnvironment {
-            detail: "it sets no PATH entry".to_owned(),
-        })?;
+        let value = manager_env::effective_search_path(environment.search_path, &unit, &unit_name)
+            .await?
+            .ok_or_else(|| Error::ManagerEnvironment {
+                detail: "it sets no PATH entry".to_owned(),
+            })?;
         return Ok(JobPath {
             value,
             source: PathSource::UserManager,

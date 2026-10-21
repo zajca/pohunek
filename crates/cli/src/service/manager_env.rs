@@ -135,10 +135,6 @@ pub struct UserManagerEnvironment {
     pub search_path: Option<String>,
     /// The manager's variables the allowlist selects, `PATH` excluded.
     pub variables: BTreeMap<String, String>,
-    /// The manager's own `HOME`, which its `%h` specifier expands to.
-    pub home: Option<String>,
-    /// The manager's own `XDG_RUNTIME_DIR`, which its `%t` specifier expands to.
-    pub runtime_dir: Option<String>,
 }
 
 // Variables are printed by name only: their values may be secrets.
@@ -207,17 +203,9 @@ pub fn selected_environment(
             .split_once('=')
             .map(|(name, value)| (name.to_owned(), value.to_owned()))
     });
-    let find = |name: &str| {
-        entries
-            .iter()
-            .find_map(|entry| entry.strip_prefix(name)?.strip_prefix('='))
-            .map(str::to_owned)
-    };
     Ok(UserManagerEnvironment {
         search_path,
         variables: allowlisted_variables(pairs, allowlist)?,
-        home: find("HOME"),
-        runtime_dir: find("XDG_RUNTIME_DIR"),
     })
 }
 
@@ -264,47 +252,18 @@ pub(crate) fn carry(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
-/// The values of the specifiers a drop-in of a removed unit may use. systemd
-/// expands them in a loaded unit; for an unloaded one they are expanded here,
-/// and only those whose value does not depend on the manager.
-#[derive(Debug, Clone, Default)]
-pub struct Specifiers {
-    /// `%h`, the user's home directory; `None` when the manager's `HOME` cannot be
-    /// confirmed equal to it.
-    pub home: Option<String>,
-    /// `%U`, the numeric user ID.
-    pub uid: u32,
-    /// `%t`, the runtime directory; `None` when the manager's `XDG_RUNTIME_DIR`
-    /// cannot be confirmed equal to it.
-    pub runtime_dir: Option<String>,
-}
-
-impl Specifiers {
-    /// Expands `%%`, `%h`, `%U` and `%t` in `text`; any other specifier, or one
-    /// without a value, is the `Err` naming it.
-    fn expand(&self, text: &str) -> Result<String, String> {
-        let mut out = String::new();
-        let mut chars = text.chars();
-        while let Some(c) = chars.next() {
-            if c != '%' {
-                out.push(c);
-                continue;
-            }
-            match chars.next() {
-                Some('%') => out.push('%'),
-                Some('h') if self.home.is_some() => {
-                    out.push_str(self.home.as_deref().unwrap_or_default());
-                }
-                Some('t') if self.runtime_dir.is_some() => {
-                    out.push_str(self.runtime_dir.as_deref().unwrap_or_default());
-                }
-                Some('U') => out.push_str(&self.uid.to_string()),
-                Some(other) => return Err(format!("%{other}")),
-                None => return Err("%".to_owned()),
-            }
+/// Returns `text` unchanged, or the first specifier in it as the `Err`: the
+/// manager expands a loaded unit's specifiers itself, but for a unit it has not
+/// loaded the values it would use (`%h`, `%t`, ...) cannot be read here, so none
+/// is expanded.
+fn without_specifiers(text: &str) -> Result<String, String> {
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            return Err(format!("%{}", chars.next().unwrap_or_default()));
         }
-        Ok(out)
     }
+    Ok(text.to_owned())
 }
 
 /// The `PATH` the daemon job gets from the user manager and its own unit.
@@ -332,12 +291,11 @@ pub async fn effective_search_path(
     manager_path: Option<String>,
     unit: &UnitEnvironment,
     unit_name: &str,
-    specifiers: &Specifiers,
 ) -> Result<Option<String>, Error> {
     if unit.load_state == "not-found"
         && (!unit.drop_in_paths.is_empty() || !unit.drop_ins_on_disk.is_empty())
     {
-        return path_from_orphan_drop_ins(manager_path, unit, unit_name, specifiers).await;
+        return path_from_orphan_drop_ins(manager_path, unit, unit_name).await;
     }
     if !unit_can_set_path(unit, unit_name).await? {
         return Ok(manager_path);
@@ -354,8 +312,7 @@ pub async fn effective_search_path(
             drop_ins_on_disk: unit.drop_ins_on_disk.clone(),
             ..UnitEnvironment::default()
         };
-        let after =
-            path_from_orphan_drop_ins(manager_path, &removed, unit_name, specifiers).await?;
+        let after = path_from_orphan_drop_ins(manager_path, &removed, unit_name).await?;
         if after != loaded {
             return Err(Error::ManagerEnvironment {
                 detail: format!(
@@ -490,7 +447,6 @@ async fn path_from_orphan_drop_ins(
     manager_path: Option<String>,
     unit: &UnitEnvironment,
     unit_name: &str,
-    specifiers: &Specifiers,
 ) -> Result<Option<String>, Error> {
     let refuse = |detail: String| Error::ManagerEnvironment { detail };
     let mut files = unit.drop_in_paths.clone();
@@ -512,7 +468,7 @@ async fn path_from_orphan_drop_ins(
         };
         let unsupported = |directive: &str, specifier: &str| {
             refuse(format!(
-                "{unit_name} has no unit file yet and the drop-in {path} uses the specifier {specifier} in {directive}=, which is not expanded here (only %U and %% always are; %h and %t only while the service manager's own HOME and XDG_RUNTIME_DIR agree with the CLI's, which cannot be told for this unit). Write the value out and retry"
+                "{unit_name} has no unit file yet and the drop-in {path} uses the specifier {specifier} in {directive}=, which is not expanded here: the service manager has not loaded the unit, so the value it would use cannot be read. Write the value out and retry"
             ))
         };
         for line in service_lines(&bytes) {
@@ -546,15 +502,13 @@ async fn path_from_orphan_drop_ins(
                         if raw.contains(['"', '\'']) {
                             return Err(unreadable(key));
                         }
-                        let raw = specifiers
-                            .expand(raw)
+                        let raw = without_specifiers(raw)
                             .map_err(|specifier| unsupported(key, &specifier))?;
                         let optional = raw.starts_with('-');
                         let file = raw.strip_prefix('-').unwrap_or(&raw).to_owned();
                         environment_files.push((file, optional));
                     } else {
-                        let list = specifiers
-                            .expand(&split.words[0])
+                        let list = without_specifiers(&split.words[0])
                             .map_err(|specifier| unsupported(key, &specifier))?;
                         for entry in list.split(':').filter(|entry| !entry.is_empty()) {
                             if !entry.starts_with('/') {
@@ -574,7 +528,7 @@ async fn path_from_orphan_drop_ins(
                 _ => {}
             }
         }
-        let events = match path_events(&bytes, specifiers) {
+        let events = match path_events(&bytes) {
             Ok(events) => events,
             Err(Some(specifier)) => return Err(unsupported("Environment", &specifier)),
             Err(None) => return Err(unreadable("Environment=")),
@@ -1048,10 +1002,7 @@ fn service_lines(bytes: &[u8]) -> Vec<Result<String, String>> {
 /// a reset (an empty assignment), `Some(value)` for an assignment, specifiers
 /// expanded. `Err(None)` is a line that may touch it in a form not read here,
 /// `Err(Some(specifier))` a specifier that is not expanded here.
-fn path_events(
-    bytes: &[u8],
-    specifiers: &Specifiers,
-) -> Result<Vec<Option<String>>, Option<String>> {
+fn path_events(bytes: &[u8]) -> Result<Vec<Option<String>>, Option<String>> {
     let mut events = Vec::new();
     for line in service_lines(bytes) {
         let Ok(line) = line else {
@@ -1080,7 +1031,7 @@ fn path_events(
                 if split.escaped {
                     return Err(None);
                 }
-                events.push(Some(specifiers.expand(path).map_err(Some)?));
+                events.push(Some(without_specifiers(path).map_err(Some)?));
             }
         }
     }
