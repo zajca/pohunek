@@ -3522,8 +3522,11 @@ fn unloaded_persisted_path(
     context: &Context,
     usage: PathUse,
 ) -> Result<(String, PathSource), Error> {
-    let activity = persisted_config_is_active(context);
+    let dated = persisted_config_is_active(context);
     let persisted = persisted_user_domain_path(context)?;
+    // A write between the dating and the read would make the date describe
+    // another configuration than the one read.
+    let activity = dated.and_then(|()| persisted_config_is_active(context));
     match (activity, usage) {
         (Ok(()), _) => Ok((persisted, PathSource::PersistedActive)),
         (Err(_), PathUse::Rollback) => Ok((persisted, PathSource::Persisted)),

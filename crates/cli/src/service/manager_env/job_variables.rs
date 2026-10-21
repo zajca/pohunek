@@ -28,7 +28,6 @@ use super::{
 use crate::service::error::Error;
 
 /// An `Environment=` or filter line whose effect is not read here.
-#[derive(Debug)]
 struct UnclearLine {
     file: String,
     text: String,
@@ -44,14 +43,38 @@ impl UnclearLine {
         if self.name_escaped || (self.lossy && self.text.contains("Environment")) {
             return true;
         }
-        self.text
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        // An escape sequence ends a word and is not part of the next one
+        // (`\x20NAME`, `\040NAME`, `\nNAME`), so the code after each backslash
+        // is dropped before the text is split into names.
+        let mut segments = self.text.split('\\');
+        let first = segments.next().unwrap_or_default();
+        std::iter::once(first)
+            .chain(segments.map(strip_escape_code))
+            .flat_map(|segment| segment.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')))
             .any(|token| !token.is_empty() && pred(token))
     }
 }
 
-/// What the enabled drop-ins of a unit say about its environment.
-#[derive(Debug, Default)]
+/// `segment`, which follows a backslash, without the escape code at its start:
+/// `xHH`, three octal digits, or one letter.
+fn strip_escape_code(segment: &str) -> &str {
+    let bytes = segment.as_bytes();
+    let hex = bytes.first() == Some(&b'x')
+        && bytes.len() >= 3
+        && bytes[1].is_ascii_hexdigit()
+        && bytes[2].is_ascii_hexdigit();
+    let octal = bytes.len() >= 3 && bytes[..3].iter().all(|b| (b'0'..=b'7').contains(b));
+    let code = if hex || octal {
+        3
+    } else {
+        usize::from(!bytes.is_empty())
+    };
+    &segment[code..]
+}
+
+/// What the enabled drop-ins of a unit say about its environment. It has no
+/// `Debug`: the assigned values may be secrets.
+#[derive(Default)]
 struct DropInEnvironment {
     /// The plain assignments in force: name to the drop-in and the raw value.
     assigned: BTreeMap<String, (String, String)>,
@@ -254,18 +277,18 @@ impl Judgement<'_> {
     /// Refuses what may change a store variable in a way that is not derived
     /// here: an `EnvironmentFile=` assignment, a `PassEnvironment=` that no
     /// drop-in assignment overrides, and a drop-in line that is not read.
-    fn refuse_unreadable_store_settings(
-        &self,
-        manager: &BTreeMap<String, String>,
-    ) -> Result<(), Error> {
+    fn refuse_unreadable_store_settings(&self) -> Result<(), Error> {
         let Self {
-            unit,
             unit_name,
             facts,
             file_keys,
-            loaded,
+            allowlist,
             ..
         } = self;
+        if allowlist.is_empty() {
+            // Nothing is selected, so no store variable is judged.
+            return Ok(());
+        }
         if let Some((name, file)) = file_keys.iter().find(|(name, _)| self.selects(name)) {
             return Err(refuse(format!(
                 "{unit_name}: the EnvironmentFile= {file} assigns {name}, which the daemon reads from its environment, and the value it gets is not re-parsed here. Move the assignment to an Environment= line of a drop-in and retry"
@@ -278,17 +301,11 @@ impl Judgement<'_> {
                 )));
             }
         }
-        let merged_names: Vec<&str> = unit
-            .environment
-            .iter()
-            .filter_map(|entry| entry.split_once('=').map(|(name, _)| name))
-            .collect();
-        // For a loaded unit the manager's list says which names are set at all,
-        // so a line only matters when it may touch a name that is set somewhere.
-        let touches = |token: &str| {
-            self.selects(token)
-                && (!loaded || merged_names.contains(&token) || manager.contains_key(token))
-        };
+        // A line that may touch a selected name is refused whether or not the
+        // name is set now: once a rollback removes the unit the manager's list
+        // no longer says which names the line sets, and the same files must
+        // give the same answer then.
+        let touches = |token: &str| self.selects(token);
         if let Some(line) = facts
             .unclear
             .iter()
@@ -399,7 +416,7 @@ pub async fn unit_job_variables(
         loaded,
     };
     judgement.refuse_bootstrap_overrides()?;
-    judgement.refuse_unreadable_store_settings(&manager)?;
+    judgement.refuse_unreadable_store_settings()?;
     judgement.apply(&mut manager)?;
     allowlisted_variables(manager, allowlist)
 }

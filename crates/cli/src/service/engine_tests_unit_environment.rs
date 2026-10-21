@@ -999,3 +999,19 @@ async fn a_loaded_unit_with_an_unfollowed_drop_in_syntax_is_still_refused() {
         );
     }
 }
+
+/// A line the CLI cannot read is refused for a selected variable even when the
+/// variable is set nowhere now: a rollback that removes the unit has no merged
+/// list to excuse it, so the forward gate answers as the rollback will.
+#[tokio::test]
+async fn an_unclear_line_naming_an_unset_store_variable_is_refused_for_a_loaded_unit_too() {
+    let (_dir, unit) = loaded_with(
+        &[(
+            "10-odd.conf",
+            "[Service]\nEnvironment=NOTE=a\\x20CLAUDE_CONFIG_DIR\n",
+        )],
+        &[],
+    );
+    let text = refusal(judge_job(unit, &MANAGER_ENTRIES, &[STORE], true).await);
+    assert!(text.contains("10-odd.conf"), "{text}");
+}

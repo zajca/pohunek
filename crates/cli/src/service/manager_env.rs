@@ -242,11 +242,25 @@ pub fn allowlisted_variables(
 /// The unit setting files read while one judgement resolves a daemon job's
 /// environment, each at most once, so every part of the judgement sees the same
 /// bytes.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct UnitFileReader {
     unit_files: BTreeMap<String, Vec<u8>>,
     drop_ins: BTreeMap<String, Option<Vec<u8>>>,
     environment_files: BTreeMap<String, Result<Vec<u8>, (std::io::ErrorKind, String)>>,
+}
+
+// The files may hold secrets: only their paths are printed.
+impl Debug for UnitFileReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnitFileReader")
+            .field("unit_files", &self.unit_files.keys().collect::<Vec<_>>())
+            .field("drop_ins", &self.drop_ins.keys().collect::<Vec<_>>())
+            .field(
+                "environment_files",
+                &self.environment_files.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 /// The `PATH` value of a job, if a process environment can carry it.

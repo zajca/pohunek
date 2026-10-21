@@ -1027,7 +1027,7 @@ property for a loaded unit; a mismatch is refused.
 | Setting | `PATH` | Store variable the allowlist selects | Bootstrap key (`HOME`, `XDG_*`) |
 |---|---|---|---|
 | Drop-in `Environment=NAME=value` | the last drop-in's value replaces the recorded (or the manager's) `PATH`; a warning names the drop-in | replaces the manager's value | refused, naming the key and the drop-in |
-| Drop-in `Environment=` with no value (reset) | refused when it removes the recorded `PATH`; a later `PATH=` assignment is read | resets the drop-in assignments before it | refused (it removes the keys the unit file gives the job) |
+| Drop-in `Environment=` with no value (reset) | refused (it removes the `PATH` and the bootstrap keys the unit file gives the job) | refused | refused |
 | `EnvironmentFile=` assigning the name | refused (quoting is not re-parsed) | refused: move it to an `Environment=` line of a drop-in | refused |
 | `PassEnvironment=NAME` | no effect on a recorded `PATH`; refused for an unrecorded one | refused unless a drop-in `Environment=` assigns it (the value would be the manager process's own) | no effect |
 | `UnsetEnvironment=NAME` | refused | the variable is absent; `NAME=VALUE` removes it only when the final value equals `VALUE`; a name only the unit file unsets is ignored | refused |
