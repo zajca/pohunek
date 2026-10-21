@@ -1940,19 +1940,25 @@ fn a_0_34_2_host_with_built_in_sessions_is_adoptable_through_the_release_plan() 
     );
 }
 
+/// Profiles created in descending and in ascending name order are listed by
+/// name. Enough of them that a filesystem listing in hash order is not sorted
+/// by chance.
 #[test]
 fn the_release_plan_lists_profiles_by_name_whatever_order_they_were_created_in() {
-    for names in [
-        ["official-claude", "official-codex"],
-        ["official-codex", "official-claude"],
-    ] {
+    const PROFILE_COUNT: usize = 32;
+    let sorted: Vec<String> = (0..PROFILE_COUNT)
+        .map(|n| format!("claude-{n:02}"))
+        .collect();
+    let mut descending = sorted.clone();
+    descending.reverse();
+    for names in [descending, sorted.clone()] {
         let host = Host::new();
         let catalog = official_runtimes::OfficialCatalog::new();
         let release = host.env.root().join("release").join("runtime");
-        catalog.write_release(&release, &["claude", "codex"]);
+        catalog.write_release(&release, &["claude"]);
         let profiles = private_dir(host.env.config_home().join("pohunek").join("agents"));
-        for name in names {
-            write_profile(&profiles, name, name.trim_start_matches("official-"));
+        for name in &names {
+            write_profile(&profiles, name, "claude");
         }
 
         let report = run_with(
@@ -1967,7 +1973,7 @@ fn the_release_plan_lists_profiles_by_name_whatever_order_they_were_created_in()
             .iter()
             .map(|profile| profile.name.as_str())
             .collect();
-        assert_eq!(bound, ["official-claude", "official-codex"], "{names:?}");
+        assert_eq!(bound, sorted, "created as {:?}", &names[..2]);
     }
 }
 

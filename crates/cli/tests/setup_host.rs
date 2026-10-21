@@ -76,7 +76,7 @@ const KEPT_REPORT: &str = r#"{
      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
      "status": "kept", "reasons": ["profile"], "release_version": "1.0.3"}
   ],
-  "catalog": "unavailable",
+  "catalog": "record",
   "profiles": [],
   "integrations": [],
   "refusals": []

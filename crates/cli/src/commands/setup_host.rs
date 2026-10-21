@@ -1176,7 +1176,8 @@ async fn apply_remaining(
 /// Runs the final checks and fails when any is not met.
 ///
 /// Every runtime the preview planned must be present in the plan read after
-/// the apply, that plan must carry no refusal, and a runtime it lists but the
+/// the apply (a package the preview showed `kept` counts when it is still
+/// `kept`: a kept package serves the runtime), that plan must carry no refusal, and a runtime it lists but the
 /// preview did not is reported. Hook gaps are reported and do not fail.
 ///
 /// # Errors

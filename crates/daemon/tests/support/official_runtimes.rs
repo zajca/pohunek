@@ -389,14 +389,26 @@ fn edited_archive(
 ) -> (Vec<u8>, PackageDigest) {
     let source = workspace_root().join("runtime-packages").join(runtime);
     let scratch = pohunek_test_support::tempdir().expect("a scratch directory");
-    for entry in std::fs::read_dir(&source).expect("the runtime package directory") {
+    copy_edited(&source, scratch.path(), edit);
+    archive_of(scratch.path(), runtime)
+}
+
+/// Copies the tree `source` into `target`, passing every file's text through
+/// `edit` with its file name.
+fn copy_edited(source: &Path, target: &Path, edit: &dyn Fn(&str, String) -> String) {
+    for entry in std::fs::read_dir(source).expect("the runtime package directory") {
         let path = entry.expect("a package file entry").path();
         let name = path.file_name().expect("a file name").to_owned();
+        if path.is_dir() {
+            let child = target.join(&name);
+            std::fs::create_dir(&child).expect("copy a package directory");
+            copy_edited(&path, &child, edit);
+            continue;
+        }
         let text = std::fs::read_to_string(&path).expect("a package file");
         let edited = edit(&name.to_string_lossy(), text);
-        std::fs::write(scratch.path().join(name), edited).expect("copy a package file");
+        std::fs::write(target.join(name), edited).expect("copy a package file");
     }
-    archive_of(scratch.path(), runtime)
 }
 
 fn archive_of(directory: &Path, runtime: &str) -> (Vec<u8>, PackageDigest) {

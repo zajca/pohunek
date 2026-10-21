@@ -56,6 +56,9 @@ pub const CODE_SERVICE_CONFIG_UNREADABLE: &str = "service_config_unreadable";
 /// release package. The step keeps the pin, so a downgrade is never applied
 /// to it.
 pub const CODE_PINNED_TO_NEWER_VERSION: &str = "pinned_to_newer_version";
+/// A host profile is pinned to a digest other than the selected version the
+/// step keeps for its runtime. The step keeps the pin and repins nothing.
+pub const CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION: &str = "pinned_differs_from_kept_selection";
 /// A host profile is pinned to a different package of the same version as the
 /// release package. Such a pin is anomalous, so the step keeps it.
 pub const CODE_PINNED_TO_SAME_VERSION: &str = "pinned_to_same_version";

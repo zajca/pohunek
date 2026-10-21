@@ -27,10 +27,10 @@ use pohunek_service_config::runtimes::{
     UseReason, CODE_DAEMON_RUNNING, CODE_GAP_AGENT_NOT_ON_PATH, CODE_GAP_CONFIG_HOME_MISSING,
     CODE_GAP_CONFIG_HOME_SYMLINK, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
     CODE_GAP_SERVED_BY_OTHER_PACKAGE, CODE_GAP_UPDATE_VERSION_UNORDERED,
-    CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PINNED_TO_NEWER_VERSION,
-    CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_VERSION_UNKNOWN, CODE_PROFILE_NOT_MIGRATABLE,
-    CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE, DETECT_FLAG, DRY_RUN_FLAG,
-    ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
+    CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION,
+    CODE_PINNED_TO_NEWER_VERSION, CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_VERSION_UNKNOWN,
+    CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE,
+    DETECT_FLAG, DRY_RUN_FLAG, ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
 };
 use pohunek_test_support::bin_exe;
 use pohunek_test_support::env::TestEnv;
@@ -1901,7 +1901,7 @@ fn a_profile_pinned_to_a_newer_official_version_is_kept_and_the_replaced_selecti
 /// release's is kept, reported as a gap and never replaced, as for Pi.
 #[test]
 fn a_selected_reserved_runtime_version_without_an_order_against_the_release_is_kept() {
-    for runtime in ["claude", "codex"] {
+    for runtime in ["claude", "codex", "hermes"] {
         let host = Host::new();
         let (bytes, digest) = official_runtimes::variant_archive(runtime, "2.0");
         host.publish_archives(1, &[(runtime, &bytes, &digest)]);
@@ -1950,7 +1950,7 @@ fn a_selected_reserved_runtime_version_without_an_order_against_the_release_is_k
 /// plan reports a gap.
 #[test]
 fn a_disabled_unordered_selected_reserved_runtime_version_is_left_untouched() {
-    for runtime in ["claude", "codex"] {
+    for runtime in ["claude", "codex", "hermes"] {
         let host = Host::new();
         let (bytes, digest) = official_runtimes::variant_archive(runtime, "2.0");
         host.publish_archives(1, &[(runtime, &bytes, &digest)]);
@@ -2061,7 +2061,7 @@ fn a_kept_unordered_selection_goes_through_the_detect_checks() {
 /// plan reports a gap with a repair hint.
 #[test]
 fn an_unloadable_unordered_selected_reserved_runtime_version_is_left_untouched() {
-    for runtime in ["claude", "codex"] {
+    for runtime in ["claude", "codex", "hermes"] {
         let host = Host::new();
         let (bytes, digest) = official_runtimes::variant_archive(runtime, "2.0");
         host.publish_archives(1, &[(runtime, &bytes, &digest)]);
@@ -2593,6 +2593,77 @@ async fn a_disabled_unordered_pi_selection_is_reported_once_by_the_detecting_pla
         .registry()
         .set_enabled(&id, true)
         .expect("the hinted package can be enabled");
+}
+
+/// An enabled selected version with no order against the release's whose root
+/// is present but altered is refused with the command that removes it, and
+/// nothing changes: a hint that `plugin install` would not accept is never
+/// printed for it.
+#[test]
+fn an_altered_unordered_selected_reserved_runtime_version_is_refused() {
+    for runtime in ["claude", "codex"] {
+        let host = Host::new();
+        let (bytes, digest) = official_runtimes::variant_archive(runtime, "2.0");
+        host.publish_archives(1, &[(runtime, &bytes, &digest)]);
+        host.write_profile(runtime, &format!("base = \"{runtime}\"\n"));
+        let installed = host.step(false);
+        assert!(installed.refusals.is_empty(), "{runtime}: {installed:?}");
+        host.alter_installed_root();
+        let (release, release_digest) = official_runtimes::variant_archive(runtime, "1.0.3");
+        host.publish_archives(2, &[(runtime, &release, &release_digest)]);
+        let registry = fs::read(host.registry_path()).expect("the registry record");
+        let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
+
+        let plan = host.step(true);
+        let applied = host.step(false);
+
+        for report in [&plan, &applied] {
+            assert_eq!(refusal_codes(report), [root_refusal.as_str()], "{runtime}");
+            assert!(
+                report.refusals[0].detail.contains(&format!(
+                    "pohunek plugin uninstall --digest {} --remove-modified --yes",
+                    digest.as_str()
+                )),
+                "{}",
+                report.refusals[0].detail
+            );
+            assert!(report.packages.is_empty(), "{runtime}");
+        }
+        assert_eq!(
+            fs::read(host.registry_path()).expect("the registry record"),
+            registry,
+            "{runtime}"
+        );
+    }
+}
+
+/// A profile pinned to a digest other than the selected version the step
+/// keeps is reported as kept with its reason and is never repinned.
+#[test]
+fn a_profile_pinned_elsewhere_is_reported_beside_a_kept_unordered_selection() {
+    let host = Host::new();
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "2.0");
+    host.publish_archives(1, &[("claude", &bytes, &digest)]);
+    host.write_claude_profile();
+    let bound = host.step(false);
+    assert_eq!(bound.profiles[0].status, ProfileStatus::Bound, "{bound:?}");
+    let elsewhere = format!("sha256:{}", "b".repeat(64));
+    let pinned = host.profile_text().replace(digest.as_str(), &elsewhere);
+    assert_ne!(pinned, host.profile_text());
+    fs::write(host.profile_path(), &pinned).expect("write the profile");
+    publish_claude_version(&host, "1.0.3", 2);
+
+    for report in [host.step(true), host.step(false)] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert_eq!(report.packages[0].status, PackageStatus::Kept);
+        assert_eq!(report.profiles.len(), 1, "{:?}", report.profiles);
+        assert_eq!(report.profiles[0].status, ProfileStatus::Kept);
+        assert_eq!(
+            report.profiles[0].kept_reason.as_deref(),
+            Some(CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION)
+        );
+    }
+    assert_eq!(host.profile_text(), pinned);
 }
 
 /// A kept unordered selection of a runtime nothing uses, whose program is off

@@ -7,6 +7,8 @@
   with the version the release offers. A selected version that is newer and
   ordered keeps its behaviour: for a reserved runtime the release's package
   replaces it and the plan warns.
+- A host profile pinned to a digest other than a kept selection stays as it is
+  and is reported `kept` with the new reason `pinned_differs_from_kept_selection`.
 - A disabled unordered selection, or an enabled one whose package does not
   load, is left untouched (gap `official_package_not_serving`, with the repair
   step for the second), never replaced or enabled. `pohunek setup`

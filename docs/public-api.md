@@ -2354,7 +2354,12 @@ installs and selects the release's version (reason `installed`) and the profiles
 pinned to the older official version are repinned; unpinned profiles stay unpinned,
 an absent package is never installed, nothing the operator turned off is changed,
 and a selected version newer than the release's is kept (status `kept`, with
-`release_version` naming the release's older one) and never downgraded. `integrations` lists the config homes the installer reinstalls hooks
+`release_version` naming the release's older one) and never downgraded. For every
+runtime, reserved or not, a selected version that cannot be ordered against the
+release's and is enabled and loadable is kept the same way (status `kept`, with
+`release_version` naming the release's version). A host profile pinned to another
+digest than a kept selection stays as it is and is reported `kept` with the reason
+`pinned_differs_from_kept_selection`. `integrations` lists the config homes the installer reinstalls hooks
 into: without `--detect`, the homes that already hold hooks; with `--detect`, each
 existing home of a planned runtime whose hooks the setup installs, whether or not
 hooks are present yet (Pi declares none). Each distinct home appears once. `reason`
