@@ -733,15 +733,28 @@ session's default configuration.
 
 The durable session record keeps the active agent the worker journaled, with
 whether it was reported or observed, so a daemon restart restores it even after
-the worker's claim expired. An agent reported only to the daemon socket (the
-hooks' fallback when the worker cannot be reached) or observed by procwatch is
-held in memory and reaches the record only with the session's next record
-write for another reason (a native reference report, a stop, a worker becoming
-unavailable or being adopted again). Whether such an agent restores as reported
-after a restart therefore depends on that timing; without such a write,
-procwatch observes it again, as observed. A worker snapshot projected after
-such a report replaces it with the worker's journaled identity, also when the
-snapshot was read before the report arrived (#1101). A record written before
+the worker's claim expired. A bound `session.report_agent` or
+`session.release_agent` (it carries `pid` and `monotonic_sequence`) is
+forwarded into the worker of a live session that negotiated worker protocol 8:
+the worker validates the subject like a hook claim, journals it, and only then
+answers, and the daemon commits the claim the worker holds. A bound report
+therefore survives a restart whenever it is accepted, and `recorded: false`
+also covers a report the worker refused. A report that is unbound (an SDK or
+remote client, an older hook), that meets a protocol 7 worker, or whose forward
+failed is held in memory and logged once per session and cause as
+`session.active_identity.not_durable` (`unbound`, `worker_protocol_v7`,
+`forward_failed`; a failed forward also logs `forward_failed` at WARN; an
+accepted forward whose snapshot was not read or applied in time logs
+`session.active_identity.commit_deferred` at WARN, and the next sync commits
+it). It
+reaches the record only with the session's next record write for another
+reason, and procwatch observes the agent again after a restart, as observed.
+An agent observed by procwatch is held in memory in the same way. A per-session
+commit guard and the newest committed worker identity revision order a worker
+snapshot against a forwarded commit: a snapshot read before the commit carries
+an older revision and cannot replace the forwarded identity or its release
+(#1101). A worker that predates the revision (protocol 7) gives no such order.
+A record written before
 schema 10 carries no origin, and its agent counts as observed when its name
 equals the agent's own runtime: a reported agent under a profile named like
 its runtime, nested or not, is then restored as observed until it reports

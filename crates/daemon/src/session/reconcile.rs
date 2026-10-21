@@ -20,6 +20,7 @@ use protocol::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use super::claim::{same_claim, ClaimKey, ClaimOrigin, PendingRelease};
 use super::conflict_stop::is_conflict_proven_removal;
 use super::supervision::{
     classify_unreachable, describe_unreadable_candidates, job_identity_mismatch, observe,
@@ -476,6 +477,8 @@ struct JournalOutcome {
 struct WorkerIdentityProjection {
     active: Option<ActiveAgentReport>,
     release: Option<ReleasedIdentityClaim>,
+    /// Whether `release` names the active agent the record held.
+    release_names_held: bool,
     privately_reported: bool,
 }
 
@@ -484,6 +487,7 @@ impl WorkerIdentityProjection {
         Self {
             active: None,
             release: None,
+            release_names_held: false,
             privately_reported: false,
         }
     }
@@ -579,11 +583,30 @@ impl SessionRegistry {
         })
     }
 
+    pub(super) async fn apply_worker_metadata_snapshot(
+        &self,
+        id: &SessionId,
+        snapshot: &InspectSnapshot,
+    ) -> WorkerMetadataApplyOutcome {
+        let commit = {
+            let sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get(id) else {
+                return WorkerMetadataApplyOutcome::Discarded;
+            };
+            Arc::clone(&entry.identity_commit)
+        };
+        let _held = commit.lock().await;
+        self.apply_worker_metadata_snapshot_locked(id, snapshot)
+            .await
+    }
+
+    /// [`Self::apply_worker_metadata_snapshot`] for a caller that holds the
+    /// session's identity-commit guard.
     #[expect(
         clippy::too_many_lines,
         reason = "one locked projection keeps identity and subagent snapshot updates atomic"
     )]
-    pub(super) async fn apply_worker_metadata_snapshot(
+    pub(super) async fn apply_worker_metadata_snapshot_locked(
         &self,
         id: &SessionId,
         snapshot: &InspectSnapshot,
@@ -602,7 +625,7 @@ impl SessionRegistry {
             .worker_instance_id
             .as_ref()
             .map(ToString::to_string);
-        let (mut memory_base, import_pin) = {
+        let (mut memory_base, import_pin, fence, claim_reported_activity) = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(id) else {
                 return WorkerMetadataApplyOutcome::Discarded;
@@ -618,12 +641,33 @@ impl SessionRegistry {
             ) {
                 return outcome;
             }
-            (record, entry.pinned.clone())
+            (
+                record,
+                entry.pinned.clone(),
+                entry.identity_fence.clone(),
+                entry
+                    .active_agent
+                    .as_ref()
+                    .is_some_and(|active| active.activity_reported),
+            )
         };
-        let projected = InspectSnapshot {
+        // A snapshot older than the identity revision already committed for
+        // this worker instance cannot change the active identity; everything
+        // else it carries still applies.
+        let identity_superseded = fence.as_ref().is_some_and(|fence| {
+            Some(fence.worker_instance_id.as_str()) == expected_worker_instance_id.as_deref()
+                && snapshot
+                    .active_identity_revision
+                    .is_some_and(|revision| revision < fence.revision)
+        });
+        let mut projected = InspectSnapshot {
             hook_schema: self.effective_hook_schema_id(&memory_base, snapshot),
             ..snapshot.clone()
         };
+        if identity_superseded {
+            projected.active_identity = None;
+            projected.active_identity_release = None;
+        }
         let snapshot = &projected;
         let mut outcome = WorkerMetadataApplyOutcome::Applied;
         let mut identities_accepted = true;
@@ -713,6 +757,16 @@ impl SessionRegistry {
         } else {
             WorkerIdentityProjection::unreported()
         };
+        // The activity a claim reported ends with the claim, in the record the
+        // release is written to as well as in memory.
+        let activity_ends = projection.release_names_held && claim_reported_activity;
+        let end_reported_activity = |record: &mut SessionRecord| {
+            if activity_ends {
+                record.info.activity = None;
+                record.info.state_source = StateSource::Process;
+            }
+        };
+        end_reported_activity(&mut candidate);
         candidate.info.subagents.clone_from(&subagents);
         if let Some(update) = &background_update {
             candidate.info.background.clone_from(update);
@@ -721,6 +775,12 @@ impl SessionRegistry {
             candidate.info.updated_at = timestamp_now();
         }
         preserve_newer_updated_at(&memory_base.info.updated_at, &mut candidate.info.updated_at);
+        #[cfg(test)]
+        if projection.privately_reported {
+            self.hold_metadata_apply().await;
+        }
+        // The record holds the worker's journaled claim even when a memory
+        // claim overlays it in memory: the journal is the durable truth.
         if candidate != durable_base {
             if let Err(error) = self
                 .write_session_record_if_current(durable_base, candidate.clone())
@@ -753,6 +813,7 @@ impl SessionRegistry {
             let durable_before_rebase = candidate.clone();
             candidate = current_after_store.clone();
             preserve_durable_worker_metadata(&durable_before_rebase, &mut candidate);
+            end_reported_activity(&mut candidate);
             if candidate != durable_before_rebase {
                 if let Err(error) = self
                     .write_session_record_if_current(durable_before_rebase, candidate.clone())
@@ -774,10 +835,6 @@ impl SessionRegistry {
             let reported_detector_config = projection.active.as_ref().and_then(|active| {
                 self.active_agent_detector_config(&candidate.info, pinned.as_ref(), Some(active))
             });
-            #[cfg(test)]
-            if projection.privately_reported {
-                self.hold_metadata_apply().await;
-            }
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(id) else {
                 return WorkerMetadataApplyOutcome::Discarded;
@@ -817,6 +874,13 @@ impl SessionRegistry {
                 .cloned()
                 .collect::<Vec<_>>();
             let projected = apply_identity_projection(entry, &candidate, &projection, snapshot);
+            if identities_accepted && !identity_superseded {
+                advance_identity_fence(
+                    entry,
+                    expected_worker_instance_id.as_deref(),
+                    snapshot.active_identity_revision,
+                );
+            }
             if projected.active {
                 // A projected claim is bound or released by a scan that reads
                 // its process, so ask for one.
@@ -886,6 +950,7 @@ impl SessionRegistry {
             self.persist_resume_binding(id).await;
         }
         if identities_accepted {
+            Box::pin(self.settle_pending_activity(id)).await;
             WorkerMetadataApplyOutcome::Applied
         } else {
             outcome
@@ -3893,10 +3958,11 @@ impl SessionRegistry {
             }
         }
         import_native_reference(&mut record, &snapshot);
-        let identity_projection = if root_missing_during_drain || retry_identity {
-            clear_active_identity(&mut record);
-            WorkerIdentityProjection::unreported()
-        } else {
+        let identity_applied = !(root_missing_during_drain || retry_identity);
+        let adopted_fence = identity_applied
+            .then(|| snapshot_revision(&snapshot))
+            .flatten();
+        let identity_projection = if identity_applied {
             match import_worker_identities(&mut record, &snapshot) {
                 Ok(mut projection) => {
                     let pin = record
@@ -3923,6 +3989,9 @@ impl SessionRegistry {
                     return true;
                 }
             }
+        } else {
+            clear_active_identity(&mut record);
+            WorkerIdentityProjection::unreported()
         };
         record.info.subagents = match import_worker_subagents(&snapshot) {
             Ok(subagents) => subagents,
@@ -4070,6 +4139,14 @@ impl SessionRegistry {
             activity_revision: 0,
             activity_evidence: VecDeque::new(),
             input_gate: Arc::new(Mutex::new(())),
+            identity_commit: Arc::new(Mutex::new(())),
+            // The snapshot's identity state was applied above, so its revision
+            // is the newest this entry has committed.
+            identity_fence: adopted_fence,
+            pending_activity: None,
+            pending_release: None,
+            displaced_pending: Vec::new(),
+            not_durable_logged: HashSet::new(),
             runtime: RuntimeHandle::Worker(worker.clone()),
             job,
             desired_state: DesiredState::Running,
@@ -4187,6 +4264,8 @@ impl SessionRegistry {
         let state = classification.state();
         let id = SessionId(record.session_id.clone());
         let (classified, entry) = self.unavailable_entry(record.clone(), &classification, reason);
+        // Boxed so the entry does not widen the futures of the callers.
+        let entry = Box::new(entry);
         let info = entry.info.clone();
         if let Err(error) = self.write_session_record(classified).await {
             tracing::warn!(session_id = %id.0, error = %error, "failed to persist runtime classification");
@@ -4209,7 +4288,7 @@ impl SessionRegistry {
             .await
             .get(&id)
             .is_some_and(|current| current.info.background.is_some());
-        self.install_session_entry(&id, entry).await;
+        self.install_session_entry(&id, *entry).await;
         if !logged {
             warn_unavailable(&id.0, info_worker_id(&info), state, reason, "");
         }
@@ -4272,6 +4351,10 @@ impl SessionRegistry {
 
     /// Classifies `record` as `state` for `reason` and builds the in-memory
     /// entry that shows it, returning the classified record with it.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one struct literal initializes every entry field"
+    )]
     fn unavailable_entry(
         &self,
         mut record: SessionRecord,
@@ -4341,6 +4424,12 @@ impl SessionRegistry {
             activity_revision: 0,
             activity_evidence: VecDeque::new(),
             input_gate: Arc::new(Mutex::new(())),
+            identity_commit: Arc::new(Mutex::new(())),
+            identity_fence: None,
+            pending_activity: None,
+            pending_release: None,
+            displaced_pending: Vec::new(),
+            not_durable_logged: HashSet::new(),
             runtime: RuntimeHandle::Unavailable(state),
             // A malformed job reference is not adoptable evidence; the runtime is
             // already classified unavailable, so the entry keeps no job.
@@ -4985,12 +5074,262 @@ struct ProjectedIdentity {
     active: bool,
 }
 
+/// Records that the identity revision `revision` of worker instance
+/// `instance` is committed. A snapshot without a revision (a worker that
+/// predates it) sets no fence, and a new worker instance starts a new one.
+fn advance_identity_fence(entry: &mut SessionEntry, instance: Option<&str>, revision: Option<u64>) {
+    let (Some(instance), Some(revision)) = (instance, revision) else {
+        return;
+    };
+    match &mut entry.identity_fence {
+        Some(fence) if fence.worker_instance_id == instance => {
+            fence.revision = fence.revision.max(revision);
+        }
+        fence => {
+            *fence = Some(super::IdentityFence {
+                worker_instance_id: instance.to_owned(),
+                revision,
+            });
+        }
+    }
+}
+
+/// The identity revision a snapshot carries, with the worker instance that
+/// counted it; absent for a worker that predates revisions.
+fn snapshot_revision(snapshot: &InspectSnapshot) -> Option<super::IdentityFence> {
+    Some(super::IdentityFence {
+        worker_instance_id: snapshot.worker_instance_id.as_ref()?.to_string(),
+        revision: snapshot.active_identity_revision?,
+    })
+}
+
+/// Whether a claim this daemon recorded in memory outranks what the worker
+/// journaled: the snapshot is at or below the revision the claim was recorded
+/// over, on the same worker instance, or its change is the operation the claim
+/// was recorded after without knowing its revision. A claim released from
+/// memory keeps that floor in its tombstone.
+fn memory_claim_holds(
+    entry: &SessionEntry,
+    snapshot: &InspectSnapshot,
+    projection: &WorkerIdentityProjection,
+) -> bool {
+    let (over, shadow) = match entry.active_agent.as_ref() {
+        Some(active) if !active.observed => match &active.origin {
+            ClaimOrigin::Memory { over, shadow, .. } => (over.as_ref(), shadow.as_slice()),
+            ClaimOrigin::Journaled { .. } => (None, &[][..]),
+        },
+        Some(_) => (None, &[][..]),
+        None => match entry.last_agent_report.as_ref().map(|last| &last.origin) {
+            Some(ClaimOrigin::Memory { over, shadow, .. }) => (over.as_ref(), shadow.as_slice()),
+            _ => (None, &[][..]),
+        },
+    };
+    let below = over
+        .zip(snapshot_revision(snapshot))
+        .is_some_and(|(over, revision)| {
+            revision.worker_instance_id == over.worker_instance_id
+                && revision.revision <= over.revision
+        });
+    let shadowed = shadow.iter().any(|shadow| {
+        if shadow.released {
+            projection.release.as_ref().is_some_and(|release| {
+                release.provider == shadow.key.provider
+                    && release.process.pid == shadow.key.pid
+                    && release.process.start_identity == shadow.key.start_identity
+                    && release.sequence == shadow.key.sequence
+            })
+        } else {
+            projection
+                .active
+                .as_ref()
+                .and_then(|active| active.origin.key())
+                == Some(&shadow.key)
+        }
+    });
+    below || shadowed
+}
+
+/// Whether the release a snapshot carries is one this daemon forwarded for a
+/// claim it never projected: the entry holds no claim and the release waits
+/// for its commit, so its public order must be recorded although the release
+/// names no claim the record holds.
+fn release_ends_unprojected_claim(
+    entry: &SessionEntry,
+    projection: &WorkerIdentityProjection,
+    previous: Option<&ActiveAgentReport>,
+) -> bool {
+    let Some(release) = &projection.release else {
+        return false;
+    };
+    previous.is_none() && waiting_release(entry, release).is_some()
+}
+
+/// Whether `pending` is the forwarded release the snapshot carries.
+fn is_release_of(pending: &PendingRelease, release: &ReleasedIdentityClaim) -> bool {
+    pending.provider == release.provider
+        && pending.pid == release.process.pid
+        && pending.start_identity == release.process.start_identity
+        && pending.sequence == release.sequence
+}
+
+/// The forwarded release `release` carries, whether it holds the release slot
+/// or lost it to a later operation.
+fn waiting_release<'a>(
+    entry: &'a SessionEntry,
+    release: &ReleasedIdentityClaim,
+) -> Option<&'a PendingRelease> {
+    entry
+        .pending_release
+        .as_deref()
+        .into_iter()
+        .chain(
+            entry
+                .displaced_pending
+                .iter()
+                .filter_map(|operation| match operation {
+                    crate::session::claim::Unacknowledged::Release(pending) => Some(&**pending),
+                    crate::session::claim::Unacknowledged::Report(_) => None,
+                }),
+        )
+        .filter(|pending| is_release_of(pending, release))
+        .max_by_key(|pending| pending.admitted)
+}
+
+/// Makes the worker's journal the source of the entry's report: the claim the
+/// worker holds replaces the daemon's record of it, and a release clears the
+/// activity the released report supplied.
+///
+/// A projection that carries the claim the entry already has changes nothing,
+/// so a periodic sync does not renew a claim.
+#[expect(
+    clippy::too_many_lines,
+    reason = "claim adoption and release adoption share one view of the entry and its pendings"
+)]
+fn adopt_projected_claim(
+    entry: &mut SessionEntry,
+    projection: &WorkerIdentityProjection,
+    snapshot: &InspectSnapshot,
+) {
+    let previous = entry.active_agent.take();
+    if let Some(active) = &projection.active {
+        let mut adopted = ActiveAgentReport {
+            activity_reported: previous.as_ref().is_some_and(|previous| {
+                previous.activity_reported && same_claim(&previous.origin, &active.origin)
+            }),
+            ..active.clone()
+        };
+        let waiting = entry
+            .pending_activity
+            .as_deref()
+            .into_iter()
+            .chain(
+                entry
+                    .displaced_pending
+                    .iter()
+                    .filter_map(|operation| match operation {
+                        crate::session::claim::Unacknowledged::Report(pending) => Some(&**pending),
+                        crate::session::claim::Unacknowledged::Release(_) => None,
+                    }),
+            )
+            .filter(|pending| match &active.origin {
+                ClaimOrigin::Journaled { key, .. } => pending.key == *key,
+                ClaimOrigin::Memory { .. } => false,
+            })
+            .max_by_key(|pending| pending.admitted);
+        if let ClaimOrigin::Journaled { key, public, .. } = &mut adopted.origin {
+            // The public order of the newest report for this claim: the one
+            // that waits for its commit, else the one the entry already holds.
+            if let Some(pending) = waiting {
+                *public = Some(pending.public.clone());
+            } else if let Some(ClaimOrigin::Journaled {
+                key: held,
+                public: held_public,
+                ..
+            }) = previous.as_ref().map(|previous| &previous.origin)
+            {
+                if held == key {
+                    public.clone_from(held_public);
+                }
+            }
+        }
+        // A worker without identity revisions cannot be forwarded to, so a
+        // public report of the process it journaled stays the active claim.
+        let unrevised = snapshot.active_identity_revision.is_none();
+        if let Some(mut held) = previous.filter(|previous| {
+            previous.origin == adopted.origin
+                || (unrevised
+                    && !previous.observed
+                    && matches!(previous.origin, ClaimOrigin::Memory { .. })
+                    && previous.agent == adopted.agent
+                    && previous.pid == adopted.pid
+                    && previous
+                        .start_identity
+                        .zip(adopted.start_identity)
+                        .is_none_or(|(held, current)| held == current))
+        }) {
+            // The label is re-resolved on every snapshot; the report keeps its
+            // time and order.
+            held.agent.clone_from(&adopted.agent);
+            if let Some(last) = entry
+                .last_agent_report
+                .as_mut()
+                .filter(|last| last.origin.key() == held.origin.key())
+            {
+                last.agent.clone_from(&adopted.agent);
+            }
+            entry.active_agent = Some(held);
+        } else {
+            entry.active_agent = Some(adopted.clone());
+            entry.last_agent_report = Some(adopted);
+        }
+    } else if projection.release.is_some()
+        && !projection.release_names_held
+        && !release_ends_unprojected_claim(entry, projection, previous.as_ref())
+    {
+        // A release of another process ends nothing the entry holds.
+        entry.active_agent = previous;
+    } else {
+        if previous
+            .as_ref()
+            .is_some_and(|previous| previous.activity_reported)
+        {
+            entry.info.activity = None;
+            entry.info.state_source = StateSource::Process;
+        }
+        let pending = projection.release.as_ref().and_then(|release| {
+            let found = waiting_release(entry, release).cloned();
+            entry
+                .pending_release
+                .take_if(|pending| is_release_of(pending, release));
+            entry.displaced_pending.retain(|operation| match operation {
+                crate::session::claim::Unacknowledged::Release(pending) => {
+                    !is_release_of(pending, release)
+                }
+                crate::session::claim::Unacknowledged::Report(_) => true,
+            });
+            found
+        });
+        entry.last_agent_report = projection.release.as_ref().map(|release| {
+            let mut tombstone = release_tombstone(snapshot, release);
+            // The caller's public order outranks the worker's: a report it
+            // made before the release stays released.
+            if let Some(pending) = pending {
+                tombstone.source = pending.public.source;
+                tombstone.agent = pending.agent;
+                tombstone.seq = pending.public.seq;
+            }
+            tombstone
+        });
+    }
+}
+
 fn apply_identity_projection(
     entry: &mut SessionEntry,
     candidate: &SessionRecord,
     projection: &WorkerIdentityProjection,
     snapshot: &InspectSnapshot,
 ) -> ProjectedIdentity {
+    let held = projection.privately_reported && memory_claim_holds(entry, snapshot, projection);
     let provenance = candidate
         .recovery
         .as_ref()
@@ -5001,12 +5340,16 @@ fn apply_identity_projection(
         || entry.info.native_session_id != candidate.info.native_session_id
         || entry.info.native_session_path != candidate.info.native_session_path;
     let active_changed = projection.privately_reported
+        && !held
         && (super::active_agent_origin(entry) != candidate.active_agent_origin
             || entry.info.active_agent != candidate.info.active_agent
             || entry.info.active_agent_base != candidate.info.active_agent_base
             || entry.info.active_agent_pid != candidate.info.active_agent_pid
             || entry.info.active_agent_session_id != candidate.info.active_agent_session_id
             || entry.info.active_agent_session_path != candidate.info.active_agent_session_path);
+    if projection.privately_reported && !held {
+        adopt_projected_claim(entry, projection, snapshot);
+    }
     if !native_changed && !active_changed {
         return ProjectedIdentity {
             any: false,
@@ -5042,13 +5385,6 @@ fn apply_identity_projection(
             .info
             .active_agent_session_path
             .clone_from(&candidate.info.active_agent_session_path);
-        entry.active_agent.clone_from(&projection.active);
-        entry.last_agent_report = projection.active.clone().or_else(|| {
-            projection
-                .release
-                .as_ref()
-                .map(|release| release_tombstone(snapshot, release))
-        });
     }
     ProjectedIdentity {
         any: true,
@@ -5346,6 +5682,7 @@ fn active_report_from_record(record: &SessionRecord) -> Option<ActiveAgentReport
         reported_at: crate::time::now(),
         activity_reported: false,
         observed,
+        origin: ClaimOrigin::memory(),
     })
 }
 
@@ -5366,12 +5703,13 @@ fn release_tombstone(
     ActiveAgentReport {
         source: format!("worker:{}", snapshot.worker_id),
         agent: release.provider.clone(),
-        seq: Some(release.sequence),
+        seq: None,
         pid: Some(release.process.pid),
         start_identity: Some(release.process.start_identity),
         reported_at: crate::time::now(),
         activity_reported: false,
         observed: false,
+        origin: ClaimOrigin::memory(),
     }
 }
 
@@ -5435,6 +5773,7 @@ fn apply_worker_identities_with(
         return Ok(WorkerIdentityProjection {
             active: None,
             release: Some(release),
+            release_names_held: release_matches,
             privately_reported: true,
         });
     };
@@ -5467,14 +5806,25 @@ fn apply_worker_identities_with(
         active: Some(ActiveAgentReport {
             source: format!("worker:{}", snapshot.worker_id),
             agent: identity.provider.clone(),
-            seq: Some(identity.sequence),
+            seq: None,
             pid: Some(identity.process.pid),
             start_identity: Some(identity.process.start_identity),
             reported_at: crate::time::now(),
             activity_reported: false,
             observed: false,
+            origin: ClaimOrigin::Journaled {
+                key: ClaimKey {
+                    provider: identity.provider.clone(),
+                    pid: identity.process.pid,
+                    start_identity: identity.process.start_identity,
+                    sequence: identity.sequence,
+                },
+                revision: snapshot_revision(snapshot),
+                public: None,
+            },
         }),
         release: None,
+        release_names_held: false,
         privately_reported: true,
     })
 }
@@ -6790,6 +7140,7 @@ fn classify_connect_error(error: &WorkerError) -> (RuntimeState, &'static str) {
         | WorkerError::NotInitialized
         | WorkerError::AttachReadyTimeout { .. }
         | WorkerError::StopUnanswered { .. }
+        | WorkerError::AnswerLost(_)
         | WorkerError::TornStream => (RuntimeState::Lost, UNREACHABLE_SOCKET),
     }
 }
@@ -9364,6 +9715,19 @@ while os.getppid() == parent:
                 resume: true,
                 fork: false,
             }
+        );
+
+        let fence = replacement
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(&SessionId(session_id.to_owned()))
+            .and_then(|entry| entry.identity_fence.clone());
+        assert_eq!(
+            fence.map(|fence| fence.worker_instance_id),
+            Some(worker_instance_id.to_string()),
+            "the adopted entry starts from the revision of the snapshot it applied"
         );
 
         replacement
@@ -19519,6 +19883,9 @@ generation "$1"
         const LONG_CONNECT: Duration = Duration::from_secs(120);
         /// Connect deadline of fixtures whose classification needs it.
         const SHORT_CONNECT: Duration = Duration::from_millis(300);
+        /// Bound of the forwards before a worker is stopped; the forwards after
+        /// it end at [`SHORT_CONNECT`].
+        const FORWARD_CONNECT: Duration = Duration::from_secs(10);
         /// Sweep grace; short so the `SIGKILL` fallback stays fast.
         const SWEEP_GRACE: Duration = Duration::from_millis(300);
         use pohunek_test_support::wait::HANG_GUARD;
@@ -19605,6 +19972,18 @@ generation "$1"
             host: impl FnOnce(&std::path::Path) -> Arc<dyn ProcessInspector>,
             supervision_retry_initial: Duration,
         ) -> Fixture {
+            fixture_with_agents(connect, workload, host, supervision_retry_initial, None)
+        }
+
+        /// A [`fixture_over_retrying`] whose registry also reads the agent
+        /// profiles of `agents_dir`.
+        fn fixture_with_agents(
+            connect: Duration,
+            workload: Workload,
+            host: impl FnOnce(&std::path::Path) -> Arc<dyn ProcessInspector>,
+            supervision_retry_initial: Duration,
+            agents_dir: Option<PathBuf>,
+        ) -> Fixture {
             let root = temp_root();
             let inspector = host(&root);
             let environment = SubprocessWorkerEnvironment {
@@ -19624,20 +20003,36 @@ generation "$1"
             let script = workload.script(&marker_pid_file);
             let launcher = SubprocessWorkerLauncher::new();
             let supervisor = Arc::new(ScriptedSupervisor::over(launcher.clone()));
-            let registry = SessionRegistry::new_with_launcher_and_inspector(
-                SessionRegistryConfig {
-                    shell_command: ShellCommand::new("/bin/sh", ["-c".to_owned(), script]),
-                    store_path: Some(root.join("data/metadata.jsonl")),
-                    worker_runtime_root: Some(root.join("r/pohunek/workers")),
-                    worker_state_root: Some(root.join("s/pohunek/workers")),
-                    worker_connect_deadline: connect,
-                    supervision: Some(supervision),
-                    supervision_retry_initial,
-                    ..SessionRegistryConfig::default()
-                },
-                Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
-                inspector,
-            );
+            let official_runtimes = agents_dir.is_some();
+            let config = SessionRegistryConfig {
+                shell_command: ShellCommand::new("/bin/sh", ["-c".to_owned(), script]),
+                store_path: Some(root.join("data/metadata.jsonl")),
+                worker_runtime_root: Some(root.join("r/pohunek/workers")),
+                worker_state_root: Some(root.join("s/pohunek/workers")),
+                worker_connect_deadline: connect,
+                supervision: Some(supervision),
+                supervision_retry_initial,
+                agents_dir,
+                ..SessionRegistryConfig::default()
+            };
+            let launcher_backend =
+                Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>;
+            let registry = if official_runtimes {
+                SessionRegistry::new_with_runtimes_and_launcher(
+                    config,
+                    crate::agent::host::fixture::official_host_over(
+                        &crate::agent::host::BuiltinSource::from_host_environment(),
+                    ),
+                    launcher_backend,
+                    inspector,
+                )
+            } else {
+                SessionRegistry::new_with_launcher_and_inspector(
+                    config,
+                    launcher_backend,
+                    inspector,
+                )
+            };
             Fixture {
                 root,
                 registry,
@@ -19651,11 +20046,16 @@ generation "$1"
             /// Creates one shell session and returns it with its job and the
             /// PID of its hangup-ignoring marked descendant.
             async fn create(&self) -> (SessionInfo, ServiceId, u32) {
+                self.create_agent("shell").await
+            }
+
+            /// Creates one session of `agent`.
+            async fn create_agent(&self, agent: &str) -> (SessionInfo, ServiceId, u32) {
                 let created = self
                     .registry
                     .create(protocol::SessionNewParams {
                         name: None,
-                        agent: "shell".to_owned(),
+                        agent: agent.to_owned(),
                         cwd: Some(self.root.clone()),
                         cols: 80,
                         rows: 24,
@@ -19676,6 +20076,13 @@ generation "$1"
                     .find(|record| record.session_id == created.id.0)
                     .and_then(|record| record.runtime.service_id)
                     .expect("the record names its job");
+                if agent != "shell" {
+                    return (
+                        created,
+                        ServiceId::parse(service_id).expect("service id"),
+                        0,
+                    );
+                }
                 let deadline = tokio::time::Instant::now() + HANG_GUARD;
                 let descendant = loop {
                     if let Some(pid) = std::fs::read_to_string(&self.marker_pid_file)
@@ -20567,6 +20974,19 @@ generation "$1"
         }
 
         impl Fixture {
+            /// Stops the worker `pid` and bounds every later forward of the
+            /// fixture at [`SHORT_CONNECT`]; the setup before the stop runs
+            /// under [`FORWARD_CONNECT`].
+            fn stop_worker(&self, pid: u32) -> StoppedWorker {
+                *self
+                    .registry
+                    .inner
+                    .forward_bound
+                    .lock()
+                    .expect("forward bound is never poisoned") = Some(SHORT_CONNECT);
+                StoppedWorker::stop(pid)
+            }
+
             /// Applies `edit` to the session's only journal in place.
             fn edit_journal(
                 &self,
@@ -20586,6 +21006,1233 @@ generation "$1"
                 std::fs::write(&path, serde_json::to_vec(&value).expect("encode journal"))
                     .expect("write journal");
             }
+        }
+
+        /// A fixture whose sessions can run a `codex` agent whose root process the
+        /// real worker supervises.
+        fn codex_fixture(connect: Duration) -> Fixture {
+            let agents_dir = crate::session::tests::temp_agents_dir_with(
+                "forward-stopped-worker",
+                "codex-agent",
+                &format!(
+                    "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", {:?}]\n",
+                    format!("exec {}", pohunek_test_support::hold::shell_words())
+                ),
+            );
+            fixture_with_agents(
+                connect,
+                Workload::Held,
+                |_root| Arc::new(ReadableHost::new()),
+                crate::session::supervision::SUPERVISION_RETRY_INITIAL,
+                Some(agents_dir),
+            )
+        }
+
+        /// How a forward to the stopped worker ends: the bound elapses, or the
+        /// connection is lost after the request was sent.
+        #[derive(PartialEq, Eq, Clone, Copy)]
+        enum Answer {
+            Timeout,
+            Lost,
+            /// Another request holds the stopped worker's connection, so the
+            /// forward times out before its request is written.
+            Busy,
+        }
+
+        /// A worker stopped with `SIGSTOP` answers nothing until it is continued.
+        struct StoppedWorker(i32);
+
+        impl StoppedWorker {
+            fn stop(pid: u32) -> Self {
+                let pid = i32::try_from(pid).expect("worker pid");
+                kill(Pid::from_raw(pid), Signal::SIGSTOP).expect("stop the worker");
+                Self(pid)
+            }
+        }
+
+        impl Drop for StoppedWorker {
+            fn drop(&mut self) {
+                let _continued = kill(Pid::from_raw(self.0), Signal::SIGCONT);
+            }
+        }
+
+        /// A bound report of the session's root process, which the real worker
+        /// can journal.
+        fn forwardable_report(created: &SessionInfo) -> protocol::SessionReportAgentParams {
+            let start = HostInspector::new()
+                .identity(created.pid)
+                .expect("read the root process")
+                .expect("the root process runs")
+                .start_identity
+                .get();
+            protocol::SessionReportAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                activity: None,
+                seq: Some(protocol::ReportSequence::new(2_000)),
+                pid: Some(created.pid),
+                agent_session_id: Some("native-one".to_owned()),
+                agent_session_path: None,
+                pid_start_identity: Some(protocol::ProcessStartIdentity::new(start)),
+                monotonic_sequence: Some(protocol::ReportSequence::new(1)),
+                retryable_admission: false,
+            }
+        }
+
+        async fn claim_is_journaled(fixture: &Fixture, id: &SessionId) -> bool {
+            fixture
+                .registry
+                .inner
+                .sessions
+                .lock()
+                .await
+                .get(id)
+                .and_then(|entry| entry.active_agent.as_ref())
+                .is_some_and(|active| {
+                    matches!(
+                        active.origin,
+                        crate::session::claim::ClaimOrigin::Journaled { .. }
+                    )
+                })
+        }
+
+        /// A forward to a worker that answers nothing ends at the configured
+        /// worker bound: the report stays a memory-only claim and is accepted.
+        #[tokio::test]
+        async fn a_report_forwarded_to_a_stopped_worker_stays_in_memory_at_the_bound() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            let worker = fixture
+                .launcher
+                .worker_process_id(&created.id.0)
+                .await
+                .expect("the worker runs");
+            let stopped = fixture.stop_worker(worker);
+
+            let result = tokio::time::timeout(
+                HANG_GUARD,
+                fixture.registry.report_agent(forwardable_report(&created)),
+            )
+            .await
+            .expect("the report is answered at the worker bound");
+
+            assert!(result.recorded, "the daemon's own rules accept the report");
+            assert!(
+                !claim_is_journaled(&fixture, &created.id).await,
+                "nothing was journaled"
+            );
+            drop(stopped);
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// A request to a stopped worker that no deadline bounds (a periodic
+        /// sync, another operation) keeps the worker connection busy; a forward
+        /// still ends at the worker bound.
+        #[tokio::test]
+        async fn a_report_forwarded_over_a_busy_worker_connection_stays_in_memory_at_the_bound() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            let worker = fixture
+                .launcher
+                .worker_process_id(&created.id.0)
+                .await
+                .expect("the worker runs");
+            let handle =
+                crate::session::tests::session_worker(&fixture.registry, &created.id).await;
+            let stopped = fixture.stop_worker(worker);
+            let busy = tokio::spawn(async move { handle.inspect().await });
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+
+            let result = tokio::time::timeout(
+                HANG_GUARD,
+                fixture.registry.report_agent(forwardable_report(&created)),
+            )
+            .await
+            .expect("the report is answered at the worker bound");
+
+            assert!(result.recorded);
+            assert!(!claim_is_journaled(&fixture, &created.id).await);
+            assert_eq!(
+                pending_state_of(&fixture, &created.id).await,
+                (None, None),
+                "a request that never left leaves nothing the worker may hold"
+            );
+            drop(stopped);
+            let _ = busy.await;
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// Runs `operation` until it is about to call the worker (`points` is the
+        /// number of parking points it passes), stops the worker there and lets
+        /// the operation go on. The worker has the operation's request in its
+        /// socket and answers it once it is continued.
+        async fn stop_worker_at_forward<T: Send + 'static>(
+            fixture: &Fixture,
+            created: &SessionInfo,
+            points: usize,
+            answer: Answer,
+            operation: impl std::future::Future<Output = T> + Send + 'static,
+        ) -> (T, StoppedWorker) {
+            stop_worker_at_forward_then(fixture, created, points, answer, async {}, operation).await
+        }
+
+        /// [`stop_worker_at_forward`] that runs `between` once the worker is
+        /// stopped and before the operation goes on.
+        async fn stop_worker_at_forward_then<T: Send + 'static>(
+            fixture: &Fixture,
+            created: &SessionInfo,
+            points: usize,
+            answer: Answer,
+            between: impl std::future::Future<Output = ()>,
+            operation: impl std::future::Future<Output = T> + Send + 'static,
+        ) -> (T, StoppedWorker) {
+            let worker = fixture
+                .launcher
+                .worker_process_id(&created.id.0)
+                .await
+                .expect("the worker runs");
+            let gate = crate::runtime::lifecycle::tests::StartGate {
+                session_id: None,
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+            };
+            let arm = |hold: Option<crate::runtime::lifecycle::tests::StartGate>| {
+                *fixture
+                    .registry
+                    .inner
+                    .report_hold
+                    .lock()
+                    .expect("report hold is never poisoned") = hold;
+            };
+            arm(Some(gate.clone()));
+            let operation = tokio::spawn(operation);
+            for point in 0..points {
+                tokio::time::timeout(HANG_GUARD, gate.entered.notified())
+                    .await
+                    .expect("the operation reaches its parking point");
+                if point + 1 < points {
+                    gate.release.notify_waiters();
+                }
+            }
+            // A lost answer needs the connection to close before the bound.
+            let stopped = if answer == Answer::Lost {
+                StoppedWorker::stop(worker)
+            } else {
+                fixture.stop_worker(worker)
+            };
+            arm(None);
+            between.await;
+            if answer == Answer::Busy {
+                let handle =
+                    crate::session::tests::session_worker(&fixture.registry, &created.id).await;
+                drop(tokio::spawn(async move { handle.inspect().await }));
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            gate.release.notify_waiters();
+            if answer == Answer::Lost {
+                // The stopped worker holds the request in its socket; killing it
+                // closes the connection before the bound elapses.
+                for _ in 0..200 {
+                    tokio::task::yield_now().await;
+                }
+                kill(
+                    Pid::from_raw(i32::try_from(worker).expect("worker pid")),
+                    Signal::SIGKILL,
+                )
+                .expect("kill the worker");
+            }
+            let result = tokio::time::timeout(HANG_GUARD, operation)
+                .await
+                .expect("the operation ends at the worker bound")
+                .expect("the operation finishes");
+            (result, stopped)
+        }
+
+        fn unbound_report(created: &SessionInfo, seq: u64) -> protocol::SessionReportAgentParams {
+            protocol::SessionReportAgentParams {
+                activity: Some(protocol::AgentActivity::Blocked),
+                seq: Some(protocol::ReportSequence::new(seq)),
+                pid_start_identity: None,
+                monotonic_sequence: None,
+                ..forwardable_report(created)
+            }
+        }
+
+        async fn sync_after_continue(fixture: &Fixture, created: &SessionInfo) {
+            let worker =
+                crate::session::tests::session_worker(&fixture.registry, &created.id).await;
+            crate::session::tests::sync_from(&fixture.registry, &created.id, &worker).await;
+        }
+
+        async fn claim_state(
+            fixture: &Fixture,
+            id: &SessionId,
+        ) -> (bool, Option<protocol::AgentActivity>) {
+            let sessions = fixture.registry.inner.sessions.lock().await;
+            let entry = sessions.get(id).expect("the session");
+            (
+                entry.active_agent.as_ref().is_some_and(|active| {
+                    matches!(
+                        active.origin,
+                        crate::session::claim::ClaimOrigin::Memory { .. }
+                    )
+                }),
+                entry.info.activity,
+            )
+        }
+
+        async fn pending_state_of(
+            fixture: &Fixture,
+            id: &SessionId,
+        ) -> (Option<bool>, Option<bool>) {
+            let sessions = fixture.registry.inner.sessions.lock().await;
+            let entry = sessions.get(id).expect("the session");
+            (
+                entry
+                    .pending_activity
+                    .as_ref()
+                    .map(|pending| pending.acknowledged),
+                entry
+                    .pending_release
+                    .as_ref()
+                    .map(|pending| pending.acknowledged),
+            )
+        }
+
+        /// The unacknowledged and accepted operations the session tracks,
+        /// including the ones that lost their slot.
+        async fn tracked_operations(fixture: &Fixture, id: &SessionId) -> usize {
+            let sessions = fixture.registry.inner.sessions.lock().await;
+            let entry = sessions.get(id).expect("the session");
+            usize::from(entry.pending_activity.is_some())
+                + usize::from(entry.pending_release.is_some())
+                + entry.displaced_pending.len()
+        }
+
+        /// V-A: a report that timed out before its request was written leaves no
+        /// pending the worker could be thought to hold.
+        #[tokio::test]
+        async fn an_unsent_report_leaves_no_pending() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            let (result, stopped) = {
+                let registry = fixture.registry.clone();
+                let report = forwardable_report(&created);
+                stop_worker_at_forward(&fixture, &created, 2, Answer::Busy, async move {
+                    registry.report_agent(report).await
+                })
+                .await
+            };
+            assert!(result.recorded);
+            assert_eq!(pending_state_of(&fixture, &created.id).await, (None, None));
+            drop(stopped);
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// V-B: a release that timed out before it was written leaves no pending,
+        /// so the journal still holds the claim and a memory report of another
+        /// process is refused (D2).
+        #[tokio::test]
+        async fn an_unsent_release_leaves_the_journaled_claim_held() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            assert!(
+                fixture
+                    .registry
+                    .report_agent(forwardable_report(&created))
+                    .await
+                    .recorded
+            );
+            assert!(claim_is_journaled(&fixture, &created.id).await);
+            let release = protocol::SessionReleaseAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                seq: Some(protocol::ReportSequence::new(2_010)),
+                pid: Some(created.pid),
+                pid_start_identity: forwardable_report(&created).pid_start_identity,
+                monotonic_sequence: Some(protocol::ReportSequence::new(2)),
+                retryable_admission: false,
+            };
+            let (released, stopped) = {
+                let registry = fixture.registry.clone();
+                stop_worker_at_forward(&fixture, &created, 1, Answer::Busy, async move {
+                    registry.release_agent(release).await
+                })
+                .await
+            };
+            assert!(!released.released);
+            assert_eq!(
+                pending_state_of(&fixture, &created.id).await.1,
+                None,
+                "an unsent release is not pending"
+            );
+            let other = protocol::SessionReportAgentParams {
+                source: "pohunek:codex-other".to_owned(),
+                pid: Some(std::process::id()),
+                pid_start_identity: None,
+                monotonic_sequence: None,
+                ..forwardable_report(&created)
+            };
+            assert!(
+                !tokio::time::timeout(HANG_GUARD, fixture.registry.report_agent(other))
+                    .await
+                    .expect("the report is answered")
+                    .recorded,
+                "the claim the worker holds is not replaced by another process"
+            );
+            drop(stopped);
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// X001: a report whose answer was lost after the request was sent may
+        /// be journaled, so it stays pending like one that timed out, and a
+        /// memory report made after it holds against it.
+        #[tokio::test]
+        async fn a_report_whose_answer_was_lost_leaves_an_unacknowledged_pending() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            let (first, stopped) = {
+                let registry = fixture.registry.clone();
+                let report = forwardable_report(&created);
+                stop_worker_at_forward(&fixture, &created, 2, Answer::Lost, async move {
+                    registry.report_agent(report).await
+                })
+                .await
+            };
+            assert!(first.recorded);
+            assert_eq!(
+                pending_state_of(&fixture, &created.id).await,
+                (Some(false), None),
+                "the report the worker may hold stays pending"
+            );
+            drop(stopped);
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// X001: the same for a release.
+        #[tokio::test]
+        async fn a_release_whose_answer_was_lost_leaves_an_unacknowledged_pending() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            assert!(
+                fixture
+                    .registry
+                    .report_agent(forwardable_report(&created))
+                    .await
+                    .recorded
+            );
+            let release = protocol::SessionReleaseAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                seq: Some(protocol::ReportSequence::new(2_010)),
+                pid: Some(created.pid),
+                pid_start_identity: forwardable_report(&created).pid_start_identity,
+                monotonic_sequence: Some(protocol::ReportSequence::new(2)),
+                retryable_admission: false,
+            };
+            let (released, stopped) = {
+                let registry = fixture.registry.clone();
+                stop_worker_at_forward(&fixture, &created, 1, Answer::Lost, async move {
+                    registry.release_agent(release).await
+                })
+                .await
+            };
+            assert!(!released.released);
+            assert_eq!(
+                pending_state_of(&fixture, &created.id).await.1,
+                Some(false),
+                "the release the worker may hold stays pending"
+            );
+            drop(stopped);
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// T1 / V6: a forwarded report whose answer timed out and that the worker
+        /// journaled afterwards does not replace the newer memory report made
+        /// after it.
+        #[tokio::test]
+        async fn a_newer_memory_report_holds_against_a_report_the_worker_journaled_after_the_bound()
+        {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            let (first, stopped) = {
+                let registry = fixture.registry.clone();
+                let report = protocol::SessionReportAgentParams {
+                    seq: Some(protocol::ReportSequence::new(2_010)),
+                    ..forwardable_report(&created)
+                };
+                stop_worker_at_forward(&fixture, &created, 2, Answer::Timeout, async move {
+                    registry.report_agent(report).await
+                })
+                .await
+            };
+            assert!(first.recorded, "the report stays in memory at the bound");
+            assert!(
+                tokio::time::timeout(
+                    HANG_GUARD,
+                    fixture
+                        .registry
+                        .report_agent(unbound_report(&created, 2_020)),
+                )
+                .await
+                .expect("the newer report is answered")
+                .recorded
+            );
+            drop(stopped);
+
+            sync_after_continue(&fixture, &created).await;
+
+            assert_eq!(
+                claim_state(&fixture, &created.id).await,
+                (true, Some(protocol::AgentActivity::Blocked))
+            );
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// T2 / V7: a forwarded release whose answer timed out and that the worker
+        /// journaled afterwards does not clear the newer memory report made after
+        /// it.
+        #[tokio::test]
+        async fn a_newer_memory_report_holds_against_a_release_the_worker_journaled_after_the_bound(
+        ) {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            assert!(
+                fixture
+                    .registry
+                    .report_agent(protocol::SessionReportAgentParams {
+                        seq: Some(protocol::ReportSequence::new(2_005)),
+                        ..forwardable_report(&created)
+                    })
+                    .await
+                    .recorded
+            );
+            let release = protocol::SessionReleaseAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                seq: Some(protocol::ReportSequence::new(2_010)),
+                pid: Some(created.pid),
+                pid_start_identity: forwardable_report(&created).pid_start_identity,
+                monotonic_sequence: Some(protocol::ReportSequence::new(2)),
+                retryable_admission: false,
+            };
+            let (released, stopped) = {
+                let registry = fixture.registry.clone();
+                stop_worker_at_forward(&fixture, &created, 1, Answer::Timeout, async move {
+                    registry.release_agent(release).await
+                })
+                .await
+            };
+            assert!(
+                !released.released,
+                "a release that could not be answered does not end the journaled claim"
+            );
+            assert!(
+                tokio::time::timeout(
+                    HANG_GUARD,
+                    fixture
+                        .registry
+                        .report_agent(unbound_report(&created, 2_030)),
+                )
+                .await
+                .expect("the newer report is answered")
+                .recorded
+            );
+            drop(stopped);
+
+            sync_after_continue(&fixture, &created).await;
+
+            assert_eq!(
+                claim_state(&fixture, &created.id).await,
+                (true, Some(protocol::AgentActivity::Blocked))
+            );
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// A release whose answer timed out is ordered after a report the worker
+        /// accepted and the daemon has not committed: a report older than the
+        /// release is refused, as it is once the release committed.
+        #[tokio::test]
+        async fn a_timed_out_release_is_ordered_after_a_report_waiting_for_its_commit() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            fixture
+                .registry
+                .inner
+                .worker_imports_blocked
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                fixture
+                    .registry
+                    .report_agent(forwardable_report(&created))
+                    .await
+                    .recorded
+            );
+            let release = protocol::SessionReleaseAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                seq: Some(protocol::ReportSequence::new(2_010)),
+                pid: Some(created.pid),
+                pid_start_identity: forwardable_report(&created).pid_start_identity,
+                monotonic_sequence: Some(protocol::ReportSequence::new(2)),
+                retryable_admission: false,
+            };
+            let (released, stopped) = {
+                let registry = fixture.registry.clone();
+                stop_worker_at_forward(&fixture, &created, 1, Answer::Timeout, async move {
+                    registry.release_agent(release).await
+                })
+                .await
+            };
+            assert!(!released.released);
+
+            assert!(
+                !tokio::time::timeout(
+                    HANG_GUARD,
+                    fixture.registry.report_agent(unbound_report(&created, 2_005)),
+                )
+                .await
+                .expect("the report is answered")
+                .recorded,
+                "a report older than the release is judged against the release, not against the waiting report"
+            );
+            drop(stopped);
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        fn report_at(
+            created: &SessionInfo,
+            monotonic: u64,
+            seq: u64,
+        ) -> protocol::SessionReportAgentParams {
+            protocol::SessionReportAgentParams {
+                seq: Some(protocol::ReportSequence::new(seq)),
+                monotonic_sequence: Some(protocol::ReportSequence::new(monotonic)),
+                ..forwardable_report(created)
+            }
+        }
+
+        fn release_at(
+            created: &SessionInfo,
+            monotonic: u64,
+            seq: u64,
+        ) -> protocol::SessionReleaseAgentParams {
+            protocol::SessionReleaseAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                seq: Some(protocol::ReportSequence::new(seq)),
+                pid: Some(created.pid),
+                pid_start_identity: forwardable_report(created).pid_start_identity,
+                monotonic_sequence: Some(protocol::ReportSequence::new(monotonic)),
+                retryable_admission: false,
+            }
+        }
+
+        /// A release of the memory claim `unbound_report` makes.
+        fn unbound_release(created: &SessionInfo, seq: u64) -> protocol::SessionReleaseAgentParams {
+            protocol::SessionReleaseAgentParams {
+                pid_start_identity: None,
+                monotonic_sequence: None,
+                ..release_at(created, 0, seq)
+            }
+        }
+
+        /// Reports the session's root process to its worker, which journals the
+        /// claim; the daemon commits it only once imports are allowed again, so
+        /// no sync moves the identity fence while the scenario goes on.
+        async fn defer_a_claim(
+            fixture: &Fixture,
+            created: &SessionInfo,
+            activity: Option<protocol::AgentActivity>,
+        ) {
+            allow_imports(fixture, false);
+            assert!(
+                fixture
+                    .registry
+                    .report_agent(protocol::SessionReportAgentParams {
+                        activity,
+                        ..report_at(created, 1, 2_000)
+                    })
+                    .await
+                    .recorded
+            );
+            assert_eq!(
+                pending_state_of(fixture, &created.id).await.0,
+                Some(true),
+                "the worker accepted the report and the commit waits"
+            );
+        }
+
+        fn allow_imports(fixture: &Fixture, allowed: bool) {
+            fixture
+                .registry
+                .inner
+                .worker_imports_blocked
+                .store(!allowed, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        /// Forwards `operation` to a worker stopped at the forward, so it times
+        /// out after its request was sent, then continues the worker and waits
+        /// until it has handled the request without the daemon applying it.
+        async fn lose_and_settle<T: Send + 'static>(
+            fixture: &Fixture,
+            created: &SessionInfo,
+            points: usize,
+            operation: impl std::future::Future<Output = T> + Send + 'static,
+        ) -> T {
+            let (result, stopped) =
+                stop_worker_at_forward(fixture, created, points, Answer::Timeout, operation).await;
+            drop(stopped);
+            crate::session::tests::session_worker(&fixture.registry, &created.id)
+                .await
+                .inspect()
+                .await
+                .expect("the continued worker answers");
+            result
+        }
+
+        async fn lose_report(
+            fixture: &Fixture,
+            created: &SessionInfo,
+            report: protocol::SessionReportAgentParams,
+        ) -> protocol::SessionReportAgentResult {
+            let registry = fixture.registry.clone();
+            lose_and_settle(fixture, created, 2, async move {
+                Box::pin(registry.report_agent(report)).await
+            })
+            .await
+        }
+
+        async fn lose_release(
+            fixture: &Fixture,
+            created: &SessionInfo,
+            release: protocol::SessionReleaseAgentParams,
+        ) -> protocol::SessionReleaseAgentResult {
+            let registry = fixture.registry.clone();
+            lose_and_settle(fixture, created, 1, async move {
+                registry.release_agent(release).await
+            })
+            .await
+        }
+
+        async fn memory_report_is_recorded(
+            fixture: &Fixture,
+            report: protocol::SessionReportAgentParams,
+        ) -> bool {
+            tokio::time::timeout(HANG_GUARD, fixture.registry.report_agent(report))
+                .await
+                .expect("the report is answered")
+                .recorded
+        }
+
+        async fn active_agent_name(fixture: &Fixture, id: &SessionId) -> Option<String> {
+            fixture
+                .registry
+                .inspect(id)
+                .await
+                .expect("inspect the session")
+                .active_agent
+        }
+
+        /// M1: a release and then a report, both sent and answered by nobody the
+        /// daemon heard, are both journaled by the worker; a memory report made
+        /// after both holds against the snapshot that carries them.
+        #[tokio::test]
+        async fn a_memory_report_holds_against_a_lost_release_and_a_lost_report() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            defer_a_claim(&fixture, &created, None).await;
+            assert!(
+                !lose_release(&fixture, &created, release_at(&created, 2, 2_010))
+                    .await
+                    .released
+            );
+            assert!(
+                Box::pin(lose_report(
+                    &fixture,
+                    &created,
+                    report_at(&created, 3, 2_020)
+                ))
+                .await
+                .recorded
+            );
+            assert_eq!(
+                pending_state_of(&fixture, &created.id).await,
+                (Some(true), Some(false))
+            );
+            assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_030)).await);
+
+            allow_imports(&fixture, true);
+            sync_after_continue(&fixture, &created).await;
+
+            assert_eq!(
+                claim_state(&fixture, &created.id).await,
+                (true, Some(protocol::AgentActivity::Blocked))
+            );
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// M2: the same when the worker rejects the newest of the two (its
+        /// sequence is stale), so it journals only the release; the memory
+        /// report holds against the older one.
+        #[tokio::test]
+        async fn a_memory_report_holds_against_the_older_of_two_lost_operations() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            defer_a_claim(&fixture, &created, None).await;
+            assert!(
+                !lose_release(&fixture, &created, release_at(&created, 2, 2_010))
+                    .await
+                    .released
+            );
+            assert!(
+                Box::pin(lose_report(
+                    &fixture,
+                    &created,
+                    report_at(&created, 1, 2_020)
+                ))
+                .await
+                .recorded
+            );
+            assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_030)).await);
+
+            allow_imports(&fixture, true);
+            sync_after_continue(&fixture, &created).await;
+
+            assert_eq!(
+                claim_state(&fixture, &created.id).await,
+                (true, Some(protocol::AgentActivity::Blocked))
+            );
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// M3: a memory release of the report made after two lost operations
+        /// ends it, and the snapshot that carries them does not bring a claim
+        /// back.
+        #[tokio::test]
+        async fn a_memory_release_ends_a_report_made_after_two_lost_operations() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            defer_a_claim(&fixture, &created, None).await;
+            assert!(
+                !lose_release(&fixture, &created, release_at(&created, 2, 2_010))
+                    .await
+                    .released
+            );
+            assert!(
+                Box::pin(lose_report(
+                    &fixture,
+                    &created,
+                    report_at(&created, 3, 2_020)
+                ))
+                .await
+                .recorded
+            );
+            assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_030)).await);
+
+            let released = fixture
+                .registry
+                .release_agent(unbound_release(&created, 2_040))
+                .await;
+
+            assert!(released.released);
+            allow_imports(&fixture, true);
+            sync_after_continue(&fixture, &created).await;
+            assert_eq!(active_agent_name(&fixture, &created.id).await, None);
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// H1: a report the worker accepted and the daemon has not committed
+        /// keeps its activity when a report of another process whose answer was
+        /// lost is refused by the daemon's own rules and then rejected by the
+        /// worker.
+        #[tokio::test]
+        async fn an_accepted_report_keeps_its_activity_when_a_later_lost_report_is_rejected() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            defer_a_claim(&fixture, &created, Some(protocol::AgentActivity::Blocked)).await;
+            let other_process = protocol::SessionReportAgentParams {
+                pid: Some(std::process::id()),
+                pid_start_identity: None,
+                ..report_at(&created, 5, 2_020)
+            };
+            assert!(
+                !Box::pin(lose_report(&fixture, &created, other_process))
+                    .await
+                    .recorded,
+                "the claim the worker accepted is not replaced by another process"
+            );
+            allow_imports(&fixture, true);
+
+            sync_after_continue(&fixture, &created).await;
+
+            assert!(claim_is_journaled(&fixture, &created.id).await);
+            assert_eq!(
+                claim_state(&fixture, &created.id).await.1,
+                Some(protocol::AgentActivity::Blocked),
+                "the accepted report keeps the activity it applies once adopted"
+            );
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// A release that lost the release slot to a later lost release still
+        /// supplies its public order when the snapshot that carries it is
+        /// adopted: a report older than it is refused.
+        #[tokio::test]
+        async fn a_release_that_lost_its_slot_still_orders_the_snapshot_that_carries_it() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            defer_a_claim(&fixture, &created, None).await;
+            assert!(
+                !lose_release(&fixture, &created, release_at(&created, 2, 2_010))
+                    .await
+                    .released
+            );
+            assert!(
+                !lose_release(&fixture, &created, release_at(&created, 3, 2_020))
+                    .await
+                    .released
+            );
+
+            allow_imports(&fixture, true);
+            sync_after_continue(&fixture, &created).await;
+
+            assert!(
+                !memory_report_is_recorded(&fixture, unbound_report(&created, 2_005)).await,
+                "a report older than the journaled release is refused"
+            );
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        fn stored_activity(fixture: &Fixture, id: &SessionId) -> Option<protocol::AgentActivity> {
+            Store::new(fixture.root.join("data/metadata.jsonl"))
+                .load_sessions()
+                .expect("load the store")
+                .into_iter()
+                .find(|record| record.session_id == id.0)
+                .expect("the session is stored")
+                .info
+                .activity
+        }
+
+        /// The activity a forwarded claim reported ends with the claim in the
+        /// stored record too, not only in memory.
+        #[tokio::test]
+        async fn a_forwarded_release_ends_the_reported_activity_in_the_stored_record() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            assert!(
+                fixture
+                    .registry
+                    .report_agent(protocol::SessionReportAgentParams {
+                        activity: Some(protocol::AgentActivity::Blocked),
+                        ..report_at(&created, 1, 2_000)
+                    })
+                    .await
+                    .recorded
+            );
+            assert_eq!(
+                claim_state(&fixture, &created.id).await.1,
+                Some(protocol::AgentActivity::Blocked)
+            );
+
+            let released = fixture
+                .registry
+                .release_agent(release_at(&created, 2, 2_010))
+                .await;
+
+            assert!(released.released);
+            assert_eq!(active_agent_name(&fixture, &created.id).await, None);
+            assert_eq!(claim_state(&fixture, &created.id).await.1, None);
+            assert_eq!(
+                stored_activity(&fixture, &created.id),
+                None,
+                "a restart does not restore the activity of a released claim"
+            );
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// A forward lost after it was sent stays pending although the report
+        /// is then refused for a reason that arises while it waits for the
+        /// worker: the session's pin is replaced and the report names a runtime
+        /// the daemon no longer serves. A memory report made after it holds.
+        #[tokio::test]
+        async fn a_lost_forward_stays_pending_when_the_report_is_then_refused() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            let pin = fixture
+                .registry
+                .inner
+                .sessions
+                .lock()
+                .await
+                .get(&created.id)
+                .and_then(|entry| entry.pinned.clone())
+                .expect("the session is pinned");
+            let (lost, stopped) = {
+                let registry = fixture.registry.clone();
+                let report = report_at(&created, 1, 2_010);
+                stop_worker_at_forward_then(
+                    &fixture,
+                    &created,
+                    2,
+                    Answer::Timeout,
+                    async {
+                        fixture
+                            .registry
+                            .inner
+                            .sessions
+                            .lock()
+                            .await
+                            .get_mut(&created.id)
+                            .expect("the session")
+                            .pinned = None;
+                    },
+                    async move { registry.report_agent(report).await },
+                )
+                .await
+            };
+            fixture
+                .registry
+                .inner
+                .sessions
+                .lock()
+                .await
+                .get_mut(&created.id)
+                .expect("the session")
+                .pinned = Some(pin);
+
+            assert!(
+                !lost.recorded,
+                "the report names a runtime that is not served"
+            );
+            assert_eq!(
+                pending_state_of(&fixture, &created.id).await,
+                (Some(false), None),
+                "the request the worker may journal stays pending"
+            );
+            assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_020)).await);
+            drop(stopped);
+
+            sync_after_continue(&fixture, &created).await;
+
+            assert_eq!(
+                claim_state(&fixture, &created.id).await,
+                (true, Some(protocol::AgentActivity::Blocked))
+            );
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// M4 / V-A: two reports that time out before their request is written
+        /// leave nothing pending; the report that was sent before them is the
+        /// only one the worker journals, and a memory report made after all
+        /// three holds against it.
+        #[tokio::test]
+        async fn a_memory_report_holds_against_a_lost_report_followed_by_unsent_ones() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            let (first, stopped) = {
+                let registry = fixture.registry.clone();
+                let report = report_at(&created, 1, 2_010);
+                stop_worker_at_forward(&fixture, &created, 2, Answer::Timeout, async move {
+                    registry.report_agent(report).await
+                })
+                .await
+            };
+            assert!(first.recorded);
+            let handle =
+                crate::session::tests::session_worker(&fixture.registry, &created.id).await;
+            let busy = tokio::spawn(async move { handle.inspect().await });
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            for (monotonic, seq) in [(2, 2_020), (3, 2_030)] {
+                assert!(
+                    memory_report_is_recorded(&fixture, report_at(&created, monotonic, seq)).await
+                );
+            }
+            assert_eq!(
+                tracked_operations(&fixture, &created.id).await,
+                1,
+                "only the report that was sent is tracked"
+            );
+            assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_040)).await);
+            drop(stopped);
+            let _ = busy.await;
+
+            sync_after_continue(&fixture, &created).await;
+
+            assert_eq!(
+                claim_state(&fixture, &created.id).await,
+                (true, Some(protocol::AgentActivity::Blocked))
+            );
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// A worker that acknowledged a forwarded report and then stops answering
+        /// does not hold the session's identity-commit guard past the worker
+        /// bound: the commit waits for the next sync and the report is accepted.
+        #[tokio::test]
+        async fn a_stopped_worker_does_not_hold_the_identity_commit_past_the_bound() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            let worker = fixture
+                .launcher
+                .worker_process_id(&created.id.0)
+                .await
+                .expect("the worker runs");
+            let gate = crate::runtime::lifecycle::tests::StartGate {
+                session_id: None,
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+            };
+            let arm = |hold: Option<crate::runtime::lifecycle::tests::StartGate>| {
+                *fixture
+                    .registry
+                    .inner
+                    .report_hold
+                    .lock()
+                    .expect("report hold is never poisoned") = hold;
+            };
+            arm(Some(gate.clone()));
+            let registry = fixture.registry.clone();
+            let report = forwardable_report(&created);
+            let op = tokio::spawn(async move { registry.report_agent(report).await });
+            // Admission, the worker call, then the commit that follows the
+            // worker's acknowledgement.
+            for point in 0..3 {
+                tokio::time::timeout(HANG_GUARD, gate.entered.notified())
+                    .await
+                    .expect("the report reaches its parking point");
+                if point == 2 {
+                    break;
+                }
+                gate.release.notify_waiters();
+            }
+            let stopped = fixture.stop_worker(worker);
+            arm(None);
+            gate.release.notify_waiters();
+
+            let result = tokio::time::timeout(HANG_GUARD, op)
+                .await
+                .expect("the report ends at the worker bound")
+                .expect("the report finishes");
+
+            assert!(result.recorded);
+            // The guard is free again: another operation of the session is not
+            // held behind the commit.
+            let unforwarded = protocol::SessionReportAgentParams {
+                pid_start_identity: None,
+                monotonic_sequence: None,
+                seq: Some(protocol::ReportSequence::new(3_000)),
+                ..forwardable_report(&created)
+            };
+            assert!(
+                tokio::time::timeout(HANG_GUARD, fixture.registry.report_agent(unforwarded))
+                    .await
+                    .expect("a later operation is not held by the stopped worker")
+                    .recorded
+            );
+            drop(stopped);
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// A worker that acknowledged a forwarded report and then stops answering
+        /// while another request keeps the connection busy: the order and activity
+        /// of the report are kept for the sync that adopts it. (Variant of the test above.)
+        /// does not hold the session's identity-commit guard past the worker
+        /// bound: the commit waits for the next sync and the report is accepted.
+        #[tokio::test]
+        async fn a_busy_connection_after_the_acknowledgement_keeps_the_context_of_the_report() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            let worker = fixture
+                .launcher
+                .worker_process_id(&created.id.0)
+                .await
+                .expect("the worker runs");
+            let gate = crate::runtime::lifecycle::tests::StartGate {
+                session_id: None,
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+            };
+            let arm = |hold: Option<crate::runtime::lifecycle::tests::StartGate>| {
+                *fixture
+                    .registry
+                    .inner
+                    .report_hold
+                    .lock()
+                    .expect("report hold is never poisoned") = hold;
+            };
+            arm(Some(gate.clone()));
+            let registry = fixture.registry.clone();
+            let report = forwardable_report(&created);
+            let op = tokio::spawn(async move { registry.report_agent(report).await });
+            // Admission, the worker call, then the commit that follows the
+            // worker's acknowledgement.
+            for point in 0..3 {
+                tokio::time::timeout(HANG_GUARD, gate.entered.notified())
+                    .await
+                    .expect("the report reaches its parking point");
+                if point == 2 {
+                    break;
+                }
+                gate.release.notify_waiters();
+            }
+            let stopped = fixture.stop_worker(worker);
+            let handle =
+                crate::session::tests::session_worker(&fixture.registry, &created.id).await;
+            let busy = tokio::spawn(async move { handle.inspect().await });
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            arm(None);
+            gate.release.notify_waiters();
+
+            let result = tokio::time::timeout(HANG_GUARD, op)
+                .await
+                .expect("the report ends at the worker bound")
+                .expect("the report finishes");
+
+            assert!(result.recorded);
+            assert!(
+                fixture
+                    .registry
+                    .inner
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&created.id)
+                    .is_some_and(|entry| entry.pending_activity.is_some()),
+                "the public order of the acknowledged report waits for its commit"
+            );
+            // The guard is free again: another operation of the session is not
+            // held behind the commit.
+            let unforwarded = protocol::SessionReportAgentParams {
+                pid_start_identity: None,
+                monotonic_sequence: None,
+                seq: Some(protocol::ReportSequence::new(3_000)),
+                ..forwardable_report(&created)
+            };
+            assert!(
+                tokio::time::timeout(HANG_GUARD, fixture.registry.report_agent(unforwarded))
+                    .await
+                    .expect("a later operation is not held by the stopped worker")
+                    .recorded
+            );
+            drop(stopped);
+            let _ = busy.await;
+            let _ = fixture.registry.stop(&created.id).await;
         }
 
         #[tokio::test]

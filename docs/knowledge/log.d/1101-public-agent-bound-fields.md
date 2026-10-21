@@ -14,6 +14,5 @@
   checked and still applies; one whose identity the host contradicts answers
   `released: false`.
 - The managed Claude and Codex state hooks send the new fields on their
-  daemon-socket fallback. Nothing forwards a bound report into the worker yet:
-  that arrives with the rest of #1101, and until then the fields only bind the
-  claim to its process.
+  daemon-socket fallback. The daemon forwards a report that carries them into the
+  worker (see the entry on durable public agent reports).

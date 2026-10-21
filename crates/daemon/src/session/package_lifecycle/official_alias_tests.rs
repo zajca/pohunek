@@ -30,7 +30,7 @@ use super::catalog_tests::{anchor, catalog, catalog_install, entry, signed_by, s
 use super::test_fixture::{explicit, Fixture, Package, INERT_PROGRAM, RUNTIME};
 use crate::agent::host::fixture::compiled_in_host;
 use crate::agent::host::ServedBy;
-use crate::procwatch::HostInspector;
+use crate::procwatch::{HostInspector, ProcessInspector as _};
 use crate::session::procwatch::OwnRuntime;
 use crate::session::tests::{
     durable_recovery, hermetic_shell, hook_gate, native_report_params, params, temp_dir,
@@ -1899,6 +1899,7 @@ async fn assert_transition_rules(
             reported_at: now,
             activity_reported: false,
             observed: true,
+            origin: crate::session::ClaimOrigin::memory(),
         };
         super::super::procwatch::apply_observed_transition(
             entry,
@@ -3150,6 +3151,23 @@ fn tuned_report(id: &protocol::SessionId) -> protocol::SessionReportAgentParams 
     }
 }
 
+/// The label of the active identity the session's worker has journaled.
+async fn journaled_label(registry: &SessionRegistry, id: &protocol::SessionId) -> Option<String> {
+    let worker = {
+        let sessions = registry.inner.sessions.lock().await;
+        let crate::session::RuntimeHandle::Worker(worker) = &sessions[id].runtime else {
+            panic!("the session runs on a worker");
+        };
+        worker.clone()
+    };
+    worker
+        .inspect()
+        .await
+        .expect("inspect the worker")
+        .active_identity
+        .and_then(|identity| identity.agent)
+}
+
 #[tokio::test]
 async fn an_own_runtime_report_naming_a_profile_keeps_its_manifest_override_through_a_package_change(
 ) {
@@ -3413,6 +3431,7 @@ async fn observe_own_runtime_process(registry: &SessionRegistry, id: &protocol::
         reported_at: std::time::Instant::now(),
         activity_reported: false,
         observed: true,
+        origin: crate::session::ClaimOrigin::memory(),
     });
     entry.info.active_agent = Some(RuntimeId::CLAUDE.to_owned());
     entry.info.active_agent_base = Some(entry.info.agent_base.clone());
@@ -3864,6 +3883,7 @@ async fn observe_nested_codex(registry: &SessionRegistry, id: &protocol::Session
         reported_at: std::time::Instant::now(),
         activity_reported: false,
         observed: true,
+        origin: crate::session::ClaimOrigin::memory(),
     });
     entry.info.active_agent = Some(RuntimeId::CODEX.to_owned());
     entry.info.active_agent_base = Some(protocol::RuntimeRef::codex());
@@ -4109,27 +4129,33 @@ async fn an_explicit_report_of_a_differently_named_profile_keeps_its_override_th
     )
     .await;
     let override_config = running_detector(&adopted.registry, &created.id).await;
+    // The report is bound to the session's root process: the daemon forwards it
+    // into the worker, which journals it, and the daemon's record follows the
+    // journal. Nothing here writes the record.
+    let root = HostInspector::new()
+        .identity(created.pid)
+        .expect("inspect the session root")
+        .expect("the session root runs");
     assert!(
         adopted
             .registry
             .report_agent(protocol::SessionReportAgentParams {
-                session_id: created.id.clone(),
-                source: "pohunek:tuned".to_owned(),
-                agent: TUNED_PROFILE.to_owned(),
-                activity: None,
-                seq: None,
-                pid: None,
-                agent_session_id: None,
-                agent_session_path: None,
-                pid_start_identity: None,
-                monotonic_sequence: None,
-                retryable_admission: false,
+                pid: Some(created.pid),
+                pid_start_identity: Some(protocol::ProcessStartIdentity::new(
+                    root.start_identity.get(),
+                )),
+                monotonic_sequence: Some(protocol::ReportSequence::new(1)),
+                ..tuned_report(&created.id)
             })
             .await
             .recorded,
         "the explicit report of the tuned profile is recorded"
     );
-    persist_session(&adopted.registry, &created.id).await;
+    assert_eq!(
+        journaled_label(&adopted.registry, &created.id).await,
+        Some(TUNED_PROFILE.to_owned()),
+        "the worker journaled the label of the report"
+    );
     let adopted = adopted.reopen_with_workers_of(&adopted.registry).await;
     Box::pin(adopted.registry.reconcile_workers())
         .await

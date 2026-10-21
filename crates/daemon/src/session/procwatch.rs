@@ -16,9 +16,9 @@ use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessIdentity, StartIdenti
 
 use super::{
     agent_kind_label, clear_active_agent, is_terminal, report_is_current, same_pin,
-    send_detector_config, timestamp_now, ActiveAgentReport, CancellationToken, MatchedDefinition,
-    Notify, ObservedAgent, Ordering, RuntimeWatchIdentity, SessionEntry, SessionId,
-    SessionRegistry,
+    send_detector_config, timestamp_now, ActiveAgentReport, CancellationToken, ClaimOrigin,
+    MatchedDefinition, Notify, ObservedAgent, Ordering, RuntimeWatchIdentity, SessionEntry,
+    SessionId, SessionRegistry,
 };
 
 const PROCWATCH_SOURCE: &str = "pohunek:procwatch";
@@ -1302,6 +1302,7 @@ impl SessionRegistry {
             reported_at: now,
             activity_reported: false,
             observed: true,
+            origin: ClaimOrigin::memory(),
         };
         Some(apply_observed_transition(entry, observed, report, agent))
     }
@@ -1321,6 +1322,7 @@ impl SessionRegistry {
             reported_at: now,
             activity_reported: false,
             observed: active.observed,
+            origin: ClaimOrigin::memory(),
         }
     }
 
@@ -1388,6 +1390,7 @@ impl SessionRegistry {
                 reported_at: now,
                 activity_reported: false,
                 observed: true,
+                origin: ClaimOrigin::memory(),
             };
             let _ = apply_observed_transition(entry, &observed, report, agent);
             return ForegroundDecision::Updated;
@@ -1714,7 +1717,15 @@ fn forget_observed_generation(entry: &mut SessionEntry, identity: ProcessIdentit
 
 /// The identity of the claim a scan reads: its source, agent, sequence,
 /// process, the process generation and origin.
-type ClaimKey = (String, String, Option<u64>, Option<Pid>, Option<u64>, bool);
+type ClaimKey = (
+    String,
+    String,
+    Option<u64>,
+    Option<Pid>,
+    Option<u64>,
+    bool,
+    Option<super::claim::ClaimKey>,
+);
 
 fn claim_key(entry: &SessionEntry) -> Option<ClaimKey> {
     entry.active_agent.as_ref().map(|active| {
@@ -1725,6 +1736,7 @@ fn claim_key(entry: &SessionEntry) -> Option<ClaimKey> {
             active.pid,
             active.start_identity,
             active.observed,
+            active.origin.key().cloned(),
         )
     })
 }

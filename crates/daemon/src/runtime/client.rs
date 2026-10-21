@@ -1,7 +1,7 @@
 //! Private client for one durable session worker.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,6 +64,10 @@ pub enum WorkerError {
         "worker control stream was interrupted mid-request and cannot carry further exchanges"
     )]
     TornStream,
+    /// A request was completely sent and its answer could not be read, so the
+    /// worker may have executed it.
+    #[error("worker answer to a sent request was lost: {0}")]
+    AnswerLost(Box<WorkerError>),
     /// The worker did not answer a stop within the daemon's bound, so it is
     /// frozen rather than slow.
     #[error("worker did not answer the stop within {bound:?} {stage}")]
@@ -829,18 +833,35 @@ impl Worker {
         &self,
         report: ForwardedActiveReport,
     ) -> Result<ActiveIdentityOutcome, WorkerError> {
+        self.record_active_identity_tracked(report, &AtomicBool::new(false))
+            .await
+    }
+
+    /// [`Self::record_active_identity`] that sets `sent` once the request was completely
+    /// written, so a caller that gives up waiting knows whether the worker may
+    /// have seen it.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::record_active_identity`] does.
+    pub async fn record_active_identity_tracked(
+        &self,
+        report: ForwardedActiveReport,
+        sent: &AtomicBool,
+    ) -> Result<ActiveIdentityOutcome, WorkerError> {
         let mut inner = self.inner.lock().await;
         require_active_identity_forwarding(inner.selected_version)?;
         let scope = scope(&inner)?;
-        let response = request_locked(
+        let response = request_forwarded(
             &mut inner,
             self.next_request_id("record-active-identity")?,
             RequestKind::RecordActiveIdentity { scope, report },
+            sent,
         )
         .await?;
         match response {
             ResponseKind::ActiveIdentityRecorded { outcome } => Ok(outcome),
-            other => response_error(other),
+            other => forwarded_response_error(other),
         }
     }
 
@@ -853,18 +874,35 @@ impl Worker {
         &self,
         release: ForwardedActiveRelease,
     ) -> Result<ActiveIdentityOutcome, WorkerError> {
+        self.release_active_identity_tracked(release, &AtomicBool::new(false))
+            .await
+    }
+
+    /// [`Self::release_active_identity`] that sets `sent` once the request was completely
+    /// written, so a caller that gives up waiting knows whether the worker may
+    /// have seen it.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::release_active_identity`] does.
+    pub async fn release_active_identity_tracked(
+        &self,
+        release: ForwardedActiveRelease,
+        sent: &AtomicBool,
+    ) -> Result<ActiveIdentityOutcome, WorkerError> {
         let mut inner = self.inner.lock().await;
         require_active_identity_forwarding(inner.selected_version)?;
         let scope = scope(&inner)?;
-        let response = request_locked(
+        let response = request_forwarded(
             &mut inner,
             self.next_request_id("release-active-identity")?,
             RequestKind::ReleaseActiveIdentity { scope, release },
+            sent,
         )
         .await?;
         match response {
             ResponseKind::ActiveIdentityRecorded { outcome } => Ok(outcome),
-            other => response_error(other),
+            other => forwarded_response_error(other),
         }
     }
 
@@ -1369,6 +1407,30 @@ fn input_write_id(lease_id: &LeaseId, sequence: u64) -> Result<WriteId, WorkerEr
         .map_err(|error| WorkerError::Protocol(error.to_string()))
 }
 
+/// Sends one request on the shared control connection and reads its response,
+/// for a request the worker may act on even when its answer never arrives.
+///
+/// `sent` is set once the request was completely written, also when the caller
+/// is dropped afterwards, and a failure after that point is reported as
+/// [`WorkerError::AnswerLost`]. See [`exchange_locked`] for how dropped callers
+/// are handled.
+async fn request_forwarded(
+    inner: &mut Inner,
+    request_id: RequestId,
+    kind: RequestKind,
+    sent: &AtomicBool,
+) -> Result<ResponseKind, WorkerError> {
+    exchange_tracked(inner, ControlRequest { request_id, kind }, || {}, sent)
+        .await
+        .map_err(|error| {
+            if sent.load(Ordering::Acquire) {
+                WorkerError::AnswerLost(Box::new(error))
+            } else {
+                error
+            }
+        })
+}
+
 /// Sends one request on the shared control connection and reads its response.
 ///
 /// See [`exchange_locked`] for how dropped callers are handled.
@@ -1406,11 +1468,27 @@ async fn exchange_locked<F>(
 where
     F: FnOnce(),
 {
+    exchange_tracked(inner, request, send_started, &AtomicBool::new(false)).await
+}
+
+/// [`exchange_locked`] that reports through `completed` whether the request was
+/// completely written, so a caller can tell a failure that precedes the worker
+/// seeing it from one that follows.
+async fn exchange_tracked<F>(
+    inner: &mut Inner,
+    request: ControlRequest,
+    send_started: F,
+    completed: &AtomicBool,
+) -> Result<ResponseKind, WorkerError>
+where
+    F: FnOnce(),
+{
     drain_marked(inner).await?;
     let expected = request.request_id.clone();
     let send = SendGuard::arm(Arc::clone(&inner.send_state));
     send_started();
     send_request(&mut inner.writer, request).await?;
+    completed.store(true, Ordering::Release);
     // No await separates the completed send from the marker, so a dropped
     // caller can only abandon the response, never tear the stream.
     inner.stream_state = StreamState::Unread(expected.clone());
@@ -1520,6 +1598,15 @@ fn require_active_identity_forwarding(selected_version: Version) -> Result<(), W
     })
 }
 
+/// [`response_error`] for a request the worker may have executed: an answer of
+/// an unexpected kind is a lost answer, a rejection the worker states is not.
+fn forwarded_response_error<T>(response: ResponseKind) -> Result<T, WorkerError> {
+    match response_error(response) {
+        Err(error @ WorkerError::ResponseMismatch) => Err(WorkerError::AnswerLost(Box::new(error))),
+        other => other,
+    }
+}
+
 fn response_error<T>(response: ResponseKind) -> Result<T, WorkerError> {
     match response {
         ResponseKind::Error { error } => Err(WorkerError::Rejected {
@@ -1538,6 +1625,26 @@ mod tests {
     use pohunek_session_worker::{Server, ServerArgs, WorkerConfig};
 
     use super::*;
+
+    /// An answer of an unexpected kind to a forwarded identity request is a
+    /// lost answer; a rejection the worker states is not.
+    #[test]
+    fn a_forwarded_request_answered_with_another_kind_is_a_lost_answer() {
+        assert!(matches!(
+            forwarded_response_error::<()>(ResponseKind::TerminalAcknowledged),
+            Err(WorkerError::AnswerLost(_))
+        ));
+        assert!(matches!(
+            forwarded_response_error::<()>(ResponseKind::Error {
+                error: pohunek_worker_protocol::ControlError {
+                    code: pohunek_worker_protocol::ControlCode::IdentityMismatch,
+                    message: "no".to_owned(),
+                    retryable: false,
+                },
+            }),
+            Err(WorkerError::Rejected { .. })
+        ));
+    }
 
     /// A private root for one test, removed when dropped.
     fn test_root(name: &str) -> crate::test_support::ScopedDir {

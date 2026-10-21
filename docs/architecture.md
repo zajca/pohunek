@@ -526,6 +526,46 @@ The inspect snapshot also reports `drains_streams_on_terminal_ack` (absent means
 false): a worker that sets it lets attached data streams finish before it
 answers `AcknowledgeTerminal`, and the daemon acknowledges no worker that omits it.
 
+The daemon forwards a bound `session.report_agent` or `session.release_agent`
+(it carries `pid` and `monotonic_sequence`; the daemon reads the start identity of
+the process when the caller sends none and confirms it when the caller does) once
+the existing admission has passed. The forward and its commit run in a task the
+daemon owns, so a hook that gave up on its answer cannot cancel a half-done
+commit. A worker refusal is final and answers `recorded: false`; the one
+exception is a release for an identity that was only ever held in memory, which
+the memory release rule still clears. A release that cannot be forwarded never
+ends a claim the worker journaled: the journal is the truth for it, and the exit
+watch of the reporting process ends it. A memory-only report replaces a journaled
+claim only from the same process (pid and start identity) with a newer public
+sequence; a report that names a pid without its start identity is bound by the
+identity the host reports for the pid. After an acceptance the daemon commits the
+claim the worker holds through the projection of a worker snapshot. A per-session
+identity-commit guard serializes every claim-changing public operation (check,
+forward, commit) with every other snapshot projection: a report or release is
+checked against the claim it meets and committed inside one critical section, and
+the public order (source, label, sequence) that produced the claim is recorded
+with it, release tombstone included. A claim that waits for its commit counts as
+the held journaled claim, and a release that waits for its commit holds the
+journal empty: a memory report is judged against that release only. A memory
+claim or release recorded while an operation waits carries the newest revision
+the worker accepted as its floor, so the adoption of that operation and every
+later projection at or below it leave the memory claim alone; a revision above
+it replaces it. A request that timed out before it was written leaves nothing pending. An operation whose answer timed out, or was lost after the request was sent, stays pending with an
+unknown revision, and a memory claim recorded after it holds against the
+snapshot whose change is that operation, at any revision. The worker call and the snapshot read that follow it are
+bounded by the worker connect deadline (`service.toml` `worker_connect_ms`); a
+timeout keeps the report memory-only or leaves the commit to the next sync. A fence of the newest committed identity
+revision (per worker instance, in memory) makes a snapshot read before a commit
+leave the active identity alone while its native reference, subagents and
+background still apply. A report that cannot be forwarded takes the memory-only
+path: it is unbound, the worker negotiated v7, or the forward failed in transit
+or in the worker's journal. The last two keep today's `recorded: true` when the
+daemon's own rules accept it, with a WARN for a failed forward, and an INFO
+`session.active_identity.not_durable` per session and cause names each of them.
+A forward the worker accepted whose snapshot the daemon could not read or apply
+in time logs `session.active_identity.commit_deferred` at WARN: the worker
+journaled the claim and the next sync commits it. A v7 worker reports no revision, so no fence applies to it.
+
 Public observation is bounded by the 1 MiB control-line ceiling. Output accounts
 for base64 expansion and response metadata; screen snapshots are measured after
 JSON serialization. The default maximum wait is eight seconds. Waiting

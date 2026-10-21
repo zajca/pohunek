@@ -6855,7 +6855,13 @@ async fn worker_metadata_reported_before_the_record_is_current_is_applied_afterw
             .is_empty(),
         "a record that is not live yet takes no worker metadata"
     );
-    assert_reconnect_transition_applied(&registry, &created.id, &expected, &worker).await;
+    Box::pin(assert_reconnect_transition_applied(
+        &registry,
+        &created.id,
+        &expected,
+        &worker,
+    ))
+    .await;
 
     // The worker outlives the wait, so only a retry of the dropped snapshot
     // can register the subagent within the bound.
@@ -7403,6 +7409,7 @@ async fn a_worker_report_of_an_observed_agent_makes_it_reported() {
         reported_at: crate::time::now(),
         activity_reported: false,
         observed: true,
+        origin: super::ClaimOrigin::memory(),
     });
     entry.info.active_agent = Some("codex".to_owned());
     entry.info.active_agent_base = Some(RuntimeRef::codex());
@@ -10421,6 +10428,7 @@ async fn procwatch_retires_root_authority_before_reused_pid_can_drive_state() {
             reported_at: Instant::now(),
             activity_reported: false,
             observed: false,
+            origin: super::ClaimOrigin::memory(),
         });
         entry.info.active_agent = Some("shell".to_owned());
         entry.info.active_agent_base = Some(RuntimeRef::shell());
@@ -10476,6 +10484,7 @@ async fn procwatch_retires_a_zombie_root_with_its_exact_generation() {
             reported_at: Instant::now(),
             activity_reported: false,
             observed: false,
+            origin: super::ClaimOrigin::memory(),
         });
         entry.info.active_agent = Some("shell".to_owned());
         entry.info.active_agent_base = Some(RuntimeRef::shell());
@@ -10548,6 +10557,7 @@ async fn procwatch_discards_cwd_when_focus_generation_changes_inside_bracket() {
             reported_at: Instant::now(),
             activity_reported: false,
             observed: false,
+            origin: super::ClaimOrigin::memory(),
         });
         entry.info.active_agent = Some("codex".to_owned());
         entry.info.active_agent_base = Some(RuntimeRef::codex());
@@ -10596,6 +10606,7 @@ async fn stale_procwatch_retirement_cannot_clear_replacement_runtime() {
             reported_at: Instant::now(),
             activity_reported: false,
             observed: false,
+            origin: super::ClaimOrigin::memory(),
         });
         entry.info.active_agent = Some("codex".to_owned());
         entry.info.active_agent_base = Some(RuntimeRef::codex());
@@ -10833,6 +10844,7 @@ async fn admit_descendant_claim_unannounced_at(
         reported_at: Instant::now(),
         activity_reported: false,
         observed: false,
+        origin: super::ClaimOrigin::memory(),
     };
     entry.active_agent = Some(report.clone());
     entry.last_agent_report = Some(report);
@@ -12538,6 +12550,7 @@ async fn adopted_claim_binds_at_the_first_scan() {
             reported_at: Instant::now(),
             activity_reported: false,
             observed: false,
+            origin: super::ClaimOrigin::memory(),
         };
         entry.active_agent = Some(report.clone());
         entry.last_agent_report = Some(report);
@@ -14042,7 +14055,13 @@ async fn reconnect_persistence_failure_retries_without_orphaning_live_handle() {
             .state,
         RuntimeState::Reconnecting
     );
-    assert_reconnect_transition_applied(&registry, &created.id, &expected, &worker).await;
+    Box::pin(assert_reconnect_transition_applied(
+        &registry,
+        &created.id,
+        &expected,
+        &worker,
+    ))
+    .await;
     assert_eq!(
         next_runtime_event(&mut events).await,
         protocol::event::SESSION_RUNTIME_RECONNECTED
@@ -14063,7 +14082,13 @@ async fn reconnect_persistence_failure_retries_without_orphaning_live_handle() {
         .as_ref()
         .expect("registry store")
         .fail_next_parent_sync_after_rename();
-    assert_reconnect_transition_applied(&registry, &created.id, &expected, &worker).await;
+    Box::pin(assert_reconnect_transition_applied(
+        &registry,
+        &created.id,
+        &expected,
+        &worker,
+    ))
+    .await;
     assert_eq!(
         next_runtime_event(&mut events).await,
         protocol::event::SESSION_RUNTIME_RECONNECTED
@@ -14232,7 +14257,12 @@ async fn lost_transition_retries_precommit_failure_before_single_event() {
             .state,
         RuntimeState::Reconnecting
     );
-    assert_lost_transition_applied(&registry, &created.id, &expected).await;
+    Box::pin(assert_lost_transition_applied(
+        &registry,
+        &created.id,
+        &expected,
+    ))
+    .await;
     let inspected = registry.inspect(&created.id).await.expect("inspect lost");
     let subagent = inspected.subagents.first().expect("lost subagent");
     assert_eq!(subagent.lifecycle, SubagentLifecycle::Lost);
@@ -14893,7 +14923,7 @@ async fn report_native_id_rejects_stale_expired_and_mismatched_claims() {
 /// Create a temp `agents/` dir holding one profile file; return the dir path.
 /// A Codex or Claude base is bound to its official fixture package
 /// ([`pin_official_base`]).
-fn temp_agents_dir_with(tag: &str, name: &str, body: &str) -> PathBuf {
+pub(in crate::session) fn temp_agents_dir_with(tag: &str, name: &str, body: &str) -> PathBuf {
     let dir = temp_store_path(tag)
         .parent()
         .expect("store parent")
@@ -22972,8 +23002,8 @@ async fn wait_for_adapters(done: &std::path::Path) {
     );
 }
 
-/// Asserts that the worker journaled the adapters' identity and subagent and
-/// that the daemon imports that snapshot.
+/// Asserts that the worker journaled the adapters' newest identity and the
+/// subagent and that the daemon imports that snapshot.
 ///
 /// The daemon's own `active_agent` projection is not observed: procwatch
 /// releases a claim that no foreground process backs within a tick, so it is
@@ -22981,26 +23011,26 @@ async fn wait_for_adapters(done: &std::path::Path) {
 /// that timed out has moved on, so the journal is awaited. Applying the
 /// snapshot returns once the daemon has committed it.
 #[cfg(unix)]
-async fn assert_worker_state_imported(registry: &SessionRegistry, id: &SessionId) {
+async fn assert_worker_state_imported(registry: &SessionRegistry, id: &SessionId, newest: &str) {
     let (worker, _identity) = live_worker_and_identity(registry, id).await;
     let snapshot = wait_until("the worker to journal the adapters' reports", || async {
         let snapshot = worker.inspect().await.expect("inspect worker");
-        let claude = snapshot
+        let newest = snapshot
             .active_identity
             .as_ref()
-            .is_some_and(|identity| identity.provider == "claude");
-        (claude && !snapshot.subagents.is_empty()).then_some(snapshot)
+            .is_some_and(|identity| identity.provider == newest);
+        (newest && !snapshot.subagents.is_empty()).then_some(snapshot)
     })
     .await;
-    // The Claude state adapter reports last through the worker socket, so a
-    // Claude adapter that does not report as `claude` leaves another identity.
+    let identity = snapshot
+        .active_identity
+        .as_ref()
+        .expect("the newest identity is journaled");
+    assert_eq!(identity.provider, newest);
     assert_eq!(
-        snapshot
-            .active_identity
-            .as_ref()
-            .map(|identity| identity.provider.as_str()),
-        Some("claude"),
-        "the Claude adapter's identity is journaled"
+        identity.origin == Some(pohunek_worker_protocol::ClaimOrigin::Forwarded),
+        newest == "codex",
+        "only the adapter that reports through the public socket journals a forwarded claim"
     );
     assert_eq!(snapshot.subagents.len(), 1, "subagent journaled");
     let outcome = wait_until("the daemon to settle the worker snapshot", || async {
@@ -23129,7 +23159,12 @@ async fn a_runtime_with_a_hook_schema_accepts_the_adapter_reports_on_both_socket
         .expect("create session");
     wait_for_adapters(&done).await;
 
-    Box::pin(assert_worker_state_imported(&rig.registry, &created.id)).await;
+    Box::pin(assert_worker_state_imported(
+        &rig.registry,
+        &created.id,
+        "codex",
+    ))
+    .await;
     let notification = rig
         .request(
             method::NOTIFICATION_CREATE,
@@ -23205,14 +23240,18 @@ async fn the_public_socket_alone_accepts_adapter_reports_of_a_runtime_with_a_hoo
     })
     .await;
     assert!(
-        source.starts_with("pohunek:"),
-        "the public socket recorded an adapter report: {source}"
+        source.starts_with("worker:"),
+        "the public socket forwarded an adapter report into the worker: {source}"
     );
     let (worker, _identity) = live_worker_and_identity(&rig.registry, &created.id).await;
     let snapshot = worker.inspect().await.expect("inspect worker");
-    assert!(
-        snapshot.active_identity.is_none(),
-        "the worker was not used"
+    assert_eq!(
+        snapshot
+            .active_identity
+            .as_ref()
+            .and_then(|identity| identity.origin),
+        Some(pohunek_worker_protocol::ClaimOrigin::Forwarded),
+        "the worker journaled the forwarded claim"
     );
 
     rig.finish(&created.id).await;
@@ -23235,7 +23274,12 @@ async fn a_shell_session_accepts_the_adapter_reports_of_the_agents_it_hosts() {
         .expect("create session");
     wait_for_adapters(&done).await;
 
-    Box::pin(assert_worker_state_imported(&rig.registry, &created.id)).await;
+    Box::pin(assert_worker_state_imported(
+        &rig.registry,
+        &created.id,
+        "codex",
+    ))
+    .await;
     for provider in ["codex", "claude"] {
         let response = rig
             .request(
@@ -23280,7 +23324,12 @@ async fn a_shell_session_hosting_an_unserved_agent_takes_input() {
         .await
         .expect("create session");
     wait_for_adapters(&done).await;
-    Box::pin(assert_worker_state_imported(&rig.registry, &created.id)).await;
+    Box::pin(assert_worker_state_imported(
+        &rig.registry,
+        &created.id,
+        "claude",
+    ))
+    .await;
     let info = rig.registry.inspect(&created.id).await.expect("inspect");
     assert_eq!(info.agent_base, RuntimeRef::shell());
     // The claim's process is the session's own root shell, which runs on, so
@@ -23900,7 +23949,7 @@ fn attested_report(
         agent_session_id: None,
         agent_session_path: None,
         pid_start_identity: start.map(protocol::ProcessStartIdentity::new),
-        monotonic_sequence: Some(ReportSequence::new(7)),
+        monotonic_sequence: None,
         retryable_admission: false,
     }
 }
@@ -23996,7 +24045,7 @@ async fn a_release_is_ignored_when_the_host_contradicts_its_start_identity() {
         seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
         pid: Some(created.pid),
         pid_start_identity: start.map(protocol::ProcessStartIdentity::new),
-        monotonic_sequence: Some(ReportSequence::new(8)),
+        monotonic_sequence: None,
         retryable_admission: false,
     };
 
@@ -24018,5 +24067,3274 @@ async fn a_release_is_ignored_when_the_host_contradicts_its_start_identity() {
 
     inspector.set_identity(created.pid, None);
     assert!(registry.release_agent(release(Some(real))).await.released);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A bound report of the session's root process, ordered by `sequence`.
+fn bound_report(
+    created: &SessionInfo,
+    start: u64,
+    sequence: u64,
+    session: &str,
+) -> SessionReportAgentParams {
+    SessionReportAgentParams {
+        agent_session_id: Some(session.to_owned()),
+        monotonic_sequence: Some(ReportSequence::new(sequence)),
+        ..attested_report(created, Some(start), Some(created.pid))
+    }
+}
+
+fn bound_release(created: &SessionInfo, start: u64, sequence: u64) -> SessionReleaseAgentParams {
+    SessionReleaseAgentParams {
+        session_id: created.id.clone(),
+        source: CODEX_HOOK_SOURCE.to_owned(),
+        agent: "codex".to_owned(),
+        seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+        pid: Some(created.pid),
+        pid_start_identity: Some(protocol::ProcessStartIdentity::new(start)),
+        monotonic_sequence: Some(ReportSequence::new(sequence)),
+        retryable_admission: false,
+    }
+}
+
+fn root_start_identity(inspector: &MockInspector, created: &SessionInfo) -> u64 {
+    inspector
+        .identity(created.pid)
+        .expect("read the agent process")
+        .expect("the agent process runs")
+        .start_identity
+        .get()
+}
+
+pub(in crate::session) async fn session_worker(
+    registry: &SessionRegistry,
+    id: &SessionId,
+) -> Worker {
+    live_worker_and_identity(registry, id).await.0
+}
+
+async fn annotation(registry: &SessionRegistry, id: &SessionId) -> Option<String> {
+    registry
+        .inspect(id)
+        .await
+        .expect("inspect session")
+        .active_agent_session_id
+}
+
+fn armed_metadata_hold(registry: &SessionRegistry) -> crate::runtime::lifecycle::tests::StartGate {
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *registry
+        .inner
+        .metadata_apply_hold
+        .lock()
+        .expect("metadata apply hold is never poisoned") = Some(gate.clone());
+    gate
+}
+
+/// A bound report reaches the worker, and the daemon's identity and its record
+/// follow the worker's journal; the report is not promoted to the session's
+/// launch identity or native reference.
+#[tokio::test]
+async fn a_bound_report_is_journaled_by_the_worker_and_never_becomes_a_native_reference() {
+    let (registry, inspector, created) = mock_direct_codex_registry("forward-bound").await;
+    let start = root_start_identity(&inspector, &created);
+    let worker = session_worker(&registry, &created.id).await;
+    let before = worker.inspect().await.expect("inspect worker");
+
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 1, "native-one"))
+            .await
+            .recorded
+    );
+
+    let after = worker.inspect().await.expect("inspect worker");
+    let claim = after
+        .active_identity
+        .as_ref()
+        .expect("the claim is journaled");
+    assert_eq!(
+        claim.origin,
+        Some(pohunek_worker_protocol::ClaimOrigin::Forwarded)
+    );
+    assert_eq!(claim.sequence, 1);
+    assert_eq!(after.native_reference, before.native_reference);
+    assert_eq!(after.launch_identity, before.launch_identity);
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(info.active_agent_session_id.as_deref(), Some("native-one"));
+    assert_eq!(info.native_session_id, created.native_session_id);
+    let record = registry
+        .load_durable_session_record(&created.id)
+        .await
+        .expect("read the record");
+    if let Some(record) = record {
+        assert_eq!(
+            record.info.active_agent_session_id.as_deref(),
+            Some("native-one")
+        );
+    }
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A worker snapshot parked before it commits cannot overwrite a report made
+/// while it waits; the report is forwarded and committed after it.
+#[tokio::test]
+async fn a_snapshot_parked_before_its_identity_write_cannot_overwrite_a_forwarded_report() {
+    let (registry, inspector, created) = mock_direct_codex_registry("fence-race").await;
+    let start = root_start_identity(&inspector, &created);
+    let worker = session_worker(&registry, &created.id).await;
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 1, "native-one"))
+            .await
+            .recorded
+    );
+    let stale = worker.inspect().await.expect("inspect worker");
+
+    let gate = armed_metadata_hold(&registry);
+    let parked = tokio::spawn({
+        let registry = registry.clone();
+        let id = created.id.clone();
+        async move { registry.apply_worker_metadata_snapshot(&id, &stale).await }
+    });
+    guard("the snapshot to park", gate.entered.notified()).await;
+    let forwarded = tokio::spawn({
+        let registry = registry.clone();
+        let report = bound_report(&created, start, 2, "native-two");
+        async move { registry.report_agent(report).await }
+    });
+    // timing-allowed: #1101 bounded run that shows the report waits for the
+    // parked projection
+    let mut forwarded = forwarded;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut forwarded)
+            .await
+            .is_err(),
+        "the report waits for the parked projection"
+    );
+    let journaled = worker.inspect().await.expect("inspect worker");
+    assert_eq!(
+        journaled.active_identity.map(|claim| claim.sequence),
+        Some(1),
+        "the report is not offered to the worker meanwhile"
+    );
+    gate.release.notify_one();
+
+    assert_eq!(
+        parked.await.expect("parked projection"),
+        WorkerMetadataApplyOutcome::Applied
+    );
+    assert!(forwarded.await.expect("forwarded report").recorded);
+    assert_eq!(
+        annotation(&registry, &created.id).await.as_deref(),
+        Some("native-two")
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A snapshot read before a forwarded commit carries an older revision and
+/// leaves the committed identity alone.
+#[tokio::test]
+async fn a_snapshot_older_than_the_committed_revision_cannot_replace_the_identity() {
+    let (registry, inspector, created) = mock_direct_codex_registry("fence-stale").await;
+    let start = root_start_identity(&inspector, &created);
+    let worker = session_worker(&registry, &created.id).await;
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 1, "native-one"))
+            .await
+            .recorded
+    );
+    let stale = worker.inspect().await.expect("inspect worker");
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 2, "native-two"))
+            .await
+            .recorded
+    );
+
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &stale)
+            .await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    assert_eq!(
+        annotation(&registry, &created.id).await.as_deref(),
+        Some("native-two")
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A forwarded release survives a parked snapshot that still holds the claim.
+#[tokio::test]
+async fn a_forwarded_release_survives_a_snapshot_parked_with_the_claim() {
+    let (registry, inspector, created) = mock_direct_codex_registry("fence-release").await;
+    let start = root_start_identity(&inspector, &created);
+    let worker = session_worker(&registry, &created.id).await;
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 1, "native-one"))
+            .await
+            .recorded
+    );
+    let stale = worker.inspect().await.expect("inspect worker");
+
+    let gate = armed_metadata_hold(&registry);
+    let parked = tokio::spawn({
+        let registry = registry.clone();
+        let id = created.id.clone();
+        async move { registry.apply_worker_metadata_snapshot(&id, &stale).await }
+    });
+    guard("the snapshot to park", gate.entered.notified()).await;
+    let released = tokio::spawn({
+        let registry = registry.clone();
+        let release = bound_release(&created, start, 2);
+        async move { registry.release_agent(release).await }
+    });
+    // timing-allowed: #1101 bounded run that shows the release waits for the
+    // parked projection
+    let mut released = released;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut released)
+            .await
+            .is_err(),
+        "the release waits for the parked projection"
+    );
+    let journaled = worker.inspect().await.expect("inspect worker");
+    assert!(
+        journaled.active_identity.is_some(),
+        "the release is not offered to the worker meanwhile"
+    );
+    gate.release.notify_one();
+
+    assert_eq!(
+        parked.await.expect("parked projection"),
+        WorkerMetadataApplyOutcome::Applied
+    );
+    assert!(released.await.expect("forwarded release").released);
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(info.active_agent, None);
+    assert_eq!(info.active_agent_session_id, None);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A report without a process or a monotonic sequence is never offered to the
+/// worker and takes the memory-only path.
+#[tokio::test]
+async fn an_unbound_report_stays_in_memory_and_is_not_sent_to_the_worker() {
+    let (registry, _inspector, created) = mock_direct_codex_registry("forward-unbound").await;
+    let worker = session_worker(&registry, &created.id).await;
+    let before = worker.inspect().await.expect("inspect worker");
+
+    let report = SessionReportAgentParams {
+        monotonic_sequence: None,
+        pid_start_identity: None,
+        ..attested_report(&created, None, Some(created.pid))
+    };
+    assert!(registry.report_agent(report).await.recorded);
+
+    let after = worker.inspect().await.expect("inspect worker");
+    assert_eq!(after.active_identity, before.active_identity);
+    assert_eq!(
+        after.active_identity_revision,
+        before.active_identity_revision
+    );
+    let sessions = registry.inner.sessions.lock().await;
+    let entry = &sessions[&created.id];
+    assert!(crate::session::claim::is_memory_report(entry));
+    assert!(entry
+        .not_durable_logged
+        .contains(&crate::session::NotDurableCause::Unbound));
+    drop(sessions);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A worker that negotiated protocol 7 cannot journal a forwarded claim: no
+/// request is sent, and the report is kept in memory.
+#[tokio::test]
+async fn a_report_for_a_protocol_7_worker_stays_in_memory() {
+    let (registry, inspector, created) = mock_direct_codex_registry("forward-v7").await;
+    let start = root_start_identity(&inspector, &created);
+    let current = session_worker(&registry, &created.id).await;
+    current
+        .release_controller()
+        .await
+        .expect("release the lease");
+    let previous = Worker::connect_with_range(
+        current.socket_path(),
+        &created.id.0,
+        registry.daemon_instance_id(),
+        pohunek_worker_protocol::PREVIOUS_VERSION,
+        pohunek_worker_protocol::PREVIOUS_VERSION,
+    )
+    .await
+    .expect("connect at the previous protocol");
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .expect("entry")
+        .runtime = RuntimeHandle::Worker(previous.clone());
+
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 1, "native-one"))
+            .await
+            .recorded
+    );
+
+    let snapshot = previous.inspect().await.expect("inspect at protocol 7");
+    assert!(
+        snapshot.active_identity.is_none(),
+        "the worker was not used"
+    );
+    assert_eq!(snapshot.active_identity_revision, None);
+    let sessions = registry.inner.sessions.lock().await;
+    assert!(sessions[&created.id]
+        .not_durable_logged
+        .contains(&crate::session::NotDurableCause::WorkerProtocolV7));
+    assert!(sessions[&created.id].identity_fence.is_none());
+    assert!(sessions[&created.id].pending_activity.is_none());
+    assert!(matches!(
+        sessions[&created.id]
+            .active_agent
+            .as_ref()
+            .map(|a| &a.origin),
+        Some(crate::session::claim::ClaimOrigin::Memory { .. })
+    ));
+    drop(sessions);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A runtime the daemon cannot reach leaves the report in memory with the
+/// forward-failure cause, and the report is still recorded.
+#[tokio::test]
+async fn a_report_whose_forward_cannot_start_is_kept_in_memory() {
+    let (registry, inspector, created) = mock_direct_codex_registry("forward-failed").await;
+    let start = root_start_identity(&inspector, &created);
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .expect("entry")
+        .runtime = RuntimeHandle::Unavailable(RuntimeState::Lost);
+
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 1, "native-one"))
+            .await
+            .recorded
+    );
+
+    let sessions = registry.inner.sessions.lock().await;
+    assert!(sessions[&created.id]
+        .not_durable_logged
+        .contains(&crate::session::NotDurableCause::ForwardFailed));
+    assert!(crate::session::claim::is_memory_report(
+        &sessions[&created.id]
+    ));
+    drop(sessions);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A release the worker refuses is final, except for an identity the worker
+/// never journaled: a memory-only report must not get stuck.
+#[tokio::test]
+async fn a_refused_release_still_clears_an_identity_that_was_never_journaled() {
+    let (registry, inspector, created) = mock_direct_codex_registry("forward-release-memory").await;
+    let start = root_start_identity(&inspector, &created);
+    let unbound = SessionReportAgentParams {
+        monotonic_sequence: None,
+        pid_start_identity: None,
+        ..attested_report(&created, None, Some(created.pid))
+    };
+    assert!(registry.report_agent(unbound).await.recorded);
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session")
+            .active_agent
+            .as_deref(),
+        Some("codex")
+    );
+
+    assert!(
+        registry
+            .release_agent(bound_release(&created, start, 2))
+            .await
+            .released
+    );
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session")
+            .active_agent,
+        None
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// The activity a bound report carries is applied although the worker's claim
+/// carries none, and the identity then reports its own activity.
+#[tokio::test]
+async fn a_bound_report_applies_the_activity_it_carries() {
+    let (registry, inspector, created) = mock_direct_codex_registry("forward-activity").await;
+    let start = root_start_identity(&inspector, &created);
+
+    assert!(
+        registry
+            .report_agent(SessionReportAgentParams {
+                activity: Some(AgentActivity::Blocked),
+                ..bound_report(&created, start, 1, "native-one")
+            })
+            .await
+            .recorded
+    );
+
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(info.activity, Some(AgentActivity::Blocked));
+    assert_eq!(info.state_source, StateSource::Report);
+    let sessions = registry.inner.sessions.lock().await;
+    assert!(sessions[&created.id]
+        .active_agent
+        .as_ref()
+        .is_some_and(|active| active.activity_reported));
+    drop(sessions);
+
+    assert!(
+        registry
+            .release_agent(bound_release(&created, start, 2))
+            .await
+            .released
+    );
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(
+        info.activity, None,
+        "the release ends the reported activity"
+    );
+    assert_eq!(info.state_source, StateSource::Process);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A report that names a session id and its transcript keeps both public
+/// fields through the worker's journal.
+#[tokio::test]
+async fn a_bound_report_keeps_both_the_session_id_and_the_transcript_path() {
+    let (registry, inspector, created) = mock_direct_codex_registry("forward-transcript").await;
+    let start = root_start_identity(&inspector, &created);
+
+    assert!(
+        registry
+            .report_agent(SessionReportAgentParams {
+                agent_session_path: Some("/work/native-one.jsonl".to_owned()),
+                ..bound_report(&created, start, 1, "native-one")
+            })
+            .await
+            .recorded
+    );
+
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(info.active_agent_session_id.as_deref(), Some("native-one"));
+    assert_eq!(
+        info.active_agent_session_path.as_deref(),
+        Some("/work/native-one.jsonl")
+    );
+    let worker = session_worker(&registry, &created.id).await;
+    let annotation = worker
+        .inspect()
+        .await
+        .expect("inspect worker")
+        .active_identity
+        .and_then(|claim| claim.reported_session)
+        .expect("the worker journaled the annotation");
+    assert_eq!(
+        annotation.transcript_path.as_deref(),
+        Some("/work/native-one.jsonl")
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A registry on the host's real process table whose session runs two
+/// background children under its root, and the first of them.
+async fn real_session_with_children(tag: &str) -> (SessionRegistry, SessionInfo, ProcessIdentity) {
+    let agents_dir = temp_agents_dir_with(
+        tag,
+        "direct-agent",
+        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600 & sleep 600 & wait\"]\n",
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        stop_grace: Duration::from_millis(50),
+        procwatch_poll: Duration::from_mins(1),
+        agents_dir: Some(agents_dir),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(SessionNewParams {
+            name: Some(tag.to_owned()),
+            agent: "direct-agent".to_owned(),
+            ..params()
+        })
+        .await
+        .expect("create a session with children");
+    let inspector = crate::procwatch::HostInspector::new();
+    let root = inspector
+        .identity(created.pid)
+        .expect("inspect the session root")
+        .expect("the session root runs");
+    let child = wait_until("the root to start its children", || async {
+        inspector
+            .descendant_identities(root)
+            .ok()
+            .and_then(|children| children.into_iter().next())
+    })
+    .await;
+    (registry, created, child)
+}
+
+/// A process that exited after it reported releases itself by its exact pid
+/// and start identity through the real worker; the same pid with another
+/// start identity releases nothing.
+#[tokio::test]
+async fn a_release_of_a_really_exited_process_clears_a_forwarded_identity() {
+    let (registry, created, child) = real_session_with_children("exited-release").await;
+    let child_report = SessionReportAgentParams {
+        pid: Some(child.pid),
+        pid_start_identity: Some(protocol::ProcessStartIdentity::new(
+            child.start_identity.get(),
+        )),
+        monotonic_sequence: Some(ReportSequence::new(1)),
+        ..attested_report(&created, None, None)
+    };
+    assert!(registry.report_agent(child_report).await.recorded);
+    let child_release = |start: u64, sequence: u64| SessionReleaseAgentParams {
+        pid: Some(child.pid),
+        ..bound_release(&created, start, sequence)
+    };
+    let killed = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(child.pid.to_string())
+        .status()
+        .expect("run kill");
+    assert!(killed.success());
+    let inspector = crate::procwatch::HostInspector::new();
+    wait_until("the child to be gone", || async {
+        match inspector.identity(child.pid) {
+            Ok(Some(current)) if current.start_identity == child.start_identity => None,
+            _ => Some(()),
+        }
+    })
+    .await;
+
+    assert!(
+        !registry
+            .release_agent(child_release(child.start_identity.get() + 1, 2))
+            .await
+            .released,
+        "another start identity is another process"
+    );
+    let worker = session_worker(&registry, &created.id).await;
+    assert!(
+        worker
+            .inspect()
+            .await
+            .expect("inspect worker")
+            .active_identity
+            .is_some(),
+        "the refused release kept the journaled claim"
+    );
+
+    assert!(
+        registry
+            .release_agent(child_release(child.start_identity.get(), 2))
+            .await
+            .released
+    );
+    let snapshot = worker.inspect().await.expect("inspect worker");
+    assert!(snapshot.active_identity.is_none());
+    assert!(
+        snapshot.active_identity_release.is_some(),
+        "the worker journaled the release"
+    );
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session")
+            .active_agent,
+        None
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// The activity of a report whose identity commit was deferred is applied by
+/// the sync that commits the identity.
+#[tokio::test]
+async fn the_activity_of_a_report_with_a_deferred_commit_lands_with_the_commit() {
+    let (registry, inspector, created) = mock_direct_codex_registry("deferred-activity").await;
+    let start = root_start_identity(&inspector, &created);
+    registry
+        .inner
+        .worker_imports_blocked
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    assert!(
+        registry
+            .report_agent(SessionReportAgentParams {
+                activity: Some(AgentActivity::Blocked),
+                ..bound_report(&created, start, 1, "native-one")
+            })
+            .await
+            .recorded
+    );
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session")
+            .activity,
+        None,
+        "the identity is not committed yet"
+    );
+
+    registry
+        .inner
+        .worker_imports_blocked
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let snapshot = session_worker(&registry, &created.id)
+        .await
+        .inspect()
+        .await
+        .expect("inspect worker");
+    registry
+        .apply_worker_metadata_snapshot(&created.id, &snapshot)
+        .await;
+
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session")
+            .activity,
+        Some(AgentActivity::Blocked)
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A journaled claim of a process that exited is not brought back by the next
+/// worker sync once the daemon ended the claim on the exit.
+#[tokio::test]
+async fn a_sync_does_not_resurrect_the_claim_of_an_exited_reporter() {
+    let (registry, created, child) = real_session_with_children("exited-sync").await;
+    let child_report = SessionReportAgentParams {
+        pid: Some(child.pid),
+        pid_start_identity: Some(protocol::ProcessStartIdentity::new(
+            child.start_identity.get(),
+        )),
+        monotonic_sequence: Some(ReportSequence::new(1)),
+        ..attested_report(&created, None, None)
+    };
+    assert!(registry.report_agent(child_report).await.recorded);
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session")
+            .active_agent_pid,
+        Some(child.pid)
+    );
+    let killed = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(child.pid.to_string())
+        .status()
+        .expect("run kill");
+    assert!(killed.success());
+    wait_until(
+        "the daemon to end the claim of the exited reporter",
+        || async {
+            registry
+                .inspect(&created.id)
+                .await
+                .ok()
+                .filter(|info| info.active_agent_pid.is_none())
+        },
+    )
+    .await;
+
+    let snapshot = session_worker(&registry, &created.id)
+        .await
+        .inspect()
+        .await
+        .expect("inspect worker");
+    assert!(
+        snapshot.active_identity.is_some(),
+        "the worker still journals the claim"
+    );
+    registry
+        .apply_worker_metadata_snapshot(&created.id, &snapshot)
+        .await;
+
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session")
+            .active_agent_pid,
+        None
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+// Claim model scenarios: each case of the forwarded-identity claim table.
+
+async fn claim_origin(
+    registry: &SessionRegistry,
+    id: &SessionId,
+) -> Option<crate::session::claim::ClaimOrigin> {
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get(id)
+        .and_then(|entry| {
+            entry
+                .active_agent
+                .as_ref()
+                .map(|active| active.origin.clone())
+        })
+}
+
+/// The sequence of the journaled claim the session holds, if it holds one.
+async fn journaled_sequence(registry: &SessionRegistry, id: &SessionId) -> Option<u64> {
+    match claim_origin(registry, id).await {
+        Some(crate::session::claim::ClaimOrigin::Journaled { key, .. }) => Some(key.sequence),
+        _ => None,
+    }
+}
+
+/// Makes forwarding impossible and returns the worker the session had.
+async fn without_forward(registry: &SessionRegistry, id: &SessionId) -> Worker {
+    let worker = session_worker(registry, id).await;
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(id)
+        .expect("entry")
+        .runtime = RuntimeHandle::Unavailable(RuntimeState::Lost);
+    worker
+}
+
+/// Applies the snapshot `worker` reports now.
+pub(in crate::session) async fn sync_from(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    worker: &Worker,
+) {
+    let snapshot = worker.inspect().await.expect("inspect worker");
+    registry.apply_worker_metadata_snapshot(id, &snapshot).await;
+}
+
+async fn active_agent_of(registry: &SessionRegistry, id: &SessionId) -> Option<String> {
+    registry
+        .inspect(id)
+        .await
+        .expect("inspect session")
+        .active_agent
+}
+
+/// R1-X001 / D1: a release that cannot be forwarded to the worker (it names no
+/// process) does not end a claim the worker journaled; the journal and
+/// procwatch end it.
+#[tokio::test]
+async fn a_release_that_cannot_be_forwarded_does_not_end_a_journaled_claim() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-release-d1").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 5, "native-one"))
+            .await
+            .recorded
+    );
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
+    // The release rule matches by source; the guard must hold even for a
+    // journaled claim that carries the releasing hook's source.
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .and_then(|entry| entry.active_agent.as_mut())
+        .expect("active claim")
+        .source = CODEX_HOOK_SOURCE.to_owned();
+
+    let unbound = SessionReleaseAgentParams {
+        pid: None,
+        pid_start_identity: None,
+        monotonic_sequence: None,
+        retryable_admission: false,
+        ..bound_release(&created, start, 6)
+    };
+    assert!(!registry.release_agent(unbound).await.released);
+
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
+    let _ = registry.stop(&created.id).await;
+}
+
+/// R3-B: a release of an exited process names the start identity of the claim;
+/// the same pid with another start identity, or a delayed release of a reused
+/// pid, ends nothing.
+#[tokio::test]
+async fn a_release_naming_another_start_identity_ends_no_journaled_claim() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-release-start").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 1, "native-one"))
+            .await
+            .recorded
+    );
+    let _worker = without_forward(&registry, &created.id).await;
+    inspector.set_identity(created.pid, None);
+
+    for claimed in [start + 1, start] {
+        assert!(
+            !registry
+                .release_agent(bound_release(&created, claimed, 2))
+                .await
+                .released
+        );
+    }
+
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(1));
+    let _ = registry.stop(&created.id).await;
+}
+
+/// N6: a daemon that restarts holds the persisted identity as a memory claim
+/// without a fence; the first sync adopts the worker's journaled claim.
+#[tokio::test]
+async fn the_first_sync_after_a_restart_adopts_the_journaled_claim() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-restart").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 7, "native-one"))
+            .await
+            .recorded
+    );
+    let worker = session_worker(&registry, &created.id).await;
+    let () = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("entry");
+        let mut persisted = entry.active_agent.clone().expect("active claim");
+        persisted.source = "persisted".to_owned();
+        persisted.seq = None;
+        persisted.origin = crate::session::claim::ClaimOrigin::memory();
+        entry.active_agent = Some(persisted);
+        entry.identity_fence = None;
+        entry.pending_activity = None;
+    };
+
+    sync_from(&registry, &created.id, &worker).await;
+
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(7));
+    assert!(registry.inner.sessions.lock().await[&created.id]
+        .identity_fence
+        .is_some());
+    let _ = registry.stop(&created.id).await;
+}
+
+/// R1-X004: a memory-only report that the worker later journals with the same
+/// public fields becomes the journaled claim; a later refusal of the worker
+/// does not send a release into the memory rule.
+#[tokio::test]
+async fn a_memory_report_journaled_unchanged_becomes_the_journaled_claim() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-memory-journaled").await;
+    let start = root_start_identity(&inspector, &created);
+    let unbound = SessionReportAgentParams {
+        agent_session_id: Some("native-one".to_owned()),
+        monotonic_sequence: None,
+        pid_start_identity: None,
+        ..attested_report(&created, None, Some(created.pid))
+    };
+    assert!(registry.report_agent(unbound).await.recorded);
+    assert!(claim_origin(&registry, &created.id)
+        .await
+        .is_some_and(|origin| matches!(origin, crate::session::claim::ClaimOrigin::Memory { .. })));
+
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 5, "native-one"))
+            .await
+            .recorded
+    );
+
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
+    assert!(
+        !registry
+            .release_agent(bound_release(&created, start, 3))
+            .await
+            .released,
+        "the worker refuses a release older than the claim"
+    );
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
+    let _ = registry.stop(&created.id).await;
+}
+
+/// R2-X003: the activity of a report whose claim a newer report replaced is
+/// dropped when it settles.
+#[tokio::test]
+async fn the_activity_of_a_superseded_claim_is_dropped() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-superseded").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(SessionReportAgentParams {
+                activity: Some(AgentActivity::Working),
+                ..bound_report(&created, start, 1, "native-one")
+            })
+            .await
+            .recorded
+    );
+    let Some(crate::session::claim::ClaimOrigin::Journaled { key: older, .. }) =
+        claim_origin(&registry, &created.id).await
+    else {
+        panic!("the report is journaled");
+    };
+    assert!(
+        registry
+            .report_agent(SessionReportAgentParams {
+                activity: Some(AgentActivity::Blocked),
+                ..bound_report(&created, start, 2, "native-one")
+            })
+            .await
+            .recorded
+    );
+    let () = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("entry");
+        let revision = entry.identity_fence.clone().expect("fence");
+        entry.pending_activity = Some(Box::new(crate::session::claim::PendingActivity {
+            acknowledged: true,
+            key: older,
+            revision,
+            public: hook_order(),
+            activity: Some(AgentActivity::Working),
+            epoch: "epoch".to_owned(),
+            admitted: crate::session::claim::next_admission(),
+        }));
+    };
+
+    registry.settle_pending_activity(&created.id).await;
+
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(info.activity, Some(AgentActivity::Blocked));
+    assert!(registry.inner.sessions.lock().await[&created.id]
+        .pending_activity
+        .is_none());
+    let _ = registry.stop(&created.id).await;
+}
+
+/// R2-X004: reports with unchanged public fields order the claim by the newest
+/// worker sequence; a delayed release between them ends nothing.
+#[tokio::test]
+async fn repeated_bound_reports_order_the_claim_by_the_newest_sequence() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-repeated").await;
+    let start = root_start_identity(&inspector, &created);
+    for sequence in [10, 20] {
+        assert!(
+            registry
+                .report_agent(bound_report(&created, start, sequence, "native-one"))
+                .await
+                .recorded
+        );
+    }
+
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(20));
+    assert!(
+        !registry
+            .release_agent(bound_release(&created, start, 15))
+            .await
+            .released
+    );
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(20));
+    let _ = registry.stop(&created.id).await;
+}
+
+/// R3-A: an older snapshot applying after a deferred commit keeps the activity
+/// waiting for its identity until the snapshot that holds it applies.
+#[tokio::test]
+async fn an_older_snapshot_keeps_the_activity_waiting_for_a_deferred_commit() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-pending-older").await;
+    let start = root_start_identity(&inspector, &created);
+    let worker = session_worker(&registry, &created.id).await;
+    let older = worker.inspect().await.expect("inspect worker");
+    registry
+        .inner
+        .worker_imports_blocked
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        registry
+            .report_agent(SessionReportAgentParams {
+                activity: Some(AgentActivity::Blocked),
+                ..bound_report(&created, start, 1, "native-one")
+            })
+            .await
+            .recorded
+    );
+    registry
+        .inner
+        .worker_imports_blocked
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    registry
+        .apply_worker_metadata_snapshot(&created.id, &older)
+        .await;
+    assert!(
+        registry.inner.sessions.lock().await[&created.id]
+            .pending_activity
+            .is_some(),
+        "the older snapshot does not settle the waiting activity"
+    );
+    sync_from(&registry, &created.id, &worker).await;
+
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session")
+            .activity,
+        Some(AgentActivity::Blocked)
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// N1: a report that cannot be forwarded and is older than the last public
+/// report of its caller does not replace the journaled claim; a newer one does.
+#[tokio::test]
+async fn an_older_public_report_does_not_replace_a_journaled_claim() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-public-order").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 5, "native-one"))
+            .await
+            .recorded
+    );
+    let _worker = without_forward(&registry, &created.id).await;
+    let at = |seq: u64| SessionReportAgentParams {
+        seq: Some(ReportSequence::new(seq)),
+        ..bound_report(&created, start, 6, "native-two")
+    };
+
+    assert!(
+        !registry
+            .report_agent(at(DIRECT_AGENT_REPORT_SEQ - 1))
+            .await
+            .recorded
+    );
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
+
+    assert!(
+        registry
+            .report_agent(at(DIRECT_AGENT_REPORT_SEQ + 1))
+            .await
+            .recorded
+    );
+    assert!(claim_origin(&registry, &created.id)
+        .await
+        .is_some_and(|origin| matches!(origin, crate::session::claim::ClaimOrigin::Memory { .. })));
+    let _ = registry.stop(&created.id).await;
+}
+
+/// N2: a snapshot at or below the fence a memory claim was recorded over does
+/// not replace it with the older journaled claim.
+#[tokio::test]
+async fn a_snapshot_at_the_floor_does_not_replace_a_memory_claim() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-floor").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 5, "native-one"))
+            .await
+            .recorded
+    );
+    let worker = without_forward(&registry, &created.id).await;
+    assert!(
+        registry
+            .report_agent(SessionReportAgentParams {
+                seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 1)),
+                ..bound_report(&created, start, 6, "native-two")
+            })
+            .await
+            .recorded
+    );
+
+    sync_from(&registry, &created.id, &worker).await;
+
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session")
+            .active_agent_session_id
+            .as_deref(),
+        Some("native-two"),
+        "the newer memory report survives a snapshot at its floor"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// N4: a release the worker journaled whose acknowledgement never reached the
+/// daemon is adopted by the next snapshot.
+#[tokio::test]
+async fn a_release_journaled_without_an_acknowledgement_is_adopted_by_the_next_sync() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-lost-release-ack").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 1, "native-one"))
+            .await
+            .recorded
+    );
+    let worker = session_worker(&registry, &created.id).await;
+    let outcome = worker
+        .release_active_identity(pohunek_worker_protocol::ForwardedActiveRelease {
+            provider: "codex".to_owned(),
+            process: pohunek_worker_protocol::ProcessIdentity {
+                pid: created.pid,
+                start_identity: start,
+            },
+            sequence: 2,
+        })
+        .await
+        .expect("release in the worker");
+    assert!(matches!(
+        outcome,
+        pohunek_worker_protocol::ActiveIdentityOutcome::Accepted { .. }
+    ));
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(1));
+
+    sync_from(&registry, &created.id, &worker).await;
+
+    assert_eq!(active_agent_of(&registry, &created.id).await, None);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// N5: a report the worker journaled although its acknowledgement was lost keeps
+/// the activity it supplied when the snapshot adopts it.
+#[tokio::test]
+async fn a_memory_claim_the_worker_journaled_keeps_its_activity() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-lost-report-ack").await;
+    let start = root_start_identity(&inspector, &created);
+    let worker = without_forward(&registry, &created.id).await;
+    assert!(
+        registry
+            .report_agent(SessionReportAgentParams {
+                activity: Some(AgentActivity::Blocked),
+                ..bound_report(&created, start, 1, "native-one")
+            })
+            .await
+            .recorded
+    );
+    let outcome = worker
+        .record_active_identity(pohunek_worker_protocol::ForwardedActiveReport {
+            provider: "codex".to_owned(),
+            agent: None,
+            process: pohunek_worker_protocol::ProcessIdentity {
+                pid: created.pid,
+                start_identity: start,
+            },
+            sequence: 1,
+            expires_at: (time::OffsetDateTime::now_utc() + time::Duration::seconds(30))
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("format expiry"),
+            reported_session: Some(pohunek_worker_protocol::ReportedSession {
+                kind: pohunek_worker_protocol::ReportedSessionKind::Id,
+                value: "native-one".to_owned(),
+                transcript_path: None,
+            }),
+        })
+        .await
+        .expect("record in the worker");
+    assert!(matches!(
+        outcome,
+        pohunek_worker_protocol::ActiveIdentityOutcome::Accepted { .. }
+    ));
+
+    sync_from(&registry, &created.id, &worker).await;
+
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(1));
+    let sessions = registry.inner.sessions.lock().await;
+    assert!(sessions[&created.id]
+        .active_agent
+        .as_ref()
+        .is_some_and(|active| active.activity_reported));
+    drop(sessions);
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session")
+            .activity,
+        Some(AgentActivity::Blocked)
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// N7: activity waiting for a worker instance that was replaced is dropped.
+#[tokio::test]
+async fn activity_waiting_for_a_replaced_worker_instance_is_dropped() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-new-instance").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 1, "native-one"))
+            .await
+            .recorded
+    );
+    let () = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("entry");
+        let fence = entry.identity_fence.clone().expect("fence");
+        entry.pending_activity = Some(Box::new(crate::session::claim::PendingActivity {
+            acknowledged: true,
+            key: crate::session::claim::ClaimKey {
+                provider: "codex".to_owned(),
+                pid: created.pid,
+                start_identity: start,
+                sequence: 1,
+            },
+            revision: crate::session::IdentityFence {
+                worker_instance_id: "an-earlier-instance".to_owned(),
+                revision: fence.revision + 1,
+            },
+            public: hook_order(),
+            activity: Some(AgentActivity::Blocked),
+            epoch: "epoch".to_owned(),
+            admitted: crate::session::claim::next_admission(),
+        }));
+    };
+
+    registry.settle_pending_activity(&created.id).await;
+
+    let sessions = registry.inner.sessions.lock().await;
+    assert!(sessions[&created.id].pending_activity.is_none());
+    drop(sessions);
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session")
+            .activity,
+        None
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// N9: a memory release of a memory claim is not undone by a snapshot at the
+/// floor the claim was recorded over.
+#[tokio::test]
+async fn a_memory_release_is_not_undone_by_a_snapshot_at_its_floor() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-memory-release").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 5, "native-one"))
+            .await
+            .recorded
+    );
+    let worker = without_forward(&registry, &created.id).await;
+    let newer = SessionReportAgentParams {
+        seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 1)),
+        ..bound_report(&created, start, 6, "native-two")
+    };
+    assert!(registry.report_agent(newer).await.recorded);
+    let release = SessionReleaseAgentParams {
+        seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 2)),
+        ..bound_release(&created, start, 7)
+    };
+    assert!(registry.release_agent(release).await.released);
+    assert_eq!(active_agent_of(&registry, &created.id).await, None);
+
+    sync_from(&registry, &created.id, &worker).await;
+
+    assert_eq!(
+        active_agent_of(&registry, &created.id).await,
+        None,
+        "the older journaled claim is not brought back"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A report as the shipped Hermes reporter used to send it: a pid and a public
+/// sequence, no start identity and no monotonic sequence.
+fn legacy_report(created: &SessionInfo, pid: Pid, seq: u64) -> SessionReportAgentParams {
+    SessionReportAgentParams {
+        activity: Some(AgentActivity::Blocked),
+        seq: Some(ReportSequence::new(seq)),
+        ..attested_report(created, None, Some(pid))
+    }
+}
+
+/// L1: a reporter that omits the bound fields is bound by the start identity
+/// the host reports for its pid, so it keeps reporting after its identity was
+/// journaled by the worker.
+#[tokio::test]
+async fn a_reporter_without_bound_fields_is_bound_by_the_host_over_a_journaled_claim() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-legacy").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 5, "native-one"))
+            .await
+            .recorded
+    );
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
+
+    assert!(
+        registry
+            .report_agent(legacy_report(
+                &created,
+                created.pid,
+                DIRECT_AGENT_REPORT_SEQ + 1
+            ))
+            .await
+            .recorded
+    );
+
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session")
+            .activity,
+        Some(AgentActivity::Blocked)
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// L2: the same report from a pid the host cannot read, or from another
+/// process than the claim's, replaces nothing.
+#[tokio::test]
+async fn a_reporter_the_host_cannot_bind_does_not_replace_a_journaled_claim() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-legacy-gone").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 5, "native-one"))
+            .await
+            .recorded
+    );
+
+    assert!(
+        !registry
+            .report_agent(legacy_report(
+                &created,
+                created.pid + 1,
+                DIRECT_AGENT_REPORT_SEQ + 1
+            ))
+            .await
+            .recorded
+    );
+    inspector.set_identity(created.pid, None);
+    assert!(
+        !registry
+            .report_agent(legacy_report(
+                &created,
+                created.pid,
+                DIRECT_AGENT_REPORT_SEQ + 2
+            ))
+            .await
+            .recorded
+    );
+
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A session whose journaled claim belongs to its root process, which the
+/// daemon's observation cache also lists as the one agent of its runtime.
+async fn journaled_observed_agent(tag: &str) -> (SessionRegistry, Arc<MockInspector>, SessionInfo) {
+    let (registry, inspector, created) = mock_direct_codex_registry(tag).await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 5, "native-one"))
+            .await
+            .recorded
+    );
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
+    inspector.set_descendants(
+        created.pid,
+        vec![codex_fact(DESCENDANT_WRAPPER_PID, created.pid)],
+    );
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("the session");
+    let observed = entry
+        .observed_agents
+        .iter_mut()
+        .find(|agent| agent.pid == DESCENDANT_WRAPPER_PID)
+        .expect("procwatch observed the agent process");
+    observed.pid = created.pid;
+    observed.start_identity = start;
+    drop(sessions);
+    (registry, inspector, created)
+}
+
+/// X002: a reporter that names a pid but no start identity is bound by the
+/// start identity the host reports now, never by an earlier observation of the
+/// pid, so a reused pid does not pass for the owner of a journaled claim.
+#[tokio::test]
+async fn a_reused_pid_does_not_replace_a_journaled_claim_through_a_stale_observation() {
+    let (registry, inspector, created) = journaled_observed_agent("claim-legacy-reuse").await;
+    inspector.set_identity(
+        created.pid,
+        Some(ProcessIdentity {
+            pid: created.pid,
+            start_identity: StartIdentity::new(root_start_identity(&inspector, &created) + 1),
+        }),
+    );
+    let stale = SessionReportAgentParams {
+        pid: Some(DESCENDANT_WRAPPER_PID),
+        ..legacy_report(
+            &created,
+            DESCENDANT_WRAPPER_PID,
+            DIRECT_AGENT_REPORT_SEQ + 1,
+        )
+    };
+    assert!(!registry.report_agent(stale).await.recorded);
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
+    let _ = registry.stop(&created.id).await;
+}
+
+/// X002: the same for a pid the host cannot read.
+#[tokio::test]
+async fn an_unreadable_pid_does_not_replace_a_journaled_claim_through_a_stale_observation() {
+    let (registry, inspector, created) = journaled_observed_agent("claim-legacy-unread").await;
+    inspector.set_identity(created.pid, None);
+    let stale = SessionReportAgentParams {
+        pid: Some(DESCENDANT_WRAPPER_PID),
+        ..legacy_report(
+            &created,
+            DESCENDANT_WRAPPER_PID,
+            DIRECT_AGENT_REPORT_SEQ + 1,
+        )
+    };
+    assert!(!registry.report_agent(stale).await.recorded);
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
+    let _ = registry.stop(&created.id).await;
+}
+
+/// V-C: a report that names no pid is not bound to the one agent procwatch
+/// observed, so it does not replace a journaled claim.
+#[tokio::test]
+async fn a_report_without_a_pid_does_not_replace_a_journaled_claim_through_the_observation() {
+    let (registry, _inspector, created) = journaled_observed_agent("claim-pidless").await;
+    let pidless = SessionReportAgentParams {
+        pid: None,
+        ..legacy_report(
+            &created,
+            DESCENDANT_WRAPPER_PID,
+            DIRECT_AGENT_REPORT_SEQ + 1,
+        )
+    };
+    assert!(!registry.report_agent(pidless).await.recorded);
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
+    let _ = registry.stop(&created.id).await;
+}
+
+/// P1: the public order of a report whose identity commit was deferred is
+/// kept by the sync that adopts the claim, so a delayed report of the same
+/// process with an older sequence does not replace it.
+#[tokio::test]
+async fn a_deferred_commit_keeps_the_public_order_of_its_report() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-deferred-order").await;
+    let start = root_start_identity(&inspector, &created);
+    registry
+        .inner
+        .worker_imports_blocked
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 5, "native-one"))
+            .await
+            .recorded
+    );
+    registry
+        .inner
+        .worker_imports_blocked
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let worker = session_worker(&registry, &created.id).await;
+    sync_from(&registry, &created.id, &worker).await;
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
+
+    let report = |seq: u64| SessionReportAgentParams {
+        activity: None,
+        ..legacy_report(&created, created.pid, seq)
+    };
+    assert!(
+        !registry
+            .report_agent(report(DIRECT_AGENT_REPORT_SEQ - 1))
+            .await
+            .recorded
+    );
+    assert!(
+        registry
+            .report_agent(report(DIRECT_AGENT_REPORT_SEQ + 1))
+            .await
+            .recorded
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// E1: a snapshot that re-projects a claim with an equal origin updates the
+/// label the report carries when the profile behind it changed.
+#[tokio::test]
+async fn a_profile_change_updates_the_label_of_an_unchanged_claim() {
+    let agents_dir = temp_agents_dir_with(
+        "claim-relabel",
+        "tuned",
+        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+    );
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            agents_dir: Some(agents_dir.clone()),
+            stop_grace: Duration::from_millis(50),
+            procwatch_poll: Duration::from_mins(1),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    let root = snapshot.child_process.expect("worker child");
+    snapshot.active_identity = Some(pohunek_worker_protocol::ActiveIdentityClaim {
+        provider: "codex".to_owned(),
+        process: root,
+        sequence: 1,
+        expires_at: native_report_expiry(),
+        reference_kind: None,
+        native_reference: None,
+        agent: Some("tuned".to_owned()),
+        origin: Some(pohunek_worker_protocol::ClaimOrigin::Forwarded),
+        reported_session: None,
+    });
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    let reported_at = registry.inner.sessions.lock().await[&created.id]
+        .active_agent
+        .as_ref()
+        .expect("active claim")
+        .reported_at;
+
+    std::fs::remove_file(agents_dir.join("tuned.toml")).expect("remove the profile");
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+
+    let sessions = registry.inner.sessions.lock().await;
+    let entry = &sessions[&created.id];
+    let active = entry.active_agent.as_ref().expect("active claim");
+    assert_eq!(entry.info.active_agent.as_deref(), Some("codex"));
+    assert_eq!(active.agent, "codex");
+    assert_eq!(active.reported_at, reported_at);
+    assert!(super::active_agent_origin(entry).is_some());
+    drop(sessions);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// R5-B: a release a snapshot carries for another provider or process ends
+/// nothing: the claim the entry holds stays its active claim.
+#[tokio::test]
+async fn a_projected_release_of_another_process_leaves_the_held_claim() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-foreign-release").await;
+    let _ = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(attested_report(&created, None, None))
+            .await
+            .recorded
+    );
+    let worker = session_worker(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    let root = snapshot.child_process.expect("worker child");
+    snapshot.active_identity = None;
+    snapshot.active_identity_release = Some(pohunek_worker_protocol::ReleasedIdentityClaim {
+        provider: "claude".to_owned(),
+        process: pohunek_worker_protocol::ProcessIdentity {
+            pid: root.pid + 1,
+            start_identity: root.start_identity,
+        },
+        sequence: 9,
+    });
+    registry
+        .apply_worker_metadata_snapshot(&created.id, &snapshot)
+        .await;
+
+    let sessions = registry.inner.sessions.lock().await;
+    let entry = &sessions[&created.id];
+    assert_eq!(entry.info.active_agent.as_deref(), Some("codex"));
+    assert!(
+        entry.active_agent.is_some(),
+        "the report that SessionInfo names must stay releasable"
+    );
+    drop(sessions);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// R5-C: a journaled claim refreshed while a scan runs is another claim for
+/// that scan, whatever its process: the scan proves nothing for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refreshed_journaled_claim_is_not_proven_by_an_older_scan() {
+    let (registry, inspector, created) = mock_procwatch_registry("claim-refresh-scan").await;
+    let reporter = descendant_reporter_fact(DESCENDANT_WRAPPER_PID, DESCENDANT_WRAPPER_PID);
+    inspector.set_descendants(
+        created.pid,
+        vec![
+            codex_fact(DESCENDANT_WRAPPER_PID, created.pid),
+            reporter.clone(),
+        ],
+    );
+    stop_procwatch_loop(&registry, &inspector, &created.id).await;
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let base = worker.inspect().await.expect("inspect worker");
+    let snapshot = |sequence: u64| {
+        let mut snapshot = base.clone();
+        snapshot.active_identity = Some(pohunek_worker_protocol::ActiveIdentityClaim {
+            provider: "codex".to_owned(),
+            process: pohunek_worker_protocol::ProcessIdentity {
+                pid: reporter.pid,
+                start_identity: reporter.start_identity.get(),
+            },
+            sequence,
+            expires_at: native_report_expiry(),
+            reference_kind: None,
+            native_reference: None,
+            agent: None,
+            origin: None,
+            reported_session: None,
+        });
+        snapshot
+    };
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot(1))
+            .await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    let block = inspector.block_foreground();
+    let _release_guard = ForegroundReleaseGuard(Arc::clone(&block));
+    let scan_registry = registry.clone();
+    let scan_id = created.id.clone();
+    let root_pid = created.pid;
+    let runtime = tokio::runtime::Handle::current();
+    let scan = std::thread::spawn(move || {
+        runtime.block_on(scan_registry.rescan_procwatch_at(&scan_id, root_pid, Instant::now()));
+    });
+    tokio::time::timeout(HANG_GUARD, async {
+        while !block.entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the scan collected its descendants");
+
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot(2))
+            .await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    block.release();
+    scan.join().expect("scan thread");
+
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(2));
+    assert!(
+        !reporter_is_bound(&registry, &created.id).await,
+        "the scan proves nothing for the refreshed claim"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A snapshot of `worker` that carries only a release tombstone for a process
+/// the daemon holds no claim of.
+async fn foreign_release_snapshot(
+    worker: &Worker,
+    revision: Option<u64>,
+) -> pohunek_worker_protocol::InspectSnapshot {
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    let root = snapshot.child_process.expect("worker child");
+    snapshot.active_identity = None;
+    snapshot.active_identity_revision = revision;
+    snapshot.active_identity_release = Some(pohunek_worker_protocol::ReleasedIdentityClaim {
+        provider: "claude".to_owned(),
+        process: pohunek_worker_protocol::ProcessIdentity {
+            pid: root.pid + 1,
+            start_identity: root.start_identity,
+        },
+        sequence: 9,
+    });
+    snapshot
+}
+
+/// D1-a, D1-b: a release tombstone of another process, carried by every
+/// periodic snapshot, leaves a memory claim and its activity alone, for a
+/// worker without identity revisions and for one with revisions.
+#[tokio::test]
+async fn a_worker_release_of_another_process_leaves_a_memory_claim_and_its_activity() {
+    for (label, revision) in [("v7", None), ("v8", Some(1))] {
+        let (registry, inspector, created) =
+            mock_direct_codex_registry(&format!("claim-foreign-{label}")).await;
+        let _ = root_start_identity(&inspector, &created);
+        assert!(
+            registry
+                .report_agent(SessionReportAgentParams {
+                    activity: Some(AgentActivity::Working),
+                    ..attested_report(&created, None, None)
+                })
+                .await
+                .recorded,
+            "{label}"
+        );
+        let worker = session_worker(&registry, &created.id).await;
+        let snapshot = foreign_release_snapshot(&worker, revision).await;
+
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await;
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await;
+
+        let () = {
+            let sessions = registry.inner.sessions.lock().await;
+            let entry = &sessions[&created.id];
+            assert!(entry.active_agent.is_some(), "{label}: claim kept");
+            assert_eq!(entry.info.activity, Some(AgentActivity::Working), "{label}");
+        };
+        assert!(
+            registry
+                .release_agent(bound_release(&created, 0, 1))
+                .await
+                .released
+                || registry
+                    .release_agent(SessionReleaseAgentParams {
+                        pid: None,
+                        pid_start_identity: None,
+                        monotonic_sequence: None,
+                        retryable_admission: false,
+                        ..bound_release(&created, 0, 1)
+                    })
+                    .await
+                    .released,
+            "{label}: the claim can still be released"
+        );
+        let _ = registry.stop(&created.id).await;
+    }
+}
+
+/// D1-c: the memory release tombstone survives a snapshot that carries a
+/// release of another process, so a delayed report is still refused.
+#[tokio::test]
+async fn a_worker_release_of_another_process_keeps_the_memory_tombstone() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-foreign-tomb").await;
+    let _ = root_start_identity(&inspector, &created);
+    let at = |seq: u64| SessionReportAgentParams {
+        seq: Some(ReportSequence::new(seq)),
+        ..attested_report(&created, None, None)
+    };
+    assert!(
+        registry
+            .report_agent(at(DIRECT_AGENT_REPORT_SEQ + 10))
+            .await
+            .recorded
+    );
+    assert!(
+        registry
+            .release_agent(SessionReleaseAgentParams {
+                session_id: created.id.clone(),
+                source: CODEX_HOOK_SOURCE.to_owned(),
+                agent: "codex".to_owned(),
+                seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 10)),
+                pid: None,
+                pid_start_identity: None,
+                monotonic_sequence: None,
+                retryable_admission: false,
+            })
+            .await
+            .released
+    );
+    let worker = session_worker(&registry, &created.id).await;
+    let snapshot = foreign_release_snapshot(&worker, None).await;
+    registry
+        .apply_worker_metadata_snapshot(&created.id, &snapshot)
+        .await;
+
+    assert!(
+        !registry
+            .report_agent(at(DIRECT_AGENT_REPORT_SEQ + 5))
+            .await
+            .recorded
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// D1-d: an observed claim survives repeated syncs under a release tombstone
+/// of another process.
+#[tokio::test]
+async fn an_observed_claim_survives_syncs_under_a_foreign_release_tombstone() {
+    let (registry, inspector, created) = mock_procwatch_registry("claim-observed-tomb").await;
+    let observed = codex_fact(510, created.pid);
+    inspector.set_descendants(created.pid, vec![observed.clone()]);
+    inspector.set_foreground_group(created.pid, Some(observed.pid));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect")
+            .active_agent_pid,
+        Some(observed.pid),
+        "the scan observes the agent"
+    );
+    let worker = session_worker(&registry, &created.id).await;
+    let snapshot = foreign_release_snapshot(&worker, Some(1)).await;
+
+    for sync in 0..2 {
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await;
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = &sessions[&created.id];
+        assert!(
+            entry
+                .active_agent
+                .as_ref()
+                .is_some_and(|active| active.observed),
+            "sync {sync}: the observed claim stays"
+        );
+        assert_eq!(
+            entry.info.active_agent_pid,
+            Some(observed.pid),
+            "sync {sync}"
+        );
+    }
+    let _ = registry.stop(&created.id).await;
+}
+
+/// F1, F2: a forwardable report that is older than a memory claim, or than a
+/// memory release, of the same source is refused before it reaches the worker.
+#[tokio::test]
+async fn a_forwardable_report_is_ordered_against_memory_state_before_it_is_forwarded() {
+    for released in [false, true] {
+        let (registry, inspector, created) =
+            mock_direct_codex_registry(&format!("claim-forward-order-{released}")).await;
+        let start = root_start_identity(&inspector, &created);
+        let memory = SessionReportAgentParams {
+            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 10)),
+            ..attested_report(&created, None, None)
+        };
+        assert!(registry.report_agent(memory).await.recorded);
+        if released {
+            assert!(
+                registry
+                    .release_agent(SessionReleaseAgentParams {
+                        session_id: created.id.clone(),
+                        source: CODEX_HOOK_SOURCE.to_owned(),
+                        agent: "codex".to_owned(),
+                        seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 10)),
+                        pid: None,
+                        pid_start_identity: None,
+                        monotonic_sequence: None,
+                        retryable_admission: false,
+                    })
+                    .await
+                    .released
+            );
+        }
+
+        assert!(
+            !registry
+                .report_agent(SessionReportAgentParams {
+                    seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 5)),
+                    ..bound_report(&created, start, 1, "native-old")
+                })
+                .await
+                .recorded,
+            "released={released}"
+        );
+
+        let snapshot = session_worker(&registry, &created.id)
+            .await
+            .inspect()
+            .await
+            .expect("inspect worker");
+        assert!(
+            snapshot.active_identity.is_none(),
+            "released={released}: nothing reached the worker's journal"
+        );
+        let _ = registry.stop(&created.id).await;
+    }
+}
+
+/// X1: a forwarded report leaves its active claim and its last report with
+/// the same origin.
+#[tokio::test]
+async fn a_forwarded_report_leaves_one_origin_on_both_records() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-one-origin").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 5, "native-one"))
+            .await
+            .recorded
+    );
+
+    let sessions = registry.inner.sessions.lock().await;
+    let entry = &sessions[&created.id];
+    assert_eq!(
+        entry.active_agent.as_ref().map(|active| &active.origin),
+        entry.last_agent_report.as_ref().map(|last| &last.origin)
+    );
+    drop(sessions);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// V7-A: a worker without identity revisions cannot be forwarded to, so a
+/// public report of the process it journaled stays the active claim across
+/// syncs and a public release still ends it.
+#[tokio::test]
+async fn a_sync_from_a_protocol_7_worker_keeps_a_newer_public_report() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-v7-overlay").await;
+    let _ = root_start_identity(&inspector, &created);
+    let worker = session_worker(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    let root = snapshot.child_process.expect("worker child");
+    snapshot.active_identity_revision = None;
+    snapshot.active_identity = Some(pohunek_worker_protocol::ActiveIdentityClaim {
+        provider: "codex".to_owned(),
+        process: root,
+        sequence: 1,
+        expires_at: native_report_expiry(),
+        reference_kind: None,
+        native_reference: None,
+        agent: None,
+        origin: None,
+        reported_session: None,
+    });
+    registry
+        .apply_worker_metadata_snapshot(&created.id, &snapshot)
+        .await;
+    assert!(
+        registry
+            .report_agent(SessionReportAgentParams {
+                activity: Some(AgentActivity::Working),
+                ..attested_report(&created, None, Some(created.pid))
+            })
+            .await
+            .recorded
+    );
+
+    registry
+        .apply_worker_metadata_snapshot(&created.id, &snapshot)
+        .await;
+
+    let () = {
+        let sessions = registry.inner.sessions.lock().await;
+        let active = sessions[&created.id]
+            .active_agent
+            .as_ref()
+            .expect("active claim");
+        assert!(matches!(
+            active.origin,
+            crate::session::claim::ClaimOrigin::Memory { .. }
+        ));
+        assert!(active.activity_reported);
+    };
+    assert!(
+        registry
+            .release_agent(SessionReleaseAgentParams {
+                pid: None,
+                pid_start_identity: None,
+                monotonic_sequence: None,
+                retryable_admission: false,
+                ..bound_release(&created, 0, 1)
+            })
+            .await
+            .released
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// V7-B: a protocol 7 snapshot of another process generation behind the same
+/// pid replaces the memory report instead of leaving it to the old exit watch.
+#[tokio::test]
+async fn a_protocol_7_snapshot_of_another_process_generation_replaces_the_memory_report() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-v7-generation").await;
+    let start = root_start_identity(&inspector, &created);
+    let worker = session_worker(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    let root = snapshot.child_process.expect("worker child");
+    snapshot.active_identity_revision = None;
+    let claim = |process| pohunek_worker_protocol::ActiveIdentityClaim {
+        provider: "codex".to_owned(),
+        process,
+        sequence: 1,
+        expires_at: native_report_expiry(),
+        reference_kind: None,
+        native_reference: None,
+        agent: None,
+        origin: None,
+        reported_session: None,
+    };
+    snapshot.active_identity = Some(claim(root));
+    registry
+        .apply_worker_metadata_snapshot(&created.id, &snapshot)
+        .await;
+    assert!(
+        registry
+            .report_agent(attested_report(&created, Some(start), Some(created.pid)))
+            .await
+            .recorded
+    );
+    assert!(claim_origin(&registry, &created.id)
+        .await
+        .is_some_and(|origin| matches!(origin, crate::session::claim::ClaimOrigin::Memory { .. })));
+
+    // The memory report names an earlier generation of the pid the snapshot
+    // now journals.
+    if let Some(active) = registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .and_then(|entry| entry.active_agent.as_mut())
+    {
+        active.start_identity = Some(start + 1);
+    }
+    snapshot.active_identity = Some(claim(root));
+    registry
+        .apply_worker_metadata_snapshot(&created.id, &snapshot)
+        .await;
+
+    let origin = claim_origin(&registry, &created.id).await;
+    assert!(
+        origin.is_some_and(|origin| !matches!(origin, crate::session::claim::ClaimOrigin::Memory { .. })),
+        "the memory report of the earlier process generation must not outlive the snapshot of the new one"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// F3: a forwardable release that is older than a memory-only claim of the
+/// same source is refused before it reaches the worker.
+#[tokio::test]
+async fn a_forwardable_release_is_ordered_against_a_memory_claim_before_it_is_forwarded() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-release-order").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 5, "native-one"))
+            .await
+            .recorded
+    );
+    assert!(
+        registry
+            .report_agent(legacy_report(
+                &created,
+                created.pid,
+                DIRECT_AGENT_REPORT_SEQ + 10
+            ))
+            .await
+            .recorded
+    );
+    assert!(claim_origin(&registry, &created.id)
+        .await
+        .is_some_and(|origin| matches!(origin, crate::session::claim::ClaimOrigin::Memory { .. })));
+
+    let delayed = SessionReleaseAgentParams {
+        seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 5)),
+        ..bound_release(&created, start, 6)
+    };
+    assert!(!registry.release_agent(delayed).await.released);
+
+    let snapshot = session_worker(&registry, &created.id)
+        .await
+        .inspect()
+        .await
+        .expect("inspect worker");
+    assert!(
+        snapshot.active_identity.is_some(),
+        "the release never reached the worker's journal"
+    );
+    assert!(registry.inner.sessions.lock().await[&created.id]
+        .active_agent
+        .is_some());
+    let _ = registry.stop(&created.id).await;
+}
+
+/// X001 (round 6): a forwarded release keeps the public order of its caller,
+/// so a delayed unbound report between the report and the release does not
+/// bring the claim back.
+#[tokio::test]
+async fn a_delayed_report_does_not_resurrect_a_claim_a_forwarded_release_ended() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-release-order6").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(SessionReportAgentParams {
+                seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 10)),
+                ..bound_report(&created, start, 5, "native-one")
+            })
+            .await
+            .recorded
+    );
+    assert!(
+        registry
+            .release_agent(SessionReleaseAgentParams {
+                seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 20)),
+                ..bound_release(&created, start, 6)
+            })
+            .await
+            .released
+    );
+    assert_eq!(claim_origin(&registry, &created.id).await, None);
+
+    assert!(
+        !registry
+            .report_agent(SessionReportAgentParams {
+                seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 15)),
+                ..attested_report(&created, None, None)
+            })
+            .await
+            .recorded
+    );
+    assert_eq!(claim_origin(&registry, &created.id).await, None);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A forward parked at the worker: `op` runs until it is about to offer its
+/// report or release to the worker, with the session's identity-commit guard
+/// held when the daemon serializes the forward.
+struct ParkedForward<T> {
+    registry: SessionRegistry,
+    gate: crate::runtime::lifecycle::tests::StartGate,
+    op: tokio::task::JoinHandle<T>,
+}
+
+/// Parks `op` at its forward; `holds` is how many parking points it passes
+/// (a report parks after its admission and again before the worker, a release
+/// only before the worker).
+async fn park_forward<F>(
+    registry: &SessionRegistry,
+    holds: usize,
+    op: F,
+) -> ParkedForward<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let arm = |hold: Option<crate::runtime::lifecycle::tests::StartGate>| {
+        *registry
+            .inner
+            .report_hold
+            .lock()
+            .expect("report hold is never poisoned") = hold;
+    };
+    arm(Some(gate.clone()));
+    let op = tokio::spawn(op);
+    for point in 0..holds {
+        guard(
+            "the operation to reach its parking point",
+            gate.entered.notified(),
+        )
+        .await;
+        if point + 1 < holds {
+            gate.release.notify_waiters();
+        }
+    }
+    arm(None);
+    ParkedForward {
+        registry: registry.clone(),
+        gate,
+        op,
+    }
+}
+
+impl<T> ParkedForward<T> {
+    /// Lets `other` run while the forward is parked, then releases the forward
+    /// and returns both results. An operation the daemon serializes behind the
+    /// forward is still waiting after the bounded run and finishes afterwards.
+    async fn race<U>(self, other: impl std::future::Future<Output = U> + Send + 'static) -> (T, U)
+    where
+        U: Send + 'static,
+    {
+        let mut other = tokio::spawn(other);
+        // timing-allowed: #1101 bounded run that shows whether the second
+        // operation waits for the parked forward
+        let early = tokio::time::timeout(Duration::from_millis(300), &mut other).await;
+        self.gate.release.notify_waiters();
+        let first = self.op.await.expect("the parked operation finishes");
+        let second = match early {
+            Ok(result) => result.expect("the second operation finishes"),
+            Err(_) => other.await.expect("the second operation finishes"),
+        };
+        drop(self.registry);
+        (first, second)
+    }
+}
+
+async fn activity_of(registry: &SessionRegistry, id: &SessionId) -> Option<AgentActivity> {
+    registry
+        .inspect(id)
+        .await
+        .expect("inspect session")
+        .activity
+}
+
+async fn origin_is_memory(registry: &SessionRegistry, id: &SessionId) -> bool {
+    claim_origin(registry, id)
+        .await
+        .is_some_and(|origin| matches!(origin, crate::session::claim::ClaimOrigin::Memory { .. }))
+}
+
+/// X002 (rows 2, 3 during): a memory report of the same process with a newer
+/// public sequence, made while an older bound report is forwarded, is judged
+/// after that report and stays the active claim.
+#[tokio::test]
+async fn a_newer_memory_report_made_during_a_forward_stays_the_active_claim() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-race-newer").await;
+    let start = root_start_identity(&inspector, &created);
+    let older = SessionReportAgentParams {
+        seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 10)),
+        ..bound_report(&created, start, 5, "native-one")
+    };
+    let parked = park_forward(&registry, 2, {
+        let registry = registry.clone();
+        async move { registry.report_agent(older).await }
+    })
+    .await;
+
+    let (first, second) = parked
+        .race({
+            let registry = registry.clone();
+            let newer = legacy_report(&created, created.pid, DIRECT_AGENT_REPORT_SEQ + 20);
+            async move { registry.report_agent(newer).await }
+        })
+        .await;
+
+    assert!(first.recorded && second.recorded);
+    assert!(origin_is_memory(&registry, &created.id).await);
+    assert_eq!(
+        activity_of(&registry, &created.id).await,
+        Some(AgentActivity::Blocked)
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// Y1 (row 2 during): an older unbound report made during a forward is refused
+/// once the forwarded claim is adopted.
+#[tokio::test]
+async fn an_older_unbound_report_made_during_a_forward_is_refused() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-race-older").await;
+    let start = root_start_identity(&inspector, &created);
+    let newer = SessionReportAgentParams {
+        seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 20)),
+        ..bound_report(&created, start, 5, "native-one")
+    };
+    let parked = park_forward(&registry, 2, {
+        let registry = registry.clone();
+        async move { registry.report_agent(newer).await }
+    })
+    .await;
+
+    let (first, second) = parked
+        .race({
+            let registry = registry.clone();
+            let older = SessionReportAgentParams {
+                seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 10)),
+                ..attested_report(&created, None, None)
+            };
+            async move { registry.report_agent(older).await }
+        })
+        .await;
+
+    assert!(first.recorded);
+    assert!(!second.recorded);
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
+    let _ = registry.stop(&created.id).await;
+}
+
+/// Y2 (row 3 during, deferred commit): a newer memory report made while the
+/// accepted report waits for its commit holds against the adoption of that
+/// report.
+#[tokio::test]
+async fn a_newer_memory_report_holds_against_a_deferred_commit() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-deferred-newer").await;
+    let start = root_start_identity(&inspector, &created);
+    registry
+        .inner
+        .worker_imports_blocked
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        registry
+            .report_agent(SessionReportAgentParams {
+                seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 10)),
+                ..bound_report(&created, start, 5, "native-one")
+            })
+            .await
+            .recorded
+    );
+    assert!(
+        registry
+            .report_agent(legacy_report(
+                &created,
+                created.pid,
+                DIRECT_AGENT_REPORT_SEQ + 20
+            ))
+            .await
+            .recorded
+    );
+    registry
+        .inner
+        .worker_imports_blocked
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    let worker = session_worker(&registry, &created.id).await;
+    sync_from(&registry, &created.id, &worker).await;
+
+    assert!(origin_is_memory(&registry, &created.id).await);
+    assert_eq!(
+        activity_of(&registry, &created.id).await,
+        Some(AgentActivity::Blocked)
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// R7-X002: the newer memory report that outranked a deferred forwarded report
+/// keeps holding against the later projections of the same worker identity.
+#[tokio::test]
+async fn a_newer_memory_report_survives_every_projection_of_the_deferred_identity() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-deferred-twice").await;
+    let start = root_start_identity(&inspector, &created);
+    registry
+        .inner
+        .worker_imports_blocked
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        registry
+            .report_agent(SessionReportAgentParams {
+                seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 10)),
+                ..bound_report(&created, start, 5, "native-one")
+            })
+            .await
+            .recorded
+    );
+    assert!(
+        registry
+            .report_agent(legacy_report(
+                &created,
+                created.pid,
+                DIRECT_AGENT_REPORT_SEQ + 20
+            ))
+            .await
+            .recorded
+    );
+    registry
+        .inner
+        .worker_imports_blocked
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    let worker = session_worker(&registry, &created.id).await;
+    sync_from(&registry, &created.id, &worker).await;
+    sync_from(&registry, &created.id, &worker).await;
+
+    assert!(origin_is_memory(&registry, &created.id).await);
+    assert_eq!(
+        activity_of(&registry, &created.id).await,
+        Some(AgentActivity::Blocked)
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// R7-X001: a newer memory report of the process whose forwarded release waits
+/// for its commit is not cleared when the release is adopted.
+#[tokio::test]
+async fn a_newer_memory_report_holds_against_a_deferred_release() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-deferred-release").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(SessionReportAgentParams {
+                seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 5)),
+                ..bound_report(&created, start, 5, "native-one")
+            })
+            .await
+            .recorded
+    );
+    registry
+        .inner
+        .worker_imports_blocked
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        registry
+            .release_agent(SessionReleaseAgentParams {
+                seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 10)),
+                ..bound_release(&created, start, 6)
+            })
+            .await
+            .released
+    );
+    assert!(
+        registry
+            .report_agent(legacy_report(
+                &created,
+                created.pid,
+                DIRECT_AGENT_REPORT_SEQ + 20
+            ))
+            .await
+            .recorded
+    );
+    registry
+        .inner
+        .worker_imports_blocked
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    let worker = session_worker(&registry, &created.id).await;
+    sync_from(&registry, &created.id, &worker).await;
+
+    assert!(origin_is_memory(&registry, &created.id).await);
+    assert_eq!(
+        activity_of(&registry, &created.id).await,
+        Some(AgentActivity::Blocked)
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+fn block_imports(registry: &SessionRegistry, blocked: bool) {
+    registry
+        .inner
+        .worker_imports_blocked
+        .store(blocked, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A memory release of the hook source that names no process.
+fn memory_release(created: &SessionInfo, seq: u64) -> SessionReleaseAgentParams {
+    SessionReleaseAgentParams {
+        seq: Some(ReportSequence::new(seq)),
+        pid: None,
+        pid_start_identity: None,
+        monotonic_sequence: None,
+        retryable_admission: false,
+        ..bound_release(created, 0, 1)
+    }
+}
+
+/// A memory report of another source for the same process.
+fn other_source_report(created: &SessionInfo, seq: u64) -> SessionReportAgentParams {
+    SessionReportAgentParams {
+        source: "pohunek:codex-other".to_owned(),
+        ..legacy_report(created, created.pid, seq)
+    }
+}
+
+/// A bound report the worker journals with the public sequence `seq`.
+fn report_at(
+    created: &SessionInfo,
+    start: u64,
+    monotonic: u64,
+    seq: u64,
+) -> SessionReportAgentParams {
+    SessionReportAgentParams {
+        seq: Some(ReportSequence::new(seq)),
+        ..bound_report(created, start, monotonic, "native-one")
+    }
+}
+
+/// A bound release the worker journals with the public sequence `seq`.
+fn release_at(
+    created: &SessionInfo,
+    start: u64,
+    monotonic: u64,
+    seq: u64,
+) -> SessionReleaseAgentParams {
+    SessionReleaseAgentParams {
+        seq: Some(ReportSequence::new(seq)),
+        ..bound_release(created, start, monotonic)
+    }
+}
+
+/// R2 / V1: a memory report of another source for the same process, made while
+/// a forwarded report waits for its commit, holds when that report is adopted,
+/// as it does once the commit is not deferred.
+#[tokio::test]
+async fn a_memory_report_of_another_source_holds_against_a_deferred_report() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-i-dr-other").await;
+    let start = root_start_identity(&inspector, &created);
+    block_imports(&registry, true);
+    assert!(
+        registry
+            .report_agent(report_at(&created, start, 5, DIRECT_AGENT_REPORT_SEQ + 10))
+            .await
+            .recorded
+    );
+    assert!(
+        registry
+            .report_agent(other_source_report(&created, DIRECT_AGENT_REPORT_SEQ + 20))
+            .await
+            .recorded
+    );
+    block_imports(&registry, false);
+
+    let worker = session_worker(&registry, &created.id).await;
+    sync_from(&registry, &created.id, &worker).await;
+
+    assert!(origin_is_memory(&registry, &created.id).await);
+    assert_eq!(
+        activity_of(&registry, &created.id).await,
+        Some(AgentActivity::Blocked)
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// L2 / V1: the same for a forwarded release that waits for its commit.
+#[tokio::test]
+async fn a_memory_report_of_another_source_holds_against_a_deferred_release() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-i-dl-other").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(report_at(&created, start, 5, DIRECT_AGENT_REPORT_SEQ + 5))
+            .await
+            .recorded
+    );
+    block_imports(&registry, true);
+    assert!(
+        registry
+            .release_agent(release_at(&created, start, 6, DIRECT_AGENT_REPORT_SEQ + 10))
+            .await
+            .released
+    );
+    assert!(
+        registry
+            .report_agent(other_source_report(&created, DIRECT_AGENT_REPORT_SEQ + 20))
+            .await
+            .recorded
+    );
+    block_imports(&registry, false);
+
+    let worker = session_worker(&registry, &created.id).await;
+    sync_from(&registry, &created.id, &worker).await;
+
+    assert!(origin_is_memory(&registry, &created.id).await);
+    assert_eq!(
+        activity_of(&registry, &created.id).await,
+        Some(AgentActivity::Blocked)
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// R5 / V2: the caller of a memory report made over a deferred report can
+/// release it while the commit waits.
+#[tokio::test]
+async fn a_memory_claim_over_a_deferred_report_can_be_released() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-i-release-over").await;
+    let start = root_start_identity(&inspector, &created);
+    block_imports(&registry, true);
+    assert!(
+        registry
+            .report_agent(report_at(&created, start, 5, DIRECT_AGENT_REPORT_SEQ + 10))
+            .await
+            .recorded
+    );
+    assert!(
+        registry
+            .report_agent(legacy_report(
+                &created,
+                created.pid,
+                DIRECT_AGENT_REPORT_SEQ + 20
+            ))
+            .await
+            .recorded
+    );
+
+    assert!(
+        registry
+            .release_agent(memory_release(&created, DIRECT_AGENT_REPORT_SEQ + 30))
+            .await
+            .released
+    );
+    block_imports(&registry, false);
+    let worker = session_worker(&registry, &created.id).await;
+    sync_from(&registry, &created.id, &worker).await;
+
+    assert_eq!(active_agent_of(&registry, &created.id).await, None);
+    assert_eq!(activity_of(&registry, &created.id).await, None);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// R6 / V3: a memory claim released after the deferred report was adopted stays
+/// released across the projections that follow.
+#[tokio::test]
+async fn a_released_memory_claim_stays_released_across_projections() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-i-tombstone").await;
+    let start = root_start_identity(&inspector, &created);
+    block_imports(&registry, true);
+    assert!(
+        registry
+            .report_agent(report_at(&created, start, 5, DIRECT_AGENT_REPORT_SEQ + 10))
+            .await
+            .recorded
+    );
+    assert!(
+        registry
+            .report_agent(legacy_report(
+                &created,
+                created.pid,
+                DIRECT_AGENT_REPORT_SEQ + 20
+            ))
+            .await
+            .recorded
+    );
+    block_imports(&registry, false);
+    let worker = session_worker(&registry, &created.id).await;
+    sync_from(&registry, &created.id, &worker).await;
+    assert!(
+        registry
+            .release_agent(memory_release(&created, DIRECT_AGENT_REPORT_SEQ + 30))
+            .await
+            .released
+    );
+
+    sync_from(&registry, &created.id, &worker).await;
+    sync_from(&registry, &created.id, &worker).await;
+
+    assert_eq!(active_agent_of(&registry, &created.id).await, None);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// R3 / R4: an older memory report and a memory release made while a report
+/// waits for its commit change nothing.
+#[tokio::test]
+async fn an_older_report_and_a_memory_release_leave_a_deferred_report_alone() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-i-older").await;
+    let start = root_start_identity(&inspector, &created);
+    block_imports(&registry, true);
+    assert!(
+        registry
+            .report_agent(report_at(&created, start, 5, DIRECT_AGENT_REPORT_SEQ + 10))
+            .await
+            .recorded
+    );
+    let older = SessionReportAgentParams {
+        pid_start_identity: Some(protocol::ProcessStartIdentity::new(start)),
+        ..legacy_report(&created, created.pid, DIRECT_AGENT_REPORT_SEQ + 5)
+    };
+    assert!(!registry.report_agent(older).await.recorded);
+    assert!(
+        !registry
+            .release_agent(memory_release(&created, DIRECT_AGENT_REPORT_SEQ + 30))
+            .await
+            .released
+    );
+    block_imports(&registry, false);
+
+    let worker = session_worker(&registry, &created.id).await;
+    sync_from(&registry, &created.id, &worker).await;
+
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
+    let _ = registry.stop(&created.id).await;
+}
+
+/// L3 / V4: once a release is accepted, a report of another process starts a
+/// new claim, as it does when the commit is not deferred.
+#[tokio::test]
+async fn a_report_of_another_process_is_admitted_after_a_deferred_release() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-i-other-process").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(report_at(&created, start, 5, DIRECT_AGENT_REPORT_SEQ + 5))
+            .await
+            .recorded
+    );
+    block_imports(&registry, true);
+    assert!(
+        registry
+            .release_agent(release_at(&created, start, 6, DIRECT_AGENT_REPORT_SEQ + 10))
+            .await
+            .released
+    );
+
+    let other = SessionReportAgentParams {
+        pid: Some(created.pid + 1),
+        ..legacy_report(&created, created.pid, DIRECT_AGENT_REPORT_SEQ + 20)
+    };
+    assert!(registry.report_agent(other).await.recorded);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// L4 / V5: a report older than a release the worker accepted is refused while
+/// the release waits for its commit, and the claim stays as it was.
+#[tokio::test]
+async fn a_report_older_than_a_deferred_release_is_refused() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-i-stale-release").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(report_at(&created, start, 5, DIRECT_AGENT_REPORT_SEQ + 5))
+            .await
+            .recorded
+    );
+    block_imports(&registry, true);
+    assert!(
+        registry
+            .release_agent(release_at(&created, start, 6, DIRECT_AGENT_REPORT_SEQ + 20))
+            .await
+            .released
+    );
+
+    let stale = SessionReportAgentParams {
+        pid_start_identity: Some(protocol::ProcessStartIdentity::new(start)),
+        ..legacy_report(&created, created.pid, DIRECT_AGENT_REPORT_SEQ + 15)
+    };
+    assert!(!registry.report_agent(stale).await.recorded);
+    assert_eq!(activity_of(&registry, &created.id).await, None);
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
+    block_imports(&registry, false);
+
+    let worker = session_worker(&registry, &created.id).await;
+    sync_from(&registry, &created.id, &worker).await;
+    sync_from(&registry, &created.id, &worker).await;
+
+    assert_eq!(active_agent_of(&registry, &created.id).await, None);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// L4 / V5: the public order of a release the worker accepted replaces the one
+/// of the report it ended, so a report of the released source that is older than
+/// that report is admitted, as it is once the commit is not deferred.
+#[tokio::test]
+async fn a_report_of_another_source_than_a_deferred_release_is_ordered_against_the_release() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-i-release-src").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(report_at(&created, start, 5, DIRECT_AGENT_REPORT_SEQ + 20))
+            .await
+            .recorded
+    );
+    block_imports(&registry, true);
+    assert!(
+        registry
+            .release_agent(SessionReleaseAgentParams {
+                source: "pohunek:codex-other".to_owned(),
+                ..release_at(&created, start, 6, DIRECT_AGENT_REPORT_SEQ + 30)
+            })
+            .await
+            .released
+    );
+
+    let waits = registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get(&created.id)
+        .is_some_and(|entry| entry.pending_release.is_some());
+    assert!(waits, "the release waits");
+    let older = other_source_report(&created, DIRECT_AGENT_REPORT_SEQ + 10);
+    let older = SessionReportAgentParams {
+        source: CODEX_HOOK_SOURCE.to_owned(),
+        ..older
+    };
+    assert!(registry.report_agent(older).await.recorded);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// X002: a release made while the report it ends still waits for its
+/// projection keeps its public order, so a delayed report of the same source
+/// that is older than the release stays refused after both are adopted.
+#[tokio::test]
+async fn a_release_of_a_report_that_was_never_projected_keeps_its_order() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-i-unprojected").await;
+    let start = root_start_identity(&inspector, &created);
+    block_imports(&registry, true);
+    assert!(
+        registry
+            .report_agent(report_at(&created, start, 5, DIRECT_AGENT_REPORT_SEQ + 10))
+            .await
+            .recorded
+    );
+    assert!(
+        registry
+            .release_agent(release_at(&created, start, 6, DIRECT_AGENT_REPORT_SEQ + 20))
+            .await
+            .released
+    );
+    block_imports(&registry, false);
+
+    let worker = session_worker(&registry, &created.id).await;
+    sync_from(&registry, &created.id, &worker).await;
+    sync_from(&registry, &created.id, &worker).await;
+
+    let delayed = legacy_report(&created, created.pid, DIRECT_AGENT_REPORT_SEQ + 15);
+    assert!(
+        !registry.report_agent(delayed).await.recorded,
+        "a report older than the release is refused"
+    );
+    assert_eq!(active_agent_of(&registry, &created.id).await, None);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// L5 / L6: a memory release while a release waits ends nothing more; a memory
+/// claim made after it can be released and stays released.
+#[tokio::test]
+async fn a_memory_claim_made_after_a_deferred_release_is_released_for_good() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-i-release-twice").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(report_at(&created, start, 5, DIRECT_AGENT_REPORT_SEQ + 5))
+            .await
+            .recorded
+    );
+    block_imports(&registry, true);
+    assert!(
+        registry
+            .release_agent(release_at(&created, start, 6, DIRECT_AGENT_REPORT_SEQ + 10))
+            .await
+            .released
+    );
+    assert!(
+        !registry
+            .release_agent(memory_release(&created, DIRECT_AGENT_REPORT_SEQ + 12))
+            .await
+            .released
+    );
+
+    assert!(
+        registry
+            .report_agent(legacy_report(
+                &created,
+                created.pid,
+                DIRECT_AGENT_REPORT_SEQ + 20
+            ))
+            .await
+            .recorded
+    );
+    assert!(
+        registry
+            .release_agent(memory_release(&created, DIRECT_AGENT_REPORT_SEQ + 30))
+            .await
+            .released
+    );
+    block_imports(&registry, false);
+    let worker = session_worker(&registry, &created.id).await;
+    sync_from(&registry, &created.id, &worker).await;
+    sync_from(&registry, &created.id, &worker).await;
+
+    assert_eq!(active_agent_of(&registry, &created.id).await, None);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// Restart after a release: a daemon that holds the persisted claim without a
+/// fence adopts the release the worker journaled at its first sync.
+#[tokio::test]
+async fn the_first_sync_after_a_restart_adopts_the_journaled_release() {
+    let (registry, inspector, created) =
+        mock_direct_codex_registry("claim-i-restart-release").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(report_at(&created, start, 5, DIRECT_AGENT_REPORT_SEQ + 5))
+            .await
+            .recorded
+    );
+    assert!(
+        registry
+            .release_agent(release_at(&created, start, 6, DIRECT_AGENT_REPORT_SEQ + 10))
+            .await
+            .released
+    );
+    let worker = session_worker(&registry, &created.id).await;
+    let () = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("entry");
+        let mut persisted = ActiveAgentReport::clone(
+            entry
+                .last_agent_report
+                .as_ref()
+                .expect("the released claim"),
+        );
+        persisted.origin = crate::session::claim::ClaimOrigin::memory();
+        entry.active_agent = Some(persisted);
+        entry.identity_fence = None;
+        entry.pending_activity = None;
+        entry.pending_release = None;
+    };
+
+    sync_from(&registry, &created.id, &worker).await;
+
+    assert_eq!(active_agent_of(&registry, &created.id).await, None);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A claim the worker accepted and the daemon has not adopted yet is the
+/// journaled claim for D1 and D2: an unbound report and an unforwardable
+/// release do not replace or end it.
+#[tokio::test]
+async fn a_claim_waiting_for_its_commit_is_held_by_the_journal() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-pending-held").await;
+    let start = root_start_identity(&inspector, &created);
+    registry
+        .inner
+        .worker_imports_blocked
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        registry
+            .report_agent(SessionReportAgentParams {
+                seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 10)),
+                ..bound_report(&created, start, 5, "native-one")
+            })
+            .await
+            .recorded
+    );
+
+    assert!(
+        !registry
+            .report_agent(SessionReportAgentParams {
+                seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 20)),
+                ..attested_report(&created, None, None)
+            })
+            .await
+            .recorded
+    );
+    assert!(
+        !registry
+            .release_agent(SessionReleaseAgentParams {
+                seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 10)),
+                pid: None,
+                pid_start_identity: None,
+                monotonic_sequence: None,
+                retryable_admission: false,
+                ..bound_release(&created, start, 1)
+            })
+            .await
+            .released
+    );
+
+    registry
+        .inner
+        .worker_imports_blocked
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let worker = session_worker(&registry, &created.id).await;
+    sync_from(&registry, &created.id, &worker).await;
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
+    let _ = registry.stop(&created.id).await;
+}
+
+/// Y3 (row 5 during): an unforwardable release made during a forward ends no
+/// claim: the forwarded claim is the journaled one by then.
+#[tokio::test]
+async fn an_unforwardable_release_made_during_a_forward_ends_nothing() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-race-release").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(SessionReportAgentParams {
+                seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 5)),
+                ..attested_report(&created, None, None)
+            })
+            .await
+            .recorded
+    );
+    let forwarded = SessionReportAgentParams {
+        seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 10)),
+        ..bound_report(&created, start, 5, "native-one")
+    };
+    let parked = park_forward(&registry, 2, {
+        let registry = registry.clone();
+        async move { registry.report_agent(forwarded).await }
+    })
+    .await;
+
+    let (first, second) = parked
+        .race({
+            let registry = registry.clone();
+            let release = SessionReleaseAgentParams {
+                seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 5)),
+                pid: None,
+                pid_start_identity: None,
+                monotonic_sequence: None,
+                retryable_admission: false,
+                ..bound_release(&created, start, 1)
+            };
+            async move { registry.release_agent(release).await }
+        })
+        .await;
+
+    assert!(first.recorded);
+    assert!(!second.released);
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(5));
+    let _ = registry.stop(&created.id).await;
+}
+
+/// Y4 (row 8 during): a memory report of the same process made while a bound
+/// release is forwarded is judged after the release and starts a new claim.
+#[tokio::test]
+async fn a_memory_report_made_during_a_forwarded_release_starts_a_new_claim() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-race-fl").await;
+    let start = root_start_identity(&inspector, &created);
+    assert!(
+        registry
+            .report_agent(SessionReportAgentParams {
+                seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 10)),
+                ..bound_report(&created, start, 5, "native-one")
+            })
+            .await
+            .recorded
+    );
+    let release = SessionReleaseAgentParams {
+        seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 20)),
+        ..bound_release(&created, start, 6)
+    };
+    let parked = park_forward(&registry, 1, {
+        let registry = registry.clone();
+        async move { registry.release_agent(release).await }
+    })
+    .await;
+
+    let (first, second) = parked
+        .race({
+            let registry = registry.clone();
+            let newer = legacy_report(&created, created.pid, DIRECT_AGENT_REPORT_SEQ + 30);
+            async move { registry.report_agent(newer).await }
+        })
+        .await;
+
+    assert!(first.released && second.recorded);
+    assert!(origin_is_memory(&registry, &created.id).await);
+    assert_eq!(
+        activity_of(&registry, &created.id).await,
+        Some(AgentActivity::Blocked)
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+/// Row 4 (forwarded report, then a bound release during it): the release is
+/// judged after the report's claim is adopted and ends it.
+#[tokio::test]
+async fn a_bound_release_made_during_a_forward_ends_the_forwarded_claim() {
+    let (registry, inspector, created) = mock_direct_codex_registry("claim-race-bl").await;
+    let start = root_start_identity(&inspector, &created);
+    let report = SessionReportAgentParams {
+        seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 10)),
+        ..bound_report(&created, start, 5, "native-one")
+    };
+    let parked = park_forward(&registry, 2, {
+        let registry = registry.clone();
+        async move { registry.report_agent(report).await }
+    })
+    .await;
+
+    let (first, second) = parked
+        .race({
+            let registry = registry.clone();
+            let release = SessionReleaseAgentParams {
+                seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ + 20)),
+                ..bound_release(&created, start, 6)
+            };
+            async move { registry.release_agent(release).await }
+        })
+        .await;
+
+    assert!(first.recorded && second.released);
+    assert_eq!(claim_origin(&registry, &created.id).await, None);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// The public order of the hook report the claim scenarios make.
+fn hook_order() -> crate::session::claim::PublicOrder {
+    crate::session::claim::PublicOrder {
+        source: CODEX_HOOK_SOURCE.to_owned(),
+        seq: Some(DIRECT_AGENT_REPORT_SEQ),
+    }
+}
+
+/// The blocked activity of a report that waits for `revision` of `instance`.
+fn blocked_pending(
+    child: pohunek_worker_protocol::ProcessIdentity,
+    sequence: u64,
+    instance: String,
+    revision: u64,
+) -> crate::session::claim::PendingActivity {
+    crate::session::claim::PendingActivity {
+        acknowledged: true,
+        key: crate::session::claim::ClaimKey {
+            provider: "claude".to_owned(),
+            pid: child.pid,
+            start_identity: child.start_identity,
+            sequence,
+        },
+        revision: crate::session::IdentityFence {
+            worker_instance_id: instance,
+            revision,
+        },
+        public: hook_order(),
+        activity: Some(AgentActivity::Blocked),
+        epoch: "epoch".to_owned(),
+        admitted: crate::session::claim::next_admission(),
+    }
+}
+
+/// R3-C: a snapshot that changes the native reference and nothing else about
+/// the active agent still carries the newest claim and settles its activity.
+#[tokio::test]
+async fn a_native_reference_change_adopts_the_newest_claim() {
+    let store_path = temp_store_path("claim-native-change");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        agents_dir: Some(temp_resumable_agents_dir("claim-native-change")),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(SessionNewParams {
+            agent: "resumable".to_owned(),
+            ..params()
+        })
+        .await
+        .expect("create resumable session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let base = worker.inspect().await.expect("inspect worker");
+    let child = base.child_process.expect("worker child");
+    let claim = |sequence: u64| pohunek_worker_protocol::ActiveIdentityClaim {
+        provider: "claude".to_owned(),
+        process: child,
+        sequence,
+        expires_at: (time::OffsetDateTime::now_utc() + time::Duration::seconds(30))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("format expiry"),
+        reference_kind: None,
+        native_reference: None,
+        agent: None,
+        origin: Some(pohunek_worker_protocol::ClaimOrigin::Forwarded),
+        reported_session: Some(pohunek_worker_protocol::ReportedSession {
+            kind: pohunek_worker_protocol::ReportedSessionKind::Id,
+            value: "annotation".to_owned(),
+            transcript_path: None,
+        }),
+    };
+    let snapshot = |revision: u64, sequence: u64, native: &str| {
+        let mut snapshot = base.clone();
+        snapshot.hook_schema = Some("identity-subagent-v1".to_owned());
+        snapshot.launch_identity = Some(pohunek_worker_protocol::ReportedLaunchIdentity {
+            provider: "claude".to_owned(),
+            process: child,
+            reference_kind: "id".to_owned(),
+            native_reference: "launch-native".to_owned(),
+        });
+        snapshot.native_reference = Some(pohunek_worker_protocol::ReportedNativeReference {
+            provider: "claude".to_owned(),
+            process: child,
+            sequence: revision,
+            reference_kind: "id".to_owned(),
+            native_reference: native.to_owned(),
+        });
+        snapshot.active_identity = Some(claim(sequence));
+        snapshot.active_identity_revision = Some(revision);
+        snapshot
+    };
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot(5, 10, "native-a"))
+            .await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(10));
+    let instance = worker
+        .worker_instance_id()
+        .await
+        .expect("worker instance")
+        .to_string();
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .expect("entry")
+        .pending_activity = Some(Box::new(blocked_pending(child, 20, instance, 6)));
+
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot(6, 20, "native-b"))
+            .await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+
+    let info = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(info.native_session_id.as_deref(), Some("native-b"));
+    assert_eq!(journaled_sequence(&registry, &created.id).await, Some(20));
+    assert_eq!(info.activity, Some(AgentActivity::Blocked));
     let _ = registry.stop(&created.id).await;
 }
