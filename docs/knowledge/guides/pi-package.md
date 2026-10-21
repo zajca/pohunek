@@ -200,10 +200,11 @@ reserved, so either way of installing serves it.
   installed from the official catalog, selected and enabled, the upgrade
   installs and selects the release's version and keeps the older one installed.
   It never installs an absent Pi package, never enables or selects one you turned
-  off (the plan reports a gap with the `pohunek plugin update pohunek.runtime.pi
-  runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json --yes`
-  command), and keeps a selected version newer than the release's instead of
-  downgrading it.
+  off, and keeps a selected version newer than the release's instead of
+  downgrading it. The plan reports a deselected package as a gap with the
+  `pohunek plugin update pohunek.runtime.pi runtime/packages/pi.tar.zst --catalog
+  runtime/runtime-catalog.json --yes` command, and a disabled one with
+  `pohunek plugin enable pohunek.runtime.pi --digest <digest>`.
 - Pin a profile to the installed digest (`pohunek plugin profile migrate`) so a
   later `plugin update` cannot change an existing profile's package. A profile
   `[env]` may set `PI_OFFLINE`, `PI_SKIP_VERSION_CHECK` and `PI_TELEMETRY`; never

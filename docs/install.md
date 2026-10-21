@@ -361,9 +361,9 @@ plugin disable` or `pohunek plugin uninstall` leaves `claude`, `codex` or
 every official runtime the host uses. It repins the host profiles pinned to an
 older version of that package and lists the pinned profiles it keeps. An official
 Pi package that is installed, selected and enabled is updated the same way; an
-absent Pi package is never installed, a Pi package you disabled or deselected is
-left as it is (the plan names the `pohunek plugin update` command), and a
-selected version newer than the release's is kept, never downgraded. Outside
+absent Pi package is never installed, a Pi package you deselected is left as it is
+(the plan names the `pohunek plugin update` command), and a selected version newer
+than the release's is kept, never downgraded. Outside
 an upgrade, `pohunek plugin update <package> runtime/packages/<runtime>.tar.zst
 --catalog runtime/runtime-catalog.json` installs and selects a newer release's
 version. It refuses a version lower than the selected official one
@@ -375,9 +375,15 @@ for example after a `plugin update` from a later archive, the upgrade plan says
 that the upgrade re-selects the release's version. Select the newer one again afterwards. A plain
 `install` of another version leaves it installed but unselected. A selected version of any official runtime
 that cannot be ordered against the release's is never replaced while it is enabled and loads:
-it is kept and reported as the gap `plugin_update_version_unordered`. A disabled one is left
-untouched with the gap `official_package_not_serving`; an enabled one that cannot load is
-left as it is too, with the same gap and a repair hint.
+it is kept and reported as the gap `plugin_update_version_unordered`. A selected package you disabled
+is never replaced, selected or enabled by an upgrade, whatever its version is, even a newer
+one: the runtime is left as you set it with the gap `official_package_not_serving`, whose
+hint is `pohunek plugin enable <package> --digest <digest>`; the next upgrade then proceeds
+as for any enabled package. The release's own package that you installed with `--no-enable`
+or disabled, while another version is selected, is not enabled or selected by the upgrade
+either; the selected version keeps serving (a newer Pi version is kept silently, and
+an altered root of that package is refused with `plugin uninstall --remove-modified`, beside an older selection). An enabled unordered one that cannot load is left as it is too,
+with the same gap and a repair hint.
 The trust model and the package classes are described
 in [the architecture](architecture.md#runtime-packages-and-trust) and the
 [runtime packages guide](knowledge/guides/runtime-packages.md).

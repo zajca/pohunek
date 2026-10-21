@@ -36,8 +36,8 @@ use pohunek_test_support::catalog::{
 };
 use pohunek_test_support::{worker_binary, workspace_root};
 use protocol::{
-    BindingProvenance, LaunchBinding, PackageInstallParams, PackageInstallStatus, PackageTrust,
-    RuntimeId,
+    BindingProvenance, LaunchBinding, PackageInstallParams, PackageInstallStatus,
+    PackageSetEnabledParams, PackageTrust, RuntimeId,
 };
 
 /// The runtimes the official packages serve, each built from
@@ -267,6 +267,23 @@ pub(crate) async fn preinstall_third_party(
         .unwrap_or_else(|error| panic!("the third-party {runtime} package installs: {error:?}"));
     assert_eq!(result.status, PackageInstallStatus::Installed, "{runtime}");
     digest
+}
+
+/// Enables the installed package `digest` through the production
+/// `package.set_enabled` method, as `pohunek plugin enable --digest` calls it.
+pub(crate) async fn enable_package(plugins_dir: &Path, scratch: &Path, digest: &PackageDigest) {
+    let config = SessionRegistryConfig {
+        plugins_dir: Some(plugins_dir.to_path_buf()),
+        ..installer_config(scratch)
+    };
+    let result = installer_registry(config)
+        .package_set_enabled(PackageSetEnabledParams {
+            digest: digest.clone(),
+            enabled: true,
+        })
+        .await
+        .unwrap_or_else(|error| panic!("the hinted package enables: {error:?}"));
+    assert!(result.package.enabled);
 }
 
 /// The `--version` banner of the release `compat/<runtime>/compatibility-lock.json`

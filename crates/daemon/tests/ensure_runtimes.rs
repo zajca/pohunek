@@ -28,9 +28,10 @@ use pohunek_service_config::runtimes::{
     CODE_GAP_CONFIG_HOME_SYMLINK, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
     CODE_GAP_SERVED_BY_OTHER_PACKAGE, CODE_GAP_UPDATE_VERSION_UNORDERED,
     CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION,
-    CODE_PINNED_TO_NEWER_VERSION, CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_VERSION_UNKNOWN,
-    CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE,
-    DETECT_FLAG, DRY_RUN_FLAG, ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
+    CODE_PINNED_TO_NEWER_VERSION, CODE_PINNED_TO_NON_OFFICIAL_PACKAGE,
+    CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_VERSION_UNKNOWN, CODE_PROFILE_NOT_MIGRATABLE,
+    CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE, DETECT_FLAG, DRY_RUN_FLAG,
+    ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
 };
 use pohunek_test_support::bin_exe;
 use pohunek_test_support::env::TestEnv;
@@ -188,26 +189,22 @@ impl Host {
     /// the root is present but does not match its recorded manifest.
     fn alter_installed_root(&self) {
         let packages = self.plugins_dir().join("packages");
-        let mut pending = vec![fs::read_dir(&packages)
+        let root = fs::read_dir(&packages)
             .expect("the packages directory")
             .next()
             .expect("one installed package root")
             .expect("a package root entry")
-            .path()];
-        while let Some(directory) = pending.pop() {
-            for entry in fs::read_dir(&directory).expect("a package directory") {
-                let path = entry.expect("a directory entry").path();
-                if path.is_dir() {
-                    pending.push(path);
-                } else {
-                    let mut content = fs::read(&path).expect("a package file");
-                    content.extend_from_slice(b"altered\n");
-                    fs::write(&path, content).expect("alter the package file");
-                    return;
-                }
-            }
-        }
-        panic!("the installed package root holds no file");
+            .path();
+        alter_root(root);
+    }
+
+    /// Alters the root of the installed package `digest` the same way.
+    fn alter_package_root(&self, digest: &PackageDigest) {
+        let hex = digest
+            .as_str()
+            .strip_prefix("sha256:")
+            .expect("a sha256 digest");
+        alter_root(self.plugins_dir().join("packages").join(hex));
     }
 
     fn registry_path(&self) -> PathBuf {
@@ -902,92 +899,41 @@ fn a_digest_only_profile_does_not_block_an_installed_release_package() {
     assert_eq!(plan.profiles[0].status, ProfileStatus::Bind);
 }
 
-/// A release package that is selected but disabled is only enabled: the apply
-/// makes no selecting call, so the retained set is not judged for it. A
-/// digest-only profile that retains a damaged older version is then bound to
-/// the enabled package, and the plan and the apply agree.
+/// A release package that is selected but disabled is left disabled, with a
+/// gap whose hint enables it: the operator turned it off, and a digest-only
+/// profile that retains a damaged older version is not bound to it.
 #[test]
-fn a_selected_but_disabled_release_package_is_enabled_and_its_profile_bound() {
+fn a_selected_but_disabled_release_package_is_left_disabled_and_its_profile_unbound() {
     let host = Host::new();
     let (_older, digest, second) = digest_only_repair_state(&host);
     host.disable_package(&digest);
-
-    let plan = host.step(true);
-
-    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
-    let claude = plan
-        .packages
-        .iter()
-        .find(|package| package.runtime == "claude")
-        .expect("the claude package");
-    assert_eq!(claude.status, PackageStatus::Install);
-    assert_eq!(plan.profiles.len(), 1);
-    assert_eq!(plan.profiles[0].status, ProfileStatus::Bind);
-
-    let applied = host.step(false);
-
-    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
-    let claude = applied
-        .packages
-        .iter()
-        .find(|package| package.runtime == "claude")
-        .expect("the claude package");
-    assert_eq!(claude.status, PackageStatus::Installed);
-    assert_eq!(applied.profiles.len(), 1);
-    assert_eq!(applied.profiles[0].status, ProfileStatus::Bound);
-    assert!(fs::read_to_string(&second)
-        .expect("the bound profile")
-        .contains(&format!("digest = \"{}\"", digest.as_str())));
-
-    let repeat = host.step(false);
-    let claude = repeat
-        .packages
-        .iter()
-        .find(|package| package.runtime == "claude")
-        .expect("the claude package");
-    assert_eq!(claude.status, PackageStatus::Present);
-}
-
-/// A selected but disabled release package is only enabled, and the apply then
-/// runs the coexistence check of the profile bind it carries. Another profile
-/// retains a damaged older version, so the plan refuses the bind before the
-/// enable is applied, and nothing changes.
-#[test]
-fn a_selected_but_disabled_release_package_is_not_enabled_when_its_bind_would_refuse() {
-    let host = Host::new();
-    host.publish_at(&["claude"], 1);
-    host.write_profile("other", "base = \"claude\"\n");
-    let older = host.step(false).packages[0].digest.clone();
-    let pinned_older = host.profile_text_of("other");
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.3");
-    host.publish_archives(2, &[("claude", &bytes, &digest)]);
-    let newer = host.step(false);
-    assert_eq!(newer.packages[0].status, PackageStatus::Installed);
-    host.write_profile("other", &pinned_older);
-    host.disable_package(&digest);
-    host.remove_package_root(&older);
-    let target = host.write_profile("target", "base = \"claude\"\n");
     let registry = fs::read(host.registry_path()).expect("the registry record");
-    let profile = fs::read(&target).expect("the unpinned profile");
-    let incompatible = ProtocolError::from(PackageErrorKind::IntegrationIncompatible).code;
+    let profile = fs::read(&second).expect("the profile");
 
     let plan = host.step(true);
     let applied = host.step(false);
 
     for report in [&plan, &applied] {
-        assert_eq!(refusal_codes(report), [incompatible.as_str()]);
-        assert_eq!(report.refusals[0].subject, "target");
-        assert!(report
-            .profiles
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert!(report.packages.is_empty(), "{:?}", report.packages);
+        assert!(report.profiles.is_empty(), "{:?}", report.profiles);
+        let gap = report
+            .gaps
             .iter()
-            .all(|profile| profile.name != "target"));
+            .find(|gap| gap.runtime == "claude")
+            .expect("the claude gap");
+        assert_eq!(gap.code, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING);
+        assert!(
+            gap.detail.contains(&enable_command("claude", &digest)),
+            "{}",
+            gap.detail
+        );
     }
     assert_eq!(
         fs::read(host.registry_path()).expect("the registry record"),
-        registry,
-        "the enable is not applied"
+        registry
     );
-    assert_eq!(fs::read(&target).expect("the unpinned profile"), profile);
+    assert_eq!(fs::read(&second).expect("the profile"), profile);
 }
 
 /// The status of the profile `name` in `profiles`, which must have an entry.
@@ -1945,72 +1891,563 @@ fn a_selected_reserved_runtime_version_without_an_order_against_the_release_is_k
     }
 }
 
+/// The version of the release the disabled-selection scenarios publish.
+const RELEASE_VERSION: &str = "1.0.3";
+
+/// The enable command a gap hint names for the package `runtime` serves.
+fn enable_command(runtime: &str, digest: &PackageDigest) -> String {
+    let hex = digest
+        .as_str()
+        .strip_prefix("sha256:")
+        .expect("a sha256 digest");
+    format!("pohunek plugin enable pohunek.runtime.{runtime} --digest {hex}")
+}
+
+/// A host whose `runtime` package `installed` is installed, selected and bound
+/// to a profile, then disabled by the operator, with `release` published as the
+/// release under a later catalog.
+fn host_with_disabled_selection(
+    runtime: &str,
+    installed: &(Vec<u8>, PackageDigest),
+    release: &(Vec<u8>, PackageDigest),
+) -> Host {
+    let host = Host::new();
+    host.publish_archives(1, &[(runtime, &installed.0, &installed.1)]);
+    host.write_profile(runtime, &format!("base = \"{runtime}\"\n"));
+    let first = host.step(false);
+    assert!(first.refusals.is_empty(), "{runtime}: {first:?}");
+    host.disable_package(&installed.1);
+    if runtime == "claude" {
+        host.write_claude_hook();
+    }
+    host.publish_archives(2, &[(runtime, &release.0, &release.1)]);
+    host
+}
+
+/// Asserts that the plan and the apply of `host` leave the runtime whose
+/// disabled package is `digest` as the operator set it: no package, no
+/// integration, no refusal, one gap whose hint enables `digest`, and the
+/// registry and the profile unchanged.
+fn assert_disabled_selection_left(host: &Host, runtime: &str, digest: &PackageDigest, label: &str) {
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let profile = host.profile_text_of(runtime);
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        let context = format!("{runtime} {label}");
+        assert!(
+            report.refusals.is_empty(),
+            "{context}: {:?}",
+            report.refusals
+        );
+        assert!(
+            report.packages.is_empty(),
+            "{context}: {:?}",
+            report.packages
+        );
+        assert!(report.integrations.is_empty(), "{context}");
+        assert!(
+            report.profiles.is_empty(),
+            "{context}: {:?}",
+            report.profiles
+        );
+        assert_eq!(
+            gap_codes(report)
+                .into_iter()
+                .filter(|(name, _)| *name == runtime)
+                .collect::<Vec<_>>(),
+            [(runtime, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)],
+            "{context}"
+        );
+        let gap = report
+            .gaps
+            .iter()
+            .find(|gap| gap.runtime == runtime)
+            .expect("the runtime's gap");
+        assert!(
+            gap.detail.contains(&enable_command(runtime, digest)),
+            "{context}: {}",
+            gap.detail
+        );
+        assert!(
+            !gap.detail.contains("plugin update"),
+            "{context}: {}",
+            gap.detail
+        );
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry,
+        "{runtime} {label}"
+    );
+    assert_eq!(host.profile_text_of(runtime), profile, "{runtime} {label}");
+}
+
 /// A selected version with no order against the release's that the operator
 /// disabled is left as set: nothing is replaced, selected or enabled, and the
 /// plan reports a gap.
 #[test]
 fn a_disabled_unordered_selected_reserved_runtime_version_is_left_untouched() {
     for runtime in ["claude", "codex", "hermes"] {
-        let host = Host::new();
-        let (bytes, digest) = official_runtimes::variant_archive(runtime, "2.0");
-        host.publish_archives(1, &[(runtime, &bytes, &digest)]);
-        host.write_profile(runtime, &format!("base = \"{runtime}\"\n"));
-        let installed = host.step(false);
-        assert!(installed.refusals.is_empty(), "{runtime}: {installed:?}");
-        host.disable_package(&digest);
-        if runtime == "claude" {
-            host.write_claude_hook();
+        let installed = official_runtimes::variant_archive(runtime, "2.0");
+        let release = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+        let host = host_with_disabled_selection(runtime, &installed, &release);
+
+        assert_disabled_selection_left(&host, runtime, &installed.1, "unordered");
+    }
+}
+
+/// A selected version that is ordered against the release's, older or newer or
+/// equal under another digest, is left as the operator disabled it too: the
+/// release's package neither replaces nor re-enables it, and a newer version is
+/// never downgraded.
+#[test]
+fn a_disabled_ordered_selected_reserved_runtime_version_is_left_untouched() {
+    for runtime in ["claude", "codex", "hermes"] {
+        let alternative = format!("{runtime}-alt");
+        let release = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+        for (label, installed) in [
+            (
+                "older",
+                official_runtimes::variant_archive(runtime, "1.0.1"),
+            ),
+            (
+                "newer",
+                official_runtimes::variant_archive(runtime, "2.1.0"),
+            ),
+            (
+                "equal",
+                official_runtimes::variant_archive_with_program(
+                    runtime,
+                    RELEASE_VERSION,
+                    &alternative,
+                ),
+            ),
+        ] {
+            let host = host_with_disabled_selection(runtime, &installed, &release);
+
+            assert_disabled_selection_left(&host, runtime, &installed.1, label);
         }
-        let (release, release_digest) = official_runtimes::variant_archive(runtime, "1.0.3");
-        host.publish_archives(2, &[(runtime, &release, &release_digest)]);
+    }
+}
+
+/// A disabled selected package whose root is missing is left as set, and the
+/// hint restores the root before it enables the package: `plugin enable` of a
+/// package without a root fails.
+#[test]
+fn a_disabled_selection_without_its_root_is_left_with_a_restoring_hint() {
+    for (label, version) in [("older", "1.0.1"), ("newer", "2.1.0")] {
+        let installed = official_runtimes::variant_archive("claude", version);
+        let release = official_runtimes::variant_archive("claude", RELEASE_VERSION);
+        let host = host_with_disabled_selection("claude", &installed, &release);
+        host.remove_installed_root();
         let registry = fs::read(host.registry_path()).expect("the registry record");
-        let profile = host.profile_text_of(runtime);
 
         let plan = host.step(true);
         let applied = host.step(false);
 
         for report in [&plan, &applied] {
-            assert!(
-                report.refusals.is_empty(),
-                "{runtime}: {:?}",
-                report.refusals
-            );
-            assert!(
-                report.packages.is_empty(),
-                "{runtime}: {:?}",
-                report.packages
-            );
-            assert!(report.integrations.is_empty(), "{runtime}");
-            assert_eq!(
-                gap_codes(report)
-                    .into_iter()
-                    .filter(|(name, _)| *name == runtime)
-                    .collect::<Vec<_>>(),
-                [(runtime, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)]
-            );
-            let hex = digest
-                .as_str()
-                .strip_prefix("sha256:")
-                .expect("a sha256 digest");
+            assert!(report.refusals.is_empty(), "{label}: {:?}", report.refusals);
+            assert!(report.packages.is_empty(), "{label}: {:?}", report.packages);
             let gap = report
                 .gaps
                 .iter()
-                .find(|gap| gap.runtime == runtime)
-                .expect("the runtime's gap");
+                .find(|gap| gap.runtime == "claude")
+                .expect("the claude gap");
+            assert_eq!(gap.code, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING, "{label}");
+            let restore = gap
+                .detail
+                .find("pohunek plugin install")
+                .expect("a restore hint");
+            let enable = gap
+                .detail
+                .find(&enable_command("claude", &installed.1))
+                .expect("an enable hint");
+            assert!(restore < enable, "{label}: {}", gap.detail);
+        }
+        assert_eq!(
+            fs::read(host.registry_path()).expect("the registry record"),
+            registry,
+            "{label}"
+        );
+    }
+}
+
+/// A disabled selected package whose root is altered is refused with the
+/// command that removes it, as an enabled one is, and nothing changes.
+#[test]
+fn a_disabled_selection_with_an_altered_root_is_refused() {
+    for runtime in ["claude", "codex", "hermes"] {
+        let installed = official_runtimes::variant_archive(runtime, "1.0.1");
+        let release = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+        let host = host_with_disabled_selection(runtime, &installed, &release);
+        host.alter_installed_root();
+        let registry = fs::read(host.registry_path()).expect("the registry record");
+        let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
+
+        let plan = host.step(true);
+        let applied = host.step(false);
+
+        for report in [&plan, &applied] {
+            assert_eq!(refusal_codes(report), [root_refusal.as_str()], "{runtime}");
             assert!(
-                gap.detail.contains(&format!(
-                    "pohunek plugin enable pohunek.runtime.{runtime} --digest {hex}"
+                report.refusals[0].detail.contains(&format!(
+                    "pohunek plugin uninstall pohunek.runtime.{runtime} --digest {} --remove-modified --yes",
+                    installed.1.as_str()
                 )),
                 "{}",
-                gap.detail
+                report.refusals[0].detail
             );
+            assert!(report.packages.is_empty(), "{runtime}");
         }
         assert_eq!(
             fs::read(host.registry_path()).expect("the registry record"),
             registry,
             "{runtime}"
         );
-        assert_eq!(host.profile_text_of(runtime), profile, "{runtime}");
+    }
+}
+
+/// The release's own package, selected and disabled, is left disabled: an
+/// install records the enabled flag and the selection in one registry commit,
+/// so only the operator leaves a package selected and disabled.
+#[test]
+fn a_disabled_selected_release_package_is_left_untouched() {
+    for runtime in ["claude", "codex", "hermes"] {
+        let release = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+        let host = host_with_disabled_selection(runtime, &release, &release);
+
+        assert_disabled_selection_left(&host, runtime, &release.1, "release");
+    }
+}
+
+/// A host whose `runtime` has the enabled version `selected_version` serving
+/// it, with profile `runtime` and, for claude, a hook, beside the release's
+/// package recorded as disabled (`plugin install --no-enable`). Returns the
+/// host, the serving digest and the release digest.
+fn host_serving_beside_a_disabled_release(
+    runtime: &str,
+    selected_version: &str,
+) -> (Host, PackageDigest, PackageDigest) {
+    let host = Host::new();
+    let release = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+    let selected = official_runtimes::variant_archive(runtime, selected_version);
+    host.write_profile(runtime, &format!("base = \"{runtime}\"\n"));
+    host.publish_archives(1, &[(runtime, &release.0, &release.1)]);
+    assert!(host.step(false).refusals.is_empty());
+    host.publish_archives(2, &[(runtime, &selected.0, &selected.1)]);
+    let swapped = host.step(false);
+    assert!(swapped.refusals.is_empty(), "{runtime}: {swapped:?}");
+    host.publish_archives(3, &[(runtime, &release.0, &release.1)]);
+    let store = pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+        .expect("the package store");
+    store
+        .registry()
+        .select(&selected.1)
+        .expect("select the serving version");
+    host.disable_package(&release.1);
+    if runtime == "claude" {
+        host.write_claude_hook();
+    }
+    (host, selected.1, release.1)
+}
+
+/// The release's package is installed and disabled while an enabled version,
+/// older or newer than the release's, serves the runtime: the version keeps
+/// serving with its package entry and integrations, nothing is enabled,
+/// selected or downgraded, and the gap names the release's digest.
+#[tokio::test]
+async fn a_disabled_release_package_leaves_the_serving_selection_in_place() {
+    for runtime in ["claude", "codex", "hermes"] {
+        for (label, version) in [("older", "1.0.1"), ("newer", "2.1.0")] {
+            let (host, selected, release) =
+                host_serving_beside_a_disabled_release(runtime, version);
+            let registry = fs::read(host.registry_path()).expect("the registry record");
+            let context = format!("{runtime} {label}");
+
+            let plan = host.step(true);
+            let applied = host.step(false);
+
+            for report in [&plan, &applied] {
+                assert!(
+                    report.refusals.is_empty(),
+                    "{context}: {:?}",
+                    report.refusals
+                );
+                let package = report
+                    .packages
+                    .iter()
+                    .find(|package| package.runtime == runtime)
+                    .unwrap_or_else(|| panic!("{context}: {:?}", report.packages));
+                assert_eq!(package.status, PackageStatus::Kept, "{context}");
+                assert_eq!(package.digest, selected.as_str(), "{context}");
+                assert_eq!(package.replaces_newer, None, "{context}");
+                if runtime == "claude" {
+                    assert!(!report.integrations.is_empty(), "{context}");
+                }
+                let gap = report
+                    .gaps
+                    .iter()
+                    .find(|gap| gap.runtime == runtime)
+                    .unwrap_or_else(|| panic!("{context}: {:?}", report.gaps));
+                assert_eq!(gap.code, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING, "{context}");
+                assert!(
+                    gap.detail.contains("keeps serving"),
+                    "{context}: {}",
+                    gap.detail
+                );
+                assert!(
+                    gap.detail.contains(&enable_command(runtime, &release)),
+                    "{context}: {}",
+                    gap.detail
+                );
+            }
+            assert_eq!(
+                fs::read(host.registry_path()).expect("the registry record"),
+                registry,
+                "{context}"
+            );
+
+            official_runtimes::enable_package(&host.plugins_dir(), host.env.root(), &release).await;
+            let enabled = host.step(true);
+            assert!(
+                enabled.refusals.is_empty(),
+                "{context}: {:?}",
+                enabled.refusals
+            );
+            let package = enabled
+                .packages
+                .iter()
+                .find(|package| package.runtime == runtime)
+                .expect("the runtime package");
+            assert_eq!(package.digest, release.as_str(), "{context}");
+            assert_eq!(package.status, PackageStatus::Install, "{context}");
+        }
+    }
+}
+
+/// The release's package is recorded disabled with an altered root while an
+/// enabled selection serves the runtime: the plan refuses it with the command
+/// that removes the root, as it does for any release package, and changes
+/// nothing.
+#[test]
+fn a_disabled_release_package_with_an_altered_root_beside_a_serving_selection_is_refused() {
+    for runtime in ["claude", "codex", "hermes"] {
+        for version in ["1.0.1", "2.1.0"] {
+            let (host, _selected, release) =
+                host_serving_beside_a_disabled_release(runtime, version);
+            host.alter_package_root(&release);
+            let registry = fs::read(host.registry_path()).expect("the registry record");
+            let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
+            let context = format!("{runtime} {version}");
+
+            let plan = host.step(true);
+            let applied = host.step(false);
+
+            for report in [&plan, &applied] {
+                assert_eq!(
+                    refusal_codes(report),
+                    [root_refusal.as_str()],
+                    "{context}: {:?}",
+                    report.refusals
+                );
+                assert!(
+                    report.refusals[0].detail.contains(&format!(
+                        "pohunek plugin uninstall pohunek.runtime.{runtime} --digest {} \
+                         --remove-modified --yes",
+                        release.as_str()
+                    )),
+                    "{context}: {}",
+                    report.refusals[0].detail
+                );
+                assert!(
+                    !gap_codes(report).contains(&(runtime, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)),
+                    "{context}: {:?}",
+                    report.gaps
+                );
+            }
+            assert_eq!(
+                fs::read(host.registry_path()).expect("the registry record"),
+                registry,
+                "{context}"
+            );
+        }
+    }
+}
+
+/// A detecting plan drops a runtime nothing uses whose program is off the
+/// search path before it judges the altered root of the disabled release
+/// package, so the plan is not refused for an agent that is not there.
+#[test]
+fn a_detecting_plan_drops_an_unused_runtime_before_judging_a_damaged_release_package() {
+    for runtime in ["codex", "hermes"] {
+        let (host, _selected, release) = host_serving_beside_a_disabled_release(runtime, "1.0.1");
+        host.alter_package_root(&release);
+        fs::remove_file(host.profiles_dir().join(format!("{runtime}.toml")))
+            .expect("remove the profile");
+
+        let detected = host.detect_step();
+
+        assert!(
+            detected.refusals.is_empty(),
+            "{runtime}: {:?}",
+            detected.refusals
+        );
+        assert!(
+            detected
+                .packages
+                .iter()
+                .all(|package| package.runtime != runtime),
+            "{runtime}: {:?}",
+            detected.packages
+        );
+    }
+}
+
+/// The release's package is the only record of its package, disabled and not
+/// selected, and nothing else serves the runtime: the upgrade neither installs
+/// nor enables nor selects it, and the gap hint enables it.
+#[tokio::test]
+async fn a_disabled_unselected_release_package_with_nothing_serving_is_left_untouched() {
+    for runtime in ["claude", "codex", "hermes"] {
+        let host = Host::new();
+        let release = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+        host.publish_archives(1, &[(runtime, &release.0, &release.1)]);
+        host.write_profile(runtime, &format!("base = \"{runtime}\"\n"));
+        assert!(host.step(false).refusals.is_empty());
+        let mut registry: serde_json::Value =
+            serde_json::from_slice(&fs::read(host.registry_path()).expect("registry"))
+                .expect("registry json");
+        registry["packages"][0]["enabled"] = serde_json::Value::Bool(false);
+        registry["selected"] = serde_json::json!({});
+        fs::write(host.registry_path(), registry.to_string()).expect("write the registry");
+
+        assert_disabled_selection_left(&host, runtime, &release.1, "unselected");
+
+        official_runtimes::enable_package(&host.plugins_dir(), host.env.root(), &release.1).await;
+        let enabled = host.step(true);
+        assert!(
+            enabled.refusals.is_empty(),
+            "{runtime}: {:?}",
+            enabled.refusals
+        );
+        let package = enabled
+            .packages
+            .iter()
+            .find(|package| package.runtime == runtime)
+            .expect("the runtime package");
+        assert_eq!(package.digest, release.1.as_str(), "{runtime}");
+    }
+}
+
+/// Records a copy of the first registry package as the disabled package
+/// `digest` at `version`, as a `plugin install --no-enable` of it would leave it.
+fn record_disabled_copy(host: &Host, digest: &PackageDigest, version: &str) {
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(host.registry_path()).expect("registry"))
+            .expect("registry json");
+    let mut record = registry["packages"][0].clone();
+    record["digest"] = json_string(digest.as_str());
+    record["identity"]["version"] = json_string(version);
+    record["enabled"] = serde_json::Value::Bool(false);
+    let packages = registry["packages"].as_array_mut().expect("packages");
+    packages.push(record);
+    packages.sort_by_key(|record| record["digest"].as_str().map(str::to_owned));
+    fs::write(host.registry_path(), registry.to_string()).expect("write the registry");
+}
+
+/// A kept enabled selection is not turned into a gap by a disabled record of
+/// the release's package: an unordered claude selection stays kept.
+#[test]
+fn a_disabled_release_record_does_not_override_a_kept_enabled_selection() {
+    let host = Host::new();
+    publish_claude_version(&host, "1.0.2", 1);
+    host.write_claude_profile();
+    assert!(host.step(false).refusals.is_empty());
+    let release = publish_claude_version(&host, "2.0", 2);
+    record_disabled_copy(&host, &release, "2.0");
+
+    for report in [host.step(true), host.step(false)] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert_eq!(report.packages[0].status, PackageStatus::Kept);
+        let codes = gap_codes(&report);
+        assert!(
+            codes.contains(&("claude", CODE_GAP_UPDATE_VERSION_UNORDERED)),
+            "{codes:?}"
+        );
+        assert!(
+            !codes.contains(&("claude", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)),
+            "{codes:?}"
+        );
+    }
+}
+
+/// A Pi selection newer than the release's stays kept, never downgraded, beside
+/// a disabled record of the release's package.
+#[tokio::test]
+async fn a_disabled_release_record_does_not_override_a_newer_kept_pi_selection() {
+    let host = Host::with_installed_pi().await;
+    let release = host.publish_pi(PI_OLDER_VERSION, 1);
+    record_disabled_copy(&host, &release, PI_OLDER_VERSION);
+
+    for report in [host.step(true), host.step(false)] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert_eq!(pi_package(&report).status, PackageStatus::Kept);
+        assert_eq!(pi_package(&report).version, PI_INSTALLED_VERSION);
+        assert!(report.gaps.is_empty(), "{:?}", report.gaps);
+    }
+}
+
+/// Following the hint enables the package it names, and the next upgrade then
+/// proceeds as it does for an enabled package: an older version is replaced, a
+/// newer one is replaced with the downgrade named, the release's own package is
+/// present.
+#[tokio::test]
+async fn enabling_the_hinted_package_lets_the_upgrade_proceed() {
+    let release = official_runtimes::variant_archive("claude", RELEASE_VERSION);
+    for (label, installed) in [
+        (
+            "older",
+            official_runtimes::variant_archive("claude", "1.0.1"),
+        ),
+        (
+            "newer",
+            official_runtimes::variant_archive("claude", "2.1.0"),
+        ),
+        ("release", release.clone()),
+    ] {
+        let host = host_with_disabled_selection("claude", &installed, &release);
+        let gap = host
+            .step(true)
+            .gaps
+            .into_iter()
+            .find(|gap| gap.runtime == "claude")
+            .expect("the claude gap");
+        let hex = gap
+            .detail
+            .split("--digest ")
+            .nth(1)
+            .expect("the hint names a digest")
+            .trim();
+        let hinted = PackageDigest::parse(&format!("sha256:{hex}")).expect("the hinted digest");
+        assert_eq!(hinted, installed.1, "{label}");
+        official_runtimes::enable_package(&host.plugins_dir(), host.env.root(), &hinted).await;
+
+        let plan = host.step(true);
+
+        assert!(plan.refusals.is_empty(), "{label}: {:?}", plan.refusals);
+        let package = &plan.packages[0];
+        match label {
+            "older" => assert_eq!(package.status, PackageStatus::Install, "{label}"),
+            "newer" => {
+                assert_eq!(package.status, PackageStatus::Install, "{label}");
+                assert!(package.replaces_newer.is_some(), "{label}");
+            }
+            _ => assert_eq!(package.status, PackageStatus::Present, "{label}"),
+        }
+        assert_eq!(package.digest, release.1.as_str(), "{label}");
     }
 }
 
@@ -2601,7 +3038,7 @@ async fn a_disabled_unordered_pi_selection_is_reported_once_by_the_detecting_pla
 /// printed for it.
 #[test]
 fn an_altered_unordered_selected_reserved_runtime_version_is_refused() {
-    for runtime in ["claude", "codex"] {
+    for runtime in ["claude", "codex", "hermes"] {
         let host = Host::new();
         let (bytes, digest) = official_runtimes::variant_archive(runtime, "2.0");
         host.publish_archives(1, &[(runtime, &bytes, &digest)]);
@@ -2621,7 +3058,7 @@ fn an_altered_unordered_selected_reserved_runtime_version_is_refused() {
             assert_eq!(refusal_codes(report), [root_refusal.as_str()], "{runtime}");
             assert!(
                 report.refusals[0].detail.contains(&format!(
-                    "pohunek plugin uninstall --digest {} --remove-modified --yes",
+                    "pohunek plugin uninstall pohunek.runtime.{runtime} --digest {} --remove-modified --yes",
                     digest.as_str()
                 )),
                 "{}",
@@ -2637,33 +3074,118 @@ fn an_altered_unordered_selected_reserved_runtime_version_is_refused() {
     }
 }
 
-/// A profile pinned to a digest other than the selected version the step
-/// keeps is reported as kept with its reason and is never repinned.
-#[test]
-fn a_profile_pinned_elsewhere_is_reported_beside_a_kept_unordered_selection() {
+/// A host whose selected claude version 1.0.2 has no order against the release's
+/// `2.0`, so the step keeps it, and whose profile `official` is bound to it.
+/// Returns the host, the older version 1.0.1 the profile was bound to before,
+/// and the kept one.
+fn host_keeping_a_selection_over_an_older_version() -> (Host, PackageDigest, PackageDigest) {
     let host = Host::new();
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "2.0");
-    host.publish_archives(1, &[("claude", &bytes, &digest)]);
+    let older = publish_claude_version(&host, "1.0.1", 1);
     host.write_claude_profile();
     let bound = host.step(false);
     assert_eq!(bound.profiles[0].status, ProfileStatus::Bound, "{bound:?}");
-    let elsewhere = format!("sha256:{}", "b".repeat(64));
-    let pinned = host.profile_text().replace(digest.as_str(), &elsewhere);
+    let kept = publish_claude_version(&host, "1.0.2", 2);
+    let repinned = host.step(false);
+    assert_eq!(
+        repinned.profiles[0].status,
+        ProfileStatus::Repinned,
+        "{repinned:?}"
+    );
+    publish_claude_version(&host, "2.0", 3);
+    (host, older, kept)
+}
+
+/// Writes the profile with `edit` applied to its text, and asserts that the plan
+/// and the apply keep it for `reason` beside the kept selection, unchanged.
+fn assert_pin_kept_beside_a_kept_selection(
+    host: &Host,
+    edit: impl Fn(&str) -> String,
+    reason: &str,
+) {
+    let pinned = edit(&host.profile_text());
     assert_ne!(pinned, host.profile_text());
     fs::write(host.profile_path(), &pinned).expect("write the profile");
-    publish_claude_version(&host, "1.0.3", 2);
-
     for report in [host.step(true), host.step(false)] {
         assert!(report.refusals.is_empty(), "{:?}", report.refusals);
         assert_eq!(report.packages[0].status, PackageStatus::Kept);
         assert_eq!(report.profiles.len(), 1, "{:?}", report.profiles);
         assert_eq!(report.profiles[0].status, ProfileStatus::Kept);
-        assert_eq!(
-            report.profiles[0].kept_reason.as_deref(),
-            Some(CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION)
-        );
+        assert_eq!(report.profiles[0].kept_reason.as_deref(), Some(reason));
     }
     assert_eq!(host.profile_text(), pinned);
+}
+
+/// A profile pinned to another official version of the kept selection's package
+/// is reported as kept, is never repinned, and has the reason that names the
+/// difference.
+#[test]
+fn a_profile_pinned_elsewhere_is_reported_beside_a_kept_unordered_selection() {
+    let (host, older, kept) = host_keeping_a_selection_over_an_older_version();
+
+    assert_pin_kept_beside_a_kept_selection(
+        &host,
+        |text| text.replace(kept.as_str(), older.as_str()),
+        CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION,
+    );
+}
+
+/// A pin to a digest the registry does not record keeps its precise reason
+/// beside a kept selection.
+#[test]
+fn a_profile_pinned_to_an_unknown_digest_beside_a_kept_selection_has_its_precise_reason() {
+    let (host, _older, kept) = host_keeping_a_selection_over_an_older_version();
+    let elsewhere = format!("sha256:{}", "b".repeat(64));
+
+    assert_pin_kept_beside_a_kept_selection(
+        &host,
+        |text| text.replace(kept.as_str(), &elsewhere),
+        CODE_PINNED_VERSION_UNKNOWN,
+    );
+}
+
+/// A pin whose `package` key names another package than its digest records
+/// keeps its precise reason beside a kept selection.
+#[test]
+fn a_profile_naming_another_package_beside_a_kept_selection_has_its_precise_reason() {
+    let (host, older, kept) = host_keeping_a_selection_over_an_older_version();
+
+    assert_pin_kept_beside_a_kept_selection(
+        &host,
+        |text| {
+            text.replace(kept.as_str(), older.as_str())
+                .replace("pohunek.runtime.claude", "acme.runtime.other")
+        },
+        CODE_PINNED_TO_OTHER_PACKAGE,
+    );
+}
+
+/// A pin to a package that was not installed from the official catalog keeps its
+/// precise reason beside a kept selection.
+#[tokio::test]
+async fn a_profile_pinned_to_a_third_party_package_beside_a_kept_selection_has_its_precise_reason()
+{
+    let host = Host::new();
+    let foreign = official_runtimes::preinstall_third_party(
+        &host.plugins_dir(),
+        host.env.root(),
+        "pi",
+        "acme.runtime.pi",
+    )
+    .await;
+    let kept = publish_claude_version(&host, "1.0.2", 1);
+    host.write_claude_profile();
+    let bound = host.step(false);
+    assert_eq!(bound.profiles[0].status, ProfileStatus::Bound, "{bound:?}");
+    publish_claude_version(&host, "2.0", 2);
+
+    assert_pin_kept_beside_a_kept_selection(
+        &host,
+        |text| {
+            text.replace(kept.as_str(), foreign.as_str())
+                .replace("pohunek.runtime.claude", "acme.runtime.pi")
+        },
+        CODE_PINNED_TO_NON_OFFICIAL_PACKAGE,
+    );
 }
 
 /// The detecting plan judges a kept selection by the program of the kept
@@ -2710,6 +3232,47 @@ fn a_kept_selection_is_detected_by_its_own_program() {
         "{:?}",
         kept_program.gaps
     );
+}
+
+/// A runtime nothing uses whose selected version is disabled, whatever its
+/// order against the release's, and whose program is off the search path, is
+/// dropped by the detecting plan: no refusal, no not-serving gap.
+#[test]
+fn an_unused_undetected_disabled_selection_is_dropped_whatever_its_order() {
+    for installed_version in ["1.0.1", "2.1.0", "2.0"] {
+        let host = Host::new();
+        let installed = official_runtimes::variant_archive("claude", installed_version);
+        host.publish_archives(1, &[("claude", &installed.0, &installed.1)]);
+        host.write_claude_profile();
+        assert!(host.step(false).refusals.is_empty());
+        fs::remove_file(host.profile_path()).expect("remove the profile");
+        host.disable_package(&installed.1);
+        publish_claude_version(&host, RELEASE_VERSION, 2);
+
+        let plan = host.detect_step();
+
+        assert!(
+            plan.refusals.is_empty(),
+            "{installed_version}: {:?}",
+            plan.refusals
+        );
+        assert!(
+            plan.packages
+                .iter()
+                .all(|package| package.runtime != "claude"),
+            "{installed_version}: {:?}",
+            plan.packages
+        );
+        let codes = gap_codes(&plan);
+        assert!(
+            !codes.contains(&("claude", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)),
+            "{installed_version}: {codes:?}"
+        );
+        assert!(
+            codes.contains(&("claude", CODE_GAP_AGENT_NOT_ON_PATH)),
+            "{installed_version}: {codes:?}"
+        );
+    }
 }
 
 /// A runtime nothing uses whose unordered selection is altered, disabled or
@@ -2895,7 +3458,7 @@ async fn a_damaged_installed_pi_package_refuses_the_upgrade() {
         assert!(
             report.refusals[0]
                 .detail
-                .contains("pohunek plugin uninstall --digest"),
+                .contains("pohunek plugin uninstall pohunek.runtime.pi --digest"),
             "{}",
             report.refusals[0].detail
         );
@@ -2921,34 +3484,267 @@ async fn without_a_catalog_an_installed_pi_package_is_kept() {
     }
 }
 
+/// A disabled selected Pi version, older or newer than the release's, is left
+/// as the operator set it by every kind of plan. The gap hint enables it: `plugin
+/// update` refuses a newer selection as a downgrade, so it is never printed.
 #[tokio::test]
-async fn a_disabled_or_unselected_pi_package_is_reported_not_changed() {
+async fn a_disabled_ordered_pi_selection_is_reported_not_changed() {
+    for (label, release_version) in [("older", PI_NEWER_VERSION), ("newer", PI_OLDER_VERSION)] {
+        let host = Host::with_installed_pi().await;
+        host.publish_pi(release_version, 1);
+        host.disable_package(&Host::installed_pi_digest());
+        host.write_profile("work", "base = \"pi\"\n");
+        let registry = fs::read(host.registry_path()).expect("the registry record");
+        let hex = Host::installed_pi_digest()
+            .as_str()
+            .strip_prefix("sha256:")
+            .expect("a sha256 digest")
+            .to_owned();
+        let command = format!("pohunek plugin enable {PI_PACKAGE} --digest {hex}");
+
+        let plan = host.step(true);
+        let applied = host.step(false);
+        let detected = host.detect_step();
+
+        for report in [&plan, &applied, &detected] {
+            assert!(report.refusals.is_empty(), "{label}: {:?}", report.refusals);
+            assert!(report.packages.is_empty(), "{label}: {:?}", report.packages);
+            let not_serving: Vec<_> = report
+                .gaps
+                .iter()
+                .filter(|gap| {
+                    gap.runtime == "pi" && gap.code == CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING
+                })
+                .collect();
+            assert_eq!(not_serving.len(), 1, "{label}: {:?}", report.gaps);
+            let detail = &not_serving[0].detail;
+            assert!(detail.contains(&command), "{label}: {detail}");
+            assert!(!detail.contains("plugin update"), "{label}: {detail}");
+        }
+        assert_eq!(
+            fs::read(host.registry_path()).expect("the registry record"),
+            registry,
+            "{label}"
+        );
+    }
+}
+
+/// An installed official Pi package that nothing selects is left as it is, and
+/// the gap hint is the `plugin update` command: it installs and selects the
+/// release's version, which `plugin enable` of the unselected package would not.
+#[tokio::test]
+async fn an_unselected_pi_package_is_reported_with_the_update_hint() {
+    let host = Host::with_installed_pi().await;
+    host.publish_pi(PI_NEWER_VERSION, 1);
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(host.registry_path()).expect("registry"))
+            .expect("registry json");
+    registry["selected"] = serde_json::json!({});
+    fs::write(host.registry_path(), registry.to_string()).expect("write the registry");
+
+    for report in [host.step(true), host.step(false)] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert!(report.packages.is_empty(), "{:?}", report.packages);
+        assert_eq!(report.gaps.len(), 1, "{:?}", report.gaps);
+        let gap = &report.gaps[0];
+        assert_eq!(gap.code, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING);
+        assert!(
+            gap.detail.contains("pohunek plugin update"),
+            "{}",
+            gap.detail
+        );
+        assert!(!gap.detail.contains("plugin enable"), "{}", gap.detail);
+    }
+    // The detecting plan drops the runtime, and its gap, when `pi` is off the
+    // search path and nothing uses it.
+    let detected = host.detect_step();
+    assert!(
+        detected
+            .gaps
+            .iter()
+            .all(|gap| gap.runtime != "pi" || gap.code != CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING),
+        "{:?}",
+        detected.gaps
+    );
+}
+
+/// Following the hint of a disabled older Pi selection lets the next upgrade
+/// update it; the hinted digest is the one the registry enables.
+#[tokio::test]
+async fn enabling_a_hinted_older_pi_selection_lets_the_upgrade_update_it() {
     let host = Host::with_installed_pi().await;
     host.publish_pi(PI_NEWER_VERSION, 1);
     host.disable_package(&Host::installed_pi_digest());
     host.write_profile("work", "base = \"pi\"\n");
-    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let gap = host
+        .step(true)
+        .gaps
+        .into_iter()
+        .find(|gap| gap.runtime == "pi")
+        .expect("the pi gap");
+    let hex = gap
+        .detail
+        .split("--digest ")
+        .nth(1)
+        .expect("the hint names a digest")
+        .trim();
+    let hinted = PackageDigest::parse(&format!("sha256:{hex}")).expect("the hinted digest");
+    assert_eq!(hinted, Host::installed_pi_digest());
+    official_runtimes::enable_package(&host.plugins_dir(), host.env.root(), &hinted).await;
 
     let plan = host.step(true);
-    let applied = host.step(false);
 
-    for report in [&plan, &applied] {
-        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
-        assert!(report.packages.is_empty(), "{:?}", report.packages);
-        assert_eq!(
-            gap_codes(report),
-            [("pi", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)]
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(pi_package(&plan).status, PackageStatus::Install);
+    assert_eq!(pi_package(&plan).version, PI_NEWER_VERSION);
+}
+
+/// A disabled Pi selection that nothing uses and whose program is off the
+/// search path is dropped by the detecting plan, which does not report the
+/// package as not serving; the plan without detection still does.
+#[tokio::test]
+async fn a_disabled_pi_selection_nothing_detects_is_not_reported_by_the_detecting_plan() {
+    for release_version in [PI_NEWER_VERSION, PI_OLDER_VERSION, "2.0"] {
+        let host = Host::with_installed_pi().await;
+        host.publish_pi(release_version, 1);
+        host.disable_package(&Host::installed_pi_digest());
+
+        let detected = host.detect_step();
+        let plan = host.step(true);
+
+        assert!(detected.refusals.is_empty(), "{:?}", detected.refusals);
+        assert!(
+            !gap_codes(&detected).contains(&("pi", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)),
+            "{release_version}: {:?}",
+            detected.gaps
         );
         assert!(
-            report.gaps[0].detail.contains("pohunek plugin update"),
-            "{}",
-            report.gaps[0].detail
+            gap_codes(&plan).contains(&("pi", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)),
+            "{release_version}: {:?}",
+            plan.gaps
         );
     }
-    assert_eq!(
-        fs::read(host.registry_path()).expect("the registry record"),
-        registry
+}
+
+/// A disabled Pi selection cannot be enabled while a third-party package serves
+/// the runtime id: the detecting plan reports that gap and prints no enable
+/// hint, which `plugin enable` would refuse.
+#[tokio::test]
+async fn a_disabled_pi_selection_beside_a_third_party_server_is_reported_as_claimed() {
+    let host = Host::with_installed_pi().await;
+    host.publish_pi(PI_NEWER_VERSION, 1);
+    host.disable_package(&Host::installed_pi_digest());
+    official_runtimes::preinstall_third_party(
+        &host.plugins_dir(),
+        host.env.root(),
+        "pi",
+        "acme.runtime.pi",
+    )
+    .await;
+    host.put_program("pi");
+
+    let detected = host.detect_step();
+
+    assert!(detected.refusals.is_empty(), "{:?}", detected.refusals);
+    let codes = gap_codes(&detected);
+    assert!(
+        codes.contains(&("pi", CODE_GAP_SERVED_BY_OTHER_PACKAGE)),
+        "{:?}",
+        detected.gaps
     );
+    assert!(
+        !codes.contains(&("pi", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)),
+        "{codes:?}"
+    );
+    assert!(
+        detected
+            .gaps
+            .iter()
+            .all(|gap| !gap.detail.contains("plugin enable")),
+        "{:?}",
+        detected.gaps
+    );
+}
+
+/// The claim is judged for a disabled Pi selection whose root is missing too:
+/// restoring the root does not help while a third-party package serves `pi`.
+#[tokio::test]
+async fn a_rootless_disabled_pi_selection_beside_a_third_party_server_is_reported_as_claimed() {
+    let host = Host::with_installed_pi().await;
+    host.publish_pi(PI_NEWER_VERSION, 1);
+    let digest = Host::installed_pi_digest();
+    host.disable_package(&digest);
+    host.remove_package_root(digest.as_str());
+    official_runtimes::preinstall_third_party(
+        &host.plugins_dir(),
+        host.env.root(),
+        "pi",
+        "acme.runtime.pi",
+    )
+    .await;
+    host.put_program("pi");
+
+    let detected = host.detect_step();
+
+    assert!(detected.refusals.is_empty(), "{:?}", detected.refusals);
+    let codes = gap_codes(&detected);
+    assert!(
+        codes.contains(&("pi", CODE_GAP_SERVED_BY_OTHER_PACKAGE)),
+        "{:?}",
+        detected.gaps
+    );
+    assert!(
+        detected
+            .gaps
+            .iter()
+            .all(|gap| !gap.detail.contains("plugin install")),
+        "{:?}",
+        detected.gaps
+    );
+}
+
+/// A disabled Pi selection nothing uses, whose root is altered or whose id
+/// another package serves, is reported by the plan without detection with the
+/// `plugin doctor` pointer and no enable hint, which `plugin enable` would not
+/// satisfy.
+#[tokio::test]
+async fn an_unused_disabled_pi_selection_that_cannot_be_enabled_points_to_the_doctor() {
+    for state in ["altered", "claimed"] {
+        let host = Host::with_installed_pi().await;
+        host.publish_pi(PI_NEWER_VERSION, 1);
+        let digest = Host::installed_pi_digest();
+        host.disable_package(&digest);
+        if state == "altered" {
+            host.alter_package_root(&digest);
+        } else {
+            official_runtimes::preinstall_third_party(
+                &host.plugins_dir(),
+                host.env.root(),
+                "pi",
+                "acme.runtime.pi",
+            )
+            .await;
+        }
+
+        let plan = host.step(true);
+
+        assert!(plan.refusals.is_empty(), "{state}: {:?}", plan.refusals);
+        let gap = plan
+            .gaps
+            .iter()
+            .find(|gap| gap.runtime == "pi" && gap.code == CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)
+            .unwrap_or_else(|| panic!("{state}: {:?}", plan.gaps));
+        assert!(
+            gap.detail.contains("pohunek plugin doctor"),
+            "{state}: {}",
+            gap.detail
+        );
+        assert!(
+            !gap.detail.contains("plugin enable"),
+            "{state}: {}",
+            gap.detail
+        );
+    }
 }
 
 #[test]
@@ -2970,6 +3766,26 @@ fn install_detection_never_adds_pi() {
         Vec::<String>::new(),
         "nothing installed"
     );
+}
+
+/// Appends a line to the first file under the package root `root`, so the root
+/// is present but does not match its recorded manifest.
+fn alter_root(root: PathBuf) {
+    let mut pending = vec![root];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).expect("a package directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let mut content = fs::read(&path).expect("a package file");
+                content.extend_from_slice(b"altered\n");
+                fs::write(&path, content).expect("alter the package file");
+                return;
+            }
+        }
+    }
+    panic!("the installed package root holds no file");
 }
 
 /// Copies the directory `from` to `to`, recursively.

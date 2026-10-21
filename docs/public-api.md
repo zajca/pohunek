@@ -2336,13 +2336,22 @@ the runtime id; it is left untouched), `official_package_unavailable_for_platfor
 `--detect`, except for an installed official package of a runtime that is not
 reserved, such as Pi, where it is a gap in every mode), and
 `official_package_not_serving` (an official package of such a runtime is
-installed but not selected and enabled, so the step leaves it, or selected while its
-version cannot be ordered against the release's but disabled or not loadable, so the
-step leaves that too; the detail names the command by cause: `pohunek plugin update`
-for a package that is not selected and enabled, `pohunek plugin enable <package>
---digest <digest>` for a disabled unordered selection (any runtime, Pi included),
-and `pohunek plugin install` or `plugin select` for an unordered selection that does
-not load), and
+installed but not selected, so the step leaves it, or the selected package is disabled
+(whatever its version order against the release's, the release's own package
+included), or the selected version cannot be ordered
+against the release's and does not load, so the step leaves that too; the detail names the
+command by cause: `pohunek plugin update` for a package that is not selected,
+`pohunek plugin enable <package> --digest <digest>` for a disabled package (any runtime,
+Pi included; `plugin update` would refuse a newer selection as a downgrade), and
+`pohunek plugin install` or `plugin select` for an unordered selection that does not
+load; when an enabled version still serves the runtime beside a disabled release
+package it keeps serving and the gap names the release package, except that a release
+package with an altered root is refused with its uninstall command (beside an older
+ordered selection, the case where it would otherwise update the runtime), a selected Pi
+version newer than the release's is kept silently and a selected version that cannot be
+ordered against the release's reports `plugin_update_version_unordered`; under `--detect`
+the gap is dropped with a runtime the detecting plan drops, that is one nothing uses,
+no profile has as its base, and whose program is off the search path), and
 `plugin_update_version_unordered` (the selected version of an official package, of
 a reserved runtime or not, cannot be ordered against the release's and is enabled and loadable, so it is kept,
 as `plugin update` refuses to replace it). The first two of these three name the command
@@ -2358,8 +2367,10 @@ and a selected version newer than the release's is kept (status `kept`, with
 runtime, reserved or not, a selected version that cannot be ordered against the
 release's and is enabled and loadable is kept the same way (status `kept`, with
 `release_version` naming the release's version). A host profile pinned to another
-digest than a kept selection stays as it is and is reported `kept` with the reason
-`pinned_differs_from_kept_selection`. `integrations` lists the config homes the installer reinstalls hooks
+digest than a kept selection stays as it is and is reported `kept` with the precise
+reason (`pinned_version_unknown`, `pinned_to_non_official_package` or
+`pinned_to_other_package`) when the pin has one, and `pinned_differs_from_kept_selection`
+for an official version of the same package. `integrations` lists the config homes the installer reinstalls hooks
 into: without `--detect`, the homes that already hold hooks; with `--detect`, each
 existing home of a planned runtime whose hooks the setup installs, whether or not
 hooks are present yet (Pi declares none). Each distinct home appears once. `reason`
