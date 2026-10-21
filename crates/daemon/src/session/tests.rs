@@ -2502,11 +2502,8 @@ async fn turn_starts_never_decrease_when_the_wall_clock_steps_back_after_a_takeo
     let created = registry.create(params()).await.expect("create session");
 
     registry.turn_events().pin_wall_clock(100);
-    registry.note_input(&created.id);
-    registry
-        .record_activity(&created.id, transition(AgentActivity::Working))
-        .await;
-    // The agent changes while working: the restated activity opens the next
+    hook_report(&registry, &created.id, 1, Some(AgentActivity::Working)).await;
+    // The agent changes while working: the restated report opens the next
     // turn at a later wall time, which the transition clock does not record.
     registry.turn_events().pin_wall_clock(200);
     let mut sessions = registry.inner.sessions.lock().await;
@@ -2515,18 +2512,14 @@ async fn turn_starts_never_decrease_when_the_wall_clock_steps_back_after_a_takeo
         .expect("the session")
         .agent_left(&registry.inner.turns);
     drop(sessions);
-    registry
-        .record_activity(&created.id, transition(AgentActivity::Working))
-        .await;
-    registry
-        .record_activity(&created.id, transition(AgentActivity::Idle))
-        .await;
+    hook_report(&registry, &created.id, 2, Some(AgentActivity::Working)).await;
+    hook_report(&registry, &created.id, 3, Some(AgentActivity::Idle)).await;
     let takeover = ended_turns(&mut edges);
     assert_eq!(takeover.len(), 1);
 
     registry.turn_events().pin_wall_clock(150);
-    registry.note_input(&created.id);
-    work_then_idle(&registry, &created.id).await;
+    hook_report(&registry, &created.id, 4, Some(AgentActivity::Working)).await;
+    hook_report(&registry, &created.id, 5, Some(AgentActivity::Idle)).await;
     let later = ended_turns(&mut edges);
     assert_eq!(later.len(), 1);
     let owner = registry.turn_owner(&created.id).await;
