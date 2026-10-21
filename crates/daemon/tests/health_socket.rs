@@ -1031,6 +1031,7 @@ fn notification_params(session_id: Option<SessionId>) -> NotificationCreateParam
         source_id: Some("permission-request-1".to_owned()),
         dedupe_key: Some("session:s-1:attention".to_owned()),
         project_id: None,
+        retryable_admission: false,
     }
 }
 
@@ -5378,6 +5379,7 @@ async fn report_agent_api_records_active_agent_and_streams_report_state() {
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .expect("serialize report-agent params"),
     );

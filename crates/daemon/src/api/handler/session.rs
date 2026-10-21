@@ -439,8 +439,10 @@ pub(super) async fn handle_session_report_agent(
         Ok(params) => params,
         Err(err) => return error_value(request, err),
     };
-    let result = sessions.report_agent(params).await;
-    ok_value(request, &result)
+    match sessions.try_report_agent(params).await {
+        Ok(result) => ok_value(request, &result),
+        Err(err) => error_value(request, err),
+    }
 }
 
 pub(super) async fn handle_session_release_agent(
@@ -451,6 +453,8 @@ pub(super) async fn handle_session_release_agent(
         Ok(params) => params,
         Err(err) => return error_value(request, err),
     };
-    let result = sessions.release_agent(params).await;
-    ok_value(request, &result)
+    match sessions.try_release_agent(params).await {
+        Ok(result) => ok_value(request, &result),
+        Err(err) => error_value(request, err),
+    }
 }

@@ -2279,6 +2279,7 @@ async fn shell_foreground_preserves_recent_unbound_claim_until_ttl() {
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(report.recorded);
@@ -2457,6 +2458,7 @@ async fn foreground_replacement_replaces_hook_identity_and_detector() {
             agent_session_path: Some("/work/stale-codex.jsonl".to_owned()),
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(report.recorded);
@@ -2508,6 +2510,7 @@ async fn first_foreground_scan_binds_hook_identity_without_replacing_metadata() 
             agent_session_path: Some("/work/hook-native.jsonl".to_owned()),
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(report.recorded);
@@ -9095,6 +9098,7 @@ async fn report_input_activity(
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await
 }
@@ -9235,6 +9239,65 @@ fn session_pty_env_marks_session_id_for_every_agent_kind() {
     }
 }
 
+#[test]
+fn every_launch_announces_the_hook_admission_retry_policy() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        socket_path: Some(PathBuf::from("/run/pohunek/daemon.sock")),
+        ..SessionRegistryConfig::default()
+    });
+    let id = SessionId("s-8".to_owned());
+    let expected = [
+        (protocol::ENV_HOOK_ADMISSION_RETRY, "1".to_owned()),
+        (
+            protocol::ENV_HOOK_RETRY_DEADLINE_MS,
+            crate::integration::hook_retry_deadline()
+                .as_millis()
+                .to_string(),
+        ),
+        (
+            protocol::ENV_HOOK_RETRY_BACKOFF_MS,
+            pohunek_service_config::HOOK_RETRY_BACKOFF
+                .as_millis()
+                .to_string(),
+        ),
+        (
+            protocol::ENV_HOOK_RETRY_BACKOFF_MAX_MS,
+            pohunek_service_config::HOOK_RETRY_BACKOFF_MAX
+                .as_millis()
+                .to_string(),
+        ),
+    ];
+    // The worker passes exactly these names through from the launch environment.
+    let mut announced: Vec<&str> = expected.iter().map(|(name, _)| *name).collect();
+    announced.sort_unstable();
+    let mut passed_through = pohunek_worker_protocol::HOOK_RETRY_ENV_NAMES.to_vec();
+    passed_through.sort_unstable();
+    assert_eq!(announced, passed_through);
+    // New, resumed and forked launches all compose their environment here.
+    for agent in [
+        RuntimeRef::shell(),
+        RuntimeRef::codex(),
+        RuntimeRef::claude(),
+    ] {
+        let env = registry.launch_env(&[], agent.clone(), &id);
+        for (name, value) in &expected {
+            let values: Vec<&str> = env
+                .iter()
+                .filter(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(values, [value.as_str()], "{agent:?}: {name}");
+        }
+    }
+    // A registry without a daemon socket announces nothing.
+    let silent = SessionRegistry::default();
+    assert!(silent
+        .launch_env(&[], RuntimeRef::claude(), &id)
+        .iter()
+        .all(|(key, _)| key != protocol::ENV_HOOK_ADMISSION_RETRY));
+}
+
 #[tokio::test]
 async fn report_agent_on_shell_session_sets_active_agent_without_changing_launch_identity() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
@@ -9259,6 +9322,7 @@ async fn report_agent_on_shell_session_sets_active_agent_without_changing_launch
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(result.recorded);
@@ -9337,6 +9401,7 @@ async fn report_agent_reconfigures_detector_and_release_restores_default_config(
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(report.recorded);
@@ -9359,6 +9424,7 @@ async fn report_agent_reconfigures_detector_and_release_restores_default_config(
             pid: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(release.released);
@@ -9495,6 +9561,7 @@ async fn release_agent_clears_current_active_agent_but_ignores_stale_sequence() 
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(newer.recorded);
@@ -9508,6 +9575,7 @@ async fn release_agent_clears_current_active_agent_but_ignores_stale_sequence() 
             pid: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(!stale_release.released);
@@ -9527,6 +9595,7 @@ async fn release_agent_clears_current_active_agent_but_ignores_stale_sequence() 
             pid: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(current_release.released);
@@ -9565,6 +9634,7 @@ async fn report_agent_release_with_no_sequence_does_not_clear_newer_sequenced_re
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(result.recorded);
@@ -9578,6 +9648,7 @@ async fn report_agent_release_with_no_sequence_does_not_clear_newer_sequenced_re
             pid: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(!stale_release.released);
@@ -9616,6 +9687,7 @@ async fn report_agent_with_no_sequence_does_not_overwrite_newer_sequenced_report
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(newer.recorded);
@@ -9632,6 +9704,7 @@ async fn report_agent_with_no_sequence_does_not_overwrite_newer_sequenced_report
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(!stale_report.recorded);
@@ -9671,6 +9744,7 @@ async fn report_agent_release_tombstone_rejects_delayed_lower_sequence() {
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(report.recorded);
@@ -9684,6 +9758,7 @@ async fn report_agent_release_tombstone_rejects_delayed_lower_sequence() {
             pid: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(release.released);
@@ -9713,6 +9788,7 @@ async fn report_agent_release_tombstone_rejects_delayed_lower_sequence() {
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(!delayed_report.recorded);
@@ -9736,6 +9812,7 @@ async fn report_agent_release_tombstone_rejects_delayed_lower_sequence() {
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(higher_report.recorded);
@@ -9775,6 +9852,7 @@ async fn report_agent_activity_blocks_detector_until_release() {
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(report.recorded);
@@ -9795,6 +9873,7 @@ async fn report_agent_activity_blocks_detector_until_release() {
             pid: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(release.released);
@@ -9833,6 +9912,7 @@ async fn report_agent_without_activity_keeps_detector_activity_enabled() {
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(report.recorded);
@@ -9858,6 +9938,7 @@ async fn report_agent_without_activity_keeps_detector_activity_enabled() {
             pid: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(release.released);
@@ -9896,6 +9977,7 @@ async fn report_agent_active_metadata_is_cleared_on_terminal_session() {
             agent_session_path: Some("/work/codex-session.jsonl".to_owned()),
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(report.recorded);
@@ -9936,6 +10018,7 @@ async fn report_agent_returns_false_for_unknown_agent() {
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(!result.recorded);
@@ -10608,6 +10691,7 @@ async fn report_release_matrix_agent(registry: &SessionRegistry, created: &Sessi
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(report.recorded);
@@ -10641,6 +10725,7 @@ async fn direct_agent_root_pid_hook_claim_survives_procwatch_reconciles() {
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(report.recorded);
@@ -10718,6 +10803,7 @@ async fn report_descendant_claim(registry: &SessionRegistry, created: &SessionIn
             agent_session_path: Some(DESCENDANT_NATIVE_SESSION_PATH.to_owned()),
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(report.recorded);
@@ -11025,6 +11111,7 @@ async fn procwatch_unknown_foreground_never_binds_an_unverified_reporter() {
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(report.recorded);
@@ -11529,6 +11616,7 @@ async fn refresh_descendant_claim(
             agent_session_path: Some(DESCENDANT_NATIVE_SESSION_PATH.to_owned()),
             monotonic_sequence: None,
             pid_start_identity: None,
+            retryable_admission: false,
         })
         .await;
     assert!(report.recorded);
@@ -12600,6 +12688,7 @@ async fn procwatch_reconciles_unbound_claim_after_descendants_error() {
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(report.recorded);
@@ -13008,6 +13097,7 @@ async fn procwatch_releases_hook_claim_when_observed_pid_exits() {
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(report.recorded);
@@ -13053,6 +13143,7 @@ async fn procwatch_late_hook_report_for_dead_pid_is_cleared_on_reconcile() {
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(late.recorded);
@@ -13104,6 +13195,7 @@ async fn procwatch_expires_unbound_hook_claim_after_ttl() {
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(report.recorded);
@@ -13175,6 +13267,7 @@ async fn procwatch_rebinds_restart_to_new_observed_pid() {
             agent_session_path: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(report.recorded);
@@ -22315,6 +22408,7 @@ fn pi_report(id: &SessionId, agent: &str) -> SessionReportAgentParams {
         agent_session_path: None,
         pid_start_identity: None,
         monotonic_sequence: None,
+        retryable_admission: false,
     }
 }
 
@@ -22406,6 +22500,7 @@ async fn callbacks_of_a_running_package_session_are_accepted_after_disable_and_r
             pid: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(release.released, "and releases");
@@ -23806,6 +23901,7 @@ fn attested_report(
         agent_session_path: None,
         pid_start_identity: start.map(protocol::ProcessStartIdentity::new),
         monotonic_sequence: Some(ReportSequence::new(7)),
+        retryable_admission: false,
     }
 }
 
@@ -23901,6 +23997,7 @@ async fn a_release_is_ignored_when_the_host_contradicts_its_start_identity() {
         pid: Some(created.pid),
         pid_start_identity: start.map(protocol::ProcessStartIdentity::new),
         monotonic_sequence: Some(ReportSequence::new(8)),
+        retryable_admission: false,
     };
 
     assert!(

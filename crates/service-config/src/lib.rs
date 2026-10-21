@@ -310,6 +310,25 @@ pub const DEFAULT_WORKER_INPUT_STOP_WAIT: Duration =
 /// budget has nine steps and the stop itself needs one.
 const WORKER_INPUT_STOP_WAIT_STEPS: u32 = 8;
 
+/// How long the daemon waits for a session's worker to report its hook schema
+/// when a hook reporter asked for the retryable answer. It stays below the
+/// reporters' socket timeout so the typed refusal reaches a reporter that is
+/// still listening; the reporter retries instead of the daemon waiting out
+/// the worker connect deadline.
+pub const DEFAULT_HOOK_ADMISSION_WAIT: Duration = Duration::from_millis(250);
+
+/// First pause of a hook reporter between two delivery attempts while the
+/// session's worker is unreachable.
+pub const HOOK_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Longest pause between two delivery attempts of a hook reporter; the pause
+/// doubles from [`HOOK_RETRY_BACKOFF`] up to this value.
+pub const HOOK_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// Time a hook reporter keeps for itself before the agent's hook timeout: one
+/// socket timeout of its last attempt, process start and the final trace.
+pub const HOOK_RETRY_MARGIN: Duration = Duration::from_secs(2);
+
 /// Longest accepted path in bytes.
 ///
 /// Equal to the supervisor's job value limit, because the prefix and roots

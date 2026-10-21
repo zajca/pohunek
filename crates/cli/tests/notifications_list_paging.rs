@@ -67,6 +67,7 @@ async fn create_history(harness: &Harness, body_char: char) {
                 source_id: None,
                 dedupe_key: None,
                 project_id: None,
+                retryable_admission: false,
             })
             .await
             .expect("create a notification");

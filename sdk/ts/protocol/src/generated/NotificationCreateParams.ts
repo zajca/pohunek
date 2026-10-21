@@ -50,6 +50,14 @@ export type NotificationCreateParams = {
    */
   source_id?: string;
   /**
+   * Opts into the retryable admission answer: when the session's worker
+   * cannot report its hook schema, the daemon waits only its configured
+   * admission wait and answers `hook_schema_unavailable` instead of the
+   * refusal a schema denial gets. Reporters send it only to a daemon that
+   * announced support through the launch environment.
+   */
+  retryable_admission?: boolean;
+  /**
    * Source-independent dedupe key for one lifecycle group.
    *
    * Session-scoped keys use `attention:<session_id>` or `turn:<session_id>`.

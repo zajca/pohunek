@@ -1072,7 +1072,10 @@ Hooks have two separate roles:
   owner-private, size-bounded `pohunek-hooks.jsonl` in the log directory
   (path and bound from the worker-injected `POHUNEK_HOOK_TRACE_PATH` and
   `POHUNEK_HOOK_TRACE_MAX_BYTES`; see "Hook failure trace" in
-  `docs/public-api.md`). Running children become `lost` when
+  `docs/public-api.md`). A report refused only because its session's worker is
+  unreachable gets a retryable error after a short configured admission wait
+  (`hook_admission_wait`, below the reporter's socket timeout) when it opts in,
+  and the reporters retry it within their hook timeout. Running children become `lost` when
   their PTY runtime terminates. This state is independent of the parent
   session's coarse `activity` and survives daemon and client reconnects.
 

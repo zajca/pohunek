@@ -326,6 +326,15 @@ pub fn validate_pattern(pattern: &str) -> Result<(), EnvError> {
     Ok(())
 }
 
+/// The `POHUNEK_*` hook retry variables a daemon sets in a launch environment.
+/// The worker keeps these and drops every other `POHUNEK_*` name from it.
+pub const HOOK_RETRY_ENV_NAMES: [&str; 4] = [
+    "POHUNEK_HOOK_ADMISSION_RETRY",
+    "POHUNEK_HOOK_RETRY_DEADLINE_MS",
+    "POHUNEK_HOOK_RETRY_BACKOFF_MS",
+    "POHUNEK_HOOK_RETRY_BACKOFF_MAX_MS",
+];
+
 /// Reports whether `name` is on the [`SERVICE_MANAGER_DENYLIST`].
 #[must_use]
 pub fn is_denylisted(name: &str) -> bool {

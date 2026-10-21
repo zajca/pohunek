@@ -44,6 +44,18 @@ pub const ENV_WORKER_PROTOCOL_VERSION: &str = "POHUNEK_WORKER_PROTOCOL_VERSION";
 /// protocol version: [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) is the single
 /// source of truth.
 pub const ENV_PROTOCOL_VERSION: &str = "POHUNEK_PROTOCOL_VERSION";
+/// Set to `1` in a session's environment by a daemon that answers a hook
+/// report with the retryable `hook_schema_unavailable` error when the report
+/// opts in with `retryable_admission`. A reporter sends the opt-in only when
+/// this is set, because an older daemon rejects the unknown field.
+pub const ENV_HOOK_ADMISSION_RETRY: &str = "POHUNEK_HOOK_ADMISSION_RETRY";
+/// Milliseconds a reporter keeps retrying a hook report that got
+/// `hook_schema_unavailable`, counted from the start of the invocation.
+pub const ENV_HOOK_RETRY_DEADLINE_MS: &str = "POHUNEK_HOOK_RETRY_DEADLINE_MS";
+/// First pause in milliseconds between two retries of a hook report.
+pub const ENV_HOOK_RETRY_BACKOFF_MS: &str = "POHUNEK_HOOK_RETRY_BACKOFF_MS";
+/// Longest pause in milliseconds between two retries of a hook report.
+pub const ENV_HOOK_RETRY_BACKOFF_MAX_MS: &str = "POHUNEK_HOOK_RETRY_BACKOFF_MAX_MS";
 /// Absolute path of the shared hook failure trace in the pohunek log directory.
 ///
 /// The worker injects it into every managed PTY; the state hooks append one

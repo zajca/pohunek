@@ -409,6 +409,7 @@ fn notification_create_params_json_shape_roundtrips() {
         dedupe_key: None,
         project_id: Some("p-42".to_owned()),
         metadata: BTreeMap::new(),
+        retryable_admission: false,
     };
 
     let value = serde_json::to_value(&params).expect("serialize notification create params");
@@ -491,6 +492,7 @@ fn notification_create_params_metadata_roundtrips_when_present() {
         dedupe_key: None,
         project_id: Some("p-42".to_owned()),
         metadata: metadata(&[("provider", "codex"), ("reason", "approval")]),
+        retryable_admission: false,
     };
 
     let value = serde_json::to_value(&params).expect("serialize notification create params");
@@ -520,6 +522,7 @@ fn notification_create_params_carries_source_independent_dedupe_key() {
         dedupe_key: Some("attention:s-42:approval".to_owned()),
         project_id: Some("p-42".to_owned()),
         metadata: BTreeMap::new(),
+        retryable_admission: false,
     };
 
     let value = serde_json::to_value(&params).expect("serialize notification create params");
@@ -1343,6 +1346,7 @@ fn session_report_agent_params_roundtrip_with_optional_native_refs() {
         agent_session_path: None,
         pid_start_identity: None,
         monotonic_sequence: None,
+        retryable_admission: false,
     };
 
     let value = serde_json::to_value(&params).expect("serialize report params");
@@ -1375,6 +1379,7 @@ fn session_release_agent_params_omits_absent_sequence() {
         pid: None,
         pid_start_identity: None,
         monotonic_sequence: None,
+        retryable_admission: false,
     };
 
     let value = serde_json::to_value(&params).expect("serialize release params");
@@ -1404,6 +1409,7 @@ fn session_agent_bound_fields_use_decimal_strings_and_old_params_still_decode() 
         agent_session_path: None,
         pid_start_identity: Some(ProcessStartIdentity::new(u64::MAX)),
         monotonic_sequence: Some(ReportSequence::new(1_790_000_000_123_456_789)),
+        retryable_admission: false,
     };
     let value = serde_json::to_value(&report).expect("serialize report params");
     assert_eq!(value["pid_start_identity"], json!(u64::MAX.to_string()));
@@ -1418,6 +1424,7 @@ fn session_agent_bound_fields_use_decimal_strings_and_old_params_still_decode() 
         pid: Some(9001),
         pid_start_identity: Some(ProcessStartIdentity::new(7)),
         monotonic_sequence: Some(ReportSequence::new(8)),
+        retryable_admission: false,
     };
     let value = serde_json::to_value(&release).expect("serialize release params");
     assert_eq!(value["pid"], json!(9001));
@@ -5170,5 +5177,61 @@ fn a_doctor_report_with_an_unknown_status_decodes_only_on_the_client() {
         DoctorReport::from_checks(report.checks).overall,
         DoctorStatus::Warn,
         "an unknown check never makes the aggregate ok"
+    );
+}
+
+#[test]
+fn the_retryable_admission_opt_in_is_additive_on_every_hook_report() {
+    // A native-id report without the field still parses under the strict
+    // parser, reads as not opted in, and serializes without the key, so an
+    // older daemon sees exactly the request it knows.
+    let report = json!({
+        "session_id": "s-42",
+        "worker_instance_id": "runtime-42",
+        "agent": "codex",
+        "pid": 42,
+        "pid_start_identity": "7",
+        "sequence": "1",
+        "expires_at": "2026-08-04T10:00:00Z",
+        "native_session_id": "native-42"
+    });
+    let plain = serde_json::from_value::<SessionReportNativeIdParams>(report.clone())
+        .expect("a report without the opt-in field");
+    assert!(!plain.retryable_admission());
+    assert_eq!(serde_json::to_value(&plain).expect("serialize"), report);
+
+    let mut opted = report;
+    opted["retryable_admission"] = json!(true);
+    let parsed = serde_json::from_value::<SessionReportNativeIdParams>(opted.clone())
+        .expect("a report with the opt-in field");
+    assert!(parsed.retryable_admission());
+    assert_eq!(serde_json::to_value(&parsed).expect("serialize"), opted);
+
+    // The other three requests behave the same way.
+    let agent = json!({"session_id": "s-42", "source": "pohunek:codex", "agent": "codex"});
+    let agent_plain: SessionReportAgentParams =
+        serde_json::from_value(agent.clone()).expect("report_agent without the field");
+    assert!(!agent_plain.retryable_admission);
+    assert_eq!(
+        serde_json::to_value(&agent_plain).expect("serialize"),
+        agent
+    );
+    let mut agent_opted = agent;
+    agent_opted["retryable_admission"] = json!(true);
+    let parsed: SessionReportAgentParams =
+        serde_json::from_value(agent_opted.clone()).expect("report_agent with the field");
+    assert!(parsed.retryable_admission);
+    assert_eq!(
+        serde_json::to_value(&parsed).expect("serialize"),
+        agent_opted
+    );
+
+    let release = json!({"session_id": "s-42", "source": "pohunek:codex", "agent": "codex"});
+    let release_plain: SessionReleaseAgentParams =
+        serde_json::from_value(release.clone()).expect("release_agent without the field");
+    assert!(!release_plain.retryable_admission);
+    assert_eq!(
+        serde_json::to_value(&release_plain).expect("serialize"),
+        release
     );
 }

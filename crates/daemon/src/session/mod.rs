@@ -527,6 +527,9 @@ pub struct SessionRegistryConfig {
     /// Bound on a worker generation's socket negotiation, on reconnecting to
     /// a live worker, and on startup discovery.
     pub worker_connect_deadline: Duration,
+    /// Bound on the wait for a worker's hook schema when a hook report opted
+    /// into the retryable `hook_schema_unavailable` answer.
+    pub hook_admission_wait: Duration,
     /// Worker job supervision (definition inputs and deadlines).
     ///
     /// `None` disables session launch with `worker_backend_required`; there is
@@ -620,6 +623,7 @@ impl Default for SessionRegistryConfig {
             worker_runtime_root: None,
             worker_state_root: None,
             worker_connect_deadline: DEFAULT_WORKER_CONNECT_DEADLINE,
+            hook_admission_wait: pohunek_service_config::DEFAULT_HOOK_ADMISSION_WAIT,
             supervision: None,
             supervision_retry_initial: supervision::SUPERVISION_RETRY_INITIAL,
             create_drain_timeout: DEFAULT_CREATE_DRAIN_TIMEOUT,
@@ -3590,16 +3594,23 @@ impl SessionRegistry {
             debug!(session_id = %session_id.0, "native-id report provider mismatch; ignoring");
             return not_recorded;
         }
-        let Some(Ok(schema)) = self
+        let schema = match self
             .session_hook_admission(
                 &session_id,
                 pohunek_worker_protocol::HookAction::IdentityReport,
                 &expected_base,
                 "native-id report",
+                params.retryable_admission(),
             )
             .await
-        else {
-            return not_recorded;
+        {
+            Some(Ok(schema)) => schema,
+            Some(Err(refusal @ HookAdmissionError::SchemaUnavailable { .. }))
+                if params.retryable_admission() =>
+            {
+                return Err(refusal.retryable_error());
+            }
+            Some(Err(_)) | None => return not_recorded,
         };
         if schema.launch_process == LaunchProcess::FrozenRootEntrypoint {
             return Err(unattested(
@@ -3944,7 +3955,10 @@ impl SessionRegistry {
         clippy::too_many_lines,
         reason = "ordered admission, ordering and projection checks stay linear so every rejection precedes mutation"
     )]
-    pub async fn report_agent(&self, params: SessionReportAgentParams) -> SessionReportAgentResult {
+    pub async fn try_report_agent(
+        &self,
+        params: SessionReportAgentParams,
+    ) -> Result<SessionReportAgentResult, ProtocolError> {
         let not_recorded = SessionReportAgentResult { recorded: false };
         let activity_epoch = self.daemon_instance_id().to_owned();
         let valid_session_id =
@@ -3959,7 +3973,7 @@ impl SessionRegistry {
             params.pid_start_identity,
             "active-agent report",
         ) else {
-            return not_recorded;
+            return Ok(not_recorded);
         };
         let mut stale_resolutions = 0;
         let (info, rescan, evidence) = loop {
@@ -3975,7 +3989,7 @@ impl SessionRegistry {
                         "active-agent report",
                         &refusal,
                     );
-                    return not_recorded;
+                    return Ok(not_recorded);
                 }
             };
             let resolved = &resolution.agent;
@@ -3985,10 +3999,11 @@ impl SessionRegistry {
                     pohunek_worker_protocol::HookAction::IdentityReport,
                     resolved.base.as_str(),
                     "active-agent report",
+                    params.retryable_admission,
                 )
-                .await
+                .await?
             {
-                return not_recorded;
+                return Ok(not_recorded);
             }
             let active_detector_config = detector_config_for_resolved_agent(resolved);
             #[cfg(test)]
@@ -4000,14 +4015,14 @@ impl SessionRegistry {
                     session_id = %params.session_id.0,
                     "active-agent report for an unknown session; ignoring"
                 );
-                return not_recorded;
+                return Ok(not_recorded);
             };
             if is_terminal(entry.info.state) {
                 debug!(
                     session_id = %params.session_id.0,
                     "active-agent report for a terminal session; ignoring"
                 );
-                return not_recorded;
+                return Ok(not_recorded);
             }
             // A package change replaced a definition the agent resolved
             // against: committing it would restore the previous detector rules.
@@ -4020,7 +4035,7 @@ impl SessionRegistry {
                         agent = %params.agent,
                         "active-agent report kept resolving against a replaced pin; ignoring"
                     );
-                    return not_recorded;
+                    return Ok(not_recorded);
                 }
                 continue;
             }
@@ -4037,7 +4052,7 @@ impl SessionRegistry {
                     seq = ?params.seq,
                     "stale active-agent report; ignoring"
                 );
-                return not_recorded;
+                return Ok(not_recorded);
             }
 
             let report_base = RuntimeRef::from(resolved.base.clone());
@@ -4098,14 +4113,22 @@ impl SessionRegistry {
             );
             let _ = self.inner.events.send(event);
         }
-        SessionReportAgentResult { recorded: true }
+        Ok(SessionReportAgentResult { recorded: true })
+    }
+
+    /// Record the active nested agent currently owning a live session; a
+    /// report the daemon cannot admit yet is simply not recorded.
+    pub async fn report_agent(&self, params: SessionReportAgentParams) -> SessionReportAgentResult {
+        self.try_report_agent(params)
+            .await
+            .unwrap_or(SessionReportAgentResult { recorded: false })
     }
 
     /// Release the active nested agent currently owning a live session.
-    pub async fn release_agent(
+    pub async fn try_release_agent(
         &self,
         params: SessionReleaseAgentParams,
-    ) -> SessionReleaseAgentResult {
+    ) -> Result<SessionReleaseAgentResult, ProtocolError> {
         let not_released = SessionReleaseAgentResult { released: false };
         let report_sequence = params.seq.map(protocol::ReportSequence::get);
         // A releasing process that already exited cannot be checked and does
@@ -4118,7 +4141,7 @@ impl SessionRegistry {
             "active-agent release",
         ) {
             if refusal != StartIdentityRefusal::ProcessGone {
-                return not_released;
+                return Ok(not_released);
             }
         }
         let resolved = match self
@@ -4133,7 +4156,7 @@ impl SessionRegistry {
                     "active-agent release",
                     &refusal,
                 );
-                return not_released;
+                return Ok(not_released);
             }
         };
         if !self
@@ -4142,10 +4165,11 @@ impl SessionRegistry {
                 pohunek_worker_protocol::HookAction::IdentityRelease,
                 resolved.base.as_str(),
                 "active-agent release",
+                params.retryable_admission,
             )
-            .await
+            .await?
         {
-            return not_released;
+            return Ok(not_released);
         }
 
         let info = {
@@ -4155,17 +4179,17 @@ impl SessionRegistry {
                     session_id = %params.session_id.0,
                     "active-agent release for an unknown session; ignoring"
                 );
-                return not_released;
+                return Ok(not_released);
             };
             if is_terminal(entry.info.state) {
                 debug!(
                     session_id = %params.session_id.0,
                     "active-agent release for a terminal session; ignoring"
                 );
-                return not_released;
+                return Ok(not_released);
             }
             let Some(active) = entry.active_agent.as_ref() else {
-                return not_released;
+                return Ok(not_released);
             };
             if !release_matches(active, &params.source, &resolved.name, report_sequence) {
                 debug!(
@@ -4175,7 +4199,7 @@ impl SessionRegistry {
                     seq = ?params.seq,
                     "active-agent release did not match current report; ignoring"
                 );
-                return not_released;
+                return Ok(not_released);
             }
             let tombstone = ActiveAgentReport {
                 source: params.source.clone(),
@@ -4191,7 +4215,18 @@ impl SessionRegistry {
         };
 
         self.emit(event::SESSION_UPDATED, &info);
-        SessionReleaseAgentResult { released: true }
+        Ok(SessionReleaseAgentResult { released: true })
+    }
+
+    /// Release the active nested agent currently owning a live session; a
+    /// release the daemon cannot admit yet is simply not applied.
+    pub async fn release_agent(
+        &self,
+        params: SessionReleaseAgentParams,
+    ) -> SessionReleaseAgentResult {
+        self.try_release_agent(params)
+            .await
+            .unwrap_or(SessionReleaseAgentResult { released: false })
     }
 
     /// List all known sessions, with each session's `project_label` enriched from
@@ -6998,6 +7033,12 @@ impl SessionRegistry {
     ///
     /// # Errors
     ///
+    /// With `retryable` the wait for the worker ends after the configured
+    /// `hook_admission_wait`, so the caller can answer the retryable
+    /// `hook_schema_unavailable` error before the reporter gives up.
+    ///
+    /// # Errors
+    ///
     /// Returns the [`HookAdmissionError`] when the session's runtime has no
     /// schema, the schema does not admit `action`, `provider` may not report
     /// it, or the worker could not report its schema within the bound.
@@ -7007,9 +7048,10 @@ impl SessionRegistry {
         action: pohunek_worker_protocol::HookAction,
         provider: &str,
         operation: &str,
+        retryable: bool,
     ) -> Result<(), HookAdmissionError> {
         match self
-            .session_hook_admission(id, action, provider, operation)
+            .session_hook_admission(id, action, provider, operation, retryable)
             .await
         {
             None => Ok(()),
@@ -7026,6 +7068,7 @@ impl SessionRegistry {
         action: pohunek_worker_protocol::HookAction,
         provider: &str,
         operation: &str,
+        retryable: bool,
     ) -> Option<Result<&'static pohunek_worker_protocol::HookSchema, HookAdmissionError>> {
         let (agent_base, pinned, pin) = {
             let sessions = self.inner.sessions.lock().await;
@@ -7036,15 +7079,18 @@ impl SessionRegistry {
                 entry.snapshot.launch_binding.clone(),
             )
         };
+        let bound = if retryable {
+            self.inner.config.hook_admission_wait
+        } else {
+            self.inner.config.worker_connect_deadline
+        };
         let schema = match pinned {
             Some(definition) => definition.hook_schema(),
-            None => match self.journaled_hook_schema(id, operation).await? {
+            None => match self.journaled_hook_schema(id, operation, bound).await? {
                 JournaledHookSchema::Journaled(schema) => Some(schema),
                 JournaledHookSchema::Absent => self.session_hook_schema(&agent_base, &pin),
                 JournaledHookSchema::Unavailable => {
-                    let refusal = HookAdmissionError::SchemaUnavailable {
-                        bound: self.inner.config.worker_connect_deadline,
-                    };
+                    let refusal = HookAdmissionError::SchemaUnavailable { bound };
                     log_hook_refusal(id, operation, &refusal);
                     return Some(Err(refusal));
                 }
@@ -7066,17 +7112,27 @@ impl SessionRegistry {
     }
 
     /// Whether the hook schema of session `id` admits `action` from
-    /// `provider`; a refusal is logged naming the `operation`.
+    /// `provider`; a refusal is logged naming the `operation`. A report that
+    /// opted into the retryable answer gets the `hook_schema_unavailable`
+    /// error when the refusal is only that the worker's schema was unavailable.
     async fn hook_report_admitted(
         &self,
         id: &SessionId,
         action: pohunek_worker_protocol::HookAction,
         provider: &str,
         operation: &str,
-    ) -> bool {
-        self.admit_session_hook(id, action, provider, operation)
+        retryable: bool,
+    ) -> Result<bool, ProtocolError> {
+        match self
+            .admit_session_hook(id, action, provider, operation, retryable)
             .await
-            .is_ok()
+        {
+            Ok(()) => Ok(true),
+            Err(refusal @ HookAdmissionError::SchemaUnavailable { .. }) if retryable => {
+                Err(refusal.retryable_error())
+            }
+            Err(_refusal) => Ok(false),
+        }
     }
 
     /// The hook schema the live worker of session `id` journaled, read for
@@ -7084,16 +7140,19 @@ impl SessionRegistry {
     ///
     /// A worker that cannot be asked, because its inspect fails or it is
     /// starting or reconnecting, is asked again every `WORKER_CONNECT_RETRY`
-    /// until the configured `worker_connect_deadline`, measured from the first
-    /// attempt; an inspect still pending at the deadline is abandoned. A report
+    /// until `bound` (the configured `worker_connect_deadline`, or the shorter
+    /// `hook_admission_wait` for a report that opted into the retryable
+    /// answer), measured from the first attempt; an inspect still pending at
+    /// the deadline is abandoned. A report
     /// that comes in while the worker reconnects is therefore admitted by the
     /// worker's schema once it is back, never by the pin's.
     async fn journaled_hook_schema(
         &self,
         id: &SessionId,
         operation: &str,
+        bound: Duration,
     ) -> Option<JournaledHookSchema> {
-        let deadline = tokio::time::Instant::now() + self.inner.config.worker_connect_deadline;
+        let deadline = tokio::time::Instant::now() + bound;
         let mut waiting_logged = false;
         loop {
             let runtime = {
@@ -7197,6 +7256,24 @@ pub enum HookAdmissionError {
         /// The configured `worker_connect_deadline` the admission waited.
         bound: Duration,
     },
+}
+
+/// Code of the retryable refusal of a hook report whose session worker could
+/// not report its hook schema within the admission wait.
+pub const HOOK_SCHEMA_UNAVAILABLE_CODE: &str = "hook_schema_unavailable";
+
+impl HookAdmissionError {
+    /// The retryable `hook_schema_unavailable` error a report that opted in
+    /// receives for a refusal caused only by an unreachable worker.
+    #[must_use]
+    pub fn retryable_error(&self) -> ProtocolError {
+        ProtocolError::new(
+            protocol::ErrorClass::Daemon,
+            HOOK_SCHEMA_UNAVAILABLE_CODE,
+            "the session's worker could not report its hook schema in time".to_owned(),
+            Some("the session's worker is reconnecting; retry the report".to_owned()),
+        )
+    }
 }
 
 /// What the live worker of a session without a launch pin reports about its

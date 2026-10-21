@@ -37,8 +37,10 @@ POHUNEK_HOOK_INPUT_FILE="$hook_input_file" \
 POHUNEK_HOOK_ACTION="$action" \
 POHUNEK_AGENT_PID="$agent_pid" \
 python3 -I - >/dev/null 2>&1 <<'PY' || exit 0
+import hashlib
 import json
 import os
+import secrets
 import socket
 import sys
 import time
@@ -46,6 +48,12 @@ import time
 AGENT = "codex"
 MAX_HOOK_INPUT_CHARS = 65536
 MAX_SESSION_ID_BYTES = 512
+# The daemon keeps at most this many characters of a source id; a longer key
+# would be cut and could collide, so it is replaced by a digest of itself.
+MAX_SOURCE_ID_CHARS = 256
+# Random bytes of the event id used when the provider payload carries none.
+EVENT_ID_RANDOM_BYTES = 16
+RETRYABLE_ADMISSION_CODE = "hook_schema_unavailable"
 SAFE_ID_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:@")
 SECRET_MARKERS = (
     "token",
@@ -131,12 +139,28 @@ def safe_session_id(value):
     return value
 
 
-def hook_event_id(hook_input, timestamp_ms):
+def hook_event_id(hook_input):
     for key in ("hook_event_id", "event_id", "id"):
         candidate = safe_event_id(hook_input.get(key))
         if candidate:
             return candidate
-    return str(timestamp_ms)
+    # Drawn once per invocation, so the worker route, the daemon fallback and
+    # every retry of this hook name the same event while two invocations never do.
+    return secrets.token_hex(EVENT_ID_RANDOM_BYTES)
+
+
+def build_source_id(provider_event, event_id):
+    # The session id is part of the key: two sessions reporting the same event
+    # must not merge into one record.
+    parts = ["hook", AGENT]
+    if session_id:
+        parts.append(session_id)
+    parts.extend([provider_event, event_id])
+    source_id = ":".join(parts)
+    if len(source_id) > MAX_SOURCE_ID_CHARS:
+        digest = hashlib.sha256(source_id.encode("utf-8")).hexdigest()
+        source_id = f"hook:{AGENT}:sha256:{digest}"
+    return source_id
 
 
 # Darwin `proc_pidinfo(PROC_PIDTBSDINFO)` layout of `struct proc_bsdinfo`: the
@@ -228,6 +252,7 @@ def send_worker_notification(params, sequence):
 
 
 def send_request(method, params, request_id):
+    """Sends one daemon request; True when the daemon asked for a retry."""
     request = {
         "v": {"minimum": protocol_version, "maximum": protocol_version},
         "id": request_id,
@@ -240,12 +265,41 @@ def send_request(method, params, request_id):
         client.connect(socket_path)
         client.sendall((json.dumps(request) + "\n").encode())
         try:
-            client.recv(RESPONSE_BYTES)
+            response = client.recv(RESPONSE_BYTES)
         except Exception:
-            pass
+            response = b""
         client.close()
     except Exception:
-        pass
+        return False
+    try:
+        error = json.loads(response.splitlines()[0]).get("err")
+    except Exception:
+        return False
+    return isinstance(error, dict) and error.get("code") == RETRYABLE_ADMISSION_CODE
+
+
+def strict_positive_int(raw):
+    # ASCII digits without a leading zero, as the daemon writes them.
+    if raw and len(raw) <= 9 and raw.isascii() and raw.isdigit() and raw[0] != "0":
+        return int(raw)
+    return None
+
+
+def retry_policy():
+    """(deadline, first pause, longest pause) in seconds, or None without opt-in."""
+    if os.environ.get("POHUNEK_HOOK_ADMISSION_RETRY") != "1":
+        return None
+    values = [
+        strict_positive_int(os.environ.get(name))
+        for name in (
+            "POHUNEK_HOOK_RETRY_DEADLINE_MS",
+            "POHUNEK_HOOK_RETRY_BACKOFF_MS",
+            "POHUNEK_HOOK_RETRY_BACKOFF_MAX_MS",
+        )
+    ]
+    if any(value is None for value in values):
+        return None
+    return tuple(value / 1000 for value in values)
 
 
 session_id = safe_session_id(os.environ.get("POHUNEK_SESSION_ID"))
@@ -264,11 +318,10 @@ try:
 except ValueError:
     protocol_version = None
 
-timestamp_ms = int(time.time() * 1000)
 hook_input = read_hook_input(os.environ.get("POHUNEK_HOOK_INPUT_FILE"))
-event_id = hook_event_id(hook_input, timestamp_ms)
+event_id = hook_event_id(hook_input)
 provider_event = event["provider_event"]
-source_id = f"hook:{AGENT}:{provider_event}:{event_id}"
+source_id = build_source_id(provider_event, event_id)
 metadata = {
     "provider": AGENT,
     "provider_event": provider_event,
@@ -299,8 +352,23 @@ elif session_id and event["kind"] == "turn_completed":
 # The worker forwards this value as the request sequence of a short-lived hook
 # process, so it comes from a system-wide clock (see `sequence` in the state
 # hook), not from `time.monotonic_ns()`, which is only defined per process.
-if send_worker_notification(params, time.clock_gettime_ns(time.CLOCK_MONOTONIC)):
-    raise SystemExit(0)
-if socket_path and protocol_version is not None:
-    send_request("notification.create", params, f"{source_id}:create")
+# A report the daemon could not admit yet, because the session's worker is
+# unreachable, is retried until the policy's deadline. The retry starts with the
+# worker route again, because a reconnected worker admits the report first, and
+# keeps the source id of the first attempt.
+policy = retry_policy()
+daemon_params = dict(params, retryable_admission=True) if policy else params
+started = time.monotonic()
+pause = policy[1] if policy else 0
+while True:
+    if send_worker_notification(params, time.clock_gettime_ns(time.CLOCK_MONOTONIC)):
+        raise SystemExit(0)
+    if not (socket_path and protocol_version is not None):
+        raise SystemExit(0)
+    if not send_request("notification.create", daemon_params, f"{source_id}:create"):
+        raise SystemExit(0)
+    if policy is None or time.monotonic() - started + pause >= policy[0]:
+        raise SystemExit(0)
+    time.sleep(pause)
+    pause = min(pause * 2, policy[2])
 PY

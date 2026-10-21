@@ -78,6 +78,8 @@ mod lifecycle_tests;
 #[cfg(all(test, unix))]
 mod removal_tests;
 #[cfg(all(test, unix))]
+pub(crate) mod reporter_retry_tests;
+#[cfg(all(test, unix))]
 mod worker_hook_tests;
 #[cfg(unix)]
 use commit::{Action, Expected, Step, StepGate};
@@ -186,6 +188,14 @@ const GROUP_OR_OTHER_WRITE_MASK: u32 = 0o022;
 /// kills a hook that outlives it, so it is the longest a hook can take to
 /// deliver a report.
 pub(crate) const HOOK_TIMEOUT_SECS: u64 = 10;
+
+/// How long a hook reporter keeps retrying a report refused only because its
+/// session's worker was unreachable: the hook timeout the integration installs
+/// minus the reporter's own margin.
+pub(crate) fn hook_retry_deadline() -> std::time::Duration {
+    std::time::Duration::from_secs(HOOK_TIMEOUT_SECS)
+        .saturating_sub(pohunek_service_config::HOOK_RETRY_MARGIN)
+}
 /// Action argument passed to the hook script for the `SessionStart` event.
 const HOOK_ACTION: &str = "session";
 /// Action argument passed to the hook script for the `SessionEnd` event.
@@ -4094,7 +4104,7 @@ mod tests {
 
         let source_id = params["source_id"].as_str().expect("source_id is a string");
         assert!(
-            source_id.starts_with(&format!("hook:{agent}:{provider_event}:")),
+            source_id.starts_with(&format!("hook:{agent}:session-123:{provider_event}:")),
             "unexpected source_id: {source_id}"
         );
         assert_eq!(params["source"]["host_local_source_id"], json!(source_id));
@@ -4284,7 +4294,7 @@ mod tests {
                 "hook must report active agent before native id"
             );
             assert!(
-                asset.contains("native_id_params[\"transcript_path\"] = transcript_path"),
+                asset.contains("params[\"transcript_path\"] = transcript_path"),
                 "hook must forward transcript_path to native-id reports for path-kind resume"
             );
             assert!(
@@ -4292,7 +4302,7 @@ mod tests {
                 "{agent} hook must pass the parent agent pid into Python"
             );
             assert!(
-                asset.contains("report_agent_params[\"pid\"] = agent_pid"),
+                asset.contains("\"pid\": agent_pid"),
                 "{agent} hook must include a parsed pid in active-agent reports"
             );
             for env_name in [

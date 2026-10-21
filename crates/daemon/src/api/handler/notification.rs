@@ -16,7 +16,7 @@ use crate::notifications::{
     is_debounced_create, is_hook_provider, stored_provider, AttentionCoordinator,
     NotificationService,
 };
-use crate::session::SessionRegistry;
+use crate::session::{HookAdmissionError, SessionRegistry};
 
 /// Resolve the notification service, or a typed error response when this daemon
 /// state was built without durable notification storage.
@@ -193,10 +193,17 @@ async fn admit_hook_notification(
             pohunek_worker_protocol::HookAction::Notification,
             &provider,
             "hook notification",
+            params.retryable_admission,
         )
         .await
         .map(|()| true)
-        .map_err(|_refusal| refuse("the session runtime does not admit this hook report"))
+        .map_err(|refusal| match refusal {
+            // Only a report that opted in learns that a retry can succeed.
+            HookAdmissionError::SchemaUnavailable { .. } if params.retryable_admission => {
+                error_value(request, refusal.retryable_error())
+            }
+            _ => refuse("the session runtime does not admit this hook report"),
+        })
 }
 
 /// Enrich producer params with live session context without making a missing

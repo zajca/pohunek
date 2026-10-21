@@ -661,6 +661,7 @@ impl ProjectorState {
             source_id: Some(source_id),
             dedupe_key: derived.dedupe_key,
             project_id: derived.project_id,
+            retryable_admission: false,
         };
         Some(PendingNotification {
             session_id: derived.session_id,
@@ -1102,6 +1103,7 @@ mod tests {
             source_id: Some("codex:s-1:permission:1".to_owned()),
             dedupe_key: Some(attention_dedupe_key(&session_id)),
             project_id: Some("p-test".to_owned()),
+            retryable_admission: false,
         }
     }
 
@@ -1123,6 +1125,7 @@ mod tests {
             source_id: Some("codex:s-1:stop:1".to_owned()),
             dedupe_key: Some(format!("turn:{}", session_id.0)),
             project_id: Some("p-test".to_owned()),
+            retryable_admission: false,
         }
     }
 
@@ -1593,6 +1596,7 @@ mod tests {
                 )),
                 dedupe_key: None,
                 project_id: None,
+                retryable_admission: false,
             })
             .expect("store a record at the epoch limit");
         let attention = AttentionCoordinator::disconnected();
@@ -1838,6 +1842,7 @@ mod tests {
                 source_id: error.source_id,
                 dedupe_key: error.dedupe_key,
                 project_id: error.project_id,
+                retryable_admission: false,
             })
             .expect("recreate same deleted source");
         delete_visible_terminals(&service);
@@ -2073,6 +2078,7 @@ mod tests {
                     source_id: Some(source_id),
                     dedupe_key: Some(attention_dedupe_key(&session_id)),
                     project_id: None,
+                    retryable_admission: false,
                 },
                 "2026-07-03T10:00:00Z",
             )
@@ -2165,6 +2171,7 @@ mod tests {
                     source_id: Some(source_id),
                     dedupe_key: None,
                     project_id: None,
+                    retryable_admission: false,
                 },
                 created_at,
             )

@@ -1921,6 +1921,14 @@ pub struct SessionReportNativeIdParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     transcript_path: Option<String>,
+    /// Opts into the retryable admission answer: when the session's worker
+    /// cannot report its hook schema, the daemon waits only its configured
+    /// admission wait and answers `hook_schema_unavailable` instead of the
+    /// refusal a schema denial gets. Reporters send it only to a daemon that
+    /// announced support through the launch environment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    retryable_admission: bool,
 }
 
 impl SessionReportNativeIdParams {
@@ -1970,7 +1978,21 @@ impl SessionReportNativeIdParams {
             expires_at,
             native_session_id,
             transcript_path,
+            retryable_admission: false,
         })
+    }
+
+    /// Returns the report with the retryable admission answer requested.
+    #[must_use]
+    pub const fn with_retryable_admission(mut self, retryable: bool) -> Self {
+        self.retryable_admission = retryable;
+        self
+    }
+
+    /// Whether the reporter asked for the retryable admission answer.
+    #[must_use]
+    pub const fn retryable_admission(&self) -> bool {
+        self.retryable_admission
     }
 
     /// Returns the logical session receiving the report.
@@ -2046,6 +2068,8 @@ impl<'de> Deserialize<'de> for SessionReportNativeIdParams {
             native_session_id: String,
             #[serde(default)]
             transcript_path: Option<String>,
+            #[serde(default)]
+            retryable_admission: bool,
         }
         let wire = WireParams::deserialize(deserializer)?;
         Self::new(
@@ -2059,6 +2083,7 @@ impl<'de> Deserialize<'de> for SessionReportNativeIdParams {
             wire.native_session_id,
             wire.transcript_path,
         )
+        .map(|params| params.with_retryable_admission(wire.retryable_admission))
         .map_err(serde::de::Error::custom)
     }
 }
@@ -2073,6 +2098,7 @@ impl std::fmt::Debug for SessionReportNativeIdParams {
             .field("pid_start_identity", &self.pid_start_identity)
             .field("sequence", &self.sequence)
             .field("expires_at", &self.expires_at)
+            .field("retryable_admission", &self.retryable_admission)
             .field("native_session_id", &"[REDACTED]")
             .field(
                 "transcript_path",
@@ -2144,6 +2170,14 @@ pub struct SessionReportAgentParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub agent_session_path: Option<String>,
+    /// Opts into the retryable admission answer: when the session's worker
+    /// cannot report its hook schema, the daemon waits only its configured
+    /// admission wait and answers `hook_schema_unavailable` instead of the
+    /// refusal a schema denial gets. Reporters send it only to a daemon that
+    /// announced support through the launch environment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub retryable_admission: bool,
 }
 
 /// Parameters for `session.release_agent`.
@@ -2177,6 +2211,14 @@ pub struct SessionReleaseAgentParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub monotonic_sequence: Option<ReportSequence>,
+    /// Opts into the retryable admission answer: when the session's worker
+    /// cannot report its hook schema, the daemon waits only its configured
+    /// admission wait and answers `hook_schema_unavailable` instead of the
+    /// refusal a schema denial gets. Reporters send it only to a daemon that
+    /// announced support through the launch environment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub retryable_admission: bool,
 }
 
 /// Result returned by `session.report_agent`.
