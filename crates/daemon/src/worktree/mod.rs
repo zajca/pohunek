@@ -39,7 +39,8 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1486,9 +1487,20 @@ fn fetch_into_ref(repo: &Path, base_branch: &str, fetch_ref: &str) -> Result<Fet
         _ => return Err(output_failure_message(&probed)),
     }
     let cmd = fetch_command(repo, base_branch, fetch_ref)?;
+    // The fetch's connectivity check reads every `worktrees/<name>/HEAD`, and
+    // `git worktree add` first writes a null-oid placeholder there, which fails
+    // the check with `bad object worktrees/<name>/HEAD`. Holding the admin lock
+    // shared keeps the fetch from overlapping an add or prune on the same
+    // repository while fetches still run side by side.
+    let lock = admin_lock(repo)?;
+    let guard = share_within(&lock, fetch_lock_wait())?;
     // Fetch diagnostics are not parsed: a successful fetch already owns its ref.
-    let output =
-        run_output_bounded_then(cmd, GIT_COMMAND_TIMEOUT, OutputPolicy::StatusOnly, || {})?;
+    let output = run_output_bounded_then(
+        cmd,
+        GIT_COMMAND_TIMEOUT,
+        OutputPolicy::StatusOnly,
+        move || drop(guard),
+    )?;
     if !output.status.success() {
         return Err(output_failure_message(&output));
     }
@@ -1556,24 +1568,47 @@ fn worktree_remove(repo: &Path, path: &Path) -> Result<(), String> {
     run_admin_command(repo, cmd)
 }
 
-/// Locks serializing the git commands that write a repository's
-/// `worktrees/` admin directory, keyed by the canonical git common dir.
+/// Locks guarding a repository's `worktrees/` admin directory, keyed by the
+/// canonical git common dir.
 ///
 /// `git worktree add` creates `worktrees/<name>/` and fills it file by file
-/// (`commondir`, `gitdir`, ...). A concurrent `add` scans every sibling entry
-/// to check branch and path uniqueness, and a concurrent `prune` deletes
-/// entries it judges stale, so either can observe or destroy a half-written
-/// entry (`fatal: failed to read .git/worktrees/<name>/commondir`). Git has no
-/// lock for this. Entries are one small `Arc` per repository the daemon has
-/// touched and live for the process lifetime.
-static ADMIN_LOCKS: Mutex<Option<HashMap<PathBuf, Arc<Mutex<()>>>>> = Mutex::new(None);
+/// (`commondir`, `gitdir`, a null-oid `HEAD` placeholder, ...). A concurrent
+/// `add` scans every sibling entry to check branch and path uniqueness, and a
+/// concurrent `prune` deletes entries it judges stale, so either can observe or
+/// destroy a half-written entry (`fatal: failed to read
+/// .git/worktrees/<name>/commondir`). A `git fetch` reads every entry's `HEAD`
+/// in its connectivity check and fails on the placeholder. Git has no lock for
+/// this: the commands that write the directory hold the lock exclusively, a
+/// fetch holds it shared. Entries are one small `Arc` per repository the daemon
+/// has touched and live for the process lifetime.
+///
+/// Both kinds of holder share the single [`GIT_COMMAND_TIMEOUT`] budget for
+/// waiting, so the lock couples them in both directions: a fetch waits behind
+/// an add or prune (and the add's `post-checkout` hook), and an add, remove or
+/// prune waits behind an in-flight fetch, for up to that budget each. A wait
+/// that runs out is reported like the operation's own failure.
+static ADMIN_LOCKS: Mutex<Option<HashMap<PathBuf, Arc<AdminLock>>>> = Mutex::new(None);
+
+/// The lock of one repository's `worktrees/` admin directory.
+#[derive(Default)]
+struct AdminLock {
+    rw: RwLock<()>,
+    /// Exclusive requests that are waiting. Shared requests hold back while it
+    /// is non-zero, so a steady stream of fetches cannot starve an add, a remove
+    /// or a prune.
+    writers_waiting: AtomicUsize,
+    /// Shared requests that are waiting; lets a test observe that a fetch is
+    /// parked on the lock.
+    #[cfg(test)]
+    readers_waiting: AtomicUsize,
+}
 
 /// The lock guarding the `worktrees/` admin directory of the repository that
 /// `repo` (any checkout, linked worktree or bare repo path) belongs to.
 ///
 /// Every spelling of one repository resolves to the same lock; distinct
 /// repositories get distinct locks and so never wait on each other.
-fn admin_lock(repo: &Path) -> Result<Arc<Mutex<()>>, String> {
+fn admin_lock(repo: &Path) -> Result<Arc<AdminLock>, String> {
     let common_dir = git_capture(
         repo,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -1588,16 +1623,71 @@ fn admin_lock(repo: &Path) -> Result<Arc<Mutex<()>>, String> {
     Ok(Arc::clone(lock))
 }
 
-/// Take `lock`, waiting at most `timeout` for the holder to finish.
+/// Take `lock` exclusively, waiting at most `timeout` for the holders to finish.
 ///
-/// The wait is bounded like every other git step: the holder is itself bound by
-/// [`GIT_COMMAND_TIMEOUT`], so a stuck sibling cannot pin this blocking thread
-/// forever. The lock protects no data, so a poisoned lock (a panicking holder)
-/// is still usable.
-fn lock_within(lock: &Mutex<()>, timeout: Duration) -> Result<MutexGuard<'_, ()>, String> {
+/// The wait is bounded like every other git step: the holders are themselves
+/// bound by [`GIT_COMMAND_TIMEOUT`], so a stuck sibling cannot pin this blocking
+/// thread forever. The lock protects no data, so a poisoned lock (a panicking
+/// holder) is still usable.
+fn lock_within(lock: &AdminLock, timeout: Duration) -> Result<RwLockWriteGuard<'_, ()>, String> {
+    let _waiting = Waiting::register(&lock.writers_waiting);
+    acquire_within(timeout, || lock.rw.try_write())
+}
+
+/// Counts one waiting request for as long as it lives.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn register(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How long a fetch waits for the admin lock: the git command bound, or the
+/// bound a test injected for its thread.
+fn fetch_lock_wait() -> Duration {
+    #[cfg(test)]
+    if let Some(wait) = FETCH_LOCK_WAIT_OVERRIDE.with(std::cell::Cell::get) {
+        return wait;
+    }
+    GIT_COMMAND_TIMEOUT
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only bound on this thread's fetch wait for the admin lock.
+    static FETCH_LOCK_WAIT_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Take `lock` shared, waiting at most `timeout` for an exclusive holder or
+/// waiter to finish; see [`lock_within`].
+fn share_within(lock: &AdminLock, timeout: Duration) -> Result<RwLockReadGuard<'_, ()>, String> {
+    #[cfg(test)]
+    let _waiting = Waiting::register(&lock.readers_waiting);
+    acquire_within(timeout, || {
+        if lock.writers_waiting.load(Ordering::SeqCst) > 0 {
+            return Err(TryLockError::WouldBlock);
+        }
+        lock.rw.try_read()
+    })
+}
+
+/// Poll `try_take` until it yields a guard or `timeout` elapses.
+fn acquire_within<G>(
+    timeout: Duration,
+    mut try_take: impl FnMut() -> Result<G, TryLockError<G>>,
+) -> Result<G, String> {
     let deadline = Instant::now() + timeout;
     loop {
-        match lock.try_lock() {
+        match try_take() {
             Ok(guard) => return Ok(guard),
             Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
             Err(TryLockError::WouldBlock) => {

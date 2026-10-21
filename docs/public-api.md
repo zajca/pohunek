@@ -1581,7 +1581,11 @@ Important fields:
   is never replaced by the repository's default branch: a base that is not local
   and cannot be fetched fails the create with `invalid_base_branch` (it does not
   exist) or `base_branch_fetch_failed` (the fetch from `origin` failed; the
-  message names git's failure). `kind` is
+  message names git's failure). Worktree operations in one repository wait for
+  each other for up to the git command timeout, and a wait that runs out is
+  reported the same way, with the text "waiting for another worktree operation
+  on the same repository" in the `fetch` warning's `detail` or in the
+  `base_branch_fetch_failed` message; the ordering covers one daemon only. `kind` is
   `native_recovery` for a session whose stored native recovery record could
   not be completed after an upgrade: it cannot resume or fork, `message` says to
   start a new session and resume the native conversation, and `detail` carries

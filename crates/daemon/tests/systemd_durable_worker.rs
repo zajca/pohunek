@@ -54,6 +54,9 @@ const REPLAY_HISTORY_BYTES: u64 = 3_000_000;
 const WORKER_GENERATION: &str = "abcd2345";
 /// Installation version directory the fixture's `service.toml` activates.
 const FIXTURE_VERSION: &str = "0.0.0-e2e";
+/// Name prefix of the fixture root directory. Kept short: the worker socket
+/// paths below the root are limited to 107 bytes.
+const ROOT_PREFIX: &str = "phsd-";
 /// Bound on one D-Bus call to the user manager while starting fixture workers.
 const SYSTEMD_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Worker socket negotiation bound written to the fixture's `service.toml`.
@@ -526,6 +529,26 @@ fn require_memory_controller() {
     );
 }
 
+/// Fails with the offending path when a fixture session's worker socket, or
+/// the staged bind path beside it, exceeds the platform limit.
+///
+/// The worker refuses to start in that case; checking before any unit starts
+/// reports the path instead of a worker that never became ready.
+fn assert_worker_sockets_fit<'a>(
+    runtime_root: &Path,
+    session_ids: impl IntoIterator<Item = &'a String>,
+) {
+    let platform = pohunek_paths::Platform::current().expect("supported platform");
+    let workers_root = runtime_root.join(pohunek_paths::WORKERS_SUBDIR);
+    for id in session_ids {
+        pohunek_paths::worker_socket_path(&workers_root, id, platform)
+            .unwrap_or_else(|error| {
+                panic!("the fixture's worker socket path does not fit: {error}")
+            })
+            .expect("the fixture session id names a worker");
+    }
+}
+
 struct Fixture {
     root: PathBuf,
     runtime_home: PathBuf,
@@ -588,15 +611,17 @@ impl Fixture {
     /// and an explicit `service.toml` whose namespace names the fixture's
     /// transient units.
     fn new(worker_bin: &Path) -> Self {
-        let unique = format!(
-            "{}{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time after epoch")
-                .subsec_nanos()
-        );
-        let root = pohunek_test_support::temp_root().join(format!("pohunek-systemd-e2e-{unique}"));
+        // One number names the fixture: the pid in the high bits and the
+        // sub-second nanoseconds (below 2^30) in the low bits. The session ids
+        // and unit names spell it in decimal; the root directory spells it in
+        // hex, so the worker socket paths below it stay short.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time after epoch")
+            .subsec_nanos();
+        let token = (u64::from(std::process::id()) << 30) | u64::from(nanos);
+        let unique = token.to_string();
+        let root = pohunek_test_support::temp_root().join(format!("{ROOT_PREFIX}{token:x}"));
         let runtime_home = root.join("runtime");
         let config_home = root.join("config");
         let data_home = root.join("data");
@@ -663,6 +688,10 @@ impl Fixture {
         let namespace = service.namespace();
         let session_id = format!("s-{unique}");
         let isolation_session_id = format!("s-{unique}9");
+        assert_worker_sockets_fit(
+            &runtime_home.join("pohunek"),
+            [&session_id, &isolation_session_id],
+        );
         let worker_key = WorkerKey::new(session_id.clone(), WORKER_GENERATION).expect("worker key");
         let isolation_worker_key = WorkerKey::new(isolation_session_id.clone(), WORKER_GENERATION)
             .expect("isolation worker key");
