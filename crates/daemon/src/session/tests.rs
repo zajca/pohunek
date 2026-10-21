@@ -8276,7 +8276,8 @@ async fn forward_claim(
 
 #[tokio::test]
 async fn a_forwarded_claim_of_another_agent_does_not_complete_the_turn_it_replaced() {
-    let (registry, created, mut snapshot, root, mut edges) = forwarded_turn_session().await;
+    let (registry, created, mut snapshot, root, mut edges) =
+        Box::pin(forwarded_turn_session()).await;
     assert_eq!(started_turns(&mut edges).len(), 1);
 
     forward_claim(
@@ -8299,7 +8300,8 @@ async fn a_forwarded_claim_of_another_agent_does_not_complete_the_turn_it_replac
 
 #[tokio::test]
 async fn a_forwarded_claim_of_another_agent_runs_its_own_turn() {
-    let (registry, created, mut snapshot, root, mut edges) = forwarded_turn_session().await;
+    let (registry, created, mut snapshot, root, mut edges) =
+        Box::pin(forwarded_turn_session()).await;
     let first = started_turns(&mut edges);
 
     forward_claim(
@@ -8322,7 +8324,8 @@ async fn a_forwarded_claim_of_another_agent_runs_its_own_turn() {
 
 #[tokio::test]
 async fn a_forwarded_release_does_not_leave_its_turn_to_the_next_idle() {
-    let (registry, created, mut snapshot, root, mut edges) = forwarded_turn_session().await;
+    let (registry, created, mut snapshot, root, mut edges) =
+        Box::pin(forwarded_turn_session()).await;
     assert_eq!(started_turns(&mut edges).len(), 1);
 
     snapshot.active_identity = None;
