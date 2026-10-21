@@ -398,7 +398,7 @@ describe("Client request/response", () => {
     }
   });
 
-  test("garbled JSON reply maps to json_error and poisons the connection", async () => {
+  test("garbled JSON reply maps to json_error and the next call reopens", async () => {
     const daemon = await startUnixDaemon([
       { kind: "garbled" },
       { kind: "reply", line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), { status: "ok" }) },
@@ -411,10 +411,8 @@ describe("Client request/response", () => {
       expect(firstError.toProtocolError().code).toBe("json_error");
       await daemon.nextRequest();
 
-      const secondError = await expectClientError(client.call("daemon.health", null));
-      expect(secondError.toProtocolError().class).toBe("transport");
-      expect(secondError.toProtocolError().code).toBe("framing");
-      await daemon.expectNoRequest(50);
+      expect(await client.call("daemon.health", null)).toEqual({ status: "ok" });
+      expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe("daemon.health");
     } finally {
       await daemon.close();
     }
@@ -934,8 +932,14 @@ describe("Client request/response", () => {
     }
   });
 
-  test("session.new with input rejects a poisoned client", async () => {
-    const daemon = startMemoryDaemon([{ kind: "reply", line: () => "invalid json" }]);
+  test("session.new with input runs on its own connection after the shared one was poisoned", async () => {
+    const daemon = startMemoryDaemon([
+      { kind: "reply", line: () => "invalid json" },
+      {
+        kind: "reply",
+        line: (line) => okResponseLine(requestIdFromLine(line), { ...minimalSessionInfo(), applied_input: true }),
+      },
+    ]);
     if (daemon.endpoint.kind !== "memory") {
       throw new Error("memory daemon returned a different transport");
     }
@@ -951,12 +955,13 @@ describe("Client request/response", () => {
     try {
       const client = await Client.connectTransport(transport);
       await expectClientError(client.call("daemon.health", null));
-      const error = await expectClientError(client.call("session.new", {
+      const created = await client.call("session.new", {
         agent: "claude", cols: 80, rows: 24, input: "hello",
-      }));
-      expect(error.toProtocolError().code).toBe("framing");
-      expect(connections).toBe(1);
+      });
+      expect(created.id).toBe(minimalSessionInfo().id);
+      expect(connections).toBe(2);
       expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe("daemon.health");
+      expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe("session.new");
       await client.close();
     } finally {
       await daemon.close();
@@ -1262,13 +1267,14 @@ describe("Client request/response", () => {
     }
   });
 
-  test("request timeout rejects and poisons the connection", async () => {
+  test("request timeout rejects and the next call reopens the connection", async () => {
     const daemon = await startUnixDaemon([
       {
         kind: "delay",
         ms: 60,
         line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), { status: "ok" }),
       },
+      { kind: "reply", line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), { status: "second" }) },
     ]);
     try {
       const client = await connectClient(daemon, undefined, { requestTimeoutMs: 20 });
@@ -1278,10 +1284,8 @@ describe("Client request/response", () => {
       expect(firstError.toProtocolError().code).toBe("request_timeout");
       await daemon.nextRequest();
 
-      const secondError = await expectClientError(client.call("daemon.health", null));
-      expect(secondError.toProtocolError().class).toBe("transport");
-      expect(secondError.toProtocolError().code).toBe("framing");
-      await daemon.expectNoRequest(50);
+      // The late reply of the first request dies with its connection.
+      expect(await client.call("daemon.health", null)).toEqual({ status: "second" });
     } finally {
       await daemon.close();
     }

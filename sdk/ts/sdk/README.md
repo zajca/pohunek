@@ -78,6 +78,19 @@ deadline of resume, fork, stop or remove rejects with `ClientError.kind`
 still complete the call, and a retried fork creates a second child. Code that
 switches exhaustively on `ClientError.kind` must handle these kinds.
 
+## Timeouts and reconnecting
+
+A request that times out (or is answered with another request's id, or an
+unparsable line) fails with `requestTimeout`, `framing` or `json`, and the
+connection it ran on is dropped, because its late reply could be read as the
+answer to a later request. The client never resends the call, reads included.
+The next call on the same `Client` opens a fresh control connection, learns the
+daemon's protocol version again and sends only its own request; concurrent
+callers share one reconnect, and a failed reconnect rejects with the connect
+error so the following call tries again. A closed client, a client whose
+subscription took the channel and an incompatible protocol version stay
+refused. The version probe of a fresh connection has its own `requestTimeoutMs`.
+
 ## Subscribe
 
 `subscribe` consumes the control connection after the acknowledgement, so use a

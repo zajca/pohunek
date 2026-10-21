@@ -41,6 +41,10 @@ function healthReply(): (requestLine: string) => string {
   });
 }
 
+function healthStep(): ScriptStep {
+  return { kind: "reply", line: healthReply() };
+}
+
 function healthGate(): { step: ScriptStep; release: () => void } {
   let release = (): void => {};
   const ready = new Promise<void>((resolve) => {
@@ -106,9 +110,9 @@ describe("late version negotiation over a real TCP daemon", () => {
     const gate = healthGate();
     const daemon = await startTcpDaemon([
       gate.step,
-      // The answer a correct client never asks for: `package.uninstall` was
-      // abandoned with the probe, so the daemon must never see this step.
-      { kind: "reply", line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), { removed: true }) },
+      // The answer to the next call: `package.uninstall` was abandoned with
+      // the probe, so the first request the daemon sees after it is a health call.
+      healthStep(),
     ]);
     try {
       const client = await connectTcp(HOST, address(daemon), { requestTimeoutMs: PROBE_TIMEOUT_MS });
@@ -121,9 +125,9 @@ describe("late version negotiation over a real TCP daemon", () => {
       gate.release();
       await daemon.expectNoRequest(SETTLE_MS);
 
-      // The connection is poisoned; further calls fail locally and stay silent.
-      const retry = await expectClientError(client.call("daemon.health", null));
-      expect(retry.kind).toBe("framing");
+      // The next call opens a fresh connection and sends only its own request.
+      expect((await client.call("daemon.health", null)).protocol_version).toBe(PROTOCOL_VERSION);
+      expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe("daemon.health");
       await daemon.expectNoRequest(SETTLE_MS);
       await client.close();
     } finally {

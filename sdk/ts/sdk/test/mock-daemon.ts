@@ -270,11 +270,16 @@ function createRuntime(steps: ScriptStep[]): Runtime {
         throw new Error(`unexpected request line: ${maybeLine}`);
       }
       await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(resolve, timeoutMs);
-        waiters.push((line) => {
+        const waiter = (line: string): void => {
           clearTimeout(timer);
           reject(new Error(`unexpected request line: ${line}`));
-        });
+        };
+        // A waiter left behind would swallow the next request a test awaits.
+        const timer = setTimeout(() => {
+          waiters.splice(waiters.indexOf(waiter), 1);
+          resolve();
+        }, timeoutMs);
+        waiters.push(waiter);
       });
     },
   };

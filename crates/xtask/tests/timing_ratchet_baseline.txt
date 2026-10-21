@@ -11,7 +11,7 @@ crates/cli/tests/service_lock_terminal.rs 1
 crates/cli/tests/session_process_api.rs 4
 crates/cli/tests/support/native.rs 1
 crates/client/src/discovery.rs 1
-crates/client/tests/request_response.rs 4
+crates/client/tests/request_response.rs 2
 crates/daemon/src/events/mod.rs 1
 crates/daemon/src/integration/mod.rs 4
 crates/daemon/src/project/detect.rs 1
