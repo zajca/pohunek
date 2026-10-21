@@ -1706,11 +1706,17 @@ impl<'a> Engine<'a> {
                 if restarts_previous && new_daemon_may_run && record.runtime_backup.is_none() {
                     gated = Some(self.rollback_gate(&layout, previous, record).await?);
                 }
-                self.mark_rolling_back(record)?;
-                if record.step >= Step::Registering
+                let stops_daemon = record.step >= Step::Registering
                     || record.runtime_stop
-                    || (record.config_backup.is_some() && record.step >= Step::StopDaemon)
-                {
+                    || (record.config_backup.is_some() && record.step >= Step::StopDaemon);
+                if restarts_previous && stops_daemon && record.runtime_backup.is_some() {
+                    // The gate waits for the restore, but the job's `PATH` must be
+                    // resolvable before the daemon is stopped: the gate after the
+                    // stop would otherwise refuse with the daemon down.
+                    journal_job_path(self.context, record).await?;
+                }
+                self.mark_rolling_back(record)?;
+                if stops_daemon {
                     // A journaled migration stop may not have happened yet;
                     // a later swap may have registered the new daemon. Stop
                     // either job before restoring previous-schema bytes so neither

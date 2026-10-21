@@ -4185,6 +4185,45 @@ async fn a_held_data_authority_lock_keeps_a_pending_rollback_and_its_backup() {
     harness.assert_installed(V1);
 }
 
+/// A pending rollback that restores a runtime backup resolves the job's `PATH`
+/// before it stops the daemon, so a drop-in the removed unit could not
+/// reproduce is refused with the daemon still up.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_rollback_with_a_runtime_backup_resolves_the_path_before_it_stops_the_daemon() {
+    let mut harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.runtimes.script().calls.clear();
+    seed_runtime_state(&harness);
+    harness.runtimes.plan(installing_plan());
+    harness.runtimes.script().fail_apply = true;
+    let authority = hold_data_authority(&harness);
+    harness.upgrade(V2).await.expect_err("the rollback is held");
+    drop(authority);
+
+    let (_keep, unit) = unit_with_files(
+        b"[Service]\nExecStart=/bin/true\n",
+        &[b"[Service]\nEnvironment=PATH=%h/bin\n"],
+        &["PATH=/expanded/bin"],
+    );
+    harness.context = harness
+        .context
+        .clone()
+        .with_user_manager(Arc::new(UnitManager { unit: Ok(unit) }));
+    let uninstalls = harness.fake.world().uninstalls;
+    let error = harness
+        .upgrade(V1)
+        .await
+        .expect_err("a specifier is not reproducible");
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    assert_eq!(
+        harness.fake.world().uninstalls,
+        uninstalls,
+        "nothing stopped"
+    );
+    assert!(harness.pending().is_some(), "the transaction is kept");
+}
+
 #[tokio::test]
 async fn a_catalog_record_is_a_plan_of_its_own_and_is_applied_with_a_stop_and_backup() {
     let harness = Harness::new();
