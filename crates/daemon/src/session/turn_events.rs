@@ -11,7 +11,7 @@
 // Rust guideline compliant 2026-10-12
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -259,6 +259,10 @@ pub(crate) struct TurnProgress {
     /// Unix nanoseconds of the last transition into `working`; what
     /// `session.wait_turn` reports as the turn start.
     turn_started_nanos: AtomicU64,
+    /// Whether the session was seen ready (idle) or an agent reported its
+    /// activity: until then the detector's `working` is start-up output, not
+    /// a turn.
+    ready: AtomicBool,
     table: Mutex<TurnTable>,
 }
 
@@ -293,10 +297,16 @@ impl TurnProgress {
         metadata: &BTreeMap<String, String>,
         wall_nanos: u64,
         window: Duration,
+        detector_observed: bool,
     ) -> TurnChange {
         let now = Instant::now();
         let mut table = self.table();
         table.depart_changed(owner);
+        if !detector_observed || next == AgentActivity::Idle {
+            self.ready.store(true, Ordering::Relaxed);
+        } else if next == AgentActivity::Working && !self.ready.load(Ordering::Relaxed) {
+            return TurnChange::default();
+        }
         // A working report of a new owner opens its own turn even when the
         // session was already working, because the previous turn departed.
         let running = table
@@ -380,9 +390,10 @@ impl TurnProgress {
         self.table().abandon_all();
     }
 
-    fn abandon_running(&self) {
+    fn abandon_running(&self, owner: TurnOwner) {
         if let Some((_, record)) = self.table().newest_mut() {
-            if matches!(record.state, TurnState::Open | TurnState::Paused) {
+            if record.owner == owner && matches!(record.state, TurnState::Open | TurnState::Paused)
+            {
                 record.state = TurnState::Abandoned;
             }
         }
@@ -581,10 +592,10 @@ impl TurnEvents {
         }
     }
 
-    /// A running turn of the session can no longer be observed to end.
-    pub(crate) fn abandon_running(&self, session_id: &SessionId) {
+    /// A running turn of `owner` can no longer be observed to end.
+    pub(crate) fn abandon_running(&self, session_id: &SessionId, owner: TurnOwner) {
         if let Some(progress) = self.existing_progress(session_id) {
-            progress.abandon_running();
+            progress.abandon_running(owner);
         }
     }
 
@@ -746,6 +757,8 @@ impl TurnEvents {
 
     /// Applies an activity change of the session's `owner`. A turn that goes
     /// idle is announced on the edge channel, in order with the change.
+    /// `detector_observed` marks activity inferred from terminal output rather
+    /// than reported by an agent.
     pub(crate) fn note_activity(
         &self,
         session_id: &SessionId,
@@ -753,6 +766,7 @@ impl TurnEvents {
         previous: Option<AgentActivity>,
         next: AgentActivity,
         metadata: &BTreeMap<String, String>,
+        detector_observed: bool,
     ) {
         let window = Duration::from_millis(self.inner.flap_window_ms.load(Ordering::Relaxed));
         let change = self.progress(session_id).note_activity(
@@ -762,6 +776,7 @@ impl TurnEvents {
             metadata,
             self.wall_nanos(),
             window,
+            detector_observed,
         );
         if let Some(id) = change.started {
             let _ = self

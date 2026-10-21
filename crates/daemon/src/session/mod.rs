@@ -4083,6 +4083,7 @@ impl SessionRegistry {
             entry.info.activity,
             activity,
             &entry.info.metadata,
+            false,
         );
         entry.info.activity = Some(activity);
         entry.info.state_source = StateSource::Report;
@@ -5974,6 +5975,7 @@ impl SessionRegistry {
     ) -> RuntimeTransitionOutcome {
         let state = classification.state();
         let activity_is_lost = classification.proof().is_some();
+        let mut lost_owner = None;
         let (base, candidate) = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(id) else {
@@ -5983,6 +5985,7 @@ impl SessionRegistry {
                 return RuntimeTransitionOutcome::IdentityMismatch;
             }
             let base = Self::session_record(id, entry, entry.desired_state, None);
+            lost_owner = Some(entry.turn_owner());
             let mut candidate = entry.clone();
             candidate.runtime = RuntimeHandle::Unavailable(state);
             candidate.info.background = None;
@@ -6021,10 +6024,10 @@ impl SessionRegistry {
             );
         }
         if let RuntimeTransitionOutcome::Applied(info) = &outcome {
-            if activity_is_lost {
+            if let (true, Some(lost_owner)) = (activity_is_lost, lost_owner) {
                 // The session shows no activity now, so a running turn can no
                 // longer be seen to end.
-                self.inner.turns.abandon_running(id);
+                self.inner.turns.abandon_running(id, lost_owner);
             }
             reconcile::warn_unavailable(&id.0, Some(&expected.worker_id), state, reason, "");
             let event_name = match state {

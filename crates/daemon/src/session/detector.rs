@@ -290,6 +290,7 @@ impl SessionRegistry {
                 entry.info.activity,
                 transition.activity,
                 &entry.info.metadata,
+                true,
             );
             entry.info.activity = Some(transition.activity);
             entry.info.state_source = transition.source;

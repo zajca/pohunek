@@ -1164,7 +1164,7 @@ async fn a_stale_stop_during_the_next_turn_is_dropped() {
 }
 
 #[tokio::test]
-async fn two_quick_turns_report_the_last_turn_once() {
+async fn a_flap_between_two_hook_stops_inside_the_window_is_one_logical_turn() {
     let fixture = Fixture::with_policy(
         SessionRegistryConfig::default(),
         Some(every_provider(NotificationKindPolicy {
@@ -1182,8 +1182,7 @@ async fn two_quick_turns_report_the_last_turn_once() {
         "timeout_ms": LONG_WAIT_MS
     }));
     parked(&fixture, 1).await;
-    // Turn one: work starts, and its stop follows one second later, inside the
-    // window after the working edge, so the inbox treats it as stale.
+    // Work starts and a stop follows one second later; the session goes idle.
     fixture.activity(&session, "working").await;
     settle().await;
     tokio::time::advance(QUICK_TURN_STEP).await;
@@ -1191,7 +1190,8 @@ async fn two_quick_turns_report_the_last_turn_once() {
     fixture.activity(&session, "idle").await;
     settle().await;
     tokio::time::advance(QUICK_TURN_STEP).await;
-    // Turn two starts inside turn one's window and stops one second later.
+    // The session works again inside the settle window: the same logical turn
+    // continues, and a second stop follows.
     fixture.activity(&session, "working").await;
     settle().await;
     tokio::time::advance(QUICK_TURN_STEP).await;
@@ -1202,8 +1202,7 @@ async fn two_quick_turns_report_the_last_turn_once() {
     let result = ok(joined(wait).await);
     assert_eq!(result["reason"], "event");
     assert_eq!(result["event"]["kind"], "turn_completed");
-    // Turn two began inside turn one's window, which dropped turn one's pending
-    // report; only the last turn reaches the inbox, and the event names it.
+    // The flap is one logical turn: one inbox record, and the event names it.
     let inbox = fixture.inbox().await;
     assert_eq!(inbox.len(), 1, "{inbox:?}");
     assert_eq!(result["event"]["notification_id"], inbox[0]["id"]);

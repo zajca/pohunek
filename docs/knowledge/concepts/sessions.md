@@ -294,8 +294,9 @@ seconds by default) instead of being persisted immediately; `notification.create
 still reports `created: true` with a minted id, but the record does not appear
 in `notification.list` and no `notification_created` event fires while it is
 pending. If the session enters `working` or reaches a terminal lifecycle state
-inside that window, the pending record is dropped entirely and nothing is ever
-created — the same self-resolve edge described above, applied before the record
+inside that window, a pending record that is not tied to a turn the daemon runs
+is dropped entirely and nothing is ever created (the reports of a running turn
+follow that turn instead, see below) — the same self-resolve edge described above, applied before the record
 surfaces rather than after. Only a genuinely outstanding session signal, still unresolved once
 the window elapses, is committed and broadcast. This is distinct from
 `attention_dedupe_window_secs`, which merges duplicate attention reports across
@@ -305,8 +306,9 @@ window elapses the daemon also records the session turn event that
 the kind, when the report came from the projector or from an admitted provider
 hook for a session the daemon holds; a create whose kind the policy disables
 still answers `notification_kind_disabled`. The turn event does not use the
-inbox's stale-stop suppression after resumed work: a `turn_completed` is
-dropped instead when the session is `working` as its window ends.
+inbox's stale-stop suppression after resumed work: a `turn_completed` that
+names no turn is dropped instead when the session is `working` as its window
+ends.
 
 The projector emits a `turn_completed` for every session whose activity goes
 `working` to `idle`, so runtimes without managed hooks report turns too. It

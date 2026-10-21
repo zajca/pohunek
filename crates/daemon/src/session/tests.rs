@@ -2235,6 +2235,36 @@ fn ended_turns(edges: &mut tokio::sync::mpsc::UnboundedReceiver<TurnEdge>) -> Ve
 }
 
 #[tokio::test]
+async fn start_up_output_seen_by_the_detector_is_not_a_turn() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+
+    // The banner prints (working), then the idle prompt matches.
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    let seen: Vec<TurnEdge> = std::iter::from_fn(|| edges.try_recv().ok()).collect();
+    assert!(seen.is_empty(), "start-up output opened a turn: {seen:?}");
+
+    // Once the session was ready, the next working edge is a turn.
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert_eq!(ended_turns(&mut edges).len(), 1);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
 async fn a_replaced_agent_restating_working_opens_its_own_turn() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
@@ -2247,6 +2277,9 @@ async fn a_replaced_agent_restating_working_opens_its_own_turn() {
         .expect("the first taker");
     let created = registry.create(params()).await.expect("create session");
 
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
     registry
         .record_activity(&created.id, transition(AgentActivity::Working))
         .await;
@@ -2281,6 +2314,9 @@ async fn another_process_of_the_same_agent_does_not_inherit_the_turn_of_the_one_
         .await;
 
     // The same process observed again keeps the turn it runs.
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
     registry
         .record_activity(&created.id, transition(AgentActivity::Working))
         .await;
@@ -2356,6 +2392,9 @@ async fn a_re_adopted_working_session_runs_its_own_unobserved_turn() {
         .expect("the first taker");
     let created = registry.create(params()).await.expect("create session");
     registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    registry
         .record_activity(&created.id, transition(AgentActivity::Working))
         .await;
     let old = started_turns(&mut edges)[0];
@@ -2402,6 +2441,9 @@ async fn working_seen_from_another_source_keeps_the_running_turn() {
         .expect("the first taker");
     let created = registry.create(params()).await.expect("create session");
     registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    registry
         .record_activity(&created.id, transition(AgentActivity::Working))
         .await;
     registry
@@ -2442,6 +2484,9 @@ async fn a_rebuilt_idle_entry_does_not_complete_the_turn_of_the_one_it_replaced(
         .expect("the first taker");
     let created = registry.create(params()).await.expect("create session");
     registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    registry
         .record_activity(&created.id, transition(AgentActivity::Working))
         .await;
     started_turns(&mut edges);
@@ -2475,6 +2520,9 @@ async fn a_runtime_lost_without_proof_abandons_the_turn_it_can_no_longer_observe
         .expect("the first taker");
     let created = registry.create(params()).await.expect("create session");
     let (worker, expected) = live_worker_and_identity(&registry, &created.id).await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
     registry
         .record_activity(&created.id, transition(AgentActivity::Working))
         .await;
@@ -2527,6 +2575,9 @@ async fn a_turn_never_starts_before_the_one_that_ran_when_the_wall_clock_steps_b
 
     registry.turn_events().pin_wall_clock(10_000);
     registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    registry
         .record_activity(&created.id, transition(AgentActivity::Working))
         .await;
     let first = progress().turn_started_nanos();
@@ -2554,6 +2605,9 @@ async fn a_restarted_daemon_counts_turns_from_one_and_knows_no_earlier_turn() {
         .take_edge_receiver()
         .expect("the first taker");
     let created = registry.create(params()).await.expect("create session");
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
     for _ in 0..2 {
         registry
             .record_activity(&created.id, transition(AgentActivity::Working))
@@ -2571,6 +2625,9 @@ async fn a_restarted_daemon_counts_turns_from_one_and_knows_no_earlier_turn() {
         .take_edge_receiver()
         .expect("the first taker");
     let other = restarted.create(params()).await.expect("create session");
+    restarted
+        .record_activity(&other.id, transition(AgentActivity::Idle))
+        .await;
     restarted
         .record_activity(&other.id, transition(AgentActivity::Working))
         .await;

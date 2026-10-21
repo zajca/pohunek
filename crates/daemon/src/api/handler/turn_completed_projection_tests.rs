@@ -387,6 +387,72 @@ async fn a_disabled_kind_still_records_the_turn_event_for_waits() {
 }
 
 #[tokio::test]
+async fn a_full_metadata_snapshot_is_copied_and_an_empty_one_is_omitted() {
+    let fixture = enabled_fixture();
+    let session = fixture.session("metadata-limit").await;
+    let full: serde_json::Map<String, Value> = (0..32)
+        .map(|index| (format!("work.key{index:02}"), json!("v")))
+        .collect();
+    ok(fixture
+        .call(
+            method::SESSION_SET_METADATA,
+            json!({"session_id": session, "metadata": full}),
+        )
+        .await);
+    let bare = fixture.session("metadata-none").await;
+    fixture.activity(&session, "idle").await;
+    fixture.activity(&bare, "idle").await;
+    let inhibitor = pause_clock().await;
+
+    turn(&fixture, &session, Duration::from_secs(1)).await;
+    turn(&fixture, &bare, Duration::from_secs(1)).await;
+    flush_window().await;
+
+    let records = turn_records(&fixture).await;
+    let of = |id: &str| {
+        records
+            .iter()
+            .find(|record| record["session_id"] == id)
+            .unwrap_or_else(|| panic!("a record of {id}: {records:?}"))
+    };
+    assert_eq!(of(&session)["session_metadata"], Value::Object(full));
+    assert!(of(&bare).get("session_metadata").is_none());
+    finish(&fixture, inhibitor, &session).await;
+}
+
+#[tokio::test]
+async fn enabling_the_kind_between_two_turns_gives_a_record_only_for_the_second() {
+    let fixture = Fixture::new(SessionRegistryConfig::default());
+    let session = fixture.session("toggle").await;
+    fixture.activity(&session, "idle").await;
+    let cursor = fresh_cursor(&fixture, &session).await;
+    let inhibitor = pause_clock().await;
+
+    turn(&fixture, &session, Duration::from_secs(1)).await;
+    flush_window().await;
+    assert!(turn_records(&fixture).await.is_empty());
+    assert_eq!(
+        turn_events_after(&fixture, &session, &cursor).await.len(),
+        1,
+        "the disabled kind still signals the wait"
+    );
+
+    fixture
+        .notifications()
+        .set_policy(every_provider(NotificationKindPolicy {
+            turn_completed: true,
+            ..default_policy().enabled
+        }))
+        .expect("set policy");
+    turn(&fixture, &session, Duration::from_secs(2)).await;
+    flush_window().await;
+    let records = turn_records(&fixture).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["turn_duration_ms"], 2_000);
+    finish(&fixture, inhibitor, &session).await;
+}
+
+#[tokio::test]
 async fn the_snapshot_is_taken_at_the_idle_edge_and_outlives_the_session() {
     let fixture = enabled_fixture();
     let session = fixture.session("snapshot").await;

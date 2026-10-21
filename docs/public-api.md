@@ -2136,9 +2136,10 @@ Event sources:
   signal for the same session and kind, so it arrives no earlier than that
   window after the agent stops, and later when signals repeat. An
   `agent_blocked` or `approval_required` is dropped when the session resumes
-  work or ends inside the window. A `turn_completed` is dropped when the
-  session is `working` when its window ends: that is the stale stop of an
-  earlier turn, and the running turn reports its own stop. A turn that starts
+  work or ends inside the window. A `turn_completed` report that names no turn
+  is dropped when the session is `working` when its window ends: that is the
+  stale stop of an earlier turn, and the running turn reports its own stop. A
+  report of a turn the daemon runs is held until that turn is over. A turn that starts
   and stops within the window (a short turn) is recorded once, after its stop.
 - A turn ends, for the projector, when activity goes `working` to `idle`; a
   turn that ends `blocked`, an idle that no `working` preceded (start-up, an
