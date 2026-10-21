@@ -10693,19 +10693,19 @@ fn assert_rollback_refused(result: &Result<Vec<String>, Error>, reason: &str) {
     );
 }
 
-/// The gate before the rollback's stop judges the unloaded job, not the loaded
-/// one it can read: a journal that cannot be decided is refused with the daemon
-/// still running, instead of after the stop with it down.
+/// A reboot activated a pending configuration that was then changed again: the
+/// journal can no longer tell which default the loaded job has, but the job can.
+/// The rollback journals what the loaded job reports before it stops it, so the
+/// gate after the stop judges that default instead of refusing with the daemon down.
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn a_rollback_gate_before_the_stop_judges_the_unloaded_job() {
+async fn a_rollback_journals_the_loaded_default_before_it_stops_the_job() {
     const LATER: &str = "/opt/later/bin:/usr/bin";
     let mut harness = Harness::new();
     let domain = harness.root.join("user.plist");
     std::fs::write(&domain, launchd_domain_xml(PENDING_PATH)).expect("domain configuration");
     harness.context = harness.context.clone().with_launchd_domain_config(&domain);
     interrupted_upgrade_journal(&mut harness).await;
-    // A reboot happened and the persisted configuration changed again since.
     std::fs::write(&domain, launchd_domain_xml(LATER)).expect("domain configuration");
     harness.context = harness
         .context
@@ -10716,84 +10716,75 @@ async fn a_rollback_gate_before_the_stop_judges_the_unloaded_job() {
             unloaded: not_loaded(),
             boot: SECOND_BOOT.to_owned(),
         }));
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
     let uninstalls = harness.fake.world().uninstalls;
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V1), V1)
+        .await
+        .expect("rolled back");
+
+    assert!(
+        harness.fake.world().uninstalls > uninstalls,
+        "the job was stopped"
+    );
+    let judged = judged.lock().expect("search path lock").clone();
+    assert!(
+        !judged.is_empty() && judged.iter().all(|path| path == LATER),
+        "{judged:?}"
+    );
+    harness.assert_installed(V1);
+}
+
+/// A swap whose apply fails rolls back with the job unloaded: the default the
+/// loaded job had at the swap is journaled first, so that rollback completes.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_failed_apply_rolls_back_with_the_default_the_loaded_job_had() {
+    const LATER: &str = "/opt/later/bin:/usr/bin";
+    let mut harness = Harness::new();
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(PENDING_PATH)).expect("domain configuration");
+    harness.context = harness.context.clone().with_launchd_domain_config(&domain);
+    set_job_path(&mut harness, JOURNALED_PATH);
+    harness.install(V1).await.expect("install");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Definition);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted before the runtime step");
+    std::fs::write(&domain, launchd_domain_xml(LATER)).expect("domain configuration");
+    harness.context = harness
+        .context
+        .clone()
+        .with_launchd_job(Arc::new(FlipLaunchd {
+            fake: harness.fake.clone(),
+            loaded: loaded_job(LATER),
+            unloaded: not_loaded(),
+            boot: SECOND_BOOT.to_owned(),
+        }));
+    seed_runtime_state(&harness);
+    harness.runtimes.plan(installing_plan());
+    harness.runtimes.script().fail_apply = true;
 
     let error = harness
         .engine()
         .with_adoption_preflight(Box::new(ScriptedPreflight::default()))
-        .upgrade(&harness.staged(V1), V1)
+        .upgrade(&harness.staged(V2), V2)
         .await
-        .expect_err("which PATH is active cannot be told");
+        .expect_err("the apply fails");
 
-    assert_eq!(error.code(), "service_manager_environment_unavailable");
-    assert_eq!(
-        harness.fake.world().uninstalls,
-        uninstalls,
-        "refused before the stop: {error}"
+    assert_ne!(
+        error.code(),
+        "service_manager_environment_unavailable",
+        "the rollback was not refused with the job down: {error}"
     );
-    assert!(harness.pending().is_some(), "the transaction is kept");
-}
-
-/// The swap and the runtime step stop or replace the daemon: with the job
-/// undecidable once it is unloaded, both refuse before touching it.
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn the_swap_and_the_runtime_step_judge_the_unloaded_job_before_they_stop_the_daemon() {
-    const LATER: &str = "/opt/later/bin:/usr/bin";
-    // `changed`: the persisted configuration changed again (undecidable); otherwise
-    // it is unchanged and decidable, but not the loaded job's default.
-    for (apply, changed) in [(false, true), (true, true), (false, false)] {
-        let mut harness = Harness::new();
-        let domain = harness.root.join("user.plist");
-        std::fs::write(&domain, launchd_domain_xml(PENDING_PATH)).expect("domain configuration");
-        harness.context = harness.context.clone().with_launchd_domain_config(&domain);
-        set_job_path(&mut harness, JOURNALED_PATH);
-        harness.install(V1).await.expect("install");
-        let mut engine = harness.engine();
-        engine.interrupt_after = Some(Step::Definition);
-        engine
-            .upgrade(&harness.staged(V2), V2)
-            .await
-            .expect_err("interrupted before the runtime step");
-        if changed {
-            std::fs::write(&domain, launchd_domain_xml(LATER)).expect("domain configuration");
-        }
-        harness.context = harness
-            .context
-            .clone()
-            .with_launchd_job(Arc::new(FlipLaunchd {
-                fake: harness.fake.clone(),
-                loaded: loaded_job(LATER),
-                unloaded: not_loaded(),
-                boot: SECOND_BOOT.to_owned(),
-            }));
-        if apply {
-            harness.runtimes.plan(installing_plan());
-        }
-        let (uninstalls, replaces) = {
-            let world = harness.fake.world();
-            (world.uninstalls, world.replaces)
-        };
-
-        // Resuming the same upgrade reaches the swap with the daemon loaded.
-        let error = harness
-            .engine()
-            .with_adoption_preflight(Box::new(ScriptedPreflight::default()))
-            .upgrade(&harness.staged(V2), V2)
-            .await
-            .expect_err("the unloaded job cannot be judged");
-
-        assert_eq!(error.code(), "service_manager_environment_unavailable");
-        let world = harness.fake.world();
-        assert_eq!(
-            world.uninstalls, uninstalls,
-            "no stop (apply {apply}, changed {changed})"
-        );
-        assert_eq!(
-            world.replaces, replaces,
-            "no replacement (apply {apply}, changed {changed})"
-        );
-    }
+    assert!(harness.pending().is_none(), "the rollback finished");
+    harness.assert_installed(V1);
 }
 
 #[cfg(target_os = "macos")]

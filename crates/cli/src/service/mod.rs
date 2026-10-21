@@ -237,8 +237,7 @@ async fn finish_check(
                     detail: "previous version has no valid installation directory".to_owned(),
                 })?;
         let daemon_dir = layout::verify_installed(&layout, &daemon_dir)?;
-        let job = engine::journal_job_path(context, record, engine::rollback_stops_daemon(record))
-            .await?;
+        let job = engine::journal_job_path(context, record).await?;
         let warnings = engine::job_warnings(context, &job);
         let mut gated = rollback::gate(
             rollback::Inputs {
