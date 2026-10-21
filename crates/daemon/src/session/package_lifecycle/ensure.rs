@@ -51,7 +51,8 @@ use super::{
     unix_now, Context, HostTrustAnchor, InstallPlan, Prepared,
 };
 use crate::agent::host::{
-    is_reserved, version_order, PackageRejection, PackageStore, RuntimeDefinition, RuntimeHost,
+    decide_claim, is_reserved, version_order, Authority, PackageRejection, PackageStore,
+    RuntimeDefinition, RuntimeHost,
 };
 use crate::agent::{apply_pin, parse_head, Pin, ProfileRegistry, ValidatedLaunchProgram};
 use crate::catalog_anchor::CatalogTrust;
@@ -1139,7 +1140,7 @@ fn managed_runtimes(
                 Some(disabled) => disabled_package_detail(
                     entry.package_id(),
                     &disabled,
-                    disabled_state(plan, &disabled),
+                    disabled_state(plan, &disabled, runtime),
                 ),
                 None => format!(
                     "an official package of this runtime is installed but not selected and \
@@ -1243,7 +1244,7 @@ fn plan_installed(
     match health_of(plan, &digest) {
         Health::Present => {}
         Health::Damaged(kind) => {
-            refuse_damaged(report, runtime.as_str(), kind, &digest);
+            refuse_damaged(report, runtime.as_str(), kind, &identity.id, &digest);
             return None;
         }
         Health::Install => {
@@ -1337,7 +1338,7 @@ fn plan_runtime(
     }
     let health = health_of(plan, &prepared.digest);
     if let Health::Damaged(kind) = health {
-        refuse_damaged(report, &subject, kind, &prepared.digest);
+        refuse_prepared_damaged(report, &subject, kind, &prepared);
         return Ok(None);
     }
     if !matches!(health, Health::Present) {
@@ -1416,7 +1417,8 @@ fn passes_detect_gate_before_leaving(
     reserved: bool,
 ) -> bool {
     let left = disabled_package(plan, prepared).is_some()
-        || disabled_release_package(plan, prepared, reserved).is_some()
+        || (disabled_release_package(plan, prepared, reserved).is_some()
+            && !selection_serves(plan, prepared))
         || matches!(
             unordered_selection(plan, prepared),
             Some((Serving::Broken | Serving::Damaged(_), _))
@@ -2116,12 +2118,29 @@ fn claim_refusal(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<PackageEr
     .err()
 }
 
+/// [`refuse_damaged`] for the installed root of the release package `prepared`.
+fn refuse_prepared_damaged(
+    report: &mut Report,
+    subject: &str,
+    kind: PackageErrorKind,
+    prepared: &Prepared,
+) {
+    refuse_damaged(
+        report,
+        subject,
+        kind,
+        &prepared.identity.id,
+        &prepared.digest,
+    );
+}
+
 /// Refuses a release package whose installed root is present but damaged, with
 /// the operator's next step.
 fn refuse_damaged(
     report: &mut Report,
     subject: &str,
     kind: PackageErrorKind,
+    package: &PackageId,
     digest: &PackageDigest,
 ) {
     report.refuse(
@@ -2129,8 +2148,8 @@ fn refuse_damaged(
         &ProtocolError::from(kind).code,
         &format!(
             "the installed package root of this runtime is altered or damaged; remove it with \
-             `pohunek plugin uninstall --digest {} --remove-modified --yes`, then run the \
-             upgrade again",
+             `pohunek plugin uninstall {package} --digest {} --remove-modified --yes`, then \
+             run the upgrade again",
             digest.as_str()
         ),
     );
@@ -2335,6 +2354,24 @@ fn disabled_release_package(
         .then(|| prepared.digest.clone())
 }
 
+/// Whether an enabled official selection other than the release's package
+/// serves the runtime: it is recorded, enabled, and its root verifies and loads.
+fn selection_serves(plan: &PlanInputs<'_>, prepared: &Prepared) -> bool {
+    let Some(state) = plan.state else {
+        return false;
+    };
+    let Some(selected) = state
+        .selected(&prepared.identity.id)
+        .filter(|selected| **selected != prepared.digest)
+    else {
+        return false;
+    };
+    state
+        .package(selected)
+        .is_some_and(|record| record.source() == PackageSource::Official && record.enabled())
+        && matches!(health_of(plan, selected), Health::Present)
+}
+
 /// Whether `plugin enable` succeeds for a disabled package.
 #[derive(Clone, Copy)]
 enum DisabledState {
@@ -2349,7 +2386,11 @@ enum DisabledState {
 }
 
 /// The state of the disabled package `digest`, judged as `plugin enable` does.
-fn disabled_state(plan: &PlanInputs<'_>, digest: &PackageDigest) -> DisabledState {
+fn disabled_state(
+    plan: &PlanInputs<'_>,
+    digest: &PackageDigest,
+    runtime: &RuntimeId,
+) -> DisabledState {
     let (Some(context), Some(record)) = (
         plan.planning,
         plan.state.and_then(|state| state.package(digest)),
@@ -2361,7 +2402,18 @@ fn disabled_state(plan: &PlanInputs<'_>, digest: &PackageDigest) -> DisabledStat
             Ok(_definition) => DisabledState::Enableable,
             Err(kind) => DisabledState::Claimed(kind),
         },
-        Err(PackageRejection::Root(VerifyError::RootMissing)) => DisabledState::RootMissing,
+        // A missing root cannot name its runtime, so the runtime the release
+        // lists for the package stands for it: restoring the root does not help
+        // while another package serves the id.
+        Err(PackageRejection::Root(VerifyError::RootMissing)) => match decide_claim(
+            runtime,
+            &record.identity().id,
+            Authority::Official,
+            context.runtimes.served_by(runtime).as_ref(),
+        ) {
+            Ok(()) => DisabledState::RootMissing,
+            Err(_refusal) => DisabledState::Claimed(PackageErrorKind::RuntimeConflict),
+        },
         Err(rejection) => DisabledState::Damaged(rejection_kind(&rejection)),
     }
 }
@@ -2432,13 +2484,13 @@ fn selection_outcome(
 ) -> Selection {
     let id = &prepared.identity.id;
     if let Some(digest) = disabled_package(plan, prepared) {
-        leave_disabled(plan, report, subject, id, &digest);
+        leave_disabled(plan, report, subject, prepared, &digest);
         return Selection::Leave;
     }
     match unordered_selection(plan, prepared) {
         Some((Serving::Loadable, _)) => return Selection::Keep { unordered: true },
         Some((Serving::Damaged(kind), selected)) => {
-            refuse_damaged(report, subject, kind, &selected);
+            refuse_damaged(report, subject, kind, id, &selected);
             return Selection::Leave;
         }
         Some((Serving::Broken, _)) => {
@@ -2458,7 +2510,19 @@ fn selection_outcome(
         None => {}
     }
     if let Some(digest) = disabled_release_package(plan, prepared, reserved) {
-        leave_disabled(plan, report, subject, id, &digest);
+        if selection_serves(plan, prepared) {
+            // The enabled selection keeps serving; the release's package stays
+            // as the operator set it.
+            let state = disabled_state(plan, &digest, prepared.definition.runtime_id());
+            let detail = format!(
+                "the selected version keeps serving, and the release's package is disabled, so \
+                 the upgrade does not update it; {}",
+                disabled_package_detail(id, &digest, state)
+            );
+            report.gap(subject, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING, &detail);
+            return Selection::Keep { unordered: false };
+        }
+        leave_disabled(plan, report, subject, prepared, &digest);
         return Selection::Leave;
     }
     if !reserved && replaces_newer(plan, prepared).is_some() {
@@ -2474,10 +2538,11 @@ fn leave_disabled(
     plan: &PlanInputs<'_>,
     report: &mut Report,
     subject: &str,
-    id: &PackageId,
+    prepared: &Prepared,
     digest: &PackageDigest,
 ) {
-    let state = disabled_state(plan, digest);
+    let id = &prepared.identity.id;
+    let state = disabled_state(plan, digest, prepared.definition.runtime_id());
     if matches!(state, DisabledState::Damaged(_) | DisabledState::Claimed(_)) {
         // The refusal or the claim gap below supersedes the gap that
         // `managed_runtimes` reported for the package.
@@ -2486,7 +2551,7 @@ fn leave_disabled(
         });
     }
     match state {
-        DisabledState::Damaged(kind) => refuse_damaged(report, subject, kind, digest),
+        DisabledState::Damaged(kind) => refuse_damaged(report, subject, kind, id, digest),
         DisabledState::Claimed(kind) => report_claim_refusal(
             report,
             subject,

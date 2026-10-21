@@ -857,9 +857,11 @@ package serves the runtime id is the gap `runtime_served_by_other_package` (a re
 without `--detect`); a Pi runtime the plan does not judge gets only a gap that points to
 `pohunek plugin doctor` in those states. The release's own package, recorded and
 disabled while another enabled version is selected, is not enabled or selected by the
-upgrade either: the gap names `plugin enable` for its digest. Under
-`service check --detect` the gap is dropped with a Pi runtime whose package is disabled and whose program
-is off the search path. The same holds for a selected version that is enabled but
+upgrade either: the selected version keeps serving, with its package entry and
+integrations, and the gap names `plugin enable` for the release's digest. The
+detecting plan of `pohunek setup` drops `official_package_not_serving` together with a
+runtime it drops (nothing uses it and its program is off the search path), whatever the
+state of its package. The same holds for a selected version that is enabled but
 cannot be loaded: the plan names the repair (`plugin install` of that version, or
 `plugin select` of another). A selected version whose root is present but altered
 is refused, and the refusal names `plugin uninstall --remove-modified`. Unpinned profiles

@@ -2344,8 +2344,10 @@ command by cause: `pohunek plugin update` for a package that is not selected,
 `pohunek plugin enable <package> --digest <digest>` for a disabled package (any runtime,
 Pi included; `plugin update` would refuse a newer selection as a downgrade), and
 `pohunek plugin install` or `plugin select` for an unordered selection that does not
-load; under `--detect` the gap is dropped with a Pi runtime whose package is disabled and whose program is
-off the search path), and
+load; when an enabled version still serves the runtime beside a disabled release
+package it keeps serving and the gap names the release package; under `--detect`
+the gap is dropped with a runtime the detecting plan drops, that is one nothing uses
+whose program is off the search path), and
 `plugin_update_version_unordered` (the selected version of an official package, of
 a reserved runtime or not, cannot be ordered against the release's and is enabled and loadable, so it is kept,
 as `plugin update` refuses to replace it). The first two of these three name the command
