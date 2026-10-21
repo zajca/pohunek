@@ -18,7 +18,7 @@ use super::{
     agent_kind_label, clear_active_agent, is_terminal, report_is_current, same_pin,
     send_detector_config, timestamp_now, ActiveAgentReport, CancellationToken, ClaimOrigin,
     MatchedDefinition, Notify, ObservedAgent, Ordering, RuntimeWatchIdentity, SessionEntry,
-    SessionId, SessionRegistry,
+    SessionId, SessionRegistry, TurnEvents,
 };
 
 const PROCWATCH_SOURCE: &str = "pohunek:procwatch";
@@ -496,10 +496,13 @@ impl SessionRegistry {
             entry.observed_agents.clear();
             drop_bound_reporter(entry);
             entry.foreground_process_group = None;
-            entry
-                .active_agent
-                .clone()
-                .map(|active| clear_active_agent(entry, self.procwatch_tombstone_for(&active, now)))
+            entry.active_agent.clone().map(|active| {
+                clear_active_agent(
+                    entry,
+                    self.procwatch_tombstone_for(&active, now),
+                    &self.inner.turns,
+                )
+            })
         };
         if let Some(info) = updated {
             self.emit(event::SESSION_UPDATED, &info);
@@ -1226,6 +1229,7 @@ impl SessionRegistry {
             return Some(clear_active_agent(
                 entry,
                 self.procwatch_tombstone_for(&active, now),
+                &self.inner.turns,
             ));
         };
 
@@ -1251,6 +1255,7 @@ impl SessionRegistry {
             return Some(clear_active_agent(
                 entry,
                 self.procwatch_tombstone_for(&active, now),
+                &self.inner.turns,
             ));
         }
 
@@ -1270,6 +1275,7 @@ impl SessionRegistry {
             return Some(clear_active_agent(
                 entry,
                 self.procwatch_tombstone_for(&active, now),
+                &self.inner.turns,
             ));
         }
 
@@ -1304,7 +1310,13 @@ impl SessionRegistry {
             observed: true,
             origin: ClaimOrigin::memory(),
         };
-        Some(apply_observed_transition(entry, observed, report, agent))
+        Some(apply_observed_transition(
+            entry,
+            observed,
+            report,
+            agent,
+            &self.inner.turns,
+        ))
     }
 
     fn procwatch_tombstone_for(
@@ -1392,7 +1404,7 @@ impl SessionRegistry {
                 observed: true,
                 origin: ClaimOrigin::memory(),
             };
-            let _ = apply_observed_transition(entry, &observed, report, agent);
+            let _ = apply_observed_transition(entry, &observed, report, agent, &self.inner.turns);
             return ForegroundDecision::Updated;
         }
 
@@ -1406,7 +1418,11 @@ impl SessionRegistry {
             if unbound_claim_is_current(&active, now, self.inner.config.active_agent_claim_ttl) {
                 return ForegroundDecision::Preserve;
             }
-            let _ = clear_active_agent(entry, self.procwatch_tombstone_for(&active, now));
+            let _ = clear_active_agent(
+                entry,
+                self.procwatch_tombstone_for(&active, now),
+                &self.inner.turns,
+            );
             return ForegroundDecision::Updated;
         }
 
@@ -1431,7 +1447,11 @@ impl SessionRegistry {
         {
             ForegroundDecision::Preserve
         } else {
-            let _ = clear_active_agent(entry, self.procwatch_tombstone_for(&active, now));
+            let _ = clear_active_agent(
+                entry,
+                self.procwatch_tombstone_for(&active, now),
+                &self.inner.turns,
+            );
             ForegroundDecision::Updated
         }
     }
@@ -1883,7 +1903,15 @@ pub(super) fn apply_observed_transition(
     observed: &ObservedAgent,
     report: ActiveAgentReport,
     agent: String,
+    turns: &TurnEvents,
 ) -> SessionInfo {
+    if entry
+        .active_agent
+        .as_ref()
+        .is_none_or(|active| report.replaces(active))
+    {
+        entry.agent_left(turns);
+    }
     let report_activity_was_current = entry
         .active_agent
         .as_ref()

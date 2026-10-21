@@ -10,17 +10,19 @@
 
 // Rust guideline compliant 2026-10-12
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::notifications::DEFAULT_ATTENTION_DEBOUNCE_SECS;
 use protocol::{
     AgentActivity, NotificationId, SessionId, SessionState, SessionTurnCursor, SessionTurnEventKind,
 };
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 /// Leading tag of every cursor this daemon issues.
@@ -66,15 +68,198 @@ pub(crate) struct TurnScan {
     pub(crate) evicted: bool,
 }
 
-/// Observed output and turn-start times of one session.
+/// Identity of one turn of one session.
 ///
-/// Both values are Unix nanoseconds; zero means "not observed by this daemon".
-/// The detector updates the output time for every PTY chunk without taking
-/// the sessions lock.
+/// Allocated from a per-session counter that lives as long as the session's
+/// [`TurnProgress`], so an id is never reused for another turn of the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct TurnId(u64);
+
+#[cfg(test)]
+impl TurnId {
+    /// The turn numbered `number`, for scenarios that feed the projector.
+    pub(crate) fn numbered(number: u64) -> Self {
+        Self(number)
+    }
+}
+
+/// Who ran a turn: the registry entry (runtime incarnation) and the agent
+/// incarnation within it. A turn belongs to its owner for its whole life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TurnOwner {
+    pub(crate) entry: u64,
+    pub(crate) agent: u64,
+}
+
+/// Where a turn stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnState {
+    /// The session works on it.
+    Open,
+    /// The session waits in `blocked`; it resumes the same turn.
+    Paused,
+    /// The session went idle; until `deadline` it may still resume the turn.
+    Settling { deadline: Instant },
+    /// Over for good: it can no longer resume.
+    Closed,
+    /// It never completed: its owner left, it ended `blocked`, or the session
+    /// ended.
+    Abandoned,
+}
+
+#[derive(Debug, Clone)]
+struct TurnRecord {
+    owner: TurnOwner,
+    /// The wall-clock start, when this daemon observed the turn begin.
+    started_nanos: Option<u64>,
+    started: Option<Instant>,
+    ended: Option<Instant>,
+    /// The session's metadata when the turn left `working`.
+    ended_metadata: Option<BTreeMap<String, String>>,
+    state: TurnState,
+    inbox_reported: bool,
+    signal_reported: bool,
+}
+
+/// How many turns of a session stay known; an older id counts as reported.
+const RECENT_TURNS: usize = 8;
+
+#[derive(Debug, Default)]
+struct TurnTable {
+    next_id: u64,
+    newest: Option<TurnId>,
+    records: BTreeMap<TurnId, TurnRecord>,
+}
+
+impl TurnTable {
+    fn open(&mut self, owner: TurnOwner, started_nanos: Option<u64>, now: Instant) -> TurnId {
+        self.next_id += 1;
+        let id = TurnId(self.next_id);
+        self.records.insert(
+            id,
+            TurnRecord {
+                owner,
+                started_nanos,
+                started: started_nanos.map(|_| now),
+                ended: None,
+                ended_metadata: None,
+                state: TurnState::Open,
+                inbox_reported: false,
+                signal_reported: false,
+            },
+        );
+        self.newest = Some(id);
+        while self.records.len() > RECENT_TURNS {
+            self.records.pop_first();
+        }
+        id
+    }
+
+    fn newest_mut(&mut self) -> Option<(TurnId, &mut TurnRecord)> {
+        let id = self.newest?;
+        self.records.get_mut(&id).map(|record| (id, record))
+    }
+
+    /// A turn whose owner is not `owner` departs: an open or paused one is
+    /// abandoned, a settling one ends for good.
+    fn depart_changed(&mut self, owner: TurnOwner) {
+        if let Some((_, record)) = self.newest_mut() {
+            if record.owner != owner {
+                depart(record);
+            }
+        }
+    }
+
+    fn abandon_all(&mut self) {
+        for record in self.records.values_mut() {
+            if record.state != TurnState::Closed {
+                record.state = TurnState::Abandoned;
+            }
+        }
+    }
+}
+
+fn depart(record: &mut TurnRecord) {
+    record.state = match record.state {
+        TurnState::Settling { .. } => TurnState::Closed,
+        TurnState::Open | TurnState::Paused => TurnState::Abandoned,
+        state @ (TurnState::Closed | TurnState::Abandoned) => state,
+    };
+}
+
+/// A change of the turns of a session, in the order it happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TurnEdge {
+    /// A new turn opened: what earlier turns of the session left unread is
+    /// over.
+    Started(SessionId, TurnId),
+    /// The turn went idle and its report is due.
+    Ended(SessionId, TurnId),
+}
+
+/// What one activity change did to the turns of a session.
+#[derive(Debug, Default)]
+struct TurnChange {
+    started: Option<TurnId>,
+    ended: Option<TurnId>,
+}
+
+/// A turn as the report of its end reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TurnSnapshot {
+    /// Unix nanoseconds of the first transition into `working`, when observed.
+    pub(crate) started_nanos: Option<u64>,
+    /// Monotonic length from that transition to the turn leaving `working`.
+    pub(crate) length: Option<Duration>,
+    /// The session's metadata when the turn left `working`.
+    pub(crate) metadata: BTreeMap<String, String>,
+    pub(crate) inbox_reported: bool,
+    pub(crate) signal_reported: bool,
+}
+
+impl TurnRecord {
+    fn reported(&self) -> bool {
+        self.inbox_reported || self.signal_reported
+    }
+
+    fn snapshot(&self) -> TurnSnapshot {
+        TurnSnapshot {
+            started_nanos: self.started_nanos,
+            length: self
+                .started
+                .zip(self.ended)
+                .map(|(started, ended)| ended - started),
+            metadata: self.ended_metadata.clone().unwrap_or_default(),
+            inbox_reported: self.inbox_reported,
+            signal_reported: self.signal_reported,
+        }
+    }
+}
+
+/// What a flush does with the report of a turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TurnVerdict {
+    /// The turn is not over: look again after the given wait, or after the
+    /// recheck floor when none is given.
+    Hold(Option<Duration>),
+    /// The turn is over for good.
+    Surface(TurnSnapshot),
+    /// The turn will never be reported.
+    Drop,
+}
+
+/// Observed output and turn state of one session.
+///
+/// The output time is Unix nanoseconds, zero meaning "not observed by this
+/// daemon". The detector updates it for every PTY chunk without taking the
+/// sessions lock.
 #[derive(Debug, Default)]
 pub(crate) struct TurnProgress {
     last_output_nanos: AtomicU64,
+    /// Unix nanoseconds of the last transition into `working`; what
+    /// `session.wait_turn` reports as the turn start.
     turn_started_nanos: AtomicU64,
+    table: Mutex<TurnTable>,
 }
 
 impl TurnProgress {
@@ -93,6 +278,211 @@ impl TurnProgress {
     pub(crate) fn turn_started_nanos(&self) -> Option<u64> {
         non_zero(self.turn_started_nanos.load(Ordering::Relaxed))
     }
+
+    fn table(&self) -> MutexGuard<'_, TurnTable> {
+        self.table.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Applies an activity change of the session's `owner`; returns the turn
+    /// that just went idle, whose end is to be reported.
+    fn note_activity(
+        &self,
+        owner: TurnOwner,
+        previous: Option<AgentActivity>,
+        next: AgentActivity,
+        metadata: &BTreeMap<String, String>,
+        wall_nanos: u64,
+        window: Duration,
+    ) -> TurnChange {
+        let now = Instant::now();
+        let mut table = self.table();
+        table.depart_changed(owner);
+        // A working report of a new owner opens its own turn even when the
+        // session was already working, because the previous turn departed.
+        let running = table
+            .newest_mut()
+            .is_some_and(|(_, record)| record.state == TurnState::Open);
+        if next == AgentActivity::Working && (previous != Some(AgentActivity::Working) || !running)
+        {
+            // The start orders turns for `session.wait_turn`, so a wall clock
+            // that stepped back must not give a new turn a smaller one.
+            let nanos = wall_nanos.max(self.turn_started_nanos.load(Ordering::Relaxed) + 1);
+            self.turn_started_nanos.store(nanos, Ordering::Relaxed);
+            let started = enter_working(&mut table, owner, previous, non_zero(nanos), now);
+            return TurnChange {
+                started,
+                ended: None,
+            };
+        }
+        let Some((id, record)) = table.newest_mut() else {
+            return TurnChange::default();
+        };
+        let ended = match (previous, next) {
+            // A repeated `working` of the running turn changes nothing.
+            (Some(AgentActivity::Working), AgentActivity::Working) => None,
+            (Some(AgentActivity::Working), AgentActivity::Blocked)
+                if record.state == TurnState::Open =>
+            {
+                record.state = TurnState::Paused;
+                None
+            }
+            (Some(AgentActivity::Working), AgentActivity::Idle)
+                if record.state == TurnState::Open =>
+            {
+                record.ended = Some(now);
+                record.ended_metadata = Some(metadata.clone());
+                record.state = TurnState::Settling {
+                    deadline: now + window,
+                };
+                Some(id)
+            }
+            (Some(AgentActivity::Working), _) if record.state == TurnState::Open => {
+                record.state = TurnState::Abandoned;
+                None
+            }
+            (Some(AgentActivity::Blocked), AgentActivity::Idle)
+                if record.state == TurnState::Paused =>
+            {
+                record.state = TurnState::Abandoned;
+                None
+            }
+            _ => None,
+        };
+        TurnChange {
+            started: None,
+            ended,
+        }
+    }
+
+    fn lacks_running_turn(&self, owner: TurnOwner) -> bool {
+        let mut table = self.table();
+        table.depart_changed(owner);
+        !table
+            .newest_mut()
+            .is_some_and(|(_, record)| record.state == TurnState::Open)
+    }
+
+    /// Opens a turn of unobserved start for an entry adopted while working.
+    fn adopt(&self, owner: TurnOwner) -> Option<TurnId> {
+        let mut table = self.table();
+        table.depart_changed(owner);
+        let live = table
+            .newest_mut()
+            .is_some_and(|(_, record)| matches!(record.state, TurnState::Open | TurnState::Paused));
+        (!live).then(|| table.open(owner, None, Instant::now()))
+    }
+
+    fn depart(&self, owner: TurnOwner) {
+        self.table().depart_changed(owner);
+    }
+
+    fn abandon_all(&self) {
+        self.table().abandon_all();
+    }
+
+    fn abandon_running(&self) {
+        if let Some((_, record)) = self.table().newest_mut() {
+            if matches!(record.state, TurnState::Open | TurnState::Paused) {
+                record.state = TurnState::Abandoned;
+            }
+        }
+    }
+
+    /// The turn a provider report that carries no identity belongs to: the
+    /// newest turn of `owner` that can still end, or that ended and was not
+    /// reported yet, so the report merges into the pending one of that turn.
+    fn attach_report(&self, owner: TurnOwner) -> Option<TurnId> {
+        let now = Instant::now();
+        let mut table = self.table();
+        table.depart_changed(owner);
+        let (id, record) = table.newest_mut()?;
+        match record.state {
+            TurnState::Open | TurnState::Paused => Some(id),
+            TurnState::Settling { deadline } if now < deadline => Some(id),
+            TurnState::Settling { .. } => {
+                record.state = TurnState::Closed;
+                (record.owner == owner && !record.reported()).then_some(id)
+            }
+            TurnState::Closed => (record.owner == owner && !record.reported()).then_some(id),
+            TurnState::Abandoned => None,
+        }
+    }
+
+    /// What a flush does with the report of turn `id` while `owner` runs the
+    /// session (`None` when the session is gone).
+    fn settle(&self, id: TurnId, owner: Option<TurnOwner>) -> TurnVerdict {
+        let now = Instant::now();
+        let mut table = self.table();
+        if owner.is_none() {
+            table.abandon_all();
+        }
+        let Some(record) = table.records.get_mut(&id) else {
+            return TurnVerdict::Drop;
+        };
+        // Only the settled turn departs: an owner read before the registry
+        // lock was released may already be stale, and the turn a newer owner
+        // opened is not this report's to abandon.
+        if owner.is_some_and(|owner| record.owner != owner) {
+            depart(record);
+        }
+        match record.state {
+            TurnState::Abandoned => TurnVerdict::Drop,
+            TurnState::Open | TurnState::Paused => TurnVerdict::Hold(None),
+            TurnState::Settling { deadline } if now < deadline => {
+                TurnVerdict::Hold(Some(deadline - now))
+            }
+            TurnState::Settling { .. } => {
+                record.state = TurnState::Closed;
+                TurnVerdict::Surface(record.snapshot())
+            }
+            TurnState::Closed => TurnVerdict::Surface(record.snapshot()),
+        }
+    }
+
+    /// Whether the newest turn reached the inbox and ended within `within`.
+    fn recently_reported(&self, within: Duration) -> bool {
+        let mut table = self.table();
+        table.newest_mut().is_some_and(|(_, record)| {
+            record.inbox_reported && record.ended.is_some_and(|ended| ended.elapsed() <= within)
+        })
+    }
+
+    /// Records what the flush of turn `id` delivered.
+    pub(crate) fn mark_reported(&self, id: TurnId, inbox: bool, signal: bool) {
+        if let Some(record) = self.table().records.get_mut(&id) {
+            record.inbox_reported |= inbox;
+            record.signal_reported |= signal;
+        }
+    }
+}
+
+/// Enters `working`: a paused turn resumes after `blocked`, a settling one
+/// before its deadline; anything else opens a new turn.
+fn enter_working(
+    table: &mut TurnTable,
+    owner: TurnOwner,
+    previous: Option<AgentActivity>,
+    started_nanos: Option<u64>,
+    now: Instant,
+) -> Option<TurnId> {
+    if let Some((_, record)) = table.newest_mut() {
+        match record.state {
+            TurnState::Paused if previous == Some(AgentActivity::Blocked) => {
+                record.state = TurnState::Open;
+                return None;
+            }
+            TurnState::Settling { deadline } if now < deadline => {
+                record.state = TurnState::Open;
+                record.ended = None;
+                record.ended_metadata = None;
+                return None;
+            }
+            TurnState::Settling { .. } => record.state = TurnState::Closed,
+            TurnState::Open | TurnState::Paused => record.state = TurnState::Abandoned,
+            TurnState::Closed | TurnState::Abandoned => {}
+        }
+    }
+    Some(table.open(owner, started_nanos, now))
 }
 
 /// Turn-event journal, progress map, and turn waiter pool of one registry.
@@ -109,6 +499,17 @@ struct Inner {
     epoch: String,
     /// Maximum number of retained journal entries.
     capacity: usize,
+    /// Milliseconds after a turn's end within which an `idle` to `working` edge
+    /// continues the turn.
+    flap_window_ms: Arc<AtomicU64>,
+    /// Unix nanoseconds that replace the system clock for turn starts, or 0.
+    wall_clock_pin: AtomicU64,
+    /// How often a held provider report was evaluated again while its turn
+    /// still worked.
+    held_rechecks: AtomicU64,
+    /// Turns that went idle, for the notification projector: `(session, turn)`.
+    edges: mpsc::UnboundedSender<TurnEdge>,
+    edge_receiver: Mutex<Option<mpsc::UnboundedReceiver<TurnEdge>>>,
     journal: Mutex<Journal>,
     /// Bumped after every append and every session removal; waiters re-scan
     /// on each change.
@@ -137,15 +538,126 @@ impl TurnEvents {
     /// Creates an empty journal for the daemon instance `epoch`.
     pub(crate) fn new(epoch: String, capacity: usize) -> Self {
         let (version, _receiver) = watch::channel(0);
+        let (edges, edge_receiver) = mpsc::unbounded_channel();
         Self {
             inner: Arc::new(Inner {
                 epoch,
                 capacity: capacity.max(1),
+                held_rechecks: AtomicU64::new(0),
+                wall_clock_pin: AtomicU64::new(0),
+                flap_window_ms: Arc::new(AtomicU64::new(
+                    u64::from(DEFAULT_ATTENTION_DEBOUNCE_SECS) * 1000,
+                )),
+                edges,
+                edge_receiver: Mutex::new(Some(edge_receiver)),
                 journal: Mutex::new(Journal::default()),
                 version,
                 waiters: Mutex::new(Waiters::default()),
             }),
         }
+    }
+
+    /// The window in milliseconds, shared so that the notification policy
+    /// keeps it current.
+    pub(crate) fn flap_window_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.inner.flap_window_ms)
+    }
+
+    /// Takes the channel the turn changes arrive on; only the first
+    /// taker gets it.
+    pub(crate) fn take_edge_receiver(&self) -> Option<mpsc::UnboundedReceiver<TurnEdge>> {
+        self.inner
+            .edge_receiver
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// Lets a turn whose owner is not `owner` depart, ahead of the next
+    /// operation that would notice.
+    pub(crate) fn depart(&self, session_id: &SessionId, owner: TurnOwner) {
+        if let Some(progress) = self.existing_progress(session_id) {
+            progress.depart(owner);
+        }
+    }
+
+    /// A running turn of the session can no longer be observed to end.
+    pub(crate) fn abandon_running(&self, session_id: &SessionId) {
+        if let Some(progress) = self.existing_progress(session_id) {
+            progress.abandon_running();
+        }
+    }
+
+    /// Opens a turn of unobserved start for an entry adopted while working.
+    pub(crate) fn adopt(&self, session_id: &SessionId, owner: TurnOwner) {
+        if let Some(id) = self.progress(session_id).adopt(owner) {
+            let _ = self
+                .inner
+                .edges
+                .send(TurnEdge::Started(session_id.clone(), id));
+        }
+    }
+
+    /// The turn a provider report with no identity belongs to.
+    pub(crate) fn attach_report(&self, session_id: &SessionId, owner: TurnOwner) -> Option<TurnId> {
+        self.existing_progress(session_id)?.attach_report(owner)
+    }
+
+    /// Whether the session's newest turn reached the inbox and ended within
+    /// `within`: a provider report that names no turn then repeats it.
+    pub(crate) fn recently_reported(&self, session_id: &SessionId, within: Duration) -> bool {
+        self.existing_progress(session_id)
+            .is_some_and(|progress| progress.recently_reported(within))
+    }
+
+    /// What a flush does with the report of turn `id`.
+    pub(crate) fn settle(
+        &self,
+        session_id: &SessionId,
+        id: TurnId,
+        owner: Option<TurnOwner>,
+    ) -> TurnVerdict {
+        match self.existing_progress(session_id) {
+            Some(progress) => progress.settle(id, owner),
+            None => TurnVerdict::Drop,
+        }
+    }
+
+    /// Records what the flush of a turn delivered.
+    pub(crate) fn mark_reported(
+        &self,
+        session_id: &SessionId,
+        id: TurnId,
+        inbox: bool,
+        signal: bool,
+    ) {
+        if let Some(progress) = self.existing_progress(session_id) {
+            progress.mark_reported(id, inbox, signal);
+        }
+    }
+
+    /// Counts one more evaluation of a held provider report.
+    pub(crate) fn note_held_recheck(&self) {
+        self.inner.held_rechecks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn wall_nanos(&self) -> u64 {
+        match self.inner.wall_clock_pin.load(Ordering::Relaxed) {
+            0 => unix_nanos_now(),
+            pinned => pinned,
+        }
+    }
+
+    /// Reads turn starts as `nanos` instead of from the system clock.
+    #[cfg(test)]
+    pub(crate) fn pin_wall_clock(&self, nanos: u64) {
+        self.inner.wall_clock_pin.store(nanos, Ordering::Relaxed);
+    }
+
+    /// How often held provider reports were evaluated again.
+    #[cfg(test)]
+    pub(crate) fn held_rechecks(&self) -> u64 {
+        self.inner.held_rechecks.load(Ordering::Relaxed)
     }
 
     /// Records one turn event now and wakes every waiter.
@@ -181,6 +693,11 @@ impl TurnEvents {
         let exited = {
             let mut journal = self.journal();
             let previous = journal.terminal.insert(session_id.clone(), terminal);
+            if terminal && previous == Some(false) {
+                if let Some(progress) = journal.progress.get(session_id) {
+                    progress.abandon_all();
+                }
+            }
             (terminal && previous == Some(false)).then(|| {
                 self.append(
                     &mut journal,
@@ -227,18 +744,44 @@ impl TurnEvents {
         self.journal().progress.get(session_id).map(Arc::clone)
     }
 
-    /// Records an activity change; entering `working` starts a new turn.
+    /// Applies an activity change of the session's `owner`. A turn that goes
+    /// idle is announced on the edge channel, in order with the change.
     pub(crate) fn note_activity(
         &self,
         session_id: &SessionId,
+        owner: TurnOwner,
         previous: Option<AgentActivity>,
         next: AgentActivity,
+        metadata: &BTreeMap<String, String>,
     ) {
-        if next == AgentActivity::Working && previous != Some(AgentActivity::Working) {
-            self.progress(session_id)
-                .turn_started_nanos
-                .store(unix_nanos_now(), Ordering::Relaxed);
+        let window = Duration::from_millis(self.inner.flap_window_ms.load(Ordering::Relaxed));
+        let change = self.progress(session_id).note_activity(
+            owner,
+            previous,
+            next,
+            metadata,
+            self.wall_nanos(),
+            window,
+        );
+        if let Some(id) = change.started {
+            let _ = self
+                .inner
+                .edges
+                .send(TurnEdge::Started(session_id.clone(), id));
         }
+        if let Some(id) = change.ended {
+            let _ = self
+                .inner
+                .edges
+                .send(TurnEdge::Ended(session_id.clone(), id));
+        }
+    }
+
+    /// Whether `owner` has no running turn, so that a `working` report of it
+    /// has a turn to open even when the session already shows `working`.
+    pub(crate) fn lacks_running_turn(&self, session_id: &SessionId, owner: TurnOwner) -> bool {
+        self.existing_progress(session_id)
+            .is_none_or(|progress| progress.lacks_running_turn(owner))
     }
 
     /// Subscribes to journal changes; the current version counts as seen.

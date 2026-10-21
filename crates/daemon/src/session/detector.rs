@@ -275,6 +275,8 @@ impl SessionRegistry {
             // before it takes its boundary under that lock, so a boundary this
             // restatement follows always finds its waiter.
             if !self.has_evidence_waiter(id)
+                && (transition.activity != AgentActivity::Working
+                    || !self.inner.turns.lacks_running_turn(id, entry.turn_owner()))
                 && entry.info.activity == Some(transition.activity)
                 && entry.info.state_source == transition.source
                 && activity_already_recorded(entry, transition.activity, transition.source)
@@ -282,9 +284,13 @@ impl SessionRegistry {
                 return;
             }
 
-            self.inner
-                .turns
-                .note_activity(id, entry.info.activity, transition.activity);
+            self.inner.turns.note_activity(
+                id,
+                entry.turn_owner(),
+                entry.info.activity,
+                transition.activity,
+                &entry.info.metadata,
+            );
             entry.info.activity = Some(transition.activity);
             entry.info.state_source = transition.source;
             entry.info.updated_at = timestamp_now();

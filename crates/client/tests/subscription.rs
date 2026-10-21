@@ -544,6 +544,9 @@ fn sample_notification_record() -> protocol::NotificationRecord {
         archived_at: None,
         deleted_at: None,
         superseded_by: None,
+        turn_started_at: None,
+        turn_duration_ms: None,
+        session_metadata: BTreeMap::new(),
     }
 }
 

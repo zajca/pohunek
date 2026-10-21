@@ -1906,6 +1906,7 @@ async fn assert_transition_rules(
             observed,
             report,
             RuntimeId::HERMES.to_owned(),
+            &fixture.registry.inner.turns,
         );
         let applied = format!("{:?}", entry.detector_config.borrow().config.manifest);
         assert_eq!(blocker(&applied), expect_selected_rule, "{}", observed.pid);

@@ -308,6 +308,18 @@ still answers `notification_kind_disabled`. The turn event does not use the
 inbox's stale-stop suppression after resumed work: a `turn_completed` is
 dropped instead when the session is `working` as its window ends.
 
+The projector emits a `turn_completed` for every session whose activity goes
+`working` to `idle`, so runtimes without managed hooks report turns too. It
+reports nothing for a turn that ends `blocked`, for an idle that no `working`
+preceded, or when the session works again inside the debounce window. The
+daemon stamps the record with `turn_started_at`, `turn_duration_ms` and a copy
+of the session metadata (`session_metadata`) that stays readable after
+`session rm`; a hook report of the same turn is merged with the projector's, and
+one that arrives after its turn was reported adds no second inbox record
+(a waiting `session.wait_turn` may still see one more turn event). The kind stays
+disabled for the inbox by default; enable it with `notifications policy set` for
+a manager that follows many sessions.
+
 Unread `turn_completed` rows are bounded per session. A newer
 `turn:<session_id>` record acknowledges any older unread turn for that key with
 `superseded_by` pointing at the newer record, and a visible attention record for

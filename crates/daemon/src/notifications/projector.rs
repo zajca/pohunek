@@ -12,12 +12,12 @@ use protocol::{
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use time::OffsetDateTime;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::session::SessionRegistry;
+use crate::session::{SessionRegistry, TurnEdge, TurnId};
 
 use super::{
     is_debounced_create, parse_timestamp, policy_enables_kind, AttentionCoordinator,
@@ -91,13 +91,20 @@ fn spawn_projector_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut state = ProjectorState::default();
+        let mut turn_edges = sessions.turn_events().take_edge_receiver();
         loop {
             tokio::select! {
                 biased;
                 () = shutdown.cancelled() => {
-                    drain_buffered_events(&sessions, &notifications, &attention, &mut events, &mut state).await;
+                    drain_buffered_events(&sessions, &notifications, &attention, &mut events, &mut turn_edges, &mut state).await;
                     break;
                 }
+                edge = next_turn_edge(&mut turn_edges) => match edge {
+                    Some(edge) => {
+                        state.handle_turn_edge_blocking(&notifications, &attention, edge).await;
+                    }
+                    None => turn_edges = None,
+                },
                 received = events.recv() => match received {
                     Ok(event) => state.handle_event_blocking(&notifications, &attention, &event).await,
                     Err(broadcast::error::RecvError::Lagged(dropped)) => {
@@ -114,13 +121,27 @@ fn spawn_projector_task(
     })
 }
 
+/// The next turn change, pending forever once the channel is gone.
+async fn next_turn_edge(edges: &mut Option<mpsc::UnboundedReceiver<TurnEdge>>) -> Option<TurnEdge> {
+    match edges {
+        Some(edges) => edges.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn drain_buffered_events(
     sessions: &SessionRegistry,
     notifications: &NotificationService,
     attention: &AttentionCoordinator,
     events: &mut broadcast::Receiver<Event>,
+    turn_edges: &mut Option<mpsc::UnboundedReceiver<TurnEdge>>,
     state: &mut ProjectorState,
 ) {
+    while let Some(edge) = turn_edges.as_mut().and_then(|edges| edges.try_recv().ok()) {
+        state
+            .handle_turn_edge_blocking(notifications, attention, edge)
+            .await;
+    }
     loop {
         match events.try_recv() {
             Ok(event) => {
@@ -389,6 +410,55 @@ impl ProjectorState {
         }
     }
 
+    /// Acts on a turn change of the registry: a turn that went idle derives its
+    /// `turn_completed`; a turn that opened ends what the earlier turns left
+    /// unread. Both arrive in the order the turns changed.
+    async fn handle_turn_edge_blocking(
+        &mut self,
+        notifications: &NotificationService,
+        attention: &AttentionCoordinator,
+        edge: TurnEdge,
+    ) {
+        let (session_id, turn) = match edge {
+            TurnEdge::Started(session_id, _) => {
+                attention.resolve(turn_dedupe_key(&session_id));
+                return;
+            }
+            TurnEdge::Ended(session_id, turn) => (session_id, turn),
+        };
+        let session_id = &session_id;
+        if !self.seed_transition_epochs(notifications, session_id).await {
+            return;
+        }
+        let pending = self.prepare_derived(
+            notifications,
+            DerivedNotification {
+                session_id: session_id.clone(),
+                kind: NotificationKind::TurnCompleted,
+                severity: NotificationSeverity::Info,
+                source_event: event::AGENT_STATE,
+                title: "Turn completed".to_owned(),
+                body: format!("Session {} completed a turn.", session_id.0),
+                metadata: BTreeMap::new(),
+                agent_kind: None,
+                project_id: None,
+                dedupe_key: Some(turn_dedupe_key(session_id)),
+                runtime_generation: None,
+            },
+        );
+        if let Some(pending) = pending {
+            create_pending_notification_blocking(
+                notifications.clone(),
+                attention,
+                PendingNotification {
+                    turn: Some(turn),
+                    ..pending
+                },
+            )
+            .await;
+        }
+    }
+
     fn pending_event(
         &mut self,
         notifications: &NotificationService,
@@ -466,7 +536,9 @@ impl ProjectorState {
         if activity == AgentActivity::Working {
             self.blocked_replay_candidates.remove(session_id);
             if previous != Some(AgentActivity::Working) {
-                resolve_session_notifications(attention, session_id);
+                // The turn key resolves with the turn that starts, in order
+                // with the turns that ended.
+                attention.resolve(attention_dedupe_key(session_id));
             }
         }
         if activity != AgentActivity::Blocked || previous == Some(AgentActivity::Blocked) {
@@ -664,6 +736,7 @@ impl ProjectorState {
             retryable_admission: false,
         };
         Some(PendingNotification {
+            turn: None,
             session_id: derived.session_id,
             kind: derived.kind,
             params,
@@ -805,6 +878,8 @@ struct PendingNotification {
     session_id: SessionId,
     kind: NotificationKind,
     params: NotificationCreateParams,
+    /// The turn the notification reports, for a `turn_completed`.
+    turn: Option<TurnId>,
 }
 
 async fn create_pending_notification_blocking(
@@ -857,10 +932,16 @@ fn defer_pending_notification(
 ) {
     match notifications.prepare_deferred(pending.params) {
         // The projector derives the signal from the registry's own events.
-        Ok(deferred) => attention.defer(DeferredNotification {
-            signal: true,
-            ..deferred
-        }),
+        Ok(deferred) => {
+            let deferred = DeferredNotification {
+                signal: true,
+                ..deferred
+            };
+            attention.defer(match pending.turn {
+                Some(turn) => deferred.for_turn(turn),
+                None => deferred,
+            });
+        }
         Err(err) => {
             warn!(
                 error = %err,
@@ -1293,10 +1374,13 @@ mod tests {
         assert_eq!(created[0].status, NotificationStatus::Unread);
 
         projector
-            .handle_event_blocking(
+            .handle_turn_edge_blocking(
                 &service,
                 &attention,
-                &agent_state_event("s-1", AgentActivity::Working),
+                crate::session::TurnEdge::Started(
+                    SessionId("s-1".to_owned()),
+                    crate::session::TurnId::numbered(1),
+                ),
             )
             .await;
         settle().await;

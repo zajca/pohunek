@@ -921,6 +921,8 @@ impl SessionRegistry {
         let entry = SessionEntry {
             info: info.clone(),
             activity_revision: 0,
+            entry_incarnation: super::next_entry_incarnation(),
+            agent_incarnation: 0,
             activity_evidence: VecDeque::new(),
             input_gate: Arc::new(Mutex::new(())),
             identity_commit: Arc::new(Mutex::new(())),

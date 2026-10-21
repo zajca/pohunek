@@ -41,19 +41,19 @@ args = ["-c", "printf ready; i=0; while [ $i -lt 2400 ] && sleep 0.05; do i=$((i
 "#;
 
 /// Debounce window of the default notification policy.
-fn debounce() -> Duration {
+pub(super) fn debounce() -> Duration {
     Duration::from_secs(u64::from(DEFAULT_ATTENTION_DEBOUNCE_SECS))
 }
 
 /// A wait duration no scenario reaches unless it advances the clock to it.
-const LONG_WAIT_MS: u64 = 600_000;
+pub(super) const LONG_WAIT_MS: u64 = 600_000;
 
 /// Virtual-time increment of [`advance_until_finished`].
-const CLOCK_STEP: Duration = Duration::from_millis(50);
+pub(super) const CLOCK_STEP: Duration = Duration::from_millis(50);
 
 /// Virtual time past the debounce window within which a flushed turn must
 /// complete a parked wait.
-const FLUSH_SLACK: Duration = Duration::from_secs(1);
+pub(super) const FLUSH_SLACK: Duration = Duration::from_secs(1);
 
 /// Real-time bound of a wait that a correct daemon completes at once; a
 /// daemon that misses the completion lets it time out instead of hanging.
@@ -73,7 +73,7 @@ const QUICK_TURN_STEP: Duration = Duration::from_secs(1);
 const SETTLE_YIELDS: usize = 64;
 
 /// Daemon state, its registry, inbox, and the owning task handles.
-struct Fixture {
+pub(super) struct Fixture {
     state: DaemonState,
     sessions: SessionRegistry,
     root: tempfile::TempDir,
@@ -82,14 +82,22 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// The notification service the daemon components share.
+    pub(super) fn notifications(&self) -> &crate::notifications::NotificationService {
+        self.state.notifications.as_ref().expect("notifications")
+    }
+
     /// Builds the daemon components with the default notification policy.
-    fn new(config: SessionRegistryConfig) -> Self {
+    pub(super) fn new(config: SessionRegistryConfig) -> Self {
         Self::with_policy(config, None)
     }
 
     /// Builds the daemon components with `policy` replacing the default
     /// notification policy.
-    fn with_policy(config: SessionRegistryConfig, policy: Option<NotificationPolicy>) -> Self {
+    pub(super) fn with_policy(
+        config: SessionRegistryConfig,
+        policy: Option<NotificationPolicy>,
+    ) -> Self {
         let root = pohunek_test_support::tempdir_with_prefix("ph-turn-").expect("fixture root");
         let agents = root.path().join("agents");
         std::fs::create_dir_all(&agents).expect("create the agents dir");
@@ -135,7 +143,7 @@ impl Fixture {
     }
 
     /// Creates a live session through `session.new` and returns its id.
-    async fn session(&self, tag: &str) -> String {
+    pub(super) async fn session(&self, tag: &str) -> String {
         let cwd = self.cwd(tag);
         std::fs::create_dir_all(&cwd).expect("create the session working directory");
         let created = ok(self
@@ -147,11 +155,11 @@ impl Fixture {
         created["id"].as_str().expect("session id").to_owned()
     }
 
-    fn cwd(&self, tag: &str) -> PathBuf {
+    pub(super) fn cwd(&self, tag: &str) -> PathBuf {
         self.root.path().join("work").join(tag)
     }
 
-    async fn call(&self, method: &str, params: Value) -> Result<Value, ProtocolError> {
+    pub(super) async fn call(&self, method: &str, params: Value) -> Result<Value, ProtocolError> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let id = format!("turn-{}", NEXT.fetch_add(1, Ordering::Relaxed));
         let request = Request::new(id, method, params).expect("valid request");
@@ -159,7 +167,7 @@ impl Fixture {
     }
 
     /// Starts `session.wait_turn` on its own task, as a dedicated connection does.
-    fn spawn_wait(&self, params: Value) -> JoinHandle<Result<Value, ProtocolError>> {
+    pub(super) fn spawn_wait(&self, params: Value) -> JoinHandle<Result<Value, ProtocolError>> {
         let state = self.state.clone();
         tokio::spawn(async move {
             let request =
@@ -169,13 +177,17 @@ impl Fixture {
     }
 
     /// Reports a Claude `Stop` hook for `session`, as the managed hook does.
-    async fn turn_completed(&self, session: &str, seq: u32) -> Result<Value, ProtocolError> {
+    pub(super) async fn turn_completed(
+        &self,
+        session: &str,
+        seq: u32,
+    ) -> Result<Value, ProtocolError> {
         self.turn_report("claude", session, seq).await
     }
 
     /// Reports a `turn_completed` for `session` from `provider`, shaped like a
     /// provider `Stop` hook report.
-    async fn turn_report(
+    pub(super) async fn turn_report(
         &self,
         provider: &str,
         session: &str,
@@ -205,7 +217,7 @@ impl Fixture {
     ///
     /// A reported activity owns the session's activity from then on, so screen
     /// detection of the test program cannot start a turn on its own.
-    async fn activity(&self, session: &str, activity: &str) {
+    pub(super) async fn activity(&self, session: &str, activity: &str) {
         let reported = ok(self
             .call(
                 method::SESSION_REPORT_AGENT,
@@ -220,7 +232,7 @@ impl Fixture {
         assert_eq!(reported["recorded"], true, "{activity} report is recorded");
     }
 
-    async fn inbox(&self) -> Vec<Value> {
+    pub(super) async fn inbox(&self) -> Vec<Value> {
         let listed = ok(self.call(method::NOTIFICATION_LIST, json!({})).await);
         listed["notifications"]
             .as_array()
@@ -228,7 +240,12 @@ impl Fixture {
             .clone()
     }
 
-    async fn stop_all(&self, sessions: &[&str]) {
+    /// How often the coordinator evaluated a held provider report again.
+    pub(super) fn held_rechecks(&self) -> u64 {
+        self.sessions.turn_events().held_rechecks()
+    }
+
+    pub(super) async fn stop_all(&self, sessions: &[&str]) {
         for session in sessions {
             let stopped = ok(self.call(method::SESSION_STOP, json!(session)).await);
             assert_eq!(stopped["stopped"], true, "{session} stops");
@@ -237,22 +254,22 @@ impl Fixture {
 }
 
 /// The default policy with `enabled` as the per-kind switches of every provider.
-fn every_provider(enabled: NotificationKindPolicy) -> NotificationPolicy {
+pub(super) fn every_provider(enabled: NotificationKindPolicy) -> NotificationPolicy {
     let mut policy = default_policy();
     policy.enabled = enabled;
     policy.providers.clear();
     policy
 }
 
-fn ok(result: Result<Value, ProtocolError>) -> Value {
+pub(super) fn ok(result: Result<Value, ProtocolError>) -> Value {
     result.unwrap_or_else(|error| panic!("expected a success result: {error:?}"))
 }
 
-fn err(result: Result<Value, ProtocolError>) -> ProtocolError {
+pub(super) fn err(result: Result<Value, ProtocolError>) -> ProtocolError {
     result.expect_err("expected an error result")
 }
 
-async fn settle() {
+pub(super) async fn settle() {
     for _ in 0..SETTLE_YIELDS {
         tokio::task::yield_now().await;
     }
@@ -264,7 +281,7 @@ async fn settle() {
 /// The clock then moves past one debounce window, so a turn resolution
 /// recorded while the sessions started (an activity edge before the first
 /// hook report) is too old to consume a later turn report.
-async fn pause_clock() -> AutoAdvanceInhibitor {
+pub(super) async fn pause_clock() -> AutoAdvanceInhibitor {
     let inhibitor = AutoAdvanceInhibitor::new();
     tokio::time::pause();
     settle().await;
@@ -276,7 +293,7 @@ async fn pause_clock() -> AutoAdvanceInhibitor {
 /// Waits until `count` turn waits hold slots, so their deadlines are armed
 /// before a paused clock moves. A parked wait has acquired its slot and set its
 /// deadline in the same poll.
-async fn parked(fixture: &Fixture, count: usize) {
+pub(super) async fn parked(fixture: &Fixture, count: usize) {
     guard("the turn waits to park", async {
         while fixture.sessions.turn_events().active_waiters() < count {
             tokio::task::yield_now().await;
@@ -294,7 +311,10 @@ async fn parked(fixture: &Fixture, count: usize) {
 /// # Panics
 ///
 /// Panics when `wait` is still running after `limit` of virtual time.
-async fn advance_until_finished(wait: &JoinHandle<Result<Value, ProtocolError>>, limit: Duration) {
+pub(super) async fn advance_until_finished(
+    wait: &JoinHandle<Result<Value, ProtocolError>>,
+    limit: Duration,
+) {
     let mut moved = Duration::ZERO;
     while !wait.is_finished() {
         assert!(moved <= limit, "the wait did not finish within {limit:?}");
@@ -304,18 +324,38 @@ async fn advance_until_finished(wait: &JoinHandle<Result<Value, ProtocolError>>,
     }
 }
 
-async fn joined(wait: JoinHandle<Result<Value, ProtocolError>>) -> Result<Value, ProtocolError> {
+pub(super) async fn joined(
+    wait: JoinHandle<Result<Value, ProtocolError>>,
+) -> Result<Value, ProtocolError> {
     guard("the turn wait", wait).await.expect("wait task joins")
 }
 
 /// Issues a cursor at the current end of the journal with a 1 ms wait on the
 /// running clock.
-async fn fresh_cursor(fixture: &Fixture, session: &str) -> String {
+pub(super) async fn fresh_cursor(fixture: &Fixture, session: &str) -> String {
     let wait = fixture.spawn_wait(json!({
         "session_ids": [session], "until": ["turn_completed"], "timeout_ms": 1
     }));
     let result = ok(joined(wait).await);
     assert_eq!(result["reason"], "timeout");
+    result["cursor"].as_str().expect("cursor").to_owned()
+}
+
+/// A cursor at the end of the journal once every debounce window opened so far
+/// has passed, on the paused clock.
+pub(super) async fn settled_cursor(fixture: &Fixture, session: &str) -> String {
+    let mut moved = Duration::ZERO;
+    while moved < debounce() + FLUSH_SLACK {
+        tokio::time::advance(CLOCK_STEP).await;
+        moved += CLOCK_STEP;
+        settle().await;
+    }
+    let wait = fixture.spawn_wait(json!({
+        "session_ids": [session], "until": ["turn_completed"], "timeout_ms": 1
+    }));
+    settle().await;
+    tokio::time::advance(TIMER_TICK).await;
+    let result = ok(joined(wait).await);
     result["cursor"].as_str().expect("cursor").to_owned()
 }
 
@@ -601,10 +641,14 @@ async fn a_multi_session_wait_names_the_session_that_fired() {
         fixture.activity(session, "idle").await;
     }
     let _inhibitor = pause_clock().await;
+    // A shell's startup output can read as a turn that the projector reports
+    // once its window passes; the wait starts after that report.
+    let cursor = settled_cursor(&fixture, &first).await;
 
     let wait = fixture.spawn_wait(json!({
         "session_ids": [first, second],
         "until": ["turn_completed", "agent_blocked"],
+        "after": cursor,
         "timeout_ms": LONG_WAIT_MS
     }));
     parked(&fixture, 1).await;
@@ -1120,7 +1164,7 @@ async fn a_stale_stop_during_the_next_turn_is_dropped() {
 }
 
 #[tokio::test]
-async fn two_quick_turns_keep_the_inbox_suppression_and_record_the_last_stop() {
+async fn two_quick_turns_report_the_last_turn_once() {
     let fixture = Fixture::with_policy(
         SessionRegistryConfig::default(),
         Some(every_provider(NotificationKindPolicy {
@@ -1158,11 +1202,11 @@ async fn two_quick_turns_keep_the_inbox_suppression_and_record_the_last_stop() {
     let result = ok(joined(wait).await);
     assert_eq!(result["reason"], "event");
     assert_eq!(result["event"]["kind"], "turn_completed");
-    assert!(
-        fixture.inbox().await.is_empty(),
-        "both stops arrive inside a window after a working edge, so the inbox keeps none"
-    );
-    assert!(result["event"].get("notification_id").is_none());
+    // Turn two began inside turn one's window, which dropped turn one's pending
+    // report; only the last turn reaches the inbox, and the event names it.
+    let inbox = fixture.inbox().await;
+    assert_eq!(inbox.len(), 1, "{inbox:?}");
+    assert_eq!(result["event"]["notification_id"], inbox[0]["id"]);
 
     let again = fixture.spawn_wait(json!({
         "session_ids": [session], "until": ["turn_completed"], "after": result["cursor"],
@@ -1175,6 +1219,6 @@ async fn two_quick_turns_keep_the_inbox_suppression_and_record_the_last_stop() {
         "timeout",
         "recorded once"
     );
-    assert!(fixture.inbox().await.is_empty());
+    assert_eq!(fixture.inbox().await.len(), 1);
     fixture.stop_all(&[&session]).await;
 }

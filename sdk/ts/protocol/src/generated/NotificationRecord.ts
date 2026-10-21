@@ -115,4 +115,31 @@ export type NotificationRecord = {
    * Additive: an older daemon omits it, and an older client ignores it.
    */
   superseded_by?: NotificationId;
+  /**
+   * When the turn a `turn_completed` record reports started, as an RFC 3339
+   * timestamp.
+   *
+   * Additive: an older daemon omits it, and an older client ignores it. The
+   * daemon sets it from its own turn clock (the turn's first transition into
+   * `working`); a client cannot supply it. Absent when this daemon did not
+   * observe the turn start.
+   */
+  turn_started_at?: string;
+  /**
+   * Milliseconds the reported turn lasted, from its first transition into
+   * `working` to the moment the session left `working`.
+   *
+   * Additive: an older daemon omits it, and an older client ignores it. Set
+   * only by the daemon, together with `turn_started_at`.
+   */
+  turn_duration_ms?: number;
+  /**
+   * Metadata of the linked session when the turn ended.
+   *
+   * Additive: an older daemon omits it, and an older client ignores it. A
+   * verbatim copy of the session's owner-set metadata (at most the session
+   * metadata limits), kept with the record after the session is removed.
+   * Set only by the daemon on `turn_completed` records.
+   */
+  session_metadata?: { [key in string]: string };
 };

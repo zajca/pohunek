@@ -24,6 +24,8 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::sync::broadcast;
 
+use crate::session::{rfc3339_from_nanos, TurnId, TurnSnapshot};
+
 #[doc(inline)]
 pub use coordinator::{AttentionCoordinator, AttentionCoordinatorTask};
 #[doc(inline)]
@@ -55,9 +57,31 @@ pub(crate) struct DeferredNotification {
     pub(crate) inbox: bool,
     /// Whether the record comes from a producer trusted to report turn events.
     pub(crate) signal: bool,
+    /// The turn the record reports, when it reports one the daemon runs.
+    /// Producers meet on it; only the daemon says which it is.
+    pub(crate) turn: Option<TurnId>,
 }
 
 impl DeferredNotification {
+    /// Attaches the record to the turn it reports; any kind but
+    /// `turn_completed` is returned unchanged.
+    #[must_use]
+    pub(crate) fn for_turn(mut self, turn: TurnId) -> Self {
+        if self.record.kind == NotificationKind::TurnCompleted {
+            self.turn = Some(turn);
+        }
+        self
+    }
+
+    /// Stamps the record with the turn it reports, as the daemon saw it end.
+    pub(crate) fn stamp(record: &mut NotificationRecord, turn: &TurnSnapshot) {
+        record.turn_started_at = turn.started_nanos.and_then(rfc3339_from_nanos);
+        record.turn_duration_ms = turn
+            .length
+            .and_then(|length| u64::try_from(length.as_millis()).ok());
+        record.session_metadata = turn.metadata.clone();
+    }
+
     /// The error an immediate create of this record reports, when the policy
     /// drops it.
     pub(crate) fn policy_refusal(&self) -> Option<NotificationError> {
@@ -427,6 +451,9 @@ pub struct NotificationService {
 struct NotificationServiceInner {
     store: NotificationStore,
     policy: RwLock<NotificationPolicy>,
+    /// Milliseconds of the debounce window, kept equal to the policy for the
+    /// consumer that bound it.
+    attention_window: RwLock<Option<Arc<AtomicU64>>>,
     events: broadcast::Sender<Event>,
     next_id: AtomicU64,
 }
@@ -469,6 +496,7 @@ impl NotificationService {
             inner: Arc::new(NotificationServiceInner {
                 store,
                 policy: RwLock::new(policy),
+                attention_window: RwLock::new(None),
                 events,
                 next_id: AtomicU64::new(1),
             }),
@@ -640,7 +668,35 @@ impl NotificationService {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.inner.store.write_policy(&policy)?;
         *guard = policy;
+        self.publish_attention_window(&guard);
         Ok(())
+    }
+
+    /// Keeps `window` (milliseconds) equal to the policy's debounce window,
+    /// from now on and at every policy change.
+    pub(crate) fn bind_attention_window(&self, window: Arc<AtomicU64>) {
+        let policy = self.policy();
+        *self
+            .inner
+            .attention_window
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(window);
+        self.publish_attention_window(&policy);
+    }
+
+    fn publish_attention_window(&self, policy: &NotificationPolicy) {
+        if let Some(window) = self
+            .inner
+            .attention_window
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            window.store(
+                u64::from(policy.attention_debounce_secs) * 1000,
+                Ordering::Relaxed,
+            );
+        }
     }
 
     /// Explicitly prune records matched by retention parameters.
@@ -825,11 +881,15 @@ impl NotificationService {
             archived_at: None,
             deleted_at: None,
             superseded_by: None,
+            turn_started_at: None,
+            turn_duration_ms: None,
+            session_metadata: BTreeMap::new(),
         };
         Ok(DeferredNotification {
             record,
             inbox,
             signal: false,
+            turn: None,
         })
     }
 
