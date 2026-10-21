@@ -765,13 +765,11 @@ where
     let parts = framed.into_parts();
     let mut stream = parts.io;
     let submitted = attach.session_id.clone();
-    let bridge_result = run_attach_bridge(
-        &mut stream,
-        &mut attach,
-        parts.read_buf.to_vec(),
-        &|| registry.note_input(&submitted),
-    )
-    .await;
+    let bridge_result =
+        run_attach_bridge(&mut stream, &mut attach, parts.read_buf.to_vec(), &|| {
+            registry.note_input(&submitted);
+        })
+        .await;
     let failure = bridge_result
         .as_ref()
         .err()
@@ -825,17 +823,23 @@ where
         stream_id: data.stream_id.clone(),
         worker_instance_id: data.worker_instance_id.clone(),
     };
+    note_submission(&initial_input, on_submit);
     bridge_worker_frames(
         stream,
         &mut data.stream,
         &identity,
         attach_stream_id,
         session_id,
-        cancel,
+        &AttachControl { cancel, on_submit },
         initial_input,
-        on_submit,
     )
     .await
+}
+
+/// What ends an attach bridge and what it reports about the client's input.
+struct AttachControl<'a> {
+    cancel: &'a tokio_util::sync::CancellationToken,
+    on_submit: &'a (dyn Fn() + Sync),
 }
 
 /// Frame identity every frame of one worker attach stream carries.
@@ -863,9 +867,8 @@ async fn bridge_worker_frames<S, W>(
     identity: &WorkerFrameIdentity,
     attach_stream_id: &str,
     session_id: &protocol::SessionId,
-    cancel: &tokio_util::sync::CancellationToken,
+    control: &AttachControl<'_>,
     initial_input: Vec<u8>,
-    on_submit: &(dyn Fn() + Sync),
 ) -> Result<(), AttachBridgeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -875,7 +878,6 @@ where
     let mut worker_write = Some(worker_write);
     let mut write_sequence = 1_u64;
     if !initial_input.is_empty() {
-        note_submission(&initial_input, on_submit);
         let writer = worker_write.as_mut().expect("the worker writer is idle");
         send_worker_attach_input(writer, identity, write_sequence, initial_input)
             .await
@@ -958,7 +960,7 @@ where
                 if count == 0 {
                     break;
                 }
-                note_submission(&input[..count], on_submit);
+                note_submission(&input[..count], control.on_submit);
                 let writer = worker_write.take().expect("the worker writer is idle");
                 pending_send = Some(Box::pin(send_owned_attach_input(
                     writer,
@@ -967,7 +969,7 @@ where
                     input[..count].to_vec(),
                 )));
             }
-            () = cancel.cancelled() => break,
+            () = control.cancel.cancelled() => break,
         }
     }
     Ok(())
@@ -1347,7 +1349,7 @@ mod tests {
 
     use super::{
         bridge_worker_frames, enforce_connection_version, read_frame, run_worker_attach_bridge,
-        write_frame, WorkerFrameIdentity,
+        write_frame, AttachControl, WorkerFrameIdentity,
     };
     use crate::runtime::DataStream;
 
@@ -1571,9 +1573,11 @@ mod tests {
                 &identity,
                 "a-partial",
                 &protocol::SessionId("s-partial".to_owned()),
-                &CancellationToken::new(),
+                &AttachControl {
+                    cancel: &CancellationToken::new(),
+                    on_submit: &|| {},
+                },
                 Vec::new(),
-                &|| {},
             )
             .await
         });
@@ -1649,11 +1653,13 @@ mod tests {
                     &identity,
                     "a-submit",
                     &protocol::SessionId("s-submit".to_owned()),
-                    &CancellationToken::new(),
-                    Vec::new(),
-                    &|| {
-                        submitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    &AttachControl {
+                        cancel: &CancellationToken::new(),
+                        on_submit: &|| {
+                            submitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        },
                     },
+                    Vec::new(),
                 )
                 .await
             }

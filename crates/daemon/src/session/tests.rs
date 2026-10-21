@@ -21743,6 +21743,60 @@ fn assert_assigned_binding_persisted(store: &crate::store::Store, id: &SessionId
     );
 }
 
+/// A hook-less runtime takes its first prompt as a launch argument: the
+/// daemon never writes it, yet the output that answers it is a turn, while
+/// the banner of a launch without a prompt is not.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_prompt_in_the_launch_arguments_makes_the_first_answer_a_turn() {
+    let dir = temp_dir("argv-prompt-turn");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let registry = assigned_registry(
+        &script,
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+        &temp_store_path("argv-prompt-turn"),
+        None,
+    );
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let launch = |input: Option<&str>| SessionNewParams {
+        agent: "pi".to_owned(),
+        cwd: Some(dir.clone()),
+        input: input.map(str::to_owned),
+        ..params()
+    };
+
+    let bare = registry.create(launch(None)).await.expect("create bare");
+    registry
+        .record_activity(&bare.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&bare.id, transition(AgentActivity::Idle))
+        .await;
+    assert!(
+        started_turns(&mut edges).is_empty(),
+        "the banner of a launch without a prompt opened a turn"
+    );
+
+    let prompted = registry
+        .create(launch(Some("hello")))
+        .await
+        .expect("create prompted");
+    wait_for_file_contains(&marker, "hello\n").await;
+    registry
+        .record_activity(&prompted.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&prompted.id, transition(AgentActivity::Idle))
+        .await;
+    assert_eq!(ended_turns(&mut edges).len(), 1);
+    let _ = registry.stop(&bare.id).await;
+    let _ = registry.stop(&prompted.id).await;
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_hook_less_runtime_launches_with_an_assigned_reference_and_recovers_from_it() {
