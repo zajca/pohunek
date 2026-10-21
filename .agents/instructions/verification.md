@@ -520,6 +520,9 @@ Both checks read the process table from `/proc` (never through `PATH`), kill the
 worker's workload (descendants and the sessions they lead, which outlive a terminated
 worker) before the worker, and signal each process only after re-verifying its start time. Plain `cargo nextest run` relies on
 the guards alone.
+A fixture that stops its daemon with `SIGTERM` calls `WorkerGuard::wait_for_exit` (bounded by `HANG_GUARD`) after the
+daemon's exit and before the guard drops, because the daemon signals its workers as it exits and the kernel may still be
+tearing them down; a worker still listed after the wait fails the test as before.
 The daemon crate's fixtures end every other process a failing fixture started the same
 way: its `ScopedDir` and thread-scoped roots and the supervised-lifecycle `Installation`
 carry a `ScopeReaper` (`procwatch::scoped_host`) that, on drop and on unwind, kills every
