@@ -860,6 +860,10 @@ struct WorkerFrameIdentity {
 /// previous one, so a paste into a program that does not read fills the
 /// socket; worker output keeps being forwarded meanwhile, and public input is
 /// read again only once the send completed.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one select loop keeps the worker frame and public input directions in a single view"
+)]
 async fn bridge_worker_frames<S, W>(
     stream: &mut S,
     worker: &mut W,
@@ -1703,8 +1707,9 @@ mod tests {
         let (mut worker, _peer) = tokio::io::duplex(PUBLIC_BUFFER);
         let (_read, writer) = tokio::io::split(&mut worker);
 
-        let send = send_owned_attach_input(writer, &identity, (1, &on_submit), b"ls\r".to_vec());
-        drop(send);
+        let unpolled =
+            send_owned_attach_input(writer, &identity, (1, &on_submit), b"ls\r".to_vec());
+        drop(unpolled);
         assert_eq!(submitted.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         let (_read, writer) = tokio::io::split(&mut worker);
