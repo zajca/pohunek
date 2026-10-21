@@ -214,10 +214,10 @@ pub struct PackageAction {
     /// operator can select again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaces_newer: Option<SelectedPackage>,
-    /// Set when the status is `kept` because the registry selects a newer
-    /// official version than the release carries: the release's version. The
-    /// fields above then name the selected package, which the step never
-    /// downgrades.
+    /// Set when the status is `kept` because the registry selects an official
+    /// version that is newer than the release's (non-reserved runtime) or has
+    /// no order against it (any runtime): the release's version. The fields
+    /// above then name the selected package, which the step never replaces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_version: Option<String>,
 }

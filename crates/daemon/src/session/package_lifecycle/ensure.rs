@@ -2167,7 +2167,9 @@ fn keeps_selected(
 }
 
 /// Whether the selected official version of the package differs from the
-/// prepared one and the two versions have no order.
+/// prepared one, the two versions have no order, and the selected package
+/// serves (enabled, loadable). A selection that does not serve is repaired by
+/// the release's package instead of being kept.
 fn selection_unordered(plan: &PlanInputs<'_>, prepared: &Prepared) -> bool {
     let Some(state) = plan.state else {
         return false;
@@ -2178,10 +2180,11 @@ fn selection_unordered(plan: &PlanInputs<'_>, prepared: &Prepared) -> bool {
     if selected == &prepared.digest {
         return false;
     }
-    state.package(selected).is_some_and(|record| {
+    let unordered = state.package(selected).is_some_and(|record| {
         record.source() == PackageSource::Official
             && version_order(&record.identity().version, &prepared.identity.version).is_none()
-    })
+    });
+    unordered && matches!(health_of(plan, selected), Health::Present)
 }
 
 /// The base environment the integration status reads the config homes with:

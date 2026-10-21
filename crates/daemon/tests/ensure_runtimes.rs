@@ -1945,6 +1945,34 @@ fn a_selected_reserved_runtime_version_without_an_order_against_the_release_is_k
     }
 }
 
+/// A disabled selected version that has no order against the release's is not
+/// kept: the release's package is installed and selected over it.
+#[test]
+fn a_disabled_unordered_selected_reserved_runtime_version_is_replaced_by_the_release() {
+    let host = Host::new();
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "2.0");
+    host.publish_archives(1, &[("claude", &bytes, &digest)]);
+    host.write_claude_profile();
+    let installed = host.step(false);
+    assert!(installed.refusals.is_empty(), "{installed:?}");
+    host.disable_package(&digest);
+    let release = publish_claude_version(&host, "1.0.3", 2);
+
+    let plan = host.step(true);
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    let package = &plan.packages[0];
+    assert_eq!(package.status, PackageStatus::Install);
+    assert_eq!(package.digest, release.as_str());
+    assert!(
+        gap_codes(&plan)
+            .iter()
+            .all(|(_, code)| *code != CODE_GAP_UPDATE_VERSION_UNORDERED),
+        "{:?}",
+        plan.gaps
+    );
+}
+
 /// A profile pinned to a digest the registry holds no record of is kept, as
 /// its version cannot be compared with the release package.
 #[test]
