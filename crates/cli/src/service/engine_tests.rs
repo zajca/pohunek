@@ -55,6 +55,10 @@ use crate::service::usage::tests::{
 use crate::service::VERSION;
 use pohunek_platform::supervisor::UnitEnvironment;
 
+#[cfg(target_os = "linux")]
+#[path = "engine_tests_unit_environment.rs"]
+mod unit_environment;
+
 const V1: &str = "1.0.0";
 const V2: &str = "2.0.0";
 /// A supervised version older than and unrelated to the installed one.
