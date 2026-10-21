@@ -2438,6 +2438,57 @@ async fn input_whose_write_failed_after_it_started_is_still_evidence() {
 }
 
 #[tokio::test]
+async fn wait_turn_progress_follows_the_last_transition_into_working() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    let progress = || {
+        registry
+            .turn_events()
+            .existing_progress(&created.id)
+            .expect("progress")
+            .turn_started_nanos()
+    };
+
+    // An edge that opens no turn is still the last transition into `working`.
+    registry.turn_events().pin_wall_clock(10_000);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    assert_eq!(started_turns(&mut edges).len(), 0);
+    assert_eq!(progress(), Some(10_000));
+
+    // A turn that opens on a restatement is ordered after that edge without
+    // moving it: nothing transitioned.
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    registry.note_input(&created.id);
+    registry.turn_events().pin_wall_clock(20_000);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    assert_eq!(started_turns(&mut edges).len(), 1);
+    assert_eq!(progress(), Some(20_000));
+    let mut sessions = registry.inner.sessions.lock().await;
+    sessions
+        .get_mut(&created.id)
+        .expect("the session")
+        .agent_left(&registry.inner.turns);
+    drop(sessions);
+    registry.turn_events().pin_wall_clock(30_000);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    assert_eq!(started_turns(&mut edges).len(), 1);
+    assert_eq!(progress(), Some(20_000), "a restatement is no transition");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
 async fn a_resumed_runtime_banner_is_not_a_turn_until_input_reaches_it() {
     let registry = turn_registry();
     let mut edges = registry

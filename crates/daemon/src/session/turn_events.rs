@@ -368,6 +368,15 @@ impl TurnProgress {
         let now = Instant::now();
         let mut table = self.table();
         table.depart_changed(owner);
+        // `session.wait_turn` reports the last transition into `working` as
+        // the turn start, whether or not the transition opens a turn. A turn
+        // opened by a restatement or an owner change is ordered after it
+        // without moving it. A wall clock that stepped back must not give a
+        // start a smaller value.
+        let nanos = wall_nanos.max(self.turn_started_nanos.load(Ordering::Relaxed) + 1);
+        if next == AgentActivity::Working && previous != Some(AgentActivity::Working) {
+            self.turn_started_nanos.store(nanos, Ordering::Relaxed);
+        }
         // A working report of a new owner opens its own turn even when the
         // session was already working, because the previous turn departed.
         let running = table
@@ -380,10 +389,6 @@ impl TurnProgress {
             if detector_observed && !table.token && !continues_turn(&mut table, previous, now) {
                 return TurnChange::default();
             }
-            // The start orders turns for `session.wait_turn`, so a wall clock
-            // that stepped back must not give a new turn a smaller one.
-            let nanos = wall_nanos.max(self.turn_started_nanos.load(Ordering::Relaxed) + 1);
-            self.turn_started_nanos.store(nanos, Ordering::Relaxed);
             let started = enter_working(&mut table, owner, previous, non_zero(nanos), now);
             if let Some(id) = started {
                 table.take_token(id);

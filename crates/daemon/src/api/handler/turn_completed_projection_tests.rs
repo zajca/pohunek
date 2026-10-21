@@ -13,8 +13,8 @@ use protocol::{method, AgentActivity, NotificationKindPolicy, SessionId};
 use serde_json::{json, Value};
 
 use super::turn_wait_tests::{
-    debounce, every_provider, fresh_cursor, joined, ok, pause_clock, settle, Fixture, CLOCK_STEP,
-    FLUSH_SLACK, LONG_WAIT_MS,
+    debounce, every_provider, fresh_cursor, joined, ok, pause_clock, settle, settled_cursor,
+    Fixture, CLOCK_STEP, FLUSH_SLACK, LONG_WAIT_MS,
 };
 use crate::notifications::default_policy;
 use crate::session::SessionRegistryConfig;
@@ -1024,6 +1024,48 @@ async fn a_turn_stays_unread_when_its_start_and_end_wait_in_the_projector_togeth
     let records = turn_records(&fixture).await;
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0]["status"], "unread", "{records:?}");
+    finish(&fixture, inhibitor, &session).await;
+}
+
+#[tokio::test]
+async fn output_past_a_turns_deadline_without_input_neither_closes_nor_follows_it() {
+    let fixture = enabled_fixture();
+    let session = fixture.session("gated-after-deadline").await;
+    let id = SessionId(session.clone());
+    let inhibitor = pause_clock().await;
+
+    fixture.sessions.note_input(&id);
+    fixture
+        .sessions
+        .feed_detector_activity(&id, AgentActivity::Working)
+        .await;
+    settle().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    fixture
+        .sessions
+        .feed_detector_activity(&id, AgentActivity::Idle)
+        .await;
+    settle().await;
+
+    // The agent goes on working once the settle window has run out, with no
+    // input behind it: the turn is reported as it ended, and nothing opens.
+    tokio::time::advance(debounce()).await;
+    fixture
+        .sessions
+        .feed_detector_activity(&id, AgentActivity::Working)
+        .await;
+    flush_window().await;
+    let records = turn_records(&fixture).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["turn_duration_ms"], 2_000);
+    assert_eq!(records[0]["status"], "unread", "{records:?}");
+
+    fixture
+        .sessions
+        .feed_detector_activity(&id, AgentActivity::Idle)
+        .await;
+    flush_window().await;
+    assert_eq!(turn_records(&fixture).await.len(), 1);
     finish(&fixture, inhibitor, &session).await;
 }
 
