@@ -2,6 +2,7 @@
 
 // Rust guideline compliant 2026-10-14
 
+use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -310,40 +311,6 @@ fn missing_tables_are_named() {
 }
 
 #[test]
-fn unknown_keys_are_rejected_at_every_level() {
-    let fixture = Fixture::new();
-    for text in [
-        replace(GOLDEN, "prefix =", "surprise = 1\nprefix ="),
-        replace(GOLDEN, "uid = 1000", "uid = 1000\nsurprise = 1"),
-        replace(GOLDEN, "grace_ms = 5000", "grace_ms = 5000\nsurprise = 1"),
-        replace(
-            GOLDEN,
-            "initial_startup_grace_ms = 5000",
-            "initial_startup_grace_ms = 5000\nsurprise = 1",
-        ),
-        replace(
-            GOLDEN,
-            "turn_max_ms = 1800000",
-            "turn_max_ms = 1800000\nsurprise = 1",
-        ),
-        replace(
-            GOLDEN,
-            "stderr_tail_bytes = 4096",
-            "stderr_tail_bytes = 4096\nsurprise = 1",
-        ),
-        replace(
-            GOLDEN,
-            "open_files = 8192",
-            "open_files = 8192\nsurprise = 1",
-        ),
-        format!("{GOLDEN}\n[surprise]\nvalue = 1\n"),
-    ] {
-        let message = parse_message(fixture.load(&text));
-        assert!(message.contains("unknown field `surprise`"), "{message}");
-    }
-}
-
-#[test]
 fn mistyped_values_are_parse_errors() {
     let fixture = Fixture::new();
     for text in [
@@ -367,7 +334,11 @@ const SENTINEL_TOKEN: &str = "PH-TOKEN-sentinel-7f3a-ea91";
 /// name and the position survive.
 #[test]
 fn parse_diagnostics_never_quote_file_contents() {
-    let unknown_key = format!("{GOLDEN}\noperator_token = \"{SENTINEL_TOKEN}\"\n");
+    let unknown_key = replace(
+        GOLDEN,
+        "[environment]\n",
+        &format!("[environment]\noperator_token = \"{SENTINEL_TOKEN}\"\n"),
+    );
     let broken_integer = replace(
         GOLDEN,
         "uid = 1000",
@@ -1796,4 +1767,487 @@ fn a_schema_one_file_is_rejected_with_an_actionable_error() {
     assert!(message.contains("pohunek service uninstall"), "{message}");
     assert!(message.contains("pohunek service install"), "{message}");
     assert!(!message.contains("missing field"), "{message}");
+}
+
+// ---------------------------------------------------------------------------
+// Tolerant loading (#1401): unknown keys warn, the security tables stay strict.
+// ---------------------------------------------------------------------------
+
+/// Paths of the unknown keys a config reports, in report order.
+fn unknown_paths(config: &ServiceConfig) -> Vec<&str> {
+    config
+        .unknown_keys()
+        .iter()
+        .map(|key| key.path.as_str())
+        .collect()
+}
+
+/// 1-based line of the first line of `text` that starts with `needle`.
+fn line_of(text: &str, needle: &str) -> usize {
+    text.lines()
+        .position(|line| line.starts_with(needle))
+        .unwrap_or_else(|| panic!("fixture lacks a line starting with {needle:?}"))
+        + 1
+}
+
+/// Value that stands in for a secret a hand-edited file could hold.
+const UNKNOWN_SECRET: &str = "PH-UNKNOWN-sentinel-51c2-b7d0";
+
+#[test]
+fn unknown_keys_in_tolerant_tables_load_and_are_reported() {
+    let fixture = Fixture::new();
+    let text = [
+        ("prefix =", "future_top = \"x\"\nprefix ="),
+        (
+            "worker_connect_ms",
+            "future_deadline = 1\nworker_connect_ms",
+        ),
+        ("grace_ms = 5000", "grace_ms = 5000\nfuture_sweep = 1"),
+        ("submit_delay_ms", "future_input = 1\nsubmit_delay_ms"),
+        (
+            "turn_max_ms = 1800000",
+            "turn_max_ms = 1800000\nfuture_wait = 1",
+        ),
+        (
+            "stderr_tail_bytes = 4096",
+            "stderr_tail_bytes = 4096\nfuture_hook = 1",
+        ),
+        ("open_files = 8192", "open_files = 8192\nfuture_limit = 1"),
+    ]
+    .iter()
+    .fold(GOLDEN.to_owned(), |text, (from, to)| {
+        replace(&text, from, to)
+    });
+
+    let config = fixture
+        .load(&text)
+        .expect("tolerant tables accept unknown keys");
+
+    let mut expected = vec![
+        ("future_top", line_of(&text, "future_top")),
+        (
+            "deadlines.future_deadline",
+            line_of(&text, "future_deadline"),
+        ),
+        ("sweep.future_sweep", line_of(&text, "future_sweep")),
+        ("input.future_input", line_of(&text, "future_input")),
+        ("waits.future_wait", line_of(&text, "future_wait")),
+        ("hooks.future_hook", line_of(&text, "future_hook")),
+        ("limits.future_limit", line_of(&text, "future_limit")),
+    ];
+    let mut reported: Vec<(&str, usize)> = config
+        .unknown_keys()
+        .iter()
+        .map(|key| (key.path.as_str(), key.line))
+        .collect();
+    expected.sort_unstable();
+    reported.sort_unstable();
+    assert_eq!(reported, expected);
+
+    // Known values are untouched by the unknown keys around them.
+    let baseline = fixture.load(GOLDEN).expect("golden loads");
+    assert!(baseline.unknown_keys().is_empty());
+    assert_eq!(config.to_spec(), baseline.to_spec());
+}
+
+#[test]
+fn an_unknown_section_loads_and_is_reported() {
+    let fixture = Fixture::new();
+    let text = format!(
+        "{GOLDEN}\n[future]\nflag = true\n\n[future.nested]\ndeep = 1\n\n[[future_list]]\nitem = 1\n"
+    );
+    let config = fixture.load(&text).expect("an unknown section loads");
+
+    let mut paths = unknown_paths(&config);
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        [
+            "future",
+            "future.flag",
+            "future.nested",
+            "future.nested.deep",
+            "future_list"
+        ]
+    );
+    let section = config
+        .unknown_keys()
+        .iter()
+        .find(|key| key.path == "future.nested.deep")
+        .expect("nested key");
+    assert_eq!(section.line, line_of(&text, "deep"));
+}
+
+#[test]
+fn unknown_keys_in_security_tables_are_refused() {
+    let fixture = Fixture::new();
+    for text in [
+        replace(GOLDEN, "uid = 1000", "uid = 1000\nsurprise = 1"),
+        replace(
+            GOLDEN,
+            "[environment]\n",
+            "[environment]\nsurprise = [\"A\"]\n",
+        ),
+        format!("{GOLDEN}\n[namespace.sub]\nvalue = 1\n"),
+    ] {
+        let message = parse_message(fixture.load(&text));
+        assert!(
+            message.contains("unknown field `surprise`") || message.contains("`sub`"),
+            "{message}"
+        );
+        assert!(message.contains("line "), "{message}");
+    }
+}
+
+#[test]
+fn a_typo_of_a_required_key_fails_with_a_suggestion() {
+    let fixture = Fixture::new();
+    let text = replace(
+        GOLDEN,
+        "stderr_tail_bytes = 4096",
+        "stderr_tail_byte = 4096",
+    );
+    let message = parse_message(fixture.load(&text));
+    assert!(
+        message.contains("missing field `stderr_tail_bytes`"),
+        "{message}"
+    );
+    assert!(
+        message.contains("did you mean `hooks.stderr_tail_bytes`"),
+        "{message}"
+    );
+    assert!(
+        message.contains("`hooks.stderr_tail_byte` is not a key"),
+        "{message}"
+    );
+
+    // A top-level typo of a required table is hinted the same way.
+    let table = replace(GOLDEN, "[limits]", "[limit]");
+    let message = parse_message(fixture.load(&table));
+    assert!(message.contains("missing field `limits`"), "{message}");
+    assert!(message.contains("did you mean `limits`"), "{message}");
+
+    // A key that resembles nothing gets no hint.
+    let far = replace(GOLDEN, "stderr_tail_bytes = 4096", "unrelated = 4096");
+    let message = parse_message(fixture.load(&far));
+    assert!(
+        message.contains("missing field `stderr_tail_bytes`"),
+        "{message}"
+    );
+    assert!(!message.contains("did you mean"), "{message}");
+}
+
+#[test]
+fn a_near_miss_unknown_key_warns_with_a_suggestion() {
+    let fixture = Fixture::new();
+    let text = replace(
+        GOLDEN,
+        "open_files = 8192",
+        "open_files = 8192\nopen_file = 1",
+    );
+    let config = fixture.load(&text).expect("a near miss only warns");
+
+    let key = config
+        .unknown_keys()
+        .iter()
+        .find(|key| key.path == "limits.open_file")
+        .expect("reported");
+    assert_eq!(key.suggestion.as_deref(), Some("limits.open_files"));
+    assert!(
+        key.to_string().contains("did you mean `limits.open_files`"),
+        "{key}"
+    );
+    assert_eq!(config.open_files(), 8192);
+}
+
+#[test]
+fn unknown_keys_never_mask_validation_errors() {
+    let fixture = Fixture::new();
+    let text = replace(
+        &replace(
+            GOLDEN,
+            "open_files = 8192",
+            "open_files = 1\nfuture_limit = 1",
+        ),
+        "prefix =",
+        "future_top = 1\nprefix =",
+    );
+    match fixture.load(&text) {
+        Err(ConfigError::OutOfRange { key, .. }) => assert_eq!(key, "limits.open_files"),
+        other => panic!("expected the open_files range error, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_schema_version_rule_is_unchanged_for_tolerant_files() {
+    let fixture = Fixture::new();
+    let newer = replace(
+        GOLDEN,
+        "schema_version = 6",
+        "schema_version = 7\nfuture_key = true",
+    );
+    assert!(matches!(
+        fixture.load(&newer),
+        Err(ConfigError::UnsupportedSchema { found: 7 })
+    ));
+    let missing = GOLDEN.replacen("schema_version = 6\n", "future_key = 1\n", 1);
+    let message = parse_message(fixture.load(&missing));
+    assert!(
+        message.contains("missing field `schema_version`"),
+        "{message}"
+    );
+}
+
+#[test]
+fn previous_schema_sources_stay_strict() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    for (version, golden, shared_table_line) in [
+        (2, SCHEMA_TWO_GOLDEN, "grace_ms = 5000"),
+        (3, SCHEMA_THREE_GOLDEN, "grace_ms = 5000"),
+        (4, SCHEMA_FOUR_GOLDEN, "grace_ms = 5000"),
+        (5, SCHEMA_FIVE_GOLDEN, "grace_ms = 5000"),
+    ] {
+        fixture.write(golden, 0o600);
+        ServiceConfig::load_upgrade_source(&path)
+            .unwrap_or_else(|error| panic!("schema {version} golden loads: {error}"));
+        for text in [
+            replace(golden, "prefix =", "future_top = 1\nprefix ="),
+            replace(
+                golden,
+                shared_table_line,
+                &format!("{shared_table_line}\nfuture_sweep = 1"),
+            ),
+            format!("{golden}\n[future]\nvalue = 1\n"),
+        ] {
+            fixture.write(&text, 0o600);
+            match ServiceConfig::load_upgrade_source(&path) {
+                Err(ConfigError::Parse { .. }) => {}
+                other => panic!("schema {version} with an unknown key: {other:?}"),
+            }
+            match ServiceConfig::load_upgrade_source_bytes(&path, text.as_bytes()) {
+                Err(ConfigError::Parse { .. }) => {}
+                other => panic!("schema {version} bytes with an unknown key: {other:?}"),
+            }
+        }
+    }
+}
+
+/// Header every rendering starts with.
+const SPEC_HEADER: &str =
+    "# Pohunek service configuration, written by `pohunek service install`.\n\
+# Every key is required. Unknown keys are kept and reported as warnings,\n\
+# except inside [namespace] and [environment], where they are rejected.\n\n";
+
+/// Body of today's rendering of `spec()`, frozen: a file with only schema-6
+/// keys must stay byte-identical below the header, so a strict previous
+/// release reads every file this release writes.
+const SPEC_BODY: &str = r#"schema_version = 6
+prefix = "/home/u/.local"
+active_version = "0.31.6"
+
+[namespace]
+uid = 1000
+state_root = "/home/u/.local/state/pohunek"
+runtime_root = "/run/user/1000/pohunek"
+
+[deadlines]
+worker_connect_ms = 10000
+worker_initialize_ms = 45000
+launchctl_command_ms = 10000
+worker_exit_timeout_ms = 30000
+daemon_exit_timeout_ms = 30000
+daemon_restart_throttle_ms = 5000
+
+[environment]
+search_path = []
+allowlist = ["PATH", "LC_*"]
+
+[sweep]
+grace_ms = 5000
+
+[input]
+initial_startup_grace_ms = 5000
+submit_delay_ms = 150
+write_stall_timeout_ms = 3000
+
+[waits]
+turn_default_ms = 300000
+turn_max_ms = 1800000
+
+[hooks]
+stderr_tail_bytes = 4096
+
+[limits]
+open_files = 8192
+"#;
+
+#[test]
+fn a_schema_6_file_renders_unchanged() {
+    let config = ServiceConfig::new(spec()).expect("valid spec");
+    let rendering = format!("{SPEC_HEADER}{SPEC_BODY}");
+    assert_eq!(config.to_toml(), rendering);
+
+    let fixture = Fixture::new();
+    let reloaded = fixture.load(&rendering).expect("rendering loads");
+    assert!(reloaded.unknown_keys().is_empty());
+    assert_eq!(reloaded.to_toml(), rendering);
+}
+
+/// Parses rendered output into a plain table for structural comparison.
+fn table_of(text: &str) -> toml::Table {
+    toml::from_str(text).expect("rendered output is TOML")
+}
+
+#[test]
+fn rendering_preserves_unknown_keys() {
+    let fixture = Fixture::new();
+    let text = format!(
+        "{}\n[future]\nflag = true\nname = \"{UNKNOWN_SECRET}\"\n\n[future.nested]\ndeep = [1, 2]\n",
+        replace(
+            &replace(GOLDEN, "prefix =", "future_top = \"top\"\nprefix ="),
+            "open_files = 8192",
+            "open_files = 8192\nfuture_limit = 7\n\n[limits.extra]\ninner = \"v\"",
+        ),
+    );
+    let config = fixture.load(&text).expect("loads");
+    let rendered = config.to_toml();
+
+    let original = table_of(&text);
+    let again = table_of(&rendered);
+    assert_eq!(again, original, "rendered:\n{rendered}");
+
+    // Typed values win, are written once, and the reload reports the same keys.
+    assert_eq!(rendered.matches("open_files =").count(), 1, "{rendered}");
+    let reloaded = fixture.load(&rendered).expect("rendered file loads");
+    assert_eq!(unknown_paths(&reloaded), unknown_paths(&config));
+    assert_eq!(reloaded.to_toml(), rendered, "rendering is stable");
+
+    // A changed typed value is written from the typed value, not from the file.
+    let edited = config.with_active_version("0.31.7").expect("new version");
+    assert_eq!(edited.active_version(), "0.31.7");
+    assert_eq!(unknown_paths(&edited), unknown_paths(&config));
+    let edited_table = table_of(&edited.to_toml());
+    assert_eq!(edited_table["future_top"].as_str(), Some("top"));
+    assert_eq!(edited_table["active_version"].as_str(), Some("0.31.7"));
+}
+
+/// Layouts whose unknown subtrees interleave with known tables and with each
+/// other, so a rewrite has to keep ancestors, dotted keys and order apart.
+fn interleaved_layouts() -> Vec<String> {
+    let secret = UNKNOWN_SECRET;
+    let before_limits = |extra: &str| replace(GOLDEN, "[limits]", &format!("{extra}\n[limits]"));
+    vec![
+        // Unknown tables around a known table whose dotted unknown key has a
+        // later sub-table.
+        replace(
+            &before_limits("[future]\nk = 1\n"),
+            "open_files = 8192",
+            &format!(
+                "open_files = 8192\nextra.foo = \"{secret}\"\n\n[limits.extra.bar]\nb = \"{secret}\"\n\n[future.tail]\nt = 3"
+            ),
+        ),
+        // An unknown array of tables and an unknown table inside a known one.
+        replace(
+            &before_limits(&format!("[[plugin]]\nname = \"{secret}\"\n\n[[plugin]]\nname = \"two\"\n")),
+            "grace_ms = 5000",
+            &format!("grace_ms = 5000\n\n[sweep.later]\nv = \"{secret}\"\n\n[sweep.later.deep]\nw = 1"),
+        ),
+        // Unknown inline values and an unknown table under the root only.
+        replace(
+            &replace(GOLDEN, "prefix =", &format!("top = {{ a = \"{secret}\", b = [1, 2] }}\nprefix =")),
+            "[limits]",
+            "[zz]\nlast = 1\n\n[limits]",
+        ),
+    ]
+}
+
+#[test]
+fn rendering_keeps_interleaved_unknown_subtrees_valid_and_stable() {
+    let fixture = Fixture::new();
+    for text in interleaved_layouts() {
+        let config = fixture.load(&text).expect("loads");
+        let rendered = config.to_toml();
+        assert_eq!(table_of(&rendered), table_of(&text), "{rendered}");
+        let reloaded = fixture.load(&rendered).expect("rendered file loads");
+        let sorted = |config: &ServiceConfig| {
+            let mut paths = unknown_paths(config);
+            paths.sort_unstable();
+            paths.into_iter().map(str::to_owned).collect::<Vec<_>>()
+        };
+        assert_eq!(sorted(&reloaded), sorted(&config));
+        assert_eq!(reloaded.to_toml(), rendered, "rendering is stable");
+        let upgraded = config.with_active_version("0.31.7").expect("new version");
+        fixture
+            .load(&upgraded.to_toml())
+            .expect("an upgraded rendering loads");
+    }
+}
+
+#[test]
+fn many_unknown_keys_stay_within_the_file_bound() {
+    let fixture = Fixture::new();
+    let mut text = format!("{GOLDEN}\n[future]\n");
+    let mut count = 0usize;
+    while text.len() + 16 < MAX_CONFIG_BYTES {
+        writeln!(text, "k{count} = 1").expect("writing to String is infallible");
+        count += 1;
+    }
+    assert!(text.len() <= MAX_CONFIG_BYTES);
+    let config = fixture.load(&text).expect("loads within the bound");
+    assert_eq!(config.unknown_keys().len(), count + 1);
+    assert_eq!(
+        table_of(&config.to_toml())["future"]
+            .as_table()
+            .expect("kept table")
+            .len(),
+        count
+    );
+}
+
+#[test]
+fn unknown_key_values_are_never_echoed_by_the_library() {
+    let fixture = Fixture::new();
+    let text = replace(
+        GOLDEN,
+        "open_files = 8192",
+        &format!("open_files = 8192\nfuture_secret = \"{UNKNOWN_SECRET}\""),
+    );
+    let config = fixture.load(&text).expect("loads");
+    let surfaces = format!(
+        "{:?} {:?}",
+        config,
+        config
+            .unknown_keys()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert!(!surfaces.contains(UNKNOWN_SECRET), "{surfaces}");
+    assert!(surfaces.contains("limits.future_secret"), "{surfaces}");
+}
+
+#[test]
+fn a_rewrite_that_outgrows_the_load_bound_is_refused_and_leaves_the_file() {
+    let fixture = Fixture::new();
+    // A compact array just under the bound; the rendering spreads it out.
+    let big = format!(
+        "big = [{}]\n",
+        vec!["0"; (MAX_CONFIG_BYTES - GOLDEN.len() - 64) / 2].join(",")
+    );
+    let text = format!("{GOLDEN}\n[future]\n{big}");
+    assert!(text.len() <= MAX_CONFIG_BYTES);
+    let path = fixture.write(&text, 0o600);
+    let config = ServiceConfig::load(&path).expect("loads within the bound");
+
+    assert!(
+        config.to_toml().len() > MAX_CONFIG_BYTES,
+        "the fixture must outgrow the bound"
+    );
+    let result = config.write(&path);
+    assert!(
+        matches!(result, Err(ConfigError::TooLarge { .. })),
+        "{result:?}"
+    );
+    assert_eq!(fs::read_to_string(&path).expect("read"), text);
 }

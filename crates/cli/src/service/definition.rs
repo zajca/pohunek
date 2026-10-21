@@ -107,17 +107,46 @@ pub(crate) fn config_with_search_path(
     })?)
 }
 
+/// Describes the unknown keys of the loaded `service.toml` as one warning.
+///
+/// Returns `None` for a file without unknown keys. The warning names key
+/// paths and lines, never values, and lists at most
+/// [`settings::MAX_LISTED_UNKNOWN_KEYS`] of them.
+#[must_use]
+pub fn unknown_keys_warning(config: &ServiceConfig) -> Option<String> {
+    let keys = config.unknown_keys();
+    if keys.is_empty() {
+        return None;
+    }
+    let listed: Vec<String> = keys
+        .iter()
+        .take(settings::MAX_LISTED_UNKNOWN_KEYS)
+        .map(ToString::to_string)
+        .collect();
+    let mut warning = format!(
+        "service.toml holds {} key(s) this version does not know; they are ignored and kept \
+         when the file is rewritten: {}",
+        keys.len(),
+        listed.join(", ")
+    );
+    let rest = keys.len().saturating_sub(listed.len());
+    if rest > 0 {
+        std::fmt::Write::write_fmt(&mut warning, format_args!(", and {rest} more"))
+            .expect("writing to String is infallible");
+    }
+    Some(warning)
+}
+
 /// Returns `config` with only its active version changed.
 ///
-/// The recorded search path is kept, so an upgrade never re-runs discovery.
+/// The recorded search path and the unknown keys of the loaded file are kept,
+/// so an upgrade never re-runs discovery or drops a setting it does not own.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Config`] for an invalid version.
 pub fn with_version(config: &ServiceConfig, version: &str) -> Result<ServiceConfig, Error> {
-    let mut spec = config.to_spec();
-    version.clone_into(&mut spec.active_version);
-    Ok(ServiceConfig::new(spec)?)
+    Ok(config.with_active_version(version)?)
 }
 
 /// Builds the daemon's job definition for `config`.

@@ -606,3 +606,52 @@ fn check_reports_pending_migration_after_the_current_schema_write() {
         "{report:?}: the journal still describes a schema-2 migration"
     );
 }
+
+/// Replaces the rendered header of the current-schema target with the wording
+/// an older release wrote, optionally changing one body value.
+fn rewrite_target_header(config: &Path, alter_body: bool) {
+    let text = fs::read_to_string(config).expect("read the written target");
+    let body =
+        String::from_utf8(pohunek_service_config::body_after_header(text.as_bytes()).to_vec())
+            .expect("body is text");
+    let body = if alter_body {
+        body.replacen("grace_ms = 5000", "grace_ms = 5001", 1)
+    } else {
+        body
+    };
+    let old = "# Pohunek service configuration, written by `pohunek service install`.\n\
+# Every key is required; unknown keys are rejected.\n\n";
+    fs::write(config, format!("{old}{body}")).expect("rewrite the target");
+}
+
+#[test]
+fn a_pending_migration_resumes_across_a_header_wording_change_but_not_a_body_change() {
+    for alter_body in [false, true] {
+        let host = Host::schema_two();
+        let (success, envelope) = check_with_setup(&host, |config, state, source| {
+            pending_migration(config, state, source, Step::Registered, Some(source));
+            rewrite_target_header(config, alter_body);
+        });
+        if alter_body {
+            assert!(!success, "{envelope}");
+            assert_eq!(
+                envelope
+                    .get("err")
+                    .and_then(|err| err.get("code"))
+                    .and_then(Value::as_str),
+                Some("service_config_backup_invalid"),
+                "{envelope}"
+            );
+        } else {
+            assert!(success, "{envelope}");
+            assert_eq!(
+                envelope
+                    .get("ok")
+                    .and_then(|ok| ok.get("pending_action"))
+                    .and_then(Value::as_str),
+                Some("resume"),
+                "{envelope}"
+            );
+        }
+    }
+}

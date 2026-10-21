@@ -100,7 +100,9 @@ already installed and no interrupted install is pending), which:
   keeps the prefix recorded in `service.toml` and refuses a different
   `POHUNEK_INSTALL_PREFIX`;
 - writes `~/.config/pohunek/service.toml` (mode `0600`) with every deadline,
-  the agent environment allowlist, and the installation namespace;
+  the agent environment allowlist, and the installation namespace; keys it does
+  not know are reported as warnings and kept, except in `[namespace]` and
+  `[environment]`, where they are refused;
 - registers the daemon as the only login service: the systemd user unit
   `pohunek-<ns>-daemon.service` and slice `pohunek-<ns>-sessions.slice` on Linux
   (systemd 255 or newer), or the launchd agent

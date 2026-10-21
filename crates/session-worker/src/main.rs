@@ -9,7 +9,9 @@ use std::process::ExitCode;
 
 use pohunek_paths::{validate_socket_path, BasePaths, Platform, SocketKind};
 use pohunek_service_config::ServiceConfig;
-use pohunek_session_worker::{load_service_config, Server, ServerArgs, WorkerConfig, WorkerError};
+use pohunek_session_worker::{
+    load_service_config, log_unknown_service_keys, Server, ServerArgs, WorkerConfig, WorkerError,
+};
 use tracing::{event, Level};
 use tracing_subscriber::prelude::*;
 
@@ -142,6 +144,9 @@ async fn run() -> Result<(), WorkerError> {
         SocketKind::Daemon,
     )?;
     let _log_guard = init_logging(&paths.log_dir, &cli.session_id)?;
+    if let Some(service) = &service {
+        log_unknown_service_keys(service);
+    }
     let hook_trace_path = paths
         .log_dir
         .join(pohunek_logging::config::HOOK_TRACE_FILE_NAME);

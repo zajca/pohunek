@@ -167,13 +167,15 @@ use pohunek_platform::supervisor::{
 };
 use pohunek_service_config::preflight::PreflightReport;
 use pohunek_service_config::runtimes::EnsureReport;
-use pohunek_service_config::{ServiceConfig, UpgradeSource, SCHEMA_VERSION};
+use pohunek_service_config::{
+    body_after_header, ConfigError, ServiceConfig, UpgradeSource, MAX_CONFIG_BYTES, SCHEMA_VERSION,
+};
 use protocol::SessionInfo;
 
 use super::backend::Backend;
 use super::context::Context;
 use super::definition::{
-    config_with_search_path, daemon_definition, identity_config, with_version,
+    config_with_search_path, daemon_definition, identity_config, unknown_keys_warning, with_version,
 };
 use super::error::{supervisor_error, Error, LiveSession, OutdatedWorker};
 use super::layout::{self, Staged, VerifiedVersionDir};
@@ -658,6 +660,7 @@ impl<'a> Engine<'a> {
             verify_pending_migration(self.context, &self.store, record, &source)?;
         }
         let config = &source.config;
+        check_upgrade_renderings(config, version, resume.is_some(), &config_path)?;
         let layout = config.layout().clone();
         check_layout_dirs(self.context, &layout)?;
         layout::claim_prefix(&layout, &config.namespace())?;
@@ -672,7 +675,7 @@ impl<'a> Engine<'a> {
                 .refresh_active_version(staged, &layout, version)
                 .await?;
             return Ok(UpgradeReport {
-                warnings: Vec::new(),
+                warnings: unknown_keys_warning(config).into_iter().collect(),
                 from_version,
                 to_version: version.to_owned(),
                 unchanged: true,
@@ -753,6 +756,7 @@ impl<'a> Engine<'a> {
         if let Some(gated) = &gated {
             warnings.extend(gated.warnings.iter().cloned());
         }
+        warnings.extend(unknown_keys_warning(&target));
         let (removed_versions, kept_versions, gc_error) =
             self.collect_garbage_reported(&layout, version).await;
         Ok(UpgradeReport {
@@ -1041,10 +1045,12 @@ impl<'a> Engine<'a> {
             unreadable_journals: Vec::new(),
             pending_transaction,
             transaction_in_progress,
+            warnings: Vec::new(),
         };
         let Some(config) = config else {
             return Ok(report);
         };
+        report.warnings.extend(unknown_keys_warning(config));
         let layout = config.layout();
         report.namespace = Some(config.namespace().as_str().to_owned());
         report.prefix = Some(layout.prefix().to_path_buf());
@@ -1850,7 +1856,11 @@ impl<'a> Engine<'a> {
             path: config_path.to_path_buf(),
         })?;
         let restored = with_version(&current, previous)?;
-        restored.write(config_path)?;
+        // A file that never left the previous version is already restored;
+        // rewriting it could only fail on a rendering above the load bound.
+        if current.active_version() != previous {
+            restored.write(config_path)?;
+        }
         Ok(restored)
     }
 
@@ -3327,6 +3337,66 @@ fn launchd_job_path<'a>(
     })))
 }
 
+/// Refuses an upgrade whose configuration rendering exceeds the load bound.
+///
+/// Kept unknown keys can make a rendering larger than the file it came from.
+/// Every rendering the plan writes is checked before the first effect, so
+/// neither the upgrade nor its rollback can hit the bound later. A rollback
+/// writes only when the file already left the previous version, and writes the
+/// journaled original bytes for a schema migration; an upgrade to the active
+/// version rewrites nothing.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::TooLarge`] without changing anything.
+pub(crate) fn check_planned_renderings(
+    config: &ServiceConfig,
+    version: &str,
+    plan: &Plan,
+    path: &Path,
+) -> Result<(), Error> {
+    let mut resuming = false;
+    let mut after_rollback = config.clone();
+    match plan {
+        Plan::Fresh => {}
+        Plan::Resume(_) => resuming = true,
+        Plan::RollBack(record) => {
+            if let Some(previous) = &record.previous_version {
+                after_rollback = with_version(config, previous)?;
+                if record.config_backup.is_none() && config.active_version() != previous {
+                    check_rendering_size(&after_rollback, path)?;
+                }
+            }
+        }
+    }
+    check_upgrade_renderings(&after_rollback, version, resuming, path)
+}
+
+/// Refuses an upgrade whose current or target rendering exceeds the bound.
+pub(crate) fn check_upgrade_renderings(
+    config: &ServiceConfig,
+    version: &str,
+    resuming: bool,
+    path: &Path,
+) -> Result<(), Error> {
+    if !resuming && config.active_version() == version {
+        return Ok(());
+    }
+    check_rendering_size(config, path)?;
+    check_rendering_size(&with_version(config, version)?, path)
+}
+
+fn check_rendering_size(config: &ServiceConfig, path: &Path) -> Result<(), Error> {
+    if config.to_toml().len() > MAX_CONFIG_BYTES {
+        return Err(ConfigError::TooLarge {
+            path: path.to_path_buf(),
+            max_bytes: MAX_CONFIG_BYTES,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Checks a pending configuration migration without changing the file or job.
 ///
 /// `service check`, upgrade resume, and rollback use the same journal and
@@ -3334,7 +3404,8 @@ fn launchd_job_path<'a>(
 /// previous daemon's exact config can be restored.
 /// At `StopDaemon`, the config can be either the old bytes or the rendered
 /// target: a crash may have happened after the atomic write and before its
-/// checkpoint. Later forward steps require the exact target; a rollback can
+/// checkpoint. Later forward steps require the target body, whatever header
+/// text the writing release put above it; a rollback can
 /// also have restored the exact old bytes. Any third content is refused.
 ///
 /// # Errors
@@ -3369,7 +3440,8 @@ pub(crate) fn verify_pending_migration(
                 ));
             }
             let target = with_version(&previous.config, &record.version)?;
-            if source.original_bytes() == target.to_toml().as_bytes()
+            if body_after_header(source.original_bytes())
+                == body_after_header(target.to_toml().as_bytes())
                 || (source.original_bytes() == bytes
                     && (record.step == Step::StopDaemon || record.rolling_back))
             {

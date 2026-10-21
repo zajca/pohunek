@@ -205,6 +205,52 @@ async fn managed_cli_lists_sessions_and_rejects_self_attach_across_daemon_restar
         .expect("retire managed CLI session");
 }
 
+/// Value that stands in for a secret a hand-edited `service.toml` holds under
+/// a key this version does not know.
+const UNKNOWN_KEY_SECRET: &str = "PH-DAEMON-E2E-sentinel-0c5d-7e13";
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"
+)]
+async fn the_daemon_starts_on_a_newer_minor_file_and_warns_per_key() {
+    let fixture = Installation::new(Settings::default()).await;
+    let text = std::fs::read_to_string(&fixture.config_path).expect("read service.toml");
+    let text = text.replacen(
+        "[limits]\n",
+        &format!("[limits]\nfuture_limit = \"{UNKNOWN_KEY_SECRET}\"\n"),
+        1,
+    );
+    // Writing in place keeps the owner-private mode of the existing file.
+    std::fs::write(
+        &fixture.config_path,
+        format!("{text}\n[future]\nname = \"{UNKNOWN_KEY_SECRET}\"\n"),
+    )
+    .expect("write service.toml");
+
+    fixture.start_daemon().await;
+    fixture.client().await;
+
+    let mut logged = String::new();
+    for entry in std::fs::read_dir(&fixture.paths.log_dir).expect("daemon log directory") {
+        let path = entry.expect("log entry").path();
+        if path.is_file() {
+            logged.push_str(&String::from_utf8_lossy(
+                &std::fs::read(&path).expect("read log"),
+            ));
+        }
+    }
+    assert_eq!(
+        logged.matches("service_config.unknown_key").count(),
+        3,
+        "{logged}"
+    );
+    assert!(logged.contains("limits.future_limit"), "{logged}");
+    assert!(logged.contains("\"key.path\":\"future.name\""), "{logged}");
+    assert!(!logged.contains(UNKNOWN_KEY_SECRET), "{logged}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(
     target_os = "linux",

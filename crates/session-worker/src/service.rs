@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use pohunek_paths::BasePaths;
 use pohunek_service_config::{ConfigError, ServiceConfig};
+use tracing::{event, Level};
 
 /// Reports why a worker refuses its service configuration.
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +74,24 @@ pub fn load_service_config(
     config.verify_installation(uid, &paths.state_dir, &paths.runtime_dir)?;
     verify_executable(&config, executable)?;
     Ok(config)
+}
+
+/// Logs each unknown key of `config` at debug level.
+///
+/// Every generation loads the same file, so the daemon alone warns about
+/// unknown keys; repeating the warning on each spawn would flood the log. The
+/// worker calls this after its logging is initialized, because a subscriber
+/// installed later would not see the events.
+pub fn log_unknown_service_keys(config: &ServiceConfig) {
+    for key in config.unknown_keys() {
+        event!(
+            Level::DEBUG,
+            event = "service_config.unknown_key",
+            key.path = %key.path,
+            key.line = key.line,
+            "service.toml holds a key this version does not know; it is ignored"
+        );
+    }
 }
 
 /// Requires `executable` to be the worker binary of a recorded version directory.
@@ -221,6 +240,62 @@ mod tests {
 
         assert_eq!(config.active_version(), VERSION);
         assert_eq!(config.environment_allowlist(), ["PATH", "LC_*"]);
+    }
+
+    /// Shared buffer a test subscriber writes its formatted events to.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log capture").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn a_worker_generation_loads_unknown_keys_quietly() {
+        const SECRET: &str = "PH-WORKER-sentinel-6e02-91cd";
+        let installation = installation();
+        let executable = install_worker(&installation.prefix, VERSION);
+        let text = fs::read_to_string(&installation.config_path).expect("read service.toml");
+        let text = text.replacen(
+            "[limits]\n",
+            &format!("[limits]\nfuture_limit = \"{SECRET}\"\n"),
+            1,
+        );
+        fs::write(&installation.config_path, text).expect("write service.toml");
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(Level::DEBUG)
+            .finish();
+        let config = tracing::subscriber::with_default(subscriber, || {
+            let config = installation.load(&executable).expect("tolerant load");
+            log_unknown_service_keys(&config);
+            config
+        });
+
+        assert_eq!(config.unknown_keys().len(), 1);
+        let logged = String::from_utf8_lossy(&capture.0.lock().expect("log capture")).into_owned();
+        assert!(logged.contains("limits.future_limit"), "{logged}");
+        assert!(logged.contains("DEBUG"), "{logged}");
+        assert!(!logged.contains("WARN"), "{logged}");
+        assert!(!logged.contains(SECRET), "{logged}");
     }
 
     #[test]

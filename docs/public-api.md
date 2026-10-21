@@ -2260,6 +2260,29 @@ migrated the same way, with only the stall bound assigned. The `[hooks]` table
 for the `session.new` warning, `0..=32768` with 0 disabling the capture, 4096
 on fresh installs and migrations) raised it to 6; a schema-5 file is migrated
 the same way, with only the hooks default assigned.
+`service.toml` tolerates keys this version does not know (#1401). The
+`schema_version` changes only for a breaking change: a removed or renamed key, a
+changed meaning or unit, or validation that rejects a file that was valid
+before. An additive optional key with a documented default does not change it,
+and the writer omits such a key while it equals the default, so the previous
+release still reads a file this release rewrote. A schema-6 file with an
+unknown key or table loads; the key is ignored, and the daemon logs one
+`service_config.unknown_key` warning per key at start (key path, line and file,
+never the value; a worker generation logs it at debug only). `pohunek service
+status`, the `warnings` of `service check` and of the success report of
+`service upgrade`, and the `service_config_unknown_keys` check of `pohunek
+doctor` (`warn` listing the key paths and lines with a "did you mean" hint, `ok`
+when there are none) report them. The unknown keys of the tolerant tables and
+sections are kept in place when the installer rewrites the file (an upgrade, a
+reinstall or a rollback), and the upgrade says so in the same warning. An
+unknown key in `[namespace]` or `[environment]` stays a hard error naming the
+key, because an older binary must not skip a setting that moves a root or
+narrows the environment; a new setting there or among the top-level identity
+keys bumps the schema. A missing required key stays an error, with a "did you
+mean" hint when an unknown key of the same table resembles it, and an invalid
+value of a known key fails whatever unknown keys surround it. The schema 2 to 5
+upgrade sources are read in their exact shapes and still refuse an unknown key.
+The status report carries the same additive `warnings` list.
 `service check` and the success reports of `pohunek service upgrade` name that
 migration in an additive `config_schema_migration` field (the source schema,
 `2`, `3`, `4` or `5`, or `null` when no migration runs); the check runs it read-only. The migration stops the daemon before it rewrites

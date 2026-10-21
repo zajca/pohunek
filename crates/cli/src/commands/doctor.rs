@@ -39,6 +39,9 @@ const JOB_RUNNING: &str = "running";
 /// `launchd_job` state of a daemon job the service manager gave up on.
 const JOB_FAILED: &str = "failed";
 
+/// Name of the check that reports `service.toml` keys this version does not know.
+const SERVICE_CONFIG_UNKNOWN_KEYS_CHECK: &str = "service_config_unknown_keys";
+
 /// Run `doctor`. Returns `true` if the environment is healthy (no fatal checks).
 ///
 /// # Errors
@@ -87,6 +90,7 @@ pub(crate) async fn diagnose(paths: &Paths) -> Result<Report, CliError> {
     });
     let platform = hostcheck::current_platform();
     checks.extend(working_directory_check(platform, &working_dir));
+    checks.extend(service_config_unknown_keys_check(&paths.config_dir));
     let job_status = if platform == Platform::MacOs {
         Some(crate::service::status().await)
     } else {
@@ -151,6 +155,30 @@ fn working_directory_check(
              existing directory you can read"
         ),
     ))
+}
+
+/// Reports the keys of an installed `service.toml` this version does not know.
+///
+/// The check is `warn` and lists key paths and lines, never values. Nothing is
+/// reported without an installed file or when it cannot be loaded; `pohunek
+/// service status` reports that.
+fn service_config_unknown_keys_check(config_dir: &Path) -> Option<DoctorCheck> {
+    let config = pohunek_service_config::ServiceConfig::load(
+        &config_dir.join(pohunek_service_config::FILE_NAME),
+    )
+    .ok()?;
+    Some(
+        match crate::service::definition::unknown_keys_warning(&config) {
+            Some(warning) => {
+                DoctorCheck::new(SERVICE_CONFIG_UNKNOWN_KEYS_CHECK, Status::Warn, warning)
+            }
+            None => DoctorCheck::new(
+                SERVICE_CONFIG_UNKNOWN_KEYS_CHECK,
+                Status::Ok,
+                "service.toml holds no keys this version does not know",
+            ),
+        },
+    )
 }
 
 /// The supervision mode this process can infer for the daemon.
@@ -436,6 +464,7 @@ mod tests {
             unreadable_journals: Vec::new(),
             pending_transaction: None,
             transaction_in_progress: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -702,6 +731,100 @@ mod tests {
         assert!(working_directory_check(Platform::Linux, &error).is_none());
         let ok: std::io::Result<PathBuf> = Ok(PathBuf::from("/work"));
         assert!(working_directory_check(Platform::MacOs, &ok).is_none());
+    }
+
+    /// A schema-6 `service.toml` with the given extra lines in `[limits]`.
+    fn service_toml(extra_limits: &str) -> String {
+        format!(
+            r#"schema_version = 6
+prefix = "/home/u/.local"
+active_version = "0.35.2"
+
+[namespace]
+uid = 1000
+state_root = "/home/u/.local/state/pohunek"
+runtime_root = "/run/user/1000/pohunek"
+
+[deadlines]
+worker_connect_ms = 10000
+worker_initialize_ms = 45000
+launchctl_command_ms = 10000
+worker_exit_timeout_ms = 30000
+daemon_exit_timeout_ms = 30000
+daemon_restart_throttle_ms = 5000
+
+[environment]
+search_path = []
+allowlist = ["PATH"]
+
+[sweep]
+grace_ms = 5000
+
+[input]
+initial_startup_grace_ms = 5000
+submit_delay_ms = 150
+write_stall_timeout_ms = 3000
+
+[waits]
+turn_default_ms = 300000
+turn_max_ms = 1800000
+
+[hooks]
+stderr_tail_bytes = 4096
+
+[limits]
+open_files = 8192
+{extra_limits}"#
+        )
+    }
+
+    /// Writes `text` as the owner-private `service.toml` of a fresh config directory.
+    fn config_dir_with(text: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (guard, base) = unique_temp_dir();
+        std::fs::create_dir(&base).expect("create config dir");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod config dir");
+        let file = base.join(pohunek_service_config::FILE_NAME);
+        std::fs::write(&file, text).expect("write service.toml");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod service.toml");
+        (guard, base)
+    }
+
+    #[test]
+    fn doctor_reports_unknown_service_config_keys() {
+        const SECRET: &str = "PH-DOCTOR-sentinel-2b9f-77a0";
+        let (_clean_guard, clean) = config_dir_with(&service_toml(""));
+        let check = service_config_unknown_keys_check(&clean).expect("a check for a clean file");
+        assert_eq!(check.name, "service_config_unknown_keys");
+        assert_eq!(check.status, Status::Ok);
+
+        let (_guard, dir) = config_dir_with(&service_toml(&format!(
+            "open_file = \"{SECRET}\"\nfuture_limit = 1\n"
+        )));
+        let check = service_config_unknown_keys_check(&dir).expect("a check for an unknown key");
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.detail.contains("limits.open_file"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("limits.future_limit"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("did you mean `limits.open_files`"),
+            "{}",
+            check.detail
+        );
+        assert!(!check.detail.contains(SECRET), "{}", check.detail);
+
+        // Nothing is reported without an installed file.
+        let (_missing_guard, missing) = unique_temp_dir();
+        assert!(service_config_unknown_keys_check(&missing).is_none());
     }
 
     #[test]

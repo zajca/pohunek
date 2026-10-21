@@ -147,6 +147,12 @@ pub const RUNTIMES_APPLY_TIMEOUT: Duration = Duration::from_secs(600);
 /// any realistic host; the cap bounds memory for a binary that floods stdout.
 pub const RUNTIMES_OUTPUT: usize = 1024 * 1024;
 
+/// Most unknown `service.toml` keys a warning names before it counts the rest.
+///
+/// A hand-edited file can hold thousands of unknown keys; the warning stays a
+/// few lines, and the daemon log and `pohunek doctor` carry the full list.
+pub const MAX_LISTED_UNKNOWN_KEYS: usize = 8;
+
 /// Largest state file the runtime step backs up or restores.
 ///
 /// The package registry grows with the installed packages and each profile is

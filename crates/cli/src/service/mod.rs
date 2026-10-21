@@ -298,7 +298,7 @@ async fn finish_check(
         checked.report.accepted_runtime_loss |= gated.accepted;
         checked.report.acceptance = gated.acceptance;
         checked.report.preflight = Some(gated.report);
-        checked.report.warnings = warnings;
+        checked.report.warnings.extend(warnings);
         checked.report.warnings.extend(gated.warnings);
     }
     Ok(checked.report)
@@ -919,6 +919,10 @@ pub(crate) enum Adoption {
 /// # Errors
 ///
 /// See [`check`].
+#[expect(
+    clippy::too_many_lines,
+    reason = "the check mirrors install and upgrade in transaction order; splitting it would separate the decisions from the state they read"
+)]
 pub(crate) fn check_local(
     context: &Context,
     prefix: Option<PathBuf>,
@@ -936,7 +940,7 @@ pub(crate) fn check_local(
     let pending_install = pending
         .as_ref()
         .is_some_and(|record| record.operation == record::Operation::Install);
-    let (operation, prefix, namespace, plan, config_schema_migration) =
+    let (operation, prefix, namespace, plan, config_schema_migration, config_warnings) =
         if pending_install || !exists(&config_path)? {
             let prefix = match prefix {
                 Some(prefix) => prefix,
@@ -957,7 +961,14 @@ pub(crate) fn check_local(
             }
             let namespace = context.namespace()?;
             layout::verify_claim(&layout, &namespace)?;
-            (record::Operation::Install, prefix, namespace, plan, None)
+            (
+                record::Operation::Install,
+                prefix,
+                namespace,
+                plan,
+                None,
+                None,
+            )
         } else {
             let config_source = verified_config_source(context)?;
             engine::upgrade_preflight(context)?;
@@ -966,6 +977,7 @@ pub(crate) fn check_local(
                 engine::verify_pending_migration(context, &store, record, &config_source)?;
             }
             let config = &config_source.config;
+            engine::check_planned_renderings(config, version, &plan, &config_path)?;
             if engine::swaps_daemon(&plan, Some(config.active_version()), version) {
                 adoption = Adoption::Required;
             }
@@ -992,6 +1004,7 @@ pub(crate) fn check_local(
                 config.namespace(),
                 plan,
                 config_schema_migration,
+                definition::unknown_keys_warning(config),
             )
         };
     let fresh_install =
@@ -1002,6 +1015,7 @@ pub(crate) fn check_local(
         }
         _ => None,
     };
+    let warnings = config_warnings.into_iter().collect();
     let report = report::CheckReport {
         operation: operation.as_str(),
         version: version.to_owned(),
@@ -1019,7 +1033,7 @@ pub(crate) fn check_local(
         accepted_runtime_loss: false,
         acceptance: report::AcceptanceGroups::default(),
         config_schema_migration,
-        warnings: Vec::new(),
+        warnings,
     };
     Ok(Checked {
         report,
@@ -1169,6 +1183,7 @@ async fn status_of(context: &Context) -> Result<report::StatusReport, Error> {
             pending_transaction: store
                 .load()?
                 .map(|pending| engine::pending_report(&pending)),
+            warnings: Vec::new(),
         });
     }
     let config = verified_config(context)?;
