@@ -9,6 +9,7 @@
 use std::fs::File;
 use std::io::{BufReader, ErrorKind};
 use std::path::Path;
+use std::time::SystemTime;
 
 use ::plist::Value;
 
@@ -16,6 +17,9 @@ use super::super::Error;
 
 /// Operation label of the domain `PATH` read, in supervisor errors.
 const OPERATION: &str = "read_launchd_domain_path";
+
+/// Operation label of the configuration's modification-time read.
+const MODIFIED_OPERATION: &str = "read_launchd_domain_config_time";
 
 /// The launchd user-domain configuration, which `launchctl config user path`
 /// writes (see `launchctl(1)`).
@@ -38,6 +42,42 @@ pub const STANDARD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 /// See [`read_user_domain_path`].
 pub fn user_domain_path() -> Result<String, Error> {
     read_user_domain_path(Path::new(USER_DOMAIN_CONFIG))
+}
+
+/// Returns when the user domain's configuration at `config` last changed.
+///
+/// A symbolic link is dated by the later of the link and its target. An absent
+/// file is dated by its directory, whose modification time moves
+/// when the file is created, replaced or removed: the file was gone since then.
+///
+/// # Errors
+///
+/// Returns [`Error::Unavailable`] when neither the file nor its directory can
+/// be dated.
+pub fn user_domain_config_modified(config: &Path) -> Result<SystemTime, Error> {
+    let modified = |path: &Path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .map_err(|source| Error::Unavailable {
+                operation: MODIFIED_OPERATION,
+                source: Box::new(source),
+            })
+    };
+    match std::fs::symlink_metadata(config) {
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            modified(config.parent().unwrap_or_else(|| Path::new(".")))
+        }
+        // A link is replaced without touching its target, and a target is
+        // rewritten without touching the link: the later of the two dates it.
+        Ok(link) if link.file_type().is_symlink() => {
+            let link = link.modified().map_err(|source| Error::Unavailable {
+                operation: MODIFIED_OPERATION,
+                source: Box::new(source),
+            })?;
+            Ok(link.max(modified(config)?))
+        }
+        _ => modified(config),
+    }
 }
 
 /// Reads the user domain's `PATH` from the property list at `config`.
@@ -111,6 +151,48 @@ mod tests {
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>{entries}</dict></plist>\n"
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn the_configuration_is_dated_by_its_file_or_else_its_directory() {
+        let temp = pohunek_test_support::tempdir().expect("scratch directory");
+        let epoch = |seconds: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+        let date = |path: &Path, when: SystemTime| {
+            File::open(path)
+                .and_then(|file| file.set_modified(when))
+                .expect("date the path");
+        };
+
+        let config = config_in(&temp, "user.plist", &dictionary_xml(""));
+        date(&config, epoch(1_000));
+        date(temp.path(), epoch(2_000));
+        assert_eq!(
+            user_domain_config_modified(&config).expect("file"),
+            epoch(1_000)
+        );
+
+        std::fs::remove_file(&config).expect("remove");
+        date(temp.path(), epoch(3_000));
+        assert_eq!(
+            user_domain_config_modified(&config).expect("directory"),
+            epoch(3_000)
+        );
+
+        // A link made after the boot to a target older than it is a recent change.
+        let target = config_in(&temp, "target.plist", &dictionary_xml(""));
+        date(&target, epoch(1_000));
+        std::os::unix::fs::symlink(&target, &config).expect("link");
+        let linked = std::fs::symlink_metadata(&config)
+            .and_then(|metadata| metadata.modified())
+            .expect("link time");
+        assert!(linked > epoch(1_000));
+        assert_eq!(user_domain_config_modified(&config).expect("link"), linked);
+
+        let orphan = temp.path().join("absent").join("user.plist");
+        assert!(matches!(
+            user_domain_config_modified(&orphan),
+            Err(Error::Unavailable { .. })
+        ));
     }
 
     #[test]

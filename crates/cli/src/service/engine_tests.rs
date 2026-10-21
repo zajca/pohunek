@@ -9,6 +9,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+#[cfg(target_os = "macos")]
+use std::time::SystemTime;
 
 use package::ANCHOR_FILE_NAME;
 use pohunek_client::ClientError;
@@ -2725,6 +2727,8 @@ struct FakeLaunchd {
     no_domain: bool,
     /// The boot identity the host reports.
     boot: Mutex<Result<String, String>>,
+    /// When the host reports it booted.
+    boot_time: Mutex<Result<SystemTime, String>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -2736,7 +2740,13 @@ impl FakeLaunchd {
             domain_reads: AtomicUsize::new(0),
             no_domain: false,
             boot: Mutex::new(Ok(FIRST_BOOT.to_owned())),
+            boot_time: Mutex::new(Ok(boot_time())),
         }
+    }
+
+    /// Changes the boot time the host reports.
+    fn set_boot_time(&self, value: Result<SystemTime, String>) {
+        *self.boot_time.lock().expect("boot time") = value;
     }
 
     /// Changes the boot identity the host reports, as a reboot does.
@@ -2786,6 +2796,10 @@ impl LaunchdJob for FakeLaunchd {
     fn boot_identity(&self) -> Result<String, String> {
         self.boot.lock().expect("boot identity").clone()
     }
+
+    fn boot_time(&self) -> Result<SystemTime, String> {
+        self.boot_time.lock().expect("boot time").clone()
+    }
 }
 
 /// A launchd that reports `loaded` while the fake service manager holds the
@@ -2829,11 +2843,21 @@ impl LaunchdJob for FlipLaunchd {
     fn boot_identity(&self) -> Result<String, String> {
         Ok(self.boot.clone())
     }
+
+    fn boot_time(&self) -> Result<SystemTime, String> {
+        Ok(boot_time())
+    }
 }
 
 /// The boot identity a fake launchd host starts with.
 #[cfg(target_os = "macos")]
 const FIRST_BOOT: &str = "6D0CBE3B-5C31-4E4B-A1B0-0F2B6A4D5A11";
+/// When the fake launchd host booted: far enough ahead that a file written by a
+/// test predates the boot unless the test dates it after.
+#[cfg(target_os = "macos")]
+fn boot_time() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(4_000_000_000)
+}
 /// The boot identity after a reboot.
 #[cfg(target_os = "macos")]
 const SECOND_BOOT: &str = "A94F0E57-77C2-4B61-9D3F-2C6E8B1A7F42";
@@ -10555,27 +10579,41 @@ async fn an_unreadable_boot_time_journals_the_default_without_a_marker() {
 }
 
 /// Without a readable boot identity the journal cannot prove the loaded default
-/// after the stop; a persisted configuration that disagrees is refused while the
-/// job still runs.
+/// after the stop; the persisted configuration is taken for it only when it
+/// predates the boot and agrees, and anything else is refused while the job
+/// still runs.
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn an_unreadable_boot_identity_with_a_disagreeing_persisted_path_refuses_before_the_swap() {
-    let mut harness = Harness::new();
-    let launchd = FakeLaunchd::new(Ok(loaded_job(JOURNALED_PATH.to_owned())));
-    launchd.set_boot(Err("sysctl failed".to_owned()));
-    harness.context = harness
-        .context
-        .clone()
-        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged)
-        .with_launchd_job(Arc::new(launchd));
-    harness.install(V1).await.expect("install");
-    let replaces = harness.fake.world().replaces;
-    let error = harness
-        .upgrade(V2)
-        .await
-        .expect_err("the PATH after the stop cannot be told");
-    assert_eq!(error.code(), "service_manager_environment_unavailable");
-    assert_eq!(harness.fake.world().replaces, replaces, "no replacement");
+async fn an_unreadable_boot_identity_refuses_before_the_swap_unless_the_persisted_path_proves_the_default(
+) {
+    for (persisted, modified, accepted) in [
+        (PENDING_PATH, Modified::BeforeBoot, false),
+        (JOURNALED_PATH, Modified::AfterBoot, false),
+        (JOURNALED_PATH, Modified::BeforeBoot, true),
+    ] {
+        let mut harness = Harness::new();
+        let launchd = FakeLaunchd::new(Ok(loaded_job(JOURNALED_PATH.to_owned())));
+        launchd.set_boot(Err("sysctl failed".to_owned()));
+        let domain = harness.root.join("user.plist");
+        std::fs::write(&domain, launchd_domain_xml(persisted)).expect("domain configuration");
+        date(&domain, modified).expect("date the configuration");
+        harness.context = harness
+            .context
+            .clone()
+            .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged)
+            .with_launchd_domain_config(&domain)
+            .with_launchd_job(Arc::new(launchd));
+        harness.install(V1).await.expect("install");
+        let replaces = harness.fake.world().replaces;
+        let result = harness.upgrade(V2).await;
+        if accepted {
+            result.expect("the persisted configuration proves the default");
+        } else {
+            let error = result.expect_err("the PATH after the stop cannot be told");
+            assert_eq!(error.code(), "service_manager_environment_unavailable");
+            assert_eq!(harness.fake.world().replaces, replaces, "no replacement");
+        }
+    }
 }
 
 /// A job that records its `PATH` never depends on the launchd default, so an
@@ -10658,19 +10696,39 @@ async fn judging_the_path_before_the_application_roots_exist_creates_nothing() {
     assert!(!state.exists() && !runtime.exists(), "nothing was created");
 }
 
+/// When the persisted user-domain configuration last changed, relative to the boot.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+enum Modified {
+    BeforeBoot,
+    AfterBoot,
+}
+
+/// Dates `path` (a file or a directory) as `modified` says.
+#[cfg(target_os = "macos")]
+fn date(path: &std::path::Path, modified: Modified) -> std::io::Result<()> {
+    let when = match modified {
+        Modified::BeforeBoot => boot_time() - Duration::from_secs(3600),
+        Modified::AfterBoot => boot_time() + Duration::from_secs(3600),
+    };
+    std::fs::File::open(path)?.set_modified(when)
+}
+
 /// The pending upgrade of [`interrupted_upgrade_journal`], rolled back on a host
 /// whose launchd does not have the job loaded.
 ///
 /// `plist_at_journal` is the persisted user-domain `PATH` when the upgrade
 /// journals; `plist_now` is what it holds at the rollback (`None`: the file was
-/// removed). Returns the paths the rollback's gates judged.
+/// removed) and `modified` when it, or its directory, last changed. Returns the
+/// paths the rollback's gates judged.
 #[cfg(target_os = "macos")]
 async fn rollback_after_journal(
     harness: &mut Harness,
     plist_at_journal: &str,
     plist_now: Option<&str>,
+    modified: Modified,
     edit_journal: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
-    boot: Result<String, String>,
+    host: impl FnOnce(&FakeLaunchd),
 ) -> Result<Vec<String>, Error> {
     let domain = harness.root.join("user.plist");
     std::fs::write(&domain, launchd_domain_xml(plist_at_journal)).expect("domain configuration");
@@ -10685,12 +10743,15 @@ async fn rollback_after_journal(
         serde_json::to_vec(&document).expect("journal bytes"),
     )
     .expect("rewrite journal");
-    match plist_now {
-        Some(value) => std::fs::write(&domain, launchd_domain_xml(value)).expect("domain"),
-        None => std::fs::remove_file(&domain).expect("remove the configuration"),
+    if let Some(value) = plist_now {
+        std::fs::write(&domain, launchd_domain_xml(value)).expect("domain");
+        date(&domain, modified).expect("date the configuration");
+    } else {
+        std::fs::remove_file(&domain).expect("remove the configuration");
+        date(&harness.root, modified).expect("date the directory");
     }
     let launchd = FakeLaunchd::new(Ok(not_loaded()));
-    launchd.set_boot(boot);
+    host(&launchd);
     harness.context = harness.context.clone().with_launchd_job(Arc::new(launchd));
     let preflight = ScriptedPreflight::default();
     let judged = Arc::clone(&preflight.search_paths);
@@ -10701,6 +10762,12 @@ async fn rollback_after_journal(
         .await?;
     let judged = judged.lock().expect("search path lock").clone();
     Ok(judged)
+}
+
+/// A host that rebooted since the upgrade journaled.
+#[cfg(target_os = "macos")]
+fn rebooted(launchd: &FakeLaunchd) {
+    launchd.set_boot(Ok(SECOND_BOOT.to_owned()));
 }
 
 /// The journal of a pending upgrade holds the persisted `PATH` next to the default.
@@ -10836,8 +10903,9 @@ async fn the_same_boot_keeps_the_journaled_default_over_a_pending_persisted_chan
         &mut harness,
         PENDING_PATH,
         Some(PENDING_PATH),
+        Modified::AfterBoot,
         |_| {},
-        Ok(FIRST_BOOT.to_owned()),
+        |_| {},
     )
     .await;
     assert_judged(&judged, JOURNALED_PATH);
@@ -10851,15 +10919,17 @@ async fn the_same_boot_does_not_need_a_readable_persisted_configuration() {
         &mut harness,
         PENDING_PATH,
         Some("<not a property list"),
+        Modified::AfterBoot,
         |_| {},
-        Ok(FIRST_BOOT.to_owned()),
+        |_| {},
     )
     .await;
     assert_judged(&judged, JOURNALED_PATH);
 }
 
-/// A reboot activated the pending value; scheduling the journaled one again
-/// afterwards does not make it the active one.
+/// The configuration scheduled `PATH` C, a reboot applied it, and it was then
+/// changed back to the journaled B: the file's value equals the journal's, but it
+/// was written after the boot, so launchd still applies C.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_configuration_changed_back_to_the_journaled_value_after_a_reboot_is_refused() {
@@ -10868,109 +10938,214 @@ async fn a_configuration_changed_back_to_the_journaled_value_after_a_reboot_is_r
         &mut harness,
         PENDING_PATH,
         Some(JOURNALED_PATH),
+        Modified::AfterBoot,
         |_| {},
-        Ok(SECOND_BOOT.to_owned()),
+        rebooted,
     )
     .await;
-    assert_rollback_refused(&judged, "changed since the upgrade journaled it");
+    assert_rollback_refused(&judged, "modified after the host booted");
+
+    // B journaled, C scheduled and applied by the reboot, B written again: the
+    // file equals what it held at the journal write, which proves nothing.
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        JOURNALED_PATH,
+        Some(JOURNALED_PATH),
+        Modified::AfterBoot,
+        |_| {},
+        rebooted,
+    )
+    .await;
+    assert_rollback_refused(&judged, "modified after the host booted");
 }
 
+/// The same value in a file that predates the boot is the one launchd applied.
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn a_reboot_after_the_journal_write_prefers_the_persisted_configuration_it_journaled() {
+async fn a_configuration_that_predates_the_boot_is_the_active_default() {
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        JOURNALED_PATH,
+        Some(JOURNALED_PATH),
+        Modified::BeforeBoot,
+        |_| {},
+        rebooted,
+    )
+    .await;
+    assert_judged(&judged, JOURNALED_PATH);
+
     let mut harness = Harness::new();
     let judged = rollback_after_journal(
         &mut harness,
         PENDING_PATH,
         Some(PENDING_PATH),
+        Modified::BeforeBoot,
         |_| {},
-        Ok(SECOND_BOOT.to_owned()),
+        rebooted,
     )
     .await;
     assert_judged(&judged, PENDING_PATH);
 }
 
+/// A journal written while the persisted `PATH` was still journaled carries a
+/// field the rule ignores: it neither refuses nor decides.
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn a_persisted_change_or_removal_after_the_journal_write_is_refused_unless_it_agrees() {
+async fn a_stale_persisted_snapshot_in_the_journal_is_ignored() {
+    let stale = |journal: &mut serde_json::Map<String, serde_json::Value>| {
+        journal.insert(
+            "launchd_persisted_path".to_owned(),
+            serde_json::Value::String(JOURNALED_PATH.to_owned()),
+        );
+    };
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        Some(PENDING_PATH),
+        Modified::BeforeBoot,
+        stale,
+        rebooted,
+    )
+    .await;
+    assert_judged(&judged, PENDING_PATH);
+
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        Some(JOURNALED_PATH),
+        Modified::AfterBoot,
+        stale,
+        rebooted,
+    )
+    .await;
+    assert_rollback_refused(&judged, "modified after the host booted");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_persisted_change_or_removal_after_the_boot_is_refused() {
     const LATER: &str = "/opt/later/bin:/usr/bin";
     let mut harness = Harness::new();
     let judged = rollback_after_journal(
         &mut harness,
         PENDING_PATH,
         Some(LATER),
+        Modified::AfterBoot,
         |_| {},
-        Ok(SECOND_BOOT.to_owned()),
+        rebooted,
     )
     .await;
-    assert_rollback_refused(&judged, "changed since the upgrade journaled it");
+    assert_rollback_refused(&judged, "modified after the host booted");
+
+    // A removal is dated by the directory that held the file.
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        None,
+        Modified::AfterBoot,
+        |_| {},
+        rebooted,
+    )
+    .await;
+    assert_rollback_refused(&judged, "modified after the host booted");
 
     let mut harness = Harness::new();
     let judged = rollback_after_journal(
         &mut harness,
         PENDING_PATH,
         None,
+        Modified::BeforeBoot,
         |_| {},
-        Ok(SECOND_BOOT.to_owned()),
+        rebooted,
     )
     .await;
-    assert_rollback_refused(&judged, "changed since the upgrade journaled it");
+    assert_judged(
+        &judged,
+        pohunek_platform::supervisor::launchd::STANDARD_PATH,
+    );
 }
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn a_journal_without_a_boot_marker_or_snapshot_is_used_only_when_the_values_agree() {
+async fn a_configuration_or_boot_time_that_cannot_be_dated_is_refused() {
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        Some(PENDING_PATH),
+        Modified::BeforeBoot,
+        |_| {},
+        |launchd| {
+            rebooted(launchd);
+            launchd.set_boot_time(Err("sysctl failed".to_owned()));
+        },
+    )
+    .await;
+    assert_rollback_refused(&judged, "boot time cannot be read");
+}
+
+/// Without a boot marker the time rule applies too, and the persisted value
+/// must equal the journaled one.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_journal_without_a_boot_marker_is_used_only_when_the_file_predates_the_boot_and_agrees() {
     let drop_marker = |journal: &mut serde_json::Map<String, serde_json::Value>| {
         journal.remove("launchd_boot_identity");
     };
-    let drop_snapshot = |journal: &mut serde_json::Map<String, serde_json::Value>| {
-        journal.remove("launchd_persisted_path");
-    };
-    // No marker: equal values pass.
     let mut harness = Harness::new();
     let judged = rollback_after_journal(
         &mut harness,
         JOURNALED_PATH,
         Some(JOURNALED_PATH),
+        Modified::BeforeBoot,
         drop_marker,
-        Ok(SECOND_BOOT.to_owned()),
+        rebooted,
     )
     .await;
     assert_judged(&judged, JOURNALED_PATH);
-    // No marker: different values are refused.
+
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        JOURNALED_PATH,
+        Some(JOURNALED_PATH),
+        Modified::AfterBoot,
+        drop_marker,
+        rebooted,
+    )
+    .await;
+    assert_rollback_refused(&judged, "modified after the host booted");
+
     let mut harness = Harness::new();
     let judged = rollback_after_journal(
         &mut harness,
         PENDING_PATH,
         Some(PENDING_PATH),
+        Modified::BeforeBoot,
         drop_marker,
-        Ok(FIRST_BOOT.to_owned()),
+        |_| {},
     )
     .await;
     assert_rollback_refused(&judged, "no boot marker");
-    // A marker for another boot but no snapshot: refused too.
-    let mut harness = Harness::new();
-    let judged = rollback_after_journal(
-        &mut harness,
-        PENDING_PATH,
-        Some(PENDING_PATH),
-        drop_snapshot,
-        Ok(SECOND_BOOT.to_owned()),
-    )
-    .await;
-    assert_rollback_refused(&judged, "no snapshot of the persisted configuration");
 }
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn an_unreadable_current_boot_identity_is_judged_like_a_missing_marker() {
+    let unreadable = |launchd: &FakeLaunchd| launchd.set_boot(Err("sysctl failed".to_owned()));
     let mut harness = Harness::new();
     let judged = rollback_after_journal(
         &mut harness,
         JOURNALED_PATH,
         Some(JOURNALED_PATH),
+        Modified::BeforeBoot,
         |_| {},
-        Err("sysctl failed".to_owned()),
+        unreadable,
     )
     .await;
     assert_judged(&judged, JOURNALED_PATH);
@@ -10980,23 +11155,12 @@ async fn an_unreadable_current_boot_identity_is_judged_like_a_missing_marker() {
         &mut harness,
         PENDING_PATH,
         Some(PENDING_PATH),
+        Modified::BeforeBoot,
         |_| {},
-        Err("sysctl failed".to_owned()),
+        unreadable,
     )
     .await;
     assert_rollback_refused(&judged, "current boot identity cannot be read");
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn the_upgrade_journals_the_persisted_path_next_to_the_default() {
-    let mut harness = Harness::new();
-    let domain = harness.root.join("user.plist");
-    std::fs::write(&domain, launchd_domain_xml(PENDING_PATH)).expect("domain configuration");
-    harness.context = harness.context.clone().with_launchd_domain_config(&domain);
-    interrupted_upgrade_journal(&mut harness).await;
-    let record = harness.pending().expect("pending");
-    assert_eq!(record.launchd_persisted_path.as_deref(), Some(PENDING_PATH));
 }
 
 /// A unit as the manager reports it: the unit file at `FragmentPath` with the

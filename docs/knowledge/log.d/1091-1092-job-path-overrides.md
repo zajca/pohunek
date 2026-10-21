@@ -6,6 +6,6 @@ replaced by an `Environment=PATH=` of a drop-in of the daemon unit (the install 
 a masked or broken unit and drop-ins of a unit with no file are refused with
 `service_manager_environment_unavailable` and a message naming the file or directive
 to change. On macOS the upgrade journal records the boot identity next to the launchd
-default (`launchd_boot_identity`, the boot session UUID) and a snapshot of the persisted configuration (`launchd_persisted_path`); after a reboot the persisted configuration is used while it equals the snapshot,
-and a journal without the marker is used only when the persisted configuration agrees.
+default (`launchd_boot_identity`, the boot session UUID); after a reboot the persisted configuration is used only when `user.plist` was last modified before the current boot,
+and a journal without the marker also needs the persisted value to equal the journaled default.
 See the [upgrade runbook](runbooks/update-after-release.md) and `docs/public-api.md`.

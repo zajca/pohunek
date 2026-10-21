@@ -2476,9 +2476,9 @@ the domain's `environment` `PATH` (`launchctl print gui/<uid>`, set by `launchct
 setenv`), else the `default environment` of the loaded job (`launchctl print
 gui/<uid>/<label>`), else, for a job that is not loaded, the launchd default an
 upgrade journaled while the job was loaded and the host has not rebooted since (the
-journal records the boot session UUID and a snapshot of the persisted configuration; after a
-reboot the persisted configuration decides while it still equals the snapshot, and an undecidable
-difference, also without a marker or snapshot, is refused),
+journal records the boot session UUID; after a reboot the persisted configuration decides only
+when `user.plist` was last modified before the current boot, and one modified later, or without a
+readable time, is refused; without a marker the persisted value must also equal the journaled one),
 else the persisted launchd configuration, the best evidence available. A rollback judges with the same order,
 so the `PATH` it uses is the one the restored job gets where launchd can still
 report it; a `warning:` line names a journal that gave no default. An

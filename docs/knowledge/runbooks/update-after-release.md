@@ -924,11 +924,9 @@ other apply.
 An interrupted upgrade leaves its transaction journal, `service-install.json` in
 the CLI's state directory. On macOS it holds the launchd default `PATH` of the
 previous daemon job, in the optional `launchd_default_path` field, read from the
-loaded job when the upgrade started; the boot session UUID of that moment
-(`kern.bootsessionuuid`, which only a reboot changes) in `launchd_boot_identity`;
-and the `PATH` of the persisted launchd user-domain configuration at that moment
-in `launchd_persisted_path`. Linux never writes these fields, and a journal
-written without them has none.
+loaded job when the upgrade started, and the boot session UUID of that moment
+(`kern.bootsessionuuid`, which only a reboot changes) in `launchd_boot_identity`.
+Linux never writes these fields, and a journal written without them has none.
 
 A job without a recorded `PATH` gets, in launchd's order: the domain's `PATH` (set
 with `launchctl setenv`, readable whether or not the job is loaded); the loaded
@@ -948,19 +946,17 @@ default cannot be read keeps the existing journal.
 
 A reboot after the journal write makes a pending `launchctl config user path`
 active, so a journal whose boot session UUID differs from the current one is not
-used: the persisted configuration is, provided it still equals the journaled
-snapshot. A different value (changed, or the file removed, after the journal
-write) cannot be dated by any clock, so what launchd applied is unknown. A
-journal without a boot UUID, or a host whose boot UUID cannot be read, cannot
-tell either: the journaled default is then used only when the persisted
-configuration gives the same `PATH`. When the reboot is known (the boot UUID
-differs) and the persisted configuration does not equal the journaled snapshot,
-equal values prove nothing (the configuration may have been applied and changed
-back), so the call is always refused. In every undecidable case the call
-is refused with `service_manager_environment_unavailable`, and the message names
-the fix (set the `PATH` with `launchctl setenv PATH <directories>` in the GUI
-session; where no reboot is known, also making `launchctl config user path` match
-the journaled value).
+used: the persisted configuration is, but only when `user.plist` was last
+modified before the current boot (`kern.boottime`; for an absent file, its
+directory's modification time). A later write is pending, or was applied by the
+boot and changed again, and its value says nothing about what launchd applied:
+equality with the journaled default or with any earlier value is never evidence.
+A journal without a boot UUID, or a host whose boot UUID cannot be read, cannot
+tell whether a reboot happened: the same time rule applies and the persisted
+value must also equal the journaled default. A configuration modified after the
+boot, one whose time cannot be read, or an unreadable boot time is refused with
+`service_manager_environment_unavailable`; the message names the fix (set the
+`PATH` with `launchctl setenv PATH <directories>` in the GUI session).
 
 On Linux a job gets the systemd user manager's `Environment` `PATH`, replaced by
 `ExecSearchPath=` (joined with `:`) and then by an `Environment=PATH=`, both only

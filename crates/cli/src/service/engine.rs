@@ -549,7 +549,6 @@ impl<'a> Engine<'a> {
                     runtime_backup: None,
                     launchd_default_path: None,
                     launchd_boot_identity: None,
-                    launchd_persisted_path: None,
                     accepted_risks: None,
                 };
                 self.store.save(&record)?;
@@ -711,9 +710,6 @@ impl<'a> Engine<'a> {
             let launchd_boot_identity = launchd_default_path
                 .as_ref()
                 .and_then(|_| journaled_boot_identity(self.context));
-            let launchd_persisted_path = launchd_default_path
-                .as_ref()
-                .and_then(|_| journaled_persisted_path(self.context));
             let record = Record {
                 schema_version: record::SCHEMA_VERSION,
                 operation: Operation::Upgrade,
@@ -728,7 +724,6 @@ impl<'a> Engine<'a> {
                 runtime_backup: None,
                 launchd_default_path,
                 launchd_boot_identity,
-                launchd_persisted_path,
                 accepted_risks: None,
             };
             self.store.save(&record)?;
@@ -1481,24 +1476,25 @@ impl<'a> Engine<'a> {
             return Ok(());
         };
         let boot = journaled_boot_identity(self.context);
-        let persisted = journaled_persisted_path(self.context);
-        if boot.is_none() && persisted.as_deref() != Some(default.as_str()) {
+        if boot.is_none() {
             // Without a boot identity the journal cannot prove the default after
-            // the stop, and the persisted configuration disagrees with it: refuse
-            // now, while the job still runs.
-            return Err(Error::ManagerEnvironment {
-                detail: "the boot identity cannot be read and the persisted launchd user-domain configuration differs from the loaded job's PATH, so the PATH after the job is stopped cannot be told. Set the PATH explicitly with `launchctl setenv PATH <directories>` in the GUI session and retry".to_owned(),
-            });
+            // the stop: refuse now, while the job still runs, unless the
+            // persisted configuration would be taken for it then.
+            journaled_or_persisted_path(
+                self.context,
+                JournalDefault {
+                    path: &default,
+                    boot_identity: None,
+                },
+            )?;
         }
         if record.launchd_default_path.as_deref() == Some(default.as_str())
             && record.launchd_boot_identity == boot
-            && record.launchd_persisted_path == persisted
         {
             return Ok(());
         }
         record.launchd_default_path = Some(default);
         record.launchd_boot_identity = boot;
-        record.launchd_persisted_path = persisted;
         self.store.save(record)
     }
 
@@ -3077,8 +3073,6 @@ pub(crate) struct JournalDefault<'a> {
     pub(crate) path: &'a str,
     /// The boot identity read with it, when it could be.
     pub(crate) boot_identity: Option<&'a str>,
-    /// The persisted user-domain `PATH` read with it, when it could be.
-    pub(crate) persisted_path: Option<&'a str>,
 }
 
 impl Record {
@@ -3089,7 +3083,6 @@ impl Record {
             .map(|path| JournalDefault {
                 path,
                 boot_identity: self.launchd_boot_identity.as_deref(),
-                persisted_path: self.launchd_persisted_path.as_deref(),
             })
     }
 }
@@ -3444,14 +3437,15 @@ fn persisted_user_domain_path(context: &Context) -> Result<String, Error> {
 /// configuration when the host rebooted since it was journaled.
 ///
 /// The default was read from the loaded job's environment, which a pending
-/// `launchctl config user path` replaces at the next boot. A different boot
-/// identity (the kernel's boot session UUID, which a clock change leaves alone)
-/// makes the persisted value the active one, provided the persisted
-/// configuration still holds the value journaled with the default: a different
-/// value was written, or the file removed, at a time no clock can date, so what
-/// is active cannot be told. Without a boot identity, without that snapshot, or
-/// when the current boot identity cannot be read, the two sources are compared:
-/// equal values need no decision, different ones are refused.
+/// `launchctl config user path` replaces at the next boot. After a boot change
+/// (a different kernel boot session UUID, which a clock change leaves alone) the
+/// persisted value is the active one only when `user.plist` was last modified
+/// before the current boot: a later write is pending, or applied and changed
+/// again, and equality with any earlier value proves nothing about it. A
+/// configuration modified after the boot, or whose time or the boot time cannot
+/// be read, is refused. Without a boot marker, or when the current boot identity
+/// cannot be read, the same time rule applies and the persisted value must also
+/// equal the journaled one.
 #[cfg(target_os = "macos")]
 fn journaled_or_persisted_path(
     context: &Context,
@@ -3465,62 +3459,56 @@ fn journaled_or_persisted_path(
             return Ok((journal.path.to_owned(), PathSource::Journal));
         }
     }
-    let persisted = persisted_user_domain_path(context)?;
-    // After a reboot the persisted value may have been applied and changed back,
-    // so its equality with the journaled default proves nothing; only a missing
-    // or unreadable marker leaves the two values as the best evidence.
-    let (reason, equality_decides) = match (journal.boot_identity, &current) {
-        (Some(_), Ok(_)) => match journal.persisted_path {
-            Some(snapshot) if snapshot == persisted => {
-                return Ok((persisted, PathSource::Persisted));
-            }
-            Some(_) => (
-                "the persisted configuration changed since the upgrade journaled it".to_owned(),
-                false,
-            ),
-            None => (
-                "the journal holds no snapshot of the persisted configuration".to_owned(),
-                false,
-            ),
-        },
-        (None, _) => ("the journal has no boot marker".to_owned(), true),
-        (Some(_), Err(error)) => (
-            format!("the current boot identity cannot be read ({error})"),
-            true,
-        ),
-    };
-    if equality_decides && persisted == journal.path {
-        return Ok((persisted, PathSource::Journal));
-    }
-    let fix = if equality_decides {
-        "Set the PATH explicitly with `launchctl setenv PATH <directories>` in the GUI session, or make `launchctl config user path` match the journaled value, and retry"
-    } else {
-        "Set the PATH explicitly with `launchctl setenv PATH <directories>` in the GUI session and retry"
-    };
-    Err(Error::ManagerEnvironment {
+    let boot_changed = journal.boot_identity.is_some() && current.is_ok();
+    let refuse = |reason: String| {
+        Error::ManagerEnvironment {
         detail: format!(
-            "the daemon job is not loaded and the PATH the upgrade journaled differs from, or cannot be confirmed against, the persisted launchd user-domain configuration, and which of them is active cannot be told ({reason}). {fix}"
+            "the daemon job is not loaded and which PATH launchd applies cannot be told ({reason}). Set the PATH explicitly with `launchctl setenv PATH <directories>` in the GUI session and retry"
         ),
-    })
-}
-
-/// The persisted user-domain `PATH` to journal next to a launchd default, or
-/// `None` with a warning when it cannot be read.
-#[cfg(target_os = "macos")]
-fn journaled_persisted_path(context: &Context) -> Option<String> {
-    match persisted_user_domain_path(context) {
-        Ok(path) => Some(path),
-        Err(error) => {
-            tracing::warn!(%error, "the persisted launchd PATH cannot be read, so the journal holds no snapshot of it");
-            None
-        }
     }
-}
-
-/// Only macOS journals a launchd default.
-#[cfg(not(target_os = "macos"))]
-fn journaled_persisted_path(_context: &Context) -> Option<String> {
-    None
+    };
+    let booted = context
+        .launchd_job()
+        .boot_time()
+        .map_err(|error| refuse(format!("the boot time cannot be read: {error}")))?;
+    let date = || {
+        pohunek_platform::supervisor::launchd::user_domain_config_modified(
+            context.launchd_domain_config(),
+        )
+        .map_err(|error| {
+            refuse(format!(
+                "the launchd user-domain configuration cannot be dated: {error}"
+            ))
+        })
+    };
+    let changed = date()?;
+    if changed >= booted {
+        return Err(refuse(
+            "the launchd user-domain configuration was modified after the host booted, so it may be pending or may have been applied and changed again".to_owned(),
+        ));
+    }
+    let persisted = persisted_user_domain_path(context)?;
+    // A write between the dating and the read would make the date describe
+    // another configuration than the one read.
+    if date()? != changed {
+        return Err(refuse(
+            "the launchd user-domain configuration changed while it was read".to_owned(),
+        ));
+    }
+    if !boot_changed && persisted != journal.path {
+        let why = if journal.boot_identity.is_none() {
+            "the journal has no boot marker".to_owned()
+        } else {
+            format!(
+                "the current boot identity cannot be read ({})",
+                current.err().unwrap_or_default()
+            )
+        };
+        return Err(refuse(format!(
+            "the persisted configuration differs from the PATH the upgrade journaled and {why}"
+        )));
+    }
+    Ok((persisted, PathSource::Persisted))
 }
 
 /// The boot identity to journal next to a launchd default, or `None` with a

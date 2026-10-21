@@ -80,6 +80,27 @@ impl DarwinInspector {
 
         native::boot_session_uuid().map_err(|source| facility_error(OPERATION, source))
     }
+
+    /// Returns when the host booted (`kern.boottime`), on the calendar clock.
+    ///
+    /// The kernel shifts it together with the clock, so it compares with file
+    /// modification times however the clock was set since.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed inspection failures.
+    pub fn boot_time(&self) -> Result<std::time::SystemTime, Error> {
+        const OPERATION: &str = "read_boot_time";
+
+        let (seconds, microseconds) =
+            native::boot_time().map_err(|source| facility_error(OPERATION, source))?;
+        let seconds = u64::try_from(seconds)
+            .map_err(|_sign| layout_error(OPERATION, LayoutError::Malformed))?;
+        let microseconds = u32::try_from(microseconds)
+            .map_err(|_sign| layout_error(OPERATION, LayoutError::Malformed))?;
+        Ok(std::time::UNIX_EPOCH
+            + std::time::Duration::new(seconds, microseconds.saturating_mul(1000)))
+    }
 }
 
 impl ProcessInspector for DarwinInspector {

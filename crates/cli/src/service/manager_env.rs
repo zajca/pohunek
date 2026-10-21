@@ -1084,6 +1084,10 @@ pub trait LaunchdJob: Debug + Send + Sync {
     /// cannot be read. Two equal values mean no reboot happened between the
     /// reads, whatever the clock did.
     fn boot_identity(&self) -> Result<String, String>;
+
+    /// Returns when the host booted, on the calendar clock the persisted
+    /// configuration's modification time is on, or why it cannot be read.
+    fn boot_time(&self) -> Result<std::time::SystemTime, String>;
 }
 
 /// A pending read of a launchd domain's variables, in launchd's order, or
@@ -1160,6 +1164,19 @@ impl LaunchdJob for SystemLaunchd {
     /// The boot identity of a launchd host exists only on macOS.
     #[cfg(not(target_os = "macos"))]
     fn boot_identity(&self) -> Result<String, String> {
+        Err("launchd exists only on macOS".to_owned())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn boot_time(&self) -> Result<std::time::SystemTime, String> {
+        pohunek_platform::process::DarwinInspector::new()
+            .boot_time()
+            .map_err(|error| error.to_string())
+    }
+
+    /// The boot time of a launchd host exists only on macOS.
+    #[cfg(not(target_os = "macos"))]
+    fn boot_time(&self) -> Result<std::time::SystemTime, String> {
         Err("launchd exists only on macOS".to_owned())
     }
 }
