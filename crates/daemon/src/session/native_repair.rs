@@ -8,6 +8,9 @@
 //! `binding_native_launch` applies to a binding without a snapshot program. A
 //! binding that cannot be resolved stays loadable: it logs a WARN, carries a
 //! [`SessionWarningKind::NativeRecovery`] warning and is never resumed.
+//!
+//! The repair is a function of a [`ProfileRegistry`], so the upgrade preflight
+//! applies the same rule over the registry the new daemon will have.
 
 // Rust guideline compliant 2026-10-12
 
@@ -15,11 +18,11 @@ use protocol::{RuntimeRef, SessionCapabilities, SessionWarning, SessionWarningKi
 use tracing::warn;
 
 use super::{ResumeBinding, SessionRecord, SessionRegistry};
-use crate::agent::SessionRefKind;
+use crate::agent::{ProfileRegistry, SessionRefKind};
 
 /// What resolving one binding's launch spec did.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum NativeRepair {
+enum NativeRepair {
     /// The binding was not marked, or already carries a spec.
     NotNeeded,
     /// The binding gained its launch spec.
@@ -29,105 +32,14 @@ pub(super) enum NativeRepair {
 }
 
 impl SessionRegistry {
-    /// Resolves the launch spec of a marked binding by agent name, against
-    /// the definition its launch pin names.
-    ///
-    /// The flag is cleared only when the spec was set or was already present,
-    /// so an unresolved binding is retried on the next load.
-    pub(super) fn repair_native_launch(&self, binding: &mut ResumeBinding) -> NativeRepair {
-        if !binding.native_launch_unresolved {
-            return NativeRepair::NotNeeded;
-        }
-        if binding.native_launch.is_some() {
-            binding.native_launch_unresolved = false;
-            return NativeRepair::NotNeeded;
-        }
-        // The spec comes only from the runtime source the binding's pin names; an
-        // official package that adopts a built-in pin is that source (`launch::adopts`).
-        // A binding whose source is not served stays marked and is retried on the
-        // next load.
-        let pinned = match self
-            .inner
-            .profiles
-            .runtimes()
-            .definition_for_pin(&binding.agent_base, &binding.launch_binding)
-        {
-            Ok(pinned) => pinned,
-            Err(error) => {
-                return NativeRepair::Unrepairable(format!(
-                    "the runtime source session agent `{}` was started from is not served by \
-                     this daemon ({})",
-                    binding.agent, error.code
-                ));
-            }
-        };
-        let resolved = match self
-            .inner
-            .profiles
-            .resolve_agent_pinned(&binding.agent, &pinned)
-        {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                return NativeRepair::Unrepairable(format!(
-                    "agent `{}` does not resolve ({})",
-                    binding.agent, error.code
-                ));
-            }
-        };
-        if RuntimeRef::from(resolved.base.clone()) != binding.agent_base {
-            return NativeRepair::Unrepairable(format!(
-                "agent `{}` no longer runs on the runtime this session was started with",
-                binding.agent
-            ));
-        }
-        let Some(launch) = resolved.native_launch() else {
-            return NativeRepair::Unrepairable(format!(
-                "agent `{}` declares no native resume",
-                binding.agent
-            ));
-        };
-        let reference_present = match launch.reference_kind() {
-            SessionRefKind::Id => binding.native_session_id.is_some(),
-            SessionRefKind::Path => binding.native_session_path.is_some(),
-        };
-        if !reference_present {
-            return NativeRepair::Unrepairable(format!(
-                "the native reference kind of agent `{}` does not match the stored reference",
-                binding.agent
-            ));
-        }
-        binding.native_launch = Some(launch);
-        binding.native_launch_unresolved = false;
-        NativeRepair::Repaired
-    }
-
-    /// Repairs the recovery binding of `record` and the separately persisted
-    /// resume `binding`, then aligns the frozen capabilities and the warning
-    /// with the result.
-    ///
-    /// Both bindings resolve through the same rule, so they stay equal and the
-    /// merge of the two never reports a shape mismatch.
+    /// Repairs the recovery of `record` and its resume `binding` against the
+    /// registry this daemon serves, and logs a recovery that cannot be repaired.
     pub(super) fn repair_native_recovery(
         &self,
         record: &mut SessionRecord,
-        mut binding: Option<&mut ResumeBinding>,
+        binding: Option<&mut ResumeBinding>,
     ) {
-        let mut outcomes = Vec::new();
-        if let Some(recovery) = record.recovery.as_mut() {
-            outcomes.push(self.repair_native_launch(recovery));
-        }
-        if let Some(binding) = binding.as_deref_mut() {
-            outcomes.push(self.repair_native_launch(binding));
-        }
-        let unrepairable = outcomes.iter().find_map(|outcome| match outcome {
-            NativeRepair::Unrepairable(reason) => Some(reason.clone()),
-            NativeRepair::NotNeeded | NativeRepair::Repaired => None,
-        });
-        record
-            .info
-            .warnings
-            .retain(|warning| warning.kind != SessionWarningKind::NativeRecovery);
-        if let Some(reason) = unrepairable {
+        if let Some(reason) = repair_native_recovery(&self.inner.profiles, record, binding) {
             warn!(
                 name: "reconcile.native_recovery.unrepairable",
                 session_id = %record.session_id,
@@ -135,29 +47,127 @@ impl SessionRegistry {
                 reason = %reason,
                 "stored native recovery record cannot be completed; the session cannot resume or fork natively"
             );
-            let detail = native_reference_detail(record, binding.as_deref());
-            record.info.warnings.push(SessionWarning {
-                kind: SessionWarningKind::NativeRecovery,
-                message: format!(
-                    "native recovery is unavailable: {reason}. Start a new session and resume \
-                     the native conversation in it."
-                ),
-                detail,
-            });
-            return;
-        }
-        if outcomes.contains(&NativeRepair::Repaired) {
-            let launch = record
-                .recovery
-                .as_ref()
-                .and_then(|recovery| recovery.native_launch.as_ref())
-                .or_else(|| binding.as_deref().and_then(|b| b.native_launch.as_ref()));
-            record.info.capabilities = SessionCapabilities {
-                resume: launch.is_some(),
-                fork: launch.is_some_and(crate::agent::NativeSessionLaunch::supports_fork),
-            };
         }
     }
+}
+
+/// Resolves the launch spec of a marked binding by agent name, against the
+/// definition its launch pin names.
+///
+/// The flag is cleared only when the spec was set or was already present,
+/// so an unresolved binding is retried on the next load.
+fn repair_native_launch(profiles: &ProfileRegistry, binding: &mut ResumeBinding) -> NativeRepair {
+    if !binding.native_launch_unresolved {
+        return NativeRepair::NotNeeded;
+    }
+    if binding.native_launch.is_some() {
+        binding.native_launch_unresolved = false;
+        return NativeRepair::NotNeeded;
+    }
+    // The spec comes only from the runtime source the binding's pin names; an
+    // official package that adopts a built-in pin is that source (`launch::adopts`).
+    // A binding whose source is not served stays marked and is retried on the
+    // next load.
+    let pinned = match profiles
+        .runtimes()
+        .definition_for_pin(&binding.agent_base, &binding.launch_binding)
+    {
+        Ok(pinned) => pinned,
+        Err(error) => {
+            return NativeRepair::Unrepairable(format!(
+                "the runtime source session agent `{}` was started from is not served by \
+                 this daemon ({})",
+                binding.agent, error.code
+            ));
+        }
+    };
+    let resolved = match profiles.resolve_agent_pinned(&binding.agent, &pinned) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return NativeRepair::Unrepairable(format!(
+                "agent `{}` does not resolve ({})",
+                binding.agent, error.code
+            ));
+        }
+    };
+    if RuntimeRef::from(resolved.base.clone()) != binding.agent_base {
+        return NativeRepair::Unrepairable(format!(
+            "agent `{}` no longer runs on the runtime this session was started with",
+            binding.agent
+        ));
+    }
+    let Some(launch) = resolved.native_launch() else {
+        return NativeRepair::Unrepairable(format!(
+            "agent `{}` declares no native resume",
+            binding.agent
+        ));
+    };
+    let reference_present = match launch.reference_kind() {
+        SessionRefKind::Id => binding.native_session_id.is_some(),
+        SessionRefKind::Path => binding.native_session_path.is_some(),
+    };
+    if !reference_present {
+        return NativeRepair::Unrepairable(format!(
+            "the native reference kind of agent `{}` does not match the stored reference",
+            binding.agent
+        ));
+    }
+    binding.native_launch = Some(launch);
+    binding.native_launch_unresolved = false;
+    NativeRepair::Repaired
+}
+
+/// Repairs the recovery binding of `record` and the separately persisted
+/// resume `binding`, then aligns the frozen capabilities and the warning
+/// with the result.
+///
+/// Both bindings resolve through the same rule, so they stay equal and the
+/// merge of the two never reports a shape mismatch. Returns the reason when
+/// either binding cannot be repaired.
+pub(super) fn repair_native_recovery(
+    profiles: &ProfileRegistry,
+    record: &mut SessionRecord,
+    mut binding: Option<&mut ResumeBinding>,
+) -> Option<String> {
+    let mut outcomes = Vec::new();
+    if let Some(recovery) = record.recovery.as_mut() {
+        outcomes.push(repair_native_launch(profiles, recovery));
+    }
+    if let Some(binding) = binding.as_deref_mut() {
+        outcomes.push(repair_native_launch(profiles, binding));
+    }
+    let unrepairable = outcomes.iter().find_map(|outcome| match outcome {
+        NativeRepair::Unrepairable(reason) => Some(reason.clone()),
+        NativeRepair::NotNeeded | NativeRepair::Repaired => None,
+    });
+    record
+        .info
+        .warnings
+        .retain(|warning| warning.kind != SessionWarningKind::NativeRecovery);
+    if let Some(reason) = unrepairable {
+        let detail = native_reference_detail(record, binding.as_deref());
+        record.info.warnings.push(SessionWarning {
+            kind: SessionWarningKind::NativeRecovery,
+            message: format!(
+                "native recovery is unavailable: {reason}. Start a new session and resume \
+                 the native conversation in it."
+            ),
+            detail,
+        });
+        return Some(reason);
+    }
+    if outcomes.contains(&NativeRepair::Repaired) {
+        let launch = record
+            .recovery
+            .as_ref()
+            .and_then(|recovery| recovery.native_launch.as_ref())
+            .or_else(|| binding.as_deref().and_then(|b| b.native_launch.as_ref()));
+        record.info.capabilities = SessionCapabilities {
+            resume: launch.is_some(),
+            fork: launch.is_some_and(crate::agent::NativeSessionLaunch::supports_fork),
+        };
+    }
+    None
 }
 
 /// The native reference the operator resumes manually, when one is stored.

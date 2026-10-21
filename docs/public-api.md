@@ -2402,7 +2402,17 @@ profile resume would refuse (the profile is missing, or its frozen revision
 changed by more than the migration pin) is `would_lose_recovery` with resume's
 code (`agent_profile_missing`, `agent_profile_changed` or
 `agent_profile_revision_unavailable`), and a stopped session record the new
-binary cannot load is `would_lose_recovery` with `record_unreadable`. A session
+binary cannot load is `would_lose_recovery` with `record_unreadable`. A recovery
+binding that waits for the runtime registry to complete its launch spec is
+repaired first, as startup repairs it, over the profiles and runtimes the new
+daemon will have (read-only: nothing is written), and is then judged like any
+other binding. A binding the repair cannot complete (the agent no longer
+resolves, runs on another runtime, declares no native resume or another
+reference kind, or its launch pin names a source the new daemon does not serve)
+is `would_lose_recovery` with `native_recovery_unrepairable`; it has no
+acceptance scope, so accepting it is one-time. `native_recovery_unverified`
+reports the same binding only from a daemon older than this repair, which judges
+a rollback. A session
 whose frozen program resume would not find is `would_lose_recovery` with
 `agent_binary_missing`. A stopped session whose conversation is absent from its declared store
 (`agent_native_reference_missing`), or whose stored reference is malformed, is

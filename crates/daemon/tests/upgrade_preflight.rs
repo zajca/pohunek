@@ -29,9 +29,9 @@ use pohunek_service_config::preflight::{
     PreflightReport, StoreState, Verdict, CODE_ADOPTABLE, CODE_GENERATION_MISSING,
     CODE_JOURNAL_MISSING, CODE_JOURNAL_SCHEMA_UNSUPPORTED, CODE_NO_SESSION_RECORD,
     CODE_PROFILE_WITHOUT_SCREEN_READINESS, CODE_PROTOCOL_INCOMPATIBLE, CODE_RECORD_UNREADABLE,
-    CODE_RECOVERY_UNMAPPABLE, CODE_RESUME_RECORD_UNREADABLE, CODE_RUNTIME_IDENTITY_MISMATCH,
-    CODE_RUNTIME_SOURCE_NOT_SERVED, CODE_STORE_UNUSABLE, CODE_WORKER_ENDED,
-    CODE_WORKER_NOT_RUNNING, REPORT_VERSION,
+    CODE_RECOVERY_UNMAPPABLE, CODE_RECOVERY_UNREPAIRABLE, CODE_RESUME_RECORD_UNREADABLE,
+    CODE_RUNTIME_IDENTITY_MISMATCH, CODE_RUNTIME_SOURCE_NOT_SERVED, CODE_STORE_UNUSABLE,
+    CODE_WORKER_ENDED, CODE_WORKER_NOT_RUNNING, REPORT_VERSION,
 };
 use pohunek_service_config::preflight::{
     CODE_PROBE_BUDGET_EXHAUSTED, PREFLIGHT_TIMEOUT, PROBE_BUDGET, RELEASE_PLAN_FLAG,
@@ -91,7 +91,7 @@ fn default_allowlist() -> Vec<String> {
 }
 
 /// The runtimes a fake agent of the test host is written for.
-const FAKE_AGENTS: [&str; 3] = ["claude", "codex", "hermes"];
+const FAKE_AGENTS: [&str; 4] = ["claude", "codex", "hermes", "pi"];
 
 /// Directory below the test root that holds the fake agents.
 const AGENT_BIN_DIR: &str = "bin";
@@ -3344,4 +3344,430 @@ async fn no_acceptance_scope_is_issued_for_a_verdict_nothing_can_durably_accept(
     let report = host.report();
     assert_eq!(report.sessions[0].verdict, Verdict::Adoptable);
     assert_no_scope("adoptable", &report);
+}
+
+/// Flat fields the v0.33.0 daemon stored in place of `native_launch`; the
+/// v0.33.1 daemon dropped them, leaving a binding without a launch spec.
+const V0_33_0_FLAT_KEYS: [&str; 7] = [
+    "resume_mode",
+    "ref_kind",
+    "resumable",
+    "fork_mode",
+    "fork_resume_mode",
+    "fork_ref_kind",
+    "forkable",
+];
+
+/// The package runtime the repairable damaged bindings are launched on: an
+/// official package that is not a reserved alias, so an unpinned binding
+/// resolves against it.
+const DAMAGED_BASE: &str = "pi";
+
+/// The host profile every damaged binding names as its agent.
+const DAMAGED_PROFILE: &str = "work";
+
+/// Strips the v0.33.0 flat fields from the binding at `pointer` of `line`.
+fn strip_flat_fields(line: &mut Value, pointer: &str) {
+    let binding = line
+        .pointer_mut(pointer)
+        .and_then(Value::as_object_mut)
+        .expect("a binding object");
+    for key in V0_33_0_FLAT_KEYS {
+        binding.remove(key);
+    }
+}
+
+/// A stopped session launched by `agent` over [`DAMAGED_BASE`] whose recovery
+/// binding awaits the runtime registry: it has a native session id and a
+/// snapshot program, no launch spec, and the launch pin of the installed
+/// [`DAMAGED_BASE`] package. The binding is marked for repair the way the
+/// store migration marks a damaged one. A bare runtime as `agent` keeps the
+/// judgement clear of the host profile's frozen revision, which needs the
+/// host's revision key.
+fn damaged_line(session: &str, agent: &str) -> Value {
+    damaged_line_on(session, agent, DAMAGED_BASE)
+}
+
+/// [`damaged_line`] over the runtime `base`.
+fn damaged_line_on(session: &str, agent: &str, base: &str) -> Value {
+    let mut line = session_line(session, "w-damaged");
+    line["runtime"] = json!({"state": "lost"});
+    strip_flat_fields(&mut line, "/recovery");
+    line["info"]["agent"] = json!(agent);
+    line["info"]["agent_base"] = json!(base);
+    line["recovery"]["agent"] = json!(agent);
+    line["recovery"]["agent_base"] = json!(base);
+    line["recovery"]["program"] = json!(base);
+    line["recovery"]["native_launch_unresolved"] = json!(true);
+    pin_recovery(
+        &mut line,
+        serde_json::to_value(official_runtimes::package_binding(base))
+            .expect("serialize the package binding"),
+    );
+    line
+}
+
+/// The host a damaged binding is judged on: the official packages installed,
+/// a release serving [`DAMAGED_BASE`], and a profile directory.
+struct DamagedHost {
+    host: Host,
+    release: PathBuf,
+    catalog: official_runtimes::OfficialCatalog,
+    profiles: PathBuf,
+}
+
+impl DamagedHost {
+    async fn new() -> Self {
+        let host = Host::serving().await;
+        let catalog = official_runtimes::OfficialCatalog::new();
+        let release = host.env.root().join("release").join("runtime");
+        catalog.write_release(&release, &[DAMAGED_BASE]);
+        let profiles = private_dir(host.env.config_home().join("pohunek").join("agents"));
+        Self {
+            host,
+            release,
+            catalog,
+            profiles,
+        }
+    }
+
+    /// Writes the profile `name` with `body` as its text.
+    fn write_profile_text(&self, name: &str, body: &str) {
+        let path = self.profiles.join(format!("{name}.toml"));
+        fs::write(&path, body).expect("write the profile");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure the profile");
+    }
+
+    fn report(&self) -> PreflightReport {
+        run_with(
+            &self.host.inputs(),
+            &release_options(&self.host, &self.release, &self.catalog, &self.profiles),
+            &HostInspector::new(),
+        )
+    }
+}
+
+#[tokio::test]
+async fn a_repairable_stopped_binding_is_judged_as_reconciliation_and_resume_treat_it() {
+    let damaged = DamagedHost::new().await;
+    damaged
+        .host
+        .write_store(&[damaged_line("s-1", DAMAGED_BASE)]);
+
+    let report = damaged.report();
+
+    assert_eq!(
+        stopped_verdict_of(&report, "s-1"),
+        (&Verdict::Adoptable, CODE_ADOPTABLE),
+        "{:?}",
+        report.stopped_sessions
+    );
+}
+
+/// The separately stored resume binding of `session`, in the same shape
+/// [`damaged_line`] gives the record's own recovery.
+fn damaged_resume_line(session: &str, agent: &str, pending: bool) -> Value {
+    let mut line = V0_33_0_STORE
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("fixture line"))
+        .find(|line| line["kind"] == "resume")
+        .expect("fixture resume line");
+    line["session_id"] = json!(session);
+    strip_flat_fields(&mut line, "");
+    line["agent"] = json!(agent);
+    line["agent_base"] = json!(DAMAGED_BASE);
+    line["program"] = json!(DAMAGED_BASE);
+    line["native_session_id"] = json!("native-fixture-2");
+    if pending {
+        line["native_launch_unresolved"] = json!(true);
+    }
+    line["launch_binding"] = serde_json::to_value(official_runtimes::package_binding(DAMAGED_BASE))
+        .expect("serialize the package binding");
+    line
+}
+
+/// The detail of the stopped verdict of `session`.
+fn stopped_detail_of<'a>(report: &'a PreflightReport, session: &str) -> &'a str {
+    let found = report
+        .stopped_sessions
+        .iter()
+        .find(|candidate| candidate.session_id == session)
+        .unwrap_or_else(|| panic!("no stopped verdict for {session}"));
+    found.detail.as_str()
+}
+
+#[tokio::test]
+async fn an_unrepairable_stopped_binding_loses_recovery_in_preflight_and_in_resume() {
+    // The profile the binding names is gone on the release the host upgrades to.
+    let damaged = DamagedHost::new().await;
+    damaged
+        .host
+        .write_store(&[damaged_line("s-1", DAMAGED_PROFILE)]);
+    let before = damaged.host.snapshot();
+
+    let report = damaged.report();
+
+    assert_eq!(
+        stopped_verdict_of(&report, "s-1"),
+        (&Verdict::WouldLoseRecovery, CODE_RECOVERY_UNREPAIRABLE),
+        "{:?}",
+        report.stopped_sessions
+    );
+    let detail = stopped_detail_of(&report, "s-1");
+    assert!(detail.contains("`work`"), "{detail}");
+    assert_eq!(damaged.host.snapshot(), before, "nothing is written");
+}
+
+#[tokio::test]
+async fn a_binding_whose_agent_moved_runtime_is_unrepairable() {
+    let damaged = DamagedHost::new().await;
+    damaged.write_profile_text(DAMAGED_PROFILE, "base = \"codex\"\n");
+    damaged
+        .host
+        .write_store(&[damaged_line("s-1", DAMAGED_PROFILE)]);
+
+    let report = damaged.report();
+
+    assert_eq!(
+        stopped_verdict_of(&report, "s-1"),
+        (&Verdict::WouldLoseRecovery, CODE_RECOVERY_UNREPAIRABLE),
+        "{:?}",
+        report.stopped_sessions
+    );
+}
+
+#[tokio::test]
+async fn a_binding_whose_agent_has_no_native_resume_is_unrepairable() {
+    let damaged = DamagedHost::new().await;
+    damaged.write_profile_text(
+        DAMAGED_PROFILE,
+        &format!("base = \"{DAMAGED_BASE}\"\n[resume]\nresumable = false\n"),
+    );
+    damaged
+        .host
+        .write_store(&[damaged_line("s-1", DAMAGED_PROFILE)]);
+
+    let report = damaged.report();
+
+    assert_eq!(
+        stopped_verdict_of(&report, "s-1"),
+        (&Verdict::WouldLoseRecovery, CODE_RECOVERY_UNREPAIRABLE),
+        "{:?}",
+        report.stopped_sessions
+    );
+    let detail = stopped_detail_of(&report, "s-1");
+    assert!(detail.contains("declares no native resume"), "{detail}");
+}
+
+#[tokio::test]
+async fn a_binding_with_a_mismatched_reference_kind_is_unrepairable() {
+    let damaged = DamagedHost::new().await;
+    let mut line = damaged_line("s-1", DAMAGED_BASE);
+    // The package resumes by id; the binding stores a path.
+    line["recovery"]
+        .as_object_mut()
+        .expect("the recovery")
+        .remove("native_session_id");
+    line["recovery"]["native_session_path"] = json!("/workspace/project/.native/session.jsonl");
+    line["info"]
+        .as_object_mut()
+        .expect("the info")
+        .remove("native_session_id");
+    damaged.host.write_store(&[line]);
+
+    let report = damaged.report();
+
+    assert_eq!(
+        stopped_verdict_of(&report, "s-1"),
+        (&Verdict::WouldLoseRecovery, CODE_RECOVERY_UNREPAIRABLE),
+        "{:?}",
+        report.stopped_sessions
+    );
+    let detail = stopped_detail_of(&report, "s-1");
+    assert!(detail.contains("reference kind"), "{detail}");
+}
+
+#[tokio::test]
+async fn an_unrepairable_binding_with_an_unserved_source_has_no_acceptance_scope() {
+    let damaged = DamagedHost::new().await;
+    let mut line = damaged_line("s-1", DAMAGED_BASE);
+    pin_recovery(
+        &mut line,
+        json!({
+            "runtime_id": DAMAGED_BASE,
+            "provenance": {
+                "kind": "package",
+                "package": {"id": "acme.runtime.pi", "version": "1.0.0"},
+                "package_digest": MISSING_PACKAGE_DIGEST,
+            },
+        }),
+    );
+    damaged.host.write_store(&[line]);
+
+    let report = damaged.report();
+
+    assert_eq!(
+        stopped_verdict_of(&report, "s-1"),
+        (&Verdict::WouldLoseRecovery, CODE_RECOVERY_UNREPAIRABLE),
+        "{:?}",
+        report.stopped_sessions
+    );
+    assert_eq!(report.stopped_sessions[0].acceptance_scope, None);
+}
+
+#[tokio::test]
+async fn a_repairable_live_binding_is_not_reported_unverified() {
+    let damaged = DamagedHost::new().await;
+    let mut line = damaged_line("s-1", DAMAGED_BASE);
+    line["runtime"] = session_line("s-1", "w-damaged")["runtime"].clone();
+    damaged.host.write_store(&[line]);
+    damaged
+        .host
+        .write_journal("s-1", "w-damaged", &journal("s-1", "w-damaged"));
+
+    let report = damaged.report();
+
+    assert_eq!(
+        verdict_of(&report, "s-1"),
+        (&Verdict::Adoptable, CODE_ADOPTABLE),
+        "{:?}",
+        report.sessions
+    );
+}
+
+#[tokio::test]
+async fn record_and_resume_binding_are_repaired_before_the_merge() {
+    // A merge before the repair would see a record with a launch spec against
+    // a binding without one and quarantine the live runtime.
+    let damaged = DamagedHost::new().await;
+    let mut line = damaged_line("s-1", DAMAGED_BASE);
+    line["runtime"] = session_line("s-1", "w-damaged")["runtime"].clone();
+    damaged
+        .host
+        .write_store(&[line, damaged_resume_line("s-1", DAMAGED_BASE, true)]);
+    damaged
+        .host
+        .write_journal("s-1", "w-damaged", &journal("s-1", "w-damaged"));
+
+    let report = damaged.report();
+
+    assert_eq!(
+        verdict_of(&report, "s-1"),
+        (&Verdict::Adoptable, CODE_ADOPTABLE),
+        "{:?}",
+        report.sessions
+    );
+}
+
+#[tokio::test]
+async fn a_flagged_binding_with_a_spec_is_judged_normally() {
+    let damaged = DamagedHost::new().await;
+    let mut line = damaged_line("s-1", DAMAGED_BASE);
+    line["recovery"]["native_launch"] = serde_json::to_value(
+        pohunek_daemon::agent::NativeSessionLaunch::from_templates(
+            pohunek_daemon::agent::SessionRefKind::Id,
+            &["--session", pohunek_daemon::agent::REFERENCE_PLACEHOLDER],
+            Some(&["--fork", pohunek_daemon::agent::REFERENCE_PLACEHOLDER][..]),
+        )
+        .expect("a launch spec"),
+    )
+    .expect("serialize the spec");
+    line["info"]["capabilities"] = json!({"resume": true, "fork": true});
+    damaged.host.write_store(&[line]);
+
+    let report = damaged.report();
+
+    assert_eq!(
+        stopped_verdict_of(&report, "s-1"),
+        (&Verdict::Adoptable, CODE_ADOPTABLE),
+        "{:?}",
+        report.stopped_sessions
+    );
+}
+
+#[tokio::test]
+async fn the_preflight_repair_writes_nothing() {
+    let damaged = DamagedHost::new().await;
+    let mut live = damaged_line("s-1", DAMAGED_BASE);
+    live["runtime"] = session_line("s-1", "w-damaged")["runtime"].clone();
+    damaged.host.write_store(&[
+        live,
+        damaged_resume_line("s-1", DAMAGED_BASE, true),
+        damaged_line("s-2", DAMAGED_BASE),
+        damaged_line("s-3", DAMAGED_PROFILE),
+    ]);
+    damaged
+        .host
+        .write_journal("s-1", "w-damaged", &journal("s-1", "w-damaged"));
+    damaged.write_profile_text(DAMAGED_PROFILE, "base = \"codex\"\n");
+    let before = damaged.host.snapshot();
+
+    let report = damaged.report();
+
+    assert_eq!(report.stopped_sessions.len(), 2, "{report:?}");
+    assert_eq!(damaged.host.snapshot(), before);
+}
+
+#[tokio::test]
+async fn a_stop_intent_record_is_repaired_before_its_merge() {
+    // The resume binding contradicts the record, which a stopped record
+    // ignores; the record is then judged on its repaired recovery.
+    let damaged = DamagedHost::new().await;
+    let mut line = damaged_line("s-1", DAMAGED_BASE);
+    line["desired_state"] = json!("stopped");
+    damaged.host.write_store(&[
+        line,
+        damaged_resume_line("s-1", "contradicting-agent", false),
+    ]);
+
+    let report = damaged.report();
+
+    assert_eq!(
+        stopped_verdict_of(&report, "s-1"),
+        (&Verdict::Adoptable, CODE_ADOPTABLE),
+        "{:?}",
+        report.stopped_sessions
+    );
+}
+
+#[tokio::test]
+async fn the_preflight_repair_resolves_against_the_planned_profile_text() {
+    let damaged = DamagedHost::new().await;
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.9");
+    damaged
+        .catalog
+        .write_release_archives(&damaged.release, 2, &[("claude", &bytes, &digest)]);
+    damaged.write_profile_text(
+        DAMAGED_PROFILE,
+        &format!(
+            "base = \"claude\"\n{}",
+            official_runtimes::profile_pin("claude")
+        ),
+    );
+    damaged
+        .host
+        .write_store(&[damaged_line_on("s-1", DAMAGED_PROFILE, "claude")]);
+
+    let report = damaged.report();
+
+    let plan = report.runtimes.as_ref().expect("the release plan");
+    assert_eq!(
+        plan.profiles
+            .iter()
+            .map(|profile| (profile.name.as_str(), profile.status))
+            .collect::<Vec<_>>(),
+        [(DAMAGED_PROFILE, ProfileStatus::Repin)],
+        "{:?}",
+        plan.profiles
+    );
+    // The profile pins the planned version while the binding names the version
+    // it was launched from; the repair resolves the profile as the new daemon
+    // reads it, and the session is judged on from there (the host profile's
+    // revision key is outside this fixture).
+    let (_verdict, code) = stopped_verdict_of(&report, "s-1");
+    assert_ne!(
+        code, CODE_RECOVERY_UNREPAIRABLE,
+        "{:?}",
+        report.stopped_sessions
+    );
 }
