@@ -861,7 +861,7 @@ upgrade either: the selected version keeps serving, with its package entry and
 integrations, and the gap names `plugin enable` for the release's digest. Three
 exceptions: a release package whose root is altered is refused with
 `plugin uninstall --remove-modified` (beside any ordered enabled selection for claude, codex
-and hermes, beside an older one only for Pi, and when no enabled selection serves the runtime, for Pi only under `--detect`); a selected Pi version
+and hermes, beside an older one only for Pi, and when no enabled selection serves the runtime (for Pi that is an enabled selection that cannot load; a Pi without an enabled selection is judged only under `--detect`, which drops a Pi nothing uses first)); a selected Pi version
 newer than the release's is kept silently, with no gap; a selected version that cannot
 be ordered against the release's is kept with the gap `plugin_update_version_unordered`. The
 detecting plan of `pohunek setup` drops `official_package_not_serving` together with a

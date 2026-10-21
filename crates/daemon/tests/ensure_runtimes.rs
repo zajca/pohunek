@@ -2277,6 +2277,85 @@ fn a_disabled_release_package_with_an_altered_root_beside_a_serving_selection_is
     }
 }
 
+/// A host whose enabled Pi package `selected_version` serves the runtime
+/// beside the release's own Pi package `release_version`, installed, disabled
+/// and altered at its root.
+async fn pi_serving_beside_an_altered_disabled_release(
+    selected_version: &str,
+    release_version: &str,
+) -> (Host, PackageDigest) {
+    let host = Host::with_installed_pi().await;
+    let release = host.publish_pi(release_version, 1);
+    let installed = host.step(false);
+    assert!(installed.refusals.is_empty(), "{installed:?}");
+    let selected = official_runtimes::variant_archive("pi", selected_version).1;
+    if host
+        .pi_registry()
+        .0
+        .iter()
+        .all(|version| version != selected_version)
+    {
+        host.publish_pi(selected_version, 2);
+        let swapped = host.step(false);
+        assert!(swapped.refusals.is_empty(), "{swapped:?}");
+        host.publish_pi(release_version, 3);
+    }
+    pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+        .expect("the package store")
+        .registry()
+        .select(&selected)
+        .expect("select the serving version");
+    host.disable_package(&release);
+    host.alter_package_root(&release);
+    (host, release)
+}
+
+/// For Pi the altered root of the disabled release package is refused beside an
+/// older enabled selection, which the release would update, and ignored beside
+/// a newer one, which is kept silently.
+#[tokio::test]
+async fn a_disabled_pi_release_package_with_an_altered_root_is_refused_only_beside_an_older_selection(
+) {
+    let (host, release) =
+        pi_serving_beside_an_altered_disabled_release(PI_INSTALLED_VERSION, PI_NEWER_VERSION).await;
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
+    for report in [host.step(true), host.step(false)] {
+        assert_eq!(
+            refusal_codes(&report),
+            [root_refusal.as_str()],
+            "{:?}",
+            report.refusals
+        );
+        assert!(
+            report.refusals[0].detail.contains(&format!(
+                "pohunek plugin uninstall {PI_PACKAGE} --digest {} --remove-modified --yes",
+                release.as_str()
+            )),
+            "{}",
+            report.refusals[0].detail
+        );
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+
+    let (host, _release) =
+        pi_serving_beside_an_altered_disabled_release(PI_NEWER_VERSION, PI_INSTALLED_VERSION).await;
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    for report in [host.step(true), host.step(false)] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert_eq!(pi_package(&report).status, PackageStatus::Kept);
+        assert_eq!(pi_package(&report).version, PI_NEWER_VERSION);
+        assert!(report.gaps.is_empty(), "{:?}", report.gaps);
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+}
+
 /// A detecting plan drops a runtime nothing uses whose program is off the
 /// search path before it judges the altered root of the disabled release
 /// package, so the plan is not refused for an agent that is not there.
