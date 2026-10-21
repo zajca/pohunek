@@ -2,6 +2,7 @@
 
 // Rust guideline compliant 2026-10-14
 
+use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -2132,7 +2133,7 @@ fn many_unknown_keys_stay_within_the_file_bound() {
     let mut text = format!("{GOLDEN}\n[future]\n");
     let mut count = 0usize;
     while text.len() + 16 < MAX_CONFIG_BYTES {
-        text.push_str(&format!("k{count} = 1\n"));
+        writeln!(text, "k{count} = 1").expect("writing to String is infallible");
         count += 1;
     }
     assert!(text.len() <= MAX_CONFIG_BYTES);

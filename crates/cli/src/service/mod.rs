@@ -919,6 +919,10 @@ pub(crate) enum Adoption {
 /// # Errors
 ///
 /// See [`check`].
+#[expect(
+    clippy::too_many_lines,
+    reason = "the check mirrors install and upgrade in transaction order; splitting it would separate the decisions from the state they read"
+)]
 pub(crate) fn check_local(
     context: &Context,
     prefix: Option<PathBuf>,
