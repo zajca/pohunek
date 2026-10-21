@@ -2345,9 +2345,13 @@ command by cause: `pohunek plugin update` for a package that is not selected,
 Pi included; `plugin update` would refuse a newer selection as a downgrade), and
 `pohunek plugin install` or `plugin select` for an unordered selection that does not
 load; when an enabled version still serves the runtime beside a disabled release
-package it keeps serving and the gap names the release package; under `--detect`
-the gap is dropped with a runtime the detecting plan drops, that is one nothing uses
-whose program is off the search path), and
+package it keeps serving and the gap names the release package, except that a release
+package with an altered root is refused with its uninstall command (beside an older
+ordered selection, the case where it would otherwise update the runtime), a selected Pi
+version newer than the release's is kept silently and a selected version that cannot be
+ordered against the release's reports `plugin_update_version_unordered`; under `--detect`
+the gap is dropped with a runtime the detecting plan drops, that is one nothing uses,
+no profile has as its base, and whose program is off the search path), and
 `plugin_update_version_unordered` (the selected version of an official package, of
 a reserved runtime or not, cannot be ordered against the release's and is enabled and loadable, so it is kept,
 as `plugin update` refuses to replace it). The first two of these three name the command

@@ -858,10 +858,15 @@ without `--detect`); a Pi runtime the plan does not judge gets only a gap that p
 `pohunek plugin doctor` in those states. The release's own package, recorded and
 disabled while another enabled version is selected, is not enabled or selected by the
 upgrade either: the selected version keeps serving, with its package entry and
-integrations, and the gap names `plugin enable` for the release's digest. The
+integrations, and the gap names `plugin enable` for the release's digest. Three
+exceptions: a release package whose root is altered is refused with
+`plugin uninstall --remove-modified` (only where the release's package would otherwise
+update the runtime, that is beside an older ordered selection); a selected Pi version
+newer than the release's is kept silently, with no gap; a selected version that cannot
+be ordered against the release's is kept with the gap `plugin_update_version_unordered`. The
 detecting plan of `pohunek setup` drops `official_package_not_serving` together with a
-runtime it drops (nothing uses it and its program is off the search path), whatever the
-state of its package. The same holds for a selected version that is enabled but
+runtime it drops (nothing uses it, no profile has it as its base, and its program is
+off the search path), whatever the state of its package. The same holds for a selected version that is enabled but
 cannot be loaded: the plan names the repair (`plugin install` of that version, or
 `plugin select` of another). A selected version whose root is present but altered
 is refused, and the refusal names `plugin uninstall --remove-modified`. Unpinned profiles

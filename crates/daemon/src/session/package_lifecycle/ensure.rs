@@ -296,6 +296,10 @@ struct Report {
     /// Runtimes the detecting plan dropped: nothing uses them and their
     /// program is off the search path.
     undetected: Vec<String>,
+    /// The base of every profile, official or not: a profile over a runtime
+    /// keeps that runtime's not-serving gap even when the program is off the
+    /// search path.
+    profiled: Vec<String>,
 }
 
 impl Report {
@@ -312,6 +316,7 @@ impl Report {
             refusals: Vec::new(),
             gaps: Vec::new(),
             undetected: Vec::new(),
+            profiled: Vec::new(),
         }
     }
 
@@ -319,8 +324,11 @@ impl Report {
     /// which a step before the use of the runtimes was known may have reported.
     fn forget_undetected_gaps(&mut self) {
         let undetected = std::mem::take(&mut self.undetected);
+        let profiled = std::mem::take(&mut self.profiled);
         self.gaps.retain(|gap| {
-            gap.code != CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING || !undetected.contains(&gap.runtime)
+            gap.code != CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING
+                || !undetected.contains(&gap.runtime)
+                || profiled.contains(&gap.runtime)
         });
     }
 
@@ -666,6 +674,7 @@ fn gather(
                 continue;
             }
         };
+        report.profiled.push(head.base.as_str().to_owned());
         let managed_base = managed.contains(&head.base);
         if !is_official(&head.base) && !managed_base {
             continue;
@@ -1418,7 +1427,8 @@ fn passes_detect_gate_before_leaving(
 ) -> bool {
     let left = disabled_package(plan, prepared).is_some()
         || (disabled_release_package(plan, prepared, reserved).is_some()
-            && !selection_serves(plan, prepared))
+            && (!selection_serves(plan, prepared)
+                || damaged_release_package(plan, prepared, reserved).is_some()))
         || matches!(
             unordered_selection(plan, prepared),
             Some((Serving::Broken | Serving::Damaged(_), _))
@@ -2315,9 +2325,11 @@ fn replaces_newer(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<Selected
 }
 
 /// The selected official version of package `id` when the operator disabled
-/// it. Whatever its version, only the operator leaves a selected package
-/// disabled: an install records the enabled flag and the selection in one
-/// registry commit.
+/// it. Whatever its version, the operator is the one who leaves a selected
+/// package disabled: an install records the enabled flag and the selection in
+/// one registry commit. The one other writer is `commit_install`, which
+/// disables a package the loader rejects right after its install; the plan
+/// reports that package by the state of its root, as for any disabled package.
 fn disabled_selected_package(state: &RegistryState, id: &PackageId) -> Option<PackageDigest> {
     let selected = state.selected(id)?;
     let record = state.package(selected)?;
@@ -2336,9 +2348,10 @@ const RELEASE_CLAIM_DETAIL: &str =
 
 /// The release's own package when it is recorded, official and disabled, and
 /// the selection would otherwise be replaced by it: an enabled selection that
-/// is kept is not affected. Only the operator leaves a package disabled and
-/// unselected (`plugin disable`, `plugin install --no-enable`): an install
-/// records the enabled flag and the selection in one registry commit.
+/// is kept is not affected. The operator leaves a package disabled and
+/// unselected (`plugin disable`, `plugin install --no-enable`); the
+/// loader-rejection disable of `commit_install` is reported by the state of the
+/// root, as for any disabled package.
 fn disabled_release_package(
     plan: &PlanInputs<'_>,
     prepared: &Prepared,
@@ -2352,6 +2365,20 @@ fn disabled_release_package(
     let record = plan.state?.package(&prepared.digest)?;
     (record.source() == PackageSource::Official && !record.enabled())
         .then(|| prepared.digest.clone())
+}
+
+/// The failure of the root of the disabled release package when it is present
+/// but altered or damaged.
+fn damaged_release_package(
+    plan: &PlanInputs<'_>,
+    prepared: &Prepared,
+    reserved: bool,
+) -> Option<PackageErrorKind> {
+    let digest = disabled_release_package(plan, prepared, reserved)?;
+    match disabled_state(plan, &digest, prepared.definition.runtime_id()) {
+        DisabledState::Damaged(kind) => Some(kind),
+        _ => None,
+    }
 }
 
 /// Whether an enabled official selection other than the release's package
@@ -2512,7 +2539,12 @@ fn selection_outcome(
     if let Some(digest) = disabled_release_package(plan, prepared, reserved) {
         if selection_serves(plan, prepared) {
             // The enabled selection keeps serving; the release's package stays
-            // as the operator set it.
+            // as the operator set it. An altered root of that package is
+            // refused with its uninstall command, as for any release package.
+            if let Some(kind) = damaged_release_package(plan, prepared, reserved) {
+                refuse_damaged(report, subject, kind, id, &digest);
+                return Selection::Leave;
+            }
             let state = disabled_state(plan, &digest, prepared.definition.runtime_id());
             let detail = format!(
                 "the selected version keeps serving, and the release's package is disabled, so \

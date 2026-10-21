@@ -381,7 +381,8 @@ one: the runtime is left as you set it with the gap `official_package_not_servin
 hint is `pohunek plugin enable <package> --digest <digest>`; the next upgrade then proceeds
 as for any enabled package. The release's own package that you installed with `--no-enable`
 or disabled, while another version is selected, is not enabled or selected by the upgrade
-either; the selected version keeps serving. An enabled unordered one that cannot load is left as it is too,
+either; the selected version keeps serving (a newer Pi version is kept silently, and
+an altered root of that package is refused with `plugin uninstall --remove-modified`, beside an older selection). An enabled unordered one that cannot load is left as it is too,
 with the same gap and a repair hint.
 The trust model and the package classes are described
 in [the architecture](architecture.md#runtime-packages-and-trust) and the

@@ -16,15 +16,18 @@
   integration and no profile change for the runtime, and the next upgrade
   proceeds as for any enabled package once you enable it. For an official Pi
   package the hint is the same instead of `plugin update`, which refuses a newer
-  selection as a downgrade. Only the operator leaves a package selected and
-  disabled: an install records the enabled flag and the selection in one
-  registry commit. A disabled package whose root is missing is hinted with
+  selection as a downgrade. The operator is the one who leaves a package
+  selected and disabled: an install records the enabled flag and the selection
+  in one registry commit (the one other writer, the loader-rejection disable of
+  a fresh install, is reported by the state of its root like any disabled
+  package). A disabled package whose root is missing is hinted with
   `plugin install` of its archive before the enable; one whose root is altered
   is refused with `plugin uninstall --remove-modified`.
 - `pohunek setup` (the detecting plan) no longer reports
-  `official_package_not_serving` for a runtime it drops: one nothing uses and
-  whose program is off the search path, whatever the state of its package (an
-  unselected Pi package's `plugin update` gap included).
+  `official_package_not_serving` for a runtime it drops: one nothing uses, that
+  no profile has as its base, and whose program is off the search path,
+  whatever the state of its package (an unselected Pi package's `plugin update`
+  gap included).
 - A host profile pinned elsewhere beside a kept unordered selection is reported
   with the precise reason (`pinned_version_unknown`, `pinned_to_non_official_package`,
   `pinned_to_other_package`); `pinned_differs_from_kept_selection` remains for an

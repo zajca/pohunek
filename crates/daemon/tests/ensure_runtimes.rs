@@ -189,26 +189,22 @@ impl Host {
     /// the root is present but does not match its recorded manifest.
     fn alter_installed_root(&self) {
         let packages = self.plugins_dir().join("packages");
-        let mut pending = vec![fs::read_dir(&packages)
+        let root = fs::read_dir(&packages)
             .expect("the packages directory")
             .next()
             .expect("one installed package root")
             .expect("a package root entry")
-            .path()];
-        while let Some(directory) = pending.pop() {
-            for entry in fs::read_dir(&directory).expect("a package directory") {
-                let path = entry.expect("a directory entry").path();
-                if path.is_dir() {
-                    pending.push(path);
-                } else {
-                    let mut content = fs::read(&path).expect("a package file");
-                    content.extend_from_slice(b"altered\n");
-                    fs::write(&path, content).expect("alter the package file");
-                    return;
-                }
-            }
-        }
-        panic!("the installed package root holds no file");
+            .path();
+        alter_root(root);
+    }
+
+    /// Alters the root of the installed package `digest` the same way.
+    fn alter_package_root(&self, digest: &PackageDigest) {
+        let hex = digest
+            .as_str()
+            .strip_prefix("sha256:")
+            .expect("a sha256 digest");
+        alter_root(self.plugins_dir().join("packages").join(hex));
     }
 
     fn registry_path(&self) -> PathBuf {
@@ -2232,6 +2228,120 @@ async fn a_disabled_release_package_leaves_the_serving_selection_in_place() {
     }
 }
 
+/// The release's package is recorded disabled with an altered root while an
+/// enabled selection serves the runtime: the plan refuses it with the command
+/// that removes the root, as it does for any release package, and changes
+/// nothing.
+#[test]
+fn a_disabled_release_package_with_an_altered_root_beside_a_serving_selection_is_refused() {
+    for runtime in ["claude", "codex", "hermes"] {
+        for version in ["1.0.1", "2.1.0"] {
+            let (host, _selected, release) =
+                host_serving_beside_a_disabled_release(runtime, version);
+            host.alter_package_root(&release);
+            let registry = fs::read(host.registry_path()).expect("the registry record");
+            let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
+            let context = format!("{runtime} {version}");
+
+            let plan = host.step(true);
+            let applied = host.step(false);
+
+            for report in [&plan, &applied] {
+                assert_eq!(
+                    refusal_codes(report),
+                    [root_refusal.as_str()],
+                    "{context}: {:?}",
+                    report.refusals
+                );
+                assert!(
+                    report.refusals[0].detail.contains(&format!(
+                        "pohunek plugin uninstall pohunek.runtime.{runtime} --digest {} \
+                         --remove-modified --yes",
+                        release.as_str()
+                    )),
+                    "{context}: {}",
+                    report.refusals[0].detail
+                );
+                assert!(
+                    !gap_codes(report).contains(&(runtime, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)),
+                    "{context}: {:?}",
+                    report.gaps
+                );
+            }
+            assert_eq!(
+                fs::read(host.registry_path()).expect("the registry record"),
+                registry,
+                "{context}"
+            );
+        }
+    }
+}
+
+/// A detecting plan drops a runtime nothing uses whose program is off the
+/// search path before it judges the altered root of the disabled release
+/// package, so the plan is not refused for an agent that is not there.
+#[test]
+fn a_detecting_plan_drops_an_unused_runtime_before_judging_a_damaged_release_package() {
+    for runtime in ["codex", "hermes"] {
+        let (host, _selected, release) = host_serving_beside_a_disabled_release(runtime, "1.0.1");
+        host.alter_package_root(&release);
+        fs::remove_file(host.profiles_dir().join(format!("{runtime}.toml")))
+            .expect("remove the profile");
+
+        let detected = host.detect_step();
+
+        assert!(
+            detected.refusals.is_empty(),
+            "{runtime}: {:?}",
+            detected.refusals
+        );
+        assert!(
+            detected
+                .packages
+                .iter()
+                .all(|package| package.runtime != runtime),
+            "{runtime}: {:?}",
+            detected.packages
+        );
+    }
+}
+
+/// The release's package is the only record of its package, disabled and not
+/// selected, and nothing else serves the runtime: the upgrade neither installs
+/// nor enables nor selects it, and the gap hint enables it.
+#[tokio::test]
+async fn a_disabled_unselected_release_package_with_nothing_serving_is_left_untouched() {
+    for runtime in ["claude", "codex", "hermes"] {
+        let host = Host::new();
+        let release = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+        host.publish_archives(1, &[(runtime, &release.0, &release.1)]);
+        host.write_profile(runtime, &format!("base = \"{runtime}\"\n"));
+        assert!(host.step(false).refusals.is_empty());
+        let mut registry: serde_json::Value =
+            serde_json::from_slice(&fs::read(host.registry_path()).expect("registry"))
+                .expect("registry json");
+        registry["packages"][0]["enabled"] = serde_json::Value::Bool(false);
+        registry["selected"] = serde_json::json!({});
+        fs::write(host.registry_path(), registry.to_string()).expect("write the registry");
+
+        assert_disabled_selection_left(&host, runtime, &release.1, "unselected");
+
+        official_runtimes::enable_package(&host.plugins_dir(), host.env.root(), &release.1).await;
+        let enabled = host.step(true);
+        assert!(
+            enabled.refusals.is_empty(),
+            "{runtime}: {:?}",
+            enabled.refusals
+        );
+        let package = enabled
+            .packages
+            .iter()
+            .find(|package| package.runtime == runtime)
+            .expect("the runtime package");
+        assert_eq!(package.digest, release.1.as_str(), "{runtime}");
+    }
+}
+
 /// Records a copy of the first registry package as the disabled package
 /// `digest` at `version`, as a `plugin install --no-enable` of it would leave it.
 fn record_disabled_copy(host: &Host, digest: &PackageDigest, version: &str) {
@@ -2897,7 +3007,6 @@ async fn a_disabled_unordered_pi_selection_is_reported_once_by_the_detecting_pla
         "work",
         &format!("base = \"pi\"\n{}", official_runtimes::profile_pin("pi")),
     );
-    host.put_program("pi");
 
     let hex = id
         .as_str()
@@ -3385,7 +3494,6 @@ async fn a_disabled_ordered_pi_selection_is_reported_not_changed() {
         host.publish_pi(release_version, 1);
         host.disable_package(&Host::installed_pi_digest());
         host.write_profile("work", "base = \"pi\"\n");
-        host.put_program("pi");
         let registry = fs::read(host.registry_path()).expect("the registry record");
         let hex = Host::installed_pi_digest()
             .as_str()
@@ -3595,6 +3703,50 @@ async fn a_rootless_disabled_pi_selection_beside_a_third_party_server_is_reporte
     );
 }
 
+/// A disabled Pi selection nothing uses, whose root is altered or whose id
+/// another package serves, is reported by the plan without detection with the
+/// `plugin doctor` pointer and no enable hint, which `plugin enable` would not
+/// satisfy.
+#[tokio::test]
+async fn an_unused_disabled_pi_selection_that_cannot_be_enabled_points_to_the_doctor() {
+    for state in ["altered", "claimed"] {
+        let host = Host::with_installed_pi().await;
+        host.publish_pi(PI_NEWER_VERSION, 1);
+        let digest = Host::installed_pi_digest();
+        host.disable_package(&digest);
+        if state == "altered" {
+            host.alter_package_root(&digest);
+        } else {
+            official_runtimes::preinstall_third_party(
+                &host.plugins_dir(),
+                host.env.root(),
+                "pi",
+                "acme.runtime.pi",
+            )
+            .await;
+        }
+
+        let plan = host.step(true);
+
+        assert!(plan.refusals.is_empty(), "{state}: {:?}", plan.refusals);
+        let gap = plan
+            .gaps
+            .iter()
+            .find(|gap| gap.runtime == "pi" && gap.code == CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)
+            .unwrap_or_else(|| panic!("{state}: {:?}", plan.gaps));
+        assert!(
+            gap.detail.contains("pohunek plugin doctor"),
+            "{state}: {}",
+            gap.detail
+        );
+        assert!(
+            !gap.detail.contains("plugin enable"),
+            "{state}: {}",
+            gap.detail
+        );
+    }
+}
+
 #[test]
 fn install_detection_never_adds_pi() {
     let host = Host::new();
@@ -3614,6 +3766,26 @@ fn install_detection_never_adds_pi() {
         Vec::<String>::new(),
         "nothing installed"
     );
+}
+
+/// Appends a line to the first file under the package root `root`, so the root
+/// is present but does not match its recorded manifest.
+fn alter_root(root: PathBuf) {
+    let mut pending = vec![root];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).expect("a package directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let mut content = fs::read(&path).expect("a package file");
+                content.extend_from_slice(b"altered\n");
+                fs::write(&path, content).expect("alter the package file");
+                return;
+            }
+        }
+    }
+    panic!("the installed package root holds no file");
 }
 
 /// Copies the directory `from` to `to`, recursively.
