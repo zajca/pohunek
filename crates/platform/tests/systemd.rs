@@ -3038,8 +3038,7 @@ fn the_real_user_manager_orders_a_drop_in_path_after_the_unit_file() {
         reported
             .environment
             .iter()
-            .filter(|entry| entry.starts_with("PATH="))
-            .last()
+            .rfind(|entry| entry.starts_with("PATH="))
             .map(String::as_str),
         Some("PATH=/drop-in/bin"),
         "{reported:?}"

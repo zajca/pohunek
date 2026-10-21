@@ -384,19 +384,16 @@ pub async fn effective_job_environment(
 ) -> Result<JobEnvironment, Error> {
     let mut reader = UnitFileReader::default();
     let manager = selected_environment(entries, allowlist)?;
-    let (search_path, search_path_drop_in) = match recorded {
-        Some(recorded) => {
-            let path = recorded_search_path(recorded, unit, unit_name, &mut reader).await?;
-            (path.value, path.drop_in)
-        }
-        None => {
-            let path = effective_search_path(manager.search_path, unit, unit_name, &mut reader)
-                .await?
-                .ok_or_else(|| Error::ManagerEnvironment {
-                    detail: "it sets no PATH entry".to_owned(),
-                })?;
-            (path, None)
-        }
+    let (search_path, search_path_drop_in) = if let Some(recorded) = recorded {
+        let path = recorded_search_path(recorded, unit, unit_name, &mut reader).await?;
+        (path.value, path.drop_in)
+    } else {
+        let path = effective_search_path(manager.search_path, unit, unit_name, &mut reader)
+            .await?
+            .ok_or_else(|| Error::ManagerEnvironment {
+                detail: "it sets no PATH entry".to_owned(),
+            })?;
+        (path, None)
     };
     let variables = unit_job_variables(entries, unit, unit_name, allowlist, &mut reader).await?;
     Ok(JobEnvironment {

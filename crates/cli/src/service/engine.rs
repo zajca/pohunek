@@ -2743,7 +2743,13 @@ pub(crate) async fn journal_job_path(context: &Context, record: &Record) -> Resu
     let source = load_config_for_upgrade(&context.config_path())?.ok_or(Error::NotInstalled {
         path: context.config_path(),
     })?;
-    job_path(context, &source.config, record.journal_default()).await
+    job_path_for(
+        context,
+        &source.config,
+        record.journal_default(),
+        PathUse::Rollback,
+    )
+    .await
 }
 
 /// Whether rolling back `record` stops the daemon job before restoring.
@@ -3118,9 +3124,26 @@ pub(crate) enum PathSource {
     /// The launchd default the upgrade journaled while the job was loaded.
     #[cfg(target_os = "macos")]
     Journal,
-    /// The persisted launchd configuration, or launchd's standard `PATH`.
+    /// The persisted launchd configuration, or launchd's standard `PATH`, as a
+    /// stand-in: a change of it may be pending, so it may not be the active one.
     #[cfg(target_os = "macos")]
     Persisted,
+    /// The persisted launchd configuration, or launchd's standard `PATH`, which
+    /// was last changed before the host booted and is therefore the one launchd
+    /// applies to a job that is not loaded.
+    #[cfg(target_os = "macos")]
+    PersistedActive,
+}
+
+/// Which side of a transaction a daemon job's `PATH` is judged for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathUse {
+    /// A gate before or while the transaction moves forward (preflight, runtime
+    /// step, `service check`, setup): it refuses a `PATH` that cannot be told.
+    Forward,
+    /// A rollback or its gate: it goes on with the best evidence, because
+    /// refusing would strand the host between two versions.
+    Rollback,
 }
 
 /// The `PATH` a daemon job runs with, byte for byte, and where it came from.
@@ -3214,11 +3237,26 @@ pub(crate) async fn job_path(
     config: &ServiceConfig,
     journal_default: Option<JournalDefault<'_>>,
 ) -> Result<JobPath, Error> {
+    job_path_for(context, config, journal_default, PathUse::Forward).await
+}
+
+/// [`job_path`] for the given side of a transaction.
+///
+/// # Errors
+///
+/// See [`job_path`].
+pub(crate) async fn job_path_for(
+    context: &Context,
+    config: &ServiceConfig,
+    journal_default: Option<JournalDefault<'_>>,
+    usage: PathUse,
+) -> Result<JobPath, Error> {
     recorded_job_path(
         context,
         config.search_path(),
         config.environment_allowlist(),
         journal_default,
+        usage,
     )
     .await
 }
@@ -3261,7 +3299,7 @@ pub(crate) async fn recorded_job_search_path(
             manager_unreachable: None,
         });
     }
-    recorded_job_path(context, recorded, &[], journal_default).await
+    recorded_job_path(context, recorded, &[], journal_default, PathUse::Forward).await
 }
 
 /// The `PATH` and the allowlisted manager variables of a daemon job whose
@@ -3278,6 +3316,7 @@ pub(crate) async fn recorded_job_path(
     recorded: &SearchPath,
     allowlist: &[String],
     journal_default: Option<JournalDefault<'_>>,
+    usage: PathUse,
 ) -> Result<JobPath, Error> {
     if cfg!(target_os = "linux") {
         return linux_job_path(context, recorded, allowlist).await;
@@ -3298,7 +3337,7 @@ pub(crate) async fn recorded_job_path(
             manager_unreachable: unreachable,
         });
     }
-    launchd_job_path(context, journal_default, allowlist).await
+    launchd_job_path(context, journal_default, allowlist, usage).await
 }
 
 /// The `PATH` and the allowlisted variables of a daemon job on Linux, from the
@@ -3399,14 +3438,14 @@ async fn manager_variables(
 /// Linux resolves its unit in [`linux_job_path`], and no other host has a
 /// service manager that gives a job variables.
 #[cfg(not(target_os = "macos"))]
-async fn manager_variables(
+fn manager_variables(
     _context: &Context,
     _allowlist: &[String],
-) -> Result<ManagerVariables, Error> {
-    Ok(ManagerVariables {
+) -> std::future::Ready<Result<ManagerVariables, Error>> {
+    std::future::ready(Ok(ManagerVariables {
         variables: BTreeMap::new(),
         unreachable: None,
-    })
+    }))
 }
 
 /// The launchd `PATH` of a job without its own (macOS), in launchd's order: the
@@ -3418,6 +3457,7 @@ async fn launchd_job_path(
     context: &Context,
     journal_default: Option<JournalDefault<'_>>,
     allowlist: &[String],
+    usage: PathUse,
 ) -> Result<JobPath, Error> {
     use super::manager_env::ActiveJob;
 
@@ -3440,7 +3480,7 @@ async fn launchd_job_path(
     } else if let Some(journal) = journal_default {
         journaled_or_persisted_path(context, journal)?
     } else {
-        (persisted_user_domain_path(context)?, PathSource::Persisted)
+        unloaded_persisted_path(context, usage)?
     };
     let value =
         manager_env::carry(&value).map_err(|detail| Error::ManagerEnvironment { detail })?;
@@ -3462,6 +3502,66 @@ fn persisted_user_domain_path(context: &Context) -> Result<String, Error> {
         .map_err(|error| Error::ManagerEnvironment {
             detail: format!("the launchd user domain's PATH cannot be read: {error}"),
         })
+}
+
+/// The `PATH` of a job that is not loaded when no transaction journaled a
+/// launchd default: the persisted user-domain configuration, which launchd
+/// applies at boot.
+///
+/// The persisted value is the active one only when `user.plist` was last
+/// modified before the host booted, by more than the configured margin that
+/// keeps a clock step around the boot from reordering the two times: a later
+/// write is pending, or applied and changed again. An absent file is dated by
+/// its directory, and launchd's standard `PATH` then counts as persisted. A
+/// configuration that is not older, or whose time or the boot time cannot be
+/// read, may have a change pending: a forward gate refuses, and a rollback goes
+/// on with the persisted value as a stand-in and says so, because refusing a
+/// rollback would strand the host.
+#[cfg(target_os = "macos")]
+fn unloaded_persisted_path(
+    context: &Context,
+    usage: PathUse,
+) -> Result<(String, PathSource), Error> {
+    let activity = persisted_config_is_active(context);
+    let persisted = persisted_user_domain_path(context)?;
+    match (activity, usage) {
+        (Ok(()), _) => Ok((persisted, PathSource::PersistedActive)),
+        (Err(_), PathUse::Rollback) => Ok((persisted, PathSource::Persisted)),
+        (Err(reason), PathUse::Forward) => Err(Error::ManagerEnvironment {
+            detail: format!(
+                "which PATH launchd applies to the daemon job, which is not loaded, cannot be told ({reason}). Start the daemon job so launchd loads it, set the PATH explicitly with `launchctl setenv PATH <directories>` in the GUI session, or reboot the host, and retry"
+            ),
+        }),
+    }
+}
+
+/// Whether the persisted launchd user-domain configuration is older than the
+/// current boot, so launchd has applied it; the reason otherwise.
+#[cfg(target_os = "macos")]
+fn persisted_config_is_active(context: &Context) -> Result<(), String> {
+    let booted = context
+        .launchd_job()
+        .boot_time()
+        .map_err(|error| format!("the boot time cannot be read: {error}"))?;
+    let date = || {
+        pohunek_platform::supervisor::launchd::user_domain_config_modified(
+            context.launchd_domain_config(),
+        )
+        .map_err(|error| format!("the launchd user-domain configuration cannot be dated: {error}"))
+    };
+    let changed = date()?;
+    // Both times are on the calendar clock, and a clock step right after the boot
+    // moves `kern.boottime` but not the times of files written before the step.
+    let settled = booted
+        .checked_sub(super::settings::LAUNCHD_CONFIG_BOOT_MARGIN)
+        .unwrap_or(std::time::UNIX_EPOCH);
+    if changed >= settled {
+        return Err(
+            "the launchd user-domain configuration was modified after, or too close to, the host boot, so a change may be pending or may have been applied and changed again"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 /// The journaled launchd default of a job that is not loaded, or the persisted
@@ -3591,6 +3691,7 @@ fn launchd_job_path<'a>(
     _context: &'a Context,
     _journal_default: Option<JournalDefault<'a>>,
     _allowlist: &'a [String],
+    _usage: PathUse,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<JobPath, Error>> + Send + 'a>> {
     Box::pin(std::future::ready(Err(Error::ManagerEnvironment {
         detail: "a launchd job exists only on macOS".to_owned(),

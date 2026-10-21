@@ -6,8 +6,6 @@
 
 use std::collections::VecDeque;
 
-use pohunek_platform::shell_env::SearchPath;
-
 use super::*;
 
 /// The `PATH` `service.toml` records in these scenarios.
@@ -113,7 +111,14 @@ async fn judge_job(
         SearchPath::empty()
     };
     let allowlist: Vec<String> = allowlist.iter().map(|name| (*name).to_owned()).collect();
-    crate::service::engine::recorded_job_path(&context, &search_path, &allowlist, None).await
+    crate::service::engine::recorded_job_path(
+        &context,
+        &search_path,
+        &allowlist,
+        None,
+        crate::service::engine::PathUse::Forward,
+    )
+    .await
 }
 
 const MANAGER_ENTRIES: [&str; 1] = ["PATH=/manager/bin"];
@@ -877,10 +882,7 @@ async fn the_preflight_judges_store_references_at_the_drop_in_location() {
     let mut harness = recorded_harness();
     harness.install(V1).await.expect("install");
     let (_dir, unit) = loaded_with(
-        &[(
-            "10-store.conf",
-            "[Service]\nEnvironment=LC_CTYPE=/d\n",
-        )],
+        &[("10-store.conf", "[Service]\nEnvironment=LC_CTYPE=/d\n")],
         &["LC_CTYPE=/d"],
     );
     harness.context = harness

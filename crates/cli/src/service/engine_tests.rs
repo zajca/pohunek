@@ -3664,10 +3664,13 @@ async fn a_journal_without_a_launchd_default_takes_the_persisted_plist_and_warns
     .expect("rewrite journal");
     let domain = harness.root.join("user.plist");
     std::fs::write(&domain, launchd_domain_xml(PERSISTED)).expect("domain configuration");
+    // The persisted file is newer than the boot, so a change may be pending.
+    let launchd = FakeLaunchd::new(Ok(not_loaded()));
+    booted_an_hour_ago(&launchd);
     harness.context = harness
         .context
         .clone()
-        .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(not_loaded()))))
+        .with_launchd_job(Arc::new(launchd))
         .with_launchd_domain_config(&domain);
     let preflight = ScriptedPreflight::default();
     let judged = Arc::clone(&preflight.search_paths);
@@ -3692,6 +3695,250 @@ async fn a_journal_without_a_launchd_default_takes_the_persisted_plist_and_warns
         rolled_back.warnings
     );
     harness.assert_installed(V1);
+}
+
+/// The persisted user-domain `PATH` a not-loaded job gets at the early gate.
+#[cfg(target_os = "macos")]
+const PERSISTED_PATH: &str = "/opt/persisted/bin:/usr/bin";
+
+/// A V1 install whose daemon job records no `PATH`, with a launchd user-domain
+/// configuration directory in the test root; returns the file's path.
+#[cfg(target_os = "macos")]
+async fn unrecorded_install_with_domain_config(harness: &mut Harness) -> std::path::PathBuf {
+    let config_dir = harness.root.join("launchd-domain");
+    std::fs::create_dir_all(&config_dir).expect("configuration directory");
+    let domain = config_dir.join("user.plist");
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged)
+        .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(loaded_job(CURRENT_PATH)))))
+        .with_launchd_domain_config(&domain);
+    harness.install(V1).await.expect("install");
+    domain
+}
+
+/// Upgrades an installed job that launchd has not loaded and no journal holds a
+/// default for; returns the result and the `PATH` of every judgement.
+#[cfg(target_os = "macos")]
+async fn upgrade_of_an_unloaded_job(
+    harness: &mut Harness,
+    domain: &std::path::Path,
+    persisted: Option<&str>,
+    dated: impl FnOnce(&std::path::Path),
+    host: impl FnOnce(&FakeLaunchd),
+) -> (Result<UpgradeReport, Error>, Vec<String>) {
+    if let Some(value) = persisted {
+        std::fs::write(domain, launchd_domain_xml(value)).expect("domain configuration");
+    }
+    dated(domain);
+    let launchd = FakeLaunchd::new(Ok(not_loaded()));
+    host(&launchd);
+    harness.context = harness.context.clone().with_launchd_job(Arc::new(launchd));
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+    let result = harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V2), V2)
+        .await;
+    let judged = judged.lock().expect("search path lock").clone();
+    (result, judged)
+}
+
+/// Dates the configuration directory before the boot, as a file of an old
+/// configuration, or the directory an absent one would have been removed from.
+#[cfg(target_os = "macos")]
+fn dated_before_boot(domain: &std::path::Path) {
+    let target = if domain.exists() {
+        domain
+    } else {
+        domain.parent().expect("configuration directory")
+    };
+    date(target, Modified::BeforeBoot).expect("date");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_fresh_upgrade_of_an_unloaded_job_without_persisted_path_uses_the_standard_path() {
+    let mut harness = Harness::new();
+    let domain = unrecorded_install_with_domain_config(&mut harness).await;
+    let (result, judged) =
+        upgrade_of_an_unloaded_job(&mut harness, &domain, None, dated_before_boot, |_| {}).await;
+    let report = result.expect("upgrade");
+    assert!(
+        !judged.is_empty()
+            && judged
+                .iter()
+                .all(|path| path == pohunek_platform::supervisor::launchd::STANDARD_PATH),
+        "{judged:?}"
+    );
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    harness.assert_installed(V2);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_persisted_path_older_than_the_boot_is_active() {
+    let mut harness = Harness::new();
+    let domain = unrecorded_install_with_domain_config(&mut harness).await;
+    let (result, judged) = upgrade_of_an_unloaded_job(
+        &mut harness,
+        &domain,
+        Some(PERSISTED_PATH),
+        dated_before_boot,
+        |_| {},
+    )
+    .await;
+    let report = result.expect("upgrade");
+    assert!(
+        !judged.is_empty() && judged.iter().all(|path| path == PERSISTED_PATH),
+        "{judged:?}"
+    );
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    harness.assert_installed(V2);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_possibly_pending_persisted_path_refuses_the_forward_gate() {
+    let mut harness = Harness::new();
+    let domain = unrecorded_install_with_domain_config(&mut harness).await;
+    let (result, judged) = upgrade_of_an_unloaded_job(
+        &mut harness,
+        &domain,
+        Some(PERSISTED_PATH),
+        |domain| date(domain, Modified::AfterBoot).expect("date"),
+        |_| {},
+    )
+    .await;
+    let error = result.expect_err("a change may be pending");
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    let text = error.to_string();
+    assert!(
+        text.contains("launchctl setenv PATH") && text.contains("reboot"),
+        "{text}"
+    );
+    assert!(!text.contains(PERSISTED_PATH), "values stay out: {text}");
+    assert!(judged.is_empty(), "nothing was judged: {judged:?}");
+    assert_eq!(harness.pending(), None, "no journal was written");
+    harness.assert_installed(V1);
+}
+
+/// The pending upgrade of [`interrupted_upgrade_journal`], whose journal holds no
+/// launchd default, rolled back on a host whose launchd does not have the job
+/// loaded; `persisted` is dated by `dated`, and `host` shapes the fake host.
+#[cfg(target_os = "macos")]
+async fn rollback_without_a_journaled_default(
+    harness: &mut Harness,
+    dated: impl FnOnce(&std::path::Path),
+    host: impl FnOnce(&FakeLaunchd),
+) -> (Result<UpgradeReport, Error>, Vec<String>) {
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(PERSISTED_PATH)).expect("domain configuration");
+    harness.context = harness.context.clone().with_launchd_domain_config(&domain);
+    interrupted_upgrade_journal(harness).await;
+    let journal = harness.context.paths().state_dir.join(record::FILE_NAME);
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&journal).expect("journal")).expect("journal JSON");
+    document
+        .as_object_mut()
+        .expect("journal object")
+        .remove("launchd_default_path");
+    std::fs::write(
+        &journal,
+        serde_json::to_vec(&document).expect("journal bytes"),
+    )
+    .expect("rewrite journal");
+    dated(&domain);
+    let launchd = FakeLaunchd::new(Ok(not_loaded()));
+    host(&launchd);
+    harness.context = harness.context.clone().with_launchd_job(Arc::new(launchd));
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+    let result = harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V1), V1)
+        .await;
+    let judged = judged.lock().expect("search path lock").clone();
+    (result, judged)
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_rollback_uses_an_active_persisted_path_without_warning() {
+    let mut harness = Harness::new();
+    let (result, judged) = rollback_without_a_journaled_default(
+        &mut harness,
+        |domain| date(domain, Modified::BeforeBoot).expect("date"),
+        |_| {},
+    )
+    .await;
+    let report = result.expect("the pending upgrade is rolled back");
+    assert!(
+        !judged.is_empty() && judged.iter().all(|path| path == PERSISTED_PATH),
+        "{judged:?}"
+    );
+    let rolled_back = report.rolled_back.expect("the rollback is reported");
+    assert!(
+        rolled_back.warnings.is_empty(),
+        "{:?}",
+        rolled_back.warnings
+    );
+    harness.assert_installed(V1);
+}
+
+/// A boot time that cannot be read, or a configuration changed within the margin
+/// of the boot, may hide a pending change: a forward gate refuses, and a
+/// rollback goes on with the persisted value and says so.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn an_unreadable_boot_or_file_time_is_treated_as_pending() {
+    let unreadable_boot =
+        |launchd: &FakeLaunchd| launchd.set_boot_time(Err("sysctl failed".to_owned()));
+    let within_margin = |domain: &std::path::Path| {
+        let when = boot_time() - crate::service::settings::LAUNCHD_CONFIG_BOOT_MARGIN / 2;
+        std::fs::File::open(domain)
+            .and_then(|file| file.set_modified(when))
+            .expect("date");
+    };
+
+    for host_unreadable in [true, false] {
+        let host = |launchd: &FakeLaunchd| {
+            if host_unreadable {
+                unreadable_boot(launchd);
+            }
+        };
+        let dated = |domain: &std::path::Path| {
+            if host_unreadable {
+                dated_before_boot(domain);
+            } else {
+                within_margin(domain);
+            }
+        };
+
+        let mut harness = Harness::new();
+        let domain = unrecorded_install_with_domain_config(&mut harness).await;
+        let (result, _) =
+            upgrade_of_an_unloaded_job(&mut harness, &domain, Some(PERSISTED_PATH), dated, host)
+                .await;
+        let error = result.expect_err("a forward gate refuses");
+        assert_eq!(error.code(), "service_manager_environment_unavailable");
+        harness.assert_installed(V1);
+
+        let mut harness = Harness::new();
+        let (result, judged) =
+            rollback_without_a_journaled_default(&mut harness, dated, host).await;
+        let report = result.expect("a rollback goes on");
+        assert!(
+            !judged.is_empty() && judged.iter().all(|path| path == PERSISTED_PATH),
+            "{judged:?}"
+        );
+        let warnings = report.rolled_back.expect("rolled back").warnings;
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("persisted launchd configuration was used"));
+    }
 }
 
 #[tokio::test]
