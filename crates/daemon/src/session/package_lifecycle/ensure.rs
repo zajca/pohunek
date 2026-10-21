@@ -1274,7 +1274,7 @@ fn plan_runtime(
         );
         return Ok(None);
     }
-    if !is_reserved(&runtime) && keeps_selected(plan, &prepared, &subject, report) {
+    if keeps_selected(plan, &prepared, &subject, report, is_reserved(&runtime)) {
         let release_version = prepared.identity.version.as_str().to_owned();
         return Ok(
             plan_installed(plan, runtime, reasons, report).map(|mut kept| {
@@ -2143,15 +2143,17 @@ fn replaces_newer(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<Selected
     })
 }
 
-/// Whether the selected official version of a runtime that is not reserved
-/// (Pi) stays. It was installed on purpose, possibly from a later archive than
-/// this release's, so a version that is newer, or that cannot be ordered
-/// against the release's (a gap), is kept and never replaced by the release's.
+/// Whether the selected official version of a runtime stays. A version that
+/// cannot be ordered against the release's (a gap) is kept for every runtime,
+/// reserved or not, and reported. A newer version is kept only for a runtime
+/// that is not reserved (Pi); a reserved runtime's newer selection is replaced
+/// and reported through `replaces_newer`.
 fn keeps_selected(
     plan: &PlanInputs<'_>,
     prepared: &Prepared,
     subject: &str,
     report: &mut Report,
+    reserved: bool,
 ) -> bool {
     if selection_unordered(plan, prepared) {
         report.gap(
@@ -2161,7 +2163,7 @@ fn keeps_selected(
         );
         return true;
     }
-    replaces_newer(plan, prepared).is_some()
+    !reserved && replaces_newer(plan, prepared).is_some()
 }
 
 /// Whether the selected official version of the package differs from the

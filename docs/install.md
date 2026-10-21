@@ -373,7 +373,9 @@ purpose. When
 the selected version of `claude`, `codex` or `hermes` is newer than the release's,
 for example after a `plugin update` from a later archive, the upgrade plan says
 that the upgrade re-selects the release's version. Select the newer one again afterwards. A plain
-`install` of another version leaves it installed but unselected.
+`install` of another version leaves it installed but unselected. A selected version of `claude`,
+`codex` or `hermes` that cannot be ordered against the release's is kept like Pi's, never
+replaced, and reported as the gap `plugin_update_version_unordered`.
 The trust model and the package classes are described
 in [the architecture](architecture.md#runtime-packages-and-trust) and the
 [runtime packages guide](knowledge/guides/runtime-packages.md).

@@ -1897,6 +1897,54 @@ fn a_profile_pinned_to_a_newer_official_version_is_kept_and_the_replaced_selecti
     );
 }
 
+/// The selected version of a reserved runtime that has no order against the
+/// release's is kept, reported as a gap and never replaced, as for Pi.
+#[test]
+fn a_selected_reserved_runtime_version_without_an_order_against_the_release_is_kept() {
+    for runtime in ["claude", "codex"] {
+        let host = Host::new();
+        let (bytes, digest) = official_runtimes::variant_archive(runtime, "2.0");
+        host.publish_archives(1, &[(runtime, &bytes, &digest)]);
+        host.write_profile(runtime, &format!("base = \"{runtime}\"\n"));
+        let installed = host.step(false);
+        assert!(installed.refusals.is_empty(), "{runtime}: {installed:?}");
+        let (release, release_digest) = official_runtimes::variant_archive(runtime, "1.0.3");
+        host.publish_archives(2, &[(runtime, &release, &release_digest)]);
+        let registry = fs::read(host.registry_path()).expect("the registry record");
+
+        let plan = host.step(true);
+        let applied = host.step(false);
+
+        for report in [&plan, &applied] {
+            assert!(
+                report.refusals.is_empty(),
+                "{runtime}: {:?}",
+                report.refusals
+            );
+            let package = report
+                .packages
+                .iter()
+                .find(|package| package.runtime == runtime)
+                .expect("the runtime package");
+            assert_eq!(package.status, PackageStatus::Kept, "{runtime}");
+            assert_eq!(package.version, "2.0", "{runtime}");
+            assert_eq!(package.digest, digest.as_str(), "{runtime}");
+            assert_eq!(package.release_version.as_deref(), Some("1.0.3"));
+            assert_eq!(package.replaces_newer, None, "{runtime}");
+            let unordered: Vec<_> = gap_codes(report)
+                .into_iter()
+                .filter(|(_, code)| *code == CODE_GAP_UPDATE_VERSION_UNORDERED)
+                .collect();
+            assert_eq!(unordered, [(runtime, CODE_GAP_UPDATE_VERSION_UNORDERED)]);
+        }
+        assert_eq!(
+            fs::read(host.registry_path()).expect("the registry record"),
+            registry,
+            "{runtime}"
+        );
+    }
+}
+
 /// A profile pinned to a digest the registry holds no record of is kept, as
 /// its version cannot be compared with the release package.
 #[test]

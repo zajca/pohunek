@@ -1030,7 +1030,8 @@ fn profile_files(dir: &Path) -> Vec<(String, PathBuf)> {
 const MAX_SCANNED_PROFILES: usize = 4096;
 
 /// The profile files of `dir` for the retention scan, listing at most
-/// [`MAX_SCANNED_PROFILES`] entries.
+/// [`MAX_SCANNED_PROFILES`] entries, sorted by name: the directory order
+/// depends on the filesystem, and the upgrade plan and report follow this one.
 fn scanned_profile_files(dir: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
     let mut files = Vec::new();
     let mut seen = 0_usize;
@@ -1054,6 +1055,7 @@ fn scanned_profile_files(dir: &Path) -> std::io::Result<Vec<(String, PathBuf)>> 
             files.push((stem.to_owned(), path));
         }
     }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(files)
 }
 

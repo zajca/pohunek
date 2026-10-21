@@ -1941,6 +1941,37 @@ fn a_0_34_2_host_with_built_in_sessions_is_adoptable_through_the_release_plan() 
 }
 
 #[test]
+fn the_release_plan_lists_profiles_by_name_whatever_order_they_were_created_in() {
+    for names in [
+        ["official-claude", "official-codex"],
+        ["official-codex", "official-claude"],
+    ] {
+        let host = Host::new();
+        let catalog = official_runtimes::OfficialCatalog::new();
+        let release = host.env.root().join("release").join("runtime");
+        catalog.write_release(&release, &["claude", "codex"]);
+        let profiles = private_dir(host.env.config_home().join("pohunek").join("agents"));
+        for name in names {
+            write_profile(&profiles, name, name.trim_start_matches("official-"));
+        }
+
+        let report = run_with(
+            &host.inputs(),
+            &release_options(&host, &release, &catalog, &profiles),
+            &HostInspector::new(),
+        );
+
+        let plan = report.runtimes.as_ref().expect("the release plan");
+        let bound: Vec<&str> = plan
+            .profiles
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .collect();
+        assert_eq!(bound, ["official-claude", "official-codex"], "{names:?}");
+    }
+}
+
+#[test]
 fn a_profile_whose_override_lacks_screen_readiness_is_warned_before_the_upgrade() {
     let host = Host::new();
     let catalog = official_runtimes::OfficialCatalog::new();

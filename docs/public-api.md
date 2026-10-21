@@ -2337,9 +2337,9 @@ the runtime id; it is left untouched), `official_package_unavailable_for_platfor
 reserved, such as Pi, where it is a gap in every mode), and
 `official_package_not_serving` (an official package of such a runtime is
 installed but not selected and enabled, so the step leaves it), and
-`plugin_update_version_unordered` (the selected version of such a package cannot
-be ordered against the release's, so it is kept, as `plugin update` refuses to
-replace it). The first two of these three name the `pohunek plugin update` command
+`plugin_update_version_unordered` (the selected version of an official package, of
+a reserved runtime or not, cannot be ordered against the release's, so it is kept,
+as `plugin update` refuses to replace it). The first two of these three name the `pohunek plugin update` command
 that updates the package by hand. A gap never blocks an apply, and `gaps` is empty
 without `--detect` except for those three. The step also keeps an installed official package of a runtime that is
 not reserved (Pi) current: when one is installed from the official catalog,
