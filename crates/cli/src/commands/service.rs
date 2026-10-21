@@ -309,7 +309,7 @@ fn append_package_warning(text: &mut String, package: &PackageAction) {
     if let Some(release) = &package.release_version {
         let _ = writeln!(
             text,
-            "           keeps the selected {} {}, which is newer than the release's {release}",
+            "           keeps the selected {} {}; the release offers {release}",
             package.package, package.version
         );
     }
@@ -928,6 +928,31 @@ fn render_rolled_back(pending: &report::PendingReport) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_kept_package_is_described_without_claiming_why_it_is_kept() {
+        for (selected, release) in [("2.0.0", "1.0.3"), ("2.0", "1.0.3")] {
+            let package = pohunek_service_config::runtimes::PackageAction {
+                runtime: "pi".to_owned(),
+                package: "pohunek.runtime.pi".to_owned(),
+                version: selected.to_owned(),
+                digest: "de".repeat(32),
+                status: PackageStatus::Kept,
+                reasons: vec![pohunek_service_config::runtimes::UseReason::Installed],
+                replaces_newer: None,
+                release_version: Some(release.to_owned()),
+            };
+            let mut text = String::new();
+            append_package_warning(&mut text, &package);
+            assert!(
+                text.contains(&format!(
+                    "keeps the selected pohunek.runtime.pi {selected}; the release offers {release}"
+                )),
+                "{text}"
+            );
+            assert!(!text.contains("newer"), "{text}");
+        }
+    }
     use std::path::Path;
 
     use clap::Parser as _;
