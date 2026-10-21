@@ -3208,12 +3208,19 @@ pub(crate) async fn recorded_job_path(
                 | manager_env::EnvironmentFailure::Unusable(detail)) = failure;
                 Error::ManagerEnvironment { detail }
             })?;
+        // The manager expands `%h` and `%t` with its own environment, so that is
+        // the source; the context's values stand in only when it reports none.
         let specifiers = manager_env::Specifiers {
-            home: context.home().map(|path| path.display().to_string()),
+            home: environment
+                .home
+                .clone()
+                .or_else(|| context.home().map(|path| path.display().to_string())),
             uid: context.uid(),
-            runtime_dir: context
-                .runtime_base()
-                .map(|path| path.display().to_string()),
+            runtime_dir: environment.runtime_dir.clone().or_else(|| {
+                context
+                    .runtime_base()
+                    .map(|path| path.display().to_string())
+            }),
         };
         let value = manager_env::effective_search_path(
             environment.search_path,

@@ -135,6 +135,10 @@ pub struct UserManagerEnvironment {
     pub search_path: Option<String>,
     /// The manager's variables the allowlist selects, `PATH` excluded.
     pub variables: BTreeMap<String, String>,
+    /// The manager's own `HOME`, which its `%h` specifier expands to.
+    pub home: Option<String>,
+    /// The manager's own `XDG_RUNTIME_DIR`, which its `%t` specifier expands to.
+    pub runtime_dir: Option<String>,
 }
 
 // Variables are printed by name only: their values may be secrets.
@@ -203,9 +207,17 @@ pub fn selected_environment(
             .split_once('=')
             .map(|(name, value)| (name.to_owned(), value.to_owned()))
     });
+    let find = |name: &str| {
+        entries
+            .iter()
+            .find_map(|entry| entry.strip_prefix(name)?.strip_prefix('='))
+            .map(str::to_owned)
+    };
     Ok(UserManagerEnvironment {
         search_path,
         variables: allowlisted_variables(pairs, allowlist)?,
+        home: find("HOME"),
+        runtime_dir: find("XDG_RUNTIME_DIR"),
     })
 }
 

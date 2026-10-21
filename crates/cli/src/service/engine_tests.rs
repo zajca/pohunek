@@ -11263,6 +11263,60 @@ async fn a_rollback_whose_removed_unit_keeps_a_home_specifier_drop_in_completes(
     harness.assert_installed(V1);
 }
 
+/// A user manager that reports its own `HOME` and `XDG_RUNTIME_DIR`.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct HomeManager(UnitEnvironment);
+
+#[cfg(target_os = "linux")]
+impl UserManager for HomeManager {
+    fn environment(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, EnvironmentFailure>> + Send + '_>> {
+        Box::pin(async {
+            Ok(vec![
+                format!("PATH={MANAGER_PATH}"),
+                "HOME=/manager/home".to_owned(),
+                "XDG_RUNTIME_DIR=/manager/run".to_owned(),
+            ])
+        })
+    }
+
+    fn unit_environment<'a>(
+        &'a self,
+        _unit: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<UnitEnvironment, EnvironmentFailure>> + Send + 'a>>
+    {
+        let unit = self.0.clone();
+        Box::pin(async move { Ok(unit) })
+    }
+}
+
+/// `%h` and `%t` of a removed unit's drop-ins are the manager's, not the CLI's.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_removed_unit_expands_home_and_runtime_specifiers_from_the_managers_environment() {
+    let (_keep, unit) = orphan_drop_ins(&[(
+        "a.service.d",
+        "10-a.conf",
+        b"[Service]\nEnvironment=PATH=%h/bin:%t/bin\n",
+    )]);
+    let harness = Harness::new();
+    let context = harness
+        .context
+        .clone()
+        .with_user_manager(Arc::new(HomeManager(unit)));
+    context.namespace().expect("the roots exist");
+    let job = crate::service::engine::recorded_job_search_path(
+        &context,
+        &pohunek_platform::shell_env::SearchPath::empty(),
+        None,
+    )
+    .await
+    .expect("path");
+    assert_eq!(job.value, "/manager/home/bin:/manager/run/bin");
+}
+
 /// What cannot be read from drop-ins of an unloaded unit is refused with the
 /// file and the fix.
 #[cfg(target_os = "linux")]

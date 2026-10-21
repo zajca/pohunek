@@ -972,7 +972,7 @@ same code, and the message names the file or directive to change:
   drop-ins alone, so the first resolution refuses upfront, before anything is
   stopped, what the second could not read or resolves to a different `PATH`
   (the drop-in files on disk are the same in both). `%h`, `%U`, `%t` and `%%` are
-  expanded in those drop-ins from the CLI's home, uid and runtime directory;
+  expanded in those drop-ins from the manager's own `HOME` and `XDG_RUNTIME_DIR` (the CLI's when the manager reports none) and the uid;
   every other specifier is refused with its key named;
 - a unit with no unit file (not installed yet, or removed by a rollback or a
   config migration) whose drop-in files in the manager's own `UnitPath`
