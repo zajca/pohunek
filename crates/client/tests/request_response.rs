@@ -763,14 +763,47 @@ async fn session_creation_without_input_outlasts_the_default_request_timeout() {
 /// waits out its grace, above the client's 5 s default request timeout.
 const SLOW_RESUME: Duration = Duration::from_secs(30);
 
-/// Serves one `session.resume`: a health reply on the shared connection, then
-/// the resume request on whichever connection it arrives, answered with the
-/// resumed session once the test releases `reply`. `request_tx` reports the
-/// request and whether it arrived on a dedicated connection.
+/// Serves one `session.resume`: see [`spawn_lifecycle_daemon`].
 fn spawn_resume_daemon(
     listener: UnixListener,
     request_tx: oneshot::Sender<(Request, bool)>,
     reply: oneshot::Receiver<()>,
+) -> JoinHandle<()> {
+    spawn_lifecycle_daemon(listener, request_tx, reply, resumed_session_result())
+}
+
+/// The `session.resume` result the fixture answers.
+fn resumed_session_result() -> Value {
+    json!({"session": session_info_json("s-resume")})
+}
+
+/// A running session summary as the fixture daemon reports it.
+fn session_info_json(id: &str) -> Value {
+    json!({
+        "id": id,
+        "agent": "codex",
+        "agent_base": "codex",
+        "capabilities": {"fork": true, "resume": true},
+        "cwd": "/workspace/pohunek",
+        "pid": 42424,
+        "state": "running",
+        "state_source": "process",
+        "cols": 80,
+        "rows": 24,
+        "created_at": "2026-07-08T00:00:00Z",
+        "updated_at": "2026-07-08T00:01:00Z",
+    })
+}
+
+/// Serves one lifecycle request: a health reply on the shared connection, then
+/// the request on whichever connection it arrives, answered with `result` once
+/// the test releases `reply`. `request_tx` reports the request and whether it
+/// arrived on a dedicated connection.
+fn spawn_lifecycle_daemon(
+    listener: UnixListener,
+    request_tx: oneshot::Sender<(Request, bool)>,
+    reply: oneshot::Receiver<()>,
+    result: Value,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let (primary, _) = listener.accept().await.expect("accept primary connection");
@@ -807,25 +840,8 @@ fn spawn_resume_daemon(
             .send((resume, dedicated))
             .expect("report resume request");
         reply.await.expect("the test releases the resume reply");
-        let response = Response::ok(
-            protocol::PROTOCOL_VERSION,
-            resume_id,
-            json!({"session": {
-                "id": "s-resume",
-                "agent": "codex",
-                "agent_base": "codex",
-                "capabilities": {"fork": false, "resume": true},
-                "cwd": "/workspace/pohunek",
-                "pid": 42424,
-                "state": "running",
-                "state_source": "process",
-                "cols": 80,
-                "rows": 24,
-                "created_at": "2026-07-08T00:00:00Z",
-                "updated_at": "2026-07-08T00:01:00Z",
-            }}),
-        )
-        .expect("resume fixture response");
+        let response = Response::ok(protocol::PROTOCOL_VERSION, resume_id, result)
+            .expect("lifecycle fixture response");
         // The client may have given up already; the reply is best effort.
         let _ = stream
             .get_mut()
@@ -911,6 +927,337 @@ async fn session_resume_past_its_deadline_reports_an_unknown_outcome() {
     reply_tx.send(()).expect("release the resume reply");
     server.await.expect("fixture daemon completed");
     inhibitor.release().await;
+}
+
+/// Daemon-side duration of a fork, stop or remove the fixture answers, above
+/// the client's 5 s default request timeout.
+const SLOW_LIFECYCLE: Duration = Duration::from_secs(6);
+
+/// A fixture daemon serving one lifecycle request, held until the test
+/// releases its reply.
+struct LifecycleFixture {
+    request_rx: oneshot::Receiver<(Request, bool)>,
+    reply_tx: Option<oneshot::Sender<()>>,
+    server: JoinHandle<()>,
+    inhibitor: AutoAdvanceInhibitor,
+    _socket_file: SocketFile,
+}
+
+impl LifecycleFixture {
+    /// Starts the fixture and connects a client with `options` to it.
+    async fn start(result: Value, options: ClientOptions) -> (Client, Self) {
+        let inhibitor = AutoAdvanceInhibitor::new();
+        let socket_file = SocketFile::new();
+        let listener = UnixListener::bind(socket_file.path()).expect("bind fixture daemon");
+        let (request_tx, request_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel::<()>();
+        let server = spawn_lifecycle_daemon(listener, request_tx, reply_rx, result);
+        let mut client = Client::connect_local_with_options(socket_file.path(), options)
+            .await
+            .expect("connect fixture daemon");
+        client.handshake().await.expect("negotiate protocol");
+        (
+            client,
+            Self {
+                request_rx,
+                reply_tx: Some(reply_tx),
+                server,
+                inhibitor,
+                _socket_file: socket_file,
+            },
+        )
+    }
+
+    /// Waits for the lifecycle request; the flag is whether it arrived on a
+    /// dedicated connection.
+    async fn request(&mut self) -> (Request, bool) {
+        (&mut self.request_rx)
+            .await
+            .expect("the lifecycle request reached the daemon")
+    }
+
+    /// Lets the daemon answer.
+    fn release(&mut self) {
+        self.reply_tx
+            .take()
+            .expect("the reply is released once")
+            .send(())
+            .expect("release the reply");
+    }
+
+    /// Ends the fixture after the daemon answered.
+    async fn finish(self) {
+        self.server.await.expect("fixture daemon completed");
+        self.inhibitor.release().await;
+    }
+}
+
+fn fork_params() -> protocol::SessionForkParams {
+    protocol::SessionForkParams {
+        session_id: protocol::SessionId("s-source".to_owned()),
+        name: None,
+        cwd_mode: protocol::ForkCwdMode::Same,
+        cols: 80,
+        rows: 24,
+        accept_profile_change: false,
+    }
+}
+
+fn source_session() -> protocol::SessionId {
+    protocol::SessionId("s-source".to_owned())
+}
+
+fn removed_result() -> Value {
+    json!({"removed": true, "stopped": true, "worktrees_removed": 0, "worktrees_failed": 0})
+}
+
+fn explicit_options(timeout: Duration) -> ClientOptions {
+    no_origin_options().with_request_timeout(timeout)
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_fork_outlasts_the_default_request_timeout() {
+    let (mut client, mut fixture) =
+        LifecycleFixture::start(session_info_json("s-forked"), no_origin_options()).await;
+    let fork = tokio::spawn(async move { client.session_fork(fork_params()).await });
+    let (request, dedicated) = fixture.request().await;
+    assert_eq!(request.method(), protocol::method::SESSION_FORK);
+    assert!(dedicated, "the fork runs on a dedicated connection");
+    tokio::time::advance(SLOW_LIFECYCLE).await;
+    fixture.release();
+    let forked = fork
+        .await
+        .expect("fork task completed")
+        .expect("the client waits for the daemon's reply instead of timing out");
+    assert_eq!(forked.session.id.0, "s-forked");
+    fixture.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn generic_fork_call_takes_the_dedicated_budget() {
+    let (mut client, mut fixture) =
+        LifecycleFixture::start(session_info_json("s-forked"), no_origin_options()).await;
+    let fork = tokio::spawn(async move {
+        client
+            .call::<protocol::method::SessionFork>(fork_params())
+            .await
+    });
+    let (_request, dedicated) = fixture.request().await;
+    assert!(
+        dedicated,
+        "the generic fork call runs on a dedicated connection"
+    );
+    tokio::time::advance(SLOW_LIFECYCLE).await;
+    fixture.release();
+    let forked = fork
+        .await
+        .expect("fork task completed")
+        .expect("the generic call waits for the daemon's reply instead of timing out");
+    assert_eq!(forked.session.id.0, "s-forked");
+    fixture.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_fork_past_its_deadline_reports_an_unknown_outcome() {
+    let explicit = Duration::from_millis(200);
+    let (mut client, mut fixture) =
+        LifecycleFixture::start(session_info_json("s-forked"), explicit_options(explicit)).await;
+    let fork = tokio::spawn(async move { client.session_fork(fork_params()).await });
+    fixture.request().await;
+    tokio::time::advance(explicit + TIMER_TICK).await;
+
+    let error = fork
+        .await
+        .expect("fork task completed")
+        .expect_err("the explicit deadline elapses before the daemon answers");
+    assert!(
+        matches!(&error, ClientError::SessionForkOutcomeUnknown { timeout, .. } if *timeout == explicit),
+        "{error:?}"
+    );
+    let structured = error.to_protocol_error();
+    assert_eq!(structured.code, "session_fork_outcome_unknown");
+    assert_eq!(structured.class, ErrorClass::Transport);
+    let hint = structured.recover.as_deref().expect("a recover hint");
+    assert!(
+        hint.contains("may still complete") && hint.contains("session list"),
+        "{hint}"
+    );
+    assert!(
+        hint.contains("second") && hint.contains("child"),
+        "a retried fork creates another child, which the hint must say: {hint}"
+    );
+    fixture.release();
+    fixture.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_fork_explicit_timeout_wins_over_the_lifecycle_budget() {
+    let explicit = Duration::from_secs(2);
+    let (mut client, mut fixture) =
+        LifecycleFixture::start(session_info_json("s-forked"), explicit_options(explicit)).await;
+    let fork = tokio::spawn(async move { client.session_fork(fork_params()).await });
+    fixture.request().await;
+    tokio::time::advance(explicit + TIMER_TICK).await;
+
+    let error = fork
+        .await
+        .expect("fork task completed")
+        .expect_err("the daemon answers after the explicit deadline");
+    assert!(
+        matches!(&error, ClientError::SessionForkOutcomeUnknown { timeout, .. } if *timeout == explicit),
+        "{error:?}"
+    );
+    fixture.release();
+    fixture.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_stop_outlasts_the_default_request_timeout() {
+    let (mut client, mut fixture) =
+        LifecycleFixture::start(json!({"stopped": true}), no_origin_options()).await;
+    let stop = tokio::spawn(async move { client.session_stop(source_session()).await });
+    let (request, dedicated) = fixture.request().await;
+    assert_eq!(request.method(), protocol::method::SESSION_STOP);
+    assert!(dedicated, "the stop runs on a dedicated connection");
+    tokio::time::advance(SLOW_LIFECYCLE).await;
+    fixture.release();
+    let stopped = stop
+        .await
+        .expect("stop task completed")
+        .expect("the client waits for the daemon's reply instead of timing out");
+    assert!(stopped.stopped);
+    fixture.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn generic_stop_call_takes_the_dedicated_budget() {
+    let (mut client, mut fixture) =
+        LifecycleFixture::start(json!({"stopped": true}), no_origin_options()).await;
+    let stop = tokio::spawn(async move {
+        client
+            .call::<protocol::method::SessionStop>(source_session())
+            .await
+    });
+    let (_request, dedicated) = fixture.request().await;
+    assert!(
+        dedicated,
+        "the generic stop call runs on a dedicated connection"
+    );
+    tokio::time::advance(SLOW_LIFECYCLE).await;
+    fixture.release();
+    stop.await
+        .expect("stop task completed")
+        .expect("the generic call waits for the daemon's reply instead of timing out");
+    fixture.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_stop_past_its_deadline_reports_an_unknown_outcome() {
+    let explicit = Duration::from_millis(300);
+    let (mut client, mut fixture) =
+        LifecycleFixture::start(json!({"stopped": true}), explicit_options(explicit)).await;
+    let stop = tokio::spawn(async move { client.session_stop(source_session()).await });
+    fixture.request().await;
+    tokio::time::advance(explicit + TIMER_TICK).await;
+
+    let error = stop
+        .await
+        .expect("stop task completed")
+        .expect_err("the explicit deadline elapses before the daemon answers");
+    assert!(
+        matches!(&error, ClientError::SessionStopOutcomeUnknown { timeout, .. } if *timeout == explicit),
+        "{error:?}"
+    );
+    let structured = error.to_protocol_error();
+    assert_eq!(structured.code, "session_stop_outcome_unknown");
+    assert_eq!(structured.class, ErrorClass::Transport);
+    let hint = structured.recover.as_deref().expect("a recover hint");
+    assert!(
+        hint.contains("may still complete") && hint.contains("session inspect"),
+        "{hint}"
+    );
+    fixture.release();
+    fixture.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_remove_outlasts_the_default_request_timeout() {
+    let (mut client, mut fixture) =
+        LifecycleFixture::start(removed_result(), no_origin_options()).await;
+    let remove = tokio::spawn(async move { client.session_remove(source_session()).await });
+    let (request, dedicated) = fixture.request().await;
+    assert_eq!(request.method(), protocol::method::SESSION_REMOVE);
+    assert!(dedicated, "the remove runs on a dedicated connection");
+    tokio::time::advance(SLOW_LIFECYCLE).await;
+    fixture.release();
+    let removed = remove
+        .await
+        .expect("remove task completed")
+        .expect("the client waits for the daemon's reply instead of timing out");
+    assert!(removed.removed);
+    fixture.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_remove_accepting_unconfirmed_has_the_same_budget() {
+    let (mut client, mut fixture) =
+        LifecycleFixture::start(removed_result(), no_origin_options()).await;
+    let remove = tokio::spawn(async move {
+        client
+            .session_remove_accepting_unconfirmed(source_session())
+            .await
+    });
+    let (request, dedicated) = fixture.request().await;
+    assert_eq!(
+        request.method(),
+        protocol::method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED
+    );
+    assert!(
+        dedicated,
+        "the consenting remove runs on a dedicated connection"
+    );
+    tokio::time::advance(SLOW_LIFECYCLE).await;
+    fixture.release();
+    let removed = remove
+        .await
+        .expect("remove task completed")
+        .expect("the client waits for the daemon's reply instead of timing out");
+    assert!(removed.removed);
+    fixture.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_remove_past_its_deadline_reports_an_unknown_outcome() {
+    let explicit = Duration::from_millis(200);
+    for consenting in [false, true] {
+        let (mut client, mut fixture) =
+            LifecycleFixture::start(removed_result(), explicit_options(explicit)).await;
+        let remove = tokio::spawn(async move {
+            if consenting {
+                client
+                    .session_remove_accepting_unconfirmed(source_session())
+                    .await
+            } else {
+                client.session_remove(source_session()).await
+            }
+        });
+        fixture.request().await;
+        tokio::time::advance(explicit + TIMER_TICK).await;
+
+        let error = remove
+            .await
+            .expect("remove task completed")
+            .expect_err("the explicit deadline elapses before the daemon answers");
+        assert!(
+            matches!(&error, ClientError::SessionRemoveOutcomeUnknown { timeout, .. } if *timeout == explicit),
+            "consenting={consenting}: {error:?}"
+        );
+        let structured = error.to_protocol_error();
+        assert_eq!(structured.code, "session_remove_outcome_unknown");
+        assert_eq!(structured.class, ErrorClass::Transport);
+        fixture.release();
+        fixture.finish().await;
+    }
 }
 
 /// Daemon-side duration of each turn wait the fixture answers, far above the

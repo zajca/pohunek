@@ -1935,11 +1935,14 @@ fn warn_unmarked(session_id: &str, worker_instance_id: &str, skipped: &[Skipped]
 mod tests {
     use super::*;
 
-    /// The SDK's resume budget is built from the daemon's validation maximum
-    /// of one lifecycle step and from the sweep's pass limit; the budget
-    /// follows when either daemon bound changes.
+    /// The SDK's lifecycle budgets are built from the daemon's validation
+    /// maximum of one lifecycle step and from the sweep's pass limit; the
+    /// budgets follow when either daemon bound changes. Worker connection and
+    /// initialization are validated up to the same maximum, and the daemon's
+    /// waits on a worker's stop fit the two steps the budgets can give a worker
+    /// stop.
     #[test]
-    fn the_sdk_resume_budget_follows_the_daemon_bounds() {
+    fn the_sdk_lifecycle_budgets_follow_the_daemon_bounds() {
         assert_eq!(
             u128::from(pohunek_client::LIFECYCLE_STEP_BOUND_MS),
             pohunek_platform::supervisor::MAX_JOB_TIMEOUT.as_millis()
@@ -1951,6 +1954,25 @@ mod tests {
         assert_eq!(
             usize::try_from(pohunek_client::RESUME_SWEEP_PASSES).expect("pass count"),
             MAX_SWEEP_PASSES
+        );
+        assert_eq!(
+            u128::from(pohunek_client::WORKTREE_HOOK_TIMEOUT_MS),
+            crate::session::SessionRegistryConfig::default()
+                .hook_timeout
+                .as_millis()
+        );
+        assert!(
+            {
+                let config = crate::session::SessionRegistryConfig::default();
+                config.worker_exchange_wait + config.worker_stop_bound()
+            } <= 2 * pohunek_service_config::MAX_DEADLINE
+        );
+        // A stop that waits the longest behind an input still ends with its
+        // typed error before the SDK's stop budget elapses.
+        let config = crate::session::SessionRegistryConfig::default();
+        assert!(
+            config.worker_input_stop_wait + config.worker_stop_bound()
+                < Duration::from_millis(u64::from(pohunek_client::SESSION_STOP_REQUEST_BUDGET_MS))
         );
     }
 

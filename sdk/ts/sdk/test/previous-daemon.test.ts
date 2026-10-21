@@ -430,6 +430,31 @@ describe("client against a daemon of the previous release", () => {
     expect(daemon.methods().filter((method) => method === "daemon.health")).toEqual([]);
   });
 
+  test("typed lifecycle calls run on dedicated connections and decode the translated results", async () => {
+    const daemon = await startPreviousDaemon();
+    const client = await connect(daemon);
+    const methods = [
+      "session.resume",
+      "session.fork",
+      "session.stop",
+      "session.remove",
+      "session.remove_accepting_unconfirmed",
+    ] as const;
+    const exchanges = recordedExchanges();
+
+    for (const method of methods) {
+      const recorded = exchanges.find((entry) => entry.method === method);
+      if (recorded === undefined) {
+        throw new Error(`no ${method} recording`);
+      }
+      expect(await client.call(method, recorded.params as never)).toEqual(recorded.expected);
+    }
+
+    expect(daemon.seen.violations).toEqual([]);
+    expect(daemon.methods()).toEqual([...methods]);
+    expect(new Set(daemon.seen.exchanges.map((exchange) => exchange.connection)).size).toBe(methods.length);
+  });
+
   test("a dedicated first call learns the version on its own connection", async () => {
     const daemon = await startPreviousDaemon();
     const client = await connect(daemon);

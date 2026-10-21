@@ -84,6 +84,8 @@ mod service_upgrade;
 mod session_background;
 #[path = "session_background_work.rs"]
 mod session_background_work;
+#[path = "session_lifecycle_notice.rs"]
+mod session_lifecycle_notice;
 #[path = "session_metadata_filters.rs"]
 mod session_metadata_filters;
 #[path = "session_new_outcome.rs"]

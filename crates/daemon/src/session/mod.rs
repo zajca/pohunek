@@ -54,7 +54,9 @@ use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessIdentity, ProcessInsp
 use crate::project::detect::{project_id, DetectedProject};
 use crate::project::{detect_at, ProjectManager};
 use crate::runtime::lifecycle::{Generation, LifecycleGuard, SessionLocks};
-use crate::runtime::{DimensionUpdate, SupervisionConfig, Worker, WorkerError, WorkerLauncher};
+use crate::runtime::{
+    DimensionUpdate, StopWaits, SupervisionConfig, Worker, WorkerError, WorkerLauncher,
+};
 use crate::store::{
     ActiveAgentOrigin, DesiredState, ProjectRecord, ReportTransport, ResumeBinding, RuntimeRecord,
     SessionRecord, SessionTransaction, SessionWriteOutcome, Store, TransactionKind, WorktreeStatus,
@@ -356,6 +358,23 @@ pub struct SessionRegistryConfig {
     /// How long after the hard kill a worker waits for the root's death before
     /// the stop fails; never shorter than [`Self::stop_grace`].
     pub kill_reap_deadline: Duration,
+    /// How long a worker waits for the durable commit of a stopped session
+    /// before it refuses the stop as retryable. A worker fixes its own value
+    /// at [`pohunek_service_config::DEFAULT_TERMINAL_COMMIT_WAIT`], so this
+    /// field only differs from it in tests that run a worker with another
+    /// wait.
+    pub terminal_commit_wait: Duration,
+    /// Margin added to the worker's own stop bounds before the daemon gives up
+    /// on a worker that has not answered a stop.
+    pub worker_stop_headroom: Duration,
+    /// How long a stop waits for an earlier exchange on the worker's control
+    /// connection to finish. Every such exchange is bounded by the worker's
+    /// own limits, the longest being [`pohunek_service_config::MAX_DEADLINE`].
+    pub worker_exchange_wait: Duration,
+    /// How long a stop waits behind an input write that holds the worker's
+    /// control connection; an input exchange may legitimately outlast
+    /// [`Self::worker_exchange_wait`].
+    pub worker_input_stop_wait: Duration,
     /// How long a one-shot attach token may remain pending before redemption.
     pub attach_token_ttl: Duration,
     /// How long a failed attach outcome remains available to `session.detach`.
@@ -523,12 +542,35 @@ pub struct SessionRegistryConfig {
     pub create_drain_timeout: Duration,
 }
 
+impl SessionRegistryConfig {
+    /// Longest the daemon waits for a worker to answer a stop.
+    ///
+    /// A worker's stop waits one grace for the process group after `SIGTERM`
+    /// and, up to the kill reap deadline, for the root after `SIGKILL`. Its
+    /// marker sweep then waits a grace after `SIGTERM`, a grace after
+    /// `SIGKILL` and up to a grace re-reading unreadable markers, before the
+    /// terminal-commit wait. A worker silent past all of them and the headroom
+    /// is frozen; the bound is deliberately generous because only a frozen
+    /// worker ever reaches it.
+    pub(crate) fn worker_stop_bound(&self) -> Duration {
+        self.stop_grace
+            .saturating_mul(4)
+            .saturating_add(self.kill_reap_deadline)
+            .saturating_add(self.terminal_commit_wait)
+            .saturating_add(self.worker_stop_headroom)
+    }
+}
+
 impl Default for SessionRegistryConfig {
     fn default() -> Self {
         Self {
             shell_command: ShellCommand::default(),
             stop_grace: pohunek_service_config::DEFAULT_STOP_GRACE,
             kill_reap_deadline: pohunek_service_config::DEFAULT_KILL_REAP_DEADLINE,
+            terminal_commit_wait: pohunek_service_config::DEFAULT_TERMINAL_COMMIT_WAIT,
+            worker_stop_headroom: pohunek_service_config::DEFAULT_WORKER_STOP_HEADROOM,
+            worker_exchange_wait: pohunek_service_config::MAX_DEADLINE,
+            worker_input_stop_wait: pohunek_service_config::DEFAULT_WORKER_INPUT_STOP_WAIT,
             attach_token_ttl: DEFAULT_ATTACH_TOKEN_TTL,
             attach_result_ttl: DEFAULT_ATTACH_RESULT_TTL,
             attach_result_capacity: DEFAULT_ATTACH_RESULT_CAPACITY,
@@ -4175,6 +4217,22 @@ impl SessionRegistry {
             .ok_or_else(|| session_not_found(&id.0))
     }
 
+    /// Returns how many input writes of session `id` hold its worker's control
+    /// connection, for integration assertions on the order of lifecycle waits.
+    pub async fn input_writes_in_flight(&self, id: &SessionId) -> usize {
+        match self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|e| e.runtime.clone())
+        {
+            Some(RuntimeHandle::Worker(worker)) => worker.input_writes_in_flight(),
+            _ => 0,
+        }
+    }
+
     /// Whether the registry holds a managed session `id`.
     pub(crate) async fn holds(&self, id: &SessionId) -> bool {
         self.inner.sessions.lock().await.contains_key(id)
@@ -4626,7 +4684,13 @@ impl SessionRegistry {
                 let transaction =
                     pohunek_worker_protocol::TransactionId::new(transaction_id.clone())
                         .map_err(|error| runtime_error("worker_stop_invalid", error.to_string()))?;
-                let status = match worker.stop(transaction).await {
+                let bound = self.inner.config.worker_stop_bound();
+                let waits = StopWaits {
+                    exchange: self.inner.config.worker_exchange_wait,
+                    input: self.inner.config.worker_input_stop_wait,
+                    answer: bound,
+                };
+                let status = match Box::pin(worker.stop_within(transaction, waits)).await {
                     Ok(Some(status)) => status,
                     Ok(None) => {
                         self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
@@ -7486,6 +7550,15 @@ fn worker_error_to_protocol(err: WorkerError) -> ProtocolError {
             message,
             Some(
                 "the session's working directory no longer exists; nothing was started".to_owned(),
+            ),
+        ),
+        unanswered @ WorkerError::StopUnanswered { .. } => ProtocolError::new(
+            ErrorClass::Runtime,
+            "worker_operation_failed",
+            unanswered.to_string(),
+            Some(
+                "the worker is not responding: inspect the session and retry the stop once the worker answers"
+                    .to_owned(),
             ),
         ),
         other => runtime_error("worker_operation_failed", other.to_string()),

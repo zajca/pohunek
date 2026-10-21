@@ -397,4 +397,35 @@ mod tests {
         assert!(matches!(error, ClientError::Framing(_)), "{error:?}");
         server.await.expect("server task");
     }
+
+    /// The installer's own response deadline bounds a stop of the daemon's
+    /// sessions; the lifecycle budget does not replace it.
+    #[tokio::test(start_paused = true)]
+    async fn a_service_stop_keeps_the_installers_response_deadline() {
+        use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
+
+        let inhibitor = AutoAdvanceInhibitor::new();
+        let mut daemon =
+            crate::test_daemon::HeldDaemon::start(serde_json::json!({"stopped": true}));
+        let control = SocketControl::new(daemon.paths.socket.clone())
+            .with_origin_source(OriginSource::Omitted);
+        let stop = tokio::spawn(async move { control.stop("s-42").await });
+        daemon.request().await;
+        tokio::time::advance(settings::CONTROL_REQUEST_TIMEOUT + TIMER_TICK).await;
+
+        let error = stop
+            .await
+            .expect("stop task")
+            .expect_err("the installer's deadline elapses before the daemon answers");
+        assert!(
+            matches!(
+                &error,
+                ClientError::SessionStopOutcomeUnknown { timeout, .. }
+                    if *timeout == settings::CONTROL_REQUEST_TIMEOUT
+            ),
+            "{error:?}"
+        );
+        daemon.release();
+        inhibitor.release().await;
+    }
 }

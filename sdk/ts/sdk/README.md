@@ -64,6 +64,20 @@ const client = await connectTcp("build-box", {
 });
 ```
 
+## Lifecycle Budgets
+
+Typed `session.new`, `session.resume`, `session.fork`, `session.stop`,
+`session.remove` and `session.remove_accepting_unconfirmed` calls run on a
+dedicated connection whose response budget covers the daemon's bounded work
+(`SESSION_*_REQUEST_BUDGET_MS`, derived from `LIFECYCLE_STEP_BOUND_MS`,
+`RESUME_SWEEP_PASSES` and `WORKTREE_HOOK_TIMEOUT_MS`, and equal to the Rust
+client's). An explicit `requestTimeoutMs` replaces the budget. An elapsed
+deadline of resume, fork, stop or remove rejects with `ClientError.kind`
+`sessionResumeOutcomeUnknown`, `sessionForkOutcomeUnknown`,
+`sessionStopOutcomeUnknown` or `sessionRemoveOutcomeUnknown`: the daemon may
+still complete the call, and a retried fork creates a second child. Code that
+switches exhaustively on `ClientError.kind` must handle these kinds.
+
 ## Subscribe
 
 `subscribe` consumes the control connection after the acknowledgement, so use a

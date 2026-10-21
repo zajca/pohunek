@@ -333,6 +333,12 @@ const RULES: &[Rule] = &[
         "Hermes compatibility lock whose pinned release the fake agents of the daemon's integration tests report to the package version probe, read by pohunek-cli's hermes_package test; lock and goldens read by xtask",
     ),
     reminding(
+        Pattern::File("sdk/ts/sdk/test/fixtures/lifecycle-budgets.json"),
+        Effect::Packages(&["pohunek-client"]),
+        &[Reminder::SdkGates],
+        "lifecycle response budgets that pohunek-client's lifecycle_budgets test compares with its own and the SDK's lifecycle-budgets test compares with its constants",
+    ),
+    reminding(
         Pattern::Dir("crates/protocol/tests/fixtures/compat"),
         Effect::Packages(&["pohunek-protocol", "pohunek-client", "pohunek-cli"]),
         &[Reminder::SdkGates],

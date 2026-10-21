@@ -200,6 +200,36 @@ pub enum ClientError {
         timeout: Duration,
     },
 
+    /// A `session.fork` exceeded its response deadline, so the daemon may
+    /// still complete the fork and a retry would create a second child.
+    #[error("timed out after {timeout:?} waiting for the result of a session fork")]
+    SessionForkOutcomeUnknown {
+        /// Remote host involved in the request, or `None` for the local daemon.
+        host: Option<String>,
+        /// Configured response deadline that elapsed.
+        timeout: Duration,
+    },
+
+    /// A `session.stop` exceeded its response deadline, so the daemon may
+    /// still complete the stop.
+    #[error("timed out after {timeout:?} waiting for the result of a session stop")]
+    SessionStopOutcomeUnknown {
+        /// Remote host involved in the request, or `None` for the local daemon.
+        host: Option<String>,
+        /// Configured response deadline that elapsed.
+        timeout: Duration,
+    },
+
+    /// A `session.remove` or `session.remove_accepting_unconfirmed` exceeded
+    /// its response deadline, so the daemon may still complete the removal.
+    #[error("timed out after {timeout:?} waiting for the result of a session removal")]
+    SessionRemoveOutcomeUnknown {
+        /// Remote host involved in the request, or `None` for the local daemon.
+        host: Option<String>,
+        /// Configured response deadline that elapsed.
+        timeout: Duration,
+    },
+
     /// A daemon on a remote host returned a typed protocol error.
     #[error("host '{host}': {source}")]
     RemoteProtocol {
@@ -414,6 +444,33 @@ impl ClientError {
                         .to_owned(),
                 ),
             ),
+            ClientError::SessionForkOutcomeUnknown { host, timeout } => ProtocolError::new(
+                ErrorClass::Transport,
+                "session_fork_outcome_unknown",
+                lifecycle_timeout_message(host.as_deref(), *timeout, "fork the session"),
+                Some(
+                    "the fork may still complete and a retried fork creates a second child session: run `pohunek session list` and look for the new session before retrying"
+                        .to_owned(),
+                ),
+            ),
+            ClientError::SessionStopOutcomeUnknown { host, timeout } => ProtocolError::new(
+                ErrorClass::Transport,
+                "session_stop_outcome_unknown",
+                lifecycle_timeout_message(host.as_deref(), *timeout, "stop the session"),
+                Some(
+                    "the stop may still complete: run `pohunek session inspect <session>` and read its state; repeating a stop is harmless"
+                        .to_owned(),
+                ),
+            ),
+            ClientError::SessionRemoveOutcomeUnknown { host, timeout } => ProtocolError::new(
+                ErrorClass::Transport,
+                "session_remove_outcome_unknown",
+                lifecycle_timeout_message(host.as_deref(), *timeout, "remove the session"),
+                Some(
+                    "the removal may still complete: run `pohunek session list` to see whether the session is gone before retrying"
+                        .to_owned(),
+                ),
+            ),
             ClientError::RemoteProtocol { host, source } => {
                 let mut err = source.clone();
                 err.msg = format!("host '{host}': {}", err.msg);
@@ -574,6 +631,15 @@ fn ambiguity_hint(candidates: &[overlay::HostCandidate]) -> String {
             selectors.into_iter().collect::<Vec<_>>().join(", ")
         )
     }
+}
+
+/// Message of a lifecycle deadline that elapsed while the daemon `action` was
+/// still pending.
+fn lifecycle_timeout_message(host: Option<&str>, timeout: Duration, action: &str) -> String {
+    host.map_or_else(
+        || format!("timed out after {timeout:?} waiting for the local daemon to {action}"),
+        |host| format!("timed out after {timeout:?} waiting for host '{host}' to {action}"),
+    )
 }
 
 #[cfg(test)]

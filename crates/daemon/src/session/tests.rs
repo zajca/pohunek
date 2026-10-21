@@ -57,6 +57,7 @@ use super::{
 };
 
 mod conflict_cleanup;
+mod lifecycle_queue;
 mod native_recovery;
 mod native_supersede;
 mod stale_worker_metadata;

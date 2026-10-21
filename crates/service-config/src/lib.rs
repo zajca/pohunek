@@ -267,14 +267,48 @@ pub const DEFAULT_STOP_GRACE: Duration = Duration::from_millis(500);
 /// for that on a busy CI runner. Three seconds covers such a host many times
 /// over; a root still alive after it is stuck in the kernel, and the stop
 /// reports it with the state it is in. Together with the grace before
-/// `SIGKILL` that report still arrives within the five-second default request
-/// deadline of the public clients, instead of a client timeout.
+/// `SIGKILL` that report arrives well inside the daemon's bound on a worker's
+/// stop answer.
 ///
 /// Like the grace, this is not a `service.toml` key: the daemon sends it to
 /// each worker in the `Initialize` stop policy, and a worker falls back to this
 /// value when the policy does not carry it. It is never shorter than
 /// [`DEFAULT_STOP_GRACE`] and stays below [`MAX_DEADLINE`].
 pub const DEFAULT_KILL_REAP_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Default wait of a session worker for the durable commit of a stopped
+/// session's terminal outcome before it answers a stop with a retryable
+/// refusal.
+///
+/// The daemon bounds its own wait for the worker's stop answer by this value
+/// ([`DEFAULT_WORKER_STOP_HEADROOM`] on top of the worker's grace, kill reap
+/// and sweep waits), so the two sides share one constant. Like the grace, it is
+/// not a `service.toml` key.
+pub const DEFAULT_TERMINAL_COMMIT_WAIT: Duration = Duration::from_secs(10);
+
+/// Margin the daemon adds to the worker's own stop bounds before it gives up on
+/// a worker that has not answered a stop.
+///
+/// It covers the control-connection round trip and scheduling on a loaded
+/// host; a worker that is still silent after every bound of its own plus this
+/// margin is frozen, not slow.
+pub const DEFAULT_WORKER_STOP_HEADROOM: Duration = Duration::from_secs(2);
+
+/// Longest a stop waits behind an input write that holds the worker's control
+/// connection.
+///
+/// The worker delivers an input on its own stall policy, which restarts after
+/// every byte the agent reads, so a large input read slowly legitimately holds
+/// the connection for a long time and the daemon cannot see its progress. Eight
+/// [`MAX_DEADLINE`] steps leave the SDK's stop budget (nine steps) room for the
+/// stop itself; a worker frozen mid-input ends the stop with a typed error at
+/// this bound instead of waiting for the caller's budget.
+pub const DEFAULT_WORKER_INPUT_STOP_WAIT: Duration =
+    MAX_DEADLINE.saturating_mul(WORKER_INPUT_STOP_WAIT_STEPS);
+
+/// [`MAX_DEADLINE`] steps a stop may wait behind an input write: the SDK's stop
+/// budget has nine steps and the stop itself needs one.
+const WORKER_INPUT_STOP_WAIT_STEPS: u32 = 8;
 
 /// Longest accepted path in bytes.
 ///

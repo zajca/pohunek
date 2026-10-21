@@ -6702,6 +6702,7 @@ fn classify_connect_error(error: &WorkerError) -> (RuntimeState, &'static str) {
         | WorkerError::Rejected { .. }
         | WorkerError::NotInitialized
         | WorkerError::AttachReadyTimeout { .. }
+        | WorkerError::StopUnanswered { .. }
         | WorkerError::TornStream => (RuntimeState::Lost, UNREACHABLE_SOCKET),
     }
 }

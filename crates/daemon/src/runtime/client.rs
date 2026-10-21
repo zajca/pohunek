@@ -1,7 +1,7 @@
 //! Private client for one durable session worker.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,6 +64,15 @@ pub enum WorkerError {
         "worker control stream was interrupted mid-request and cannot carry further exchanges"
     )]
     TornStream,
+    /// The worker did not answer a stop within the daemon's bound, so it is
+    /// frozen rather than slow.
+    #[error("worker did not answer the stop within {bound:?} {stage}")]
+    StopUnanswered {
+        /// Bound the daemon waited.
+        bound: Duration,
+        /// Which wait elapsed.
+        stage: &'static str,
+    },
     /// The worker runtime has not been initialized.
     #[error("worker has no live runtime generation")]
     NotInitialized,
@@ -115,15 +124,43 @@ pub struct ObservedOutput {
 pub struct Worker {
     inner: Arc<Mutex<Inner>>,
     socket_path: PathBuf,
-    request_sequence: Arc<AtomicU64>,
+    counters: Arc<Counters>,
     dimension_order: Arc<Mutex<()>>,
+}
+
+/// Counters shared by every clone of a [`Worker`].
+#[derive(Debug)]
+struct Counters {
+    request_sequence: AtomicU64,
+    /// Input writes holding the control connection. An input exchange lasts as
+    /// long as the worker needs to deliver the plan and is bounded by the
+    /// worker's own stall policy, so a stop queued behind one keeps waiting;
+    /// any other holder is bounded by the stop's exchange wait.
+    input_holds: Arc<AtomicUsize>,
+}
+
+/// How long a stop waits at each stage of reaching a worker.
+#[derive(Debug, Clone, Copy)]
+pub struct StopWaits {
+    /// Wait for an earlier exchange on the control connection.
+    pub exchange: Duration,
+    /// Wait behind an input write that holds the control connection.
+    pub input: Duration,
+    /// Wait for the worker's answer once the request is sent.
+    pub answer: Duration,
 }
 
 /// Prepared exclusive input write that has not started transport delivery.
 #[derive(Debug)]
 pub(crate) struct WriteReservation {
     inner: OwnedMutexGuard<Inner>,
-    request: ControlRequest,
+    request: Option<ControlRequest>,
+}
+
+impl Drop for WriteReservation {
+    fn drop(&mut self) {
+        self.inner.input_holds.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Debug)]
@@ -142,6 +179,8 @@ struct Inner {
     /// Shared send-phase marker the send guard flips when a future is
     /// dropped mid-write; see [`SEND_IN_FLIGHT`].
     send_state: Arc<AtomicU8>,
+    /// Input writes holding the control connection; shared with [`Worker`].
+    input_holds: Arc<AtomicUsize>,
 }
 
 /// Byte-stream state of the shared control connection between exchanges.
@@ -231,6 +270,12 @@ impl Worker {
     #[must_use]
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// Returns how many input writes currently hold the control connection.
+    #[must_use]
+    pub fn input_writes_in_flight(&self) -> usize {
+        self.counters.input_holds.load(Ordering::Acquire)
     }
 
     /// Connects, negotiates, and acquires the sole controller lease.
@@ -376,6 +421,7 @@ impl Worker {
             other => return response_error(other),
         };
 
+        let input_holds = Arc::new(AtomicUsize::new(0));
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 reader,
@@ -389,9 +435,13 @@ impl Worker {
                 next_write_sequence: 1,
                 stream_state: StreamState::Ready,
                 send_state: Arc::new(AtomicU8::new(SEND_IDLE)),
+                input_holds: Arc::clone(&input_holds),
             })),
             socket_path,
-            request_sequence: Arc::new(AtomicU64::new(1)),
+            counters: Arc::new(Counters {
+                request_sequence: AtomicU64::new(1),
+                input_holds,
+            }),
             dimension_order: Arc::new(Mutex::new(())),
         })
     }
@@ -609,12 +659,16 @@ impl Worker {
         let write_id = input_write_id(&inner.lease_id, sequence)?;
         let plan = InputPlan::new(write_id, fragments)
             .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+        let request_id = self.next_request_id("write")?;
+        // Counted only once the reservation exists, so every failed
+        // preparation above leaves the count untouched.
+        inner.input_holds.fetch_add(1, Ordering::AcqRel);
         Ok(WriteReservation {
             inner,
-            request: ControlRequest {
-                request_id: self.next_request_id("write")?,
+            request: Some(ControlRequest {
+                request_id,
                 kind: RequestKind::WritePlan { scope, plan },
-            },
+            }),
         })
     }
 
@@ -697,6 +751,66 @@ impl Worker {
         .await?;
         match response {
             ResponseKind::TerminalAcknowledged => Ok(()),
+            other => response_error(other),
+        }
+    }
+
+    /// Stops like [`Self::stop`], giving up on a worker that does not answer.
+    ///
+    /// An earlier exchange on the control connection gets `waits.exchange` to
+    /// finish, so a legitimately long one is not mistaken for a frozen worker.
+    /// An input write holding the connection is delivered on the worker's own
+    /// stall policy and gets `waits.input` instead. Once this caller holds
+    /// the connection, the worker gets `waits.answer` to answer. The abandoned
+    /// exchange is drained by the next caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::StopUnanswered`] when a wait elapses, and
+    /// otherwise the errors of [`Self::stop`].
+    pub async fn stop_within(
+        &self,
+        transaction_id: TransactionId,
+        waits: StopWaits,
+    ) -> Result<Option<ExitStatus>, WorkerError> {
+        let bound = waits.answer;
+        let started = tokio::time::Instant::now();
+        let mut inner = loop {
+            match tokio::time::timeout(waits.exchange, self.inner.lock()).await {
+                Ok(inner) => break inner,
+                Err(_elapsed) if self.counters.input_holds.load(Ordering::Acquire) > 0 => {
+                    if started.elapsed() >= waits.input {
+                        return Err(WorkerError::StopUnanswered {
+                            bound: waits.input,
+                            stage: "because an input write kept the control connection busy",
+                        });
+                    }
+                }
+                Err(_elapsed) => {
+                    return Err(WorkerError::StopUnanswered {
+                        bound: waits.exchange,
+                        stage: "because an earlier exchange kept the control connection busy",
+                    });
+                }
+            }
+        };
+        let scope = scope(&inner)?;
+        let exchange = request_locked(
+            &mut inner,
+            self.next_request_id("stop")?,
+            RequestKind::Stop {
+                scope,
+                stop: StopRequest { transaction_id },
+            },
+        );
+        let response = tokio::time::timeout(bound, exchange)
+            .await
+            .map_err(|_elapsed| WorkerError::StopUnanswered {
+                bound,
+                stage: "after the request was sent",
+            })??;
+        match response {
+            ResponseKind::Stopped { exit } => Ok(exit),
             other => response_error(other),
         }
     }
@@ -904,13 +1018,19 @@ impl Worker {
     }
 
     fn next_request_id(&self, operation: &str) -> Result<RequestId, WorkerError> {
-        let sequence = self.request_sequence.fetch_add(1, Ordering::Relaxed);
+        let sequence = self
+            .counters
+            .request_sequence
+            .fetch_add(1, Ordering::Relaxed);
         RequestId::new(format!("{operation}-{sequence}"))
             .map_err(|error| WorkerError::Protocol(error.to_string()))
     }
 
     fn next_stream_id(&self, operation: &str) -> Result<StreamId, WorkerError> {
-        let sequence = self.request_sequence.fetch_add(1, Ordering::Relaxed);
+        let sequence = self
+            .counters
+            .request_sequence
+            .fetch_add(1, Ordering::Relaxed);
         StreamId::new(format!("{operation}-{sequence}"))
             .map_err(|error| WorkerError::Protocol(error.to_string()))
     }
@@ -935,7 +1055,8 @@ impl WriteReservation {
     where
         F: FnOnce(),
     {
-        let response = exchange_locked(&mut self.inner, self.request, send_started).await?;
+        let request = self.request.take().expect("a reservation commits once");
+        let response = exchange_locked(&mut self.inner, request, send_started).await?;
         match response {
             ResponseKind::WriteCompleted { acknowledgement } => Ok(acknowledgement.bytes_written),
             other => response_error(other),
@@ -1804,6 +1925,11 @@ mod tests {
             matches!(reserved, Err(WorkerError::TornStream)),
             "input write reserved over a torn stream"
         );
+        assert_eq!(
+            worker.input_writes_in_flight(),
+            0,
+            "a torn stream holds no input"
+        );
 
         let error = tokio::time::timeout(Duration::from_secs(5), worker.inspect())
             .await
@@ -1814,6 +1940,79 @@ mod tests {
             worker.inner.lock().await.stream_state,
             StreamState::Torn
         ));
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_input_reservation_leaves_no_input_hold() {
+        let root = test_root("hold-balance");
+        std::fs::create_dir_all(&root).expect("create test root");
+        let socket_path = root.join("worker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind fake worker");
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept control");
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = ControlReader::new(read_half);
+            let mut writer = ControlWriter::new(write_half);
+            let session_id = SessionId::new("session-hold").expect("session id");
+            let worker_id = WorkerId::new("worker-hold").expect("worker id");
+            let worker_instance_id = WorkerInstanceId::new("runtime-hold").expect("runtime id");
+            let challenge =
+                pohunek_worker_protocol::LeaseChallenge::new("challenge-hold").expect("challenge");
+            negotiate_and_acquire(
+                &mut reader,
+                &mut writer,
+                &session_id,
+                &worker_id,
+                Some(&worker_instance_id),
+                &challenge,
+            )
+            .await;
+            futures::future::pending::<()>().await;
+        });
+        let worker = Worker::connect(&socket_path, "session-hold", "daemon-hold")
+            .await
+            .expect("connect fake worker");
+
+        // An empty plan fails framing after the connection is locked.
+        let empty = worker.reserve_write(Vec::new()).await;
+        assert!(matches!(empty, Err(WorkerError::Protocol(_))), "{empty:?}");
+        assert_eq!(
+            worker.input_writes_in_flight(),
+            0,
+            "an invalid plan holds no input"
+        );
+
+        // An exhausted write sequence fails before the plan is built.
+        worker.inner.lock().await.next_write_sequence = u64::MAX;
+        let exhausted = worker.reserve_write(Vec::new()).await;
+        assert!(
+            matches!(exhausted, Err(WorkerError::Protocol(_))),
+            "{exhausted:?}"
+        );
+        assert_eq!(
+            worker.input_writes_in_flight(),
+            0,
+            "an exhausted sequence holds no input"
+        );
+        worker.inner.lock().await.next_write_sequence = 1;
+
+        let reserved = worker
+            .reserve_write(scripted_fragments())
+            .await
+            .expect("a valid plan reserves");
+        assert_eq!(
+            worker.input_writes_in_flight(),
+            1,
+            "a reservation is one hold"
+        );
+        drop(reserved);
+        assert_eq!(
+            worker.input_writes_in_flight(),
+            0,
+            "a dropped reservation releases its hold"
+        );
 
         server_task.abort();
     }

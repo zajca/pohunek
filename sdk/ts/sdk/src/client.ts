@@ -23,13 +23,20 @@ import {
   type SessionWaitTurnResult,
 } from "@pohunek/protocol";
 import { CompatError, downgradeRequestParams, requestIsVersionIndependent, upgradeResult } from "./compat";
-import { ClientError, type ObservedProtocolError } from "./error";
+import { ClientError, type LifecycleOperation, type ObservedProtocolError } from "./error";
 import { decodeResponse, type Request, type Response } from "./envelope";
 import { decodeHostGovernanceInspect } from "./governance";
 import { hasValidWireOrigin, type RequestOrigin } from "./origin";
 import { Subscription } from "./subscription";
 import type { ConnectOptions, ControlChannel, ResolvedConnectOptions, Transport } from "./transport";
-import { resolveConnectOptions, SESSION_NEW_REQUEST_BUDGET_MS } from "./transport";
+import {
+  resolveConnectOptions,
+  SESSION_FORK_REQUEST_BUDGET_MS,
+  SESSION_NEW_REQUEST_BUDGET_MS,
+  SESSION_REMOVE_REQUEST_BUDGET_MS,
+  SESSION_RESUME_REQUEST_BUDGET_MS,
+  SESSION_STOP_REQUEST_BUDGET_MS,
+} from "./transport";
 import { WsTransport } from "./transport-ws";
 
 // A 128-bit prefix keeps independently started SDK clients collision-resistant.
@@ -102,6 +109,34 @@ export class Client {
         "session.new",
         hasInitialInput(creation) ? { ...creation, extended_input_ready_wait: true } : creation,
         SESSION_NEW_REQUEST_BUDGET_MS,
+      );
+    }
+    if (method === "session.resume") {
+      return this.callDedicated(
+        "session.resume",
+        params as Methods["session.resume"]["params"],
+        SESSION_RESUME_REQUEST_BUDGET_MS,
+      );
+    }
+    if (method === "session.fork") {
+      return this.callDedicated(
+        "session.fork",
+        params as Methods["session.fork"]["params"],
+        SESSION_FORK_REQUEST_BUDGET_MS,
+      );
+    }
+    if (method === "session.stop") {
+      return this.callDedicated(
+        "session.stop",
+        params as Methods["session.stop"]["params"],
+        SESSION_STOP_REQUEST_BUDGET_MS,
+      );
+    }
+    if (method === "session.remove" || method === "session.remove_accepting_unconfirmed") {
+      return this.callDedicated(
+        method,
+        params as Methods["session.remove"]["params"],
+        SESSION_REMOVE_REQUEST_BUDGET_MS,
       );
     }
     if (method === "session.input" && isWaitingSessionInput(params)) {
@@ -422,7 +457,17 @@ export class Client {
   }
 
   private async callDedicated<
-    K extends "session.new" | "session.input" | "session.output" | "session.wait" | "session.wait_turn",
+    K extends
+      | "session.new"
+      | "session.resume"
+      | "session.fork"
+      | "session.stop"
+      | "session.remove"
+      | "session.remove_accepting_unconfirmed"
+      | "session.input"
+      | "session.output"
+      | "session.wait"
+      | "session.wait_turn",
   >(
     method: K,
     params: Methods[K]["params"],
@@ -432,7 +477,8 @@ export class Client {
     // Parameters and the inherited version are captured before the first await.
     const snapshot = snapshotParams(params);
     const inherited = this.selectedVersion;
-    const requestTimeoutMs = method === "session.new" && this.options.explicitRequestTimeoutMs !== undefined
+    const lifecycle = LIFECYCLE_OPERATIONS.get(method);
+    const requestTimeoutMs = isLifecycleMethod(method) && this.options.explicitRequestTimeoutMs !== undefined
       ? this.options.explicitRequestTimeoutMs
       : Math.max(this.options.requestTimeoutMs, wireTimeoutMs + DEDICATED_REQUEST_HEADROOM_MS);
     const client = await Client.connectTransport(
@@ -445,6 +491,11 @@ export class Client {
     try {
       this.ensureUsable();
       return await client.callDirect(method, snapshot);
+    } catch (error: unknown) {
+      if (lifecycle !== undefined && error instanceof ClientError && error.kind === "requestTimeout") {
+        throw ClientError.lifecycleOutcomeUnknown(lifecycle, this.remoteHost, requestTimeoutMs);
+      }
+      throw error;
     } finally {
       await client.close();
     }
@@ -484,6 +535,20 @@ export class Client {
       throw ClientError.json(error);
     }
   }
+}
+
+/** Lifecycle requests that report an unknown outcome when their deadline elapses. */
+const LIFECYCLE_OPERATIONS: ReadonlyMap<string, LifecycleOperation> = new Map([
+  ["session.resume", "resume"],
+  ["session.fork", "fork"],
+  ["session.stop", "stop"],
+  ["session.remove", "remove"],
+  ["session.remove_accepting_unconfirmed", "remove"],
+]);
+
+/** Whether an explicit request timeout replaces the method's dedicated budget. */
+function isLifecycleMethod(method: string): boolean {
+  return method === "session.new" || LIFECYCLE_OPERATIONS.has(method);
 }
 
 /** Narrows `allowed` to the client window; `undefined` when they do not overlap. */
