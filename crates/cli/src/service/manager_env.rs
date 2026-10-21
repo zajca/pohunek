@@ -313,6 +313,14 @@ pub async fn effective_search_path(
         let mut unclear = None;
         for (path, text) in &drop_ins {
             match unit_setting(text, setting) {
+                Assignment::Sets if matches!(setting, Setting::ExecSearchPath) => {
+                    // The directive appends, so the merged list holds the unit
+                    // file's entries too, which the install replaces.
+                    return Err(refuse(format!(
+                        "{unit_name} gets {} from both its unit file, which the install replaces, and the drop-in {path}, and the merged list cannot be split into the part that stays. Keep the entries in one drop-in and remove the others, and retry",
+                        setting.directive()
+                    )));
+                }
                 Assignment::Sets => return Ok(true),
                 Assignment::Unclear => unclear = Some(path),
                 Assignment::No => {}
@@ -691,11 +699,14 @@ fn unit_setting(bytes: &[u8], setting: Setting) -> Assignment {
         let mut quote: Option<char> = None;
         let mut words = Vec::new();
         let mut escaped = false;
+        // An escape ahead of the first `=` of a word can spell the variable name.
+        let mut name_escaped = false;
         let mut chars = value.chars();
         while let Some(c) = chars.next() {
             match (c, quote) {
                 ('\\', _) => {
                     escaped = true;
+                    name_escaped |= !word.contains('=');
                     word.extend(chars.next());
                 }
                 ('\'' | '"', None) => quote = Some(c),
@@ -712,6 +723,7 @@ fn unit_setting(bytes: &[u8], setting: Setting) -> Assignment {
             Setting::ExecSearchPath => true,
         };
         let mentions = value.contains(SEARCH_PATH_VARIABLE)
+            || (name_escaped && matches!(setting, Setting::EnvironmentPath))
             || matches!(setting, Setting::ExecSearchPath) && !words.is_empty();
         if quote.is_some() || escaped {
             // systemd ignores an assignment whose quote never closes, and an

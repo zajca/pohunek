@@ -10561,6 +10561,21 @@ async fn the_same_boot_keeps_the_journaled_default_over_a_pending_persisted_chan
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn the_same_boot_does_not_need_a_readable_persisted_configuration() {
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        Some("<not a property list"),
+        |_| {},
+        Ok(FIRST_BOOT.to_owned()),
+    )
+    .await;
+    assert_judged(&judged, JOURNALED_PATH);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn a_reboot_after_the_journal_write_prefers_the_persisted_configuration_it_journaled() {
     let mut harness = Harness::new();
     let judged = rollback_after_journal(
@@ -10794,6 +10809,42 @@ async fn a_drop_in_path_in_an_unreadable_form_is_refused_or_attributed_by_the_un
     );
     let job = unrecorded_job_path(Ok(unit)).await.expect("path");
     assert_eq!(job.value, "/drop-in/bin");
+}
+
+/// An escaped variable name in the replaced unit file is a `PATH` the install
+/// removes: the merged value is not a drop-in's.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_escaped_path_name_in_the_replaced_unit_file_does_not_apply() {
+    let unit_file: &[u8] = b"[Service]\nEnvironment=\"\\x50ATH=/unit-file/bin\"\n";
+    let (_keep, unit) = unit_with_files(unit_file, &[], &["PATH=/unit-file/bin"]);
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, MANAGER_PATH, "no drop-in keeps it");
+
+    let (_keep, unit) = unit_with_files(
+        unit_file,
+        &[b"[Service]\nEnvironment=PATH=/drop-in/bin\n"],
+        &["PATH=/unit-file/bin", "PATH=/drop-in/bin"],
+    );
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, "/drop-in/bin");
+}
+
+/// `ExecSearchPath=` appends across files, so a merged list that a unit file and
+/// a drop-in both feed cannot be split into the part the install keeps.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_exec_search_path_fed_by_the_unit_file_and_a_drop_in_is_refused() {
+    let (_keep, mut unit) = unit_with_files(
+        b"[Service]\nExecSearchPath=/unit-file/bin\n",
+        &[b"[Service]\nExecSearchPath=/drop-in/bin\n"],
+        &[],
+    );
+    unit.exec_search_path = vec!["/unit-file/bin".to_owned(), "/drop-in/bin".to_owned()];
+    let text = refusal(unrecorded_job_path(Ok(unit)).await);
+    assert!(text.contains("ExecSearchPath"), "{text}");
+    assert!(text.contains("both its unit file"), "{text}");
+    assert!(!text.contains("/unit-file/bin"), "values stay out: {text}");
 }
 
 /// A drop-in saved with a byte order mark or CR line ends is read as systemd

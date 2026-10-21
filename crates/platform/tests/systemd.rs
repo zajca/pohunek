@@ -2260,7 +2260,7 @@ fn the_real_user_manager_agrees_with_the_unit_setting_readers() {
     // ExecSearchPath= and a dropped word.
     std::fs::write(
         directory.join(&unit),
-        "[Service]\nExecStart=/bin/sleep 300\n",
+        "[Service]\nExecStart=/bin/sleep 300\nExecSearchPath=/unit-file/bin\n",
     )
     .expect("unit");
     std::fs::remove_file(own.join("orphan.conf")).expect("remove orphan");
@@ -2288,7 +2288,12 @@ fn the_real_user_manager_agrees_with_the_unit_setting_readers() {
         loaded.environment.contains(&"CRVAR=1".to_owned()),
         "{loaded:?}"
     );
-    assert_eq!(loaded.exec_search_path, ["/opt/tools/bin"]);
+    // The directive appends across files: the unit file's entry stays in the
+    // merged list next to the drop-in's.
+    assert_eq!(
+        loaded.exec_search_path,
+        ["/unit-file/bin", "/opt/tools/bin"]
+    );
     // The word with the unknown specifier is dropped, its neighbours are kept.
     assert!(
         !loaded.environment.iter().any(|entry| entry.contains("%Z")),

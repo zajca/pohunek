@@ -3371,11 +3371,15 @@ fn journaled_or_persisted_path(
     journal: JournalDefault<'_>,
 ) -> Result<(String, PathSource), Error> {
     let current = context.launchd_job().boot_identity();
-    let persisted = persisted_user_domain_path(context)?;
-    let reason = match (journal.boot_identity, &current) {
-        (Some(journaled), Ok(now)) if journaled == now => {
+    // The same boot needs no look at the persisted configuration, so an
+    // unreadable one must not block it.
+    if let (Some(journaled), Ok(now)) = (journal.boot_identity, &current) {
+        if journaled == now {
             return Ok((journal.path.to_owned(), PathSource::Journal));
         }
+    }
+    let persisted = persisted_user_domain_path(context)?;
+    let reason = match (journal.boot_identity, &current) {
         (Some(_), Ok(_)) => match journal.persisted_path {
             Some(snapshot) if snapshot == persisted => {
                 return Ok((persisted, PathSource::Persisted));

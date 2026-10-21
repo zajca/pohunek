@@ -933,7 +933,7 @@ written without them has none.
 A job without a recorded `PATH` gets, in launchd's order: the domain's `PATH` (set
 with `launchctl setenv`, readable whether or not the job is loaded); the loaded
 job's default; for a job that is not loaded, the journaled default of the
-transaction while the host has not rebooted since; and only when none of these is
+transaction while the host has not rebooted since (the persisted configuration is not read then, so an unreadable one does not block it); and only when none of these is
 available, the persisted launchd configuration. A rollback therefore judges with
 the `PATH` the restored job gets where launchd can still say so. The
 persisted-configuration case is reported as a `warning:` line that names the
@@ -967,6 +967,8 @@ same code, and the message names the file or directive to change:
   has no unit file yet, and a snapshot made stale by a change on disk while any
   drop-in exists (run `systemctl --user daemon-reload`); a drop-in directory that
   cannot be read;
+- an `ExecSearchPath=` that the unit file and a drop-in both feed (the directive
+  appends, so the merged list cannot be split into the part the install keeps);
 - a unit file that also sets the value, with a drop-in `Environment=` or
   `ExecSearchPath=` line that may set it in a form the CLI does not read (an
   escape sequence, a specifier systemd drops, bytes that are not UTF-8, a quote
