@@ -120,11 +120,13 @@ impl SessionRegistry {
         };
 
         let writes = build_input_writes(text, rules)?;
-        self.inner.turns.note_input(session_id);
         match runtime {
             RuntimeHandle::Worker(worker) => {
                 worker
-                    .write(worker_input_fragments(writes, Duration::ZERO))
+                    .reserve_write(worker_input_fragments(writes, Duration::ZERO))
+                    .await
+                    .map_err(worker_error_to_protocol)?
+                    .commit(|| self.inner.turns.note_input(session_id))
                     .await
                     .map_err(worker_error_to_protocol)?;
             }
@@ -229,7 +231,6 @@ impl SessionRegistry {
             (worker, entry.input_rules, runtime)
         };
         let writes = build_input_writes(text, rules)?;
-        self.inner.turns.note_input(session_id);
         validate_wait_framing(writes.submit_delay)?;
         let reservation = self
             .reserve_worker_before_deadline(
@@ -321,6 +322,7 @@ impl SessionRegistry {
     ) -> Result<InputActivitySnapshot, ProtocolError> {
         let (send_started_tx, send_started_rx) = tokio::sync::oneshot::channel();
         let registry = self.clone();
+        let turns = self.inner.turns.clone();
         let mut write = tokio::spawn(async move {
             let _input_guard = input_guard;
             let sessions = registry.inner.sessions.lock().await;
@@ -337,6 +339,7 @@ impl SessionRegistry {
             let completed_boundary = boundary.clone();
             reservation
                 .commit(move || {
+                    turns.note_input(&session_id);
                     let _result = send_started_tx.send(());
                     drop(sessions);
                 })

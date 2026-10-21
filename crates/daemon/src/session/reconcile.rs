@@ -37,7 +37,7 @@ use super::{
     DetectorInputs, DetectorScope, LossProof, Mutex, Notify, ObservedAgent, ProtocolError,
     ResumeSnapshot, RuntimeHandle, RuntimeState, RuntimeWatchIdentity, SessionEntry, SessionId,
     SessionRecord, SessionRef, SessionRefKind, SessionRegistry, SessionRuntime, SessionState,
-    StateSource, Unavailability, UnconfirmedCleanup, Worker, WorkerError,
+    StateSource, TurnEvents, Unavailability, UnconfirmedCleanup, Worker, WorkerError,
     WorkerMetadataApplyOutcome, WORKER_CONNECT_RETRY,
 };
 use crate::agent::host::RuntimeDefinition;
@@ -873,7 +873,13 @@ impl SessionRegistry {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let projected = apply_identity_projection(entry, &candidate, &projection, snapshot);
+            let projected = apply_identity_projection(
+                entry,
+                &candidate,
+                &projection,
+                snapshot,
+                &self.inner.turns,
+            );
             if identities_accepted && !identity_superseded {
                 advance_identity_fence(
                     entry,
@@ -5213,6 +5219,7 @@ fn adopt_projected_claim(
     entry: &mut SessionEntry,
     projection: &WorkerIdentityProjection,
     snapshot: &InspectSnapshot,
+    turns: &TurnEvents,
 ) {
     let previous = entry.active_agent.take();
     if let Some(active) = &projection.active {
@@ -5259,6 +5266,9 @@ fn adopt_projected_claim(
         // A worker without identity revisions cannot be forwarded to, so a
         // public report of the process it journaled stays the active claim.
         let unrevised = snapshot.active_identity_revision.is_none();
+        let replaces = previous
+            .as_ref()
+            .is_none_or(|previous| adopted.replaces(previous));
         if let Some(mut held) = previous.filter(|previous| {
             previous.origin == adopted.origin
                 || (unrevised
@@ -5283,6 +5293,9 @@ fn adopt_projected_claim(
             }
             entry.active_agent = Some(held);
         } else {
+            if replaces {
+                entry.agent_left(turns);
+            }
             entry.active_agent = Some(adopted.clone());
             entry.last_agent_report = Some(adopted);
         }
@@ -5293,6 +5306,9 @@ fn adopt_projected_claim(
         // A release of another process ends nothing the entry holds.
         entry.active_agent = previous;
     } else {
+        if previous.is_some() {
+            entry.agent_left(turns);
+        }
         if previous
             .as_ref()
             .is_some_and(|previous| previous.activity_reported)
@@ -5332,6 +5348,7 @@ fn apply_identity_projection(
     candidate: &SessionRecord,
     projection: &WorkerIdentityProjection,
     snapshot: &InspectSnapshot,
+    turns: &TurnEvents,
 ) -> ProjectedIdentity {
     let held = projection.privately_reported && memory_claim_holds(entry, snapshot, projection);
     let provenance = candidate
@@ -5352,7 +5369,7 @@ fn apply_identity_projection(
             || entry.info.active_agent_session_id != candidate.info.active_agent_session_id
             || entry.info.active_agent_session_path != candidate.info.active_agent_session_path);
     if projection.privately_reported && !held {
-        adopt_projected_claim(entry, projection, snapshot);
+        adopt_projected_claim(entry, projection, snapshot, turns);
     }
     if !native_changed && !active_changed {
         return ProjectedIdentity {

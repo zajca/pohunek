@@ -304,8 +304,6 @@ impl TurnProgress {
         table.depart_changed(owner);
         if !detector_observed {
             self.input_seen.store(true, Ordering::Relaxed);
-        } else if next == AgentActivity::Working && !self.input_seen.load(Ordering::Relaxed) {
-            return TurnChange::default();
         }
         // A working report of a new owner opens its own turn even when the
         // session was already working, because the previous turn departed.
@@ -314,14 +312,22 @@ impl TurnProgress {
             .is_some_and(|(_, record)| record.state == TurnState::Open);
         if next == AgentActivity::Working && (previous != Some(AgentActivity::Working) || !running)
         {
+            // Output nobody asked for opens no turn; it still continues one
+            // that is paused or settling.
+            if detector_observed
+                && !self.input_seen.load(Ordering::Relaxed)
+                && !continues_turn(&mut table, previous, now)
+            {
+                return TurnChange::default();
+            }
             // The start orders turns for `session.wait_turn`, so a wall clock
             // that stepped back must not give a new turn a smaller one.
-            if detector_observed {
-                self.input_seen.store(false, Ordering::Relaxed);
-            }
             let nanos = wall_nanos.max(self.turn_started_nanos.load(Ordering::Relaxed) + 1);
             self.turn_started_nanos.store(nanos, Ordering::Relaxed);
             let started = enter_working(&mut table, owner, previous, non_zero(nanos), now);
+            if started.is_some() && detector_observed {
+                self.input_seen.store(false, Ordering::Relaxed);
+            }
             return TurnChange {
                 started,
                 ended: None,
@@ -476,6 +482,18 @@ impl TurnProgress {
             record.signal_reported |= signal;
         }
     }
+}
+
+/// Whether a `working` after `previous` continues the newest turn: a paused
+/// one after `blocked`, a settling one before its deadline.
+fn continues_turn(table: &mut TurnTable, previous: Option<AgentActivity>, now: Instant) -> bool {
+    table
+        .newest_mut()
+        .is_some_and(|(_, record)| match record.state {
+            TurnState::Paused => previous == Some(AgentActivity::Blocked),
+            TurnState::Settling { deadline } => now < deadline,
+            _ => false,
+        })
 }
 
 /// Enters `working`: a paused turn resumes after `blocked`, a settling one

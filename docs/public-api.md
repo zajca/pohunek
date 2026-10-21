@@ -2148,7 +2148,7 @@ Event sources:
   turn only when input reached the session's current runtime (`session.input`,
   a line submitted by an attached client, an initial prompt, including one
   in the launch arguments) or an agent reported activity: the start-up banner,
-  or the repaint of a resumed or re-adopted session, is no turn. A turn uses
+  or the repaint of a resumed or re-adopted session, is no turn. Output without input still continues a turn that is settling or waiting for approval. A turn uses
   up the input it started on, and a resume, replacement or re-adoption starts
   without any. The report is held for the debounce window, so an idle that
   lasts less than `attention_debounce_secs` before the session works again
