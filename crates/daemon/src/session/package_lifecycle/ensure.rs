@@ -1274,19 +1274,7 @@ fn plan_runtime(
         );
         return Ok(None);
     }
-    // A runtime that is not reserved (Pi) was installed on purpose, possibly
-    // from a later archive than this release's, so a selected official version
-    // that is newer, or that cannot be ordered against the release's, is kept
-    // and never replaced by the release's.
-    let unordered = !is_reserved(&runtime) && selection_unordered(plan, &prepared);
-    if unordered {
-        report.gap(
-            &subject,
-            CODE_GAP_UPDATE_VERSION_UNORDERED,
-            "the selected version cannot be ordered against the release's, so it is kept",
-        );
-    }
-    if unordered || (!is_reserved(&runtime) && replaces_newer(plan, &prepared).is_some()) {
+    if !is_reserved(&runtime) && keeps_selected(plan, &prepared, &subject, report) {
         let release_version = prepared.identity.version.as_str().to_owned();
         return Ok(
             plan_installed(plan, runtime, reasons, report).map(|mut kept| {
@@ -2153,6 +2141,27 @@ fn replaces_newer(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<Selected
         digest: selected.as_str().to_owned(),
         version: record.identity().version.as_str().to_owned(),
     })
+}
+
+/// Whether the selected official version of a runtime that is not reserved
+/// (Pi) stays. It was installed on purpose, possibly from a later archive than
+/// this release's, so a version that is newer, or that cannot be ordered
+/// against the release's (a gap), is kept and never replaced by the release's.
+fn keeps_selected(
+    plan: &PlanInputs<'_>,
+    prepared: &Prepared,
+    subject: &str,
+    report: &mut Report,
+) -> bool {
+    if selection_unordered(plan, prepared) {
+        report.gap(
+            subject,
+            CODE_GAP_UPDATE_VERSION_UNORDERED,
+            "the selected version cannot be ordered against the release's, so it is kept",
+        );
+        return true;
+    }
+    replaces_newer(plan, prepared).is_some()
 }
 
 /// Whether the selected official version of the package differs from the
