@@ -2199,15 +2199,23 @@ fn selection_outcome(
 ) -> Selection {
     match unordered_selection(plan, prepared) {
         Some(Serving::Disabled) => {
-            report.gap(
-                subject,
-                CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
-                &format!(
-                    "the selected version cannot be ordered against the release's and is disabled, \
-                     so the upgrade leaves it as you set it; enable it with: pohunek plugin enable {}",
-                    prepared.identity.id
-                ),
-            );
+            // A non-reserved runtime's disabled package is already reported by
+            // `managed_runtimes`.
+            let reported = report.gaps.iter().any(|gap| {
+                gap.runtime == subject && gap.code == CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING
+            });
+            if !reported {
+                report.gap(
+                    subject,
+                    CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
+                    &format!(
+                        "the selected version cannot be ordered against the release's and is \
+                         disabled, so the upgrade leaves it as you set it; enable it with: \
+                         pohunek plugin enable {}",
+                        prepared.identity.id
+                    ),
+                );
+            }
             report
                 .integrations
                 .retain(|action| action.runtime != subject);

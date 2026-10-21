@@ -1958,6 +1958,9 @@ fn a_disabled_unordered_selected_reserved_runtime_version_is_left_untouched() {
         let installed = host.step(false);
         assert!(installed.refusals.is_empty(), "{runtime}: {installed:?}");
         host.disable_package(&digest);
+        if runtime == "claude" {
+            host.write_claude_hook();
+        }
         let (release, release_digest) = official_runtimes::variant_archive(runtime, "1.0.3");
         host.publish_archives(2, &[(runtime, &release, &release_digest)]);
         let registry = fs::read(host.registry_path()).expect("the registry record");
@@ -1993,6 +1996,48 @@ fn a_disabled_unordered_selected_reserved_runtime_version_is_left_untouched() {
         );
         assert_eq!(host.profile_text_of(runtime), profile, "{runtime}");
     }
+}
+
+/// A kept selection is judged by the detecting plan as the release's package
+/// is: a program off the search path is a gap and the runtime is not marked
+/// detected, a program on it is, and a missing config home is a gap.
+#[test]
+fn a_kept_unordered_selection_goes_through_the_detect_checks() {
+    let host = Host::new();
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "2.0");
+    host.publish_archives(1, &[("claude", &bytes, &digest)]);
+    host.write_claude_profile();
+    let installed = host.step(false);
+    assert!(installed.refusals.is_empty(), "{installed:?}");
+    publish_claude_version(&host, "1.0.3", 2);
+
+    let without_program = host.detect_step();
+
+    assert_eq!(without_program.packages[0].status, PackageStatus::Kept);
+    assert_eq!(without_program.packages[0].reasons, [UseReason::Profile]);
+    assert!(
+        gap_codes(&without_program).contains(&("claude", CODE_GAP_AGENT_NOT_ON_PATH)),
+        "{:?}",
+        without_program.gaps
+    );
+
+    host.put_program("claude");
+
+    let without_home = host.detect_step();
+
+    assert_eq!(without_home.packages[0].status, PackageStatus::Kept);
+    assert!(without_home.packages[0]
+        .reasons
+        .contains(&UseReason::Detected));
+    let codes = gap_codes(&without_home);
+    assert!(
+        codes.contains(&("claude", CODE_GAP_CONFIG_HOME_MISSING)),
+        "{codes:?}"
+    );
+    assert!(
+        codes.contains(&("claude", CODE_GAP_UPDATE_VERSION_UNORDERED)),
+        "{codes:?}"
+    );
 }
 
 /// An enabled selected version with no order against the release's whose root
@@ -2420,6 +2465,36 @@ async fn a_selected_pi_version_without_an_order_against_the_release_is_kept() {
             "{release_version}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_disabled_unordered_pi_selection_is_reported_once_by_the_detecting_plan() {
+    let host = Host::with_installed_pi().await;
+    let state = pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+        .expect("the package store")
+        .registry()
+        .state()
+        .expect("the registry state");
+    let id = state
+        .packages()
+        .iter()
+        .find(|record| record.identity().id.as_str() == PI_PACKAGE)
+        .map(|record| record.digest().clone())
+        .expect("the installed Pi package");
+    host.disable_package(&id);
+    host.publish_pi("2.0", 1);
+    host.write_profile(
+        "work",
+        &format!("base = \"pi\"\n{}", official_runtimes::profile_pin("pi")),
+    );
+
+    let plan = host.detect_step();
+
+    let not_serving = gap_codes(&plan)
+        .into_iter()
+        .filter(|entry| *entry == ("pi", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING))
+        .count();
+    assert_eq!(not_serving, 1, "{:?}", plan.gaps);
 }
 
 #[tokio::test]
