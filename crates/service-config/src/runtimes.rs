@@ -56,6 +56,9 @@ pub const CODE_SERVICE_CONFIG_UNREADABLE: &str = "service_config_unreadable";
 /// release package. The step keeps the pin, so a downgrade is never applied
 /// to it.
 pub const CODE_PINNED_TO_NEWER_VERSION: &str = "pinned_to_newer_version";
+/// A host profile is pinned to a digest other than the selected version the
+/// step keeps for its runtime. The step keeps the pin and repins nothing.
+pub const CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION: &str = "pinned_differs_from_kept_selection";
 /// A host profile is pinned to a different package of the same version as the
 /// release package. Such a pin is anomalous, so the step keeps it.
 pub const CODE_PINNED_TO_SAME_VERSION: &str = "pinned_to_same_version";
@@ -172,8 +175,10 @@ pub enum PackageStatus {
     Install,
     /// The step installed, enabled and selected the release's package.
     Installed,
-    /// The release has no usable catalog, and an installed package that
-    /// loads serves the runtime; it keeps serving it. The action names that
+    /// An installed package that loads keeps serving the runtime and the
+    /// release's package is not planned over it: the release has no usable
+    /// catalog, the selected version has no order against the release's, or
+    /// it is newer and the runtime is not reserved. The action names that
     /// package.
     Kept,
 }
@@ -214,10 +219,10 @@ pub struct PackageAction {
     /// operator can select again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaces_newer: Option<SelectedPackage>,
-    /// Set when the status is `kept` because the registry selects a newer
-    /// official version than the release carries: the release's version. The
-    /// fields above then name the selected package, which the step never
-    /// downgrades.
+    /// Set when the status is `kept` because the registry selects an official
+    /// version that is newer than the release's (non-reserved runtime) or has
+    /// no order against it (any runtime): the release's version. The fields
+    /// above then name the selected package, which the step never replaces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_version: Option<String>,
 }

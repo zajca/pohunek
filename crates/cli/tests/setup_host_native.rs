@@ -725,6 +725,35 @@ async fn a_verdict_plan_that_drops_a_previewed_runtime_fails_and_names_it() {
     );
 }
 
+/// A selected version the release does not replace stays `kept` in the preview
+/// and in the plans read after the apply, and the verdict passes.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_kept_selection_is_previewed_and_passes_the_verdict() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let kept = json!([{
+        "runtime": "claude",
+        "package": "claude-code",
+        "version": "2.0",
+        "digest": format!("sha256:{}", "a".repeat(64)),
+        "status": "kept",
+        "reasons": ["profile"],
+        "release_version": "1.0.3",
+    }]);
+    let planner = ScriptedPlanner::new(vec![planned(&kept, &json!([]))]);
+
+    let host_plan = plan(&installation.context, &release, &planner)
+        .await
+        .expect("plan the host");
+    apply(&installation.context, host_plan, &planner)
+        .await
+        .expect("a kept selection passes the verdict");
+}
+
 /// A Hermes home the preview listed that is gone when the apply runs fails the
 /// verdict and is named. A home that appeared after the preview is not touched.
 #[tokio::test(flavor = "multi_thread")]

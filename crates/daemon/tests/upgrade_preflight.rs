@@ -1940,6 +1940,43 @@ fn a_0_34_2_host_with_built_in_sessions_is_adoptable_through_the_release_plan() 
     );
 }
 
+/// Profiles created in descending and in ascending name order are listed by
+/// name. Enough of them that a filesystem listing in hash order is not sorted
+/// by chance.
+#[test]
+fn the_release_plan_lists_profiles_by_name_whatever_order_they_were_created_in() {
+    const PROFILE_COUNT: usize = 32;
+    let sorted: Vec<String> = (0..PROFILE_COUNT)
+        .map(|n| format!("claude-{n:02}"))
+        .collect();
+    let mut descending = sorted.clone();
+    descending.reverse();
+    for names in [descending, sorted.clone()] {
+        let host = Host::new();
+        let catalog = official_runtimes::OfficialCatalog::new();
+        let release = host.env.root().join("release").join("runtime");
+        catalog.write_release(&release, &["claude"]);
+        let profiles = private_dir(host.env.config_home().join("pohunek").join("agents"));
+        for name in &names {
+            write_profile(&profiles, name, "claude");
+        }
+
+        let report = run_with(
+            &host.inputs(),
+            &release_options(&host, &release, &catalog, &profiles),
+            &HostInspector::new(),
+        );
+
+        let plan = report.runtimes.as_ref().expect("the release plan");
+        let bound: Vec<&str> = plan
+            .profiles
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .collect();
+        assert_eq!(bound, sorted, "created as {:?}", &names[..2]);
+    }
+}
+
 #[test]
 fn a_profile_whose_override_lacks_screen_readiness_is_warned_before_the_upgrade() {
     let host = Host::new();

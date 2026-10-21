@@ -2336,11 +2336,17 @@ the runtime id; it is left untouched), `official_package_unavailable_for_platfor
 `--detect`, except for an installed official package of a runtime that is not
 reserved, such as Pi, where it is a gap in every mode), and
 `official_package_not_serving` (an official package of such a runtime is
-installed but not selected and enabled, so the step leaves it), and
-`plugin_update_version_unordered` (the selected version of such a package cannot
-be ordered against the release's, so it is kept, as `plugin update` refuses to
-replace it). The first two of these three name the `pohunek plugin update` command
-that updates the package by hand. A gap never blocks an apply, and `gaps` is empty
+installed but not selected and enabled, so the step leaves it, or selected while its
+version cannot be ordered against the release's but disabled or not loadable, so the
+step leaves that too; the detail names the command by cause: `pohunek plugin update`
+for a package that is not selected and enabled, `pohunek plugin enable <package>
+--digest <digest>` for a disabled unordered selection (any runtime, Pi included),
+and `pohunek plugin install` or `plugin select` for an unordered selection that does
+not load), and
+`plugin_update_version_unordered` (the selected version of an official package, of
+a reserved runtime or not, cannot be ordered against the release's and is enabled and loadable, so it is kept,
+as `plugin update` refuses to replace it). The first two of these three name the command
+that updates or repairs the package by hand. A gap never blocks an apply, and `gaps` is empty
 without `--detect` except for those three. The step also keeps an installed official package of a runtime that is
 not reserved (Pi) current: when one is installed from the official catalog,
 selected and enabled, and the release lists a package of the same id, the plan
@@ -2348,7 +2354,12 @@ installs and selects the release's version (reason `installed`) and the profiles
 pinned to the older official version are repinned; unpinned profiles stay unpinned,
 an absent package is never installed, nothing the operator turned off is changed,
 and a selected version newer than the release's is kept (status `kept`, with
-`release_version` naming the release's older one) and never downgraded. `integrations` lists the config homes the installer reinstalls hooks
+`release_version` naming the release's older one) and never downgraded. For every
+runtime, reserved or not, a selected version that cannot be ordered against the
+release's and is enabled and loadable is kept the same way (status `kept`, with
+`release_version` naming the release's version). A host profile pinned to another
+digest than a kept selection stays as it is and is reported `kept` with the reason
+`pinned_differs_from_kept_selection`. `integrations` lists the config homes the installer reinstalls hooks
 into: without `--detect`, the homes that already hold hooks; with `--detect`, each
 existing home of a planned runtime whose hooks the setup installs, whether or not
 hooks are present yet (Pi declares none). Each distinct home appears once. `reason`

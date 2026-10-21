@@ -24,7 +24,7 @@ use pohunek_service_config::runtimes::{
 
 use crate::commands::render_json;
 use crate::error::CliError;
-use crate::service::runtimes::{profile_detail, replaces_newer_warning};
+use crate::service::runtimes::{kept_selection_line, profile_detail, replaces_newer_warning};
 use crate::service::{self, report, UninstallOptions};
 
 /// `pohunek service` subcommands.
@@ -306,12 +306,8 @@ fn append_package_warning(text: &mut String, package: &PackageAction) {
     if let Some(warning) = replaces_newer_warning(package) {
         let _ = writeln!(text, "{warning}");
     }
-    if let Some(release) = &package.release_version {
-        let _ = writeln!(
-            text,
-            "           keeps the selected {} {}; the release offers {release}",
-            package.package, package.version
-        );
+    if let Some(line) = kept_selection_line(package) {
+        let _ = writeln!(text, "           {line}");
     }
 }
 

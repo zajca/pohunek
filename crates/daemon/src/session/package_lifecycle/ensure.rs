@@ -20,18 +20,18 @@ use std::sync::{Arc, Mutex};
 use package::catalog_state::CatalogState;
 use package::registry::{PackageSource, RegistryState, RetainedDigests};
 use package::verify::VerifyError;
-use package::{PackageDigest, VerifiedCatalog, MAX_CATALOG_BYTES};
+use package::{PackageDigest, VerifiedCatalog, VerifiedEntry, MAX_CATALOG_BYTES};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Gap, IntegrationAction, PackageAction, PackageStatus,
     ProfileAction, ProfileStatus, Refusal, SelectedPackage, UseReason, CODE_GAP_AGENT_NOT_ON_PATH,
     CODE_GAP_CONFIG_HOME_MISSING, CODE_GAP_CONFIG_HOME_SYMLINK,
     CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING, CODE_GAP_SERVED_BY_OTHER_PACKAGE,
     CODE_GAP_UPDATE_VERSION_UNORDERED, CODE_PACKAGE_ARCHIVE_INVALID,
-    CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PINNED_TARGET_NOT_OFFICIAL,
-    CODE_PINNED_TO_NEWER_VERSION, CODE_PINNED_TO_NON_OFFICIAL_PACKAGE,
-    CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_TO_SAME_VERSION, CODE_PINNED_VERSION_UNKNOWN,
-    CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE,
-    ENSURE_REPORT_VERSION,
+    CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION,
+    CODE_PINNED_TARGET_NOT_OFFICIAL, CODE_PINNED_TO_NEWER_VERSION,
+    CODE_PINNED_TO_NON_OFFICIAL_PACKAGE, CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_TO_SAME_VERSION,
+    CODE_PINNED_VERSION_UNKNOWN, CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE,
+    CODE_SERVICE_CONFIG_UNREADABLE, ENSURE_REPORT_VERSION,
 };
 use pohunek_worker_protocol::BaseEnv;
 use protocol::{
@@ -133,8 +133,9 @@ enum Action {
     /// The release archive is installed, enabled and selected, or its missing
     /// or altered root is restored.
     Install(Box<Prepared>),
-    /// No usable release catalog: the installed package that serves the
-    /// runtime keeps serving it.
+    /// The installed package that serves the runtime keeps serving it: the
+    /// release has no usable catalog, or the selected version is kept over the
+    /// release's.
     Kept,
 }
 
@@ -161,8 +162,9 @@ struct Planned {
     /// The newer official package the registry selects, which installing and
     /// selecting this release package replaces.
     replaces_newer: Option<SelectedPackage>,
-    /// The release's version when the entry keeps a newer selected package
-    /// instead of installing it.
+    /// The release's version when the entry keeps the selected package (newer
+    /// than the release's, or with no order against it) instead of installing
+    /// the release's.
     release_version: Option<String>,
 }
 
@@ -1117,14 +1119,18 @@ fn managed_runtimes(
                 && record.identity().id == *entry.package_id()
         });
         if installed {
-            report.gap(
-                runtime.as_str(),
-                CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
-                &format!(
+            let detail = match disabled_unordered_selection(state, entry) {
+                Some(selected) => disabled_selection_detail(entry.package_id(), &selected),
+                None => format!(
                     "an official package of this runtime is installed but not selected and \
                      enabled, so the upgrade leaves it as you set it; update it with: {}",
                     update_command(entry.package_id(), runtime)
                 ),
+            };
+            report.gap(
+                runtime.as_str(),
+                CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
+                &detail,
             );
         }
     }
@@ -1142,7 +1148,7 @@ fn plan_packages(
     for (runtime, reasons) in uses.list() {
         let entry = match release {
             Some(release) => plan_runtime(plan, release, runtime, reasons, report)?,
-            None => plan_installed(plan, runtime, reasons, report),
+            None => plan_installed(plan, runtime, reasons, report, false),
         };
         if let Some(entry) = entry {
             planned.push(entry);
@@ -1151,15 +1157,23 @@ fn plan_packages(
     Ok(planned)
 }
 
-/// Plans a runtime without a usable release catalog: the installed package
-/// that serves it keeps serving it, when its root verifies. A runtime nothing
-/// serves, or whose package does not verify, is refused.
+/// Plans a runtime over the installed package that serves it, which keeps
+/// serving it when its root verifies: the release has no usable catalog, or
+/// the selected version is kept (`kept_selection`). A runtime nothing serves,
+/// or whose package does not verify, is refused.
 fn plan_installed(
     plan: &PlanInputs<'_>,
     runtime: RuntimeId,
     reasons: Vec<UseReason>,
     report: &mut Report,
+    kept_selection: bool,
 ) -> Option<Planned> {
+    // The refusal names why the installed package is the one that plans.
+    let why = if kept_selection {
+        "the selected package is kept"
+    } else {
+        "this release has no usable runtime catalog"
+    };
     let served = plan
         .planning
         .map(|context| context.runtimes.resolve_id(&runtime));
@@ -1170,9 +1184,8 @@ fn plan_installed(
                 runtime.as_str(),
                 CODE_RELEASE_CATALOG_UNAVAILABLE,
                 &format!(
-                    "this release has no usable runtime catalog, and no installed package serves \
-                     this runtime ({}); install the official package from a release that carries \
-                     its catalog",
+                    "{why}, and no installed package serves this runtime ({}); install the \
+                     official package from a release that carries its catalog",
                     error.code
                 ),
             );
@@ -1182,8 +1195,10 @@ fn plan_installed(
             report.refuse(
                 runtime.as_str(),
                 CODE_RELEASE_CATALOG_UNAVAILABLE,
-                "this release has no usable runtime catalog, and no installed package serves this \
-                 runtime; install the official package from a release that carries its catalog",
+                &format!(
+                    "{why}, and no installed package serves this runtime; install the official \
+                     package from a release that carries its catalog"
+                ),
             );
             return None;
         }
@@ -1197,8 +1212,10 @@ fn plan_installed(
             report.refuse(
                 runtime.as_str(),
                 CODE_RELEASE_CATALOG_UNAVAILABLE,
-                "this release has no usable runtime catalog, and only a built-in serves this \
-                 runtime; install the official package from a release that carries its catalog",
+                &format!(
+                    "{why}, and only a built-in serves this runtime; install the official package \
+                     from a release that carries its catalog"
+                ),
             );
             return None;
         }
@@ -1274,14 +1291,19 @@ fn plan_runtime(
         );
         return Ok(None);
     }
-    if !is_reserved(&runtime) && keeps_selected(plan, &prepared, &subject, report) {
-        let release_version = prepared.identity.version.as_str().to_owned();
-        return Ok(
-            plan_installed(plan, runtime, reasons, report).map(|mut kept| {
-                kept.release_version = Some(release_version);
-                kept
-            }),
-        );
+    let reserved = is_reserved(&runtime);
+    match decide_selection(plan, &prepared, &subject, &mut reasons, report, reserved) {
+        Selection::Leave => return Ok(None),
+        Selection::Keep { unordered } => {
+            let kept = KeptSelection {
+                unordered,
+                reserved,
+            };
+            return Ok(plan_kept_selection(
+                plan, &prepared, &subject, runtime, reasons, kept, report,
+            ));
+        }
+        Selection::Replace => {}
     }
     if report.detect
         && !detect_on_search_path(
@@ -1339,6 +1361,95 @@ fn plan_runtime(
         replaces_newer,
         release_version: None,
     }))
+}
+
+/// What happens to the selected version of a runtime: under `--detect` the
+/// release package's search-path gate comes first for a runtime that would be
+/// left untouched, then [`selection_outcome`] decides.
+fn decide_selection(
+    plan: &PlanInputs<'_>,
+    prepared: &Prepared,
+    subject: &str,
+    reasons: &mut Vec<UseReason>,
+    report: &mut Report,
+    reserved: bool,
+) -> Selection {
+    if report.detect && !passes_detect_gate_before_leaving(plan, prepared, subject, reasons, report)
+    {
+        return Selection::Leave;
+    }
+    selection_outcome(plan, prepared, subject, report, reserved)
+}
+
+/// Under `--detect`, a runtime the plan would leave untouched (its unordered
+/// selection is disabled, does not load or is altered) is first judged by the
+/// release package's search-path gate, as a replacing plan is: a runtime
+/// nothing uses and whose program is off the search path is dropped, not
+/// reported or refused. `false` drops the runtime.
+fn passes_detect_gate_before_leaving(
+    plan: &PlanInputs<'_>,
+    prepared: &Prepared,
+    subject: &str,
+    reasons: &mut Vec<UseReason>,
+    report: &mut Report,
+) -> bool {
+    match unordered_selection(plan, prepared) {
+        Some((Serving::Disabled | Serving::Broken | Serving::Damaged(_), _)) => {
+            detect_on_search_path(
+                report,
+                subject,
+                prepared.definition.program().as_str(),
+                reasons,
+            )
+        }
+        _ => true,
+    }
+}
+
+/// How the selected version of a runtime stays.
+#[derive(Clone, Copy)]
+struct KeptSelection {
+    /// Its version has no order against the release's.
+    unordered: bool,
+    /// The runtime is reserved.
+    reserved: bool,
+}
+
+/// Plans a runtime whose selected version stays. A reserved runtime goes
+/// through the checks of a detecting plan as for the release's package, judged
+/// against the kept package's own program and config home; the unordered gap
+/// is reported only when the keep is planned. The entry names the version the
+/// release offers.
+fn plan_kept_selection(
+    plan: &PlanInputs<'_>,
+    prepared: &Prepared,
+    subject: &str,
+    runtime: RuntimeId,
+    reasons: Vec<UseReason>,
+    kept: KeptSelection,
+    report: &mut Report,
+) -> Option<Planned> {
+    let mut entry = plan_installed(plan, runtime, reasons, report, true)?;
+    if report.detect && kept.reserved {
+        if !detect_on_search_path(
+            report,
+            subject,
+            entry.definition.program().as_str(),
+            &mut entry.reasons,
+        ) {
+            return None;
+        }
+        config_home_gap(plan, &entry.definition, report);
+    }
+    entry.release_version = Some(prepared.identity.version.as_str().to_owned());
+    if kept.unordered {
+        report.gap(
+            subject,
+            CODE_GAP_UPDATE_VERSION_UNORDERED,
+            "the selected version cannot be ordered against the release's, so it is kept",
+        );
+    }
+    Some(entry)
 }
 
 /// Prepares the release archive of `runtime` that the catalog authorizes. A
@@ -1826,14 +1937,31 @@ fn classify_pin<'a>(
     let Some(entry) = planned.iter().find(|entry| entry.runtime == profile.base) else {
         return Pinning::Untouched;
     };
-    // Without a usable release catalog the planned package is the installed one
-    // that already serves the runtime, not a release package to move to.
-    if matches!(entry.action, Action::Kept) || entry.digest == profile.pin.digest {
+    // A kept package is the installed one that serves the runtime, not a
+    // release package to move to: no profile is repinned to it.
+    if entry.digest == profile.pin.digest {
         return Pinning::Untouched;
     }
     let keep = |reason: &str, previous_version: Option<&str>| {
         Pinning::Keep(kept_action(profile, previous_version, reason))
     };
+    if matches!(entry.action, Action::Kept) {
+        // Only a kept selection that has no order against the release's
+        // version is reported: the pin stays and differs from what serves the
+        // runtime.
+        let unordered = entry.release_version.as_deref().is_some_and(|release| {
+            semver::Version::parse(entry.identity.version.as_str()).is_err()
+                || semver::Version::parse(release).is_err()
+        });
+        if !unordered {
+            return Pinning::Untouched;
+        }
+        let version = plan
+            .state
+            .and_then(|state| state.package(&profile.pin.digest))
+            .map(|record| record.identity().version.as_str().to_owned());
+        return keep(CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION, version.as_deref());
+    }
     let Some(record) = plan
         .state
         .and_then(|state| state.package(&profile.pin.digest))
@@ -2143,43 +2271,144 @@ fn replaces_newer(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<Selected
     })
 }
 
-/// Whether the selected official version of a runtime that is not reserved
-/// (Pi) stays. It was installed on purpose, possibly from a later archive than
-/// this release's, so a version that is newer, or that cannot be ordered
-/// against the release's (a gap), is kept and never replaced by the release's.
-fn keeps_selected(
+/// The digest, as the `--digest` selector spells it, of the disabled selected
+/// official version of `entry`'s package when it has no order against the
+/// entry's version.
+fn disabled_unordered_selection(state: &RegistryState, entry: &VerifiedEntry) -> Option<String> {
+    let selected = state.selected(entry.package_id())?;
+    let record = state.package(selected)?;
+    (record.source() == PackageSource::Official
+        && !record.enabled()
+        && version_order(&record.identity().version, entry.version()).is_none())
+    .then(|| selector_digest(selected))
+}
+
+/// A digest without its `sha256:` prefix, as the `--digest` selector spells it.
+fn selector_digest(digest: &PackageDigest) -> String {
+    let text = digest.as_str();
+    text.strip_prefix(DIGEST_PREFIX).unwrap_or(text).to_owned()
+}
+
+/// The gap detail for a disabled selected version that cannot be ordered
+/// against the release's; `plugin update` refuses to replace it.
+fn disabled_selection_detail(package: &PackageId, digest: &str) -> String {
+    format!(
+        "the selected version cannot be ordered against the release's and is disabled, so \
+         the upgrade leaves it as you set it; enable it with: \
+         pohunek plugin enable {package} --digest {digest}"
+    )
+}
+
+/// Prefix of a package digest; the `--digest` selector spells it without.
+const DIGEST_PREFIX: &str = "sha256:";
+
+/// What the plan does with the selected official version of a runtime.
+enum Selection {
+    /// The release's package is planned over it.
+    Replace,
+    /// The selected package stays and serves the runtime; `unordered` when
+    /// its version has no order against the release's.
+    Keep { unordered: bool },
+    /// The runtime is not planned: the selection is disabled or does not load.
+    Leave,
+}
+
+/// Decides what happens to the selected official version of a runtime.
+///
+/// A version that cannot be ordered against the release's is never replaced,
+/// for any runtime: it is kept and reported when it serves, and left as the
+/// operator set it, with a gap, when it is disabled or cannot load. A
+/// newer ordered version is kept only for a runtime that is not reserved (Pi);
+/// a reserved runtime's is replaced and reported through `replaces_newer`.
+fn selection_outcome(
     plan: &PlanInputs<'_>,
     prepared: &Prepared,
     subject: &str,
     report: &mut Report,
-) -> bool {
-    if selection_unordered(plan, prepared) {
-        report.gap(
-            subject,
-            CODE_GAP_UPDATE_VERSION_UNORDERED,
-            "the selected version cannot be ordered against the release's, so it is kept",
-        );
-        return true;
+    reserved: bool,
+) -> Selection {
+    match unordered_selection(plan, prepared) {
+        Some((Serving::Loadable, _)) => return Selection::Keep { unordered: true },
+        Some((Serving::Damaged(kind), selected)) => {
+            refuse_damaged(report, subject, kind, &selected);
+            return Selection::Leave;
+        }
+        Some((state, selected)) => {
+            let id = &prepared.identity.id;
+            let detail = match state {
+                Serving::Disabled => disabled_selection_detail(id, &selector_digest(&selected)),
+                _ => format!(
+                    "the selected version cannot be ordered against the release's and its \
+                     package root is missing or does not load, so the upgrade leaves it; \
+                     restore it with `pohunek plugin install` of that version's archive, or \
+                     select another installed version with: pohunek plugin select {id} \
+                     --digest <digest>"
+                ),
+            };
+            // `managed_runtimes` may already report a non-reserved runtime's
+            // package; its `plugin update` hint is refused for this selection,
+            // so this detail replaces it.
+            match report.gaps.iter_mut().find(|gap| {
+                gap.runtime == subject && gap.code == CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING
+            }) {
+                Some(gap) => gap.detail = detail,
+                None => report.gap(subject, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING, &detail),
+            }
+            report
+                .integrations
+                .retain(|action| action.runtime != subject);
+            return Selection::Leave;
+        }
+        None => {}
     }
-    replaces_newer(plan, prepared).is_some()
+    if !reserved && replaces_newer(plan, prepared).is_some() {
+        Selection::Keep { unordered: false }
+    } else {
+        Selection::Replace
+    }
 }
 
-/// Whether the selected official version of the package differs from the
-/// prepared one and the two versions have no order.
-fn selection_unordered(plan: &PlanInputs<'_>, prepared: &Prepared) -> bool {
-    let Some(state) = plan.state else {
-        return false;
-    };
-    let Some(selected) = state.selected(&prepared.identity.id) else {
-        return false;
-    };
+/// The state of a selected official version that has no order against the
+/// prepared one.
+enum Serving {
+    /// Enabled and loadable.
+    Loadable,
+    /// Enabled but not serving: its root is missing or does not load.
+    Broken,
+    /// Enabled, and its root is present but altered or damaged.
+    Damaged(PackageErrorKind),
+    /// Turned off by the operator.
+    Disabled,
+}
+
+/// The state of the selected official version of the package when it differs
+/// from the prepared one and the two versions have no order, with its digest;
+/// `None` otherwise.
+fn unordered_selection(
+    plan: &PlanInputs<'_>,
+    prepared: &Prepared,
+) -> Option<(Serving, PackageDigest)> {
+    let state = plan.state?;
+    let selected = state.selected(&prepared.identity.id)?;
     if selected == &prepared.digest {
-        return false;
+        return None;
     }
-    state.package(selected).is_some_and(|record| {
-        record.source() == PackageSource::Official
-            && version_order(&record.identity().version, &prepared.identity.version).is_none()
-    })
+    let record = state.package(selected)?;
+    if record.source() != PackageSource::Official
+        || version_order(&record.identity().version, &prepared.identity.version).is_some()
+    {
+        return None;
+    }
+    let serving = if record.enabled() {
+        match health_of(plan, selected) {
+            Health::Present => Serving::Loadable,
+            Health::Install => Serving::Broken,
+            Health::Damaged(kind) => Serving::Damaged(kind),
+        }
+    } else {
+        Serving::Disabled
+    };
+    Some((serving, selected.clone()))
 }
 
 /// The base environment the integration status reads the config homes with:

@@ -63,7 +63,9 @@ use crate::paths::Paths;
 use crate::service::engine::{install_layout, installed_job_search_path, recorded_job_search_path};
 use crate::service::layout::{self, SealedRelease, VerifiedVersionDir};
 use crate::service::report::IntegrationReinstall;
-use crate::service::runtimes::{profile_detail, replaces_newer_warning, DaemonRuntimes};
+use crate::service::runtimes::{
+    kept_selection_line, profile_detail, replaces_newer_warning, DaemonRuntimes,
+};
 use crate::service::{self, Context, VERSION};
 use crate::target::LOCAL_HOST;
 
@@ -981,7 +983,8 @@ fn check_package_transitions(
         }
         let installed = engine_installed(engine, &package.runtime);
         let allowed = match (shown.status, package.status) {
-            (PackageStatus::Present, PackageStatus::Present) => true,
+            (PackageStatus::Present, PackageStatus::Present)
+            | (PackageStatus::Kept, PackageStatus::Kept) => true,
             (PackageStatus::Install, PackageStatus::Install) => !installed,
             (PackageStatus::Install, PackageStatus::Present) => installed,
             _ => false,
@@ -1173,7 +1176,8 @@ async fn apply_remaining(
 /// Runs the final checks and fails when any is not met.
 ///
 /// Every runtime the preview planned must be present in the plan read after
-/// the apply, that plan must carry no refusal, and a runtime it lists but the
+/// the apply (a package the preview showed `kept` counts when it is still
+/// `kept`: a kept package serves the runtime), that plan must carry no refusal, and a runtime it lists but the
 /// preview did not is reported. Hook gaps are reported and do not fail.
 ///
 /// # Errors
@@ -1191,7 +1195,10 @@ async fn verdict(
         .iter()
         .filter(|shown| {
             !after.packages.iter().any(|package| {
-                package.runtime == shown.runtime && package.status == PackageStatus::Present
+                package.runtime == shown.runtime
+                    && (package.status == PackageStatus::Present
+                        || (package.status == PackageStatus::Kept
+                            && shown.status == PackageStatus::Kept))
             })
         })
         .map(|shown| shown.runtime.clone())
@@ -1559,6 +1566,9 @@ fn render_plan(plan: &HostPlan) -> String {
     for package in &preview.packages {
         if let Some(warning) = replaces_newer_warning(package) {
             let _ = writeln!(out, "  {warning}");
+        }
+        if let Some(line) = kept_selection_line(package) {
+            let _ = writeln!(out, "  {line}");
         }
     }
     let _ = writeln!(out, "profiles:");

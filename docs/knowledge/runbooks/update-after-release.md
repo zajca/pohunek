@@ -816,6 +816,9 @@ version and digest. A pinned profile the step does not move is listed as
 - `pinned_version_unknown`: the pinned digest is not installed, or its version
   is not a semantic version;
 - `pinned_to_same_version`: another digest of the release's version;
+- `pinned_differs_from_kept_selection`: the step keeps a selected version of
+  the runtime that cannot be ordered against the release's, and the profile is
+  pinned to another digest; it is never repinned;
 - `pinned_target_not_official`: the release's package is recorded as not
   official on this host.
 
@@ -834,6 +837,21 @@ that the upgrade re-selects the release's lower version. The upgrade still does
 that. Select the newer version again afterwards with `pohunek plugin select
 <package> --digest <digest>`. Profiles pinned to the newer version keep their
 pin.
+
+When the selected official version of any runtime, `claude`, `codex` and
+`hermes` included, cannot be ordered against the release's (for example `2.0` against
+`1.0.3`), the upgrade keeps the selected version, installs nothing for that
+runtime and reports the gap `plugin_update_version_unordered`. The plan names
+the retained package and the version the release offers, as it does for Pi.
+A selected version you disabled is never replaced, selected or enabled: the
+plan plans nothing for that runtime and reports the gap
+`official_package_not_serving`. The same holds for a selected version that is enabled but
+cannot be loaded: the plan names the repair (`plugin install` of that version, or
+`plugin select` of another). A selected version whose root is present but altered
+is refused, and the refusal names `plugin uninstall --remove-modified`. Unpinned profiles
+of a reserved runtime are bound to the kept version. `pohunek setup` prints the same
+"keeps the selected ...; the release offers ..." line as `service check`.
+`pohunek plugin select <package> --digest <digest>` moves it on purpose.
 
 ### Stopped sessions on an older official package version
 
