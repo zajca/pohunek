@@ -2033,12 +2033,16 @@ fn previous_schema_sources_stay_strict() {
     }
 }
 
-/// Today's rendering of `spec()`, frozen: a file with only schema-6 keys must
-/// stay readable by a strict previous release.
-const SPEC_RENDERING: &str = r#"# Pohunek service configuration, written by `pohunek service install`.
-# Every key is required; unknown keys are rejected.
+/// Header every rendering starts with.
+const SPEC_HEADER: &str =
+    "# Pohunek service configuration, written by `pohunek service install`.\n\
+# Every key is required. Unknown keys are kept and reported as warnings,\n\
+# except inside [namespace] and [environment], where they are rejected.\n\n";
 
-schema_version = 6
+/// Body of today's rendering of `spec()`, frozen: a file with only schema-6
+/// keys must stay byte-identical below the header, so a strict previous
+/// release reads every file this release writes.
+const SPEC_BODY: &str = r#"schema_version = 6
 prefix = "/home/u/.local"
 active_version = "0.31.6"
 
@@ -2081,12 +2085,13 @@ open_files = 8192
 #[test]
 fn a_schema_6_file_renders_unchanged() {
     let config = ServiceConfig::new(spec()).expect("valid spec");
-    assert_eq!(config.to_toml(), SPEC_RENDERING);
+    let rendering = format!("{SPEC_HEADER}{SPEC_BODY}");
+    assert_eq!(config.to_toml(), rendering);
 
     let fixture = Fixture::new();
-    let reloaded = fixture.load(SPEC_RENDERING).expect("rendering loads");
+    let reloaded = fixture.load(&rendering).expect("rendering loads");
     assert!(reloaded.unknown_keys().is_empty());
-    assert_eq!(reloaded.to_toml(), SPEC_RENDERING);
+    assert_eq!(reloaded.to_toml(), rendering);
 }
 
 /// Parses rendered output into a plain table for structural comparison.

@@ -392,7 +392,8 @@ const NANOS_PER_MILLI: u32 = 1_000_000;
 /// Header written above the generated TOML.
 const FILE_HEADER: &str =
     "# Pohunek service configuration, written by `pohunek service install`.\n\
-# Every key is required; unknown keys are rejected.\n\n";
+# Every key is required. Unknown keys are kept and reported as warnings,\n\
+# except inside [namespace] and [environment], where they are rejected.\n\n";
 
 /// Largest edit distance at which an unknown key is offered a known key as a
 /// "did you mean" hint.
