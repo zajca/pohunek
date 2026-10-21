@@ -644,6 +644,8 @@ pub struct WorkerGuard {
     root: PathBuf,
     /// Sessions seen as the workload of a worker in an earlier scan.
     retained_sessions: Mutex<Vec<ProcessId>>,
+    /// Workload processes seen in an earlier scan, for [`Self::wait_for_exit`].
+    seen_workload: Mutex<Vec<ProcessId>>,
 }
 
 impl WorkerGuard {
@@ -656,6 +658,7 @@ impl WorkerGuard {
         Self {
             root: root.into(),
             retained_sessions: Mutex::new(Vec::new()),
+            seen_workload: Mutex::new(Vec::new()),
         }
     }
 
@@ -677,6 +680,17 @@ impl WorkerGuard {
             panic!("cannot read the process table to look for leaked workers: {error}")
         });
         retain_sessions(&mut retained, &workers);
+        let mut seen = self
+            .seen_workload
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for worker in &workers {
+            for process in &worker.workload {
+                if !seen.contains(process) {
+                    seen.push(process.clone());
+                }
+            }
+        }
         workers
     }
 
@@ -685,23 +699,15 @@ impl WorkerGuard {
     ///
     /// For a fixture that stopped its daemon: the daemon signals its workers
     /// as it exits, and the kernel may still be tearing them down when the
-    /// daemon's exit is observed. The workload of every worker seen meanwhile
-    /// is killed once its worker is gone, since the drop of the guard can only
-    /// reach a workload through a listed worker. Returns whether no worker is
+    /// daemon's exit is observed. The workload of every worker any scan of
+    /// this guard has listed is killed once the workers are gone, since the drop
+    /// of the guard can only reach a workload through a listed worker. Returns whether no worker is
     /// left; it never panics, so a worker that outlives the bound is reaped and
     /// reported by the drop of the guard.
     #[must_use]
     pub fn wait_for_exit(&self) -> bool {
         let deadline = Instant::now() + crate::wait::HANG_GUARD;
-        let mut workload: Vec<ProcessId> = Vec::new();
-        loop {
-            let workers = self.survivors();
-            for worker in &workers {
-                workload.extend(worker.workload.iter().cloned());
-            }
-            if workers.is_empty() {
-                break;
-            }
+        while !self.survivors().is_empty() {
             if Instant::now() >= deadline {
                 return false;
             }
@@ -711,7 +717,11 @@ impl WorkerGuard {
             .retained_sessions
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        for process in workload.iter().chain(retained.iter()) {
+        let seen = self
+            .seen_workload
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for process in seen.iter().chain(retained.iter()) {
             signal_process(process.pid, &process.start, Stop::Kill);
         }
         true
