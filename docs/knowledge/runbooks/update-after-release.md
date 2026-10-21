@@ -1011,9 +1011,10 @@ same code, and the message names the file or directive to change:
   entries); anything else is refused with a named reason: a
   line ending in a backslash (the continuation rule is not followed), a
   non-normalized absolute `EnvironmentFile=` path, an empty, relative or
-  non-normalized `ExecSearchPath=` entry or one with quotes, a section header
-  that is never closed, a byte order mark after the start of the file, escape
-  sequences, specifiers, an unclosed quote. A drop-in a loaded
+  non-normalized or over-long `ExecSearchPath=` entry or one with quotes, a
+  section header that is never closed (a form feed is not white space there), a
+  byte order mark after the start of the file, a line with a Unicode
+  noncharacter, escape sequences, specifiers, an unclosed quote. A drop-in a loaded
   unit's manager lists as a link to `/dev/null` is disabled, not refused;
 - a snapshot made stale by a change on disk while any drop-in exists (run
   `systemctl --user daemon-reload`); a drop-in directory that cannot be read;

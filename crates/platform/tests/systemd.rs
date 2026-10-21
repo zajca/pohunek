@@ -2785,6 +2785,26 @@ fn the_real_user_manager_reads_unusual_drop_in_syntax_as_the_cli_refuses_it() {
     let noted =
         loaded_with(b"[Service]\nExecSearchPath=/x/bin\n[Service] # note\nExecSearchPath=/y/bin\n");
     assert_eq!(noted.exec_search_path, ["/x/bin"], "{noted:?}");
+    let form_feed =
+        loaded_with(b"[Service]\nEnvironment=PATH=/a\n[Unit]\x0C\nEnvironment=PATH=/b\n");
+    assert!(
+        form_feed.environment.contains(&"PATH=/a".to_owned())
+            && !form_feed.environment.contains(&"PATH=/b".to_owned()),
+        "a form feed is not white space in a header line: {form_feed:?}"
+    );
+    let noncharacter =
+        loaded_with(b"[Service]\nEnvironment=PATH=/a\nEnvironment=PATH=/b FOO=\xEF\xBF\xBE\n");
+    assert!(
+        noncharacter.environment.contains(&"PATH=/a".to_owned())
+            && !noncharacter.environment.contains(&"PATH=/b".to_owned()),
+        "a line with a noncharacter is dropped: {noncharacter:?}"
+    );
+    let long_component = format!(
+        "[Service]\nExecSearchPath=/x:/{}:/y\nExecSearchPath=/z\n",
+        "a".repeat(256)
+    );
+    let long = loaded_with(long_component.as_bytes());
+    assert_eq!(long.exec_search_path, ["/x", "/z"], "{long:?}");
     let bom = loaded_with(b"[Service]\nEnvironment=FIRST=1\n\xEF\xBB\xBFEnvironment=PATH=/bom\n");
     assert!(
         bom.environment.contains(&"PATH=/bom".to_owned()),

@@ -11696,7 +11696,11 @@ async fn a_line_ending_in_a_backslash_in_a_removed_units_drop_in_is_refused() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn an_empty_exec_search_path_entry_of_a_removed_unit_is_refused() {
+    let component = format!("/x:/{}:/y", "a".repeat(256));
+    let entry = format!("/x:/{}", vec!["a".repeat(100); 41].join("/"));
     for value in [
+        component.as_str(),
+        entry.as_str(),
         "/a/bin::/b/bin",
         ":/a/bin",
         "/a/bin:",
@@ -11708,7 +11712,7 @@ async fn an_empty_exec_search_path_entry_of_a_removed_unit_is_refused() {
         let (_keep, unit) = orphan_drop_ins(&[("a.service.d", "10-a.conf", text.as_bytes())]);
         let text = refusal(unrecorded_job_path(Ok(unit)).await);
         assert!(
-            text.contains("empty or not a normalized absolute path"),
+            text.contains("not a normalized absolute path or too long"),
             "{value}: {text}"
         );
     }
@@ -11737,6 +11741,18 @@ async fn drop_in_syntax_systemd_reads_differently_is_refused_for_a_removed_unit(
         (
             b"[Service]\nEnvironment=FIRST=1\n\xEF\xBB\xBFEnvironment=PATH=/bom\n",
             "byte order mark",
+        ),
+        (
+            b"[Service]\nEnvironment=PATH=/a\n[Unit]\x0C\nEnvironment=PATH=/b\n",
+            "without closing it",
+        ),
+        (
+            b"[Service]\nEnvironment=PATH=/a\nEnvironment=PATH=/b FOO=\xEF\xBF\xBE\n",
+            "in a form not read here",
+        ),
+        (
+            b"[Service]\nExecSearchPath=/x\nExecSearchPath=/a/\xF4\x8F\xBF\xBF:/z\n",
+            "in a form not read here",
         ),
     ] {
         let (_keep, unit) = orphan_drop_ins(&[("a.service.d", "10-a.conf", content)]);

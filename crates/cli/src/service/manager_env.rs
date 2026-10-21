@@ -467,6 +467,14 @@ fn is_normalized_absolute(path: &str) -> bool {
     })
 }
 
+/// Whether an `ExecSearchPath=` entry is one systemd applies as written: a
+/// normalized absolute path of fewer than 4096 bytes with no component over 255.
+fn is_usable_search_entry(entry: &str) -> bool {
+    is_normalized_absolute(entry)
+        && entry.len() < 4096
+        && entry.split('/').all(|part| part.len() <= 255)
+}
+
 /// Whether a `PassEnvironment=` or `UnsetEnvironment=` value names `PATH`: a
 /// word that is exactly `PATH` (or `PATH=...`) once unquoted. An escape sequence
 /// can spell the name, and so can a specifier systemd expands, so both count as
@@ -499,8 +507,9 @@ fn refuse_unfollowed_syntax(bytes: &[u8], path: &str, unit_name: &str) -> Result
     } else if body.windows(3).any(|window| window == [0xEF, 0xBB, 0xBF]) {
         "a byte order mark after the start of the file, which is not followed here"
     } else if lines.iter().any(|line| {
-        let line = line.trim_ascii();
-        line.starts_with(b"[") && !line.ends_with(b"]")
+        let line = String::from_utf8_lossy(line);
+        let line = line.trim_matches(SYSTEMD_WHITESPACE);
+        line.starts_with('[') && !line.ends_with(']')
     }) {
         "a line that opens a section header without closing it, after which systemd reads nothing further"
     } else {
@@ -614,9 +623,9 @@ async fn path_from_orphan_drop_ins(
                         let list = without_specifiers(&split.words[0])
                             .map_err(|specifier| unsupported(key, &specifier))?;
                         for entry in list.split(':') {
-                            if !is_normalized_absolute(entry) {
+                            if !is_usable_search_entry(entry) {
                                 return Err(refuse(format!(
-                                    "{unit_name}: the drop-in {path} has an entry in ExecSearchPath= that is empty or not a normalized absolute path, which systemd ignores or simplifies (dropping the entries after it), so the list is not followed here. Write normalized absolute entries and retry"
+                                    "{unit_name}: the drop-in {path} has an entry in ExecSearchPath= that is empty, not a normalized absolute path or too long, which systemd ignores or simplifies (dropping the entries after it), so the list is not followed here. Write normalized absolute entries of at most 4095 bytes, with no component over 255 bytes, and retry"
                                 )));
                             }
                             search_path.push(entry.to_owned());
@@ -891,10 +900,21 @@ fn logical_lines(bytes: &[u8]) -> Vec<Result<String, String>> {
     lines
         .into_iter()
         .map(|line| {
-            String::from_utf8(line)
-                .map_err(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+            let text = String::from_utf8(line)
+                .map_err(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())?;
+            // systemd also drops a line holding a Unicode noncharacter.
+            if text.chars().any(is_noncharacter) {
+                return Err(text);
+            }
+            Ok(text)
         })
         .collect()
+}
+
+/// Whether `c` is a Unicode noncharacter (U+FDD0..U+FDEF or U+xFFFE/U+xFFFF).
+fn is_noncharacter(c: char) -> bool {
+    let code = u32::from(c);
+    (0xFDD0..=0xFDEF).contains(&code) || code & 0xFFFE == 0xFFFE
 }
 
 /// The physical lines of `bytes`: ended by `\n`, `\r\n`, a lone `\r` or NUL.
