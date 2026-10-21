@@ -2141,7 +2141,7 @@ fn interleaved_layouts() -> Vec<String> {
         // Unknown tables around a known table whose dotted unknown key has a
         // later sub-table.
         replace(
-            &before_limits(&format!("[future]\nk = 1\n")),
+            &before_limits("[future]\nk = 1\n"),
             "open_files = 8192",
             &format!(
                 "open_files = 8192\nextra.foo = \"{secret}\"\n\n[limits.extra.bar]\nb = \"{secret}\"\n\n[future.tail]\nt = 3"
