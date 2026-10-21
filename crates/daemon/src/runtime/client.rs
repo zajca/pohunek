@@ -450,6 +450,12 @@ impl Worker {
         })
     }
 
+    /// Whether an exchange holds the control connection right now.
+    #[cfg(test)]
+    pub(crate) fn connection_is_held(&self) -> bool {
+        self.inner.try_lock().is_err()
+    }
+
     /// Returns the authenticated logical session identity.
     pub async fn session_id(&self) -> SessionId {
         self.inner.lock().await.session_id.clone()

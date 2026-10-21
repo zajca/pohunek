@@ -21039,6 +21039,23 @@ generation "$1"
             Busy,
         }
 
+        /// Starts a request on the stopped worker's connection that nothing
+        /// answers and returns once it holds the connection, so a later
+        /// request waits behind it.
+        async fn hold_worker_connection(
+            worker: crate::runtime::Worker,
+        ) -> tokio::task::JoinHandle<
+            Result<pohunek_worker_protocol::InspectSnapshot, crate::runtime::WorkerError>,
+        > {
+            let holder = worker.clone();
+            let busy = tokio::spawn(async move { worker.inspect().await });
+            wait_until("the request to hold the worker connection", || async {
+                holder.connection_is_held().then_some(())
+            })
+            .await;
+            busy
+        }
+
         /// A worker stopped with `SIGSTOP` answers nothing until it is continued.
         struct StoppedWorker(i32);
 
@@ -21141,10 +21158,7 @@ generation "$1"
             let handle =
                 crate::session::tests::session_worker(&fixture.registry, &created.id).await;
             let stopped = fixture.stop_worker(worker);
-            let busy = tokio::spawn(async move { handle.inspect().await });
-            for _ in 0..20 {
-                tokio::task::yield_now().await;
-            }
+            let busy = hold_worker_connection(handle).await;
 
             let result = tokio::time::timeout(
                 HANG_GUARD,
@@ -21228,18 +21242,19 @@ generation "$1"
             if answer == Answer::Busy {
                 let handle =
                     crate::session::tests::session_worker(&fixture.registry, &created.id).await;
-                drop(tokio::spawn(async move { handle.inspect().await }));
-                for _ in 0..20 {
-                    tokio::task::yield_now().await;
-                }
+                drop(hold_worker_connection(handle).await);
             }
             gate.release.notify_waiters();
             if answer == Answer::Lost {
                 // The stopped worker holds the request in its socket; killing it
                 // closes the connection before the bound elapses.
-                for _ in 0..200 {
-                    tokio::task::yield_now().await;
-                }
+                wait_until("the forward to hold the worker connection", || async {
+                    crate::session::tests::session_worker(&fixture.registry, &created.id)
+                        .await
+                        .connection_is_held()
+                        .then_some(())
+                })
+                .await;
                 kill(
                     Pid::from_raw(i32::try_from(worker).expect("worker pid")),
                     Signal::SIGKILL,
@@ -22052,10 +22067,7 @@ generation "$1"
             assert!(first.recorded);
             let handle =
                 crate::session::tests::session_worker(&fixture.registry, &created.id).await;
-            let busy = tokio::spawn(async move { handle.inspect().await });
-            for _ in 0..20 {
-                tokio::task::yield_now().await;
-            }
+            let busy = hold_worker_connection(handle).await;
             for (monotonic, seq) in [(2, 2_020), (3, 2_030)] {
                 assert!(
                     memory_report_is_recorded(&fixture, report_at(&created, monotonic, seq)).await
@@ -22192,10 +22204,7 @@ generation "$1"
             let stopped = fixture.stop_worker(worker);
             let handle =
                 crate::session::tests::session_worker(&fixture.registry, &created.id).await;
-            let busy = tokio::spawn(async move { handle.inspect().await });
-            for _ in 0..20 {
-                tokio::task::yield_now().await;
-            }
+            let busy = hold_worker_connection(handle).await;
             arm(None);
             gate.release.notify_waiters();
 

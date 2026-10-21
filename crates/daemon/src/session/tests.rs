@@ -10677,6 +10677,78 @@ async fn mock_direct_registry(
     (registry, inspector, created)
 }
 
+/// A [`mock_direct_codex_registry`] whose records are stored and whose agents
+/// directory also holds the host profile `nested-codex` over codex, with a
+/// detector override that matches the title `profile-only-title`.
+async fn mock_direct_stored_registry(
+    tag: &str,
+) -> (SessionRegistry, Arc<MockInspector>, SessionInfo, PathBuf) {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let agents_dir = temp_agents_dir_with(
+        tag,
+        "direct-agent",
+        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+    );
+    std::fs::write(
+        agents_dir.join("nested-codex.toml"),
+        pin_official_base(
+            "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\nmanifest = \"nested-active\"\n",
+        ),
+    )
+    .expect("write the nested profile");
+    write_agent_manifest(
+        &agents_dir,
+        "nested-active",
+        r#"
+            [[rules]]
+            id = "profile-title"
+            state = "blocked"
+            priority = 1
+            region = "osc_title"
+            contains = "profile-only-title"
+            "#,
+    );
+    let store_path = agents_dir
+        .parent()
+        .expect("agents directory parent")
+        .join("metadata.jsonl");
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            stop_grace: Duration::from_millis(50),
+            procwatch_poll: Duration::from_mins(1),
+            active_agent_claim_ttl: Duration::from_millis(50),
+            agents_dir: Some(agents_dir),
+            store_path: Some(store_path.clone()),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    let created = registry
+        .create(SessionNewParams {
+            name: Some(tag.to_owned()),
+            agent: "direct-agent".to_owned(),
+            ..params()
+        })
+        .await
+        .expect("create direct codex session");
+    (registry, inspector, created, store_path)
+}
+
+/// The detector configuration the session runs now.
+async fn running_detector_config(registry: &SessionRegistry, id: &SessionId) -> DetectorConfig {
+    let sessions = registry.inner.sessions.lock().await;
+    let config = sessions
+        .get(id)
+        .expect("the live session")
+        .detector_config
+        .borrow()
+        .config
+        .clone();
+    config
+}
+
 async fn wait_for_active_agent_pid(
     registry: &SessionRegistry,
     id: &SessionId,
@@ -24187,7 +24259,8 @@ async fn a_bound_report_is_journaled_by_the_worker_and_never_becomes_a_native_re
 /// while it waits; the report is forwarded and committed after it.
 #[tokio::test]
 async fn a_snapshot_parked_before_its_identity_write_cannot_overwrite_a_forwarded_report() {
-    let (registry, inspector, created) = mock_direct_codex_registry("fence-race").await;
+    let (registry, inspector, created, store_path) =
+        mock_direct_stored_registry("fence-race").await;
     let start = root_start_identity(&inspector, &created);
     let worker = session_worker(&registry, &created.id).await;
     assert!(
@@ -24197,6 +24270,11 @@ async fn a_snapshot_parked_before_its_identity_write_cannot_overwrite_a_forwarde
             .recorded
     );
     let stale = worker.inspect().await.expect("inspect worker");
+    let default_config = running_detector_config(&registry, &created.id).await;
+    assert_ne!(
+        title_activity(&default_config, "profile-only-title"),
+        Some(AgentActivity::Blocked)
+    );
 
     let gate = armed_metadata_hold(&registry);
     let parked = tokio::spawn({
@@ -24207,7 +24285,10 @@ async fn a_snapshot_parked_before_its_identity_write_cannot_overwrite_a_forwarde
     guard("the snapshot to park", gate.entered.notified()).await;
     let forwarded = tokio::spawn({
         let registry = registry.clone();
-        let report = bound_report(&created, start, 2, "native-two");
+        let report = SessionReportAgentParams {
+            agent: "nested-codex".to_owned(),
+            ..bound_report(&created, start, 2, "native-two")
+        };
         async move { registry.report_agent(report).await }
     });
     // timing-allowed: #1101 bounded run that shows the report waits for the
@@ -24235,6 +24316,19 @@ async fn a_snapshot_parked_before_its_identity_write_cannot_overwrite_a_forwarde
     assert_eq!(
         annotation(&registry, &created.id).await.as_deref(),
         Some("native-two")
+    );
+    let record = stored_record(&store_path, &created.id);
+    assert_eq!(record.info.active_agent.as_deref(), Some("nested-codex"));
+    assert_eq!(
+        record.info.active_agent_session_id.as_deref(),
+        Some("native-two"),
+        "the record keeps the report made while the snapshot was parked"
+    );
+    let running = running_detector_config(&registry, &created.id).await;
+    assert_eq!(
+        title_activity(&running, "profile-only-title"),
+        Some(AgentActivity::Blocked),
+        "the detector follows the newer report"
     );
     let _ = registry.stop(&created.id).await;
 }
@@ -24276,16 +24370,30 @@ async fn a_snapshot_older_than_the_committed_revision_cannot_replace_the_identit
 /// A forwarded release survives a parked snapshot that still holds the claim.
 #[tokio::test]
 async fn a_forwarded_release_survives_a_snapshot_parked_with_the_claim() {
-    let (registry, inspector, created) = mock_direct_codex_registry("fence-release").await;
+    let (registry, inspector, created, store_path) =
+        mock_direct_stored_registry("fence-release").await;
     let start = root_start_identity(&inspector, &created);
     let worker = session_worker(&registry, &created.id).await;
+    let default_activity = title_activity(
+        &running_detector_config(&registry, &created.id).await,
+        "profile-only-title",
+    );
+    assert_ne!(default_activity, Some(AgentActivity::Blocked));
     assert!(
         registry
-            .report_agent(bound_report(&created, start, 1, "native-one"))
+            .report_agent(SessionReportAgentParams {
+                agent: "nested-codex".to_owned(),
+                ..bound_report(&created, start, 1, "native-one")
+            })
             .await
             .recorded
     );
     let stale = worker.inspect().await.expect("inspect worker");
+    let overridden = running_detector_config(&registry, &created.id).await;
+    assert_eq!(
+        title_activity(&overridden, "profile-only-title"),
+        Some(AgentActivity::Blocked)
+    );
 
     let gate = armed_metadata_hold(&registry);
     let parked = tokio::spawn({
@@ -24326,6 +24434,18 @@ async fn a_forwarded_release_survives_a_snapshot_parked_with_the_claim() {
         .expect("inspect session");
     assert_eq!(info.active_agent, None);
     assert_eq!(info.active_agent_session_id, None);
+    let record = stored_record(&store_path, &created.id);
+    assert_eq!(record.info.active_agent, None);
+    assert_eq!(
+        record.info.active_agent_session_id, None,
+        "the record keeps the release made while the snapshot was parked"
+    );
+    let restored = running_detector_config(&registry, &created.id).await;
+    assert_eq!(
+        title_activity(&restored, "profile-only-title"),
+        default_activity,
+        "the detector is back to the default after the release"
+    );
     let _ = registry.stop(&created.id).await;
 }
 

@@ -176,13 +176,17 @@ impl SessionRegistry {
                     Forwarded::Answered(SessionReportAgentResult { recorded: false })
                 }
                 Ok(Err(error @ WorkerError::AnswerLost(_))) => {
-                    registry.note_forward_failed(&id, &error).await;
+                    registry
+                        .note_forward_failed(&id, ForwardedOperation::Report, &error)
+                        .await;
                     Forwarded::Unacknowledged(Unacknowledged::Report(Box::new(
                         registry.unacknowledged_report(&id, context).await,
                     )))
                 }
                 Ok(Err(error)) => {
-                    registry.note_forward_failed(&id, &error).await;
+                    registry
+                        .note_forward_failed(&id, ForwardedOperation::Report, &error)
+                        .await;
                     Forwarded::MemoryOnly
                 }
                 Err(_elapsed) => {
@@ -307,13 +311,17 @@ impl SessionRegistry {
                     }
                 }
                 Ok(Err(error @ WorkerError::AnswerLost(_))) => {
-                    registry.note_forward_failed(&id, &error).await;
+                    registry
+                        .note_forward_failed(&id, ForwardedOperation::Release, &error)
+                        .await;
                     Forwarded::Unacknowledged(Unacknowledged::Release(Box::new(
                         registry.unacknowledged_release(&id, context).await,
                     )))
                 }
                 Ok(Err(error)) => {
-                    registry.note_forward_failed(&id, &error).await;
+                    registry
+                        .note_forward_failed(&id, ForwardedOperation::Release, &error)
+                        .await;
                     Forwarded::MemoryOnly
                 }
                 Err(_elapsed) => {
@@ -781,16 +789,36 @@ impl SessionRegistry {
     }
 
     /// A forward that failed in transit or in the worker's journal.
-    async fn note_forward_failed(&self, id: &SessionId, error: &WorkerError) {
-        warn!(
-            name: "session.active_identity.forward_failed",
-            session_id = %id.0,
-            cause = %error,
-            "forwarding an active-agent report failed; keeping it in memory only"
-        );
+    async fn note_forward_failed(
+        &self,
+        id: &SessionId,
+        operation: ForwardedOperation,
+        error: &WorkerError,
+    ) {
+        match operation {
+            ForwardedOperation::Report => warn!(
+                name: "session.active_identity.forward_failed",
+                session_id = %id.0,
+                cause = %error,
+                "forwarding an active-agent report failed; keeping it in memory only"
+            ),
+            ForwardedOperation::Release => warn!(
+                name: "session.active_identity.forward_failed",
+                session_id = %id.0,
+                cause = %error,
+                "forwarding an active-agent release failed; the worker's journal decides the claim"
+            ),
+        }
         self.note_not_durable(id, NotDurableCause::ForwardFailed)
             .await;
     }
+}
+
+/// The kind of operation a forward carried.
+#[derive(Clone, Copy)]
+enum ForwardedOperation {
+    Report,
+    Release,
 }
 
 /// Expiry of a forwarded claim: the receipt time plus the shared ceiling.
