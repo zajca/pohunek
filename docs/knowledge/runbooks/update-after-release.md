@@ -944,12 +944,16 @@ active, so a journal whose boot session UUID differs from the current one is not
 used: the persisted configuration is, provided it still equals the journaled
 snapshot. A different value (changed, or the file removed, after the journal
 write) cannot be dated by any clock, so what launchd applied is unknown. A
-journal without a boot UUID or a snapshot, or a host whose boot UUID cannot be
-read, cannot tell either: the journaled default is then used only when the
-persisted configuration gives the same `PATH`. In every undecidable case the call
+journal without a boot UUID, or a host whose boot UUID cannot be read, cannot
+tell either: the journaled default is then used only when the persisted
+configuration gives the same `PATH`. When the reboot is known (the boot UUID
+differs) and the persisted configuration does not equal the journaled snapshot,
+equal values prove nothing (the configuration may have been applied and changed
+back), so the call is always refused. In every undecidable case the call
 is refused with `service_manager_environment_unavailable`, and the message names
 the fix (set the `PATH` with `launchctl setenv PATH <directories>` in the GUI
-session, or make `launchctl config user path` match the journaled value).
+session; where no reboot is known, also making `launchctl config user path` match
+the journaled value).
 
 On Linux a job gets the systemd user manager's `Environment` `PATH`, replaced by
 `ExecSearchPath=` (joined with `:`) and then by an `Environment=PATH=`, both only
@@ -963,6 +967,11 @@ same code, and the message names the file or directive to change:
   is a wildcard, or is a required file that cannot be read as a regular file of at
   most 1 MiB;
 - `PassEnvironment=PATH` or `UnsetEnvironment=PATH`, and a masked or broken unit;
+- the drop-ins of a loaded unit that a removed unit could not resolve (below): a
+  rollback or config migration removes the unit and resolves again from its
+  drop-ins alone, so the first resolution refuses upfront, before anything is
+  stopped, what the second could not read. `%h`, `%U`, `%t` and `%%` are expanded
+  in those drop-ins; every other specifier is refused with its key named;
 - a unit with no unit file (not installed yet, or removed by a rollback or a
   config migration) whose drop-in files in the manager's own `UnitPath`
   directories hold a `PATH`-affecting line the CLI does not read: an

@@ -10642,6 +10642,23 @@ async fn the_same_boot_does_not_need_a_readable_persisted_configuration() {
     assert_judged(&judged, JOURNALED_PATH);
 }
 
+/// A reboot activated the pending value; scheduling the journaled one again
+/// afterwards does not make it the active one.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_configuration_changed_back_to_the_journaled_value_after_a_reboot_is_refused() {
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        Some(JOURNALED_PATH),
+        |_| {},
+        Ok(SECOND_BOOT.to_owned()),
+    )
+    .await;
+    assert_rollback_refused(&judged, "changed since the upgrade journaled it");
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_reboot_after_the_journal_write_prefers_the_persisted_configuration_it_journaled() {
@@ -10788,16 +10805,21 @@ fn unit_with_files(
     environment: &[&str],
 ) -> (Vec<tempfile::TempDir>, UnitEnvironment) {
     let mut guards = Vec::new();
-    let mut write = |content: &[u8]| {
+    let mut write = |name: String, content: &[u8]| {
         let dir = pohunek_test_support::tempdir().expect("scratch directory");
-        let file = dir.path().join("setting.conf");
+        let file = dir.path().join(name);
         std::fs::write(&file, content).expect("setting file");
         let path = file.display().to_string();
         guards.push(dir);
         path
     };
-    let fragment_path = write(unit_file);
-    let drop_in_paths = drop_ins.iter().map(|content| write(content)).collect();
+    let fragment_path = write("setting.conf".to_owned(), unit_file);
+    // The manager reports one file per drop-in name, so the names differ.
+    let drop_in_paths = drop_ins
+        .iter()
+        .enumerate()
+        .map(|(index, content)| write(format!("{index:02}-setting.conf"), content))
+        .collect();
     (
         guards,
         UnitEnvironment {
@@ -10859,7 +10881,6 @@ async fn a_drop_in_path_in_an_unreadable_form_is_refused_or_attributed_by_the_un
     for drop_in in [
         &b"[Service]\nEnvironment=\"PATH\\x3d/drop-in/bin\"\n"[..],
         &b"[Service]\nEnvironment=MYPATH=/x\n"[..],
-        &b"[Service]\nEnvironment=PATH=%Z/bin\n"[..],
         &b"[Service]\nEnvironment=\"PATH=/ignored\n"[..],
         &b"[Service]\nEnvironment=PATH=/\xff/bin\n"[..],
     ] {
@@ -10868,15 +10889,15 @@ async fn a_drop_in_path_in_an_unreadable_form_is_refused_or_attributed_by_the_un
         assert!(text.contains("in a form not read here"), "{text}");
         assert!(!text.contains("/unit-file/bin"), "values stay out: {text}");
     }
-    // The unit file sets no PATH, so the merged one is a drop-in's, however it
-    // is written.
+    // A removed unit would resolve from the drop-in alone, which cannot read this
+    // form, so it is refused upfront even though the unit file sets no PATH.
     let (_keep, unit) = unit_with_files(
         b"[Service]\nExecStart=/bin/true\n",
         &[&b"[Service]\nEnvironment=\"PATH\\x3d/drop-in/bin\"\n"[..]],
         &["PATH=/drop-in/bin"],
     );
-    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
-    assert_eq!(job.value, "/drop-in/bin");
+    let text = refusal(unrecorded_job_path(Ok(unit)).await);
+    assert!(text.contains("in a form not read here"), "{text}");
 }
 
 /// An escaped variable name in the replaced unit file is a `PATH` the install
@@ -10942,7 +10963,7 @@ async fn a_drop_in_with_a_byte_order_mark_or_carriage_returns_still_sets_the_pat
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn exec_search_path_from_a_drop_in_sets_the_job_path_below_environment() {
-    let drop_in: &[u8] = b"[Service]\nExecSearchPath=/opt/tools/bin /opt/more/bin\n";
+    let drop_in: &[u8] = b"[Service]\nExecSearchPath=/opt/tools/bin:/opt/more/bin\n";
     let (_keep, mut unit) = unit_with_files(b"[Service]\nExecStart=/bin/true\n", &[drop_in], &[]);
     unit.exec_search_path = vec!["/opt/tools/bin".to_owned(), "/opt/more/bin".to_owned()];
     let job = unrecorded_job_path(Ok(unit.clone())).await.expect("path");
@@ -11118,6 +11139,128 @@ async fn a_removed_unit_skips_masked_drop_ins_and_reads_a_spaced_environment_fil
     assert_eq!(job.value, MANAGER_PATH);
 }
 
+/// `%h`, `%U`, `%t` and `%%` are expanded for a removed unit's drop-ins; any
+/// other specifier is refused with the key and the specifier named.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_removed_unit_expands_the_manager_independent_specifiers_only() {
+    let (_keep, unit) = orphan_drop_ins(&[(
+        "a.service.d",
+        "10-a.conf",
+        b"[Service]\nEnvironment=PATH=%h/bin:/opt/100%%\n",
+    )]);
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert!(
+        job.value.starts_with('/')
+            && job.value.ends_with("/bin:/opt/100%")
+            && !job.value.contains("%h"),
+        "{}",
+        job.value
+    );
+
+    for (line, specifier, key) in [
+        ("Environment=PATH=%Z/bin", "%Z", "Environment"),
+        ("Environment=PATH=%u/bin", "%u", "Environment"),
+        ("ExecSearchPath=/opt/%H/bin", "%H", "ExecSearchPath"),
+    ] {
+        let text = format!("[Service]\n{line}\n");
+        let (_keep, unit) = orphan_drop_ins(&[("a.service.d", "10-a.conf", text.as_bytes())]);
+        let text = refusal(unrecorded_job_path(Ok(unit)).await);
+        assert!(
+            text.contains(specifier) && text.contains(&format!("in {key}=")),
+            "{text}"
+        );
+    }
+}
+
+/// The loaded gate refuses, before anything is stopped, a drop-in the removed
+/// unit's resolution could not read, and accepts one it can (`%h`).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_loaded_gate_validates_the_removed_resolution_before_anything_is_stopped() {
+    let mut harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let (_keep, unit) = unit_with_files(
+        b"[Service]\nExecStart=/bin/true\n",
+        &[b"[Service]\nEnvironment=PATH=%Z/bin\n"],
+        &["PATH=/expanded/bin"],
+    );
+    harness.context = harness
+        .context
+        .clone()
+        .with_user_manager(Arc::new(UnitManager { unit: Ok(unit) }));
+    harness.runtimes.script().calls.clear();
+    let uninstalls = harness.fake.world().uninstalls;
+    let error = harness.upgrade(V2).await.expect_err("%Z is not expanded");
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    assert!(error.to_string().contains("%Z"), "{error}");
+    assert!(harness.pending().is_none(), "no transaction was journaled");
+    assert_eq!(
+        harness.fake.world().uninstalls,
+        uninstalls,
+        "nothing stopped"
+    );
+    assert_eq!(harness.fake.world().replaces, 0);
+    harness.assert_installed(V1);
+
+    let (_keep, unit) = unit_with_files(
+        b"[Service]\nExecStart=/bin/true\n",
+        &[b"[Service]\nEnvironment=PATH=%h/bin\n"],
+        &["PATH=/expanded/bin"],
+    );
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(
+        job.value, "/expanded/bin",
+        "the loaded value is the manager's"
+    );
+}
+
+/// A rollback whose removed unit keeps a `%h` drop-in resolves it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_rollback_whose_removed_unit_keeps_a_home_specifier_drop_in_completes() {
+    let mut harness = Harness::new();
+    interrupted_upgrade_journal(&mut harness).await;
+    let home = harness
+        .context
+        .home()
+        .expect("the harness has a home")
+        .display()
+        .to_string();
+    let expanded = format!("{home}/bin");
+    let (_keep, present) = unit_with_files(
+        b"[Service]\nExecStart=/bin/true\n",
+        &[b"[Service]\nEnvironment=PATH=%h/bin\n"],
+        &[&format!("PATH={expanded}")],
+    );
+    let (_keep_removed, removed) = orphan_drop_ins(&[(
+        "a.service.d",
+        "10-path.conf",
+        b"[Service]\nEnvironment=PATH=%h/bin\n",
+    )]);
+    harness.context = harness
+        .context
+        .clone()
+        .with_user_manager(Arc::new(LifecycleUnitManager {
+            fake: harness.fake.clone(),
+            present,
+            removed,
+        }));
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V1), V1)
+        .await
+        .expect("the pending upgrade is rolled back");
+
+    let judged = judged.lock().expect("search path lock").clone();
+    assert!(!judged.is_empty() && judged.iter().all(|path| *path == expanded));
+    harness.assert_installed(V1);
+}
+
 /// What cannot be read from drop-ins of an unloaded unit is refused with the
 /// file and the fix.
 #[cfg(target_os = "linux")]
@@ -11142,11 +11285,6 @@ async fn a_removed_unit_with_drop_ins_that_cannot_be_read_is_refused() {
         (
             "p.conf",
             &b"[Service]\nEnvironment=\"\\x50ATH=/a\"\n"[..],
-            "form not read here",
-        ),
-        (
-            "p.conf",
-            &b"[Service]\nEnvironment=PATH=%h/bin\n"[..],
             "form not read here",
         ),
     ] {

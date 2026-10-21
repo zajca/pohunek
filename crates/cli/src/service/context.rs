@@ -269,6 +269,12 @@ impl Context {
         &self.cli_executable
     }
 
+    /// `$XDG_RUNTIME_DIR` as the context resolved it.
+    #[must_use]
+    pub fn runtime_base(&self) -> Option<&Path> {
+        self.runtime_base.as_deref()
+    }
+
     /// The user's home directory as the context resolved it.
     #[must_use]
     pub fn home(&self) -> Option<&Path> {

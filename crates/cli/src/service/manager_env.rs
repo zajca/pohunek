@@ -252,6 +252,47 @@ pub(crate) fn carry(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
+/// The values of the specifiers a drop-in of a removed unit may use. systemd
+/// expands them in a loaded unit; for an unloaded one they are expanded here,
+/// and only those whose value does not depend on the manager.
+#[derive(Debug, Clone, Default)]
+pub struct Specifiers {
+    /// `%h`, the user's home directory.
+    pub home: Option<String>,
+    /// `%U`, the numeric user ID.
+    pub uid: u32,
+    /// `%t`, the runtime directory (`$XDG_RUNTIME_DIR` of the context).
+    pub runtime_dir: Option<String>,
+}
+
+impl Specifiers {
+    /// Expands `%%`, `%h`, `%U` and `%t` in `text`; any other specifier, or one
+    /// without a value, is the `Err` naming it.
+    fn expand(&self, text: &str) -> Result<String, String> {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('%') => out.push('%'),
+                Some('h') if self.home.is_some() => {
+                    out.push_str(self.home.as_deref().unwrap_or_default());
+                }
+                Some('t') if self.runtime_dir.is_some() => {
+                    out.push_str(self.runtime_dir.as_deref().unwrap_or_default());
+                }
+                Some('U') => out.push_str(&self.uid.to_string()),
+                Some(other) => return Err(format!("%{other}")),
+                None => return Err("%".to_owned()),
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// The `PATH` the daemon job gets from the user manager and its own unit.
 ///
 /// `manager_path` is the manager's `PATH`; `unit` is what the manager holds for
@@ -277,14 +318,26 @@ pub async fn effective_search_path(
     manager_path: Option<String>,
     unit: &UnitEnvironment,
     unit_name: &str,
+    specifiers: &Specifiers,
 ) -> Result<Option<String>, Error> {
     if unit.load_state == "not-found"
         && (!unit.drop_in_paths.is_empty() || !unit.drop_ins_on_disk.is_empty())
     {
-        return path_from_orphan_drop_ins(manager_path, unit, unit_name).await;
+        return path_from_orphan_drop_ins(manager_path, unit, unit_name, specifiers).await;
     }
     if !unit_can_set_path(unit, unit_name).await? {
         return Ok(manager_path);
+    }
+    if !unit.drop_in_paths.is_empty() {
+        // A rollback or a config migration removes the unit and resolves again from
+        // its drop-ins alone: refuse now, before anything is stopped, what that
+        // second resolution could not read.
+        let removed = UnitEnvironment {
+            load_state: "not-found".to_owned(),
+            drop_in_paths: unit.drop_in_paths.clone(),
+            ..UnitEnvironment::default()
+        };
+        path_from_orphan_drop_ins(manager_path.clone(), &removed, unit_name, specifiers).await?;
     }
     let refuse = |detail: String| Error::ManagerEnvironment { detail };
     let prefix = format!("{SEARCH_PATH_VARIABLE}=");
@@ -392,6 +445,7 @@ async fn path_from_orphan_drop_ins(
     manager_path: Option<String>,
     unit: &UnitEnvironment,
     unit_name: &str,
+    specifiers: &Specifiers,
 ) -> Result<Option<String>, Error> {
     let refuse = |detail: String| Error::ManagerEnvironment { detail };
     let mut files = unit.drop_in_paths.clone();
@@ -412,7 +466,12 @@ async fn path_from_orphan_drop_ins(
         let bytes = read_unit_setting_file(path, unit_name, "drop-in").await?;
         let unreadable = |directive: &str| {
             refuse(format!(
-                "{unit_name} has no unit file yet and the drop-in {path} has a {directive} line that may affect {SEARCH_PATH_VARIABLE} in a form not read here (an escape sequence, a specifier, more than one word, a quote never closed, or bytes that are not UTF-8). Write a plain assignment and retry"
+                "{unit_name} has no unit file yet and the drop-in {path} has a {directive} line that may affect {SEARCH_PATH_VARIABLE} in a form not read here (an escape sequence, more than one word, a quote never closed, or bytes that are not UTF-8). Write a plain assignment and retry"
+            ))
+        };
+        let unsupported = |directive: &str, specifier: &str| {
+            refuse(format!(
+                "{unit_name} has no unit file yet and the drop-in {path} uses the specifier {specifier} in {directive}=, which is not expanded here (only %h, %U, %t and %% are). Write the value out and retry"
             ))
         };
         for line in service_lines(&bytes) {
@@ -436,7 +495,6 @@ async fn path_from_orphan_drop_ins(
                     let split = split_words(value);
                     if split.open_quote
                         || split.escaped
-                        || value.contains('%')
                         || (key == "ExecSearchPath" && split.words.len() != 1)
                     {
                         return Err(unreadable(key));
@@ -447,12 +505,18 @@ async fn path_from_orphan_drop_ins(
                         if raw.contains(['"', '\'']) {
                             return Err(unreadable(key));
                         }
+                        let raw = &specifiers
+                            .expand(raw)
+                            .map_err(|specifier| unsupported(key, &specifier))?;
                         match raw.strip_prefix('-') {
                             Some(file) => environment_files.push((file.to_owned(), true)),
                             None => environment_files.push((raw.to_owned(), false)),
                         }
                     } else {
-                        for entry in split.words[0].split(':').filter(|entry| !entry.is_empty()) {
+                        let list = specifiers
+                            .expand(&split.words[0])
+                            .map_err(|specifier| unsupported(key, &specifier))?;
+                        for entry in list.split(':').filter(|entry| !entry.is_empty()) {
                             if !entry.starts_with('/') {
                                 return Err(unreadable(key));
                             }
@@ -470,8 +534,10 @@ async fn path_from_orphan_drop_ins(
                 _ => {}
             }
         }
-        let Ok(events) = path_events(&bytes) else {
-            return Err(unreadable("Environment="));
+        let events = match path_events(&bytes, specifiers) {
+            Ok(events) => events,
+            Err(Some(specifier)) => return Err(unsupported("Environment", &specifier)),
+            Err(None) => return Err(unreadable("Environment=")),
         };
         for event in events {
             current = event;
@@ -939,13 +1005,17 @@ fn service_lines(bytes: &[u8]) -> Vec<Result<String, String>> {
 }
 
 /// What the `Environment=` lines of a drop-in do to `PATH`, in order: `None` for
-/// a reset (an empty assignment), `Some(value)` for an assignment. `Err` names
-/// a line that may touch it in a form not read here.
-fn path_events(bytes: &[u8]) -> Result<Vec<Option<String>>, ()> {
+/// a reset (an empty assignment), `Some(value)` for an assignment, specifiers
+/// expanded. `Err(None)` is a line that may touch it in a form not read here,
+/// `Err(Some(specifier))` a specifier that is not expanded here.
+fn path_events(
+    bytes: &[u8],
+    specifiers: &Specifiers,
+) -> Result<Vec<Option<String>>, Option<String>> {
     let mut events = Vec::new();
     for line in service_lines(bytes) {
         let Ok(line) = line else {
-            return Err(());
+            return Err(None);
         };
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -962,15 +1032,15 @@ fn path_events(bytes: &[u8]) -> Result<Vec<Option<String>>, ()> {
             || split.name_escaped
             || (split.escaped && value.contains(SEARCH_PATH_VARIABLE))
         {
-            return Err(());
+            return Err(None);
         }
         let assignment = format!("{SEARCH_PATH_VARIABLE}=");
         for word in &split.words {
             if let Some(path) = word.strip_prefix(&assignment) {
-                if path.contains('%') || split.escaped {
-                    return Err(());
+                if split.escaped {
+                    return Err(None);
                 }
-                events.push(Some(path.to_owned()));
+                events.push(Some(specifiers.expand(path).map_err(Some)?));
             }
         }
     }

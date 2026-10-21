@@ -3208,11 +3208,23 @@ pub(crate) async fn recorded_job_path(
                 | manager_env::EnvironmentFailure::Unusable(detail)) = failure;
                 Error::ManagerEnvironment { detail }
             })?;
-        let value = manager_env::effective_search_path(environment.search_path, &unit, &unit_name)
-            .await?
-            .ok_or_else(|| Error::ManagerEnvironment {
-                detail: "it sets no PATH entry".to_owned(),
-            })?;
+        let specifiers = manager_env::Specifiers {
+            home: context.home().map(|path| path.display().to_string()),
+            uid: context.uid(),
+            runtime_dir: context
+                .runtime_base()
+                .map(|path| path.display().to_string()),
+        };
+        let value = manager_env::effective_search_path(
+            environment.search_path,
+            &unit,
+            &unit_name,
+            &specifiers,
+        )
+        .await?
+        .ok_or_else(|| Error::ManagerEnvironment {
+            detail: "it sets no PATH entry".to_owned(),
+        })?;
         return Ok(JobPath {
             value,
             source: PathSource::UserManager,
@@ -3379,25 +3391,40 @@ fn journaled_or_persisted_path(
         }
     }
     let persisted = persisted_user_domain_path(context)?;
-    let reason = match (journal.boot_identity, &current) {
+    // After a reboot the persisted value may have been applied and changed back,
+    // so its equality with the journaled default proves nothing; only a missing
+    // or unreadable marker leaves the two values as the best evidence.
+    let (reason, equality_decides) = match (journal.boot_identity, &current) {
         (Some(_), Ok(_)) => match journal.persisted_path {
             Some(snapshot) if snapshot == persisted => {
                 return Ok((persisted, PathSource::Persisted));
             }
-            Some(_) => {
-                "the persisted configuration changed since the upgrade journaled it".to_owned()
-            }
-            None => "the journal holds no snapshot of the persisted configuration".to_owned(),
+            Some(_) => (
+                "the persisted configuration changed since the upgrade journaled it".to_owned(),
+                false,
+            ),
+            None => (
+                "the journal holds no snapshot of the persisted configuration".to_owned(),
+                false,
+            ),
         },
-        (None, _) => "the journal has no boot marker".to_owned(),
-        (Some(_), Err(error)) => format!("the current boot identity cannot be read ({error})"),
+        (None, _) => ("the journal has no boot marker".to_owned(), true),
+        (Some(_), Err(error)) => (
+            format!("the current boot identity cannot be read ({error})"),
+            true,
+        ),
     };
-    if persisted == journal.path {
+    if equality_decides && persisted == journal.path {
         return Ok((persisted, PathSource::Journal));
     }
+    let fix = if equality_decides {
+        "Set the PATH explicitly with `launchctl setenv PATH <directories>` in the GUI session, or make `launchctl config user path` match the journaled value, and retry"
+    } else {
+        "Set the PATH explicitly with `launchctl setenv PATH <directories>` in the GUI session and retry"
+    };
     Err(Error::ManagerEnvironment {
         detail: format!(
-            "the daemon job is not loaded and the PATH the upgrade journaled differs from the persisted launchd user-domain configuration, and which of them is active cannot be told ({reason}). Set the PATH explicitly with `launchctl setenv PATH <directories>` in the GUI session, or make `launchctl config user path` match the journaled value, and retry"
+            "the daemon job is not loaded and the PATH the upgrade journaled differs from, or cannot be confirmed against, the persisted launchd user-domain configuration, and which of them is active cannot be told ({reason}). {fix}"
         ),
     })
 }
