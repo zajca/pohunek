@@ -1274,14 +1274,18 @@ fn plan_runtime(
         );
         return Ok(None);
     }
-    if keeps_selected(plan, &prepared, &subject, report, is_reserved(&runtime)) {
-        let release_version = prepared.identity.version.as_str().to_owned();
-        return Ok(
-            plan_installed(plan, runtime, reasons, report).map(|mut kept| {
-                kept.release_version = Some(release_version);
-                kept
-            }),
-        );
+    match selection_outcome(plan, &prepared, &subject, report, is_reserved(&runtime)) {
+        Selection::Leave => return Ok(None),
+        Selection::Keep => {
+            let release_version = prepared.identity.version.as_str().to_owned();
+            return Ok(
+                plan_installed(plan, runtime, reasons, report).map(|mut kept| {
+                    kept.release_version = Some(release_version);
+                    kept
+                }),
+            );
+        }
+        Selection::Replace => {}
     }
     if report.detect
         && !detect_on_search_path(
@@ -2143,48 +2147,93 @@ fn replaces_newer(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<Selected
     })
 }
 
-/// Whether the selected official version of a runtime stays. A version that
-/// cannot be ordered against the release's (a gap) is kept for every runtime,
-/// reserved or not, and reported. A newer version is kept only for a runtime
-/// that is not reserved (Pi); a reserved runtime's newer selection is replaced
-/// and reported through `replaces_newer`.
-fn keeps_selected(
+/// What the plan does with the selected official version of a runtime.
+enum Selection {
+    /// The release's package is planned over it.
+    Replace,
+    /// The selected package stays and serves the runtime.
+    Keep,
+    /// The runtime is not planned: the operator turned the selection off.
+    Leave,
+}
+
+/// Decides what happens to the selected official version of a runtime.
+///
+/// A version that cannot be ordered against the release's is never replaced,
+/// for any runtime: it is kept and reported when it serves, and left as the
+/// operator set it, with a gap, when it is disabled. An unordered selection
+/// that is enabled but cannot load is repaired by the release's package. A
+/// newer ordered version is kept only for a runtime that is not reserved (Pi);
+/// a reserved runtime's is replaced and reported through `replaces_newer`.
+fn selection_outcome(
     plan: &PlanInputs<'_>,
     prepared: &Prepared,
     subject: &str,
     report: &mut Report,
     reserved: bool,
-) -> bool {
-    if selection_unordered(plan, prepared) {
-        report.gap(
-            subject,
-            CODE_GAP_UPDATE_VERSION_UNORDERED,
-            "the selected version cannot be ordered against the release's, so it is kept",
-        );
-        return true;
+) -> Selection {
+    match unordered_selection(plan, prepared) {
+        Some(Serving::Disabled) => {
+            report.gap(
+                subject,
+                CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
+                &format!(
+                    "the selected version cannot be ordered against the release's and is disabled, \
+                     so the upgrade leaves it as you set it; update it with: {}",
+                    update_command(&prepared.identity.id, prepared.definition.runtime_id())
+                ),
+            );
+            return Selection::Leave;
+        }
+        Some(Serving::Loadable) => {
+            report.gap(
+                subject,
+                CODE_GAP_UPDATE_VERSION_UNORDERED,
+                "the selected version cannot be ordered against the release's, so it is kept",
+            );
+            return Selection::Keep;
+        }
+        Some(Serving::Broken) | None => {}
     }
-    !reserved && replaces_newer(plan, prepared).is_some()
+    if !reserved && replaces_newer(plan, prepared).is_some() {
+        Selection::Keep
+    } else {
+        Selection::Replace
+    }
 }
 
-/// Whether the selected official version of the package differs from the
-/// prepared one, the two versions have no order, and the selected package
-/// serves (enabled, loadable). A selection that does not serve is repaired by
-/// the release's package instead of being kept.
-fn selection_unordered(plan: &PlanInputs<'_>, prepared: &Prepared) -> bool {
-    let Some(state) = plan.state else {
-        return false;
-    };
-    let Some(selected) = state.selected(&prepared.identity.id) else {
-        return false;
-    };
+/// The state of a selected official version that has no order against the
+/// prepared one.
+enum Serving {
+    /// Enabled and loadable.
+    Loadable,
+    /// Enabled but its root does not load.
+    Broken,
+    /// Turned off by the operator.
+    Disabled,
+}
+
+/// The state of the selected official version of the package when it differs
+/// from the prepared one and the two versions have no order; `None` otherwise.
+fn unordered_selection(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<Serving> {
+    let state = plan.state?;
+    let selected = state.selected(&prepared.identity.id)?;
     if selected == &prepared.digest {
-        return false;
+        return None;
     }
-    let unordered = state.package(selected).is_some_and(|record| {
-        record.source() == PackageSource::Official
-            && version_order(&record.identity().version, &prepared.identity.version).is_none()
-    });
-    unordered && matches!(health_of(plan, selected), Health::Present)
+    let record = state.package(selected)?;
+    if record.source() != PackageSource::Official
+        || version_order(&record.identity().version, &prepared.identity.version).is_some()
+    {
+        return None;
+    }
+    Some(if !record.enabled() {
+        Serving::Disabled
+    } else if matches!(health_of(plan, selected), Health::Present) {
+        Serving::Loadable
+    } else {
+        Serving::Broken
+    })
 }
 
 /// The base environment the integration status reads the config homes with:

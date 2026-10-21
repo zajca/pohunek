@@ -419,6 +419,17 @@ pub fn replaces_newer_warning(package: &PackageAction) -> Option<String> {
     ))
 }
 
+/// The line a package carries when the step keeps the selected version and the
+/// release offers another one. `None` when the package is not kept that way.
+#[must_use]
+pub fn kept_selection_line(package: &PackageAction) -> Option<String> {
+    let release = package.release_version.as_ref()?;
+    Some(format!(
+        "keeps the selected {} {}; the release offers {release}",
+        package.package, package.version
+    ))
+}
+
 /// One state file the step may change, read before the step.
 #[derive(Debug)]
 pub struct Captured {

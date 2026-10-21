@@ -63,7 +63,9 @@ use crate::paths::Paths;
 use crate::service::engine::{install_layout, installed_job_search_path, recorded_job_search_path};
 use crate::service::layout::{self, SealedRelease, VerifiedVersionDir};
 use crate::service::report::IntegrationReinstall;
-use crate::service::runtimes::{profile_detail, replaces_newer_warning, DaemonRuntimes};
+use crate::service::runtimes::{
+    kept_selection_line, profile_detail, replaces_newer_warning, DaemonRuntimes,
+};
 use crate::service::{self, Context, VERSION};
 use crate::target::LOCAL_HOST;
 
@@ -1524,7 +1526,11 @@ fn refusal_text(refusals: &[Refusal]) -> String {
 
 /// Renders the preview: every effect and gap, before anything is written.
 fn render_plan(plan: &HostPlan) -> String {
-    let preview = &plan.preview;
+    render_preview(&plan.preview)
+}
+
+/// Renders the preview of a run.
+fn render_preview(preview: &Preview) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "pohunek setup, version {VERSION}");
     match &preview.service {
@@ -1559,6 +1565,9 @@ fn render_plan(plan: &HostPlan) -> String {
     for package in &preview.packages {
         if let Some(warning) = replaces_newer_warning(package) {
             let _ = writeln!(out, "  {warning}");
+        }
+        if let Some(line) = kept_selection_line(package) {
+            let _ = writeln!(out, "  {line}");
         }
     }
     let _ = writeln!(out, "profiles:");
@@ -1638,4 +1647,47 @@ fn render_report(report: &SetupReport) -> String {
         report.verdict.health, report.verdict.doctor, report.verdict.catalog
     );
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use pohunek_service_config::runtimes::UseReason;
+
+    use super::*;
+
+    #[test]
+    fn the_preview_names_the_selected_version_a_kept_package_keeps() {
+        for runtime in ["pi", "claude", "codex"] {
+            let package = PackageAction {
+                runtime: runtime.to_owned(),
+                package: format!("pohunek.runtime.{runtime}"),
+                version: "2.0".to_owned(),
+                digest: "de".repeat(32),
+                status: PackageStatus::Kept,
+                reasons: vec![UseReason::Installed],
+                replaces_newer: None,
+                release_version: Some("1.0.3".to_owned()),
+            };
+            let preview = Preview {
+                service: ServiceStep::Present,
+                packages: vec![package],
+                profiles: Vec::new(),
+                integrations: Vec::new(),
+                gaps: Vec::new(),
+                catalog: CatalogStatus::Record,
+                catalog_note: None,
+                hermes_homes: Vec::new(),
+                config: Vec::new(),
+            };
+
+            let text = render_preview(&preview);
+
+            assert!(
+                text.contains(&format!(
+                    "  keeps the selected pohunek.runtime.{runtime} 2.0; the release offers 1.0.3"
+                )),
+                "{text}"
+            );
+        }
+    }
 }

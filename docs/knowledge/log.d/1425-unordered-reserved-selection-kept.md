@@ -7,6 +7,9 @@
   with the version the release offers. A selected version that is newer and
   ordered keeps its behaviour: the release's package replaces it and the plan
   warns.
+- A disabled unordered selection is left untouched (gap
+  `official_package_not_serving`), never replaced or enabled. `pohunek setup`
+  prints the retained-package line as `service check` does.
 - The profile scan behind the upgrade plan is sorted by name, independent of the
   order the filesystem returns the agents directory in (#1413).
 - Docs: `install.md`, `public-api.md` and the update runbook.

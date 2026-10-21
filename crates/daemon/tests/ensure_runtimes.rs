@@ -1945,10 +1945,11 @@ fn a_selected_reserved_runtime_version_without_an_order_against_the_release_is_k
     }
 }
 
-/// A disabled selected version that has no order against the release's is not
-/// kept: the release's package is installed and selected over it.
+/// A selected version with no order against the release's that the operator
+/// disabled is left as set: nothing is replaced, selected or enabled, and the
+/// plan reports a gap.
 #[test]
-fn a_disabled_unordered_selected_reserved_runtime_version_is_replaced_by_the_release() {
+fn a_disabled_unordered_selected_reserved_runtime_version_is_left_untouched() {
     let host = Host::new();
     let (bytes, digest) = official_runtimes::variant_archive("claude", "2.0");
     host.publish_archives(1, &[("claude", &bytes, &digest)]);
@@ -1956,14 +1957,49 @@ fn a_disabled_unordered_selected_reserved_runtime_version_is_replaced_by_the_rel
     let installed = host.step(false);
     assert!(installed.refusals.is_empty(), "{installed:?}");
     host.disable_package(&digest);
-    let release = publish_claude_version(&host, "1.0.3", 2);
+    publish_claude_version(&host, "1.0.3", 2);
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let profile = host.profile_text();
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert!(report.packages.is_empty(), "{:?}", report.packages);
+        assert_eq!(
+            gap_codes(report)
+                .into_iter()
+                .filter(|(runtime, _)| *runtime == "claude")
+                .collect::<Vec<_>>(),
+            [("claude", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)]
+        );
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+    assert_eq!(host.profile_text(), profile);
+}
+
+/// An enabled selected version with no order against the release's whose root
+/// does not load is not kept: the plan goes on to the release's package, whose
+/// coexistence check judges the retained version.
+#[test]
+fn an_unloadable_unordered_selected_reserved_runtime_version_is_not_kept() {
+    let host = Host::new();
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "2.0");
+    host.publish_archives(1, &[("claude", &bytes, &digest)]);
+    host.write_claude_profile();
+    let installed = host.step(false);
+    assert!(installed.refusals.is_empty(), "{installed:?}");
+    host.remove_installed_root();
+    publish_claude_version(&host, "1.0.3", 2);
 
     let plan = host.step(true);
 
-    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
-    let package = &plan.packages[0];
-    assert_eq!(package.status, PackageStatus::Install);
-    assert_eq!(package.digest, release.as_str());
+    let incompatible = ProtocolError::from(PackageErrorKind::IntegrationIncompatible).code;
+    assert_eq!(refusal_codes(&plan), [incompatible.as_str()]);
     assert!(
         gap_codes(&plan)
             .iter()
