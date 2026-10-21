@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use protocol::{SessionRetentionHold, SessionWarningKind};
 
 use super::{
-    admin_lock, git_command, lock_within, run_admin_command_within, worktree_add_new,
+    admin_lock, git_command, lock_within, run_admin_command_within, share_within, worktree_add_new,
     worktree_prune,
 };
 use super::{
@@ -640,6 +640,179 @@ fn concurrent_creates_in_one_repository_each_start_from_their_own_base() {
     assert_eq!(leftover_fetch_refs(&downstream), "");
 }
 
+/// Bound on a fetch's wait for the admin lock in the scenarios where another
+/// operation holds the lock for the whole wait.
+#[cfg(unix)]
+const SHORT_FETCH_LOCK_WAIT: Duration = Duration::from_millis(50);
+
+/// A repository whose `stacked/base` branch carries a commit `main` lacks,
+/// with that commit's id.
+#[cfg(unix)]
+fn upstream_with_stacked_base(tag: &str) -> (PathBuf, String) {
+    let upstream = init_repo(tag);
+    git_in(&upstream, &["checkout", "-q", "-b", "stacked/base", "main"]);
+    fs::write(upstream.join("BASE.md"), "base\n").expect("write base file");
+    git_in(&upstream, &["add", "."]);
+    git_in(&upstream, &["commit", "-q", "-m", "base"]);
+    let tip = git_stdout(&upstream, &["rev-parse", "HEAD"]);
+    git_in(&upstream, &["checkout", "-q", "main"]);
+    (upstream, tip)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_base_fetch_waits_for_a_worktree_add_that_has_not_finished_its_admin_entry() {
+    let (upstream, tip) = upstream_with_stacked_base("fetch-vs-add-upstream");
+    let downstream = clone_of(&upstream, "fetch-vs-add-downstream");
+
+    // `git worktree add` writes a null-oid HEAD into the admin entry before the
+    // entry is complete; the fetch's connectivity check fails on it with
+    // `bad object worktrees/<name>/HEAD`.
+    let entry = downstream.join(".git/worktrees/unfinished");
+    fs::create_dir_all(&entry).expect("create the unfinished admin entry");
+    fs::write(
+        entry.join("gitdir"),
+        format!("{}\n", entry.join("checkout/.git").display()),
+    )
+    .expect("write gitdir");
+    fs::write(entry.join("commondir"), "../..\n").expect("write commondir");
+    fs::write(entry.join("HEAD"), format!("{}\n", "0".repeat(40))).expect("write the placeholder");
+    let lock = admin_lock(&downstream).expect("repository lock");
+
+    let mgr = manager("fetch-vs-add");
+    let mut req = request("s-1", &downstream, "feat/1");
+    req.base_branch = Some("stacked/base".to_owned());
+    let bound = std::thread::scope(|scope| {
+        // Dropped on unwind too, before the scope waits for the bind.
+        let held = lock_within(&lock, TEST_LOCK_WAIT).expect("take the admin lock");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (mgr, req) = (&mgr, &req);
+        scope.spawn(move || {
+            let _ = tx.send(mgr.bind(req));
+        });
+        // The bind either parks its fetch on the lock or ends early with the
+        // fetch error the lock prevents.
+        let mut early = None;
+        pohunek_test_support::wait::poll_until("the bind to park its fetch on the lock", || {
+            if lock
+                .readers_waiting
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 1
+            {
+                return Some(());
+            }
+            early = rx.try_recv().ok();
+            early.is_some().then_some(())
+        });
+        assert!(
+            early.is_none(),
+            "the fetch must wait while an add holds the repository lock: {early:?}"
+        );
+        fs::remove_dir_all(&entry).expect("complete the admin entry");
+        drop(held);
+        rx.recv().expect("bind result")
+    })
+    .expect("bind succeeds once the add has finished");
+    assert!(
+        bound.warnings.is_empty(),
+        "no warnings expected: {:?}",
+        bound.warnings
+    );
+    assert_eq!(git_stdout(&bound.path, &["rev-parse", "HEAD"]), tip);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_base_fetch_runs_while_another_fetch_holds_the_repository_lock() {
+    let (upstream, tip) = upstream_with_stacked_base("fetch-vs-fetch-upstream");
+    let downstream = clone_of(&upstream, "fetch-vs-fetch-downstream");
+    let lock = admin_lock(&downstream).expect("repository lock");
+
+    let fetched = std::thread::scope(|scope| {
+        // Dropped on unwind too, before the scope waits for the fetch.
+        let _other_fetch = share_within(&lock, TEST_LOCK_WAIT).expect("share the lock");
+        let fetch = scope.spawn(|| super::fetch_origin(&downstream, "stacked/base"));
+        pohunek_test_support::wait::poll_until(
+            "the fetch to finish beside the other fetch",
+            || fetch.is_finished().then_some(()),
+        );
+        fetch.join().expect("fetch thread")
+    })
+    .expect("the fetch succeeds beside another fetch");
+    assert_eq!(fetched.commit, tip);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_waiting_add_holds_back_new_fetches_of_the_repository() {
+    let repo = init_repo("writer-preference");
+    let lock = admin_lock(&repo).expect("repository lock");
+
+    std::thread::scope(|scope| {
+        let fetch = share_within(&lock, TEST_LOCK_WAIT).expect("the fetch shares the lock");
+        let add = scope.spawn(|| lock_within(&lock, TEST_LOCK_WAIT).map(drop));
+        pohunek_test_support::wait::poll_until("the add to start waiting", || {
+            (lock
+                .writers_waiting
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 1)
+                .then_some(())
+        });
+
+        let overtaking = share_within(&lock, Duration::ZERO);
+        assert!(
+            overtaking.is_err(),
+            "a later fetch must not overtake the waiting add"
+        );
+        drop(fetch);
+        add.join()
+            .expect("add thread")
+            .expect("the add takes the lock once the fetch is done");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fetch_that_cannot_get_the_repository_lock_falls_back_to_the_local_base_with_a_warning() {
+    let (upstream, _) = upstream_with_stacked_base("fetch-lock-warning-upstream");
+    let downstream = clone_of(&upstream, "fetch-lock-warning-downstream");
+    let lock = admin_lock(&downstream).expect("repository lock");
+    let _held = lock_within(&lock, TEST_LOCK_WAIT).expect("take the admin lock");
+
+    super::FETCH_LOCK_WAIT_OVERRIDE.with(|wait| wait.set(Some(SHORT_FETCH_LOCK_WAIT)));
+    let mut warnings = Vec::new();
+    let (start_point, fetched) =
+        WorktreeManager::fetch_start_point(&downstream, "main", &mut warnings);
+
+    assert_eq!(start_point, "main", "the local base is used");
+    assert!(fetched.is_none());
+    let [warning] = warnings.as_slice() else {
+        panic!("one warning expected: {warnings:?}");
+    };
+    assert_eq!(warning.kind, SessionWarningKind::Fetch);
+    let detail = warning.detail.as_deref().unwrap_or_default();
+    assert!(detail.contains("timed out"), "{detail}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_bind_whose_origin_only_base_cannot_get_the_repository_lock_reports_the_fetch_failure() {
+    let (upstream, _) = upstream_with_stacked_base("fetch-lock-error-upstream");
+    let downstream = clone_of(&upstream, "fetch-lock-error-downstream");
+    let lock = admin_lock(&downstream).expect("repository lock");
+    let _held = lock_within(&lock, TEST_LOCK_WAIT).expect("take the admin lock");
+
+    super::FETCH_LOCK_WAIT_OVERRIDE.with(|wait| wait.set(Some(SHORT_FETCH_LOCK_WAIT)));
+    let mut req = request("s-1", &downstream, "feat/1");
+    req.base_branch = Some("stacked/base".to_owned());
+    let error = manager("fetch-lock-error")
+        .bind(&req)
+        .expect_err("the base cannot be fetched without the lock");
+
+    assert_eq!(error.code, "base_branch_fetch_failed", "{error:?}");
+    assert!(error.msg.contains("timed out"), "{error:?}");
+}
+
 /// Barrier-aligned rounds of concurrent adds in the raw-git race test.
 const RAW_ADD_ROUNDS: usize = 6;
 
@@ -872,9 +1045,12 @@ fn bind_with_pipe_holding_grandchild(detached: bool, fails: bool) {
     let release = state.join("release");
     let ended = state.join("ended");
     let python = crate::agent::trusted_program("python3").expect("test Python");
+    // The grandchild writes its partial output before it creates `started`, and the
+    // hook itself exits only once `started` exists, so git cannot finish (and the
+    // output drain cannot close the pipe) before that output is written.
     let hook = repo.join(".git/hooks/post-checkout");
     fs::write(&hook, format!(
-        "#!{}\nimport os,time,pathlib\ns=pathlib.Path({:?})\nif (s/'started').exists(): os._exit(0)\nif os.fork()==0:\n{}    (s/'started').write_text('ready')\n    os.write(1,b'partial stdout\\n')\n    os.write(2,b'partial stderr\\n')\n    while not (s/'release').exists(): time.sleep(0.01)\n    try: os.write(1,b'late output')\n    except BrokenPipeError: (s/'ended').write_text('closed')\n    else: (s/'ended').write_text('open')\n    os._exit(0)\nos._exit({})\n",
+        "#!{}\nimport os,time,pathlib\ns=pathlib.Path({:?})\nif (s/'started').exists(): os._exit(0)\nif os.fork()==0:\n{}    os.write(1,b'partial stdout\\n')\n    os.write(2,b'partial stderr\\n')\n    (s/'started').write_text('ready')\n    while not (s/'release').exists(): time.sleep(0.01)\n    try: os.write(1,b'late output')\n    except BrokenPipeError: (s/'ended').write_text('closed')\n    else: (s/'ended').write_text('open')\n    os._exit(0)\nwhile not (s/'started').exists(): time.sleep(0.01)\nos._exit({})\n",
         python.display(), state.to_str().expect("test state path"),
         if detached { "    os.setsid()\n" } else { "" },
         if fails { 7 } else { 0 },
@@ -968,7 +1144,7 @@ fn admin_lock_survives_a_panicking_holder() {
     let lock = admin_lock(&repo).expect("lock");
     let poisoner = Arc::clone(&lock);
     let panicked = std::thread::spawn(move || {
-        let _guard = poisoner.lock().expect("take the lock");
+        let _guard = poisoner.rw.write().expect("take the lock");
         panic!("holder panics while holding the admin lock");
     })
     .join();

@@ -36,6 +36,17 @@ into a temporary ref, not a remote-tracking branch, and an upstream set to a
 base with another name would make a plain `git push` target the base branch.
 Set one when the branch is first pushed, with `git push -u origin <branch>`.
 
+Worktree operations on one repository wait for each other. Adding, removing and
+pruning worktrees run one at a time, and a base-branch fetch waits for a running
+add or prune and holds those back while it runs (fetches run side by side).
+Each wait is bounded by the git command timeout (30 seconds). A wait that runs
+out is reported like the operation's own failure, with the text "waiting for
+another worktree operation on the same repository": as the `fetch` warning when
+the base exists locally, as `base_branch_fetch_failed` when it does not, and as
+a failed create or removal for an add or remove. The ordering holds within one
+daemon; another daemon, or a manual `git worktree add` on the same repository,
+is not ordered with it.
+
 Worktrees are useful when an agent should make branch-scoped edits without
 touching the main checkout. They also make remote project sessions practical:
 the daemon resolves the project on the target host and creates the worktree in

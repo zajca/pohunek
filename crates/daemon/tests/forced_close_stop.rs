@@ -361,6 +361,35 @@ impl Scenario {
             .expect("the journal is JSON")
     }
 
+    /// Fails the scenario at once when the worker faulted instead of
+    /// committing, which no later step of a scenario that expects a terminal
+    /// commit can undo.
+    ///
+    /// The worker cannot dismiss a same-user process with a hidden environment
+    /// that started after it, so one such process of an unrelated program on
+    /// the host keeps the forced-close cleanup unconfirmed. The message names
+    /// the processes the worker's sweep events report.
+    #[track_caller]
+    fn fail_if_cleanup_unconfirmed(&self, journal: &serde_json::Value) {
+        assert!(
+            journal["phase"] != "faulted",
+            "the worker faulted instead of committing its terminal outcome: its forced-close \
+             cleanup stayed unconfirmed, usually because a same-user process with a hidden \
+             environment started on the host after the worker.\nsweep events:\n{}",
+            self.worker_sweep_log()
+        );
+    }
+
+    /// Waits for the worker's terminal commit.
+    #[track_caller]
+    fn wait_for_terminal_commit(&self) -> serde_json::Value {
+        poll_until("the worker's terminal commit", || {
+            let journal = self.worker_journal();
+            self.fail_if_cleanup_unconfirmed(&journal);
+            (journal["phase"] == "terminal").then_some(journal)
+        })
+    }
+
     /// The worker's sweep events, which name every process that kept a
     /// cleanup unconfirmed; failure messages carry them.
     fn worker_sweep_log(&self) -> String {
@@ -690,6 +719,7 @@ async fn a_late_exit_after_the_stop_gave_up_honours_the_stop_intent() {
     );
 
     let ended = wait_until("the late exit to end the session", || async {
+        scenario.fail_if_cleanup_unconfirmed(&scenario.worker_journal());
         let info = registry
             .inspect(&created.id)
             .await
@@ -769,10 +799,7 @@ async fn an_exited_worker_still_answering_after_a_restart_honours_the_stop_inten
     persist_stop_intent(&scenario.store_path());
     // The drain deadline forces the output closed and the sweep ends the
     // holder; the worker then commits and keeps answering.
-    let journal = poll_until("the worker's terminal commit", || {
-        let journal = scenario.worker_journal();
-        (journal["phase"] == "terminal").then_some(journal)
-    });
+    let journal = scenario.wait_for_terminal_commit();
     assert_eq!(journal["outcome"]["reason"], "natural_exit", "{journal}");
     assert_eq!(
         journal["outcome"]["output_forced_closed"], true,
