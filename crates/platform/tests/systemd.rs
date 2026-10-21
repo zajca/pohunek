@@ -2410,12 +2410,12 @@ fn the_real_user_manager_reads_environment_files_as_the_cli_scan_does() {
         "OTHER=\"a\nPATH=/pinned/bin\"\nSTORE=/s\n",
         "OTHER=a\\\nPATH=/pinned/bin\nSTORE=/s\n",
         "# PATH=/pinned/bin\n; PATH=/pinned/bin\nSTORE=/s\n",
-        "OTHER=\"a b\" c\nSTORE=/s\n",
-        "OTHER=it's \"x\nSTORE=/s\n",
     ] {
         assert!(!assigned(content), "not an assignment of PATH: {content:?}");
     }
     for content in [
+        "OTHER=\"a b\" c\nPATH=/pinned/bin\n",
+        "OTHER=it's \"x\nPATH=/pinned/bin\n",
         "PATH=/pinned/bin\n",
         "FOO=1\rPATH=/pinned/bin\n",
         "# note\rPATH=/pinned/bin\n",
@@ -2731,6 +2731,65 @@ fn the_real_user_manager_agrees_on_the_value_forms_of_a_drop_in() {
     assert_eq!(reset.environment, ["AFTER=1"], "{reset:?}");
     assert!(reset.exec_search_path.is_empty(), "{reset:?}");
     assert!(reset.environment_files.is_empty(), "{reset:?}");
+}
+
+/// What the manager does with the drop-in syntax the CLI's reader of a removed
+/// unit's drop-ins refuses: quotes in `ExecSearchPath=`, entries that are not
+/// normalized, a section header that is never closed and a byte order mark in
+/// the middle of the file.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_reads_unusual_drop_in_syntax_as_the_cli_refuses_it() {
+    require_e2e();
+    let directory = user_unit_dir();
+    std::fs::create_dir_all(&directory).expect("user unit directory");
+    let unit = format!("pohunek-e2esyn-{}.service", std::process::id());
+    let _files = UnitFiles {
+        directory: directory.clone(),
+        unit: unit.clone(),
+    };
+    std::fs::write(
+        directory.join(&unit),
+        "[Service]\nExecStart=/bin/sleep 300\n",
+    )
+    .expect("unit file");
+    let own = directory.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&own).expect("drop-in directory");
+    let loaded_with = |content: &[u8]| {
+        std::fs::write(own.join("10-case.conf"), content).expect("drop-in");
+        systemctl(&["daemon-reload"]);
+        async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded")
+    };
+    let quoted = loaded_with(b"[Service]\nExecSearchPath=\"/q/bin\"\n");
+    assert!(
+        quoted.exec_search_path.is_empty(),
+        "quotes are literal: {quoted:?}"
+    );
+    let parent = loaded_with(b"[Service]\nExecSearchPath=/d/../e:/f\n");
+    assert!(
+        parent.exec_search_path.is_empty(),
+        "a `..` entry and those after it are dropped: {parent:?}"
+    );
+    let simplified = loaded_with(b"[Service]\nExecSearchPath=/g//h/:/i/./j\n");
+    assert_eq!(
+        simplified.exec_search_path,
+        ["/g/h", "/i/j"],
+        "{simplified:?}"
+    );
+    let bogus = loaded_with(b"[Service]\nEnvironment=PATH=/a\n[Bogus\nEnvironment=PATH=/b\n");
+    assert!(
+        bogus.environment.contains(&"PATH=/a".to_owned())
+            && !bogus.environment.contains(&"PATH=/b".to_owned()),
+        "nothing after an unclosed header is read: {bogus:?}"
+    );
+    let noted =
+        loaded_with(b"[Service]\nExecSearchPath=/x/bin\n[Service] # note\nExecSearchPath=/y/bin\n");
+    assert_eq!(noted.exec_search_path, ["/x/bin"], "{noted:?}");
+    let bom = loaded_with(b"[Service]\nEnvironment=FIRST=1\n\xEF\xBB\xBFEnvironment=PATH=/bom\n");
+    assert!(
+        bom.environment.contains(&"PATH=/bom".to_owned()),
+        "a byte order mark mid-file is dropped: {bom:?}"
+    );
 }
 
 /// A drop-in directory the scan cannot read is an error, never "no drop-ins".

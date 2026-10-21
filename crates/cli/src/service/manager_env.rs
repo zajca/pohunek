@@ -487,20 +487,30 @@ fn names_search_path(value: &str) -> bool {
     })
 }
 
-/// Refuses a drop-in with a line ending in a backslash: systemd joins it with the
-/// next line by a rule that is not followed here.
-fn refuse_continued_lines(bytes: &[u8], path: &str, unit_name: &str) -> Result<(), Error> {
-    if physical_lines(bytes)
-        .iter()
-        .any(|line| line.ends_with(b"\\"))
-    {
-        return Err(Error::ManagerEnvironment {
-            detail: format!(
-                "{unit_name}: the drop-in {path} has a line ending in a backslash, whose continuation is not followed here. Put each setting on one line and retry"
-            ),
-        });
-    }
-    Ok(())
+/// Refuses a drop-in whose syntax is not followed here: a line ending in a
+/// backslash (systemd joins it by a rule not reproduced), a line opening like a
+/// section header without closing it (systemd stops reading the file there), and
+/// a byte order mark after the start of the file.
+fn refuse_unfollowed_syntax(bytes: &[u8], path: &str, unit_name: &str) -> Result<(), Error> {
+    let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    let lines = physical_lines(body);
+    let reason = if lines.iter().any(|line| line.ends_with(b"\\")) {
+        "a line ending in a backslash, whose continuation is not followed here"
+    } else if body.windows(3).any(|window| window == [0xEF, 0xBB, 0xBF]) {
+        "a byte order mark after the start of the file, which is not followed here"
+    } else if lines.iter().any(|line| {
+        let line = line.trim_ascii();
+        line.starts_with(b"[") && !line.ends_with(b"]")
+    }) {
+        "a line that opens a section header without closing it, after which systemd reads nothing further"
+    } else {
+        return Ok(());
+    };
+    Err(Error::ManagerEnvironment {
+        detail: format!(
+            "{unit_name}: the drop-in {path} has {reason}. Write plain settings under a well-formed [Service] header and retry"
+        ),
+    })
 }
 
 /// Refuses an absolute `EnvironmentFile=` path that is not normalized: what
@@ -546,7 +556,7 @@ async fn path_from_orphan_drop_ins(
         let Some(bytes) = read_enabled_drop_in(path, unit_name).await? else {
             continue;
         };
-        refuse_continued_lines(&bytes, path, unit_name)?;
+        refuse_unfollowed_syntax(&bytes, path, unit_name)?;
         let unreadable = |directive: &str| {
             refuse(format!(
                 "{unit_name}: the drop-in {path} has a {directive} line that may affect {SEARCH_PATH_VARIABLE} in a form not read here (an escape sequence, more than one word, a quote never closed, or bytes that are not UTF-8). Write a plain assignment and retry"
@@ -578,7 +588,8 @@ async fn path_from_orphan_drop_ins(
                     let split = split_words(value);
                     if split.open_quote
                         || split.escaped
-                        || (key == "ExecSearchPath" && split.words.len() != 1)
+                        || (key == "ExecSearchPath"
+                            && (split.words.len() != 1 || value.contains(['"', '\''])))
                     {
                         return Err(unreadable(key));
                     }
@@ -603,13 +614,10 @@ async fn path_from_orphan_drop_ins(
                         let list = without_specifiers(&split.words[0])
                             .map_err(|specifier| unsupported(key, &specifier))?;
                         for entry in list.split(':') {
-                            if entry.is_empty() {
+                            if !is_normalized_absolute(entry) {
                                 return Err(refuse(format!(
-                                    "{unit_name}: the drop-in {path} has an empty entry in ExecSearchPath=, after which systemd applies no further entry, which is not followed here. Remove the empty entry and retry"
+                                    "{unit_name}: the drop-in {path} has an entry in ExecSearchPath= that is empty or not a normalized absolute path, which systemd ignores or simplifies (dropping the entries after it), so the list is not followed here. Write normalized absolute entries and retry"
                                 )));
-                            }
-                            if !entry.starts_with('/') {
-                                return Err(unreadable(key));
                             }
                             search_path.push(entry.to_owned());
                         }

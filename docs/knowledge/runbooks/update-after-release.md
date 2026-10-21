@@ -991,7 +991,6 @@ same code, and the message names the file or directive to change:
   config migration) whose drop-in files in the manager's own `UnitPath`
   directories hold a `PATH`-affecting line the CLI does not read: an
   `Environment=` `PATH`, `ExecSearchPath=` (more than one word, a relative entry)
-  (an empty entry too, since systemd applies no entry after it)
   or `EnvironmentFile=` with an escape sequence or specifier, `PassEnvironment=`
   or `UnsetEnvironment=` naming `PATH` (matched by the exact unquoted name, so
   `PYTHONPATH` is not `PATH`), or a file name held by directories of different
@@ -1006,12 +1005,15 @@ same code, and the message names the file or directive to change:
   rollback or migration that removed the unit still completes. Every construct
   the reader follows is one a real-manager test pins (file-name order across
   directories, same-name priority and `/dev/null` masks, hidden files, `[service]`
-  spelling, byte order mark and CR/CRLF/NUL line ends, comment lines, quoted and
-  no-break-space values, resets, a spaced or relative `EnvironmentFile=`,
-  `EnvironmentFile=` contents); anything else is refused with a named reason: a
+  spelling, a byte order mark at the start and CR/CRLF/NUL line ends, comment lines,
+  quoted and no-break-space `Environment=` values, resets, a spaced or relative
+  `EnvironmentFile=`, `EnvironmentFile=` contents, normalized `ExecSearchPath=`
+  entries); anything else is refused with a named reason: a
   line ending in a backslash (the continuation rule is not followed), a
-  non-normalized absolute `EnvironmentFile=` path, an empty `ExecSearchPath=` entry,
-  escape sequences, specifiers, an unclosed quote; A drop-in a loaded
+  non-normalized absolute `EnvironmentFile=` path, an empty, relative or
+  non-normalized `ExecSearchPath=` entry or one with quotes, a section header
+  that is never closed, a byte order mark after the start of the file, escape
+  sequences, specifiers, an unclosed quote. A drop-in a loaded
   unit's manager lists as a link to `/dev/null` is disabled, not refused;
 - a snapshot made stale by a change on disk while any drop-in exists (run
   `systemctl --user daemon-reload`); a drop-in directory that cannot be read;

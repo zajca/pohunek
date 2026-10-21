@@ -11690,20 +11690,67 @@ async fn a_line_ending_in_a_backslash_in_a_removed_units_drop_in_is_refused() {
     }
 }
 
-/// An empty entry of `ExecSearchPath=` makes systemd apply no entry after it
-/// (pinned on the real manager), so a removed unit's drop-in with one is refused.
+/// An empty or non-normalized entry of `ExecSearchPath=` is ignored or simplified
+/// by systemd, dropping the entries after it (pinned on the real manager), so a
+/// removed unit's drop-in with one is refused.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn an_empty_exec_search_path_entry_of_a_removed_unit_is_refused() {
-    for value in ["/a/bin::/b/bin", ":/a/bin", "/a/bin:"] {
+    for value in [
+        "/a/bin::/b/bin",
+        ":/a/bin",
+        "/a/bin:",
+        "/d/../e:/f",
+        "/g//h/:/i/./j",
+        "relative/bin",
+    ] {
         let text = format!("[Service]\nExecSearchPath={value}\n");
         let (_keep, unit) = orphan_drop_ins(&[("a.service.d", "10-a.conf", text.as_bytes())]);
         let text = refusal(unrecorded_job_path(Ok(unit)).await);
         assert!(
-            text.contains("empty entry in ExecSearchPath="),
+            text.contains("empty or not a normalized absolute path"),
             "{value}: {text}"
         );
     }
+}
+
+/// Quotes in `ExecSearchPath=` stay literal characters for systemd, a section
+/// header that is never closed ends what systemd reads of the file, and a byte
+/// order mark after the start is dropped wherever it is (all pinned on the real
+/// manager): a removed unit's drop-in with one is refused.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn drop_in_syntax_systemd_reads_differently_is_refused_for_a_removed_unit() {
+    for (content, reason) in [
+        (
+            &b"[Service]\nExecSearchPath=\"/q/bin\"\n"[..],
+            "ExecSearchPath",
+        ),
+        (
+            b"[Service]\nEnvironment=PATH=/a\n[Bogus\nEnvironment=PATH=/b\n",
+            "without closing it",
+        ),
+        (
+            b"[Service]\nExecSearchPath=/x/bin\n[Service] # note\nExecSearchPath=/y/bin\n",
+            "without closing it",
+        ),
+        (
+            b"[Service]\nEnvironment=FIRST=1\n\xEF\xBB\xBFEnvironment=PATH=/bom\n",
+            "byte order mark",
+        ),
+    ] {
+        let (_keep, unit) = orphan_drop_ins(&[("a.service.d", "10-a.conf", content)]);
+        let text = refusal(unrecorded_job_path(Ok(unit)).await);
+        assert!(text.contains(reason), "{content:?}: {text}");
+    }
+    // A byte order mark at the start of the file is dropped by systemd too.
+    let (_keep, unit) = orphan_drop_ins(&[(
+        "a.service.d",
+        "10-a.conf",
+        b"\xEF\xBB\xBF[Service]\nEnvironment=PATH=/bom/bin\n",
+    )]);
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, "/bom/bin");
 }
 
 /// A no-break space is not a word separator for systemd, so it keeps two
