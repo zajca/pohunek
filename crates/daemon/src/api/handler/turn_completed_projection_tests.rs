@@ -13,8 +13,8 @@ use protocol::{method, AgentActivity, NotificationKindPolicy, SessionId};
 use serde_json::{json, Value};
 
 use super::turn_wait_tests::{
-    debounce, every_provider, fresh_cursor, joined, ok, pause_clock, settle, settled_cursor,
-    Fixture, CLOCK_STEP, FLUSH_SLACK, LONG_WAIT_MS,
+    debounce, every_provider, fresh_cursor, joined, ok, pause_clock, settle, Fixture, CLOCK_STEP,
+    FLUSH_SLACK, LONG_WAIT_MS,
 };
 use crate::notifications::default_policy;
 use crate::session::SessionRegistryConfig;
