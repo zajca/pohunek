@@ -394,6 +394,12 @@ async fn path_from_orphan_drop_ins(
     let mut search_path: Vec<String> = Vec::new();
     let mut environment_files: Vec<(String, bool)> = Vec::new();
     for path in &files {
+        // A link to /dev/null disables the drop-in of that name.
+        if std::fs::canonicalize(path)
+            .is_ok_and(|target| target == std::path::Path::new("/dev/null"))
+        {
+            continue;
+        }
         let bytes = read_unit_setting_file(path, unit_name, "drop-in").await?;
         let unreadable = |directive: &str| {
             refuse(format!(
@@ -427,11 +433,14 @@ async fn path_from_orphan_drop_ins(
                         return Err(unreadable(key));
                     }
                     if key == "EnvironmentFile" {
-                        for word in split.words {
-                            match word.strip_prefix('-') {
-                                Some(file) => environment_files.push((file.to_owned(), true)),
-                                None => environment_files.push((word, false)),
-                            }
+                        // The whole value is one path, spaces included.
+                        let raw = value.trim_matches(SYSTEMD_WHITESPACE);
+                        if raw.contains(['"', '\'']) {
+                            return Err(unreadable(key));
+                        }
+                        match raw.strip_prefix('-') {
+                            Some(file) => environment_files.push((file.to_owned(), true)),
+                            None => environment_files.push((raw.to_owned(), false)),
                         }
                     } else {
                         for entry in split.words[0].split(':').filter(|entry| !entry.is_empty()) {
@@ -834,7 +843,7 @@ fn split_words(value: &str) -> Tokens {
             ('\'' | '"', None) => quote = Some(c),
             (c, Some(q)) if c == q => quote = None,
             (c, None) if SYSTEMD_WHITESPACE.contains(&c) => {
-                out.words.push(std::mem::take(&mut word))
+                out.words.push(std::mem::take(&mut word));
             }
             (c, _) => word.push(c),
         }

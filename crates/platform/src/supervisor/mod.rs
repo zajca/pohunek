@@ -77,6 +77,15 @@ impl std::fmt::Debug for UnitEnvironment {
                     .map_or(entry.as_str(), |(name, _)| name)
             })
             .collect();
+        let unset: Vec<&str> = self
+            .unset_environment
+            .iter()
+            .map(|entry| {
+                entry
+                    .split_once('=')
+                    .map_or(entry.as_str(), |(name, _)| name)
+            })
+            .collect();
         f.debug_struct("UnitEnvironment")
             .field("load_state", &self.load_state)
             .field("need_daemon_reload", &self.need_daemon_reload)
@@ -87,7 +96,7 @@ impl std::fmt::Debug for UnitEnvironment {
             .field("environment_files", &self.environment_files)
             .field("exec_search_path", &self.exec_search_path)
             .field("pass_environment", &self.pass_environment)
-            .field("unset_environment", &self.unset_environment)
+            .field("unset_environment", &unset)
             .finish()
     }
 }

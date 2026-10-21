@@ -11095,6 +11095,29 @@ async fn a_no_break_space_does_not_split_an_environment_value() {
     assert_eq!(job.value, "/first\u{a0}PATH=/second");
 }
 
+/// A drop-in linked to `/dev/null` is a disabled one; an environment file path
+/// is the whole value, spaces included.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_removed_unit_skips_masked_drop_ins_and_reads_a_spaced_environment_file() {
+    let (keep, mut unit) = orphan_drop_ins(&[("a.service.d", "10-a.conf", b"[Service]\n")]);
+    let masked = std::path::PathBuf::from(&unit.drop_ins_on_disk[0]);
+    std::fs::remove_file(&masked).expect("remove");
+    std::os::unix::fs::symlink("/dev/null", &masked).expect("mask");
+    let job = unrecorded_job_path(Ok(unit.clone())).await.expect("path");
+    assert_eq!(job.value, MANAGER_PATH);
+    unit.drop_ins_on_disk.clear();
+    drop(keep);
+
+    let dir = pohunek_test_support::tempdir().expect("scratch directory");
+    let spaced = dir.path().join("service vars");
+    std::fs::write(&spaced, "FOO=1\n").expect("environment file");
+    let text = format!("[Service]\nEnvironmentFile={}\n", spaced.display());
+    let (_keep, unit) = orphan_drop_ins(&[("a.service.d", "10-a.conf", text.as_bytes())]);
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, MANAGER_PATH);
+}
+
 /// What cannot be read from drop-ins of an unloaded unit is refused with the
 /// file and the fix.
 #[cfg(target_os = "linux")]
