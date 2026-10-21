@@ -993,7 +993,7 @@ same code, and the message names the file or directive to change:
   `Environment=` `PATH`, `ExecSearchPath=` (more than one word, a relative entry)
   or `EnvironmentFile=` with an escape sequence or specifier, `PassEnvironment=`
   or `UnsetEnvironment=` naming `PATH` (matched by the exact unquoted name, so
-  `PYTHONPATH` is not `PATH`), or a file name held by directories of different
+  `PYTHONPATH` is not `PATH`; a `PATH=` word, a specifier and an escape sequence count as naming it), or a file name held by directories of different
   names (`<unit>.d` and `service.d`, say). Of a file name held by same-named
   directories in several `UnitPath` entries the higher-priority one applies, and
   a link to `/dev/null` that wins disables the name. Plain `Environment=PATH=`,

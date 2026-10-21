@@ -11769,6 +11769,26 @@ async fn drop_in_syntax_systemd_reads_differently_is_refused_for_a_removed_unit(
     assert_eq!(job.value, "/bom/bin");
 }
 
+/// A specifier in the name of an `Environment=` word is expanded by systemd
+/// (`%i` to nothing for a unit that is not a template), so it can spell `PATH`:
+/// a removed unit's drop-in with one is refused, the specifier named.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_specifier_in_an_environment_name_of_a_removed_unit_is_refused() {
+    for line in [
+        "Environment=%iPATH=/x",
+        "Environment=P%IATH=/x FOO=1",
+        "Environment=\"%iPATH=/x\"",
+        "Environment=FOO=1 %",
+    ] {
+        let text = format!("[Service]\n{line}\n");
+        let (_keep, unit) = orphan_drop_ins(&[("a.service.d", "10-a.conf", text.as_bytes())]);
+        let text = refusal(unrecorded_job_path(Ok(unit)).await);
+        assert!(text.contains("uses the specifier %"), "{line}: {text}");
+        assert!(!text.contains('\0'), "{line}: {text:?}");
+    }
+}
+
 /// A no-break space is not a word separator for systemd, so it keeps two
 /// assignments in one value.
 #[cfg(target_os = "linux")]

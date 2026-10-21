@@ -2812,6 +2812,56 @@ fn the_real_user_manager_reads_unusual_drop_in_syntax_as_the_cli_refuses_it() {
     );
 }
 
+/// The tolerated forms the CLI's reader of a removed unit's drop-ins follows as
+/// systemd does: a specifier in a variable name, single and joined quotes, an
+/// empty value, an empty word, space before a header or around the key, a
+/// reopened `[Service]` section and an `EnvironmentFile=` path with a space after
+/// the dash.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_reads_tolerated_drop_in_forms_as_the_cli_does() {
+    require_e2e();
+    let directory = user_unit_dir();
+    std::fs::create_dir_all(&directory).expect("user unit directory");
+    let unit = format!("pohunek-e2etol-{}.service", std::process::id());
+    let _files = UnitFiles {
+        directory: directory.clone(),
+        unit: unit.clone(),
+    };
+    std::fs::write(
+        directory.join(&unit),
+        "[Service]\nExecStart=/bin/sleep 300\n",
+    )
+    .expect("unit file");
+    let own = directory.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&own).expect("drop-in directory");
+    let loaded_with = |content: &[u8]| {
+        std::fs::write(own.join("10-case.conf"), content).expect("drop-in");
+        systemctl(&["daemon-reload"]);
+        async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded")
+    };
+    let has = |loaded: &pohunek_platform::supervisor::UnitEnvironment, entry: &str| {
+        loaded.environment.contains(&entry.to_owned())
+    };
+    for (content, entry) in [
+        (&b"[Service]\nEnvironment=%iPATH=/x\n"[..], "PATH=/x"),
+        (b"[Service]\nEnvironment=PATH='/a'\"/b\"c\n", "PATH=/a/bc"),
+        (b"[Service]\nEnvironment=PATH=\n", "PATH="),
+        (b"[Service]\nEnvironment=\"\" PATH=/e\n", "PATH=/e"),
+        (b"  [Service]\nEnvironment=WS=1\n", "WS=1"),
+        (b"[Service]\nEnvironment =SPK=1\n", "SPK=1"),
+        (
+            b"[Unit]\nDescription=x\n[Service]\nEnvironment=RE=1\n[Unit]\n[Service]\nEnvironment=RE2=1\n",
+            "RE2=1",
+        ),
+    ] {
+        let loaded = loaded_with(content);
+        assert!(has(&loaded, entry), "{content:?}: {loaded:?}");
+    }
+    let dash = loaded_with(b"[Service]\nEnvironmentFile=- /x\n");
+    assert!(dash.environment_files.is_empty(), "{dash:?}");
+}
+
 /// A drop-in directory the scan cannot read is an error, never "no drop-ins".
 fn assert_unreadable_drop_in_directory_is_an_error(own: &std::path::Path, unit: &str) {
     use std::os::unix::fs::PermissionsExt;

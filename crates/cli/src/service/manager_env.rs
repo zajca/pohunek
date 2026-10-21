@@ -260,7 +260,10 @@ fn without_specifiers(text: &str) -> Result<String, String> {
     let mut chars = text.chars();
     while let Some(c) = chars.next() {
         if c == '%' {
-            return Err(format!("%{}", chars.next().unwrap_or_default()));
+            return Err(format!(
+                "%{}",
+                chars.next().map(String::from).unwrap_or_default()
+            ));
         }
     }
     Ok(text.to_owned())
@@ -1148,6 +1151,8 @@ fn path_events(bytes: &[u8]) -> Result<Vec<Option<String>>, Option<String>> {
         }
         let assignment = format!("{SEARCH_PATH_VARIABLE}=");
         for word in &split.words {
+            // A specifier in a name is expanded by systemd, so it can spell PATH.
+            without_specifiers(word.split('=').next().unwrap_or_default()).map_err(Some)?;
             if let Some(path) = word.strip_prefix(&assignment) {
                 if split.escaped {
                     return Err(None);
