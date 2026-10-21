@@ -958,6 +958,14 @@ boot, one whose time cannot be read, or an unreadable boot time is refused with
 `service_manager_environment_unavailable`; the message names the fix (set the
 `PATH` with `launchctl setenv PATH <directories>` in the GUI session).
 
+The times compared are the later of a file's modification and status change time
+(so a copy or rename that preserves the modification time still counts), and the
+nearest existing directory's for a missing file. Known limit: both times are on
+the calendar clock, so a clock step right after the boot (a VM resumed with a
+stale clock, then corrected) moves `kern.boottime` but not older file times, and
+a `launchctl config user path` written inside that window can be taken for a
+value the boot applied. Setting the `PATH` with `launchctl setenv` avoids it.
+
 On Linux a job gets the systemd user manager's `Environment` `PATH`, replaced by
 `ExecSearchPath=` (joined with `:`) and then by an `Environment=PATH=`, both only
 when a drop-in of the daemon unit gives them (the install replaces the unit file

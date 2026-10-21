@@ -3463,7 +3463,7 @@ fn journaled_or_persisted_path(
     let refuse = |reason: String| {
         Error::ManagerEnvironment {
         detail: format!(
-            "the daemon job is not loaded and which PATH launchd applies cannot be told ({reason}). Set the PATH explicitly with `launchctl setenv PATH <directories>` in the GUI session and retry"
+            "which PATH launchd applies to the daemon job cannot be told ({reason}). Set the PATH explicitly with `launchctl setenv PATH <directories>` in the GUI session and retry"
         ),
     }
     };
@@ -3482,6 +3482,9 @@ fn journaled_or_persisted_path(
         })
     };
     let changed = date()?;
+    // Both times are on the calendar clock: a clock step right after the boot
+    // moves `kern.boottime` but not the times of files written before the
+    // step, so a write inside that window can look older than the boot.
     if changed >= booted {
         return Err(refuse(
             "the launchd user-domain configuration was modified after the host booted, so it may be pending or may have been applied and changed again".to_owned(),

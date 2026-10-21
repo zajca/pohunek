@@ -8,6 +8,7 @@
 
 use std::fs::File;
 use std::io::{BufReader, ErrorKind};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -47,36 +48,53 @@ pub fn user_domain_path() -> Result<String, Error> {
 /// Returns when the user domain's configuration at `config` last changed.
 ///
 /// A symbolic link is dated by the later of the link and its target. An absent
-/// file is dated by its directory, whose modification time moves
-/// when the file is created, replaced or removed: the file was gone since then.
+/// file is dated by its nearest existing directory, whose time moves when the
+/// file is created, replaced or removed: the file was gone since then. Each is
+/// dated by the later of its modification and status change time.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Unavailable`] when neither the file nor its directory can
-/// be dated.
+/// Returns [`Error::Unavailable`] when neither the file nor any directory above
+/// it can be dated.
 pub fn user_domain_config_modified(config: &Path) -> Result<SystemTime, Error> {
-    let modified = |path: &Path| {
-        std::fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .map_err(|source| Error::Unavailable {
-                operation: MODIFIED_OPERATION,
-                source: Box::new(source),
-            })
+    let unavailable = |source: std::io::Error| Error::Unavailable {
+        operation: MODIFIED_OPERATION,
+        source: Box::new(source),
+    };
+    // The later of the modification and the status change time: a rename or a
+    // copy that preserves the modification time still moves the status change.
+    let changed = |metadata: &std::fs::Metadata| -> Result<SystemTime, Error> {
+        let modified = metadata.modified().map_err(unavailable)?;
+        let status = u64::try_from(metadata.ctime()).map_or(SystemTime::UNIX_EPOCH, |seconds| {
+            SystemTime::UNIX_EPOCH
+                + std::time::Duration::new(
+                    seconds,
+                    u32::try_from(metadata.ctime_nsec()).unwrap_or(0),
+                )
+        });
+        Ok(modified.max(status))
     };
     match std::fs::symlink_metadata(config) {
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            modified(config.parent().unwrap_or_else(|| Path::new(".")))
+            // The nearest directory that exists changed when the file, or a
+            // directory above it, was created or removed.
+            for ancestor in config.ancestors().skip(1) {
+                match std::fs::metadata(ancestor) {
+                    Ok(metadata) => return changed(&metadata),
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(unavailable(error)),
+                }
+            }
+            Err(unavailable(error))
         }
+        Err(error) => Err(unavailable(error)),
         // A link is replaced without touching its target, and a target is
         // rewritten without touching the link: the later of the two dates it.
         Ok(link) if link.file_type().is_symlink() => {
-            let link = link.modified().map_err(|source| Error::Unavailable {
-                operation: MODIFIED_OPERATION,
-                source: Box::new(source),
-            })?;
-            Ok(link.max(modified(config)?))
+            let target = std::fs::metadata(config).map_err(unavailable)?;
+            Ok(changed(&link)?.max(changed(&target)?))
         }
-        _ => modified(config),
+        Ok(file) => changed(&file),
     }
 }
 
@@ -154,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn the_configuration_is_dated_by_its_file_or_else_its_directory() {
+    fn the_configuration_is_dated_by_its_file_or_else_its_nearest_directory() {
         let temp = pohunek_test_support::tempdir().expect("scratch directory");
         let epoch = |seconds: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
         let date = |path: &Path, when: SystemTime| {
@@ -162,37 +180,39 @@ mod tests {
                 .and_then(|file| file.set_modified(when))
                 .expect("date the path");
         };
+        // Far ahead of the status change time, which a test cannot set.
+        let (late, later) = (epoch(4_000_000_000), epoch(4_000_000_100));
+        let before = SystemTime::now() - std::time::Duration::from_secs(60);
 
         let config = config_in(&temp, "user.plist", &dictionary_xml(""));
-        date(&config, epoch(1_000));
+        date(&config, late);
         date(temp.path(), epoch(2_000));
-        assert_eq!(
-            user_domain_config_modified(&config).expect("file"),
-            epoch(1_000)
-        );
+        assert_eq!(user_domain_config_modified(&config).expect("file"), late);
+
+        // A preserved modification time does not hide a later status change.
+        date(&config, epoch(1_000));
+        assert!(user_domain_config_modified(&config).expect("preserved") > before);
 
         std::fs::remove_file(&config).expect("remove");
-        date(temp.path(), epoch(3_000));
+        date(temp.path(), later);
         assert_eq!(
             user_domain_config_modified(&config).expect("directory"),
-            epoch(3_000)
+            later
         );
 
-        // A link made after the boot to a target older than it is a recent change.
+        // A link made later than its target is a recent change.
         let target = config_in(&temp, "target.plist", &dictionary_xml(""));
         date(&target, epoch(1_000));
         std::os::unix::fs::symlink(&target, &config).expect("link");
-        let linked = std::fs::symlink_metadata(&config)
-            .and_then(|metadata| metadata.modified())
-            .expect("link time");
-        assert!(linked > epoch(1_000));
-        assert_eq!(user_domain_config_modified(&config).expect("link"), linked);
+        assert!(user_domain_config_modified(&config).expect("link") > before);
 
+        // Missing directories are dated by the nearest one that exists.
+        date(temp.path(), later);
         let orphan = temp.path().join("absent").join("user.plist");
-        assert!(matches!(
-            user_domain_config_modified(&orphan),
-            Err(Error::Unavailable { .. })
-        ));
+        assert_eq!(
+            user_domain_config_modified(&orphan).expect("ancestor"),
+            later
+        );
     }
 
     #[test]

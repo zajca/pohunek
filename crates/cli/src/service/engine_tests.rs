@@ -10557,7 +10557,7 @@ async fn the_upgrade_journals_the_boot_identity_with_the_launchd_default() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn an_unreadable_boot_time_journals_the_default_without_a_marker() {
+async fn an_unreadable_boot_identity_journals_the_default_without_a_marker() {
     let mut harness = Harness::new();
     let launchd = FakeLaunchd::new(Ok(loaded_job(JOURNALED_PATH.to_owned())));
     launchd.set_boot(Err("sysctl failed".to_owned()));
