@@ -414,6 +414,17 @@ pub async fn effective_search_path(
     Ok(manager_path)
 }
 
+/// Reads a drop-in, or `None` for one linked to `/dev/null`, which disables the
+/// drop-in of that name.
+async fn read_enabled_drop_in(path: &str, unit_name: &str) -> Result<Option<Vec<u8>>, Error> {
+    if std::fs::canonicalize(path).is_ok_and(|target| target == std::path::Path::new("/dev/null")) {
+        return Ok(None);
+    }
+    read_unit_setting_file(path, unit_name, "drop-in")
+        .await
+        .map(Some)
+}
+
 /// Orders `files` by file name, the order systemd applies drop-ins in, and
 /// refuses a name that two directories share: which one applies is not derived.
 fn refuse_shared_names(files: &mut [String], unit_name: &str) -> Result<(), Error> {
@@ -457,13 +468,9 @@ async fn path_from_orphan_drop_ins(
     let mut search_path: Vec<String> = Vec::new();
     let mut environment_files: Vec<(String, bool)> = Vec::new();
     for path in &files {
-        // A link to /dev/null disables the drop-in of that name.
-        if std::fs::canonicalize(path)
-            .is_ok_and(|target| target == std::path::Path::new("/dev/null"))
-        {
+        let Some(bytes) = read_enabled_drop_in(path, unit_name).await? else {
             continue;
-        }
-        let bytes = read_unit_setting_file(path, unit_name, "drop-in").await?;
+        };
         let unreadable = |directive: &str| {
             refuse(format!(
                 "{unit_name} has no unit file yet and the drop-in {path} has a {directive} line that may affect {SEARCH_PATH_VARIABLE} in a form not read here (an escape sequence, more than one word, a quote never closed, or bytes that are not UTF-8). Write a plain assignment and retry"
@@ -505,13 +512,12 @@ async fn path_from_orphan_drop_ins(
                         if raw.contains(['"', '\'']) {
                             return Err(unreadable(key));
                         }
-                        let raw = &specifiers
+                        let raw = specifiers
                             .expand(raw)
                             .map_err(|specifier| unsupported(key, &specifier))?;
-                        match raw.strip_prefix('-') {
-                            Some(file) => environment_files.push((file.to_owned(), true)),
-                            None => environment_files.push((raw.to_owned(), false)),
-                        }
+                        let optional = raw.starts_with('-');
+                        let file = raw.strip_prefix('-').unwrap_or(&raw).to_owned();
+                        environment_files.push((file, optional));
                     } else {
                         let list = specifiers
                             .expand(&split.words[0])
@@ -539,16 +545,16 @@ async fn path_from_orphan_drop_ins(
             Err(Some(specifier)) => return Err(unsupported("Environment", &specifier)),
             Err(None) => return Err(unreadable("Environment=")),
         };
-        for event in events {
-            current = event;
+        if let Some(last) = events.into_iter().last() {
+            current = last;
         }
     }
     for (file, optional) in &environment_files {
         check_environment_file(file, *optional, unit_name).await?;
     }
-    match current {
+    let value = current.or_else(|| (!search_path.is_empty()).then(|| search_path.join(":")));
+    match value {
         Some(value) => carry(&value).map(Some).map_err(refuse),
-        None if !search_path.is_empty() => carry(&search_path.join(":")).map(Some).map_err(refuse),
         None => Ok(manager_path),
     }
 }

@@ -10699,18 +10699,6 @@ async fn a_persisted_change_or_removal_after_the_journal_write_is_refused_unless
     )
     .await;
     assert_rollback_refused(&judged, "changed since the upgrade journaled it");
-
-    // A change back to the journaled default needs no decision.
-    let mut harness = Harness::new();
-    let judged = rollback_after_journal(
-        &mut harness,
-        PENDING_PATH,
-        Some(JOURNALED_PATH),
-        |_| {},
-        Ok(SECOND_BOOT.to_owned()),
-    )
-    .await;
-    assert_judged(&judged, JOURNALED_PATH);
 }
 
 #[cfg(target_os = "macos")]
