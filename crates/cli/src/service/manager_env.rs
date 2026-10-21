@@ -361,6 +361,26 @@ pub async fn effective_search_path(
     Ok(manager_path)
 }
 
+/// Orders `files` by file name, the order systemd applies drop-ins in, and
+/// refuses a name that two directories share: which one applies is not derived.
+fn refuse_shared_names(files: &mut [String], unit_name: &str) -> Result<(), Error> {
+    let name_of = |path: &String| path.rsplit('/').next().unwrap_or(path).to_owned();
+    files.sort_by_key(name_of);
+    for pair in files.windows(2) {
+        if name_of(&pair[0]) == name_of(&pair[1]) {
+            return Err(Error::ManagerEnvironment {
+                detail: format!(
+                    "{unit_name} has no unit file yet and the drop-in {} exists in two directories ({} and {}), so which one systemd applies is not derived here. Remove one of them and retry",
+                    name_of(&pair[0]),
+                    pair[0],
+                    pair[1]
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The job's `PATH` for a unit with no unit file whose drop-in files exist
 /// (before the first install, or after a rollback or migration removed the unit):
 /// systemd reads none of them now, but the install keeps and applies them, so
@@ -378,18 +398,7 @@ async fn path_from_orphan_drop_ins(
     files.extend(unit.drop_ins_on_disk.iter().cloned());
     files.sort();
     files.dedup();
-    let name_of = |path: &String| path.rsplit('/').next().unwrap_or(path).to_owned();
-    files.sort_by_key(name_of);
-    for pair in files.windows(2) {
-        if name_of(&pair[0]) == name_of(&pair[1]) {
-            return Err(refuse(format!(
-                "{unit_name} has no unit file yet and the drop-in {} exists in two directories ({} and {}), so which one systemd applies is not derived here. Remove one of them and retry",
-                name_of(&pair[0]),
-                pair[0],
-                pair[1]
-            )));
-        }
-    }
+    refuse_shared_names(&mut files, unit_name)?;
     let mut current: Option<String> = None;
     let mut search_path: Vec<String> = Vec::new();
     let mut environment_files: Vec<(String, bool)> = Vec::new();
