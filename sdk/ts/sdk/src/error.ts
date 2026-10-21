@@ -169,9 +169,14 @@ export class ClientError extends Error {
     );
   }
 
-  public static requestTimeout(remoteHost: string | undefined, timeoutMs: number): ClientError {
+  public static requestTimeout(
+    remoteHost: string | undefined,
+    timeoutMs: number,
+    phase?: "version probe",
+  ): ClientError {
     const target = remoteHost === undefined ? "the local daemon" : `host '${remoteHost}'`;
-    const msg = `timed out after ${timeoutMs}ms waiting for a response from ${target}`;
+    const subject = phase === undefined ? "a response" : `a response to the ${phase}`;
+    const msg = `timed out after ${timeoutMs}ms waiting for ${subject} from ${target}`;
     return new ClientError(
       "requestTimeout",
       msg,

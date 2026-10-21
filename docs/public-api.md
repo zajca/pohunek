@@ -3998,6 +3998,15 @@ Public exports:
   future ends the client's wait; it does not prove the daemon canceled a
   creation already in progress. Raw envelope requests retain the ordinary
   timeout.
+  A request that times out, or is answered with another request's reply,
+  leaves its connection unusable, because a late reply could be read as the
+  answer to a later request. That call fails (`request_timeout`, or a framing
+  error for the mismatched reply) and is never sent again by the client. The
+  next `request` or `call` on the same `Client` opens a fresh connection to the
+  same endpoint, learns the daemon's protocol version again (the daemon may
+  have restarted on another version) and sends only its own request; the old
+  connection is dropped, so its late reply is never delivered. A reconnect that
+  fails returns the connect error and the following call tries again.
 - `ConnectionOptions.request_timeout` in the assistant host API is `None` by
   default, preserving these SDK budgets. `Some(duration)` is an explicit
   override even when `duration` equals the ordinary 5-second default. An
@@ -4245,6 +4254,24 @@ Public exports:
   switches exhaustively on `ClientError.kind` must handle the new kinds.
   The typed call opts into the configured host reader grace when it sends
   initial input.
+  A request that times out, is answered with another request's id, or is
+  answered with an unparsable line (or whose `subscribe` fails) leaves its
+  control connection unusable, because a late reply could be read as the answer
+  to a later request. That call fails with `requestTimeout`, `framing` or
+  `json` and is never sent again by the client, reads included: the caller
+  decides whether to retry. The next call on the same `Client` opens a fresh
+  control connection through the transport, learns the daemon's protocol
+  version again and sends only its own request; the old channel is closed
+  (without waiting longer than `connectTimeoutMs` for it), so its late reply is
+  never delivered, and concurrent callers share one reconnect. A reconnect that
+  fails rejects with the connect error and the following call tries again. A
+  closed client, a client whose subscription took the channel and a connection
+  that selected an incompatible protocol version stay refused. A version
+  probe on a fresh connection has its own `requestTimeoutMs`, so a call that
+  probes can take up to twice that; an unanswered probe rejects with
+  `requestTimeout` naming the probe. Dedicated calls (`session.new`, `wait`,
+  `session.stop`, ...) are unaffected: they open their own connection and do
+  not depend on the shared one.
 - `RequestOrigin` and `resolveRequestOrigin`: explicit browser-safe origin
   configuration and atomic identifier validation. Browser and Bun/Node defaults
   are absent; the SDK never reads `process.env`.

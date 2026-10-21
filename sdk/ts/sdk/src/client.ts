@@ -67,16 +67,48 @@ function randomToken(): string {
   return token;
 }
 
+/** Why a control connection can no longer carry requests. */
+interface Poison {
+  readonly reason: string;
+  /** Whether a fresh connection cures it; an incompatible version does not. */
+  readonly recoverable: boolean;
+}
+
+/**
+ * One control connection and everything learned on it. A request touches only
+ * the connection it started on, so a late reply or timeout of an older
+ * connection can never feed or poison a newer one.
+ */
+interface Connection {
+  readonly channel: ControlChannel;
+  readonly replies: AsyncIterator<string>;
+  selectedVersion: ProtocolVersion | undefined;
+  poisoned: Poison | undefined;
+}
+
+function openConnection(channel: ControlChannel): Connection {
+  return {
+    channel,
+    replies: channel.lines[Symbol.asyncIterator](),
+    selectedVersion: undefined,
+    poisoned: undefined,
+  };
+}
+
+/** A replacement connection being opened for the poisoned connection `from`. */
+interface Reopen {
+  readonly from: Connection;
+  promise: Promise<Connection>;
+}
+
 export class Client {
   private readonly transport: Transport;
-  private readonly channel: ControlChannel;
-  private readonly replies: AsyncIterator<string>;
+  private connection: Connection;
+  private reopening: Reopen | undefined;
   private readonly options: ResolvedConnectOptions;
   private readonly remoteHost: string | undefined;
-  private poisoned: string | undefined;
   private consumed = false;
   private closed = false;
-  private selectedVersion: ProtocolVersion | undefined;
 
   private constructor(
     transport: Transport,
@@ -85,8 +117,7 @@ export class Client {
     remoteHost?: string,
   ) {
     this.transport = transport;
-    this.channel = channel;
-    this.replies = channel.lines[Symbol.asyncIterator]();
+    this.connection = openConnection(channel);
     this.options = options;
     this.remoteHost = remoteHost;
   }
@@ -241,26 +272,84 @@ export class Client {
    * `daemonProtocolTooOld` error before anything is sent.
    */
   public async request(req: Request): Promise<unknown> {
-    this.ensureUsable();
+    this.ensureOpen();
     // The request is copied before the first await: the caller keeps ownership
     // of its parameters and may change them once this call has returned a promise.
     const request = snapshotRequest(applyRequestOrigin(req, this.options.origin));
+    const connection = await this.usableConnection();
+    return this.negotiateAndExchange(connection, request);
+  }
+
+  /**
+   * Probes the version when the request needs it, then runs the exchange. The
+   * probe and the exchange each get the request timeout, so a fresh connection
+   * does not take its probe out of the caller's budget.
+   */
+  private async negotiateAndExchange(connection: Connection, request: Request): Promise<unknown> {
+    const prepared = await this.negotiatedRequest(connection, request);
+    // The caller may have given up (timeout) or closed the client while the
+    // version probe was in flight. A request must never be written after that.
+    this.assertUsable(connection);
     return withTimeout(
-      this.negotiateAndExchange(request),
+      this.exchange(connection, prepared, stringifyRequest(prepared)),
       this.options.requestTimeoutMs,
       () => {
-        this.poisoned = "previous request timed out; pending daemon response may be stale";
+        this.poison(connection, REQUEST_TIMED_OUT, true);
         return ClientError.requestTimeout(this.remoteHost, this.options.requestTimeoutMs);
       },
     );
   }
 
-  private async negotiateAndExchange(request: Request): Promise<unknown> {
-    const prepared = await this.negotiatedRequest(request);
-    // The caller may have given up (timeout) or closed the client while the
-    // version probe was in flight. A request must never be written after that.
-    this.ensureUsable();
-    return this.exchange(prepared, stringifyRequest(prepared));
+  /**
+   * Returns the connection the next request uses: the current one, or, when a
+   * timeout or a broken reply poisoned it, a fresh one. Concurrent callers that
+   * find the same poisoned connection share one replacement.
+   */
+  private async usableConnection(): Promise<Connection> {
+    this.ensureOpen();
+    const current = this.connection;
+    const poison = current.poisoned;
+    if (poison === undefined) {
+      return current;
+    }
+    if (!poison.recoverable) {
+      throw unusableError(poison);
+    }
+    if (this.reopening?.from === current) {
+      return this.reopening.promise;
+    }
+    const attempt: Reopen = { from: current, promise: Promise.resolve(current) };
+    attempt.promise = this.openReplacement(current).finally(() => {
+      if (this.reopening === attempt) {
+        this.reopening = undefined;
+      }
+    });
+    this.reopening = attempt;
+    return attempt.promise;
+  }
+
+  private async openReplacement(stale: Connection): Promise<Connection> {
+    // The old connection is already known to be bad; its close neither fails
+    // the call nor delays it past the connect timeout.
+    await closeWithin(stale.channel, this.options.connectTimeoutMs);
+    this.ensureOpen();
+    const channel = await this.transport.control();
+    if (this.closed) {
+      await closeWithin(channel, this.options.connectTimeoutMs);
+      throw ClientError.framing("connection is closed");
+    }
+    // The daemon may have restarted on another version, so nothing is inherited.
+    const fresh = openConnection(channel);
+    this.connection = fresh;
+    return fresh;
+  }
+
+  /** Marks `connection` unusable; an unrecoverable mark is never softened. */
+  private poison(connection: Connection, reason: string, recoverable: boolean): void {
+    if (connection.poisoned?.recoverable === false) {
+      return;
+    }
+    connection.poisoned = { reason, recoverable };
   }
 
   /**
@@ -270,9 +359,9 @@ export class Client {
    * selected version outside the request's own range is refused before anything
    * is rewritten or sent.
    */
-  private async negotiatedRequest(request: Request): Promise<Request> {
+  private async negotiatedRequest(connection: Connection, request: Request): Promise<Request> {
     const allowed = request.v;
-    let version = this.selectedVersion;
+    let version = connection.selectedVersion;
     if (version === undefined) {
       if (requestIsVersionIndependent(request.method, request.params)) {
         return request;
@@ -286,7 +375,7 @@ export class Client {
           recover: "upgrade the older side so the client and daemon support an overlapping protocol version",
         });
       }
-      version = await this.probeVersion(probeRange);
+      version = await this.probeVersion(connection, probeRange);
     }
     if (version < allowed.minimum) {
       throw ClientError.daemonProtocolTooOld({
@@ -321,7 +410,10 @@ export class Client {
   }
 
   /** Learns the daemon's version with a `daemon.health` exchange offering `range`. */
-  private async probeVersion(range: ProtocolVersionRange): Promise<ProtocolVersion> {
+  private async probeVersion(
+    connection: Connection,
+    range: ProtocolVersionRange,
+  ): Promise<ProtocolVersion> {
     const probe = applyRequestOrigin(
       {
         v: range,
@@ -331,8 +423,15 @@ export class Client {
       },
       this.options.origin,
     );
-    await this.exchange(probe, stringifyRequest(probe));
-    const version = this.selectedVersion;
+    await withTimeout(
+      this.exchange(connection, probe, stringifyRequest(probe)),
+      this.options.requestTimeoutMs,
+      () => {
+        this.poison(connection, REQUEST_TIMED_OUT, true);
+        return ClientError.requestTimeout(this.remoteHost, this.options.requestTimeoutMs, "version probe");
+      },
+    );
+    const version = connection.selectedVersion;
     if (version === undefined) {
       throw ClientError.framing("daemon health response did not select a protocol version");
     }
@@ -364,25 +463,22 @@ export class Client {
   }
 
   public async subscribe(request: Request): Promise<Subscription> {
-    this.ensureUsable();
+    this.ensureOpen();
     const prepared = snapshotRequest(applyRequestOrigin(request, this.options.origin));
+    const connection = await this.usableConnection();
     try {
-      await withTimeout(
-        this.negotiateAndExchange(prepared),
-        this.options.requestTimeoutMs,
-        () => ClientError.requestTimeout(this.remoteHost, this.options.requestTimeoutMs),
-      );
+      await this.negotiateAndExchange(connection, prepared);
     } catch (error: unknown) {
-      this.poisoned = "subscription request failed; connection state is unknown";
+      this.poison(connection, "subscription request failed; connection state is unknown", true);
       throw error;
     }
 
     this.consumed = true;
-    const selectedVersion = this.selectedVersion;
+    const selectedVersion = connection.selectedVersion;
     if (selectedVersion === undefined) {
       throw ClientError.framing("subscription acknowledgement did not select a protocol version");
     }
-    return new Subscription(this.channel, selectedVersion, this.remoteHost);
+    return new Subscription(connection.channel, selectedVersion, this.remoteHost);
   }
 
   public async close(): Promise<void> {
@@ -390,7 +486,7 @@ export class Client {
       return;
     }
     this.closed = true;
-    await this.channel.close();
+    await this.connection.channel.close();
   }
 
   public static async connectTransport(
@@ -403,32 +499,42 @@ export class Client {
     return new Client(transport, channel, options, remoteHost);
   }
 
-  private ensureUsable(): void {
+  /** Refuses a client that was closed or whose subscription took the channel. */
+  private ensureOpen(): void {
     if (this.closed) {
       throw ClientError.framing("connection is closed");
     }
     if (this.consumed) {
       throw ClientError.framing("connection is unusable: subscription consumed the control channel");
     }
-    if (this.poisoned !== undefined) {
-      throw ClientError.framing(`connection is unusable: ${this.poisoned}`);
+  }
+
+  /** Refuses a request to be written on a connection that went bad meanwhile. */
+  private assertUsable(connection: Connection): void {
+    this.ensureOpen();
+    if (connection.poisoned !== undefined) {
+      throw unusableError(connection.poisoned);
     }
   }
 
-  private async exchange(request: Request, line: string): Promise<unknown> {
+  private async exchange(connection: Connection, request: Request, line: string): Promise<unknown> {
     try {
-      await this.channel.send(line);
+      await connection.channel.send(line);
     } catch (error: unknown) {
       throw mapSendError(error);
     }
 
-    const reply = await this.nextReply();
-    const response = this.parseResponse(reply);
+    const reply = await this.nextReply(connection);
+    const response = this.parseResponse(connection, reply);
     if (response.id !== request.id) {
-      this.poisoned = `previous response id mismatch; expected '${request.id}', got '${response.id}'`;
+      this.poison(
+        connection,
+        `previous response id mismatch; expected '${request.id}', got '${response.id}'`,
+        true,
+      );
       throw responseIdMismatchError(this.remoteHost, request.id, response.id);
     }
-    this.validateSelectedVersion(request.v, response.v);
+    this.validateSelectedVersion(connection, request.v, response.v);
 
     if ("ok" in response) {
       if (response.v === PROTOCOL_VERSION) {
@@ -444,16 +550,17 @@ export class Client {
   }
 
   private validateSelectedVersion(
+    connection: Connection,
     offered: ProtocolVersionRange,
     received: ProtocolVersion,
   ): void {
     const outsideOffered = received < offered.minimum || received > offered.maximum;
-    const changed = this.selectedVersion !== undefined && received !== this.selectedVersion;
+    const changed = connection.selectedVersion !== undefined && received !== connection.selectedVersion;
     if (outsideOffered || changed) {
-      this.poisoned = `response selected incompatible protocol version ${received}`;
+      this.poison(connection, `response selected incompatible protocol version ${received}`, false);
       throw ClientError.versionMismatch(offered, received);
     }
-    this.selectedVersion = received;
+    connection.selectedVersion = received;
   }
 
   private async callDedicated<
@@ -473,10 +580,15 @@ export class Client {
     params: Methods[K]["params"],
     wireTimeoutMs: number,
   ): Promise<Methods[K]["output"]> {
-    this.ensureUsable();
+    this.ensureOpen();
+    const shared = this.connection;
+    if (shared.poisoned?.recoverable === false) {
+      throw unusableError(shared.poisoned);
+    }
     // Parameters and the inherited version are captured before the first await.
+    // A connection that went bad passes on nothing; the dedicated one probes.
     const snapshot = snapshotParams(params);
-    const inherited = this.selectedVersion;
+    const inherited = shared.poisoned === undefined ? shared.selectedVersion : undefined;
     const lifecycle = LIFECYCLE_OPERATIONS.get(method);
     const requestTimeoutMs = isLifecycleMethod(method) && this.options.explicitRequestTimeoutMs !== undefined
       ? this.options.explicitRequestTimeoutMs
@@ -487,9 +599,9 @@ export class Client {
       this.remoteHost,
     );
     // The dedicated connection speaks the version this one already selected.
-    client.selectedVersion = inherited;
+    client.connection.selectedVersion = inherited;
     try {
-      this.ensureUsable();
+      this.ensureOpen();
       return await client.callDirect(method, snapshot);
     } catch (error: unknown) {
       if (lifecycle !== undefined && error instanceof ClientError && error.kind === "requestTimeout") {
@@ -501,9 +613,9 @@ export class Client {
     }
   }
 
-  private async nextReply(): Promise<string> {
+  private async nextReply(connection: Connection): Promise<string> {
     try {
-      const next = await this.replies.next();
+      const next = await connection.replies.next();
       if (next.done === true) {
         throw noResponseError(this.remoteHost, "daemon closed the connection without a response");
       }
@@ -522,19 +634,44 @@ export class Client {
     }
   }
 
-  private parseResponse(reply: string): Response {
+  private parseResponse(connection: Connection, reply: string): Response {
     let parsed: unknown;
     try {
       parsed = JSON.parse(reply) as unknown;
       return decodeResponse(parsed);
     } catch (error: unknown) {
-      this.poisoned = "previous daemon response was not valid JSON";
+      this.poison(connection, "previous daemon response was not valid JSON", true);
       if (this.remoteHost !== undefined) {
         throw ClientError.remoteDaemonUnavailable(this.remoteHost);
       }
       throw ClientError.json(error);
     }
   }
+}
+
+const REQUEST_TIMED_OUT = "previous request timed out; pending daemon response may be stale";
+
+function unusableError(poison: Poison): ClientError {
+  return ClientError.framing(`connection is unusable: ${poison.reason}`);
+}
+
+/**
+ * Closes `channel` without waiting longer than `ms` for it. A broken WebSocket
+ * can hang its close, and a close error is no news: the channel is abandoned.
+ */
+function closeWithin(channel: ControlChannel, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    const done = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    try {
+      channel.close().then(done, done);
+    } catch {
+      done();
+    }
+  });
 }
 
 /** Lifecycle requests that report an unknown outcome when their deadline elapses. */

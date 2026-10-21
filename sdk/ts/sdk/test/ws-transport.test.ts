@@ -108,7 +108,7 @@ describe("WebSocket transport through relay", () => {
     }
   });
 
-  test("garbled JSON reply maps to remote daemon unavailable and poisons the connection", async () => {
+  test("garbled JSON reply maps to remote daemon unavailable and the next call reopens", async () => {
     const fixture = await startRelayFixture([
       { kind: "garbled" },
       { kind: "reply", line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), { status: "ok" }) },
@@ -121,10 +121,7 @@ describe("WebSocket transport through relay", () => {
       expect(firstError.toProtocolError().code).toBe("remote_daemon_unavailable");
       await fixture.daemon.nextRequest();
 
-      const secondError = await expectClientError(client.call("daemon.health", null));
-      expect(secondError.toProtocolError().class).toBe("transport");
-      expect(secondError.toProtocolError().code).toBe("framing");
-      await fixture.daemon.expectNoRequest(50);
+      expect(await client.call("daemon.health", null)).toEqual({ status: "ok" });
     } finally {
       await fixture.close();
     }
@@ -179,13 +176,14 @@ describe("WebSocket transport through relay", () => {
     }
   });
 
-  test("request timeout rejects and poisons the connection", async () => {
+  test("request timeout rejects and the next call opens a second relay socket", async () => {
     const fixture = await startRelayFixture([
       {
         kind: "delay",
         ms: TIMEOUT_REPLY_DELAY_MS,
         line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), { status: "ok" }),
       },
+      { kind: "reply", line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), { status: "second" }) },
     ]);
     try {
       const client = await fixture.client(TIMEOUT_TEST_REQUEST_MS);
@@ -195,10 +193,7 @@ describe("WebSocket transport through relay", () => {
       expect(firstError.toProtocolError().code).toBe("request_timeout");
       await fixture.daemon.nextRequest();
 
-      const secondError = await expectClientError(client.call("daemon.health", null));
-      expect(secondError.toProtocolError().class).toBe("transport");
-      expect(secondError.toProtocolError().code).toBe("framing");
-      await fixture.daemon.expectNoRequest(50);
+      expect(await client.call("daemon.health", null)).toEqual({ status: "second" });
     } finally {
       await fixture.close();
     }

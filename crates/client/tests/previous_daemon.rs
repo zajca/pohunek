@@ -1070,22 +1070,32 @@ async fn a_result_the_previous_release_could_not_have_sent_is_refused() {
 #[tokio::test]
 async fn a_request_is_never_written_after_its_version_probe_timed_out() {
     guard("the timed-out probe", async {
-        // A daemon that reads the version probe and never answers it.
+        // A daemon that reads each version probe and never answers it.
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind the silent daemon");
         let addr = listener.local_addr().expect("silent daemon address");
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept the client");
-            let mut stream = BufReader::new(stream);
-            let mut lines = Vec::new();
-            loop {
-                let mut line = String::new();
-                match stream.read_line(&mut line).await {
-                    Ok(0) | Err(_) => return lines,
-                    Ok(_) => lines.push(line),
-                }
+            let mut connections = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept the client");
+                connections.push(tokio::spawn(async move {
+                    let mut stream = BufReader::new(stream);
+                    let mut lines = Vec::new();
+                    loop {
+                        let mut line = String::new();
+                        match stream.read_line(&mut line).await {
+                            Ok(0) | Err(_) => return lines,
+                            Ok(_) => lines.push(line),
+                        }
+                    }
+                }));
             }
+            let mut seen = Vec::new();
+            for connection in connections {
+                seen.push(connection.await.expect("silent connection task"));
+            }
+            seen
         });
 
         let options =
@@ -1105,17 +1115,26 @@ async fn a_request_is_never_written_after_its_version_probe_timed_out() {
             ),
             "{error:?}"
         );
-        // The connection is torn: a retry is refused without writing anything.
+        // The retry opens a fresh connection and probes again; the abandoned
+        // request is not written on either.
         let retry = client
             .request(&uninstall)
             .await
-            .expect_err("a poisoned connection refuses further requests");
-        assert!(matches!(retry, ClientError::Framing(_)), "{retry:?}");
+            .expect_err("the second probe is never answered either");
+        assert!(
+            matches!(
+                retry,
+                ClientError::RemoteProtocol { .. } | ClientError::RequestTimeout { .. }
+            ),
+            "{retry:?}"
+        );
         drop(client);
 
-        let lines = server.await.expect("silent daemon task");
-        assert_eq!(lines.len(), 1, "only the probe was written: {lines:?}");
-        assert!(lines[0].contains(method::DAEMON_HEALTH), "{}", lines[0]);
+        let connections = server.await.expect("silent daemon task");
+        for lines in &connections {
+            assert_eq!(lines.len(), 1, "only the probe was written: {lines:?}");
+            assert!(lines[0].contains(method::DAEMON_HEALTH), "{}", lines[0]);
+        }
     })
     .await;
 }

@@ -530,13 +530,44 @@ impl Client {
     /// version first learns it with a `daemon.health` probe on this
     /// connection. A method the previous version never defined fails with
     /// [`ClientError::DaemonProtocolTooOld`] before anything is sent.
+    ///
+    /// A request that times out, or is answered with another request's reply,
+    /// leaves its connection untrustworthy: a late reply could be read as the
+    /// next request's answer. The call fails, and the next call opens a fresh
+    /// connection to the same endpoint and learns the daemon's version again,
+    /// so a long-lived client survives one slow reply. A timed-out request is
+    /// never sent again on its own.
     pub async fn request(&mut self, request: &Request) -> Result<Value, ClientError> {
+        self.replace_poisoned_connection().await?;
         let request = match &self.origin {
             Some(origin) => origin.apply(request.clone())?,
             None => request.clone(),
         };
         let request = self.negotiated_request(request).await?;
         self.send(&request).await
+    }
+
+    /// Whether the shared connection was marked unusable by a timeout or a
+    /// reply that did not belong to the request.
+    fn connection_is_poisoned(&self) -> bool {
+        match &self.inner {
+            ClientInner::Local(conn) => conn.poisoned.is_some(),
+            ClientInner::Remote(conn) => conn.poisoned.is_some(),
+        }
+    }
+
+    /// Opens a fresh connection in place of a poisoned one. Nothing learned on
+    /// the old connection is kept: the daemon may have restarted on another
+    /// version. When the connect fails the client stays poisoned, so the next
+    /// call tries again.
+    async fn replace_poisoned_connection(&mut self) -> Result<(), ClientError> {
+        if !self.connection_is_poisoned() {
+            return Ok(());
+        }
+        let fresh = self.connect_dedicated(self.options).await?;
+        self.inner = fresh.inner;
+        self.selected_version = None;
+        Ok(())
     }
 
     /// Exchange one already-translated request on this connection.
@@ -1061,6 +1092,16 @@ impl Client {
         client.call_direct::<M>(params).await
     }
 
+    /// The version a dedicated connection starts with: the one this connection
+    /// selected, unless the connection went bad and nothing it learned counts.
+    fn inherited_version(&self) -> Option<ProtocolVersion> {
+        if self.connection_is_poisoned() {
+            None
+        } else {
+            self.selected_version
+        }
+    }
+
     async fn connect_dedicated(&self, options: ClientOptions) -> Result<Self, ClientError> {
         match &self.endpoint {
             Endpoint::Local(socket_path) => {
@@ -1069,7 +1110,7 @@ impl Client {
                     inner: ClientInner::Local(Conn::new(stream, None, options)),
                     endpoint: Endpoint::Local(socket_path.clone()),
                     options,
-                    selected_version: self.selected_version,
+                    selected_version: self.inherited_version(),
                     origin: self.origin.clone(),
                 })
             }
@@ -1082,7 +1123,7 @@ impl Client {
                         addr: *addr,
                     },
                     options,
-                    selected_version: self.selected_version,
+                    selected_version: self.inherited_version(),
                     origin: self.origin.clone(),
                 })
             }
