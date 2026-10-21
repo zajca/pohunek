@@ -2172,6 +2172,9 @@ fn replaces_newer(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<Selected
     })
 }
 
+/// Prefix of a package digest; the `--digest` selector spells it without.
+const DIGEST_PREFIX: &str = "sha256:";
+
 /// What the plan does with the selected official version of a runtime.
 enum Selection {
     /// The release's package is planned over it.
@@ -2197,36 +2200,36 @@ fn selection_outcome(
     reserved: bool,
 ) -> Selection {
     match unordered_selection(plan, prepared) {
-        Some(state @ (Serving::Disabled | Serving::Broken)) => {
-            // A non-reserved runtime's disabled package is already reported by
-            // `managed_runtimes`.
-            let reported = report.gaps.iter().any(|gap| {
+        Some((state @ (Serving::Disabled | Serving::Broken), selected)) => {
+            let id = &prepared.identity.id;
+            let detail = match state {
+                Serving::Disabled => format!(
+                    "the selected version cannot be ordered against the release's and is \
+                     disabled, so the upgrade leaves it as you set it; enable it with: \
+                     pohunek plugin enable {id} --digest {selected}"
+                ),
+                _ => format!(
+                    "the selected version cannot be ordered against the release's and its \
+                     package does not load, so the upgrade leaves it; reinstall that version \
+                     with `pohunek plugin install`, or select another one with: pohunek \
+                     plugin select {id} --digest <digest>"
+                ),
+            };
+            // `managed_runtimes` may already report a non-reserved runtime's
+            // package; its `plugin update` hint is refused for this selection,
+            // so this detail replaces it.
+            match report.gaps.iter_mut().find(|gap| {
                 gap.runtime == subject && gap.code == CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING
-            });
-            if !reported {
-                let detail = match state {
-                    Serving::Disabled => format!(
-                        "the selected version cannot be ordered against the release's and is \
-                         disabled, so the upgrade leaves it as you set it; enable it with: \
-                         pohunek plugin enable {}",
-                        prepared.identity.id
-                    ),
-                    _ => format!(
-                        "the selected version cannot be ordered against the release's and its \
-                         package does not load, so the upgrade leaves it; reinstall that version \
-                         with `pohunek plugin install`, or select another one with: pohunek \
-                         plugin select {} --digest <digest>",
-                        prepared.identity.id
-                    ),
-                };
-                report.gap(subject, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING, &detail);
+            }) {
+                Some(gap) => gap.detail = detail,
+                None => report.gap(subject, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING, &detail),
             }
             report
                 .integrations
                 .retain(|action| action.runtime != subject);
             return Selection::Leave;
         }
-        Some(Serving::Loadable) => {
+        Some((Serving::Loadable, _)) => {
             report.gap(
                 subject,
                 CODE_GAP_UPDATE_VERSION_UNORDERED,
@@ -2255,8 +2258,9 @@ enum Serving {
 }
 
 /// The state of the selected official version of the package when it differs
-/// from the prepared one and the two versions have no order; `None` otherwise.
-fn unordered_selection(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<Serving> {
+/// from the prepared one and the two versions have no order, with its digest
+/// as the `--digest` selector spells it; `None` otherwise.
+fn unordered_selection(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<(Serving, String)> {
     let state = plan.state?;
     let selected = state.selected(&prepared.identity.id)?;
     if selected == &prepared.digest {
@@ -2268,13 +2272,18 @@ fn unordered_selection(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<Ser
     {
         return None;
     }
-    Some(if !record.enabled() {
+    let serving = if !record.enabled() {
         Serving::Disabled
     } else if matches!(health_of(plan, selected), Health::Present) {
         Serving::Loadable
     } else {
         Serving::Broken
-    })
+    };
+    let hex = selected.as_str();
+    Some((
+        serving,
+        hex.strip_prefix(DIGEST_PREFIX).unwrap_or(hex).to_owned(),
+    ))
 }
 
 /// The base environment the integration status reads the config homes with:

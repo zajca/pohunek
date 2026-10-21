@@ -172,8 +172,10 @@ pub enum PackageStatus {
     Install,
     /// The step installed, enabled and selected the release's package.
     Installed,
-    /// The release has no usable catalog, and an installed package that
-    /// loads serves the runtime; it keeps serving it. The action names that
+    /// An installed package that loads keeps serving the runtime and the
+    /// release's package is not planned over it: the release has no usable
+    /// catalog, the selected version has no order against the release's, or
+    /// it is newer and the runtime is not reserved. The action names that
     /// package.
     Kept,
 }

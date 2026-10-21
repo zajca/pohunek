@@ -1988,6 +1988,22 @@ fn a_disabled_unordered_selected_reserved_runtime_version_is_left_untouched() {
                     .collect::<Vec<_>>(),
                 [(runtime, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)]
             );
+            let hex = digest
+                .as_str()
+                .strip_prefix("sha256:")
+                .expect("a sha256 digest");
+            let gap = report
+                .gaps
+                .iter()
+                .find(|gap| gap.runtime == runtime)
+                .expect("the runtime's gap");
+            assert!(
+                gap.detail.contains(&format!(
+                    "pohunek plugin enable pohunek.runtime.{runtime} --digest {hex}"
+                )),
+                "{}",
+                gap.detail
+            );
         }
         assert_eq!(
             fs::read(host.registry_path()).expect("the registry record"),
@@ -2557,11 +2573,26 @@ async fn a_disabled_unordered_pi_selection_is_reported_once_by_the_detecting_pla
 
     let plan = host.detect_step();
 
-    let not_serving = gap_codes(&plan)
-        .into_iter()
-        .filter(|entry| *entry == ("pi", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING))
-        .count();
-    assert_eq!(not_serving, 1, "{:?}", plan.gaps);
+    let not_serving: Vec<_> = plan
+        .gaps
+        .iter()
+        .filter(|gap| gap.runtime == "pi" && gap.code == CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)
+        .collect();
+    assert_eq!(not_serving.len(), 1, "{:?}", plan.gaps);
+    let detail = &not_serving[0].detail;
+    assert!(!detail.contains("plugin update"), "{detail}");
+    let hex = id
+        .as_str()
+        .strip_prefix("sha256:")
+        .expect("a sha256 digest");
+    let command = format!("pohunek plugin enable {PI_PACKAGE} --digest {hex}");
+    assert!(detail.contains(&command), "{detail}");
+    // The hint's digest selects the disabled package, and enabling it works.
+    pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+        .expect("the package store")
+        .registry()
+        .set_enabled(&id, true)
+        .expect("the hinted package can be enabled");
 }
 
 #[tokio::test]

@@ -1530,11 +1530,7 @@ fn refusal_text(refusals: &[Refusal]) -> String {
 
 /// Renders the preview: every effect and gap, before anything is written.
 fn render_plan(plan: &HostPlan) -> String {
-    render_preview(&plan.preview)
-}
-
-/// Renders the preview of a run.
-fn render_preview(preview: &Preview) -> String {
+    let preview = &plan.preview;
     let mut out = String::new();
     let _ = writeln!(out, "pohunek setup, version {VERSION}");
     match &preview.service {
