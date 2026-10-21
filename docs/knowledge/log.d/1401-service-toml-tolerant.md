@@ -10,3 +10,5 @@ hint. The installer keeps them when it rewrites the file. Unknown keys in
 `[namespace]` and `[environment]` stay hard errors, `schema_version` stays 6,
 and the schema 2 to 5 upgrade sources stay strict.
 An interrupted schema 2 to 5 migration resumes when the rewritten target differs from the expected one only in its header comment; a different body is still refused with `service_config_backup_invalid`.
+
+A rewrite renders the kept unknown keys from the parsed items in their original order and checks that the result parses again; a file whose unknown part cannot be written back is refused at load with a fixed message. `service upgrade` refuses a rendering above the 64 KiB load bound before it starts a transaction, and a rollback leaves a file that never left the previous version untouched.

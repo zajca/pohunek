@@ -2132,6 +2132,58 @@ fn rendering_preserves_unknown_keys() {
     assert_eq!(edited_table["active_version"].as_str(), Some("0.31.7"));
 }
 
+/// Layouts whose unknown subtrees interleave with known tables and with each
+/// other, so a rewrite has to keep ancestors, dotted keys and order apart.
+fn interleaved_layouts() -> Vec<String> {
+    let secret = UNKNOWN_SECRET;
+    let before_limits = |extra: &str| replace(GOLDEN, "[limits]", &format!("{extra}\n[limits]"));
+    vec![
+        // Unknown tables around a known table whose dotted unknown key has a
+        // later sub-table.
+        replace(
+            &before_limits(&format!("[future]\nk = 1\n")),
+            "open_files = 8192",
+            &format!(
+                "open_files = 8192\nextra.foo = \"{secret}\"\n\n[limits.extra.bar]\nb = \"{secret}\"\n\n[future.tail]\nt = 3"
+            ),
+        ),
+        // An unknown array of tables and an unknown table inside a known one.
+        replace(
+            &before_limits(&format!("[[plugin]]\nname = \"{secret}\"\n\n[[plugin]]\nname = \"two\"\n")),
+            "grace_ms = 5000",
+            &format!("grace_ms = 5000\n\n[sweep.later]\nv = \"{secret}\"\n\n[sweep.later.deep]\nw = 1"),
+        ),
+        // Unknown inline values and an unknown table under the root only.
+        replace(
+            &replace(GOLDEN, "prefix =", &format!("top = {{ a = \"{secret}\", b = [1, 2] }}\nprefix =")),
+            "[limits]",
+            "[zz]\nlast = 1\n\n[limits]",
+        ),
+    ]
+}
+
+#[test]
+fn rendering_keeps_interleaved_unknown_subtrees_valid_and_stable() {
+    let fixture = Fixture::new();
+    for text in interleaved_layouts() {
+        let config = fixture.load(&text).expect("loads");
+        let rendered = config.to_toml();
+        assert_eq!(table_of(&rendered), table_of(&text), "{rendered}");
+        let reloaded = fixture.load(&rendered).expect("rendered file loads");
+        let sorted = |config: &ServiceConfig| {
+            let mut paths = unknown_paths(config);
+            paths.sort_unstable();
+            paths.into_iter().map(str::to_owned).collect::<Vec<_>>()
+        };
+        assert_eq!(sorted(&reloaded), sorted(&config));
+        assert_eq!(reloaded.to_toml(), rendered, "rendering is stable");
+        let upgraded = config.with_active_version("0.31.7").expect("new version");
+        fixture
+            .load(&upgraded.to_toml())
+            .expect("an upgraded rendering loads");
+    }
+}
+
 #[test]
 fn many_unknown_keys_stay_within_the_file_bound() {
     let fixture = Fixture::new();

@@ -167,7 +167,9 @@ use pohunek_platform::supervisor::{
 };
 use pohunek_service_config::preflight::PreflightReport;
 use pohunek_service_config::runtimes::EnsureReport;
-use pohunek_service_config::{body_after_header, ServiceConfig, UpgradeSource, SCHEMA_VERSION};
+use pohunek_service_config::{
+    body_after_header, ConfigError, ServiceConfig, UpgradeSource, MAX_CONFIG_BYTES, SCHEMA_VERSION,
+};
 use protocol::SessionInfo;
 
 use super::backend::Backend;
@@ -658,6 +660,13 @@ impl<'a> Engine<'a> {
             verify_pending_migration(self.context, &self.store, record, &source)?;
         }
         let config = &source.config;
+        if resume.is_some() || config.active_version() != version {
+            // Kept unknown keys can make a rendering larger than the load
+            // bound. Both renderings are checked before the first effect, so
+            // neither the upgrade nor its rollback can hit the bound later.
+            check_rendering_size(config, &config_path)?;
+            check_rendering_size(&with_version(config, version)?, &config_path)?;
+        }
         let layout = config.layout().clone();
         check_layout_dirs(self.context, &layout)?;
         layout::claim_prefix(&layout, &config.namespace())?;
@@ -1853,7 +1862,11 @@ impl<'a> Engine<'a> {
             path: config_path.to_path_buf(),
         })?;
         let restored = with_version(&current, previous)?;
-        restored.write(config_path)?;
+        // A file that never left the previous version is already restored;
+        // rewriting it could only fail on a rendering above the load bound.
+        if current.active_version() != previous {
+            restored.write(config_path)?;
+        }
         Ok(restored)
     }
 
@@ -3328,6 +3341,22 @@ fn launchd_job_path<'a>(
     Box::pin(std::future::ready(Err(Error::ManagerEnvironment {
         detail: "a launchd job exists only on macOS".to_owned(),
     })))
+}
+
+/// Refuses a configuration whose rendering exceeds the load bound.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::TooLarge`] without changing anything.
+fn check_rendering_size(config: &ServiceConfig, path: &Path) -> Result<(), Error> {
+    if config.to_toml().len() > MAX_CONFIG_BYTES {
+        return Err(ConfigError::TooLarge {
+            path: path.to_path_buf(),
+            max_bytes: MAX_CONFIG_BYTES,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// Checks a pending configuration migration without changing the file or job.

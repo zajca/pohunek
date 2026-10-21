@@ -73,8 +73,16 @@ pub fn load_service_config(
     let config = ServiceConfig::load(path)?;
     config.verify_installation(uid, &paths.state_dir, &paths.runtime_dir)?;
     verify_executable(&config, executable)?;
-    // Every generation loads the same file, so the daemon alone warns about
-    // unknown keys; repeating the warning on each spawn would flood the log.
+    Ok(config)
+}
+
+/// Logs each unknown key of `config` at debug level.
+///
+/// Every generation loads the same file, so the daemon alone warns about
+/// unknown keys; repeating the warning on each spawn would flood the log. The
+/// worker calls this after its logging is initialized, because a subscriber
+/// installed later would not see the events.
+pub fn log_unknown_service_keys(config: &ServiceConfig) {
     for key in config.unknown_keys() {
         event!(
             Level::DEBUG,
@@ -84,7 +92,6 @@ pub fn load_service_config(
             "service.toml holds a key this version does not know; it is ignored"
         );
     }
-    Ok(config)
 }
 
 /// Requires `executable` to be the worker binary of a recorded version directory.
@@ -278,7 +285,9 @@ mod tests {
             .with_max_level(Level::DEBUG)
             .finish();
         let config = tracing::subscriber::with_default(subscriber, || {
-            installation.load(&executable).expect("tolerant load")
+            let config = installation.load(&executable).expect("tolerant load");
+            log_unknown_service_keys(&config);
+            config
         });
 
         assert_eq!(config.unknown_keys().len(), 1);

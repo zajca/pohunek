@@ -504,15 +504,41 @@ impl std::fmt::Display for UnknownKey {
     }
 }
 
-/// The unknown keys of one loaded file and the subtree needed to write them back.
+/// The unknown keys of one loaded file and the items needed to write them back.
 ///
-/// `kept` is TOML text of only the unknown items at their original paths. Its
-/// `Debug` shows paths only, because the text holds the values.
+/// `kept` holds the outermost unknown items with the path of the known table
+/// each sits in. Its `Debug` shows paths only, because the items hold the
+/// values.
 #[derive(Clone, Default, PartialEq, Eq)]
 struct UnknownKeys {
     keys: Vec<UnknownKey>,
-    kept: String,
+    kept: Vec<KeptItem>,
 }
+
+/// One unknown item and the known table it was found in.
+#[derive(Clone)]
+struct KeptItem {
+    /// Names of the known tables from the document root down to the item.
+    parents: Vec<String>,
+    name: String,
+    item: Item,
+}
+
+impl PartialEq for KeptItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.parents == other.parents
+            && self.name == other.name
+            && self.item.to_string() == other.item.to_string()
+    }
+}
+
+impl Eq for KeptItem {}
+
+/// The kept unknown items could not be merged into a valid document.
+///
+/// Carries no text, because the parser's own error would quote the file.
+#[derive(Debug)]
+struct KeptMergeError;
 
 impl std::fmt::Debug for UnknownKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -843,6 +869,11 @@ impl ServiceConfig {
     /// rendered from its typed value.
     #[must_use]
     pub fn to_toml(&self) -> String {
+        self.render()
+            .expect("load checked that the kept unknown keys merge into the rendering")
+    }
+
+    fn render(&self) -> Result<String, KeptMergeError> {
         let raw = RawConfig {
             schema_version: SCHEMA_VERSION,
             prefix: utf8(self.layout.prefix()).to_owned(),
@@ -889,7 +920,7 @@ impl ServiceConfig {
             .expect("validated strings, bounded integers, and tables always serialize as TOML");
         let typed = format!("{FILE_HEADER}{body}");
         if self.unknown.kept.is_empty() {
-            return typed;
+            return Ok(typed);
         }
         merge_kept_keys(&typed, &self.unknown.kept)
     }
@@ -1302,6 +1333,12 @@ fn parse(path: &Path, text: &str) -> Result<ServiceConfig, ConfigError> {
     }
     let mut config = config_from_raw(raw)?;
     config.unknown = scan_unknown(path, text)?;
+    // A rewrite must reproduce the unknown keys, so a file whose unknown part
+    // cannot be written back is refused here instead of when it is rewritten.
+    config.render().map_err(|_error| ConfigError::Parse {
+        path: path.to_path_buf(),
+        message: "the unknown keys cannot be written back to a valid file".to_owned(),
+    })?;
     Ok(config)
 }
 
@@ -1485,17 +1522,12 @@ fn scan_unknown(path: &Path, text: &str) -> Result<UnknownKeys, ConfigError> {
     let mut scan = UnknownScan {
         text,
         keys: Vec::new(),
-        kept: DocumentMut::new(),
+        kept: Vec::new(),
     };
     scan.walk(document.as_table(), Some(&shape), &mut Vec::new(), 1);
-    let kept = if scan.keys.is_empty() {
-        String::new()
-    } else {
-        scan.kept.to_string()
-    };
     Ok(UnknownKeys {
         keys: scan.keys,
-        kept,
+        kept: scan.kept,
     })
 }
 
@@ -1503,7 +1535,7 @@ fn scan_unknown(path: &Path, text: &str) -> Result<UnknownKeys, ConfigError> {
 struct UnknownScan<'a> {
     text: &'a str,
     keys: Vec<UnknownKey>,
-    kept: DocumentMut,
+    kept: Vec<KeptItem>,
 }
 
 impl UnknownScan<'_> {
@@ -1556,21 +1588,13 @@ impl UnknownScan<'_> {
         }
     }
 
-    /// Records `item` at `parents/name` in the subtree written back on render.
+    /// Records `item` as found in the known table at `parents`.
     fn keep(&mut self, parents: &[String], name: &str, item: &Item) {
-        let mut cursor = self.kept.as_table_mut();
-        for parent in parents {
-            cursor = cursor
-                .entry(parent)
-                .or_insert_with(|| {
-                    let mut table = Table::new();
-                    table.set_implicit(true);
-                    Item::Table(table)
-                })
-                .as_table_mut()
-                .expect("the parents of a kept key are tables built here");
-        }
-        cursor.insert(name, item.clone());
+        self.kept.push(KeptItem {
+            parents: parents.to_vec(),
+            name: name.to_owned(),
+            item: item.clone(),
+        });
     }
 }
 
@@ -1639,34 +1663,33 @@ fn edit_distance(known: &str, name: &str) -> Option<usize> {
 
 /// Merges the kept unknown items into the rendered typed document.
 ///
-/// A key present in the typed document is never overridden. Kept tables are
-/// placed after every typed table.
-fn merge_kept_keys(typed: &str, kept: &str) -> String {
-    let mut document: DocumentMut = typed
-        .parse()
-        .expect("the typed rendering is a valid TOML document");
-    let kept: DocumentMut = kept
-        .parse()
-        .expect("the kept subtree was rendered from a parsed TOML document");
+/// Every known table exists in the typed rendering, so each item goes into an
+/// existing table. Kept tables are placed after every typed table, in their
+/// original order. The result is parsed again, so a merge that would produce
+/// an invalid document is an error instead of a bad file.
+fn merge_kept_keys(typed: &str, kept: &[KeptItem]) -> Result<String, KeptMergeError> {
+    let mut document: DocumentMut = typed.parse().map_err(|_error| KeptMergeError)?;
     let base = max_position(document.as_table()).map_or(0, |last| last + 1);
-    merge_table(document.as_table_mut(), kept.as_table(), base);
-    document.to_string()
-}
-
-fn merge_table(typed: &mut Table, kept: &Table, base: usize) {
-    for (name, item) in kept {
-        if let Some(existing) = typed.get_mut(name) {
-            if let (Some(typed_child), Some(kept_child)) =
-                (existing.as_table_mut(), item.as_table())
-            {
-                merge_table(typed_child, kept_child, base);
-            }
-        } else {
-            let mut item = item.clone();
-            shift_positions(&mut item, base);
-            typed.insert(name, item);
+    for entry in kept {
+        let mut table = document.as_table_mut();
+        for parent in &entry.parents {
+            table = table
+                .get_mut(parent)
+                .and_then(Item::as_table_mut)
+                .ok_or(KeptMergeError)?;
         }
+        if table.contains_key(&entry.name) {
+            return Err(KeptMergeError);
+        }
+        let mut item = entry.item.clone();
+        shift_positions(&mut item, base);
+        table.insert(&entry.name, item);
     }
+    let merged = document.to_string();
+    merged
+        .parse::<DocumentMut>()
+        .map_err(|_error| KeptMergeError)?;
+    Ok(merged)
 }
 
 /// Largest document position among the tables below `table`.

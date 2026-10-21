@@ -2395,6 +2395,102 @@ async fn a_rollback_restores_the_source_config_with_its_unknown_keys() {
     assert_eq!(harness.config().expect("loads").unknown_keys().len(), 3);
 }
 
+/// Appends a compact array to `service.toml` so the file stays within the load
+/// bound while its rendering, which spreads the array out, does not.
+fn grow_rendering_past_the_bound(harness: &Harness) {
+    let path = harness.context.config_path();
+    let text = std::fs::read_to_string(&path).expect("read service.toml");
+    let elements = (pohunek_service_config::MAX_CONFIG_BYTES - text.len() - 64) / 2;
+    let grown = format!(
+        "{text}\n[future]\nbig = [{}]\n",
+        vec!["0"; elements].join(",")
+    );
+    assert!(grown.len() <= pohunek_service_config::MAX_CONFIG_BYTES);
+    std::fs::write(&path, grown).expect("write service.toml");
+    assert!(
+        harness.config().expect("still loads").to_toml().len()
+            > pohunek_service_config::MAX_CONFIG_BYTES,
+        "the fixture must outgrow the bound"
+    );
+}
+
+#[tokio::test]
+async fn an_upgrade_whose_rendering_outgrows_the_bound_is_refused_before_any_effect() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    grow_rendering_past_the_bound(&harness);
+    let before = std::fs::read(harness.context.config_path()).expect("read");
+    harness.runtimes.script().calls.clear();
+    let uninstalls = harness.fake.world().uninstalls;
+
+    // An interruption at the first checkpoint would end the upgrade there if
+    // the refusal did not come first.
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Binaries);
+    let error = engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("a rendering above the bound is refused");
+
+    assert!(
+        matches!(
+            error,
+            Error::Config(pohunek_service_config::ConfigError::TooLarge { .. })
+        ),
+        "{error:?}"
+    );
+    assert!(harness.pending().is_none(), "no transaction was started");
+    assert!(
+        harness.runtimes.calls().is_empty(),
+        "the refusal comes before any effect: {:?}",
+        harness.runtimes.calls()
+    );
+    assert_eq!(harness.fake.world().uninstalls, uninstalls);
+    assert_eq!(
+        std::fs::read(harness.context.config_path()).expect("read"),
+        before
+    );
+    assert_eq!(
+        layout::installed_versions(&harness.layout()).expect("versions"),
+        [V1],
+        "nothing was published"
+    );
+}
+
+#[tokio::test]
+async fn a_rollback_after_the_daemon_stop_does_not_rewrite_an_untouched_config() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::StopDaemon);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after the daemon stop");
+    // The operator grows the file while the upgrade is pending; its
+    // rendering now exceeds the bound, so a re-render cannot be written.
+    grow_rendering_past_the_bound(&harness);
+    let before = std::fs::read(harness.context.config_path()).expect("read");
+
+    let report = harness.upgrade(V1).await.expect("the rollback succeeds");
+
+    assert!(report.unchanged);
+    assert_eq!(
+        report.rolled_back.map(|pending| pending.step),
+        Some(Step::StopDaemon.as_str())
+    );
+    assert!(
+        harness.pending().is_none(),
+        "the journal is not left rolling back"
+    );
+    harness.assert_installed(V1);
+    assert_eq!(
+        std::fs::read(harness.context.config_path()).expect("read"),
+        before,
+        "the file is restored by not touching it"
+    );
+}
+
 #[tokio::test]
 async fn an_upgrade_interrupted_after_every_step_resumes_or_rolls_back() {
     for step in STEPS {
