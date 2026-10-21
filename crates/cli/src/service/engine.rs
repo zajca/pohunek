@@ -839,16 +839,7 @@ impl<'a> Engine<'a> {
         ) {
             return Ok((None, None));
         }
-        let job = match plan {
-            Plan::Fresh => installed_job_path(self.context).await?,
-            // The gate judges the upgrade that follows a rollback as it judges a
-            // resumed one, with the default the pending transaction journaled; the
-            // rollback itself is judged by its own gate.
-            Plan::Resume(record) | Plan::RollBack(record) => {
-                installed_job_path_in(self.context, record.journal_default(), PathUse::Forward)
-                    .await?
-            }
-        };
+        let job = adoption_job_path(self.context, plan.record()).await?;
         let warnings = job_warnings(self.context, &job);
         let basis = match (&installed, plan) {
             (Some(config), _) => config.active_version().to_owned(),
@@ -3061,14 +3052,35 @@ fn load_config_for_upgrade(path: &Path) -> Result<Option<UpgradeSource>, Error> 
     }
 }
 
-/// The `PATH` the installed daemon job runs with, which a preflight or a
-/// rollback judges with. Empty when no configuration is installed.
+/// The `PATH` the installed daemon job runs with, outside a transaction.
 ///
 /// # Errors
 ///
 /// See [`job_path`].
-pub(crate) async fn installed_job_path(context: &Context) -> Result<JobPath, Error> {
+async fn installed_job_path(context: &Context) -> Result<JobPath, Error> {
     installed_job_path_in(context, None, PathUse::Forward).await
+}
+
+/// The `PATH` the adoption preflight of an upgrade that swaps the daemon judges
+/// with, for the engine's gate and `service check` alike.
+///
+/// `pending` is the record the upgrade resumes or rolls back: it judges with the
+/// launchd default that transaction journaled, as the gates after it do, and
+/// without one the installed job's `PATH`.
+///
+/// # Errors
+///
+/// See [`job_path`].
+pub(crate) async fn adoption_job_path(
+    context: &Context,
+    pending: Option<&Record>,
+) -> Result<JobPath, Error> {
+    match pending {
+        None => installed_job_path(context).await,
+        Some(record) => {
+            installed_job_path_in(context, record.journal_default(), PathUse::Forward).await
+        }
+    }
 }
 
 /// [`installed_job_path`] inside a transaction: `journal_default` is the launchd
@@ -3547,11 +3559,15 @@ fn persisted_user_domain_path(context: &Context) -> Result<String, Error> {
 /// modified before the host booted, by more than the configured margin that
 /// keeps a clock step around the boot from reordering the two times: a later
 /// write is pending, or applied and changed again. An absent file is dated by
-/// its directory, and launchd's standard `PATH` then counts as persisted. A
+/// its directory (a change of the directory after the boot may be the removal of
+/// a file launchd applied, so the absent file is not certain to mean the standard
+/// `PATH`), and launchd's standard `PATH` then counts as persisted. A
 /// configuration that is not older, or whose time or the boot time cannot be
 /// read, may have a change pending: a forward gate refuses, and a rollback goes
 /// on with the persisted value as a stand-in and says so, because refusing a
-/// rollback would strand the host.
+/// rollback would strand the host. A configuration whose content cannot be read
+/// refuses a forward gate, and a rollback goes on with launchd's standard `PATH`
+/// as the stand-in.
 #[cfg(target_os = "macos")]
 fn unloaded_persisted_path(
     context: &Context,

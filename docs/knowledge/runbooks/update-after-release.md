@@ -1008,6 +1008,11 @@ launchd's standard `PATH` then counts as persisted.
 |---|---|---|
 | Older than the boot (or absent and its directory older) | its `PATH`, no warning | its `PATH`, no warning |
 | Newer than, or within the margin of, the boot; or the boot time or the file time cannot be read | refused with `service_manager_environment_unavailable` before any effect: start the job so launchd loads it, set the `PATH` with `launchctl setenv PATH <directories>` in the GUI session, or reboot | its `PATH` as a stand-in, with the `warning:` line, because refusing a rollback would strand the host |
+| Present but unreadable (permissions, corrupt content) | refused with `service_manager_environment_unavailable`, naming the read error: fix the file's permissions or content | launchd's standard `PATH` as a stand-in, with the `warning:` line: the value cannot be known, and refusing a rollback would strand the host |
+
+An absent file whose directory was changed after the boot is treated as possibly
+pending too, not as "no configuration": the file may have existed when launchd
+booted and been removed since, which leaves the `PATH` launchd applied unknown.
 
 Known limit: both times are on the calendar clock, so a clock step right after the
 boot moves `kern.boottime` but not older file times, and a write inside the margin
@@ -1033,7 +1038,7 @@ property for a loaded unit; a mismatch is refused.
 | `UnsetEnvironment=NAME` | refused | the variable is absent; `NAME=VALUE` removes it only when the final value equals `VALUE`; a name only the unit file unsets is ignored | refused |
 | A line in a form not read (escape sequence, unclosed quote, specifier, bytes that are not UTF-8) that may touch the name | refused | refused (whether or not the name is set now) | refused |
 | `Environment=` set only by the (replaced) unit file | ignored | ignored | n/a |
-| `EnvironmentFile=` only the (replaced) unit file holds | with drop-ins present, judged from the manager's merged list (refused when it sets `PATH`) | ignored | ignored |
+| `EnvironmentFile=` only the (replaced) unit file holds | judged from the manager's merged list, refused when it sets `PATH`: for a recorded `PATH` only when the unit has drop-ins, for an unrecorded one always | ignored | ignored |
 
 An unreachable bus, unreadable unit properties, a masked or failed unit, or a
 snapshot made stale by a change on disk next to drop-ins (run `systemctl --user

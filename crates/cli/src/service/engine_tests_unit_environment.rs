@@ -658,6 +658,32 @@ async fn unset_environment_removes_store_variables_as_systemd_does() {
     assert_eq!(variable(&job, STORE).as_deref(), Some("/m"));
 }
 
+/// The manager reports a drop-in assignment even when a later drop-in unsets it
+/// (pinned on the real manager), so the unset is applied to the assignment.
+#[tokio::test]
+async fn a_store_variable_set_in_one_drop_in_and_unset_in_a_later_one_is_absent() {
+    let (_dir, mut unit) = loaded_with(
+        &[
+            ("10-a.conf", "[Service]\nEnvironment=CLAUDE_CONFIG_DIR=/d\n"),
+            (
+                "20-b.conf",
+                "[Service]\nUnsetEnvironment=CLAUDE_CONFIG_DIR\n",
+            ),
+        ],
+        &["CLAUDE_CONFIG_DIR=/d"],
+    );
+    unit.unset_environment = vec![STORE.to_owned()];
+    let job = judge_job(
+        unit,
+        &["PATH=/manager/bin", "CLAUDE_CONFIG_DIR=/m"],
+        &[STORE],
+        true,
+    )
+    .await
+    .expect("job");
+    assert_eq!(variable(&job, STORE), None);
+}
+
 #[tokio::test]
 async fn drop_in_variables_follow_the_allowlist_rules() {
     // A denylisted name and a reserved-prefix name are skipped, as for the

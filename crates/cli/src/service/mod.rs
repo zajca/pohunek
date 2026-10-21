@@ -266,7 +266,7 @@ async fn finish_check(
         }
     }
     if checked.adoption == Adoption::Required {
-        let job = engine::installed_job_path(context).await?;
+        let job = engine::adoption_job_path(context, checked.pending.as_ref()).await?;
         let warnings = engine::job_warnings(context, &job);
         // Reading the ledger changes nothing, so a check with the flag leaves the
         // state exactly as it found it.
@@ -889,6 +889,9 @@ pub(crate) struct Checked {
     pub(crate) adoption: Adoption,
     /// Pending upgrade whose rollback needs the previous reader's verdict.
     pub(crate) rollback: Option<record::Record>,
+    /// The pending record the upgrade resumes or rolls back, which the adoption
+    /// gate judges with the launchd default it journaled.
+    pub(crate) pending: Option<record::Record>,
     /// The installed version whose sessions the adoption gate judges; the
     /// accepted-risk ledger applies only to it.
     pub(crate) installed_version: Option<String>,
@@ -1009,6 +1012,7 @@ pub(crate) fn check_local(
         };
     let fresh_install =
         operation == record::Operation::Install && !matches!(plan, engine::Plan::Resume(_));
+    let pending = plan.record().cloned();
     let rollback = match &plan {
         engine::Plan::RollBack(record) if engine::rollback_restarts_previous(record) => {
             Some(record.clone())
@@ -1042,6 +1046,7 @@ pub(crate) fn check_local(
         discovery_first: matches!(plan, engine::Plan::RollBack(_)),
         adoption,
         rollback,
+        pending,
         installed_version,
     })
 }

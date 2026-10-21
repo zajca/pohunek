@@ -3976,6 +3976,35 @@ async fn a_rollback_to_another_version_judges_the_adoption_gate_with_the_journal
     }
 }
 
+/// `service check` judges the adoption gate of a resumed upgrade, and of one that
+/// rolls another back first, with the launchd default the pending transaction
+/// journaled, as the upgrade does.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_check_judges_a_pending_transaction_with_its_journaled_default() {
+    for (interrupted_after, version) in [(Step::Definition, V2), (Step::Registered, V3)] {
+        let mut harness = Harness::new();
+        let (preflight, judged) =
+            interrupted_upgrade_with_a_pending_plist(&mut harness, interrupted_after).await;
+
+        crate::service::check_with_preflight(
+            &harness.context,
+            &harness.staged(version),
+            &preflight,
+            version,
+            false,
+        )
+        .await
+        .expect("the check judges with the journaled default");
+
+        let judged = judged.lock().expect("search path lock").clone();
+        assert!(
+            !judged.is_empty() && judged.iter().all(|path| path == JOURNALED_PATH),
+            "{version}: {judged:?}"
+        );
+    }
+}
+
 /// Without a journaled default a possibly pending plist refuses the forward
 /// upgrade that would roll the pending one back first, before any effect.
 #[cfg(target_os = "macos")]

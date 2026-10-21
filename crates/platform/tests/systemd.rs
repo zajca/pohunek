@@ -3154,6 +3154,13 @@ fn the_real_user_manager_applies_unset_environment_to_assignments() {
                 ),
             )],
         );
+        // `UnsetEnvironment=` applies to the job, not to the reported property.
+        let reported = run.reported();
+        assert_eq!(
+            reported.environment.last().map(String::as_str),
+            Some("CLAUDE_CONFIG_DIR=/drop-in/store"),
+            "{unset}: {reported:?}"
+        );
         let job = run.job_environment();
         assert_eq!(
             has_entry(&job, "CLAUDE_CONFIG_DIR=/drop-in/store"),
@@ -3166,6 +3173,39 @@ fn the_real_user_manager_applies_unset_environment_to_assignments() {
             "{unset}: {job:?}"
         );
     }
+}
+
+/// The same holds when a later drop-in unsets what an earlier one assigns.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_applies_a_later_drop_ins_unset_to_an_earlier_assignment() {
+    require_e2e();
+    let run = EnvironmentRun::new(
+        "unset-later",
+        "Environment=CLAUDE_CONFIG_DIR=/unit/store\n",
+        &[
+            (
+                "10-a.conf",
+                "[Service]\nEnvironment=CLAUDE_CONFIG_DIR=/drop-in/store\n",
+            ),
+            (
+                "20-b.conf",
+                "[Service]\nUnsetEnvironment=CLAUDE_CONFIG_DIR\n",
+            ),
+        ],
+    );
+    let reported = run.reported();
+    assert_eq!(
+        reported.environment.last().map(String::as_str),
+        Some("CLAUDE_CONFIG_DIR=/drop-in/store"),
+        "{reported:?}"
+    );
+    let job = run.job_environment();
+    assert!(
+        !job.iter()
+            .any(|entry| entry.starts_with("CLAUDE_CONFIG_DIR=")),
+        "{job:?}"
+    );
 }
 
 /// A drop-in directory the scan cannot read is an error, never "no drop-ins".
