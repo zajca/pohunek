@@ -1031,8 +1031,9 @@ property for a loaded unit; a mismatch is refused.
 | `EnvironmentFile=` assigning the name | refused (quoting is not re-parsed) | refused: move it to an `Environment=` line of a drop-in | refused |
 | `PassEnvironment=NAME` | no effect on a recorded `PATH`; refused for an unrecorded one | refused unless a drop-in `Environment=` assigns it (the value would be the manager process's own) | no effect |
 | `UnsetEnvironment=NAME` | refused | the variable is absent; `NAME=VALUE` removes it only when the final value equals `VALUE`; a name only the unit file unsets is ignored | refused |
-| A line in a form not read (escape sequence, unclosed quote, specifier, bytes that are not UTF-8) that may touch the name | refused | refused when the name is set somewhere | refused |
-| Set only by the (replaced) unit file | ignored | ignored | n/a |
+| A line in a form not read (escape sequence, unclosed quote, specifier, bytes that are not UTF-8) that may touch the name | refused | refused (whether or not the name is set now) | refused |
+| `Environment=` set only by the (replaced) unit file | ignored | ignored | n/a |
+| `EnvironmentFile=` only the (replaced) unit file holds | with drop-ins present, judged from the manager's merged list (refused when it sets `PATH`) | ignored | ignored |
 
 An unreachable bus, unreadable unit properties, a masked or failed unit, or a
 snapshot made stale by a change on disk next to drop-ins (run `systemctl --user

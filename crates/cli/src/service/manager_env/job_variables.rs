@@ -394,13 +394,11 @@ pub async fn unit_job_variables(
     }
     let loaded = unit.load_state == "loaded";
     let facts = scan_drop_ins(unit, unit_name, reader).await?;
-    let environment_files = if loaded {
-        unit.environment_files.clone()
-    } else {
-        read_drop_ins(unit, unit_name, reader)
-            .await?
-            .environment_files
-    };
+    // An `EnvironmentFile=` only the replaced unit file holds does not count, so
+    // the files are those the drop-ins give.
+    let environment_files = read_drop_ins(unit, unit_name, reader)
+        .await?
+        .environment_files;
     let mut file_keys: Vec<(String, String)> = Vec::new();
     for (file, optional) in &environment_files {
         for key in environment_file_keys(file, *optional, unit_name, reader).await? {

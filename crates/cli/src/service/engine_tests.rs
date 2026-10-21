@@ -3889,6 +3889,175 @@ async fn a_rollback_uses_an_active_persisted_path_without_warning() {
     harness.assert_installed(V1);
 }
 
+/// An upgrade interrupted after `interrupted_after`, whose journal holds the
+/// launchd default, on a host whose launchd no longer has the job loaded and
+/// whose `user.plist` was written after the boot; returns the preflight to
+/// install and the recorder of the `PATH`s it judges.
+#[cfg(target_os = "macos")]
+async fn interrupted_upgrade_with_a_pending_plist(
+    harness: &mut Harness,
+    interrupted_after: Step,
+) -> (ScriptedPreflight, Arc<Mutex<Vec<String>>>) {
+    set_job_path(harness, JOURNALED_PATH);
+    harness.install(V1).await.expect("install");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(interrupted_after);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted");
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(PERSISTED_PATH)).expect("domain configuration");
+    date(&domain, Modified::AfterBoot).expect("date");
+    harness.context = harness
+        .context
+        .clone()
+        .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(not_loaded()))))
+        .with_launchd_domain_config(&domain);
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+    (preflight, judged)
+}
+
+/// The adoption gate of a resumed upgrade judges with the launchd default the
+/// transaction journaled, as its later gates do, not with the pending plist.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_resume_judges_the_adoption_gate_with_the_journaled_default() {
+    let mut harness = Harness::new();
+    let (preflight, judged) =
+        interrupted_upgrade_with_a_pending_plist(&mut harness, Step::Definition).await;
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("the interrupted upgrade resumes");
+
+    let judged = judged.lock().expect("search path lock").clone();
+    assert!(
+        !judged.is_empty() && judged.iter().all(|path| path == JOURNALED_PATH),
+        "{judged:?}"
+    );
+    harness.assert_installed(V2);
+}
+
+/// The same for the rollback of a pending upgrade that another version's upgrade
+/// runs first.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_rollback_to_another_version_judges_the_adoption_gate_with_the_journaled_default() {
+    let mut harness = Harness::new();
+    let (preflight, judged) =
+        interrupted_upgrade_with_a_pending_plist(&mut harness, Step::Registered).await;
+
+    // Once the rollback is done the new transaction has no journaled default, so
+    // the upgrade to the third version may be refused by a later gate; the gate
+    // that precedes the rollback is under test.
+    let result = harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V3), V3)
+        .await;
+
+    let judged = judged.lock().expect("search path lock").clone();
+    assert_eq!(
+        judged.first().map(String::as_str),
+        Some(JOURNALED_PATH),
+        "{judged:?}"
+    );
+    match result {
+        Ok(_) => harness.assert_installed(V3),
+        Err(error) => {
+            assert_eq!(error.code(), "service_manager_environment_unavailable");
+            harness.assert_installed(V1);
+        }
+    }
+}
+
+/// Without a journaled default a possibly pending plist refuses the forward
+/// upgrade that would roll the pending one back first, before any effect.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_rollback_to_another_version_without_a_journaled_default_refuses_before_any_effect() {
+    let mut harness = Harness::new();
+    let (preflight, judged) =
+        interrupted_upgrade_with_a_pending_plist(&mut harness, Step::Registered).await;
+    let journal = harness.context.paths().state_dir.join(record::FILE_NAME);
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&journal).expect("journal")).expect("journal JSON");
+    document
+        .as_object_mut()
+        .expect("journal object")
+        .remove("launchd_default_path");
+    std::fs::write(
+        &journal,
+        serde_json::to_vec(&document).expect("journal bytes"),
+    )
+    .expect("rewrite journal");
+    let error = harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V3), V3)
+        .await
+        .expect_err("a change may be pending");
+
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    assert!(
+        judged.lock().expect("search path lock").is_empty(),
+        "nothing was judged"
+    );
+    assert!(
+        harness.pending().is_some(),
+        "the pending upgrade is untouched"
+    );
+}
+
+/// A rollback goes on with launchd's standard `PATH` as a stand-in when the
+/// persisted configuration cannot be read; a forward gate refuses.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn an_unreadable_persisted_configuration_does_not_strand_a_rollback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let unreadable = |domain: &std::path::Path| {
+        date(domain, Modified::BeforeBoot).expect("date");
+        std::fs::set_permissions(domain, std::fs::Permissions::from_mode(0o000))
+            .expect("permissions");
+    };
+
+    let mut harness = Harness::new();
+    let (result, judged) =
+        rollback_without_a_journaled_default(&mut harness, unreadable, |_| {}).await;
+    let report = result.expect("the pending upgrade is rolled back");
+    assert!(
+        !judged.is_empty()
+            && judged
+                .iter()
+                .all(|path| path == pohunek_platform::supervisor::launchd::STANDARD_PATH),
+        "{judged:?}"
+    );
+    let rolled_back = report.rolled_back.expect("the rollback is reported");
+    assert_eq!(rolled_back.warnings.len(), 1, "{:?}", rolled_back.warnings);
+    harness.assert_installed(V1);
+
+    let mut harness = Harness::new();
+    let domain = unrecorded_install_with_domain_config(&mut harness).await;
+    let (result, judged) = upgrade_of_an_unloaded_job(
+        &mut harness,
+        &domain,
+        Some(PERSISTED_PATH),
+        unreadable,
+        |_| {},
+    )
+    .await;
+    let error = result.expect_err("a forward gate refuses");
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    assert!(judged.is_empty(), "nothing was judged: {judged:?}");
+    harness.assert_installed(V1);
+}
+
 /// A boot time that cannot be read, or a configuration changed within the margin
 /// of the boot, may hide a pending change: a forward gate refuses, and a
 /// rollback goes on with the persisted value and says so.

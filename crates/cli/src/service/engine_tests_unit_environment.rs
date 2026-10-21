@@ -526,6 +526,50 @@ async fn an_unclear_drop_in_line_refuses_a_store_variable() {
     }
 }
 
+/// The install replaces the unit file, so an `EnvironmentFile=` that only the
+/// unit file holds (the manager's merged list shows it, no drop-in gives it) does
+/// not count, whatever it assigns.
+#[tokio::test]
+async fn an_environment_file_only_the_unit_file_holds_is_ignored() {
+    let scratch = pohunek_test_support::tempdir().expect("scratch directory");
+    let file = file_in(
+        &scratch,
+        "unit.env",
+        "CLAUDE_CONFIG_DIR=/e\nHOME=/h\nXDG_STATE_HOME=/s\n",
+    );
+    let (_dir, mut unit) = loaded_with(
+        &[("10-other.conf", "[Service]\nEnvironment=OTHER=1\n")],
+        &["OTHER=1"],
+    );
+    unit.environment_files = vec![(file, false)];
+    let job = judge_job(
+        unit,
+        &["PATH=/manager/bin", "CLAUDE_CONFIG_DIR=/m"],
+        &[STORE],
+        true,
+    )
+    .await
+    .expect("the unit file's EnvironmentFile= is replaced with it");
+    assert_eq!(variable(&job, STORE).as_deref(), Some("/m"));
+}
+
+/// Without drop-ins nothing but the replaced unit file could set the job's
+/// environment, so what only it holds, an `UnsetEnvironment=PATH` or another
+/// `Environment=PATH=` included, leaves the recorded `PATH` as it is.
+#[tokio::test]
+async fn path_settings_only_the_unit_file_holds_leave_the_recorded_path() {
+    let unit = UnitEnvironment {
+        environment: vec!["PATH=/unit/bin".to_owned()],
+        unset_environment: vec!["PATH".to_owned()],
+        ..loaded_unit()
+    };
+    let job = judge_job(unit, &MANAGER_ENTRIES, &[], true)
+        .await
+        .expect("job");
+    assert_eq!(job.value, RECORDED);
+    assert!(job.path_drop_in.is_none());
+}
+
 #[tokio::test]
 async fn an_environment_file_store_variable_is_refused() {
     let scratch = pohunek_test_support::tempdir().expect("scratch directory");

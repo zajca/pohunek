@@ -839,7 +839,16 @@ impl<'a> Engine<'a> {
         ) {
             return Ok((None, None));
         }
-        let job = installed_job_path(self.context).await?;
+        let job = match plan {
+            Plan::Fresh => installed_job_path(self.context).await?,
+            // The gate judges the upgrade that follows a rollback as it judges a
+            // resumed one, with the default the pending transaction journaled; the
+            // rollback itself is judged by its own gate.
+            Plan::Resume(record) | Plan::RollBack(record) => {
+                installed_job_path_in(self.context, record.journal_default(), PathUse::Forward)
+                    .await?
+            }
+        };
         let warnings = job_warnings(self.context, &job);
         let basis = match (&installed, plan) {
             (Some(config), _) => config.active_version().to_owned(),
@@ -2723,7 +2732,7 @@ fn persisted_path_warnings(context: &Context, job: &JobPath) -> Vec<String> {
     }
     let journal = context.paths().state_dir.join(record::FILE_NAME);
     let warning = format!(
-        "the launchd job is not loaded and the transaction journal {} holds no launchd default PATH, so the persisted launchd configuration was used",
+        "the launchd job is not loaded and the transaction journal {} holds no launchd default PATH, so the persisted launchd configuration was used (launchd's standard PATH when it cannot be read)",
         journal.display()
     );
     tracing::warn!(journal = %journal.display(), "{warning}");
@@ -3059,10 +3068,24 @@ fn load_config_for_upgrade(path: &Path) -> Result<Option<UpgradeSource>, Error> 
 ///
 /// See [`job_path`].
 pub(crate) async fn installed_job_path(context: &Context) -> Result<JobPath, Error> {
+    installed_job_path_in(context, None, PathUse::Forward).await
+}
+
+/// [`installed_job_path`] inside a transaction: `journal_default` is the launchd
+/// default it journaled, and `usage` the side of it the judgement serves.
+///
+/// # Errors
+///
+/// See [`job_path`].
+async fn installed_job_path_in(
+    context: &Context,
+    journal_default: Option<JournalDefault<'_>>,
+    usage: PathUse,
+) -> Result<JobPath, Error> {
     let source = load_config_for_upgrade(&context.config_path())?.ok_or(Error::NotInstalled {
         path: context.config_path(),
     })?;
-    job_path(context, &source.config, None).await
+    job_path_for(context, &source.config, journal_default, usage).await
 }
 
 /// The `PATH` the installed daemon job runs with, as [`job_search_path`] gives
@@ -3211,19 +3234,26 @@ fn manager_warnings(job: &JobPath) -> Vec<String> {
 ///
 /// The recorded `PATH` of `config` is the job's `PATH`, as
 /// [`super::definition::daemon_definition`] writes it into the systemd unit or
-/// the launchd plist. A job that records none inherits its service manager's
-/// `PATH`:
+/// the launchd plist, except on Linux where the last drop-in of the daemon unit
+/// that sets `PATH` replaces it ([`PathSource::DropIn`]). A job that records none
+/// inherits its service manager's `PATH`:
 ///
-/// - Linux: the systemd user manager's `Environment`, read now. The restored or
-///   new job gets exactly that, so no journal value applies.
+/// - Linux: the systemd user manager's `Environment`, read now, or a drop-in's
+///   `PATH`. The restored or new job gets exactly that, so no journal value
+///   applies.
 /// - macOS, in launchd's order: the domain's `environment` `PATH` (readable
 ///   whether or not the job is loaded); the loaded job's `default environment`;
 ///   for a job that is not loaded, `journal_default` (the launchd default the
 ///   upgrade journaled while the job was loaded) while the host has not
 ///   rebooted since, otherwise the persisted configuration; and only without that, the
-///   persisted launchd configuration, then launchd's standard `PATH`. The last
-///   two are the best evidence available and are reported as
-///   [`PathSource::Persisted`].
+///   persisted launchd configuration, then launchd's standard `PATH`. Without a
+///   journaled default the persisted configuration is
+///   [`PathSource::PersistedActive`] when it is older than the host boot;
+///   otherwise a forward judgement refuses and a rollback
+///   ([`PathUse::Rollback`]) goes on with it, or with launchd's standard `PATH`
+///   when it cannot be read, as [`PathSource::Persisted`]. After a reboot a
+///   journaled default gives way to the persisted configuration only when that
+///   is older than the boot, for a rollback too.
 ///
 /// `journal_default` is the journal's `launchd_default_path` with its boot
 /// identity, for the transaction the call belongs to, or `None` outside one.
@@ -3231,7 +3261,12 @@ fn manager_warnings(job: &JobPath) -> Vec<String> {
 /// # Errors
 ///
 /// Returns [`Error::ManagerEnvironment`] when the service manager's `PATH` cannot
-/// be read or cannot be carried by a process environment.
+/// be read or cannot be carried by a process environment; on Linux also when the
+/// manager is unreachable (a recorded `PATH` included), the daemon unit is masked
+/// or failed, or a drop-in or `EnvironmentFile=` removes or cannot be followed
+/// for `PATH`, a bootstrap key (`HOME`, `XDG_*`) or a selected store variable;
+/// on macOS when a forward judgement of an unloaded job cannot tell which `PATH`
+/// launchd applies.
 pub(crate) async fn job_path(
     context: &Context,
     config: &ServiceConfig,
@@ -3523,7 +3558,19 @@ fn unloaded_persisted_path(
     usage: PathUse,
 ) -> Result<(String, PathSource), Error> {
     let dated = persisted_config_is_active(context);
-    let persisted = persisted_user_domain_path(context)?;
+    let persisted = match (persisted_user_domain_path(context), usage) {
+        (Ok(persisted), _) => persisted,
+        // The configuration cannot be read, so its value is unknown: launchd's
+        // standard `PATH` stands in, as it does for a missing file.
+        (Err(error), PathUse::Rollback) => {
+            tracing::warn!(%error, "the launchd user-domain configuration cannot be read");
+            return Ok((
+                pohunek_platform::supervisor::launchd::STANDARD_PATH.to_owned(),
+                PathSource::Persisted,
+            ));
+        }
+        (Err(error), PathUse::Forward) => return Err(error),
+    };
     // A write between the dating and the read would make the date describe
     // another configuration than the one read.
     let activity = dated.and_then(|()| persisted_config_is_active(context));
