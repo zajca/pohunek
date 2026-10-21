@@ -11081,6 +11081,20 @@ async fn a_removed_unit_keeps_resolving_exec_search_path_and_environment_files()
     assert!(text.contains("sets PATH"), "{text}");
 }
 
+/// A no-break space is not a word separator for systemd, so it keeps two
+/// assignments in one value.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_no_break_space_does_not_split_an_environment_value() {
+    let (_keep, unit) = orphan_drop_ins(&[(
+        "a.service.d",
+        "10-a.conf",
+        "[Service]\nEnvironment=PATH=/first\u{a0}PATH=/second\n".as_bytes(),
+    )]);
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, "/first\u{a0}PATH=/second");
+}
+
 /// What cannot be read from drop-ins of an unloaded unit is refused with the
 /// file and the fix.
 #[cfg(target_os = "linux")]

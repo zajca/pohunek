@@ -407,10 +407,10 @@ async fn path_from_orphan_drop_ins(
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            let key = key.trim_end();
+            let key = key.trim_end_matches(SYSTEMD_WHITESPACE);
             match key {
                 "EnvironmentFile" | "ExecSearchPath" => {
-                    if value.trim().is_empty() {
+                    if value.trim_matches(SYSTEMD_WHITESPACE).is_empty() {
                         if key == "EnvironmentFile" {
                             environment_files.clear();
                         } else {
@@ -619,7 +619,7 @@ fn environment_file_sets_path(text: &str) -> Option<bool> {
     let mut chars = text.chars().peekable();
     let mut sets_path = false;
     loop {
-        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        while chars.next_if(|c| SYSTEMD_WHITESPACE.contains(c)).is_some() {}
         let Some(first) = chars.peek().copied() else {
             return Some(sets_path);
         };
@@ -639,12 +639,12 @@ fn environment_file_sets_path(text: &str) -> Option<bool> {
             // A line without `=` assigns nothing.
             continue;
         }
-        if key.trim().is_empty() {
+        if key.trim_matches(SYSTEMD_WHITESPACE).is_empty() {
             // systemd drops an assignment without a name, and what it does with
             // a continuation after one is not followed here.
             return None;
         }
-        if key.trim() == SEARCH_PATH_VARIABLE {
+        if key.trim_matches(SYSTEMD_WHITESPACE) == SEARCH_PATH_VARIABLE {
             sets_path = true;
         }
         // A value that opens with a quote ends at the matching one; quotes
@@ -799,6 +799,10 @@ fn specifiers_resolve(word: &str) -> bool {
     true
 }
 
+/// The characters systemd treats as white space in unit and environment files;
+/// Unicode spaces such as U+00A0 are ordinary characters there.
+const SYSTEMD_WHITESPACE: [char; 4] = [' ', '\t', '\n', '\r'];
+
 /// The words of a unit file value, split and unquoted as systemd does.
 struct Tokens {
     words: Vec<String>,
@@ -829,7 +833,9 @@ fn split_words(value: &str) -> Tokens {
             }
             ('\'' | '"', None) => quote = Some(c),
             (c, Some(q)) if c == q => quote = None,
-            (c, None) if c.is_whitespace() => out.words.push(std::mem::take(&mut word)),
+            (c, None) if SYSTEMD_WHITESPACE.contains(&c) => {
+                out.words.push(std::mem::take(&mut word))
+            }
             (c, _) => word.push(c),
         }
     }
@@ -856,7 +862,7 @@ fn unit_setting(bytes: &[u8], setting: Setting) -> Assignment {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if key.trim_end() != setting.key() {
+        if key.trim_end_matches(SYSTEMD_WHITESPACE) != setting.key() {
             continue;
         }
         let split = split_words(value);
@@ -901,7 +907,7 @@ fn service_lines(bytes: &[u8]) -> Vec<Result<String, String>> {
             lines.push(line);
             continue;
         };
-        let trimmed = text.trim();
+        let trimmed = text.trim_matches(SYSTEMD_WHITESPACE);
         if let Some(section) = trimmed
             .strip_prefix('[')
             .and_then(|rest| rest.strip_suffix(']'))
@@ -926,10 +932,10 @@ fn path_events(bytes: &[u8]) -> Result<Vec<Option<String>>, ()> {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if key.trim_end() != Setting::EnvironmentPath.key() {
+        if key.trim_end_matches(SYSTEMD_WHITESPACE) != Setting::EnvironmentPath.key() {
             continue;
         }
-        if value.trim().is_empty() {
+        if value.trim_matches(SYSTEMD_WHITESPACE).is_empty() {
             events.push(None);
             continue;
         }
