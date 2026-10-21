@@ -172,50 +172,6 @@ mod tests {
     }
 
     #[test]
-    fn the_configuration_is_dated_by_its_file_or_else_its_nearest_directory() {
-        let temp = pohunek_test_support::tempdir().expect("scratch directory");
-        let epoch = |seconds: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
-        let date = |path: &Path, when: SystemTime| {
-            File::open(path)
-                .and_then(|file| file.set_modified(when))
-                .expect("date the path");
-        };
-        // Far ahead of the status change time, which a test cannot set.
-        let (late, later) = (epoch(4_000_000_000), epoch(4_000_000_100));
-        let before = SystemTime::now() - std::time::Duration::from_secs(60);
-
-        let config = config_in(&temp, "user.plist", &dictionary_xml(""));
-        date(&config, late);
-        date(temp.path(), epoch(2_000));
-        assert_eq!(user_domain_config_modified(&config).expect("file"), late);
-
-        // A preserved modification time does not hide a later status change.
-        date(&config, epoch(1_000));
-        assert!(user_domain_config_modified(&config).expect("preserved") > before);
-
-        std::fs::remove_file(&config).expect("remove");
-        date(temp.path(), later);
-        assert_eq!(
-            user_domain_config_modified(&config).expect("directory"),
-            later
-        );
-
-        // A link made later than its target is a recent change.
-        let target = config_in(&temp, "target.plist", &dictionary_xml(""));
-        date(&target, epoch(1_000));
-        std::os::unix::fs::symlink(&target, &config).expect("link");
-        assert!(user_domain_config_modified(&config).expect("link") > before);
-
-        // Missing directories are dated by the nearest one that exists.
-        date(temp.path(), later);
-        let orphan = temp.path().join("absent").join("user.plist");
-        assert_eq!(
-            user_domain_config_modified(&orphan).expect("ancestor"),
-            later
-        );
-    }
-
-    #[test]
     fn the_domain_path_scenarios_read_the_configuration_as_launchd_writes_it() {
         let temp = pohunek_test_support::tempdir().expect("scratch directory");
 

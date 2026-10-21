@@ -2131,6 +2131,104 @@ impl Drop for UnitFiles {
     }
 }
 
+/// Removes a drop-in directory a test wrote.
+struct DropInDirectory(PathBuf);
+
+impl Drop for DropInDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+        systemctl(&["daemon-reload"]);
+    }
+}
+
+/// systemd applies the drop-ins of every directory sorted by file name, not
+/// directory by directory, and it reads only the `[Service]` section spelled
+/// exactly so: the rules the CLI's reader of drop-in files follows.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_orders_drop_ins_by_file_name_across_directories() {
+    require_e2e();
+    let directory = user_unit_dir();
+    std::fs::create_dir_all(&directory).expect("user unit directory");
+    let unit = format!("pohunek-e2e-ord-{}-x.service", std::process::id());
+    let prefix_dir = directory.join(format!("pohunek-e2e-ord-{}-.service.d", std::process::id()));
+    let _files = UnitFiles {
+        directory: directory.clone(),
+        unit: unit.clone(),
+    };
+    let _prefix = DropInDirectory(prefix_dir.clone());
+    std::fs::write(
+        directory.join(&unit),
+        "[Service]\nExecStart=/bin/sleep 300\n",
+    )
+    .expect("unit file");
+    let own = directory.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&own).expect("own drop-in directory");
+    std::fs::create_dir_all(&prefix_dir).expect("prefix drop-in directory");
+    let path_of = |unit: &str| {
+        let loaded = async_io::block_on(unit_environment(unit, CALL_TIMEOUT)).expect("loaded unit");
+        let paths: Vec<String> = loaded
+            .environment
+            .iter()
+            .filter(|entry| entry.starts_with("PATH="))
+            .cloned()
+            .collect();
+        (paths, loaded.environment)
+    };
+    // The file name decides, whichever directory holds the file: the last
+    // `PATH=` of the sorted names wins, and the merged property keeps that one.
+    // Each directory order (own first, prefix first) gives a different pair.
+    for (own_name, prefix_name, expected) in [
+        ("90-p.conf", "10-p.conf", "PATH=/own/bin"),
+        ("10-p.conf", "90-p.conf", "PATH=/prefix/bin"),
+    ] {
+        let _ = std::fs::remove_dir_all(&own);
+        let _ = std::fs::remove_dir_all(&prefix_dir);
+        std::fs::create_dir_all(&own).expect("own drop-in directory");
+        std::fs::create_dir_all(&prefix_dir).expect("prefix drop-in directory");
+        std::fs::write(own.join(own_name), "[Service]\nEnvironment=PATH=/own/bin\n")
+            .expect("own drop-in");
+        std::fs::write(
+            prefix_dir.join(prefix_name),
+            "[Service]\nEnvironment=PATH=/prefix/bin\n",
+        )
+        .expect("prefix drop-in");
+        systemctl(&["daemon-reload"]);
+        let (paths, environment) = path_of(&unit);
+        assert_eq!(
+            paths,
+            [expected],
+            "{own_name} / {prefix_name}: {environment:?}"
+        );
+    }
+
+    // A drop-in masked by a link to `/dev/null` stays in the manager's list.
+    std::os::unix::fs::symlink("/dev/null", own.join("97-mask.conf")).expect("mask");
+    systemctl(&["daemon-reload"]);
+    let masked = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded unit");
+    assert!(
+        masked
+            .drop_in_paths
+            .iter()
+            .any(|path| path.ends_with("97-mask.conf")),
+        "{:?}",
+        masked.drop_in_paths
+    );
+
+    // A `[service]` section is not the `[Service]` section.
+    std::fs::write(
+        own.join("95-case.conf"),
+        "[service]\nEnvironment=LOWERCASE=1\n",
+    )
+    .expect("lowercase section drop-in");
+    systemctl(&["daemon-reload"]);
+    let (_, environment) = path_of(&unit);
+    assert!(
+        !environment.iter().any(|entry| entry == "LOWERCASE=1"),
+        "a [service] section is not read: {environment:?}"
+    );
+}
+
 /// Enabling a unit that has a drop-in, after the reload that loaded it, does not
 /// leave the unit with a stale snapshot: the gates that refuse on
 /// `NeedDaemonReload` do not trip on an installed daemon unit.

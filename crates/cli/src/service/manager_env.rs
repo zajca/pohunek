@@ -349,10 +349,11 @@ async fn loaded_search_path(
     };
     let mut drop_ins = Vec::with_capacity(unit.drop_in_paths.len());
     for path in &unit.drop_in_paths {
-        drop_ins.push((
-            path,
-            read_unit_setting_file(path, unit_name, "drop-in").await?,
-        ));
+        // The manager keeps a link to `/dev/null` in its list, and it disables
+        // the drop-in of that name.
+        if let Some(bytes) = read_enabled_drop_in(path, unit_name).await? {
+            drop_ins.push((path, bytes));
+        }
     }
     let given_by_drop_in = |setting: Setting| -> Result<bool, Error> {
         if drop_ins.is_empty() {
@@ -432,7 +433,7 @@ fn drop_ins_by_priority(files: &[String], unit_name: &str) -> Result<Vec<String>
             Some(kept) => {
                 return Err(Error::ManagerEnvironment {
                     detail: format!(
-                        "{unit_name} has no unit file yet and the drop-in {} exists in two directories ({kept} and {path}) of different names, so which one systemd applies is not derived here. Remove one of them and retry",
+                        "{unit_name}: the drop-in {} exists in two directories ({kept} and {path}) of different names, so which one systemd applies is not derived here. Remove one of them and retry",
                         name_of(path),
                     ),
                 });
@@ -498,12 +499,12 @@ async fn path_from_orphan_drop_ins(
         };
         let unreadable = |directive: &str| {
             refuse(format!(
-                "{unit_name} has no unit file yet and the drop-in {path} has a {directive} line that may affect {SEARCH_PATH_VARIABLE} in a form not read here (an escape sequence, more than one word, a quote never closed, or bytes that are not UTF-8). Write a plain assignment and retry"
+                "{unit_name}: the drop-in {path} has a {directive} line that may affect {SEARCH_PATH_VARIABLE} in a form not read here (an escape sequence, more than one word, a quote never closed, or bytes that are not UTF-8). Write a plain assignment and retry"
             ))
         };
         let unsupported = |directive: &str, specifier: &str| {
             refuse(format!(
-                "{unit_name} has no unit file yet and the drop-in {path} uses the specifier {specifier} in {directive}=, which is not expanded here: the service manager has not loaded the unit, so the value it would use cannot be read. Write the value out and retry"
+                "{unit_name}: the drop-in {path} uses the specifier {specifier} in {directive}=, which is not expanded here: a recovery that removes the unit resolves its drop-ins without the service manager, so the value the manager would use cannot be read. Write the value out and retry"
             ))
         };
         for line in service_lines(&bytes) {
@@ -555,7 +556,7 @@ async fn path_from_orphan_drop_ins(
                 }
                 "PassEnvironment" | "UnsetEnvironment" if names_search_path(value) => {
                     return Err(refuse(format!(
-                        "{unit_name} has no unit file yet and the drop-in {path} sets {key}= for {SEARCH_PATH_VARIABLE}, which the service manager cannot report for an unloaded unit. Remove that line and retry"
+                        "{unit_name}: the drop-in {path} sets {key}= for {SEARCH_PATH_VARIABLE}, which the service manager cannot report once the unit is removed. Remove that line and retry"
                     )));
                 }
                 _ => {}

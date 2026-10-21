@@ -10702,16 +10702,41 @@ async fn judging_the_path_before_the_application_roots_exist_creates_nothing() {
 enum Modified {
     BeforeBoot,
     AfterBoot,
+    /// The modification time was set long ago; the status change time is now.
+    Preserved,
+    /// A link made now to a target whose times are long ago.
+    Linked,
+    /// A link to a target modified after the boot, the link itself made before.
+    LinkedTargetAfterBoot,
+    /// The configuration directory is gone; the nearest directory above it
+    /// changed before the boot.
+    DirectoryGoneBeforeBoot,
+    /// The same, after the boot.
+    DirectoryGoneAfterBoot,
 }
 
 /// Dates `path` (a file or a directory) as `modified` says.
 #[cfg(target_os = "macos")]
 fn date(path: &std::path::Path, modified: Modified) -> std::io::Result<()> {
     let when = match modified {
-        Modified::BeforeBoot => boot_time() - Duration::from_secs(3600),
-        Modified::AfterBoot => boot_time() + Duration::from_secs(3600),
+        Modified::BeforeBoot | Modified::DirectoryGoneBeforeBoot => {
+            boot_time() - Duration::from_secs(3600)
+        }
+        Modified::AfterBoot
+        | Modified::DirectoryGoneAfterBoot
+        | Modified::LinkedTargetAfterBoot => boot_time() + Duration::from_secs(3600),
+        Modified::Preserved | Modified::Linked => {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1000)
+        }
     };
     std::fs::File::open(path)?.set_modified(when)
+}
+
+/// A host whose boot was an hour ago, so a file written now is newer than it.
+#[cfg(target_os = "macos")]
+fn booted_an_hour_ago(launchd: &FakeLaunchd) {
+    launchd.set_boot(Ok(SECOND_BOOT.to_owned()));
+    launchd.set_boot_time(Ok(SystemTime::now() - Duration::from_secs(3600)));
 }
 
 /// The pending upgrade of [`interrupted_upgrade_journal`], rolled back on a host
@@ -10730,7 +10755,9 @@ async fn rollback_after_journal(
     edit_journal: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
     host: impl FnOnce(&FakeLaunchd),
 ) -> Result<Vec<String>, Error> {
-    let domain = harness.root.join("user.plist");
+    let config_dir = harness.root.join("launchd-domain");
+    std::fs::create_dir_all(&config_dir).expect("configuration directory");
+    let domain = config_dir.join("user.plist");
     std::fs::write(&domain, launchd_domain_xml(plist_at_journal)).expect("domain configuration");
     harness.context = harness.context.clone().with_launchd_domain_config(&domain);
     interrupted_upgrade_journal(harness).await;
@@ -10745,10 +10772,25 @@ async fn rollback_after_journal(
     .expect("rewrite journal");
     if let Some(value) = plist_now {
         std::fs::write(&domain, launchd_domain_xml(value)).expect("domain");
-        date(&domain, modified).expect("date the configuration");
+        if matches!(modified, Modified::Linked | Modified::LinkedTargetAfterBoot) {
+            let target = config_dir.join("target.plist");
+            std::fs::rename(&domain, &target).expect("move the configuration");
+            date(&target, modified).expect("date the target");
+            std::os::unix::fs::symlink(&target, &domain).expect("link the configuration");
+        } else {
+            date(&domain, modified).expect("date the configuration");
+        }
     } else {
         std::fs::remove_file(&domain).expect("remove the configuration");
-        date(&harness.root, modified).expect("date the directory");
+        if matches!(
+            modified,
+            Modified::DirectoryGoneBeforeBoot | Modified::DirectoryGoneAfterBoot
+        ) {
+            std::fs::remove_dir_all(&config_dir).expect("remove the directory");
+            date(&harness.root, modified).expect("date the ancestor");
+        } else {
+            date(&config_dir, modified).expect("date the directory");
+        }
     }
     let launchd = FakeLaunchd::new(Ok(not_loaded()));
     host(&launchd);
@@ -11032,6 +11074,79 @@ async fn a_persisted_change_or_removal_after_the_boot_is_refused() {
         &judged,
         pohunek_platform::supervisor::launchd::STANDARD_PATH,
     );
+}
+
+/// The configuration is dated by the later of its modification and status change
+/// time, a change of a link's target is seen through the link, and a missing
+/// directory is dated by the nearest one that exists.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_persisted_configuration_is_dated_by_its_latest_change() {
+    // A modification time set long ago does not hide a write after the boot.
+    for modified in [Modified::Preserved, Modified::Linked] {
+        let mut harness = Harness::new();
+        let judged = rollback_after_journal(
+            &mut harness,
+            PENDING_PATH,
+            Some(PENDING_PATH),
+            modified,
+            |_| {},
+            booted_an_hour_ago,
+        )
+        .await;
+        assert_rollback_refused(&judged, "modified after the host booted");
+    }
+    // A target changed after the boot, behind a link made earlier.
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        Some(PENDING_PATH),
+        Modified::LinkedTargetAfterBoot,
+        |_| {},
+        rebooted,
+    )
+    .await;
+    assert_rollback_refused(&judged, "modified after the host booted");
+    // The same files are older than a boot that happened after them.
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        Some(PENDING_PATH),
+        Modified::Preserved,
+        |_| {},
+        rebooted,
+    )
+    .await;
+    assert_judged(&judged, PENDING_PATH);
+
+    // A removed directory is dated by the nearest one above it.
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        None,
+        Modified::DirectoryGoneBeforeBoot,
+        |_| {},
+        rebooted,
+    )
+    .await;
+    assert_judged(
+        &judged,
+        pohunek_platform::supervisor::launchd::STANDARD_PATH,
+    );
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        None,
+        Modified::DirectoryGoneAfterBoot,
+        |_| {},
+        rebooted,
+    )
+    .await;
+    assert_rollback_refused(&judged, "modified after the host booted");
 }
 
 #[cfg(target_os = "macos")]
@@ -11421,6 +11536,25 @@ async fn a_drop_in_name_in_two_lookup_directories_resolves_by_priority() {
     std::os::unix::fs::symlink("/dev/null", &unit.drop_ins_on_disk[1]).expect("mask");
     let job = unrecorded_job_path(Ok(unit)).await.expect("path");
     assert_eq!(job.value, "/vendor/bin");
+}
+
+/// The manager keeps a drop-in masked by a link to `/dev/null` in its list; a
+/// loaded unit's resolution treats it as disabled instead of refusing it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_masked_drop_in_of_a_loaded_unit_is_disabled_not_refused() {
+    let (keep, mut unit) = unit_with_files(
+        b"[Service]\nExecStart=/bin/true\n",
+        &[b"[Service]\nEnvironment=PATH=/drop-in/bin\n"],
+        &["PATH=/drop-in/bin"],
+    );
+    let mask_dir = pohunek_test_support::tempdir().expect("scratch directory");
+    let mask = mask_dir.path().join("00-vendor.conf");
+    std::os::unix::fs::symlink("/dev/null", &mask).expect("mask");
+    unit.drop_in_paths.push(mask.display().to_string());
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, "/drop-in/bin");
+    drop((keep, mask_dir));
 }
 
 /// `PassEnvironment=` and `UnsetEnvironment=` refuse only for the name `PATH`,

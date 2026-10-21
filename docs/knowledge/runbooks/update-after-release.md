@@ -992,11 +992,16 @@ same code, and the message names the file or directive to change:
   directories hold a `PATH`-affecting line the CLI does not read: an
   `Environment=` `PATH`, `ExecSearchPath=` (more than one word, a relative entry)
   or `EnvironmentFile=` with an escape sequence or specifier, `PassEnvironment=`
-  or `UnsetEnvironment=` naming `PATH`, or a file name shared between two
-  directories. Plain `Environment=PATH=`, colon-separated `ExecSearchPath=` and
-  `EnvironmentFile=` lines (checked like a loaded unit's) of those drop-ins are
-  read in file-name order (an empty assignment resets) and give the job's `PATH`,
-  so a rollback or migration that removed the unit still completes;
+  or `UnsetEnvironment=` naming `PATH` (matched by the exact unquoted name, so
+  `PYTHONPATH` is not `PATH`), or a file name held by directories of different
+  names (`<unit>.d` and `service.d`, say). Of a file name held by same-named
+  directories in several `UnitPath` entries the higher-priority one applies, and
+  a link to `/dev/null` that wins disables the name. Plain `Environment=PATH=`,
+  colon-separated `ExecSearchPath=` and `EnvironmentFile=` lines (checked like a
+  loaded unit's) of those drop-ins are read in file-name order across the
+  directories (an empty assignment resets) and give the job's `PATH`, so a
+  rollback or migration that removed the unit still completes. A drop-in a loaded
+  unit's manager lists as a link to `/dev/null` is disabled, not refused;
 - a snapshot made stale by a change on disk while any drop-in exists (run
   `systemctl --user daemon-reload`); a drop-in directory that cannot be read;
 - an `ExecSearchPath=` that the unit file and a drop-in both feed (the directive
