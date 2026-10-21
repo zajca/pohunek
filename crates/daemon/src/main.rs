@@ -1875,7 +1875,11 @@ mod supervision_tests {
         });
 
         let logged = String::from_utf8_lossy(&capture.0.lock().expect("log capture")).into_owned();
-        assert_eq!(logged.matches("service_config.unknown_key").count(), 2, "{logged}");
+        assert_eq!(
+            logged.matches("service_config.unknown_key").count(),
+            2,
+            "{logged}"
+        );
         assert!(logged.contains("WARN"), "{logged}");
         assert!(logged.contains("future_top"), "{logged}");
         assert!(logged.contains("limits.open_file"), "{logged}");

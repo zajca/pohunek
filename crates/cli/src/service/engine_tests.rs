@@ -2257,15 +2257,24 @@ fn add_unknown_keys(harness: &Harness) {
         &format!("[limits]\nfuture_limit = \"{UNKNOWN_KEY_SECRET}\"\n"),
         1,
     );
-    assert!(text.contains("future_limit"), "the fixture has a [limits] table");
+    assert!(
+        text.contains("future_limit"),
+        "the fixture has a [limits] table"
+    );
     // Writing in place keeps the owner-private mode of the existing file.
-    std::fs::write(&path, format!("{text}\n[future]\nname = \"{UNKNOWN_KEY_SECRET}\"\n"))
-        .expect("write service.toml");
+    std::fs::write(
+        &path,
+        format!("{text}\n[future]\nname = \"{UNKNOWN_KEY_SECRET}\"\n"),
+    )
+    .expect("write service.toml");
 }
 
 fn assert_names_unknown_keys(warnings: &[String], context: &str) {
     let joined = warnings.join("\n");
-    assert!(joined.contains("limits.future_limit"), "{context}: {joined}");
+    assert!(
+        joined.contains("limits.future_limit"),
+        "{context}: {joined}"
+    );
     assert!(joined.contains("future.name"), "{context}: {joined}");
     assert!(!joined.contains(UNKNOWN_KEY_SECRET), "{context}: {joined}");
 }
@@ -2291,7 +2300,11 @@ async fn service_commands_report_unknown_keys() {
     )
     .await
     .expect("clean check");
-    assert!(clean_check.warnings.is_empty(), "{:?}", clean_check.warnings);
+    assert!(
+        clean_check.warnings.is_empty(),
+        "{:?}",
+        clean_check.warnings
+    );
 
     add_unknown_keys(&harness);
     let config = harness.config().expect("config with unknown keys");
@@ -2302,7 +2315,10 @@ async fn service_commands_report_unknown_keys() {
         .expect("status");
     assert_names_unknown_keys(&status.warnings, "status");
     let json = serde_json::to_string(&status).expect("status JSON");
-    assert!(json.contains("future_limit") && !json.contains(UNKNOWN_KEY_SECRET), "{json}");
+    assert!(
+        json.contains("future_limit") && !json.contains(UNKNOWN_KEY_SECRET),
+        "{json}"
+    );
 
     let checked = crate::service::check_with(
         &harness.context,
@@ -2332,7 +2348,10 @@ async fn an_upgrade_keeps_unknown_keys_it_does_not_own() {
 
     assert_names_unknown_keys(&report.warnings, "upgrade");
     assert!(
-        report.warnings.iter().any(|warning| warning.contains("kept")),
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("kept")),
         "{:?}",
         report.warnings
     );
@@ -2340,7 +2359,10 @@ async fn an_upgrade_keeps_unknown_keys_it_does_not_own() {
     assert!(!json.contains(UNKNOWN_KEY_SECRET), "{json}");
     harness.assert_installed(V2);
     let text = std::fs::read_to_string(harness.context.config_path()).expect("read service.toml");
-    assert!(text.contains(&format!("future_limit = \"{UNKNOWN_KEY_SECRET}\"")), "{text}");
+    assert!(
+        text.contains(&format!("future_limit = \"{UNKNOWN_KEY_SECRET}\"")),
+        "{text}"
+    );
     assert!(text.contains("[future]"), "{text}");
     let reloaded = harness.config().expect("the new daemon's file loads");
     assert_eq!(reloaded.active_version(), V2);

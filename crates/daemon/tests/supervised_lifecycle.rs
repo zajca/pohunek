@@ -236,10 +236,16 @@ async fn the_daemon_starts_on_a_newer_minor_file_and_warns_per_key() {
     for entry in std::fs::read_dir(&fixture.paths.log_dir).expect("daemon log directory") {
         let path = entry.expect("log entry").path();
         if path.is_file() {
-            logged.push_str(&String::from_utf8_lossy(&std::fs::read(&path).expect("read log")));
+            logged.push_str(&String::from_utf8_lossy(
+                &std::fs::read(&path).expect("read log"),
+            ));
         }
     }
-    assert_eq!(logged.matches("service_config.unknown_key").count(), 3, "{logged}");
+    assert_eq!(
+        logged.matches("service_config.unknown_key").count(),
+        3,
+        "{logged}"
+    );
     assert!(logged.contains("limits.future_limit"), "{logged}");
     assert!(logged.contains("\"key.path\":\"future.name\""), "{logged}");
     assert!(!logged.contains(UNKNOWN_KEY_SECRET), "{logged}");

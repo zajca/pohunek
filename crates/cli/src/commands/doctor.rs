@@ -163,17 +163,22 @@ fn working_directory_check(
 /// reported without an installed file or when it cannot be loaded; `pohunek
 /// service status` reports that.
 fn service_config_unknown_keys_check(config_dir: &Path) -> Option<DoctorCheck> {
-    let config =
-        pohunek_service_config::ServiceConfig::load(&config_dir.join(pohunek_service_config::FILE_NAME))
-            .ok()?;
-    Some(match crate::service::definition::unknown_keys_warning(&config) {
-        Some(warning) => DoctorCheck::new(SERVICE_CONFIG_UNKNOWN_KEYS_CHECK, Status::Warn, warning),
-        None => DoctorCheck::new(
-            SERVICE_CONFIG_UNKNOWN_KEYS_CHECK,
-            Status::Ok,
-            "service.toml holds no keys this version does not know",
-        ),
-    })
+    let config = pohunek_service_config::ServiceConfig::load(
+        &config_dir.join(pohunek_service_config::FILE_NAME),
+    )
+    .ok()?;
+    Some(
+        match crate::service::definition::unknown_keys_warning(&config) {
+            Some(warning) => {
+                DoctorCheck::new(SERVICE_CONFIG_UNKNOWN_KEYS_CHECK, Status::Warn, warning)
+            }
+            None => DoctorCheck::new(
+                SERVICE_CONFIG_UNKNOWN_KEYS_CHECK,
+                Status::Ok,
+                "service.toml holds no keys this version does not know",
+            ),
+        },
+    )
 }
 
 /// The supervision mode this process can infer for the daemon.
@@ -800,8 +805,16 @@ open_files = 8192
         )));
         let check = service_config_unknown_keys_check(&dir).expect("a check for an unknown key");
         assert_eq!(check.status, Status::Warn);
-        assert!(check.detail.contains("limits.open_file"), "{}", check.detail);
-        assert!(check.detail.contains("limits.future_limit"), "{}", check.detail);
+        assert!(
+            check.detail.contains("limits.open_file"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("limits.future_limit"),
+            "{}",
+            check.detail
+        );
         assert!(
             check.detail.contains("did you mean `limits.open_files`"),
             "{}",

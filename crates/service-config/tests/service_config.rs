@@ -1797,11 +1797,20 @@ fn unknown_keys_in_tolerant_tables_load_and_are_reported() {
     let fixture = Fixture::new();
     let text = [
         ("prefix =", "future_top = \"x\"\nprefix ="),
-        ("worker_connect_ms", "future_deadline = 1\nworker_connect_ms"),
+        (
+            "worker_connect_ms",
+            "future_deadline = 1\nworker_connect_ms",
+        ),
         ("grace_ms = 5000", "grace_ms = 5000\nfuture_sweep = 1"),
         ("submit_delay_ms", "future_input = 1\nsubmit_delay_ms"),
-        ("turn_max_ms = 1800000", "turn_max_ms = 1800000\nfuture_wait = 1"),
-        ("stderr_tail_bytes = 4096", "stderr_tail_bytes = 4096\nfuture_hook = 1"),
+        (
+            "turn_max_ms = 1800000",
+            "turn_max_ms = 1800000\nfuture_wait = 1",
+        ),
+        (
+            "stderr_tail_bytes = 4096",
+            "stderr_tail_bytes = 4096\nfuture_hook = 1",
+        ),
         ("open_files = 8192", "open_files = 8192\nfuture_limit = 1"),
     ]
     .iter()
@@ -1809,11 +1818,16 @@ fn unknown_keys_in_tolerant_tables_load_and_are_reported() {
         replace(&text, from, to)
     });
 
-    let config = fixture.load(&text).expect("tolerant tables accept unknown keys");
+    let config = fixture
+        .load(&text)
+        .expect("tolerant tables accept unknown keys");
 
     let mut expected = vec![
         ("future_top", line_of(&text, "future_top")),
-        ("deadlines.future_deadline", line_of(&text, "future_deadline")),
+        (
+            "deadlines.future_deadline",
+            line_of(&text, "future_deadline"),
+        ),
         ("sweep.future_sweep", line_of(&text, "future_sweep")),
         ("input.future_input", line_of(&text, "future_input")),
         ("waits.future_wait", line_of(&text, "future_wait")),
@@ -1847,7 +1861,13 @@ fn an_unknown_section_loads_and_is_reported() {
     paths.sort_unstable();
     assert_eq!(
         paths,
-        ["future", "future.flag", "future.nested", "future.nested.deep", "future_list"]
+        [
+            "future",
+            "future.flag",
+            "future.nested",
+            "future.nested.deep",
+            "future_list"
+        ]
     );
     let section = config
         .unknown_keys()
@@ -1887,9 +1907,18 @@ fn a_typo_of_a_required_key_fails_with_a_suggestion() {
         "stderr_tail_byte = 4096",
     );
     let message = parse_message(fixture.load(&text));
-    assert!(message.contains("missing field `stderr_tail_bytes`"), "{message}");
-    assert!(message.contains("did you mean `hooks.stderr_tail_bytes`"), "{message}");
-    assert!(message.contains("`hooks.stderr_tail_byte` is not a key"), "{message}");
+    assert!(
+        message.contains("missing field `stderr_tail_bytes`"),
+        "{message}"
+    );
+    assert!(
+        message.contains("did you mean `hooks.stderr_tail_bytes`"),
+        "{message}"
+    );
+    assert!(
+        message.contains("`hooks.stderr_tail_byte` is not a key"),
+        "{message}"
+    );
 
     // A top-level typo of a required table is hinted the same way.
     let table = replace(GOLDEN, "[limits]", "[limit]");
@@ -1900,14 +1929,21 @@ fn a_typo_of_a_required_key_fails_with_a_suggestion() {
     // A key that resembles nothing gets no hint.
     let far = replace(GOLDEN, "stderr_tail_bytes = 4096", "unrelated = 4096");
     let message = parse_message(fixture.load(&far));
-    assert!(message.contains("missing field `stderr_tail_bytes`"), "{message}");
+    assert!(
+        message.contains("missing field `stderr_tail_bytes`"),
+        "{message}"
+    );
     assert!(!message.contains("did you mean"), "{message}");
 }
 
 #[test]
 fn a_near_miss_unknown_key_warns_with_a_suggestion() {
     let fixture = Fixture::new();
-    let text = replace(GOLDEN, "open_files = 8192", "open_files = 8192\nopen_file = 1");
+    let text = replace(
+        GOLDEN,
+        "open_files = 8192",
+        "open_files = 8192\nopen_file = 1",
+    );
     let config = fixture.load(&text).expect("a near miss only warns");
 
     let key = config
@@ -1916,7 +1952,10 @@ fn a_near_miss_unknown_key_warns_with_a_suggestion() {
         .find(|key| key.path == "limits.open_file")
         .expect("reported");
     assert_eq!(key.suggestion.as_deref(), Some("limits.open_files"));
-    assert!(key.to_string().contains("did you mean `limits.open_files`"), "{key}");
+    assert!(
+        key.to_string().contains("did you mean `limits.open_files`"),
+        "{key}"
+    );
     assert_eq!(config.open_files(), 8192);
 }
 
@@ -1924,7 +1963,11 @@ fn a_near_miss_unknown_key_warns_with_a_suggestion() {
 fn unknown_keys_never_mask_validation_errors() {
     let fixture = Fixture::new();
     let text = replace(
-        &replace(GOLDEN, "open_files = 8192", "open_files = 1\nfuture_limit = 1"),
+        &replace(
+            GOLDEN,
+            "open_files = 8192",
+            "open_files = 1\nfuture_limit = 1",
+        ),
         "prefix =",
         "future_top = 1\nprefix =",
     );
@@ -1948,7 +1991,10 @@ fn the_schema_version_rule_is_unchanged_for_tolerant_files() {
     ));
     let missing = GOLDEN.replacen("schema_version = 6\n", "future_key = 1\n", 1);
     let message = parse_message(fixture.load(&missing));
-    assert!(message.contains("missing field `schema_version`"), "{message}");
+    assert!(
+        message.contains("missing field `schema_version`"),
+        "{message}"
+    );
 }
 
 #[test]

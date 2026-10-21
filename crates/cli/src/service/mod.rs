@@ -957,7 +957,14 @@ pub(crate) fn check_local(
             }
             let namespace = context.namespace()?;
             layout::verify_claim(&layout, &namespace)?;
-            (record::Operation::Install, prefix, namespace, plan, None, None)
+            (
+                record::Operation::Install,
+                prefix,
+                namespace,
+                plan,
+                None,
+                None,
+            )
         } else {
             let config_source = verified_config_source(context)?;
             engine::upgrade_preflight(context)?;
