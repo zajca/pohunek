@@ -1166,6 +1166,9 @@ impl<'a> Engine<'a> {
         let warnings = job_warnings(self.context, &job);
         late.warnings.extend(warnings.iter().cloned());
         if swap {
+            // A failed swap rolls back with the old job gone: refuse now, while
+            // it still runs, a job the rollback could not judge then.
+            journal_job_path(self.context, record, true).await?;
             if let Some(dir) = config.daemon_executable().parent() {
                 self.pass_swap_gate(record, layout, dir, &job, &warnings, late)
                     .await?;

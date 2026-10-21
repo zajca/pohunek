@@ -10734,51 +10734,56 @@ async fn a_rollback_gate_before_the_stop_judges_the_unloaded_job() {
     assert!(harness.pending().is_some(), "the transaction is kept");
 }
 
-/// The runtime step stops the daemon to apply: with the job undecidable once it
-/// is unloaded, the step refuses before the stop.
+/// The swap and the runtime step stop or replace the daemon: with the job
+/// undecidable once it is unloaded, both refuse before touching it.
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn the_runtime_step_judges_the_unloaded_job_before_it_stops_the_daemon() {
+async fn the_swap_and_the_runtime_step_judge_the_unloaded_job_before_they_stop_the_daemon() {
     const LATER: &str = "/opt/later/bin:/usr/bin";
-    let mut harness = Harness::new();
-    let domain = harness.root.join("user.plist");
-    std::fs::write(&domain, launchd_domain_xml(PENDING_PATH)).expect("domain configuration");
-    harness.context = harness.context.clone().with_launchd_domain_config(&domain);
-    set_job_path(&mut harness, JOURNALED_PATH);
-    harness.install(V1).await.expect("install");
-    let mut engine = harness.engine();
-    engine.interrupt_after = Some(Step::Definition);
-    engine
-        .upgrade(&harness.staged(V2), V2)
-        .await
-        .expect_err("interrupted before the runtime step");
-    std::fs::write(&domain, launchd_domain_xml(LATER)).expect("domain configuration");
-    harness.context = harness
-        .context
-        .clone()
-        .with_launchd_job(Arc::new(FlipLaunchd {
-            fake: harness.fake.clone(),
-            loaded: loaded_job(LATER),
-            unloaded: not_loaded(),
-            boot: SECOND_BOOT.to_owned(),
-        }));
-    harness.runtimes.plan(installing_plan());
-    let uninstalls = harness.fake.world().uninstalls;
+    for apply in [false, true] {
+        let mut harness = Harness::new();
+        let domain = harness.root.join("user.plist");
+        std::fs::write(&domain, launchd_domain_xml(PENDING_PATH)).expect("domain configuration");
+        harness.context = harness.context.clone().with_launchd_domain_config(&domain);
+        set_job_path(&mut harness, JOURNALED_PATH);
+        harness.install(V1).await.expect("install");
+        let mut engine = harness.engine();
+        engine.interrupt_after = Some(Step::Definition);
+        engine
+            .upgrade(&harness.staged(V2), V2)
+            .await
+            .expect_err("interrupted before the runtime step");
+        std::fs::write(&domain, launchd_domain_xml(LATER)).expect("domain configuration");
+        harness.context = harness
+            .context
+            .clone()
+            .with_launchd_job(Arc::new(FlipLaunchd {
+                fake: harness.fake.clone(),
+                loaded: loaded_job(LATER),
+                unloaded: not_loaded(),
+                boot: SECOND_BOOT.to_owned(),
+            }));
+        if apply {
+            harness.runtimes.plan(installing_plan());
+        }
+        let (uninstalls, replaces) = {
+            let world = harness.fake.world();
+            (world.uninstalls, world.replaces)
+        };
 
-    // Resuming the same upgrade reaches the runtime step with the daemon loaded.
-    let error = harness
-        .engine()
-        .with_adoption_preflight(Box::new(ScriptedPreflight::default()))
-        .upgrade(&harness.staged(V2), V2)
-        .await
-        .expect_err("the unloaded job cannot be judged");
+        // Resuming the same upgrade reaches the swap with the daemon loaded.
+        let error = harness
+            .engine()
+            .with_adoption_preflight(Box::new(ScriptedPreflight::default()))
+            .upgrade(&harness.staged(V2), V2)
+            .await
+            .expect_err("the unloaded job cannot be judged");
 
-    assert_eq!(error.code(), "service_manager_environment_unavailable");
-    assert_eq!(
-        harness.fake.world().uninstalls,
-        uninstalls,
-        "refused before the stop"
-    );
+        assert_eq!(error.code(), "service_manager_environment_unavailable");
+        let world = harness.fake.world();
+        assert_eq!(world.uninstalls, uninstalls, "no stop (apply {apply})");
+        assert_eq!(world.replaces, replaces, "no replacement (apply {apply})");
+    }
 }
 
 #[cfg(target_os = "macos")]
