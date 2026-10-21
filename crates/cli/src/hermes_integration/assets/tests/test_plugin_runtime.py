@@ -905,6 +905,23 @@ class HookTests(unittest.TestCase):
         self.assertEqual(attention["agent_kind"], "codex")
         self.assertEqual(attention["title"], "Codex session update")
 
+    def test_activity_report_keeps_the_native_session_id_of_the_identity_report(self) -> None:
+        reporter = Reporter("hermes", environ={
+            "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_INSTANCE_ID": "r-1",
+            "POHUNEK_WORKER_SOCKET_PATH": "/tmp/worker", "POHUNEK_SOCKET_PATH": "/tmp/daemon",
+            "POHUNEK_PROTOCOL_VERSION": "1", "POHUNEK_DAEMON_ID": "host-a",
+        })
+        reporter._start_identity = 1
+        with mock.patch.object(reporter, "_send_worker", return_value=True), \
+                mock.patch.object(reporter, "_send_public") as public:
+            reporter.activity("working")
+            reporter.identity("native-session")
+            reporter.activity("blocked")
+
+        before, after = (call.args[1] for call in public.call_args_list)
+        self.assertNotIn("agent_session_id", before)
+        self.assertEqual(after["agent_session_id"], "native-session")
+
     def test_unmanaged_process_never_reports(self) -> None:
         reporter = hook_reporter({})
         with mock.patch.object(reporter._reporter, "_send", wraps=reporter._reporter._send) as send:
@@ -1016,6 +1033,24 @@ class HookTests(unittest.TestCase):
         self.assertEqual(methods.count("session.report_agent"), 3)
         kinds = [call.args[1]["kind"] for call in public.call_args_list if call.args[0] == "notification.create"]
         self.assertEqual(kinds, ["agent_blocked", "error"])
+
+    def test_public_activity_and_release_bind_the_report_to_its_process(self) -> None:
+        reporter = hook_reporter({
+            "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s", "POHUNEK_WORKER_INSTANCE_ID": "r",
+            "POHUNEK_SOCKET_PATH": "/tmp/d", "POHUNEK_WORKER_SOCKET_PATH": "/tmp/w", "POHUNEK_PROTOCOL_VERSION": "1",
+        })
+        inner = reporter._reporter
+        inner._start_identity = 77
+        with mock.patch.object(inner, "_send_worker", return_value=False), mock.patch.object(inner, "_send_public") as public:
+            inner._report_activity("working")
+            inner.release()
+        report = next(call.args[1] for call in public.call_args_list if call.args[0] == "session.report_agent")
+        release = next(call.args[1] for call in public.call_args_list if call.args[0] == "session.release_agent")
+        for params in (report, release):
+            self.assertEqual(params["pid"], inner._pid)
+            self.assertEqual(params["pid_start_identity"], "77")
+            self.assertEqual(params["monotonic_sequence"], params["seq"])
+        self.assertGreater(int(release["seq"]), int(report["seq"]))
 
     def test_pinned_false_completed_maps_to_failed_and_semantic_response_errors_count(self) -> None:
         reporter = hook_reporter({"POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s", "POHUNEK_WORKER_INSTANCE_ID": "r", "POHUNEK_SOCKET_PATH": "/tmp/d", "POHUNEK_WORKER_SOCKET_PATH": "/tmp/w", "POHUNEK_PROTOCOL_VERSION": "1"})

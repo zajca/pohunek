@@ -70,9 +70,11 @@ use native_attestation::{attest_report_caller, unattested, NativeReportRefusal};
 use reconcile::LossClassification;
 
 mod attach;
+mod claim;
 mod conflict_stop;
 mod detector;
 mod diff;
+mod forward;
 mod hooks;
 mod input;
 mod lag;
@@ -88,6 +90,8 @@ mod profile_freeze_tests;
 mod profile_pin_tests;
 mod read;
 mod reconcile;
+use claim::{ClaimKey, ClaimOrigin, PendingActivity, PendingRelease};
+use forward::Forwarded;
 pub use native_attestation::ControlPeer;
 pub use reconcile::upgrade_preflight;
 mod resume;
@@ -780,6 +784,9 @@ struct SessionRegistryInner {
     /// resolving its agent and committing it.
     #[cfg(test)]
     report_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Replaces the bound of a forward to the worker while armed.
+    #[cfg(test)]
+    forward_bound: std::sync::Mutex<Option<Duration>>,
     /// Parks the next worker metadata projection of a reported agent between
     /// resolving its detector configuration and committing it.
     #[cfg(test)]
@@ -864,6 +871,26 @@ struct SessionEntry {
     activity_evidence: VecDeque<ActivityEvidence>,
     /// Serializes complete input framing transactions for this logical session.
     input_gate: Arc<Mutex<()>>,
+    /// Serializes the commits of the active identity: a worker metadata
+    /// projection and the commit of a forwarded report or release. It is held
+    /// across the store write, so the order of two commits is the order in
+    /// which they take it.
+    identity_commit: Arc<Mutex<()>>,
+    /// Newest worker identity revision this daemon committed, with the worker
+    /// instance that counted it. A snapshot read before that commit carries a
+    /// smaller revision and cannot replace the identity.
+    identity_fence: Option<IdentityFence>,
+    /// Public order and activity of an accepted forwarded report whose
+    /// identity the daemon has not committed yet; the claim counts as held.
+    pending_activity: Option<Box<PendingActivity>>,
+    /// The public order of a forwarded release the worker journaled and the
+    /// daemon has not adopted yet.
+    pending_release: Option<Box<PendingRelease>>,
+    /// Unacknowledged forwarded operations that lost their slot to a later one;
+    /// the worker may hold them.
+    displaced_pending: Vec<claim::Unacknowledged>,
+    /// Reasons already logged for reports that stay memory-only.
+    not_durable_logged: HashSet<NotDurableCause>,
     runtime: RuntimeHandle,
     /// Worker job of the current runtime, when the record names one.
     job: Option<Generation>,
@@ -933,6 +960,34 @@ impl SessionEntry {
         self.detector_cancel.cancel();
         self.procwatch_cancel.cancel();
         self.runtime_watch_cancel.cancel();
+    }
+}
+
+/// The newest worker identity revision committed for a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IdentityFence {
+    worker_instance_id: String,
+    revision: u64,
+}
+
+/// Why an agent report is kept in memory only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NotDurableCause {
+    /// The report names no process or no monotonic sequence.
+    Unbound,
+    /// The worker negotiated a protocol that cannot journal a forwarded claim.
+    WorkerProtocolV7,
+    /// Forwarding to the worker failed.
+    ForwardFailed,
+}
+
+impl NotDurableCause {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unbound => "unbound",
+            Self::WorkerProtocolV7 => "worker_protocol_v7",
+            Self::ForwardFailed => "forward_failed",
+        }
     }
 }
 
@@ -1072,6 +1127,7 @@ enum RuntimeHandle {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveAgentReport {
+    /// Names the caller of a memory claim; a journaled claim is named by its origin.
     source: String,
     agent: String,
     seq: Option<u64>,
@@ -1083,6 +1139,8 @@ struct ActiveAgentReport {
     /// client reported it: an observed agent runs the pinned definition as
     /// observed, never a host profile of the same name.
     observed: bool,
+    /// Where the claim came from and what orders it.
+    origin: ClaimOrigin,
 }
 
 type NativeIdentityReport = crate::store::NativeIdentityOrdering;
@@ -2139,6 +2197,8 @@ impl SessionRegistry {
                 #[cfg(test)]
                 report_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
+                forward_bound: std::sync::Mutex::new(None),
+                #[cfg(test)]
                 metadata_apply_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 initial_input_hold: std::sync::Mutex::new(None),
@@ -3124,6 +3184,21 @@ impl SessionRegistry {
         }
     }
 
+    /// How long a forwarded report or release, and the admission that precedes
+    /// it, wait for the worker.
+    fn forward_bound(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(bound) = *self
+            .inner
+            .forward_bound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return bound;
+        }
+        self.inner.config.worker_connect_deadline
+    }
+
     /// Parks an active-agent report resolution between resolving its agent and
     /// committing it, for as long as a test keeps the hold armed.
     #[cfg(test)]
@@ -3950,14 +4025,55 @@ impl SessionRegistry {
         }
     }
 
+    /// Applies the activity a report carried to the session and returns the
+    /// evidence it recorded.
+    fn apply_reported_activity(
+        &self,
+        entry: &mut SessionEntry,
+        session_id: &SessionId,
+        activity: AgentActivity,
+        activity_epoch: &str,
+    ) -> Option<ActivityEvidence> {
+        self.inner
+            .turns
+            .note_activity(session_id, entry.info.activity, activity);
+        entry.info.activity = Some(activity);
+        entry.info.state_source = StateSource::Report;
+        record_activity_evidence(entry, activity, StateSource::Report, activity_epoch)
+    }
+
     /// Record the active nested agent currently owning a live session.
+    ///
+    /// A forward whose answer was lost is attached to the session at this one
+    /// exit, whatever the attempt returned, so no early return can drop it.
+    pub async fn try_report_agent(
+        &self,
+        params: SessionReportAgentParams,
+    ) -> Result<SessionReportAgentResult, ProtocolError> {
+        let session_id = params.session_id.clone();
+        let mut unacknowledged: Option<claim::Unacknowledged> = None;
+        let mut commit_guard: Option<forward::CommitGuard> = None;
+        let result = self
+            .attempt_report_agent(params, &mut unacknowledged, &mut commit_guard)
+            .await;
+        if let Some(operation) = unacknowledged.take() {
+            if let Some(entry) = self.inner.sessions.lock().await.get_mut(&session_id) {
+                claim::attach_unacknowledged(entry, operation);
+            }
+        }
+        drop(commit_guard);
+        result
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "ordered admission, ordering and projection checks stay linear so every rejection precedes mutation"
     )]
-    pub async fn try_report_agent(
+    async fn attempt_report_agent(
         &self,
         params: SessionReportAgentParams,
+        unacknowledged: &mut Option<claim::Unacknowledged>,
+        commit_guard: &mut Option<forward::CommitGuard>,
     ) -> Result<SessionReportAgentResult, ProtocolError> {
         let not_recorded = SessionReportAgentResult { recorded: false };
         let activity_epoch = self.daemon_instance_id().to_owned();
@@ -3975,7 +4091,16 @@ impl SessionRegistry {
         ) else {
             return Ok(not_recorded);
         };
+        // A reporter that names its pid but not its start identity is bound
+        // by the one the host reports for the pid now when it contends with a
+        // journaled claim.
+        let host_start = params
+            .pid
+            .filter(|_| attested_start.is_none())
+            .and_then(|pid| self.inner.inspector.identity(pid).ok().flatten())
+            .map(|current| current.start_identity.get());
         let mut stale_resolutions = 0;
+        let mut forward_offered = false;
         let (info, rescan, evidence) = loop {
             let resolution = match self
                 .resolve_session_agent(&params.session_id, &params.agent)
@@ -4005,9 +4130,71 @@ impl SessionRegistry {
             {
                 return Ok(not_recorded);
             }
-            let active_detector_config = detector_config_for_resolved_agent(resolved);
             #[cfg(test)]
             self.hold_report().await;
+            // One operation decides, forwards and commits a claim change at a
+            // time, so its order checks hold until its commit.
+            if commit_guard.is_none() {
+                *commit_guard = self.lock_identity_commit(&params.session_id).await;
+            }
+            if !std::mem::replace(&mut forward_offered, true) {
+                // The worker never saw a report or release that stayed in this
+                // daemon's memory, so the public order against them is
+                // checked before the report is offered to it.
+                // The same report again (the hook's fallback after a timeout)
+                // is the one the worker may journal now.
+                let superseded = self
+                    .inner
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&params.session_id)
+                    .is_some_and(|entry| {
+                        entry.last_agent_report.as_ref().is_some_and(|last| {
+                            let repeated = entry.active_agent.is_some()
+                                && last.source == params.source
+                                && last.agent == resolved.name
+                                && last.seq == report_sequence;
+                            matches!(last.origin, ClaimOrigin::Memory { .. })
+                                && !repeated
+                                && !report_is_current(
+                                    Some(last),
+                                    &params.source,
+                                    &resolved.name,
+                                    report_sequence,
+                                )
+                        })
+                    });
+                if superseded {
+                    debug!(
+                        session_id = %params.session_id.0,
+                        source = %params.source,
+                        agent = %resolved.name,
+                        seq = ?params.seq,
+                        "stale active-agent report; ignoring"
+                    );
+                    return Ok(not_recorded);
+                }
+                match self
+                    .forward_active_report(
+                        &params,
+                        resolved,
+                        (valid_session_id.as_deref(), valid_session_path.as_deref()),
+                        attested_start,
+                        reported_activity.map(|activity| (activity, activity_epoch.as_str())),
+                        commit_guard,
+                    )
+                    .await
+                {
+                    Forwarded::Answered(result) => return Ok(result),
+                    Forwarded::Unacknowledged(operation) => *unacknowledged = Some(operation),
+                    Forwarded::MemoryOnly => {}
+                }
+                if commit_guard.is_none() {
+                    *commit_guard = self.lock_identity_commit(&params.session_id).await;
+                }
+            }
+            let active_detector_config = detector_config_for_resolved_agent(resolved);
 
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(&params.session_id) else {
@@ -4052,17 +4239,50 @@ impl SessionRegistry {
                     seq = ?params.seq,
                     "stale active-agent report; ignoring"
                 );
+                if let Some(operation) = unacknowledged.take() {
+                    claim::attach_unacknowledged(entry, operation);
+                }
                 return Ok(not_recorded);
             }
 
             let report_base = RuntimeRef::from(resolved.base.clone());
+            let (bound_pid, bound_start) =
+                bind_report_process(entry, params.pid, &report_base, attested_start);
+            // Against a journaled claim a reporter that names no start identity
+            // is bound by the one the host reports now; a cached observation
+            // may belong to an earlier process under a reused pid.
+            // A report that names no pid has no process to bind.
+            let process = if claim::is_journaled(entry) && attested_start.is_none() {
+                (params.pid, host_start)
+            } else {
+                (bound_pid, bound_start)
+            };
+            if !claim::memory_report_may_replace(
+                entry,
+                &params.source,
+                &resolved.name,
+                report_sequence,
+                process,
+            ) {
+                debug!(
+                    session_id = %params.session_id.0,
+                    source = %params.source,
+                    agent = %resolved.name,
+                    "active-agent report could not be forwarded and does not replace the worker's claim; ignoring"
+                );
+                if let Some(operation) = unacknowledged.take() {
+                    claim::attach_unacknowledged(entry, operation);
+                }
+                return Ok(not_recorded);
+            }
+            let (over, shadow) = claim::memory_floor(entry);
             let (pid, start_identity) = procwatch::keep_bound_reporter(
                 entry,
                 &params.source,
                 &resolved.name,
                 &report_base,
                 params.pid,
-                bind_report_process(entry, params.pid, &report_base, attested_start),
+                process,
             );
             let report = ActiveAgentReport {
                 source: params.source.clone(),
@@ -4073,7 +4293,22 @@ impl SessionRegistry {
                 reported_at: crate::time::now(),
                 activity_reported: reported_activity.is_some(),
                 observed: false,
+                origin: ClaimOrigin::Memory {
+                    key: pid.zip(start_identity).zip(params.monotonic_sequence).map(
+                        |((pid, start_identity), sequence)| ClaimKey {
+                            provider: resolved.base.as_str().to_owned(),
+                            pid,
+                            start_identity,
+                            sequence: sequence.get(),
+                        },
+                    ),
+                    over,
+                    shadow,
+                },
             };
+            if let Some(operation) = unacknowledged.take() {
+                claim::attach_unacknowledged(entry, operation);
+            }
             entry.active_agent = Some(report.clone());
             entry.last_agent_report = Some(report);
             entry.info.active_agent = Some(resolved.name.clone());
@@ -4088,12 +4323,7 @@ impl SessionRegistry {
                 .active_agent_session_path
                 .clone_from(&valid_session_path);
             let evidence = reported_activity.and_then(|activity| {
-                self.inner
-                    .turns
-                    .note_activity(&params.session_id, entry.info.activity, activity);
-                entry.info.activity = Some(activity);
-                entry.info.state_source = StateSource::Report;
-                record_activity_evidence(entry, activity, StateSource::Report, &activity_epoch)
+                self.apply_reported_activity(entry, &params.session_id, activity, &activity_epoch)
             });
             send_detector_config(entry, active_detector_config);
             entry.info.updated_at = timestamp_now();
@@ -4134,16 +4364,18 @@ impl SessionRegistry {
         // A releasing process that already exited cannot be checked and does
         // not block its release; any other refusal means the claimed subject is
         // not the process behind the pid.
-        if let Err(refusal) = self.attest_start_identity(
+        let attested_start = match self.attest_start_identity(
             &params.session_id,
             params.pid,
             params.pid_start_identity,
             "active-agent release",
         ) {
-            if refusal != StartIdentityRefusal::ProcessGone {
-                return Ok(not_released);
-            }
-        }
+            Ok(start) => start,
+            Err(StartIdentityRefusal::ProcessGone) => params
+                .pid_start_identity
+                .map(protocol::ProcessStartIdentity::get),
+            Err(_) => return Ok(not_released),
+        };
         let resolved = match self
             .resolve_session_agent(&params.session_id, &params.agent)
             .await
@@ -4171,47 +4403,51 @@ impl SessionRegistry {
         {
             return Ok(not_released);
         }
+        // One operation decides, forwards and commits a claim change at a time,
+        // so its order checks hold until its commit.
+        let mut commit_guard = self.lock_identity_commit(&params.session_id).await;
+        // The worker never saw a report that stayed in this daemon's memory, so
+        // the public order against it is checked before the release is offered.
+        let superseded = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(&params.session_id)
+            .and_then(|entry| entry.active_agent.as_ref())
+            .is_some_and(|active| {
+                matches!(active.origin, ClaimOrigin::Memory { .. })
+                    && active.source == params.source
+                    && active.agent == resolved.name
+                    && !release_matches(active, &params.source, &resolved.name, report_sequence)
+            });
+        if superseded {
+            debug!(
+                session_id = %params.session_id.0,
+                source = %params.source,
+                seq = ?params.seq,
+                "active-agent release did not match current report; ignoring"
+            );
+            return Ok(not_released);
+        }
+        let unacknowledged = match self
+            .forward_active_release(&params, &resolved, attested_start, &mut commit_guard)
+            .await
+        {
+            Forwarded::Answered(result) => return Ok(result),
+            Forwarded::Unacknowledged(operation) => Some(operation),
+            Forwarded::MemoryOnly => None,
+        };
+        let _commit_guard = match commit_guard {
+            Some(guard) => Some(guard),
+            None => self.lock_identity_commit(&params.session_id).await,
+        };
 
-        let info = {
-            let mut sessions = self.inner.sessions.lock().await;
-            let Some(entry) = sessions.get_mut(&params.session_id) else {
-                debug!(
-                    session_id = %params.session_id.0,
-                    "active-agent release for an unknown session; ignoring"
-                );
-                return Ok(not_released);
-            };
-            if is_terminal(entry.info.state) {
-                debug!(
-                    session_id = %params.session_id.0,
-                    "active-agent release for a terminal session; ignoring"
-                );
-                return Ok(not_released);
-            }
-            let Some(active) = entry.active_agent.as_ref() else {
-                return Ok(not_released);
-            };
-            if !release_matches(active, &params.source, &resolved.name, report_sequence) {
-                debug!(
-                    session_id = %params.session_id.0,
-                    source = %params.source,
-                    agent = %resolved.name,
-                    seq = ?params.seq,
-                    "active-agent release did not match current report; ignoring"
-                );
-                return Ok(not_released);
-            }
-            let tombstone = ActiveAgentReport {
-                source: params.source.clone(),
-                agent: resolved.name.clone(),
-                seq: report_sequence,
-                pid: None,
-                start_identity: None,
-                reported_at: crate::time::now(),
-                activity_reported: false,
-                observed: false,
-            };
-            clear_active_agent(entry, tombstone)
+        let Some(info) = self
+            .release_memory_claim(&params, &resolved.name, report_sequence, unacknowledged)
+            .await
+        else {
+            return Ok(not_released);
         };
 
         self.emit(event::SESSION_UPDATED, &info);
@@ -4227,6 +4463,86 @@ impl SessionRegistry {
         self.try_release_agent(params)
             .await
             .unwrap_or(SessionReleaseAgentResult { released: false })
+    }
+
+    /// Applies a release that was not forwarded to the in-memory claim and
+    /// returns the session's info when the claim ended.
+    async fn release_memory_claim(
+        &self,
+        params: &SessionReleaseAgentParams,
+        agent: &str,
+        report_sequence: Option<u64>,
+        unacknowledged: Option<claim::Unacknowledged>,
+    ) -> Option<SessionInfo> {
+        let mut sessions = self.inner.sessions.lock().await;
+        let Some(entry) = sessions.get_mut(&params.session_id) else {
+            debug!(
+                session_id = %params.session_id.0,
+                "active-agent release for an unknown session; ignoring"
+            );
+            return None;
+        };
+        if is_terminal(entry.info.state) {
+            debug!(
+                session_id = %params.session_id.0,
+                "active-agent release for a terminal session; ignoring"
+            );
+            return None;
+        }
+        let released = Self::end_memory_claim(entry, params, agent, report_sequence);
+        if let Some(operation) = unacknowledged {
+            claim::attach_unacknowledged(entry, operation);
+        }
+        released
+    }
+
+    /// Ends the in-memory claim of `entry` that a release names, unless the
+    /// worker's journal holds it.
+    fn end_memory_claim(
+        entry: &mut SessionEntry,
+        params: &SessionReleaseAgentParams,
+        agent: &str,
+        report_sequence: Option<u64>,
+    ) -> Option<SessionInfo> {
+        let active = entry.active_agent.as_ref()?;
+        if claim::is_journaled(entry) {
+            warn!(
+                name: "session.active_identity.forward_failed",
+                session_id = %params.session_id.0,
+                "a release could not be forwarded and does not end a claim the worker journaled; ignoring"
+            );
+            return None;
+        }
+        if !release_matches(active, &params.source, agent, report_sequence) {
+            debug!(
+                session_id = %params.session_id.0,
+                source = %params.source,
+                agent = %agent,
+                seq = ?params.seq,
+                "active-agent release did not match current report; ignoring"
+            );
+            return None;
+        }
+        let (over, shadow) = match &active.origin {
+            ClaimOrigin::Memory { over, shadow, .. } => (over.clone(), shadow.clone()),
+            ClaimOrigin::Journaled { .. } => (None, Vec::new()),
+        };
+        let tombstone = ActiveAgentReport {
+            source: params.source.clone(),
+            agent: agent.to_owned(),
+            seq: report_sequence,
+            pid: None,
+            start_identity: None,
+            reported_at: crate::time::now(),
+            activity_reported: false,
+            observed: false,
+            origin: ClaimOrigin::Memory {
+                key: None,
+                over,
+                shadow,
+            },
+        };
+        Some(clear_active_agent(entry, tombstone))
     }
 
     /// List all known sessions, with each session's `project_label` enriched from
@@ -5423,6 +5739,26 @@ impl SessionRegistry {
     /// this attempt without shortening the launch budget of its healthy
     /// session; the watcher passes the configured `worker_connect_deadline`.
     async fn reconnect_worker(
+        &self,
+        id: &SessionId,
+        expected: &RuntimeWatchIdentity,
+        socket_path: &Path,
+        cancel: &CancellationToken,
+        error: &WorkerError,
+        connect_deadline: Duration,
+    ) -> Option<Worker> {
+        Box::pin(self.reconnect_worker_attempts(
+            id,
+            expected,
+            socket_path,
+            cancel,
+            error,
+            connect_deadline,
+        ))
+        .await
+    }
+
+    async fn reconnect_worker_attempts(
         &self,
         id: &SessionId,
         expected: &RuntimeWatchIdentity,
@@ -7082,7 +7418,7 @@ impl SessionRegistry {
         let bound = if retryable {
             self.inner.config.hook_admission_wait
         } else {
-            self.inner.config.worker_connect_deadline
+            self.forward_bound()
         };
         let schema = match pinned {
             Some(definition) => definition.hook_schema(),

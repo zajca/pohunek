@@ -8,8 +8,8 @@
 use pohunek_worker_protocol::{
     ActiveIdentityOutcome, ClaimOrigin, ControlCode, ForwardedActiveRelease, ForwardedActiveReport,
     IdentityRejectReason, LeaseId, ProcessIdentity, ReportedSession, ReportedSessionKind,
-    RequestKind, ResponseKind, RuntimeScope, SessionId, WorkerId, WorkerInstanceId,
-    CURRENT_VERSION, PREVIOUS_VERSION,
+    RequestKind, ResponseKind, RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, WorkerId,
+    WorkerInstanceId, CURRENT_VERSION, PREVIOUS_VERSION,
 };
 
 use super::{
@@ -621,6 +621,103 @@ async fn a_replaced_release_tombstone_does_not_reopen_the_sequences_of_its_proce
         record(&server, &mut connection, &lease_id, report(child, 6)).await,
         rejected(IdentityRejectReason::SequenceStale),
         "the released process keeps its mark"
+    );
+    stop(&server, &pty).await;
+}
+
+/// Kills `child` and waits until the host no longer reports it.
+async fn exit_child(child: ProcessIdentity) {
+    let inspector = HostInspector::new();
+    let killed = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(child.pid.to_string())
+        .status()
+        .expect("run kill");
+    assert!(killed.success(), "the child accepts the signal");
+    pohunek_test_support::wait::wait_until("the child to be gone", || async {
+        match inspector.identity(child.pid) {
+            Ok(Some(current)) if current.start_identity.get() == child.start_identity => None,
+            _ => Some(()),
+        }
+    })
+    .await;
+}
+
+/// A process that exited after it reported can still release itself, by its
+/// exact pid and start identity; no other subject is accepted once it is gone.
+#[tokio::test]
+async fn a_release_naming_the_exact_journaled_owner_outlives_its_process() {
+    let (server, pty, _directory) =
+        launch_claim_fixture_running("sleep 600 & sleep 600 & wait").await;
+    let (mut connection, lease_id) = controller_connection(&server);
+    let child = background_child(&pty).await;
+    assert_eq!(
+        record(&server, &mut connection, &lease_id, report(child, 5)).await,
+        ActiveIdentityOutcome::Accepted { revision: 1 }
+    );
+    exit_child(child).await;
+
+    let other_start = ProcessIdentity {
+        start_identity: child.start_identity + 1,
+        ..child
+    };
+    assert_eq!(
+        release_active(&server, &mut connection, &lease_id, release(other_start, 6)).await,
+        rejected(IdentityRejectReason::ReportedProcessInvalid),
+        "the same pid with another start identity is another process"
+    );
+    assert!(
+        server
+            .shared
+            .journal
+            .load()
+            .expect("load the journal")
+            .active_identity
+            .is_some(),
+        "the refused release kept the claim"
+    );
+
+    assert_eq!(
+        release_active(&server, &mut connection, &lease_id, release(child, 6)).await,
+        ActiveIdentityOutcome::Accepted { revision: 2 }
+    );
+    let journaled = server.shared.journal.load().expect("load the journal");
+    assert!(journaled.active_identity.is_none());
+    assert_eq!(
+        journaled
+            .active_identity_release
+            .map(|released| (released.process.pid, released.sequence)),
+        Some((child.pid, 6))
+    );
+    stop(&server, &pty).await;
+}
+
+/// A release is refused outside the Running phase, as a report is, even when it
+/// names the exact journaled owner.
+#[tokio::test]
+async fn a_release_is_refused_once_the_runtime_is_not_running() {
+    let (server, pty, _directory) = launch_claim_fixture().await;
+    let (mut connection, lease_id) = controller_connection(&server);
+    let owner = root_process(&pty);
+    assert_eq!(
+        record(&server, &mut connection, &lease_id, report(owner, 5)).await,
+        ActiveIdentityOutcome::Accepted { revision: 1 }
+    );
+    server.shared.state.lock().await.phase = WireRuntimePhase::Stopping;
+
+    assert_eq!(
+        release_active(&server, &mut connection, &lease_id, release(owner, 6)).await,
+        rejected(IdentityRejectReason::PhaseNotRunning)
+    );
+    assert!(
+        server
+            .shared
+            .journal
+            .load()
+            .expect("load the journal")
+            .active_identity
+            .is_some(),
+        "the refused release kept the claim"
     );
     stop(&server, &pty).await;
 }

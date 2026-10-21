@@ -271,6 +271,9 @@ async fn commit_release(
     let reject = |reason| ActiveIdentityOutcome::Rejected {
         reason: refuse(shared, connection, OPERATION, reason),
     };
+    if state.phase != WireRuntimePhase::Running {
+        return Ok(reject(IdentityRejectReason::PhaseNotRunning));
+    }
     let schema = match admit_hook(
         state.hook_schema,
         HookAction::IdentityRelease,
@@ -291,13 +294,24 @@ async fn commit_release(
         pid: release.process.pid,
         start_identity: release.process.start_identity,
     };
-    if validate_hook_process(
-        schema.ancestry,
-        reporting.pid,
-        reporting.start_identity,
-        root.pid,
-    )
-    .is_err()
+    // The journaled owner was validated against the PTY tree when it reported,
+    // and a release that names its exact pid and start identity may outlive the
+    // process; any other subject must still be a live member of the tree.
+    let names_the_owner = state
+        .journal
+        .active_identity
+        .as_ref()
+        .is_some_and(|active| {
+            active.provider == release.provider && is_reporter(&active.process, reporting)
+        });
+    if !names_the_owner
+        && validate_hook_process(
+            schema.ancestry,
+            reporting.pid,
+            reporting.start_identity,
+            root.pid,
+        )
+        .is_err()
     {
         return Ok(reject(IdentityRejectReason::ReportedProcessInvalid));
     }

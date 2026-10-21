@@ -2576,14 +2576,26 @@ without waiting for procwatch to observe it. `monotonic_sequence` is a decimal
 string on the session host's `CLOCK_MONOTONIC` clock, the clock the worker hook
 path orders reports with. It is a separate field from `seq`, which stays the
 wall-clock value that orders the memory-only path, and the daemon does not
-compare the two. The shipped Claude and Codex state hooks send both fields on
-their daemon-socket fallback.
+compare the two. The shipped Claude, Codex and Hermes reporters send both
+fields on their daemon-socket fallback. A report that names a `pid` without a
+`pid_start_identity` while the session's active claim is journaled by the worker
+is bound by the identity the host reports for the `pid` now, so it replaces that
+claim only from the same process with a newer `seq`; a `pid` the host cannot
+read binds nothing. A report that carries `pid` and
+`monotonic_sequence` for a live session whose worker speaks protocol 8 is
+forwarded into the worker, which validates and journals it before the daemon
+answers: `recorded: true` then means the identity is durable, and
+`recorded: false` also covers a report the worker refused (a process outside the
+session, a reused pid, an older sequence than an earlier claim of the process).
+Any other report, and any report whose forward failed, is held in memory only
+and answers as before.
 
 `session.release_agent` accepts the same `source`/`agent` identity plus an
 optional `seq`, and the same optional `pid`, `pid_start_identity` and
 `monotonic_sequence`. A release that names an identity the host contradicts is
 ignored (`released: false`); a release whose process has already exited is not
-checked and still applies. A release clears only the current matching active-agent claim;
+checked and still applies, except that a release the daemon cannot forward never
+ends a claim the worker journaled (`released: false`). A release clears only the current matching active-agent claim;
 stale releases do not clear newer reports. Claude installs a `SessionEnd` state
 hook that sends `session.release_agent` with a fresh timestamp sequence, so
 clean exits normally clear active state promptly. Codex has no installed

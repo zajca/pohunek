@@ -70,6 +70,7 @@ class Reporter:
         self._pid = os.getpid()
         self._start_identity = _process_start_identity(self._pid)
         self._sequence = 0
+        self._native_id: str | None = None
         self.failures = 0
 
     @property
@@ -80,6 +81,7 @@ class Reporter:
         """Report a bounded native reference to the worker, then public API."""
         if not self.active or not isinstance(reference, str) or not 0 < len(reference) <= _MAX_NATIVE_ID_CHARS:
             return
+        self._native_id = reference
         self._safe(self._report_identity, reference)
 
     def activity(self, state: str) -> None:
@@ -107,7 +109,8 @@ class Reporter:
             return
         self._safe(self._send_public, "session.release_agent", {
             "session_id": self._session_id, "source": f"pohunek:{self._provider}", "agent": self._provider,
-            "seq": str(sequence),
+            "seq": str(sequence), "pid": self._pid, "pid_start_identity": str(self._start_identity),
+            "monotonic_sequence": str(sequence),
         })
 
     def _report_identity(self, native_id: str) -> None:
@@ -127,10 +130,17 @@ class Reporter:
         })
 
     def _report_activity(self, state: str) -> None:
-        self._safe(self._send_public, "session.report_agent", {
+        sequence = self._next_sequence()
+        params = {
             "session_id": self._session_id, "source": f"pohunek:{self._provider}", "agent": self._provider,
-            "activity": state, "seq": str(self._next_sequence()), "pid": self._pid,
-        })
+            "activity": state, "seq": str(sequence), "pid": self._pid,
+            "pid_start_identity": str(self._start_identity), "monotonic_sequence": str(sequence),
+        }
+        # The forwarded claim replaces the one the identity report made, so it
+        # carries the native session id that claim annotated.
+        if self._native_id is not None:
+            params["agent_session_id"] = self._native_id
+        self._safe(self._send_public, "session.report_agent", params)
 
     def _report_attention(self, kind: str, severity: str) -> None:
         self._safe(self._send_public, "notification.create", {
