@@ -2467,12 +2467,19 @@ upgrade's own gates and `service check` of an upgrade); without it, as for a
 rollback, which never applies the plan, the preflight judges the installed
 packages only. The preflight runs with the `PATH` the daemon job runs with, byte
 for byte: the one `service.toml` records; else, on Linux, the systemd user
-manager's `Environment` `PATH`; else, on macOS, launchd's active `PATH` of the job:
+manager's `Environment` `PATH`, replaced by an `ExecSearchPath=` and then an `Environment=PATH=` entry of a
+drop-in of the daemon unit (the install replaces the unit file itself) and refused (`service_manager_environment_unavailable`, naming the file or
+directive) when the unit has an `EnvironmentFile=` that sets `PATH`, a wildcard, unreadable or non-regular
+required `EnvironmentFile=`, `PassEnvironment=PATH`, `UnsetEnvironment=PATH`, is masked or broken,
+or has drop-ins but no unit file yet with a `PATH`-affecting line the CLI does not read (plain `Environment=PATH=`, `ExecSearchPath=` and `EnvironmentFile=` lines of such drop-ins are read and give the `PATH`); else, on macOS, launchd's active `PATH` of the job:
 the domain's `environment` `PATH` (`launchctl print gui/<uid>`, set by `launchctl
 setenv`), else the `default environment` of the loaded job (`launchctl print
 gui/<uid>/<label>`), else, for a job that is not loaded, the launchd default an
-upgrade journaled while the job was loaded, else the persisted launchd
-configuration, the best evidence available. A rollback judges with the same order,
+upgrade journaled while the job was loaded and the host has not rebooted since (the
+journal records the boot session UUID; after a reboot the persisted configuration decides only
+when `user.plist` was last modified before the current boot, and one modified later, or without a
+readable time, is refused; without a marker the persisted value must also equal the journaled one),
+else the persisted launchd configuration, the best evidence available. A rollback judges with the same order,
 so the `PATH` it uses is the one the restored job gets where launchd can still
 report it; a `warning:` line names a journal that gave no default. An
 unrecognized `launchctl print` output refuses the upgrade with `service_manager_environment_unavailable`.

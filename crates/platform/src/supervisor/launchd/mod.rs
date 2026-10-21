@@ -46,7 +46,10 @@ pub use backend::{
     Discovery, LaunchdDaemon, LaunchdPluginUnits, LaunchdSupervisor, MAX_DISCOVERED_DEFINITIONS,
 };
 #[doc(inline)]
-pub use domain_path::{read_user_domain_path, user_domain_path, STANDARD_PATH, USER_DOMAIN_CONFIG};
+pub use domain_path::{
+    read_user_domain_path, user_domain_config_modified, user_domain_path, STANDARD_PATH,
+    USER_DOMAIN_CONFIG,
+};
 pub use job_path::{domain_environment_of, job_path_sources, JobPathSources};
 pub use registration::{ExternalVolume, StrandedDefinition};
 

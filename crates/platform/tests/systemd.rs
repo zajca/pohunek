@@ -24,8 +24,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use pohunek_platform::supervisor::systemd::{
-    render_daemon_unit, render_sessions_slice, user_manager_environment, SystemdDaemon,
-    SystemdPluginUnits, SystemdSupervisor,
+    render_daemon_unit, render_sessions_slice, unit_environment, user_manager_environment,
+    SystemdDaemon, SystemdPluginUnits, SystemdSupervisor,
 };
 use pohunek_platform::supervisor::{
     Activation, DaemonSupervisor, Error, ExitEvidence, JobDefinition, JobExit, JobSpec, Namespace,
@@ -2113,6 +2113,766 @@ async fn dollar_signs_reach_a_plugin_unit_verbatim() {
     );
 
     plugin.units.remove(&key).await.expect("remove plugin job");
+}
+
+/// Removes the unit and drop-in directory a test wrote and reloads the manager.
+struct UnitFiles {
+    directory: PathBuf,
+    unit: String,
+}
+
+impl Drop for UnitFiles {
+    fn drop(&mut self) {
+        systemctl(&["stop", &self.unit]);
+        systemctl(&["disable", &self.unit]);
+        let _ = std::fs::remove_dir_all(self.directory.join(format!("{}.d", self.unit)));
+        let _ = std::fs::remove_file(self.directory.join(&self.unit));
+        systemctl(&["daemon-reload"]);
+    }
+}
+
+/// Removes a drop-in directory a test wrote.
+struct DropInDirectory(PathBuf);
+
+impl Drop for DropInDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+        systemctl(&["daemon-reload"]);
+    }
+}
+
+/// systemd applies the drop-ins of every directory sorted by file name, not
+/// directory by directory, and it reads only the `[Service]` section spelled
+/// exactly so: the rules the CLI's reader of drop-in files follows.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_orders_drop_ins_by_file_name_across_directories() {
+    require_e2e();
+    let directory = user_unit_dir();
+    std::fs::create_dir_all(&directory).expect("user unit directory");
+    let unit = format!("pohunek-e2e-ord-{}-x.service", std::process::id());
+    let prefix_dir = directory.join(format!("pohunek-e2e-ord-{}-.service.d", std::process::id()));
+    let _files = UnitFiles {
+        directory: directory.clone(),
+        unit: unit.clone(),
+    };
+    let _prefix = DropInDirectory(prefix_dir.clone());
+    std::fs::write(
+        directory.join(&unit),
+        "[Service]\nExecStart=/bin/sleep 300\n",
+    )
+    .expect("unit file");
+    let own = directory.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&own).expect("own drop-in directory");
+    std::fs::create_dir_all(&prefix_dir).expect("prefix drop-in directory");
+    let path_of = |unit: &str| {
+        let loaded = async_io::block_on(unit_environment(unit, CALL_TIMEOUT)).expect("loaded unit");
+        let paths: Vec<String> = loaded
+            .environment
+            .iter()
+            .filter(|entry| entry.starts_with("PATH="))
+            .cloned()
+            .collect();
+        (paths, loaded.environment)
+    };
+    // The file name decides, whichever directory holds the file: the last
+    // `PATH=` of the sorted names wins, and the merged property keeps that one.
+    // Each directory order (own first, prefix first) gives a different pair.
+    for (own_name, prefix_name, expected) in [
+        ("90-p.conf", "10-p.conf", "PATH=/own/bin"),
+        ("10-p.conf", "90-p.conf", "PATH=/prefix/bin"),
+    ] {
+        let _ = std::fs::remove_dir_all(&own);
+        let _ = std::fs::remove_dir_all(&prefix_dir);
+        std::fs::create_dir_all(&own).expect("own drop-in directory");
+        std::fs::create_dir_all(&prefix_dir).expect("prefix drop-in directory");
+        std::fs::write(own.join(own_name), "[Service]\nEnvironment=PATH=/own/bin\n")
+            .expect("own drop-in");
+        std::fs::write(
+            prefix_dir.join(prefix_name),
+            "[Service]\nEnvironment=PATH=/prefix/bin\n",
+        )
+        .expect("prefix drop-in");
+        systemctl(&["daemon-reload"]);
+        let (paths, environment) = path_of(&unit);
+        assert_eq!(
+            paths,
+            [expected],
+            "{own_name} / {prefix_name}: {environment:?}"
+        );
+    }
+
+    // A drop-in masked by a link to `/dev/null` stays in the manager's list.
+    std::os::unix::fs::symlink("/dev/null", own.join("97-mask.conf")).expect("mask");
+    systemctl(&["daemon-reload"]);
+    let masked = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded unit");
+    assert!(
+        masked
+            .drop_in_paths
+            .iter()
+            .any(|path| path.ends_with("97-mask.conf")),
+        "{:?}",
+        masked.drop_in_paths
+    );
+
+    // A `[service]` section is not the `[Service]` section.
+    std::fs::write(
+        own.join("95-case.conf"),
+        "[service]\nEnvironment=LOWERCASE=1\n",
+    )
+    .expect("lowercase section drop-in");
+    systemctl(&["daemon-reload"]);
+    let (_, environment) = path_of(&unit);
+    assert!(
+        !environment.iter().any(|entry| entry == "LOWERCASE=1"),
+        "a [service] section is not read: {environment:?}"
+    );
+}
+
+/// A drop-in file name present in the `<unit>.d` directories of two lookup
+/// directories is read from the first one the manager's search path lists, and a
+/// first holder linked to `/dev/null` disables the name for both: the priority
+/// rule the CLI's resolver of drop-in files follows.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_reads_a_drop_in_name_from_the_first_lookup_directory() {
+    require_e2e();
+    let runtime = user_unit_dir();
+    std::fs::create_dir_all(&runtime).expect("user unit directory");
+    let search = Command::new("systemctl")
+        .args(["--user", "show", "--property=UnitPath", "--value"])
+        .output()
+        .expect("run systemctl show");
+    let search = String::from_utf8(search.stdout).expect("UTF-8 search path");
+    let home = std::env::var_os("HOME").map(PathBuf::from).expect("HOME");
+    let first: PathBuf = search
+        .split_whitespace()
+        .map(PathBuf::from)
+        .find(|directory| directory.starts_with(&home) && directory != &runtime)
+        .expect("a lookup directory under the home directory");
+    let unit = format!("pohunek-e2e-prio-{}.service", std::process::id());
+    let _files = UnitFiles {
+        directory: runtime.clone(),
+        unit: unit.clone(),
+    };
+    std::fs::write(runtime.join(&unit), "[Service]\nExecStart=/bin/sleep 300\n")
+        .expect("unit file");
+    let runtime_dir = runtime.join(format!("{unit}.d"));
+    let first_dir = first.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&runtime_dir).expect("runtime drop-in directory");
+    std::fs::create_dir_all(&first_dir).expect("first drop-in directory");
+    let _first = DropInDirectory(first_dir.clone());
+    std::fs::write(
+        runtime_dir.join("50-p.conf"),
+        "[Service]\nEnvironment=PICK=runtime\n",
+    )
+    .expect("runtime drop-in");
+    std::fs::write(
+        first_dir.join("50-p.conf"),
+        "[Service]\nEnvironment=PICK=first\n",
+    )
+    .expect("first drop-in");
+    systemctl(&["daemon-reload"]);
+    let loaded = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded unit");
+    let listed: Vec<&String> = loaded
+        .drop_ins_on_disk
+        .iter()
+        .filter(|path| path.ends_with("/50-p.conf"))
+        .collect();
+    assert_eq!(listed.len(), 2, "{loaded:?}");
+    assert_eq!(
+        loaded.drop_in_paths,
+        [listed[0].clone()],
+        "the first listed holder of the name is the loaded one: {loaded:?}"
+    );
+    let pick = |environment: &[String]| {
+        environment
+            .iter()
+            .filter(|entry| entry.starts_with("PICK="))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let expected = if listed[0].starts_with(first.to_str().expect("UTF-8 path")) {
+        "PICK=first"
+    } else {
+        "PICK=runtime"
+    };
+    assert_eq!(pick(&loaded.environment), [expected], "{loaded:?}");
+
+    // A first holder masked by a link to `/dev/null` disables the name.
+    let winner = PathBuf::from(listed[0]);
+    std::fs::remove_file(&winner).expect("remove winner");
+    std::os::unix::fs::symlink("/dev/null", &winner).expect("mask");
+    systemctl(&["daemon-reload"]);
+    let masked = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded unit");
+    assert!(
+        pick(&masked.environment).is_empty(),
+        "a masked first holder disables the name for the later directory: {masked:?}"
+    );
+}
+
+/// The reader rules the CLI's resolver of drop-in files follows: systemd skips a
+/// hidden drop-in, ignores a relative `EnvironmentFile=`, and a backslash
+/// followed by white space is not a continuation.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_skips_hidden_drop_ins_and_ignores_relative_environment_files() {
+    require_e2e();
+    let directory = user_unit_dir();
+    std::fs::create_dir_all(&directory).expect("user unit directory");
+    let unit = format!("pohunek-e2e-edge-{}.service", std::process::id());
+    let _files = UnitFiles {
+        directory: directory.clone(),
+        unit: unit.clone(),
+    };
+    std::fs::write(
+        directory.join(&unit),
+        "[Service]\nExecStart=/bin/sleep 300\n",
+    )
+    .expect("unit file");
+    let own = directory.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&own).expect("drop-in directory");
+    std::fs::write(
+        own.join(".hidden.conf"),
+        "[Service]\nEnvironment=HIDDEN=1\n",
+    )
+    .expect("hidden");
+    std::fs::write(
+        own.join("10-rel.conf"),
+        "[Service]\nEnvironmentFile=relative.env\nEnvironmentFile=-also-relative.env\n",
+    )
+    .expect("relative");
+    std::fs::write(
+        own.join("20-cont.conf"),
+        "[Service]\nEnvironment=FIRST=1 \\ \nEnvironment=SECOND=2\nEnvironment=THIRD=3 \\\t\nEnvironment=FOURTH=4\n",
+    )
+    .expect("continuation");
+    systemctl(&["daemon-reload"]);
+
+    let loaded = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded unit");
+    let listed = |paths: &[String], name: &str| paths.iter().any(|path| path.ends_with(name));
+    assert!(
+        !listed(&loaded.drop_in_paths, ".hidden.conf")
+            && !loaded.environment.iter().any(|entry| entry == "HIDDEN=1"),
+        "the manager skips a hidden drop-in: {loaded:?}"
+    );
+    assert!(
+        !listed(&loaded.drop_ins_on_disk, ".hidden.conf"),
+        "the on-disk listing skips it too: {:?}",
+        loaded.drop_ins_on_disk
+    );
+    assert!(listed(&loaded.drop_ins_on_disk, "10-rel.conf"));
+    assert!(
+        loaded.environment_files.is_empty(),
+        "a relative EnvironmentFile= is ignored: {:?}",
+        loaded.environment_files
+    );
+    for name in ["FIRST=1", "SECOND=2", "THIRD=3", "FOURTH=4"] {
+        assert!(
+            loaded.environment.iter().any(|entry| entry == name),
+            "{name}: a backslash then white space is not a continuation: {:?}",
+            loaded.environment
+        );
+    }
+}
+
+/// The `EnvironmentFile=` reader rules the CLI's scan follows: a `PATH=` text
+/// inside a quoted or continued value or a comment is not an assignment, and a
+/// carriage return ends a line like a line feed.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_reads_environment_files_as_the_cli_scan_does() {
+    require_e2e();
+    let directory = pohunek_test_support::tempdir().expect("scratch directory");
+    let assigned = |content: &str| -> bool {
+        let file = directory.path().join("job.env");
+        let output = directory.path().join("job.out");
+        std::fs::write(&file, content).expect("environment file");
+        let _ = std::fs::remove_file(&output);
+        let status = Command::new("systemd-run")
+            .args(["--user", "--wait", "--collect", "--quiet"])
+            .arg(format!("--property=EnvironmentFile={}", file.display()))
+            .arg(format!(
+                "--property=StandardOutput=file:{}",
+                output.display()
+            ))
+            .args(["/usr/bin/env", "-0"])
+            .status()
+            .expect("run systemd-run");
+        assert!(status.success(), "systemd-run failed for {content:?}");
+        std::fs::read_to_string(&output)
+            .expect("job output")
+            .split('\0')
+            .any(|entry| entry == "PATH=/pinned/bin")
+    };
+    for content in [
+        "OTHER='first\nPATH=/pinned/bin\nlast'\n",
+        "OTHER=\"a\nPATH=/pinned/bin\"\nSTORE=/s\n",
+        "OTHER=a\\\nPATH=/pinned/bin\nSTORE=/s\n",
+        "# PATH=/pinned/bin\n; PATH=/pinned/bin\nSTORE=/s\n",
+    ] {
+        assert!(!assigned(content), "not an assignment of PATH: {content:?}");
+    }
+    for content in [
+        "OTHER=\"a b\" c\nPATH=/pinned/bin\n",
+        "OTHER=it's \"x\nPATH=/pinned/bin\n",
+        "PATH=/pinned/bin\n",
+        "FOO=1\rPATH=/pinned/bin\n",
+        "# note\rPATH=/pinned/bin\n",
+        "FOO=1\r\nPATH=/pinned/bin\r\n",
+    ] {
+        assert!(assigned(content), "assigns PATH: {content:?}");
+    }
+}
+
+/// Enabling a unit that has a drop-in, after the reload that loaded it, does not
+/// leave the unit with a stale snapshot: the gates that refuse on
+/// `NeedDaemonReload` do not trip on an installed daemon unit.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn enabling_a_loaded_unit_with_a_drop_in_leaves_no_pending_reload() {
+    require_e2e();
+    let directory = user_unit_dir();
+    std::fs::create_dir_all(&directory).expect("user unit directory");
+    let unit = format!("pohunek-e2e-enable-{}.service", std::process::id());
+    let _files = UnitFiles {
+        directory: directory.clone(),
+        unit: unit.clone(),
+    };
+    std::fs::write(
+        directory.join(&unit),
+        "[Service]\nExecStart=/bin/sleep 300\n[Install]\nWantedBy=default.target\n",
+    )
+    .expect("unit file");
+    let drop_ins = directory.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&drop_ins).expect("drop-in directory");
+    std::fs::write(
+        drop_ins.join("path.conf"),
+        "[Service]\nEnvironment=PATH=/drop-in/bin\n",
+    )
+    .expect("drop-in");
+    systemctl(&["daemon-reload"]);
+    systemctl(&["enable", &unit]);
+
+    let enabled = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("enabled unit");
+    assert_eq!(enabled.load_state, "loaded");
+    assert!(
+        !enabled.need_daemon_reload,
+        "enabling must not leave a stale snapshot: {enabled:?}"
+    );
+    assert!(!enabled.drop_in_paths.is_empty(), "{enabled:?}");
+}
+
+/// The real user manager reports the environment a unit and its drop-ins give a
+/// job: the merged `Environment=`, the `EnvironmentFile=`, `PassEnvironment=` and
+/// `UnsetEnvironment=` settings, and a drop-in on a unit with no file.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_reports_a_units_environment_settings_with_drop_ins() {
+    require_e2e();
+    let directory = user_unit_dir();
+    std::fs::create_dir_all(&directory).expect("user unit directory");
+    let unit = format!("pohunek-e2e-env-{}.service", std::process::id());
+    let _files = UnitFiles {
+        directory: directory.clone(),
+        unit: unit.clone(),
+    };
+
+    // No file and no drop-in: not found, nothing configured.
+    let absent = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("absent unit");
+    assert_eq!(absent.load_state, "not-found");
+    assert!(absent.drop_in_paths.is_empty() && absent.environment.is_empty());
+
+    std::fs::write(
+        directory.join(&unit),
+        "[Service]\nExecStart=/bin/sleep 300\nEnvironment=PATH=/unit/bin\nEnvironmentFile=-/nonexistent/pohunek-e2e.env\nPassEnvironment=HOME\nUnsetEnvironment=GONE\n",
+    )
+    .expect("unit file");
+    let drop_ins = directory.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&drop_ins).expect("drop-in directory");
+    std::fs::write(
+        drop_ins.join("path.conf"),
+        "[Service]\nEnvironment=PATH=/drop-in/bin\n",
+    )
+    .expect("drop-in");
+    systemctl(&["daemon-reload"]);
+
+    let loaded = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded unit");
+    assert_eq!(loaded.load_state, "loaded");
+    assert!(!loaded.need_daemon_reload);
+    assert!(
+        loaded
+            .drop_ins_on_disk
+            .iter()
+            .any(|path| path.ends_with("path.conf")),
+        "{:?}",
+        loaded.drop_ins_on_disk
+    );
+    assert!(
+        loaded.fragment_path.ends_with(&unit),
+        "{:?}",
+        loaded.fragment_path
+    );
+    assert_eq!(
+        loaded.environment.last().map(String::as_str),
+        Some("PATH=/drop-in/bin")
+    );
+    assert!(
+        loaded
+            .drop_in_paths
+            .iter()
+            .any(|path| path.ends_with("path.conf")),
+        "{:?}",
+        loaded.drop_in_paths
+    );
+    assert_eq!(
+        loaded.environment_files,
+        [("/nonexistent/pohunek-e2e.env".to_owned(), true)]
+    );
+    assert_eq!(loaded.pass_environment, ["HOME"]);
+    assert_eq!(loaded.unset_environment, ["GONE"]);
+
+    // A drop-in edited while the unit stays loaded (it runs) leaves the
+    // properties stale.
+    systemctl(&["start", &unit]);
+    std::fs::write(
+        drop_ins.join("path.conf"),
+        "[Service]\nEnvironment=PATH=/edited/bin\n",
+    )
+    .expect("edited drop-in");
+    let stale = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("stale unit");
+    assert!(stale.need_daemon_reload, "{stale:?}");
+    assert!(!stale.drop_ins_on_disk.is_empty(), "{stale:?}");
+}
+
+/// What systemd itself does with the forms the resolver has to agree with: an
+/// orphan drop-in, a dash-truncated drop-in directory, `ExecSearchPath=`, a byte
+/// order mark, CR line ends and a word with an unknown specifier.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_agrees_with_the_unit_setting_readers() {
+    require_e2e();
+    let directory = user_unit_dir();
+    std::fs::create_dir_all(&directory).expect("user unit directory");
+    let id = std::process::id();
+    let unit = format!("pohunek-e2eform-{id}.service");
+    let truncated = "pohunek-e2eform-.service.d".to_owned();
+    let _files = UnitFiles {
+        directory: directory.clone(),
+        unit: unit.clone(),
+    };
+    let _truncated = UnitFiles {
+        directory: directory.clone(),
+        unit: truncated.trim_end_matches(".d").to_owned(),
+    };
+
+    // An orphan drop-in: the manager reports no file and no drop-in, the scan
+    // of the manager's own lookup directories finds it.
+    let own = directory.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&own).expect("drop-in directory");
+    std::fs::write(
+        own.join("orphan.conf"),
+        "[Service]\nEnvironment=PATH=/orphan/bin\n",
+    )
+    .expect("orphan drop-in");
+    systemctl(&["daemon-reload"]);
+    let orphan = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("orphan");
+    assert_eq!(orphan.load_state, "not-found");
+    assert!(orphan.drop_in_paths.is_empty(), "{orphan:?}");
+    assert!(
+        orphan
+            .drop_ins_on_disk
+            .iter()
+            .any(|path| path.ends_with("orphan.conf")),
+        "{orphan:?}"
+    );
+
+    // Now with a unit file: a BOM, CR line ends, a dash-truncated directory,
+    // ExecSearchPath= and a dropped word.
+    std::fs::write(
+        directory.join(&unit),
+        "[Service]\nExecStart=/bin/sleep 300\nExecSearchPath=/unit-file/bin\n",
+    )
+    .expect("unit");
+    std::fs::remove_file(own.join("orphan.conf")).expect("remove orphan");
+    std::fs::write(
+        own.join("bom.conf"),
+        b"\xef\xbb\xbf[Service]\nEnvironment=PATH=/bom/bin\nExecSearchPath=/opt/tools/bin\n",
+    )
+    .expect("bom drop-in");
+    std::fs::write(own.join("cr.conf"), b"[Service]\rEnvironment=CRVAR=1\r").expect("cr drop-in");
+    // CRLF is one line end, so the continuation joins the next line.
+    std::fs::write(
+        own.join("crlf.conf"),
+        b"[Service]\r\nEnvironment=CRLF1=1 \\\r\nCRLF2=2\r\n",
+    )
+    .expect("crlf drop-in");
+    let shared = directory.join(&truncated);
+    std::fs::create_dir_all(&shared).expect("truncated drop-in directory");
+    std::fs::write(
+        shared.join("dropped.conf"),
+        "[Service]\nEnvironment=PATH=%Z/bin DROPPED=1 KEPT=1\n",
+    )
+    .expect("dropped drop-in");
+    systemctl(&["daemon-reload"]);
+    let loaded = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded");
+    assert_eq!(loaded.load_state, "loaded");
+    assert!(
+        loaded.environment.contains(&"PATH=/bom/bin".to_owned()),
+        "{loaded:?}"
+    );
+    assert!(
+        loaded.environment.contains(&"CRVAR=1".to_owned()),
+        "{loaded:?}"
+    );
+    // The directive appends across files: the unit file's entry stays in the
+    // merged list next to the drop-in's.
+    for entry in ["CRLF1=1", "CRLF2=2"] {
+        assert!(loaded.environment.contains(&entry.to_owned()), "{loaded:?}");
+    }
+    assert_eq!(
+        loaded.exec_search_path,
+        ["/unit-file/bin", "/opt/tools/bin"]
+    );
+    // The word with the unknown specifier is dropped, its neighbours are kept.
+    assert!(
+        !loaded.environment.iter().any(|entry| entry.contains("%Z")),
+        "{loaded:?}"
+    );
+    assert!(
+        loaded.environment.contains(&"KEPT=1".to_owned()),
+        "{loaded:?}"
+    );
+    for name in ["bom.conf", "cr.conf", "dropped.conf"] {
+        assert!(
+            loaded.drop_in_paths.iter().any(|path| path.ends_with(name)),
+            "{name}: {:?}",
+            loaded.drop_in_paths
+        );
+        assert!(
+            loaded
+                .drop_ins_on_disk
+                .iter()
+                .any(|path| path.ends_with(name)),
+            "{name}: {:?}",
+            loaded.drop_ins_on_disk
+        );
+    }
+
+    assert_unreadable_drop_in_directory_is_an_error(&own, &unit);
+}
+
+/// The value forms the CLI's reader of a removed unit's drop-ins follows:
+/// comment lines, a NUL line end, a quoted word, a no-break space, an
+/// `EnvironmentFile=` path with a space, empty entries of `ExecSearchPath=` and
+/// an empty assignment resetting each list.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_agrees_on_the_value_forms_of_a_drop_in() {
+    require_e2e();
+    let directory = user_unit_dir();
+    std::fs::create_dir_all(&directory).expect("user unit directory");
+    let unit = format!("pohunek-e2eval-{}.service", std::process::id());
+    let _files = UnitFiles {
+        directory: directory.clone(),
+        unit: unit.clone(),
+    };
+    std::fs::write(
+        directory.join(&unit),
+        "[Service]\nExecStart=/bin/sleep 300\n",
+    )
+    .expect("unit file");
+    let own = directory.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&own).expect("drop-in directory");
+    std::fs::write(
+        own.join("10-a.conf"),
+        "[Service]\nEnvironment=KEEP=1\nEnvironmentFile=-/nonexistent/spaced path.env\nExecSearchPath=/a/bin\n",
+    )
+    .expect("first drop-in");
+    std::fs::write(
+        own.join("20-b.conf"),
+        "[Service]\n# Environment=COMMENT=1\n; Environment=SEMI=1\nEnvironment=\"QUOTED=a b\"\nEnvironment=NBSP=1\u{a0}X=2\nExecSearchPath=/b/bin::/c/bin\n",
+    )
+    .expect("second drop-in");
+    std::fs::write(
+        own.join("25-nul.conf"),
+        b"[Service]\0Environment=NULVAR=1\0",
+    )
+    .expect("NUL drop-in");
+    systemctl(&["daemon-reload"]);
+    let loaded = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded");
+    for entry in ["KEEP=1", "QUOTED=a b", "NBSP=1\u{a0}X=2", "NULVAR=1"] {
+        assert!(
+            loaded.environment.contains(&entry.to_owned()),
+            "{entry}: {loaded:?}"
+        );
+    }
+    for entry in ["COMMENT=1", "SEMI=1"] {
+        assert!(
+            !loaded.environment.iter().any(|value| value.contains(entry)),
+            "{entry}: {loaded:?}"
+        );
+    }
+    // An empty entry is not skipped: the entries after it are not applied, which
+    // is why the resolver refuses a list holding one.
+    assert_eq!(loaded.exec_search_path, ["/a/bin", "/b/bin"]);
+    assert_eq!(
+        loaded.environment_files,
+        [("/nonexistent/spaced path.env".to_owned(), true)]
+    );
+
+    std::fs::write(
+        own.join("30-reset.conf"),
+        "[Service]\nEnvironment=\nEnvironmentFile=\nExecSearchPath=\nEnvironment=AFTER=1\n",
+    )
+    .expect("reset drop-in");
+    systemctl(&["daemon-reload"]);
+    let reset = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded");
+    assert_eq!(reset.environment, ["AFTER=1"], "{reset:?}");
+    assert!(reset.exec_search_path.is_empty(), "{reset:?}");
+    assert!(reset.environment_files.is_empty(), "{reset:?}");
+}
+
+/// What the manager does with the drop-in syntax the CLI's reader of a removed
+/// unit's drop-ins refuses: quotes in `ExecSearchPath=`, entries that are not
+/// normalized, a section header that is never closed and a byte order mark in
+/// the middle of the file.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_reads_unusual_drop_in_syntax_as_the_cli_refuses_it() {
+    require_e2e();
+    let directory = user_unit_dir();
+    std::fs::create_dir_all(&directory).expect("user unit directory");
+    let unit = format!("pohunek-e2esyn-{}.service", std::process::id());
+    let _files = UnitFiles {
+        directory: directory.clone(),
+        unit: unit.clone(),
+    };
+    std::fs::write(
+        directory.join(&unit),
+        "[Service]\nExecStart=/bin/sleep 300\n",
+    )
+    .expect("unit file");
+    let own = directory.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&own).expect("drop-in directory");
+    let loaded_with = |content: &[u8]| {
+        std::fs::write(own.join("10-case.conf"), content).expect("drop-in");
+        systemctl(&["daemon-reload"]);
+        async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded")
+    };
+    let quoted = loaded_with(b"[Service]\nExecSearchPath=\"/q/bin\"\n");
+    assert!(
+        quoted.exec_search_path.is_empty(),
+        "quotes are literal: {quoted:?}"
+    );
+    let parent = loaded_with(b"[Service]\nExecSearchPath=/d/../e:/f\n");
+    assert!(
+        parent.exec_search_path.is_empty(),
+        "a `..` entry and those after it are dropped: {parent:?}"
+    );
+    let simplified = loaded_with(b"[Service]\nExecSearchPath=/g//h/:/i/./j\n");
+    assert_eq!(
+        simplified.exec_search_path,
+        ["/g/h", "/i/j"],
+        "{simplified:?}"
+    );
+    let bogus = loaded_with(b"[Service]\nEnvironment=PATH=/a\n[Bogus\nEnvironment=PATH=/b\n");
+    assert!(
+        bogus.environment.contains(&"PATH=/a".to_owned())
+            && !bogus.environment.contains(&"PATH=/b".to_owned()),
+        "nothing after an unclosed header is read: {bogus:?}"
+    );
+    let noted =
+        loaded_with(b"[Service]\nExecSearchPath=/x/bin\n[Service] # note\nExecSearchPath=/y/bin\n");
+    assert_eq!(noted.exec_search_path, ["/x/bin"], "{noted:?}");
+    let form_feed =
+        loaded_with(b"[Service]\nEnvironment=PATH=/a\n[Unit]\x0C\nEnvironment=PATH=/b\n");
+    assert!(
+        form_feed.environment.contains(&"PATH=/a".to_owned())
+            && !form_feed.environment.contains(&"PATH=/b".to_owned()),
+        "a form feed is not white space in a header line: {form_feed:?}"
+    );
+    let noncharacter =
+        loaded_with(b"[Service]\nEnvironment=PATH=/a\nEnvironment=PATH=/b FOO=\xEF\xBF\xBE\n");
+    assert!(
+        noncharacter.environment.contains(&"PATH=/a".to_owned())
+            && !noncharacter.environment.contains(&"PATH=/b".to_owned()),
+        "a line with a noncharacter is dropped: {noncharacter:?}"
+    );
+    let long_component = format!(
+        "[Service]\nExecSearchPath=/x:/{}:/y\nExecSearchPath=/z\n",
+        "a".repeat(256)
+    );
+    let long = loaded_with(long_component.as_bytes());
+    assert_eq!(long.exec_search_path, ["/x", "/z"], "{long:?}");
+    let bom = loaded_with(b"[Service]\nEnvironment=FIRST=1\n\xEF\xBB\xBFEnvironment=PATH=/bom\n");
+    assert!(
+        bom.environment.contains(&"PATH=/bom".to_owned()),
+        "a byte order mark mid-file is dropped: {bom:?}"
+    );
+}
+
+/// The tolerated forms the CLI's reader of a removed unit's drop-ins follows as
+/// systemd does: a specifier in a variable name, single and joined quotes, an
+/// empty value, an empty word, space before a header or around the key, a
+/// reopened `[Service]` section and an `EnvironmentFile=` path with a space after
+/// the dash.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_reads_tolerated_drop_in_forms_as_the_cli_does() {
+    require_e2e();
+    let directory = user_unit_dir();
+    std::fs::create_dir_all(&directory).expect("user unit directory");
+    let unit = format!("pohunek-e2etol-{}.service", std::process::id());
+    let _files = UnitFiles {
+        directory: directory.clone(),
+        unit: unit.clone(),
+    };
+    std::fs::write(
+        directory.join(&unit),
+        "[Service]\nExecStart=/bin/sleep 300\n",
+    )
+    .expect("unit file");
+    let own = directory.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&own).expect("drop-in directory");
+    let loaded_with = |content: &[u8]| {
+        std::fs::write(own.join("10-case.conf"), content).expect("drop-in");
+        systemctl(&["daemon-reload"]);
+        async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded")
+    };
+    let has = |loaded: &pohunek_platform::supervisor::UnitEnvironment, entry: &str| {
+        loaded.environment.contains(&entry.to_owned())
+    };
+    for (content, entry) in [
+        (&b"[Service]\nEnvironment=%iPATH=/x\n"[..], "PATH=/x"),
+        (b"[Service]\nEnvironment=PATH='/a'\"/b\"c\n", "PATH=/a/bc"),
+        (b"[Service]\nEnvironment=PATH=\n", "PATH="),
+        (b"[Service]\nEnvironment=\"\" PATH=/e\n", "PATH=/e"),
+        (b"  [Service]\nEnvironment=WS=1\n", "WS=1"),
+        (b"[Service]\nEnvironment =SPK=1\n", "SPK=1"),
+        (
+            b"[Unit]\nDescription=x\n[Service]\nEnvironment=RE=1\n[Unit]\n[Service]\nEnvironment=RE2=1\n",
+            "RE2=1",
+        ),
+    ] {
+        let loaded = loaded_with(content);
+        assert!(has(&loaded, entry), "{content:?}: {loaded:?}");
+    }
+    let dash = loaded_with(b"[Service]\nEnvironmentFile=- /x\n");
+    assert!(dash.environment_files.is_empty(), "{dash:?}");
+}
+
+/// A drop-in directory the scan cannot read is an error, never "no drop-ins".
+fn assert_unreadable_drop_in_directory_is_an_error(own: &std::path::Path, unit: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(own, std::fs::Permissions::from_mode(0o000)).expect("lock");
+    let unreadable = async_io::block_on(unit_environment(unit, CALL_TIMEOUT));
+    std::fs::set_permissions(own, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+    assert!(
+        matches!(unreadable, Err(Error::Operation { .. })),
+        "{unreadable:?}"
+    );
 }
 
 /// The real user manager reports the `KEY=VALUE` environment its units get,

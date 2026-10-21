@@ -104,8 +104,8 @@ use zbus::zvariant::{OwnedObjectPath, Value};
 use super::{
     Activation, DaemonSupervisor, DefinitionFacts, Error, ExitEvidence, JobDefinition, JobExit,
     Namespace, Operation, PluginUnitDefinition, PluginUnitKey, PluginUnitKind, PluginUnits,
-    RestartPolicy, ServiceId, ServiceObservation, ServiceState, Supervisor, WorkerKey,
-    MAX_JOB_TIMEOUT,
+    RestartPolicy, ServiceId, ServiceObservation, ServiceState, Supervisor, UnitEnvironment,
+    WorkerKey, MAX_JOB_TIMEOUT,
 };
 use crate::filesystem::{EntryKind, FsError, StageOutcome, TrustedDir};
 use crate::process::{Error as ProcessError, LinuxInspector, ProcessIdentity, ProcessInspector};
@@ -935,6 +935,153 @@ async fn read_user_manager_environment(
         .get_property::<Vec<String>>(MANAGER_ENVIRONMENT_PROPERTY)
         .await
         .map_err(|source| bus_error(OPERATION, source))
+}
+
+/// Reads the environment configuration the user manager holds for `unit`.
+///
+/// The unit is loaded (not started) so drop-ins apply. A unit with no file and
+/// no drop-in reports `not-found` and empty settings, which is the state of a
+/// job that is not installed yet. Both the connection and the calls are bounded
+/// by `call_timeout`.
+///
+/// # Errors
+///
+/// Returns [`Error::Unavailable`] when the session bus cannot be reached,
+/// [`Error::Timeout`] when a call does not finish within `call_timeout`, and
+/// [`Error::Operation`] when the manager rejects a read.
+pub async fn unit_environment(
+    unit: &str,
+    call_timeout: Duration,
+) -> Result<UnitEnvironment, Error> {
+    read_unit_environment(None, unit, call_timeout).await
+}
+
+/// The `*.conf` drop-in files on disk that apply to `unit` in the manager's own
+/// lookup directories (`unit_paths`, from its `UnitPath` property). Each lookup
+/// directory is listed in turn, higher priority first, so of same-named `.d`
+/// directories the higher-priority one comes first.
+///
+/// A unit `a-b-c.service` takes drop-ins from `a-b-c.service.d`, then the
+/// dash-truncated `a-b-.service.d` and `a-.service.d`, then `service.d`. A
+/// directory that is absent has none; any other failure to read one is an error,
+/// because a guess of "none" would let an override through.
+fn drop_in_files_on_disk(unit: &str, unit_paths: &[String]) -> Result<Vec<String>, Error> {
+    const OPERATION: &str = "read_unit_drop_ins";
+
+    let stem = unit.strip_suffix(".service").unwrap_or(unit);
+    let mut names = vec![unit.to_owned()];
+    let mut prefix = stem;
+    while let Some(dash) = prefix.rfind('-') {
+        prefix = &prefix[..dash];
+        names.push(format!("{prefix}-.service"));
+    }
+    names.push("service".to_owned());
+
+    let failed = |source: io::Error| Error::Operation {
+        operation: OPERATION,
+        source: Box::new(source),
+    };
+    let mut files = Vec::new();
+    for directory in unit_paths {
+        for name in &names {
+            let entries = match std::fs::read_dir(Path::new(directory).join(format!("{name}.d"))) {
+                Ok(entries) => entries,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(failed(error)),
+            };
+            for entry in entries {
+                let entry = entry.map_err(failed)?;
+                let path = entry.path();
+                if !hidden_file(&entry.file_name())
+                    && path.extension().is_some_and(|ext| ext == "conf")
+                {
+                    files.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    files.retain(|file| seen.insert(file.clone()));
+    Ok(files)
+}
+
+/// Whether systemd skips a directory entry as hidden: a name that starts with a
+/// dot (an editor lock or a dotfile). The other names it skips as backups (a `~`
+/// suffix, package-manager suffixes) cannot end in `.conf`, which the caller
+/// requires. The name is compared as bytes, because systemd does not require
+/// UTF-8.
+fn hidden_file(name: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    name.as_bytes().starts_with(b".")
+}
+
+/// [`unit_environment`] over the bus at `address`, or over the session bus the
+/// environment names when `address` is `None`.
+async fn read_unit_environment(
+    address: Option<&str>,
+    unit: &str,
+    call_timeout: Duration,
+) -> Result<UnitEnvironment, Error> {
+    const OPERATION: &str = "read_unit_environment";
+
+    let bus = Bus::connect_to(address, call_timeout).await?;
+    let manager = bus.manager(OPERATION).await?;
+    let read = |source| bus_error(OPERATION, source);
+    let path: OwnedObjectPath = manager
+        .call("LoadUnit", &(unit,))
+        .await
+        .map_err(|source| bus_error(OPERATION, source))?;
+    let unit_paths: Vec<String> = manager.get_property("UnitPath").await.map_err(read)?;
+    let unit_proxy = bus.proxy(path.clone(), UNIT_INTERFACE, OPERATION).await?;
+    let service = bus.proxy(path, SERVICE_INTERFACE, OPERATION).await?;
+    let load_state: String = unit_proxy.get_property("LoadState").await.map_err(read)?;
+    let need_daemon_reload: bool = unit_proxy
+        .get_property("NeedDaemonReload")
+        .await
+        .map_err(read)?;
+    let drop_in_paths: Vec<String> = unit_proxy.get_property("DropInPaths").await.map_err(read)?;
+    let fragment_path: String = unit_proxy
+        .get_property("FragmentPath")
+        .await
+        .map_err(read)?;
+    let drop_ins_on_disk = drop_in_files_on_disk(unit, &unit_paths)?;
+    if load_state == "not-found" && drop_in_paths.is_empty() {
+        return Ok(UnitEnvironment {
+            load_state,
+            need_daemon_reload,
+            drop_ins_on_disk,
+            ..UnitEnvironment::default()
+        });
+    }
+    Ok(UnitEnvironment {
+        load_state,
+        need_daemon_reload,
+        fragment_path,
+        drop_ins_on_disk,
+        drop_in_paths,
+        environment: service.get_property("Environment").await.map_err(read)?,
+        exec_search_path: service.get_property("ExecSearchPath").await.map_err(read)?,
+        environment_files: service
+            .get_property("EnvironmentFiles")
+            .await
+            .map_err(read)?,
+        pass_environment: service
+            .get_property("PassEnvironment")
+            .await
+            .map_err(read)?,
+        unset_environment: service
+            .get_property("UnsetEnvironment")
+            .await
+            .map_err(read)?,
+    })
 }
 
 /// Session-bus connection to the systemd user manager.

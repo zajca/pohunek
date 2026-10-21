@@ -299,6 +299,15 @@ pub struct Record {
     /// never written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launchd_default_path: Option<String>,
+    /// The boot identity (`kern.bootsessionuuid`) read when `launchd_default_path` was
+    /// journaled.
+    ///
+    /// A `launchctl config user path` change takes effect at the next boot, so a
+    /// journaled default is current only while the boot is the same. A journal
+    /// without it (written before it existed, or when the boot identity could not be
+    /// read) cannot prove that. Never written on Linux.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launchd_boot_identity: Option<String>,
     /// The at-risk verdicts the last adoption gate of this transaction passed.
     ///
     /// Written before the transaction advances past the gate, so a resume past
@@ -1093,6 +1102,7 @@ mod tests {
             runtime_stop: false,
             runtime_backup: None,
             launchd_default_path: None,
+            launchd_boot_identity: None,
             accepted_risks: None,
         }
     }
@@ -1119,6 +1129,18 @@ mod tests {
         store.clear().expect("clear");
         store.clear().expect("clearing twice is fine");
         assert_eq!(store.load().expect("load cleared"), None);
+    }
+
+    /// A journal without launchd data (Linux, or a job that was not loaded) has
+    /// none of the launchd fields, so a release that does not know them reads it.
+    #[test]
+    fn a_journal_without_a_launchd_default_carries_no_launchd_field() {
+        let written = serde_json::to_value(record(Step::Definition)).expect("value");
+        let object = written.as_object().expect("record object");
+        assert!(
+            object.keys().all(|key| !key.starts_with("launchd_")),
+            "{object:?}"
+        );
     }
 
     #[test]
@@ -1174,6 +1196,7 @@ mod tests {
             runtime_stop: true,
             runtime_backup: Some(journal.clone()),
             launchd_default_path: None,
+            launchd_boot_identity: None,
             step: Step::Runtimes,
             ..record(Step::Runtimes)
         };

@@ -31,6 +31,77 @@ pub mod namespace;
 #[cfg(target_os = "linux")]
 pub mod systemd;
 
+/// What the user manager has loaded for one unit that decides the unit's
+/// process environment.
+///
+/// systemd has already merged the unit file and its drop-ins into these
+/// properties, so a caller never parses a drop-in itself.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct UnitEnvironment {
+    /// The unit's `LoadState`: `loaded`, `not-found`, `masked`, `error`, ...
+    pub load_state: String,
+    /// Whether the unit file or a drop-in changed on disk after the manager
+    /// loaded it, so the properties below are stale until a `daemon-reload`.
+    pub need_daemon_reload: bool,
+    /// The `*.conf` drop-in files on disk now in the standard user-unit
+    /// directories of the manager's `UnitPath` that apply to the unit (its own `<unit>.d`, the dash-truncated
+    /// `<prefix>-.service.d` forms and `service.d`), whatever the manager has
+    /// loaded. Of directories of the same name (`<unit>.d` in each lookup
+    /// directory), those of a higher-priority lookup directory come first. systemd reads none of them for a unit whose file is missing.
+    pub drop_ins_on_disk: Vec<String>,
+    /// The unit file the manager read, empty when it found none.
+    pub fragment_path: String,
+    /// The drop-in files the manager read for the unit.
+    pub drop_in_paths: Vec<String>,
+    /// The merged `Environment=` entries, in order; a later entry wins.
+    pub environment: Vec<String>,
+    /// The `EnvironmentFile=` paths with their optional (`-`) flag.
+    pub environment_files: Vec<(String, bool)>,
+    /// The merged `ExecSearchPath=` entries; they become the job's `PATH` unless
+    /// an `Environment=` or `EnvironmentFile=` sets one.
+    pub exec_search_path: Vec<String>,
+    /// The variable names `PassEnvironment=` copies from the manager.
+    pub pass_environment: Vec<String>,
+    /// The `UnsetEnvironment=` names or assignments.
+    pub unset_environment: Vec<String>,
+}
+
+// The `Environment=` values may be secrets: only their names are printed.
+impl std::fmt::Debug for UnitEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self
+            .environment
+            .iter()
+            .map(|entry| {
+                entry
+                    .split_once('=')
+                    .map_or(entry.as_str(), |(name, _)| name)
+            })
+            .collect();
+        let unset: Vec<&str> = self
+            .unset_environment
+            .iter()
+            .map(|entry| {
+                entry
+                    .split_once('=')
+                    .map_or(entry.as_str(), |(name, _)| name)
+            })
+            .collect();
+        f.debug_struct("UnitEnvironment")
+            .field("load_state", &self.load_state)
+            .field("need_daemon_reload", &self.need_daemon_reload)
+            .field("drop_ins_on_disk", &self.drop_ins_on_disk)
+            .field("fragment_path", &self.fragment_path)
+            .field("drop_in_paths", &self.drop_in_paths)
+            .field("environment", &names)
+            .field("environment_files", &self.environment_files)
+            .field("exec_search_path", &self.exec_search_path)
+            .field("pass_environment", &self.pass_environment)
+            .field("unset_environment", &unset)
+            .finish()
+    }
+}
+
 #[doc(inline)]
 pub use namespace::{Namespace, PluginUnitKey, PluginUnitKind, WorkerKey};
 

@@ -24,6 +24,11 @@ pub const WORKER_INITIALIZE: Duration = Duration::from_secs(45);
 /// Time the systemd user manager may take to report its environment.
 pub const MANAGER_ENVIRONMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Largest `EnvironmentFile=` or unit drop-in file the CLI reads to judge a
+/// job's `PATH`. systemd reads such files whole, so a larger one is refused
+/// rather than truncated: a truncated read could hide a `PATH` assignment.
+pub const UNIT_SETTINGS_FILE_LIMIT: u64 = 1024 * 1024;
+
 /// Bytes of the user manager's environment report that are kept.
 pub const MANAGER_ENVIRONMENT_OUTPUT: usize = 1024 * 1024;
 

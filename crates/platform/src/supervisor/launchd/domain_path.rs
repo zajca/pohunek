@@ -8,7 +8,9 @@
 
 use std::fs::File;
 use std::io::{BufReader, ErrorKind};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::time::SystemTime;
 
 use ::plist::Value;
 
@@ -16,6 +18,9 @@ use super::super::Error;
 
 /// Operation label of the domain `PATH` read, in supervisor errors.
 const OPERATION: &str = "read_launchd_domain_path";
+
+/// Operation label of the configuration's modification-time read.
+const MODIFIED_OPERATION: &str = "read_launchd_domain_config_time";
 
 /// The launchd user-domain configuration, which `launchctl config user path`
 /// writes (see `launchctl(1)`).
@@ -38,6 +43,59 @@ pub const STANDARD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 /// See [`read_user_domain_path`].
 pub fn user_domain_path() -> Result<String, Error> {
     read_user_domain_path(Path::new(USER_DOMAIN_CONFIG))
+}
+
+/// Returns when the user domain's configuration at `config` last changed.
+///
+/// A symbolic link is dated by the later of the link and its target. An absent
+/// file is dated by its nearest existing directory, whose time moves when the
+/// file is created, replaced or removed: the file was gone since then. Each is
+/// dated by the later of its modification and status change time.
+///
+/// # Errors
+///
+/// Returns [`Error::Unavailable`] when neither the file nor any directory above
+/// it can be dated.
+pub fn user_domain_config_modified(config: &Path) -> Result<SystemTime, Error> {
+    let unavailable = |source: std::io::Error| Error::Unavailable {
+        operation: MODIFIED_OPERATION,
+        source: Box::new(source),
+    };
+    // The later of the modification and the status change time: a rename or a
+    // copy that preserves the modification time still moves the status change.
+    let changed = |metadata: &std::fs::Metadata| -> Result<SystemTime, Error> {
+        let modified = metadata.modified().map_err(unavailable)?;
+        let status = u64::try_from(metadata.ctime()).map_or(SystemTime::UNIX_EPOCH, |seconds| {
+            SystemTime::UNIX_EPOCH
+                + std::time::Duration::new(
+                    seconds,
+                    u32::try_from(metadata.ctime_nsec()).unwrap_or(0),
+                )
+        });
+        Ok(modified.max(status))
+    };
+    match std::fs::symlink_metadata(config) {
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            // The nearest directory that exists changed when the file, or a
+            // directory above it, was created or removed.
+            for ancestor in config.ancestors().skip(1) {
+                match std::fs::metadata(ancestor) {
+                    Ok(metadata) => return changed(&metadata),
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(unavailable(error)),
+                }
+            }
+            Err(unavailable(error))
+        }
+        Err(error) => Err(unavailable(error)),
+        // A link is replaced without touching its target, and a target is
+        // rewritten without touching the link: the later of the two dates it.
+        Ok(link) if link.file_type().is_symlink() => {
+            let target = std::fs::metadata(config).map_err(unavailable)?;
+            Ok(changed(&link)?.max(changed(&target)?))
+        }
+        Ok(file) => changed(&file),
+    }
 }
 
 /// Reads the user domain's `PATH` from the property list at `config`.

@@ -378,6 +378,7 @@ async fn pending_migration(
         runtime_stop: false,
         runtime_backup: None,
         launchd_default_path: None,
+        launchd_boot_identity: None,
         accepted_risks: None,
     };
     store.save(&record).expect("journal the migration boundary");
@@ -623,6 +624,7 @@ async fn upgrade_resumes_a_migration_from_its_journaled_state() {
         runtime_stop: false,
         runtime_backup: None,
         launchd_default_path: None,
+        launchd_boot_identity: None,
         accepted_risks: None,
     };
     pohunek_cli::service::record::Store::new(installation.context.paths().state_dir.clone())
@@ -689,6 +691,7 @@ async fn upgrade_refuses_a_migration_whose_source_it_cannot_trust() {
         runtime_stop: false,
         runtime_backup: None,
         launchd_default_path: None,
+        launchd_boot_identity: None,
         accepted_risks: None,
     };
     pohunek_cli::service::record::Store::new(installation.context.paths().state_dir.clone())

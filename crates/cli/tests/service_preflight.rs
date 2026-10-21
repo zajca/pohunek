@@ -31,6 +31,7 @@ use pohunek_cli::service::{Context, Error, VERSION};
 use pohunek_daemon::store::{DesiredState, RuntimeRecord, SessionRecord, Store};
 use pohunek_paths::{BasePaths, PathEnv, Platform};
 use pohunek_platform::process::{HostInspector, ProcessInspector as _};
+use pohunek_platform::supervisor::UnitEnvironment;
 use pohunek_service_config::preflight::{
     PreflightReport, ProfileWarning, SessionVerdict, StoreReport, StoreState, Verdict,
     CODE_PROFILE_WITHOUT_SCREEN_READINESS, RELEASE_PLAN_FLAG, REPORT_VERSION,
@@ -818,6 +819,19 @@ impl UserManager for FakeUserManager {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, EnvironmentFailure>> + Send + '_>> {
         let value = self.0.clone().map_err(EnvironmentFailure::Unreachable);
         Box::pin(async move { value })
+    }
+
+    fn unit_environment<'a>(
+        &'a self,
+        _unit: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<UnitEnvironment, EnvironmentFailure>> + Send + 'a>>
+    {
+        Box::pin(async {
+            Ok(UnitEnvironment {
+                load_state: "loaded".to_owned(),
+                ..UnitEnvironment::default()
+            })
+        })
     }
 }
 

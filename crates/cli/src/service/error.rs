@@ -832,7 +832,7 @@ impl Error {
                 "the upgrade is kept, not rolled back: confirm that no `pohunekd ensure-official-runtimes` process of that release is running (`pgrep -fl ensure-official-runtimes`), then rerun `pohunek service upgrade`",
             ),
             Self::ManagerEnvironment { .. } => Some(
-                "the daemon job's PATH comes from its definition when it records one, otherwise from the service manager's environment (the systemd user manager's Environment on Linux, the launchd domain on macOS); make that manager's environment readable, that is its bus reachable and its answer well formed, and retry; nothing was changed",
+                "the daemon job's PATH comes from its definition when it records one, otherwise from the service manager's environment (the systemd user manager's Environment on Linux, the launchd domain on macOS); make that manager's environment readable, that is its bus reachable and its answer well formed, or remove the unit setting, drop-in or journal ambiguity the message names, and retry; nothing was changed",
             ),
             Self::ManagerVariablesUnread { .. } => Some(
                 "make the service manager's environment readable (on Linux, the systemd user manager's bus reachable; on macOS, the user logged in to a GUI session so launchd has the gui/<uid> domain) and retry, or pass --accept-runtime-loss to accept that a session judged without those variables may lose its recovery; nothing was changed",
