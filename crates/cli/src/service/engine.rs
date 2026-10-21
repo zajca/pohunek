@@ -1470,26 +1470,36 @@ impl<'a> Engine<'a> {
         let (Some(default), None) = (active.loaded_default, active.domain) else {
             return Ok(());
         };
-        let Some(boot) = journaled_boot_identity(self.context) else {
-            return Ok(());
-        };
+        let boot = journaled_boot_identity(self.context);
         let persisted = journaled_persisted_path(self.context);
+        if boot.is_none() && persisted.as_deref() != Some(default.as_str()) {
+            // Without a boot identity the journal cannot prove the default after
+            // the stop, and the persisted configuration disagrees with it: refuse
+            // now, while the job still runs.
+            return Err(Error::ManagerEnvironment {
+                detail: "the boot identity cannot be read and the persisted launchd user-domain configuration differs from the loaded job's PATH, so the PATH after the job is stopped cannot be told. Set the PATH explicitly with `launchctl setenv PATH <directories>` in the GUI session and retry".to_owned(),
+            });
+        }
         if record.launchd_default_path.as_deref() == Some(default.as_str())
-            && record.launchd_boot_identity.as_deref() == Some(boot.as_str())
+            && record.launchd_boot_identity == boot
             && record.launchd_persisted_path == persisted
         {
             return Ok(());
         }
         record.launchd_default_path = Some(default);
-        record.launchd_boot_identity = Some(boot);
+        record.launchd_boot_identity = boot;
         record.launchd_persisted_path = persisted;
         self.store.save(record)
     }
 
     /// Only launchd has a default to journal.
     #[cfg(not(target_os = "macos"))]
-    async fn refresh_journaled_default(&self, _record: &mut Record) -> Result<(), Error> {
-        Ok(())
+    #[expect(clippy::unused_self, reason = "the macOS form reads the launchd job")]
+    fn refresh_journaled_default(
+        &self,
+        _record: &mut Record,
+    ) -> std::future::Ready<Result<(), Error>> {
+        std::future::ready(Ok(()))
     }
 
     /// Plans and applies the release's official runtime packages and profile

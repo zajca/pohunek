@@ -10544,14 +10544,38 @@ async fn an_unreadable_boot_time_journals_the_default_without_a_marker() {
         .with_launchd_job(Arc::new(launchd));
     harness.install(V1).await.expect("install");
     let mut engine = harness.engine();
-    engine.interrupt_after = Some(Step::Registered);
+    engine.interrupt_after = Some(Step::Definition);
     engine
         .upgrade(&harness.staged(V2), V2)
         .await
-        .expect_err("interrupted after the registration");
+        .expect_err("interrupted before the swap");
     let record = harness.pending().expect("pending");
     assert_eq!(record.launchd_default_path.as_deref(), Some(JOURNALED_PATH));
     assert_eq!(record.launchd_boot_identity, None);
+}
+
+/// Without a readable boot identity the journal cannot prove the loaded default
+/// after the stop; a persisted configuration that disagrees is refused while the
+/// job still runs.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn an_unreadable_boot_identity_with_a_disagreeing_persisted_path_refuses_before_the_swap() {
+    let mut harness = Harness::new();
+    let launchd = FakeLaunchd::new(Ok(loaded_job(JOURNALED_PATH.to_owned())));
+    launchd.set_boot(Err("sysctl failed".to_owned()));
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged)
+        .with_launchd_job(Arc::new(launchd));
+    harness.install(V1).await.expect("install");
+    let replaces = harness.fake.world().replaces;
+    let error = harness
+        .upgrade(V2)
+        .await
+        .expect_err("the PATH after the stop cannot be told");
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    assert_eq!(harness.fake.world().replaces, replaces, "no replacement");
 }
 
 #[cfg(target_os = "macos")]
