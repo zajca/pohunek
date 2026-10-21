@@ -2712,6 +2712,66 @@ fn a_kept_selection_is_detected_by_its_own_program() {
     );
 }
 
+/// A runtime nothing uses whose unordered selection is altered, disabled or
+/// does not load, and whose program is off the search path, is dropped by the
+/// detecting plan as a replacing plan drops it: no refusal, no not-serving gap.
+#[test]
+fn an_unused_undetected_unordered_selection_is_dropped_whatever_its_state() {
+    for state in ["altered", "disabled", "missing"] {
+        let host = Host::new();
+        let (bytes, digest) = official_runtimes::variant_archive("claude", "2.0");
+        host.publish_archives(1, &[("claude", &bytes, &digest)]);
+        host.write_claude_profile();
+        let installed = host.step(false);
+        assert!(installed.refusals.is_empty(), "{state}: {installed:?}");
+        fs::remove_file(host.profile_path()).expect("remove the profile");
+        match state {
+            "altered" => host.alter_installed_root(),
+            "disabled" => host.disable_package(&digest),
+            _ => host.remove_installed_root(),
+        }
+        publish_claude_version(&host, "1.0.3", 2);
+
+        let plan = host.detect_step();
+
+        assert!(plan.refusals.is_empty(), "{state}: {:?}", plan.refusals);
+        assert!(
+            plan.packages
+                .iter()
+                .all(|package| package.runtime != "claude"),
+            "{state}: {:?}",
+            plan.packages
+        );
+        let codes = gap_codes(&plan);
+        assert!(
+            !codes.contains(&("claude", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)),
+            "{state}: {codes:?}"
+        );
+        assert!(
+            codes.contains(&("claude", CODE_GAP_AGENT_NOT_ON_PATH)),
+            "{state}: {codes:?}"
+        );
+    }
+}
+
+/// A Pi selection kept because it is newer than the release's leaves a profile
+/// pinned elsewhere unreported: only an unordered keep is.
+#[tokio::test]
+async fn a_profile_pinned_elsewhere_is_not_reported_beside_a_newer_pi_keep() {
+    let host = Host::with_installed_pi().await;
+    host.publish_pi(PI_OLDER_VERSION, 1);
+    let elsewhere = format!("sha256:{}", "b".repeat(64));
+    host.write_profile(
+        "work",
+        &format!("base = \"pi\"\npackage = \"{PI_PACKAGE}\"\ndigest = \"{elsewhere}\"\n"),
+    );
+
+    let plan = host.step(true);
+
+    assert_eq!(pi_package(&plan).status, PackageStatus::Kept);
+    assert!(plan.profiles.is_empty(), "{:?}", plan.profiles);
+}
+
 /// A kept unordered selection of a runtime nothing uses, whose program is off
 /// the search path, is not planned, and the plan does not claim it is kept.
 #[test]

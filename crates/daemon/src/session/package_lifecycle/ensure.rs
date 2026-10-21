@@ -133,8 +133,9 @@ enum Action {
     /// The release archive is installed, enabled and selected, or its missing
     /// or altered root is restored.
     Install(Box<Prepared>),
-    /// No usable release catalog: the installed package that serves the
-    /// runtime keeps serving it.
+    /// The installed package that serves the runtime keeps serving it: the
+    /// release has no usable catalog, or the selected version is kept over the
+    /// release's.
     Kept,
 }
 
@@ -161,8 +162,9 @@ struct Planned {
     /// The newer official package the registry selects, which installing and
     /// selecting this release package replaces.
     replaces_newer: Option<SelectedPackage>,
-    /// The release's version when the entry keeps a newer selected package
-    /// instead of installing it.
+    /// The release's version when the entry keeps the selected package (newer
+    /// than the release's, or with no order against it) instead of installing
+    /// the release's.
     release_version: Option<String>,
 }
 
@@ -1289,12 +1291,13 @@ fn plan_runtime(
         );
         return Ok(None);
     }
-    match selection_outcome(plan, &prepared, &subject, report, is_reserved(&runtime)) {
+    let reserved = is_reserved(&runtime);
+    match decide_selection(plan, &prepared, &subject, &mut reasons, report, reserved) {
         Selection::Leave => return Ok(None),
         Selection::Keep { unordered } => {
             let kept = KeptSelection {
                 unordered,
-                reserved: is_reserved(&runtime),
+                reserved,
             };
             return Ok(plan_kept_selection(
                 plan, &prepared, &subject, runtime, reasons, kept, report,
@@ -1358,6 +1361,49 @@ fn plan_runtime(
         replaces_newer,
         release_version: None,
     }))
+}
+
+/// What happens to the selected version of a runtime: under `--detect` the
+/// release package's search-path gate comes first for a runtime that would be
+/// left untouched, then [`selection_outcome`] decides.
+fn decide_selection(
+    plan: &PlanInputs<'_>,
+    prepared: &Prepared,
+    subject: &str,
+    reasons: &mut Vec<UseReason>,
+    report: &mut Report,
+    reserved: bool,
+) -> Selection {
+    if report.detect && !passes_detect_gate_before_leaving(plan, prepared, subject, reasons, report)
+    {
+        return Selection::Leave;
+    }
+    selection_outcome(plan, prepared, subject, report, reserved)
+}
+
+/// Under `--detect`, a runtime the plan would leave untouched (its unordered
+/// selection is disabled, does not load or is altered) is first judged by the
+/// release package's search-path gate, as a replacing plan is: a runtime
+/// nothing uses and whose program is off the search path is dropped, not
+/// reported or refused. `false` drops the runtime.
+fn passes_detect_gate_before_leaving(
+    plan: &PlanInputs<'_>,
+    prepared: &Prepared,
+    subject: &str,
+    reasons: &mut Vec<UseReason>,
+    report: &mut Report,
+) -> bool {
+    match unordered_selection(plan, prepared) {
+        Some((Serving::Disabled | Serving::Broken | Serving::Damaged(_), _)) => {
+            detect_on_search_path(
+                report,
+                subject,
+                prepared.definition.program().as_str(),
+                reasons,
+            )
+        }
+        _ => true,
+    }
 }
 
 /// How the selected version of a runtime stays.
@@ -1900,9 +1946,14 @@ fn classify_pin<'a>(
         Pinning::Keep(kept_action(profile, previous_version, reason))
     };
     if matches!(entry.action, Action::Kept) {
-        // Only a kept selection that the release offers another version of is
-        // reported: the pin stays and differs from what serves the runtime.
-        if entry.release_version.is_none() {
+        // Only a kept selection that has no order against the release's
+        // version is reported: the pin stays and differs from what serves the
+        // runtime.
+        let unordered = entry.release_version.as_deref().is_some_and(|release| {
+            semver::Version::parse(entry.identity.version.as_str()).is_err()
+                || semver::Version::parse(release).is_err()
+        });
+        if !unordered {
             return Pinning::Untouched;
         }
         let version = plan
