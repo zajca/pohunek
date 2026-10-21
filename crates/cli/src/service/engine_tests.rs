@@ -10740,7 +10740,9 @@ async fn a_rollback_gate_before_the_stop_judges_the_unloaded_job() {
 #[tokio::test]
 async fn the_swap_and_the_runtime_step_judge_the_unloaded_job_before_they_stop_the_daemon() {
     const LATER: &str = "/opt/later/bin:/usr/bin";
-    for apply in [false, true] {
+    // `changed`: the persisted configuration changed again (undecidable); otherwise
+    // it is unchanged and decidable, but not the loaded job's default.
+    for (apply, changed) in [(false, true), (true, true), (false, false)] {
         let mut harness = Harness::new();
         let domain = harness.root.join("user.plist");
         std::fs::write(&domain, launchd_domain_xml(PENDING_PATH)).expect("domain configuration");
@@ -10753,7 +10755,9 @@ async fn the_swap_and_the_runtime_step_judge_the_unloaded_job_before_they_stop_t
             .upgrade(&harness.staged(V2), V2)
             .await
             .expect_err("interrupted before the runtime step");
-        std::fs::write(&domain, launchd_domain_xml(LATER)).expect("domain configuration");
+        if changed {
+            std::fs::write(&domain, launchd_domain_xml(LATER)).expect("domain configuration");
+        }
         harness.context = harness
             .context
             .clone()
@@ -10781,8 +10785,14 @@ async fn the_swap_and_the_runtime_step_judge_the_unloaded_job_before_they_stop_t
 
         assert_eq!(error.code(), "service_manager_environment_unavailable");
         let world = harness.fake.world();
-        assert_eq!(world.uninstalls, uninstalls, "no stop (apply {apply})");
-        assert_eq!(world.replaces, replaces, "no replacement (apply {apply})");
+        assert_eq!(
+            world.uninstalls, uninstalls,
+            "no stop (apply {apply}, changed {changed})"
+        );
+        assert_eq!(
+            world.replaces, replaces,
+            "no replacement (apply {apply}, changed {changed})"
+        );
     }
 }
 

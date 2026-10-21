@@ -1168,7 +1168,7 @@ impl<'a> Engine<'a> {
         if swap {
             // A failed swap rolls back with the old job gone: refuse now, while
             // it still runs, a job the rollback could not judge then.
-            journal_job_path(self.context, record, true).await?;
+            self.require_same_after_stop(record, &job).await?;
             if let Some(dir) = config.daemon_executable().parent() {
                 self.pass_swap_gate(record, layout, dir, &job, &warnings, late)
                     .await?;
@@ -1451,6 +1451,19 @@ impl<'a> Engine<'a> {
         self.stop_daemon_for_migration().await
     }
 
+    /// Refuses a transaction whose job `PATH` after the daemon is stopped is not
+    /// the one judged now: a failed swap or apply rolls back with the job gone,
+    /// so the gates run while it still loads must judge that same `PATH`.
+    async fn require_same_after_stop(&self, record: &Record, job: &JobPath) -> Result<(), Error> {
+        let after = journal_job_path(self.context, record, true).await?;
+        if after.value != job.value {
+            return Err(Error::ManagerEnvironment {
+                detail: "the PATH the daemon job has now differs from the one it will have once it is stopped (the launchd default changed since the upgrade journaled it), so a rollback would judge another PATH than this step does. Set the PATH explicitly with `launchctl setenv PATH <directories>` in the GUI session and retry".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Plans and applies the release's official runtime packages and profile
     /// pins, stopping the previous daemon only when the plan changes something.
     ///
@@ -1500,7 +1513,7 @@ impl<'a> Engine<'a> {
             if record.config_backup.is_none() {
                 // A failed apply rolls back with the daemon down: refuse now,
                 // while it still runs, a job the rollback could not judge then.
-                journal_job_path(self.context, record, true).await?;
+                self.require_same_after_stop(record, job).await?;
             }
             record.runtime_stop = true;
             self.store.save(record)?;
