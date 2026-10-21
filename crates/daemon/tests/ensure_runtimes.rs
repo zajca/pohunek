@@ -2571,28 +2571,81 @@ async fn a_disabled_unordered_pi_selection_is_reported_once_by_the_detecting_pla
         &format!("base = \"pi\"\n{}", official_runtimes::profile_pin("pi")),
     );
 
-    let plan = host.detect_step();
-
-    let not_serving: Vec<_> = plan
-        .gaps
-        .iter()
-        .filter(|gap| gap.runtime == "pi" && gap.code == CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)
-        .collect();
-    assert_eq!(not_serving.len(), 1, "{:?}", plan.gaps);
-    let detail = &not_serving[0].detail;
-    assert!(!detail.contains("plugin update"), "{detail}");
     let hex = id
         .as_str()
         .strip_prefix("sha256:")
         .expect("a sha256 digest");
     let command = format!("pohunek plugin enable {PI_PACKAGE} --digest {hex}");
-    assert!(detail.contains(&command), "{detail}");
+    for plan in [host.detect_step(), host.step(true)] {
+        let not_serving: Vec<_> = plan
+            .gaps
+            .iter()
+            .filter(|gap| gap.runtime == "pi" && gap.code == CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)
+            .collect();
+        assert_eq!(not_serving.len(), 1, "{:?}", plan.gaps);
+        let detail = &not_serving[0].detail;
+        assert!(!detail.contains("plugin update"), "{detail}");
+        assert!(detail.contains(&command), "{detail}");
+    }
     // The hint's digest selects the disabled package, and enabling it works.
     pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
         .expect("the package store")
         .registry()
         .set_enabled(&id, true)
         .expect("the hinted package can be enabled");
+}
+
+/// A kept unordered selection of a runtime nothing uses, whose program is off
+/// the search path, is not planned, and the plan does not claim it is kept.
+#[test]
+fn an_unused_unordered_selection_without_its_program_is_not_reported_as_kept() {
+    let host = Host::new();
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "2.0");
+    host.publish_archives(1, &[("claude", &bytes, &digest)]);
+    host.write_claude_profile();
+    let installed = host.step(false);
+    assert!(installed.refusals.is_empty(), "{installed:?}");
+    fs::remove_file(host.profile_path()).expect("remove the profile");
+    publish_claude_version(&host, "1.0.3", 2);
+
+    let plan = host.detect_step();
+
+    assert!(
+        plan.packages
+            .iter()
+            .all(|package| package.runtime != "claude"),
+        "{:?}",
+        plan.packages
+    );
+    let codes = gap_codes(&plan);
+    assert!(
+        codes.contains(&("claude", CODE_GAP_AGENT_NOT_ON_PATH)),
+        "{codes:?}"
+    );
+    assert!(
+        !codes.contains(&("claude", CODE_GAP_UPDATE_VERSION_UNORDERED)),
+        "{codes:?}"
+    );
+}
+
+/// A kept Pi selection is not judged by the detect checks of the search path.
+#[tokio::test]
+async fn a_kept_pi_selection_skips_the_detect_search_path_check() {
+    let host = Host::with_installed_pi().await;
+    host.publish_pi(PI_OLDER_VERSION, 1);
+    host.write_profile(
+        "work",
+        &format!("base = \"pi\"\n{}", official_runtimes::profile_pin("pi")),
+    );
+
+    let plan = host.detect_step();
+
+    assert_eq!(pi_package(&plan).status, PackageStatus::Kept);
+    assert!(
+        !gap_codes(&plan).contains(&("pi", CODE_GAP_AGENT_NOT_ON_PATH)),
+        "{:?}",
+        plan.gaps
+    );
 }
 
 #[tokio::test]

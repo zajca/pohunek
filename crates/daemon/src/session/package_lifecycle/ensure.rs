@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use package::catalog_state::CatalogState;
 use package::registry::{PackageSource, RegistryState, RetainedDigests};
 use package::verify::VerifyError;
-use package::{PackageDigest, VerifiedCatalog, MAX_CATALOG_BYTES};
+use package::{PackageDigest, VerifiedCatalog, VerifiedEntry, MAX_CATALOG_BYTES};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Gap, IntegrationAction, PackageAction, PackageStatus,
     ProfileAction, ProfileStatus, Refusal, SelectedPackage, UseReason, CODE_GAP_AGENT_NOT_ON_PATH,
@@ -1117,14 +1117,18 @@ fn managed_runtimes(
                 && record.identity().id == *entry.package_id()
         });
         if installed {
-            report.gap(
-                runtime.as_str(),
-                CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
-                &format!(
+            let detail = match disabled_unordered_selection(state, entry) {
+                Some(selected) => disabled_selection_detail(entry.package_id(), &selected),
+                None => format!(
                     "an official package of this runtime is installed but not selected and \
                      enabled, so the upgrade leaves it as you set it; update it with: {}",
                     update_command(entry.package_id(), runtime)
                 ),
+            };
+            report.gap(
+                runtime.as_str(),
+                CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
+                &detail,
             );
         }
     }
@@ -1276,9 +1280,13 @@ fn plan_runtime(
     }
     match selection_outcome(plan, &prepared, &subject, report, is_reserved(&runtime)) {
         Selection::Leave => return Ok(None),
-        Selection::Keep => {
+        Selection::Keep { unordered } => {
+            let kept = KeptSelection {
+                unordered,
+                reserved: is_reserved(&runtime),
+            };
             return Ok(plan_kept_selection(
-                plan, &prepared, &subject, runtime, reasons, report,
+                plan, &prepared, &subject, runtime, reasons, kept, report,
             ));
         }
         Selection::Replace => {}
@@ -1341,18 +1349,29 @@ fn plan_runtime(
     }))
 }
 
-/// Plans a runtime whose selected version stays: the checks of a detecting
-/// plan run as for the release's package, and the entry names the version the
-/// release offers.
+/// How the selected version of a runtime stays.
+#[derive(Clone, Copy)]
+struct KeptSelection {
+    /// Its version has no order against the release's.
+    unordered: bool,
+    /// The runtime is reserved.
+    reserved: bool,
+}
+
+/// Plans a runtime whose selected version stays. A reserved runtime goes
+/// through the checks of a detecting plan as for the release's package; the
+/// unordered gap is reported only when the keep is planned. The entry names
+/// the version the release offers.
 fn plan_kept_selection(
     plan: &PlanInputs<'_>,
     prepared: &Prepared,
     subject: &str,
     runtime: RuntimeId,
     mut reasons: Vec<UseReason>,
+    kept: KeptSelection,
     report: &mut Report,
 ) -> Option<Planned> {
-    if report.detect {
+    if report.detect && kept.reserved {
         if !detect_on_search_path(
             report,
             subject,
@@ -1364,10 +1383,18 @@ fn plan_kept_selection(
         config_home_gap(plan, &prepared.definition, report);
     }
     let release_version = prepared.identity.version.as_str().to_owned();
-    plan_installed(plan, runtime, reasons, report).map(|mut kept| {
-        kept.release_version = Some(release_version);
-        kept
-    })
+    let planned = plan_installed(plan, runtime, reasons, report).map(|mut entry| {
+        entry.release_version = Some(release_version);
+        entry
+    });
+    if kept.unordered && planned.is_some() {
+        report.gap(
+            subject,
+            CODE_GAP_UPDATE_VERSION_UNORDERED,
+            "the selected version cannot be ordered against the release's, so it is kept",
+        );
+    }
+    planned
 }
 
 /// Prepares the release archive of `runtime` that the catalog authorizes. A
@@ -2172,6 +2199,34 @@ fn replaces_newer(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<Selected
     })
 }
 
+/// The digest, as the `--digest` selector spells it, of the disabled selected
+/// official version of `entry`'s package when it has no order against the
+/// entry's version.
+fn disabled_unordered_selection(state: &RegistryState, entry: &VerifiedEntry) -> Option<String> {
+    let selected = state.selected(entry.package_id())?;
+    let record = state.package(selected)?;
+    (record.source() == PackageSource::Official
+        && !record.enabled()
+        && version_order(&record.identity().version, entry.version()).is_none())
+    .then(|| selector_digest(selected))
+}
+
+/// A digest without its `sha256:` prefix, as the `--digest` selector spells it.
+fn selector_digest(digest: &PackageDigest) -> String {
+    let text = digest.as_str();
+    text.strip_prefix(DIGEST_PREFIX).unwrap_or(text).to_owned()
+}
+
+/// The gap detail for a disabled selected version that cannot be ordered
+/// against the release's; `plugin update` refuses to replace it.
+fn disabled_selection_detail(package: &PackageId, digest: &str) -> String {
+    format!(
+        "the selected version cannot be ordered against the release's and is disabled, so \
+         the upgrade leaves it as you set it; enable it with: \
+         pohunek plugin enable {package} --digest {digest}"
+    )
+}
+
 /// Prefix of a package digest; the `--digest` selector spells it without.
 const DIGEST_PREFIX: &str = "sha256:";
 
@@ -2179,8 +2234,9 @@ const DIGEST_PREFIX: &str = "sha256:";
 enum Selection {
     /// The release's package is planned over it.
     Replace,
-    /// The selected package stays and serves the runtime.
-    Keep,
+    /// The selected package stays and serves the runtime; `unordered` when
+    /// its version has no order against the release's.
+    Keep { unordered: bool },
     /// The runtime is not planned: the selection is disabled or does not load.
     Leave,
 }
@@ -2203,11 +2259,7 @@ fn selection_outcome(
         Some((state @ (Serving::Disabled | Serving::Broken), selected)) => {
             let id = &prepared.identity.id;
             let detail = match state {
-                Serving::Disabled => format!(
-                    "the selected version cannot be ordered against the release's and is \
-                     disabled, so the upgrade leaves it as you set it; enable it with: \
-                     pohunek plugin enable {id} --digest {selected}"
-                ),
+                Serving::Disabled => disabled_selection_detail(id, &selected),
                 _ => format!(
                     "the selected version cannot be ordered against the release's and its \
                      package does not load, so the upgrade leaves it; reinstall that version \
@@ -2229,18 +2281,11 @@ fn selection_outcome(
                 .retain(|action| action.runtime != subject);
             return Selection::Leave;
         }
-        Some((Serving::Loadable, _)) => {
-            report.gap(
-                subject,
-                CODE_GAP_UPDATE_VERSION_UNORDERED,
-                "the selected version cannot be ordered against the release's, so it is kept",
-            );
-            return Selection::Keep;
-        }
+        Some((Serving::Loadable, _)) => return Selection::Keep { unordered: true },
         None => {}
     }
     if !reserved && replaces_newer(plan, prepared).is_some() {
-        Selection::Keep
+        Selection::Keep { unordered: false }
     } else {
         Selection::Replace
     }

@@ -2336,10 +2336,13 @@ the runtime id; it is left untouched), `official_package_unavailable_for_platfor
 `--detect`, except for an installed official package of a runtime that is not
 reserved, such as Pi, where it is a gap in every mode), and
 `official_package_not_serving` (an official package of such a runtime is
-installed but not selected and enabled, or selected while its version cannot be
-ordered against the release's but disabled or not loadable, so the step leaves it;
-the detail names `pohunek plugin update`, or for a reserved runtime `pohunek plugin
-enable` or `plugin select`), and
+installed but not selected and enabled, so the step leaves it, or selected while its
+version cannot be ordered against the release's but disabled or not loadable, so the
+step leaves that too; the detail names the command by cause: `pohunek plugin update`
+for a package that is not selected and enabled, `pohunek plugin enable <package>
+--digest <digest>` for a disabled unordered selection (any runtime, Pi included),
+and `pohunek plugin install` or `plugin select` for an unordered selection that does
+not load), and
 `plugin_update_version_unordered` (the selected version of an official package, of
 a reserved runtime or not, cannot be ordered against the release's and is enabled and loadable, so it is kept,
 as `plugin update` refuses to replace it). The first two of these three name the command
