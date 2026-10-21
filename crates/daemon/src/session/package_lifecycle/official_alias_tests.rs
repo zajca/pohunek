@@ -1215,6 +1215,7 @@ impl ReleasedWorker {
                     pohunek_worker_protocol::HookAction::Notification,
                     RuntimeId::HERMES,
                     "hook notification",
+                    false,
                 )
                 .await
         });
@@ -1252,6 +1253,7 @@ async fn a_hook_report_while_an_unpinned_sessions_worker_reconnects_is_admitted_
             pohunek_worker_protocol::HookAction::Notification,
             "unlisted-provider",
             "hook notification",
+            false,
         )
         .await
         .expect_err("the Hermes schema refuses a provider it does not list");
@@ -1455,6 +1457,7 @@ fn identity_report(id: &protocol::SessionId, agent: &str) -> protocol::SessionRe
         agent_session_path: None,
         pid_start_identity: None,
         monotonic_sequence: None,
+        retryable_admission: false,
     }
 }
 
@@ -1482,6 +1485,7 @@ async fn assert_hooks_not_attributed_through_the_package(
             pid: None,
             pid_start_identity: None,
             monotonic_sequence: None,
+            retryable_admission: false,
         })
         .await;
     assert!(!released.released, "the release is not applied");
@@ -1494,6 +1498,7 @@ async fn assert_hooks_not_attributed_through_the_package(
             pohunek_worker_protocol::HookAction::Notification,
             RuntimeId::HERMES,
             "hook notification",
+            false,
         )
         .await
         .expect("the journaled schema admits a Hermes notification");
@@ -2284,6 +2289,7 @@ fn claude_identity_report(id: &protocol::SessionId) -> protocol::SessionReportAg
         agent_session_path: None,
         pid_start_identity: None,
         monotonic_sequence: None,
+        retryable_admission: false,
     }
 }
 
@@ -2993,6 +2999,7 @@ async fn a_nested_agent_report_held_across_an_uninstall_of_its_package_is_never_
         agent_session_path: None,
         pid_start_identity: None,
         monotonic_sequence: None,
+        retryable_admission: false,
     };
     let before = running_detector(&fixture.registry, &created.id).await;
 
@@ -3092,6 +3099,7 @@ async fn a_nested_agent_of_another_runtime_keeps_its_detector_through_a_package_
         agent_session_path: None,
         pid_start_identity: None,
         monotonic_sequence: None,
+        retryable_admission: false,
     };
     assert!(
         adopted.registry.report_agent(nested).await.recorded,
@@ -3138,6 +3146,7 @@ fn tuned_report(id: &protocol::SessionId) -> protocol::SessionReportAgentParams 
         agent_session_path: None,
         pid_start_identity: None,
         monotonic_sequence: None,
+        retryable_admission: false,
     }
 }
 
@@ -4114,6 +4123,7 @@ async fn an_explicit_report_of_a_differently_named_profile_keeps_its_override_th
                 agent_session_path: None,
                 pid_start_identity: None,
                 monotonic_sequence: None,
+                retryable_admission: false,
             })
             .await
             .recorded,
@@ -5421,4 +5431,339 @@ async fn damaged_profile_session_loss(installed: bool) {
             "runtime_builtin_removed"
         }
     );
+}
+
+// Hook admission for a report that opted into the retryable answer: a session
+// without a served launch pin is admitted by the schema its worker journaled,
+// and a worker that stays away ends the wait with `hook_schema_unavailable`
+// after the short admission wait instead of the worker connect deadline.
+
+/// Runs `admission` on the paused clock and returns its result with the
+/// virtual time it waited. The released worker fails its inspect at once, so
+/// only the admission's own sleeps move the clock.
+async fn timed_admission<T>(
+    admission: impl std::future::Future<Output = T>,
+) -> (T, std::time::Duration) {
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let result = admission.await;
+    (result, started.elapsed())
+}
+
+#[tokio::test]
+async fn an_opted_in_report_is_refused_retryably_after_the_admission_wait() {
+    let released = ReleasedWorker::hermes("alias-retry-fast").await;
+    let registry = &released.restarted.registry;
+    let config = &registry.inner.config;
+
+    let (refusal, waited) = timed_admission(registry.admit_session_hook(
+        &released.id,
+        pohunek_worker_protocol::HookAction::Notification,
+        RuntimeId::HERMES,
+        "hook notification",
+        true,
+    ))
+    .await;
+
+    let refusal = refusal.expect_err("the worker stays away");
+    assert!(
+        matches!(&refusal, crate::session::HookAdmissionError::SchemaUnavailable { bound } if *bound == config.hook_admission_wait),
+        "{refusal:?}"
+    );
+    assert!(
+        waited >= config.hook_admission_wait && waited < config.worker_connect_deadline,
+        "the wait ends at the admission wait: {waited:?}"
+    );
+    let error = refusal.retryable_error();
+    assert_eq!(error.code, "hook_schema_unavailable");
+    assert_eq!(error.class, protocol::ErrorClass::Daemon);
+    assert!(error
+        .recover
+        .as_deref()
+        .is_some_and(|hint| hint.contains("retry")));
+}
+
+#[tokio::test]
+async fn a_report_without_the_opt_in_waits_the_full_connect_deadline() {
+    let released = ReleasedWorker::hermes("alias-retry-legacy").await;
+    let registry = &released.restarted.registry;
+    let config = &registry.inner.config;
+
+    let (refusal, waited) = timed_admission(registry.admit_session_hook(
+        &released.id,
+        pohunek_worker_protocol::HookAction::Notification,
+        RuntimeId::HERMES,
+        "hook notification",
+        false,
+    ))
+    .await;
+
+    let refusal = refusal.expect_err("the worker stays away");
+    assert!(
+        matches!(&refusal, crate::session::HookAdmissionError::SchemaUnavailable { bound } if *bound == config.worker_connect_deadline),
+        "{refusal:?}"
+    );
+    assert!(waited >= config.worker_connect_deadline, "{waited:?}");
+}
+
+#[tokio::test]
+async fn the_retryable_answer_reaches_only_a_report_that_opted_in() {
+    let released = ReleasedWorker::hermes("alias-retry-mapping").await;
+    let registry = &released.restarted.registry;
+    tokio::time::pause();
+    let admission = |retryable| {
+        registry.hook_report_admitted(
+            &released.id,
+            pohunek_worker_protocol::HookAction::IdentityReport,
+            RuntimeId::HERMES,
+            "active-agent report",
+            retryable,
+        )
+    };
+
+    let error = admission(true)
+        .await
+        .expect_err("an opted-in report learns that a retry can succeed");
+    assert_eq!(error.code, "hook_schema_unavailable");
+    assert!(
+        !admission(false)
+            .await
+            .expect("no opt-in keeps the old answer"),
+        "the report is simply not admitted"
+    );
+}
+
+#[tokio::test]
+async fn a_worker_that_answers_inside_the_admission_wait_admits_the_report() {
+    let released = ReleasedWorker::hermes("alias-retry-window").await;
+    let registry = released.restarted.registry.clone();
+    let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+    let _subscriber = logs.install();
+    // The clock stays put until the worker is back, so the wait cannot lapse.
+    tokio::time::pause();
+    let inhibitor = pohunek_test_support::time::AutoAdvanceInhibitor::new();
+    let reported = released.id.clone();
+    let admission = tokio::spawn(async move {
+        registry
+            .admit_session_hook(
+                &reported,
+                pohunek_worker_protocol::HookAction::Notification,
+                RuntimeId::HERMES,
+                "hook notification",
+                true,
+            )
+            .await
+    });
+    while !logs
+        .text()
+        .contains("the worker cannot report its journaled hook schema")
+    {
+        tokio::task::yield_now().await;
+    }
+
+    released.reconnect().await;
+    admission
+        .await
+        .expect("the admission task joins")
+        .expect("the reconnected worker's schema admits the report");
+    inhibitor.release().await;
+}
+
+#[tokio::test]
+async fn a_schema_denial_stays_final_with_the_opt_in() {
+    let released = ReleasedWorker::hermes("alias-retry-denied").await;
+    released.reconnect().await;
+
+    let refusal = released
+        .restarted
+        .registry
+        .admit_session_hook(
+            &released.id,
+            pohunek_worker_protocol::HookAction::Notification,
+            "unlisted-provider",
+            "hook notification",
+            true,
+        )
+        .await
+        .expect_err("the Hermes schema refuses a provider it does not list");
+    assert!(
+        matches!(refusal, crate::session::HookAdmissionError::Denied(_)),
+        "{refusal:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_opted_in_native_id_report_gets_the_retryable_error_while_the_worker_is_away() {
+    let released = ReleasedWorker::built_in(RuntimeId::CLAUDE, "alias-retry-native").await;
+    let report = released
+        .native_report
+        .clone()
+        .with_retryable_admission(true);
+    let registry = &released.restarted.registry;
+    let peer = crate::session::ControlPeer::for_test(crate::procwatch::ProcessIdentity {
+        pid: report.pid(),
+        start_identity: crate::procwatch::StartIdentity::new(report.pid_start_identity().get()),
+    });
+    tokio::time::pause();
+
+    let error = registry
+        .report_native_id(report, Some(&peer))
+        .await
+        .expect_err("the worker stays away past the admission wait");
+    assert_eq!(error.code, "hook_schema_unavailable");
+
+    // Without the opt-in the report is simply not recorded, as before.
+    let plain = released.native_report.clone();
+    let outcome = registry
+        .report_native_id(plain, Some(&peer))
+        .await
+        .expect("an old-style report is not an error");
+    assert!(!outcome.recorded);
+}
+
+/// The public `notification.create` request a Hermes hook sends for `session`.
+fn hook_notification_line(session: &protocol::SessionId, retryable: bool) -> String {
+    let mut params = serde_json::json!({
+        "source": {
+            "provider": RuntimeId::HERMES,
+            "provider_event": "Stop",
+            "host_local_source_id": format!("hook:hermes:{}:Stop:e1", session.0),
+        },
+        "kind": "error", "severity": "error", "title": "Agent error",
+        "body": "The agent reported an error.", "metadata": {},
+        "session_id": session, "agent_kind": RuntimeId::HERMES,
+        "source_id": format!("hook:hermes:{}:Stop:e1", session.0),
+    });
+    if retryable {
+        params["retryable_admission"] = serde_json::json!(true);
+    }
+    serde_json::json!({
+        "v": {"minimum": protocol::PROTOCOL_VERSION.get(), "maximum": protocol::PROTOCOL_VERSION.get()},
+        "id": "hook-notification-1",
+        "method": protocol::method::NOTIFICATION_CREATE,
+        "params": params,
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_hook_notification_gets_the_retryable_error_only_when_it_opted_in() {
+    let released = ReleasedWorker::hermes("alias-retry-notification").await;
+    let dir = temp_dir("alias-retry-notification-data");
+    let notifications =
+        crate::notifications::NotificationService::open(&dir).expect("notification service");
+    let state = crate::api::DaemonState::new(
+        crate::api::HealthInfo::new("test"),
+        released.restarted.registry.clone(),
+        std::sync::Arc::new(crate::governance::HostGovernanceService::open_test()),
+        crate::test_support::overlay_registry(),
+    )
+    .with_notifications(notifications);
+    tokio::time::pause();
+
+    let mut codes = Vec::new();
+    for retryable in [true, false] {
+        let crate::api::Dispatch::Reply(reply) = crate::api::dispatch_line(
+            &hook_notification_line(&released.id, retryable),
+            &state,
+            None,
+        )
+        .await
+        else {
+            panic!("a notification request is answered");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&reply).expect("reply JSON");
+        codes.push(reply["err"]["code"].as_str().map(str::to_owned));
+    }
+    assert_eq!(
+        codes,
+        [
+            Some("hook_schema_unavailable".to_owned()),
+            Some("hook_not_admitted".to_owned())
+        ]
+    );
+}
+
+/// The retry policy the daemon announces to a session's hooks.
+fn announced_retry_policy() -> crate::integration::reporter_retry_tests::Policy {
+    let millis = |duration: std::time::Duration| {
+        u32::try_from(duration.as_millis()).expect("an announced duration fits in u32")
+    };
+    crate::integration::reporter_retry_tests::Policy {
+        deadline: millis(crate::integration::hook_retry_deadline()),
+        backoff: millis(pohunek_service_config::HOOK_RETRY_BACKOFF),
+        backoff_max: millis(pohunek_service_config::HOOK_RETRY_BACKOFF_MAX),
+    }
+}
+
+/// The real Claude notification hook runs against a served daemon whose
+/// session worker is away: the first delivery is refused, the worker comes back
+/// while the hook retries, and exactly one notification is recorded.
+#[tokio::test]
+async fn a_claude_hook_retries_until_the_unpinned_sessions_worker_is_back() {
+    let released = ReleasedWorker::built_in(RuntimeId::CLAUDE, "alias-retry-e2e").await;
+    let dir = crate::test_support::scoped_dir("ph-alias-retry-e2e-");
+    let notifications = crate::notifications::NotificationService::open(&dir.join("data"))
+        .expect("notification service");
+    let mut policy = crate::notifications::default_policy();
+    policy.enabled.system = true;
+    policy.providers.clear();
+    notifications
+        .set_policy(policy)
+        .expect("enable system notifications");
+    let (attention, _attention_task) = crate::notifications::AttentionCoordinator::spawn(
+        notifications.clone(),
+        &released.restarted.registry,
+    );
+    let state = crate::api::DaemonState::new(
+        crate::api::HealthInfo::new("test"),
+        released.restarted.registry.clone(),
+        std::sync::Arc::new(crate::governance::HostGovernanceService::open_test()),
+        crate::test_support::overlay_registry(),
+    )
+    .with_notifications(notifications.clone())
+    .with_attention_coordinator(attention);
+    let socket = dir.join("daemon.sock");
+    let server = crate::api::ControlServer::bind_with_state(&socket, state)
+        .await
+        .expect("the daemon socket binds");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(server.serve(async move {
+        let _ = stopped.await;
+    }));
+    let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+    let _subscriber = logs.install();
+
+    let session = released.id.0.clone();
+    let hook = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            let policy = announced_retry_policy();
+            let mut run = crate::integration::reporter_retry_tests::Run::notify("claude", "{}");
+            run.session = &session;
+            run.policy = Some(&policy);
+            run.run_at(&socket).await
+        }
+    });
+    wait_until(
+        "the daemon refuses the hook while the worker is away",
+        || async {
+            logs.text()
+                .contains("the worker's hook schema was unavailable after the bound")
+                .then_some(())
+        },
+    )
+    .await;
+    released.reconnect().await;
+    hook.await.expect("the hook script finishes");
+
+    let recorded = notifications
+        .list(protocol::NotificationListParams::default())
+        .expect("list notifications")
+        .notifications;
+    assert_eq!(recorded.len(), 1, "one record: {recorded:?}");
+    assert_eq!(recorded[0].session_id.as_ref(), Some(&released.id));
+
+    let _ = stop.send(());
+    serving.await.expect("the server stops");
 }

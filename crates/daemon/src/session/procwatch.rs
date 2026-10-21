@@ -1997,6 +1997,7 @@ mod tests {
                 agent_session_path: None,
                 pid_start_identity: None,
                 monotonic_sequence: None,
+                retryable_admission: false,
             })
             .await;
         assert!(report.recorded);

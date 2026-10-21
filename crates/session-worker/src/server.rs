@@ -6804,7 +6804,12 @@ fn command_from_initialize(
         initialize
             .environment
             .iter()
-            .filter(|(name, _)| !name.starts_with("POHUNEK_"))
+            .filter(|(name, _)| {
+                !name.starts_with("POHUNEK_")
+                    || protocol::HOOK_RETRY_ENV_NAMES
+                        .iter()
+                        .any(|known| name == known)
+            })
             .map(|(name, value)| (name.to_owned(), value.to_owned())),
     );
     let mut reserved = BTreeMap::from([
@@ -10293,6 +10298,35 @@ mod tests {
         assert!(command
             .env
             .contains(&("TERM".to_owned(), "screen".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn only_the_hook_retry_variables_of_the_launch_environment_reach_the_child() {
+        let directory = pohunek_test_support::tempdir().expect("fixture directory");
+        let server = environment_fixture(directory.path(), "abcd2345")
+            .await
+            .expect("bind worker");
+        let mut launch: Vec<(&str, &str)> = protocol::HOOK_RETRY_ENV_NAMES
+            .iter()
+            .map(|name| (*name, "1"))
+            .collect();
+        launch.push(("POHUNEK_SOMETHING_ELSE", "1"));
+        let initialize = environment_initialize(base_environment(&[]), &launch);
+        let worker_instance_id = WorkerInstanceId::new("runtime-environment").expect("runtime id");
+
+        let command =
+            super::command_from_initialize(&server.shared, &initialize, &worker_instance_id);
+
+        for name in protocol::HOOK_RETRY_ENV_NAMES {
+            assert!(
+                command.env.contains(&(name.to_owned(), "1".to_owned())),
+                "{name}"
+            );
+        }
+        assert!(!command
+            .env
+            .iter()
+            .any(|(name, _)| name == "POHUNEK_SOMETHING_ELSE"));
     }
 
     #[tokio::test]

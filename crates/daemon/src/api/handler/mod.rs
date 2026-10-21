@@ -1063,6 +1063,7 @@ mod tests {
             source_id: Some("codex:s-1:permission:1".to_owned()),
             dedupe_key: Some("attention:s-1".to_owned()),
             project_id: Some("p-1".to_owned()),
+            retryable_admission: false,
         };
         request(
             id,
@@ -1088,6 +1089,7 @@ mod tests {
             source_id: Some("codex:s-1:error:1".to_owned()),
             dedupe_key: None,
             project_id: Some("p-1".to_owned()),
+            retryable_admission: false,
         };
         request(
             id,
@@ -1113,6 +1115,7 @@ mod tests {
             source_id: Some("codex:s-1:stop:1".to_owned()),
             dedupe_key: Some("turn:s-1".to_owned()),
             project_id: Some("p-1".to_owned()),
+            retryable_admission: false,
         };
         request(
             id,

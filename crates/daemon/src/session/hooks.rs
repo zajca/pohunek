@@ -6,6 +6,11 @@ use super::{
     SessionId, SessionRegistry, Value, ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION,
     ENV_SESSION_ID, ENV_SOCKET_PATH, EVENT_LOG_FLUSH_TIMEOUT, PROTOCOL_VERSION,
 };
+use crate::integration::hook_retry_deadline;
+use protocol::{
+    ENV_HOOK_ADMISSION_RETRY, ENV_HOOK_RETRY_BACKOFF_MAX_MS, ENV_HOOK_RETRY_BACKOFF_MS,
+    ENV_HOOK_RETRY_DEADLINE_MS,
+};
 
 /// Debounce window for session-layer `agent-state` hooks. The detector/event log
 /// still sees every transition immediately; only hook side effects wait briefly
@@ -144,6 +149,23 @@ impl SessionRegistry {
                 (
                     ENV_PROTOCOL_VERSION.to_owned(),
                     PROTOCOL_VERSION.get().to_string(),
+                ),
+                (ENV_HOOK_ADMISSION_RETRY.to_owned(), "1".to_owned()),
+                (
+                    ENV_HOOK_RETRY_DEADLINE_MS.to_owned(),
+                    hook_retry_deadline().as_millis().to_string(),
+                ),
+                (
+                    ENV_HOOK_RETRY_BACKOFF_MS.to_owned(),
+                    pohunek_service_config::HOOK_RETRY_BACKOFF
+                        .as_millis()
+                        .to_string(),
+                ),
+                (
+                    ENV_HOOK_RETRY_BACKOFF_MAX_MS.to_owned(),
+                    pohunek_service_config::HOOK_RETRY_BACKOFF_MAX
+                        .as_millis()
+                        .to_string(),
                 ),
             ],
             None => Vec::new(),

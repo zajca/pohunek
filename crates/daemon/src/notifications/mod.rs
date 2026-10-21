@@ -1346,6 +1346,7 @@ mod tests {
             dedupe_key: dedupe_key.map(str::to_owned),
             project_id: Some("p-1".to_owned()),
             metadata: BTreeMap::new(),
+            retryable_admission: false,
         }
     }
 

@@ -75,6 +75,7 @@ from datetime import datetime, timedelta, timezone
 # start), so the system-wide monotonic clock is read instead. It is read before
 # stdin, so a large provider input never delays the moment it records.
 sequence = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+invocation_start = time.monotonic()
 
 agent = "claude"
 ACTION_SESSION = "session"
@@ -92,6 +93,7 @@ ACTIONS = (
 TIMESTAMP_MS_FACTOR = 1000
 SOCKET_TIMEOUT_SECS = 0.5
 RESPONSE_BYTES = 4096
+MAX_RETRY_MS_DIGITS = 9
 MIN_AGENT_PID = 1
 IDENTITY_TTL_SECS = 30
 # Protocol 3 spells the worker instance key `runtime_id`; protocol 4 renamed it.
@@ -748,6 +750,9 @@ def send_worker_snapshot(tasks):
 
 
 def send_request(method, params, suffix):
+    # Sends one daemon request; True when the daemon asked for a retry.
+    if retry is not None:
+        params = dict(params, retryable_admission=True)
     request = {
         "v": {"minimum": protocol_version, "maximum": protocol_version},
         "id": f"hook:{agent}:{timestamp_ms}:{suffix}",
@@ -755,8 +760,57 @@ def send_request(method, params, suffix):
         "params": params,
     }
     answer = exchange(socket_path, request, "daemon")
-    if answer is not None and "error" in answer:
-        trace("daemon_refused")
+    error = answer.get("err") if answer is not None else None
+    if error is None:
+        return False
+    if retry is not None and isinstance(error, dict) and error.get("code") == RETRYABLE_ADMISSION_CODE:
+        return True
+    trace("daemon_refused")
+    return False
+
+
+RETRYABLE_ADMISSION_CODE = "hook_schema_unavailable"
+
+
+def retry_policy():
+    # (deadline, first pause, longest pause) in seconds. The daemon announces
+    # support and the values through the launch environment; without all of
+    # them the report is sent once, as before.
+    if os.environ.get("POHUNEK_HOOK_ADMISSION_RETRY") != "1":
+        return None
+    values = [
+        strict_positive_int(os.environ.get(name), MAX_RETRY_MS_DIGITS)
+        for name in (
+            "POHUNEK_HOOK_RETRY_DEADLINE_MS",
+            "POHUNEK_HOOK_RETRY_BACKOFF_MS",
+            "POHUNEK_HOOK_RETRY_BACKOFF_MAX_MS",
+        )
+    ]
+    if any(value is None for value in values):
+        return None
+    return tuple(value / 1000 for value in values)
+
+
+retry = retry_policy()
+
+
+def deliver_with_retry(attempt):
+    # `attempt` runs one whole delivery, the worker route first and the daemon
+    # fallback after it, and returns True when the daemon asked for a retry
+    # because the session's worker was unreachable. A retry waits a doubling
+    # pause until the deadline counted from the start of the invocation. Every
+    # attempt keeps the invocation's sequence so a late retry cannot outrank a
+    # newer report.
+    pause = retry[1] if retry else 0
+    while attempt():
+        if retry is None:
+            return
+        if time.monotonic() - invocation_start + pause >= retry[0]:
+            trace("daemon_retry_exhausted")
+            return
+        trace("daemon_retry")
+        time.sleep(pause)
+        pause = min(pause * 2, retry[2])
 
 
 def daemon_unusable():
@@ -785,12 +839,21 @@ if action == ACTION_STOP:
     send_worker_snapshot(hook_input["tasks"])
     raise SystemExit(0)
 
-if action == ACTION_RELEASE:
-    if worker_socket_path and send_worker_hook("identity_release"):
-        raise SystemExit(0)
-    if daemon_unusable():
-        raise SystemExit(0)
-    release_agent_params = {
+def once(build):
+    # Builds a value on first use and returns the same one on every retry, so a
+    # retried report keeps the identifiers of its first attempt.
+    cache = []
+
+    def get():
+        if not cache:
+            cache.append(build())
+        return cache[0]
+
+    return get
+
+
+def release_params():
+    params = {
         "session_id": session_id,
         "source": f"pohunek:{agent}",
         "agent": agent,
@@ -798,51 +861,63 @@ if action == ACTION_RELEASE:
         "monotonic_sequence": str(sequence),
     }
     if agent_pid is not None:
-        release_agent_params["pid"] = agent_pid
+        params["pid"] = agent_pid
         start_identity = agent_start_identity()
         if start_identity is not None:
-            release_agent_params["pid_start_identity"] = str(start_identity)
-    send_request("session.release_agent", release_agent_params, "release")
+            params["pid_start_identity"] = str(start_identity)
+    return params
+
+
+if action == ACTION_RELEASE:
+    release_agent_params = once(release_params)
+
+    def release_attempt():
+        if worker_socket_path and send_worker_hook("identity_release"):
+            return False
+        if daemon_unusable():
+            return False
+        return send_request("session.release_agent", release_agent_params(), "release")
+
+    deliver_with_retry(release_attempt)
     raise SystemExit(0)
 
 if not native_session_id:
     trace(*missing_input("session_id_missing"))
     raise SystemExit(0)
 
-if worker_socket_path and send_worker_hook("identity_report"):
-    raise SystemExit(0)
 
-if daemon_unusable():
-    raise SystemExit(0)
+def agent_params():
+    params = {
+        "session_id": session_id,
+        "source": f"pohunek:{agent}",
+        "agent": agent,
+        "seq": str(timestamp_ms),
+        "agent_session_id": native_session_id,
+    }
+    params["monotonic_sequence"] = str(sequence)
+    if agent_pid is not None:
+        params["pid"] = agent_pid
+        start_identity = agent_start_identity()
+        if start_identity is not None:
+            params["pid_start_identity"] = str(start_identity)
+    if transcript_path:
+        params["agent_session_path"] = transcript_path
+    return params
 
-report_agent_params = {
-    "session_id": session_id,
-    "source": f"pohunek:{agent}",
-    "agent": agent,
-    "seq": str(timestamp_ms),
-    "agent_session_id": native_session_id,
-}
-report_agent_params["monotonic_sequence"] = str(sequence)
-if agent_pid is not None:
-    report_agent_params["pid"] = agent_pid
-    start_identity = agent_start_identity()
-    if start_identity is not None:
-        report_agent_params["pid_start_identity"] = str(start_identity)
-if transcript_path:
-    report_agent_params["agent_session_path"] = transcript_path
 
-send_request("session.report_agent", report_agent_params, "agent")
-
-if worker_instance_id and agent_pid is not None:
+def native_params():
+    # None when the worker instance or the agent identity is unknown.
+    if not (worker_instance_id and agent_pid is not None):
+        return None
     start_identity = agent_start_identity()
     if start_identity is None:
-        raise SystemExit(0)
+        return None
     worker_instance_key = (
         "worker_instance_id"
         if protocol_version >= WORKER_INSTANCE_KEY_RENAMED_AT
         else "runtime_id"
     )
-    native_id_params = {
+    params = {
         "session_id": session_id,
         worker_instance_key: worker_instance_id,
         "agent": agent,
@@ -855,6 +930,26 @@ if worker_instance_id and agent_pid is not None:
         "native_session_id": native_session_id,
     }
     if transcript_path:
-        native_id_params["transcript_path"] = transcript_path
-    send_request("session.report_native_id", native_id_params, "native")
+        params["transcript_path"] = transcript_path
+    return params
+
+
+report_agent_params = once(agent_params)
+report_native_params = once(native_params)
+
+
+def report_attempt():
+    if worker_socket_path and send_worker_hook("identity_report"):
+        return False
+    if daemon_unusable():
+        return False
+    if send_request("session.report_agent", report_agent_params(), "agent"):
+        return True
+    native_id_params = report_native_params()
+    if native_id_params is None:
+        return False
+    return send_request("session.report_native_id", native_id_params, "native")
+
+
+deliver_with_retry(report_attempt)
 PY

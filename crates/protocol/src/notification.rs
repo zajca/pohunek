@@ -260,6 +260,14 @@ pub struct NotificationCreateParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub source_id: Option<String>,
+    /// Opts into the retryable admission answer: when the session's worker
+    /// cannot report its hook schema, the daemon waits only its configured
+    /// admission wait and answers `hook_schema_unavailable` instead of the
+    /// refusal a schema denial gets. Reporters send it only to a daemon that
+    /// announced support through the launch environment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub retryable_admission: bool,
     /// Source-independent dedupe key for one lifecycle group.
     ///
     /// Session-scoped keys use `attention:<session_id>` or `turn:<session_id>`.

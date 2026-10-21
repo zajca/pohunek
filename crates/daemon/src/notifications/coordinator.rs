@@ -585,6 +585,7 @@ mod tests {
             dedupe_key: Some(format!("attention:{session}")),
             project_id: Some("p-1".to_owned()),
             metadata: BTreeMap::new(),
+            retryable_admission: false,
         }
     }
 

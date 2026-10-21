@@ -115,6 +115,7 @@ async fn create(harness: &Harness, session: &str, kind: NotificationKind, title:
             source_id: None,
             dedupe_key: None,
             project_id: None,
+            retryable_admission: false,
         })
         .await
         .expect("create the notification");

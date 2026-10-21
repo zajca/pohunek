@@ -56,4 +56,12 @@ export type SessionReportAgentParams = {
    * Native session path for the active nested agent, when reported.
    */
   agent_session_path?: string;
+  /**
+   * Opts into the retryable admission answer: when the session's worker
+   * cannot report its hook schema, the daemon waits only its configured
+   * admission wait and answers `hook_schema_unavailable` instead of the
+   * refusal a schema denial gets. Reporters send it only to a daemon that
+   * announced support through the launch environment.
+   */
+  retryable_admission?: boolean;
 };
