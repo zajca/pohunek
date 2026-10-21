@@ -2041,10 +2041,10 @@ fn a_kept_unordered_selection_goes_through_the_detect_checks() {
 }
 
 /// An enabled selected version with no order against the release's whose root
-/// does not load is not kept: the plan goes on to the release's package, whose
-/// coexistence check judges the retained version.
+/// does not load is not replaced either: the runtime is left as it is and the
+/// plan reports a gap with a repair hint.
 #[test]
-fn an_unloadable_unordered_selected_reserved_runtime_version_is_not_kept() {
+fn an_unloadable_unordered_selected_reserved_runtime_version_is_left_untouched() {
     for runtime in ["claude", "codex"] {
         let host = Host::new();
         let (bytes, digest) = official_runtimes::variant_archive(runtime, "2.0");
@@ -2055,19 +2055,86 @@ fn an_unloadable_unordered_selected_reserved_runtime_version_is_not_kept() {
         host.remove_installed_root();
         let (release, release_digest) = official_runtimes::variant_archive(runtime, "1.0.3");
         host.publish_archives(2, &[(runtime, &release, &release_digest)]);
+        let registry = fs::read(host.registry_path()).expect("the registry record");
 
         let plan = host.step(true);
+        let applied = host.step(false);
 
-        let incompatible = ProtocolError::from(PackageErrorKind::IntegrationIncompatible).code;
-        assert_eq!(refusal_codes(&plan), [incompatible.as_str()], "{runtime}");
-        assert!(
-            gap_codes(&plan)
+        for report in [&plan, &applied] {
+            assert!(
+                report.refusals.is_empty(),
+                "{runtime}: {:?}",
+                report.refusals
+            );
+            assert!(
+                report.packages.is_empty(),
+                "{runtime}: {:?}",
+                report.packages
+            );
+            let gaps: Vec<_> = report
+                .gaps
                 .iter()
-                .all(|(_, code)| *code != CODE_GAP_UPDATE_VERSION_UNORDERED),
-            "{runtime}: {:?}",
-            plan.gaps
+                .filter(|gap| gap.runtime == runtime)
+                .collect();
+            assert_eq!(gaps.len(), 1, "{runtime}: {gaps:?}");
+            assert_eq!(gaps[0].code, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING);
+            assert!(gaps[0].detail.contains("pohunek plugin select"), "{gaps:?}");
+        }
+        assert_eq!(
+            fs::read(host.registry_path()).expect("the registry record"),
+            registry,
+            "{runtime}"
         );
     }
+}
+
+#[tokio::test]
+async fn an_unloadable_unordered_pi_selection_is_left_untouched() {
+    let host = Host::with_installed_pi().await;
+    let state = pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+        .expect("the package store")
+        .registry()
+        .state()
+        .expect("the registry state");
+    let digest = state
+        .packages()
+        .iter()
+        .find(|record| record.identity().id.as_str() == PI_PACKAGE)
+        .map(|record| record.digest().as_str().to_owned())
+        .expect("the installed Pi package");
+    host.remove_package_root(&digest);
+    host.publish_pi("2.0", 1);
+    host.write_profile(
+        "work",
+        &format!("base = \"pi\"\n{}", official_runtimes::profile_pin("pi")),
+    );
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert!(
+            report
+                .packages
+                .iter()
+                .all(|package| package.runtime != "pi"),
+            "{:?}",
+            report.packages
+        );
+        assert_eq!(
+            gap_codes(report)
+                .into_iter()
+                .filter(|(runtime, _)| *runtime == "pi")
+                .collect::<Vec<_>>(),
+            [("pi", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)]
+        );
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
 }
 
 /// A profile pinned to a digest the registry holds no record of is kept, as

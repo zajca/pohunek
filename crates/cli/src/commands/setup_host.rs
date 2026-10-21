@@ -983,7 +983,8 @@ fn check_package_transitions(
         }
         let installed = engine_installed(engine, &package.runtime);
         let allowed = match (shown.status, package.status) {
-            (PackageStatus::Present, PackageStatus::Present) => true,
+            (PackageStatus::Present, PackageStatus::Present)
+            | (PackageStatus::Kept, PackageStatus::Kept) => true,
             (PackageStatus::Install, PackageStatus::Install) => !installed,
             (PackageStatus::Install, PackageStatus::Present) => installed,
             _ => false,
@@ -1193,7 +1194,10 @@ async fn verdict(
         .iter()
         .filter(|shown| {
             !after.packages.iter().any(|package| {
-                package.runtime == shown.runtime && package.status == PackageStatus::Present
+                package.runtime == shown.runtime
+                    && (package.status == PackageStatus::Present
+                        || (package.status == PackageStatus::Kept
+                            && shown.status == PackageStatus::Kept))
             })
         })
         .map(|shown| shown.runtime.clone())
@@ -1647,47 +1651,4 @@ fn render_report(report: &SetupReport) -> String {
         report.verdict.health, report.verdict.doctor, report.verdict.catalog
     );
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use pohunek_service_config::runtimes::UseReason;
-
-    use super::*;
-
-    #[test]
-    fn the_preview_names_the_selected_version_a_kept_package_keeps() {
-        for runtime in ["pi", "claude", "codex"] {
-            let package = PackageAction {
-                runtime: runtime.to_owned(),
-                package: format!("pohunek.runtime.{runtime}"),
-                version: "2.0".to_owned(),
-                digest: "de".repeat(32),
-                status: PackageStatus::Kept,
-                reasons: vec![UseReason::Installed],
-                replaces_newer: None,
-                release_version: Some("1.0.3".to_owned()),
-            };
-            let preview = Preview {
-                service: ServiceStep::Present,
-                packages: vec![package],
-                profiles: Vec::new(),
-                integrations: Vec::new(),
-                gaps: Vec::new(),
-                catalog: CatalogStatus::Record,
-                catalog_note: None,
-                hermes_homes: Vec::new(),
-                config: Vec::new(),
-            };
-
-            let text = render_preview(&preview);
-
-            assert!(
-                text.contains(&format!(
-                    "  keeps the selected pohunek.runtime.{runtime} 2.0; the release offers 1.0.3"
-                )),
-                "{text}"
-            );
-        }
-    }
 }

@@ -65,6 +65,23 @@ const UNREADABLE_REPORT: &str = r#"{
   "refusals": []
 }"#;
 
+/// Report with a claude package whose selected version the release does not
+/// replace.
+const KEPT_REPORT: &str = r#"{
+  "report_version": 2,
+  "daemon_version": "fixture",
+  "dry_run": true,
+  "packages": [
+    {"runtime": "claude", "package": "claude-code", "version": "2.0",
+     "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "status": "kept", "reasons": ["profile"], "release_version": "1.0.3"}
+  ],
+  "catalog": "unavailable",
+  "profiles": [],
+  "integrations": [],
+  "refusals": []
+}"#;
+
 /// Relative path to every entry under `root`, with its size for files, so a
 /// change of any file shows up in the comparison.
 fn tree(root: &Path) -> BTreeMap<PathBuf, Option<u64>> {
@@ -219,6 +236,27 @@ fn a_refused_plan_stops_setup_before_any_write() {
         "stderr carries the daemon's refusal: {stderr}"
     );
     assert_eq!(tree(env.root()), before, "a refused plan writes nothing");
+}
+
+/// The dry-run preview names the selected version a kept package keeps and the
+/// version the release offers.
+#[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager on the session bus"
+)]
+fn the_preview_names_the_selected_version_a_kept_package_keeps() {
+    let env = TestEnv::new().expect("private environment");
+    let binary = release_with_fixture(&env, KEPT_REPORT);
+
+    let output = run_setup(&env, &binary, &["setup", "--dry-run"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("keeps the selected claude-code 2.0; the release offers 1.0.3"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// A plan report of a version this CLI does not read is an unusable plan, so

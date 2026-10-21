@@ -842,8 +842,9 @@ runtime and reports the gap `plugin_update_version_unordered`. The plan names
 the retained package and the version the release offers, as it does for Pi.
 A selected version you disabled is never replaced, selected or enabled: the
 plan plans nothing for that runtime and reports the gap
-`official_package_not_serving`. A selected version that is enabled but cannot be
-loaded is not kept: the plan goes on to the release's package. Unpinned profiles
+`official_package_not_serving`. The same holds for a selected version that is enabled but
+cannot be loaded: the plan names the repair (`plugin install` of that version, or
+`plugin select` of another). Unpinned profiles
 of a reserved runtime are bound to the kept version. `pohunek setup` prints the same
 "keeps the selected ...; the release offers ..." line as `service check`.
 `pohunek plugin select <package> --digest <digest>` moves it on purpose.

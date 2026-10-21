@@ -2178,7 +2178,7 @@ enum Selection {
     Replace,
     /// The selected package stays and serves the runtime.
     Keep,
-    /// The runtime is not planned: the operator turned the selection off.
+    /// The runtime is not planned: the selection is disabled or does not load.
     Leave,
 }
 
@@ -2186,8 +2186,7 @@ enum Selection {
 ///
 /// A version that cannot be ordered against the release's is never replaced,
 /// for any runtime: it is kept and reported when it serves, and left as the
-/// operator set it, with a gap, when it is disabled. An unordered selection
-/// that is enabled but cannot load is repaired by the release's package. A
+/// operator set it, with a gap, when it is disabled or cannot load. A
 /// newer ordered version is kept only for a runtime that is not reserved (Pi);
 /// a reserved runtime's is replaced and reported through `replaces_newer`.
 fn selection_outcome(
@@ -2198,23 +2197,29 @@ fn selection_outcome(
     reserved: bool,
 ) -> Selection {
     match unordered_selection(plan, prepared) {
-        Some(Serving::Disabled) => {
+        Some(state @ (Serving::Disabled | Serving::Broken)) => {
             // A non-reserved runtime's disabled package is already reported by
             // `managed_runtimes`.
             let reported = report.gaps.iter().any(|gap| {
                 gap.runtime == subject && gap.code == CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING
             });
             if !reported {
-                report.gap(
-                    subject,
-                    CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
-                    &format!(
+                let detail = match state {
+                    Serving::Disabled => format!(
                         "the selected version cannot be ordered against the release's and is \
                          disabled, so the upgrade leaves it as you set it; enable it with: \
                          pohunek plugin enable {}",
                         prepared.identity.id
                     ),
-                );
+                    _ => format!(
+                        "the selected version cannot be ordered against the release's and its \
+                         package does not load, so the upgrade leaves it; reinstall that version \
+                         with `pohunek plugin install`, or select another one with: pohunek \
+                         plugin select {} --digest <digest>",
+                        prepared.identity.id
+                    ),
+                };
+                report.gap(subject, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING, &detail);
             }
             report
                 .integrations
@@ -2229,7 +2234,7 @@ fn selection_outcome(
             );
             return Selection::Keep;
         }
-        Some(Serving::Broken) | None => {}
+        None => {}
     }
     if !reserved && replaces_newer(plan, prepared).is_some() {
         Selection::Keep

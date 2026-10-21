@@ -2336,12 +2336,14 @@ the runtime id; it is left untouched), `official_package_unavailable_for_platfor
 `--detect`, except for an installed official package of a runtime that is not
 reserved, such as Pi, where it is a gap in every mode), and
 `official_package_not_serving` (an official package of such a runtime is
-installed but not selected and enabled, or selected but disabled while its version
-cannot be ordered against the release's, so the step leaves it), and
+installed but not selected and enabled, or selected while its version cannot be
+ordered against the release's but disabled or not loadable, so the step leaves it;
+the detail names `pohunek plugin update`, or for a reserved runtime `pohunek plugin
+enable` or `plugin select`), and
 `plugin_update_version_unordered` (the selected version of an official package, of
 a reserved runtime or not, cannot be ordered against the release's and is enabled and loadable, so it is kept,
-as `plugin update` refuses to replace it). The first two of these three name the `pohunek plugin update` command
-that updates the package by hand. A gap never blocks an apply, and `gaps` is empty
+as `plugin update` refuses to replace it). The first two of these three name the command
+that updates or repairs the package by hand. A gap never blocks an apply, and `gaps` is empty
 without `--detect` except for those three. The step also keeps an installed official package of a runtime that is
 not reserved (Pi) current: when one is installed from the official catalog,
 selected and enabled, and the release lists a package of the same id, the plan

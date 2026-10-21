@@ -377,7 +377,7 @@ that the upgrade re-selects the release's version. Select the newer one again af
 that cannot be ordered against the release's is never replaced while it is enabled and loads:
 it is kept and reported as the gap `plugin_update_version_unordered`. A disabled one is left
 untouched with the gap `official_package_not_serving`; an enabled one that cannot load is
-replaced by the release's package.
+left as it is too, with the same gap and a repair hint.
 The trust model and the package classes are described
 in [the architecture](architecture.md#runtime-packages-and-trust) and the
 [runtime packages guide](knowledge/guides/runtime-packages.md).
