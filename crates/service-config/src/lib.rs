@@ -395,6 +395,24 @@ const FILE_HEADER: &str =
 # Every key is required. Unknown keys are kept and reported as warnings,\n\
 # except inside [namespace] and [environment], where they are rejected.\n\n";
 
+/// The configuration text without the leading comment header and the blank
+/// lines after it.
+///
+/// Rendered files start with a header whose wording differs between releases;
+/// comparing two renderings by body ignores that wording.
+#[must_use]
+pub fn body_after_header(bytes: &[u8]) -> &[u8] {
+    let mut rest = bytes;
+    while let Some(line_end) = rest.iter().position(|b| *b == b'\n') {
+        let line = &rest[..line_end];
+        if line.first() != Some(&b'#') && !line.iter().all(u8::is_ascii_whitespace) {
+            break;
+        }
+        rest = &rest[line_end + 1..];
+    }
+    rest
+}
+
 /// Largest edit distance at which an unknown key is offered a known key as a
 /// "did you mean" hint.
 const MAX_SUGGESTION_DISTANCE: usize = 2;

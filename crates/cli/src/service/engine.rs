@@ -167,7 +167,7 @@ use pohunek_platform::supervisor::{
 };
 use pohunek_service_config::preflight::PreflightReport;
 use pohunek_service_config::runtimes::EnsureReport;
-use pohunek_service_config::{ServiceConfig, UpgradeSource, SCHEMA_VERSION};
+use pohunek_service_config::{body_after_header, ServiceConfig, UpgradeSource, SCHEMA_VERSION};
 use protocol::SessionInfo;
 
 use super::backend::Backend;
@@ -3337,7 +3337,8 @@ fn launchd_job_path<'a>(
 /// previous daemon's exact config can be restored.
 /// At `StopDaemon`, the config can be either the old bytes or the rendered
 /// target: a crash may have happened after the atomic write and before its
-/// checkpoint. Later forward steps require the exact target; a rollback can
+/// checkpoint. Later forward steps require the target body, whatever header
+/// text the writing release put above it; a rollback can
 /// also have restored the exact old bytes. Any third content is refused.
 ///
 /// # Errors
@@ -3372,7 +3373,8 @@ pub(crate) fn verify_pending_migration(
                 ));
             }
             let target = with_version(&previous.config, &record.version)?;
-            if source.original_bytes() == target.to_toml().as_bytes()
+            if body_after_header(source.original_bytes())
+                == body_after_header(target.to_toml().as_bytes())
                 || (source.original_bytes() == bytes
                     && (record.step == Step::StopDaemon || record.rolling_back))
             {
