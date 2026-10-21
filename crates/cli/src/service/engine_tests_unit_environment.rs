@@ -351,11 +351,39 @@ async fn a_broken_or_stale_unit_refuses_a_recorded_path() {
 #[tokio::test]
 async fn a_drop_in_reset_drops_the_recorded_path() {
     let (_dir, unit) = loaded_with(&[("10-reset.conf", "[Service]\nEnvironment=\n")], &[]);
-    let text = refusal(judge_job(unit, &MANAGER_ENTRIES, &[], true).await);
+    let text = refusal(judge_job(unit.clone(), &MANAGER_ENTRIES, &[], true).await);
     assert!(
         text.contains("10-reset.conf") && text.contains("resets Environment="),
         "{text}"
     );
+    // The `PATH` reader refuses on its own account, naming what it removes.
+    let error = crate::service::manager_env::recorded_search_path(
+        RECORDED,
+        &unit,
+        "daemon.service",
+        &mut crate::service::manager_env::UnitFileReader::default(),
+    )
+    .await
+    .expect_err("the reset removes the recorded PATH");
+    assert!(error.to_string().contains("removes the PATH"), "{error}");
+
+    // A reset followed by a PATH assignment is read.
+    let (_dir, unit) = loaded_with(
+        &[(
+            "10-reset.conf",
+            "[Service]\nEnvironment=\nEnvironment=PATH=/y/bin\n",
+        )],
+        &["PATH=/y/bin"],
+    );
+    let path = crate::service::manager_env::recorded_search_path(
+        RECORDED,
+        &unit,
+        "daemon.service",
+        &mut crate::service::manager_env::UnitFileReader::default(),
+    )
+    .await
+    .expect("path");
+    assert_eq!(path.value, "/y/bin");
 }
 
 #[tokio::test]
