@@ -416,31 +416,70 @@ async fn read_enabled_drop_in(path: &str, unit_name: &str) -> Result<Option<Vec<
         .map(Some)
 }
 
-/// Orders `files` by file name, the order systemd applies drop-ins in, and
-/// refuses a name that two directories share: which one applies is not derived.
-fn refuse_shared_names(files: &mut [String], unit_name: &str) -> Result<(), Error> {
-    let name_of = |path: &String| path.rsplit('/').next().unwrap_or(path).to_owned();
-    files.sort_by_key(name_of);
-    for pair in files.windows(2) {
-        if name_of(&pair[0]) == name_of(&pair[1]) {
-            return Err(Error::ManagerEnvironment {
-                detail: format!(
-                    "{unit_name} has no unit file yet and the drop-in {} exists in two directories ({} and {}), so which one systemd applies is not derived here. Remove one of them and retry",
-                    name_of(&pair[0]),
-                    pair[0],
-                    pair[1]
-                ),
-            });
+/// The drop-ins that apply, in file-name order (the order systemd applies them
+/// in). `files` come in lookup priority: of a name that several directories
+/// hold, the first wins, and a link to `/dev/null` as the winner disables it.
+/// A name held by differently named directories (`a.service.d` and `service.d`,
+/// say) has no priority derived here and is refused.
+fn drop_ins_by_priority(files: &[String], unit_name: &str) -> Result<Vec<String>, Error> {
+    let name_of = |path: &str| path.rsplit('/').next().unwrap_or(path).to_owned();
+    let directory_of = |path: &str| path.rsplit('/').nth(1).unwrap_or_default().to_owned();
+    let mut winners: Vec<&String> = Vec::new();
+    for path in files {
+        match winners.iter().find(|kept| name_of(kept) == name_of(path)) {
+            None => winners.push(path),
+            Some(kept) if directory_of(kept) == directory_of(path) => {}
+            Some(kept) => {
+                return Err(Error::ManagerEnvironment {
+                    detail: format!(
+                        "{unit_name} has no unit file yet and the drop-in {} exists in two directories ({kept} and {path}) of different names, so which one systemd applies is not derived here. Remove one of them and retry",
+                        name_of(path),
+                    ),
+                });
+            }
         }
     }
-    Ok(())
+    winners.sort_by_key(|path| name_of(path));
+    Ok(winners.into_iter().cloned().collect())
+}
+
+/// The drop-in files of `unit` in lookup priority: those on disk, then any the
+/// manager loaded that the scan did not list.
+fn drop_in_files_of(unit: &UnitEnvironment) -> Vec<String> {
+    let mut files = unit.drop_ins_on_disk.clone();
+    for path in &unit.drop_in_paths {
+        if !files.contains(path) {
+            files.push(path.clone());
+        }
+    }
+    files
+}
+
+/// Whether a `PassEnvironment=` or `UnsetEnvironment=` value names `PATH`: a
+/// word that is exactly `PATH` (or `PATH=...`) once unquoted. An escape sequence
+/// can spell the name, and so can a specifier systemd expands, so both count as
+/// naming it; an open quote only when the value mentions `PATH`.
+fn names_search_path(value: &str) -> bool {
+    let split = split_words(value);
+    if split.escaped
+        || value.replace("%%", "").contains('%')
+        || (split.open_quote && value.contains(SEARCH_PATH_VARIABLE))
+    {
+        return true;
+    }
+    split.words.iter().any(|word| {
+        word == SEARCH_PATH_VARIABLE
+            || word
+                .strip_prefix(SEARCH_PATH_VARIABLE)
+                .is_some_and(|rest| rest.starts_with('='))
+    })
 }
 
 /// The job's `PATH` for a unit with no unit file whose drop-in files exist
 /// (before the first install, or after a rollback or migration removed the unit):
 /// systemd reads none of them now, but the install keeps and applies them, so
-/// they are read here, in file-name order (a name in two directories is
-/// ambiguous). Refuses what it cannot read as plain `Environment=PATH=` lines,
+/// they are read here, in file-name order (a name in directories of different
+/// names is ambiguous). Refuses what it cannot read as plain `Environment=PATH=` lines,
 /// and every directive whose effect on `PATH` the manager cannot report for an
 /// unloaded unit.
 async fn path_from_orphan_drop_ins(
@@ -449,11 +488,7 @@ async fn path_from_orphan_drop_ins(
     unit_name: &str,
 ) -> Result<Option<String>, Error> {
     let refuse = |detail: String| Error::ManagerEnvironment { detail };
-    let mut files = unit.drop_in_paths.clone();
-    files.extend(unit.drop_ins_on_disk.iter().cloned());
-    files.sort();
-    files.dedup();
-    refuse_shared_names(&mut files, unit_name)?;
+    let files = drop_ins_by_priority(&drop_in_files_of(unit), unit_name)?;
     let mut current: Option<String> = None;
     let mut search_path: Vec<String> = Vec::new();
     let mut environment_files: Vec<(String, bool)> = Vec::new();
@@ -518,9 +553,7 @@ async fn path_from_orphan_drop_ins(
                         }
                     }
                 }
-                "PassEnvironment" | "UnsetEnvironment"
-                    if value.contains(SEARCH_PATH_VARIABLE) || value.contains('\\') =>
-                {
+                "PassEnvironment" | "UnsetEnvironment" if names_search_path(value) => {
                     return Err(refuse(format!(
                         "{unit_name} has no unit file yet and the drop-in {path} sets {key}= for {SEARCH_PATH_VARIABLE}, which the service manager cannot report for an unloaded unit. Remove that line and retry"
                     )));

@@ -1448,8 +1448,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Journals the launchd default the daemon job has right now, with the boot
-    /// it was read at and the persisted configuration then, before a step stops
-    /// or replaces that job. Once the job is unloaded its default can no longer be
+    /// identity it was read at, before a step stops or replaces that job. Once the job is unloaded its default can no longer be
     /// read, so every later gate (a rollback after a failed swap or apply) judges
     /// the journaled one: this keeps it the value that was observed, not the one
     /// an earlier boot saw. A job whose default cannot be read leaves the journal.
@@ -3521,7 +3520,7 @@ fn journaled_boot_identity(context: &Context) -> Option<String> {
     match context.launchd_job().boot_identity() {
         Ok(identity) => Some(identity),
         Err(error) => {
-            tracing::warn!(%error, "the boot time cannot be read, so the journaled launchd PATH carries no boot marker");
+            tracing::warn!(%error, "the boot identity cannot be read, so the journaled launchd PATH carries no boot marker");
             None
         }
     }

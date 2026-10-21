@@ -46,7 +46,8 @@ pub struct UnitEnvironment {
     /// The `*.conf` drop-in files on disk now in the standard user-unit
     /// directories of the manager's `UnitPath` that apply to the unit (its own `<unit>.d`, the dash-truncated
     /// `<prefix>-.service.d` forms and `service.d`), whatever the manager has
-    /// loaded. systemd reads none of them for a unit whose file is missing.
+    /// loaded. Of directories of the same name (`<unit>.d` in each lookup
+    /// directory), those of a higher-priority lookup directory come first. systemd reads none of them for a unit whose file is missing.
     pub drop_ins_on_disk: Vec<String>,
     /// The unit file the manager read, empty when it found none.
     pub fragment_path: String,

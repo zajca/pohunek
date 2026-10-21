@@ -957,7 +957,9 @@ pub async fn unit_environment(
 }
 
 /// The `*.conf` drop-in files on disk that apply to `unit` in the manager's own
-/// lookup directories (`unit_paths`, from its `UnitPath` property), sorted.
+/// lookup directories (`unit_paths`, from its `UnitPath` property). Each lookup
+/// directory is listed in turn, higher priority first, so of same-named `.d`
+/// directories the higher-priority one comes first.
 ///
 /// A unit `a-b-c.service` takes drop-ins from `a-b-c.service.d`, then the
 /// dash-truncated `a-b-.service.d` and `a-.service.d`, then `service.d`. A
@@ -1002,8 +1004,8 @@ fn drop_in_files_on_disk(unit: &str, unit_paths: &[String]) -> Result<Vec<String
             }
         }
     }
-    files.sort();
-    files.dedup();
+    let mut seen = std::collections::HashSet::new();
+    files.retain(|file| seen.insert(file.clone()));
     Ok(files)
 }
 

@@ -10989,42 +10989,6 @@ async fn a_configuration_that_predates_the_boot_is_the_active_default() {
     assert_judged(&judged, PENDING_PATH);
 }
 
-/// A journal written while the persisted `PATH` was still journaled carries a
-/// field the rule ignores: it neither refuses nor decides.
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn a_stale_persisted_snapshot_in_the_journal_is_ignored() {
-    let stale = |journal: &mut serde_json::Map<String, serde_json::Value>| {
-        journal.insert(
-            "launchd_persisted_path".to_owned(),
-            serde_json::Value::String(JOURNALED_PATH.to_owned()),
-        );
-    };
-    let mut harness = Harness::new();
-    let judged = rollback_after_journal(
-        &mut harness,
-        PENDING_PATH,
-        Some(PENDING_PATH),
-        Modified::BeforeBoot,
-        stale,
-        rebooted,
-    )
-    .await;
-    assert_judged(&judged, PENDING_PATH);
-
-    let mut harness = Harness::new();
-    let judged = rollback_after_journal(
-        &mut harness,
-        PENDING_PATH,
-        Some(JOURNALED_PATH),
-        Modified::AfterBoot,
-        stale,
-        rebooted,
-    )
-    .await;
-    assert_rollback_refused(&judged, "modified after the host booted");
-}
-
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_persisted_change_or_removal_after_the_boot_is_refused() {
@@ -11420,6 +11384,77 @@ async fn a_removed_unit_with_surviving_drop_ins_is_judged_by_them() {
     )]);
     let job = unrecorded_job_path(Ok(unit)).await.expect("path");
     assert_eq!(job.value, MANAGER_PATH, "no PATH in the drop-ins");
+}
+
+/// A name two same-named directories hold resolves by lookup priority, and a
+/// link to `/dev/null` that wins disables the name.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_drop_in_name_in_two_lookup_directories_resolves_by_priority() {
+    let real: &[u8] = b"[Service]\nEnvironment=PATH=/vendor/bin\n";
+    let other: &[u8] = b"[Service]\nEnvironment=PATH=/other/bin\n";
+
+    // Two real files: the higher-priority (first) directory wins.
+    let (_keep, unit) = orphan_drop_ins(&[
+        ("a.service.d", "10-p.conf", other),
+        ("a.service.d", "10-p.conf", real),
+    ]);
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, "/other/bin");
+
+    // A mask in the higher-priority directory disables the vendor drop-in.
+    let (_keep, unit) = orphan_drop_ins(&[
+        ("a.service.d", "10-p.conf", b""),
+        ("a.service.d", "10-p.conf", real),
+    ]);
+    std::fs::remove_file(&unit.drop_ins_on_disk[0]).expect("remove placeholder");
+    std::os::unix::fs::symlink("/dev/null", &unit.drop_ins_on_disk[0]).expect("mask");
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, MANAGER_PATH, "the masked name does not apply");
+
+    // A mask below a real file does not hide it.
+    let (_keep, unit) = orphan_drop_ins(&[
+        ("a.service.d", "10-p.conf", real),
+        ("a.service.d", "10-p.conf", b""),
+    ]);
+    std::fs::remove_file(&unit.drop_ins_on_disk[1]).expect("remove placeholder");
+    std::os::unix::fs::symlink("/dev/null", &unit.drop_ins_on_disk[1]).expect("mask");
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, "/vendor/bin");
+}
+
+/// `PassEnvironment=` and `UnsetEnvironment=` refuse only for the name `PATH`,
+/// quoted or not; a variable whose name contains it is not `PATH`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pass_and_unset_environment_are_matched_by_the_exact_name() {
+    for line in [
+        "UnsetEnvironment=PYTHONPATH",
+        "PassEnvironment=LD_LIBRARY_PATH PATHS",
+        "UnsetEnvironment=\"MYPATH\" OTHER",
+    ] {
+        let text = format!("[Service]\n{line}\nEnvironment=PATH=/a/bin\n");
+        let (_keep, unit) = orphan_drop_ins(&[("a.service.d", "p.conf", text.as_bytes())]);
+        let job = unrecorded_job_path(Ok(unit))
+            .await
+            .expect("a lookalike is not PATH");
+        assert_eq!(job.value, "/a/bin", "{line}");
+    }
+    for line in [
+        "UnsetEnvironment=P\"ATH\"",
+        "PassEnvironment=\"PATH\"",
+        "UnsetEnvironment=PATH=/x",
+        "PassEnvironment=PA\\x54H",
+        "PassEnvironment=%j",
+    ] {
+        let text = format!("[Service]\n{line}\n");
+        let (_keep, unit) = orphan_drop_ins(&[("a.service.d", "p.conf", text.as_bytes())]);
+        let text = refusal(unrecorded_job_path(Ok(unit)).await);
+        assert!(
+            text.contains("p.conf") && text.contains("Environment="),
+            "{line}: {text}"
+        );
+    }
 }
 
 /// The drop-in settings that resolve while the unit is loaded resolve after its

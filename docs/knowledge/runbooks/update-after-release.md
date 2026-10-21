@@ -939,7 +939,7 @@ journal, because it is the best evidence available and not launchd's answer.
 
 Before any step stops or replaces a loaded job (the swap, the runtime apply, the
 migration stop, a rollback that stops the daemon) the CLI journals the default
-the loaded job reports now, with the boot UUID and the persisted configuration
+the loaded job reports now, with the boot UUID
 at that moment, so the gates after the stop and a rollback after a failed apply
 judge the value that was observed, not one an earlier boot saw. A job whose
 default cannot be read keeps the existing journal.

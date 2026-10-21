@@ -244,10 +244,6 @@ pub struct RuntimeBackup {
     pub entries: Vec<RuntimeBackupEntry>,
 }
 
-/// The journal field that once held the persisted launchd `PATH`; a journal
-/// that still has it is read without it.
-const RETIRED_PERSISTED_PATH_FIELD: &str = "launchd_persisted_path";
-
 /// One in-flight install or upgrade.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -308,7 +304,7 @@ pub struct Record {
     ///
     /// A `launchctl config user path` change takes effect at the next boot, so a
     /// journaled default is current only while the boot is the same. A journal
-    /// without it (written before it existed, or when the boot time could not be
+    /// without it (written before it existed, or when the boot identity could not be
     /// read) cannot prove that. Never written on Linux.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launchd_boot_identity: Option<String>,
@@ -613,12 +609,6 @@ impl Store {
                         .unwrap_or(&serde_json::Value::Null)
                 ),
             });
-        }
-        let mut value = value;
-        // A journal written while the persisted launchd PATH was still recorded
-        // carries a field the current rule does not use.
-        if let Some(object) = value.as_object_mut() {
-            object.remove(RETIRED_PERSISTED_PATH_FIELD);
         }
         let mut record: Record = serde_json::from_value(value).map_err(malformed)?;
         // The next save writes the current schema, which is what a
@@ -1139,32 +1129,6 @@ mod tests {
         store.clear().expect("clear");
         store.clear().expect("clearing twice is fine");
         assert_eq!(store.load().expect("load cleared"), None);
-    }
-
-    #[test]
-    fn a_journal_with_the_retired_persisted_path_field_loads_and_is_saved_without_it() {
-        let (_root, root) = temp_root();
-        let state = root.as_path().join("state");
-        let store = Store::new(state.clone());
-        store
-            .save(&record(Step::Definition))
-            .expect("create directory");
-        let mut value = serde_json::to_value(record(Step::Definition)).expect("value");
-        let object = value.as_object_mut().expect("record object");
-        object.insert("launchd_default_path".into(), "/opt/a/bin".into());
-        object.insert("launchd_boot_identity".into(), "boot-1".into());
-        object.insert("launchd_persisted_path".into(), "/opt/b/bin".into());
-        std::fs::write(state.join(FILE_NAME), value.to_string()).expect("write record");
-
-        let loaded = store.load().expect("load").expect("record");
-        assert_eq!(loaded.launchd_default_path.as_deref(), Some("/opt/a/bin"));
-        assert_eq!(loaded.launchd_boot_identity.as_deref(), Some("boot-1"));
-
-        store.save(&loaded).expect("save");
-        let written: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(state.join(FILE_NAME)).expect("read"))
-                .expect("json");
-        assert!(written.get("launchd_persisted_path").is_none());
     }
 
     /// A journal without launchd data (Linux, or a job that was not loaded) has

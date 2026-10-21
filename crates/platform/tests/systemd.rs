@@ -2124,10 +2124,49 @@ struct UnitFiles {
 impl Drop for UnitFiles {
     fn drop(&mut self) {
         systemctl(&["stop", &self.unit]);
+        systemctl(&["disable", &self.unit]);
         let _ = std::fs::remove_dir_all(self.directory.join(format!("{}.d", self.unit)));
         let _ = std::fs::remove_file(self.directory.join(&self.unit));
         systemctl(&["daemon-reload"]);
     }
+}
+
+/// Enabling a unit that has a drop-in, after the reload that loaded it, does not
+/// leave the unit with a stale snapshot: the gates that refuse on
+/// `NeedDaemonReload` do not trip on an installed daemon unit.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn enabling_a_loaded_unit_with_a_drop_in_leaves_no_pending_reload() {
+    require_e2e();
+    let directory = user_unit_dir();
+    std::fs::create_dir_all(&directory).expect("user unit directory");
+    let unit = format!("pohunek-e2e-enable-{}.service", std::process::id());
+    let _files = UnitFiles {
+        directory: directory.clone(),
+        unit: unit.clone(),
+    };
+    std::fs::write(
+        directory.join(&unit),
+        "[Service]\nExecStart=/bin/sleep 300\n[Install]\nWantedBy=default.target\n",
+    )
+    .expect("unit file");
+    let drop_ins = directory.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&drop_ins).expect("drop-in directory");
+    std::fs::write(
+        drop_ins.join("path.conf"),
+        "[Service]\nEnvironment=PATH=/drop-in/bin\n",
+    )
+    .expect("drop-in");
+    systemctl(&["daemon-reload"]);
+    systemctl(&["enable", &unit]);
+
+    let enabled = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("enabled unit");
+    assert_eq!(enabled.load_state, "loaded");
+    assert!(
+        !enabled.need_daemon_reload,
+        "enabling must not leave a stale snapshot: {enabled:?}"
+    );
+    assert!(!enabled.drop_in_paths.is_empty(), "{enabled:?}");
 }
 
 /// The real user manager reports the environment a unit and its drop-ins give a

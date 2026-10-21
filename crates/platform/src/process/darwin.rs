@@ -83,8 +83,9 @@ impl DarwinInspector {
 
     /// Returns when the host booted (`kern.boottime`), on the calendar clock.
     ///
-    /// The kernel shifts it together with the clock, so it compares with file
-    /// modification times however the clock was set since.
+    /// The kernel shifts it when the clock is set, while the times of files
+    /// written earlier stay as they were, so a comparison with a file time is
+    /// exact only for a file written after the last clock step.
     ///
     /// # Errors
     ///
