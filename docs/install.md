@@ -382,7 +382,7 @@ hint is `pohunek plugin enable <package> --digest <digest>`; the next upgrade th
 as for any enabled package. The release's own package that you installed with `--no-enable`
 or disabled, while another version is selected, is not enabled or selected by the upgrade
 either; the selected version keeps serving (a newer Pi version is kept silently, and
-an altered root of that package is refused with `plugin uninstall --remove-modified`, beside an older selection). An enabled unordered one that cannot load is left as it is too,
+an altered root of that package is refused with `plugin uninstall --remove-modified`: beside any ordered enabled selection for claude, codex and hermes, beside an older one only for Pi, and when no enabled selection serves the runtime, for Pi only under `--detect`). An enabled unordered one that cannot load is left as it is too,
 with the same gap and a repair hint.
 The trust model and the package classes are described
 in [the architecture](architecture.md#runtime-packages-and-trust) and the

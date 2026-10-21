@@ -3703,6 +3703,49 @@ async fn a_rootless_disabled_pi_selection_beside_a_third_party_server_is_reporte
     );
 }
 
+/// Without detection, a disabled selected Pi package that a third-party package
+/// shadows is left with the `plugin doctor` pointer even when a profile is over
+/// `pi`: the plan and the apply report the gap, print no enable hint, refuse
+/// nothing and change nothing.
+#[tokio::test]
+async fn a_disabled_pi_selection_beside_a_third_party_server_is_a_gap_without_detect() {
+    let host = Host::with_installed_pi().await;
+    host.publish_pi(PI_NEWER_VERSION, 1);
+    host.disable_package(&Host::installed_pi_digest());
+    official_runtimes::preinstall_third_party(
+        &host.plugins_dir(),
+        host.env.root(),
+        "pi",
+        "acme.runtime.pi",
+    )
+    .await;
+    host.write_profile("work", "base = \"pi\"\n");
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let profile = host.profile_text_of("work");
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert_eq!(
+            gap_codes(report),
+            [("pi", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)],
+            "{:?}",
+            report.gaps
+        );
+        let detail = &report.gaps[0].detail;
+        assert!(detail.contains("pohunek plugin doctor"), "{detail}");
+        assert!(!detail.contains("plugin enable"), "{detail}");
+        assert!(report.packages.is_empty(), "{:?}", report.packages);
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+    assert_eq!(host.profile_text_of("work"), profile);
+}
+
 /// A disabled Pi selection nothing uses, whose root is altered or whose id
 /// another package serves, is reported by the plan without detection with the
 /// `plugin doctor` pointer and no enable hint, which `plugin enable` would not
