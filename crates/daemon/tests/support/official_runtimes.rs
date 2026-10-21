@@ -368,6 +368,37 @@ pub(crate) fn variant_archive(runtime: &str, version: &str) -> (Vec<u8>, Package
     })
 }
 
+/// [`variant_archive`] whose descriptor also names `program` as the agent
+/// program the runtime launches.
+pub(crate) fn variant_archive_with_program(
+    runtime: &str,
+    version: &str,
+    program: &str,
+) -> (Vec<u8>, PackageDigest) {
+    edited_archive(runtime, &|name, text| {
+        if name != "runtime.toml" {
+            return text;
+        }
+        let mut version_set = false;
+        let mut program_set = false;
+        text.lines()
+            .map(|line| {
+                if !version_set && line.starts_with("version = ") {
+                    version_set = true;
+                    format!("version = \"{version}\"")
+                } else if !program_set && line.starts_with("program = ") {
+                    program_set = true;
+                    format!("program = \"{program}\"")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    })
+}
+
 /// The archive of `runtime-packages/<runtime>` whose descriptor declares
 /// `package_id` instead of the official package id.
 fn third_party_archive(runtime: &str, package_id: &str) -> (Vec<u8>, PackageDigest) {

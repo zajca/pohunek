@@ -2666,6 +2666,52 @@ fn a_profile_pinned_elsewhere_is_reported_beside_a_kept_unordered_selection() {
     assert_eq!(host.profile_text(), pinned);
 }
 
+/// The detecting plan judges a kept selection by the program of the kept
+/// package, not by the program of the release's package.
+#[test]
+fn a_kept_selection_is_detected_by_its_own_program() {
+    const KEPT_PROGRAM: &str = "claude-kept";
+    let host = Host::new();
+    let (bytes, digest) =
+        official_runtimes::variant_archive_with_program("claude", "2.0", KEPT_PROGRAM);
+    host.publish_archives(1, &[("claude", &bytes, &digest)]);
+    host.write_claude_profile();
+    let installed = host.step(false);
+    assert!(installed.refusals.is_empty(), "{installed:?}");
+    publish_claude_version(&host, "1.0.3", 2);
+    host.put_program("claude");
+
+    let release_program_only = host.detect_step();
+
+    assert_eq!(release_program_only.packages[0].status, PackageStatus::Kept);
+    assert_eq!(
+        release_program_only.packages[0].reasons,
+        [UseReason::Profile]
+    );
+    assert!(
+        gap_codes(&release_program_only).contains(&("claude", CODE_GAP_AGENT_NOT_ON_PATH)),
+        "{:?}",
+        release_program_only.gaps
+    );
+
+    host.put_program(KEPT_PROGRAM);
+
+    let kept_program = host.detect_step();
+
+    assert!(
+        kept_program.packages[0]
+            .reasons
+            .contains(&UseReason::Detected),
+        "{:?}",
+        kept_program.packages
+    );
+    assert!(
+        !gap_codes(&kept_program).contains(&("claude", CODE_GAP_AGENT_NOT_ON_PATH)),
+        "{:?}",
+        kept_program.gaps
+    );
+}
+
 /// A kept unordered selection of a runtime nothing uses, whose program is off
 /// the search path, is not planned, and the plan does not claim it is kept.
 #[test]
