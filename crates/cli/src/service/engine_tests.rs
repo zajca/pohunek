@@ -11353,15 +11353,14 @@ async fn a_removed_unit_expands_home_and_runtime_specifiers_only_when_the_manage
             None,
         )
         .await;
-        match expected {
-            Some(expected) => assert_eq!(result.expect("path").value, expected),
-            None => {
-                let text = refusal(result);
-                assert!(
-                    text.contains("Environment=") && text.contains("agree"),
-                    "{text}"
-                );
-            }
+        if let Some(expected) = expected {
+            assert_eq!(result.expect("path").value, expected);
+        } else {
+            let text = refusal(result);
+            assert!(
+                text.contains("Environment=") && text.contains("agree"),
+                "{text}"
+            );
         }
     }
 }
