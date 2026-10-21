@@ -2376,6 +2376,32 @@ pub struct SessionRuntime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub loss_reason: Option<String>,
+    /// How the service manager saw the worker end, when it still held a
+    /// failed result at the moment of loss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub exit: Option<RuntimeExit>,
+}
+
+/// The end of a worker as recorded by the service manager.
+///
+/// `cause` is an open string: clients must tolerate a value they do not
+/// know. The documented values are `oom_kill`, `signal`, `exit_code`,
+/// `core_dump`, `timeout`, `watchdog`, `resources` and `other`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "RuntimeExit.ts"))]
+pub struct RuntimeExit {
+    /// Why the service manager ended the worker.
+    pub cause: String,
+    /// Signal that ended the worker process, when it was killed by one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub signal: Option<i32>,
+    /// Exit code of the worker process, when it exited by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub code: Option<i32>,
 }
 
 impl RuntimeState {

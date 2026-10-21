@@ -1604,7 +1604,7 @@ impl SessionRegistry {
                 return false;
             }
             return !self
-                .insert_lost_record(record, "worker_unavailable", LossProof::Unproven)
+                .insert_lost_record(record, "worker_unavailable", LossProof::Unproven, None)
                 .await;
         };
 
@@ -1711,6 +1711,12 @@ impl SessionRegistry {
                     }
                     None => Cleanup::Complete,
                 };
+                let exit = match lifecycle {
+                    Some(lifecycle) => {
+                        Box::pin(self.read_exit(&id.0, lifecycle, &generation)).await
+                    }
+                    None => None,
+                };
                 let retired = match lifecycle {
                     Some(lifecycle) => lifecycle.retire(&generation).await,
                     None => Ok(()),
@@ -1727,6 +1733,7 @@ impl SessionRegistry {
                     // The abandoned create is compensated only once its job
                     // is gone, so the deleted record never hides a job.
                     if retired.is_ok() {
+                        self.forget_exit(&id.0);
                         self.compensate_abandoned_create(&id).await;
                         return false;
                     }
@@ -1759,11 +1766,16 @@ impl SessionRegistry {
                 // A stop the user asked for ended the runtime on purpose:
                 // the outcome is a stop, never a loss.
                 if record.desired_state == DesiredState::Stopped {
+                    self.forget_exit(&id.0);
                     return Box::pin(self.settle_ended_stop(record, Some(&generation), retry))
                         .await;
                 }
                 let (proof, reason) = ended_loss(journaled, cleanup);
-                !self.insert_lost_record(record, reason, proof).await
+                let committed = self.insert_lost_record(record, reason, proof, exit).await;
+                if committed {
+                    self.forget_exit(&id.0);
+                }
+                !committed
             }
         }
     }
@@ -1952,7 +1964,7 @@ impl SessionRegistry {
         }
         let (_record, entry) = self.unavailable_entry(
             record,
-            Unavailability::other(RuntimeState::Conflict),
+            &Unavailability::other(RuntimeState::Conflict),
             SUPERVISION_AMBIGUOUS,
         );
         let info = entry.info.clone();
@@ -2009,7 +2021,7 @@ impl SessionRegistry {
         // A pending classification is never proven ended: its `Lost` comes
         // from a worker socket that could not be reached.
         let _persisted = if state == RuntimeState::Lost {
-            self.insert_lost_record(record, reason, LossProof::Unproven)
+            self.insert_lost_record(record, reason, LossProof::Unproven, None)
                 .await
         } else {
             self.insert_unavailable_record(record, state, reason).await
@@ -2190,19 +2202,9 @@ impl SessionRegistry {
                 } else {
                     Cleanup::Complete
                 };
-                let retired = match (lifecycle.as_ref(), job.as_ref()) {
-                    (Some(lifecycle), Some(generation)) => {
-                        lifecycle.retire(generation).await.map_err(|error| {
-                            tracing::warn!(
-                                session_id = %id.0,
-                                service_id = %generation.service_id(),
-                                error = %error,
-                                "failed to retire the crashed worker generation"
-                            );
-                        })
-                    }
-                    _ => Ok(()),
-                };
+                let (exit, retired) = self
+                    .read_exit_and_retire(&id.0, lifecycle.as_ref(), job.as_ref())
+                    .await;
                 // `Lost` counts as ended, so a later removal skips retirement:
                 // until the job is retired the session stays unavailable and
                 // the background re-check reaches this classification again.
@@ -2210,15 +2212,24 @@ impl SessionRegistry {
                     (RECONNECTING, SUPERVISION_UNAVAILABLE)
                 } else {
                     let (proof, reason) = ended_loss(journaled, cleanup);
-                    (Unavailability::Lost(proof), reason)
+                    (Unavailability::lost(proof, exit), reason)
                 }
             }
         };
         let state = classification.state();
-        match self
+        let outcome = self
             .mark_worker_unavailable(id, expected, classification, reason)
-            .await
+            .await;
+        if state == RuntimeState::Lost
+            && matches!(
+                outcome,
+                super::RuntimeTransitionOutcome::Applied(_)
+                    | super::RuntimeTransitionOutcome::IdentityMismatch
+            )
         {
+            self.forget_exit(&id.0);
+        }
+        match outcome {
             super::RuntimeTransitionOutcome::Applied(_) => {
                 // A conflicted runtime is watched too: its worker or job may
                 // end without anything else noticing.
@@ -2233,6 +2244,70 @@ impl SessionRegistry {
                 LossClassification::Pending
             }
         }
+    }
+
+    /// Retires the ended job of a crashed worker generation after reading its
+    /// verdict, which the retirement resets.
+    async fn read_exit_and_retire(
+        &self,
+        session_id: &str,
+        lifecycle: Option<&Lifecycle<'_>>,
+        job: Option<&super::Generation>,
+    ) -> (Option<protocol::RuntimeExit>, Result<(), ()>) {
+        let (Some(lifecycle), Some(generation)) = (lifecycle, job) else {
+            return (None, Ok(()));
+        };
+        let exit = Box::pin(self.read_exit(session_id, lifecycle, generation)).await;
+        let retired = lifecycle.retire(generation).await.map_err(|error| {
+            tracing::warn!(
+                session_id,
+                service_id = %generation.service_id(),
+                error = %error,
+                "failed to retire the crashed worker generation"
+            );
+        });
+        (exit, retired)
+    }
+
+    /// Reads the verdict of the failed job of `generation` before the job is
+    /// retired, which resets it.
+    ///
+    /// A verdict read earlier for the same job and not yet recorded is
+    /// returned when the job holds none any more: the classification that
+    /// retired it did not commit.
+    async fn read_exit(
+        &self,
+        session_id: &str,
+        lifecycle: &Lifecycle<'_>,
+        generation: &super::Generation,
+    ) -> Option<protocol::RuntimeExit> {
+        let read = lifecycle.exit_evidence(generation).await;
+        let service_id = generation.service_id();
+        let mut unrecorded = self
+            .inner
+            .unrecorded_exits
+            .lock()
+            .expect("unrecorded exits are never poisoned");
+        match read {
+            Some(exit) => {
+                unrecorded.insert(session_id.to_owned(), (service_id, exit.clone()));
+                Some(exit)
+            }
+            None => unrecorded
+                .get(session_id)
+                .filter(|(job, _)| *job == service_id)
+                .map(|(_, exit)| exit.clone()),
+        }
+    }
+
+    /// Drops the verdict kept for `session_id` once its classification is
+    /// committed or superseded.
+    fn forget_exit(&self, session_id: &str) {
+        self.inner
+            .unrecorded_exits
+            .lock()
+            .expect("unrecorded exits are never poisoned")
+            .remove(session_id);
     }
 
     /// Decides what the unreachable worker of a running entry is.
@@ -3330,6 +3405,7 @@ impl SessionRegistry {
                 .and_then(|runtime| runtime.started_at.clone()),
             last_connected_at: None,
             loss_reason: None,
+            exit: None,
         });
         self.insert_unavailable_record(record, RuntimeState::Terminal, "worker_journal_terminal")
             .await
@@ -3380,7 +3456,7 @@ impl SessionRegistry {
         let id = SessionId(record.session_id.clone());
         let Some((worker, snapshot)) = candidate else {
             return !self
-                .insert_lost_record(record, "worker_unavailable", LossProof::Unproven)
+                .insert_lost_record(record, "worker_unavailable", LossProof::Unproven, None)
                 .await;
         };
 
@@ -3403,7 +3479,12 @@ impl SessionRegistry {
         }
         if recovery_not_advanced(&record, snapshot.worker_id.as_str()) {
             return !self
-                .insert_lost_record(record, WORKER_GENERATION_NOT_ADVANCED, LossProof::Unproven)
+                .insert_lost_record(
+                    record,
+                    WORKER_GENERATION_NOT_ADVANCED,
+                    LossProof::Unproven,
+                    None,
+                )
                 .await;
         }
 
@@ -3527,7 +3608,7 @@ impl SessionRegistry {
         if state == RuntimeState::Lost {
             // The worker still answers: a `Stopping` or `Faulted` runtime may
             // still own processes, so nothing proves the session's end.
-            self.insert_lost_record(record, "worker_runtime_terminal", LossProof::Unproven)
+            self.insert_lost_record(record, "worker_runtime_terminal", LossProof::Unproven, None)
                 .await
         } else {
             self.insert_unavailable_record(record, state, "worker_runtime_terminal")
@@ -3771,6 +3852,7 @@ impl SessionRegistry {
                     } else {
                         LossProof::Ended
                     },
+                    None,
                 )
                 .await;
         };
@@ -3908,6 +3990,7 @@ impl SessionRegistry {
                 .or_else(|| Some(record.info.created_at.clone())),
             last_connected_at: Some(now.clone()),
             loss_reason: None,
+            exit: None,
         });
         record.info.updated_at = now;
         record.transaction = None;
@@ -4077,8 +4160,7 @@ impl SessionRegistry {
         state: RuntimeState,
         reason: &str,
     ) -> bool {
-        self.insert_classified_record(record, Unavailability::other(state), reason)
-            .await
+        Box::pin(self.insert_classified_record(record, Unavailability::other(state), reason)).await
     }
 
     /// [`Self::insert_unavailable_record`] for a `Lost` runtime, with what the
@@ -4089,8 +4171,9 @@ impl SessionRegistry {
         record: SessionRecord,
         reason: &str,
         proof: LossProof,
+        exit: Option<protocol::RuntimeExit>,
     ) -> bool {
-        self.insert_classified_record(record, Unavailability::Lost(proof), reason)
+        Box::pin(self.insert_classified_record(record, Unavailability::lost(proof, exit), reason))
             .await
     }
 
@@ -4103,7 +4186,7 @@ impl SessionRegistry {
     ) -> bool {
         let state = classification.state();
         let id = SessionId(record.session_id.clone());
-        let (classified, entry) = self.unavailable_entry(record.clone(), classification, reason);
+        let (classified, entry) = self.unavailable_entry(record.clone(), &classification, reason);
         let info = entry.info.clone();
         if let Err(error) = self.write_session_record(classified).await {
             tracing::warn!(session_id = %id.0, error = %error, "failed to persist runtime classification");
@@ -4155,7 +4238,7 @@ impl SessionRegistry {
         }
         let (_, placeholder) = self.unavailable_entry(
             record.clone(),
-            Unavailability::other(RuntimeState::Reconnecting),
+            &Unavailability::other(RuntimeState::Reconnecting),
             SUPERVISION_UNAVAILABLE,
         );
         let info = placeholder.info.clone();
@@ -4192,7 +4275,7 @@ impl SessionRegistry {
     fn unavailable_entry(
         &self,
         mut record: SessionRecord,
-        classification: Unavailability,
+        classification: &Unavailability,
         reason: &str,
     ) -> (SessionRecord, SessionEntry) {
         let state = classification.state();
@@ -4205,7 +4288,9 @@ impl SessionRegistry {
             started_at: None,
             last_connected_at: None,
             loss_reason: Some(reason.to_owned()),
+            exit: None,
         });
+        classification.apply_exit(runtime);
         runtime.state = state;
         runtime.loss_reason = (state != RuntimeState::Terminal).then(|| reason.to_owned());
         record.runtime.state = state;
@@ -4362,6 +4447,7 @@ impl SessionRegistry {
                         started_at: None,
                         last_connected_at: None,
                         loss_reason: None,
+                        exit: None,
                     })
                     .state = RuntimeState::Terminal;
                 let imported = self
@@ -6274,6 +6360,7 @@ fn import_legacy_manifest(store: &crate::store::Store) -> Result<LegacyManifest,
             started_at: None,
             last_connected_at: None,
             loss_reason: live.then(|| "legacy_runtime_not_transferable".to_owned()),
+            exit: None,
         });
         let recovery = resume
             .iter()
@@ -6711,7 +6798,7 @@ fn classify_connect_error(error: &WorkerError) -> (RuntimeState, &'static str) {
 /// subagents end with a lost or terminal runtime, an unreachable runtime holds
 /// no background snapshot it can vouch for, and a lost runtime applies its
 /// [`LossProof`].
-fn present_unavailable_record(record: &mut SessionRecord, classification: Unavailability) {
+fn present_unavailable_record(record: &mut SessionRecord, classification: &Unavailability) {
     if matches!(
         classification.state(),
         RuntimeState::Lost | RuntimeState::Terminal
@@ -8847,6 +8934,7 @@ while os.getppid() == parent:
                 started_at: Some(created_at.clone()),
                 last_connected_at: Some(created_at.clone()),
                 loss_reason: None,
+                exit: None,
             }),
             cols: 80,
             rows: 24,
@@ -8939,6 +9027,7 @@ while os.getppid() == parent:
                         started_at: None,
                         last_connected_at: None,
                         loss_reason: None,
+                        exit: None,
                     }),
                     ..info
                 },
@@ -10381,6 +10470,7 @@ while os.getppid() == parent:
                     started_at: Some(created_at.clone()),
                     last_connected_at: Some(created_at.clone()),
                     loss_reason: None,
+                    exit: None,
                 }),
                 cols: 80,
                 rows: 24,
@@ -13505,6 +13595,322 @@ handler = "codex-hook-v1"
             assert_eq!(info.state, protocol::SessionState::Failed);
             assert_eq!(info.runtime.expect("runtime").state, RuntimeState::Lost);
             let _ = &mut events;
+        }
+
+        fn oom_evidence() -> crate::runtime::lifecycle::tests::EvidenceScript {
+            crate::runtime::lifecycle::tests::EvidenceScript::Failed(
+                pohunek_platform::supervisor::ExitEvidence::new("oom-kill".to_owned(), None),
+            )
+        }
+
+        fn oom_exit() -> protocol::RuntimeExit {
+            protocol::RuntimeExit {
+                cause: "oom_kill".to_owned(),
+                signal: None,
+                code: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn startup_reads_the_verdict_of_a_failed_job_before_retiring_it() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            Marked::spawn(&fixture.root, "runtime-s-1340");
+            persist_record(&fixture.root, "s-1340", Some("runtime-s-1340"));
+            write_live_journal(
+                &fixture.root,
+                "s-1340",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-1340"),
+            );
+            let id = service_id("s-1340", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            fixture.supervisor.script_exit_evidence(id, oom_evidence());
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let info = fixture
+                .registry
+                .inspect(&SessionId("s-1340".to_owned()))
+                .await
+                .expect("inspect");
+            assert_eq!(info.state, protocol::SessionState::Failed);
+            let runtime = info.runtime.expect("runtime");
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.exit, Some(oom_exit()));
+            let stored = Store::new(fixture.root.join("data/metadata.jsonl"))
+                .load_sessions()
+                .expect("load store")
+                .into_iter()
+                .find(|record| record.session_id == "s-1340")
+                .expect("record");
+            assert_eq!(
+                stored.info.runtime.and_then(|runtime| runtime.exit),
+                Some(oom_exit())
+            );
+        }
+
+        #[tokio::test]
+        async fn a_generation_that_never_journaled_still_reports_the_verdict_of_its_job() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            persist_record(&fixture.root, "s-1341", Some("runtime-s-1341"));
+            let id = service_id("s-1341", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            fixture.supervisor.script_exit_evidence(id, oom_evidence());
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let info = fixture
+                .registry
+                .inspect(&SessionId("s-1341".to_owned()))
+                .await
+                .expect("inspect");
+            let runtime = info.runtime.expect("runtime");
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.loss_reason.as_deref(), Some("worker_unavailable"));
+            assert_eq!(runtime.exit, Some(oom_exit()));
+        }
+
+        #[tokio::test]
+        async fn an_unproven_loss_records_the_verdict_and_keeps_the_session_state() {
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.fail_enumeration(true);
+            let fixture =
+                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+            Marked::spawn(&fixture.root, "runtime-s-1342");
+            persist_record(&fixture.root, "s-1342", Some("runtime-s-1342"));
+            write_live_journal(
+                &fixture.root,
+                "s-1342",
+                dead_worker(),
+                Some("runtime-s-1342"),
+            );
+            let id = service_id("s-1342", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            fixture.supervisor.script_exit_evidence(id, oom_evidence());
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let info = fixture
+                .registry
+                .inspect(&SessionId("s-1342".to_owned()))
+                .await
+                .expect("inspect");
+            assert_eq!(info.state, protocol::SessionState::Running);
+            let runtime = info.runtime.expect("runtime");
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(
+                runtime.loss_reason.as_deref(),
+                Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED)
+            );
+            assert_eq!(runtime.exit, Some(oom_exit()));
+        }
+
+        #[tokio::test]
+        async fn a_lost_runtime_keeps_its_exit_across_a_second_start() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            Marked::spawn(&fixture.root, "runtime-s-1343");
+            persist_record(&fixture.root, "s-1343", Some("runtime-s-1343"));
+            write_live_journal(
+                &fixture.root,
+                "s-1343",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-1343"),
+            );
+            let id = service_id("s-1343", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            fixture.supervisor.script_exit_evidence(id, oom_evidence());
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("first start");
+
+            // The retirement reset the failed job: the second start finds no
+            // job and no verdict.
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("second start");
+
+            let info = fixture
+                .registry
+                .inspect(&SessionId("s-1343".to_owned()))
+                .await
+                .expect("inspect");
+            assert_eq!(info.state, protocol::SessionState::Failed);
+            let runtime = info.runtime.expect("runtime");
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.exit, Some(oom_exit()));
+        }
+
+        #[tokio::test]
+        async fn a_verdict_survives_a_failed_write_of_the_classification() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            Marked::spawn(&fixture.root, "runtime-s-1346");
+            persist_record(&fixture.root, "s-1346", Some("runtime-s-1346"));
+            write_live_journal(
+                &fixture.root,
+                "s-1346",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-1346"),
+            );
+            let id = service_id("s-1346", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            fixture.supervisor.script_exit_evidence(id, oom_evidence());
+            fixture
+                .registry
+                .inner
+                .store
+                .as_ref()
+                .expect("registry store")
+                .fail_next_write_before_rename();
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let session = SessionId("s-1346".to_owned());
+            assert_eq!(
+                runtime_of(&fixture.registry, "s-1346").await.state,
+                RuntimeState::Reconnecting,
+                "the failed write leaves the session pending"
+            );
+            assert!(
+                fixture.supervisor.retired().len() == 1,
+                "the job was retired by the first pass"
+            );
+
+            assert!(fixture.registry.retry_supervised_session(&session).await);
+
+            let runtime = runtime_of(&fixture.registry, "s-1346").await;
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(
+                runtime.exit,
+                Some(oom_exit()),
+                "the retry has no job left to ask"
+            );
+        }
+
+        /// A stop the user asked for ends the runtime on purpose: the session is
+        /// stopped with a terminal runtime, and the manager's verdict on the
+        /// worker the stop took down is not a loss to report.
+        #[tokio::test]
+        async fn a_stop_intent_ends_terminal_without_an_exit() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            Marked::spawn(&fixture.root, "runtime-s-1347");
+            let mut record = persist_record(&fixture.root, "s-1347", Some("runtime-s-1347"));
+            record.desired_state = DesiredState::Stopped;
+            Store::new(fixture.root.join("data/metadata.jsonl"))
+                .record_session(&record)
+                .expect("persist the stop intent");
+            write_live_journal(
+                &fixture.root,
+                "s-1347",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-1347"),
+            );
+            let id = service_id("s-1347", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            fixture.supervisor.script_exit_evidence(id, oom_evidence());
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let info = fixture
+                .registry
+                .inspect(&SessionId("s-1347".to_owned()))
+                .await
+                .expect("inspect");
+            assert_eq!(info.state, protocol::SessionState::Stopped);
+            let runtime = info.runtime.expect("runtime");
+            assert_eq!(runtime.state, RuntimeState::Terminal);
+            assert_eq!(runtime.exit, None);
+            assert!(
+                !fixture
+                    .registry
+                    .inner
+                    .unrecorded_exits
+                    .lock()
+                    .expect("unrecorded exits")
+                    .contains_key("s-1347"),
+                "the verdict of a stopped runtime is not kept"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_ambiguous_job_is_not_asked_for_a_verdict() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            Marked::spawn(&fixture.root, "runtime-s-1344");
+            persist_record(&fixture.root, "s-1344", Some("runtime-s-1344"));
+            write_live_journal(
+                &fixture.root,
+                "s-1344",
+                dead_worker(),
+                Some("runtime-s-1344"),
+            );
+            let id = service_id("s-1344", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Running, None));
+            fixture.supervisor.script_exit_evidence(id, oom_evidence());
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-1344").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert_eq!(runtime.exit, None);
+        }
+
+        #[tokio::test]
+        async fn a_lost_record_reclassified_as_a_conflict_drops_its_exit() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            Marked::spawn(&fixture.root, "runtime-s-1345");
+            persist_record(&fixture.root, "s-1345", Some("runtime-s-1345"));
+            store_as_running_lost(&fixture.root, "s-1345");
+            let store = Store::new(fixture.root.join("data/metadata.jsonl"));
+            let mut record = store
+                .load_sessions()
+                .expect("load store")
+                .into_iter()
+                .find(|record| record.session_id == "s-1345")
+                .expect("record");
+            record.info.runtime.as_mut().expect("runtime").exit = Some(oom_exit());
+            store.record_session(&record).expect("store lost+exit");
+            write_live_journal(
+                &fixture.root,
+                "s-1345",
+                dead_worker(),
+                Some("runtime-s-1345"),
+            );
+            let id = service_id("s-1345", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id, present(ServiceState::Running, None));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-1345").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            assert_eq!(runtime.exit, None);
         }
 
         /// Generations of [`FORKING_HOLDER`] after the first: the sweep's
@@ -19030,7 +19436,12 @@ generation "$1"
                 let committed = if state == RuntimeState::Lost {
                     fixture
                         .registry
-                        .insert_lost_record(unbound, reason, crate::session::LossProof::Unproven)
+                        .insert_lost_record(
+                            unbound,
+                            reason,
+                            crate::session::LossProof::Unproven,
+                            None,
+                        )
                         .await
                 } else {
                     fixture
@@ -19469,10 +19880,190 @@ generation "$1"
             wait_gone(descendant).await;
         }
 
+        /// Crashes a fresh session whose failed job reports `evidence`, and
+        /// returns the lost session once it is shown.
+        async fn lose_with_evidence(
+            fixture: &Fixture,
+            evidence: crate::runtime::lifecycle::tests::EvidenceScript,
+        ) -> (SessionInfo, u32) {
+            let (created, job, descendant) = fixture.create().await;
+            fixture.supervisor.script_exit_evidence(job, evidence);
+            fixture.crash(&created.id).await;
+            fixture.wait_for(&created.id, RuntimeState::Lost).await;
+            let info = fixture
+                .registry
+                .inspect(&created.id)
+                .await
+                .expect("inspect");
+            (info, descendant)
+        }
+
+        fn failed(
+            result: &str,
+            exit: Option<pohunek_platform::supervisor::JobExit>,
+        ) -> crate::runtime::lifecycle::tests::EvidenceScript {
+            crate::runtime::lifecycle::tests::EvidenceScript::Failed(
+                pohunek_platform::supervisor::ExitEvidence::new(result.to_owned(), exit),
+            )
+        }
+
+        #[tokio::test]
+        async fn an_oom_killed_worker_job_reports_its_exit_on_every_surface() {
+            let fixture = fixture(LONG_CONNECT);
+            let mut events = fixture.registry.subscribe();
+            let (info, descendant) = lose_with_evidence(&fixture, failed("oom-kill", None)).await;
+
+            let expected = protocol::RuntimeExit {
+                cause: "oom_kill".to_owned(),
+                signal: None,
+                code: None,
+            };
+            assert_eq!(info.state, protocol::SessionState::Failed);
+            assert_eq!(info.activity, None);
+            let runtime = info.runtime.expect("runtime");
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.exit.as_ref(), Some(&expected));
+            let listed = fixture
+                .registry
+                .list()
+                .await
+                .into_iter()
+                .find(|session| session.id == info.id)
+                .expect("listed");
+            assert_eq!(
+                listed.runtime.and_then(|runtime| runtime.exit),
+                Some(expected.clone())
+            );
+            let stored = Store::new(fixture.root.join("data/metadata.jsonl"))
+                .load_sessions()
+                .expect("load store")
+                .into_iter()
+                .find(|record| record.session_id == info.id.0)
+                .expect("the logical record is kept");
+            assert_eq!(
+                stored.info.runtime.and_then(|runtime| runtime.exit),
+                Some(expected)
+            );
+            let lost_event = loop {
+                let event = tokio::time::timeout(HANG_GUARD, events.recv())
+                    .await
+                    .expect("the lost event arrives")
+                    .expect("event stream");
+                let text = serde_json::to_string(&event).expect("event json");
+                if text.contains(crate::session::event::SESSION_RUNTIME_LOST) {
+                    break text;
+                }
+            };
+            assert!(
+                lost_event.contains("\"exit\":{\"cause\":\"oom_kill\"}"),
+                "the lost event carries the exit: {lost_event}"
+            );
+            wait_gone(descendant).await;
+        }
+
+        #[tokio::test]
+        async fn a_worker_job_that_exited_by_code_reports_the_code() {
+            let fixture = fixture(LONG_CONNECT);
+            let (info, descendant) = lose_with_evidence(
+                &fixture,
+                failed(
+                    "exit-code",
+                    Some(pohunek_platform::supervisor::JobExit::Code(3)),
+                ),
+            )
+            .await;
+
+            assert_eq!(
+                info.runtime.and_then(|runtime| runtime.exit),
+                Some(protocol::RuntimeExit {
+                    cause: "exit_code".to_owned(),
+                    signal: None,
+                    code: Some(3),
+                })
+            );
+            wait_gone(descendant).await;
+        }
+
+        #[tokio::test]
+        async fn a_worker_job_killed_by_a_signal_reports_the_signal() {
+            let fixture = fixture(LONG_CONNECT);
+            let (info, descendant) = lose_with_evidence(
+                &fixture,
+                failed(
+                    "signal",
+                    Some(pohunek_platform::supervisor::JobExit::Signal(9)),
+                ),
+            )
+            .await;
+
+            assert_eq!(
+                info.runtime.and_then(|runtime| runtime.exit),
+                Some(protocol::RuntimeExit {
+                    cause: "signal".to_owned(),
+                    signal: Some(9),
+                    code: None,
+                })
+            );
+            wait_gone(descendant).await;
+        }
+
+        #[tokio::test]
+        async fn a_result_outside_the_documented_set_is_the_other_cause() {
+            let fixture = fixture(LONG_CONNECT);
+            let (info, descendant) =
+                lose_with_evidence(&fixture, failed("start-limit-hit", None)).await;
+
+            assert_eq!(
+                info.runtime.and_then(|runtime| runtime.exit),
+                Some(protocol::RuntimeExit {
+                    cause: "other".to_owned(),
+                    signal: None,
+                    code: None,
+                })
+            );
+            wait_gone(descendant).await;
+        }
+
+        #[tokio::test]
+        async fn a_job_without_a_verdict_is_lost_without_an_exit() {
+            let fixture = fixture(LONG_CONNECT);
+            let (created, _job, descendant) = fixture.create().await;
+            fixture.crash(&created.id).await;
+            fixture.wait_for(&created.id, RuntimeState::Lost).await;
+
+            let info = fixture
+                .registry
+                .inspect(&created.id)
+                .await
+                .expect("inspect");
+            assert_eq!(info.state, protocol::SessionState::Failed);
+            assert_eq!(info.runtime.expect("runtime").exit, None);
+            wait_gone(descendant).await;
+        }
+
+        #[tokio::test]
+        async fn an_unreadable_verdict_never_blocks_the_loss() {
+            let fixture = fixture(LONG_CONNECT);
+            let (info, descendant) = lose_with_evidence(
+                &fixture,
+                crate::runtime::lifecycle::tests::EvidenceScript::Unavailable,
+            )
+            .await;
+
+            assert_eq!(info.state, protocol::SessionState::Failed);
+            let runtime = info.runtime.expect("runtime");
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.exit, None);
+            wait_gone(descendant).await;
+        }
+
         #[tokio::test]
         async fn a_proven_loss_after_a_stop_intent_presents_a_stopped_session() {
             let fixture = fixture(LONG_CONNECT);
-            let (created, _job, descendant) = fixture.create().await;
+            let (created, job, descendant) = fixture.create().await;
+            fixture
+                .supervisor
+                .script_exit_evidence(job, failed("oom-kill", None));
             // A stop that gave up waiting leaves its intent behind.
             let mut sessions = fixture.registry.inner.sessions.lock().await;
             sessions
@@ -19491,6 +20082,13 @@ generation "$1"
                 .expect("inspect");
             assert_eq!(info.state, protocol::SessionState::Stopped);
             assert_eq!(info.activity, None);
+            assert_eq!(
+                info.runtime
+                    .and_then(|runtime| runtime.exit)
+                    .map(|exit| exit.cause),
+                Some("oom_kill".to_owned()),
+                "a loss that settles as a stop still reports how the worker ended"
+            );
             wait_gone(descendant).await;
         }
 
@@ -19670,6 +20268,62 @@ generation "$1"
 
             let runtime = fixture.wait_for(&created.id, RuntimeState::Lost).await;
             assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            assert_eq!(fixture.supervisor.retired(), vec![job.clone(), job]);
+            wait_gone(descendant).await;
+        }
+
+        #[tokio::test]
+        async fn a_verdict_survives_a_failed_write_of_the_loss() {
+            let fixture = fixture(SHORT_CONNECT);
+            let (created, job, descendant) = fixture.create().await;
+            fixture
+                .supervisor
+                .script_exit_evidence(job, failed("oom-kill", None));
+            fixture
+                .registry
+                .inner
+                .store
+                .as_ref()
+                .expect("registry store")
+                .fail_next_write_before_rename();
+
+            fixture.crash(&created.id).await;
+            let runtime = fixture.wait_for(&created.id, RuntimeState::Lost).await;
+
+            assert_eq!(
+                runtime.exit,
+                Some(protocol::RuntimeExit {
+                    cause: "oom_kill".to_owned(),
+                    signal: None,
+                    code: None,
+                }),
+                "the pass that wrote the loss found the job already retired"
+            );
+            wait_gone(descendant).await;
+        }
+
+        #[tokio::test]
+        async fn a_failed_retirement_keeps_the_verdict_for_the_pass_that_loses_the_session() {
+            let fixture = fixture(SHORT_CONNECT);
+            let (created, job, descendant) = fixture.create().await;
+            fixture.supervisor.script_retire_unavailable(job.clone());
+            fixture
+                .supervisor
+                .script_exit_evidence(job.clone(), failed("oom-kill", None));
+
+            fixture.crash(&created.id).await;
+            let runtime = fixture.wait_for(&created.id, RuntimeState::Lost).await;
+
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            assert_eq!(
+                runtime.exit,
+                Some(protocol::RuntimeExit {
+                    cause: "oom_kill".to_owned(),
+                    signal: None,
+                    code: None,
+                }),
+                "the failed retirement did not reset the verdict"
+            );
             assert_eq!(fixture.supervisor.retired(), vec![job.clone(), job]);
             wait_gone(descendant).await;
         }
@@ -20517,6 +21171,11 @@ generation "$1"
                 started_at: None,
                 last_connected_at: None,
                 loss_reason: Some("runtime_lost".to_owned()),
+                exit: Some(protocol::RuntimeExit {
+                    cause: "oom_kill".to_owned(),
+                    signal: None,
+                    code: None,
+                }),
             });
             store.record_session(&record).expect("store failed+lost");
             let registry = upgraded_registry(
@@ -20540,6 +21199,7 @@ generation "$1"
                 runtime.loss_reason
             );
             assert_eq!(runtime.loss_reason, None);
+            assert_eq!(runtime.exit, None, "a live runtime carries no exit");
             assert_eq!(session.state, protocol::SessionState::Running);
             worker.server_task.abort();
             drop(worker.reporter);

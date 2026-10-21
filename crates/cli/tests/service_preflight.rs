@@ -325,6 +325,7 @@ fn session_info() -> SessionInfo {
             started_at: None,
             last_connected_at: None,
             loss_reason: None,
+            exit: None,
         }),
     }
 }

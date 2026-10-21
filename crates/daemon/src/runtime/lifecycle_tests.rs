@@ -74,6 +74,15 @@ pub(crate) enum JobScript {
     Panic,
 }
 
+/// What the manager reports for a failed job; retiring the job resets it.
+#[derive(Debug, Clone)]
+pub(crate) enum EvidenceScript {
+    /// The failed job's verdict.
+    Failed(ExitEvidence),
+    /// The manager cannot be read.
+    Unavailable,
+}
+
 /// One supervisor call, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Call {
@@ -108,6 +117,7 @@ pub(crate) struct ScriptedSupervisor {
     retire_ends: StdMutex<HashMap<ServiceId, u32>>,
     retire_ends_then_fails: StdMutex<HashMap<ServiceId, u32>>,
     retire_gate: StdMutex<Option<StartGate>>,
+    evidence: StdMutex<HashMap<ServiceId, EvidenceScript>>,
     discovery_unavailable: std::sync::atomic::AtomicBool,
 }
 
@@ -174,6 +184,12 @@ impl ScriptedSupervisor {
             .lock()
             .expect("retire script")
             .insert(id, pid);
+    }
+
+    /// Scripts the verdict of the failed job `id`. Retiring the job removes
+    /// it, the way resetting a failed unit destroys its result.
+    pub(crate) fn script_exit_evidence(&self, id: ServiceId, script: EvidenceScript) {
+        self.evidence.lock().expect("evidence").insert(id, script);
     }
 
     /// Makes `discover` fail as an unreachable manager.
@@ -424,6 +440,7 @@ impl Supervisor for ScriptedSupervisor {
                 end_process(pid, "the process of the failing retirement");
                 return Err(unavailable("retire"));
             }
+            self.evidence.lock().expect("evidence").remove(id);
             let scripted = self.jobs.lock().expect("jobs").remove(id);
             if let Some(script) = scripted {
                 return match script {
@@ -451,6 +468,20 @@ impl Supervisor for ScriptedSupervisor {
             match &self.delegate {
                 Some(delegate) => delegate.exit_status(id).await,
                 None => Ok(None),
+            }
+        })
+    }
+
+    fn exit_evidence<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, Option<ExitEvidence>> {
+        Box::pin(async move {
+            let scripted = self.evidence.lock().expect("evidence").get(id).cloned();
+            match scripted {
+                Some(EvidenceScript::Failed(evidence)) => Ok(Some(evidence)),
+                Some(EvidenceScript::Unavailable) => Err(unavailable("exit_evidence")),
+                None => match &self.delegate {
+                    Some(delegate) => delegate.exit_evidence(id).await,
+                    None => Ok(None),
+                },
             }
         })
     }
@@ -2516,4 +2547,38 @@ async fn recovery_refuses_a_journal_missing_its_generation_without_a_schema_reas
         "{refusal:?}"
     );
     assert!(harness.supervisor.retired().is_empty());
+}
+
+#[test]
+fn every_documented_result_maps_to_its_cause_and_the_exit_rides_along() {
+    use pohunek_platform::supervisor::{ExitEvidence, JobExit};
+
+    let cases = [
+        ("oom-kill", "oom_kill"),
+        ("signal", "signal"),
+        ("exit-code", "exit_code"),
+        ("core-dump", "core_dump"),
+        ("timeout", "timeout"),
+        ("watchdog", "watchdog"),
+        ("resources", "resources"),
+        ("protocol", "other"),
+        ("start-limit-hit", "other"),
+    ];
+    for (result, cause) in cases {
+        let exit = super::runtime_exit(&ExitEvidence::new(result.to_owned(), None));
+        assert_eq!(exit.cause, cause, "{result}");
+        assert_eq!((exit.signal, exit.code), (None, None), "{result}");
+    }
+    // An OOM kill reports the stop signal as the main status: the cause stays.
+    let killed = super::runtime_exit(&ExitEvidence::new(
+        "oom-kill".to_owned(),
+        Some(JobExit::Signal(15)),
+    ));
+    assert_eq!(killed.cause, "oom_kill");
+    assert_eq!(killed.signal, Some(15));
+    let exited = super::runtime_exit(&ExitEvidence::new(
+        "exit-code".to_owned(),
+        Some(JobExit::Code(3)),
+    ));
+    assert_eq!((exited.signal, exited.code), (None, Some(3)));
 }

@@ -2228,7 +2228,7 @@ async fn a_worker_crash_after_a_journaled_switch_keeps_the_switch_when_the_worke
         .mark_worker_unavailable(
             rig.id(),
             &identity,
-            crate::session::Unavailability::Lost(crate::session::LossProof::Ended),
+            crate::session::Unavailability::lost(crate::session::LossProof::Ended, None),
             "worker_lost",
         )
         .await;

@@ -23,7 +23,8 @@
 //! Renames are applied only at those typed locations. Free-form values such as
 //! session metadata or notification payloads are never walked, so a user key
 //! named `runtime_id` is never rewritten. Anything else protocol 3 could not
-//! decode is dropped: events it never defined and warning kinds it never knew.
+//! decode is dropped: events it never defined, warning kinds it never knew and
+//! the `exit` of a session runtime.
 
 // Rust guideline compliant 2026-06-26
 
@@ -315,6 +316,9 @@ fn session_info(
     };
     if let Some(runtime) = object.get_mut(RUNTIME_FIELD) {
         rename_in(runtime, site, direction)?;
+        if let (Direction::ToLegacy, Value::Object(runtime)) = (direction, runtime) {
+            runtime.remove("exit");
+        }
     }
     if matches!(direction, Direction::ToLegacy) {
         object.remove("native_last_activity_at");

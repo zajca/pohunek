@@ -149,6 +149,7 @@ export type { ProviderKind } from "./ProviderKind";
 export type { QuarantineReason } from "./QuarantineReason";
 export type { RelayId } from "./RelayId";
 export type { ReportSequence } from "./ReportSequence";
+export type { RuntimeExit } from "./RuntimeExit";
 export type { RuntimeGeneration } from "./RuntimeGeneration";
 export type { RuntimeId } from "./RuntimeId";
 export type { RuntimeInventoryEntry } from "./RuntimeInventoryEntry";

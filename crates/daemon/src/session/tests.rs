@@ -8189,7 +8189,7 @@ async fn lost_transition_preserves_worker_metadata_committed_ahead_of_memory() {
             .mark_worker_unavailable(
                 &created.id,
                 &identity,
-                crate::session::Unavailability::Lost(crate::session::LossProof::Ended),
+                crate::session::Unavailability::lost(crate::session::LossProof::Ended, None),
                 crate::session::supervision::RUNTIME_LOST,
             )
             .await,
@@ -13802,7 +13802,7 @@ async fn stale_runtime_watchers_emit_nothing_during_new_runtime_commit() {
         .mark_worker_unavailable(
             &created.id,
             &expected_old,
-            crate::session::Unavailability::Lost(crate::session::LossProof::Ended),
+            crate::session::Unavailability::lost(crate::session::LossProof::Ended, None),
             crate::session::supervision::RUNTIME_LOST,
         )
         .await;
@@ -14110,7 +14110,7 @@ async fn lost_transition_retries_precommit_failure_before_single_event() {
             .mark_worker_unavailable(
                 &created.id,
                 &expected,
-                crate::session::Unavailability::Lost(crate::session::LossProof::Ended),
+                crate::session::Unavailability::lost(crate::session::LossProof::Ended, None),
                 crate::session::supervision::RUNTIME_LOST,
             )
             .await;
@@ -14396,7 +14396,7 @@ async fn assert_lost_transition_applied(
             .mark_worker_unavailable(
                 id,
                 expected,
-                crate::session::Unavailability::Lost(crate::session::LossProof::Ended),
+                crate::session::Unavailability::lost(crate::session::LossProof::Ended, None),
                 crate::session::supervision::RUNTIME_LOST,
             )
             .await
@@ -15638,6 +15638,11 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
         started_at: Some(original_created_at.clone()),
         last_connected_at: None,
         loss_reason: Some(super::supervision::RUNTIME_LOST_CLEANUP_UNCONFIRMED.to_owned()),
+        exit: Some(protocol::RuntimeExit {
+            cause: "oom_kill".to_owned(),
+            signal: None,
+            code: None,
+        }),
     });
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
     let lost_job = entry.job.clone().expect("created session records its job");
@@ -15731,6 +15736,11 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
             .expect("resumed runtime")
             .runtime_generation,
         RuntimeGeneration::new(2)
+    );
+    assert_eq!(
+        resumed.runtime.as_ref().expect("resumed runtime").exit,
+        None,
+        "the recovered runtime carries no exit of the lost one"
     );
 
     let argv = wait_for_file_contains(&marker, "native-manual").await;
@@ -16292,6 +16302,7 @@ async fn explicit_native_recovery_rejects_nonterminal_runtime_states() {
             started_at: None,
             last_connected_at: None,
             loss_reason: None,
+            exit: None,
         });
         drop(sessions);
         let error = registry
@@ -23587,6 +23598,7 @@ async fn a_resume_over_outdated_hook_assets_carries_a_hook_warning() {
         started_at: Some(created.created_at.clone()),
         last_connected_at: None,
         loss_reason: Some("test_runtime_lost".to_owned()),
+        exit: None,
     });
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
     let lost_job = entry.job.clone().expect("created session records its job");
@@ -23750,6 +23762,7 @@ async fn a_resume_of_a_profile_named_after_its_runtime_checks_the_profile_home()
         started_at: Some(created.created_at.clone()),
         last_connected_at: None,
         loss_reason: Some("test_runtime_lost".to_owned()),
+        exit: None,
     });
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
     let lost_job = entry.job.clone().expect("created session records its job");

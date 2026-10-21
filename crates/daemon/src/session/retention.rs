@@ -750,6 +750,7 @@ mod tests {
             started_at: None,
             last_connected_at,
             loss_reason: (state == RuntimeState::Lost).then(|| "worker_unavailable".to_owned()),
+            exit: None,
         }
     }
 

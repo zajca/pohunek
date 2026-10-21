@@ -271,8 +271,8 @@ kinds and events v3 never defined (a v3 connection never receives a
 `native_recovery` session warning; v4 connections do). The `background_state`
 event is withheld from v3 connections, and `SessionInfo.background` is removed
 from the session objects a v3 connection receives, so a v3 client sees no
-background snapshot. `SessionInfo.capability_refusals` is removed from them as
-well. A client whose range does not overlap the window
+background snapshot. `SessionInfo.capability_refusals` and `SessionRuntime.exit` are removed from
+them as well. A client whose range does not overlap the window
 receives `daemon/version_mismatch` before any method runs; a client of this build
 negotiates v3 and translates as described above. The window covers
 the public daemon protocol and the Hermes CLI tool path: the CLI's `--json`
@@ -1479,8 +1479,23 @@ Important fields:
   a canonical unsigned decimal JSON string, not a JSON number. `runtime.state` is
   `starting`, `live`, `reconnecting`, `terminal`, `lost`, `conflict`, or
   `incompatible`; `worker_id` identifies the PTY owner and `worker_instance_id`
-  identifies the PTY generation. `started_at`, `last_connected_at`, and
-  `loss_reason` are optional. Daemon reconnection preserves both identities;
+  identifies the PTY generation. `started_at`, `last_connected_at`, `loss_reason`
+  and `exit` are optional. `exit` (`RuntimeExit`) says how the service manager
+  saw the worker end and is present only on a `lost` runtime whose failed
+  worker job the daemon read before retiring it: `cause` is an open string
+  (`oom_kill`, `signal`, `exit_code`, `core_dump`, `timeout`, `watchdog`,
+  `resources`, `other`; a client treats any other value as unknown), `signal`
+  and `code` are the optional signal number or exit code of the worker process
+  (for `oom_kill` they describe how the worker process died, usually the stop
+  signal, and the cause comes from the manager's verdict alone). It is absent
+  after a host restart, on macOS (launchd keeps no verdict; tracked in #1343),
+  for a worker started directly by the daemon, when the manager held no failed
+  job, and when the read failed; it is kept while the runtime stays `lost` and
+  cleared when the runtime becomes anything else (a stop the user requested
+  ends the runtime `terminal`, without an exit). It is diagnostic: it does not
+  change `state` or the proof of the loss, and an unproven loss records it too.
+  Peers on protocol 3 never see it, and a 0.35 client ignores it. Daemon
+  reconnection preserves both identities;
   explicit native recovery changes them. A `lost` runtime whose end the daemon
   observed (the worker's job ended and was retired, a host restart, or an
   answering worker whose child process is gone) belongs to a `failed` session with no `activity`
@@ -1652,7 +1667,7 @@ running inside a session on the same host. `plugin profile migrate` and
 its frozen revision over the migration pin (the `package` and `digest` keys), so
 it resumes without the decision; any other rewrite of the text needs the decision
 once for the existing sessions of that profile. The optional `profile_revision` field of a
-resume binding (store schema 3 and later; the current store schema is 10) is
+resume binding (store schema 3 and later; the current store schema is 11) is
 absent for sessions without a profile and for bindings written by schema 2.
 
 A host profile over a package-served base carries the top-level keys
@@ -3344,7 +3359,7 @@ The daemon then writes these events:
 | `session_stopped` | `{session: SessionInfo}` | A user-requested stop completed. |
 | `session_removed` | `{session: SessionInfo}` | A session was evicted from the registry; clients drop it from their view. |
 | `session_runtime_reconnected` | `{session: SessionInfo}` | A replacement daemon adopted the same worker and runtime generation. This is not a new session and does not imply provider-native recovery. |
-| `session_runtime_lost` | `{session: SessionInfo}` | The worker or host runtime is gone. The logical record remains visible and may support explicit recovery. When the daemon observed the runtime end, `session.state` is `failed` with no `activity`; otherwise the session keeps its state and has no `activity`. |
+| `session_runtime_lost` | `{session: SessionInfo}` | The worker or host runtime is gone. The logical record remains visible and may support explicit recovery. When the daemon observed the runtime end, `session.state` is `failed` with no `activity`; otherwise the session keeps its state and has no `activity`. `session.runtime.exit` carries the service manager's verdict on the worker job when it held one. |
 | `session_runtime_conflict` | `{session: SessionInfo}` | Runtime discovery found duplicate, mismatched, or otherwise ambiguous live identity. The daemon quarantines the conflict and does not kill a worker automatically; it re-checks a conflict whose record names a worker generation in the background, and `session.stop` can end one whose recorded identity the journal proves. |
 | `session_runtime_discovered` | `{entry: RuntimeInventoryEntry}` | Startup reconciliation classified a discovered durable worker that is not a plainly managed runtime (orphaned, conflicting, incompatible, or identity-mismatched). Emitted once per non-managed discovery so operators can inspect quarantined runtimes. |
 | `session_native_recovered` | `{session: SessionInfo, previous_worker_instance_id?: string, worker_instance_id?: string}` | Explicit provider-native recovery created a new worker and runtime generation for the same logical session. `previous_worker_instance_id` can be absent for a one-time migrated legacy session; production worker recovery includes the new `worker_instance_id`. |

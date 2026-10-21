@@ -68,6 +68,14 @@ const RESTART_THROTTLE: Duration = Duration::from_secs(5);
 const SWEEP_GRACE: Duration = Duration::from_secs(5);
 /// Open-file limit written to the fixture's `service.toml`.
 const OPEN_FILES: u64 = 8_192;
+/// Scheduling margin on top of the sweep grace and one manager call when the
+/// daemon classifies a killed worker.
+const LOSS_MARGIN: Duration = Duration::from_secs(15);
+/// `MemoryMax` of the running worker unit: below what the worker already
+/// holds, so the kernel's OOM killer runs as soon as the limit is written.
+const OOM_MEMORY_MAX: &str = "1M";
+/// Makes the kernel pick the worker over its own children.
+const OOM_SCORE_ADJ_MAX: &str = "1000";
 
 #[tokio::test]
 #[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a real systemd user manager"]
@@ -376,9 +384,16 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
     let lost_isolation = fixture
         .wait_for_runtime_state(&fixture.isolation_session_id, RuntimeState::Lost)
         .await;
+    let isolation_runtime = lost_isolation.runtime.expect("isolation runtime");
+    assert_eq!(isolation_runtime.state, RuntimeState::Lost);
     assert_eq!(
-        lost_isolation.runtime.expect("isolation runtime").state,
-        RuntimeState::Lost
+        isolation_runtime.exit,
+        Some(protocol::RuntimeExit {
+            cause: "signal".to_owned(),
+            signal: Some(9),
+            code: None,
+        }),
+        "the manager's verdict on the SIGKILLed worker reaches the session"
     );
     assert_eq!(
         Fixture::main_pid(&fixture.isolation_worker_unit),
@@ -403,6 +418,111 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
          worker_instance_id={worker_instance_id} recovered_worker_instance_id={recovered_worker_instance_id} \
          daemon_pids={daemon_pid},{restarted_daemon_pid},{killed_daemon_pid}",
         pty_device.display()
+    );
+}
+
+/// A worker unit OOM-killed under real memory pressure is a failed session
+/// whose runtime says why: the manager's verdict is read before the daemon
+/// retires the failed unit.
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a real systemd user manager"]
+async fn an_oom_killed_systemd_worker_is_a_failed_session_with_its_cause() {
+    assert_eq!(
+        std::env::var("POHUNEK_SYSTEMD_E2E").as_deref(),
+        Ok("1"),
+        "set POHUNEK_SYSTEMD_E2E=1 explicitly"
+    );
+    require_memory_controller();
+    let daemon_bin = required_binary("POHUNEK_DAEMON_BIN");
+    let worker_bin = required_binary("POHUNEK_WORKER_BIN");
+    let fixture = Fixture::new(&worker_bin);
+    fixture.install_claude_package().await;
+
+    fixture.start_worker(&fixture.worker_key).await;
+    let worker = fixture.connect_worker("fixture-controller").await;
+    let worker_id = worker.worker_id().await;
+    let worker_instance_id = worker
+        .initialize(fixture.initialize(worker_id.clone()))
+        .await
+        .expect("initialize systemd worker");
+    let child_pid = worker
+        .inspect()
+        .await
+        .expect("inspect initialized worker")
+        .child_process
+        .expect("child process")
+        .pid;
+    fixture.persist_record(
+        &worker_id.to_string(),
+        &worker_instance_id.to_string(),
+        child_pid,
+    );
+    worker
+        .release_controller()
+        .await
+        .expect("release bootstrap worker controller");
+    drop(worker);
+    // timing-allowed: #326 lets the worker settle after its controller is released, as the lifecycle scenario does
+    tokio::time::sleep(CONNECT_DELAY).await;
+    fixture.start_daemon(&daemon_bin);
+    fixture
+        .wait_for_activity(&fixture.session_id, AgentActivity::Working)
+        .await;
+
+    let unit_pid = Fixture::main_pid(&fixture.worker_unit);
+    assert_ne!(unit_pid, 0, "the worker unit runs");
+    std::fs::write(format!("/proc/{unit_pid}/oom_score_adj"), OOM_SCORE_ADJ_MAX)
+        .expect("make the worker the preferred OOM victim");
+    Fixture::systemctl([
+        "set-property",
+        "--runtime",
+        fixture.worker_unit.as_str(),
+        format!("MemoryMax={OOM_MEMORY_MAX}").as_str(),
+        "MemorySwapMax=0",
+    ]);
+
+    let deadline = tokio::time::Instant::now() + SWEEP_GRACE + SYSTEMD_CALL_TIMEOUT + LOSS_MARGIN;
+    let lost = loop {
+        let info = fixture.inspect().await;
+        if info
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.state == RuntimeState::Lost)
+        {
+            break info;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            fixture.print_status();
+            panic!("the OOM-killed worker was not classified lost in time");
+        }
+        // timing-allowed: #326 polls the real daemon for the loss, bounded by the explicit deadline above
+        tokio::time::sleep(CONNECT_DELAY).await;
+    };
+    assert_eq!(lost.state, protocol::SessionState::Failed);
+    assert_eq!(lost.activity, None);
+    let runtime = lost.runtime.expect("lost runtime");
+    assert_eq!(
+        runtime.exit.as_ref().map(|exit| exit.cause.as_str()),
+        Some("oom_kill"),
+        "{runtime:?}"
+    );
+}
+
+/// The OOM scenario needs the user manager to enforce `MemoryMax`, which
+/// requires the memory controller to be delegated to it. A runner without it
+/// fails here with the reason instead of skipping.
+fn require_memory_controller() {
+    let uid = nix::unistd::Uid::effective().as_raw();
+    let controllers = PathBuf::from(format!(
+        "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/cgroup.controllers"
+    ));
+    let delegated = std::fs::read_to_string(&controllers).unwrap_or_default();
+    assert!(
+        delegated.split_whitespace().any(|name| name == "memory"),
+        "precondition: the systemd user manager does not have the memory controller \
+         delegated ({} lists: {delegated:?}); delegate it (for example \
+         `Delegate=cpu memory pids` for user@.service) before running this scenario",
+        controllers.display()
     );
 }
 
@@ -773,6 +893,7 @@ impl Fixture {
                 started_at: Some(now.clone()),
                 last_connected_at: Some(now.clone()),
                 loss_reason: None,
+                exit: None,
             }),
             cols: 80,
             rows: 24,

@@ -640,6 +640,18 @@ struct SessionRegistryInner {
     /// Sessions shown only by an in-memory placeholder because the write of
     /// their classification failed, with the state and reason shown.
     unpersisted_classifications: std::sync::Mutex<HashMap<String, (RuntimeState, String)>>,
+    /// The verdict read from the failed job of a session's worker whose `Lost`
+    /// classification is not committed yet. Retiring the job destroys the
+    /// service manager's copy, so a repeated classification takes it from here.
+    unrecorded_exits: std::sync::Mutex<
+        HashMap<
+            String,
+            (
+                pohunek_platform::supervisor::ServiceId,
+                protocol::RuntimeExit,
+            ),
+        >,
+    >,
     pending_attaches: Mutex<HashMap<String, PendingAttach>>,
     active_attaches: Mutex<HashMap<String, ActiveAttach>>,
     recent_attach_failures: Mutex<VecDeque<attach::RecentAttachFailure>>,
@@ -1288,14 +1300,24 @@ pub(super) enum LossProof {
 
 /// A runtime classification committed by the unavailable-runtime funnels.
 ///
-/// A `Lost` classification cannot be built without its [`LossProof`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A `Lost` classification cannot be built without its [`LossProof`]. The
+/// exit the service manager recorded for the worker rides with it: it is a
+/// fact about the worker's job, independent of the proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Unavailability {
-    Lost(LossProof),
+    Lost {
+        proof: LossProof,
+        exit: Option<protocol::RuntimeExit>,
+    },
     Other(RuntimeState),
 }
 
 impl Unavailability {
+    /// A `Lost` classification with what the caller proved and observed.
+    pub(super) const fn lost(proof: LossProof, exit: Option<protocol::RuntimeExit>) -> Self {
+        Self::Lost { proof, exit }
+    }
+
     /// A classification other than `Lost`.
     ///
     /// # Panics
@@ -1306,17 +1328,33 @@ impl Unavailability {
         Self::Other(state)
     }
 
-    pub(super) fn state(self) -> RuntimeState {
+    pub(super) const fn state(&self) -> RuntimeState {
         match self {
-            Self::Lost(_) => RuntimeState::Lost,
-            Self::Other(state) => state,
+            Self::Lost { .. } => RuntimeState::Lost,
+            Self::Other(state) => *state,
         }
     }
 
-    pub(super) fn proof(self) -> Option<LossProof> {
+    pub(super) const fn proof(&self) -> Option<LossProof> {
         match self {
-            Self::Lost(proof) => Some(proof),
+            Self::Lost { proof, .. } => Some(*proof),
             Self::Other(_) => None,
+        }
+    }
+
+    /// Records this classification in `runtime`, which still names the
+    /// state it had before.
+    ///
+    /// A `Lost` classification without new evidence keeps the exit of a
+    /// runtime that was already lost, because the job that held it is gone;
+    /// every other classification drops it.
+    pub(super) fn apply_exit(&self, runtime: &mut SessionRuntime) {
+        match self {
+            Self::Lost {
+                exit: Some(exit), ..
+            } => runtime.exit = Some(exit.clone()),
+            Self::Lost { exit: None, .. } if runtime.state == RuntimeState::Lost => {}
+            Self::Lost { exit: None, .. } | Self::Other(_) => runtime.exit = None,
         }
     }
 }
@@ -1422,6 +1460,7 @@ fn exit_transition(
     if let Some(runtime) = candidate.info.runtime.as_mut() {
         runtime.state = RuntimeState::Terminal;
         runtime.loss_reason = None;
+        runtime.exit = None;
     }
     // A runtime that was unavailable ends as the terminal runtime it is.
     if matches!(candidate.runtime, RuntimeHandle::Unavailable(_)) {
@@ -2042,6 +2081,7 @@ impl SessionRegistry {
                 sessions: Mutex::new(HashMap::new()),
                 runtime_inventory: Mutex::new(Vec::new()),
                 unpersisted_classifications: std::sync::Mutex::new(HashMap::new()),
+                unrecorded_exits: std::sync::Mutex::new(HashMap::new()),
                 pending_attaches: Mutex::new(HashMap::new()),
                 active_attaches: Mutex::new(HashMap::new()),
                 recent_attach_failures: Mutex::new(VecDeque::new()),
@@ -5461,6 +5501,7 @@ impl SessionRegistry {
         if let Some(runtime) = entry.info.runtime.as_mut() {
             runtime.state = RuntimeState::Reconnecting;
             runtime.loss_reason = Some(WORKER_CONNECTION_LOST.to_owned());
+            runtime.exit = None;
         }
         entry.info.updated_at = timestamp_now();
         drop(sessions);
@@ -5500,6 +5541,7 @@ impl SessionRegistry {
             candidate.runtime = RuntimeHandle::Unavailable(state);
             candidate.info.background = None;
             if let Some(runtime) = candidate.info.runtime.as_mut() {
+                classification.apply_exit(runtime);
                 runtime.state = state;
                 runtime.loss_reason = Some(reason.to_owned());
             }
@@ -5584,6 +5626,7 @@ impl SessionRegistry {
                 runtime.worker_instance_id = Some(worker_instance_id);
                 runtime.last_connected_at = Some(timestamp_now());
                 runtime.loss_reason = None;
+                runtime.exit = None;
             }
             candidate.info.updated_at = timestamp_now();
             (base, candidate)
@@ -6753,6 +6796,7 @@ fn create_intent_record(
             started_at: None,
             last_connected_at: None,
             loss_reason: None,
+            exit: None,
         }),
         cols: params.cols,
         rows: params.rows,

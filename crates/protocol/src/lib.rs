@@ -136,7 +136,7 @@ pub use runtime_id::{
 pub use session::{
     AgentActivity, AgentStateEvent, AttachEvent, AttachHeader, BackgroundItem, BackgroundKind,
     BackgroundStateEvent, BackgroundStatus, CwdSource, DetectionRegionKind, DetectionRegionPreview,
-    ForkCwdMode, ObservationParamsError, RuntimeInventoryEntry, RuntimeInventoryEvent,
+    ForkCwdMode, ObservationParamsError, RuntimeExit, RuntimeInventoryEntry, RuntimeInventoryEvent,
     RuntimeInventoryResult, RuntimeInventoryStatus, RuntimeState, SessionAttachParams,
     SessionAttachResult, SessionBackground, SessionCapabilities, SessionCapabilityRefusals,
     SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
