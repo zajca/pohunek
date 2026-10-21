@@ -1491,7 +1491,8 @@ Important fields:
   after a host restart, on macOS (launchd keeps no verdict; tracked in #1343),
   for a worker started directly by the daemon, when the manager held no failed
   job, and when the read failed; it is kept while the runtime stays `lost` and
-  cleared when the runtime becomes anything else. It is diagnostic: it does not
+  cleared when the runtime becomes anything else (a stop the user requested
+  ends the runtime `terminal`, without an exit). It is diagnostic: it does not
   change `state` or the proof of the loss, and an unproven loss records it too.
   Peers on protocol 3 never see it, and a 0.35 client ignores it. Daemon
   reconnection preserves both identities;
@@ -1666,7 +1667,7 @@ running inside a session on the same host. `plugin profile migrate` and
 its frozen revision over the migration pin (the `package` and `digest` keys), so
 it resumes without the decision; any other rewrite of the text needs the decision
 once for the existing sessions of that profile. The optional `profile_revision` field of a
-resume binding (store schema 3 and later; the current store schema is 10) is
+resume binding (store schema 3 and later; the current store schema is 11) is
 absent for sessions without a profile and for bindings written by schema 2.
 
 A host profile over a package-served base carries the top-level keys

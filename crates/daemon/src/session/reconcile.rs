@@ -13803,6 +13803,55 @@ handler = "codex-hook-v1"
             );
         }
 
+        /// A stop the user asked for ends the runtime on purpose: the session is
+        /// stopped with a terminal runtime, and the manager's verdict on the
+        /// worker the stop took down is not a loss to report.
+        #[tokio::test]
+        async fn a_stop_intent_ends_terminal_without_an_exit() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            Marked::spawn(&fixture.root, "runtime-s-1347");
+            let mut record = persist_record(&fixture.root, "s-1347", Some("runtime-s-1347"));
+            record.desired_state = DesiredState::Stopped;
+            Store::new(fixture.root.join("data/metadata.jsonl"))
+                .record_session(&record)
+                .expect("persist the stop intent");
+            write_live_journal(
+                &fixture.root,
+                "s-1347",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-1347"),
+            );
+            let id = service_id("s-1347", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            fixture.supervisor.script_exit_evidence(id, oom_evidence());
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let info = fixture
+                .registry
+                .inspect(&SessionId("s-1347".to_owned()))
+                .await
+                .expect("inspect");
+            assert_eq!(info.state, protocol::SessionState::Stopped);
+            let runtime = info.runtime.expect("runtime");
+            assert_eq!(runtime.state, RuntimeState::Terminal);
+            assert_eq!(runtime.exit, None);
+            assert!(
+                !fixture
+                    .registry
+                    .inner
+                    .unrecorded_exits
+                    .lock()
+                    .expect("unrecorded exits")
+                    .contains_key("s-1347"),
+                "the verdict of a stopped runtime is not kept"
+            );
+        }
+
         #[tokio::test]
         async fn an_ambiguous_job_is_not_asked_for_a_verdict() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
@@ -20011,7 +20060,10 @@ generation "$1"
         #[tokio::test]
         async fn a_proven_loss_after_a_stop_intent_presents_a_stopped_session() {
             let fixture = fixture(LONG_CONNECT);
-            let (created, _job, descendant) = fixture.create().await;
+            let (created, job, descendant) = fixture.create().await;
+            fixture
+                .supervisor
+                .script_exit_evidence(job, failed("oom-kill", None));
             // A stop that gave up waiting leaves its intent behind.
             let mut sessions = fixture.registry.inner.sessions.lock().await;
             sessions
@@ -20030,6 +20082,13 @@ generation "$1"
                 .expect("inspect");
             assert_eq!(info.state, protocol::SessionState::Stopped);
             assert_eq!(info.activity, None);
+            assert_eq!(
+                info.runtime
+                    .and_then(|runtime| runtime.exit)
+                    .map(|exit| exit.cause),
+                Some("oom_kill".to_owned()),
+                "a loss that settles as a stop still reports how the worker ended"
+            );
             wait_gone(descendant).await;
         }
 

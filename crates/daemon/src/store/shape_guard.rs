@@ -43,6 +43,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (8, include_str!("fixtures/shape/schema-8.txt")),
     (9, include_str!("fixtures/shape/schema-9.txt")),
     (10, include_str!("fixtures/shape/schema-10.txt")),
+    (11, include_str!("fixtures/shape/schema-11.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -192,7 +193,8 @@ fn session_json() -> Value {
                 "worker_instance_id": "wi-1",
                 "started_at": "2026-01-01T00:00:00Z",
                 "last_connected_at": "2026-01-01T00:00:01Z",
-                "loss_reason": "none"
+                "loss_reason": "none",
+                "exit": {"cause": "oom_kill", "signal": 15, "code": 1}
             },
             "cols": 120,
             "rows": 40,

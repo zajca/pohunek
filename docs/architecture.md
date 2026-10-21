@@ -777,7 +777,7 @@ release-notes line for each one that changed.
 `metadata.jsonl` holds four record kinds: session, resume, worktree and project.
 Each line carries `schema_version`; a line without it is schema 1. The current
 value is `STORE_SCHEMA_VERSION` (`crates/daemon/src/store/schema.rs`, currently
-9), and `SessionRecord.info` embeds the protocol type `SessionInfo`, so a
+11), and `SessionRecord.info` embeds the protocol type `SessionInfo`, so a
 protocol field that reaches `info` is a persisted-shape change too.
 
 Startup order in `crates/daemon/src/main.rs`:
@@ -1480,9 +1480,11 @@ Durability tiers (honest about limits):
    (`Supervisor::exit_evidence`); the launchd backend returns none (#1343), and a
    failed read never blocks the classification. A lost runtime that is
    classified again without a verdict keeps the one it has; any other
-   classification of the runtime drops it. The field is additive on the wire
-   and in the store (no protocol or store schema bump); protocol 3 peers do not
-   receive it. N-1 readers know both values:
+   classification of the runtime drops it. A user-requested stop ends the
+   runtime `terminal` and carries no exit. The field is additive on the wire
+   (no protocol bump; protocol 3 peers do not receive it) and a persisted-shape
+   change in the store (store schema 11, a no-op migration from 10). N-1
+   readers know both values:
    they treat the session as ended and not stoppable. Rolled back to a release
    that predates this presentation, the stored `failed` record is aged by the
    shorter terminal window when automatic retention is enabled.
