@@ -965,12 +965,14 @@ same code, and the message names the file or directive to change:
 - `PassEnvironment=PATH` or `UnsetEnvironment=PATH`, and a masked or broken unit;
 - a unit with no unit file (not installed yet, or removed by a rollback or a
   config migration) whose drop-in files in the manager's own `UnitPath`
-  directories set `EnvironmentFile=`, `ExecSearchPath=`, `PassEnvironment=` or
-  `UnsetEnvironment=` naming `PATH`, or an `Environment=` `PATH` in a form the CLI
-  does not read, or share a file name between two directories; plain
-  `Environment=PATH=` lines of those drop-ins are read in file-name order (an
-  empty `Environment=` resets) and give the job's `PATH`, so a rollback or
-  migration that removed the unit still completes;
+  directories hold a `PATH`-affecting line the CLI does not read: an
+  `Environment=` `PATH`, `ExecSearchPath=` (more than one word, a relative entry)
+  or `EnvironmentFile=` with an escape sequence or specifier, `PassEnvironment=`
+  or `UnsetEnvironment=` naming `PATH`, or a file name shared between two
+  directories. Plain `Environment=PATH=`, colon-separated `ExecSearchPath=` and
+  `EnvironmentFile=` lines (checked like a loaded unit's) of those drop-ins are
+  read in file-name order (an empty assignment resets) and give the job's `PATH`,
+  so a rollback or migration that removed the unit still completes;
 - a snapshot made stale by a change on disk while any drop-in exists (run
   `systemctl --user daemon-reload`); a drop-in directory that cannot be read;
 - an `ExecSearchPath=` that the unit file and a drop-in both feed (the directive

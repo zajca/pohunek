@@ -11033,6 +11033,54 @@ async fn a_removed_unit_with_surviving_drop_ins_is_judged_by_them() {
     assert_eq!(job.value, MANAGER_PATH, "no PATH in the drop-ins");
 }
 
+/// The drop-in settings that resolve while the unit is loaded resolve after its
+/// removal too: `ExecSearchPath=` and an `EnvironmentFile=` without `PATH`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_removed_unit_keeps_resolving_exec_search_path_and_environment_files() {
+    let (_keep, unit) = orphan_drop_ins(&[
+        (
+            "a.service.d",
+            "10-a.conf",
+            b"[Service]\nExecSearchPath=/opt/a/bin:/opt/b/bin\n",
+        ),
+        (
+            "a.service.d",
+            "20-b.conf",
+            b"[Service]\nExecSearchPath=/opt/c/bin\n",
+        ),
+    ]);
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, "/opt/a/bin:/opt/b/bin:/opt/c/bin");
+
+    let (_keep, unit) = orphan_drop_ins(&[
+        (
+            "a.service.d",
+            "10-a.conf",
+            b"[Service]\nExecSearchPath=/opt/a/bin\n",
+        ),
+        (
+            "a.service.d",
+            "20-b.conf",
+            b"[Service]\nEnvironment=PATH=/env/bin\n",
+        ),
+    ]);
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, "/env/bin", "Environment=PATH wins");
+
+    let (_dir, file) = environment_file("FOO=1\n");
+    let line = format!("[Service]\nEnvironmentFile=-{file}\n");
+    let (_keep, unit) = orphan_drop_ins(&[("a.service.d", "10-a.conf", line.as_bytes())]);
+    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
+    assert_eq!(job.value, MANAGER_PATH);
+
+    let (_dir, file) = environment_file("PATH=/file/bin\n");
+    let line = format!("[Service]\nEnvironmentFile={file}\n");
+    let (_keep, unit) = orphan_drop_ins(&[("a.service.d", "10-a.conf", line.as_bytes())]);
+    let text = refusal(unrecorded_job_path(Ok(unit)).await);
+    assert!(text.contains("sets PATH"), "{text}");
+}
+
 /// What cannot be read from drop-ins of an unloaded unit is refused with the
 /// file and the fix.
 #[cfg(target_os = "linux")]
@@ -11041,13 +11089,13 @@ async fn a_removed_unit_with_drop_ins_that_cannot_be_read_is_refused() {
     for (name, text, expect) in [
         (
             "p.conf",
-            &b"[Service]\nEnvironmentFile=/etc/x.env\n"[..],
-            "EnvironmentFile=",
+            &b"[Service]\nExecSearchPath=/a:/b /c\n"[..],
+            "ExecSearchPath",
         ),
         (
             "p.conf",
-            &b"[Service]\nExecSearchPath=/opt/bin\n"[..],
-            "ExecSearchPath=",
+            &b"[Service]\nExecSearchPath=relative/bin\n"[..],
+            "ExecSearchPath",
         ),
         (
             "p.conf",
@@ -11154,6 +11202,19 @@ async fn carriage_returns_end_environment_file_lines_like_newlines() {
         let text = refusal(unrecorded_job_path(Ok(unit)).await);
         assert!(text.contains("sets PATH"), "{content:?}: {text}");
     }
+}
+
+/// An assignment without a name is not followed past its continuation: refuse.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_environment_file_line_without_a_name_is_refused() {
+    let (_dir, file) = environment_file("=\\\nPATH=/actual/bin\n");
+    let unit = UnitEnvironment {
+        environment_files: vec![(file, false)],
+        ..loaded_unit()
+    };
+    let text = refusal(unrecorded_job_path(Ok(unit)).await);
+    assert!(text.contains("EnvironmentFile"), "{text}");
 }
 
 /// Another quoted segment after a closed one is not followed: refuse.

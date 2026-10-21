@@ -391,37 +391,80 @@ async fn path_from_orphan_drop_ins(
         }
     }
     let mut current: Option<String> = None;
+    let mut search_path: Vec<String> = Vec::new();
+    let mut environment_files: Vec<(String, bool)> = Vec::new();
     for path in &files {
         let bytes = read_unit_setting_file(path, unit_name, "drop-in").await?;
-        for line in service_lines(&bytes).into_iter().flatten() {
+        let unreadable = |directive: &str| {
+            refuse(format!(
+                "{unit_name} has no unit file yet and the drop-in {path} has a {directive} line that may affect {SEARCH_PATH_VARIABLE} in a form not read here (an escape sequence, a specifier, more than one word, a quote never closed, or bytes that are not UTF-8). Write a plain assignment and retry"
+            ))
+        };
+        for line in service_lines(&bytes) {
+            let Ok(line) = line else {
+                return Err(unreadable("Environment="));
+            };
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
             let key = key.trim_end();
-            let opaque = match key {
-                "EnvironmentFile" | "ExecSearchPath" => true,
-                "PassEnvironment" | "UnsetEnvironment" => {
-                    value.contains(SEARCH_PATH_VARIABLE) || value.contains('\\')
+            match key {
+                "EnvironmentFile" | "ExecSearchPath" => {
+                    if value.trim().is_empty() {
+                        if key == "EnvironmentFile" {
+                            environment_files.clear();
+                        } else {
+                            search_path.clear();
+                        }
+                        continue;
+                    }
+                    let split = split_words(value);
+                    if split.open_quote
+                        || split.escaped
+                        || value.contains('%')
+                        || (key == "ExecSearchPath" && split.words.len() != 1)
+                    {
+                        return Err(unreadable(key));
+                    }
+                    if key == "EnvironmentFile" {
+                        for word in split.words {
+                            match word.strip_prefix('-') {
+                                Some(file) => environment_files.push((file.to_owned(), true)),
+                                None => environment_files.push((word, false)),
+                            }
+                        }
+                    } else {
+                        for entry in split.words[0].split(':').filter(|entry| !entry.is_empty()) {
+                            if !entry.starts_with('/') {
+                                return Err(unreadable(key));
+                            }
+                            search_path.push(entry.to_owned());
+                        }
+                    }
                 }
-                _ => false,
-            };
-            if opaque {
-                return Err(refuse(format!(
-                    "{unit_name} has no unit file yet and the drop-in {path} sets {key}=, whose effect on {SEARCH_PATH_VARIABLE} the service manager cannot report for an unloaded unit. Remove that line or install the unit first, and retry"
-                )));
+                "PassEnvironment" | "UnsetEnvironment"
+                    if value.contains(SEARCH_PATH_VARIABLE) || value.contains('\\') =>
+                {
+                    return Err(refuse(format!(
+                        "{unit_name} has no unit file yet and the drop-in {path} sets {key}= for {SEARCH_PATH_VARIABLE}, which the service manager cannot report for an unloaded unit. Remove that line and retry"
+                    )));
+                }
+                _ => {}
             }
         }
         let Ok(events) = path_events(&bytes) else {
-            return Err(refuse(format!(
-                "{unit_name} has no unit file yet and the drop-in {path} has an Environment= line that may set {SEARCH_PATH_VARIABLE} in a form not read here (an escape sequence, a specifier, bytes that are not UTF-8, or a quote never closed). Write a plain assignment and retry"
-            )));
+            return Err(unreadable("Environment="));
         };
         for event in events {
             current = event;
         }
     }
+    for (file, optional) in &environment_files {
+        check_environment_file(file, *optional, unit_name).await?;
+    }
     match current {
         Some(value) => carry(&value).map(Some).map_err(refuse),
+        None if !search_path.is_empty() => carry(&search_path.join(":")).map(Some).map_err(refuse),
         None => Ok(manager_path),
     }
 }
@@ -595,6 +638,11 @@ fn environment_file_sets_path(text: &str) -> Option<bool> {
         if chars.next_if_eq(&'=').is_none() {
             // A line without `=` assigns nothing.
             continue;
+        }
+        if key.trim().is_empty() {
+            // systemd drops an assignment without a name, and what it does with
+            // a continuation after one is not followed here.
+            return None;
         }
         if key.trim() == SEARCH_PATH_VARIABLE {
             sets_path = true;
