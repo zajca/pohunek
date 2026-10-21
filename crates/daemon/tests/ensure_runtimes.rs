@@ -25,7 +25,8 @@ use pohunek_paths::{METADATA_STORE_NAME as STORE_NAME, PLUGINS_SUBDIR};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, PackageStatus, ProfileAction, ProfileStatus, SelectedPackage,
     UseReason, CODE_DAEMON_RUNNING, CODE_GAP_AGENT_NOT_ON_PATH, CODE_GAP_CONFIG_HOME_MISSING,
-    CODE_GAP_CONFIG_HOME_SYMLINK, CODE_GAP_SERVED_BY_OTHER_PACKAGE,
+    CODE_GAP_CONFIG_HOME_SYMLINK, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
+    CODE_GAP_SERVED_BY_OTHER_PACKAGE, CODE_GAP_UPDATE_VERSION_UNORDERED,
     CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PINNED_TO_NEWER_VERSION,
     CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_VERSION_UNKNOWN, CODE_PROFILE_NOT_MIGRATABLE,
     CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE, DETECT_FLAG, DRY_RUN_FLAG,
@@ -1929,4 +1930,601 @@ fn a_profile_pinned_to_an_unrecorded_digest_is_kept_with_its_version_unknown() {
         fs::read(host.profile_path()).expect("the kept profile"),
         profile
     );
+}
+
+/// The package id of the official Pi package.
+const PI_PACKAGE: &str = "pohunek.runtime.pi";
+
+/// The version of the Pi package `runtime-packages/pi` builds, which
+/// [`Host::with_installed_pi`] installs.
+const PI_INSTALLED_VERSION: &str = "1.0.3";
+
+/// A version newer than [`PI_INSTALLED_VERSION`], published as a later release.
+const PI_NEWER_VERSION: &str = "1.0.4";
+
+/// A version older than [`PI_INSTALLED_VERSION`], published as an earlier release.
+const PI_OLDER_VERSION: &str = "1.0.2";
+
+impl Host {
+    /// A host whose package store holds the official packages at the versions
+    /// `runtime-packages` builds, installed from the official catalog, enabled
+    /// and selected.
+    async fn with_installed_pi() -> Self {
+        let host = Self::new();
+        host.catalog
+            .preinstall(&host.plugins_dir(), host.env.root())
+            .await;
+        host
+    }
+
+    /// Publishes a release whose Pi package declares `version`, under catalog
+    /// `sequence`, and returns its digest.
+    fn publish_pi(&self, version: &str, sequence: u64) -> PackageDigest {
+        let (bytes, digest) = official_runtimes::variant_archive("pi", version);
+        self.publish_archives(sequence, &[("pi", &bytes, &digest)]);
+        digest
+    }
+
+    /// The versions of the Pi package the registry holds, and the one it
+    /// selects.
+    fn pi_registry(&self) -> (Vec<String>, Option<String>) {
+        let state = pohunek_daemon::agent::host::PackageStore::open(&self.plugins_dir())
+            .expect("the package store")
+            .registry()
+            .state()
+            .expect("the registry state");
+        let mut versions = Vec::new();
+        let mut selected = None;
+        for record in state.packages() {
+            if record.identity().id.as_str() != PI_PACKAGE {
+                continue;
+            }
+            let version = record.identity().version.as_str().to_owned();
+            if state.selected(&record.identity().id) == Some(record.digest()) {
+                selected = Some(version.clone());
+            }
+            versions.push(version);
+        }
+        versions.sort();
+        (versions, selected)
+    }
+
+    /// Uninstalls the installed Pi package from the registry.
+    fn uninstall_pi(&self) {
+        pohunek_daemon::agent::host::PackageStore::open(&self.plugins_dir())
+            .expect("the package store")
+            .registry()
+            .uninstall(
+                &Self::installed_pi_digest(),
+                &package::registry::RetainedDigests::new(),
+            )
+            .expect("uninstall the Pi package");
+    }
+
+    /// The digest of the installed Pi package.
+    fn installed_pi_digest() -> PackageDigest {
+        official_runtimes::variant_archive("pi", PI_INSTALLED_VERSION).1
+    }
+}
+
+/// The entry of the Pi runtime in `report`.
+fn pi_package(report: &EnsureReport) -> &pohunek_service_config::runtimes::PackageAction {
+    report
+        .packages
+        .iter()
+        .find(|package| package.runtime == "pi")
+        .unwrap_or_else(|| panic!("a plan entry for pi: {:?}", report.packages))
+}
+
+#[tokio::test]
+async fn the_upgrade_updates_an_installed_official_pi_package() {
+    let host = Host::with_installed_pi().await;
+    let newer = host.publish_pi(PI_NEWER_VERSION, 1);
+
+    let plan = host.step(true);
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(plan.packages.len(), 1, "{:?}", plan.packages);
+    let pi = pi_package(&plan);
+    assert_eq!(pi.status, PackageStatus::Install);
+    assert_eq!(pi.version, PI_NEWER_VERSION);
+    assert_eq!(pi.digest, newer.as_str());
+    assert_eq!(pi.reasons, [UseReason::Installed]);
+    assert_eq!(
+        host.pi_registry(),
+        (
+            vec![PI_INSTALLED_VERSION.to_owned()],
+            Some(PI_INSTALLED_VERSION.to_owned())
+        ),
+        "a dry run changes nothing"
+    );
+
+    let applied = host.step(false);
+
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    assert_eq!(pi_package(&applied).status, PackageStatus::Installed);
+    assert_eq!(
+        host.pi_registry(),
+        (
+            vec![PI_INSTALLED_VERSION.to_owned(), PI_NEWER_VERSION.to_owned()],
+            Some(PI_NEWER_VERSION.to_owned())
+        ),
+        "the release version is installed and selected, the older one stays installed"
+    );
+}
+
+#[tokio::test]
+async fn the_upgrade_repins_a_pi_profile_pinned_to_the_older_official_version() {
+    let host = Host::with_installed_pi().await;
+    let newer = host.publish_pi(PI_NEWER_VERSION, 1);
+    host.write_profile(
+        "work",
+        &format!("base = \"pi\"\n{}", official_runtimes::profile_pin("pi")),
+    );
+
+    let plan = host.step(true);
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(plan.profiles.len(), 1, "{:?}", plan.profiles);
+    assert_eq!(plan.profiles[0].name, "work");
+    assert_eq!(plan.profiles[0].status, ProfileStatus::Repin);
+    assert_eq!(plan.profiles[0].digest, newer.as_str());
+    assert_eq!(
+        plan.profiles[0].previous_version.as_deref(),
+        Some(PI_INSTALLED_VERSION)
+    );
+
+    let applied = host.step(false);
+
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    assert_eq!(applied.profiles[0].status, ProfileStatus::Repinned);
+    assert!(
+        host.profile_text_of("work")
+            .contains(&format!("digest = \"{}\"", newer.as_str())),
+        "{}",
+        host.profile_text_of("work")
+    );
+}
+
+#[tokio::test]
+async fn pi_profile_pins_follow_the_official_repin_rules() {
+    let host = Host::with_installed_pi().await;
+    host.publish_pi(PI_NEWER_VERSION, 1);
+    let claude = official_runtimes::profile_pin("claude");
+    let unrecorded = format!("sha256:{}", "0".repeat(64));
+    host.write_profile("other-package", &format!("base = \"pi\"\n{claude}"));
+    host.write_profile(
+        "unknown-version",
+        &format!("base = \"pi\"\npackage = \"{PI_PACKAGE}\"\ndigest = \"{unrecorded}\"\n"),
+    );
+    let before = (
+        host.profile_text_of("other-package"),
+        host.profile_text_of("unknown-version"),
+    );
+
+    let applied = host.step(false);
+
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    let mut kept: Vec<(&str, Option<&str>)> = applied
+        .profiles
+        .iter()
+        .map(|profile| (profile.name.as_str(), profile.kept_reason.as_deref()))
+        .collect();
+    kept.sort_unstable();
+    assert_eq!(
+        kept,
+        [
+            ("other-package", Some(CODE_PINNED_TO_OTHER_PACKAGE)),
+            ("unknown-version", Some(CODE_PINNED_VERSION_UNKNOWN)),
+        ]
+    );
+    assert_eq!(
+        (
+            host.profile_text_of("other-package"),
+            host.profile_text_of("unknown-version")
+        ),
+        before
+    );
+}
+
+#[tokio::test]
+async fn an_unpinned_pi_profile_is_not_bound_by_the_upgrade() {
+    let host = Host::with_installed_pi().await;
+    host.publish_pi(PI_NEWER_VERSION, 1);
+    host.write_profile("work", "base = \"pi\"\n");
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert!(report.profiles.is_empty(), "{:?}", report.profiles);
+    }
+    assert_eq!(host.profile_text_of("work"), "base = \"pi\"\n");
+    assert_eq!(pi_package(&applied).status, PackageStatus::Installed);
+}
+
+#[test]
+fn the_upgrade_never_installs_an_absent_pi_package() {
+    let host = Host::new();
+    host.publish_at(&["pi"], 1);
+    host.write_profile("work", "base = \"pi\"\n");
+    host.put_program("pi");
+
+    let plan = host.step(true);
+    assert!(!host.plugins_dir().exists(), "a dry run creates no store");
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert!(report.packages.is_empty(), "{:?}", report.packages);
+        assert!(report.profiles.is_empty(), "{:?}", report.profiles);
+    }
+    assert_eq!(
+        host.pi_registry().0,
+        Vec::<String>::new(),
+        "nothing installed"
+    );
+}
+
+#[tokio::test]
+async fn the_upgrade_never_installs_pi_beside_other_installed_official_packages() {
+    let host = Host::with_installed_pi().await;
+    host.uninstall_pi();
+    host.publish_pi(PI_NEWER_VERSION, 1);
+    host.write_profile("work", "base = \"pi\"\n");
+    host.put_program("pi");
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert!(report.packages.is_empty(), "{:?}", report.packages);
+        assert!(report.profiles.is_empty(), "{:?}", report.profiles);
+        assert!(report.gaps.is_empty(), "{:?}", report.gaps);
+    }
+    assert_eq!(
+        host.pi_registry().0,
+        Vec::<String>::new(),
+        "nothing installed"
+    );
+}
+
+#[tokio::test]
+async fn a_non_official_pi_package_is_not_managed() {
+    let host = Host::new();
+    official_runtimes::preinstall_third_party(
+        &host.plugins_dir(),
+        host.env.root(),
+        "pi",
+        "acme.runtime.pi",
+    )
+    .await;
+    host.publish_pi(PI_NEWER_VERSION, 1);
+    host.write_profile("work", "base = \"pi\"\n");
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert!(report.packages.is_empty(), "{:?}", report.packages);
+        assert!(report.gaps.is_empty(), "{:?}", report.gaps);
+    }
+}
+
+#[tokio::test]
+async fn a_current_pi_package_is_reported_present_and_idempotent() {
+    let host = Host::with_installed_pi().await;
+    host.publish_pi(PI_INSTALLED_VERSION, 1);
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+
+    let first = host.step(false);
+    let second = host.step(false);
+
+    for report in [&first, &second] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert_eq!(pi_package(report).status, PackageStatus::Present);
+    }
+    assert_eq!(first.packages, second.packages);
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+}
+
+#[tokio::test]
+async fn a_newer_selected_pi_package_is_never_downgraded() {
+    let host = Host::with_installed_pi().await;
+    host.publish_pi(PI_OLDER_VERSION, 1);
+    host.write_profile(
+        "work",
+        &format!("base = \"pi\"\n{}", official_runtimes::profile_pin("pi")),
+    );
+    let profile = host.profile_text_of("work");
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        let pi = pi_package(report);
+        assert_eq!(pi.status, PackageStatus::Kept);
+        assert_eq!(pi.version, PI_INSTALLED_VERSION);
+        assert_eq!(pi.release_version.as_deref(), Some(PI_OLDER_VERSION));
+        assert_eq!(pi.replaces_newer, None);
+        assert!(report.profiles.is_empty(), "{:?}", report.profiles);
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+    assert_eq!(host.profile_text_of("work"), profile);
+}
+
+#[tokio::test]
+async fn a_selected_pi_version_without_an_order_against_the_release_is_kept() {
+    for release_version in ["2.0", "1.0"] {
+        let host = Host::with_installed_pi().await;
+        host.publish_pi(release_version, 1);
+        let registry = fs::read(host.registry_path()).expect("the registry record");
+
+        let plan = host.step(true);
+        let applied = host.step(false);
+
+        for report in [&plan, &applied] {
+            assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+            let pi = pi_package(report);
+            assert_eq!(pi.status, PackageStatus::Kept, "{release_version}");
+            assert_eq!(pi.version, PI_INSTALLED_VERSION);
+            assert_eq!(pi.release_version.as_deref(), Some(release_version));
+            assert_eq!(
+                gap_codes(report),
+                [("pi", CODE_GAP_UPDATE_VERSION_UNORDERED)],
+                "{release_version}"
+            );
+        }
+        assert_eq!(
+            fs::read(host.registry_path()).expect("the registry record"),
+            registry,
+            "{release_version}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_pi_package_missing_from_the_catalog_is_a_gap() {
+    let host = Host::with_installed_pi().await;
+    host.publish_at(&["claude"], 1);
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert!(report.packages.is_empty(), "{:?}", report.packages);
+        assert_eq!(
+            gap_codes(report),
+            [("pi", CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM)]
+        );
+        assert!(
+            report.gaps[0].detail.contains(&format!(
+                "pohunek plugin update {PI_PACKAGE} runtime/packages/pi.tar.zst --catalog \
+                 runtime/runtime-catalog.json --yes"
+            )),
+            "{}",
+            report.gaps[0].detail
+        );
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+}
+
+#[tokio::test]
+async fn a_damaged_installed_pi_package_refuses_the_upgrade() {
+    let host = Host::with_installed_pi().await;
+    host.publish_pi(PI_INSTALLED_VERSION, 1);
+    let hex = Host::installed_pi_digest()
+        .as_str()
+        .strip_prefix("sha256:")
+        .expect("a sha256 digest")
+        .to_owned();
+    let root = host.plugins_dir().join("packages").join(hex);
+    let mut pending = vec![root];
+    let mut altered = false;
+    while let Some(directory) = pending.pop() {
+        if altered {
+            break;
+        }
+        for entry in fs::read_dir(&directory).expect("a package directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if !altered {
+                let mut content = fs::read(&path).expect("a package file");
+                content.extend_from_slice(b"altered\n");
+                fs::write(&path, content).expect("alter the package file");
+                altered = true;
+            }
+        }
+    }
+    assert!(altered, "the Pi package root holds a file");
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert_eq!(report.refusals.len(), 1, "{:?}", report.refusals);
+        assert_eq!(report.refusals[0].subject, "pi");
+        assert!(
+            report.refusals[0]
+                .detail
+                .contains("pohunek plugin uninstall --digest"),
+            "{}",
+            report.refusals[0].detail
+        );
+    }
+}
+
+#[tokio::test]
+async fn without_a_catalog_an_installed_pi_package_is_kept() {
+    let host = Host::with_installed_pi().await;
+    host.publish_pi(PI_NEWER_VERSION, 1);
+    host.remove_release();
+    host.write_profile("work", "base = \"pi\"\n");
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        let pi = pi_package(report);
+        assert_eq!(pi.status, PackageStatus::Kept);
+        assert_eq!(pi.version, PI_INSTALLED_VERSION);
+        assert_eq!(pi.release_version, None);
+    }
+}
+
+#[tokio::test]
+async fn a_disabled_or_unselected_pi_package_is_reported_not_changed() {
+    let host = Host::with_installed_pi().await;
+    host.publish_pi(PI_NEWER_VERSION, 1);
+    host.disable_package(&Host::installed_pi_digest());
+    host.write_profile("work", "base = \"pi\"\n");
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert!(report.packages.is_empty(), "{:?}", report.packages);
+        assert_eq!(
+            gap_codes(report),
+            [("pi", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)]
+        );
+        assert!(
+            report.gaps[0].detail.contains("pohunek plugin update"),
+            "{}",
+            report.gaps[0].detail
+        );
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+}
+
+#[test]
+fn install_detection_never_adds_pi() {
+    let host = Host::new();
+    host.publish_at(&["claude", "pi"], 1);
+    host.put_program("pi");
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert!(report.packages.is_empty(), "{:?}", report.packages);
+        assert!(report.gaps.is_empty(), "{:?}", report.gaps);
+    }
+    assert_eq!(
+        host.pi_registry().0,
+        Vec::<String>::new(),
+        "nothing installed"
+    );
+}
+
+/// Copies the directory `from` to `to`, recursively.
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).expect("create the directory");
+    for entry in fs::read_dir(from).expect("list the directory") {
+        let entry = entry.expect("a directory entry");
+        let target = to.join(entry.file_name());
+        let metadata = fs::symlink_metadata(entry.path()).expect("stat");
+        if metadata.is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).expect("copy the file");
+            fs::set_permissions(&target, metadata.permissions()).expect("copy the mode");
+        }
+    }
+}
+
+/// Adds the third-party package serving `pi` to the registry beside the
+/// official one, the state an install refuses to produce but an edited store
+/// or a registry written by another release can hold.
+async fn add_conflicting_pi_package(host: &Host, package_id: &str) {
+    let other = TestEnv::new().expect("a second environment");
+    let other_plugins = other.root().join("plugins");
+    official_runtimes::preinstall_third_party(&other_plugins, other.root(), "pi", package_id).await;
+    let foreign: serde_json::Value =
+        serde_json::from_slice(&fs::read(other_plugins.join("registry.json")).expect("registry"))
+            .expect("registry json");
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(host.registry_path()).expect("registry"))
+            .expect("registry json");
+    let record = foreign["packages"][0].clone();
+    let digest = record["digest"].as_str().expect("digest").to_owned();
+    registry["packages"]
+        .as_array_mut()
+        .expect("packages")
+        .push(record);
+    // The registry keeps its records ordered by digest.
+    registry["packages"]
+        .as_array_mut()
+        .expect("packages")
+        .sort_by_key(|record| record["digest"].as_str().map(str::to_owned));
+    registry["selected"][package_id] = json_string(&digest);
+    let hex = digest.strip_prefix("sha256:").expect("sha256");
+    copy_tree(
+        &other_plugins.join("packages").join(hex),
+        &host.plugins_dir().join("packages").join(hex),
+    );
+    fs::write(host.registry_path(), registry.to_string()).expect("write the registry");
+}
+
+fn json_string(text: &str) -> serde_json::Value {
+    serde_json::Value::String(text.to_owned())
+}
+
+/// The registry holds a third-party package selected and enabled for the id
+/// `pi` beside the official one. The runtime host rejects every package of a
+/// duplicated runtime id (`PackageLoad`), so no package serves `pi` and the
+/// claim check of the plan finds nothing to conflict with: the update proceeds
+/// and leaves the foreign package's records as they are.
+#[tokio::test]
+async fn a_registry_with_a_foreign_package_for_pi_is_updated_without_touching_it() {
+    let foreign = "acme.runtime.pi";
+    let host = Host::with_installed_pi().await;
+    add_conflicting_pi_package(&host, foreign).await;
+    host.publish_pi(PI_NEWER_VERSION, 1);
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert_eq!(pi_package(report).version, PI_NEWER_VERSION);
+    }
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(host.registry_path()).expect("registry"))
+            .expect("registry json");
+    assert!(
+        registry["selected"][foreign].is_string(),
+        "the foreign package keeps its selection"
+    );
+    let record = registry["packages"]
+        .as_array()
+        .expect("packages")
+        .iter()
+        .find(|record| record["identity"]["id"] == foreign)
+        .expect("the foreign record");
+    assert_eq!(record["enabled"], true);
 }

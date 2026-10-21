@@ -743,8 +743,9 @@ built-in definitions and the package store opened read-only (nothing is
 created); only an unreadable runtime definition leaves it unavailable
 (`worker_identity_unverified`). The remaining blind spots are the supervisor
 job's identity and socket failures at connect time. A binding that needs the
-runtime registry to complete its launch spec is reported as
-`native_recovery_unverified`. A session whose launch pin names a built-in
+runtime registry to complete its launch spec is repaired first by the function
+startup uses, over the profiles and runtimes the new daemon will have, and is
+reported as `native_recovery_unrepairable` only when that repair fails. A session whose launch pin names a built-in
 runtime source of an earlier release is `adoptable` when the official package
 that serves its runtime id is installed and adopts it, live or stopped. A session
 whose launch pin names a runtime source the new binary does not serve, resolved

@@ -4416,6 +4416,101 @@ async fn a_stopped_session_whose_profile_changed_is_judged_as_resume_refuses_it(
     );
 }
 
+/// Leaves the recovery of session `id`, and its separately stored resume
+/// projection, as the store migration leaves a binding that awaits the runtime
+/// registry: no launch spec and the repair flag set.
+fn leave_recovery_unresolved(store_path: &Path, id: &protocol::SessionId) {
+    edit_durable_recovery(store_path, id, |binding| {
+        binding.native_launch = None;
+        binding.native_launch_unresolved = true;
+    });
+    crate::store::Store::new(store_path.to_path_buf())
+        .record_resume(&durable_recovery(store_path, id))
+        .expect("write the resume projection");
+}
+
+#[tokio::test]
+async fn a_repairable_stopped_binding_is_judged_as_reconciliation_and_resume_treat_it() {
+    let session = stopped_built_in_claude("preflight-repairable-binding").await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &package,
+        5,
+    )
+    .await;
+    bind_claude_profile(&session.fixture).await;
+    leave_recovery_unresolved(&session.store_path, &session.id);
+
+    let (verdict, code) =
+        stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
+    let restarted = restart(&session.fixture).await;
+    let resumed = restarted
+        .registry
+        .resume_with(&session.id, crate::session::ProfileChange::Refuse)
+        .await
+        .expect("startup repaired the binding, so resume relaunches the session");
+
+    assert_eq!(verdict, Verdict::Adoptable, "{code}");
+    assert_eq!(code, pohunek_service_config::preflight::CODE_ADOPTABLE);
+    assert_eq!(
+        resumed.runtime.as_ref().map(|runtime| runtime.state),
+        Some(protocol::RuntimeState::Live)
+    );
+    restarted
+        .registry
+        .remove(&session.id)
+        .await
+        .expect("remove the resumed session");
+}
+
+#[tokio::test]
+async fn an_unrepairable_stopped_binding_loses_recovery_in_preflight_and_in_resume() {
+    let session = stopped_built_in_claude("preflight-unrepairable-binding").await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &package,
+        5,
+    )
+    .await;
+    bind_claude_profile(&session.fixture).await;
+    leave_recovery_unresolved(&session.store_path, &session.id);
+    fs::remove_file(session.fixture.agents.join(format!("{PROFILE}.toml")))
+        .expect("remove the profile");
+
+    let (verdict, code) =
+        stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
+    let restarted = restart(&session.fixture).await;
+    let info = restarted
+        .registry
+        .inspect(&session.id)
+        .await
+        .expect("the session is listed");
+
+    assert_eq!(verdict, Verdict::WouldLoseRecovery);
+    assert_eq!(
+        code,
+        pohunek_service_config::preflight::CODE_RECOVERY_UNREPAIRABLE
+    );
+    assert!(
+        info.warnings
+            .iter()
+            .any(|warning| warning.kind == protocol::SessionWarningKind::NativeRecovery),
+        "startup reports the recovery as unavailable: {:?}",
+        info.warnings
+    );
+    restarted
+        .registry
+        .resume_with(&session.id, crate::session::ProfileChange::Refuse)
+        .await
+        .expect_err("resume refuses the session the repair could not complete");
+}
+
 /// A stopped Claude session that the official package has adopted and that
 /// resumed through it once, so its launch pin names the package rather than
 /// the built-in runtime: the upgrade leaves its runtime source unchanged.
@@ -5400,7 +5495,11 @@ async fn damaged_profile_session_loss(installed: bool) {
         .iter()
         .find(|verdict| verdict.session_id == id.0);
     assert!(
-        matches!(verdict, Some(verdict) if verdict.verdict == Verdict::WouldLoseRecovery),
+        matches!(
+            verdict,
+            Some(verdict) if verdict.verdict == Verdict::WouldLoseRecovery
+                && verdict.code == pohunek_service_config::preflight::CODE_RECOVERY_UNREPAIRABLE
+        ),
         "the preflight reports the recovery the head cannot restore: {:?}",
         report.stopped_sessions
     );

@@ -191,11 +191,19 @@ reserved, so either way of installing serves it.
   fork when three things hold. The newer version keeps the session's native
   reference check and its `--session-id` assignment. A session launched from a
   profile also needs the profile to pin the newer version
-  (`pohunek plugin profile migrate <name> --yes`; `service upgrade` does not
-  repin Pi profiles). A session launched as the bare `pi` runtime follows the
+  (`pohunek plugin profile migrate <name> --yes`; `service upgrade` repins a Pi
+  profile pinned to an older official version, and leaves an unpinned one). A session launched as the bare `pi` runtime follows the
   selected version. The relaunch is then pinned to the newer digest. A
   version whose check or assignment differs, such as 1.0.2 over a session from
   1.0.1, keeps the session on its own digest.
+- `service upgrade` keeps an installed official Pi package current: when it is
+  installed from the official catalog, selected and enabled, the upgrade
+  installs and selects the release's version and keeps the older one installed.
+  It never installs an absent Pi package, never enables or selects one you turned
+  off (the plan reports a gap with the `pohunek plugin update pohunek.runtime.pi
+  runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json --yes`
+  command), and keeps a selected version newer than the release's instead of
+  downgrading it.
 - Pin a profile to the installed digest (`pohunek plugin profile migrate`) so a
   later `plugin update` cannot change an existing profile's package. A profile
   `[env]` may set `PI_OFFLINE`, `PI_SKIP_VERSION_CHECK` and `PI_TELEMETRY`; never

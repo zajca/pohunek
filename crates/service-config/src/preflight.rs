@@ -183,7 +183,16 @@ pub const CODE_WORKER_MARKER_LEGACY: &str = "worker_marker_legacy";
 /// The native recovery binding cannot be mapped to the current launch shape.
 pub const CODE_RECOVERY_UNMAPPABLE: &str = "native_recovery_unmappable";
 /// The native recovery binding needs the runtime registry to be completed.
+/// Only a daemon older than the upgrade preflight's own repair reports it,
+/// when it judges a rollback; the current preflight repairs the binding first
+/// and reports [`CODE_RECOVERY_UNREPAIRABLE`] or no loss.
 pub const CODE_RECOVERY_UNVERIFIED: &str = "native_recovery_unverified";
+/// The native recovery binding needs the runtime registry to be completed, and
+/// the registry the new daemon will have cannot complete it: the agent no
+/// longer resolves, runs on another runtime, declares no native resume, serves
+/// another reference kind, or the runtime source its launch pin names is not
+/// served. Startup gives the session a recovery warning and resume is refused.
+pub const CODE_RECOVERY_UNREPAIRABLE: &str = "native_recovery_unrepairable";
 /// The session's launch pin names a runtime source the new daemon does not
 /// serve: a built-in runtime it does not ship or an official package serves
 /// in its place, or a package digest that is not installed. The worker is

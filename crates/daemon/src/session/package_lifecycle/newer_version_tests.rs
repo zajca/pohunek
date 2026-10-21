@@ -936,21 +936,30 @@ fn apply_release_step(
     .expect("the release step applies")
 }
 
-/// The release step plans the release package `new` of Claude for a stopped
+async fn assert_release_step(tag: &str, new: Package, adopts: bool) {
+    assert_release_step_of(&CLAUDE, tag, new, adopts).await;
+}
+
+/// Pi is not a reserved runtime: the release step keeps its installed official
+/// package current only because it is installed, selected and enabled. The
+/// profile of a stopped Pi session moves to the release's version, and the
+/// preflight judges the adoption that enables.
+#[tokio::test]
+async fn a_stopped_pi_session_is_adopted_by_the_updated_package() {
+    assert_release_step_of(&PI, "newer-release-step-pi", PI.newer(), true).await;
+}
+
+/// The release step plans the release package `new` of `kind` for a stopped
 /// session launched from the older version, and its profile is repinned. When
 /// `adopts`, the preflight names the adoption and the resume runs through
 /// `new`; otherwise the preflight and the resume keep the frozen digest.
-async fn assert_release_step(tag: &str, new: Package, adopts: bool) {
-    let old = CLAUDE.older();
-    let session = stopped_on(tag, &CLAUDE, &old, CLAUDE.old_version).await;
-    let agent = if adopts {
-        CLAUDE.only_new
-    } else {
-        CLAUDE.in_both
-    };
-    CLAUDE.write_agent(&session.agent, agent);
+async fn assert_release_step_of(kind: &Kind, tag: &str, new: Package, adopts: bool) {
+    let old = kind.older();
+    let session = stopped_on(tag, kind, &old, kind.old_version).await;
+    let agent = if adopts { kind.only_new } else { kind.in_both };
+    kind.write_agent(&session.agent, agent);
     let release = session.fixture.dir.join("release").join("runtime");
-    write_release(&release, &CLAUDE, &new, CLAUDE.new_version, 6);
+    write_release(&release, kind, &new, kind.new_version, 6);
     let trust =
         crate::catalog_anchor::CatalogTrust::Loaded(anchor(&[&signing_key("root")], Vec::new()));
 

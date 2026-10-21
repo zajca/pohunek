@@ -2331,14 +2331,28 @@ the step follows no symlink), `integration_path_untrusted` (the installer refuse
 path: it is not a normalized absolute path to a real directory), a profile's own
 resolution error such as `runtime_not_installed` (a profile pinned to a package the host
 cannot serve, which `integration.install` would reject), `runtime_served_by_other_package` (another package serves
-the runtime id; it is left untouched), and `official_package_unavailable_for_platform`
+the runtime id; it is left untouched), `official_package_unavailable_for_platform`
 (the release catalog lists no package for this platform; a refusal without
-`--detect`). A gap never blocks an apply, and `gaps` is always empty without
-`--detect`. `integrations` lists the config homes the installer reinstalls hooks
+`--detect`, except for an installed official package of a runtime that is not
+reserved, such as Pi, where it is a gap in every mode), and
+`official_package_not_serving` (an official package of such a runtime is
+installed but not selected and enabled, so the step leaves it), and
+`plugin_update_version_unordered` (the selected version of such a package cannot
+be ordered against the release's, so it is kept, as `plugin update` refuses to
+replace it). The first two of these three name the `pohunek plugin update` command
+that updates the package by hand. A gap never blocks an apply, and `gaps` is empty
+without `--detect` except for those three. The step also keeps an installed official package of a runtime that is
+not reserved (Pi) current: when one is installed from the official catalog,
+selected and enabled, and the release lists a package of the same id, the plan
+installs and selects the release's version (reason `installed`) and the profiles
+pinned to the older official version are repinned; unpinned profiles stay unpinned,
+an absent package is never installed, nothing the operator turned off is changed,
+and a selected version newer than the release's is kept (status `kept`, with
+`release_version` naming the release's older one) and never downgraded. `integrations` lists the config homes the installer reinstalls hooks
 into: without `--detect`, the homes that already hold hooks; with `--detect`, each
 existing home of a planned runtime whose hooks the setup installs, whether or not
 hooks are present yet (Pi declares none). Each distinct home appears once. `reason`
-values are `profile`, `session`, `integration` and `detected`. The report layout
+values are `profile`, `session`, `integration`, `detected` and `installed`. The report layout
 stays at `report_version` 1.
 
 `pohunek service upgrade` and `pohunek service check` of an existing service run
@@ -2402,7 +2416,17 @@ profile resume would refuse (the profile is missing, or its frozen revision
 changed by more than the migration pin) is `would_lose_recovery` with resume's
 code (`agent_profile_missing`, `agent_profile_changed` or
 `agent_profile_revision_unavailable`), and a stopped session record the new
-binary cannot load is `would_lose_recovery` with `record_unreadable`. A session
+binary cannot load is `would_lose_recovery` with `record_unreadable`. A recovery
+binding that waits for the runtime registry to complete its launch spec is
+repaired first, as startup repairs it, over the profiles and runtimes the new
+daemon will have (read-only: nothing is written), and is then judged like any
+other binding. A binding the repair cannot complete (the agent no longer
+resolves, runs on another runtime, declares no native resume or another
+reference kind, or its launch pin names a source the new daemon does not serve)
+is `would_lose_recovery` with `native_recovery_unrepairable`; it has no
+acceptance scope, so accepting it is one-time. `native_recovery_unverified`
+reports the same binding only from a daemon older than this repair, which judges
+a rollback. A session
 whose frozen program resume would not find is `would_lose_recovery` with
 `agent_binary_missing`. A stopped session whose conversation is absent from its declared store
 (`agent_native_reference_missing`), or whose stored reference is malformed, is

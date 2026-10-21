@@ -306,6 +306,25 @@ fn append_package_warning(text: &mut String, package: &PackageAction) {
     if let Some(warning) = replaces_newer_warning(package) {
         let _ = writeln!(text, "{warning}");
     }
+    if let Some(release) = &package.release_version {
+        let _ = writeln!(
+            text,
+            "           keeps the selected {} {}; the release offers {release}",
+            package.package, package.version
+        );
+    }
+}
+
+/// Appends what the plan found and leaves to the operator, one gap per line
+/// with its next step.
+fn append_gaps(text: &mut String, plan: &EnsureReport) {
+    for gap in &plan.gaps {
+        let _ = writeln!(
+            text,
+            "gap        {} [{}] {}",
+            gap.runtime, gap.code, gap.detail
+        );
+    }
 }
 
 /// Appends the detail of a profile that repins or keeps its pin, when there is
@@ -541,6 +560,7 @@ fn render_plan(text: &mut String, plan: &EnsureReport) {
             integration.runtime
         );
     }
+    append_gaps(text, plan);
 }
 
 fn render_upgrade(report: &report::UpgradeReport) -> String {
@@ -668,6 +688,7 @@ fn render_runtimes(text: &mut String, runtimes: &EnsureReport) {
         );
         append_profile_detail(text, profile);
     }
+    append_gaps(text, runtimes);
 }
 
 fn render_check(report: &report::CheckReport) -> String {
@@ -907,6 +928,31 @@ fn render_rolled_back(pending: &report::PendingReport) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_kept_package_is_described_without_claiming_why_it_is_kept() {
+        for (selected, release) in [("2.0.0", "1.0.3"), ("2.0", "1.0.3")] {
+            let package = pohunek_service_config::runtimes::PackageAction {
+                runtime: "pi".to_owned(),
+                package: "pohunek.runtime.pi".to_owned(),
+                version: selected.to_owned(),
+                digest: "de".repeat(32),
+                status: PackageStatus::Kept,
+                reasons: vec![pohunek_service_config::runtimes::UseReason::Installed],
+                replaces_newer: None,
+                release_version: Some(release.to_owned()),
+            };
+            let mut text = String::new();
+            append_package_warning(&mut text, &package);
+            assert!(
+                text.contains(&format!(
+                    "keeps the selected pohunek.runtime.pi {selected}; the release offers {release}"
+                )),
+                "{text}"
+            );
+            assert!(!text.contains("newer"), "{text}");
+        }
+    }
     use std::path::Path;
 
     use clap::Parser as _;
@@ -1242,6 +1288,7 @@ mod tests {
                     status: PackageStatus::Install,
                     reasons: vec![UseReason::Profile, UseReason::Session],
                     replaces_newer: None,
+                    release_version: None,
                 }],
                 profiles: vec![ProfileAction {
                     name: "work".to_owned(),
@@ -1425,6 +1472,7 @@ mod tests {
                 status: PackageStatus::Kept,
                 reasons: vec![pohunek_service_config::runtimes::UseReason::Profile],
                 replaces_newer: None,
+                release_version: None,
             }],
             catalog: CatalogStatus::Unavailable,
             profiles: Vec::new(),

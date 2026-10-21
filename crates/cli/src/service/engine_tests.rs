@@ -345,6 +345,7 @@ fn package(status: PackageStatus) -> PackageAction {
         status,
         reasons: vec![UseReason::Profile],
         replaces_newer: None,
+        release_version: None,
     }
 }
 
@@ -3712,6 +3713,44 @@ async fn a_failed_runtime_apply_restores_the_state_it_changed_and_the_previous_d
         layout::installed_versions(&harness.layout()).expect("versions"),
         [V1]
     );
+}
+
+/// A registry that selects an older official Pi package, and a Pi profile
+/// pinned to it, as an operator who installed Pi by hand leaves them.
+const PI_REGISTRY_BEFORE: &str = concat!(
+    r#"{"schema":1,"generation":2,"packages":[{"digest":"sha256:"#,
+    "1111111111111111111111111111111111111111111111111111111111111111",
+    r#"","identity":{"id":"pohunek.runtime.pi","version":"1.0.2"},"source":"official","#,
+    r#""manifest":"2222222222222222222222222222222222222222222222222222222222222222","#,
+    r#""installed_at_unix_seconds":1,"enabled":true}],"selected":{"pohunek.runtime.pi":"sha256:"#,
+    "1111111111111111111111111111111111111111111111111111111111111111",
+    r#""}}"#
+);
+
+#[tokio::test]
+async fn a_rolled_back_upgrade_restores_the_pi_selection_and_pins() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.runtimes.script().calls.clear();
+    seed_runtime_state(&harness);
+    let plugins = harness.context.paths().plugins_dir();
+    write_private(&plugins.join("registry.json"), PI_REGISTRY_BEFORE);
+    let pinned = "base = \"pi\"\npackage = \"pohunek.runtime.pi\"\ndigest = \"sha256:1111111111111111111111111111111111111111111111111111111111111111\"\n";
+    write_private(&profile_path(&harness), pinned);
+    harness.runtimes.plan(installing_plan());
+    harness.runtimes.script().fail_apply = true;
+
+    let error = harness.upgrade(V2).await.expect_err("the apply fails");
+    assert!(
+        matches!(error, Error::UpgradeRuntimesFailed { .. }),
+        "{error:?}"
+    );
+    assert_eq!(
+        runtime_state(&harness),
+        (Some(PI_REGISTRY_BEFORE.to_owned()), pinned.to_owned()),
+        "the Pi selection and the Pi profile are restored byte for byte"
+    );
+    harness.assert_installed(V1);
 }
 
 /// Writes a state file with exactly `mode`, as an editor or a copy leaves it.

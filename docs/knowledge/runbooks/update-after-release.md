@@ -627,10 +627,16 @@ the upgrade is not what ends it.
   an older official package version" below.
 - `would lose recovery`: the worker is adopted but the session cannot resume
   natively (`native_recovery_unmappable`, `resume_record_unreadable`,
-  `native_recovery_unverified`, `runtime_source_not_served`). A binding that
-  needs the runtime registry to complete its launch spec is
-  `native_recovery_unverified`, because the store migration cannot consult the
-  registry. `runtime_source_not_served` means the session's launch pin names a
+  `native_recovery_unrepairable`, `runtime_source_not_served`). A binding that
+  needs the runtime registry to complete its launch spec is repaired first, by
+  the function startup uses, over the profiles and runtimes the new daemon will
+  have; nothing is written. It is `native_recovery_unrepairable` only when that
+  repair fails: the agent no longer resolves, runs on another runtime, declares
+  no native resume or another reference kind, or its launch pin names a source
+  the new daemon does not serve. The `detail` names the reason. Restore the
+  profile or runtime it names, or accept the loss; accepting it is one-time.
+  `native_recovery_unverified` appears only when the installed daemon predates
+  this repair and judges a rollback. `runtime_source_not_served` means the session's launch pin names a
   runtime source the new binary does not serve and no installed package adopts:
   a built-in runtime it does not ship, or a package digest that is not
   installed. Resume and fork resolve exactly the pinned source, so nothing
@@ -848,11 +854,16 @@ sessions launched before it. All of these must hold:
   version (the upgrade repins it, see above). A profile still pinned to the
   older version keeps the session on it.
 
-This covers Pi too. `service upgrade` does not repin Pi profiles, because the
-upgrade's runtime step manages only `claude`, `codex` and `hermes`. After
-`pohunek plugin update pohunek.runtime.pi <archive> --catalog <catalog> --yes`,
-move a Pi profile with `pohunek plugin profile migrate <name> --yes`. Its
-stopped sessions are then adopted on their next resume or fork. A session
+This covers Pi too. The upgrade's runtime step manages `claude`, `codex` and
+`hermes`, and also an official Pi package that is installed, selected and
+enabled: it installs and selects the release's Pi version and repins a Pi
+profile pinned to the older official version. An unpinned Pi profile follows the
+selection. An absent, disabled or deselected Pi package is not changed; the plan
+lists a gap with the `pohunek plugin update pohunek.runtime.pi
+runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json --yes`
+command, after which `pohunek plugin profile migrate <name> --yes` moves a Pi
+profile. A selected Pi version newer than the release's is kept. Its stopped
+sessions are adopted on their next resume or fork. A session
 launched as the bare `pi` runtime follows the selected version.
 
 A newer version that fails one of these checks does not break the session.

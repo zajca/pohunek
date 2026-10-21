@@ -45,7 +45,7 @@ use pohunek_service_config::preflight::{
     CODE_GENERATION_MISSING, CODE_IDENTITY_UNVERIFIED, CODE_INTENT_FINISHED,
     CODE_JOURNAL_AMBIGUOUS, CODE_JOURNAL_MISSING, CODE_JOURNAL_SCHEMA_UNSUPPORTED,
     CODE_JOURNAL_UNREADABLE, CODE_NO_SESSION_RECORD, CODE_PROTOCOL_INCOMPATIBLE,
-    CODE_RECORD_UNREADABLE, CODE_RECOVERY_UNMAPPABLE, CODE_RECOVERY_UNVERIFIED,
+    CODE_RECORD_UNREADABLE, CODE_RECOVERY_UNMAPPABLE, CODE_RECOVERY_UNREPAIRABLE,
     CODE_RESUME_RECORD_UNREADABLE, CODE_RUNTIME_IDENTITY_MISMATCH, CODE_RUNTIME_SOURCE_NOT_SERVED,
     CODE_STORE_UNUSABLE, CODE_WORKER_CHILD_MISSING, CODE_WORKER_ENDED, CODE_WORKER_MARKER_LEGACY,
     CODE_WORKER_NOT_ADVANCED, CODE_WORKER_NOT_INITIALIZED, CODE_WORKER_NOT_RUNNING,
@@ -90,6 +90,7 @@ use crate::procwatch::ProcessInspector;
 use crate::runtime::environment::effective_variable;
 use crate::runtime::lifecycle::IDENTITY_MISMATCH;
 use crate::runtime::LaunchEnvironment;
+use crate::session::native_repair::repair_native_recovery;
 use crate::session::resume::{
     binding_native_launch, binding_program, check_recovery_reference, recovery_contract,
     recovery_definition, reference_existence, session_ref_from_binding,
@@ -690,8 +691,58 @@ fn facts_of<'a>(
             .get(&record.session_id)
             .copied()
             .unwrap_or(RecoveryOutcome::Preserved),
+        unrepairable: None,
         resume_unreadable: anonymous_resume
             || unreadable_resume.contains(record.session_id.as_str()),
+    }
+}
+
+/// The record and resume binding of a session after the repair reconciliation
+/// applies to every record it loads, with the facts that repair changes.
+///
+/// The repair reads the profiles the new daemon will have and writes only to
+/// these copies. A binding the repair completes is no longer pending the
+/// registry; one it cannot complete keeps the session at risk with the reason.
+struct Repaired {
+    record: SessionRecord,
+    binding: Option<ResumeBinding>,
+    recovery: RecoveryOutcome,
+    unrepairable: Option<String>,
+}
+
+impl Repaired {
+    fn of(record: &SessionRecord, facts: &Facts<'_>, judging: &Judging<'_>) -> Self {
+        let mut record = record.clone();
+        let mut binding = facts.binding.cloned();
+        let mut unrepairable =
+            repair_native_recovery(judging.profiles, &mut record, binding.as_mut());
+        let pending = record
+            .recovery
+            .iter()
+            .chain(binding.iter())
+            .any(|binding| binding.native_launch_unresolved);
+        if unrepairable.is_none() && pending {
+            unrepairable = Some("the launch spec is still pending the runtime registry".to_owned());
+        }
+        let recovery = match facts.recovery {
+            RecoveryOutcome::NeedsRegistry if unrepairable.is_none() => RecoveryOutcome::Preserved,
+            recovery => recovery,
+        };
+        Self {
+            record,
+            binding,
+            recovery,
+            unrepairable,
+        }
+    }
+
+    fn facts<'a>(&'a self, facts: &Facts<'_>) -> Facts<'a> {
+        Facts {
+            binding: self.binding.as_ref(),
+            recovery: self.recovery,
+            unrepairable: self.unrepairable.clone(),
+            resume_unreadable: facts.resume_unreadable,
+        }
     }
 }
 
@@ -767,8 +818,15 @@ fn judge_stopped(
     journals: Option<&WorkerJournalScan>,
     judging: &Judging<'_>,
 ) -> (Option<Judgement>, SessionRecord) {
-    let mut candidate = record.clone();
-    let judgement = judge_stopped_candidate(record, &mut candidate, facts, journals, judging);
+    let repaired = Repaired::of(record, facts, judging);
+    let mut candidate = repaired.record.clone();
+    let judgement = judge_stopped_candidate(
+        &repaired.record,
+        &mut candidate,
+        &repaired.facts(facts),
+        journals,
+        judging,
+    );
     (judgement, candidate)
 }
 
@@ -1396,8 +1454,12 @@ fn may_run(journal: &JournalEvidence, inspector: &dyn ProcessInspector) -> bool 
 struct Facts<'a> {
     /// The separately stored resume binding.
     binding: Option<&'a ResumeBinding>,
-    /// What the migration does to the session's native recovery.
+    /// What the migration does to the session's native recovery, once the
+    /// repair reconciliation runs on load has been applied.
     recovery: crate::store::RecoveryOutcome,
+    /// Why the registry the new daemon will have cannot complete the launch
+    /// spec of a binding that awaits it, when that repair fails.
+    unrepairable: Option<String>,
     /// Whether the session's resume line is skipped at load.
     resume_unreadable: bool,
 }
@@ -1568,8 +1630,16 @@ fn judge(
     inspector: &dyn ProcessInspector,
     judging: &Judging<'_>,
 ) -> (Judgement, SessionRecord) {
-    let mut candidate = record.clone();
-    let judgement = judge_candidate(record, &mut candidate, facts, scan, inspector, judging);
+    let repaired = Repaired::of(record, facts, judging);
+    let mut candidate = repaired.record.clone();
+    let judgement = judge_candidate(
+        &repaired.record,
+        &mut candidate,
+        &repaired.facts(facts),
+        scan,
+        inspector,
+        judging,
+    );
     (judgement, candidate)
 }
 
@@ -2007,13 +2077,15 @@ fn recovery_loss(
                 .to_owned(),
         ));
     }
-    if facts.recovery == RecoveryOutcome::NeedsRegistry {
+    if let Some(reason) = &facts.unrepairable {
         return Some((
             Verdict::WouldLoseRecovery,
-            CODE_RECOVERY_UNVERIFIED.to_owned(),
-            "the stored native recovery needs the runtime registry to complete its launch spec; \
-             that cannot be verified before the upgrade"
-                .to_owned(),
+            CODE_RECOVERY_UNREPAIRABLE.to_owned(),
+            format!(
+                "the stored native recovery needs the runtime registry to complete its launch \
+                 spec, and the registry the new daemon will have cannot: {reason}. The session \
+                 cannot resume or fork natively"
+            ),
         ));
     }
     judge_pin(candidate, judging.profiles).or_else(|| judge_launch(candidate, judging))
