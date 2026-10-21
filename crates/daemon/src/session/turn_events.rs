@@ -196,6 +196,14 @@ impl TurnTable {
             if record.state != TurnState::Closed {
                 record.state = TurnState::Abandoned;
             }
+        }
+        self.discard_input();
+    }
+
+    /// Drops the input evidence of the session, wherever it is: armed, held
+    /// by a turn, or handed back.
+    fn discard_input(&mut self) {
+        for record in self.records.values_mut() {
             record.holds_input = false;
         }
         self.token = false;
@@ -448,9 +456,7 @@ impl TurnProgress {
     }
 
     fn forget_input(&self) {
-        let mut table = self.table();
-        table.token = false;
-        table.returned_start = None;
+        self.table().discard_input();
     }
 
     fn abandon_all(&self) {
@@ -720,8 +726,8 @@ impl TurnEvents {
         self.existing_progress(session_id)?.attach_report(owner)
     }
 
-    /// Whether the session's newest turn reached the inbox and ended within
-    /// `within`: a provider report that names no turn then repeats it.
+    /// Whether the session's newest turn reached the inbox within `within`:
+    /// a provider report that names no turn then repeats it.
     pub(crate) fn recently_reported(&self, session_id: &SessionId, within: Duration) -> bool {
         self.existing_progress(session_id)
             .is_some_and(|progress| progress.recently_reported(within))

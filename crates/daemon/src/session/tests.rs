@@ -2396,6 +2396,28 @@ fn started_turns_and_ends(
 }
 
 #[tokio::test]
+async fn the_input_a_running_turn_held_does_not_outlive_its_runtime() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    assert_eq!(started_turns(&mut edges).len(), 1);
+
+    // The runtime is re-adopted while the turn runs: its departure must not
+    // hand the old runtime's input to the new one's banner.
+    reinstall_entry(&registry, &created.id, None).await;
+    work_then_idle(&registry, &created.id).await;
+    assert_eq!(started_turns_and_ends(&mut edges), (0, 0));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
 async fn a_resumed_runtime_banner_is_not_a_turn_until_input_reaches_it() {
     let registry = turn_registry();
     let mut edges = registry
