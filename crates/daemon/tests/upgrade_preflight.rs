@@ -2447,7 +2447,12 @@ async fn a_built_in_session_is_judged_through_the_installed_package_when_no_rele
         .iter()
         .map(|package| (package.runtime.as_str(), package.status))
         .collect();
-    assert_eq!(kept, [("claude", PackageStatus::Kept)]);
+    // The host serves the installed official Pi package too, which the plan
+    // keeps as it is without a usable release catalog.
+    assert_eq!(
+        kept,
+        [("claude", PackageStatus::Kept), ("pi", PackageStatus::Kept)]
+    );
     assert_eq!(
         verdict_of(&report, "s-1"),
         (&Verdict::Adoptable, CODE_ADOPTABLE),

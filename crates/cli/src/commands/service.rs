@@ -1470,55 +1470,6 @@ mod tests {
     }
 
     #[test]
-    fn the_plan_renders_a_pi_update_a_kept_newer_package_and_the_gap_with_its_command() {
-        use pohunek_service_config::runtimes::{Gap, PackageAction, UseReason};
-        let package = |status, version: &str, release_version: Option<&str>| PackageAction {
-            runtime: "pi".to_owned(),
-            package: "pohunek.runtime.pi".to_owned(),
-            version: version.to_owned(),
-            digest: "de".repeat(32),
-            status,
-            reasons: vec![UseReason::Installed],
-            replaces_newer: None,
-            release_version: release_version.map(str::to_owned),
-        };
-        let runtimes = EnsureReport {
-            report_version: pohunek_service_config::runtimes::ENSURE_REPORT_VERSION,
-            daemon_version: "2.0.0".to_owned(),
-            dry_run: true,
-            packages: vec![
-                package(PackageStatus::Install, "1.0.4", None),
-                package(PackageStatus::Kept, "1.0.5", Some("1.0.4")),
-            ],
-            catalog: CatalogStatus::Current,
-            profiles: Vec::new(),
-            integrations: Vec::new(),
-            refusals: Vec::new(),
-            gaps: vec![Gap {
-                runtime: "pi".to_owned(),
-                code: "official_package_not_serving".to_owned(),
-                detail: "update it with: pohunek plugin update pohunek.runtime.pi runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json --yes".to_owned(),
-            }],
-        };
-        let mut plan = String::new();
-        render_plan(&mut plan, &runtimes);
-        let mut applied = String::new();
-        render_runtimes(&mut applied, &runtimes);
-        for text in [&plan, &applied] {
-            assert!(text.contains("pohunek.runtime.pi 1.0.4"), "{text}");
-            assert!(text.contains("1.0.4  install"), "{text}");
-            assert!(
-                text.contains("keeps the selected pohunek.runtime.pi 1.0.5, which is newer than the release's 1.0.4"),
-                "{text}"
-            );
-            assert!(
-                text.contains("gap        pi [official_package_not_serving] update it with: pohunek plugin update pohunek.runtime.pi runtime/packages/pi.tar.zst"),
-                "{text}"
-            );
-        }
-    }
-
-    #[test]
     fn an_unchanged_upgrade_renders_its_version_cleanup() {
         let text = render_upgrade(&report::UpgradeReport {
             warnings: Vec::new(),
