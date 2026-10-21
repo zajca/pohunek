@@ -999,7 +999,9 @@ same code, and the message names the file or directive to change:
   a link to `/dev/null` that wins disables the name. Plain `Environment=PATH=`,
   colon-separated `ExecSearchPath=` and `EnvironmentFile=` lines (checked like a
   loaded unit's) of those drop-ins are read in file-name order across the
-  directories (an empty assignment resets) and give the job's `PATH`, so a
+  directories (an empty assignment resets; hidden and backup files such as
+  `.name.conf` are skipped, a relative `EnvironmentFile=` is ignored as systemd
+  does) and give the job's `PATH`, so a
   rollback or migration that removed the unit still completes. A drop-in a loaded
   unit's manager lists as a link to `/dev/null` is disabled, not refused;
 - a snapshot made stale by a change on disk while any drop-in exists (run

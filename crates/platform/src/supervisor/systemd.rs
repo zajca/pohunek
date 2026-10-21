@@ -997,8 +997,11 @@ fn drop_in_files_on_disk(unit: &str, unit_paths: &[String]) -> Result<Vec<String
                 Err(error) => return Err(failed(error)),
             };
             for entry in entries {
-                let path = entry.map_err(failed)?.path();
-                if path.extension().is_some_and(|ext| ext == "conf") {
+                let entry = entry.map_err(failed)?;
+                let path = entry.path();
+                if !hidden_file(&entry.file_name())
+                    && path.extension().is_some_and(|ext| ext == "conf")
+                {
                     files.push(path.display().to_string());
                 }
             }
@@ -1007,6 +1010,17 @@ fn drop_in_files_on_disk(unit: &str, unit_paths: &[String]) -> Result<Vec<String
     let mut seen = std::collections::HashSet::new();
     files.retain(|file| seen.insert(file.clone()));
     Ok(files)
+}
+
+/// Whether systemd skips a directory entry as hidden: a name that starts with a
+/// dot (an editor lock or a dotfile). The other names it skips as backups (a `~`
+/// suffix, package-manager suffixes) cannot end in `.conf`, which the caller
+/// requires. The name is compared as bytes, because systemd does not require
+/// UTF-8.
+fn hidden_file(name: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    name.as_bytes().starts_with(b".")
 }
 
 /// [`unit_environment`] over the bus at `address`, or over the session bus the

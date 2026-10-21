@@ -456,6 +456,17 @@ fn drop_in_files_of(unit: &UnitEnvironment) -> Vec<String> {
     files
 }
 
+/// Whether `path` is absolute and normalized: no empty, `.` or `..` component and
+/// no trailing slash, the form systemd accepts for an `EnvironmentFile=`.
+fn is_normalized_absolute(path: &str) -> bool {
+    path.strip_prefix('/').is_some_and(|rest| {
+        rest.is_empty()
+            || rest
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != "..")
+    })
+}
+
 /// Whether a `PassEnvironment=` or `UnsetEnvironment=` value names `PATH`: a
 /// word that is exactly `PATH` (or `PATH=...`) once unquoted. An escape sequence
 /// can spell the name, and so can a specifier systemd expands, so both count as
@@ -542,7 +553,11 @@ async fn path_from_orphan_drop_ins(
                             .map_err(|specifier| unsupported(key, &specifier))?;
                         let optional = raw.starts_with('-');
                         let file = raw.strip_prefix('-').unwrap_or(&raw).to_owned();
-                        environment_files.push((file, optional));
+                        // systemd ignores a path that is relative or not
+                        // normalized, so no file is read for one.
+                        if is_normalized_absolute(&file) {
+                            environment_files.push((file, optional));
+                        }
                     } else {
                         let list = without_specifiers(&split.words[0])
                             .map_err(|specifier| unsupported(key, &specifier))?;

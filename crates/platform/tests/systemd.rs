@@ -2229,6 +2229,71 @@ fn the_real_user_manager_orders_drop_ins_by_file_name_across_directories() {
     );
 }
 
+/// The reader rules the CLI's resolver of drop-in files follows: systemd skips a
+/// hidden drop-in, ignores a relative `EnvironmentFile=`, and a backslash
+/// followed by white space is not a continuation.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_skips_hidden_drop_ins_and_ignores_relative_environment_files() {
+    require_e2e();
+    let directory = user_unit_dir();
+    std::fs::create_dir_all(&directory).expect("user unit directory");
+    let unit = format!("pohunek-e2e-edge-{}.service", std::process::id());
+    let _files = UnitFiles {
+        directory: directory.clone(),
+        unit: unit.clone(),
+    };
+    std::fs::write(
+        directory.join(&unit),
+        "[Service]\nExecStart=/bin/sleep 300\n",
+    )
+    .expect("unit file");
+    let own = directory.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&own).expect("drop-in directory");
+    std::fs::write(
+        own.join(".hidden.conf"),
+        "[Service]\nEnvironment=HIDDEN=1\n",
+    )
+    .expect("hidden");
+    std::fs::write(
+        own.join("10-rel.conf"),
+        "[Service]\nEnvironmentFile=relative.env\nEnvironmentFile=-also-relative.env\n",
+    )
+    .expect("relative");
+    std::fs::write(
+        own.join("20-cont.conf"),
+        "[Service]\nEnvironment=FIRST=1 \\ \nEnvironment=SECOND=2\nEnvironment=THIRD=3 \\\t\nEnvironment=FOURTH=4\n",
+    )
+    .expect("continuation");
+    systemctl(&["daemon-reload"]);
+
+    let loaded = async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded unit");
+    let listed = |paths: &[String], name: &str| paths.iter().any(|path| path.ends_with(name));
+    assert!(
+        !listed(&loaded.drop_in_paths, ".hidden.conf")
+            && !loaded.environment.iter().any(|entry| entry == "HIDDEN=1"),
+        "the manager skips a hidden drop-in: {loaded:?}"
+    );
+    assert!(
+        !listed(&loaded.drop_ins_on_disk, ".hidden.conf"),
+        "the on-disk listing skips it too: {:?}",
+        loaded.drop_ins_on_disk
+    );
+    assert!(listed(&loaded.drop_ins_on_disk, "10-rel.conf"));
+    assert!(
+        loaded.environment_files.is_empty(),
+        "a relative EnvironmentFile= is ignored: {:?}",
+        loaded.environment_files
+    );
+    for name in ["FIRST=1", "SECOND=2", "THIRD=3", "FOURTH=4"] {
+        assert!(
+            loaded.environment.iter().any(|entry| entry == name),
+            "{name}: a backslash then white space is not a continuation: {:?}",
+            loaded.environment
+        );
+    }
+}
+
 /// Enabling a unit that has a drop-in, after the reload that loaded it, does not
 /// leave the unit with a stale snapshot: the gates that refuse on
 /// `NeedDaemonReload` do not trip on an installed daemon unit.

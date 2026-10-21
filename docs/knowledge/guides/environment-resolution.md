@@ -130,7 +130,7 @@ which stays the only channel: no other variable is added, and no secret or
 interactive environment is captured. Linux and systemd keep `search_path = []`:
 the daemon inherits the user manager's environment and no `PATH` is written. The
 install, upgrade and rollback judge that job with the `PATH` the unit really gets: the
-user manager's, replaced by an `Environment=PATH=` of a drop-in of the daemon unit (the install replaces the unit file itself, so a `PATH` set only there does not count).
+user manager's, replaced by an `ExecSearchPath=` (joined with `:`) and then by an `Environment=PATH=` of a drop-in of the daemon unit (the install replaces the unit file itself, so a `PATH` set only there does not count). Where the unit has no file yet, or a rollback removed it, its drop-in files are read from disk in file-name order across directories (a higher-priority directory wins a shared name, a `/dev/null` link disables it, hidden and backup files are skipped).
 A unit setting the CLI cannot read (an `EnvironmentFile=` that sets `PATH`,
 `PassEnvironment=PATH`, `UnsetEnvironment=PATH`) is refused with the file or directive to
 change, instead of judging a `PATH` the job does not get.
