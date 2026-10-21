@@ -1277,13 +1277,9 @@ fn plan_runtime(
     match selection_outcome(plan, &prepared, &subject, report, is_reserved(&runtime)) {
         Selection::Leave => return Ok(None),
         Selection::Keep => {
-            let release_version = prepared.identity.version.as_str().to_owned();
-            return Ok(
-                plan_installed(plan, runtime, reasons, report).map(|mut kept| {
-                    kept.release_version = Some(release_version);
-                    kept
-                }),
-            );
+            return Ok(plan_kept_selection(
+                plan, &prepared, &subject, runtime, reasons, report,
+            ));
         }
         Selection::Replace => {}
     }
@@ -1343,6 +1339,35 @@ fn plan_runtime(
         replaces_newer,
         release_version: None,
     }))
+}
+
+/// Plans a runtime whose selected version stays: the checks of a detecting
+/// plan run as for the release's package, and the entry names the version the
+/// release offers.
+fn plan_kept_selection(
+    plan: &PlanInputs<'_>,
+    prepared: &Prepared,
+    subject: &str,
+    runtime: RuntimeId,
+    mut reasons: Vec<UseReason>,
+    report: &mut Report,
+) -> Option<Planned> {
+    if report.detect {
+        if !detect_on_search_path(
+            report,
+            subject,
+            prepared.definition.program().as_str(),
+            &mut reasons,
+        ) {
+            return None;
+        }
+        config_home_gap(plan, &prepared.definition, report);
+    }
+    let release_version = prepared.identity.version.as_str().to_owned();
+    plan_installed(plan, runtime, reasons, report).map(|mut kept| {
+        kept.release_version = Some(release_version);
+        kept
+    })
 }
 
 /// Prepares the release archive of `runtime` that the catalog authorizes. A
@@ -2179,10 +2204,13 @@ fn selection_outcome(
                 CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
                 &format!(
                     "the selected version cannot be ordered against the release's and is disabled, \
-                     so the upgrade leaves it as you set it; update it with: {}",
-                    update_command(&prepared.identity.id, prepared.definition.runtime_id())
+                     so the upgrade leaves it as you set it; enable it with: pohunek plugin enable {}",
+                    prepared.identity.id
                 ),
             );
+            report
+                .integrations
+                .retain(|action| action.runtime != subject);
             return Selection::Leave;
         }
         Some(Serving::Loadable) => {

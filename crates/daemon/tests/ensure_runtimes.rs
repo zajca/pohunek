@@ -1950,36 +1950,49 @@ fn a_selected_reserved_runtime_version_without_an_order_against_the_release_is_k
 /// plan reports a gap.
 #[test]
 fn a_disabled_unordered_selected_reserved_runtime_version_is_left_untouched() {
-    let host = Host::new();
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "2.0");
-    host.publish_archives(1, &[("claude", &bytes, &digest)]);
-    host.write_claude_profile();
-    let installed = host.step(false);
-    assert!(installed.refusals.is_empty(), "{installed:?}");
-    host.disable_package(&digest);
-    publish_claude_version(&host, "1.0.3", 2);
-    let registry = fs::read(host.registry_path()).expect("the registry record");
-    let profile = host.profile_text();
+    for runtime in ["claude", "codex"] {
+        let host = Host::new();
+        let (bytes, digest) = official_runtimes::variant_archive(runtime, "2.0");
+        host.publish_archives(1, &[(runtime, &bytes, &digest)]);
+        host.write_profile(runtime, &format!("base = \"{runtime}\"\n"));
+        let installed = host.step(false);
+        assert!(installed.refusals.is_empty(), "{runtime}: {installed:?}");
+        host.disable_package(&digest);
+        let (release, release_digest) = official_runtimes::variant_archive(runtime, "1.0.3");
+        host.publish_archives(2, &[(runtime, &release, &release_digest)]);
+        let registry = fs::read(host.registry_path()).expect("the registry record");
+        let profile = host.profile_text_of(runtime);
 
-    let plan = host.step(true);
-    let applied = host.step(false);
+        let plan = host.step(true);
+        let applied = host.step(false);
 
-    for report in [&plan, &applied] {
-        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
-        assert!(report.packages.is_empty(), "{:?}", report.packages);
+        for report in [&plan, &applied] {
+            assert!(
+                report.refusals.is_empty(),
+                "{runtime}: {:?}",
+                report.refusals
+            );
+            assert!(
+                report.packages.is_empty(),
+                "{runtime}: {:?}",
+                report.packages
+            );
+            assert!(report.integrations.is_empty(), "{runtime}");
+            assert_eq!(
+                gap_codes(report)
+                    .into_iter()
+                    .filter(|(name, _)| *name == runtime)
+                    .collect::<Vec<_>>(),
+                [(runtime, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)]
+            );
+        }
         assert_eq!(
-            gap_codes(report)
-                .into_iter()
-                .filter(|(runtime, _)| *runtime == "claude")
-                .collect::<Vec<_>>(),
-            [("claude", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)]
+            fs::read(host.registry_path()).expect("the registry record"),
+            registry,
+            "{runtime}"
         );
+        assert_eq!(host.profile_text_of(runtime), profile, "{runtime}");
     }
-    assert_eq!(
-        fs::read(host.registry_path()).expect("the registry record"),
-        registry
-    );
-    assert_eq!(host.profile_text(), profile);
 }
 
 /// An enabled selected version with no order against the release's whose root
@@ -1987,26 +2000,29 @@ fn a_disabled_unordered_selected_reserved_runtime_version_is_left_untouched() {
 /// coexistence check judges the retained version.
 #[test]
 fn an_unloadable_unordered_selected_reserved_runtime_version_is_not_kept() {
-    let host = Host::new();
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "2.0");
-    host.publish_archives(1, &[("claude", &bytes, &digest)]);
-    host.write_claude_profile();
-    let installed = host.step(false);
-    assert!(installed.refusals.is_empty(), "{installed:?}");
-    host.remove_installed_root();
-    publish_claude_version(&host, "1.0.3", 2);
+    for runtime in ["claude", "codex"] {
+        let host = Host::new();
+        let (bytes, digest) = official_runtimes::variant_archive(runtime, "2.0");
+        host.publish_archives(1, &[(runtime, &bytes, &digest)]);
+        host.write_profile(runtime, &format!("base = \"{runtime}\"\n"));
+        let installed = host.step(false);
+        assert!(installed.refusals.is_empty(), "{runtime}: {installed:?}");
+        host.remove_installed_root();
+        let (release, release_digest) = official_runtimes::variant_archive(runtime, "1.0.3");
+        host.publish_archives(2, &[(runtime, &release, &release_digest)]);
 
-    let plan = host.step(true);
+        let plan = host.step(true);
 
-    let incompatible = ProtocolError::from(PackageErrorKind::IntegrationIncompatible).code;
-    assert_eq!(refusal_codes(&plan), [incompatible.as_str()]);
-    assert!(
-        gap_codes(&plan)
-            .iter()
-            .all(|(_, code)| *code != CODE_GAP_UPDATE_VERSION_UNORDERED),
-        "{:?}",
-        plan.gaps
-    );
+        let incompatible = ProtocolError::from(PackageErrorKind::IntegrationIncompatible).code;
+        assert_eq!(refusal_codes(&plan), [incompatible.as_str()], "{runtime}");
+        assert!(
+            gap_codes(&plan)
+                .iter()
+                .all(|(_, code)| *code != CODE_GAP_UPDATE_VERSION_UNORDERED),
+            "{runtime}: {:?}",
+            plan.gaps
+        );
+    }
 }
 
 /// A profile pinned to a digest the registry holds no record of is kept, as

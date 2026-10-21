@@ -5,8 +5,9 @@
   release's (for example `2.0` against `1.0.3`), as they do for Pi. The plan
   reports the gap `plugin_update_version_unordered` and the retained package
   with the version the release offers. A selected version that is newer and
-  ordered keeps its behaviour: the release's package replaces it and the plan
-  warns.
+  ordered keeps its behaviour: for a reserved runtime the release's package
+  replaces it and the plan warns; an enabled selection that cannot load is
+  replaced by the release's package.
 - A disabled unordered selection is left untouched (gap
   `official_package_not_serving`), never replaced or enabled. `pohunek setup`
   prints the retained-package line as `service check` does.
