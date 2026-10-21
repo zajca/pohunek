@@ -1129,6 +1129,15 @@ mod tests {
             .is_ok_and(|stat| !stat.contains(") Z "))
     }
 
+    /// Whether `pid` names a process: `ESRCH` means gone, `EPERM` means it exists.
+    fn process_alive(pid: u32) -> bool {
+        let pid = rustix::process::Pid::from_raw(i32::try_from(pid).expect("pid")).expect("pid");
+        !matches!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH)
+        )
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_signal_resistant_workload_in_its_own_session_is_stopped_with_its_worker() {
@@ -1404,7 +1413,7 @@ mod tests {
         std::fs::write(&gate, b"").expect("release the worker");
         assert!(guard.wait_for_exit(), "the worker ended");
         poll_until("the workload is killed", || {
-            (!process_exists(workload) && !process_exists(worker.pid)).then_some(())
+            (!process_alive(workload) && !process_alive(worker.pid)).then_some(())
         });
         drop(guard);
     }
