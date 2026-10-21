@@ -48,6 +48,14 @@ const OFFICIAL_RUNTIMES: [&str; 4] = ["codex", "claude", "hermes", "pi"];
 /// Sequence number of the one catalog a test signs.
 const CATALOG_SEQUENCE: u64 = 1;
 
+/// The flags an install records for a package: whether it is enabled and
+/// whether it becomes the selected version of its package.
+#[derive(Clone, Copy)]
+pub(crate) struct InstallFlags {
+    pub(crate) enable: bool,
+    pub(crate) select: bool,
+}
+
 /// A throwaway catalog signing key and the trust a daemon gives it.
 pub(crate) struct OfficialCatalog {
     key: SigningKey,
@@ -185,6 +193,55 @@ impl OfficialCatalog {
     /// executable.
     pub(crate) fn anchor_bytes(&self) -> Vec<u8> {
         anchor_for(&self.key)
+    }
+
+    /// Installs one official `archive` of `runtime` into the plugin root
+    /// `plugins_dir` through `package.install`, authorized by a catalog at
+    /// `sequence` that this key signs, with the given `enable` and `select`
+    /// flags, as `pohunek plugin install` records them. Unlike the upgrade
+    /// step it installs any version, whatever the registry already holds.
+    pub(crate) async fn install_archive(
+        &self,
+        plugins_dir: &Path,
+        scratch: &Path,
+        runtime: &str,
+        archive: &(Vec<u8>, PackageDigest),
+        sequence: u64,
+        flags: InstallFlags,
+    ) {
+        let registry = installer_registry(
+            self.configure(installer_config(scratch), plugins_dir.to_path_buf()),
+        );
+        let (bytes, digest) = archive;
+        let catalog = scratch.join(format!("{runtime}-{sequence}-catalog.json"));
+        std::fs::write(
+            &catalog,
+            signed(
+                &self.key,
+                catalog_of(
+                    sequence,
+                    WINDOW_END,
+                    vec![catalog_entry(runtime, bytes, digest)],
+                ),
+            ),
+        )
+        .expect("write the official runtime catalog");
+        let file = scratch.join(format!("{runtime}-{sequence}.tar.zst"));
+        std::fs::write(&file, bytes).expect("write the official package archive");
+        let result = registry
+            .package_install(PackageInstallParams {
+                archive_path: path_string(&file),
+                trust: PackageTrust::Catalog {
+                    catalog_path: path_string(&catalog),
+                },
+                enable: flags.enable,
+                select: flags.select,
+                dry_run: false,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("the official {runtime} package installs: {error:?}"));
+        assert_eq!(result.status, PackageInstallStatus::Installed, "{runtime}");
+        assert_eq!(&result.package.digest, digest, "{runtime}");
     }
 
     /// Installs the official Codex, Claude and Hermes packages into the plugin root
