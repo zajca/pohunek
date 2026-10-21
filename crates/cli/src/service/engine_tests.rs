@@ -11639,21 +11639,70 @@ async fn a_removed_unit_keeps_resolving_exec_search_path_and_environment_files()
     assert!(text.contains("sets PATH"), "{text}");
 }
 
-/// systemd ignores an `EnvironmentFile=` that is relative or not normalized, so a
-/// removed unit's drop-in with one gives no file to read.
+/// systemd ignores a relative `EnvironmentFile=` (pinned on the real manager), so
+/// a removed unit's drop-in with one gives no file to read; a non-normalized
+/// absolute path is refused, since what systemd reads for it is not followed.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn a_relative_environment_file_of_a_removed_unit_is_ignored() {
+async fn environment_file_paths_of_a_removed_unit_are_ignored_when_relative_and_refused_when_not_normalized(
+) {
     for line in [
         "EnvironmentFile=relative.env",
         "EnvironmentFile=-also-relative.env",
-        "EnvironmentFile=/nonexistent/../pohunek-test.env",
-        "EnvironmentFile=/nonexistent//pohunek-test.env",
     ] {
         let text = format!("[Service]\n{line}\n");
         let (_keep, unit) = orphan_drop_ins(&[("a.service.d", "10-a.conf", text.as_bytes())]);
         let job = unrecorded_job_path(Ok(unit)).await.expect("path");
         assert_eq!(job.value, MANAGER_PATH, "{line}");
+    }
+    for line in [
+        "EnvironmentFile=/nonexistent/../pohunek-test.env",
+        "EnvironmentFile=-/nonexistent/./pohunek-test.env",
+        "EnvironmentFile=/nonexistent//pohunek-test.env",
+        "EnvironmentFile=/nonexistent/",
+    ] {
+        let text = format!("[Service]\n{line}\n");
+        let (_keep, unit) = orphan_drop_ins(&[("a.service.d", "10-a.conf", text.as_bytes())]);
+        let text = refusal(unrecorded_job_path(Ok(unit)).await);
+        assert!(text.contains("not a normalized path"), "{line}: {text}");
+    }
+}
+
+/// A line ending in a backslash is a continuation systemd joins by an odd/even
+/// rule that is not followed here: any such line in a removed unit's drop-in is
+/// refused, whatever it continues into.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_line_ending_in_a_backslash_in_a_removed_units_drop_in_is_refused() {
+    for content in [
+        "[Service]\nEnvironment=FIRST=1 \\\nPATH=/hidden/bin\n",
+        "[Service]\nEnvironment=FIRST=1 \\\\\nPATH=/hidden/bin\n",
+        "[Service]\nEnvironment=PATH=/a/bin \\\n",
+        "[Service]\n# note \\\nEnvironment=PATH=/a/bin\n",
+        "[Unit]\nDescription=x \\\n[Service]\nEnvironment=PATH=/a/bin\n",
+    ] {
+        let (_keep, unit) = orphan_drop_ins(&[("a.service.d", "10-a.conf", content.as_bytes())]);
+        let text = refusal(unrecorded_job_path(Ok(unit)).await);
+        assert!(
+            text.contains("ending in a backslash"),
+            "{content:?}: {text}"
+        );
+    }
+}
+
+/// An empty entry of `ExecSearchPath=` makes systemd apply no entry after it
+/// (pinned on the real manager), so a removed unit's drop-in with one is refused.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_empty_exec_search_path_entry_of_a_removed_unit_is_refused() {
+    for value in ["/a/bin::/b/bin", ":/a/bin", "/a/bin:"] {
+        let text = format!("[Service]\nExecSearchPath={value}\n");
+        let (_keep, unit) = orphan_drop_ins(&[("a.service.d", "10-a.conf", text.as_bytes())]);
+        let text = refusal(unrecorded_job_path(Ok(unit)).await);
+        assert!(
+            text.contains("empty entry in ExecSearchPath="),
+            "{value}: {text}"
+        );
     }
 }
 

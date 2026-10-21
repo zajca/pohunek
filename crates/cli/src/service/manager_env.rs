@@ -487,6 +487,44 @@ fn names_search_path(value: &str) -> bool {
     })
 }
 
+/// Refuses a drop-in with a line ending in a backslash: systemd joins it with the
+/// next line by a rule that is not followed here.
+fn refuse_continued_lines(bytes: &[u8], path: &str, unit_name: &str) -> Result<(), Error> {
+    if physical_lines(bytes)
+        .iter()
+        .any(|line| line.ends_with(b"\\"))
+    {
+        return Err(Error::ManagerEnvironment {
+            detail: format!(
+                "{unit_name}: the drop-in {path} has a line ending in a backslash, whose continuation is not followed here. Put each setting on one line and retry"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Refuses an absolute `EnvironmentFile=` path that is not normalized: what
+/// systemd reads for it is not followed here.
+fn refuse_unnormalized_path(file: &str, path: &str, unit_name: &str) -> Result<(), Error> {
+    if is_normalized_absolute(file) {
+        return Ok(());
+    }
+    Err(Error::ManagerEnvironment {
+        detail: format!(
+            "{unit_name}: the drop-in {path} names the EnvironmentFile= {file}, which is not a normalized path (an empty, `.` or `..` component, or a trailing slash), so what systemd reads for it is not followed here. Write the normalized path and retry"
+        ),
+    })
+}
+
+/// The refusal for a `PassEnvironment=` or `UnsetEnvironment=` naming `PATH`.
+fn refuse_path_filter(key: &str, path: &str, unit_name: &str) -> Error {
+    Error::ManagerEnvironment {
+        detail: format!(
+            "{unit_name}: the drop-in {path} sets {key}= for {SEARCH_PATH_VARIABLE}, which the service manager cannot report once the unit is removed. Remove that line and retry"
+        ),
+    }
+}
+
 /// The job's `PATH` for a unit with no unit file whose drop-in files exist
 /// (before the first install, or after a rollback or migration removed the unit):
 /// systemd reads none of them now, but the install keeps and applies them, so
@@ -508,6 +546,7 @@ async fn path_from_orphan_drop_ins(
         let Some(bytes) = read_enabled_drop_in(path, unit_name).await? else {
             continue;
         };
+        refuse_continued_lines(&bytes, path, unit_name)?;
         let unreadable = |directive: &str| {
             refuse(format!(
                 "{unit_name}: the drop-in {path} has a {directive} line that may affect {SEARCH_PATH_VARIABLE} in a form not read here (an escape sequence, more than one word, a quote never closed, or bytes that are not UTF-8). Write a plain assignment and retry"
@@ -553,15 +592,22 @@ async fn path_from_orphan_drop_ins(
                             .map_err(|specifier| unsupported(key, &specifier))?;
                         let optional = raw.starts_with('-');
                         let file = raw.strip_prefix('-').unwrap_or(&raw).to_owned();
-                        // systemd ignores a path that is relative or not
-                        // normalized, so no file is read for one.
-                        if is_normalized_absolute(&file) {
+                        // systemd ignores a relative path (pinned on the real
+                        // manager); how it reads a non-normalized absolute one
+                        // is not reproduced here.
+                        if file.starts_with('/') {
+                            refuse_unnormalized_path(&file, path, unit_name)?;
                             environment_files.push((file, optional));
                         }
                     } else {
                         let list = without_specifiers(&split.words[0])
                             .map_err(|specifier| unsupported(key, &specifier))?;
-                        for entry in list.split(':').filter(|entry| !entry.is_empty()) {
+                        for entry in list.split(':') {
+                            if entry.is_empty() {
+                                return Err(refuse(format!(
+                                    "{unit_name}: the drop-in {path} has an empty entry in ExecSearchPath=, after which systemd applies no further entry, which is not followed here. Remove the empty entry and retry"
+                                )));
+                            }
                             if !entry.starts_with('/') {
                                 return Err(unreadable(key));
                             }
@@ -570,9 +616,7 @@ async fn path_from_orphan_drop_ins(
                     }
                 }
                 "PassEnvironment" | "UnsetEnvironment" if names_search_path(value) => {
-                    return Err(refuse(format!(
-                        "{unit_name}: the drop-in {path} sets {key}= for {SEARCH_PATH_VARIABLE}, which the service manager cannot report once the unit is removed. Remove that line and retry"
-                    )));
+                    return Err(refuse_path_filter(key, path, unit_name));
                 }
                 _ => {}
             }
