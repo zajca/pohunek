@@ -330,6 +330,9 @@ pub(crate) struct TurnProgress {
     /// Unix nanoseconds of the last transition into `working`; what
     /// `session.wait_turn` reports as the turn start.
     turn_started_nanos: AtomicU64,
+    /// The largest start handed to a turn record, which later starts follow
+    /// even when the wall clock stepped back.
+    record_start_floor: AtomicU64,
     table: Mutex<TurnTable>,
 }
 
@@ -373,7 +376,11 @@ impl TurnProgress {
         // opened by a restatement or an owner change is ordered after it
         // without moving it. A wall clock that stepped back must not give a
         // start a smaller value.
-        let nanos = wall_nanos.max(self.turn_started_nanos.load(Ordering::Relaxed) + 1);
+        let floor = self
+            .turn_started_nanos
+            .load(Ordering::Relaxed)
+            .max(self.record_start_floor.load(Ordering::Relaxed));
+        let nanos = wall_nanos.max(floor + 1);
         if next == AgentActivity::Working && previous != Some(AgentActivity::Working) {
             self.turn_started_nanos.store(nanos, Ordering::Relaxed);
         }
@@ -391,6 +398,7 @@ impl TurnProgress {
             }
             let started = enter_working(&mut table, owner, previous, non_zero(nanos), now);
             if let Some(id) = started {
+                self.record_start_floor.store(nanos, Ordering::Relaxed);
                 table.take_token(id);
             }
             return TurnChange {

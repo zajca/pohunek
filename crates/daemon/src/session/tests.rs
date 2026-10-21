@@ -2489,6 +2489,56 @@ async fn wait_turn_progress_follows_the_last_transition_into_working() {
 }
 
 #[tokio::test]
+async fn turn_starts_never_decrease_when_the_wall_clock_steps_back_after_a_takeover() {
+    let registry = turn_registry();
+    registry
+        .turn_events()
+        .flap_window_handle()
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+
+    registry.turn_events().pin_wall_clock(100);
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    // The agent changes while working: the restated activity opens the next
+    // turn at a later wall time, which the transition clock does not record.
+    registry.turn_events().pin_wall_clock(200);
+    let mut sessions = registry.inner.sessions.lock().await;
+    sessions
+        .get_mut(&created.id)
+        .expect("the session")
+        .agent_left(&registry.inner.turns);
+    drop(sessions);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    let takeover = ended_turns(&mut edges);
+    assert_eq!(takeover.len(), 1);
+
+    registry.turn_events().pin_wall_clock(150);
+    registry.note_input(&created.id);
+    work_then_idle(&registry, &created.id).await;
+    let later = ended_turns(&mut edges);
+    assert_eq!(later.len(), 1);
+    let owner = registry.turn_owner(&created.id).await;
+    let start = |id| match registry.turn_events().settle(&created.id, id, owner) {
+        TurnVerdict::Surface(snapshot) => snapshot.started_nanos.expect("observed start"),
+        other => panic!("the turn ended: {other:?}"),
+    };
+    assert!(start(later[0]) > start(takeover[0]));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
 async fn a_resumed_runtime_banner_is_not_a_turn_until_input_reaches_it() {
     let registry = turn_registry();
     let mut edges = registry
