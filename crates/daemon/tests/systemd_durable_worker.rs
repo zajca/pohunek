@@ -462,19 +462,17 @@ async fn an_oom_killed_systemd_worker_is_a_failed_session_with_its_cause() {
         .await
         .expect("release bootstrap worker controller");
     drop(worker);
+    // timing-allowed: #326 lets the worker settle after its controller is released, as the lifecycle scenario does
     tokio::time::sleep(CONNECT_DELAY).await;
     fixture.start_daemon(&daemon_bin);
     fixture
         .wait_for_activity(&fixture.session_id, AgentActivity::Working)
         .await;
 
-    let worker_pid = Fixture::main_pid(&fixture.worker_unit);
-    assert_ne!(worker_pid, 0, "the worker unit runs");
-    std::fs::write(
-        format!("/proc/{worker_pid}/oom_score_adj"),
-        OOM_SCORE_ADJ_MAX,
-    )
-    .expect("make the worker the preferred OOM victim");
+    let unit_pid = Fixture::main_pid(&fixture.worker_unit);
+    assert_ne!(unit_pid, 0, "the worker unit runs");
+    std::fs::write(format!("/proc/{unit_pid}/oom_score_adj"), OOM_SCORE_ADJ_MAX)
+        .expect("make the worker the preferred OOM victim");
     Fixture::systemctl([
         "set-property",
         "--runtime",
@@ -497,6 +495,7 @@ async fn an_oom_killed_systemd_worker_is_a_failed_session_with_its_cause() {
             fixture.print_status();
             panic!("the OOM-killed worker was not classified lost in time");
         }
+        // timing-allowed: #326 polls the real daemon for the loss, bounded by the explicit deadline above
         tokio::time::sleep(CONNECT_DELAY).await;
     };
     assert_eq!(lost.state, protocol::SessionState::Failed);

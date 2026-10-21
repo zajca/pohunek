@@ -1712,7 +1712,9 @@ impl SessionRegistry {
                     None => Cleanup::Complete,
                 };
                 let exit = match lifecycle {
-                    Some(lifecycle) => self.read_exit(&id.0, lifecycle, &generation).await,
+                    Some(lifecycle) => {
+                        Box::pin(self.read_exit(&id.0, lifecycle, &generation)).await
+                    }
                     None => None,
                 };
                 let retired = match lifecycle {
@@ -1962,7 +1964,7 @@ impl SessionRegistry {
         }
         let (_record, entry) = self.unavailable_entry(
             record,
-            Unavailability::other(RuntimeState::Conflict),
+            &Unavailability::other(RuntimeState::Conflict),
             SUPERVISION_AMBIGUOUS,
         );
         let info = entry.info.clone();
@@ -2200,25 +2202,9 @@ impl SessionRegistry {
                 } else {
                     Cleanup::Complete
                 };
-                let exit = match (lifecycle.as_ref(), job.as_ref()) {
-                    (Some(lifecycle), Some(generation)) => {
-                        self.read_exit(&id.0, lifecycle, generation).await
-                    }
-                    _ => None,
-                };
-                let retired = match (lifecycle.as_ref(), job.as_ref()) {
-                    (Some(lifecycle), Some(generation)) => {
-                        lifecycle.retire(generation).await.map_err(|error| {
-                            tracing::warn!(
-                                session_id = %id.0,
-                                service_id = %generation.service_id(),
-                                error = %error,
-                                "failed to retire the crashed worker generation"
-                            );
-                        })
-                    }
-                    _ => Ok(()),
-                };
+                let (exit, retired) = self
+                    .read_exit_and_retire(&id.0, lifecycle.as_ref(), job.as_ref())
+                    .await;
                 // `Lost` counts as ended, so a later removal skips retirement:
                 // until the job is retired the session stays unavailable and
                 // the background re-check reaches this classification again.
@@ -2258,6 +2244,29 @@ impl SessionRegistry {
                 LossClassification::Pending
             }
         }
+    }
+
+    /// Retires the ended job of a crashed worker generation after reading its
+    /// verdict, which the retirement resets.
+    async fn read_exit_and_retire(
+        &self,
+        session_id: &str,
+        lifecycle: Option<&Lifecycle<'_>>,
+        job: Option<&super::Generation>,
+    ) -> (Option<protocol::RuntimeExit>, Result<(), ()>) {
+        let (Some(lifecycle), Some(generation)) = (lifecycle, job) else {
+            return (None, Ok(()));
+        };
+        let exit = Box::pin(self.read_exit(session_id, lifecycle, generation)).await;
+        let retired = lifecycle.retire(generation).await.map_err(|error| {
+            tracing::warn!(
+                session_id,
+                service_id = %generation.service_id(),
+                error = %error,
+                "failed to retire the crashed worker generation"
+            );
+        });
+        (exit, retired)
     }
 
     /// Reads the verdict of the failed job of `generation` before the job is
@@ -4151,8 +4160,7 @@ impl SessionRegistry {
         state: RuntimeState,
         reason: &str,
     ) -> bool {
-        self.insert_classified_record(record, Unavailability::other(state), reason)
-            .await
+        Box::pin(self.insert_classified_record(record, Unavailability::other(state), reason)).await
     }
 
     /// [`Self::insert_unavailable_record`] for a `Lost` runtime, with what the
@@ -4165,7 +4173,7 @@ impl SessionRegistry {
         proof: LossProof,
         exit: Option<protocol::RuntimeExit>,
     ) -> bool {
-        self.insert_classified_record(record, Unavailability::lost(proof, exit), reason)
+        Box::pin(self.insert_classified_record(record, Unavailability::lost(proof, exit), reason))
             .await
     }
 
@@ -4178,7 +4186,7 @@ impl SessionRegistry {
     ) -> bool {
         let state = classification.state();
         let id = SessionId(record.session_id.clone());
-        let (classified, entry) = self.unavailable_entry(record.clone(), classification, reason);
+        let (classified, entry) = self.unavailable_entry(record.clone(), &classification, reason);
         let info = entry.info.clone();
         if let Err(error) = self.write_session_record(classified).await {
             tracing::warn!(session_id = %id.0, error = %error, "failed to persist runtime classification");
@@ -4230,7 +4238,7 @@ impl SessionRegistry {
         }
         let (_, placeholder) = self.unavailable_entry(
             record.clone(),
-            Unavailability::other(RuntimeState::Reconnecting),
+            &Unavailability::other(RuntimeState::Reconnecting),
             SUPERVISION_UNAVAILABLE,
         );
         let info = placeholder.info.clone();
@@ -4267,7 +4275,7 @@ impl SessionRegistry {
     fn unavailable_entry(
         &self,
         mut record: SessionRecord,
-        classification: Unavailability,
+        classification: &Unavailability,
         reason: &str,
     ) -> (SessionRecord, SessionEntry) {
         let state = classification.state();
@@ -4287,7 +4295,7 @@ impl SessionRegistry {
         runtime.loss_reason = (state != RuntimeState::Terminal).then(|| reason.to_owned());
         record.runtime.state = state;
         record.runtime.reason.clone_from(&runtime.loss_reason);
-        present_unavailable_record(&mut record, &classification);
+        present_unavailable_record(&mut record, classification);
         record.info.updated_at = now;
         let recovery = record.recovery.clone();
         let input_rules = recovery.as_ref().map_or_else(
