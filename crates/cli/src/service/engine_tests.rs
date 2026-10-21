@@ -9941,6 +9941,21 @@ async fn setup_applies_nothing_when_the_version_directory_stopped_being_trusted_
 #[derive(Debug)]
 struct UnitManager {
     unit: Result<UnitEnvironment, EnvironmentFailure>,
+    /// The manager's own `HOME` and `XDG_RUNTIME_DIR` entries.
+    identity: Vec<String>,
+}
+
+/// The `HOME` and `XDG_RUNTIME_DIR` entries a manager of `context`'s user reports.
+#[cfg(target_os = "linux")]
+fn manager_identity(context: &Context) -> Vec<String> {
+    let mut entries = Vec::new();
+    if let Some(home) = context.home() {
+        entries.push(format!("HOME={}", home.display()));
+    }
+    if let Some(run) = context.runtime_base() {
+        entries.push(format!("XDG_RUNTIME_DIR={}", run.display()));
+    }
+    entries
 }
 
 #[cfg(target_os = "linux")]
@@ -9948,7 +9963,9 @@ impl UserManager for UnitManager {
     fn environment(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, EnvironmentFailure>> + Send + '_>> {
-        Box::pin(async { Ok(vec![format!("PATH={MANAGER_PATH}")]) })
+        let mut entries = vec![format!("PATH={MANAGER_PATH}")];
+        entries.extend(self.identity.clone());
+        Box::pin(async move { Ok(entries) })
     }
 
     fn unit_environment<'a>(
@@ -9969,6 +9986,7 @@ struct LifecycleUnitManager {
     fake: Fake,
     present: UnitEnvironment,
     removed: UnitEnvironment,
+    identity: Vec<String>,
 }
 
 #[cfg(target_os = "linux")]
@@ -9976,7 +9994,9 @@ impl UserManager for LifecycleUnitManager {
     fn environment(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, EnvironmentFailure>> + Send + '_>> {
-        Box::pin(async { Ok(vec![format!("PATH={MANAGER_PATH}")]) })
+        let mut entries = vec![format!("PATH={MANAGER_PATH}")];
+        entries.extend(self.identity.clone());
+        Box::pin(async move { Ok(entries) })
     }
 
     fn unit_environment<'a>(
@@ -10016,7 +10036,10 @@ async fn unrecorded_job_path(
     let context = harness
         .context
         .clone()
-        .with_user_manager(Arc::new(UnitManager { unit }));
+        .with_user_manager(Arc::new(UnitManager {
+            unit,
+            identity: manager_identity(&harness.context),
+        }));
     // The daemon unit's name derives from the application roots.
     context.namespace().expect("the roots exist");
     crate::service::engine::recorded_job_search_path(
@@ -10346,7 +10369,10 @@ async fn the_upgrade_judges_and_runs_with_the_drop_in_path_not_the_managers() {
     harness.context = harness
         .context
         .clone()
-        .with_user_manager(Arc::new(UnitManager { unit: Ok(unit) }));
+        .with_user_manager(Arc::new(UnitManager {
+            unit: Ok(unit),
+            identity: manager_identity(&harness.context),
+        }));
     harness.runtimes.script().search_paths.clear();
     let preflight = ScriptedPreflight::default();
     let judged = Arc::clone(&preflight.search_paths);
@@ -10393,6 +10419,7 @@ async fn a_rollback_whose_unit_was_removed_still_judges_by_the_surviving_drop_in
             fake: harness.fake.clone(),
             present,
             removed,
+            identity: manager_identity(&harness.context),
         }));
     let preflight = ScriptedPreflight::default();
     let judged = Arc::clone(&preflight.search_paths);
@@ -10426,7 +10453,10 @@ async fn the_upgrade_refuses_before_any_effect_when_a_unit_override_cannot_be_re
     harness.context = harness
         .context
         .clone()
-        .with_user_manager(Arc::new(UnitManager { unit: Ok(unit) }));
+        .with_user_manager(Arc::new(UnitManager {
+            unit: Ok(unit),
+            identity: manager_identity(&harness.context),
+        }));
     harness.runtimes.script().calls.clear();
 
     let error = harness.upgrade(V2).await.expect_err("PassEnvironment=PATH");
@@ -10506,6 +10536,7 @@ async fn judging_the_path_before_the_application_roots_exist_creates_nothing() {
                 pass_environment: vec!["PATH".to_owned()],
                 ..loaded_unit()
             }),
+            identity: manager_identity(&harness.context),
         }));
     let (state, runtime) = (
         context.paths().state_dir.clone(),
@@ -11176,7 +11207,10 @@ async fn the_loaded_gate_validates_the_removed_resolution_before_anything_is_sto
     harness.context = harness
         .context
         .clone()
-        .with_user_manager(Arc::new(UnitManager { unit: Ok(unit) }));
+        .with_user_manager(Arc::new(UnitManager {
+            unit: Ok(unit),
+            identity: manager_identity(&harness.context),
+        }));
     harness.runtimes.script().calls.clear();
     let uninstalls = harness.fake.world().uninstalls;
     let error = harness.upgrade(V2).await.expect_err("%Z is not expanded");
@@ -11247,6 +11281,7 @@ async fn a_rollback_whose_removed_unit_keeps_a_home_specifier_drop_in_completes(
             fake: harness.fake.clone(),
             present,
             removed,
+            identity: manager_identity(&harness.context),
         }));
     let preflight = ScriptedPreflight::default();
     let judged = Arc::clone(&preflight.search_paths);
@@ -11263,58 +11298,72 @@ async fn a_rollback_whose_removed_unit_keeps_a_home_specifier_drop_in_completes(
     harness.assert_installed(V1);
 }
 
-/// A user manager that reports its own `HOME` and `XDG_RUNTIME_DIR`.
-#[cfg(target_os = "linux")]
-#[derive(Debug)]
-struct HomeManager(UnitEnvironment);
-
-#[cfg(target_os = "linux")]
-impl UserManager for HomeManager {
-    fn environment(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, EnvironmentFailure>> + Send + '_>> {
-        Box::pin(async {
-            Ok(vec![
-                format!("PATH={MANAGER_PATH}"),
-                "HOME=/manager/home".to_owned(),
-                "XDG_RUNTIME_DIR=/manager/run".to_owned(),
-            ])
-        })
-    }
-
-    fn unit_environment<'a>(
-        &'a self,
-        _unit: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<UnitEnvironment, EnvironmentFailure>> + Send + 'a>>
-    {
-        let unit = self.0.clone();
-        Box::pin(async move { Ok(unit) })
-    }
-}
-
-/// `%h` and `%t` of a removed unit's drop-ins are the manager's, not the CLI's.
+/// `%h` and `%t` of a removed unit's drop-ins are expanded only when the manager's
+/// own `HOME` and `XDG_RUNTIME_DIR` equal the CLI's: a manager that reports
+/// another value, or none, makes the expansion unverifiable and it is refused.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn a_removed_unit_expands_home_and_runtime_specifiers_from_the_managers_environment() {
-    let (_keep, unit) = orphan_drop_ins(&[(
-        "a.service.d",
-        "10-a.conf",
-        b"[Service]\nEnvironment=PATH=%h/bin:%t/bin\n",
-    )]);
+async fn a_removed_unit_expands_home_and_runtime_specifiers_only_when_the_manager_agrees() {
     let harness = Harness::new();
-    let context = harness
+    let home = harness.context.home().expect("home").display().to_string();
+    let run = harness
         .context
-        .clone()
-        .with_user_manager(Arc::new(HomeManager(unit)));
-    context.namespace().expect("the roots exist");
-    let job = crate::service::engine::recorded_job_search_path(
-        &context,
-        &pohunek_platform::shell_env::SearchPath::empty(),
-        None,
-    )
-    .await
-    .expect("path");
-    assert_eq!(job.value, "/manager/home/bin:/manager/run/bin");
+        .runtime_base()
+        .expect("runtime")
+        .display()
+        .to_string();
+    for (identity, expected) in [
+        (
+            vec![format!("HOME={home}"), format!("XDG_RUNTIME_DIR={run}")],
+            Some(format!("{home}/bin:{run}/bin")),
+        ),
+        (vec![format!("XDG_RUNTIME_DIR={run}")], None),
+        (vec![format!("HOME={home}")], None),
+        (
+            vec![
+                "HOME=/manager/home".to_owned(),
+                format!("XDG_RUNTIME_DIR={run}"),
+            ],
+            None,
+        ),
+        (
+            vec![
+                format!("HOME={home}"),
+                "XDG_RUNTIME_DIR=/manager/run".to_owned(),
+            ],
+            None,
+        ),
+    ] {
+        let (_keep, unit) = orphan_drop_ins(&[(
+            "a.service.d",
+            "10-a.conf",
+            b"[Service]\nEnvironment=PATH=%h/bin:%t/bin\n",
+        )]);
+        let context = harness
+            .context
+            .clone()
+            .with_user_manager(Arc::new(UnitManager {
+                unit: Ok(unit),
+                identity,
+            }));
+        context.namespace().expect("the roots exist");
+        let result = crate::service::engine::recorded_job_search_path(
+            &context,
+            &pohunek_platform::shell_env::SearchPath::empty(),
+            None,
+        )
+        .await;
+        match expected {
+            Some(expected) => assert_eq!(result.expect("path").value, expected),
+            None => {
+                let text = refusal(result);
+                assert!(
+                    text.contains("Environment=") && text.contains("agree"),
+                    "{text}"
+                );
+            }
+        }
+    }
 }
 
 /// What cannot be read from drop-ins of an unloaded unit is refused with the

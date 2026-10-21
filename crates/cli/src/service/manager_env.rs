@@ -269,11 +269,13 @@ pub(crate) fn carry(value: &str) -> Result<String, String> {
 /// and only those whose value does not depend on the manager.
 #[derive(Debug, Clone, Default)]
 pub struct Specifiers {
-    /// `%h`, the user's home directory.
+    /// `%h`, the user's home directory; `None` when the manager's `HOME` cannot be
+    /// confirmed equal to it.
     pub home: Option<String>,
     /// `%U`, the numeric user ID.
     pub uid: u32,
-    /// `%t`, the runtime directory (`$XDG_RUNTIME_DIR` of the context).
+    /// `%t`, the runtime directory; `None` when the manager's `XDG_RUNTIME_DIR`
+    /// cannot be confirmed equal to it.
     pub runtime_dir: Option<String>,
 }
 
@@ -510,7 +512,7 @@ async fn path_from_orphan_drop_ins(
         };
         let unsupported = |directive: &str, specifier: &str| {
             refuse(format!(
-                "{unit_name} has no unit file yet and the drop-in {path} uses the specifier {specifier} in {directive}=, which is not expanded here (only %h, %U, %t and %% are). Write the value out and retry"
+                "{unit_name} has no unit file yet and the drop-in {path} uses the specifier {specifier} in {directive}=, which is not expanded here (only %U and %% always are; %h and %t only while the service manager's own HOME and XDG_RUNTIME_DIR agree with the CLI's, which cannot be told for this unit). Write the value out and retry"
             ))
         };
         for line in service_lines(&bytes) {
