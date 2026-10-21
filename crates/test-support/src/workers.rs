@@ -685,12 +685,36 @@ impl WorkerGuard {
     ///
     /// For a fixture that stopped its daemon: the daemon signals its workers
     /// as it exits, and the kernel may still be tearing them down when the
-    /// daemon's exit is observed. Returns whether none is left; it never
-    /// panics, so a worker that outlives the bound is reaped and reported by
-    /// the drop of the guard.
+    /// daemon's exit is observed. The workload of every worker seen meanwhile
+    /// is killed once its worker is gone, since the drop of the guard can only
+    /// reach a workload through a listed worker. Returns whether no worker is
+    /// left; it never panics, so a worker that outlives the bound is reaped and
+    /// reported by the drop of the guard.
     #[must_use]
     pub fn wait_for_exit(&self) -> bool {
-        wait_for_none(&self.root, crate::wait::HANG_GUARD)
+        let deadline = Instant::now() + crate::wait::HANG_GUARD;
+        let mut workload: Vec<ProcessId> = Vec::new();
+        loop {
+            let workers = self.survivors();
+            for worker in &workers {
+                workload.extend(worker.workload.iter().cloned());
+            }
+            if workers.is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let retained = self
+            .retained_sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for process in workload.iter().chain(retained.iter()) {
+            signal_process(process.pid, &process.start, Stop::Kill);
+        }
+        true
     }
 }
 
@@ -1329,15 +1353,59 @@ mod tests {
     #[test]
     fn a_worker_that_is_still_ending_passes_after_the_guard_waited_for_it() {
         let root = tempdir().expect("root");
-        // Ends by itself shortly after the detach shell returns.
+        let gate = root.path().join("release");
+        // Ends once the gate file exists.
         spawn_orphan_at(
             root.path(),
             &root.path().join("pohunek-sessiond"),
             &root.path().join("r/pohunek/daemon.sock"),
-            "sleep 1; true",
+            &format!(
+                "while [ ! -e {} ]; do sleep 0.1; done; true",
+                gate.display()
+            ),
         );
         let guard = WorkerGuard::watch(root.path());
+        std::thread::scope(|scope| {
+            scope.spawn(|| std::fs::write(&gate, b"").expect("release the worker"));
+            assert!(guard.wait_for_exit(), "the worker ended");
+        });
+        drop(guard);
+    }
+
+    #[test]
+    fn waiting_for_a_worker_to_end_kills_the_workload_it_leaves_behind() {
+        let root = tempdir().expect("root");
+        let gate = root.path().join("release");
+        let pid_file = root.path().join("workload.pid");
+        // The worker's child records its PID and idles; the worker ends at the gate.
+        let worker = spawn_orphan_at(
+            root.path(),
+            &root.path().join("pohunek-sessiond"),
+            &root.path().join("r/pohunek/daemon.sock"),
+            &format!(
+                "sh -c 'echo $$ > {}; exec sleep 613' & while [ ! -e {} ]; do sleep 0.1; done; true",
+                pid_file.display(),
+                gate.display()
+            ),
+        );
+        let workload: u32 = poll_until("the workload records its PID", || {
+            std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+        });
+        let guard = WorkerGuard::watch(root.path());
+        poll_until("the guard lists the workload", || {
+            guard
+                .survivors()
+                .iter()
+                .any(|listed| listed.workload.iter().any(|p| p.pid == workload))
+                .then_some(())
+        });
+        std::fs::write(&gate, b"").expect("release the worker");
         assert!(guard.wait_for_exit(), "the worker ended");
+        poll_until("the workload is killed", || {
+            (!process_exists(workload) && !process_exists(worker.pid)).then_some(())
+        });
         drop(guard);
     }
 
