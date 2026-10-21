@@ -1464,6 +1464,12 @@ impl<'a> Engine<'a> {
     /// Returns the store's error when the record cannot be saved.
     #[cfg(target_os = "macos")]
     async fn refresh_journaled_default(&self, record: &mut Record) -> Result<(), Error> {
+        // A job that records its `PATH` never reads the launchd default.
+        if load_config_for_upgrade(&self.context.config_path())?
+            .is_some_and(|source| !source.config.search_path().is_empty())
+        {
+            return Ok(());
+        }
         let Ok(active) = active_launchd_job(self.context).await else {
             return Ok(());
         };

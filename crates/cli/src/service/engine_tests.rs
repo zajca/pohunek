@@ -10578,6 +10578,22 @@ async fn an_unreadable_boot_identity_with_a_disagreeing_persisted_path_refuses_b
     assert_eq!(harness.fake.world().replaces, replaces, "no replacement");
 }
 
+/// A job that records its `PATH` never depends on the launchd default, so an
+/// unreadable boot identity does not stop its upgrade.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_recorded_path_job_is_not_refused_for_an_unreadable_boot_identity() {
+    let mut harness = Harness::new();
+    let launchd = FakeLaunchd::new(Ok(loaded_job(JOURNALED_PATH.to_owned())));
+    launchd.set_boot(Err("sysctl failed".to_owned()));
+    // The harness records the PATH its install discovers.
+    harness.context = harness.context.clone().with_launchd_job(Arc::new(launchd));
+    harness.install(V1).await.expect("install");
+    assert!(!harness.config().expect("config").search_path().is_empty());
+    harness.upgrade(V2).await.expect("upgrade");
+    harness.assert_installed(V2);
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_loaded_job_ignores_the_journal_and_its_boot_marker() {
