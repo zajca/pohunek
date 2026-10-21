@@ -2168,3 +2168,28 @@ fn unknown_key_values_are_never_echoed_by_the_library() {
     assert!(!surfaces.contains(UNKNOWN_SECRET), "{surfaces}");
     assert!(surfaces.contains("limits.future_secret"), "{surfaces}");
 }
+
+#[test]
+fn a_rewrite_that_outgrows_the_load_bound_is_refused_and_leaves_the_file() {
+    let fixture = Fixture::new();
+    // A compact array just under the bound; the rendering spreads it out.
+    let big = format!(
+        "big = [{}]\n",
+        vec!["0"; (MAX_CONFIG_BYTES - GOLDEN.len() - 64) / 2].join(",")
+    );
+    let text = format!("{GOLDEN}\n[future]\n{big}");
+    assert!(text.len() <= MAX_CONFIG_BYTES);
+    let path = fixture.write(&text, 0o600);
+    let config = ServiceConfig::load(&path).expect("loads within the bound");
+
+    assert!(
+        config.to_toml().len() > MAX_CONFIG_BYTES,
+        "the fixture must outgrow the bound"
+    );
+    let result = config.write(&path);
+    assert!(
+        matches!(result, Err(ConfigError::TooLarge { .. })),
+        "{result:?}"
+    );
+    assert_eq!(fs::read_to_string(&path).expect("read"), text);
+}

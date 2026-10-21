@@ -131,7 +131,8 @@ pub fn unknown_keys_warning(config: &ServiceConfig) -> Option<String> {
     );
     let rest = keys.len().saturating_sub(listed.len());
     if rest > 0 {
-        warning.push_str(&format!(", and {rest} more"));
+        std::fmt::Write::write_fmt(&mut warning, format_args!(", and {rest} more"))
+            .expect("writing to String is infallible");
     }
     Some(warning)
 }

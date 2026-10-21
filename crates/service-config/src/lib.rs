@@ -782,7 +782,9 @@ impl ServiceConfig {
     /// Returns [`ConfigError::ConfigPath`] for a relative or unnormalized path,
     /// [`ConfigError::Untrusted`] when the directory is foreign-owned or
     /// group- or world-writable,
-    /// [`ConfigError::Io`] when it cannot be opened or created, and
+    /// [`ConfigError::Io`] when it cannot be opened or created,
+    /// [`ConfigError::TooLarge`] when the rendering, with the unknown keys it
+    /// keeps, exceeds [`MAX_CONFIG_BYTES`] (the file is left untouched), and
     /// [`ConfigError::Write`] when the replacement fails.
     pub fn write(&self, path: &Path) -> Result<(), ConfigError> {
         write_config_text(path, &self.to_toml())
@@ -1059,6 +1061,15 @@ fn read_config_text(path: &Path) -> Result<String, ConfigError> {
 
 /// Replaces a trusted service configuration or transaction backup atomically.
 fn write_config_text(path: &Path, text: &str) -> Result<(), ConfigError> {
+    // Kept unknown keys can make a rewrite larger than the file it came from;
+    // a file above the load bound would replace a working one with one no
+    // daemon can read.
+    if text.len() > MAX_CONFIG_BYTES {
+        return Err(ConfigError::TooLarge {
+            path: path.to_path_buf(),
+            max_bytes: MAX_CONFIG_BYTES,
+        });
+    }
     let (parent, name) = split_config_path(path)?;
     let directory =
         open_or_create_directory(parent).map_err(|source| classify_read_error(path, source))?;
@@ -1625,19 +1636,16 @@ fn merge_kept_keys(typed: &str, kept: &str) -> String {
 
 fn merge_table(typed: &mut Table, kept: &Table, base: usize) {
     for (name, item) in kept {
-        match typed.get_mut(name) {
-            Some(existing) => {
-                if let (Some(typed_child), Some(kept_child)) =
-                    (existing.as_table_mut(), item.as_table())
-                {
-                    merge_table(typed_child, kept_child, base);
-                }
+        if let Some(existing) = typed.get_mut(name) {
+            if let (Some(typed_child), Some(kept_child)) =
+                (existing.as_table_mut(), item.as_table())
+            {
+                merge_table(typed_child, kept_child, base);
             }
-            None => {
-                let mut item = item.clone();
-                shift_positions(&mut item, base);
-                typed.insert(name, item);
-            }
+        } else {
+            let mut item = item.clone();
+            shift_positions(&mut item, base);
+            typed.insert(name, item);
         }
     }
 }
@@ -1693,9 +1701,11 @@ fn diagnostic_with_hint(path: &Path, text: &str, error: &toml::de::Error) -> Str
                 .then_some((known, key.path.as_str()))
         });
         if let Some((known, unknown_path)) = hinted {
-            message.push_str(&format!(
-                "; did you mean `{known}`? `{unknown_path}` is not a key"
-            ));
+            std::fmt::Write::write_fmt(
+                &mut message,
+                format_args!("; did you mean `{known}`? `{unknown_path}` is not a key"),
+            )
+            .expect("writing to String is infallible");
         }
     }
     message
