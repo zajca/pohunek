@@ -911,3 +911,63 @@ async fn the_preflight_judges_store_references_at_the_drop_in_location() {
         "{variables:?}"
     );
 }
+
+#[tokio::test]
+async fn the_rollback_gate_judges_the_drop_in_path_over_the_recorded_one() {
+    let mut harness = recorded_harness();
+    let (_dir, unit) = loaded_with(
+        &[("10-path.conf", "[Service]\nEnvironment=PATH=/x/bin\n")],
+        &["PATH=/x/bin"],
+    );
+    harness.context = harness
+        .context
+        .clone()
+        .with_user_manager(ScriptedManager::new(&["PATH=/manager/bin"], vec![unit]));
+    harness.install(V1).await.expect("install");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after the registration");
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+
+    let report = harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V1), V1)
+        .await
+        .expect("the pending upgrade is rolled back");
+
+    let judged = judged.lock().expect("search path lock").clone();
+    assert!(
+        !judged.is_empty() && judged.iter().all(|path| path == "/x/bin"),
+        "{judged:?}"
+    );
+    assert!(report.rolled_back.is_some());
+    harness.assert_installed(V1);
+}
+
+/// The syntax whose reading is not reproduced stays refused for a loaded unit:
+/// the same files are refused once a rollback removes the unit.
+#[tokio::test]
+async fn a_loaded_unit_with_an_unfollowed_drop_in_syntax_is_still_refused() {
+    for (content, reason) in [
+        (
+            "[Service]\nEnvironment=PATH=/a/bin\n[Bogus\nEnvironment=X=1\n",
+            "without closing it",
+        ),
+        (
+            "[Service]\nEnvironment=PATH=/a/bin\n\u{feff}Environment=X=1\n",
+            "byte order mark",
+        ),
+    ] {
+        let (_dir, unit) = loaded_with(&[("10-odd.conf", content)], &["PATH=/a/bin"]);
+        let text = refusal(judge_job(unit, &MANAGER_ENTRIES, &[], false).await);
+        assert!(
+            text.contains("10-odd.conf") && text.contains(reason),
+            "{text}"
+        );
+    }
+}
