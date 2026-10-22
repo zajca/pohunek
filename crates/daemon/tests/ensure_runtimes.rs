@@ -5503,6 +5503,10 @@ enum Damage {
 enum PinKind {
     Profile,
     Session,
+    /// A host profile and a session record pin it together.
+    Both,
+    /// A host profile with only a `digest` line pins it.
+    DigestOnly,
 }
 
 /// One step of a remedy: the release of a pin, or a command the hint names.
@@ -5519,6 +5523,9 @@ enum Cmd {
 enum Outcome {
     Gap,
     Refusal,
+    /// A Pi without an enabled official selection whose holder is altered: a gap
+    /// in plan and apply, the refusal under `--detect`.
+    GapThenRefusal,
 }
 
 /// Where a remedy ends.
@@ -5532,6 +5539,35 @@ enum End {
     Removed,
     /// The next plan names the next step of the same-version holder.
     Chain,
+}
+
+/// What the plan and the apply (a gap) and the detecting plan (the root-invalid
+/// refusal, which supersedes the managed-runtime gap) say for an unmanaged
+/// `runtime` whose unselected holder is altered: the same detail in all three,
+/// and the registry and the profiles unchanged. Returns the detail.
+fn assert_held_pi_altered(host: &Host, runtime: &str) -> String {
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let profiles = profiles_snapshot(host);
+    let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
+    let mut seen = Vec::new();
+    for report in [host.step(true), host.step(false)] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        seen.push(not_serving_detail(&report, runtime).expect("the gap"));
+    }
+    let detected = host.detect_step();
+    assert_eq!(refusal_codes(&detected), [root_refusal.as_str()]);
+    assert_eq!(not_serving_detail(&detected, runtime), None);
+    seen.push(detected.refusals[0].detail.clone());
+    assert!(
+        seen.iter().all(|detail| *detail == seen[0]),
+        "the three modes say the same: {seen:?}"
+    );
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+    assert_eq!(profiles_snapshot(host), profiles);
+    seen.swap_remove(0)
 }
 
 const RESERVED: &[&str] = &["claude", "codex", "hermes"];
@@ -5551,6 +5587,8 @@ struct Cell {
     installs: &'static [(Role, bool, bool)],
     damage: &'static [(Role, Damage)],
     pin: Option<(Role, PinKind)>,
+    /// A second session record of the runtime pins another digest.
+    other_session: bool,
     /// A host profile uses the runtime.
     profile: bool,
     /// An installed hook uses the runtime.
@@ -5570,6 +5608,7 @@ const BASE: Cell = Cell {
     installs: &[],
     damage: &[],
     pin: None,
+    other_session: false,
     profile: true,
     hook: false,
     store: false,
@@ -5656,6 +5695,35 @@ const CELLS: &[Cell] = &[
         installs: &[(Holder, true, true)],
         damage: &[(Holder, Damage::Missing)],
         pin: Some((Holder, PinKind::Profile)),
+        steps: &[Release, Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R5 holder pinned by a profile and a session together",
+        runtimes: CLAUDE,
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Missing)],
+        pin: Some((Holder, PinKind::Both)),
+        steps: &[Release, Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R5 holder pinned by a profile with only a digest line",
+        runtimes: CLAUDE,
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Missing)],
+        pin: Some((Holder, PinKind::DigestOnly)),
+        steps: &[Release, Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R5 holder pinned by a session beside another session",
+        runtimes: CLAUDE,
+        profile: false,
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Missing)],
+        pin: Some((Holder, PinKind::Session)),
+        other_session: true,
         steps: &[Release, Uninstall(Holder)],
         ..BASE
     },
@@ -5964,6 +6032,17 @@ const CELLS: &[Cell] = &[
         ..BASE
     },
     Cell {
+        id: "P15 nothing selected, holder altered and pinned",
+        runtimes: PI,
+        installs: &[(Holder, true, false)],
+        damage: &[(Holder, Damage::Altered)],
+        pin: Some((Holder, PinKind::Profile)),
+        outcome: Outcome::GapThenRefusal,
+        steps: &[Release, RemoveModified(Holder), Install],
+        end: End::Present,
+        ..BASE
+    },
+    Cell {
         id: "P16 non-official selected",
         runtimes: PI,
         installs: &[(Older, true, true), (Holder, true, false)],
@@ -6021,8 +6100,32 @@ fn pinned_profile(runtime: &str, digest: &PackageDigest) -> String {
     )
 }
 
+/// The metadata store of a cell: a session record of Claude that pins `pinned`,
+/// and a second record that pins another digest when `other` is set.
+fn session_store(pinned: Option<&PackageDigest>, other: bool) -> String {
+    let first = pinned.map_or_else(String::new, |pinned| {
+        PACKAGE_SESSION_STORE.replace(&format!("sha256:{}", "a".repeat(64)), pinned.as_str())
+    });
+    let second = if other {
+        PACKAGE_SESSION_STORE
+            .replace(
+                &format!("sha256:{}", "a".repeat(64)),
+                &format!("sha256:{}", "b".repeat(64)),
+            )
+            .replace("RPV", "RPW")
+    } else {
+        String::new()
+    };
+    format!("{first}{second}")
+}
+
 /// The command text a step names, as the hint spells it.
-fn step_text(runtime: &str, step: Cmd, digest: &dyn Fn(Role) -> PackageDigest) -> Option<String> {
+fn step_text(
+    runtime: &str,
+    pin: Option<PinKind>,
+    step: Cmd,
+    digest: &dyn Fn(Role) -> PackageDigest,
+) -> String {
     let hex = |role: Role| {
         digest(role)
             .as_str()
@@ -6031,23 +6134,44 @@ fn step_text(runtime: &str, step: Cmd, digest: &dyn Fn(Role) -> PackageDigest) -
             .to_owned()
     };
     match step {
-        Cmd::Release => None,
-        Cmd::Uninstall(role) => Some(format!(
+        Cmd::Release => {
+            let profile = cell_profile(runtime);
+            let profile_lines = format!(
+                "remove the `package` and `digest` lines from `{profile}.toml` in the host \
+                 profile directory"
+            );
+            let sessions = "remove the sessions launched from it";
+            let (who, release) = match pin.expect("a pinned cell") {
+                PinKind::Profile | PinKind::DigestOnly => {
+                    (format!("the host profile `{profile}.toml` pins"), profile_lines)
+                }
+                PinKind::Session => ("a session record pins".to_owned(), sessions.to_owned()),
+                PinKind::Both => (
+                    format!("the host profile `{profile}.toml` and a session record pin"),
+                    format!("{profile_lines} and {sessions}"),
+                ),
+            };
+            format!(
+                "{who} it, so the registry refuses its removal until the pin is released: \
+                 {release}; then "
+            )
+        }
+        Cmd::Uninstall(role) => format!(
             "pohunek plugin uninstall pohunek.runtime.{runtime} --digest {} --yes",
             hex(role)
-        )),
-        Cmd::RemoveModified(role) => Some(format!(
+        ),
+        Cmd::RemoveModified(role) => format!(
             "pohunek plugin uninstall pohunek.runtime.{runtime} --digest {} --remove-modified --yes",
             hex(role)
-        )),
-        Cmd::Install => Some(format!(
+        ),
+        Cmd::Install => format!(
             "pohunek plugin install runtime/packages/{runtime}.tar.zst --catalog \
              runtime/runtime-catalog.json --yes"
-        )),
-        Cmd::Update => Some(format!(
+        ),
+        Cmd::Update => format!(
             "pohunek plugin update pohunek.runtime.{runtime} runtime/packages/{runtime}.tar.zst \
              --catalog runtime/runtime-catalog.json --yes"
-        )),
+        ),
     }
 }
 
@@ -6099,15 +6223,22 @@ async fn cell_host(cell: &Cell, runtime: &str) -> (Host, Vec<(Role, Archive)>, A
         }
     }
     if let Some((role, kind)) = cell.pin {
-        match kind {
-            PinKind::Profile => {
-                host.write_profile(profile, &pinned_profile(runtime, &digest(role)));
-            }
-            PinKind::Session => host.write_store(
-                &PACKAGE_SESSION_STORE
-                    .replace(&format!("sha256:{}", "a".repeat(64)), digest(role).as_str()),
-            ),
+        if kind == PinKind::DigestOnly {
+            host.write_profile(
+                profile,
+                &format!(
+                    "base = \"{runtime}\"\ndigest = \"{}\"\n",
+                    digest(role).as_str()
+                ),
+            );
+        } else if kind != PinKind::Session {
+            host.write_profile(profile, &pinned_profile(runtime, &digest(role)));
         }
+        if matches!(kind, PinKind::Session | PinKind::Both) {
+            host.write_store(&session_store(Some(&digest(role)), cell.other_session));
+        }
+    } else if cell.other_session {
+        host.write_store(&session_store(None, true));
     }
     (host, archives, release)
 }
@@ -6133,6 +6264,7 @@ async fn run_cell(cell: &Cell, runtime: &str) {
     let detail = match cell.outcome {
         Outcome::Gap => assert_held_runtime_left(&host, runtime, &[]),
         Outcome::Refusal => assert_held_runtime_refused(&host, runtime, ""),
+        Outcome::GapThenRefusal => assert_held_pi_altered(&host, runtime),
     };
     if cell.select {
         // A pinned holder cannot be removed, so only the select is named.
@@ -6149,13 +6281,12 @@ async fn run_cell(cell: &Cell, runtime: &str) {
     let mut at = 0;
     let mut commands = 0;
     for step in cell.steps {
-        if let Some(text) = step_text(runtime, *step, &digest) {
-            let found = detail[at..]
-                .find(&text)
-                .unwrap_or_else(|| panic!("{label}: `{text}` is not named in order: {detail}"));
-            at += found + text.len();
-            commands += 1;
-        }
+        let text = step_text(runtime, cell.pin.map(|(_, kind)| kind), *step, &digest);
+        let found = detail[at..]
+            .find(&text)
+            .unwrap_or_else(|| panic!("{label}: `{text}` is not named in order: {detail}"));
+        at += found + text.len();
+        commands += usize::from(!matches!(step, Release));
     }
     assert_eq!(
         detail.matches("`pohunek ").count(),
@@ -6202,16 +6333,11 @@ async fn run_cell(cell: &Cell, runtime: &str) {
                     "{label}: the removal is refused while the pin stands"
                 );
                 let (_, kind) = cell.pin.expect("a pinned cell");
-                match kind {
-                    PinKind::Profile => {
-                        host.write_profile(
-                            cell_profile(runtime),
-                            &format!("base = \"{runtime}\"\n"),
-                        );
-                    }
-                    PinKind::Session => {
-                        fs::remove_file(host.store_path()).expect("remove the session records");
-                    }
+                if kind != PinKind::Session {
+                    host.write_profile(cell_profile(runtime), &format!("base = \"{runtime}\"\n"));
+                }
+                if matches!(kind, PinKind::Session | PinKind::Both) {
+                    host.write_store(&session_store(None, cell.other_session));
                 }
                 retained = package::registry::RetainedDigests::new();
             }

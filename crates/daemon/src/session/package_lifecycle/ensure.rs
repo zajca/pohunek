@@ -254,25 +254,18 @@ struct Gathered {
 struct Pins {
     /// Each host profile with the digest it pins.
     profiles: Vec<(String, PackageDigest)>,
-    /// The digests the session records pin.
-    session: Vec<PackageDigest>,
+    /// The session records, each with the official runtime it launched and the
+    /// digest it pins.
+    sessions: Vec<SessionRecord>,
 }
 
 /// Reads the pins of the host profiles and the session records.
 fn read_pins(store_path: &Path, profiles: &ProfileRegistry) -> Result<Pins, EnsureError> {
-    let mut pinned = Vec::new();
-    for (name, text) in profiles.scanned_texts().map_err(EnsureError::Profiles)? {
-        let Ok(source) = text else { continue };
-        let Ok(head) = parse_head(&source) else {
-            continue;
-        };
-        if let Some(pin) = head.pin() {
-            pinned.push((name, pin.digest));
-        }
-    }
     Ok(Pins {
-        profiles: pinned,
-        session: read_store(store_path)?.pins,
+        profiles: profiles
+            .pinning_profiles(None)
+            .map_err(EnsureError::Profiles)?,
+        sessions: read_store(store_path)?.records,
     })
 }
 
@@ -751,8 +744,9 @@ fn gather(
             uses.add(&runtime, UseReason::Integration);
         }
     }
-    for runtime in read_store(&inputs.store_path)?.runtimes {
-        uses.add(&runtime, UseReason::Session);
+    let store = read_store(&inputs.store_path)?;
+    for runtime in store.runtimes() {
+        uses.add(runtime, UseReason::Session);
     }
     Ok(Gathered {
         uses,
@@ -948,12 +942,31 @@ fn session_runtime(binding: &crate::store::ResumeBinding) -> Option<RuntimeId> {
     is_official(&runtime).then_some(runtime)
 }
 
+/// One session record of the metadata store.
+struct SessionRecord {
+    /// The record's official runtime, whatever its state.
+    runtime: Option<RuntimeId>,
+    /// The package digest the record pins.
+    pin: Option<PackageDigest>,
+}
+
 /// What the metadata store's records use and pin.
 struct StoreView {
-    /// The official runtime of every session record, whatever its state.
-    runtimes: Vec<RuntimeId>,
+    records: Vec<SessionRecord>,
+}
+
+impl StoreView {
+    /// The official runtime of every record.
+    fn runtimes(&self) -> impl Iterator<Item = &RuntimeId> {
+        self.records
+            .iter()
+            .filter_map(|record| record.runtime.as_ref())
+    }
+
     /// The package digests the records pin.
-    pins: Vec<PackageDigest>,
+    fn pins(&self) -> impl Iterator<Item = &PackageDigest> {
+        self.records.iter().filter_map(|record| record.pin.as_ref())
+    }
 }
 
 /// Reads the metadata store through the startup migration's dry run, so records
@@ -970,23 +983,23 @@ fn read_store(store_path: &Path) -> Result<StoreView, EnsureError> {
         .filter_map(|session| session.recovery.as_ref())
         .chain(dry.resume.iter())
         .collect();
-    let runtimes = bindings
+    let records = bindings
         .iter()
-        .filter_map(|binding| session_runtime(binding))
-        .collect();
-    let pins = bindings
-        .iter()
-        .filter_map(|binding| match binding.launch_binding.binding() {
-            Some(launch) => match &launch.provenance {
-                protocol::BindingProvenance::Package { package_digest, .. } => {
+        .map(|binding| SessionRecord {
+            runtime: session_runtime(binding),
+            pin: match binding
+                .launch_binding
+                .binding()
+                .map(|launch| &launch.provenance)
+            {
+                Some(protocol::BindingProvenance::Package { package_digest, .. }) => {
                     Some(package_digest.clone())
                 }
-                protocol::BindingProvenance::Builtin { .. } => None,
+                Some(protocol::BindingProvenance::Builtin { .. }) | None => None,
             },
-            None => None,
         })
         .collect();
-    Ok(StoreView { runtimes, pins })
+    Ok(StoreView { records })
 }
 
 /// Digests every installed package a session or profile still pins, excluding
@@ -1001,7 +1014,7 @@ pub(in crate::session) fn retained_pins(
     let mut retained = profiles
         .pinned_digests_excluding(skip)
         .map_err(EnsureError::Profiles)?;
-    retained.extend(read_store(store_path)?.pins);
+    retained.extend(read_store(store_path)?.pins().cloned());
     Ok(retained)
 }
 
@@ -2906,7 +2919,11 @@ fn pin_release(plan: &PlanInputs<'_>, digest: &PackageDigest) -> Option<String> 
         .filter(|(_, pinned)| pinned == digest)
         .map(|(name, _)| format!("{name}.toml"))
         .collect();
-    let session = plan.pins.session.contains(digest);
+    let session = plan
+        .pins
+        .sessions
+        .iter()
+        .any(|record| record.pin.as_ref() == Some(digest));
     let mut who = Vec::new();
     let mut exit = Vec::new();
     if !profiles.is_empty() {
@@ -2957,7 +2974,12 @@ fn follow_up(
         // three modes name the same step.
         let used_after = reasons.iter().any(|reason| match reason {
             UseReason::Profile | UseReason::Integration => true,
-            UseReason::Session => !plan.pins.session.contains(removed),
+            // Another record of the runtime that does not pin the package keeps
+            // it used after the pinning sessions are gone.
+            UseReason::Session => plan.pins.sessions.iter().any(|record| {
+                record.runtime.as_ref() == Some(blocked.runtime)
+                    && record.pin.as_ref() != Some(removed)
+            }),
             UseReason::Detected | UseReason::Installed => false,
         });
         let detected_only = reasons
