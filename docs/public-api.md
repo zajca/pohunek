@@ -2157,8 +2157,9 @@ Event sources:
   evidence still continues a turn that is settling or waiting for approval. The report is held for the debounce window, so an idle that
   lasts less than `attention_debounce_secs` before the session works again
   reports nothing. A hook `Stop` and the projector's idle edge of one turn are
-  one inbox record; a hook report that arrives after its turn was reported adds
-  no second record, though a waiting `session.wait_turn` may see one more turn
+  one inbox record; a hook report that arrives after its turn was reported, within
+  twice `attention_debounce_secs` (at least 2 seconds) of the record reaching the
+  inbox, adds no second record, though a waiting `session.wait_turn` may see one more turn
   event. A daemon restart during a turn, or during the window, can lose that
   turn's report. A runtime without managed hooks (a shell, Hermes without its
   plugin) now completes `until: ["turn_completed"]` waits too.
@@ -3000,7 +3001,7 @@ each turn keeps its own record, and the record of a finished turn is
 acknowledged when the next turn starts. Reports of one turn are merged while
 pending and add nothing once the turn was reported; reports of different turns
 are never merged. A provider report that names no turn right after the
-session's turn reached the inbox does not add a second inbox record.
+session's turn reached the inbox, within that repeat window, does not add a second inbox record.
 The older record remains in history but disappears from default unread inbox
 views. When an attention record for the same session becomes visible, it
 acknowledges any unread `turn:<session_id>` twin with `superseded_by` pointing at
@@ -3022,7 +3023,10 @@ held pending rather than persisted immediately when they carry
 notification id and returns `notification.create` result `created: true` with
 the full record, but the record is not written to the store and does not appear
 in `notification.list` until it flushes. No `notification_created` event is
-emitted for a pending record.
+emitted for a pending record. A `turn_completed` record is stamped with
+`turn_started_at`, `turn_duration_ms` and `session_metadata` when it flushes, so
+the record in the `notification.create` result does not carry them; the one in
+`notification.list` and the events does.
 
 The daemon holds the pending record for `attention_debounce_secs`. If the
 session enters `working` or reaches a terminal lifecycle state within that

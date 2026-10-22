@@ -190,12 +190,16 @@ impl TurnTable {
         self.give_back(handback);
     }
 
-    /// The session ended: no turn answers its input any more.
+    /// The session ended: no turn answers its input any more. A settling turn
+    /// whose window already passed finished before the end and stays reportable.
     fn abandon_all(&mut self) {
+        let now = Instant::now();
         for record in self.records.values_mut() {
-            if record.state != TurnState::Closed {
-                record.state = TurnState::Abandoned;
-            }
+            record.state = match record.state {
+                TurnState::Closed => TurnState::Closed,
+                TurnState::Settling { deadline } if now >= deadline => TurnState::Closed,
+                _ => TurnState::Abandoned,
+            };
         }
         self.discard_input();
     }
@@ -706,7 +710,17 @@ impl TurnEvents {
     /// Input reached the runtime of `session_id`: its next detector-observed
     /// `working` is the answer to it, a turn.
     pub(crate) fn note_input(&self, session_id: &SessionId) {
-        self.progress(session_id).note_input();
+        let progress = {
+            let mut journal = self.journal();
+            // A removed session is unknown to the journal; input to it arms nothing.
+            journal
+                .terminal
+                .contains_key(session_id)
+                .then(|| Arc::clone(journal.progress.entry(session_id.clone()).or_default()))
+        };
+        if let Some(progress) = progress {
+            progress.note_input();
+        }
     }
 
     /// The session runs on a new runtime generation (a launch, a resume, an

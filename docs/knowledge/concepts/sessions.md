@@ -59,9 +59,10 @@ daemon holds and from the daemon's own projector, and are independent of the
 notification policy: a `turn_completed` the inbox drops (the default) still
 completes the wait. An event is recorded when the attention debounce window
 (5 seconds by default) has passed since the last report, so it arrives no
-earlier than that after the agent stops. A `turn_completed` whose window ends
-while the session is `working` is a stale stop and is dropped; a short turn
-that starts and stops inside one window is still recorded once.
+earlier than that after the agent stops. A `turn_completed` report that names no turn
+is a stale stop and is dropped when the session is `working` as its window
+ends; the report of a turn the daemon runs is held until that turn is over. A
+short turn that starts and stops inside one window is still recorded once.
 
 The daemon opens a turn on a `working` it infers from terminal output only
 while the session's runtime holds input evidence (`session.input`, a line an
@@ -324,7 +325,8 @@ preceded, or when the session works again inside the debounce window. The
 daemon stamps the record with `turn_started_at`, `turn_duration_ms` and a copy
 of the session metadata (`session_metadata`) that stays readable after
 `session rm`; a hook report of the same turn is merged with the projector's, and
-one that arrives after its turn was reported adds no second inbox record
+one that arrives after its turn was reported, within twice the debounce window
+(at least 2 seconds) of the record reaching the inbox, adds no second inbox record
 (a waiting `session.wait_turn` may still see one more turn event). The kind stays
 disabled for the inbox by default; enable it with `notifications policy set` for
 a manager that follows many sessions.

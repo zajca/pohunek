@@ -3103,6 +3103,86 @@ async fn a_re_adopted_working_session_runs_its_own_unobserved_turn() {
 }
 
 #[tokio::test]
+async fn a_turn_that_finished_before_the_session_stopped_is_still_reported() {
+    let registry = turn_registry();
+    registry
+        .turn_events()
+        .flap_window_handle()
+        .store(3_000, std::sync::atomic::Ordering::Relaxed);
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    let ended = ended_turns(&mut edges);
+    assert_eq!(ended.len(), 1, "{ended:?}");
+
+    // The window passes without a flush, then the session stops: the report
+    // that was waiting for the flush still finds a finished turn.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(4)).await;
+    tokio::time::resume();
+    let _ = registry.stop(&created.id).await;
+    assert!(
+        matches!(
+            registry.turn_events().settle(&created.id, ended[0], None),
+            TurnVerdict::Surface(_)
+        ),
+        "a turn that went idle a full window before the stop was lost"
+    );
+}
+
+#[tokio::test]
+async fn a_turn_still_inside_its_window_is_dropped_when_the_session_stops() {
+    let registry = turn_registry();
+    registry
+        .turn_events()
+        .flap_window_handle()
+        .store(3_000, std::sync::atomic::Ordering::Relaxed);
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    let ended = ended_turns(&mut edges);
+    let _ = registry.stop(&created.id).await;
+    assert_eq!(
+        registry.turn_events().settle(&created.id, ended[0], None),
+        TurnVerdict::Drop
+    );
+}
+
+#[tokio::test]
+async fn input_to_a_removed_session_arms_nothing() {
+    let registry = turn_registry();
+    let created = registry.create(params()).await.expect("create session");
+    let _ = registry.stop(&created.id).await;
+    registry.remove(&created.id).await.expect("remove session");
+    registry.note_input(&created.id);
+    assert!(
+        registry
+            .turn_events()
+            .existing_progress(&created.id)
+            .is_none(),
+        "the removed session's progress came back"
+    );
+}
+
+#[tokio::test]
 async fn working_seen_from_another_source_keeps_the_running_turn() {
     let registry = turn_registry();
     let mut edges = registry

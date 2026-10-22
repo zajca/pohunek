@@ -501,7 +501,8 @@ pohunek notifications watch --session s-01J00000000000000000000000 --kind turn_c
 The daemon itself reports each finished turn of a session (activity `working`
 to `idle`) as a `turn_completed` once the attention debounce window passes
 without the session working again, whether or not the runtime has a managed
-hook. The record carries `turn_started_at`, `turn_duration_ms` and
+hook. A turn opens on a `working` the daemon infers from terminal output only
+after input reached the runtime; agent reports always open one. The record carries `turn_started_at`, `turn_duration_ms` and
 `session_metadata` (the session's metadata when the turn ended, kept after
 `session rm`), which `--json` prints. The kind is disabled for the inbox by
 default, so a manager enables it first (the `policy set` line above).
