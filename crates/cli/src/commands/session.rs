@@ -179,6 +179,20 @@ pub(crate) fn parse_turn_cursor(value: &str) -> Result<SessionTurnCursor, String
     })
 }
 
+/// Parse an input acknowledgement window of `session new`.
+pub(crate) fn parse_input_ack_timeout_ms(value: &str) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_error| "--input-ack-timeout-ms must be an unsigned 32-bit integer".to_owned())?;
+    if !(1..=protocol::MAX_SESSION_WAIT_MS).contains(&parsed) {
+        return Err(format!(
+            "--input-ack-timeout-ms must be between 1 and {} milliseconds",
+            protocol::MAX_SESSION_WAIT_MS
+        ));
+    }
+    Ok(parsed)
+}
+
 /// Parse a non-zero daemon response timeout for `session new`.
 pub(crate) fn parse_request_timeout_ms(value: &str) -> Result<u32, String> {
     let parsed = value
@@ -371,6 +385,9 @@ pub(crate) struct NewArgs {
     pub reset_diverged: bool,
     /// Initial text to inject into the spawned PTY.
     pub input: Option<String>,
+    /// Acknowledgement window for the initial input; the result then reports
+    /// whether the agent started working on it.
+    pub input_ack_timeout_ms: Option<u32>,
     /// Optional daemon response timeout for this creation request.
     pub request_timeout_ms: Option<u32>,
     /// Parsed `--meta KEY=VALUE` pairs, one per repeated flag. Shape-validated
@@ -647,7 +664,7 @@ pub(crate) async fn run_new(
     // A daemon that predates the behavior would start the session in the
     // checkout root or the project checkout, so the request is refused before it
     // is sent.
-    if cwd_requested || args.from_remote {
+    if cwd_requested || args.from_remote || args.input_ack_timeout_ms.is_some() {
         let capabilities = client.call::<method::HostInspect>(()).await?;
         if cwd_requested && !capabilities.session_new_cwd_supported {
             return Err(CliError::SessionNewCwdUnsupported {
@@ -657,6 +674,12 @@ pub(crate) async fn run_new(
         }
         if args.from_remote && !capabilities.session_new_branch_source_supported {
             return Err(CliError::SessionNewBranchSourceUnsupported {
+                host: host.to_owned(),
+                daemon_version: capabilities.daemon_version,
+            });
+        }
+        if args.input_ack_timeout_ms.is_some() && !capabilities.session_new_input_ack_supported {
+            return Err(CliError::SessionNewInputAckUnsupported {
                 host: host.to_owned(),
                 daemon_version: capabilities.daemon_version,
             });
@@ -686,10 +709,30 @@ pub(crate) async fn run_new(
         );
     }
 
+    // The session exists either way, so a daemon that advertises the capability
+    // but omits the outcome leaves the delivery unknown: it is not printed.
+    let prompt_delivered = if args.input_ack_timeout_ms.is_some() {
+        if result.prompt_delivered.is_none() {
+            eprintln!(
+                "pohunek: warning: host '{host}' did not report whether the prompt was delivered \
+                 although it advertises `session_new_input_ack_supported`; session {} is running.",
+                result.session.id.0
+            );
+        }
+        result.prompt_delivered
+    } else {
+        None
+    };
     if json {
         let mut value = serde_json::to_value(info)?;
         if let (Some(source), Some(object)) = (&result.worktree_source, value.as_object_mut()) {
             object.insert("worktree_source".to_owned(), serde_json::to_value(source)?);
+        }
+        if let (Some(delivered), Some(object)) = (prompt_delivered, value.as_object_mut()) {
+            object.insert(
+                "prompt_delivered".to_owned(),
+                serde_json::Value::Bool(delivered),
+            );
         }
         print!(
             "{}",
@@ -698,7 +741,7 @@ pub(crate) async fn run_new(
     } else {
         print!(
             "{}",
-            render_new_human(info, result.worktree_source.as_ref())
+            render_new_human(info, result.worktree_source.as_ref(), prompt_delivered)
         );
     }
     Ok(())
@@ -1990,6 +2033,7 @@ fn new_params(args: &NewArgs) -> Result<SessionNewParams, CliError> {
         on_diverged: args
             .reset_diverged
             .then_some(protocol::OnDiverged::BackupReset),
+        input_ack_timeout_ms: args.input_ack_timeout_ms,
         metadata: parse_meta_pairs(&args.meta)?,
     })
 }
@@ -2247,7 +2291,11 @@ fn build_diff_request(target: &Target, base: Option<String>) -> Result<Request, 
     request_with_params(method::SESSION_DIFF, &diff_params(target, base))
 }
 
-fn render_new_human(info: &SessionInfo, source: Option<&protocol::WorktreeSource>) -> String {
+fn render_new_human(
+    info: &SessionInfo,
+    source: Option<&protocol::WorktreeSource>,
+    prompt_delivered: Option<bool>,
+) -> String {
     let mut output = format!(
         "session {} created (state: {})\n",
         info.id.0,
@@ -2273,6 +2321,13 @@ fn render_new_human(info: &SessionInfo, source: Option<&protocol::WorktreeSource
         if let Some(backup) = &source.backup_ref {
             let _ = writeln!(output, "  previous local head kept as: {backup}");
         }
+    }
+    if let Some(delivered) = prompt_delivered {
+        let _ = writeln!(
+            output,
+            "  prompt delivered: {}",
+            if delivered { "yes" } else { "no" }
+        );
     }
     write_warnings(&mut output, &info.warnings);
     output
@@ -3084,6 +3139,7 @@ mod tests {
             from_remote: false,
             reset_diverged: false,
             input: None,
+            input_ack_timeout_ms: None,
             request_timeout_ms: None,
             meta: Vec::new(),
         }
@@ -3179,6 +3235,7 @@ mod tests {
             from_remote: false,
             reset_diverged: false,
             input: Some("Fix #1234".to_owned()),
+            input_ack_timeout_ms: None,
             request_timeout_ms: None,
             meta: vec![
                 ("link.provider".to_owned(), "github".to_owned()),
@@ -3826,7 +3883,7 @@ mod tests {
             },
         ];
 
-        let output = render_new_human(&session, None);
+        let output = render_new_human(&session, None, None);
 
         assert!(
             output.starts_with("session s-42 created (state: running)\n"),

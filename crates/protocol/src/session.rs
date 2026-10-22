@@ -402,6 +402,15 @@ pub struct SessionNewParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub extended_input_ready_wait: Option<bool>,
+    /// Acknowledge the initial `input` like a waited `session.input` with
+    /// `until: [working]`: the daemon waits up to this many milliseconds
+    /// (`1..=MAX_SESSION_WAIT_MS`) for `working` activity after the submit and
+    /// reports the outcome as [`SessionNewResult::prompt_delivered`]. Requires
+    /// `input`. A daemon that does not advertise
+    /// `HostCapabilities::session_new_input_ack_supported` ignores the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub input_ack_timeout_ms: Option<u32>,
     /// Owner-controlled metadata for the session. Must not contain secrets.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
@@ -3079,6 +3088,16 @@ pub struct SessionNewResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub worktree_source: Option<WorktreeSource>,
+    /// With [`SessionNewParams::input_ack_timeout_ms`]: `true` when the agent
+    /// showed `working` activity after the initial input was submitted within
+    /// the window. `false` when the window elapsed first, the runtime changed,
+    /// the session ended, the daemon began shutting down, or the delivery ended
+    /// after Enter's send began: the prompt may or may not have been submitted,
+    /// so a client must not resend it on `false` alone. The session is kept
+    /// either way. Absent when no acknowledgement was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub prompt_delivered: Option<bool>,
 }
 
 /// Result returned by `session.fork`.

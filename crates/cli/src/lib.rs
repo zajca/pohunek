@@ -1195,11 +1195,21 @@ enum SessionAction {
         #[arg(long, requires = "from_remote")]
         reset_diverged: bool,
         /// Initial text to inject into the session after the PTY is spawned.
-        #[arg(long)]
+        #[arg(long, group = "initial_input")]
         input: Option<String>,
         /// Read initial text from stdin. Alias: `--stdin`.
-        #[arg(long = "input-stdin", alias = "stdin", conflicts_with = "input")]
+        #[arg(long = "input-stdin", alias = "stdin", group = "initial_input")]
         input_stdin: bool,
+        /// Wait up to this many milliseconds (1..=8000) for the agent to start
+        /// working on the initial input and report whether it did
+        /// (`prompt_delivered`). Requires `--input` or `--input-stdin`.
+        #[arg(
+            long,
+            value_name = "ms",
+            requires = "initial_input",
+            value_parser = commands::session::parse_input_ack_timeout_ms
+        )]
+        input_ack_timeout_ms: Option<u32>,
         /// Override the daemon response timeout for this creation request.
         #[arg(long, value_parser = commands::session::parse_request_timeout_ms)]
         request_timeout_ms: Option<u32>,
@@ -1999,6 +2009,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     reset_diverged,
                     input,
                     input_stdin,
+                    input_ack_timeout_ms,
                     request_timeout_ms,
                     meta,
                     yes,
@@ -2027,6 +2038,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                             from_remote,
                             reset_diverged,
                             input,
+                            input_ack_timeout_ms,
                             request_timeout_ms,
                             meta,
                         },

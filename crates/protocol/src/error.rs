@@ -410,9 +410,9 @@ impl ProtocolError {
         )
     }
 
-    /// The rejection older daemons return for delayed framing that cannot
-    /// safely confirm input; this daemon paces such input itself and no longer
-    /// returns it, but clients keep recognizing it.
+    /// The rejection a daemon that cannot pace delayed-submit input returns for
+    /// a waited input on such framing, before any byte is written. Daemons
+    /// that pace it do not return this code; clients still recognize it.
     #[must_use]
     pub fn session_input_wait_unsupported() -> Self {
         Self::new(

@@ -32,12 +32,13 @@ pub(super) async fn handle_session_new(request: &Request, sessions: &SessionRegi
     // set means the input was applied. Echoing this lets a client detect an
     // older daemon that silently ignored `input` (which returns no flag).
     let requested_input = params.input.is_some();
-    match sessions.create_with_source(params).await {
-        Ok((session, worktree_source)) => {
+    match sessions.create_outcome(params).await {
+        Ok(outcome) => {
             let result = SessionNewResult {
-                session,
+                session: outcome.session,
                 applied_input: requested_input.then_some(true),
-                worktree_source,
+                worktree_source: outcome.worktree_source,
+                prompt_delivered: outcome.prompt_delivered,
             };
             ok_value(request, &result)
         }

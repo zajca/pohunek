@@ -39,7 +39,9 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 10 minutes. The pre-create and post-create hooks each run a host layer and
 /// a repository layer capped at 5 minutes, 20 minutes in all. The remaining
 /// 10 minutes cover the rest of creation, so this client bound does not race
-/// those valid settings.
+/// those valid settings. A creation that asks for an input acknowledgement
+/// (`input_ack_timeout_ms`) adds that window and the delivery bound
+/// ([`protocol::MAX_SESSION_WAIT_MS`]) on top.
 pub const SESSION_NEW_REQUEST_BUDGET_MS: u32 = 60 * 60 * 1_000;
 /// Longest valid daemon bound of one lifecycle step, in milliseconds.
 ///
@@ -761,7 +763,12 @@ impl Client {
         if params.input.is_some() {
             params.extended_input_ready_wait = Some(true);
         }
-        let timeout = lifecycle_request_timeout(self.options, SESSION_NEW_REQUEST_BUDGET_MS);
+        let budget_ms = SESSION_NEW_REQUEST_BUDGET_MS.saturating_add(
+            params.input_ack_timeout_ms.map_or(0, |ack_ms| {
+                ack_ms.saturating_add(protocol::MAX_SESSION_WAIT_MS)
+            }),
+        );
+        let timeout = lifecycle_request_timeout(self.options, budget_ms);
         let mut client = self
             .connect_dedicated(self.options.with_request_timeout(timeout))
             .await?;

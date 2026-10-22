@@ -173,10 +173,13 @@ export function downgradeRequestParams(version: number, method: string, params: 
   ) {
     throw new CompatError({ kind: "methodNotDefined", method });
   }
+  // The previous daemon drops these fields silently.
   if (
     method === "session.new" &&
     isObject(params) &&
-    (isSet(params["branch_source"]) || isSet(params["on_diverged"]))
+    (isSet(params["branch_source"]) ||
+      isSet(params["on_diverged"]) ||
+      isSet(params["input_ack_timeout_ms"]))
   ) {
     throw new CompatError({ kind: "methodNotDefined", method });
   }

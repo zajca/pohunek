@@ -221,6 +221,7 @@ fn host_capabilities_for(
         session_wait_supported: true,
         session_wait_turn_supported: true,
         session_new_cwd_supported: true,
+        session_new_input_ack_supported: true,
         session_idle_stop_supported: true,
         session_new_branch_source_supported: true,
     }

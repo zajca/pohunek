@@ -75,6 +75,15 @@ export type HostCapabilities = {
    */
   session_new_branch_source_supported?: boolean;
   /**
+   * Whether `session.new` honors `input_ack_timeout_ms` and reports
+   * `prompt_delivered`.
+   *
+   * A daemon that predates the field omits it, which decodes as `false`; it
+   * would drop `input_ack_timeout_ms` silently. `false` is likewise omitted
+   * on the wire.
+   */
+  session_new_input_ack_supported?: boolean;
+  /**
    * Whether the daemon serves `session.idle_stop.get` and
    * `session.idle_stop.set` and stops sessions opted in to idle stop.
    *

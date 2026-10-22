@@ -846,6 +846,7 @@ fn session_new_params_json_shape_roundtrips() {
         extended_input_ready_wait: None,
         branch_source: None,
         on_diverged: None,
+        input_ack_timeout_ms: None,
         metadata: BTreeMap::new(),
     };
 
@@ -880,6 +881,7 @@ fn session_new_params_roundtrips_with_metadata() {
         extended_input_ready_wait: None,
         branch_source: None,
         on_diverged: None,
+        input_ack_timeout_ms: None,
         metadata: metadata(&[("owner", "cli"), ("ticket", "DMD-1356")]),
     };
 
@@ -918,6 +920,7 @@ fn session_new_params_roundtrips_with_worktree_fields() {
         extended_input_ready_wait: None,
         branch_source: None,
         on_diverged: None,
+        input_ack_timeout_ms: None,
         metadata: BTreeMap::new(),
     };
 
@@ -954,6 +957,7 @@ fn session_new_params_roundtrips_with_initial_input() {
         extended_input_ready_wait: None,
         branch_source: None,
         on_diverged: None,
+        input_ack_timeout_ms: None,
         metadata: BTreeMap::new(),
     };
 
@@ -3416,6 +3420,7 @@ fn host_capabilities_json_shape_roundtrips() {
         session_wait_supported: true,
         session_wait_turn_supported: true,
         session_new_cwd_supported: true,
+        session_new_input_ack_supported: true,
         session_idle_stop_supported: true,
         session_new_branch_source_supported: true,
     };
@@ -3448,6 +3453,7 @@ fn host_capabilities_json_shape_roundtrips() {
             "session_wait_turn_supported": true,
             "session_new_cwd_supported": true,
             "session_new_branch_source_supported": true,
+            "session_new_input_ack_supported": true,
             "session_idle_stop_supported": true
         })
     );
@@ -3483,6 +3489,10 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
     assert!(
         !caps.session_new_cwd_supported,
         "a host that omits the cwd flag ignores cwd on a project-bound session.new"
+    );
+    assert!(
+        !caps.session_new_input_ack_supported,
+        "a host that omits the ack flag drops input_ack_timeout_ms"
     );
     assert!(
         !caps.session_idle_stop_supported,
@@ -5262,4 +5272,21 @@ fn the_retryable_admission_opt_in_is_additive_on_every_hook_report() {
         serde_json::to_value(&release_plain).expect("serialize"),
         release
     );
+}
+
+#[test]
+fn session_new_input_ack_json_shape_roundtrips() {
+    let params: SessionNewParams = serde_json::from_value(json!({
+        "agent": "shell", "cols": 80, "rows": 24, "input": "hi", "input_ack_timeout_ms": 8000
+    }))
+    .expect("decode acknowledged creation parameters");
+    assert_eq!(params.input_ack_timeout_ms, Some(8000));
+    let value = serde_json::to_value(&params).expect("serialize parameters");
+    assert_eq!(value["input_ack_timeout_ms"], 8000);
+
+    let legacy: SessionNewParams =
+        serde_json::from_value(json!({"agent": "shell", "cols": 80, "rows": 24}))
+            .expect("decode parameters without the window");
+    let value = serde_json::to_value(&legacy).expect("serialize parameters");
+    assert!(value.get("input_ack_timeout_ms").is_none(), "{value}");
 }

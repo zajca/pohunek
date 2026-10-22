@@ -149,6 +149,20 @@ pub(crate) enum CliError {
         cwd: PathBuf,
     },
 
+    /// The host's daemon predates `session new --input-ack-timeout-ms` and
+    /// would drop it, so the outcome of the acknowledgement could not be known.
+    #[error(
+        "host '{host}' runs daemon {daemon_version}, which does not advertise \
+         `session_new_input_ack_supported`: --input-ack-timeout-ms needs a daemon that \
+         advertises it (upgrade the daemon on that host); no session was created"
+    )]
+    SessionNewInputAckUnsupported {
+        /// The host as the user typed it.
+        host: String,
+        /// Version the host's daemon reported.
+        daemon_version: String,
+    },
+
     /// The host's daemon predates `session new --cwd` and would start the
     /// session in the checkout instead of the requested directory.
     #[error(
@@ -428,6 +442,16 @@ impl CliError {
                 "remote_cwd_not_absolute",
                 self.to_string(),
                 Some("pass an absolute --cwd path that exists on that host".to_owned()),
+            ),
+            CliError::SessionNewInputAckUnsupported { .. } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "session_new_input_ack_unsupported",
+                self.to_string(),
+                Some(
+                    "update and restart the pohunek daemon on that host to a release that advertises \
+                     `session_new_input_ack_supported`, or start the session without --input-ack-timeout-ms"
+                        .to_owned(),
+                ),
             ),
             CliError::SessionNewCwdUnsupported { .. } => ProtocolError::new(
                 ErrorClass::Configuration,

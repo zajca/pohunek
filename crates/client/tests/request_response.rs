@@ -868,6 +868,59 @@ async fn session_resume_outlasts_the_default_request_timeout() {
     inhibitor.release().await;
 }
 
+/// Daemon-side duration of an acknowledged creation that used its whole
+/// budget: the creation budget, then the largest delivery bound and the largest
+/// acknowledgement window the daemon accepts, less one second of the client's
+/// transport headroom.
+fn slow_acknowledged_creation() -> Duration {
+    Duration::from_millis(u64::from(pohunek_client::SESSION_NEW_REQUEST_BUDGET_MS))
+        + Duration::from_millis(u64::from(protocol::MAX_SESSION_WAIT_MS) * 2)
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_creation_with_the_largest_input_ack_outlasts_the_creation_budget() {
+    let inhibitor = AutoAdvanceInhibitor::new();
+    let socket_file = SocketFile::new();
+    let listener = UnixListener::bind(socket_file.path()).expect("bind fixture daemon");
+    let (request_tx, request_rx) = oneshot::channel();
+    let (reply_tx, reply_rx) = oneshot::channel::<()>();
+    let mut result = session_info_json("s-ack");
+    result["applied_input"] = json!(true);
+    result["prompt_delivered"] = json!(false);
+    let server = spawn_lifecycle_daemon(listener, request_tx, reply_rx, result);
+
+    let mut client = Client::connect_local_with_options(socket_file.path(), no_origin_options())
+        .await
+        .expect("connect fixture daemon");
+    client.handshake().await.expect("negotiate protocol");
+    let params = serde_json::from_value(json!({
+        "agent": "shell", "cols": 80, "rows": 24, "input": "hello",
+        "input_ack_timeout_ms": protocol::MAX_SESSION_WAIT_MS
+    }))
+    .expect("valid creation parameters");
+    let creation = tokio::spawn(async move { client.session_new(params).await });
+    let (request, dedicated) = request_rx.await.expect("creation request reached daemon");
+    assert_eq!(request.method(), protocol::method::SESSION_NEW);
+    assert!(dedicated, "the creation runs on a dedicated connection");
+    // Past the creation budget plus the transport headroom, so a client that
+    // did not add the delivery bound and the window would have given up.
+    tokio::time::advance(
+        slow_acknowledged_creation()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the acknowledged creation outlasts one second"),
+    )
+    .await;
+    reply_tx.send(()).expect("release the creation reply");
+
+    let created = creation
+        .await
+        .expect("creation task completed")
+        .expect("the client waits for the daemon's reply instead of timing out");
+    assert_eq!(created.prompt_delivered, Some(false));
+    server.await.expect("fixture daemon completed");
+    inhibitor.release().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn session_resume_past_its_deadline_reports_an_unknown_outcome() {
     let inhibitor = AutoAdvanceInhibitor::new();

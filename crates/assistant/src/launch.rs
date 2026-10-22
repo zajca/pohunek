@@ -320,6 +320,7 @@ pub async fn prepare_with_options(
         extended_input_ready_wait: None,
         branch_source: params.branch_source,
         on_diverged: params.on_diverged,
+        input_ack_timeout_ms: None,
         metadata: std::collections::BTreeMap::new(),
     };
 

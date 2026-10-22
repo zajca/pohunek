@@ -857,6 +857,7 @@ fn session_params_in(cwd: PathBuf) -> SessionNewParams {
         extended_input_ready_wait: None,
         branch_source: None,
         on_diverged: None,
+        input_ack_timeout_ms: None,
         metadata: std::collections::BTreeMap::new(),
     }
 }
@@ -876,6 +877,7 @@ fn session_params_for_agent(agent: &RuntimeRef, cwd: PathBuf) -> SessionNewParam
         extended_input_ready_wait: None,
         branch_source: None,
         on_diverged: None,
+        input_ack_timeout_ms: None,
         metadata: std::collections::BTreeMap::new(),
     }
 }
@@ -900,6 +902,7 @@ fn session_params_for_worktree(
         extended_input_ready_wait: None,
         branch_source: None,
         on_diverged: None,
+        input_ack_timeout_ms: None,
         metadata: std::collections::BTreeMap::new(),
     }
 }
@@ -2993,13 +2996,23 @@ fn oversized_input() -> String {
 
 #[tokio::test]
 async fn session_new_rolls_back_when_the_agent_never_reads_its_initial_input() {
-    let socket = temp_socket("session-new-input-stalled");
+    assert_stalled_create_rolls_back("session-new-input-stalled", None).await;
+}
+
+#[tokio::test]
+async fn session_new_with_an_ack_window_rolls_back_when_the_agent_never_reads_its_input() {
+    assert_stalled_create_rolls_back("session-new-ack-stalled", Some(1_000)).await;
+}
+
+async fn assert_stalled_create_rolls_back(tag: &str, input_ack_timeout_ms: Option<u32>) {
+    let socket = temp_socket(tag);
     let (shutdown, handle, _) =
         spawn_server_with_config(&socket, "0.0.0", silent_agent_config()).await;
 
     let mut client = connect(&socket).await;
     let mut params = session_params(&socket);
     params.input = Some(oversized_input());
+    params.input_ack_timeout_ms = input_ack_timeout_ms;
     let error = err_payload(create_session_with_params(&mut client, params).await);
     assert_eq!(error.code, "session_input_stalled");
     assert_eq!(error.class, ErrorClass::Runtime);
@@ -4863,6 +4876,11 @@ async fn host_zero_submit_delay_passes_wait_framing_for_opted_in_claude() {
         .into_result()
         .expect_err("the fake agent leaves the activity wait incomplete");
     assert_eq!(error.code, "session_input_timeout");
+    assert!(
+        !error.msg.contains("Enter was written"),
+        "a zero-delay profile settles in one plan: {}",
+        error.msg
+    );
     assert_eq!(captured, Some(b"hello\r".to_vec()));
 }
 
@@ -4877,6 +4895,11 @@ async fn host_zero_submit_delay_does_not_override_non_opted_in_codex() {
         .into_result()
         .expect_err("the fake agent leaves the activity wait incomplete");
     assert_eq!(error.code, "session_input_timeout");
+    assert!(
+        error.msg.contains("Enter was written"),
+        "Codex keeps its delayed, daemon-paced submit: {}",
+        error.msg
+    );
     // Codex frames the body as a bracketed paste, so the fake agent's first
     // six bytes are the paste start.
     assert_eq!(captured, Some(b"\x1b[200~".to_vec()));
@@ -4898,6 +4921,11 @@ async fn per_runtime_submit_delay_override_wins_over_host_zero() {
         .into_result()
         .expect_err("the fake agent leaves the activity wait incomplete");
     assert_eq!(error.code, "session_input_timeout");
+    assert!(
+        error.msg.contains("Enter was written"),
+        "the per-runtime delay wins over host zero: {}",
+        error.msg
+    );
     assert_eq!(captured, Some(b"hello\r".to_vec()));
 }
 
