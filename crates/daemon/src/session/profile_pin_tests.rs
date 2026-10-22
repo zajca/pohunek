@@ -181,6 +181,31 @@ async fn a_disabled_package_refuses_a_fresh_launch_through_a_relay_approved_pinn
     assert_eq!(refused.code, "runtime_not_installed");
 }
 
+/// The offline upgrade plan retains what the daemon's uninstall retains for a
+/// profile pin.
+#[tokio::test]
+async fn the_upgrade_plan_retains_what_the_daemon_uninstall_retains_for_a_profile_pin() {
+    let dir = temp_dir("pin-retained-plan");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let pinned = Pinned::new("pin-retained-plan", &script, &dir);
+    let registry = pinned.registry();
+
+    let daemon = registry.retained_package_digests().await.expect("retained");
+    let plan = super::package_lifecycle::ensure::retained_pins(
+        &pinned.store_path,
+        &registry.inner.profiles,
+        None,
+    )
+    .expect("the plan's retained set");
+
+    assert!(daemon.contains(&pinned.digest));
+    assert_eq!(
+        plan.iter().collect::<Vec<_>>(),
+        daemon.iter().collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test]
 async fn a_profile_pin_alone_retains_the_package_and_refuses_uninstall() {
     let dir = temp_dir("pin-retained");

@@ -2383,9 +2383,21 @@ the gap is dropped with a runtime the detecting plan drops, that is one nothing 
 no profile has as its base, and whose program is off the search path), and
 `plugin_update_version_unordered` (the selected version of an official package, of
 a reserved runtime or not, cannot be ordered against the release's and is enabled and loadable, so it is kept,
-as `plugin update` refuses to replace it). The first two of these three name the command
+as `plugin update` refuses to replace it), and
+`plugin_update_same_version_other_digest` (the registry already records the release
+package's id and version under another digest, whatever its flags, source or selection,
+so the release's archive cannot be installed beside it; the enabled, loadable selection
+that serves the runtime is kept, status `kept` with `release_version` the shared
+version, nothing is written; a newer Pi selection is kept silently. The detail names
+`pohunek plugin uninstall <package> --digest <digest> --yes` of the recorded package only
+when that package is the verified, selected one of a reserved runtime that a profile,
+session or installed hook makes the plain upgrade plan, and no session or host profile pins
+it and no unpinned profile is bound to it by the upgrade (no command releases a pin); in
+every other state it names no command: the selected package keeps serving, and the fix is a
+release that gives the package a new version. For Pi the detail adds that the upgrade does
+not install a Pi package again once none is installed.) The first two of these four name the command
 that updates or repairs the package by hand. A gap never blocks an apply, and `gaps` is empty
-without `--detect` except for those three. The step also keeps an installed official package of a runtime that is
+without `--detect` except for those four. The step also keeps an installed official package of a runtime that is
 not reserved (Pi) current: when one is installed from the official catalog,
 selected and enabled, and the release lists a package of the same id, the plan
 installs and selects the release's version (reason `installed`) and the profiles
@@ -2489,7 +2501,11 @@ How to read it:
   without an enabled S, 18-23).
 - S cannot have the release's version under another digest while R is recorded: the
   registry holds one digest per package version, so a second digest is refused with
-  `package_identity_installed`.
+  `package_identity_installed`. When the registry records the release's id and version
+  under another digest and an enabled, loadable S serves the runtime (R is not
+  recorded), the plan and the apply keep S (status `kept`) with the gap
+  `plugin_update_same_version_other_digest` and write nothing, for a reserved runtime and
+  for Pi; a disabled S is row 18-20's outcome.
 
 The scenarios are `claude_judges_the_disabled_release_package_by_the_selection_state`,
 `codex_judges_the_disabled_release_package_by_the_selection_state`,

@@ -851,6 +851,19 @@ When the selected official version of any runtime, `claude`, `codex` and
 `1.0.3`), the upgrade keeps the selected version, installs nothing for that
 runtime and reports the gap `plugin_update_version_unordered`. The plan names
 the retained package and the version the release offers, as it does for Pi.
+When the registry already records the release package's id and version under another
+digest (a rebuilt archive that kept its version string; the record may be selected or
+not, enabled or not), the upgrade cannot install the release's archive beside it
+(`package_identity_installed`). It keeps the enabled selection that serves the runtime,
+installs nothing and reports the gap `plugin_update_same_version_other_digest`. The fix
+at the source is a release that bumps the version. The detail names
+`pohunek plugin uninstall <package> --digest <digest> --yes` of the recorded package only
+when that package is the verified, selected one of a reserved runtime that a profile,
+session or hook makes the plain upgrade plan, and no session or host profile pins it and
+no unpinned profile is bound to it by the upgrade (the next upgrade then installs the
+release's archive). The profile the earlier upgrade bound normally pins it, no command
+releases that pin, and the detail then names no command. For Pi it never names one: the
+upgrade does not install a Pi package again once none is installed.
 A selected package you disabled is never replaced, selected or enabled, whatever its
 version is (older, newer, equal under another digest or unordered; the release's own
 package counts too): the plan plans nothing for that runtime and reports the gap

@@ -101,6 +101,12 @@ pub const CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING: &str = "official_package_not_se
 /// code is the one `plugin update` reports for the same condition.
 pub const CODE_GAP_UPDATE_VERSION_UNORDERED: &str = "plugin_update_version_unordered";
 
+/// The registry holds the release package's id and version under another
+/// digest, so the release's archive cannot be installed beside it. The enabled
+/// selection that serves the runtime is kept.
+pub const CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST: &str =
+    "plugin_update_same_version_other_digest";
+
 /// What the step found, planned and (unless a dry run) did.
 ///
 /// A report with any [`EnsureReport::refusals`] changed nothing: the step
