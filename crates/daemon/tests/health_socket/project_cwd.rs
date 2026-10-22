@@ -285,21 +285,51 @@ async fn a_project_session_follows_a_directory_inside_another_repository() {
 }
 
 #[tokio::test]
-async fn a_symlinked_launch_directory_is_stored_in_canonical_form() {
+async fn a_symlinked_launch_directory_is_stored_and_observed_in_canonical_form() {
     let mut rig = ProjectRig::start("pcwd-symlink").await;
     let real = rig.outside.join("real");
+    let nested = real.join("nested");
     let link = rig.outside.join("link");
-    std::fs::create_dir(&real).expect("create the real directory");
+    std::fs::create_dir_all(&nested).expect("create the real directories");
     std::os::unix::fs::symlink(&real, &link).expect("create the symlink");
 
     let session: SessionInfo =
-        serde_json::from_value(ok_payload(rig.new_session(Some(link)).await))
+        serde_json::from_value(ok_payload(rig.new_session(Some(link.clone())).await))
             .expect("session info");
-
     assert_eq!(
         session.cwd,
         real.canonicalize().expect("canonical real directory"),
         "the stored launch directory is the path the process tree reports"
+    );
+
+    let moved = rig.move_session_to(&session.id, &link.join("nested")).await;
+
+    assert_eq!(
+        moved.cwd,
+        nested.canonicalize().expect("canonical nested directory"),
+        "the observation reports the canonical path"
+    );
+    assert_eq!(
+        moved.project_id.as_deref(),
+        Some(rig.project.id.as_str()),
+        "the reference's project survives the observation of the canonical path"
+    );
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn a_project_session_launched_in_the_checkout_follows_its_directory_out() {
+    let mut rig = ProjectRig::start("pcwd-clears").await;
+    let session: SessionInfo =
+        serde_json::from_value(ok_payload(rig.new_session(None).await)).expect("session info");
+    assert_eq!(session.project_id.as_deref(), Some(rig.project.id.as_str()));
+
+    let outside = rig.outside.to_path_buf();
+    let moved = rig.move_session_to(&session.id, &outside).await;
+
+    assert_eq!(
+        moved.project_id, None,
+        "a session launched inside a repository follows its directory out of the project"
     );
     rig.finish().await;
 }

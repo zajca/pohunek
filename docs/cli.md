@@ -166,8 +166,9 @@ pohunek notifications watch --all-hosts        # one triage stream for every mac
 ```
 
 Remote session starts ask for confirmation (skip with `--yes`); project
-references resolve on the *target* host, so no filesystem path ever crosses
-the wire.
+references resolve on the *target* host. The only filesystem path the CLI
+sends is an explicit absolute `session new --cwd`, which the target host
+resolves on its own filesystem.
 
 The human `host inspect` table adds `config_home_id=...` to every runtime that
 declares a config home. Entries that show the same value launch against the same

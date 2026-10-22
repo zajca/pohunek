@@ -152,16 +152,14 @@ pub(crate) enum CliError {
     /// session in the checkout instead of the requested directory.
     #[error(
         "host '{host}' runs daemon {daemon_version}, which does not advertise \
-         `session_new_cwd_supported`: --cwd needs a daemon of release {cli_version} (this CLI) \
-         or newer; no session was created"
+         `session_new_cwd_supported`: --cwd needs a daemon that advertises it (upgrade the \
+         daemon on that host); no session was created"
     )]
     SessionNewCwdUnsupported {
         /// The host as the user typed it.
         host: String,
         /// Version the host's daemon reported.
         daemon_version: String,
-        /// Version of this CLI, the oldest release known to honor `--cwd`.
-        cli_version: &'static str,
     },
 
     /// A remote `project add` named no PATH. A local path is meaningless on
@@ -421,8 +419,8 @@ impl CliError {
                 "session_new_cwd_unsupported",
                 self.to_string(),
                 Some(
-                    "update and restart the pohunek daemon on that host to this CLI's release, \
-                     or start the session without --cwd"
+                    "update and restart the pohunek daemon on that host to a release that advertises \
+                     `session_new_cwd_supported`, or start the session without --cwd"
                         .to_owned(),
                 ),
             ),

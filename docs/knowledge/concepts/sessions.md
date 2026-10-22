@@ -812,7 +812,13 @@ change emits `session_updated` and re-resolves project and worktree context. If
 the new cwd is inside another registered active worktree, `worktree_path`,
 `branch`, and project metadata move to that worktree; if it is outside every
 known worktree, `worktree_path` is cleared while git `repo`/`branch` metadata is
-kept when detection still finds a repository.
+kept when detection still finds a repository. A session started by reference
+(`--project`/`--repo`) whose launch directory lies outside every repository
+(`session new --cwd`) keeps its `project_id`/`repo`/`branch` while the observed
+cwd also resolves to no project; an observed cwd inside a repository follows
+it. A by-reference session launched inside a repository follows its cwd
+exactly like any other session, so a `cd` to a directory outside every
+repository clears the association.
 
 Every managed `SessionInfo` has a `runtime` object distinct from its agent
 `state` and `activity`. Runtime state is one of `starting`, `live`,

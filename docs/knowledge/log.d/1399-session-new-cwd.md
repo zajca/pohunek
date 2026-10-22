@@ -7,8 +7,9 @@ reference. A missing or non-directory path, a relative remote path and `--cwd`
 with `--branch` are refused before a session is created, and a host whose daemon
 does not advertise `session_new_cwd_supported` is refused with
 `session_new_cwd_unsupported` for every explicit `--cwd`. The daemon stores the
-canonical launch directory, and a by-reference session keeps its project when
-it later moves outside every repository. See [sessions](concepts/sessions.md).
+canonical launch directory. A by-reference session launched outside every
+repository keeps its project while it moves between directories outside every
+repository; one launched inside a repository follows its cwd as before. See [sessions](concepts/sessions.md).
 Without `--project`/`--repo`, an explicit `--cwd` below a checkout now starts the
 session in that directory; the CLI sends the work-tree root itself for a start
 without `--cwd`. An older CLI with this daemon sends its own directory for such

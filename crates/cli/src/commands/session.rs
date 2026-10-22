@@ -649,7 +649,6 @@ pub(crate) async fn run_new(
             return Err(CliError::SessionNewCwdUnsupported {
                 host: host.to_owned(),
                 daemon_version: capabilities.daemon_version,
-                cli_version: env!("CARGO_PKG_VERSION"),
             });
         }
     }

@@ -4886,10 +4886,11 @@ impl SessionRegistry {
     /// The association an observed `cwd` gives the session, or `None` when the
     /// session keeps its current one.
     ///
-    /// A session created by reference outside every repository holds an
-    /// association its cwd does not explain. An observed cwd that resolves to
-    /// no project leaves it alone, while an observed cwd inside a repository
-    /// replaces it as before.
+    /// A session whose current cwd lies outside every repository but that holds
+    /// an association (a by-reference session started outside its checkout)
+    /// keeps it while the observed cwd also resolves to no project. An observed
+    /// cwd inside a repository replaces the association, and a session whose
+    /// current cwd is inside a repository drops it on a move outside.
     async fn resolve_cwd_association(
         &self,
         id: &SessionId,
