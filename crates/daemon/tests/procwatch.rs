@@ -397,6 +397,8 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
                 base_branch: None,
                 input: None,
                 extended_input_ready_wait: None,
+                branch_source: None,
+                on_diverged: None,
                 metadata: BTreeMap::new(),
             })
             .await
@@ -482,6 +484,8 @@ async fn assert_foreground_agent_unattributed_without_the_official_package(agent
                 base_branch: None,
                 input: None,
                 extended_input_ready_wait: None,
+                branch_source: None,
+                on_diverged: None,
                 metadata: BTreeMap::new(),
             })
             .await
@@ -580,6 +584,8 @@ async fn procwatch_keeps_worker_agent_after_daemon_restart() {
                                 base_branch: None,
                                 input: None,
                                 extended_input_ready_wait: None,
+                                branch_source: None,
+                                on_diverged: None,
                                 metadata: BTreeMap::new(),
                             })
                             .await
@@ -733,6 +739,8 @@ async fn procwatch_skips_nested_worker_agent_with_same_session_marker() {
                 base_branch: None,
                 input: None,
                 extended_input_ready_wait: None,
+                branch_source: None,
+                on_diverged: None,
                 metadata: BTreeMap::new(),
             })
             .await
@@ -814,6 +822,8 @@ async fn procwatch_updates_cwd_after_shell_cd() {
             base_branch: None,
             input: None,
             extended_input_ready_wait: None,
+            branch_source: None,
+            on_diverged: None,
             metadata: BTreeMap::new(),
         })
         .await

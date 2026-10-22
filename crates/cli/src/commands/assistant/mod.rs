@@ -81,6 +81,8 @@ pub(crate) struct AssistantOptions {
     pub(crate) repo: Option<PathBuf>,
     pub(crate) branch: Option<String>,
     pub(crate) base_branch: Option<String>,
+    pub(crate) from_remote: bool,
+    pub(crate) reset_diverged: bool,
     pub(crate) yes: bool,
     pub(crate) json: bool,
     pub(crate) print_prompt: bool,
@@ -324,12 +326,15 @@ fn emit_launch_output(
         #[derive(Serialize)]
         struct Output<'a> {
             session: &'a protocol::SessionInfo,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            worktree_source: Option<&'a protocol::WorktreeSource>,
             assistant: AssistantMeta<'a>,
         }
         print!(
             "{}",
             crate::commands::render_json(&Output {
                 session: info,
+                worktree_source: result.worktree_source.as_ref(),
                 assistant: AssistantMeta {
                     intent: opts.intent.as_str(),
                     agent: &result.assistant.agent,
@@ -352,6 +357,18 @@ fn emit_launch_output(
             ""
         };
         println!("started assistant session{degraded_note}: {target}");
+        if let Some(source) = &result.worktree_source {
+            println!(
+                "worktree source: {} at {}",
+                source.source_ref, source.commit
+            );
+            if let Some(previous) = &source.fast_forwarded_from {
+                println!("fast-forwarded from: {previous}");
+            }
+            if let Some(backup) = &source.backup_ref {
+                println!("previous local head kept as: {backup}");
+            }
+        }
         println!("agent: {}", result.assistant.agent);
         println!("intent: {}", opts.intent.as_str());
         println!(
@@ -415,6 +432,10 @@ fn assistant_params(opts: &AssistantOptions, auto_started: bool) -> core_assista
         repo: opts.repo.clone(),
         branch: opts.branch.clone(),
         base_branch: opts.base_branch.clone(),
+        branch_source: opts.from_remote.then_some(protocol::BranchSource::Remote),
+        on_diverged: opts
+            .reset_diverged
+            .then_some(protocol::OnDiverged::BackupReset),
         cols: DEFAULT_COLS,
         rows: DEFAULT_ROWS,
         no_snapshot: opts.no_snapshot,
@@ -468,6 +489,8 @@ mod tests {
             repo: None,
             branch: None,
             base_branch: None,
+            from_remote: false,
+            reset_diverged: false,
             yes: false,
             json: false,
             print_prompt: false,

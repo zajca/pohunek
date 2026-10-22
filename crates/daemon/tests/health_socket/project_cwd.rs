@@ -193,6 +193,7 @@ async fn the_host_advertises_that_it_honors_the_directory() {
             .expect("host capabilities");
 
     assert!(capabilities.session_new_cwd_supported);
+    assert!(capabilities.session_new_branch_source_supported);
     rig.finish().await;
 }
 

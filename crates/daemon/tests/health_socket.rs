@@ -9,6 +9,8 @@
 
 // The daemon's unit tests share this view; it keeps `session.remove`
 // independent of the test host's processes whose markers cannot be read.
+#[path = "health_socket/branch_source.rs"]
+mod branch_source;
 #[path = "health_socket/native_attestation.rs"]
 mod native_attestation;
 #[path = "health_socket/native_recovery.rs"]
@@ -807,6 +809,8 @@ fn session_params_in(cwd: PathBuf) -> SessionNewParams {
         base_branch: None,
         input: None,
         extended_input_ready_wait: None,
+        branch_source: None,
+        on_diverged: None,
         metadata: std::collections::BTreeMap::new(),
     }
 }
@@ -824,6 +828,8 @@ fn session_params_for_agent(agent: &RuntimeRef, cwd: PathBuf) -> SessionNewParam
         base_branch: None,
         input: None,
         extended_input_ready_wait: None,
+        branch_source: None,
+        on_diverged: None,
         metadata: std::collections::BTreeMap::new(),
     }
 }
@@ -846,6 +852,8 @@ fn session_params_for_worktree(
         base_branch: None,
         input: None,
         extended_input_ready_wait: None,
+        branch_source: None,
+        on_diverged: None,
         metadata: std::collections::BTreeMap::new(),
     }
 }

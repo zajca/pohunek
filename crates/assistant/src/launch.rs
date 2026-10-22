@@ -120,6 +120,8 @@ pub struct LaunchParams {
     pub repo: Option<PathBuf>,
     pub branch: Option<String>,
     pub base_branch: Option<String>,
+    pub branch_source: Option<protocol::BranchSource>,
+    pub on_diverged: Option<protocol::OnDiverged>,
     pub cols: u16,
     pub rows: u16,
     pub no_snapshot: bool,
@@ -164,6 +166,7 @@ pub struct LaunchMeta {
 pub struct LaunchResult {
     pub session: SessionInfo,
     pub applied_input: Option<bool>,
+    pub worktree_source: Option<protocol::WorktreeSource>,
     pub assistant: LaunchMeta,
 }
 
@@ -244,6 +247,22 @@ pub async fn prepare_with_options(
     validate_target(config, &params)?;
     let mut client = connect_client(config, options).await?;
     let capabilities = fetch_capabilities(&mut client).await?;
+    if params.branch_source.is_some() && !capabilities.session_new_branch_source_supported {
+        return Err(protocol::ProtocolError::new(
+            protocol::ErrorClass::Configuration,
+            "session_new_branch_source_unsupported",
+            format!(
+                "host's daemon {} does not advertise `session_new_branch_source_supported`: \
+                 --from-remote needs a daemon that advertises it; no session was created",
+                capabilities.daemon_version
+            ),
+            Some(
+                "update and restart the pohunek daemon on that host, or start without --from-remote"
+                    .to_owned(),
+            ),
+        )
+        .into());
+    }
     let selection = select_agent(&capabilities, params.agent.as_deref())?;
     let (snapshot, orientation) = if params.no_snapshot {
         skipped_snapshot(config, &params, &selection.name)
@@ -299,6 +318,8 @@ pub async fn prepare_with_options(
         base_branch: params.base_branch,
         input: Some(prompt.clone()),
         extended_input_ready_wait: None,
+        branch_source: params.branch_source,
+        on_diverged: params.on_diverged,
         metadata: std::collections::BTreeMap::new(),
     };
 
@@ -331,6 +352,7 @@ pub async fn start_prepared_with_options(
     Ok(LaunchResult {
         session: result.session,
         applied_input: result.applied_input,
+        worktree_source: result.worktree_source,
         assistant: LaunchMeta {
             intent: prepared.intent,
             agent: prepared.selection.name,

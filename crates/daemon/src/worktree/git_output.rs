@@ -69,17 +69,40 @@ impl Stream {
 /// Reap the leader before returning and close every pipe on every path.
 /// `after_exit` runs immediately on reap, before any post-exit drain.
 pub(super) fn capture(
+    command: Command,
+    timeout: Duration,
+    after_exit: impl FnOnce(),
+) -> Result<Captured, String> {
+    capture_with_input(command, timeout, after_exit, None)
+}
+
+/// [`capture`] feeding `input` to the command's stdin before closing it.
+///
+/// `input` must fit the pipe buffer (a few lines of ref updates): it is written
+/// before the output is drained, so a larger one could block on a command that
+/// is itself blocked writing.
+pub(super) fn capture_with_input(
     mut command: Command,
     timeout: Duration,
     after_exit: impl FnOnce(),
+    input: Option<&[u8]>,
 ) -> Result<Captured, String> {
     let (stdout, stdout_writer) = Stream::new().map_err(|error| capture_error(&error))?;
     let (stderr, stderr_writer) = Stream::new().map_err(|error| capture_error(&error))?;
     configure_process_group(&mut command);
     command.stdout(stdout_writer).stderr(stderr_writer);
+    if input.is_some() {
+        command.stdin(std::process::Stdio::piped());
+    }
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to run git: {error}"))?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        if let Err(error) = std::io::Write::write_all(&mut stdin, input) {
+            terminate_process_group(&mut child);
+            return Err(format!("failed to feed git: {error}"));
+        }
+    }
     // Command retains its configured writers after spawn; they must not keep EOF open.
     drop(command);
     let mut streams = [stdout, stderr];

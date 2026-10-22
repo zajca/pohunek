@@ -273,6 +273,53 @@ impl CwdSource {
     }
 }
 
+/// Where the branch of a worktree session comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "BranchSource.ts"))]
+#[serde(rename_all = "snake_case")]
+pub enum BranchSource {
+    /// Use the local branch when it exists, else create it from the base.
+    Local,
+    /// Fetch `origin/<branch>` and build the worktree from that commit,
+    /// fast-forwarding a local branch that is behind it.
+    Remote,
+}
+
+/// Resolution of a local branch that has diverged from its remote namesake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "OnDiverged.ts"))]
+#[serde(rename_all = "snake_case")]
+pub enum OnDiverged {
+    /// Keep the local head as `backup/<branch>-<short-sha>`, then reset the
+    /// branch to the remote head.
+    BackupReset,
+}
+
+/// The commit a `session.new` worktree was built from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "WorktreeSource.ts"))]
+pub struct WorktreeSource {
+    /// `origin/<branch>` when the worktree starts at the fetched remote head,
+    /// `refs/heads/<branch>` when it starts at a local head that is ahead of it.
+    #[serde(rename = "ref")]
+    #[cfg_attr(feature = "ts", ts(rename = "ref"))]
+    pub source_ref: String,
+    /// Commit the worktree was created at.
+    pub commit: String,
+    /// The previous local head, when the local branch was fast-forwarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub fast_forwarded_from: Option<String>,
+    /// The ref (without `refs/heads/`) that keeps the previous local head, when
+    /// a diverged branch was reset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub backup_ref: Option<String>,
+}
+
 /// Parameters for `session.new`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -329,6 +376,20 @@ pub struct SessionNewParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub base_branch: Option<String>,
+    /// Where `branch` comes from. Absent or `local` checks out an existing
+    /// local branch as it is; `remote` fetches `origin/<branch>` first and
+    /// builds the worktree from it (see [`BranchSource`]). `remote` requires
+    /// `branch` and excludes `base_branch`. A daemon that predates the option
+    /// ignores it, so a client must not send it to one (the N-1 client adapter
+    /// refuses it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub branch_source: Option<BranchSource>,
+    /// What to do when a `remote` branch has diverged from its local namesake.
+    /// Absent refuses with `branch_diverged`. Requires `branch_source: remote`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub on_diverged: Option<OnDiverged>,
     /// Initial text to inject into the freshly spawned PTY in the same
     /// `session.new` round-trip. The daemon applies the same agent-specific
     /// submit framing used by `session.input`.
@@ -2529,6 +2590,10 @@ pub enum SessionWarningKind {
     /// stays listed; start a new session and resume the native conversation
     /// from the reference in the warning's `detail`.
     NativeRecovery,
+    /// A `remote` worktree session started at the local head of a branch that
+    /// is ahead of `origin/<branch>`, so commits not on the remote are in the
+    /// worktree. The `detail` names both heads.
+    BranchAheadOfRemote,
     /// A kind this build does not know, sent by a newer daemon. Decoding a
     /// [`SessionInfo`] drops warnings of this kind, and serializing it fails,
     /// so it never reaches a display or a re-emitted document.
@@ -3002,6 +3067,11 @@ pub struct SessionNewResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub applied_input: Option<bool>,
+    /// Which commit the worktree was built from; present for a worktree
+    /// session started with `branch_source: remote`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub worktree_source: Option<WorktreeSource>,
 }
 
 /// Result returned by `session.fork`.

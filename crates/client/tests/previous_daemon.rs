@@ -606,6 +606,49 @@ async fn metadata_list_filters_fail_before_the_previous_daemon_receives_them() {
 }
 
 #[tokio::test]
+async fn branch_source_options_fail_before_the_previous_daemon_receives_them() {
+    guard("the current-only branch source options", async {
+        for option in [
+            json!({ "branch_source": "remote" }),
+            json!({ "branch_source": "local" }),
+            json!({ "branch_source": "remote", "on_diverged": "backup_reset" }),
+        ] {
+            let daemon = PreviousDaemon::start().await;
+            let mut client = daemon.client().await;
+            let mut params = json!({
+                "agent": "shell",
+                "cols": 80,
+                "rows": 24,
+                "repo": "/work/repo",
+                "branch": "feat"
+            });
+            params
+                .as_object_mut()
+                .expect("object params")
+                .extend(option.as_object().expect("object option").clone());
+            let error = client
+                .request(&request_for(method::SESSION_NEW, params))
+                .await
+                .expect_err("the previous daemon would check out the stale local branch");
+            assert!(matches!(
+                error,
+                ClientError::DaemonProtocolTooOld {
+                    method: ref name,
+                    daemon_version,
+                    required_version,
+                    ..
+                } if name == method::SESSION_NEW
+                    && daemon_version == previous()
+                    && required_version == PROTOCOL_VERSION
+            ));
+            assert_eq!(daemon.methods(), [method::DAEMON_HEALTH]);
+            assert_eq!(daemon.violations(), Vec::<String>::new());
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_version_dependent_request_learns_the_version_before_it_is_sent() {
     guard("the dependent request", async {
         let daemon = PreviousDaemon::start().await;

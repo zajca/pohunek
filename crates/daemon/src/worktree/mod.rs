@@ -45,7 +45,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use protocol::{
-    ErrorClass, ProtocolError, SessionRetentionHold, SessionWarning, SessionWarningKind,
+    BranchSource, ErrorClass, OnDiverged, ProtocolError, SessionRetentionHold, SessionWarning,
+    SessionWarningKind, WorktreeSource,
 };
 use tracing::{debug, info, warn};
 
@@ -53,9 +54,11 @@ use crate::store::{Store, StoreMutation, WorktreeBinding, WorktreeStatus};
 use crate::time::now_rfc3339;
 
 mod git_output;
+mod remote;
 mod stderr_drain;
 mod stderr_tail;
 
+use remote::{create_remote_worktree, plan_remote_branch, verify_start, RemotePlan};
 use stderr_tail::{CaptureSettings, HookOrigin, StderrCapture};
 
 /// Relative path of the optional per-repository setup script, run inside a
@@ -133,6 +136,11 @@ pub struct WorktreeRequest {
     /// Resolved agent NAME (Part B), persisted onto the binding and exposed to the
     /// create/remove hooks as `POHUNEK_AGENT`. A non-secret name only.
     pub agent: String,
+    /// Where `branch` comes from; [`BranchSource::Remote`] fetches `origin` first.
+    pub branch_source: BranchSource,
+    /// Resolution of a local branch that diverged from `origin/<branch>`; only
+    /// meaningful with [`BranchSource::Remote`].
+    pub on_diverged: Option<OnDiverged>,
 }
 
 /// Result of a successful [`WorktreeManager::bind`].
@@ -152,6 +160,8 @@ pub struct WorktreeBound {
     pub warnings: Vec<SessionWarning>,
     /// Stderr tails of the failing create hooks among [`Self::warnings`].
     pub stderr_tails: Vec<HookStderrTail>,
+    /// The commit a [`BranchSource::Remote`] worktree was built from.
+    pub source: Option<WorktreeSource>,
 }
 
 /// The rendered stderr tail of one failing hook.
@@ -438,6 +448,7 @@ impl WorktreeManager {
                         reused: true,
                         warnings: Vec::new(),
                         stderr_tails: Vec::new(),
+                        source: None,
                     }))
                 }
                 Some(_) => {
@@ -499,17 +510,20 @@ impl WorktreeManager {
 
         let mut warnings = Vec::new();
         let mut stderr_tails = Vec::new();
-        let resolved_base = Self::resolve_base_branch(&repository, req)?;
+        let resolved_base = Self::resolve_request_base(&repository, req)?;
         let base_branch = resolved_base.name;
         // Resolve the start-point for a new branch: the commit id pinned by a
         // successful fetch, else the (recorded) local base. The logical
         // `base_branch` name is what we persist/display; `start_point` is what
         // `git worktree add` actually branches from.
         // The pinning ref (`fetched`) lives until `git worktree add` returned.
-        let (start_point, fetched) = match resolved_base.fetched {
-            Some(fetched) => (fetched.commit.clone(), Some(fetched)),
-            None => Self::fetch_start_point(&repository, &base_branch, &mut warnings),
-        };
+        let (start_point, fetched, remote) = Self::resolve_start_point(
+            &repository,
+            req,
+            &base_branch,
+            resolved_base.fetched,
+            &mut warnings,
+        )?;
         // Pre-create hook: fires only on the fresh-create path (the reuse / recreate
         // / foreign-conflict branches above all returned before here). The worktree
         // does not exist yet, so it runs IN THE REPOSITORY — `POHUNEK_BASE_BRANCH`
@@ -543,7 +557,13 @@ impl WorktreeManager {
             .record_worktree(&binding)
             .map(StoreMutation::into_value)
             .map_err(|err| store_error("persist worktree binding", &err))?;
-        let added = Self::create_worktree(&repository, &path, &req.branch, &start_point);
+        let added = match &remote {
+            Some(plan) => {
+                create_remote_worktree(&repository, &path, &req.branch, plan).map(|()| false)
+            }
+            None => Self::create_worktree(&repository, &path, &req.branch, &start_point),
+        };
+        let source = remote.as_ref().map(|plan| plan.source(&req.branch));
         if let Ok(true) = added {
             Self::warn_ignored_base_branch(
                 &repository,
@@ -556,6 +576,7 @@ impl WorktreeManager {
         }
         // The new branch holds the commit from here on.
         drop(fetched);
+        drop(remote);
         if let Err(add_error) = added {
             // Nothing was checked out, so the binding owns nothing. A binding
             // that cannot be dropped is settled by the session's compensation,
@@ -569,6 +590,11 @@ impl WorktreeManager {
                 );
             }
             return Err(add_error);
+        }
+        if let Some(source) = &source {
+            // The checkout exists and its binding stays, so the session's
+            // compensation removes it.
+            verify_start(&path, &req.branch, &source.commit)?;
         }
         // Post-create hook (replaces the legacy `.pohunek/setup` script, which it
         // still falls back to): runs IN the freshly created worktree.
@@ -591,6 +617,7 @@ impl WorktreeManager {
             reused: false,
             warnings,
             stderr_tails,
+            source,
         })
     }
 
@@ -1081,6 +1108,34 @@ impl WorktreeManager {
         }
     }
 
+    /// [`Self::resolve_base_branch`], with a recovery hint that fits a
+    /// [`BranchSource::Remote`] request (which cannot name a base).
+    fn resolve_request_base(
+        repository: &Path,
+        req: &WorktreeRequest,
+    ) -> Result<BaseRef, ProtocolError> {
+        // A remote branch takes its commit from `origin/<branch>`: a project's
+        // default base only names the binding's diff base and is neither
+        // verified nor fetched.
+        if req.branch_source == BranchSource::Remote {
+            if let Some(base) = req.base_branch.as_deref().filter(|base| !base.is_empty()) {
+                return Ok(BaseRef {
+                    name: base.to_owned(),
+                    fetched: None,
+                });
+            }
+        }
+        Self::resolve_base_branch(repository, req).map_err(|mut err| {
+            if req.branch_source == BranchSource::Remote && err.code == "invalid_base_branch" {
+                err.recover = Some(
+                    "check out a branch in the repository (--base-branch cannot be combined with --from-remote)"
+                        .to_owned(),
+                );
+            }
+            err
+        })
+    }
+
     /// The repository's current branch, used as the default base ref, validated
     /// like any other git ref argument.
     ///
@@ -1168,6 +1223,30 @@ impl WorktreeManager {
         });
     }
 
+    /// The commit a new worktree starts from, with the guards that pin it.
+    ///
+    /// A [`BranchSource::Remote`] request takes it from `origin/<branch>` (the
+    /// base only names the binding's diff base and is neither fetched nor
+    /// used); otherwise it is the fetched base, else the local base.
+    fn resolve_start_point(
+        repository: &Path,
+        req: &WorktreeRequest,
+        base_branch: &str,
+        base_fetched: Option<FetchedBase>,
+        warnings: &mut Vec<SessionWarning>,
+    ) -> Result<(String, Option<FetchedBase>, Option<RemotePlan>), ProtocolError> {
+        if req.branch_source == BranchSource::Remote {
+            let plan = plan_remote_branch(repository, &req.branch, req.on_diverged)?;
+            warnings.extend(plan.warning(&req.branch));
+            return Ok((plan.fetched.commit.clone(), None, Some(plan)));
+        }
+        let (start_point, fetched) = match base_fetched {
+            Some(fetched) => (fetched.commit.clone(), Some(fetched)),
+            None => Self::fetch_start_point(repository, base_branch, warnings),
+        };
+        Ok((start_point, fetched, None))
+    }
+
     /// Determine the start-point for a **new** branch: the freshly fetched base
     /// when a fetch from `origin` succeeds, else the local `base_branch` (with a
     /// non-fatal `fetch` warning on failure). A fetch is only attempted when an
@@ -1218,28 +1297,38 @@ impl WorktreeManager {
         } else {
             worktree_add_new(repository, path, branch, start_point)
         };
-        result.map(|()| exists).map_err(|message| {
-            // Git allows only one worktree per branch: a concurrent or prior
-            // session already holding this branch fails with "already checked
-            // out"/"already used by worktree". Surface that as a clear typed
-            // error rather than a generic add failure.
-            if is_branch_in_use_error(&message) {
-                error(
-                    ErrorClass::Runtime,
-                    "worktree_branch_in_use",
-                    format!("branch {branch:?} is already checked out in another worktree"),
-                    Some("use a different branch for this session".to_owned()),
-                )
-            } else {
-                error(
-                    ErrorClass::Runtime,
-                    "worktree_add_failed",
-                    format!("git worktree add failed: {message}"),
-                    None,
-                )
-            }
-        })
+        result
+            .map(|()| exists)
+            .map_err(|message| worktree_add_error(branch, &message))
     }
+}
+
+/// The typed error of a failed `git worktree add` of `branch`.
+///
+/// Git allows only one worktree per branch: a concurrent or prior session
+/// already holding this branch fails with "already checked out"/"already used
+/// by worktree". That surfaces as a clear typed error rather than a generic add
+/// failure.
+fn worktree_add_error(branch: &str, message: &str) -> ProtocolError {
+    if is_branch_in_use_error(message) {
+        branch_in_use_error(branch)
+    } else {
+        error(
+            ErrorClass::Runtime,
+            "worktree_add_failed",
+            format!("git worktree add failed: {message}"),
+            None,
+        )
+    }
+}
+
+fn branch_in_use_error(branch: &str) -> ProtocolError {
+    error(
+        ErrorClass::Runtime,
+        "worktree_branch_in_use",
+        format!("branch {branch:?} is already checked out in another worktree"),
+        Some("use a different branch for this session".to_owned()),
+    )
 }
 
 /// Whether a `git worktree add` failure means the branch is already bound to
@@ -1454,18 +1543,18 @@ fn fetch_origin(repo: &Path, base_branch: &str) -> Result<FetchedBase, String> {
     fetch_into_ref(repo, base_branch, &fetch_ref_name()?)
 }
 
-/// The `git fetch` of `base_branch` from `origin` into `fetch_ref`.
+/// The `git fetch` of `source` from `origin` into `fetch_ref`.
 ///
 /// Automatic maintenance is disabled: its `git gc` runs `worktree prune`, which
 /// can overlap a locked add and inspect its incomplete admin entry.
-fn fetch_command(repo: &Path, base_branch: &str, fetch_ref: &str) -> Result<Command, String> {
+fn fetch_command(repo: &Path, source: &str, fetch_ref: &str) -> Result<Command, String> {
     let mut cmd = git_command(repo)?;
     cmd.args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .arg("fetch")
         .arg("--no-tags")
         .arg("origin")
         .arg("--end-of-options")
-        .arg(format!("{base_branch}:{fetch_ref}"));
+        .arg(format!("{source}:{fetch_ref}"));
     Ok(cmd)
 }
 
@@ -1476,8 +1565,8 @@ fn fetch_command(repo: &Path, base_branch: &str, fetch_ref: &str) -> Result<Comm
 /// never deletes anything. `--end-of-options` keeps the refspec positional even
 /// if a caller forgets the leading-dash guard (defense in depth against argv
 /// flag injection).
-fn fetch_into_ref(repo: &Path, base_branch: &str, fetch_ref: &str) -> Result<FetchedBase, String> {
-    check_fetch_source(repo, base_branch)?;
+fn fetch_into_ref(repo: &Path, source: &str, fetch_ref: &str) -> Result<FetchedBase, String> {
+    check_fetch_source(repo, source)?;
     let mut probe = git_command(repo)?;
     probe.args(["rev-parse", "--verify", "--quiet", fetch_ref]);
     let probed = run_output_bounded(probe, GIT_COMMAND_TIMEOUT)?;
@@ -1486,7 +1575,7 @@ fn fetch_into_ref(repo: &Path, base_branch: &str, fetch_ref: &str) -> Result<Fet
         Some(0) => return Err(format!("fetch ref {fetch_ref} already exists")),
         _ => return Err(output_failure_message(&probed)),
     }
-    let cmd = fetch_command(repo, base_branch, fetch_ref)?;
+    let cmd = fetch_command(repo, source, fetch_ref)?;
     // The fetch's connectivity check reads every `worktrees/<name>/HEAD`, and
     // `git worktree add` first writes a null-oid placeholder there, which fails
     // the check with `bad object worktrees/<name>/HEAD`. Holding the admin lock

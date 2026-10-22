@@ -802,6 +802,8 @@ mod tests {
                 base_branch: None,
                 input: None,
                 extended_input_ready_wait: None,
+                branch_source: None,
+                on_diverged: None,
                 metadata: BTreeMap::new(),
             })
             .await
@@ -890,6 +892,8 @@ mod tests {
                 base_branch: None,
                 input: None,
                 extended_input_ready_wait: None,
+                branch_source: None,
+                on_diverged: None,
                 metadata: metadata(&[("owner", "cli")]),
             })
             .await
@@ -949,6 +953,8 @@ mod tests {
                 base_branch: None,
                 input: None,
                 extended_input_ready_wait: None,
+                branch_source: None,
+                on_diverged: None,
                 metadata: BTreeMap::new(),
             })
             .await
@@ -1000,6 +1006,8 @@ mod tests {
                 base_branch: None,
                 input: None,
                 extended_input_ready_wait: None,
+                branch_source: None,
+                on_diverged: None,
                 metadata: BTreeMap::new(),
             })
             .await

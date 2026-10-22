@@ -163,6 +163,20 @@ pub(crate) enum CliError {
         daemon_version: String,
     },
 
+    /// The host's daemon predates `session new --from-remote` and would check
+    /// out the possibly stale local branch instead.
+    #[error(
+        "host '{host}' runs daemon {daemon_version}, which does not advertise \
+         `session_new_branch_source_supported`: --from-remote needs a daemon that advertises it \
+         (upgrade the daemon on that host); no session was created"
+    )]
+    SessionNewBranchSourceUnsupported {
+        /// The host as the user typed it.
+        host: String,
+        /// Version the host's daemon reported.
+        daemon_version: String,
+    },
+
     /// A remote `project add` named no PATH. A local path is meaningless on
     /// another host, so a remote add must give a path valid on that host; fails
     /// fast before any connection is dialed.
@@ -422,6 +436,16 @@ impl CliError {
                 Some(
                     "update and restart the pohunek daemon on that host to a release that advertises \
                      `session_new_cwd_supported`, or start the session without --cwd"
+                        .to_owned(),
+                ),
+            ),
+            CliError::SessionNewBranchSourceUnsupported { .. } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "session_new_branch_source_unsupported",
+                self.to_string(),
+                Some(
+                    "update and restart the pohunek daemon on that host to a release that advertises \
+                     `session_new_branch_source_supported`, or start the session without --from-remote"
                         .to_owned(),
                 ),
             ),

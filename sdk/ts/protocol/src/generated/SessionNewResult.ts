@@ -12,6 +12,7 @@ import type { SessionState } from "./SessionState";
 import type { SessionWarning } from "./SessionWarning";
 import type { StateSource } from "./StateSource";
 import type { SubagentInfo } from "./SubagentInfo";
+import type { WorktreeSource } from "./WorktreeSource";
 
 /**
  * Result returned by `session.new`.
@@ -34,6 +35,11 @@ export type SessionNewResult = {
    * not support it.
    */
   applied_input?: boolean;
+  /**
+   * Which commit the worktree was built from; present for a worktree
+   * session started with `branch_source: remote`.
+   */
+  worktree_source?: WorktreeSource;
   /**
    * Stable session identifier.
    */

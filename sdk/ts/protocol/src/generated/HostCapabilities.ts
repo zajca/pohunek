@@ -67,6 +67,14 @@ export type HostCapabilities = {
    */
   session_new_cwd_supported?: boolean;
   /**
+   * Whether `session.new` honors `branch_source` and `on_diverged`.
+   *
+   * A daemon that predates them ignores both and checks out the local branch
+   * as it is, so a client checks this flag before it sends either. Omitted
+   * when `false`, which is how an older daemon decodes.
+   */
+  session_new_branch_source_supported?: boolean;
+  /**
    * Whether the daemon serves `session.idle_stop.get` and
    * `session.idle_stop.set` and stops sessions opted in to idle stop.
    *

@@ -98,6 +98,10 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isSet(value: unknown): boolean {
+  return value !== undefined && value !== null;
+}
+
 function adapted(version: number): "current" | "v3" {
   if (version === PROTOCOL_VERSION) {
     return "current";
@@ -166,6 +170,13 @@ export function downgradeRequestParams(version: number, method: string, params: 
       isObject(filter) &&
       (filter["key"] === "metadata_eq" || filter["key"] === "metadata_has"),
     )
+  ) {
+    throw new CompatError({ kind: "methodNotDefined", method });
+  }
+  if (
+    method === "session.new" &&
+    isObject(params) &&
+    (isSet(params["branch_source"]) || isSet(params["on_diverged"]))
   ) {
     throw new CompatError({ kind: "methodNotDefined", method });
   }

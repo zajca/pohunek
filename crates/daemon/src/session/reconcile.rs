@@ -9802,6 +9802,8 @@ while os.getppid() == parent:
                 base_branch: None,
                 input: None,
                 extended_input_ready_wait: None,
+                branch_source: None,
+                on_diverged: None,
                 metadata: BTreeMap::new(),
             })
             .await
@@ -13067,6 +13069,8 @@ handler = "codex-hook-v1"
             base_branch: None,
             input: None,
             extended_input_ready_wait: None,
+            branch_source: None,
+            on_diverged: None,
             metadata: BTreeMap::new(),
         }
     }
@@ -20090,6 +20094,8 @@ generation "$1"
                         base_branch: None,
                         input: None,
                         extended_input_ready_wait: None,
+                        branch_source: None,
+                        on_diverged: None,
                         metadata: std::collections::BTreeMap::new(),
                     })
                     .await

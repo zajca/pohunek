@@ -185,6 +185,8 @@ fn request(session: &str, repo: &Path, branch: &str) -> WorktreeRequest {
         base_branch: None,
         project_id: None,
         agent: "claude".to_owned(),
+        branch_source: protocol::BranchSource::Local,
+        on_diverged: None,
     }
 }
 

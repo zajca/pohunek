@@ -165,6 +165,16 @@ fn translate_request(
             method: method.to_owned(),
         });
     }
+    // A protocol 3 daemon would drop the branch options and check out the local
+    // branch as it is, which is what they exist to avoid.
+    if method == method::SESSION_NEW
+        && matches!(direction, Direction::ToLegacy)
+        && has_branch_source_option(&params)
+    {
+        return Err(CompatError::MethodNotDefined {
+            method: method.to_owned(),
+        });
+    }
     match method {
         method::SESSION_OUTPUT | method::SESSION_WAIT => {
             nested_identity(&mut params, "params.runtime", direction)?;
@@ -175,6 +185,12 @@ fn translate_request(
         _ => {}
     }
     Ok(params)
+}
+
+fn has_branch_source_option(params: &Value) -> bool {
+    ["branch_source", "on_diverged"]
+        .iter()
+        .any(|key| params.get(key).is_some_and(|value| !value.is_null()))
 }
 
 fn has_metadata_list_filter(params: &Value) -> bool {

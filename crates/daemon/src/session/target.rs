@@ -227,6 +227,9 @@ pub(super) struct TargetResolution {
     /// Stderr tails of the failing create hooks among [`Self::warnings`], for
     /// the `session.new` result only.
     pub(super) hook_stderr_tails: Vec<HookStderrTail>,
+    /// The commit a `branch_source: remote` worktree was built from, for the
+    /// `session.new` result only.
+    pub(super) worktree_source: Option<protocol::WorktreeSource>,
 }
 
 impl TargetResolution {
@@ -404,14 +407,18 @@ impl SessionRegistry {
             .clone()
             .or_else(|| project.as_ref().and_then(|r| r.default_base_branch.clone()));
         let bound = self
-            .bind_worktree(
-                &id.0,
+            .bind_worktree(WorktreeRequest {
+                session_id: id.0.clone(),
                 repo,
                 branch,
                 base_branch,
-                project_id.clone(),
-                &params.agent,
-            )
+                project_id: project_id.clone(),
+                agent: params.agent.clone(),
+                branch_source: params
+                    .branch_source
+                    .unwrap_or(protocol::BranchSource::Local),
+                on_diverged: params.on_diverged,
+            })
             .await?;
         Ok(TargetResolution {
             launch_cwd: bound.path.clone(),
@@ -423,6 +430,7 @@ impl SessionRegistry {
             warnings: bound.warnings,
             reference_outside_repository: false,
             hook_stderr_tails: bound.stderr_tails,
+            worktree_source: bound.source,
         })
     }
 
@@ -464,6 +472,7 @@ impl SessionRegistry {
             warnings: Vec::new(),
             reference_outside_repository: false,
             hook_stderr_tails: Vec::new(),
+            worktree_source: None,
         }
     }
 
@@ -533,26 +542,13 @@ impl SessionRegistry {
     /// thread. Errors when worktree binding is not configured.
     async fn bind_worktree(
         &self,
-        session_id: &str,
-        repo: PathBuf,
-        branch: String,
-        base_branch: Option<String>,
-        project_id: Option<String>,
-        agent: &str,
+        request: WorktreeRequest,
     ) -> Result<crate::worktree::WorktreeBound, ProtocolError> {
         let Some(manager) = self.inner.worktree.clone() else {
             return Err(runtime_error(
                 "worktree_not_configured",
                 "the daemon is not configured for worktree binding",
             ));
-        };
-        let request = WorktreeRequest {
-            session_id: session_id.to_owned(),
-            repo,
-            branch,
-            base_branch,
-            project_id,
-            agent: agent.to_owned(),
         };
         tokio::task::spawn_blocking(move || manager.bind(&request))
             .await

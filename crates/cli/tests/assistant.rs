@@ -42,8 +42,8 @@ fn assistant_flags_reach_the_daemon_on_default_and_intent_forms() {
         "ui",
         "--branch",
         "feat/x",
-        "--base-branch",
-        "main",
+        "--from-remote",
+        "--reset-diverged",
         "--yes",
         "--json",
         "--print-prompt",
@@ -126,4 +126,34 @@ fn assistant_help_wrapper_is_a_command_not_the_help_screen() {
     assert!(output.stderr.is_empty(), "{output:?}");
     let help = String::from_utf8(output.stdout).expect("UTF-8 help");
     assert!(help.contains("Usage:"), "{help}");
+}
+
+#[test]
+fn assistant_branch_source_flags_that_contradict_each_other_are_usage_errors() {
+    for args in [
+        vec!["assistant", "--repo", "/code/ui", "--from-remote"],
+        vec![
+            "assistant",
+            "--repo",
+            "/code/ui",
+            "--branch",
+            "feat",
+            "--from-remote",
+            "--base-branch",
+            "main",
+        ],
+        vec![
+            "assistant",
+            "--repo",
+            "/code/ui",
+            "--branch",
+            "feat",
+            "--reset-diverged",
+        ],
+    ] {
+        let mut full = args.clone();
+        full.extend(["--json", "--no-start-daemon"]);
+        let output = run_assistant(&full);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+    }
 }

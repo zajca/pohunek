@@ -12,6 +12,7 @@ import {
   type Client,
   type ProtocolEvent,
   type SessionInputParams,
+  type SessionNewParams,
   type SessionOutputParams,
   type SessionScreenParams,
   type SessionWaitParams,
@@ -265,6 +266,35 @@ describe("client against a daemon of the previous release", () => {
     });
     expect(daemon.methods()).toEqual(["daemon.health"]);
     expect(daemon.seen.violations).toEqual([]);
+  });
+
+  test("branch source options fail before the previous daemon receives them", async () => {
+    const options: Array<Pick<SessionNewParams, "branch_source" | "on_diverged">> = [
+      { branch_source: "remote" },
+      { branch_source: "local" },
+      { branch_source: "remote", on_diverged: "backup_reset" },
+    ];
+    for (const option of options) {
+      const daemon = await startPreviousDaemon();
+      const client = await connect(daemon);
+      const error = await client.call("session.new", {
+        agent: "shell",
+        cols: 80,
+        rows: 24,
+        repo: "/work/repo",
+        branch: "feat",
+        ...option,
+      }).then(() => undefined, (caught: unknown) => caught as ClientError);
+      expect(error?.kind).toBe("daemonProtocolTooOld");
+      expect(error?.tooOld).toEqual({
+        host: HOST,
+        method: "session.new",
+        daemonVersion: PREVIOUS,
+        requiredVersion: PROTOCOL_VERSION,
+      });
+      expect(daemon.methods()).toEqual(["daemon.health"]);
+      expect(daemon.seen.violations).toEqual([]);
+    }
   });
 
   test("a version-dependent request learns the version before it is sent", async () => {
