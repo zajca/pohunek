@@ -390,6 +390,22 @@ fn session_resume_keeps_its_protocol_3_bare_id_and_gains_an_object_form() {
 }
 
 #[test]
+fn session_new_input_ack_is_refused_for_protocol_3_and_other_requests_pass() {
+    let plain = json!({"agent": "shell", "cols": 80, "rows": 24, "input": "hi"});
+    assert_eq!(
+        downgrade_request_params(v3(), method::SESSION_NEW, plain.clone()).expect("plain request"),
+        plain
+    );
+    let acknowledged = json!({
+        "agent": "shell", "cols": 80, "rows": 24, "input": "hi", "input_ack_timeout_ms": 500
+    });
+    assert!(
+        downgrade_request_params(v3(), method::SESSION_NEW, acknowledged).is_err(),
+        "protocol 3 has no acknowledgement of the initial input"
+    );
+}
+
+#[test]
 fn session_fork_gains_an_optional_override_that_protocol_3_requests_never_carry() {
     use protocol::SessionForkParams;
 

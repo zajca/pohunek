@@ -37,7 +37,8 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 /** Budget for `session.new`: three 10-minute native service ceilings (worker
  * connection, initialization and, with initial input, reader grace), the
  * `pre-create` and `post-create` hooks with a host and a repository layer of
- * 5 minutes each, and 10 minutes for the rest of creation. */
+ * 5 minutes each, and 10 minutes for the rest of creation. A creation with
+ * `input_ack_timeout_ms` adds that window and `MAX_SESSION_WAIT_MS` on top. */
 export const SESSION_NEW_REQUEST_BUDGET_MS = 60 * 60 * 1_000;
 /** Longest valid daemon bound of one lifecycle step: worker connection, worker
  * initialization, a job's exit timeout and the marker sweep's grace are each

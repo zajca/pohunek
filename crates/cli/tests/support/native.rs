@@ -161,6 +161,7 @@ impl Installation {
                 extended_input_ready_wait: None,
                 branch_source: None,
                 on_diverged: None,
+                input_ack_timeout_ms: None,
                 metadata: BTreeMap::new(),
             })
             .await

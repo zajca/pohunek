@@ -410,7 +410,7 @@ fn session_input_artifact_explains_waited_input_for_coding_agents() {
     }
     assert!(
         !EMBEDDED_SKILL.contains("session_input_wait_unsupported"),
-        "the daemon no longer returns session_input_wait_unsupported"
+        "the artifact documents waited input as supported, so it must not name session_input_wait_unsupported"
     );
 }
 

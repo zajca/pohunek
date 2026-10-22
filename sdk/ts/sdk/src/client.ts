@@ -139,7 +139,10 @@ export class Client {
       return this.callDedicated(
         "session.new",
         hasInitialInput(creation) ? { ...creation, extended_input_ready_wait: true } : creation,
-        SESSION_NEW_REQUEST_BUDGET_MS,
+        SESSION_NEW_REQUEST_BUDGET_MS
+          + (creation.input_ack_timeout_ms === undefined
+            ? 0
+            : creation.input_ack_timeout_ms + MAX_SESSION_WAIT_MS),
       );
     }
     if (method === "session.resume") {

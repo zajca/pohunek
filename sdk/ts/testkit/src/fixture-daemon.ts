@@ -866,7 +866,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     return okResponse(request.id, cloneValue(this.discoveredHosts));
   }
 
-  private handleSessionNew(request: ControlRequest): ControlResponse {
+  private async handleSessionNew(request: ControlRequest): Promise<ControlResponse> {
     const params = readSessionNewParams(request);
     if (params === undefined) {
       return errResponse(request.id, invalidParams(request.method));
@@ -890,13 +890,30 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       return errResponse(request.id, agentRuntimeUnsupported());
     }
 
+    const ackTimeoutMs = params.input_ack_timeout_ms;
+    if (ackTimeoutMs !== undefined) {
+      if (params.input === undefined) {
+        return errResponse(request.id, invalidParams(request.method));
+      }
+      if (ackTimeoutMs === 0) return errResponse(request.id, sessionInputInvalidWait());
+      if (ackTimeoutMs > MAX_SESSION_WAIT_MS) return errResponse(request.id, sessionWaitLimitExceeded());
+    }
+
     const session = this.buildSession(params, runtime.agent_base ?? agentBaseFor(params.agent));
     this.sessions.set(session.id, session);
+    const activityStream = ackTimeoutMs === undefined ? undefined : this.openActivityStream(session.id);
     this.emitSessionEvent(EVENT_SESSION_CREATED, session);
 
     const result: SessionNewResult = cloneValue(session);
     if (params.input !== undefined) {
       result.applied_input = true;
+    }
+    if (activityStream !== undefined && ackTimeoutMs !== undefined) {
+      try {
+        result.prompt_delivered = await this.awaitWorkingActivity(activityStream, ackTimeoutMs);
+      } finally {
+        activityStream.close();
+      }
     }
     return okResponse(request.id, result);
   }
@@ -1207,6 +1224,20 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
         }
       },
     };
+  }
+
+  /** Whether `working` evidence arrives on `activityStream` within `timeoutMs`. */
+  private async awaitWorkingActivity(
+    activityStream: { next: (timeoutMs: number) => Promise<FixtureInputWaitEvent | undefined> },
+    timeoutMs: number,
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const event = await activityStream.next(deadline - Date.now());
+      if (event === undefined) return false;
+      if (event.kind === "activity" && event.evidence.activity === "working") return true;
+    }
+    return false;
   }
 
   private handleSessionAttach(request: ControlRequest): ControlResponse {
@@ -2147,6 +2178,7 @@ function defaultHostCapabilities(daemonVersion: string): HostCapabilities {
     output_read_supported: true,
     session_wait_supported: true,
     session_wait_turn_supported: true,
+    session_new_input_ack_supported: true,
   };
 }
 
@@ -2442,6 +2474,10 @@ function readSessionNewParams(request: ControlRequest): SessionNewParams | undef
     return undefined;
   }
   if (!optionalString(params.input) || !optionalStringRecord(params.metadata)) {
+    return undefined;
+  }
+  if (params.input_ack_timeout_ms !== undefined &&
+    !(Number.isInteger(params.input_ack_timeout_ms) && params.input_ack_timeout_ms >= 0)) {
     return undefined;
   }
   const hasRepo = params.repo !== undefined;

@@ -237,6 +237,40 @@ describe("@pohunek/testkit fixture daemon", () => {
     }
   });
 
+  test("session new reports prompt_delivered for an acknowledged initial input", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("new-ack") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const idle = await client.call("session.new", {
+        agent: "shell",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+        input: "hello",
+        input_ack_timeout_ms: 30,
+      });
+      expect(idle.applied_input).toBe(true);
+      expect(idle.prompt_delivered).toBe(false);
+
+      const plain = await client.call("session.new", {
+        agent: "shell",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+        input: "hello",
+      });
+      expect(plain.prompt_delivered).toBeUndefined();
+
+      await expectProtocolError(client.call("session.new", {
+        agent: "shell",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+        input_ack_timeout_ms: 30,
+      }), "bad_request");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("session input wait returns a typed timeout without matching activity", async () => {
     const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-timeout") } });
     try {

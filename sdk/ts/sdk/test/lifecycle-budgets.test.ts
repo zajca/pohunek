@@ -2,7 +2,7 @@ import { describe, expect, jest, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PROTOCOL_VERSION } from "@pohunek/protocol";
+import { MAX_SESSION_WAIT_MS, PROTOCOL_VERSION } from "@pohunek/protocol";
 import {
   Client,
   ClientError,
@@ -212,4 +212,60 @@ describe("lifecycle response budgets", () => {
       await daemon.close();
     }
   }, SCENARIO_TIMEOUT_MS);
+
+  test("session.new with the largest input_ack_timeout_ms outlasts the creation budget", async () => {
+    const created = {
+      id: "s-ack",
+      agent: "shell",
+      agent_base: "shell",
+      capabilities: { fork: false, resume: false },
+      cwd: "/project",
+      pid: 42,
+      state: "running",
+      state_source: "process",
+      cols: 80,
+      rows: 24,
+      created_at: "2026-07-08T00:00:00Z",
+      updated_at: "2026-07-08T00:01:00Z",
+      applied_input: true,
+      prompt_delivered: false,
+    };
+    let releaseReply: () => void = () => undefined;
+    const ready = new Promise<void>((resolve) => {
+      releaseReply = resolve;
+    });
+    const daemon = startMemoryDaemon([
+      { kind: "reply", line: healthLine },
+      { kind: "gate", ready, line: (line) => okResponseLine(requestIdFromLine(line), created) },
+    ]);
+    if (daemon.endpoint.kind !== "memory") {
+      throw new Error("memory daemon returned a different transport");
+    }
+    jest.useFakeTimers();
+    try {
+      const client = await Client.connectTransport(daemon.endpoint.transport);
+      // The acknowledgement window makes the request version-dependent, so the
+      // connection learns the daemon's version before the creation is sent.
+      await client.call("daemon.health", null);
+      const call = client.call("session.new", {
+        agent: "shell",
+        cols: 80,
+        rows: 24,
+        input: "hello",
+        input_ack_timeout_ms: MAX_SESSION_WAIT_MS,
+      });
+      expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe("daemon.health");
+      expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe("session.new");
+      // Past the creation budget, inside the budget plus the delivery bound and
+      // the acknowledgement window.
+      jest.advanceTimersByTime(SESSION_NEW_REQUEST_BUDGET_MS + 2 * MAX_SESSION_WAIT_MS - 1_000);
+      releaseReply();
+
+      expect(await call).toEqual(created);
+      await client.close();
+    } finally {
+      jest.useRealTimers();
+      await daemon.close();
+    }
+  });
 });

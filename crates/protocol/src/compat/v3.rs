@@ -157,19 +157,20 @@ fn translate_request(
     direction: Direction,
 ) -> Result<Value, CompatError> {
     reject_introduced(method)?;
-    if method == method::SESSION_LIST
-        && matches!(direction, Direction::ToLegacy)
+    if matches!(direction, Direction::ToLegacy)
+        && method == method::SESSION_LIST
         && has_metadata_list_filter(&params)
     {
         return Err(CompatError::MethodNotDefined {
             method: method.to_owned(),
         });
     }
-    // A protocol 3 daemon would drop the branch options and check out the local
-    // branch as it is, which is what they exist to avoid.
+    // A protocol 3 daemon would drop these options silently: the branch options
+    // would check out the local branch as it is, and the acknowledgement window
+    // would leave `prompt_delivered` unreported.
     if method == method::SESSION_NEW
         && matches!(direction, Direction::ToLegacy)
-        && has_branch_source_option(&params)
+        && has_session_new_option(&params)
     {
         return Err(CompatError::MethodNotDefined {
             method: method.to_owned(),
@@ -187,8 +188,8 @@ fn translate_request(
     Ok(params)
 }
 
-fn has_branch_source_option(params: &Value) -> bool {
-    ["branch_source", "on_diverged"]
+fn has_session_new_option(params: &Value) -> bool {
+    ["branch_source", "on_diverged", "input_ack_timeout_ms"]
         .iter()
         .any(|key| params.get(key).is_some_and(|value| !value.is_null()))
 }

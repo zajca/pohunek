@@ -127,9 +127,10 @@ duplicate `--until` values are deduplicated in first-occurrence order; omitted
 targets default to `idle` and `blocked`; the timeout range is `1..8000` ms
 (default 8000). The timeout is one overall deadline measured before the
 per-session input gate, so gate contention, the two-fragment worker-plan
-acknowledgement, and activity waiting all consume it. Every input plan preserves
-the body fragment and separate submit fragment; fire-and-forget keeps the
-provider delay on the body fragment. A waited request rejects blocked activity
+acknowledgement, and activity waiting all consume it. Fire-and-forget and
+zero-delay waited input send one plan with a body fragment and a separate submit
+fragment, the provider delay on the body fragment; delayed-framing waited input
+sends two single-fragment plans. A waited request rejects blocked activity
 as `session_agent_blocked` regardless of provider policy. Waited input on
 delayed framing is daemon-paced: the daemon writes the body, waits out the
 delay, re-checks activity and the runtime under the session lock, and only then
@@ -245,6 +246,14 @@ starts the write. Such a runtime gets the full configured grace even from an
 older client. When the box does not render in time, `session.new`
 fails with `session_input_not_ready`, the initial input is not written, and the
 session is removed through the same rollback as any failed initial-input create.
+
+`pohunek session new --input-ack-timeout-ms <1..8000>` (with `--input` or
+`--input-stdin`) delivers the initial input like a waited `session input` and
+reports whether the agent started working on it within that window as
+`prompt_delivered` (`--json`, a top-level key) or `prompt delivered: yes/no`;
+the session is kept either way, and a delivery that fails before the submit is
+written rolls the create back as above. A host whose daemon does not advertise
+`session_new_input_ack_supported` is refused before the session is created.
 
 A session can also carry owner metadata, set atomically at creation with
 repeatable `pohunek session new --meta key=value` flags (split on the first

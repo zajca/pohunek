@@ -297,6 +297,27 @@ describe("client against a daemon of the previous release", () => {
     }
   });
 
+  test("a session.new acknowledgement window fails before the previous daemon receives it", async () => {
+    const daemon = await startPreviousDaemon();
+    const client = await connect(daemon);
+    const error = await client.call("session.new", {
+      agent: "claude",
+      cols: 80,
+      rows: 24,
+      input: "go",
+      input_ack_timeout_ms: 500,
+    }).then(() => undefined, (caught: unknown) => caught as ClientError);
+    expect(error?.kind).toBe("daemonProtocolTooOld");
+    expect(error?.tooOld).toEqual({
+      host: HOST,
+      method: "session.new",
+      daemonVersion: PREVIOUS,
+      requiredVersion: PROTOCOL_VERSION,
+    });
+    expect(daemon.methods()).toEqual(["daemon.health"]);
+    expect(daemon.seen.violations).toEqual([]);
+  });
+
   test("a version-dependent request learns the version before it is sent", async () => {
     const daemon = await startPreviousDaemon();
     const client = await connect(daemon);

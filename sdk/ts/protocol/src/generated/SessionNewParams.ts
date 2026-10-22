@@ -91,6 +91,15 @@ export type SessionNewParams = {
    */
   extended_input_ready_wait?: boolean;
   /**
+   * Acknowledge the initial `input` like a waited `session.input` with
+   * `until: [working]`: the daemon waits up to this many milliseconds
+   * (`1..=MAX_SESSION_WAIT_MS`) for `working` activity after the submit and
+   * reports the outcome as [`SessionNewResult::prompt_delivered`]. Requires
+   * `input`. A daemon that does not advertise
+   * `HostCapabilities::session_new_input_ack_supported` ignores the field.
+   */
+  input_ack_timeout_ms?: number;
+  /**
    * Owner-controlled metadata for the session. Must not contain secrets.
    */
   metadata?: { [key in string]: string };

@@ -797,6 +797,8 @@ struct SessionRegistryInner {
     input_send_hold: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     input_delay_hold: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    input_sent_hold: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Holds the next create once its target is bound, before its launch.
     #[cfg(test)]
     bound_create_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
@@ -1664,6 +1666,17 @@ impl Default for SessionRegistry {
     }
 }
 
+/// What a committed `session.new` reports.
+#[derive(Debug)]
+pub struct CreateOutcome {
+    /// The created session.
+    pub session: SessionInfo,
+    /// The commit a `branch_source: remote` worktree was built from.
+    pub worktree_source: Option<protocol::WorktreeSource>,
+    /// Whether the initial input was acknowledged, when asked for.
+    pub prompt_delivered: Option<bool>,
+}
+
 impl SessionRegistry {
     /// Reports whether inherited origin markers target the named session.
     ///
@@ -2321,6 +2334,8 @@ impl SessionRegistry {
                 #[cfg(test)]
                 input_delay_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
+                input_sent_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
                 bound_create_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 recovery_hold: std::sync::Mutex::new(None),
@@ -2795,21 +2810,22 @@ impl SessionRegistry {
     /// failed create whose compensation cannot finish stays listed as
     /// `create_compensation_pending` for the supervision retry.
     pub async fn create(&self, params: SessionNewParams) -> Result<SessionInfo, ProtocolError> {
-        self.create_with_source(params)
+        self.create_outcome(params)
             .await
-            .map(|(session, _source)| session)
+            .map(|outcome| outcome.session)
     }
 
-    /// [`Self::create`], also returning the commit a `branch_source: remote`
-    /// worktree was built from (`None` for every other session).
+    /// [`Self::create`] with everything `session.new` reports besides the
+    /// session: the commit a `branch_source: remote` worktree was built from
+    /// and the acknowledgement of the initial input.
     ///
     /// # Errors
     ///
     /// As [`Self::create`].
-    pub async fn create_with_source(
+    pub async fn create_outcome(
         &self,
         params: SessionNewParams,
-    ) -> Result<(SessionInfo, Option<protocol::WorktreeSource>), ProtocolError> {
+    ) -> Result<CreateOutcome, ProtocolError> {
         self.ensure_migration_settled()?;
         validate_new_params(&params)?;
         idle_stop::validate_opt_in(&params.metadata, self.inner.config.idle_stop_min_secs)?;
@@ -2859,6 +2875,7 @@ impl SessionRegistry {
         self.spawn_create(async move {
             let extended_input_ready_wait = params.extended_input_ready_wait.unwrap_or(false);
             let branch = params.branch.clone();
+            let input_ack_timeout = params.input_ack_timeout_ms;
             let (info, pending_initial_input, source) = Box::pin(registry.create_transaction(
                 id,
                 params,
@@ -2868,11 +2885,20 @@ impl SessionRegistry {
                 fallback_cwd,
             ))
             .await?;
-            let session = registry
-                .complete_create(info, pending_initial_input, extended_input_ready_wait)
+            let (session, prompt_delivered) = registry
+                .complete_create(
+                    info,
+                    pending_initial_input,
+                    extended_input_ready_wait,
+                    input_ack_timeout,
+                )
                 .await
                 .map_err(|err| note_kept_backup(err, branch.as_deref(), source.as_ref()))?;
-            Ok((session, source))
+            Ok(CreateOutcome {
+                session,
+                worktree_source: source,
+                prompt_delivered,
+            })
         })?
         .await
         .map_err(|_join_error| {
@@ -2900,7 +2926,8 @@ impl SessionRegistry {
         info: SessionInfo,
         pending_initial_input: Option<String>,
         extended_input_ready_wait: bool,
-    ) -> Result<SessionInfo, ProtocolError> {
+        input_ack_timeout_ms: Option<u32>,
+    ) -> Result<(SessionInfo, Option<bool>), ProtocolError> {
         // A reference assigned at launch makes the session resumable at once.
         if info.native_session_id.is_some() {
             self.persist_resume_binding(&info.id).await;
@@ -2915,7 +2942,7 @@ impl SessionRegistry {
             activity: None,
         });
         let Some(input) = pending_initial_input else {
-            return Ok(info);
+            return Ok((info, None));
         };
         #[cfg(test)]
         self.hold_initial_input(&info.id).await;
@@ -2930,15 +2957,30 @@ impl SessionRegistry {
             self.rollback_failed_initial_input(&info.id).await;
             return Err(error);
         }
-        let delivered = match self.write_input_to_session(&info.id, &input).await {
-            Ok(()) => self.commit_initial_input(&info.id).await,
-            Err(error) => Err(error),
+        let mut prompt_delivered = None;
+        let delivered = match input_ack_timeout_ms {
+            None => match self.write_input_to_session(&info.id, &input).await {
+                Ok(()) => self.commit_initial_input(&info.id).await,
+                Err(error) => Err(error),
+            },
+            Some(timeout_ms) => {
+                match self
+                    .deliver_acknowledged_initial_input(&info.id, &input, timeout_ms)
+                    .await
+                {
+                    Ok(acknowledged) => {
+                        prompt_delivered = Some(acknowledged);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
         };
         if let Err(error) = delivered {
             self.rollback_failed_initial_input(&info.id).await;
             return Err(error);
         }
-        Ok(info)
+        Ok((info, prompt_delivered))
     }
 
     /// Clears the `initial_input` marker of a delivered create, durably
@@ -7526,6 +7568,22 @@ fn validate_new_params(params: &SessionNewParams) -> Result<(), ProtocolError> {
         return Err(ProtocolError::bad_request(
             "session.new on_diverged requires branch_source remote",
         ));
+    }
+    if let Some(timeout_ms) = params.input_ack_timeout_ms {
+        if params.input.is_none() {
+            return Err(ProtocolError::bad_request(
+                "session.new: input_ack_timeout_ms requires input",
+            ));
+        }
+        if timeout_ms == 0 {
+            return Err(ProtocolError::observation(
+                "session_input_invalid_wait",
+                "input_ack_timeout_ms must be greater than zero",
+            ));
+        }
+        if timeout_ms > protocol::MAX_SESSION_WAIT_MS {
+            return Err(ProtocolError::session_wait_limit_exceeded());
+        }
     }
     validate_session_metadata(&params.metadata)?;
     validate_session_name(params.name.as_deref())?;

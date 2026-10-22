@@ -41,6 +41,16 @@ export type SessionNewResult = {
    */
   worktree_source?: WorktreeSource;
   /**
+   * With [`SessionNewParams::input_ack_timeout_ms`]: `true` when the agent
+   * showed `working` activity after the initial input was submitted within
+   * the window. `false` when the window elapsed first, the runtime changed,
+   * the session ended, the daemon began shutting down, or the delivery ended
+   * after Enter's send began: the prompt may or may not have been submitted,
+   * so a client must not resend it on `false` alone. The session is kept
+   * either way. Absent when no acknowledgement was requested.
+   */
+  prompt_delivered?: boolean;
+  /**
    * Stable session identifier.
    */
   id: SessionId;
