@@ -4499,10 +4499,10 @@ impl SessionRegistry {
             );
             return Ok(not_released);
         }
-        let unacknowledged = match self
+        let forwarded = self
             .forward_active_release(&params, &resolved, attested_start, &mut commit_guard)
-            .await
-        {
+            .await;
+        let unacknowledged = match forwarded.outcome {
             Forwarded::Answered(result) => return Ok(result),
             Forwarded::Unacknowledged(operation) => Some(operation),
             Forwarded::MemoryOnly => None,
@@ -4513,7 +4513,13 @@ impl SessionRegistry {
         };
 
         let Some(info) = self
-            .release_memory_claim(&params, &resolved.name, report_sequence, unacknowledged)
+            .release_memory_claim(
+                &params,
+                &resolved.name,
+                report_sequence,
+                unacknowledged,
+                forwarded.failure_logged,
+            )
             .await
         else {
             return Ok(not_released);
@@ -4536,12 +4542,16 @@ impl SessionRegistry {
 
     /// Applies a release that was not forwarded to the in-memory claim and
     /// returns the session's info when the claim ended.
+    ///
+    /// `forward_failure_logged` tells that the forward of this release already
+    /// logged its failure.
     async fn release_memory_claim(
         &self,
         params: &SessionReleaseAgentParams,
         agent: &str,
         report_sequence: Option<u64>,
         unacknowledged: Option<claim::Unacknowledged>,
+        forward_failure_logged: bool,
     ) -> Option<SessionInfo> {
         let mut sessions = self.inner.sessions.lock().await;
         let Some(entry) = sessions.get_mut(&params.session_id) else {
@@ -4558,8 +4568,14 @@ impl SessionRegistry {
             );
             return None;
         }
-        let released =
-            Self::end_memory_claim(entry, params, agent, report_sequence, &self.inner.turns);
+        let released = Self::end_memory_claim(
+            entry,
+            params,
+            agent,
+            report_sequence,
+            &self.inner.turns,
+            forward_failure_logged,
+        );
         if let Some(operation) = unacknowledged {
             claim::attach_unacknowledged(entry, operation);
         }
@@ -4568,20 +4584,33 @@ impl SessionRegistry {
 
     /// Ends the in-memory claim of `entry` that a release names, unless the
     /// worker's journal holds it.
+    ///
+    /// A journaled claim stays and the release is ignored. That logs
+    /// `session.active_identity.forward_failed` unless the release's forward
+    /// already did (`forward_failure_logged`), so one failed release logs the
+    /// event once.
     fn end_memory_claim(
         entry: &mut SessionEntry,
         params: &SessionReleaseAgentParams,
         agent: &str,
         report_sequence: Option<u64>,
         turns: &TurnEvents,
+        forward_failure_logged: bool,
     ) -> Option<SessionInfo> {
         let active = entry.active_agent.as_ref()?;
         if claim::is_journaled(entry) {
-            warn!(
-                name: "session.active_identity.forward_failed",
-                session_id = %params.session_id.0,
-                "a release could not be forwarded and does not end a claim the worker journaled; ignoring"
-            );
+            if forward_failure_logged {
+                debug!(
+                    session_id = %params.session_id.0,
+                    "a release that could not be forwarded does not end a claim the worker journaled; ignoring"
+                );
+            } else {
+                warn!(
+                    name: "session.active_identity.forward_failed",
+                    session_id = %params.session_id.0,
+                    "a release could not be forwarded and does not end a claim the worker journaled; ignoring"
+                );
+            }
             return None;
         }
         if !release_matches(active, &params.source, agent, report_sequence) {
@@ -5199,7 +5228,14 @@ impl SessionRegistry {
                 return Err(unavailable_runtime_error(id, state, None));
             }
         };
-        self.commit_user_stop_exit(id, exit, &terminal_base).await?;
+        if let Err(error) = self.commit_user_stop_exit(id, exit, &terminal_base).await {
+            // The worker already ended the session. The pending stop intent
+            // makes the worker exit watcher commit the terminal state, so the
+            // other watchers resume until it does.
+            self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
+                .await;
+            return Err(error);
+        }
         runtime_watch_cancel.cancel();
         // `stop` is the user-owned terminal transition and must be the final
         // word on native-recovery eligibility. A concurrent exit watcher can race

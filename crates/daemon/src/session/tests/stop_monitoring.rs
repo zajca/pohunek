@@ -9,15 +9,16 @@ use tokio::task::JoinHandle;
 
 use super::{
     claude_fact, codex_fact, descendant_claim_fixture, mock_procwatch_registry, next_runtime_event,
-    settle_procwatch_scans, wait_for_first_procwatch_scan, wait_until, MockInspector,
-    DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID, PID_REUSE_AGENT_PID,
+    params, settle_procwatch_scans, temp_store_path, wait_for_first_procwatch_scan, wait_until,
+    MockInspector, DESCENDANT_REPORTER_PID, DESCENDANT_WRAPPER_PID, PID_REUSE_AGENT_PID,
 };
-use crate::procwatch::StartIdentity;
-use crate::session::{RuntimeHandle, SessionRegistry};
+use crate::procwatch::{ProcessInspector, StartIdentity};
+use crate::session::{RuntimeHandle, SessionRegistry, SessionRegistryConfig, ShellCommand};
 use crate::store::DesiredState;
 use pohunek_test_support::wait::HANG_GUARD;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Pid of the observed agent the scenarios start and end.
 const AGENT_PID: u32 = PID_REUSE_AGENT_PID;
@@ -385,4 +386,127 @@ async fn failed_remove_stop_keeps_monitoring() {
     inspector.set_descendants(created.pid, Vec::new());
     inspector.fire_exit(AGENT_PID);
     wait_for_observed_pids(&registry, &created.id, &[]).await;
+}
+
+/// A registry over a durable store whose session runs under a mock process
+/// inspector, so the scenarios read the watchers' cancellation tokens.
+async fn stored_registry(tag: &str) -> (SessionRegistry, Arc<MockInspector>, SessionInfo) {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let store_path = temp_store_path(tag);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            procwatch_poll: Duration::from_mins(1),
+            store_path: Some(store_path),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    let created = registry.create(params()).await.expect("create session");
+    wait_for_first_procwatch_scan(&inspector).await;
+    settle_procwatch_scans(&registry).await;
+    (registry, inspector, created)
+}
+
+/// Asserts that a stop or removal of `id` that failed after the worker ended
+/// the session left it running, monitored, and with `intent` pending.
+async fn assert_stop_released(registry: &SessionRegistry, id: &SessionId, intent: DesiredState) {
+    let sessions = registry.inner.sessions.lock().await;
+    let entry = &sessions[id];
+    assert!(
+        !entry.stopping,
+        "a stop that did not commit does not pause the watchers"
+    );
+    assert!(entry.stop_transaction_id.is_none());
+    assert_eq!(entry.desired_state, intent);
+    assert_eq!(entry.info.state, SessionState::Running);
+}
+
+/// The desired state the store holds for `id`.
+fn durable_desired_state(registry: &SessionRegistry, id: &SessionId) -> DesiredState {
+    registry
+        .inner
+        .store
+        .as_ref()
+        .expect("registry store")
+        .load_sessions()
+        .expect("load the store")
+        .into_iter()
+        .find(|record| record.info.id == *id)
+        .expect("the session is stored")
+        .desired_state
+}
+
+/// A stop whose worker ended the session but whose terminal commit meets a
+/// storage outage returns the error without leaving the session paused: the
+/// stop intent stays durable, the watchers keep running, and the session
+/// reaches `Stopped` once the store accepts the write, with no restart.
+#[tokio::test]
+async fn failed_terminal_commit_after_a_worker_stop_keeps_monitoring_until_the_store_recovers() {
+    let (registry, _inspector, created) = stored_registry("terminal-commit-outage").await;
+    let mut events = registry.subscribe();
+    let store = registry.inner.store.as_ref().expect("registry store");
+    store.fail_terminal_session_writes(true);
+
+    let error = registry
+        .stop(&created.id)
+        .await
+        .expect_err("the terminal commit fails");
+    assert_eq!(error.code, "session_store_failed");
+
+    assert_stop_released(&registry, &created.id, DesiredState::Stopped).await;
+    assert_eq!(tokens_live(&registry, &created.id).await, (true, true));
+    assert_eq!(
+        durable_desired_state(&registry, &created.id),
+        DesiredState::Stopped,
+        "the durable stop intent stays pending"
+    );
+
+    store.fail_terminal_session_writes(false);
+    wait_until("the pending stop committed its terminal state", || async {
+        (registry.inspect(&created.id).await.ok()?.state == SessionState::Stopped).then_some(())
+    })
+    .await;
+    assert_eq!(
+        next_transition_after_reconnects(&mut events).await,
+        event::SESSION_STOPPED
+    );
+    super::assert_no_runtime_event(&mut events).await;
+    assert_eq!(tokens_live(&registry, &created.id).await, (false, false));
+}
+
+/// A removal whose stop step ended the session but whose terminal commit meets
+/// a storage outage errors and leaves the session monitored with its removal
+/// intent pending; the session is stopped once the store recovers, stays
+/// listed, and the retried removal completes.
+#[tokio::test]
+async fn failed_terminal_commit_during_a_remove_leaves_the_removal_pending() {
+    let (registry, _inspector, created) = stored_registry("remove-terminal-commit-outage").await;
+    let store = registry.inner.store.as_ref().expect("registry store");
+    store.fail_terminal_session_writes(true);
+
+    let error = registry
+        .remove(&created.id)
+        .await
+        .expect_err("the terminal commit fails");
+    assert_eq!(error.code, "session_store_failed");
+
+    assert_stop_released(&registry, &created.id, DesiredState::Removed).await;
+    assert_eq!(tokens_live(&registry, &created.id).await, (true, true));
+
+    store.fail_terminal_session_writes(false);
+    wait_until("the pending removal stopped the session", || async {
+        (registry.inspect(&created.id).await.ok()?.state == SessionState::Stopped).then_some(())
+    })
+    .await;
+    registry
+        .remove(&created.id)
+        .await
+        .expect("the retried removal completes");
+    registry
+        .inspect(&created.id)
+        .await
+        .expect_err("the removed session is gone");
 }

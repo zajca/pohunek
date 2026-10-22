@@ -16,7 +16,7 @@ use super::turn_wait_tests::{
     debounce, every_provider, fresh_cursor, joined, ok, pause_clock, settle, Fixture, CLOCK_STEP,
     FLUSH_SLACK, LONG_WAIT_MS,
 };
-use crate::notifications::default_policy;
+use crate::notifications::{default_policy, SEED_RETRY_DELAY};
 use crate::session::SessionRegistryConfig;
 
 /// How long before the idle edge the hook reports the stop.
@@ -33,15 +33,40 @@ fn enabled_fixture() -> Fixture {
     )
 }
 
-/// Moves the paused clock past one debounce window, letting the coordinator
-/// flush what it holds.
-async fn flush_window() {
+/// Moves the paused clock forward by `span` in small steps, letting the tasks
+/// that wait on it run between the steps.
+async fn advance_by(span: Duration) {
     let mut moved = Duration::ZERO;
-    while moved < debounce() + FLUSH_SLACK {
+    while moved < span {
         tokio::time::advance(CLOCK_STEP).await;
         moved += CLOCK_STEP;
         settle().await;
     }
+}
+
+/// Moves the paused clock past one debounce window, letting the coordinator
+/// flush what it holds.
+async fn flush_window() {
+    advance_by(debounce() + FLUSH_SLACK).await;
+}
+
+/// Moves the paused clock past one seed retry and the debounce window of what
+/// the retry projects.
+async fn retry_and_flush() {
+    advance_by(SEED_RETRY_DELAY + debounce() + FLUSH_SLACK).await;
+}
+
+/// Makes the projector's epoch seed of every session fail until
+/// [`recover_seeds`], so a session's first input is its first sight and keeps
+/// waiting.
+fn fail_all_seeds(fixture: &Fixture) {
+    fixture
+        .notifications()
+        .fail_projector_seeds(None, usize::MAX);
+}
+
+fn recover_seeds(fixture: &Fixture) {
+    fixture.notifications().fail_projector_seeds(None, 0);
 }
 
 /// Returns to the real clock, then stops `session`, whose process exit the
@@ -1358,5 +1383,199 @@ async fn a_turn_the_daemon_did_not_observe_is_reported_without_a_length() {
     assert!(records[0].get("turn_started_at").is_none(), "{records:?}");
     assert!(records[0].get("turn_duration_ms").is_none(), "{records:?}");
     assert!(records[0].get("session_metadata").is_none(), "{records:?}");
+    finish(&fixture, inhibitor, &session).await;
+}
+
+#[tokio::test]
+async fn a_turn_whose_projector_seed_fails_is_reported_once_the_seed_retry_succeeds() {
+    let fixture = enabled_fixture();
+    fail_all_seeds(&fixture);
+    let session = fixture.session("seed-fails").await;
+    fixture.activity(&session, "idle").await;
+    let cursor = fresh_cursor(&fixture, &session).await;
+    let inhibitor = pause_clock().await;
+
+    turn(&fixture, &session, Duration::from_secs(3)).await;
+    retry_and_flush().await;
+    assert!(
+        turn_records(&fixture).await.is_empty(),
+        "nothing is projected while the seed fails"
+    );
+
+    recover_seeds(&fixture);
+    retry_and_flush().await;
+    let records = turn_records(&fixture).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["turn_duration_ms"], 3_000, "{records:?}");
+    assert_eq!(
+        turn_events_after(&fixture, &session, &cursor).await.len(),
+        1
+    );
+    finish(&fixture, inhibitor, &session).await;
+}
+
+#[tokio::test]
+async fn the_successor_of_a_turn_waits_behind_it_while_the_seed_fails() {
+    let fixture = enabled_fixture();
+    fail_all_seeds(&fixture);
+    let session = fixture.session("seed-fails-successor").await;
+    fixture.activity(&session, "idle").await;
+    let inhibitor = pause_clock().await;
+
+    turn(&fixture, &session, Duration::from_secs(1)).await;
+    flush_window().await;
+    // The next turn opens before the first one was ever projected.
+    fixture.activity(&session, "working").await;
+    settle().await;
+    assert!(turn_records(&fixture).await.is_empty());
+
+    recover_seeds(&fixture);
+    retry_and_flush().await;
+    let records = turn_records(&fixture).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_ne!(
+        records[0]["status"], "unread",
+        "the opened turn ends what the finished one left unread: {records:?}"
+    );
+    assert_eq!(records[0]["turn_duration_ms"], 1_000, "{records:?}");
+    finish(&fixture, inhibitor, &session).await;
+}
+
+/// The `agent_blocked` records of the inbox.
+async fn blocked_records(fixture: &Fixture) -> Vec<Value> {
+    fixture
+        .inbox()
+        .await
+        .into_iter()
+        .filter(|record| record["kind"] == "agent_blocked")
+        .collect()
+}
+
+#[tokio::test]
+async fn events_of_a_session_whose_seed_failed_project_in_their_arrival_order() {
+    let fixture = enabled_fixture();
+    fail_all_seeds(&fixture);
+    let session = fixture.session("seed-fails-events").await;
+    fixture.activity(&session, "idle").await;
+    let inhibitor = pause_clock().await;
+
+    // The agent waits for the owner while the seed fails, and resumes after the
+    // seed recovered but before the retry ran: the resume must not overtake the
+    // wait it ends, so no attention record may remain.
+    fixture.activity(&session, "blocked").await;
+    settle().await;
+    recover_seeds(&fixture);
+    fixture.activity(&session, "working").await;
+    settle().await;
+    retry_and_flush().await;
+
+    assert!(blocked_records(&fixture).await.is_empty());
+    finish(&fixture, inhibitor, &session).await;
+}
+
+#[tokio::test]
+async fn a_session_that_stopped_while_its_seed_failed_leaves_no_attention_record() {
+    let fixture = enabled_fixture();
+    fail_all_seeds(&fixture);
+    let session = fixture.session("seed-fails-stop").await;
+    fixture.activity(&session, "idle").await;
+    let inhibitor = pause_clock().await;
+    fixture.activity(&session, "blocked").await;
+    settle().await;
+
+    inhibitor.release().await;
+    tokio::time::resume();
+    fixture.stop_all(&[session.as_str()]).await;
+    let inhibitor = pause_clock().await;
+    recover_seeds(&fixture);
+    retry_and_flush().await;
+
+    assert!(
+        blocked_records(&fixture).await.is_empty(),
+        "the stop ends the wait it queued behind"
+    );
+    inhibitor.release().await;
+    tokio::time::resume();
+}
+
+#[tokio::test]
+async fn a_session_with_a_working_seed_is_projected_while_another_waits() {
+    let fixture = enabled_fixture();
+    fail_all_seeds(&fixture);
+    let waiting = fixture.session("seed-waits").await;
+    let seeded = fixture.session("seed-works").await;
+    fixture.activity(&waiting, "idle").await;
+    fixture.activity(&seeded, "idle").await;
+    fixture
+        .notifications()
+        .fail_projector_seeds(Some(waiting.as_str()), usize::MAX);
+    let inhibitor = pause_clock().await;
+    advance_by(SEED_RETRY_DELAY + FLUSH_SLACK).await;
+
+    turn(&fixture, &waiting, Duration::from_secs(1)).await;
+    turn(&fixture, &seeded, Duration::from_secs(2)).await;
+    flush_window().await;
+    let records = turn_records(&fixture).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["session_id"], seeded.as_str(), "{records:?}");
+
+    recover_seeds(&fixture);
+    retry_and_flush().await;
+    assert_eq!(turn_records(&fixture).await.len(), 2);
+    inhibitor.release().await;
+    tokio::time::resume();
+    fixture.stop_all(&[waiting.as_str(), seeded.as_str()]).await;
+}
+
+/// The reports that overflow the backlog of a session: two inputs each (the
+/// turn edge and the activity event), more than the projector keeps.
+const OVERFLOW_REPORT_PAIRS: usize = 200;
+
+#[tokio::test]
+async fn a_session_whose_seed_keeps_failing_drops_its_oldest_input_with_a_warning() {
+    let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+    let _subscriber = logs.install();
+    let fixture = enabled_fixture();
+    fail_all_seeds(&fixture);
+    let session = fixture.session("seed-keeps-failing").await;
+    fixture.activity(&session, "idle").await;
+    let inhibitor = pause_clock().await;
+
+    for _ in 0..OVERFLOW_REPORT_PAIRS {
+        fixture.activity(&session, "working").await;
+        fixture.activity(&session, "idle").await;
+    }
+    settle().await;
+    assert!(
+        logs.text().contains("dropping its oldest input"),
+        "{}",
+        logs.text()
+    );
+
+    recover_seeds(&fixture);
+    retry_and_flush().await;
+    turn(&fixture, &session, Duration::from_secs(1)).await;
+    flush_window().await;
+    assert!(!turn_records(&fixture).await.is_empty());
+    finish(&fixture, inhibitor, &session).await;
+}
+
+#[tokio::test]
+async fn a_projector_that_ends_retries_the_seed_of_the_inputs_it_still_holds() {
+    let fixture = enabled_fixture();
+    fail_all_seeds(&fixture);
+    let session = fixture.session("seed-fails-shutdown").await;
+    fixture.activity(&session, "idle").await;
+    let inhibitor = pause_clock().await;
+    turn(&fixture, &session, Duration::from_secs(1)).await;
+    flush_window().await;
+    assert!(turn_records(&fixture).await.is_empty());
+
+    // The seed recovered, and the projector ends before its retry is due.
+    recover_seeds(&fixture);
+    fixture.end_projector().await;
+    flush_window().await;
+    let records = turn_records(&fixture).await;
+    assert_eq!(records.len(), 1, "{records:?}");
     finish(&fixture, inhibitor, &session).await;
 }

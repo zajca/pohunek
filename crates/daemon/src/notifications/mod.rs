@@ -33,6 +33,8 @@ pub use policy::{
     default_policy, policy_enables_kind, DEFAULT_ATTENTION_DEBOUNCE_SECS,
     DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS,
 };
+#[cfg(test)]
+pub(crate) use projector::SEED_RETRY_DELAY;
 #[doc(inline)]
 pub use projector::{attention_dedupe_key, turn_dedupe_key, NotificationProjector};
 #[doc(inline)]
@@ -456,6 +458,18 @@ struct NotificationServiceInner {
     attention_window: RwLock<Option<Arc<AtomicU64>>>,
     events: broadcast::Sender<Event>,
     next_id: AtomicU64,
+    /// The projector epoch seeds that still fail on purpose.
+    #[cfg(test)]
+    projector_seed_fault: std::sync::Mutex<Option<ProjectorSeedFault>>,
+}
+
+/// Seeds of the projector that fail on purpose: those of one session, or of
+/// every session.
+#[cfg(test)]
+#[derive(Debug)]
+struct ProjectorSeedFault {
+    session_id: Option<String>,
+    remaining: usize,
 }
 
 /// Outcome of one daemon-owned notification maintenance sweep.
@@ -499,6 +513,8 @@ impl NotificationService {
                 attention_window: RwLock::new(None),
                 events,
                 next_id: AtomicU64::new(1),
+                #[cfg(test)]
+                projector_seed_fault: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -514,7 +530,55 @@ impl NotificationService {
     /// timestamp.
     #[must_use]
     pub(crate) fn source_id_suffixes(&self, provider: &str, prefix: &str) -> Vec<(String, String)> {
+        #[cfg(test)]
+        if self.injected_seed_failure(prefix) {
+            // A panic in the blocking read is the failure the projector's seed
+            // can meet; `resume_unwind` skips the panic hook's output.
+            std::panic::resume_unwind(Box::new("injected projector seed failure"));
+        }
         self.inner.store.source_id_suffixes(provider, prefix)
+    }
+
+    /// Makes the next `count` projector epoch seeds of `session_id` (of every
+    /// session when `None`) fail, replacing an earlier fault.
+    #[cfg(test)]
+    pub(crate) fn fail_projector_seeds(&self, session_id: Option<&str>, count: usize) {
+        *self
+            .inner
+            .projector_seed_fault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ProjectorSeedFault {
+            session_id: session_id.map(str::to_owned),
+            remaining: count,
+        });
+    }
+
+    /// Whether the seed that reads `prefix` is one the test made fail, which
+    /// uses up one of the fault's failures.
+    #[cfg(test)]
+    fn injected_seed_failure(&self, prefix: &str) -> bool {
+        let mut fault = self
+            .inner
+            .projector_seed_fault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(fault) = fault.as_mut() else {
+            return false;
+        };
+        if fault
+            .session_id
+            .as_deref()
+            .is_some_and(|id| !prefix.contains(id))
+        {
+            return false;
+        }
+        match fault.remaining.checked_sub(1) {
+            Some(remaining) => {
+                fault.remaining = remaining;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Whether an unread `agent_blocked` or `approval_required` record carries

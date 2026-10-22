@@ -837,6 +837,8 @@ pub struct Store {
     #[cfg(test)]
     fail_before_rename_countdown: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
+    fail_terminal_session_writes: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     fail_binding_removal: std::sync::atomic::AtomicBool,
 }
 
@@ -851,6 +853,8 @@ impl Store {
             fail_parent_sync_after_rename: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_before_rename_countdown: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_terminal_session_writes: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_binding_removal: std::sync::atomic::AtomicBool::new(false),
         }
@@ -878,6 +882,15 @@ impl Store {
     pub(crate) fn fail_write_before_rename_after(&self, writes: usize) {
         self.fail_before_rename_countdown
             .store(writes, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Makes every conditional write of a terminal session record fail before
+    /// it renames while `failing`, so a retry loop meets the same storage
+    /// outage on each attempt. Other writes, such as a stop intent, succeed.
+    #[cfg(test)]
+    pub(crate) fn fail_terminal_session_writes(&self, failing: bool) {
+        self.fail_terminal_session_writes
+            .store(failing, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -1011,6 +1024,14 @@ impl Store {
         expected: &SessionRecord,
         record: &SessionRecord,
     ) -> io::Result<SessionWriteOutcome> {
+        #[cfg(test)]
+        if record.info.state.is_terminal()
+            && self
+                .fail_terminal_session_writes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(io::Error::other("injected terminal session write failure"));
+        }
         let _guard = self
             .write_lock
             .lock()
