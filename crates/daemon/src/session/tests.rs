@@ -22196,6 +22196,43 @@ async fn durable_bindings_without_a_live_session_still_retain_the_package() {
     assert!(second.uninstall_package(&packaged.digest).await.is_err());
 }
 
+/// The offline upgrade plan decides whether an uninstall command is safe to name
+/// from the set it retains; that set equals the one the daemon's uninstall judges
+/// by, for a durable session record that pins the package.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_upgrade_plan_retains_what_the_daemon_uninstall_retains_for_a_session_record() {
+    let dir = temp_dir("packaged-retained-plan");
+    let marker = dir.join("argv.txt");
+    let (script, mut gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-retained-plan-plugins", &script);
+    let store_path = temp_store_path("packaged-retained-plan");
+    let first = packaged.registry(&store_path);
+    let created = first
+        .create(packaged_params(&dir))
+        .await
+        .expect("create a package session");
+    let mut events = first.subscribe();
+    gate.write_all(b"go\n").expect("release the exit gate");
+    first
+        .wait_for_exit(&created.id, HANG_GUARD)
+        .await
+        .expect("session exits");
+    drop_settled(first, &mut events, &created.id).await;
+
+    let second = packaged.registry(&store_path);
+    let daemon = second.retained_package_digests().await.expect("retained");
+    let plan =
+        super::package_lifecycle::ensure::retained_pins(&store_path, &second.inner.profiles, None)
+            .expect("the plan's retained set");
+
+    assert!(daemon.contains(&packaged.digest));
+    assert_eq!(
+        plan.iter().collect::<Vec<_>>(),
+        daemon.iter().collect::<Vec<_>>()
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_registry_without_a_package_store_cannot_uninstall() {

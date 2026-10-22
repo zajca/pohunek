@@ -959,8 +959,10 @@ fn read_store(store_path: &Path) -> Result<StoreView, EnsureError> {
 }
 
 /// Digests every installed package a session or profile still pins, excluding
-/// the pin of the profile `skip` when one is given.
-fn retained_pins(
+/// the pin of the profile `skip` when one is given. The offline step reads the
+/// same sources as the daemon's `retained_package_digests`, which an uninstall
+/// judges by.
+pub(in crate::session) fn retained_pins(
     store_path: &Path,
     profiles: &ProfileRegistry,
     skip: Option<&str>,

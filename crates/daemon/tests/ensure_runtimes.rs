@@ -5057,3 +5057,37 @@ fn a_runtime_planned_only_by_detection_gets_no_uninstall_hint() {
         .unwrap_or_else(|| panic!("{:?}", detected.gaps));
     assert_same_version_hint(&gap.detail, runtime, Hint::NewVersion);
 }
+
+/// A durable session record pins the holder: the plan and the apply name no
+/// uninstall command, because the daemon's uninstall retains the record's digest.
+#[test]
+fn a_session_record_that_pins_the_holder_withdraws_the_uninstall_hint() {
+    let runtime = "claude";
+    let installed = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+    let release = official_runtimes::variant_archive_with_program(
+        runtime,
+        RELEASE_VERSION,
+        SAME_VERSION_PROGRAM,
+    );
+    let host = Host::new();
+    host.write_claude_hook();
+    host.publish_archives(1, &[(runtime, &installed.0, &installed.1)]);
+    assert!(host.step(false).refusals.is_empty());
+    host.write_store(
+        &PACKAGE_SESSION_STORE.replace(&format!("sha256:{}", "a".repeat(64)), installed.1.as_str()),
+    );
+    host.publish_archives(2, &[(runtime, &release.0, &release.1)]);
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        let gap = report
+            .gaps
+            .iter()
+            .find(|gap| gap.runtime == runtime)
+            .expect("the same-version gap");
+        assert_eq!(gap.code, CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST);
+        assert_same_version_hint(&gap.detail, runtime, Hint::NewVersion);
+    }
+}
