@@ -6025,3 +6025,44 @@ async fn a_pi_without_an_enabled_official_selection_beside_a_holder_is_not_plann
         );
     }
 }
+
+/// A host profile pins the altered package, the holder or the selected version:
+/// the registry refuses its removal, so the refusal names no removal command.
+#[tokio::test]
+async fn an_altered_package_that_a_profile_pins_is_refused_without_a_removal_command() {
+    for (runtime, other_selected, profile) in [
+        ("claude", false, "claude"),
+        ("claude", true, "claude"),
+        ("pi", false, "work"),
+    ] {
+        let older = official_runtimes::variant_archive(runtime, "1.0.1");
+        let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+        let release = holder_release(runtime);
+        let (installs, altered): (Vec<(&Archive, bool, bool)>, &Archive) = if other_selected {
+            (vec![(&older, true, true), (&holder, true, false)], &older)
+        } else {
+            (vec![(&holder, true, true)], &holder)
+        };
+        let host = host_with_holder(runtime, &installs, &release).await;
+        host.write_profile(
+            profile,
+            &format!(
+                "base = \"{runtime}\"\npackage = \"pohunek.runtime.{runtime}\"\ndigest = \"{}\"\n",
+                altered.1.as_str()
+            ),
+        );
+        host.alter_package_root(&altered.1);
+
+        assert_held_runtime_refused(
+            &host,
+            runtime,
+            "pins it, so the registry refuses its removal",
+        );
+
+        let detail = host.step(true).refusals[0].detail.clone();
+        assert!(
+            !detail.contains("`pohunek plugin uninstall"),
+            "{runtime}: {detail}"
+        );
+    }
+}

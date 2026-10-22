@@ -2600,12 +2600,8 @@ fn selection_outcome(
                 plan, prepared, &holder, reserved,
             )),
         },
-        Held::Damaged(kind, selected) if selected == holder => {
-            refuse_held_damaged(plan, prepared, report, subject, kind, &holder, reserved);
-            Selection::Leave
-        }
         Held::Damaged(kind, selected) => {
-            refuse_damaged(report, subject, kind, id, &selected);
+            refuse_held_damaged(plan, prepared, report, subject, kind, &selected);
             Selection::Leave
         }
         held => {
@@ -2692,20 +2688,32 @@ fn pi_install_step(plan: &PlanInputs<'_>, prepared: &Prepared, holder: &PackageD
     format!("install the release's package with `{command}`")
 }
 
-/// Refuses the selected holder whose installed root is altered or damaged. The
-/// removal leaves a reserved runtime to the next upgrade; Pi is installed by hand.
+/// Refuses the selected package `digest` whose installed root is altered or
+/// damaged, naming the removal only where the registry accepts it: a host
+/// profile or session that pins the package makes it refuse. The removal of the
+/// holder leaves a reserved runtime to the next upgrade; Pi is installed by hand.
 fn refuse_held_damaged(
     plan: &PlanInputs<'_>,
     prepared: &Prepared,
     report: &mut Report,
     subject: &str,
     kind: PackageErrorKind,
-    holder: &PackageDigest,
-    reserved: bool,
+    digest: &PackageDigest,
 ) {
     let id = &prepared.identity.id;
-    if reserved {
-        refuse_damaged(report, subject, kind, id, holder);
+    let holder = same_version_holder(plan, prepared);
+    if plan.retained.contains(digest) {
+        report.refuse(
+            subject,
+            &ProtocolError::from(kind).code,
+            "the installed package root of this runtime is altered or damaged and a host \
+             profile or session pins it, so the registry refuses its removal; `pohunek plugin \
+             doctor` names the cause",
+        );
+        return;
+    }
+    if holder.as_ref() != Some(digest) || is_reserved(prepared.definition.runtime_id()) {
+        refuse_damaged(report, subject, kind, id, digest);
         return;
     }
     report.refuse(
@@ -2714,8 +2722,8 @@ fn refuse_held_damaged(
         &format!(
             "the installed package root of this runtime is altered or damaged; remove it with \
              `pohunek plugin uninstall {id} --digest {} --remove-modified --yes`, then {}",
-            holder.as_str(),
-            pi_install_step(plan, prepared, holder)
+            digest.as_str(),
+            pi_install_step(plan, prepared, digest)
         ),
     );
 }

@@ -2606,8 +2606,10 @@ search path is dropped before it is judged, as in the table above.
 | S is selected, enabled, and its root is altered | refusal for S | `plugin uninstall <package> --digest <S> --remove-modified --yes` |
 | The selected package is not official (a registry edited by hand) | gap `official_package_not_serving` | `plugin select <package> --digest <digest>` |
 
-The uninstall command of the first three rows is named only for a runtime that a
-profile, session or installed hook uses, and only while no session or
+The altered-root refusals name the removal only while no session or host profile pins the
+package; a pinned one is refused with a detail that names no removal. The uninstall command of
+the first three rows is named only for a runtime that a profile, session or installed hook
+uses, and only while no session or
 host profile pins H (the registry refuses the uninstall of a pinned package); otherwise the
 detail names no command and says the fix is a release that gives the package a new version.
 A profile that pins another installed version P keeps the command: the uninstall is accepted
@@ -2629,6 +2631,8 @@ S), all in `crates/daemon/tests/ensure_runtimes.rs`, and
 `a_selected_holder_without_its_root_is_left_and_its_uninstall_lets_the_release_install`,
 `a_selected_pi_holder_without_its_root_is_left_and_two_commands_install_the_release`,
 `a_selected_pi_holder_without_its_root_that_nothing_uses_is_left_with_no_command`,
+`a_pi_without_an_enabled_official_selection_beside_a_holder_is_not_planned`,
+`an_altered_package_that_a_profile_pins_is_refused_without_a_removal_command`,
 `a_selected_pi_holder_without_its_root_beside_another_version_names_the_update`,
 `a_holder_beside_a_runtime_used_only_by_a_session_or_a_hook_names_the_uninstall`,
 `a_runtime_planned_only_by_detection_beside_a_holder_gets_no_uninstall_command`,
