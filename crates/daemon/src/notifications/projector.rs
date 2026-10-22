@@ -22,7 +22,8 @@ use crate::session::{SessionRegistry, TurnEdge, TurnId};
 
 use super::{
     is_debounced_create, parse_timestamp, policy_enables_kind, AttentionCoordinator,
-    DeferredNotification, NotificationService, ATTENTION_DEDUPE_KEY_PREFIX, TURN_DEDUPE_KEY_PREFIX,
+    DeferredNotification, NotificationService, ResolveAsOf, ATTENTION_DEDUPE_KEY_PREFIX,
+    TURN_DEDUPE_KEY_PREFIX,
 };
 
 /// Provider namespace used for daemon-derived notification records.
@@ -407,12 +408,22 @@ struct ProjectorState {
     /// The inputs of sessions whose epoch seed failed, in arrival order. A
     /// session with a backlog queues every further input behind it, so the
     /// inputs project in the order they arrived once the seed succeeds.
-    deferred: HashMap<SessionId, VecDeque<DeferredInput>>,
+    deferred: HashMap<SessionId, VecDeque<Deferred>>,
     /// When the seed of the sessions in `deferred` is retried next.
     seed_retry_at: Option<Instant>,
 }
 
-/// An input of one session the projector keeps until its epoch seed succeeds.
+/// An input of one session the projector keeps until its epoch seed succeeds,
+/// with the moment it arrived.
+///
+/// Its resolve acts on what existed at that moment, not on what other
+/// producers created while the input waited.
+#[derive(Debug)]
+struct Deferred {
+    input: DeferredInput,
+    arrived: ResolveAsOf,
+}
+
 #[derive(Debug)]
 enum DeferredInput {
     Event(Event),
@@ -574,9 +585,17 @@ impl ProjectorState {
     /// input.
     fn defer(&mut self, session_id: &SessionId, input: DeferredInput) {
         let backlog = self.deferred.entry(session_id.clone()).or_default();
+        let arrived = ResolveAsOf::now();
         match (backlog.back_mut(), input) {
-            (Some(DeferredInput::Snapshot(newest)), DeferredInput::Snapshot(snapshot)) => {
+            (
+                Some(Deferred {
+                    input: DeferredInput::Snapshot(newest),
+                    arrived: newest_arrived,
+                }),
+                DeferredInput::Snapshot(snapshot),
+            ) => {
                 *newest = snapshot;
+                *newest_arrived = arrived;
             }
             (_, input) => {
                 if backlog.len() >= MAX_DEFERRED_INPUTS_PER_SESSION {
@@ -587,7 +606,7 @@ impl ProjectorState {
                         "projector backlog of a session whose epoch seed keeps failing is full; dropping its oldest input"
                     );
                 }
-                backlog.push_back(input);
+                backlog.push_back(Deferred { input, arrived });
             }
         }
         self.seed_retry_at
@@ -613,7 +632,8 @@ impl ProjectorState {
             let Some(backlog) = self.deferred.remove(&session_id) else {
                 continue;
             };
-            for input in backlog {
+            for Deferred { input, arrived } in backlog {
+                let attention = &attention.as_of(arrived);
                 match input {
                     DeferredInput::Event(event) => {
                         self.project_event(notifications, attention, &event).await;
@@ -1221,7 +1241,7 @@ mod tests {
 
     use super::{
         attention_dedupe_key, projector_source_id, run_projector_blocking, AttentionCoordinator,
-        ProjectorState, TransitionKey,
+        DeferredInput, ProjectorState, TransitionKey,
     };
     use crate::notifications::{
         default_policy, NotificationService, DEFAULT_ATTENTION_DEBOUNCE_SECS,
@@ -1394,6 +1414,29 @@ mod tests {
             project_id: Some("p-test".to_owned()),
             retryable_admission: false,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consecutive_snapshots_of_a_backlog_collapse_into_the_newest_arrival() {
+        let mut state = ProjectorState::default();
+        let session = session_info("s-1", SessionState::Running, None);
+        state.defer(
+            &session.id,
+            DeferredInput::Snapshot(Box::new(session.clone())),
+        );
+        let first = state.deferred[&session.id][0].arrived;
+        tokio::time::advance(std::time::Duration::from_secs(3)).await;
+
+        state.defer(
+            &session.id,
+            DeferredInput::Snapshot(Box::new(session.clone())),
+        );
+        let backlog = &state.deferred[&session.id];
+        assert_eq!(backlog.len(), 1);
+        assert!(
+            backlog[0].arrived.monotonic > first.monotonic,
+            "the collapsed snapshot resolves as of its own arrival"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

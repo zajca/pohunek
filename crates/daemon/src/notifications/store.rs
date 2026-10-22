@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::{
-    apply_status, inside_attention_window, is_attention_dedupe_key, is_attention_kind,
+    apply_status, existed_at, inside_attention_window, is_attention_dedupe_key, is_attention_kind,
     is_turn_dedupe_key, is_valid_status_transition, parse_timestamp, same_source_namespace,
-    source_priority, NotificationError, SourcePriority, TURN_DEDUPE_KEY_PREFIX,
+    source_priority, NotificationError, ResolveAsOf, SourcePriority, TURN_DEDUPE_KEY_PREFIX,
 };
 
 /// Directory under the daemon data dir holding notification state.
@@ -656,7 +656,8 @@ impl NotificationStore {
     /// `turn:<session_id>`, marks `unread` and `read` `turn_completed` records
     /// as `acknowledged`. Records already acknowledged, archived, deleted, or
     /// unrelated to the key prefix are left untouched, so repeated calls are
-    /// idempotent.
+    /// idempotent. With `as_of`, records that other producers created after
+    /// that moment are left untouched too.
     ///
     /// # Errors
     ///
@@ -665,6 +666,7 @@ impl NotificationStore {
         &self,
         dedupe_key: &str,
         now: &str,
+        as_of: Option<&ResolveAsOf>,
     ) -> Result<Vec<NotificationRecord>, NotificationError> {
         let mut state = self
             .state
@@ -683,6 +685,7 @@ impl NotificationStore {
                         record.status,
                         NotificationStatus::Unread | NotificationStatus::Read
                     )
+                    && existed_at(record, as_of)
             })
             .map(|record| record.id.0.clone())
             .collect();
@@ -1129,7 +1132,7 @@ mod tests {
         store.append_created(other).expect("append other session");
 
         let resolved = store
-            .resolve_session_notifications("attention:s-1", "2026-07-03T10:05:00Z")
+            .resolve_session_notifications("attention:s-1", "2026-07-03T10:05:00Z", None)
             .expect("resolve attention");
 
         assert_eq!(resolved.len(), 2);
@@ -1165,13 +1168,13 @@ mod tests {
         store.append_created(errored).expect("append error");
 
         let first = store
-            .resolve_session_notifications("attention:s-1", "2026-07-03T10:05:00Z")
+            .resolve_session_notifications("attention:s-1", "2026-07-03T10:05:00Z", None)
             .expect("first resolve");
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].id.0, "n-1");
 
         let second = store
-            .resolve_session_notifications("attention:s-1", "2026-07-03T10:06:00Z")
+            .resolve_session_notifications("attention:s-1", "2026-07-03T10:06:00Z", None)
             .expect("second resolve");
         assert!(second.is_empty());
 
@@ -1247,7 +1250,7 @@ mod tests {
         store.append_created(attention).expect("append attention");
 
         let resolved = store
-            .resolve_session_notifications("turn:s-1", "2026-07-03T10:05:00Z")
+            .resolve_session_notifications("turn:s-1", "2026-07-03T10:05:00Z", None)
             .expect("resolve turn");
 
         assert_eq!(resolved.len(), 1);

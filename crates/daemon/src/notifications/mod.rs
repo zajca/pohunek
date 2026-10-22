@@ -26,6 +26,7 @@ use tokio::sync::broadcast;
 
 use crate::session::{rfc3339_from_nanos, TurnId, TurnSnapshot};
 
+pub(crate) use coordinator::{existed_at, ResolveAsOf};
 #[doc(inline)]
 pub use coordinator::{AttentionCoordinator, AttentionCoordinatorTask};
 #[doc(inline)]
@@ -707,15 +708,16 @@ impl NotificationService {
     /// # Errors
     ///
     /// Returns a [`NotificationError`] when the store append fails.
-    pub fn resolve_session_notifications(
+    pub(crate) fn resolve_session_notifications(
         &self,
         dedupe_key: &str,
+        as_of: Option<&ResolveAsOf>,
     ) -> Result<Vec<NotificationRecord>, NotificationError> {
         let now = timestamp_now();
         let resolved = self
             .inner
             .store
-            .resolve_session_notifications(dedupe_key, &now)?;
+            .resolve_session_notifications(dedupe_key, &now, as_of)?;
         for record in &resolved {
             self.emit_updated(record);
         }

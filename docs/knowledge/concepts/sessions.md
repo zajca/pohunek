@@ -358,7 +358,10 @@ those of the store. When that read fails, the session's inputs (events,
 snapshots and turn changes) wait in order and are projected after a retry that
 runs every second, so the notifications they derive arrive late. Only an outage
 that outlasts the bound of 256 inputs per session (the oldest is dropped with a
-warning) or the daemon's shutdown loses them.
+warning) or the daemon's shutdown loses them. A queued input that ends a
+condition (a turn that opens, an agent that resumes, a session that stops)
+ends only what existed when it arrived: a record that a provider hook created
+while the input waited stays as it is.
 
 Unread `turn_completed` rows are bounded per session. A newer
 `turn:<session_id>` record acknowledges any older unread turn for that key with
