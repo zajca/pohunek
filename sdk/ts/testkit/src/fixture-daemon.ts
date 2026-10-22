@@ -1101,9 +1101,10 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     if (timeoutMs > MAX_SESSION_WAIT_MS) {
       return errResponse(request.id, sessionWaitLimitExceeded());
     }
-    if (session.agent_base !== "shell") {
-      return errResponse(request.id, sessionInputWaitUnsupported());
-    }
+    // Delayed-submit profiles: an idle target counts only after working
+    // evidence above the submit boundary (the prompt box reads as idle until
+    // Enter is written).
+    const idleRequiresWorking = session.agent_base !== "shell";
     if (session.activity === "blocked") {
       return errResponse(request.id, sessionAgentBlocked());
     }
@@ -1113,66 +1114,99 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     const observation = this.observation(session.id);
     const deadline = Date.now() + timeoutMs;
     const afterRevision = this.activityRevisions.get(session.id) ?? 0n;
-    this.deliverSessionInput(session.id, encoder.encode(params.text));
-    while (Date.now() < deadline) {
-      const event = await this.waitForActivity(session.id, deadline - Date.now());
-      if (event === undefined) {
-        break;
+    let firstWorkingRevision: bigint | undefined;
+    const activityStream = this.openActivityStream(session.id);
+    try {
+      this.deliverSessionInput(session.id, encoder.encode(params.text));
+      while (Date.now() < deadline) {
+        const event = await activityStream.next(deadline - Date.now());
+        if (event === undefined) {
+          break;
+        }
+        if (event.kind === "removed") {
+          return errResponse(request.id, sessionNotFound(session.id));
+        }
+        if (event.kind === "stopped") {
+          return errResponse(request.id, sessionNotRunning(session.id));
+        }
+        if (event.kind === "runtime_changed") {
+          return errResponse(request.id, sessionRuntimeChanged());
+        }
+        if (event.kind === "shutdown") {
+          return errResponse(request.id, daemonShuttingDown());
+        }
+        const evidence = event.evidence;
+        if (
+          evidence.revision > afterRevision
+          && evidence.activity === "working"
+          && firstWorkingRevision === undefined
+          && sameRuntime(evidence.runtime, observation)
+        ) {
+          firstWorkingRevision = evidence.revision;
+        }
+        if (
+          evidence.revision > afterRevision
+          && targets.has(evidence.activity)
+          && sameRuntime(evidence.runtime, observation)
+          && (!idleRequiresWorking
+            || evidence.activity !== "idle"
+            || (firstWorkingRevision !== undefined && firstWorkingRevision < evidence.revision))
+        ) {
+          return okResponse(request.id, {
+            accepted: true,
+            activity: evidence.activity,
+            activity_source: evidence.source,
+            runtime: evidence.runtime,
+            activity_epoch: this.activityEpoch,
+            activity_revision: evidence.revision.toString(),
+            submitted: true,
+          } satisfies SessionInputResult);
+        }
       }
-      if (event.kind === "removed") {
-        return errResponse(request.id, sessionNotFound(session.id));
-      }
-      if (event.kind === "stopped") {
-        return errResponse(request.id, sessionNotRunning(session.id));
-      }
-      if (event.kind === "runtime_changed") {
-        return errResponse(request.id, sessionRuntimeChanged());
-      }
-      if (event.kind === "shutdown") {
-        return errResponse(request.id, daemonShuttingDown());
-      }
-      const evidence = event.evidence;
-      if (
-        evidence.revision > afterRevision
-        && targets.has(evidence.activity)
-        && sameRuntime(evidence.runtime, observation)
-      ) {
-        return okResponse(request.id, {
-          accepted: true,
-          activity: evidence.activity,
-          activity_source: evidence.source,
-          runtime: evidence.runtime,
-          activity_epoch: this.activityEpoch,
-          activity_revision: evidence.revision.toString(),
-        } satisfies SessionInputResult);
-      }
+    } finally {
+      activityStream.close();
     }
     return errResponse(request.id, sessionInputTimeout());
   }
 
-  private waitForActivity(
-    sessionId: string,
-    timeoutMs: number,
-  ): Promise<FixtureInputWaitEvent | undefined> {
-    return new Promise((resolve) => {
-      const waiters = this.activityWaiters.get(sessionId) ?? new Set();
-      this.activityWaiters.set(sessionId, waiters);
-      const finish = (event: FixtureInputWaitEvent | undefined): void => {
-        clearTimeout(timer);
+  /**
+   * Opens a listener that queues every activity event of the session from now
+   * on, so events raised in the same tick as an earlier one are not lost.
+   */
+  private openActivityStream(sessionId: string): {
+    next: (timeoutMs: number) => Promise<FixtureInputWaitEvent | undefined>;
+    close: () => void;
+  } {
+    const queue: FixtureInputWaitEvent[] = [];
+    let wake: (() => void) | undefined;
+    const waiters = this.activityWaiters.get(sessionId) ?? new Set();
+    this.activityWaiters.set(sessionId, waiters);
+    const onEvent = (event: FixtureInputWaitEvent): void => {
+      queue.push(event);
+      wake?.();
+    };
+    waiters.add(onEvent);
+    return {
+      next: async (timeoutMs) => {
+        if (queue.length === 0) {
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, timeoutMs);
+            wake = () => {
+              clearTimeout(timer);
+              resolve();
+            };
+          });
+          wake = undefined;
+        }
+        return queue.shift();
+      },
+      close: () => {
         waiters.delete(onEvent);
         if (waiters.size === 0) {
           this.activityWaiters.delete(sessionId);
         }
-        resolve(event);
-      };
-      const onEvent = (event: FixtureInputWaitEvent): void => {
-        finish(event);
-      };
-      const timer = setTimeout(() => {
-        finish(undefined);
-      }, timeoutMs);
-      waiters.add(onEvent);
-    });
+      },
+    };
   }
 
   private handleSessionAttach(request: ControlRequest): ControlResponse {
@@ -2725,15 +2759,6 @@ function sessionInputTimeout(): ProtocolError {
     "session_input_timeout",
     "the overall input deadline elapsed before delivery and requested activity were confirmed",
     "delivery outcome may be unknown; inspect the current session before deciding whether to resend, and do not retry blindly",
-  );
-}
-
-function sessionInputWaitUnsupported(): ProtocolError {
-  return protocolError(
-    "runtime",
-    "session_input_wait_unsupported",
-    "bounded input confirmation is unavailable for agents that require delayed submit framing",
-    "use fire-and-forget input only when safe, or select a zero-delay agent profile",
   );
 }
 

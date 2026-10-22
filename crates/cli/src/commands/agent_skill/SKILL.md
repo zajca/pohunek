@@ -214,10 +214,14 @@ ambiguous. The ordering is what makes the outcome attributable to the new
 prompt, not the predicate itself. Report a timeout as ambiguous and hand it
 to the operator.
 
-The waited-input form of `session input` (`--until`/`--timeout`) fails with
-`session_input_wait_unsupported` for the default coding agents: codex, claude,
-and hermes submit with a non-zero delay, and only zero-delay profiles such as
-`shell` support it.
+The waited-input form of `session input` (`--until`/`--timeout`) works for every
+agent profile. Codex, claude, and hermes submit with a delay, so the daemon types
+the text, waits out the delay, re-checks the agent, and only then presses Enter;
+`--until working` confirms the agent started on the input (`submitted: true`),
+and an `idle` target counts only after `working` followed the submit.
+`session_input_not_submitted` means Enter was not written and the typed text may
+remain in the input box (it cannot be retracted); `session_input_timeout` means
+no target activity arrived, so inspect the session instead of resending.
 
 ### Following sessions across turns
 

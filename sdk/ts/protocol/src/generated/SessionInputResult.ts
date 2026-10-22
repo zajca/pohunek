@@ -33,4 +33,10 @@ export type SessionInputResult = {
    * Exact post-submission activity revision within [`Self::activity_epoch`].
    */
   activity_revision?: ActivityRevision;
+  /**
+   * `true` when a waited input's Enter was written and the requested
+   * activity was observed after it. Absent for fire-and-forget input and
+   * from daemons that predate the field.
+   */
+  submitted?: boolean;
 };

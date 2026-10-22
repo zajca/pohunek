@@ -161,9 +161,12 @@ opening the dedicated connection and normalizes an omitted `wait.until` to `[]`
 before validation and wire serialization. The target array is copied before the
 first transport await, so caller mutation cannot change the in-flight contract.
 Both `sessionInput(...)` and generic typed `call("session.input", ...)` route
-waited input through this path. Delayed provider framing returns
-`session_input_wait_unsupported` before delivery because the daemon cannot
-safely revalidate approval state inside a worker-owned delay. Deduplicate evidence by `(activity_epoch, runtime,
+waited input through this path. Delayed provider framing is
+paced by the daemon, which re-checks approval state before it writes Enter: an
+agent that turned blocked meanwhile, or a deadline or shutdown before Enter,
+returns `session_input_not_submitted` with the typed text possibly left in the
+input box. The result's optional `submitted: true` is not required by the
+contract check. Deduplicate evidence by `(activity_epoch, runtime,
 activity_revision)`, since daemon reconnect preserves the runtime but starts a
 new epoch-scoped revision sequence. Missing or contradictory evidence fails closed as
 `session_input_wait_contract_mismatch`; it is never treated as delivery

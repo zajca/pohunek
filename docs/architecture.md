@@ -1207,10 +1207,15 @@ An optional bounded input wait uses one overall deadline measured before
 delivery. Waiting for the per-session input gate consumes the same budget
 advertised to Rust and TypeScript transports. A waited request rejects blocked
 activity with `session_agent_blocked` both before the gate and at the causal
-boundary, independently of the provider's fire-and-forget policy. The daemon
-cannot revalidate activity inside a worker-owned delay or safely retract body
-text already consumed by an arbitrary TUI. It therefore rejects nonzero-delay
-wait framing with `session_input_wait_unsupported` before writing any bytes.
+boundary, independently of the provider's fire-and-forget policy. Nonzero-delay
+wait framing is daemon-paced: the daemon writes the body as one worker plan,
+waits out the delay itself, re-checks activity and runtime identity under the
+session lock and writes Enter as a second plan, holding the input gate and the
+worker control connection across both. Body text already consumed by an
+arbitrary TUI cannot be retracted, so a blocked agent, an elapsed deadline or a
+shutdown before Enter fails with `session_input_not_submitted` and no Enter. A deadline not longer than the delay is refused before the body is written. An
+`idle` target on such framing counts only after `working` evidence above the
+boundary captured before Enter's send.
 For zero-delay framing, the daemon first obtains the exclusive worker write
 reservation, then captures the runtime-scoped activity boundary immediately
 before starting the prepared two-fragment worker plan. A timeout or shutdown

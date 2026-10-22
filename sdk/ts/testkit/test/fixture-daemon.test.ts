@@ -201,7 +201,7 @@ describe("@pohunek/testkit fixture daemon", () => {
     }
   });
 
-  test("session input wait rejects delayed provider framing before delivery", async () => {
+  test("session input wait on delayed provider framing needs working before idle", async () => {
     const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-delayed") } });
     try {
       const client = await connectLocal(requireUnixSocket(daemon));
@@ -211,11 +211,26 @@ describe("@pohunek/testkit fixture daemon", () => {
         rows: TEST_ROWS,
       });
 
+      setTimeout(() => {
+        daemon.scenario.setAgentState(created.id, "idle", "report");
+      }, 10);
       await expectProtocolError(client.call("session.input", {
         session_id: created.id,
         text: "hello",
-        wait: {},
-      }), "session_input_wait_unsupported");
+        wait: { until: ["idle"], timeout_ms: 100 },
+      }), "session_input_timeout");
+
+      setTimeout(() => {
+        daemon.scenario.setAgentState(created.id, "working", "report");
+        daemon.scenario.setAgentState(created.id, "idle", "report");
+      }, 10);
+      const result = await client.call("session.input", {
+        session_id: created.id,
+        text: "again",
+        wait: { until: ["idle"], timeout_ms: 500 },
+      });
+      expect(result.activity).toBe("idle");
+      expect(result.submitted).toBe(true);
       await client.close();
     } finally {
       await daemon.close();

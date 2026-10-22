@@ -89,6 +89,17 @@ pub struct ProtocolError {
     pub recover: Option<String>,
 }
 
+/// Why a waited input stopped between its body and its Enter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputNotSubmittedReason {
+    /// The agent's activity became `blocked`.
+    AgentBlocked,
+    /// The overall input deadline elapsed.
+    DeadlineElapsed,
+    /// The daemon began shutting down.
+    DaemonShuttingDown,
+}
+
 impl ProtocolError {
     /// Construct an error with all fields explicit.
     #[must_use]
@@ -357,7 +368,51 @@ impl ProtocolError {
         )
     }
 
-    /// The canonical rejection for delayed framing that cannot safely confirm input.
+    /// The canonical error for a waited input whose body may sit in the agent's
+    /// input box while Enter was not written.
+    #[must_use]
+    pub fn session_input_not_submitted(reason: InputNotSubmittedReason) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "session_input_not_submitted",
+            match reason {
+                InputNotSubmittedReason::AgentBlocked => {
+                    "the agent turned blocked before Enter; the typed text may remain in the input and Enter was not written"
+                }
+                InputNotSubmittedReason::DeadlineElapsed => {
+                    "the input deadline elapsed before Enter; the typed text may remain in the input and Enter was not written"
+                }
+                InputNotSubmittedReason::DaemonShuttingDown => {
+                    "the daemon began shutting down before Enter; the typed text may remain in the input and Enter was not written"
+                }
+            },
+            Some(
+                "typed text cannot be retracted: inspect the session, and answer or clear the prompt before sending new input"
+                    .to_owned(),
+            ),
+        )
+    }
+
+    /// The timeout of a waited input whose Enter was written and acknowledged
+    /// while no requested activity followed it.
+    #[must_use]
+    pub fn session_input_timeout_after_enter(session_id: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "session_input_timeout",
+            format!(
+                "Enter was written to session {session_id}, but no requested activity followed it before the input deadline"
+            ),
+            Some(
+                "the input was submitted; inspect the current session before deciding whether to resend, and do not retry blindly"
+                    .to_owned(),
+            ),
+        )
+    }
+
+    /// The rejection older daemons return for delayed framing that cannot
+    /// safely confirm input; this daemon paces such input itself and no longer
+    /// returns it, but clients keep recognizing it.
     #[must_use]
     pub fn session_input_wait_unsupported() -> Self {
         Self::new(

@@ -5,9 +5,10 @@ import type { AgentActivity } from "./AgentActivity";
 /**
  * Optional delivery-wait contract attached to a `session.input` request.
  *
- * Agents that require delayed submit framing reject this contract before any
- * input bytes are written because activity cannot be revalidated inside the
- * worker-owned delay.
+ * Agents that require delayed submit framing are served by two daemon-paced
+ * worker writes (body, then Enter after the delay) so activity is revalidated
+ * before Enter is written. On such agents an `idle` target is satisfied only
+ * by `idle` evidence that follows `working` evidence after the submit.
  */
 export type SessionInputWait = {
   /**

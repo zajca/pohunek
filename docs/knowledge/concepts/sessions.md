@@ -127,10 +127,17 @@ per-session input gate, so gate contention, the two-fragment worker-plan
 acknowledgement, and activity waiting all consume it. Every input plan preserves
 the body fragment and separate submit fragment; fire-and-forget keeps the
 provider delay on the body fragment. A waited request rejects blocked activity
-as `session_agent_blocked` regardless of provider policy. Because the daemon
-cannot revalidate activity during a worker-owned delay or safely retract text
-already consumed by an arbitrary TUI, waited input rejects delayed framing with
-`session_input_wait_unsupported` before any bytes are written. Zero-delay waited
+as `session_agent_blocked` regardless of provider policy. Waited input on
+delayed framing is daemon-paced: the daemon writes the body, waits out the
+delay, re-checks activity and the runtime under the session lock, and only then
+writes Enter, holding the input gate and the worker connection across both
+writes. If the agent turned `blocked` meanwhile, or the deadline or a shutdown
+arrives before Enter, Enter is not written and the call fails with
+`session_input_not_submitted`; the typed text may remain in the input box
+because arbitrary TUIs cannot retract it. A deadline that is not longer than the submit delay, or that or a shutdown arrives before the body is written, writes nothing (`session_input_timeout`, `daemon_shutting_down`). An `idle` target on delayed framing
+counts only after `working` evidence above the boundary, since the prompt box
+reads as idle until Enter is written; `--until working` confirms the agent
+started on the input, and a success carries `submitted: true`. Zero-delay waited
 input reserves the exclusive worker write first, then captures its causal
 boundary immediately before the prepared atomic two-fragment plan starts. A
 timeout or shutdown while reserving the worker cancels the unsent plan without
@@ -145,9 +152,10 @@ activity_revision)` because a daemon reconnect changes the epoch while retaining
 the worker runtime. Rapid matching transitions remain valid even when the latest
 activity changes again, arrives before submit ACK, or the event receiver lags. The wait returns
 `session_not_running` if that runtime exits, `session_runtime_changed` if it is
-replaced, `session_input_wait_unsupported` for delayed provider framing, and
+replaced, `session_input_not_submitted` when Enter was not written, and
 `session_input_timeout` when delivery acknowledgement or a target does not
-arrive before the deadline. Rust and TypeScript
+arrive before the deadline (on delayed framing also when Enter was written and
+no target followed). Rust and TypeScript
 SDK helpers validate the timeout locally and fail closed with
 `session_input_wait_contract_mismatch` when a daemon ignores `wait` or omits
 runtime-scoped evidence. Its recovery guidance says to inspect the session rather

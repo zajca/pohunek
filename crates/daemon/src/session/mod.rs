@@ -791,6 +791,8 @@ struct SessionRegistryInner {
     /// Rendezvous the next waited input write meets at its send boundary.
     #[cfg(test)]
     input_send_hold: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    input_delay_hold: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Holds the next create once its target is bound, before its launch.
     #[cfg(test)]
     bound_create_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
@@ -2273,6 +2275,8 @@ impl SessionRegistry {
                 external_association_block: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 input_send_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                input_delay_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 bound_create_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
