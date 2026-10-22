@@ -2600,6 +2600,10 @@ fn selection_outcome(
                 plan, prepared, &holder, reserved,
             )),
         },
+        Held::Damaged(kind, selected) if selected == holder => {
+            refuse_held_damaged(plan, prepared, report, subject, kind, &holder, reserved);
+            Selection::Leave
+        }
         Held::Damaged(kind, selected) => {
             refuse_damaged(report, subject, kind, id, &selected);
             Selection::Leave
@@ -2668,6 +2672,54 @@ fn held_leaves(plan: &PlanInputs<'_>, prepared: &Prepared, reserved: bool) -> bo
         )
 }
 
+/// The step that installs and selects the release's Pi package by hand once the
+/// holder is gone: `plugin install` selects only when no other version of the
+/// package is installed, `plugin update` always does.
+fn pi_install_step(plan: &PlanInputs<'_>, prepared: &Prepared, holder: &PackageDigest) -> String {
+    let id = &prepared.identity.id;
+    let runtime = prepared.definition.runtime_id();
+    let other_version = plan.state.is_some_and(|state| {
+        state
+            .packages()
+            .iter()
+            .any(|record| record.identity().id == *id && record.digest() != holder)
+    });
+    let command = if other_version {
+        update_command(id, runtime)
+    } else {
+        install_command(runtime)
+    };
+    format!("install the release's package with `{command}`")
+}
+
+/// Refuses the selected holder whose installed root is altered or damaged. The
+/// removal leaves a reserved runtime to the next upgrade; Pi is installed by hand.
+fn refuse_held_damaged(
+    plan: &PlanInputs<'_>,
+    prepared: &Prepared,
+    report: &mut Report,
+    subject: &str,
+    kind: PackageErrorKind,
+    holder: &PackageDigest,
+    reserved: bool,
+) {
+    let id = &prepared.identity.id;
+    if reserved {
+        refuse_damaged(report, subject, kind, id, holder);
+        return;
+    }
+    report.refuse(
+        subject,
+        &ProtocolError::from(kind).code,
+        &format!(
+            "the installed package root of this runtime is altered or damaged; remove it with \
+             `pohunek plugin uninstall {id} --digest {} --remove-modified --yes`, then {}",
+            holder.as_str(),
+            pi_install_step(plan, prepared, holder)
+        ),
+    );
+}
+
 /// The gap detail for a runtime the upgrade leaves because the registry holds
 /// the release package's id and version under the digest `holder`, and no
 /// enabled official selection serves.
@@ -2727,19 +2779,7 @@ fn held_left_detail(
         let then = if reserved {
             "run the upgrade again".to_owned()
         } else {
-            let runtime = prepared.definition.runtime_id();
-            let other_version = plan.state.is_some_and(|state| {
-                state
-                    .packages()
-                    .iter()
-                    .any(|record| record.identity().id == *id && record.digest() != holder)
-            });
-            let command = if other_version {
-                update_command(id, runtime)
-            } else {
-                install_command(runtime)
-            };
-            format!("install the release's package with `{command}`")
+            pi_install_step(plan, prepared, holder)
         };
         return format!("{lead}; remove the installed one with {uninstall}, then {then}");
     }

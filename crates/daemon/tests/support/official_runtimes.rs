@@ -245,9 +245,9 @@ impl OfficialCatalog {
     }
 
     /// Installs the release package of `runtime` from the extracted release
-    /// directory `release` into `plugins_dir`, enabled and selected, as
-    /// `pohunek plugin install packages/<runtime>.tar.zst --catalog
-    /// runtime-catalog.json --yes` does.
+    /// directory `release` into `plugins_dir`, enabled and selected, with the
+    /// request `pohunek plugin update` always sends and `pohunek plugin install`
+    /// sends when no other version of the package is installed.
     pub(crate) async fn install_release_package(
         &self,
         plugins_dir: &Path,

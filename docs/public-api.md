@@ -2601,7 +2601,7 @@ search path is dropped before it is judged, as in the table above.
 | Reserved: nothing selected, H enabled or disabled | gap `official_package_not_serving`, no package entry, profile left unbound | `plugin uninstall <package> --digest <H> --yes`, then the next upgrade installs the release's archive and binds the profile |
 | Reserved: H is selected, enabled and its root is missing or does not load | gap `official_package_not_serving` | the same uninstall (the registry unrecords a package without a root) |
 | Pi: H is selected, enabled and its root is missing or does not load | gap `official_package_not_serving` | the same uninstall, then `pohunek plugin install runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json --yes` (`plugin update` with the same arguments when another Pi version is installed, because `install` selects only the first): the upgrade plans Pi only while an enabled official selection manages it, so Pi is installed by hand; no command when nothing uses Pi |
-| H is unselected or selected, and its root is altered | refusal with the root-invalid code | `plugin uninstall <package> --digest <H> --remove-modified --yes`, then the next upgrade installs the release's archive of a reserved runtime; for Pi, install it with `plugin install` as in the Pi row above |
+| H is unselected or selected, and its root is altered | refusal with the root-invalid code | `plugin uninstall <package> --digest <H> --remove-modified --yes`, then the next upgrade installs the release's archive of a reserved runtime; for Pi the refusal itself names the `plugin install` (or `plugin update`) step as in the Pi row above |
 | Another version S is selected, enabled, and its root is missing or does not load | gap `official_package_not_serving` | restore S with `plugin install`, or `plugin select <package> --digest <digest>` |
 | S is selected, enabled, and its root is altered | refusal for S | `plugin uninstall <package> --digest <S> --remove-modified --yes` |
 | The selected package is not official (a registry edited by hand) | gap `official_package_not_serving` | `plugin select <package> --digest <digest>` |
@@ -2629,12 +2629,13 @@ S), all in `crates/daemon/tests/ensure_runtimes.rs`, and
 `a_selected_holder_without_its_root_is_left_and_its_uninstall_lets_the_release_install`,
 `a_selected_pi_holder_without_its_root_is_left_and_two_commands_install_the_release`,
 `a_selected_pi_holder_without_its_root_that_nothing_uses_is_left_with_no_command`,
+`a_selected_pi_holder_without_its_root_beside_another_version_names_the_update`,
 `a_holder_beside_a_runtime_used_only_by_a_session_or_a_hook_names_the_uninstall`,
 `a_runtime_planned_only_by_detection_beside_a_holder_gets_no_uninstall_command`,
 `an_unselected_holder_with_an_altered_root_is_refused_and_its_removal_lets_the_release_install`,
 `a_holder_that_a_profile_pins_is_left_with_no_uninstall_command`,
 `a_selected_holder_with_an_altered_root_is_refused_and_its_removal_lets_the_release_install`,
-`a_selected_pi_holder_with_an_altered_root_is_refused`,
+`a_selected_pi_holder_with_an_altered_root_is_refused_and_two_commands_install_the_release`,
 `a_selected_version_without_its_root_beside_a_holder_is_left_with_the_select_hint`,
 `a_selected_version_with_an_altered_root_beside_a_holder_is_refused`,
 `a_non_official_selection_beside_a_holder_is_left_with_the_select_hint`,

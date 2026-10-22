@@ -5282,6 +5282,11 @@ fn assert_uninstall_remedy_installs_the_release(
         detail.contains(&uninstall_command(runtime, holder)),
         "{runtime}: {detail}"
     );
+    assert!(
+        detail.ends_with("then run the upgrade again"),
+        "{runtime}: {detail}"
+    );
+    assert!(!detail.contains("plugin install"), "{runtime}: {detail}");
     pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
         .expect("the package store")
         .registry()
@@ -5480,18 +5485,66 @@ async fn a_selected_holder_with_an_altered_root_is_refused_and_its_removal_lets_
     }
 }
 
-/// Row 4 for Pi: the same refusal, with the registry unchanged.
+/// Row 4 for Pi: the refusal names the removal and then the install (or, with
+/// another Pi version installed, the update) of the release's archive, because
+/// the upgrade does not plan Pi without a selection. The registry accepts the
+/// removal and the install, and the next upgrade finds Pi at the release digest.
 #[tokio::test]
-async fn a_selected_pi_holder_with_an_altered_root_is_refused() {
-    let holder = official_runtimes::variant_archive("pi", RELEASE_VERSION);
-    let release = holder_release("pi");
-    let host = host_with_holder("pi", &[(&holder, true, true)], &release).await;
-    host.alter_package_root(&holder.1);
-    assert_held_runtime_refused(
-        &host,
-        "pi",
-        &format!("--digest {} --remove-modified --yes", holder.1.as_str()),
-    );
+async fn a_selected_pi_holder_with_an_altered_root_is_refused_and_two_commands_install_the_release()
+{
+    for with_older in [false, true] {
+        let older = official_runtimes::variant_archive("pi", PI_OLDER_VERSION);
+        let holder = official_runtimes::variant_archive("pi", RELEASE_VERSION);
+        let release = holder_release("pi");
+        let host = if with_older {
+            host_with_holder(
+                "pi",
+                &[(&older, true, false), (&holder, true, true)],
+                &release,
+            )
+            .await
+        } else {
+            host_with_holder("pi", &[(&holder, true, true)], &release).await
+        };
+        host.alter_package_root(&holder.1);
+        let step = if with_older {
+            "pohunek plugin update pohunek.runtime.pi runtime/packages/pi.tar.zst"
+        } else {
+            "pohunek plugin install runtime/packages/pi.tar.zst"
+        };
+
+        assert_held_runtime_refused(
+            &host,
+            "pi",
+            &format!(
+                "--digest {} --remove-modified --yes`, then install the release's package \
+                 with `{step} --catalog runtime/runtime-catalog.json --yes`",
+                holder.1.as_str()
+            ),
+        );
+
+        pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+            .expect("the package store")
+            .registry()
+            .remove_modified(&holder.1, &package::registry::RetainedDigests::new())
+            .expect("the registry accepts the hinted removal");
+        host.catalog
+            .install_release_package(
+                &host.plugins_dir(),
+                host.env.root(),
+                &host.release_dir(),
+                "pi",
+            )
+            .await;
+        let next = host.step(false);
+        assert!(next.refusals.is_empty(), "{:?}", next.refusals);
+        assert_eq!(
+            pi_package(&next).status,
+            PackageStatus::Present,
+            "{with_older}"
+        );
+        assert_eq!(pi_package(&next).digest, release.1.as_str(), "{with_older}");
+    }
 }
 
 /// Row 5: another version is selected and its root is missing, while the holder
@@ -5528,7 +5581,27 @@ async fn a_selected_version_without_its_root_beside_a_holder_is_left_with_the_se
             !detail.contains(&uninstall_command(runtime, &holder.1)),
             "{runtime}: {detail}"
         );
+        assert_select_hint_makes_the_holder_serve(&host, runtime, &holder.1);
     }
+}
+
+/// Runs the select the gap names: the registry selects the holder, and the next
+/// plan keeps it as the serving selection.
+fn assert_select_hint_makes_the_holder_serve(host: &Host, runtime: &str, holder: &PackageDigest) {
+    pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+        .expect("the package store")
+        .registry()
+        .select(holder)
+        .expect("the registry accepts the hinted select");
+    let plan = host.step(true);
+    assert!(plan.refusals.is_empty(), "{runtime}: {:?}", plan.refusals);
+    let package = plan
+        .packages
+        .iter()
+        .find(|package| package.runtime == runtime)
+        .unwrap_or_else(|| panic!("{runtime}: {:?}", plan.packages));
+    assert_eq!(package.status, PackageStatus::Kept, "{runtime}");
+    assert_eq!(package.digest, holder.as_str(), "{runtime}");
 }
 
 /// Row 6: another version is selected and its root is altered, while the holder
@@ -5555,6 +5628,15 @@ async fn a_selected_version_with_an_altered_root_beside_a_holder_is_refused() {
             runtime,
             &format!("--digest {} --remove-modified --yes", selected.1.as_str()),
         );
+        if runtime != "pi" {
+            // The removal leaves the holder unselected: row 1 names its uninstall.
+            pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+                .expect("the package store")
+                .registry()
+                .remove_modified(&selected.1, &package::registry::RetainedDigests::new())
+                .expect("the registry accepts the hinted removal");
+            assert_held_runtime_left(&host, runtime, &[&uninstall_command(runtime, &holder.1)]);
+        }
     }
 }
 
@@ -5588,6 +5670,7 @@ async fn a_non_official_selection_beside_a_holder_is_left_with_the_select_hint()
         !detail.contains(&uninstall_command(runtime, &holder.1)),
         "{detail}"
     );
+    assert_select_hint_makes_the_holder_serve(&host, runtime, &holder.1);
 }
 
 /// Row 8: a newer Pi selection whose root is missing beside a holder keeps its
@@ -5898,4 +5981,47 @@ async fn a_selected_pi_holder_without_its_root_beside_another_version_names_the_
     assert!(next.refusals.is_empty(), "{:?}", next.refusals);
     assert_eq!(pi_package(&next).status, PackageStatus::Present);
     assert_eq!(pi_package(&next).digest, release.1.as_str());
+}
+
+/// Rows 1, 2 and 7 for Pi: Pi is planned only while an enabled official selection
+/// manages it, so with nothing selected or a non-official selection the holder
+/// check is never reached. Plan and apply agree on the managed-runtime gap and
+/// write nothing.
+#[tokio::test]
+async fn a_pi_without_an_enabled_official_selection_beside_a_holder_is_not_planned() {
+    for state in ["no selection", "disabled holder", "non-official selection"] {
+        let older = official_runtimes::variant_archive("pi", PI_OLDER_VERSION);
+        let holder = official_runtimes::variant_archive("pi", RELEASE_VERSION);
+        let release = holder_release("pi");
+        let host = match state {
+            "no selection" => host_with_holder("pi", &[(&holder, true, false)], &release).await,
+            "disabled holder" => host_with_holder("pi", &[(&holder, false, false)], &release).await,
+            _ => {
+                let host = host_with_holder(
+                    "pi",
+                    &[(&older, true, true), (&holder, true, false)],
+                    &release,
+                )
+                .await;
+                set_package_source(&host, &older.1, "explicit_digest");
+                host
+            }
+        };
+        let registry = fs::read(host.registry_path()).expect("the registry record");
+
+        for report in [host.step(true), host.step(false)] {
+            assert!(report.refusals.is_empty(), "{state}: {:?}", report.refusals);
+            assert!(report.packages.is_empty(), "{state}: {:?}", report.packages);
+            assert!(
+                gap_codes(&report).contains(&("pi", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)),
+                "{state}: {:?}",
+                report.gaps
+            );
+        }
+        assert_eq!(
+            fs::read(host.registry_path()).expect("the registry record"),
+            registry,
+            "{state}"
+        );
+    }
 }
