@@ -549,6 +549,7 @@ async fn run() -> Result<(), DaemonError> {
     //    both session and notification control-plane events into one file.
     let event_logs = spawn_event_logs(
         &paths.data_dir.join(EVENTS_SUBDIR),
+        sessions.event_retention(),
         &sessions,
         &notifications,
     )?;
@@ -807,6 +808,7 @@ async fn build_session_registry(
             apply_input_timing(&mut config, service.input_timing());
             apply_wait_timing(&mut config, service.wait_timing());
             config.hook_stderr_tail_bytes = service.hook_stderr_tail_bytes();
+            config.event_retention = service.event_retention();
             let (supervisor, worker_logs) = native_supervisor(&service, paths).await?;
             info!(
                 service.namespace = %service.namespace(),
@@ -1009,15 +1011,16 @@ struct EventLogDrains {
 
 fn spawn_event_logs(
     events_dir: &std::path::Path,
+    retention: pohunek_service_config::EventRetention,
     sessions: &SessionRegistry,
     notifications: &NotificationService,
 ) -> Result<EventLogDrains, DaemonError> {
-    let log = Arc::new(
-        EventLog::open(events_dir).map_err(|source| DaemonError::Directory {
+    let log = Arc::new(EventLog::open(events_dir, retention).map_err(|source| {
+        DaemonError::Directory {
             path: events_dir.to_path_buf(),
             source,
-        })?,
-    );
+        }
+    })?);
     let shutdown = CancellationToken::new();
     let handles = vec![
         spawn_drain(Arc::clone(&log), sessions.subscribe(), shutdown.clone()),
@@ -1845,7 +1848,7 @@ mod supervision_tests {
             .expect("chmod config directory");
         let file = dir.path().join(pohunek_service_config::FILE_NAME);
         let text = format!(
-            "schema_version = 6\nprefix = \"/home/u/.local\"\nactive_version = \"0.35.2\"\n\
+            "schema_version = 7\nprefix = \"/home/u/.local\"\nactive_version = \"0.35.2\"\n\
              future_top = \"{SECRET}\"\n\
              [namespace]\nuid = 1000\nstate_root = \"/home/u/.local/state/pohunek\"\n\
              runtime_root = \"/run/user/1000/pohunek\"\n\
@@ -1858,6 +1861,7 @@ mod supervision_tests {
              write_stall_timeout_ms = 3000\n\
              [waits]\nturn_default_ms = 300000\nturn_max_ms = 1800000\n\
              [hooks]\nstderr_tail_bytes = 4096\n\
+             [events]\nmax_file_bytes = 33554432\nmax_files = 8\nmax_age_days = 14\n\
              [limits]\nopen_files = 8192\nopen_file = \"{SECRET}\"\n"
         );
         std::fs::write(&file, text).expect("write service.toml");

@@ -328,7 +328,13 @@ async fn spawn_worker_backed_server_with(
         ),
     };
     if let Some(event_log_dir) = event_log_dir {
-        let log = Arc::new(EventLog::open(&event_log_dir).expect("event log opens"));
+        let log = Arc::new(
+            EventLog::open(
+                &event_log_dir,
+                pohunek_service_config::DEFAULT_EVENT_RETENTION,
+            )
+            .expect("event log opens"),
+        );
         let _drain = spawn_drain(
             log,
             registry.subscribe(),

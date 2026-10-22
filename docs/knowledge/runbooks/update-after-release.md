@@ -1258,21 +1258,29 @@ the new key. A previous release that is still strict refuses a file with any
 unknown key, so remove hand-added keys before a rollback to a release older
 than #1401.
 
-## Configuration migration from schemas 2, 3, 4 and 5
+## Configuration migration from schemas 2, 3, 4, 5 and 6
 
 When the installed `service.toml` was written by release 0.33.x (schema 2, no
 `[input]` or `[waits]` table), by a release with schema 3 (no `[waits]`
-table), by a release with schema 4 (no `input.write_stall_timeout_ms`), or by a
-release with schema 5 (no `[hooks]` table) and the target version differs, `pohunek service upgrade` turns into a
+table), by a release with schema 4 (no `input.write_stall_timeout_ms`), by a
+release with schema 5 (no `[hooks]` table), or by a release with schema 6 (no
+`[events]` table) and the target version differs, `pohunek service upgrade` turns into a
 configuration migration and the `--json` reports carry the source schema,
-`config_schema_migration: 2`, `3`, `4` or `5`. `service check` verifies a pending migration's
+`config_schema_migration: 2`, `3`, `4`, `5` or `6`. `service check` verifies a pending migration's
 backup and reports the migration it would perform without writing anything,
 so an archive updater sees it before any effect. A same-version refresh runs
 no migration and reports `null`. The migration assigns the documented
 defaults of the missing keys and tables explicitly: `[input]` 5000 ms and
 150 ms for schema 2, `input.write_stall_timeout_ms` 3000 ms for schemas 2 to 4,
 `[waits]` 300000 ms and 1800000 ms for schemas 2 and 3, and
-`[hooks] stderr_tail_bytes` 4096 for schemas 2 to 5. Every value the file
+`[hooks] stderr_tail_bytes` 4096 for schemas 2 to 5, and `[events]`
+(`max_file_bytes` 33554432, `max_files` 8, `max_age_days` 14) for schemas 2 to
+6. The first daemon start under the new schema removes an `events.jsonl` above
+`max_file_bytes` without reading it, a 13 GB journal included, and logs one
+WARN with the path and removed size; the history in that file is not kept.
+A schema-6 file written by a build with tolerant unknown keys is still read in
+its exact shape, so remove hand-added keys from it before the upgrade. Every
+value the file
 records, including tuned `[input]` and `[waits]` timings of a schema-3,
 schema-4 or schema-5 file, is kept.
 

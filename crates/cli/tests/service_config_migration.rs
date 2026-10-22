@@ -3,7 +3,8 @@
 //! The real CLI binary runs against an isolated XDG layout holding the exact
 //! schema-2 configuration a v0.33.1 release wrote, the exact schema-3 shape
 //! that precedes `[waits]`, the schema-4 shape that predates the input write
-//! stall bound, the schema-5 shape that predates `[hooks]`, or a
+//! stall bound, the schema-5 shape that predates `[hooks]`, the schema-6 shape
+//! that predates `[events]`, or a
 //! current-schema file. No service manager is
 //! involved: the check of an existing installation contacts only the new
 //! daemon's `upgrade-preflight`, which reads the store below the isolated
@@ -176,11 +177,21 @@ impl Host {
         }
     }
 
-    /// A current-schema file with the given `[waits]` values.
+    /// A previous schema-6 installation, as the release before `[events]`
+    /// wrote it, with the given `[waits]` values.
     fn schema_six_with_waits(default_ms: u64, max_ms: u64) -> Self {
         Self {
             template: SCHEMA_THREE_TEMPLATE,
             repair: Box::new(move |template| waits_file(template, 6, default_ms, max_ms)),
+            temporary: temp_root(),
+        }
+    }
+
+    /// A current-schema file with the given `[waits]` values.
+    fn current_with_waits(default_ms: u64, max_ms: u64) -> Self {
+        Self {
+            template: SCHEMA_THREE_TEMPLATE,
+            repair: Box::new(move |template| waits_file(template, 7, default_ms, max_ms)),
             temporary: temp_root(),
         }
     }
@@ -199,7 +210,7 @@ impl Host {
 
 /// Turns the schema-3 template into a schema-`version` file (4 or later) with
 /// the given `[waits]` values: the input write stall bound exists from schema 5
-/// on and `[hooks]` from schema 6 on.
+/// on, `[hooks]` from schema 6 on and `[events]` from schema 7 on.
 fn waits_file(template: &str, version: u32, default_ms: u64, max_ms: u64) -> String {
     let template = template.replace("schema_version = 3", &format!("schema_version = {version}"));
     let template = if version >= 5 {
@@ -216,8 +227,16 @@ fn waits_file(template: &str, version: u32, default_ms: u64, max_ms: u64) -> Str
             .replace("300000", &default_ms.to_string())
             .replace("1800000", &max_ms.to_string()),
     );
-    if version >= 6 {
+    let template = if version >= 6 {
         template.replace("[limits]", "[hooks]\nstderr_tail_bytes = 4096\n\n[limits]")
+    } else {
+        template
+    };
+    if version >= 7 {
+        template.replace(
+            "[limits]",
+            "[events]\nmax_file_bytes = 33554432\nmax_files = 8\nmax_age_days = 14\n\n[limits]",
+        )
     } else {
         template
     }
@@ -498,8 +517,25 @@ fn check_accepts_a_schema_five_config_and_names_the_migration() {
 }
 
 #[test]
-fn check_accepts_a_current_schema_config_without_a_migration() {
+fn check_accepts_a_schema_six_config_and_names_the_migration() {
     let host = Host::schema_six_with_waits(120_000, 2_700_000);
+    let Some((success, envelope)) = check_passing(&host) else {
+        return;
+    };
+    assert!(success, "{envelope}");
+    assert_eq!(
+        envelope
+            .get("ok")
+            .and_then(|report| report.get("config_schema_migration"))
+            .and_then(Value::as_u64),
+        Some(6),
+        "{envelope}: the check names the schema-6 migration"
+    );
+}
+
+#[test]
+fn check_accepts_a_current_schema_config_without_a_migration() {
+    let host = Host::current_with_waits(120_000, 2_700_000);
     let Some((success, envelope)) = check_passing(&host) else {
         return;
     };
@@ -515,7 +551,7 @@ fn check_accepts_a_current_schema_config_without_a_migration() {
 
 #[test]
 fn check_refuses_a_default_turn_wait_above_its_ceiling() {
-    let host = Host::schema_six_with_waits(1_800_001, 1_800_000);
+    let host = Host::current_with_waits(1_800_001, 1_800_000);
     let (success, envelope) = check(&host);
     assert!(!success, "{envelope}: the default exceeds the ceiling");
     let refusal = envelope.get("err").expect("the refusal document");
@@ -540,7 +576,7 @@ fn check_refuses_a_turn_wait_outside_its_bounds() {
         (4_999, 1_800_000, "waits.turn_default_ms"),
         (300_000, 3_600_001, "waits.turn_max_ms"),
     ] {
-        let host = Host::schema_six_with_waits(default_ms, max_ms);
+        let host = Host::current_with_waits(default_ms, max_ms);
         let (success, envelope) = check(&host);
         assert!(!success, "{envelope}: {key} is out of range");
         let refusal = envelope.get("err").expect("the refusal document");
@@ -575,7 +611,7 @@ fn check_reports_no_migration_when_the_installed_version_is_already_active() {
 
 #[test]
 fn check_refuses_a_config_this_version_neither_writes_nor_migrates() {
-    for version in [1, 7] {
+    for version in [1, 8] {
         let host = Host::schema_of(version);
         let (success, envelope) = check(&host);
         assert!(!success, "{envelope}: schema {version} is not a source");

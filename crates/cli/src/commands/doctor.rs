@@ -736,7 +736,7 @@ mod tests {
     /// A schema-6 `service.toml` with the given extra lines in `[limits]`.
     fn service_toml(extra_limits: &str) -> String {
         format!(
-            r#"schema_version = 6
+            r#"schema_version = 7
 prefix = "/home/u/.local"
 active_version = "0.35.2"
 
@@ -771,6 +771,11 @@ turn_max_ms = 1800000
 
 [hooks]
 stderr_tail_bytes = 4096
+
+[events]
+max_file_bytes = 33554432
+max_files = 8
+max_age_days = 14
 
 [limits]
 open_files = 8192

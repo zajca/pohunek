@@ -6,13 +6,14 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-07-28
+// Rust guideline compliant 2026-10-22
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 pub mod config;
 
@@ -30,9 +31,14 @@ const OVERSIZE_NOTICE: &[u8] = b"{\"level\":\"WARN\",\"target\":\"pohunek_loggin
 
 /// Size and count bounds for one owned log family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the fields are the three retention limits"
+)]
 pub struct Policy {
     max_file_bytes: u64,
     max_files: usize,
+    max_age: Option<Duration>,
 }
 
 impl Policy {
@@ -53,7 +59,29 @@ impl Policy {
         Ok(Self {
             max_file_bytes,
             max_files,
+            max_age: None,
         })
+    }
+
+    /// Adds an age bound: a rotated file whose last write is older than
+    /// `max_age` is pruned when the writer opens and after each rotation, and
+    /// so is an active file whose last write is older when the writer opens.
+    ///
+    /// A zero `max_age` is treated as no age bound.
+    #[must_use]
+    pub const fn with_max_age(mut self, max_age: Duration) -> Self {
+        self.max_age = if max_age.is_zero() {
+            None
+        } else {
+            Some(max_age)
+        };
+        self
+    }
+
+    /// Returns the age bound, if any.
+    #[must_use]
+    pub const fn max_age(self) -> Option<Duration> {
+        self.max_age
     }
 
     /// Returns the maximum bytes in one file.
@@ -441,19 +469,64 @@ fn prune_locked(dir: &Path, files: &Files, policy: Policy) -> Result<(), Error> 
             continue;
         }
         if let Some(index) = files.rotation_index(&name) {
-            let size = entry
+            let metadata = entry
                 .metadata()
-                .map_err(|source| Error::io("inspect rotated log", &entry.path(), source))?
-                .len();
-            if index >= policy.max_files || size > policy.max_file_bytes {
+                .map_err(|source| Error::io("inspect rotated log", &entry.path(), source))?;
+            if index >= policy.max_files
+                || metadata.len() > policy.max_file_bytes
+                || is_expired(&metadata, policy)
+            {
                 remove_regular(&entry.path())?;
             }
         }
     }
 
     let active = files.active_path(dir);
-    if regular_file_size(&active)? > policy.max_file_bytes {
+    if regular_file_size(&active)? > policy.max_file_bytes || active_expired(&active, policy)? {
         remove_regular(&active)?;
+    }
+    Ok(())
+}
+
+/// Whether the file's last write is older than the policy's age bound.
+///
+/// A modification time in the future counts as not expired, so a clock step
+/// backwards never deletes a file.
+fn is_expired(metadata: &fs::Metadata, policy: Policy) -> bool {
+    let Some(max_age) = policy.max_age else {
+        return false;
+    };
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age > max_age)
+}
+
+fn active_expired(active: &Path, policy: Policy) -> Result<bool, Error> {
+    match fs::symlink_metadata(active) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(is_expired(&metadata, policy)),
+        Ok(_) => Ok(false),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(Error::io("inspect log file", active, source)),
+    }
+}
+
+/// Removes every rotated file past the age bound.
+fn prune_expired_rotations(dir: &Path, files: &Files, policy: Policy) -> Result<(), Error> {
+    if policy.max_age.is_none() {
+        return Ok(());
+    }
+    for index in 1..policy.max_files {
+        let path = files.rotation_path(dir, index);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() && is_expired(&metadata, policy) => {
+                remove_regular(&path)?;
+            }
+            Ok(_) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(Error::io("inspect rotated log", &path, source)),
+        }
     }
     Ok(())
 }
@@ -488,7 +561,7 @@ fn rotate_locked(dir: &Path, files: &Files, policy: Policy) -> Result<(), Error>
         fs::rename(&active, &first)
             .map_err(|source| Error::io("rotate active log", &active, source))?;
     }
-    Ok(())
+    prune_expired_rotations(dir, files, policy)
 }
 
 fn remove_family_locked(dir: &Path, files: &Files) -> Result<(), Error> {
