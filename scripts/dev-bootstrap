@@ -259,6 +259,13 @@ CHILD_ENV_EXCLUDED = (RELAY_DB_VARIABLE,)
 SYSTEMD_SUITE_COMMAND = (
     "POHUNEK_SYSTEMD_E2E=1 cargo test <suite> --ignored --test-threads 1"
 )
+# The one real-systemd suite whose tests are not `#[ignore]`d: they run in every
+# lane, and the real-systemd lane (the variable below) gives them the real bus.
+SYSTEMD_BUS_SUITE = "service_config_migration::"
+SYSTEMD_BUS_SUITE_COMMAND = (
+    "POHUNEK_SYSTEMD_E2E=1 cargo test -p pohunek-cli --test all -- "
+    f"--test-threads 1 {SYSTEMD_BUS_SUITE}"
+)
 # `systemctl --user is-system-running` states the real-systemd CI job
 # accepts: `degraded` only means some unrelated user unit failed.
 SYSTEMD_USABLE_STATES = ("running", "degraded")
@@ -1033,6 +1040,13 @@ PATH_CHECKS = {
             "POHUNEK_DAEMON_BIN, POHUNEK_WORKER_BIN and "
             "POHUNEK_CLI_BIN pointing at the built binaries (see "
             f"{VERIFICATION_DOC})",
+            on=("Linux",),
+        ),
+        Check(
+            FOCUSED, SYSTEMD_BUS_SUITE_COMMAND,
+            f"`{SYSTEMD_BUS_SUITE}` has no ignored tests, so it runs without "
+            "--ignored; in a session with a systemd user manager its tests "
+            "reach the real bus, as in the CI job",
             on=("Linux",),
         ),
         *(

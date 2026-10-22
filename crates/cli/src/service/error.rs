@@ -507,7 +507,7 @@ pub enum Error {
 
     /// The `PATH` the daemon job runs with could not be determined, so a
     /// preflight or runtime step cannot run with the daemon's `PATH`.
-    #[error("cannot determine the PATH the daemon job runs with: {detail}")]
+    #[error("cannot determine the environment the daemon job runs with: {detail}")]
     ManagerEnvironment {
         /// Why no usable `PATH` came back.
         detail: String,
@@ -832,10 +832,10 @@ impl Error {
                 "the upgrade is kept, not rolled back: confirm that no `pohunekd ensure-official-runtimes` process of that release is running (`pgrep -fl ensure-official-runtimes`), then rerun `pohunek service upgrade`",
             ),
             Self::ManagerEnvironment { .. } => Some(
-                "the daemon job's PATH comes from its definition when it records one, otherwise from the service manager's environment (the systemd user manager's Environment on Linux, the launchd domain on macOS); make that manager's environment readable, that is its bus reachable and its answer well formed, or remove the unit setting, drop-in or journal ambiguity the message names, and retry; nothing was changed",
+                "the daemon job's environment is judged as its service manager gives it: on Linux the systemd user manager's Environment and the daemon unit with its drop-ins (a drop-in can replace the recorded PATH, and an EnvironmentFile=, PassEnvironment=, UnsetEnvironment= or unreadable line the message names cannot be judged), on macOS the launchd domain and the persisted launchd configuration; make that manager readable, that is its bus reachable and its answer well formed, or remove the unit setting, drop-in or journal ambiguity the message names (for a store variable in an EnvironmentFile=, move it to an Environment= line of a drop-in), and retry; nothing was changed",
             ),
             Self::ManagerVariablesUnread { .. } => Some(
-                "make the service manager's environment readable (on Linux, the systemd user manager's bus reachable; on macOS, the user logged in to a GUI session so launchd has the gui/<uid> domain) and retry, or pass --accept-runtime-loss to accept that a session judged without those variables may lose its recovery; nothing was changed",
+                "log the user in to a GUI session so launchd has the gui/<uid> domain and retry, or pass --accept-runtime-loss to accept that a session judged without the launchd variables may lose its recovery; nothing was changed",
             ),
             Self::UpgradeRuntimesFailed { .. } => Some(
                 "run `<staged>/pohunekd ensure-official-runtimes --dry-run` by hand with the same XDG environment to see its output, then retry",

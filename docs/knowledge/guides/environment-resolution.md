@@ -177,3 +177,26 @@ directory. The resolved command uses the verified canonical target.
 - An abandoned discovery (deadline passed) starts no shell and validates no
   further output; a filesystem call already stuck in the kernel cannot be
   cancelled, only abandoned.
+
+## The daemon job's own environment
+
+The `PATH` recorded at install is the one the unit file (Linux) or property list
+(macOS) gives the daemon job, but the service manager can change what the job
+really gets, and the upgrade preflight and the rollback gate judge with what the
+job gets:
+
+- **Linux.** A drop-in of the daemon unit (`~/.config/systemd/user/<unit>.d/*.conf`)
+  applies after the unit file. A drop-in `Environment=PATH=` replaces the recorded
+  `PATH` (a warning names it), and a drop-in `Environment=` of an allowlisted store
+  variable such as `CLAUDE_CONFIG_DIR` replaces the user manager's value. Setting,
+  resetting or removing a bootstrap key (`HOME`, `XDG_*`), an `EnvironmentFile=`
+  that assigns a judged variable and an unreadable unit are refused with
+  `service_manager_environment_unavailable`; the message names the file or
+  directive. An unreachable user manager refuses a recorded `PATH` too.
+- **macOS.** A job that is not loaded and has no journaled default takes the
+  persisted launchd configuration only when `user.plist` is older than the boot;
+  a newer one may be pending, so a forward gate is refused and a rollback goes on
+  with a warning.
+
+The rules are in the
+[upgrade runbook](../runbooks/update-after-release.md#the-journal-of-an-interrupted-upgrade).

@@ -29,6 +29,17 @@ pub const MANAGER_ENVIRONMENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// rather than truncated: a truncated read could hide a `PATH` assignment.
 pub const UNIT_SETTINGS_FILE_LIMIT: u64 = 1024 * 1024;
 
+/// Margin by which the launchd user-domain configuration must predate the host
+/// boot for its `PATH` to count as applied.
+///
+/// The configuration's file time and `kern.boottime` are both calendar times, and
+/// a clock step shortly after the boot (network time) moves the boot time but not
+/// the time of a file written before the step, so a write just before the step
+/// can look older than the boot. Two minutes covers the steps seen on a cold
+/// start; a larger value only refuses more forward gates for a configuration
+/// edited shortly before a reboot.
+pub const LAUNCHD_CONFIG_BOOT_MARGIN: Duration = Duration::from_secs(120);
+
 /// Bytes of the user manager's environment report that are kept.
 pub const MANAGER_ENVIRONMENT_OUTPUT: usize = 1024 * 1024;
 

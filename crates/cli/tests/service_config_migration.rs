@@ -227,6 +227,40 @@ fn temp_root() -> tempfile::TempDir {
     pohunek_test_support::tempdir_with_prefix("phk-").expect("temporary root")
 }
 
+/// The session bus a Linux child may reach: the real user manager's, in the
+/// real-systemd lane (`POHUNEK_SYSTEMD_E2E=1`) only. Everywhere else the child
+/// gets none, and a daemon job on Linux is judged with its user manager, so
+/// the check refuses.
+fn real_bus_address() -> Option<String> {
+    if !cfg!(target_os = "linux")
+        || std::env::var_os("POHUNEK_SYSTEMD_E2E").is_none_or(|v| v != "1")
+    {
+        return None;
+    }
+    std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().or_else(|| {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(|dir| format!("unix:path={}/bus", dir.to_string_lossy()))
+    })
+}
+
+/// [`check`] for a scenario that needs the check to pass. On Linux without a
+/// reachable user manager the check is refused instead, which is asserted here
+/// and ends the scenario; the real-systemd lane runs it through.
+fn check_passing(host: &Host) -> Option<(bool, Value)> {
+    let (success, envelope) = check(host);
+    if cfg!(target_os = "linux") && real_bus_address().is_none() {
+        assert!(!success, "{envelope}");
+        let refusal = envelope.get("err").expect("the refusal document");
+        assert_eq!(
+            refusal.get("code").and_then(Value::as_str),
+            Some("service_manager_environment_unavailable"),
+            "{refusal:?}"
+        );
+        return None;
+    }
+    Some((success, envelope))
+}
+
 /// Builds the fixture and runs `service check --json` against it.
 fn check(host: &Host) -> (bool, Value) {
     check_with_setup(host, |_, _, _| {})
@@ -283,7 +317,8 @@ fn check_with_setup(host: &Host, setup: impl FnOnce(&Path, &Path, &[u8])) -> (bo
     let env_of = |base: &Path| base.to_str().expect("UTF-8 roots").to_owned();
     // The child gets only what the fixture names: an inherited session bus
     // address would reach the host's real user manager.
-    let output = Command::new(pohunek_test_support::bin_exe("pohunek"))
+    let mut output = Command::new(pohunek_test_support::bin_exe("pohunek"));
+    let output = output
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .args(["service", "check", "--json"])
@@ -292,9 +327,13 @@ fn check_with_setup(host: &Host, setup: impl FnOnce(&Path, &Path, &[u8])) -> (bo
         .env("XDG_DATA_HOME", env_of(&root.join("data")))
         .env("XDG_CACHE_HOME", env_of(&root.join("cache")))
         .env("XDG_CONFIG_HOME", env_of(&config_home))
-        .env("HOME", env_of(&root.join("home")))
-        .output()
-        .expect("run the real CLI");
+        .env("HOME", env_of(&root.join("home")));
+    let output = match real_bus_address() {
+        Some(address) => output.env("DBUS_SESSION_BUS_ADDRESS", address),
+        None => output,
+    }
+    .output()
+    .expect("run the real CLI");
     let json: Value = serde_json::from_str(
         String::from_utf8(output.stdout)
             .expect("stdout is text")
@@ -368,7 +407,9 @@ fn pending_migration(
 #[test]
 fn check_accepts_the_previous_release_config_and_names_the_migration() {
     let host = Host::schema_two_previous_version();
-    let (success, envelope) = check(&host);
+    let Some((success, envelope)) = check_passing(&host) else {
+        return;
+    };
     assert!(success, "{envelope}");
     let report = envelope
         .get("ok")
@@ -401,7 +442,9 @@ fn check_accepts_the_previous_release_config_and_names_the_migration() {
 #[test]
 fn check_accepts_a_schema_three_config_and_names_the_migration() {
     let host = Host::schema_three_previous_version();
-    let (success, envelope) = check(&host);
+    let Some((success, envelope)) = check_passing(&host) else {
+        return;
+    };
     assert!(success, "{envelope}");
     let report = envelope
         .get("ok")
@@ -423,7 +466,9 @@ fn check_accepts_a_schema_three_config_and_names_the_migration() {
 #[test]
 fn check_accepts_a_schema_four_config_and_names_the_migration() {
     let host = Host::schema_four_with_waits(120_000, 2_700_000);
-    let (success, envelope) = check(&host);
+    let Some((success, envelope)) = check_passing(&host) else {
+        return;
+    };
     assert!(success, "{envelope}");
     assert_eq!(
         envelope
@@ -438,7 +483,9 @@ fn check_accepts_a_schema_four_config_and_names_the_migration() {
 #[test]
 fn check_accepts_a_schema_five_config_and_names_the_migration() {
     let host = Host::schema_five_with_waits(120_000, 2_700_000);
-    let (success, envelope) = check(&host);
+    let Some((success, envelope)) = check_passing(&host) else {
+        return;
+    };
     assert!(success, "{envelope}");
     assert_eq!(
         envelope
@@ -453,7 +500,9 @@ fn check_accepts_a_schema_five_config_and_names_the_migration() {
 #[test]
 fn check_accepts_a_current_schema_config_without_a_migration() {
     let host = Host::schema_six_with_waits(120_000, 2_700_000);
-    let (success, envelope) = check(&host);
+    let Some((success, envelope)) = check_passing(&host) else {
+        return;
+    };
     assert!(success, "{envelope}");
     assert!(
         envelope
@@ -462,22 +511,6 @@ fn check_accepts_a_current_schema_config_without_a_migration() {
             .is_some_and(Value::is_null),
         "{envelope}: a current-schema file needs no migration"
     );
-    // On Linux the child has no reachable user bus, and the job records its
-    // PATH, so the check still passes and says which way its verdicts may err.
-    // A macOS host reads its launchd domain instead, which needs no bus.
-    if cfg!(target_os = "linux") {
-        let warnings = envelope
-            .get("ok")
-            .and_then(|report| report.get("warnings"))
-            .and_then(Value::as_array)
-            .expect("the check reports its warnings");
-        assert!(
-            warnings.iter().any(|warning| warning
-                .as_str()
-                .is_some_and(|text| text.contains("judged at the default store locations"))),
-            "{envelope}: an unreachable manager is a visible warning"
-        );
-    }
 }
 
 #[test]

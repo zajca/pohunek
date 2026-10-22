@@ -724,22 +724,28 @@ and the sessions need the flag again; a corrupt or unsafe file fails with
 acceptance. The first upgrade judged by a daemon that reports scopes still needs
 the flag once.
 
-On Linux the preflight and the runtime step run with the `PATH` of the systemd
-user manager, read from its `Environment` property over the session bus, unless
-the recorded daemon job carries its own `PATH`, because the daemon job inherits
-it. If that `PATH` cannot be read, the command stops with
-`service_manager_environment_unavailable` before any effect; the flag does not
-override it.
+On Linux the preflight and the runtime step run with the environment the
+daemon job gets from the systemd user manager and its own unit, read over the
+session bus on every gate (nothing is reused from an earlier gate): the `PATH`
+`service.toml` records, else the manager's `Environment` `PATH`; either one is
+replaced by a drop-in of the daemon unit that sets `PATH` (a warning names the
+drop-in when it replaces a recorded one). A drop-in can also set the allowlisted
+store variables such as `CLAUDE_CONFIG_DIR`, which then replace the manager's, and
+it must not set or remove a bootstrap key (`HOME`, `XDG_*`) or reset
+`Environment=`, because the unit file the install writes gives the job those. If
+the manager or the unit cannot be read, or a setting cannot be judged, the command
+stops with `service_manager_environment_unavailable` before any effect; the flag
+does not override it, whether or not the job records its `PATH`. The rules are
+under "The journal of an interrupted upgrade" below.
 
-A job that records its own `PATH` still takes store variables such as
-`CLAUDE_CONFIG_DIR` from the service manager. When that manager cannot be read
-(no reachable user bus on Linux, no launchd `gui/<uid>` domain on macOS),
-`service check` warns that native references were judged at the default store
-locations. When that judgement covers a stopped session, `service upgrade` or a
-rollback stops with `service_manager_variables_unread` before any effect; make
-the manager readable and rerun, or pass `--accept-runtime-loss` to accept that a
-session judged that way may lose its recovery. Without stopped sessions the
-upgrade proceeds with the warning.
+On macOS a job takes the store variables from the launchd domain. When launchd has
+no `gui/<uid>` domain (no GUI session), `service check` warns that native
+references were judged at the default store locations. When that judgement covers
+a stopped session, `service upgrade` or a rollback stops with
+`service_manager_variables_unread` before any effect; log in to a GUI session and
+rerun, or pass `--accept-runtime-loss` to accept that a session judged that way
+may lose its recovery. Without stopped sessions the upgrade proceeds with the
+warning.
 
 Sessions whose runtime has ended but that keep native resume or fork are judged
 by the same rules and listed under stopped sessions (`stopped_sessions` in the
@@ -988,14 +994,61 @@ stale clock, then corrected) moves `kern.boottime` but not older file times, and
 a `launchctl config user path` written inside that window can be taken for a
 value the boot applied. Setting the `PATH` with `launchctl setenv` avoids it.
 
-On Linux a job gets the systemd user manager's `Environment` `PATH`, replaced by
-`ExecSearchPath=` (joined with `:`) and then by an `Environment=PATH=`, both only
-when a drop-in of the daemon unit gives them (the install replaces the unit file
-itself, so a setting only there does not count); the journal does not change
-that. The CLI attributes the manager's merged value by reading the unit file and
-the drop-ins as systemd does (byte order mark dropped, lines ended by `\n`, `\r` or
-NUL, `[Service]` only). Whatever it cannot attribute or read is refused with the
-same code, and the message names the file or directive to change:
+### A job that is not loaded and has no journaled default (macOS)
+
+When the early gate of an upgrade finds the daemon job not loaded, there is no
+launchd default to journal, and the persisted configuration (`user.plist`) is the
+best evidence of the `PATH` launchd applies. It is the active one only when it
+was last modified before the host booted, by more than a margin (120 seconds,
+`LAUNCHD_CONFIG_BOOT_MARGIN` in `settings.rs`, so that a clock step around the
+boot cannot reorder the two times); an absent file is dated by its directory, and
+launchd's standard `PATH` then counts as persisted.
+
+| Persisted configuration | Forward gate (upgrade, check, setup) | Rollback and its gate |
+|---|---|---|
+| Older than the boot (or absent and its directory older) | its `PATH`, no warning | its `PATH`, no warning |
+| Newer than, or within the margin of, the boot; or the boot time or the file time cannot be read | refused with `service_manager_environment_unavailable` before any effect: start the job so launchd loads it, set the `PATH` with `launchctl setenv PATH <directories>` in the GUI session, or reboot | its `PATH` as a stand-in, with the `warning:` line, because refusing a rollback would strand the host |
+| Present but unreadable (permissions, corrupt content) | refused with `service_manager_environment_unavailable`, naming the read error: fix the file's permissions or content | launchd's standard `PATH` as a stand-in, with the `warning:` line: the value cannot be known, and refusing a rollback would strand the host |
+
+An absent file whose directory was changed after the boot is treated as possibly
+pending too, not as "no configuration": the file may have existed when launchd
+booted and been removed since, which leaves the `PATH` launchd applied unknown.
+
+Known limit: both times are on the calendar clock, so a clock step right after the
+boot moves `kern.boottime` but not older file times, and a write inside the margin
+is the only protection against it.
+
+On Linux a job gets the environment below; the journal does not change it. The
+manager's `Environment` is the base. The install replaces the unit file itself and
+keeps its drop-ins (`~/.config/systemd/user/<unit>.d/*.conf`), so only what a
+drop-in gives counts; a setting only the unit file holds is replaced with it. The
+CLI reads the drop-in files as systemd does (byte order mark dropped, lines ended
+by `\n`, `\r` or NUL, `[Service]` only; a run of backslashes at the end of a line
+continues it only when its length is odd, a comment line ending in a backslash
+swallows nothing, and an escaped backslash is one backslash), once per judgement,
+and takes the value from the file and checks it against the manager's merged
+property for a loaded unit; a mismatch is refused.
+
+| Setting | `PATH` | Store variable the allowlist selects | Bootstrap key (`HOME`, `XDG_*`) |
+|---|---|---|---|
+| Drop-in `Environment=NAME=value` | the last drop-in's value replaces the recorded (or the manager's) `PATH`; a warning names the drop-in | replaces the manager's value | refused, naming the key and the drop-in |
+| Drop-in `Environment=` with no value (reset) | refused (it removes the `PATH` and the bootstrap keys the unit file gives the job) | refused | refused |
+| `EnvironmentFile=` assigning the name | refused (quoting is not re-parsed) | refused: move it to an `Environment=` line of a drop-in | refused |
+| `PassEnvironment=NAME` | no effect on a recorded `PATH`; refused for an unrecorded one | refused unless a drop-in `Environment=` assigns it (the value would be the manager process's own) | no effect |
+| `UnsetEnvironment=NAME` | refused | the variable is absent; `NAME=VALUE` removes it only when the final value equals `VALUE`; a name only the unit file unsets is ignored | refused |
+| A line in a form not read (escape sequence, unclosed quote, specifier, bytes that are not UTF-8) that may touch the name | refused | refused (whether or not the name is set now) | refused |
+| `Environment=` set only by the (replaced) unit file | ignored | ignored | n/a |
+| `EnvironmentFile=` only the (replaced) unit file holds | judged from the manager's merged list, refused when it sets `PATH`: for a recorded `PATH` only when the unit has drop-ins, for an unrecorded one always | ignored | ignored |
+
+An unreachable bus, unreadable unit properties, a masked or failed unit, or a
+snapshot made stale by a change on disk next to drop-ins (run `systemctl --user
+daemon-reload`) is refused for a recorded `PATH` as for an unrecorded one. A unit
+with no unit file (not installed yet, or removed by a rollback or a config
+migration) is judged from its drop-in files by the rules below, so a recovery that
+removes the unit still completes.
+
+Whatever the CLI cannot attribute or read is refused with the same code, and the
+message names the file or directive to change:
 - an `EnvironmentFile=` that sets `PATH`, uses quoting the check does not follow,
   is a wildcard, or is a required file that cannot be read as a regular file of at
   most 1 MiB;
@@ -1030,8 +1083,7 @@ same code, and the message names the file or directive to change:
   spelling, a byte order mark at the start and CR/CRLF/NUL line ends, comment lines,
   quoted and no-break-space `Environment=` values, resets, a spaced or relative
   `EnvironmentFile=`, `EnvironmentFile=` contents, normalized `ExecSearchPath=`
-  entries); anything else is refused with a named reason: a
-  line ending in a backslash (the continuation rule is not followed), a
+  entries, and the odd/even rule for a run of backslashes at the end of a line); anything else is refused with a named reason: a
   non-normalized absolute `EnvironmentFile=` path, an empty, relative or
   non-normalized or over-long `ExecSearchPath=` entry or one with quotes, a
   section header that is never closed (a form feed is not white space there), a
@@ -1048,8 +1100,8 @@ same code, and the message names the file or directive to change:
   never closed), or with no recognizable drop-in at all.
 
 A journal written by an older CLI, or one whose job was not loaded when the upgrade
-started, has no journaled default; its rollback of a job that is not loaded reads
-the persisted configuration with that warning. A journal with the fields is read by
+started, has no journaled default; see "A job that is not loaded and has no journaled
+default" for what is judged then. A journal with the fields is read by
 older CLIs as an unknown field, so an older CLI refuses it; roll it back with the
 CLI that wrote it or with this release.
 

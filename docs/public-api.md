@@ -2482,11 +2482,18 @@ upgrade's own gates and `service check` of an upgrade); without it, as for a
 rollback, which never applies the plan, the preflight judges the installed
 packages only. The preflight runs with the `PATH` the daemon job runs with, byte
 for byte: the one `service.toml` records; else, on Linux, the systemd user
-manager's `Environment` `PATH`, replaced by an `ExecSearchPath=` and then an `Environment=PATH=` entry of a
-drop-in of the daemon unit (the install replaces the unit file itself) and refused (`service_manager_environment_unavailable`, naming the file or
-directive) when the unit has an `EnvironmentFile=` that sets `PATH`, a wildcard, unreadable or non-regular
-required `EnvironmentFile=`, `PassEnvironment=PATH`, `UnsetEnvironment=PATH`, is masked or broken,
-or has drop-ins but no unit file yet with a `PATH`-affecting line the CLI does not read (plain `Environment=PATH=`, `ExecSearchPath=` and `EnvironmentFile=` lines of such drop-ins are read and give the `PATH`); else, on macOS, launchd's active `PATH` of the job:
+manager's `Environment` `PATH`. On Linux a drop-in of the daemon unit replaces either one (an `Environment=PATH=` entry, or for the manager's `PATH` an
+`ExecSearchPath=`; the install replaces the unit file itself and keeps its drop-ins); a drop-in that replaces a recorded `PATH` is named in a
+`warning:` line. A drop-in's `Environment=` also replaces the manager's value of an allowlisted store variable the daemon reads (such as `CLAUDE_CONFIG_DIR`),
+and `UnsetEnvironment=` removes it. The command is refused with `service_manager_environment_unavailable`, naming the file or directive, and
+before any effect, when: a drop-in sets, resets or removes a bootstrap key (`HOME`, `XDG_*`) or resets `Environment=`; an `EnvironmentFile=` sets `PATH`, a bootstrap key or an
+allowlisted variable (move it to a drop-in `Environment=` line), is a wildcard, or is an unreadable or non-regular required file; `PassEnvironment=` names `PATH` of an unrecorded
+job or an allowlisted variable no drop-in assigns; `UnsetEnvironment=` names `PATH` or a bootstrap key; the unit is masked or broken; a setting is in a form the CLI does not
+read (an escape sequence, a specifier, a quote never closed); the bus is unreachable or the unit's properties cannot be read, whether or not the job records its `PATH`
+(`--accept-runtime-loss` does not override it); or a drop-in of a loaded unit could not be resolved the same way once the unit is removed, which the loaded gate refuses upfront because a
+rollback or config migration removes the unit and resolves again from its drop-ins alone (a unit with drop-ins but no unit file yet is read from them; see
+[the runbook](knowledge/runbooks/update-after-release.md#the-journal-of-an-interrupted-upgrade) for the full list of refusals and the reading rules, including the odd/even rule for a trailing
+backslash run). On macOS the job's `PATH` is launchd's active one:
 the domain's `environment` `PATH` (`launchctl print gui/<uid>`, set by `launchctl
 setenv`), else the `default environment` of the loaded job (`launchctl print
 gui/<uid>/<label>`), else, for a job that is not loaded, the launchd default an
@@ -2494,19 +2501,20 @@ upgrade journaled while the job was loaded and the host has not rebooted since (
 journal records the boot session UUID; after a reboot the persisted configuration decides only
 when `user.plist` was last modified before the current boot, and one modified later, or without a
 readable time, is refused; without a marker the persisted value must also equal the journaled one),
-else the persisted launchd configuration, the best evidence available. A rollback judges with the same order,
+else, with no journaled default, the persisted launchd configuration when it is older than the boot (by the
+configured margin; no `user.plist` means launchd's standard `PATH`), and otherwise (newer than the boot, or a time that cannot be read) a
+forward gate is refused and a rollback goes on with the persisted value and a `warning:` line. A rollback judges with the same order,
 so the `PATH` it uses is the one the restored job gets where launchd can still
 report it; a `warning:` line names a journal that gave no default. An
 unrecognized `launchctl print` output refuses the upgrade with `service_manager_environment_unavailable`.
-A job whose service manager's variables cannot be read takes none: on Linux a job that records
-its `PATH` whose systemd user manager's bus is not reachable, and on macOS any job when launchd has
+On macOS a job whose launchd variables cannot be read takes none: any job when launchd has
 no `gui/<uid>` domain, as without a GUI session (a job without a recorded `PATH` then takes the
 persisted launchd configuration's `PATH`). `service check` is not refused: it prints a `warning` that
 native references are judged at the default store locations, so a verdict may read
 `already_not_resumable` or `would_lose_recovery` for a conversation stored under a variable-set
 location, or `adoptable` for one present only at the default location. When such a judgement
 covers a stopped session, whose native reference check reads a store location, `service upgrade`
-and a rollback refuse it with `service_manager_variables_unread` before any effect, unless
+and a rollback refuse it with `service_manager_variables_unread` (macOS only) before any effect, unless
 `--accept-runtime-loss` is given; a judgement without stopped sessions does not depend on those
 variables and proceeds with the warning. The
 preflight resolves programs with the daemon's own resolver, which skips an

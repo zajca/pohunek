@@ -2862,6 +2862,352 @@ fn the_real_user_manager_reads_tolerated_drop_in_forms_as_the_cli_does() {
     assert!(dash.environment_files.is_empty(), "{dash:?}");
 }
 
+/// How systemd joins lines that end in a backslash: a run of an odd length
+/// continues the line, an even run does not, a comment line ending in a
+/// backslash swallows nothing, and a continuation that runs into a `[Service]`
+/// header joins the header text to the line.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_joins_lines_by_the_odd_backslash_rule() {
+    require_e2e();
+    let directory = user_unit_dir();
+    std::fs::create_dir_all(&directory).expect("user unit directory");
+    let unit = format!("pohunek-e2ebs-{}.service", std::process::id());
+    let _files = UnitFiles {
+        directory: directory.clone(),
+        unit: unit.clone(),
+    };
+    std::fs::write(
+        directory.join(&unit),
+        "[Service]\nExecStart=/bin/sleep 300\n",
+    )
+    .expect("unit file");
+    let own = directory.join(format!("{unit}.d"));
+    std::fs::create_dir_all(&own).expect("drop-in directory");
+    let loaded_with = |content: &[u8]| {
+        std::fs::write(own.join("10-case.conf"), content).expect("drop-in");
+        systemctl(&["daemon-reload"]);
+        async_io::block_on(unit_environment(&unit, CALL_TIMEOUT)).expect("loaded")
+    };
+    // (drop-in, merged `Environment=` entries).
+    let cases: [(&[u8], &[&str]); 8] = [
+        // One backslash continues: the next line is words of the same value.
+        (
+            b"[Service]\nEnvironment=EV=a \\\nEnvironment=NEXT=1\n",
+            &["EV=a", "Environment=NEXT=1"],
+        ),
+        // Two backslashes are an escaped backslash: the line ends.
+        (
+            b"[Service]\nEnvironment=EV=a \\\\\nEnvironment=NEXT=1\n",
+            &["EV=a", "NEXT=1"],
+        ),
+        // Three continue.
+        (
+            b"[Service]\nEnvironment=EV=a \\\\\\\nEnvironment=NEXT=1\n",
+            &["EV=a", "Environment=NEXT=1"],
+        ),
+        // A comment ending in a backslash swallows nothing.
+        (b"[Service]\n# note \\\nEnvironment=NEXT=1\n", &["NEXT=1"]),
+        // A comment inside a continuation is skipped and the continuation goes on.
+        (
+            b"[Service]\nEnvironment=EV=a \\\n# note\nEnvironment=NEXT=1\n",
+            &["EV=a", "Environment=NEXT=1"],
+        ),
+        // A header joined into a continuation is a word, not a header.
+        (
+            b"[Service]\nEnvironment=EV=a \\\n[Service]\nEnvironment=NEXT=1\n",
+            &["EV=a", "NEXT=1"],
+        ),
+        // An empty line ends the continuation.
+        (
+            b"[Service]\nEnvironment=EV=a \\\n\nEnvironment=NEXT=1\n",
+            &["EV=a", "NEXT=1"],
+        ),
+        // A trailing backslash at the end of the file.
+        (b"[Service]\nEnvironment=EV=a \\", &["EV=a"]),
+    ];
+    // An escaped backslash is one backslash, in a quoted word too.
+    for (content, expected) in [
+        (&b"[Service]\nEnvironment=PATH=/a\\\\b\n"[..], "PATH=/a\\b"),
+        (b"[Service]\nEnvironment=PATH=/a\\\\\n", "PATH=/a\\"),
+        (b"[Service]\nEnvironment=\"PATH=/a\\\\b\"\n", "PATH=/a\\b"),
+    ] {
+        let loaded = loaded_with(content);
+        assert_eq!(
+            loaded.environment,
+            [expected],
+            "{:?}",
+            String::from_utf8_lossy(content)
+        );
+    }
+    for (content, expected) in cases {
+        let loaded = loaded_with(content);
+        assert_eq!(
+            loaded.environment,
+            expected,
+            "{:?}",
+            String::from_utf8_lossy(content)
+        );
+    }
+}
+
+/// A oneshot unit that writes its environment (`env -0`) to a file when started.
+struct EnvironmentRun {
+    unit: String,
+    out: PathBuf,
+    _files: UnitFiles,
+    _scratch: tempfile::TempDir,
+}
+
+impl EnvironmentRun {
+    /// Writes the unit with `service_lines` in its `[Service]` section and one
+    /// drop-in per `(file name, content)` of `drop_ins`.
+    fn new(tag: &str, service_lines: &str, drop_ins: &[(&str, &str)]) -> Self {
+        let directory = user_unit_dir();
+        std::fs::create_dir_all(&directory).expect("user unit directory");
+        let unit = format!("pohunek-e2e{tag}-{}.service", std::process::id());
+        let files = UnitFiles {
+            directory: directory.clone(),
+            unit: unit.clone(),
+        };
+        let scratch = pohunek_test_support::tempdir().expect("scratch directory");
+        let out = scratch.path().join("job.out");
+        std::fs::write(
+            directory.join(&unit),
+            format!(
+                "[Service]\nType=oneshot\nExecStart=/usr/bin/env -0\nStandardOutput=file:{}\n{service_lines}",
+                out.display()
+            ),
+        )
+        .expect("unit file");
+        if !drop_ins.is_empty() {
+            let own = directory.join(format!("{unit}.d"));
+            std::fs::create_dir_all(&own).expect("drop-in directory");
+            for (name, content) in drop_ins {
+                std::fs::write(own.join(name), content).expect("drop-in");
+            }
+        }
+        systemctl(&["daemon-reload"]);
+        Self {
+            unit,
+            out,
+            _files: files,
+            _scratch: scratch,
+        }
+    }
+
+    /// The manager's report for the unit.
+    fn reported(&self) -> pohunek_platform::supervisor::UnitEnvironment {
+        async_io::block_on(unit_environment(&self.unit, CALL_TIMEOUT)).expect("loaded unit")
+    }
+
+    /// The environment the started job sees.
+    fn job_environment(&self) -> Vec<String> {
+        let _ = std::fs::remove_file(&self.out);
+        systemctl_checked(&["start", &self.unit]);
+        let bytes = std::fs::read(&self.out).expect("job output");
+        String::from_utf8_lossy(&bytes)
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+fn has_entry(environment: &[String], entry: &str) -> bool {
+    environment.iter().any(|candidate| candidate == entry)
+}
+
+/// A drop-in `Environment=` is applied after the unit file's: the manager
+/// reports the drop-in value last and the job sees it, which is what the CLI
+/// judges a recorded `PATH` and a bootstrap key with.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_orders_a_drop_in_path_after_the_unit_file() {
+    require_e2e();
+    let run = EnvironmentRun::new(
+        "dropath",
+        "Environment=PATH=/unit/bin HOME=/unit/home\n",
+        &[(
+            "10-path.conf",
+            "[Service]\nEnvironment=PATH=/drop-in/bin HOME=/drop-in/home\n",
+        )],
+    );
+    let reported = run.reported();
+    assert_eq!(
+        reported
+            .environment
+            .iter()
+            .rfind(|entry| entry.starts_with("PATH="))
+            .map(String::as_str),
+        Some("PATH=/drop-in/bin"),
+        "{reported:?}"
+    );
+    assert!(
+        reported
+            .drop_in_paths
+            .iter()
+            .any(|path| path.ends_with("10-path.conf")),
+        "{reported:?}"
+    );
+    let job = run.job_environment();
+    assert!(has_entry(&job, "PATH=/drop-in/bin"), "{job:?}");
+    // A bootstrap key is overridden the same way.
+    assert!(has_entry(&job, "HOME=/drop-in/home"), "{job:?}");
+}
+
+/// `EnvironmentFile=` applies after `Environment=`, and `Environment=` after
+/// `PassEnvironment=`.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_lets_an_environment_file_override_environment() {
+    require_e2e();
+    let scratch = pohunek_test_support::tempdir().expect("scratch directory");
+    let file = scratch.path().join("job.env");
+    std::fs::write(&file, "PATH=/file/bin\n").expect("environment file");
+    let run = EnvironmentRun::new(
+        "envfile",
+        &format!(
+            "Environment=PATH=/unit/bin\nEnvironmentFile={}\n",
+            file.display()
+        ),
+        &[],
+    );
+    let job = run.job_environment();
+    assert!(has_entry(&job, "PATH=/file/bin"), "{job:?}");
+}
+
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_lets_environment_override_pass_environment() {
+    require_e2e();
+    let run = EnvironmentRun::new(
+        "passenv",
+        "Environment=PATH=/unit/bin\nPassEnvironment=PATH\n",
+        &[],
+    );
+    let job = run.job_environment();
+    assert!(has_entry(&job, "PATH=/unit/bin"), "{job:?}");
+}
+
+/// An empty `Environment=` in a drop-in resets everything the unit file and the
+/// drop-ins before it assigned.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_lets_a_drop_in_reset_drop_the_unit_files_environment() {
+    require_e2e();
+    let run = EnvironmentRun::new(
+        "reset",
+        "Environment=PATH=/unit/bin HOME=/unit/home\n",
+        &[("10-reset.conf", "[Service]\nEnvironment=\n")],
+    );
+    assert!(run.reported().environment.is_empty());
+    let job = run.job_environment();
+    assert!(!has_entry(&job, "PATH=/unit/bin"), "{job:?}");
+    assert!(!has_entry(&job, "HOME=/unit/home"), "{job:?}");
+}
+
+/// A drop-in assignment of an allowlisted variable is in the merged list, and
+/// `UnsetEnvironment=` removes it by name, or by name and value when the value
+/// equals the final one.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_reports_a_drop_in_store_variable() {
+    require_e2e();
+    let run = EnvironmentRun::new(
+        "store",
+        "Environment=CLAUDE_CONFIG_DIR=/unit/store\n",
+        &[(
+            "10-store.conf",
+            "[Service]\nEnvironment=CLAUDE_CONFIG_DIR=/drop-in/store\n",
+        )],
+    );
+    let reported = run.reported();
+    assert_eq!(
+        reported.environment.last().map(String::as_str),
+        Some("CLAUDE_CONFIG_DIR=/drop-in/store"),
+        "{reported:?}"
+    );
+    let job = run.job_environment();
+    assert!(
+        has_entry(&job, "CLAUDE_CONFIG_DIR=/drop-in/store"),
+        "{job:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_applies_unset_environment_to_assignments() {
+    require_e2e();
+    for (unset, expected_present) in [
+        ("CLAUDE_CONFIG_DIR", false),
+        ("CLAUDE_CONFIG_DIR=/drop-in/store", false),
+        ("CLAUDE_CONFIG_DIR=/other/store", true),
+    ] {
+        let run = EnvironmentRun::new(
+            "unset",
+            "Environment=CLAUDE_CONFIG_DIR=/unit/store\n",
+            &[(
+                "10-store.conf",
+                &format!(
+                    "[Service]\nEnvironment=CLAUDE_CONFIG_DIR=/drop-in/store\nUnsetEnvironment={unset}\n"
+                ),
+            )],
+        );
+        // `UnsetEnvironment=` applies to the job, not to the reported property.
+        let reported = run.reported();
+        assert_eq!(
+            reported.environment.last().map(String::as_str),
+            Some("CLAUDE_CONFIG_DIR=/drop-in/store"),
+            "{unset}: {reported:?}"
+        );
+        let job = run.job_environment();
+        assert_eq!(
+            has_entry(&job, "CLAUDE_CONFIG_DIR=/drop-in/store"),
+            expected_present,
+            "{unset}: {job:?}"
+        );
+        assert!(
+            !job.iter()
+                .any(|entry| entry.starts_with("CLAUDE_CONFIG_DIR=") && !expected_present),
+            "{unset}: {job:?}"
+        );
+    }
+}
+
+/// The same holds when a later drop-in unsets what an earlier one assigns.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_applies_a_later_drop_ins_unset_to_an_earlier_assignment() {
+    require_e2e();
+    let run = EnvironmentRun::new(
+        "unset-later",
+        "Environment=CLAUDE_CONFIG_DIR=/unit/store\n",
+        &[
+            (
+                "10-a.conf",
+                "[Service]\nEnvironment=CLAUDE_CONFIG_DIR=/drop-in/store\n",
+            ),
+            (
+                "20-b.conf",
+                "[Service]\nUnsetEnvironment=CLAUDE_CONFIG_DIR\n",
+            ),
+        ],
+    );
+    let reported = run.reported();
+    assert_eq!(
+        reported.environment.last().map(String::as_str),
+        Some("CLAUDE_CONFIG_DIR=/drop-in/store"),
+        "{reported:?}"
+    );
+    let job = run.job_environment();
+    assert!(
+        !job.iter()
+            .any(|entry| entry.starts_with("CLAUDE_CONFIG_DIR=")),
+        "{job:?}"
+    );
+}
+
 /// A drop-in directory the scan cannot read is an error, never "no drop-ins".
 fn assert_unreadable_drop_in_directory_is_an_error(own: &std::path::Path, unit: &str) {
     use std::os::unix::fs::PermissionsExt;

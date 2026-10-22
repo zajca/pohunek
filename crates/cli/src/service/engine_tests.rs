@@ -55,6 +55,10 @@ use crate::service::usage::tests::{
 use crate::service::VERSION;
 use pohunek_platform::supervisor::UnitEnvironment;
 
+#[cfg(target_os = "linux")]
+#[path = "engine_tests_unit_environment.rs"]
+mod unit_environment;
+
 const V1: &str = "1.0.0";
 const V2: &str = "2.0.0";
 /// A supervised version older than and unrelated to the installed one.
@@ -3387,6 +3391,7 @@ fn the_debug_forms_of_the_job_environment_name_the_variables_and_never_their_val
     let job = JobPath {
         value: CURRENT_PATH.to_owned(),
         source: PathSource::Recorded,
+        path_drop_in: None,
         loaded_default: None,
         variables,
         manager_unreachable: None,
@@ -3442,11 +3447,12 @@ impl UserManager for FailingManager {
     }
 }
 
-/// The `PATH`-only read of a recorded job never asks the manager: an unusable
-/// manager fails the variables a judgement needs, not the `PATH` a plan needs.
+/// A job that records its `PATH` is judged with the daemon unit's settings too,
+/// so a manager that cannot be reached or answers unusably refuses the plan and
+/// the judgement alike, and nothing falls back to the recorded `PATH` alone.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn a_recorded_path_plan_does_not_depend_on_the_manager_variables() {
+async fn a_recorded_path_without_a_bus_is_refused() {
     use crate::service::manager_env::EnvironmentFailure;
     use pohunek_platform::shell_env::SearchPath;
 
@@ -3460,32 +3466,42 @@ async fn a_recorded_path_plan_does_not_depend_on_the_manager_variables() {
         search_path,
     )
     .expect("the recorded configuration");
-    harness.context = harness
-        .context
-        .clone()
-        .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unusable(
-            "the answer is not a list".to_owned(),
-        ))));
 
-    let plan = crate::service::engine::job_search_path(&harness.context, &config, None)
-        .await
-        .expect("the recorded PATH is the plan's PATH without the manager");
-    assert_eq!(plan.value, "/usr/bin");
-    assert!(plan.variables.is_empty());
-    crate::service::engine::job_path(&harness.context, &config, None)
-        .await
-        .expect_err("the judgement's variables still fail closed");
+    for failure in [
+        EnvironmentFailure::Unreachable("no session bus".to_owned()),
+        EnvironmentFailure::Unusable("the answer is not a list".to_owned()),
+    ] {
+        let detail = match &failure {
+            EnvironmentFailure::Unreachable(detail) | EnvironmentFailure::Unusable(detail) => {
+                detail.clone()
+            }
+        };
+        harness.context = harness
+            .context
+            .clone()
+            .with_user_manager(Arc::new(FailingManager(failure)));
+        let judged = crate::service::engine::job_path(&harness.context, &config, None)
+            .await
+            .expect_err("the judgement is refused");
+        let planned = crate::service::engine::job_search_path(&harness.context, &config, None)
+            .await
+            .expect_err("the plan is refused");
+        for error in [judged, planned] {
+            assert_eq!(error.code(), "service_manager_environment_unavailable");
+            assert!(error.to_string().contains(&detail), "{error}");
+        }
+    }
 }
 
-/// A job that records its `PATH` takes no variables from a manager that cannot
-/// be reached, and says so; a manager that answers unusably fails the judgement.
+/// The bus answers but the unit's properties cannot be read: the recorded `PATH`
+/// is refused, whatever the unit may hold.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn a_recorded_path_job_degrades_only_when_no_manager_is_reachable() {
+async fn unreadable_unit_properties_refuse_a_recorded_path() {
     use crate::service::manager_env::EnvironmentFailure;
     use pohunek_platform::shell_env::SearchPath;
 
-    let mut harness = Harness::new();
+    let harness = Harness::new();
     let search_path =
         SearchPath::new(vec![std::path::PathBuf::from("/usr/bin")]).expect("a trusted directory");
     let config = crate::service::definition::config_with_search_path(
@@ -3495,36 +3511,22 @@ async fn a_recorded_path_job_degrades_only_when_no_manager_is_reachable() {
         search_path,
     )
     .expect("the recorded configuration");
-
-    harness.context = harness
+    let context = harness
         .context
         .clone()
-        .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unreachable(
-            "no session bus".to_owned(),
-        ))));
-    let job = crate::service::engine::job_path(&harness.context, &config, None)
+        .with_user_manager(Arc::new(UnitManager {
+            unit: Err(EnvironmentFailure::Unusable(
+                "the property read was rejected".to_owned(),
+            )),
+        }));
+    let error = crate::service::engine::job_path(&context, &config, None)
         .await
-        .expect("an unreachable manager does not stop a recorded PATH");
-    assert!(job.variables.is_empty(), "no manager variables are applied");
-    assert_eq!(job.manager_unreachable.as_deref(), Some("no session bus"));
-    let warnings = crate::service::engine::job_warnings(&harness.context, &job);
-    assert!(
-        warnings
-            .iter()
-            .any(|warning| warning.contains("judged at the default store locations")),
-        "{warnings:?}"
-    );
-
-    harness.context = harness
-        .context
-        .clone()
-        .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unusable(
-            "the answer is not a list".to_owned(),
-        ))));
-    let error = crate::service::engine::job_path(&harness.context, &config, None)
-        .await
-        .expect_err("an unusable answer fails closed");
+        .expect_err("unreadable properties are refused");
     assert_eq!(error.code(), "service_manager_environment_unavailable");
+    assert!(
+        error.to_string().contains("the property read was rejected"),
+        "{error}"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -3662,10 +3664,13 @@ async fn a_journal_without_a_launchd_default_takes_the_persisted_plist_and_warns
     .expect("rewrite journal");
     let domain = harness.root.join("user.plist");
     std::fs::write(&domain, launchd_domain_xml(PERSISTED)).expect("domain configuration");
+    // The persisted file is newer than the boot, so a change may be pending.
+    let launchd = FakeLaunchd::new(Ok(not_loaded()));
+    booted_an_hour_ago(&launchd);
     harness.context = harness
         .context
         .clone()
-        .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(not_loaded()))))
+        .with_launchd_job(Arc::new(launchd))
         .with_launchd_domain_config(&domain);
     let preflight = ScriptedPreflight::default();
     let judged = Arc::clone(&preflight.search_paths);
@@ -3690,6 +3695,448 @@ async fn a_journal_without_a_launchd_default_takes_the_persisted_plist_and_warns
         rolled_back.warnings
     );
     harness.assert_installed(V1);
+}
+
+/// The persisted user-domain `PATH` a not-loaded job gets at the early gate.
+#[cfg(target_os = "macos")]
+const PERSISTED_PATH: &str = "/opt/persisted/bin:/usr/bin";
+
+/// A V1 install whose daemon job records no `PATH`, with a launchd user-domain
+/// configuration directory in the test root; returns the file's path.
+#[cfg(target_os = "macos")]
+async fn unrecorded_install_with_domain_config(harness: &mut Harness) -> std::path::PathBuf {
+    let config_dir = harness.root.join("launchd-domain");
+    std::fs::create_dir_all(&config_dir).expect("configuration directory");
+    let domain = config_dir.join("user.plist");
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged)
+        .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(loaded_job(CURRENT_PATH)))))
+        .with_launchd_domain_config(&domain);
+    harness.install(V1).await.expect("install");
+    domain
+}
+
+/// Upgrades an installed job that launchd has not loaded and no journal holds a
+/// default for; returns the result and the `PATH` of every judgement.
+#[cfg(target_os = "macos")]
+async fn upgrade_of_an_unloaded_job(
+    harness: &mut Harness,
+    domain: &std::path::Path,
+    persisted: Option<&str>,
+    dated: impl FnOnce(&std::path::Path),
+    host: impl FnOnce(&FakeLaunchd),
+) -> (Result<UpgradeReport, Error>, Vec<String>) {
+    if let Some(value) = persisted {
+        std::fs::write(domain, launchd_domain_xml(value)).expect("domain configuration");
+    }
+    dated(domain);
+    let launchd = FakeLaunchd::new(Ok(not_loaded()));
+    host(&launchd);
+    harness.context = harness.context.clone().with_launchd_job(Arc::new(launchd));
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+    let result = harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V2), V2)
+        .await;
+    let judged = judged.lock().expect("search path lock").clone();
+    (result, judged)
+}
+
+/// Dates the configuration directory before the boot, as a file of an old
+/// configuration, or the directory an absent one would have been removed from.
+#[cfg(target_os = "macos")]
+fn dated_before_boot(domain: &std::path::Path) {
+    let target = if domain.exists() {
+        domain
+    } else {
+        domain.parent().expect("configuration directory")
+    };
+    date(target, Modified::BeforeBoot).expect("date");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_fresh_upgrade_of_an_unloaded_job_without_persisted_path_uses_the_standard_path() {
+    let mut harness = Harness::new();
+    let domain = unrecorded_install_with_domain_config(&mut harness).await;
+    let (result, judged) =
+        upgrade_of_an_unloaded_job(&mut harness, &domain, None, dated_before_boot, |_| {}).await;
+    let report = result.expect("upgrade");
+    assert!(
+        !judged.is_empty()
+            && judged
+                .iter()
+                .all(|path| path == pohunek_platform::supervisor::launchd::STANDARD_PATH),
+        "{judged:?}"
+    );
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    harness.assert_installed(V2);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_persisted_path_older_than_the_boot_is_active() {
+    let mut harness = Harness::new();
+    let domain = unrecorded_install_with_domain_config(&mut harness).await;
+    let (result, judged) = upgrade_of_an_unloaded_job(
+        &mut harness,
+        &domain,
+        Some(PERSISTED_PATH),
+        dated_before_boot,
+        |_| {},
+    )
+    .await;
+    let report = result.expect("upgrade");
+    assert!(
+        !judged.is_empty() && judged.iter().all(|path| path == PERSISTED_PATH),
+        "{judged:?}"
+    );
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    harness.assert_installed(V2);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_possibly_pending_persisted_path_refuses_the_forward_gate() {
+    let mut harness = Harness::new();
+    let domain = unrecorded_install_with_domain_config(&mut harness).await;
+    let (result, judged) = upgrade_of_an_unloaded_job(
+        &mut harness,
+        &domain,
+        Some(PERSISTED_PATH),
+        |domain| date(domain, Modified::AfterBoot).expect("date"),
+        |_| {},
+    )
+    .await;
+    let error = result.expect_err("a change may be pending");
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    let text = error.to_string();
+    assert!(
+        text.contains("launchctl setenv PATH") && text.contains("reboot"),
+        "{text}"
+    );
+    assert!(!text.contains(PERSISTED_PATH), "values stay out: {text}");
+    assert!(judged.is_empty(), "nothing was judged: {judged:?}");
+    assert_eq!(harness.pending(), None, "no journal was written");
+    harness.assert_installed(V1);
+}
+
+/// The pending upgrade of [`interrupted_upgrade_journal`], whose journal holds no
+/// launchd default, rolled back on a host whose launchd does not have the job
+/// loaded; `persisted` is dated by `dated`, and `host` shapes the fake host.
+#[cfg(target_os = "macos")]
+async fn rollback_without_a_journaled_default(
+    harness: &mut Harness,
+    dated: impl FnOnce(&std::path::Path),
+    host: impl FnOnce(&FakeLaunchd),
+) -> (Result<UpgradeReport, Error>, Vec<String>) {
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(PERSISTED_PATH)).expect("domain configuration");
+    harness.context = harness.context.clone().with_launchd_domain_config(&domain);
+    interrupted_upgrade_journal(harness).await;
+    let journal = harness.context.paths().state_dir.join(record::FILE_NAME);
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&journal).expect("journal")).expect("journal JSON");
+    document
+        .as_object_mut()
+        .expect("journal object")
+        .remove("launchd_default_path");
+    std::fs::write(
+        &journal,
+        serde_json::to_vec(&document).expect("journal bytes"),
+    )
+    .expect("rewrite journal");
+    dated(&domain);
+    let launchd = FakeLaunchd::new(Ok(not_loaded()));
+    host(&launchd);
+    harness.context = harness.context.clone().with_launchd_job(Arc::new(launchd));
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+    let result = harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V1), V1)
+        .await;
+    let judged = judged.lock().expect("search path lock").clone();
+    (result, judged)
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_rollback_uses_an_active_persisted_path_without_warning() {
+    let mut harness = Harness::new();
+    let (result, judged) = rollback_without_a_journaled_default(
+        &mut harness,
+        |domain| date(domain, Modified::BeforeBoot).expect("date"),
+        |_| {},
+    )
+    .await;
+    let report = result.expect("the pending upgrade is rolled back");
+    assert!(
+        !judged.is_empty() && judged.iter().all(|path| path == PERSISTED_PATH),
+        "{judged:?}"
+    );
+    let rolled_back = report.rolled_back.expect("the rollback is reported");
+    assert!(
+        rolled_back.warnings.is_empty(),
+        "{:?}",
+        rolled_back.warnings
+    );
+    harness.assert_installed(V1);
+}
+
+/// An upgrade interrupted after `interrupted_after`, whose journal holds the
+/// launchd default, on a host whose launchd no longer has the job loaded and
+/// whose `user.plist` was written after the boot; returns the preflight to
+/// install and the recorder of the `PATH`s it judges.
+#[cfg(target_os = "macos")]
+async fn interrupted_upgrade_with_a_pending_plist(
+    harness: &mut Harness,
+    interrupted_after: Step,
+) -> (ScriptedPreflight, Arc<Mutex<Vec<String>>>) {
+    set_job_path(harness, JOURNALED_PATH);
+    harness.install(V1).await.expect("install");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(interrupted_after);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted");
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(PERSISTED_PATH)).expect("domain configuration");
+    date(&domain, Modified::AfterBoot).expect("date");
+    harness.context = harness
+        .context
+        .clone()
+        .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(not_loaded()))))
+        .with_launchd_domain_config(&domain);
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+    (preflight, judged)
+}
+
+/// The adoption gate of a resumed upgrade judges with the launchd default the
+/// transaction journaled, as its later gates do, not with the pending plist.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_resume_judges_the_adoption_gate_with_the_journaled_default() {
+    let mut harness = Harness::new();
+    let (preflight, judged) =
+        interrupted_upgrade_with_a_pending_plist(&mut harness, Step::Definition).await;
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("the interrupted upgrade resumes");
+
+    let judged = judged.lock().expect("search path lock").clone();
+    assert!(
+        !judged.is_empty() && judged.iter().all(|path| path == JOURNALED_PATH),
+        "{judged:?}"
+    );
+    harness.assert_installed(V2);
+}
+
+/// The same for the rollback of a pending upgrade that another version's upgrade
+/// runs first.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_rollback_to_another_version_judges_the_adoption_gate_with_the_journaled_default() {
+    let mut harness = Harness::new();
+    let (preflight, judged) =
+        interrupted_upgrade_with_a_pending_plist(&mut harness, Step::Registered).await;
+
+    // Once the rollback is done the new transaction has no journaled default, so
+    // the upgrade to the third version may be refused by a later gate; the gate
+    // that precedes the rollback is under test.
+    let result = harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V3), V3)
+        .await;
+
+    let judged = judged.lock().expect("search path lock").clone();
+    assert_eq!(
+        judged.first().map(String::as_str),
+        Some(JOURNALED_PATH),
+        "{judged:?}"
+    );
+    match result {
+        Ok(_) => harness.assert_installed(V3),
+        Err(error) => {
+            assert_eq!(error.code(), "service_manager_environment_unavailable");
+            harness.assert_installed(V1);
+        }
+    }
+}
+
+/// `service check` judges the adoption gate of a resumed upgrade, and of one that
+/// rolls another back first, with the launchd default the pending transaction
+/// journaled, as the upgrade does.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_check_judges_a_pending_transaction_with_its_journaled_default() {
+    for (interrupted_after, version) in [(Step::Definition, V2), (Step::Registered, V3)] {
+        let mut harness = Harness::new();
+        let (preflight, judged) =
+            interrupted_upgrade_with_a_pending_plist(&mut harness, interrupted_after).await;
+
+        crate::service::check_with_preflight(
+            &harness.context,
+            &harness.staged(version),
+            &preflight,
+            version,
+            false,
+        )
+        .await
+        .expect("the check judges with the journaled default");
+
+        let judged = judged.lock().expect("search path lock").clone();
+        assert!(
+            !judged.is_empty() && judged.iter().all(|path| path == JOURNALED_PATH),
+            "{version}: {judged:?}"
+        );
+    }
+}
+
+/// Without a journaled default a possibly pending plist refuses the forward
+/// upgrade that would roll the pending one back first, before any effect.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_rollback_to_another_version_without_a_journaled_default_refuses_before_any_effect() {
+    let mut harness = Harness::new();
+    let (preflight, judged) =
+        interrupted_upgrade_with_a_pending_plist(&mut harness, Step::Registered).await;
+    let journal = harness.context.paths().state_dir.join(record::FILE_NAME);
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&journal).expect("journal")).expect("journal JSON");
+    document
+        .as_object_mut()
+        .expect("journal object")
+        .remove("launchd_default_path");
+    std::fs::write(
+        &journal,
+        serde_json::to_vec(&document).expect("journal bytes"),
+    )
+    .expect("rewrite journal");
+    let error = harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V3), V3)
+        .await
+        .expect_err("a change may be pending");
+
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    assert!(
+        judged.lock().expect("search path lock").is_empty(),
+        "nothing was judged"
+    );
+    assert!(
+        harness.pending().is_some(),
+        "the pending upgrade is untouched"
+    );
+}
+
+/// A rollback goes on with launchd's standard `PATH` as a stand-in when the
+/// persisted configuration cannot be read; a forward gate refuses.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn an_unreadable_persisted_configuration_does_not_strand_a_rollback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let unreadable = |domain: &std::path::Path| {
+        date(domain, Modified::BeforeBoot).expect("date");
+        std::fs::set_permissions(domain, std::fs::Permissions::from_mode(0o000))
+            .expect("permissions");
+    };
+
+    let mut harness = Harness::new();
+    let (result, judged) =
+        rollback_without_a_journaled_default(&mut harness, unreadable, |_| {}).await;
+    let report = result.expect("the pending upgrade is rolled back");
+    assert!(
+        !judged.is_empty()
+            && judged
+                .iter()
+                .all(|path| path == pohunek_platform::supervisor::launchd::STANDARD_PATH),
+        "{judged:?}"
+    );
+    let rolled_back = report.rolled_back.expect("the rollback is reported");
+    assert_eq!(rolled_back.warnings.len(), 1, "{:?}", rolled_back.warnings);
+    harness.assert_installed(V1);
+
+    let mut harness = Harness::new();
+    let domain = unrecorded_install_with_domain_config(&mut harness).await;
+    let (result, judged) = upgrade_of_an_unloaded_job(
+        &mut harness,
+        &domain,
+        Some(PERSISTED_PATH),
+        unreadable,
+        |_| {},
+    )
+    .await;
+    let error = result.expect_err("a forward gate refuses");
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    assert!(judged.is_empty(), "nothing was judged: {judged:?}");
+    harness.assert_installed(V1);
+}
+
+/// A boot time that cannot be read, or a configuration changed within the margin
+/// of the boot, may hide a pending change: a forward gate refuses, and a
+/// rollback goes on with the persisted value and says so.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn an_unreadable_boot_or_file_time_is_treated_as_pending() {
+    let unreadable_boot =
+        |launchd: &FakeLaunchd| launchd.set_boot_time(Err("sysctl failed".to_owned()));
+    let within_margin = |domain: &std::path::Path| {
+        let when = boot_time() - crate::service::settings::LAUNCHD_CONFIG_BOOT_MARGIN / 2;
+        std::fs::File::open(domain)
+            .and_then(|file| file.set_modified(when))
+            .expect("date");
+    };
+
+    for host_unreadable in [true, false] {
+        let host = |launchd: &FakeLaunchd| {
+            if host_unreadable {
+                unreadable_boot(launchd);
+            }
+        };
+        let dated = |domain: &std::path::Path| {
+            if host_unreadable {
+                dated_before_boot(domain);
+            } else {
+                within_margin(domain);
+            }
+        };
+
+        let mut harness = Harness::new();
+        let domain = unrecorded_install_with_domain_config(&mut harness).await;
+        let (result, _) =
+            upgrade_of_an_unloaded_job(&mut harness, &domain, Some(PERSISTED_PATH), dated, host)
+                .await;
+        let error = result.expect_err("a forward gate refuses");
+        assert_eq!(error.code(), "service_manager_environment_unavailable");
+        harness.assert_installed(V1);
+
+        let mut harness = Harness::new();
+        let (result, judged) =
+            rollback_without_a_journaled_default(&mut harness, dated, host).await;
+        let report = result.expect("a rollback goes on");
+        assert!(
+            !judged.is_empty() && judged.iter().all(|path| path == PERSISTED_PATH),
+            "{judged:?}"
+        );
+        let warnings = report.rolled_back.expect("rolled back").warnings;
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("persisted launchd configuration was used"));
+    }
 }
 
 #[tokio::test]
@@ -7138,27 +7585,12 @@ async fn the_adoption_preflight_is_skipped_when_no_daemon_swap_starts() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
-/// A check of a recorded-`PATH` job with no reachable bus that refuses at-risk
-/// sessions still tells the operator the verdicts may err: the refusal carries
-/// the warning.
+/// A check of a recorded-`PATH` job with no reachable bus is refused before it
+/// judges a session, with the cause named.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn a_refused_check_without_a_bus_shows_the_warning_with_the_refusal() {
-    use crate::service::manager_env::EnvironmentFailure;
-
-    let mut harness = Harness::new();
-    harness.context = harness
-        .context
-        .clone()
-        .with_path_discovery(crate::service::context::PathDiscovery::Managed {
-            login_shell: None,
-            shell_defaulted: false,
-            fallback_directories: vec!["/usr/bin".to_owned()],
-        })
-        .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unreachable(
-            "no session bus".to_owned(),
-        ))));
-    harness.install(V1).await.expect("install");
+async fn a_check_without_a_bus_is_refused_before_it_judges() {
+    let harness = harness_without_a_bus().await;
     seed_live_session(&harness, SESSION, "w-1");
     edit_stored_line(&harness, SESSION, |line| {
         line.as_object_mut().expect("record").remove("runtime");
@@ -7173,31 +7605,27 @@ async fn a_refused_check_without_a_bus_shows_the_warning_with_the_refusal() {
         false,
     )
     .await
-    .expect_err("the at-risk session refuses the check");
-    assert!(
-        matches!(refused, Error::UpgradeAtRisk { .. }),
-        "{refused:?}"
-    );
-    let text = refused.to_string();
-    assert!(
-        text.contains("judged at the default store locations"),
-        "the refusal carries the warning: {text}"
-    );
+    .expect_err("no judgement is possible without the manager");
+    assert_eq!(refused.code(), "service_manager_environment_unavailable");
+    assert!(refused.to_string().contains("no session bus"), "{refused}");
 }
 
-/// A harness whose daemon job records its `PATH` and whose user manager has no
-/// reachable bus, so its judgements run without the manager's variables.
+/// A harness whose daemon job is installed with a recorded `PATH` while the
+/// user manager answers, and whose user manager then has no reachable bus.
 #[cfg(target_os = "linux")]
-fn harness_without_a_bus() -> Harness {
+async fn harness_without_a_bus() -> Harness {
     let mut harness = Harness::new();
-    harness.context = harness
-        .context
-        .clone()
-        .with_path_discovery(crate::service::context::PathDiscovery::Managed {
+    harness.context = harness.context.clone().with_path_discovery(
+        crate::service::context::PathDiscovery::Managed {
             login_shell: None,
             shell_defaulted: false,
             fallback_directories: vec!["/usr/bin".to_owned()],
-        })
+        },
+    );
+    harness.install(V1).await.expect("install");
+    harness.context = harness
+        .context
+        .clone()
         .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unreachable(
             "no session bus".to_owned(),
         ))));
@@ -7220,76 +7648,47 @@ fn preflight_with_a_stopped_session() -> Box<ScriptedPreflight> {
     })
 }
 
-/// An upgrade that judged a stopped session without the manager's variables
-/// refuses even when that session reads adoptable: its reference was checked at
-/// the default store location. Accepting runtime loss covers that, so the same
-/// upgrade then proceeds.
+/// An upgrade of a recorded-`PATH` job whose manager cannot be reached is
+/// refused before any effect, with or without a stopped session, and accepting
+/// runtime loss does not change that: the loss it accepts is a judgement the
+/// manager's variables could change, and here there is no judgement at all.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn an_upgrade_judged_without_the_managers_variables_refuses_unless_loss_is_accepted() {
-    let harness = harness_without_a_bus();
-    harness.install(V1).await.expect("install");
+async fn an_upgrade_without_a_bus_is_refused_before_any_effect() {
+    let harness = harness_without_a_bus().await;
 
-    let refused = harness
-        .engine()
-        .with_adoption_preflight(preflight_with_a_stopped_session())
-        .upgrade(&harness.staged(V2), V2)
-        .await
-        .expect_err("a stopped session judged without the manager's variables refuses");
-    assert!(
-        matches!(refused, Error::ManagerVariablesUnread { .. }),
-        "{refused:?}"
-    );
-    assert_eq!(refused.code(), "service_manager_variables_unread");
-    assert!(refused.to_string().contains("no session bus"), "{refused}");
-    assert_eq!(harness.pending(), None);
-    harness.assert_installed(V1);
-
-    let report = harness
-        .engine()
-        .with_runtime_loss_accepted(true)
-        .with_adoption_preflight(preflight_with_a_stopped_session())
-        .upgrade(&harness.staged(V2), V2)
-        .await
-        .expect("accepted runtime loss covers the degraded judgement");
-    assert!(report.rolled_back.is_none());
-    harness.assert_installed(V2);
+    for accept in [false, true] {
+        for preflight in [
+            preflight_with_a_stopped_session(),
+            Box::<ScriptedPreflight>::default(),
+        ] {
+            let refused = harness
+                .engine()
+                .with_runtime_loss_accepted(accept)
+                .with_adoption_preflight(preflight)
+                .upgrade(&harness.staged(V2), V2)
+                .await
+                .expect_err("no judgement is possible without the manager");
+            assert_eq!(refused.code(), "service_manager_environment_unavailable");
+            assert!(refused.to_string().contains("no session bus"), "{refused}");
+            assert_eq!(harness.pending(), None, "no journal was written");
+            harness.assert_installed(V1);
+        }
+    }
 }
 
-/// A judgement without stopped sessions reads no store location, so the
-/// manager's variables cannot change it: the upgrade proceeds without the flag
-/// and reports the warning.
+/// A rollback whose manager cannot be reached keeps its transaction.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn an_upgrade_without_stopped_sessions_proceeds_without_the_managers_variables() {
-    let harness = harness_without_a_bus();
-    harness.install(V1).await.expect("install");
-    seed_live_session(&harness, SESSION, "w-1");
-
-    let report = harness
-        .upgrade(V2)
-        .await
-        .expect("no verdict depends on the manager's variables");
-    assert!(!report.accepted_runtime_loss);
-    assert!(
-        report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("judged at the default store locations")),
-        "{:?}",
-        report.warnings
-    );
-    harness.assert_installed(V2);
-}
-
-/// A rollback that judged a stopped session without the manager's variables
-/// refuses and keeps its transaction unless runtime loss is accepted, as the
-/// upgrade does.
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn a_rollback_judged_without_the_managers_variables_refuses_unless_loss_is_accepted() {
-    let harness = harness_without_a_bus();
-    harness.install(V1).await.expect("install");
+async fn a_rollback_without_a_bus_keeps_its_transaction() {
+    let mut harness = harness_without_a_bus().await;
+    harness.context = harness
+        .context
+        .clone()
+        .with_user_manager(Arc::new(FakeUserManager(Ok(vec![format!(
+            "PATH={}",
+            harness.root.join(USER_MANAGER_BIN).display()
+        )]))));
     let mut engine = harness.engine();
     engine.interrupt_after = Some(Step::Registered);
     engine
@@ -7297,29 +7696,25 @@ async fn a_rollback_judged_without_the_managers_variables_refuses_unless_loss_is
         .await
         .expect_err("interrupted after the registration");
     let pending = harness.pending().expect("the interrupted upgrade is kept");
+    harness.context = harness
+        .context
+        .clone()
+        .with_user_manager(Arc::new(FailingManager(EnvironmentFailure::Unreachable(
+            "no session bus".to_owned(),
+        ))));
 
-    let refused = harness
-        .engine()
-        .with_adoption_preflight(preflight_with_a_stopped_session())
-        .upgrade(&harness.staged(V1), V1)
-        .await
-        .expect_err("a stopped session judged without the manager's variables refuses");
-    assert!(
-        matches!(refused, Error::ManagerVariablesUnread { .. }),
-        "{refused:?}"
-    );
-    assert_eq!(harness.pending(), Some(pending));
-    assert_eq!(harness.config().expect("config").active_version(), V2);
-
-    let report = harness
-        .engine()
-        .with_runtime_loss_accepted(true)
-        .with_adoption_preflight(preflight_with_a_stopped_session())
-        .upgrade(&harness.staged(V1), V1)
-        .await
-        .expect("accepted runtime loss covers the degraded judgement");
-    assert!(report.rolled_back.is_some());
-    harness.assert_installed(V1);
+    for accept in [false, true] {
+        let refused = harness
+            .engine()
+            .with_runtime_loss_accepted(accept)
+            .with_adoption_preflight(preflight_with_a_stopped_session())
+            .upgrade(&harness.staged(V1), V1)
+            .await
+            .expect_err("no judgement is possible without the manager");
+        assert_eq!(refused.code(), "service_manager_environment_unavailable");
+        assert_eq!(harness.pending(), Some(pending.clone()));
+        assert_eq!(harness.config().expect("config").active_version(), V2);
+    }
 }
 
 #[tokio::test]
@@ -11489,8 +11884,23 @@ async fn a_removed_unit_with_surviving_drop_ins_is_judged_by_them() {
         ),
         ("a.service.d", "20-reset.conf", b"[Service]\nEnvironment=\n"),
     ]);
-    let job = unrecorded_job_path(Ok(unit)).await.expect("path");
-    assert_eq!(job.value, MANAGER_PATH, "an empty assignment resets");
+    // The `PATH` reader follows the reset; the job as a whole is refused, because
+    // the reset also removes the bootstrap environment the unit file gives it.
+    let value = crate::service::manager_env::effective_search_path(
+        Some(MANAGER_PATH.to_owned()),
+        &unit,
+        "a.service",
+        &mut crate::service::manager_env::UnitFileReader::default(),
+    )
+    .await
+    .expect("path");
+    assert_eq!(
+        value.as_deref(),
+        Some(MANAGER_PATH),
+        "an empty assignment resets"
+    );
+    let text = refusal(unrecorded_job_path(Ok(unit)).await);
+    assert!(text.contains("resets Environment="), "{text}");
 
     let (_keep, unit) = orphan_drop_ins(&[(
         "a.service.d",
@@ -11668,25 +12078,81 @@ async fn environment_file_paths_of_a_removed_unit_are_ignored_when_relative_and_
     }
 }
 
-/// A line ending in a backslash is a continuation systemd joins by an odd/even
-/// rule that is not followed here: any such line in a removed unit's drop-in is
-/// refused, whatever it continues into.
+/// A run of backslashes at the end of a line continues it only when its length
+/// is odd (pinned on the real manager), and a comment line ending in a backslash
+/// swallows nothing, so a removed unit's drop-in is read by that rule.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn a_line_ending_in_a_backslash_in_a_removed_units_drop_in_is_refused() {
-    for content in [
-        "[Service]\nEnvironment=FIRST=1 \\\nPATH=/hidden/bin\n",
-        "[Service]\nEnvironment=FIRST=1 \\\\\nPATH=/hidden/bin\n",
-        "[Service]\nEnvironment=PATH=/a/bin \\\n",
-        "[Service]\n# note \\\nEnvironment=PATH=/a/bin\n",
-        "[Unit]\nDescription=x \\\n[Service]\nEnvironment=PATH=/a/bin\n",
+async fn a_removed_units_drop_in_with_backslashes_is_read_by_the_rule() {
+    for (content, expected) in [
+        // Odd run: the next line is more words of the same assignment.
+        (
+            "[Service]\nEnvironment=FIRST=1 \\\nPATH=/hidden/bin\n",
+            "/hidden/bin",
+        ),
+        // Even run: the line ends, the next one is a line of its own.
+        (
+            "[Service]\nEnvironment=FIRST=1 \\\\\nPATH=/hidden/bin\n",
+            MANAGER_PATH,
+        ),
+        ("[Service]\nEnvironment=PATH=/a/bin \\\n", "/a/bin"),
+        ("[Service]\nEnvironment=PATH=/a/bin \\\\\n", "/a/bin"),
+        // A comment ending in a backslash swallows nothing.
+        ("[Service]\n# note \\\nEnvironment=PATH=/a/bin\n", "/a/bin"),
+        // A header joined into a continuation is text of the continued line.
+        (
+            "[Unit]\nDescription=x \\\n[Service]\nEnvironment=PATH=/a/bin\n",
+            MANAGER_PATH,
+        ),
+        // The continuation of an assignment goes on across a comment line.
+        (
+            "[Service]\nEnvironment=FIRST=1 \\\n# note\nPATH=/c/bin\n",
+            "/c/bin",
+        ),
     ] {
         let (_keep, unit) = orphan_drop_ins(&[("a.service.d", "10-a.conf", content.as_bytes())]);
-        let text = refusal(unrecorded_job_path(Ok(unit)).await);
-        assert!(
-            text.contains("ending in a backslash"),
-            "{content:?}: {text}"
-        );
+        let job = unrecorded_job_path(Ok(unit)).await.expect(content);
+        assert_eq!(job.value, expected, "{content:?}");
+    }
+}
+
+/// A loaded unit whose drop-in uses backslash continuations, escaped backslashes
+/// or a comment ending in a backslash is resolved from the manager's merged
+/// `PATH`, not refused: the rule is the one systemd applies (pinned on the real
+/// manager).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_loaded_unit_with_backslash_forms_is_resolved_not_refused() {
+    for (content, merged, expected) in [
+        (
+            "[Service]\nEnvironment=FIRST=1 \\\nPATH=/hidden/bin\n",
+            vec!["FIRST=1", "PATH=/hidden/bin"],
+            "/hidden/bin",
+        ),
+        (
+            "[Service]\nEnvironment=FIRST=1 \\\\\nPATH=/hidden/bin\n",
+            vec!["FIRST=1"],
+            MANAGER_PATH,
+        ),
+        (
+            "[Service]\n# note \\\nEnvironment=PATH=/a/bin\n",
+            vec!["PATH=/a/bin"],
+            "/a/bin",
+        ),
+        (
+            "[Service]\nEnvironment=PATH=/a/bin \\\\\n",
+            vec!["PATH=/a/bin"],
+            "/a/bin",
+        ),
+    ] {
+        let (_dir, drop_in) = environment_file(content);
+        let unit = UnitEnvironment {
+            drop_in_paths: vec![drop_in],
+            environment: merged.into_iter().map(str::to_owned).collect(),
+            ..loaded_unit()
+        };
+        let job = unrecorded_job_path(Ok(unit)).await.expect(content);
+        assert_eq!(job.value, expected, "{content:?}");
     }
 }
 

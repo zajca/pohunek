@@ -389,7 +389,7 @@ impl ReleasePlanner for RecordingPlanner {
 /// Stands in for the systemd user manager's `Environment` property.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
-struct FakeUserManager(Vec<String>);
+struct FakeUserManager(Vec<String>, UnitEnvironment);
 
 #[cfg(target_os = "linux")]
 impl UserManager for FakeUserManager {
@@ -405,12 +405,17 @@ impl UserManager for FakeUserManager {
         _unit: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<UnitEnvironment, EnvironmentFailure>> + Send + 'a>>
     {
-        Box::pin(async {
-            Ok(UnitEnvironment {
-                load_state: "loaded".to_owned(),
-                ..UnitEnvironment::default()
-            })
-        })
+        let unit = self.1.clone();
+        Box::pin(async move { Ok(unit) })
+    }
+}
+
+/// A loaded daemon unit with no environment settings.
+#[cfg(target_os = "linux")]
+fn loaded_unit() -> UnitEnvironment {
+    UnitEnvironment {
+        load_state: "loaded".to_owned(),
+        ..UnitEnvironment::default()
     }
 }
 
@@ -430,9 +435,10 @@ async fn a_fresh_unmanaged_host_is_planned_with_the_user_managers_path() {
         .context
         .clone()
         .with_path_discovery(PathDiscovery::Unmanaged)
-        .with_user_manager(std::sync::Arc::new(FakeUserManager(vec![format!(
-            "PATH={manager_path}"
-        )])));
+        .with_user_manager(std::sync::Arc::new(FakeUserManager(
+            vec![format!("PATH={manager_path}")],
+            loaded_unit(),
+        )));
     let planner = RecordingPlanner::default();
 
     let host_plan = plan(&installation.context, &release, &planner)
@@ -447,6 +453,53 @@ async fn a_fresh_unmanaged_host_is_planned_with_the_user_managers_path() {
         *planner.search_paths.lock().expect("search path record"),
         vec![manager_path],
         "the preview plans with the user manager's PATH"
+    );
+}
+
+/// A drop-in of the daemon unit that sets `PATH` replaces the `PATH` the install
+/// records, so the preview plans with the drop-in's.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"]
+async fn setup_host_judges_with_the_drop_in_path() {
+    let mut installation = Installation::new();
+    let release = release(&installation);
+    let tools = installation.root.join("drop-in-tools");
+    directory(&tools, SEARCH_DIR);
+    let drop_in_path = path_text(&tools);
+    let drop_in = installation.root.join("10-path.conf");
+    fs::write(
+        &drop_in,
+        format!("[Service]\nEnvironment=PATH={drop_in_path}\n"),
+    )
+    .expect("drop-in");
+    let unit = UnitEnvironment {
+        drop_in_paths: vec![path_text(&drop_in)],
+        environment: vec![format!("PATH={drop_in_path}")],
+        ..loaded_unit()
+    };
+    installation.context = installation
+        .context
+        .clone()
+        .with_path_discovery(PathDiscovery::Managed {
+            login_shell: None,
+            shell_defaulted: false,
+            fallback_directories: vec!["/usr/bin".to_owned(), "/bin".to_owned()],
+        })
+        .with_user_manager(std::sync::Arc::new(FakeUserManager(
+            vec!["PATH=/manager/bin".to_owned()],
+            unit,
+        )));
+    let planner = RecordingPlanner::default();
+
+    plan(&installation.context, &release, &planner)
+        .await
+        .expect("plan the host");
+
+    assert_eq!(
+        *planner.search_paths.lock().expect("search path record"),
+        vec![drop_in_path],
+        "the preview plans with the drop-in's PATH, not the recorded one"
     );
 }
 
