@@ -390,8 +390,8 @@ implementation shared by both targets, and the worker's complete test suite,
 including idle-CPU and descriptor-release evidence, runs on the native runner.
 The daemon and CLI also build and test on that runner, including the
 real-launchd supervision suite. macOS on Apple Silicon is a supported
-platform. Release archives are ad-hoc signed and not notarized. The open items of #100 and #102-#105 are ordinary
-follow-ups.
+platform. Release archives are ad-hoc signed and not notarized. The open items
+of #100 and #102-#105 are ordinary follow-ups.
 
 The host daemon is the local control plane for one machine, written in Rust.
 

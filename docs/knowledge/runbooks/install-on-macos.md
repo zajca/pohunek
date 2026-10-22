@@ -14,7 +14,8 @@ Native macOS archives target Apple Silicon and macOS 14 or newer, tested on
 macOS 15 (`aarch64-apple-darwin`); CI and release acceptance run on macOS 15
 only. Intel Macs and Rosetta shells are refused. Release archives are ad-hoc
 signed, not notarized, and carry no Developer ID; every release asset has a
-GitHub build-provenance attestation. Everything runs as the logged-in owner: no `sudo`, no root service.
+GitHub build-provenance attestation. Everything runs as the logged-in owner: no
+`sudo`, no root service.
 
 ## What a release provides
 
