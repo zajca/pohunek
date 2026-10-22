@@ -954,6 +954,10 @@ struct SessionEntry {
     /// never replaces it, so a scan that read a process before a newer OSC 7
     /// hint landed cannot move the session back.
     cwd_observed_at: Instant,
+    /// The association a session created by `project`/`repo` in a directory
+    /// outside every repository starts with. Held in memory only, so a session
+    /// adopted after a daemon restart has none.
+    reference_launch: Option<Box<CwdAssociation>>,
     /// Daemon instance holding the create's undelivered initial input; the
     /// running session's record then carries the `initial_input` marker
     /// naming that instance.
@@ -3423,6 +3427,7 @@ impl SessionRegistry {
         validated_program: Option<crate::agent::ValidatedLaunchProgram>,
         target: TargetResolution,
     ) -> Result<(PtySessionSpec, Option<String>), ProtocolError> {
+        let reference_launch = target.reference_launch();
         let TargetResolution {
             launch_cwd,
             repo,
@@ -3521,6 +3526,7 @@ impl SessionRegistry {
             worktree_path,
             metadata: params.metadata.clone(),
             warnings,
+            reference_launch,
             initial_input_pending: plan.pending_initial_input.is_some(),
             prompt_in_argv: plan.prompt_in_argv,
             package_authority: None,
@@ -4868,6 +4874,15 @@ impl SessionRegistry {
                 return;
             }
             entry.cwd_observed_at = observed_at;
+            // A session created by reference outside every repository returns to
+            // the reference's association whenever the applied cwd provably lies
+            // outside every repository; unconfirmed evidence follows the cwd.
+            let association = association.map(|(resolved, outside)| {
+                match (outside, entry.reference_launch.as_ref()) {
+                    (true, Some(reference)) => CwdAssociation::clone(reference),
+                    _ => resolved,
+                }
+            });
             Some(apply_cwd_change(entry, cwd, source, association))
         };
 
@@ -4883,18 +4898,24 @@ impl SessionRegistry {
             .is_some_and(|entry| cwd_evidence_moves(entry, cwd, observed_at))
     }
 
+    /// The association an observed `cwd` resolves to and whether `cwd` provably
+    /// lies outside every repository, or `None` when resolving it failed and the
+    /// session keeps its current association.
     async fn resolve_cwd_association(
         &self,
         id: &SessionId,
         cwd: PathBuf,
-    ) -> Option<CwdAssociation> {
+    ) -> Option<(CwdAssociation, bool)> {
         let store = self.inner.store.clone();
         match tokio::task::spawn_blocking(move || {
-            resolve_cwd_association(cwd.as_path(), store.as_deref())
+            let resolved = resolve_cwd_association(cwd.as_path(), store.as_deref())?;
+            let outside = resolved == CwdAssociation::default()
+                && crate::project::detect::confirmed_outside_repository(&cwd);
+            Ok::<_, ProtocolError>((resolved, outside))
         })
         .await
         {
-            Ok(Ok(association)) => Some(association),
+            Ok(Ok(resolved)) => Some(resolved),
             Ok(Err(err)) => {
                 warn!(
                     session_id = %id.0,
@@ -6325,9 +6346,16 @@ impl SessionRegistry {
     ///
     /// The watchers of a replaced entry are cancelled, so re-adopting or
     /// reclassifying a runtime never leaves a second watcher set on it.
-    async fn install_session_entry(&self, id: &SessionId, entry: SessionEntry) {
+    async fn install_session_entry(&self, id: &SessionId, mut entry: SessionEntry) {
         let replaced = {
             let mut sessions = self.inner.sessions.lock().await;
+            // A rebuilt entry of the same session keeps the launch association
+            // the live one held.
+            if entry.reference_launch.is_none() {
+                entry.reference_launch = sessions
+                    .get(id)
+                    .and_then(|live| live.reference_launch.clone());
+            }
             self.set_unpersisted(&id.0, None);
             self.inner.turns.observe_state(id, entry.info.state);
             self.inner.turns.new_generation(id);

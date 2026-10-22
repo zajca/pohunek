@@ -16,6 +16,12 @@ export type SessionNewParams = {
   name?: string;
   /**
    * Working directory for the session. If omitted, the daemon chooses one.
+   *
+   * For an in-place session (no `branch`) it is the directory the session
+   * starts in when it is an absolute path of an existing directory on the
+   * daemon's host. With `project` or `repo` anything else fails with
+   * `bad_request`; without them the project is detected from it. A daemon
+   * advertises that it honors it as `session_new_cwd_supported`.
    */
   cwd?: string;
   /**
@@ -29,10 +35,12 @@ export type SessionNewParams = {
   /**
    * Project to run in, by `<id|label>` reference (see `docs/design/projects.md`).
    * The daemon resolves it against **its own** project store and turns it into a
-   * host-local checkout, so no filesystem path crosses the wire — this is the
-   * only target option for a remote host. With `branch` it picks the worktree's
+   * host-local checkout, so the reference itself carries no filesystem path;
+   * the only path sent next to it is an explicit absolute `cwd`, which the
+   * target host resolves. With `branch` it picks the worktree's
    * source repository (the project's `repo_root`); without `branch` the agent
-   * runs in-place in that checkout. Takes precedence over `cwd` auto-detection.
+   * runs in-place, in `cwd` when one is given and otherwise in that checkout.
+   * Takes precedence over `cwd` auto-detection.
    */
   project?: string;
   /**

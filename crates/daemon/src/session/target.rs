@@ -10,16 +10,16 @@ use pohunek_worker_protocol::{
 
 use super::{
     build_pty_command, debug, detect_at, event, host, mpsc, plan_initial_input_delivery,
-    runtime_error, timestamp_now, warn, watch, Arc, CancellationToken, CwdSource, DesiredState,
-    DetectedProject, DetectorConfig, DetectorConfigUpdate, DetectorInputs, DetectorScope,
-    InputRules, LaunchCommand, LaunchOpts, Manifest, Mutex, NativeSessionLaunch, Notify, Ordering,
-    PathBuf, ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding, ResumeSnapshot,
-    RuntimeHandle, RuntimeHost, RuntimeRecord, RuntimeRef, RuntimeState, RuntimeWatchIdentity,
-    SessionEntry, SessionId, SessionInfo, SessionNewParams, SessionRecord, SessionRefKind,
-    SessionRegistry, SessionRuntime, SessionState, SessionTransaction, SessionWarning, StateSource,
-    TransactionKind, Worker, WorktreeRequest, DEFAULT_WORKER_SUBSCRIBER_BYTES,
-    DEFAULT_WORKER_TERMINAL_RETENTION, DEFAULT_WORKER_WRITE_DEDUP_ENTRIES,
-    SESSION_RECORD_SCHEMA_VERSION,
+    runtime_error, timestamp_now, warn, watch, Arc, CancellationToken, CwdAssociation, CwdSource,
+    DesiredState, DetectedProject, DetectorConfig, DetectorConfigUpdate, DetectorInputs,
+    DetectorScope, InputRules, LaunchCommand, LaunchOpts, Manifest, Mutex, NativeSessionLaunch,
+    Notify, Ordering, PathBuf, ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding,
+    ResumeSnapshot, RuntimeHandle, RuntimeHost, RuntimeRecord, RuntimeRef, RuntimeState,
+    RuntimeWatchIdentity, SessionEntry, SessionId, SessionInfo, SessionNewParams, SessionRecord,
+    SessionRefKind, SessionRegistry, SessionRuntime, SessionState, SessionTransaction,
+    SessionWarning, StateSource, TransactionKind, Worker, WorktreeRequest,
+    DEFAULT_WORKER_SUBSCRIBER_BYTES, DEFAULT_WORKER_TERMINAL_RETENTION,
+    DEFAULT_WORKER_WRITE_DEDUP_ENTRIES, SESSION_RECORD_SCHEMA_VERSION,
 };
 use crate::procwatch::{ProcessIdentity, StartIdentity};
 use crate::runtime::lifecycle::{
@@ -85,6 +85,10 @@ pub(super) struct PtySessionSpec {
     pub(super) metadata: BTreeMap<String, String>,
     /// Non-fatal worktree-setup warnings to surface on the session.
     pub(super) warnings: Vec<SessionWarning>,
+    /// The association a session created by `project`/`repo` in a directory
+    /// outside every repository returns to; a relaunch of the same session in
+    /// this daemon run carries the live entry's.
+    pub(super) reference_launch: Option<Box<CwdAssociation>>,
     /// Whether an initial input follows the commit; the committed record
     /// then carries the `initial_input` marker until it is delivered.
     pub(super) initial_input_pending: bool,
@@ -94,6 +98,46 @@ pub(super) struct PtySessionSpec {
     /// Shared package authority a launch holds until its registration ends,
     /// for launches that pin a package outside the create transaction.
     pub(super) package_authority: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
+/// The canonical form of `path` when it is an absolute path of an existing
+/// directory on this host.
+///
+/// The canonical path is the one the process tree reports for it, so a later
+/// cwd observation of the session compares equal to the launch directory.
+async fn canonical_usable_dir(path: &std::path::Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let probe = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        std::fs::canonicalize(&probe)
+            .ok()
+            .filter(|canonical| canonical.is_dir())
+    })
+    .await
+    .unwrap_or(None)
+}
+
+/// Checks the launch directory a caller named for a project-bound session.
+///
+/// # Errors
+///
+/// Returns `bad_request` naming the path when it is relative, missing, or not a
+/// directory.
+async fn validated_launch_dir(cwd: &std::path::Path) -> Result<PathBuf, ProtocolError> {
+    if !cwd.is_absolute() {
+        return Err(ProtocolError::bad_request(format!(
+            "session.new cwd '{}' must be an absolute path on the host",
+            cwd.display()
+        )));
+    }
+    canonical_usable_dir(cwd).await.ok_or_else(|| {
+        ProtocolError::bad_request(format!(
+            "session.new cwd '{}' is not an existing directory on the host",
+            cwd.display()
+        ))
+    })
 }
 
 fn next_runtime_generation(
@@ -176,9 +220,29 @@ pub(super) struct TargetResolution {
     pub(super) is_linked_worktree: Option<bool>,
     /// Non-fatal worktree-setup warnings to surface on the session.
     pub(super) warnings: Vec<SessionWarning>,
+    /// Whether a session created by `project`/`repo` starts in a directory that
+    /// provably lies outside every repository, so its reference association
+    /// outlives the directory it observes.
+    pub(super) reference_outside_repository: bool,
     /// Stderr tails of the failing create hooks among [`Self::warnings`], for
     /// the `session.new` result only.
     pub(super) hook_stderr_tails: Vec<HookStderrTail>,
+}
+
+impl TargetResolution {
+    /// The association the session returns to outside every repository, when
+    /// it was created by reference in a directory outside every repository.
+    pub(super) fn reference_launch(&self) -> Option<Box<CwdAssociation>> {
+        self.reference_outside_repository.then(|| {
+            Box::new(CwdAssociation {
+                project_id: self.project_id.clone(),
+                is_linked_worktree: self.is_linked_worktree,
+                repo: self.repo.clone(),
+                branch: self.branch.clone(),
+                worktree_path: self.worktree_path.clone(),
+            })
+        })
+    }
 }
 
 impl SessionRegistry {
@@ -272,6 +336,22 @@ impl SessionRegistry {
             ));
         }
 
+        // The directory the caller named is where an in-place session starts. A
+        // project-bound request must name a usable one; without a project
+        // reference a directory that is not usable falls through to detection
+        // and the launch's own missing-directory report. A worktree session
+        // runs in the worktree, so `cwd` does not apply to it.
+        let launch_dir = match params.cwd.as_deref() {
+            Some(cwd) if params.branch.is_none() => {
+                if params.project.is_some() || params.repo.is_some() {
+                    Some(validated_launch_dir(cwd).await?)
+                } else {
+                    canonical_usable_dir(cwd).await
+                }
+            }
+            _ => None,
+        };
+
         // Phase 1: resolve the project (by reference, else by detecting a path).
         let (project, detected) = self.resolve_project(params).await?;
 
@@ -289,7 +369,20 @@ impl SessionRegistry {
                      use --branch to create a worktree",
                 ));
             }
-            return Ok(Self::in_place_target(project, detected, fallback_cwd));
+            let by_reference = params.project.is_some() || params.repo.is_some();
+            let reference_outside_repository = match launch_dir.clone() {
+                Some(dir) if by_reference && project.is_some() => {
+                    tokio::task::spawn_blocking(move || {
+                        crate::project::detect::confirmed_outside_repository(&dir)
+                    })
+                    .await
+                    .unwrap_or(false)
+                }
+                _ => false,
+            };
+            let mut target = Self::in_place_target(project, detected, fallback_cwd, launch_dir);
+            target.reference_outside_repository = reference_outside_repository;
+            return Ok(target);
         };
 
         // Worktree-per-session. The source repo is an explicit `--repo`, else the
@@ -328,12 +421,14 @@ impl SessionRegistry {
             project_id,
             is_linked_worktree: Some(true),
             warnings: bound.warnings,
+            reference_outside_repository: false,
             hook_stderr_tails: bound.stderr_tails,
         })
     }
 
     /// Build the in-place (no-worktree) target: run the agent in the project's
-    /// checkout as-is (Decision 3), or in `fallback_cwd` when no project resolved.
+    /// checkout as-is (Decision 3), in `launch_dir` when the caller named one for
+    /// a project-bound session, or in `fallback_cwd` when no project resolved.
     ///
     /// A bare project never reaches here: [`Self::resolve_target`] refuses an
     /// in-place start on a bare repo (no working tree to run in) and steers the
@@ -342,8 +437,9 @@ impl SessionRegistry {
         project: Option<ProjectRecord>,
         detected: Option<DetectedProject>,
         fallback_cwd: PathBuf,
+        launch_dir: Option<PathBuf>,
     ) -> TargetResolution {
-        let (launch_cwd, project_id, is_linked_worktree) = match (project, detected) {
+        let (checkout_cwd, project_id, is_linked_worktree) = match (project, detected) {
             // Detected from a path: launch in this work tree's root.
             (Some(record), Some(detected)) => (
                 detected.checkout_path,
@@ -355,17 +451,18 @@ impl SessionRegistry {
                 let id = record.id();
                 (record.repo_root, Some(id), Some(false))
             }
-            // No project: a plain shell in the fallback cwd (today's behavior).
+            // No project: a plain shell in the fallback cwd.
             (None, _) => (fallback_cwd, None, None),
         };
         TargetResolution {
-            launch_cwd,
+            launch_cwd: launch_dir.unwrap_or(checkout_cwd),
             repo: None,
             branch: None,
             worktree_path: None,
             project_id,
             is_linked_worktree,
             warnings: Vec::new(),
+            reference_outside_repository: false,
             hook_stderr_tails: Vec::new(),
         }
     }
@@ -642,6 +739,7 @@ impl SessionRegistry {
             worktree_path,
             metadata,
             warnings,
+            reference_launch,
             initial_input_pending,
             prompt_in_argv,
             package_authority: _package_authority,
@@ -963,6 +1061,7 @@ impl SessionRegistry {
             observed_agents: Vec::new(),
             bound_reporter: None,
             cwd_observed_at: crate::time::now(),
+            reference_launch,
             initial_input_owner: initial_input_pending
                 .then(|| self.daemon_instance_id().to_owned()),
         };

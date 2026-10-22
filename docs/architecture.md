@@ -1461,8 +1461,9 @@ keyed by the canonical `git_common_dir` so a repository's main checkout and all
 its linked worktrees collapse to one logical project. Projects accrue as a side
 effect of working (or via `pohunek project add`); there is no filesystem scan. A
 session references a project by `<id|label>` — resolved by the daemon against
-**its own** per-host store — so no filesystem path ever crosses the wire to a
-remote host. See [`docs/design/projects.md`](design/projects.md) for the full
+**its own** per-host store — so no filesystem path is needed to name a project
+on a remote host. The one path a remote start may carry is an explicit
+`session new --cwd`, an absolute directory read on that host. See [`docs/design/projects.md`](design/projects.md) for the full
 design and the three resolved decisions.
 
 A session binds:
@@ -1478,7 +1479,8 @@ A session binds:
 - resume binding.
 
 **Isolation is intent-driven.** Without `--branch`, the agent runs **in place**
-in the project's checkout as-is — "open a terminal here, work here." With
+in the project's checkout as-is — "open a terminal here, work here" — or in the
+directory `--cwd` names. With
 `--branch`, the daemon creates a **worktree-per-session** off the project's base
 branch, so two agents never share one working tree by accident. Worktree
 ownership is explicit and recorded in metadata (the binding carries the owning

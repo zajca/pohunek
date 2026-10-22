@@ -289,6 +289,7 @@ mod tests {
             output_read_supported: true,
             session_wait_supported: true,
             session_wait_turn_supported: true,
+            session_new_cwd_supported: true,
             supported_agents: vec![
                 "shell".to_owned(),
                 "codex".to_owned(),
@@ -365,6 +366,7 @@ mod tests {
             output_read_supported: true,
             session_wait_supported: true,
             session_wait_turn_supported: true,
+            session_new_cwd_supported: true,
         };
         let output = render_capabilities_human("host-b", &caps);
         assert!(output

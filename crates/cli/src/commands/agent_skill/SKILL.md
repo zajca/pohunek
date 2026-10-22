@@ -152,8 +152,8 @@ whatever the session runs: an agent profile or a shell. A `session new` that
 sends input must pin an explicit coding-agent profile (`--agent
 codex|claude|hermes`): the default `shell` agent would execute the text as
 shell commands. A `session new` without `--branch` runs in place: the agent
-works directly in the project's main checkout, where it can collide with the
-owner's own edits or another session. Start in-place sessions only on explicit
+works directly in the project's main checkout (or in the directory `--cwd`
+names), where it can collide with the owner's own edits or another session. Start in-place sessions only on explicit
 owner consent; otherwise pass `--branch` and get a dedicated worktree.
 
 Before sending text to an existing session, inspect it and confirm its agent.

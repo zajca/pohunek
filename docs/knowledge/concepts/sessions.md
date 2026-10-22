@@ -800,7 +800,8 @@ reuse is distinguished by kernel process-start identity, including delayed exit
 notifications from the replaced process.
 
 The same runtime model keeps `cwd` current. A session starts with its launch
-directory, then procwatch reads the cwd of the focus process on each tick: the
+directory (the project checkout, or the directory `session new --cwd` named for a
+project-bound session), then procwatch reads the cwd of the focus process on each tick: the
 active nested-agent PID when one is bound, otherwise the root PTY child. OSC 7
 terminal output is accepted as an immediate cwd hint, but procwatch remains
 authoritative and overwrites a hint that a later read of the process cwd
@@ -811,7 +812,22 @@ change emits `session_updated` and re-resolves project and worktree context. If
 the new cwd is inside another registered active worktree, `worktree_path`,
 `branch`, and project metadata move to that worktree; if it is outside every
 known worktree, `worktree_path` is cleared while git `repo`/`branch` metadata is
-kept when detection still finds a repository.
+kept when detection still finds a repository. A session started by reference
+(`--project`/`--repo`, `session new --cwd`) in a directory outside every
+repository remembers its create-time association in memory: the project
+(`project_id`; `repo`, `branch` and the worktree are not part of it). While its
+observed cwd provably lies outside every repository it holds that association,
+also when it returns there after following another repository. "Provably"
+means that `git` itself reports the directory is not in a repository and no
+parent holds a `.git` entry or a bare layout. An observed cwd inside a
+repository follows that repository, and an observed cwd the daemon cannot
+classify (a missing directory, a `git` that is missing, fails or times out)
+follows the cwd and clears the association. The memory survives a stop and
+resume of the session in the same daemon run and is lost only when the daemon
+restarts. Every other session, one started inside a repository, one not
+started by reference, and any session after a daemon restart, follows its cwd
+exactly: a `cd` outside every repository clears the association. The decision
+is taken under the same lock that applies the cwd.
 
 Every managed `SessionInfo` has a `runtime` object distinct from its agent
 `state` and `activity`. Runtime state is one of `starting`, `live`,

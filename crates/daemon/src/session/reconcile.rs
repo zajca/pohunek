@@ -4181,6 +4181,7 @@ impl SessionRegistry {
             observed_agents: Vec::<ObservedAgent>::new(),
             bound_reporter: None,
             cwd_observed_at: crate::time::now(),
+            reference_launch: None,
             initial_input_owner: initial_input_owner(&record),
         };
         let listed = record.clone();
@@ -4474,6 +4475,7 @@ impl SessionRegistry {
             observed_agents: Vec::new(),
             bound_reporter: None,
             cwd_observed_at: crate::time::now(),
+            reference_launch: None,
             initial_input_owner: initial_input_owner(&record),
         };
         (record, entry)

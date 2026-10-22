@@ -125,15 +125,43 @@ pub(crate) enum CliError {
     )]
     AgentSkillNotEmbedded,
 
-    /// A remote `session new` named no target. No filesystem path crosses the
-    /// wire to another host, so a remote session must be referenced by `--project`
-    /// (or, for first-introduction, `--repo` with a path valid on that host). Fails
-    /// fast before any connection is dialed (design Decision 1).
+    /// A remote `session new` named no target. The CLI's own directory means
+    /// nothing on another host, so a remote session must be referenced by
+    /// `--project` (or, for first-introduction, `--repo` with a path valid on that
+    /// host); an explicit `--cwd` names a path on that host. Fails fast before any
+    /// connection is dialed (design Decision 1).
     #[error(
         "starting a session on a remote host requires a --project reference \
          (or --repo with a path valid on that host)"
     )]
     RemoteTargetRequired,
+
+    /// `session new --cwd` together with `--branch`: the session runs in its
+    /// worktree, so the directory cannot be honored. Fails before any connection.
+    #[error("--cwd cannot be combined with --branch: a worktree session runs in its worktree")]
+    CwdWithWorktree,
+
+    /// A remote `session new --cwd` named a relative path. The path is read on
+    /// the remote host, where the CLI's own current directory means nothing.
+    #[error("--cwd '{}' must be an absolute path on the remote host", cwd.display())]
+    RemoteCwdNotAbsolute {
+        /// The relative path as typed.
+        cwd: PathBuf,
+    },
+
+    /// The host's daemon predates `session new --cwd` and would start the
+    /// session in the checkout instead of the requested directory.
+    #[error(
+        "host '{host}' runs daemon {daemon_version}, which does not advertise \
+         `session_new_cwd_supported`: --cwd needs a daemon that advertises it (upgrade the \
+         daemon on that host); no session was created"
+    )]
+    SessionNewCwdUnsupported {
+        /// The host as the user typed it.
+        host: String,
+        /// Version the host's daemon reported.
+        daemon_version: String,
+    },
 
     /// A remote `project add` named no PATH. A local path is meaningless on
     /// another host, so a remote add must give a path valid on that host; fails
@@ -372,6 +400,28 @@ impl CliError {
                 Some(
                     "pass --project <id|label> from `pohunek --host <host> project list` \
                      (or --repo with a path valid on that host the first time)"
+                        .to_owned(),
+                ),
+            ),
+            CliError::CwdWithWorktree => ProtocolError::new(
+                ErrorClass::Configuration,
+                "cwd_with_worktree",
+                self.to_string(),
+                Some("drop --cwd, or drop --branch to run in a directory".to_owned()),
+            ),
+            CliError::RemoteCwdNotAbsolute { .. } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "remote_cwd_not_absolute",
+                self.to_string(),
+                Some("pass an absolute --cwd path that exists on that host".to_owned()),
+            ),
+            CliError::SessionNewCwdUnsupported { .. } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "session_new_cwd_unsupported",
+                self.to_string(),
+                Some(
+                    "update and restart the pohunek daemon on that host to a release that advertises \
+                     `session_new_cwd_supported`, or start the session without --cwd"
                         .to_owned(),
                 ),
             ),

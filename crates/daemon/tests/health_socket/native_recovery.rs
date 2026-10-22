@@ -109,7 +109,8 @@ impl ClaudeRig {
                  printf '\\033[?2004h'\n\
                  while read -r action source reference; do\n\
                    case \"$action\" in\n\
-                     report) printf '{{\"session_id\":\"%s\",\"source\":\"%s\"}}' \"$reference\" \"$source\" | /bin/sh {hook:?} session; printf '%s\\n' \"$reference\" >> {ack:?} ;;\n\
+                     cd) cd \"$source\" ;;
+                   report) printf '{{\"session_id\":\"%s\",\"source\":\"%s\"}}' \"$reference\" \"$source\" | /bin/sh {hook:?} session; printf '%s\\n' \"$reference\" >> {ack:?} ;;\n\
                    esac\n\
                  done\n",
                 argv = argv_log.display().to_string(),
@@ -340,6 +341,56 @@ async fn assert_conversation_switch(source: &str, selected: &str) {
         String::from_utf8_lossy(&argv).contains(&format!("--resume {selected}")),
         "recovery must launch the selected Claude conversation; argv log: {}",
         String::from_utf8_lossy(&argv)
+    );
+}
+
+/// A session created by reference outside every repository keeps holding the
+/// reference after a stop and resume in the same daemon run.
+#[tokio::test]
+async fn a_resumed_by_reference_session_keeps_its_reference_outside_every_repository() {
+    let mut rig = ClaudeRig::new("claude-reference-resume").await;
+    let repo = init_git_repo();
+    let add = Request::make(
+        "claude-reference-add",
+        method::PROJECT_ADD,
+        serde_json::json!({ "path": repo.cwd() }),
+    );
+    let project: ProjectInfo =
+        serde_json::from_value(ok_payload(exchange(&mut rig.control, &add).await))
+            .expect("project info");
+    let second = rig.cwd.join("second");
+    std::fs::create_dir(&second).expect("create the second directory");
+    let mut params = session_params_in(rig.cwd.to_path_buf());
+    "claude-fixture".clone_into(&mut params.agent);
+    params.project = Some(project.id.clone());
+    params.cwd = Some(rig.cwd.to_path_buf());
+    let session: SessionInfo = serde_json::from_value(ok_payload(
+        create_session_with_params(&mut rig.control, params).await,
+    ))
+    .expect("create the by-reference session");
+    let id = session.id;
+    rig.additional_sessions.push(id.clone());
+    rig.transcript(LAUNCH);
+    rig.report_for(&id, "startup", LAUNCH).await;
+    rig.stop(&id).await;
+    ok_payload(rig.resume_session(&id).await);
+
+    let submitted = input_session(&mut rig.control, &id, &format!("cd {}", second.display())).await;
+    assert!(submitted.accepted, "fixture cd command accepted");
+    let target = second.canonicalize().expect("canonical second directory");
+    let control = tokio::sync::Mutex::new(&mut rig.control);
+    let moved = wait_until("the daemon to observe the new directory", || async {
+        let mut control = control.lock().await;
+        let info = inspect_session(&mut control, &id).await;
+        (info.cwd == target).then_some(info)
+    })
+    .await;
+    rig.finish(None).await;
+
+    assert_eq!(
+        moved.project_id.as_deref(),
+        Some(project.id.as_str()),
+        "the resumed session still holds its reference"
     );
 }
 
