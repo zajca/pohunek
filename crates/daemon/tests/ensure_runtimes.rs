@@ -2096,7 +2096,8 @@ fn a_disabled_selection_with_an_altered_root_is_refused() {
         let plan = host.step(true);
         let applied = host.step(false);
 
-        for report in [&plan, &applied] {
+        let detected = host.detect_step();
+        for report in [&plan, &applied, &detected] {
             assert_eq!(refusal_codes(report), [root_refusal.as_str()], "{runtime}");
             assert!(
                 report.refusals[0].detail.contains(&format!(
@@ -5163,7 +5164,6 @@ fn assert_held_runtime_left(host: &Host, runtime: &str, details: &[&str]) -> Str
     let plan = host.step(true);
     let applied = host.step(false);
     let detected = host.detect_step();
-    let mut plan_detail = String::new();
     for (label, report) in [("plan", &plan), ("apply", &applied), ("detect", &detected)] {
         assert!(
             report.refusals.is_empty(),
@@ -5193,9 +5193,6 @@ fn assert_held_runtime_left(host: &Host, runtime: &str, details: &[&str]) -> Str
                 gaps[0].detail
             );
         }
-        if label == "plan" {
-            plan_detail = gaps[0].detail.clone();
-        }
     }
     assert_eq!(
         plan.gaps
@@ -5219,7 +5216,11 @@ fn assert_held_runtime_left(host: &Host, runtime: &str, details: &[&str]) -> Str
         profile,
         "{runtime}"
     );
-    plan_detail
+    plan.gaps
+        .iter()
+        .find(|gap| gap.runtime == runtime)
+        .map(|gap| gap.detail.clone())
+        .expect("the plan's gap")
 }
 
 /// Runs the remedy the gap detail names for the holder: the uninstall the
@@ -5478,7 +5479,7 @@ async fn a_selected_version_with_an_altered_root_beside_a_holder_is_refused() {
         let registry = fs::read(host.registry_path()).expect("the registry record");
         let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
 
-        for report in [host.step(true), host.step(false)] {
+        for report in [host.step(true), host.step(false), host.detect_step()] {
             assert_eq!(refusal_codes(&report), [root_refusal.as_str()], "{runtime}");
             assert!(
                 report.refusals[0].detail.contains(&format!(
@@ -5567,20 +5568,26 @@ async fn a_newer_pi_selection_without_its_root_beside_a_holder_keeps_its_refusal
 /// path before it judges the holder, as it does for the other left states.
 #[tokio::test]
 async fn a_detecting_plan_drops_an_unused_runtime_before_judging_its_holder() {
-    for state in ["no selection", "root missing", "other root missing"] {
+    for state in [
+        "no selection",
+        "root missing",
+        "other root missing",
+        "root altered",
+    ] {
         let runtime = "codex";
         let selected = official_runtimes::variant_archive(runtime, "1.0.1");
         let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
         let release = holder_release(runtime);
         let installs: Vec<(&Archive, bool, bool)> = match state {
             "no selection" => vec![(&holder, true, false)],
-            "root missing" => vec![(&holder, true, true)],
+            "root missing" | "root altered" => vec![(&holder, true, true)],
             _ => vec![(&selected, true, true), (&holder, true, false)],
         };
         let host = host_with_holder(runtime, &installs, &release).await;
         match state {
             "root missing" => host.remove_package_root(holder.1.as_str()),
             "other root missing" => host.remove_package_root(selected.1.as_str()),
+            "root altered" => host.alter_package_root(&holder.1),
             _ => {}
         }
         fs::remove_file(host.profiles_dir().join(format!("{runtime}.toml")))
@@ -5709,4 +5716,56 @@ async fn a_runtime_planned_only_by_detection_beside_a_holder_gets_no_uninstall_c
         "{}",
         gap.detail
     );
+}
+
+/// Rows 1 and 2 with an altered holder root: the uninstall the registry accepts
+/// needs `--remove-modified`, so the plan and the apply refuse with it, and the
+/// whole remedy installs the release.
+#[tokio::test]
+async fn an_unselected_holder_with_an_altered_root_is_refused_and_its_removal_lets_the_release_install(
+) {
+    let runtime = "claude";
+    for enabled in [true, false] {
+        let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+        let release = holder_release(runtime);
+        let host = host_with_holder(runtime, &[(&holder, enabled, false)], &release).await;
+        host.alter_package_root(&holder.1);
+        let registry = fs::read(host.registry_path()).expect("the registry record");
+        let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
+
+        let plan = host.step(true);
+        let applied = host.step(false);
+        let detected = host.detect_step();
+
+        for report in [&plan, &applied, &detected] {
+            assert_eq!(refusal_codes(report), [root_refusal.as_str()]);
+            assert!(
+                report.refusals[0].detail.contains(&format!(
+                    "pohunek plugin uninstall pohunek.runtime.{runtime} --digest {} \
+                     --remove-modified --yes",
+                    holder.1.as_str()
+                )),
+                "{}",
+                report.refusals[0].detail
+            );
+            assert!(report.packages.is_empty());
+        }
+        assert_eq!(
+            fs::read(host.registry_path()).expect("the registry record"),
+            registry
+        );
+        pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+            .expect("the package store")
+            .registry()
+            .remove_modified(&holder.1, &package::registry::RetainedDigests::new())
+            .expect("the registry accepts the hinted removal");
+        let next = host.step(false);
+        let package = next
+            .packages
+            .iter()
+            .find(|package| package.runtime == runtime)
+            .expect("the runtime package");
+        assert_eq!(package.status, PackageStatus::Installed);
+        assert_eq!(package.digest, release.1.as_str());
+    }
 }

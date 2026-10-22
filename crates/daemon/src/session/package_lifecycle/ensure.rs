@@ -2625,7 +2625,11 @@ fn held_selection(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<(Package
     let holder = same_version_holder(plan, prepared)?;
     let state = plan.state?;
     let held = match state.selected(&prepared.identity.id) {
-        None => Held::NoSelection,
+        // The uninstall of an unselected holder is refused for an altered root.
+        None => match health_of(plan, &holder) {
+            Health::Damaged(kind) => Held::Damaged(kind, holder.clone()),
+            Health::Present | Health::Install => Held::NoSelection,
+        },
         Some(selected) if *selected == prepared.digest => return None,
         Some(selected) => match state.package(selected) {
             Some(record) if record.source() == PackageSource::Official && record.enabled() => {

@@ -2601,7 +2601,7 @@ search path is dropped before it is judged, as in the table above.
 | Reserved: nothing selected, H enabled or disabled | gap `official_package_not_serving`, no package entry, profile left unbound | `plugin uninstall <package> --digest <H> --yes`, then the next upgrade installs the release's archive and binds the profile |
 | Reserved: H is selected, enabled and its root is missing or does not load | gap `official_package_not_serving` | the same uninstall (the registry unrecords a package without a root) |
 | Pi: H is selected, enabled and its root is missing or does not load | gap `official_package_not_serving` | no command: the upgrade does not install a Pi package again once none is installed |
-| H is selected, enabled and its root is altered | refusal with the root-invalid code | `plugin uninstall <package> --digest <H> --remove-modified --yes`, then the next upgrade installs the release's archive |
+| H is unselected or selected, and its root is altered | refusal with the root-invalid code | `plugin uninstall <package> --digest <H> --remove-modified --yes`, then the next upgrade installs the release's archive |
 | Another version S is selected, enabled, and its root is missing or does not load | gap `official_package_not_serving` | restore S with `plugin install`, or `plugin select <package> --digest <digest>` |
 | S is selected, enabled, and its root is altered | refusal for S | `plugin uninstall <package> --digest <S> --remove-modified --yes` |
 | The selected package is not official (a registry edited by hand) | gap `official_package_not_serving` | `plugin select <package> --digest <digest>` |
