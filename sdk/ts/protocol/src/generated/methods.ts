@@ -73,6 +73,8 @@ import type {
   SessionForkParams,
   SessionForkResult,
   SessionId,
+  SessionIdleStopParams,
+  SessionIdleStopResult,
   SessionInfo,
   SessionInputParams,
   SessionInputResult,
@@ -154,6 +156,8 @@ export interface Methods {
   "session.detection": { params: SessionDetectionParams; output: SessionDetectionResult };
   "session.diff": { params: SessionDiffParams; output: SessionDiffResult };
   "session.fork": { params: SessionForkParams; output: SessionForkResult };
+  "session.idle_stop.get": { params: null; output: SessionIdleStopResult };
+  "session.idle_stop.set": { params: SessionIdleStopParams; output: SessionIdleStopResult };
   "session.input": { params: SessionInputParams; output: SessionInputResult };
   "session.inspect": { params: SessionId; output: SessionInfo };
   "session.list": { params: SessionListParams; output: SessionInfo[] };
@@ -223,6 +227,8 @@ export const METHOD_NAMES = [
   "session.detection",
   "session.diff",
   "session.fork",
+  "session.idle_stop.get",
+  "session.idle_stop.set",
   "session.input",
   "session.inspect",
   "session.list",

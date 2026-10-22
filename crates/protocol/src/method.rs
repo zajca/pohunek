@@ -27,16 +27,17 @@ use crate::{
     ProjectRenameParams, ProjectShowParams, ProjectShowResult, RuntimeInventoryResult,
     SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
     SessionDetectionParams, SessionDetectionResult, SessionDiffParams, SessionDiffResult,
-    SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
-    SessionOutputResult, SessionPolicyParams, SessionPolicyResult, SessionReadParams,
-    SessionReadResult, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
-    SessionRenameParams, SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionResumeParams, SessionResumeResult, SessionRetentionParams,
-    SessionRetentionResult, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
-    SessionSetMetadataResult, SessionStopResult, SessionWaitParams, SessionWaitResult,
-    SessionWaitTurnParams, SessionWaitTurnResult, WorktreeRemoveParams, WorktreeRemoveResult,
+    SessionForkParams, SessionForkResult, SessionId, SessionIdleStopParams, SessionIdleStopResult,
+    SessionInfo, SessionInputParams, SessionInputResult, SessionListParams, SessionNewParams,
+    SessionNewResult, SessionOutputParams, SessionOutputResult, SessionPolicyParams,
+    SessionPolicyResult, SessionReadParams, SessionReadResult, SessionReleaseAgentParams,
+    SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
+    SessionResumeResult, SessionRetentionParams, SessionRetentionResult, SessionScreenParams,
+    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult,
+    SessionWaitParams, SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult,
+    WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -403,6 +404,24 @@ method_table!(
     SessionPolicyResult,
     "SessionPolicyParams",
     "SessionPolicyResult";
+
+    /// Read the host default of the idle-stop duration.
+    SessionIdleStopGet,
+    SESSION_IDLE_STOP_GET,
+    "session.idle_stop.get",
+    (),
+    SessionIdleStopResult,
+    "null",
+    "SessionIdleStopResult";
+
+    /// Replace the host default of the idle-stop duration.
+    SessionIdleStopSet,
+    SESSION_IDLE_STOP_SET,
+    "session.idle_stop.set",
+    SessionIdleStopParams,
+    SessionIdleStopResult,
+    "SessionIdleStopParams",
+    "SessionIdleStopResult";
 
     /// Run one session retention sweep.
     SessionRetentionSweep,

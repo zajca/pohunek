@@ -1101,6 +1101,35 @@ worker discovery, the job listing or the journal scan failed, or a rejected
 store line names no session, it deletes nothing. A launch whose directory is not a private directory of the daemon's user fails
 with `session_tmpdir_unsafe` before the agent starts.
 
+## Idle stop
+
+An agent session launched for one task stays `running` and `idle` after the
+agent finishes. A session can opt in to being stopped for that, so interactive
+sessions are never affected: set the metadata key `pohunek.idle_stop_after_secs`
+(`session new --meta pohunek.idle_stop_after_secs=900`, or `session metadata <target> --set pohunek.idle_stop_after_secs=900`)
+to a number of seconds, or to `default` to use the host default that
+`pohunek session policy set --idle-stop-after <seconds>` sets (`0` clears it;
+`pohunek session policy get` shows it). The smallest accepted time is 60 seconds.
+A session without the key, and a `default` session while no default is set, is
+never stopped.
+
+The clock starts when the agent's activity becomes `idle` and restarts on every
+activity change; a daemon restart starts it again when the session is adopted. A
+session is never stopped while it is `working` or `blocked`, while an
+`agent_blocked` or `approval_required` notification for it is still unread or
+read (acknowledge it first), or while a `session.input`, `session.wait` or
+`session.wait_turn` call waits on it. The stop is an ordinary `session stop`: the
+worktree is kept, the `session-stop` hook fires, and the session can be resumed.
+The idle clock and the reported activity are memory only, so after a daemon
+restart a session is armed again when it reports `idle` again.
+
+To see why a session stopped, read the daemon log line `session.idle_stop.stopped`
+(INFO) or the `session_stopped` event in the event log. A `system` notification
+with `reason=idle_stop` is recorded only when the notification policy keeps
+`system` records, which the default policy does not (`pohunek notifications
+policy`). The default is a separate file, `<data_dir>/session-idle-stop.json`,
+so an older CLI keeps reading the retention policy unchanged.
+
 ## Retention
 
 A host that runs agents for weeks accumulates logical records for sessions that

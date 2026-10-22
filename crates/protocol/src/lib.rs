@@ -29,6 +29,7 @@ mod doctor;
 mod envelope;
 mod error;
 mod governance;
+mod idle_stop;
 mod integration;
 mod limits;
 pub mod method;
@@ -72,6 +73,11 @@ pub use governance::{
     ProposalNonce, QuarantineReason, RelayId, ShareSuspensionIntent, SignedTransferOutcome, TeamId,
     TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeError, TransferOutcomeId,
     TransferProposal,
+};
+#[doc(inline)]
+pub use idle_stop::{
+    IdleStopOptIn, IdleStopValueError, SessionIdleStopParams, SessionIdleStopResult,
+    IDLE_STOP_DEFAULT_VALUE, IDLE_STOP_METADATA_KEY,
 };
 #[doc(inline)]
 pub use integration::{

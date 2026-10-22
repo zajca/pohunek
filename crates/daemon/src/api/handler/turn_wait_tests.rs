@@ -29,7 +29,7 @@ use crate::notifications::{
 use crate::session::{SessionRegistry, SessionRegistryConfig};
 
 /// Name of the host profile every scenario session launches.
-const AGENT: &str = "turn-agent";
+pub(super) const AGENT: &str = "turn-agent";
 
 /// Launch keys of a profile over the official Claude package, so Claude hook
 /// reports are admitted for the session, running a shell that prints `tick`
@@ -76,7 +76,7 @@ const SETTLE_YIELDS: usize = 64;
 pub(super) struct Fixture {
     state: DaemonState,
     pub(super) sessions: SessionRegistry,
-    root: tempfile::TempDir,
+    pub(super) root: Arc<tempfile::TempDir>,
     projector: std::sync::Mutex<Option<NotificationProjector>>,
     _coordinator: AttentionCoordinatorTask,
 }
@@ -110,7 +110,8 @@ impl Fixture {
         config: SessionRegistryConfig,
         policy: Option<NotificationPolicy>,
     ) -> Self {
-        let root = pohunek_test_support::tempdir_with_prefix("ph-turn-").expect("fixture root");
+        let root =
+            Arc::new(pohunek_test_support::tempdir_with_prefix("ph-turn-").expect("fixture root"));
         let agents = root.path().join("agents");
         std::fs::create_dir_all(&agents).expect("create the agents dir");
         std::fs::write(
@@ -121,11 +122,6 @@ impl Fixture {
             ),
         )
         .expect("write the agent profile");
-        let notifications = NotificationService::open(&root.path().join("data"))
-            .expect("notification service opens");
-        if let Some(policy) = policy {
-            notifications.set_policy(policy).expect("set the policy");
-        }
         let sessions = SessionRegistry::new_with_runtimes(
             SessionRegistryConfig {
                 agents_dir: Some(agents),
@@ -133,6 +129,29 @@ impl Fixture {
             },
             official_host(),
         );
+        Self::assemble(root, sessions, policy)
+    }
+
+    /// A daemon that restarted over the same data directory: `sessions` is the
+    /// registry of the new process, which has adopted the live workers.
+    pub(super) fn restarted(
+        &self,
+        sessions: SessionRegistry,
+        policy: Option<NotificationPolicy>,
+    ) -> Self {
+        Self::assemble(Arc::clone(&self.root), sessions, policy)
+    }
+
+    fn assemble(
+        root: Arc<tempfile::TempDir>,
+        sessions: SessionRegistry,
+        policy: Option<NotificationPolicy>,
+    ) -> Self {
+        let notifications = NotificationService::open(&root.path().join("data"))
+            .expect("notification service opens");
+        if let Some(policy) = policy {
+            notifications.set_policy(policy).expect("set the policy");
+        }
         let (attention, coordinator) =
             AttentionCoordinator::spawn(notifications.clone(), &sessions);
         let projector =
@@ -152,6 +171,20 @@ impl Fixture {
             projector: std::sync::Mutex::new(Some(projector)),
             _coordinator: coordinator,
         }
+    }
+
+    /// Starts a request on its own task, as a dedicated connection does.
+    pub(super) fn spawn_call(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> JoinHandle<Result<Value, ProtocolError>> {
+        let state = self.state.clone();
+        let method = method.to_owned();
+        tokio::spawn(async move {
+            let request = Request::new("spawned", method, params).expect("request");
+            handle_request(&request, &state).await.into_result()
+        })
     }
 
     /// Creates a live session through `session.new` and returns its id.

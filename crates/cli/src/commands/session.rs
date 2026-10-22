@@ -19,13 +19,13 @@ use protocol::Request;
 use protocol::{
     method, AgentActivity, CwdSource, ForkCwdMode, OutputOffset, RuntimeGeneration,
     SessionDetectionParams, SessionDetectionResult, SessionDiffParams, SessionForkParams,
-    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
-    SessionListFilter, SessionListParams, SessionNewParams, SessionOutputParams,
-    SessionPolicyParams, SessionReadFormat, SessionReadParams, SessionReadResult,
-    SessionReadSource, SessionRemoveResult, SessionRenameParams, SessionResizeParams,
-    SessionResumeParams, SessionRetentionParams, SessionRetentionPolicy, SessionRetentionResult,
-    SessionRuntimeIdentity, SessionScreenParams, SessionSetMetadataParams, SessionState,
-    SessionStopResult, SessionTurnCursor, SessionTurnEventKind, SessionTurnProgress,
+    SessionId, SessionIdleStopParams, SessionIdleStopResult, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
+    SessionOutputParams, SessionPolicyParams, SessionReadFormat, SessionReadParams,
+    SessionReadResult, SessionReadSource, SessionRemoveResult, SessionRenameParams,
+    SessionResizeParams, SessionResumeParams, SessionRetentionParams, SessionRetentionPolicy,
+    SessionRetentionResult, SessionRuntimeIdentity, SessionScreenParams, SessionSetMetadataParams,
+    SessionState, SessionStopResult, SessionTurnCursor, SessionTurnEventKind, SessionTurnProgress,
     SessionWaitParams, SessionWaitTurnParams, SessionWaitTurnReason, SessionWaitTurnResult,
     SessionWarningKind, StateSource, SubagentLifecycle, TerminalWatermark, MAX_SESSION_INPUT_BYTES,
     MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_TURN_MS,
@@ -1541,6 +1541,82 @@ pub(crate) struct PolicyArgs {
     pub(crate) lost_ttl_secs: Option<u32>,
     /// Maximum sessions one sweep may remove.
     pub(crate) max_removals_per_sweep: Option<u32>,
+    /// Idle-stop default in seconds; 0 clears it.
+    pub(crate) idle_stop_after: Option<u32>,
+}
+
+impl PolicyArgs {
+    /// Whether any field of the retention policy is named.
+    fn names_retention(self) -> bool {
+        self.enabled
+            || self.disabled
+            || self.sweep_interval_secs.is_some()
+            || self.terminal_ttl_secs.is_some()
+            || self.lost_ttl_secs.is_some()
+            || self.max_removals_per_sweep.is_some()
+    }
+}
+
+/// What `session policy get` and `set` print: the retention policy as the
+/// daemon holds it and, from a daemon that serves it, the idle-stop default.
+#[derive(Debug, serde::Serialize)]
+struct PolicyOutput {
+    retention: SessionRetentionPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idle_stop: Option<SessionIdleStopResult>,
+}
+
+/// Whether a daemon answered that it does not serve the idle-stop methods: a
+/// daemon of the previous release answers `method_not_found`, and a protocol 3
+/// daemon is refused before anything is sent.
+fn idle_stop_unsupported(error: &CliError) -> bool {
+    match error {
+        CliError::Protocol(source) => source.code == "method_not_found",
+        CliError::Client(pohunek_client::ClientError::DaemonProtocolTooOld { .. }) => true,
+        CliError::Client(pohunek_client::ClientError::RemoteProtocol { source, .. }) => {
+            source.code == "method_not_found"
+        }
+        _ => false,
+    }
+}
+
+/// Recovery hint for a daemon that does not know the idle-stop default.
+const IDLE_STOP_METHOD_UPGRADE_HINT: &str =
+    "the daemon predates --idle-stop-after, which needs a daemon of release 0.36.0 or later; upgrade the daemon and retry. Nothing was changed";
+
+/// Adds an upgrade hint to a `method_not_found` answer for the idle-stop
+/// default. Errors relayed from a remote daemon keep their host.
+fn missing_idle_stop_method_hint(error: CliError) -> CliError {
+    let add_hint = |mut source: protocol::ProtocolError| {
+        if source.code == "method_not_found" {
+            source.recover = Some(IDLE_STOP_METHOD_UPGRADE_HINT.to_owned());
+        }
+        source
+    };
+    match error {
+        CliError::Protocol(source) => CliError::Protocol(add_hint(source)),
+        CliError::Client(pohunek_client::ClientError::RemoteProtocol { host, source }) => {
+            CliError::Client(pohunek_client::ClientError::RemoteProtocol {
+                host,
+                source: add_hint(source),
+            })
+        }
+        other => other,
+    }
+}
+
+/// Reads the idle-stop default, or `None` from a daemon that does not serve it.
+async fn read_idle_stop(client: &mut Client) -> Result<Option<SessionIdleStopResult>, CliError> {
+    match client.call::<method::SessionIdleStopGet>(()).await {
+        Ok(result) => Ok(Some(result)),
+        Err(error) => {
+            if idle_stop_unsupported(&error) {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 
 /// Arguments accepted by `session retention sweep`.
@@ -1564,19 +1640,43 @@ pub(crate) struct SweepArgs {
 pub(crate) async fn run_policy_get(host: &str, paths: &Paths, json: bool) -> Result<(), CliError> {
     let mut client = Client::connect(host, paths).await?;
     let result = client.call::<method::SessionPolicyGet>(()).await?;
+    let idle_stop = read_idle_stop(&mut client).await?;
+    print_policy(host, result.retention, idle_stop, true, json)
+}
 
+fn print_policy(
+    host: &str,
+    retention: SessionRetentionPolicy,
+    idle_stop: Option<SessionIdleStopResult>,
+    report_idle_stop: bool,
+    json: bool,
+) -> Result<(), CliError> {
     if json {
-        print!("{}", crate::commands::render_json(&result)?);
+        print!(
+            "{}",
+            crate::commands::render_json(&PolicyOutput {
+                retention,
+                idle_stop
+            })?
+        );
     } else {
-        print!("{}", render_policy_human(host, &result.retention));
+        print!(
+            "{}",
+            render_policy_human(host, &retention, idle_stop.as_ref(), report_idle_stop)
+        );
     }
     Ok(())
 }
 
 /// Run `session policy set` against the daemon for `host`.
 ///
-/// The current policy is read first so unnamed fields keep their value, which
-/// also means the daemon validates exactly the policy it will store.
+/// The idle-stop default is only touched when `--idle-stop-after` is named. The
+/// daemon's support and minimum are read and the value is checked first, then
+/// the retention fields are written, then the default, so a refusal of either
+/// changes nothing. A daemon that refuses the default after the retention
+/// policy was written says which half landed. The current retention policy is
+/// read first so unnamed fields keep their value, which also means the daemon
+/// validates exactly the policy it will store.
 ///
 /// # Errors
 ///
@@ -1590,19 +1690,82 @@ pub(crate) async fn run_policy_set(
     json: bool,
 ) -> Result<(), CliError> {
     let mut client = Client::connect(host, paths).await?;
-    let current = client.call::<method::SessionPolicyGet>(()).await?.retention;
-    let result = client
-        .call::<method::SessionPolicySet>(SessionPolicyParams {
-            retention: apply_policy_args(current, args),
-        })
-        .await?;
-
-    if json {
-        print!("{}", crate::commands::render_json(&result)?);
-    } else {
-        print!("{}", render_policy_human(host, &result.retention));
+    if let Some(secs) = args.idle_stop_after {
+        let served = client
+            .call::<method::SessionIdleStopGet>(())
+            .await
+            .map_err(missing_idle_stop_method_hint)?;
+        if secs != 0 && secs < served.min_after_secs {
+            return Err(CliError::Protocol(protocol::ProtocolError::new(
+                protocol::ErrorClass::Daemon,
+                "invalid_session_policy",
+                format!(
+                    "--idle-stop-after must be 0 or at least {} seconds",
+                    served.min_after_secs
+                ),
+                None,
+            )));
+        }
     }
-    Ok(())
+    let current = client.call::<method::SessionPolicyGet>(()).await?.retention;
+    let retention_written = args.names_retention();
+    let retention = if retention_written {
+        client
+            .call::<method::SessionPolicySet>(SessionPolicyParams {
+                retention: apply_policy_args(current, args),
+            })
+            .await?
+            .retention
+    } else {
+        current
+    };
+    let idle_stop = match args.idle_stop_after {
+        Some(secs) => Some(
+            client
+                .call::<method::SessionIdleStopSet>(SessionIdleStopParams {
+                    default_after_secs: Some(secs),
+                })
+                .await
+                .map_err(missing_idle_stop_method_hint)
+                .map_err(|error| {
+                    if retention_written {
+                        note_retention_landed(error)
+                    } else {
+                        error
+                    }
+                })?,
+        ),
+        None => None,
+    };
+    print_policy(
+        host,
+        retention,
+        idle_stop,
+        args.idle_stop_after.is_some(),
+        json,
+    )
+}
+
+/// Says in `error` that the retention policy was written before the failure.
+fn note_retention_landed(error: CliError) -> CliError {
+    const LANDED: &str = "the retention policy was updated, but the idle-stop default was not";
+    let note = |mut source: protocol::ProtocolError| {
+        source.msg = format!("{LANDED}: {}", source.msg);
+        source
+    };
+    match error {
+        CliError::Protocol(source) => CliError::Protocol(note(source)),
+        CliError::Client(pohunek_client::ClientError::RemoteProtocol { host, source }) => {
+            CliError::Client(pohunek_client::ClientError::RemoteProtocol {
+                host,
+                source: note(source),
+            })
+        }
+        other => {
+            eprintln!("{LANDED}");
+            other
+        }
+    }
 }
 
 /// Run `session retention sweep` against the daemon for `host`.
@@ -1675,7 +1838,12 @@ fn sweep_params(args: SweepArgs) -> SessionRetentionParams {
     }
 }
 
-fn render_policy_human(host: &str, policy: &SessionRetentionPolicy) -> String {
+fn render_policy_human(
+    host: &str,
+    policy: &SessionRetentionPolicy,
+    idle_stop: Option<&SessionIdleStopResult>,
+    report_idle_stop: bool,
+) -> String {
     let mut output = format!("host {host} session retention policy\n");
     let _ = writeln!(
         output,
@@ -1698,6 +1866,21 @@ fn render_policy_human(host: &str, policy: &SessionRetentionPolicy) -> String {
         "  max_removals_per_sweep: {}",
         policy.max_removals_per_sweep
     );
+    match idle_stop {
+        None if !report_idle_stop => {}
+        Some(idle) => {
+            let _ = writeln!(
+                output,
+                "  idle_stop_after: {} (minimum {} seconds)",
+                idle.default_after_secs
+                    .map_or_else(|| "not set".to_owned(), |secs| format!("{secs} seconds")),
+                idle.min_after_secs
+            );
+        }
+        None => {
+            let _ = writeln!(output, "  idle_stop_after: not supported by this daemon");
+        }
+    }
     output
 }
 

@@ -132,6 +132,10 @@ pub enum DaemonError {
     #[error("session retention policy could not be loaded: {0}")]
     RetentionPolicy(#[source] protocol::ProtocolError),
 
+    /// The durable session idle-stop default could not be loaded.
+    #[error("session idle-stop default could not be loaded: {0}")]
+    IdleStopPolicy(#[source] protocol::ProtocolError),
+
     /// Owner-private host governance could not start safely.
     #[error("host governance startup failed: {0}")]
     Governance(#[from] crate::governance::HostGovernanceError),

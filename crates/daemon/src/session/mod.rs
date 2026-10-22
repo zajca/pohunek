@@ -94,6 +94,7 @@ use claim::{ClaimKey, ClaimOrigin, PendingActivity, PendingRelease};
 use forward::Forwarded;
 pub use native_attestation::ControlPeer;
 pub use reconcile::upgrade_preflight;
+mod idle_stop;
 mod resume;
 mod retention;
 mod supervision;
@@ -104,6 +105,7 @@ mod turn_events;
 mod turn_wait;
 
 pub use attach::{RedeemedAttach, RedeemedRuntime};
+pub use idle_stop::{SessionIdleStopTask, IDLE_STOP_FILE_NAME as IDLE_STOP_POLICY_NAME};
 pub use package_lifecycle::ensure::{
     detect_official_runtimes, ensure_official_runtimes, plan_official_runtimes, EnsureError,
     EnsureInputs, OfficialPlan, PlannedProfile,
@@ -486,6 +488,16 @@ pub struct SessionRegistryConfig {
     /// `None` keeps the retention policy in memory only, which is what unit
     /// tests that never persist a policy use.
     pub retention_policy_path: Option<PathBuf>,
+    /// Durable idle-stop default (`<data_dir>/session-idle-stop.json`). `None`
+    /// keeps the default in memory only.
+    pub idle_stop_policy_path: Option<PathBuf>,
+    /// Shortest idle time accepted for the idle-stop default and for a session's
+    /// own `pohunek.idle_stop_after_secs`. Defaults to
+    /// [`idle_stop::DEFAULT_IDLE_STOP_MIN_SECS`].
+    pub idle_stop_min_secs: u32,
+    /// How long the idle-stop task waits before it looks again at a session whose
+    /// stop was held back. Defaults to [`idle_stop::DEFAULT_IDLE_STOP_RECHECK`].
+    pub idle_stop_recheck: Duration,
     /// Directory containing bounded structured logs. When set, removing a
     /// stopped session also removes its owner-private worker log family.
     pub log_dir: Option<PathBuf>,
@@ -614,6 +626,9 @@ impl Default for SessionRegistryConfig {
             event_log_dir: None,
             event_retention: pohunek_service_config::DEFAULT_EVENT_RETENTION,
             retention_policy_path: None,
+            idle_stop_policy_path: None,
+            idle_stop_min_secs: idle_stop::DEFAULT_IDLE_STOP_MIN_SECS,
+            idle_stop_recheck: idle_stop::DEFAULT_IDLE_STOP_RECHECK,
             log_dir: None,
             config_dir: None,
             agents_dir: None,
@@ -766,6 +781,8 @@ struct SessionRegistryInner {
     external: ExternalSessions,
     /// Automatic session retention policy and its sweep serialization point.
     retention: retention::RetentionState,
+    /// Host default of the idle stop and the wake-up of its task.
+    idle_stop: idle_stop::IdleStopState,
     #[cfg(test)]
     external_association_block: std::sync::Mutex<Option<Arc<ExternalAssociationBlock>>>,
     /// Rendezvous the next waited input write meets at its send boundary.
@@ -958,6 +975,11 @@ struct SessionEntry {
     /// outside every repository starts with. Held in memory only, so a session
     /// adopted after a daemon restart has none.
     reference_launch: Option<Box<CwdAssociation>>,
+    /// When `info.activity` last took its current value on the daemon clock.
+    ///
+    /// Memory only: an entry built by adoption starts the clock when it is
+    /// built, so a restart delays an idle stop and never advances it.
+    activity_since: Instant,
     /// Daemon instance holding the create's undelivered initial input; the
     /// running session's record then carries the `initial_input` marker
     /// naming that instance.
@@ -978,6 +1000,15 @@ impl SessionEntry {
             entry: self.entry_incarnation,
             agent: self.agent_incarnation,
         }
+    }
+
+    /// Sets the activity and restarts [`Self::activity_since`] when the value
+    /// differs from the current one.
+    fn set_activity(&mut self, activity: AgentActivity) {
+        if self.info.activity != Some(activity) {
+            self.activity_since = crate::time::now();
+        }
+        self.info.activity = Some(activity);
     }
 
     /// Notes that the agent the entry presents left or changed, so the turn it
@@ -2187,6 +2218,7 @@ impl SessionRegistry {
         let profiles = ProfileRegistry::with_runtimes(config.agents_dir.clone(), runtimes)
             .with_revision_state_dir(config.host_state_dir.clone());
         let retention = retention::RetentionState::new(config.retention_policy_path.clone());
+        let idle_stop = idle_stop::IdleStopState::new(config.idle_stop_policy_path.clone());
         let daemon_instance_id = generate_daemon_instance_id();
         let turns = TurnEvents::new(daemon_instance_id.clone(), config.turn_event_capacity);
         let registry = Self {
@@ -2233,6 +2265,7 @@ impl SessionRegistry {
                 procwatch_seq: AtomicU64::new(current_time_millis()),
                 external: external.clone(),
                 retention,
+                idle_stop,
                 #[cfg(test)]
                 external_association_block: std::sync::Mutex::new(None),
                 #[cfg(test)]
@@ -2706,6 +2739,7 @@ impl SessionRegistry {
     pub async fn create(&self, params: SessionNewParams) -> Result<SessionInfo, ProtocolError> {
         self.ensure_migration_settled()?;
         validate_new_params(&params)?;
+        idle_stop::validate_opt_in(&params.metadata, self.inner.config.idle_stop_min_secs)?;
         // Resolve and validate the runtime before allocating a logical id or
         // resolving a target: target resolution may bind a git worktree.
         let resolved = host::LaunchSource::OwnerLocal {
@@ -4105,7 +4139,8 @@ impl SessionRegistry {
             &entry.info.metadata,
             false,
         );
-        entry.info.activity = Some(activity);
+        entry.set_activity(activity);
+        self.wake_idle_stop();
         entry.info.state_source = StateSource::Report;
         record_activity_evidence(entry, activity, StateSource::Report, activity_epoch)
     }
@@ -4942,6 +4977,13 @@ impl SessionRegistry {
         merge: BTreeMap<String, Option<String>>,
     ) -> Result<SessionSetMetadataResult, ProtocolError> {
         self.ensure_not_external(id).await?;
+        // Only a value being set is checked, so a value an older daemon stored
+        // without validation never blocks an edit of another key.
+        let patch: BTreeMap<String, String> = merge
+            .iter()
+            .filter_map(|(key, value)| Some((key.clone(), value.clone()?)))
+            .collect();
+        idle_stop::validate_opt_in(&patch, self.inner.config.idle_stop_min_secs)?;
         let (info, has_native) = {
             let mut sessions = self.inner.sessions.lock().await;
             let entry = sessions
@@ -4970,6 +5012,7 @@ impl SessionRegistry {
             self.persist_resume_binding(id).await;
         }
 
+        self.wake_idle_stop();
         self.emit(event::SESSION_UPDATED, &info);
         Ok(SessionSetMetadataResult { session: info })
     }
@@ -5117,7 +5160,7 @@ impl SessionRegistry {
         if let Some(stopped) = self.stop_unavailable_runtime(id).await? {
             return Ok(stopped);
         }
-        self.stop_with_intent(id, DesiredState::Stopped, TransactionKind::Stop)
+        self.stop_with_intent(id, DesiredState::Stopped, TransactionKind::Stop, None)
             .await
     }
 
@@ -5130,6 +5173,7 @@ impl SessionRegistry {
         id: &SessionId,
         desired_state: DesiredState,
         transaction_kind: TransactionKind,
+        only_if: Option<&(dyn Fn(&SessionEntry) -> bool + Sync)>,
     ) -> Result<SessionStopResult, ProtocolError> {
         self.ensure_not_external_session(id).await?;
         let sequence = self.inner.next_write_id.fetch_add(1, Ordering::Relaxed);
@@ -5146,6 +5190,12 @@ impl SessionRegistry {
                 .get_mut(id)
                 .ok_or_else(|| session_not_found(&id.0))?;
             if is_terminal(entry.info.state) {
+                return Ok(SessionStopResult { stopped: false });
+            }
+            // A stop that depends on the session's state is decided here, under
+            // the lock that marks the session as stopping, so no report can
+            // slip in between the decision and the mark.
+            if only_if.is_some_and(|holds| !holds(entry)) {
                 return Ok(SessionStopResult { stopped: false });
             }
 
@@ -5528,7 +5578,7 @@ impl SessionRegistry {
 
         let stopped = if should_stop {
             let stopped = self
-                .stop_with_intent(id, DesiredState::Removed, TransactionKind::Remove)
+                .stop_with_intent(id, DesiredState::Removed, TransactionKind::Remove, None)
                 .await?
                 .stopped;
             self.retire_unstopped_job(id).await?;
@@ -6318,6 +6368,7 @@ impl SessionRegistry {
         self.set_unpersisted(&id.0, None);
         self.inner.turns.observe_state(id, info.state);
         sessions.insert(id.clone(), candidate);
+        self.wake_idle_stop();
         RuntimeTransitionOutcome::Applied(Box::new(info))
     }
 
@@ -6365,6 +6416,7 @@ impl SessionRegistry {
             }
             sessions.insert(id.clone(), entry)
         };
+        self.wake_idle_stop();
         if let Some(replaced) = replaced {
             replaced.cancel_runtime_watchers();
         }
@@ -6536,6 +6588,7 @@ impl SessionRegistry {
                 // The process watch paused for the stop and waits for this
                 // wakeup; the permit is kept when it is mid-scan.
                 entry.procwatch_rescan.notify_one();
+                self.wake_idle_stop();
             }
         }
     }
@@ -6598,6 +6651,7 @@ impl SessionRegistry {
             entry.stop_transaction_id = None;
             entry.desired_state = previous_desired_state;
             entry.procwatch_rescan.notify_one();
+            self.wake_idle_stop();
         }
     }
 

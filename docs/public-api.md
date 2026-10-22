@@ -501,6 +501,8 @@ All params and result type names below refer to structs exported by
 | `session.diff` | `SessionDiffParams` | `SessionDiffResult` | Computes a unified diff of a session's worktree against a base ref. `base: null` defers to the worktree binding's recorded base branch, then the repository default. A session without a bound worktree returns `session_no_worktree`; a hostile explicit `base` (empty, leading `-`, or a control character) returns `invalid_branch`; a `base` that cannot be resolved to a merge-base against `HEAD` returns `session_diff_base_unresolved`. Incomplete git output (a pipe still open 250 ms after git exits, or more than 8 MiB on either captured stream) returns `session_diff_failed` rather than a partial successful diff. See `SessionDiffResult` under Core Payloads for the response size cap and truncation semantics. |
 | `session.policy.get` | `null` | `SessionPolicyResult` | Reads the daemon's session retention policy. Non-null params are `daemon/bad_request`. |
 | `session.policy.set` | `SessionPolicyParams` | `SessionPolicyResult` | Validates, replaces, and persists the session retention policy at `<data_dir>/session-policy.json`. The running sweep task reloads it on its next cycle, so no daemon restart is needed. |
+| `session.idle_stop.get` | `null` | `SessionIdleStopResult` | Reads the host default of the idle-stop duration (`default_after_secs`, absent when none is set) and the smallest duration the host accepts (`min_after_secs`). Non-null params are `daemon/bad_request`. New in the current protocol window: a protocol 3 client or daemon does not define it, and a daemon of the previous release answers `method_not_found`. `host.inspect` advertises it as `session_idle_stop_supported`. See [Idle stop](#idle-stop). |
+| `session.idle_stop.set` | `SessionIdleStopParams` | `SessionIdleStopResult` | Validates, replaces and persists the idle-stop default at `<data_dir>/session-idle-stop.json`. An omitted or `null` `default_after_secs`, and `0`, clear it; a value below `min_after_secs` is `runtime/invalid_session_policy`. It never reads or writes the retention policy, so `session.policy.get` and `session.policy.set` keep their shape. |
 | `session.retention.sweep` | `SessionRetentionParams` or `null` | `SessionRetentionResult` | Runs one retention sweep under the current policy TTLs, or reports the selection when `dry_run` is true. It works whether or not automatic sweeps are enabled, never exceeds the policy's own per-sweep removal cap, and never selects an `external` session or one in `conflict`/`incompatible` runtime state. A matched session whose pohunek-owned worktree has an uncommitted change, an untracked file, commits contained in no other branch/remote/tag, or a state git cannot report is **held**, never removed: it is counted in `held`, excluded from `eligible`, and carries the `hold` reason (`worktree_uncommitted`, `worktree_untracked`, `worktree_unpushed`, `worktree_unknown`) on its candidate. One sweep inspects at most 64 checkouts; a matched session beyond that bound is held as `worktree_unknown` and inspected by the next sweep. `worktrees_cleaned` counts only checkouts confirmed gone from disk; a checkout that survived its removal is reported in `worktrees_failed`. The `pohunek session retention sweep` CLI exits non-zero when `failed` or `worktrees_failed` is above zero. |
 | `subscribe` | `null` | `{subscribed: true}` then event stream | Consumes the connection into a one-way event stream. |
 | `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for active-agent state, native session id capture, provider-managed subagent lifecycle, and notifications into the config home of the selected runtime(s). Each report carries `cleanup_incomplete`, the quarantine paths of replaced originals whose deletion did not finish after the install committed (empty when cleanup completed). `profile` selects the config home a host profile launches with and `all_profiles` every distinct home of the runtime (see "Config homes and host profiles"); both are local-only, exclusive, and unknown fields return `bad_request`. With `all_profiles` a home that fails is listed in `failed` (`{agent, home, error}`) while the others still install, and the result is not atomic across homes. Without `all_profiles` every selected home is resolved before the first write, so a home that does not resolve refuses the request with nothing written. Without `agent` on a host where no served runtime has daemon-managed hooks (a clean host: Hermes is CLI-run and the shell has no handler) the request fails with `runtime/integration_no_managed_runtime`, whose hint names the install of each official package with daemon-managed hooks (Codex, Claude Code) that nothing serves and then `pohunek integration install --agent <runtime>`; the Hermes operator plugin is installed by the CLI with its own target flags and is never named. |
@@ -539,7 +541,8 @@ daemon method in this API version. It returns `daemon/method_not_found`.
 
 `HostCapabilities` advertises `terminal_read_supported`,
 `output_read_supported`, `session_wait_supported`,
-`session_wait_turn_supported`, and `session_new_cwd_supported` independently. Clients must check the relevant
+`session_wait_turn_supported`, `session_new_cwd_supported`, and
+`session_idle_stop_supported` independently. Clients must check the relevant
 flag instead of assuming that a reachable daemon or an attach-capable session
 supports every observation method. A daemon that predates `session.wait_turn`
 omits `session_wait_turn_supported`, which decodes as `false`; it answers the
@@ -2189,6 +2192,61 @@ A protocol 3 connection does not define the method: the daemon answers
 `method_not_found`, and a current SDK client fails with
 `daemon/daemon_protocol_too_old` before sending it. A protocol 4 daemon of an
 earlier release answers `daemon/method_not_found`.
+
+### Idle Stop
+
+A session stops by itself when it opts in and its agent stays `idle`. The
+opt-in is session metadata, the first key the daemon interprets (`pohunek.` is
+reserved for such keys; other `pohunek.*` keys and every key outside it are
+opaque):
+
+| Key | Value | Meaning |
+| --- | --- | --- |
+| `pohunek.idle_stop_after_secs` | `default` | Stop after the host default of `session.idle_stop.get`; a session is never stopped while no default is set. |
+| | decimal seconds, at least `min_after_secs` | Stop after this idle time, whatever the host default. |
+
+A session without the key is never stopped for idleness. `session.new` and
+`session.set_metadata` refuse any other value (digits only: no sign, space,
+exponent or unit) with `daemon/invalid_idle_stop_after`, before anything
+starts; a refused edit leaves the previous metadata. Only a value being set is
+checked, so a value an older daemon stored unvalidated never blocks an edit of
+another key; such a session is not opted in, and the daemon logs a WARN once.
+
+The idle clock restarts whenever the session's activity value changes
+(`idle -> working -> idle`, `blocked -> idle`); a repeated `idle` report does
+not move it. It lives in memory only: after a daemon restart it starts when the
+session is adopted, so a restart can delay a stop and never advance one. The
+daemon stops the session through the ordinary stop transaction when all of
+these hold at the deadline, re-checked under the lock that marks the session
+as stopping: the session is `running` on a live worker, its activity is
+`idle`, no `agent_blocked` or `approval_required` notification for it is
+`unread` or `read`, and no `session.input`, `session.wait` or
+`session.wait_turn` call waits on it. A held session is looked at again after
+a short interval. The worktree is kept and the `session-stop` hook fires.
+The idle clock and the reported activity are memory only: after a daemon restart
+a session is armed again when it reports `idle` again, and its limit counts from
+that report.
+
+The stop is recorded where an operator can find it, without a protocol field:
+an INFO log line `session.idle_stop.stopped` (session id, idle seconds, whether
+the limit came from the session or the host default) and the `session_stopped`
+event in the event log. When the notification policy keeps `system` records, a
+`system` notification for the session carries `reason=idle_stop` and
+`summary=idle_secs=<n>`. The default policy has `system` disabled, and the
+daemon honors that choice: the stop then leaves no notification.
+
+The host default is a record of its own, `<data_dir>/session-idle-stop.json`
+(owner-private, written atomically, `{}` when no default is set; a corrupt or
+unsafe record fails daemon startup like `session-policy.json`). It is not part
+of `SessionRetentionPolicy`, so a client of the previous release reads and
+rewrites the retention policy exactly as before while a default is set.
+
+A protocol 3 connection does not define the methods (`method_not_found`; a
+current client fails with `daemon/daemon_protocol_too_old` before sending). A
+protocol 4 daemon of an earlier release answers `daemon/method_not_found`, and
+`pohunek session policy get` then reports `idle_stop_after: not supported by
+this daemon`; such a daemon treats the metadata key as plain metadata, so the
+session is simply never stopped for idleness.
 
 ### Active-Agent Hook Payloads
 
