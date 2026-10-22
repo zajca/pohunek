@@ -867,13 +867,16 @@ upgrade does not install a Pi package again once none is installed.
 When no enabled official selection serves beside the recorded package (nothing is selected,
 or the recorded package itself is the selected one and its root is missing or does not load), the upgrade installs nothing,
 leaves the runtime and reports the gap `official_package_not_serving`; for a runtime
-that is used and whose recorded package nothing pins, the detail names the same uninstall
-command (for Pi, followed by `pohunek plugin install runtime/packages/pi.tar.zst --catalog
-runtime/runtime-catalog.json --yes`, or `plugin update` with the same arguments when another
-Pi version is installed, because the upgrade does not plan Pi without an enabled official
-selection); another selected version that does not load, or a non-official selection, gets
-`plugin install` or `plugin select` instead. A selected package with an altered root, the recorded one or another version, is
-refused with `plugin uninstall --remove-modified`.
+that is used, the detail names the removal of the obstacle (the selected package, or the
+recorded one when nothing is selected) with `pohunek plugin uninstall <package> --digest
+<digest> --yes`, and `--remove-modified` for an altered root, which is a refusal. A host
+profile or session record that pins the obstacle is named first, with how to release it, because the registry
+refuses the removal while it stands. The detail ends with what follows: run the upgrade again, or for a Pi
+that keeps no enabled official selection `pohunek plugin install runtime/packages/pi.tar.zst
+--catalog runtime/runtime-catalog.json --yes` (`plugin update` with the same arguments when
+another Pi version is installed), because the upgrade does not plan such a Pi. Another selected
+version that does not load, or a non-official selection, gets `plugin install` or
+`plugin select` next to that removal while nothing pins the recorded package.
 A selected package you disabled is never replaced, selected or enabled, whatever its
 version is (older, newer, equal under another digest or unordered; the release's own
 package counts too): the plan plans nothing for that runtime and reports the gap
