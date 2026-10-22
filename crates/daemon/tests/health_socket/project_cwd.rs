@@ -73,7 +73,8 @@ impl ProjectRig {
         let target = dir.canonicalize().expect("canonical target directory");
         let control = tokio::sync::Mutex::new(&mut self.control);
         wait_until("the daemon to observe the new directory", || async {
-            let info = inspect_session(&mut *control.lock().await, id).await;
+            let mut guard = control.lock().await;
+            let info = inspect_session(&mut guard, id).await;
             (info.cwd == target).then_some(info)
         })
         .await
