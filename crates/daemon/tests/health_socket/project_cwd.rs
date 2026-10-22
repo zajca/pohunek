@@ -334,21 +334,52 @@ async fn a_project_session_launched_in_the_checkout_follows_its_directory_out() 
     rig.finish().await;
 }
 
+/// K3: the reference association comes back when a session that followed
+/// another repository returns outside every repository.
 #[tokio::test]
-async fn a_project_session_that_entered_a_repository_follows_its_directory_out() {
+async fn a_project_session_that_entered_a_repository_gets_its_reference_back_outside() {
     let mut rig = ProjectRig::start("pcwd-reenter").await;
-    let checkout = rig.repo.cwd().to_path_buf();
+    let other_repo = init_git_repo();
     let outside = rig.outside.to_path_buf();
     let session: SessionInfo =
         serde_json::from_value(ok_payload(rig.new_session(Some(outside.clone())).await))
             .expect("session info");
-    rig.move_session_to(&session.id, &checkout).await;
+    let inside = rig.move_session_to(&session.id, other_repo.cwd()).await;
+    assert_ne!(
+        inside.project_id.as_deref(),
+        Some(rig.project.id.as_str()),
+        "inside another repository the session follows it"
+    );
 
-    let moved = rig.move_session_to(&session.id, &outside).await;
+    let back = rig.move_session_to(&session.id, &outside).await;
+
+    assert_eq!(
+        back.project_id.as_deref(),
+        Some(rig.project.id.as_str()),
+        "back outside every repository the reference's project returns"
+    );
+    rig.finish().await;
+}
+
+/// K4: a directory whose repository state cannot be read is not evidence of
+/// being outside every repository.
+#[tokio::test]
+async fn a_project_session_does_not_keep_its_project_on_unreadable_repository_evidence() {
+    let mut rig = ProjectRig::start("pcwd-unreadable").await;
+    let broken = rig.outside.join("broken");
+    std::fs::create_dir(&broken).expect("create the broken checkout");
+    std::fs::write(broken.join(".git"), "gitdir: /nonexistent/pohunek-gitdir\n")
+        .expect("write the dangling .git file");
+    let session: SessionInfo = serde_json::from_value(ok_payload(
+        rig.new_session(Some(rig.outside.to_path_buf())).await,
+    ))
+    .expect("session info");
+
+    let moved = rig.move_session_to(&session.id, &broken).await;
 
     assert_eq!(
         moved.project_id, None,
-        "after entering a repository the session follows its directory like any other"
+        "a failed detection never keeps the reference's project"
     );
     rig.finish().await;
 }

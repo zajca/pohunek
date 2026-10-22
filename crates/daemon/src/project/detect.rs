@@ -73,6 +73,33 @@ pub struct DetectedProject {
     pub origin_url: Option<String>,
 }
 
+/// Whether `cwd` is an existing directory that provably lies outside every git
+/// repository: no ancestor holds a `.git` entry or the layout of a bare
+/// repository, and every probe answered.
+///
+/// [`detect`] reports `None` for a failed or timed-out `git` call as well as for
+/// a directory outside every repository, so a caller that must not act on a
+/// failed detection asks this filesystem walk instead. Any probe error other
+/// than "not found" answers `false`.
+#[must_use]
+pub fn confirmed_outside_repository(cwd: &Path) -> bool {
+    let Ok(canonical) = cwd.canonicalize() else {
+        return false;
+    };
+    if !canonical.is_dir() {
+        return false;
+    }
+    canonical.ancestors().all(|directory| {
+        let absent = |entry: &str| {
+            matches!(
+                directory.join(entry).symlink_metadata(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            )
+        };
+        absent(".git") && (absent("HEAD") || absent("objects") || absent("refs"))
+    })
+}
+
 /// Derive a project's stable id from its canonical `git_common_dir`.
 ///
 /// `"p-"` + the first 8 hex digits of the FNV-1a 64-bit hash of the key's bytes.

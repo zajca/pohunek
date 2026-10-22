@@ -10,16 +10,16 @@ use pohunek_worker_protocol::{
 
 use super::{
     build_pty_command, debug, detect_at, event, host, mpsc, plan_initial_input_delivery,
-    runtime_error, timestamp_now, warn, watch, Arc, CancellationToken, CwdSource, DesiredState,
-    DetectedProject, DetectorConfig, DetectorConfigUpdate, DetectorInputs, DetectorScope,
-    InputRules, LaunchCommand, LaunchOpts, Manifest, Mutex, NativeSessionLaunch, Notify, Ordering,
-    PathBuf, ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding, ResumeSnapshot,
-    RuntimeHandle, RuntimeHost, RuntimeRecord, RuntimeRef, RuntimeState, RuntimeWatchIdentity,
-    SessionEntry, SessionId, SessionInfo, SessionNewParams, SessionRecord, SessionRefKind,
-    SessionRegistry, SessionRuntime, SessionState, SessionTransaction, SessionWarning, StateSource,
-    TransactionKind, Worker, WorktreeRequest, DEFAULT_WORKER_SUBSCRIBER_BYTES,
-    DEFAULT_WORKER_TERMINAL_RETENTION, DEFAULT_WORKER_WRITE_DEDUP_ENTRIES,
-    SESSION_RECORD_SCHEMA_VERSION,
+    runtime_error, timestamp_now, warn, watch, Arc, CancellationToken, CwdAssociation, CwdSource,
+    DesiredState, DetectedProject, DetectorConfig, DetectorConfigUpdate, DetectorInputs,
+    DetectorScope, InputRules, LaunchCommand, LaunchOpts, Manifest, Mutex, NativeSessionLaunch,
+    Notify, Ordering, PathBuf, ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding,
+    ResumeSnapshot, RuntimeHandle, RuntimeHost, RuntimeRecord, RuntimeRef, RuntimeState,
+    RuntimeWatchIdentity, SessionEntry, SessionId, SessionInfo, SessionNewParams, SessionRecord,
+    SessionRefKind, SessionRegistry, SessionRuntime, SessionState, SessionTransaction,
+    SessionWarning, StateSource, TransactionKind, Worker, WorktreeRequest,
+    DEFAULT_WORKER_SUBSCRIBER_BYTES, DEFAULT_WORKER_TERMINAL_RETENTION,
+    DEFAULT_WORKER_WRITE_DEDUP_ENTRIES, SESSION_RECORD_SCHEMA_VERSION,
 };
 use crate::procwatch::{ProcessIdentity, StartIdentity};
 use crate::runtime::lifecycle::{
@@ -85,6 +85,9 @@ pub(super) struct PtySessionSpec {
     pub(super) metadata: BTreeMap<String, String>,
     /// Non-fatal worktree-setup warnings to surface on the session.
     pub(super) warnings: Vec<SessionWarning>,
+    /// Whether the session was created by `project`/`repo` in a directory
+    /// outside every repository; only the create path sets it.
+    pub(super) reference_outside_repository: bool,
     /// Whether an initial input follows the commit; the committed record
     /// then carries the `initial_input` marker until it is delivered.
     pub(super) initial_input_pending: bool,
@@ -216,6 +219,10 @@ pub(super) struct TargetResolution {
     pub(super) is_linked_worktree: Option<bool>,
     /// Non-fatal worktree-setup warnings to surface on the session.
     pub(super) warnings: Vec<SessionWarning>,
+    /// Whether a session created by `project`/`repo` starts in a directory that
+    /// provably lies outside every repository, so its reference association
+    /// outlives the directory it observes.
+    pub(super) reference_outside_repository: bool,
     /// Stderr tails of the failing create hooks among [`Self::warnings`], for
     /// the `session.new` result only.
     pub(super) hook_stderr_tails: Vec<HookStderrTail>,
@@ -345,12 +352,20 @@ impl SessionRegistry {
                      use --branch to create a worktree",
                 ));
             }
-            return Ok(Self::in_place_target(
-                project,
-                detected,
-                fallback_cwd,
-                launch_dir,
-            ));
+            let by_reference = params.project.is_some() || params.repo.is_some();
+            let reference_outside_repository = match launch_dir.clone() {
+                Some(dir) if by_reference && project.is_some() => {
+                    tokio::task::spawn_blocking(move || {
+                        crate::project::detect::confirmed_outside_repository(&dir)
+                    })
+                    .await
+                    .unwrap_or(false)
+                }
+                _ => false,
+            };
+            let mut target = Self::in_place_target(project, detected, fallback_cwd, launch_dir);
+            target.reference_outside_repository = reference_outside_repository;
+            return Ok(target);
         };
 
         // Worktree-per-session. The source repo is an explicit `--repo`, else the
@@ -389,6 +404,7 @@ impl SessionRegistry {
             project_id,
             is_linked_worktree: Some(true),
             warnings: bound.warnings,
+            reference_outside_repository: false,
             hook_stderr_tails: bound.stderr_tails,
         })
     }
@@ -429,6 +445,7 @@ impl SessionRegistry {
             project_id,
             is_linked_worktree,
             warnings: Vec::new(),
+            reference_outside_repository: false,
             hook_stderr_tails: Vec::new(),
         }
     }
@@ -705,6 +722,7 @@ impl SessionRegistry {
             worktree_path,
             metadata,
             warnings,
+            reference_outside_repository,
             initial_input_pending,
             prompt_in_argv,
             package_authority: _package_authority,
@@ -1026,6 +1044,13 @@ impl SessionRegistry {
             observed_agents: Vec::new(),
             bound_reporter: None,
             cwd_observed_at: crate::time::now(),
+            reference_launch: reference_outside_repository.then(|| CwdAssociation {
+                project_id: info.project_id.clone(),
+                is_linked_worktree: info.is_linked_worktree,
+                repo: info.repo.clone(),
+                branch: info.branch.clone(),
+                worktree_path: info.worktree_path.clone(),
+            }),
             initial_input_owner: initial_input_pending
                 .then(|| self.daemon_instance_id().to_owned()),
         };

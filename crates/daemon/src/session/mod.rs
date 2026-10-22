@@ -954,6 +954,10 @@ struct SessionEntry {
     /// never replaces it, so a scan that read a process before a newer OSC 7
     /// hint landed cannot move the session back.
     cwd_observed_at: Instant,
+    /// The association a session created by `project`/`repo` in a directory
+    /// outside every repository starts with. Held in memory only, so a session
+    /// adopted after a daemon restart has none.
+    reference_launch: Option<CwdAssociation>,
     /// Daemon instance holding the create's undelivered initial input; the
     /// running session's record then carries the `initial_input` marker
     /// naming that instance.
@@ -3431,6 +3435,7 @@ impl SessionRegistry {
             project_id,
             is_linked_worktree,
             warnings,
+            reference_outside_repository,
             ..
         } = target;
         let base = RuntimeRef::from(resolved.base.clone());
@@ -3521,6 +3526,7 @@ impl SessionRegistry {
             worktree_path,
             metadata: params.metadata.clone(),
             warnings,
+            reference_outside_repository,
             initial_input_pending: plan.pending_initial_input.is_some(),
             prompt_in_argv: plan.prompt_in_argv,
             package_authority: None,
@@ -4868,6 +4874,15 @@ impl SessionRegistry {
                 return;
             }
             entry.cwd_observed_at = observed_at;
+            // A session created by reference outside every repository returns to
+            // the reference's association whenever the applied cwd provably lies
+            // outside every repository; unconfirmed evidence follows the cwd.
+            let association = association.map(|(resolved, outside)| {
+                match (outside, entry.reference_launch.as_ref()) {
+                    (true, Some(reference)) => reference.clone(),
+                    _ => resolved,
+                }
+            });
             Some(apply_cwd_change(entry, cwd, source, association))
         };
 
@@ -4883,43 +4898,24 @@ impl SessionRegistry {
             .is_some_and(|entry| cwd_evidence_moves(entry, cwd, observed_at))
     }
 
-    /// The association an observed `cwd` gives the session, or `None` when the
-    /// session keeps its current one.
-    ///
-    /// A session whose current cwd lies outside every repository but that holds
-    /// an association (a by-reference session started outside its checkout)
-    /// keeps it while the observed cwd also resolves to no project. An observed
-    /// cwd inside a repository replaces the association, and a session whose
-    /// current cwd is inside a repository drops it on a move outside.
+    /// The association an observed `cwd` resolves to and whether `cwd` provably
+    /// lies outside every repository, or `None` when resolving it failed and the
+    /// session keeps its current association.
     async fn resolve_cwd_association(
         &self,
         id: &SessionId,
         cwd: PathBuf,
-    ) -> Option<CwdAssociation> {
+    ) -> Option<(CwdAssociation, bool)> {
         let store = self.inner.store.clone();
-        let current = {
-            let sessions = self.inner.sessions.lock().await;
-            sessions.get(id).map(|entry| {
-                let associated = entry.info.project_id.is_some() || entry.info.repo.is_some();
-                (entry.info.cwd.clone(), associated)
-            })
-        };
         match tokio::task::spawn_blocking(move || {
             let resolved = resolve_cwd_association(cwd.as_path(), store.as_deref())?;
-            if resolved == CwdAssociation::default() {
-                if let Some((current_cwd, true)) = current {
-                    let explained =
-                        resolve_cwd_association(current_cwd.as_path(), store.as_deref())?;
-                    if explained == CwdAssociation::default() {
-                        return Ok(None);
-                    }
-                }
-            }
-            Ok::<_, ProtocolError>(Some(resolved))
+            let outside = resolved == CwdAssociation::default()
+                && crate::project::detect::confirmed_outside_repository(&cwd);
+            Ok::<_, ProtocolError>((resolved, outside))
         })
         .await
         {
-            Ok(Ok(association)) => association,
+            Ok(Ok(resolved)) => Some(resolved),
             Ok(Err(err)) => {
                 warn!(
                     session_id = %id.0,
