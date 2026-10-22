@@ -85,9 +85,10 @@ pub(super) struct PtySessionSpec {
     pub(super) metadata: BTreeMap<String, String>,
     /// Non-fatal worktree-setup warnings to surface on the session.
     pub(super) warnings: Vec<SessionWarning>,
-    /// Whether the session was created by `project`/`repo` in a directory
-    /// outside every repository; only the create path sets it.
-    pub(super) reference_outside_repository: bool,
+    /// The association a session created by `project`/`repo` in a directory
+    /// outside every repository returns to; a relaunch of the same session in
+    /// this daemon run carries the live entry's.
+    pub(super) reference_launch: Option<Box<CwdAssociation>>,
     /// Whether an initial input follows the commit; the committed record
     /// then carries the `initial_input` marker until it is delivered.
     pub(super) initial_input_pending: bool,
@@ -722,7 +723,7 @@ impl SessionRegistry {
             worktree_path,
             metadata,
             warnings,
-            reference_outside_repository,
+            reference_launch,
             initial_input_pending,
             prompt_in_argv,
             package_authority: _package_authority,
@@ -1044,15 +1045,7 @@ impl SessionRegistry {
             observed_agents: Vec::new(),
             bound_reporter: None,
             cwd_observed_at: crate::time::now(),
-            reference_launch: reference_outside_repository.then(|| {
-                Box::new(CwdAssociation {
-                    project_id: info.project_id.clone(),
-                    is_linked_worktree: info.is_linked_worktree,
-                    repo: info.repo.clone(),
-                    branch: info.branch.clone(),
-                    worktree_path: info.worktree_path.clone(),
-                })
-            }),
+            reference_launch,
             initial_input_owner: initial_input_pending
                 .then(|| self.daemon_instance_id().to_owned()),
         };

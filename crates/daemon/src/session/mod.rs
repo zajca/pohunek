@@ -3502,6 +3502,15 @@ impl SessionRegistry {
                 .map_or(&[][..], |(_, argv)| argv.as_slice()),
             params.input.clone(),
         )?;
+        let reference_launch = reference_outside_repository.then(|| {
+            Box::new(CwdAssociation {
+                project_id: project_id.clone(),
+                is_linked_worktree,
+                repo: repo.clone(),
+                branch: branch.clone(),
+                worktree_path: worktree_path.clone(),
+            })
+        });
         let spec = PtySessionSpec {
             id: id.clone(),
             registration: target::PtyRegistration::Create,
@@ -3526,7 +3535,7 @@ impl SessionRegistry {
             worktree_path,
             metadata: params.metadata.clone(),
             warnings,
-            reference_outside_repository,
+            reference_launch,
             initial_input_pending: plan.pending_initial_input.is_some(),
             prompt_in_argv: plan.prompt_in_argv,
             package_authority: None,

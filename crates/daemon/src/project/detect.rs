@@ -74,19 +74,20 @@ pub struct DetectedProject {
 }
 
 /// Whether `cwd` is an existing directory that provably lies outside every git
-/// repository: no ancestor holds a `.git` entry or the layout of a bare
-/// repository, and every probe answered.
+/// repository: `git` itself reports "not a git repository" for it, no ancestor
+/// holds a `.git` entry or the layout of a bare repository, and every probe
+/// answered.
 ///
-/// [`detect`] reports `None` for a failed or timed-out `git` call as well as for
-/// a directory outside every repository, so a caller that must not act on a
-/// failed detection asks this filesystem walk instead. Any probe error other
+/// [`detect`] reports `None` for a failed, missing or timed-out `git` call as
+/// well as for a directory outside every repository, so a caller that must not
+/// act on a failed detection asks this function instead. Any probe error other
 /// than "not found" answers `false`.
 #[must_use]
 pub fn confirmed_outside_repository(cwd: &Path) -> bool {
     let Ok(canonical) = cwd.canonicalize() else {
         return false;
     };
-    if !canonical.is_dir() {
+    if !canonical.is_dir() || !git_reports_no_repository(&canonical) {
         return false;
     }
     canonical.ancestors().all(|directory| {
@@ -98,6 +99,51 @@ pub fn confirmed_outside_repository(cwd: &Path) -> bool {
         };
         absent(".git") && (absent("HEAD") || absent("objects") || absent("refs"))
     })
+}
+
+/// Whether `git` answered for `cwd` that it is not inside any repository: a
+/// failed exit with git's "not a git repository" message, in the C locale. A
+/// missing executable, a timeout or any other failure answers `false`.
+fn git_reports_no_repository(cwd: &Path) -> bool {
+    let Ok(mut command) = crate::git::command() else {
+        return false;
+    };
+    command
+        .env("LC_ALL", "C")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let Some(mut stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    };
+    let reader = thread::spawn(move || {
+        let mut out = String::new();
+        let _ = stderr.read_to_string(&mut out);
+        out
+    });
+    let deadline = Instant::now() + DETECT_GIT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(DETECT_POLL_INTERVAL),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return false;
+            }
+        }
+    };
+    let message = reader.join().unwrap_or_default();
+    !status.success() && message.contains("not a git repository")
 }
 
 /// Derive a project's stable id from its canonical `git_common_dir`.

@@ -814,15 +814,18 @@ the new cwd is inside another registered active worktree, `worktree_path`,
 known worktree, `worktree_path` is cleared while git `repo`/`branch` metadata is
 kept when detection still finds a repository. A session started by reference
 (`--project`/`--repo`, `session new --cwd`) in a directory outside every
-repository remembers the reference's association (`project_id`, `repo`,
-`branch`) in memory. While its observed cwd provably lies outside every
-repository it holds that association, also when it returns there after
-following another repository. An observed cwd inside a repository follows that
-repository, and an observed cwd the daemon cannot read, or whose repository
-state it cannot determine (a missing directory, a failed or timed-out `git`
-call), follows the cwd and clears the association. Every other session, one
-started inside a repository, one not started by reference, and any session
-after a daemon restart (the memory does not survive it), follows its cwd
+repository remembers its create-time association in memory: the project
+(`project_id`; `repo`, `branch` and the worktree are not part of it). While its
+observed cwd provably lies outside every repository it holds that association,
+also when it returns there after following another repository. "Provably"
+means that `git` itself reports the directory is not in a repository and no
+parent holds a `.git` entry or a bare layout. An observed cwd inside a
+repository follows that repository, and an observed cwd the daemon cannot
+classify (a missing directory, a `git` that is missing, fails or times out)
+follows the cwd and clears the association. The memory survives a stop and
+resume of the session in the same daemon run and is lost only when the daemon
+restarts. Every other session, one started inside a repository, one not
+started by reference, and any session after a daemon restart, follows its cwd
 exactly: a `cd` outside every repository clears the association. The decision
 is taken under the same lock that applies the cwd.
 

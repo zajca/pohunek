@@ -8,8 +8,8 @@ with `--branch` are refused before a session is created, and a host whose daemon
 does not advertise `session_new_cwd_supported` is refused with
 `session_new_cwd_unsupported` for every explicit `--cwd`. The daemon stores the
 canonical launch directory. A by-reference session started outside every
-repository holds the reference's association in memory while its observed cwd
-provably lies outside every repository, also after following another repository
+repository holds its create-time association (the project) in memory while its observed cwd
+provably lies outside every repository (`git` reports no repository), also after following another repository
 and returning; unreadable evidence, a daemon restart and every other session
 follow the cwd as before. See [sessions](concepts/sessions.md).
 Without `--project`/`--repo`, an explicit `--cwd` below a checkout now starts the
