@@ -863,7 +863,7 @@ package serves the runtime id is the gap `runtime_served_by_other_package` (a re
 without `--detect`); a Pi runtime the plan does not judge gets only a gap that points to
 `pohunek plugin doctor` in those states. The release's own package, recorded and
 disabled while another enabled version is selected, is not enabled or selected by the
-upgrade either: the selected version keeps serving, with its package entry and
+upgrade either: while an enabled selection loads, it keeps serving, with its package entry and
 integrations, and the gap names `plugin enable` for the release's digest. The case
 table "Disabled release package: case table" in `docs/public-api.md` gives the outcome for
 every state of the selected version and of that package's root, including when an

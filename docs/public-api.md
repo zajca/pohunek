@@ -2381,7 +2381,8 @@ hooks are present yet (Pi declares none). Each distinct home appears once. `reas
 values are `profile`, `session`, `integration`, `detected` and `installed`. The report layout
 stays at `report_version` 1.
 
-#### Disabled release package: case table
+<a id="disabled-release-package-case-table"></a>
+**Disabled release package: case table**
 
 The step never installs, selects or enables a package you disabled, and never
 re-enables the release's own package when it is recorded and disabled
@@ -2448,7 +2449,7 @@ How to read it:
   is altered, gets the restore-then-enable hint when its root is missing, and the
   enable hint when it can be enabled. When a third-party Pi package serves the
   runtime id (a third party cannot claim a reserved id) the plan cannot enable it: a
-  disabled R beside an enabled Pi S that cannot load is refused with
+  disabled R beside an older enabled Pi S that cannot load is refused with
   `package_runtime_conflict` and the detail "the disabled package cannot be enabled
   while another package serves this runtime id", which `--detect` reports as the gap
   `runtime_served_by_other_package`; a disabled Pi S is examined only under `--detect`
