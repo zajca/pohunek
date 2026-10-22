@@ -415,19 +415,20 @@ fn failed_exec_reports_terminal_recovery_syscall_errors() {
     }
 }
 
-/// A foreground group the kernel finds but that has no live member (`EPERM`
-/// from the probe, as Darwin answers for the emptied group of a reaped
-/// child) goes back to the shell, whatever the real membership query finds.
+/// A foreground group whose only member is an unreaped zombie answers the
+/// real group probe with `EPERM` on macOS, and the real membership query finds
+/// no live member, so the terminal goes back to the shell.
 #[cfg(target_os = "macos")]
 #[test]
-fn an_emptied_group_the_probe_reports_as_not_signalable_is_reclaimed() {
-    let session = Session::launch_with_failure(false, MISSING_COMMAND, Some("killpg=EPERM"));
+fn a_foreground_group_left_with_only_a_zombie_returns_the_terminal_to_the_shell() {
+    let session = Session::launch_with_failure(false, MISSING_COMMAND, Some("zombie_group"));
     let shell = i32::try_from(session.shell.process_id().expect("shell pid")).expect("pid");
     assert_ne!(line(&session.path("lock.status")), "0");
     let diagnostics = session.recovery_diagnostics();
     for expected in [
         format!("killpg=Some(Err({}))", nix::errno::Errno::EPERM as i32),
         "live_members=Some(Ok(false))".to_owned(),
+        ":Zombie".to_owned(),
         "mask_block=Ok(())".to_owned(),
     ] {
         assert!(
