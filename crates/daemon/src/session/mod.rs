@@ -804,6 +804,8 @@ struct SessionRegistryInner {
     /// before it plans the relaunch.
     #[cfg(test)]
     definition_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    #[cfg(test)]
+    entry_record_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     /// Parks an adopted detector refresh between resolving the runtime sources
     /// and applying them.
     #[cfg(test)]
@@ -1768,6 +1770,40 @@ impl SessionRegistry {
             })
     }
 
+    /// Builds the record of the registered session `id` and writes it, with
+    /// `persist_lock` held from before the snapshot until the write returns.
+    ///
+    /// [`Self::set_metadata`] holds the same lock from its merge through its
+    /// store write, so a metadata edit lands either before the snapshot (and
+    /// the record carries it) or after the write (and replaces the record's
+    /// metadata); it never lands in between and loses to the older snapshot.
+    /// The removal intent and the recovery rollback write through here. A
+    /// write conditional on the durable record needs no such lock; the
+    /// relaunch of a resume and the supervision retry rebuild a record
+    /// without it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `session_not_found` when `id` is not registered, or the store
+    /// error of [`Self::write_session_record`].
+    async fn write_entry_record(
+        &self,
+        id: &SessionId,
+        build: impl FnOnce(&mut SessionEntry) -> SessionRecord,
+    ) -> Result<(), ProtocolError> {
+        let _persist = self.inner.persist_lock.lock().await;
+        let record = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let entry = sessions
+                .get_mut(id)
+                .ok_or_else(|| session_not_found(&id.0))?;
+            build(entry)
+        };
+        #[cfg(test)]
+        self.hold_entry_record_write().await;
+        self.write_session_record(record).await
+    }
+
     async fn write_session_record_if_current(
         &self,
         expected: SessionRecord,
@@ -2283,6 +2319,8 @@ impl SessionRegistry {
                 recovery_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 definition_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                entry_record_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 refresh_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
@@ -3344,6 +3382,22 @@ impl SessionRegistry {
         let gate = self
             .inner
             .metadata_apply_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Parks [`Self::write_entry_record`] between building the record and
+    /// writing it, when a test armed the hold.
+    #[cfg(test)]
+    async fn hold_entry_record_write(&self) {
+        let gate = self
+            .inner
+            .entry_record_hold
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -5046,9 +5100,10 @@ impl SessionRegistry {
             .filter_map(|(key, value)| Some((key.clone(), value.clone()?)))
             .collect();
         idle_stop::validate_opt_in(&patch, self.inner.config.idle_stop_min_secs)?;
-        // The sessions lock is held from the merge through the store write to the
-        // in-memory edit, so a record writer that builds its record from the
-        // entry cannot interleave and write the previous metadata over the edit.
+        // `persist_lock` is held from the merge through the store write to the
+        // in-memory edit, and the sessions lock is held across them, so a record
+        // writer that goes through [`Self::write_entry_record`] cannot
+        // interleave and write the previous metadata over the edit.
         let persist = self.inner.persist_lock.lock().await;
         let (info, has_native) = {
             let mut sessions = self.inner.sessions.lock().await;
@@ -5657,11 +5712,7 @@ impl SessionRegistry {
             // Retiring first means a refused or failed retirement leaves no
             // removal intent behind; the record keeps its runtime state.
             self.retire_unstopped_job(id).await?;
-            let removal_intent = {
-                let mut sessions = self.inner.sessions.lock().await;
-                let entry = sessions
-                    .get_mut(id)
-                    .ok_or_else(|| session_not_found(&id.0))?;
+            self.write_entry_record(id, |entry| {
                 entry.desired_state = DesiredState::Removed;
                 Self::session_record(
                     id,
@@ -5679,8 +5730,8 @@ impl SessionRegistry {
                         daemon_instance_id: None,
                     }),
                 )
-            };
-            self.write_session_record(removal_intent).await?;
+            })
+            .await?;
             false
         };
 

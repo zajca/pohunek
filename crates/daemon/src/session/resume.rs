@@ -738,22 +738,21 @@ impl SessionRegistry {
         recovery_definition(&self.inner.profiles, binding)
     }
 
-    async fn persist_failed_recovery_rollback(&self, id: &SessionId) {
-        let restored = {
-            let sessions = self.inner.sessions.lock().await;
-            sessions
-                .get(id)
-                .map(|entry| Self::session_record(id, entry, entry.desired_state, None))
-        };
-        let Some(record) = restored else {
-            return;
-        };
-        if let Err(store_error) = self.write_session_record(record).await {
-            warn!(
+    pub(super) async fn persist_failed_recovery_rollback(&self, id: &SessionId) {
+        let written = self
+            .write_entry_record(id, |entry| {
+                Self::session_record(id, entry, entry.desired_state, None)
+            })
+            .await;
+        match written {
+            Ok(()) => {}
+            // The session left the registry, so no record is left to roll back.
+            Err(error) if error.code == "session_not_found" => {}
+            Err(store_error) => warn!(
                 session_id = %id.0,
                 error = %store_error,
                 "failed to roll back native recovery transaction"
-            );
+            ),
         }
     }
 

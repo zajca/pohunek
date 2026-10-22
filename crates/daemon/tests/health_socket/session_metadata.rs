@@ -20,16 +20,29 @@ fn set_metadata_request(id: &SessionId, metadata: &Value) -> ProtocolRequest {
     )
 }
 
-/// The metadata of `id` in the durable record of the store at `path`.
-fn stored_metadata(path: &Path, id: &SessionId) -> BTreeMap<String, String> {
+/// The durable record of `id` in the store at `path`.
+fn stored_record(path: &Path, id: &SessionId) -> pohunek_daemon::store::SessionRecord {
     Store::new(path.to_path_buf())
         .load_sessions()
         .expect("read the durable records")
         .into_iter()
         .find(|record| record.session_id == id.0)
         .expect("the session has a durable record")
-        .info
-        .metadata
+}
+
+/// The metadata of `id` in the durable record of the store at `path`.
+fn stored_metadata(path: &Path, id: &SessionId) -> BTreeMap<String, String> {
+    stored_record(path, id).info.metadata
+}
+
+/// Asserts that `session` carries the edit [`set_edited_key`] made.
+pub(super) fn assert_edit_survived(session: &SessionInfo) {
+    assert_eq!(
+        session.metadata.get(EDITED_KEY).map(String::as_str),
+        Some("1469"),
+        "the edit survives the restart: {:?}",
+        session.metadata
+    );
 }
 
 #[tokio::test]
@@ -168,6 +181,14 @@ pub(super) fn assert_native_session_edit_is_durable(store_path: &Path, id: &Sess
             .map(String::as_str),
         Some("1469"),
         "the durable record of a native-bound session holds the edit"
+    );
+    let recovery = stored_record(store_path, id)
+        .recovery
+        .expect("a native-bound session has a recovery record");
+    assert_eq!(
+        recovery.metadata.get(EDITED_KEY).map(String::as_str),
+        Some("1469"),
+        "the recovery record a relaunch reads holds the edit"
     );
 }
 

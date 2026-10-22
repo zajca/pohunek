@@ -328,7 +328,10 @@ fn a_daemon_of_the_previous_release_refuses_the_idle_default_and_keeps_its_reten
             .as_str()
             .is_some_and(|hint| hint.contains("upgrade the daemon")
                 && hint.contains(&format!("(version {FIXTURE_DAEMON_VERSION})"))
-                && hint.contains("release 0.36.0 or later")
+                && hint.contains(&format!(
+                    "to this CLI's release ({})",
+                    env!("CARGO_PKG_VERSION")
+                ))
                 && hint.contains("Nothing was changed")),
         "{refused}"
     );

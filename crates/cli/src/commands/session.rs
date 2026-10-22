@@ -1580,18 +1580,19 @@ fn idle_stop_unsupported(error: &CliError) -> bool {
     }
 }
 
-/// First release whose daemon serves the idle-stop methods.
-const IDLE_STOP_MIN_DAEMON_RELEASE: &str = "0.36.0";
-
 /// Recovery hint for a daemon that does not know the idle-stop default;
 /// `connected` is the version the daemon reported, when it answered `daemon.health`.
+///
+/// The upgrade target is this CLI's own release, which serves the methods it
+/// calls, so the hint names no release number of its own.
 fn idle_stop_upgrade_hint(connected: Option<&str>) -> String {
     let daemon = connected.map_or_else(
         || "the connected daemon".to_owned(),
         |version| format!("the connected daemon (version {version})"),
     );
     format!(
-        "{daemon} predates --idle-stop-after, which needs a daemon of release {IDLE_STOP_MIN_DAEMON_RELEASE} or later; upgrade the daemon and retry. Nothing was changed"
+        "{daemon} predates --idle-stop-after; upgrade the daemon to this CLI's release ({cli}) and retry. Nothing was changed",
+        cli = env!("CARGO_PKG_VERSION"),
     )
 }
 

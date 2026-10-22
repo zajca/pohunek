@@ -5507,6 +5507,8 @@ enum PinKind {
     Both,
     /// A host profile with only a `digest` line pins it.
     DigestOnly,
+    /// Two host profiles pin it.
+    TwoProfiles,
 }
 
 /// One step of a remedy: the release of a pin, or a command the hint names.
@@ -5587,8 +5589,9 @@ struct Cell {
     installs: &'static [(Role, bool, bool)],
     damage: &'static [(Role, Damage)],
     pin: Option<(Role, PinKind)>,
-    /// A second session record of the runtime pins another digest.
-    other_session: bool,
+    /// A second session record pins another digest; the value is the runtime
+    /// it launched.
+    other_session: Option<&'static str>,
     /// A host profile uses the runtime.
     profile: bool,
     /// An installed hook uses the runtime.
@@ -5608,7 +5611,7 @@ const BASE: Cell = Cell {
     installs: &[],
     damage: &[],
     pin: None,
-    other_session: false,
+    other_session: None,
     profile: true,
     hook: false,
     store: false,
@@ -5723,7 +5726,27 @@ const CELLS: &[Cell] = &[
         installs: &[(Holder, true, true)],
         damage: &[(Holder, Damage::Missing)],
         pin: Some((Holder, PinKind::Session)),
-        other_session: true,
+        other_session: Some("claude"),
+        steps: &[Release, Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R5 holder pinned by a session beside a Pi session",
+        runtimes: CLAUDE,
+        profile: false,
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Missing)],
+        pin: Some((Holder, PinKind::Session)),
+        other_session: Some("pi"),
+        steps: &[Release, Uninstall(Holder)],
+        end: End::Removed,
+        ..BASE
+    },
+    Cell {
+        id: "R5 holder pinned by two profiles",
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Missing)],
+        pin: Some((Holder, PinKind::TwoProfiles)),
         steps: &[Release, Uninstall(Holder)],
         ..BASE
     },
@@ -6092,6 +6115,11 @@ fn cell_profile(runtime: &str) -> &str {
     }
 }
 
+/// The second host profile of a cell that two profiles pin.
+fn second_profile(runtime: &str) -> String {
+    format!("{}-second", cell_profile(runtime))
+}
+
 /// The profile text that pins `digest`.
 fn pinned_profile(runtime: &str, digest: &PackageDigest) -> String {
     format!(
@@ -6101,21 +6129,20 @@ fn pinned_profile(runtime: &str, digest: &PackageDigest) -> String {
 }
 
 /// The metadata store of a cell: a session record of Claude that pins `pinned`,
-/// and a second record that pins another digest when `other` is set.
-fn session_store(pinned: Option<&PackageDigest>, other: bool) -> String {
+/// and a second record of the runtime `other` that pins another digest.
+fn session_store(pinned: Option<&PackageDigest>, other: Option<&str>) -> String {
     let first = pinned.map_or_else(String::new, |pinned| {
         PACKAGE_SESSION_STORE.replace(&format!("sha256:{}", "a".repeat(64)), pinned.as_str())
     });
-    let second = if other {
+    let second = other.map_or_else(String::new, |runtime| {
         PACKAGE_SESSION_STORE
             .replace(
                 &format!("sha256:{}", "a".repeat(64)),
                 &format!("sha256:{}", "b".repeat(64)),
             )
             .replace("RPV", "RPW")
-    } else {
-        String::new()
-    };
+            .replace("claude", runtime)
+    });
     format!("{first}{second}")
 }
 
@@ -6136,6 +6163,7 @@ fn step_text(
     match step {
         Cmd::Release => {
             let profile = cell_profile(runtime);
+            let two = format!("`{profile}.toml`, `{}.toml`", second_profile(runtime));
             let profile_lines = format!(
                 "remove the `package` and `digest` lines from `{profile}.toml` in the host \
                  profile directory"
@@ -6145,6 +6173,13 @@ fn step_text(
                 PinKind::Profile | PinKind::DigestOnly => {
                     (format!("the host profile `{profile}.toml` pins"), profile_lines)
                 }
+                PinKind::TwoProfiles => (
+                    format!("the host profile {two} pin"),
+                    format!(
+                        "remove the `package` and `digest` lines from {two} in the host \
+                         profile directory"
+                    ),
+                ),
                 PinKind::Session => ("a session record pins".to_owned(), sessions.to_owned()),
                 PinKind::Both => (
                     format!("the host profile `{profile}.toml` and a session record pin"),
@@ -6233,12 +6268,18 @@ async fn cell_host(cell: &Cell, runtime: &str) -> (Host, Vec<(Role, Archive)>, A
             );
         } else if kind != PinKind::Session {
             host.write_profile(profile, &pinned_profile(runtime, &digest(role)));
+            if kind == PinKind::TwoProfiles {
+                host.write_profile(
+                    &second_profile(runtime),
+                    &pinned_profile(runtime, &digest(role)),
+                );
+            }
         }
         if matches!(kind, PinKind::Session | PinKind::Both) {
             host.write_store(&session_store(Some(&digest(role)), cell.other_session));
         }
-    } else if cell.other_session {
-        host.write_store(&session_store(None, true));
+    } else if cell.other_session.is_some() {
+        host.write_store(&session_store(None, cell.other_session));
     }
     (host, archives, release)
 }
@@ -6335,6 +6376,12 @@ async fn run_cell(cell: &Cell, runtime: &str) {
                 let (_, kind) = cell.pin.expect("a pinned cell");
                 if kind != PinKind::Session {
                     host.write_profile(cell_profile(runtime), &format!("base = \"{runtime}\"\n"));
+                }
+                if kind == PinKind::TwoProfiles {
+                    host.write_profile(
+                        &second_profile(runtime),
+                        &format!("base = \"{runtime}\"\n"),
+                    );
                 }
                 if matches!(kind, PinKind::Session | PinKind::Both) {
                     host.write_store(&session_store(None, cell.other_session));

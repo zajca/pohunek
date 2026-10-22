@@ -17,11 +17,23 @@ use tracing::{debug, warn};
 /// Sets `timing` on `stream` and logs the values the kernel reports back.
 ///
 /// A failure is logged with the peer and the OS error and otherwise ignored:
-/// a connection whose keepalive timing was not applied (the kernel then keeps
-/// its own defaults) still works, and refusing it would turn a socket-option
-/// error into an outage.
+/// a connection whose keepalive timing was not applied still works, and
+/// refusing it would turn a socket-option error into an outage. The log says
+/// which step failed, because the socket state differs: after a set error the
+/// keepalive may be off or only partly configured, after a read-back error the
+/// configured values are applied but could not be confirmed.
 pub(super) fn apply(stream: &TcpStream, peer: SocketAddr, timing: KeepaliveTiming) {
-    match set_and_read_back(stream, timing) {
+    let socket = SockRef::from(stream);
+    if let Err(err) = set(&socket, timing) {
+        warn!(
+            peer = %peer,
+            error = %err,
+            errno = err.raw_os_error(),
+            "remote keepalive setup failed; keepalive may be off or only partly configured"
+        );
+        return;
+    }
+    match read_back(&socket) {
         Ok(applied) => debug!(
             peer = %peer,
             keepalive.enabled = applied.enabled,
@@ -34,7 +46,7 @@ pub(super) fn apply(stream: &TcpStream, peer: SocketAddr, timing: KeepaliveTimin
             peer = %peer,
             error = %err,
             errno = err.raw_os_error(),
-            "remote keepalive setup failed; serving the connection with the kernel keepalive defaults"
+            "remote keepalive was set but reading the applied values back failed; the configured values are in effect"
         ),
     }
 }
@@ -47,14 +59,16 @@ struct Applied {
     count: u32,
 }
 
-fn set_and_read_back(stream: &TcpStream, timing: KeepaliveTiming) -> io::Result<Applied> {
-    let socket = SockRef::from(stream);
+fn set(socket: &SockRef<'_>, timing: KeepaliveTiming) -> io::Result<()> {
     socket.set_tcp_keepalive(
         &TcpKeepalive::new()
             .with_time(timing.idle)
             .with_interval(timing.interval)
             .with_retries(timing.count),
-    )?;
+    )
+}
+
+fn read_back(socket: &SockRef<'_>) -> io::Result<Applied> {
     Ok(Applied {
         enabled: socket.keepalive()?,
         idle_s: socket.tcp_keepalive_time()?.as_secs(),

@@ -40,6 +40,7 @@ struct ClaudeRig {
     config_home: PathBuf,
     worker_state_root: PathBuf,
     store_path: PathBuf,
+    registry_config: SessionRegistryConfig,
     additional_sessions: Vec<SessionId>,
     _bin: TestDir,
     _state: TestDir,
@@ -156,7 +157,7 @@ impl ClaudeRig {
             ..SessionRegistryConfig::default()
         };
         let (shutdown, server, worker_home) =
-            spawn_server_serving_official_runtimes(&socket, "0.0.0", registry_config).await;
+            spawn_server_serving_official_runtimes(&socket, "0.0.0", registry_config.clone()).await;
         let worker_state_root = worker_home.join("state/pohunek/workers");
         let mut control = connect(&socket).await;
         let mut params = session_params_in(cwd.to_path_buf());
@@ -180,6 +181,7 @@ impl ClaudeRig {
             config_home,
             worker_state_root,
             store_path,
+            registry_config,
             additional_sessions: Vec::new(),
             _bin: bin,
             _state: state,
@@ -304,6 +306,43 @@ impl ClaudeRig {
         exchange(&mut self.control, &request).await
     }
 
+    /// Stops the daemon and starts a new one over the same store, profiles and
+    /// socket path, as a daemon restart does.
+    async fn restarted(self) -> Self {
+        let Self {
+            socket,
+            control,
+            shutdown,
+            server,
+            ..
+        } = self;
+        drop(control);
+        let _ = shutdown.send(());
+        server.await.expect("control server stops");
+        let (shutdown, server, worker_home) = respawn_server_serving_official_runtimes(
+            &socket,
+            "0.0.0",
+            self.registry_config.clone(),
+        )
+        .await;
+        let control = connect(&socket).await;
+        Self {
+            socket,
+            control,
+            shutdown,
+            server,
+            worker_state_root: worker_home.join("state/pohunek/workers"),
+            ..self
+        }
+    }
+
+    /// Stops the daemon and leaves the sessions as they are.
+    async fn stop_daemon(self) {
+        drop(self.control);
+        let _ = self.shutdown.send(());
+        self.server.await.expect("control server stops");
+    }
+
     async fn finish(mut self, child: Option<SessionId>) {
         for id in child
             .into_iter()
@@ -406,6 +445,25 @@ async fn metadata_set_on_a_native_bound_session_is_written_to_its_durable_record
     super::session_metadata::set_edited_key(&mut rig.control, &id).await;
     super::session_metadata::assert_native_session_edit_is_durable(&rig.store_path, &id);
     rig.finish(None).await;
+}
+
+/// A metadata edit of a native-bound session is part of the durable record the
+/// next daemon adopts the session from.
+#[tokio::test]
+async fn metadata_set_on_a_native_bound_session_survives_a_restart() {
+    let mut rig = ClaudeRig::new("claude-metadata-restart").await;
+    rig.transcript(LAUNCH);
+    rig.report("startup", LAUNCH).await;
+    let id = rig.session.id.clone();
+    super::session_metadata::set_edited_key(&mut rig.control, &id).await;
+    rig.stop(&id).await;
+
+    let mut rig = rig.restarted().await;
+    let adopted = inspect_session(&mut rig.control, &id).await;
+    super::session_metadata::assert_native_session_edit_is_durable(&rig.store_path, &id);
+    rig.stop_daemon().await;
+
+    super::session_metadata::assert_edit_survived(&adopted);
 }
 
 #[tokio::test]
