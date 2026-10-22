@@ -609,15 +609,20 @@ fn exact_version_range(version: ProtocolVersion) -> ProtocolVersionRange {
 /// each name one candidate.
 fn ambiguity_hint(candidates: &[overlay::HostCandidate]) -> String {
     // A selector that could also match another candidate would not pick one
-    // host: an FQDN selector is offered only when no other candidate carries
-    // that name. Peer identities are unique, and `local` may repeat across
+    // host: an FQDN selector is offered only when no other candidate of the same
+    // overlay carries that name, because `<overlay>:fqdn~...` matches within its
+    // overlay only. Peer identities are unique, and `local` may repeat across
     // overlays.
     let mut selectors = std::collections::BTreeSet::new();
     for candidate in candidates {
         let identity = &candidate.identity;
         let name_is_shared = candidates
             .iter()
-            .filter(|other| !std::ptr::eq(*other, candidate) && !other.identity.local)
+            .filter(|other| {
+                !std::ptr::eq(*other, candidate)
+                    && !other.identity.local
+                    && other.overlay == candidate.overlay
+            })
             .any(|other| other.identity.name.eq_ignore_ascii_case(&identity.name));
         if identity.local || identity.selector_is_peer_id || !name_is_shared {
             selectors.extend(candidate.qualified_selector());

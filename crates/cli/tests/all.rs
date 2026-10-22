@@ -40,6 +40,8 @@ mod host_fanout_local_record;
 mod host_pin_assistant;
 #[path = "host_pin_attach.rs"]
 mod host_pin_attach;
+#[path = "host_pin_session.rs"]
+mod host_pin_session;
 #[path = "integration_hooks.rs"]
 mod integration_hooks;
 #[path = "json_usage_errors.rs"]

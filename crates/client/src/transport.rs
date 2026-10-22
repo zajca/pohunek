@@ -2030,13 +2030,16 @@ fn name_typed_host(error: ClientError, pinned_route: &str, display: &str) -> Cli
         ClientError::OverlayRegistry(RegistryError::HostUnknown(_)) => {
             RegistryError::HostUnknown(display.to_owned()).into()
         }
-        ClientError::OverlayRegistry(RegistryError::AmbiguousHost { candidates, .. }) => {
-            RegistryError::AmbiguousHost {
-                host: display.to_owned(),
-                candidates,
-            }
-            .into()
+        ClientError::OverlayRegistry(RegistryError::AmbiguousHost {
+            candidates,
+            unlisted,
+            ..
+        }) => RegistryError::AmbiguousHost {
+            host: display.to_owned(),
+            candidates,
+            unlisted,
         }
+        .into(),
         ClientError::OverlayRegistry(RegistryError::HostUnavailable { failures, .. }) => {
             let failures = failures
                 .into_iter()

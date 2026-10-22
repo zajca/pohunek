@@ -61,7 +61,10 @@ covers this machine.
 
 A remote host is resolved once per operation when the operation opens more than
 one connection: `attach` (including its automatic re-attach, the live status
-line and the menu actions), `session output`, `session wait` and `assistant`.
+line and the menu actions), `assistant`, `session output`, `session wait` and
+every `session <action> <name>` command that looks the session name up before it
+acts (`inspect`, `stop`, `fork`, `rm`, `input`, `screen`, `detection`, `read`,
+`resume`, `resize`, `metadata`, `rename`, `diff`).
 Every connection of the operation then looks the peer up by its stable identity
 (`<overlay>:peer~<id>@<port>`, or `fqdn~` when the provider reports no peer id),
 so a short name that starts selecting another peer midway is never followed; the
