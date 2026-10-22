@@ -352,12 +352,11 @@ fn workspace_metadata(all_features: bool) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("metadata JSON")
 }
 
-/// zbus must stay on its runtime-agnostic backend. Cargo unifies features across
-/// the graph, so a `tokio` feature on any member makes zbus require a Tokio
-/// reactor for every consumer; the GUI's theme detection drives zbus from a
-/// non-Tokio thread and panics at startup with "there is no reactor running".
+/// Without `default-rt` (and without `tokio`), `zbus::connection::Builder::build`
+/// reports `Error::Unsupported` unless a runtime is passed to it; the systemd
+/// backend passes none, so every zbus the workspace links needs `default-rt`.
 #[test]
-fn zbus_is_never_built_with_its_tokio_backend() {
+fn zbus_keeps_its_default_runtime() {
     let metadata = workspace_metadata(false);
     let nodes = metadata["resolve"]["nodes"]
         .as_array()
@@ -382,30 +381,57 @@ fn zbus_is_never_built_with_its_tokio_backend() {
     {
         let features = node["features"].as_array().expect("resolved features");
         assert!(
-            !features.iter().any(|feature| feature == "tokio"),
-            "zbus resolved with its `tokio` feature; that makes the GUI panic at startup \
-             (\"there is no reactor running\") because its theme detection uses zbus off \
-             a Tokio runtime. Keep the workspace dependency on `default-rt`."
-        );
-        assert!(
             features.iter().any(|feature| feature == "default-rt"),
-            "zbus needs the runtime-agnostic `default-rt` backend"
+            "zbus needs its `default-rt` backend: the systemd backend builds connections \
+             without passing a runtime"
         );
     }
 }
 
+/// `smartstring` (RUSTSEC-2026-0249, ignored in `.cargo/audit.toml`) is locked
+/// only through the optional `ts` feature chain; no default-feature build may
+/// link it.
+#[test]
+fn smartstring_is_absent_from_the_default_feature_graph() {
+    let metadata = workspace_metadata(false);
+    let names: std::collections::BTreeMap<&str, &str> = metadata["packages"]
+        .as_array()
+        .expect("packages")
+        .iter()
+        .map(|package| {
+            (
+                package["id"].as_str().expect("package id"),
+                package["name"].as_str().expect("package name"),
+            )
+        })
+        .collect();
+    let linked: Vec<&str> = metadata["resolve"]["nodes"]
+        .as_array()
+        .expect("resolve nodes")
+        .iter()
+        .map(|node| names[node["id"].as_str().expect("node id")])
+        .collect();
+    assert!(
+        !linked.contains(&"smartstring"),
+        "a default-feature dependency now reaches smartstring; the RUSTSEC-2026-0249 ignore \
+         in .cargo/audit.toml is only valid for the optional `ts` feature chain"
+    );
+}
+
+/// Violations of the legacy zbus policy in `metadata` (`cargo metadata` JSON
+/// of the whole workspace with every feature).
+///
 /// zbus below 6 and its split-out `zvariant`/`zbus_names` crates are
 /// unmaintained (RUSTSEC-2026-0370, -0371, -0372). Workspace members link zbus
-/// 6; the only remaining consumers of the legacy family are `keyring 3` (its
-/// own `zbus 4` dependency) and `secret-service 4` behind it, the CLI's Linux
-/// Secret Service backend, which `.cargo/audit.toml` ignores for exactly that
-/// chain. Any other path to those
-/// crates is a new dependency on an unmaintained crate.
-#[test]
-fn legacy_zbus_family_is_reachable_only_through_the_keyring_secret_service_chain() {
+/// 6. The only remaining chain is `pohunek-cli` -> `keyring 3` (its own
+/// `zbus 4` dependency and `secret-service 4` behind it), which
+/// `.cargo/audit.toml` ignores for exactly that chain:
+/// - only `keyring 3` and `secret-service 4` may depend on the legacy family;
+/// - only `keyring 3` may depend on `secret-service 4`;
+/// - only the workspace crate `pohunek-cli` may depend on `keyring 3`.
+fn legacy_zbus_violations(metadata: &serde_json::Value) -> Vec<String> {
     use std::collections::BTreeMap;
 
-    let metadata = workspace_metadata(true);
     // package id -> (name, major version)
     let packages: BTreeMap<&str, (&str, u64)> = metadata["packages"]
         .as_array()
@@ -429,34 +455,150 @@ fn legacy_zbus_family_is_reachable_only_through_the_keyring_secret_service_chain
         ("zvariant" | "zvariant_derive" | "zvariant_utils" | "zbus_names", _) => true,
         _ => false,
     };
-    let nodes = metadata["resolve"]["nodes"]
-        .as_array()
-        .expect("resolve nodes");
+    let mut violations = Vec::new();
     let mut legacy_found = false;
-    for node in nodes {
+    for node in metadata["resolve"]["nodes"]
+        .as_array()
+        .expect("resolve nodes")
+    {
         let parent = node["id"].as_str().expect("node id");
-        let (parent_name, parent_major) = packages[parent];
+        let parent_package = packages[parent];
         for dependency in node["deps"].as_array().expect("node deps") {
             let child = dependency["pkg"].as_str().expect("dependency id");
-            if !is_legacy(child) || is_legacy(parent) {
-                continue;
+            let child_package = packages[child];
+            if is_legacy(child) && !is_legacy(parent) {
+                legacy_found = true;
+                if !matches!(parent_package, ("secret-service", 4) | ("keyring", 3)) {
+                    violations.push(format!(
+                        "`{}` {}.x depends on `{}`, part of the unmaintained zbus < 6 family",
+                        parent_package.0, parent_package.1, child_package.0
+                    ));
+                }
             }
-            legacy_found = true;
-            assert!(
-                matches!(
-                    (parent_name, parent_major),
-                    ("secret-service", 4) | ("keyring", 3)
-                ),
-                "`{parent_name}` {parent_major}.x depends on `{}`, part of the unmaintained \
-                 zbus < 6 family; only keyring 3 and secret-service 4 may, and the family must \
-                 otherwise be zbus 6 (workspace dependency `zbus`)",
-                packages[child].0
-            );
+            if child_package == ("secret-service", 4) && parent_package != ("keyring", 3) {
+                violations.push(format!(
+                    "`{}` {}.x depends on `secret-service` 4, which only `keyring` 3 may",
+                    parent_package.0, parent_package.1
+                ));
+            }
+            if child_package == ("keyring", 3) && parent_package.0 != "pohunek-cli" {
+                violations.push(format!(
+                    "`{}` {}.x depends on `keyring` 3, which only `pohunek-cli` may",
+                    parent_package.0, parent_package.1
+                ));
+            }
         }
     }
+    if !legacy_found {
+        violations.push(
+            "no legacy zbus consumer remains: remove the RUSTSEC-2026-0370/0371/0372 ignores \
+             from .cargo/audit.toml and this test"
+                .to_owned(),
+        );
+    }
+    violations
+}
+
+#[test]
+fn legacy_zbus_family_is_reachable_only_through_the_keyring_secret_service_chain() {
+    let violations = legacy_zbus_violations(&workspace_metadata(true));
     assert!(
-        legacy_found,
-        "no legacy zbus consumer remains: remove the RUSTSEC-2026-0370/0371/0372 ignores from \
-         .cargo/audit.toml and this test"
+        violations.is_empty(),
+        "{}; the family must otherwise be zbus 6 (workspace dependency `zbus`)",
+        violations.join("; ")
+    );
+}
+
+/// Synthetic `cargo metadata` of the permitted chain plus `extra` edges
+/// (`parent -> child`, each named `name@major`).
+fn synthetic_metadata(extra: &[(&str, &str)]) -> serde_json::Value {
+    let mut edges = vec![
+        ("pohunek-cli@0", "keyring@3"),
+        ("keyring@3", "zbus@4"),
+        ("keyring@3", "secret-service@4"),
+        ("secret-service@4", "zbus@4"),
+        ("zbus@4", "zvariant@4"),
+        ("pohunek-platform@0", "zbus@6"),
+    ];
+    edges.extend_from_slice(extra);
+    let mut ids: Vec<&str> = edges.iter().flat_map(|(a, b)| [*a, *b]).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let packages: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            let (name, major) = id.split_once('@').expect("name@major");
+            serde_json::json!({"id": id, "name": name, "version": format!("{major}.0.0")})
+        })
+        .collect();
+    let nodes: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            let deps: Vec<_> = edges
+                .iter()
+                .filter(|(parent, _)| parent == id)
+                .map(|(_, child)| serde_json::json!({"pkg": child}))
+                .collect();
+            serde_json::json!({"id": id, "deps": deps})
+        })
+        .collect();
+    serde_json::json!({"packages": packages, "resolve": {"nodes": nodes}})
+}
+
+#[test]
+fn legacy_zbus_policy_accepts_the_reviewed_chain() {
+    assert_eq!(
+        legacy_zbus_violations(&synthetic_metadata(&[])),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn legacy_zbus_policy_rejects_any_other_consumer_of_the_chain() {
+    for (extra, expected) in [
+        (
+            ("other@1", "secret-service@4"),
+            "`other` 1.x depends on `secret-service` 4",
+        ),
+        (
+            ("other@1", "keyring@3"),
+            "`other` 1.x depends on `keyring` 3",
+        ),
+        (
+            ("pohunek-relay@0", "keyring@3"),
+            "`pohunek-relay` 0.x depends on `keyring` 3",
+        ),
+        (("other@1", "zbus@4"), "`other` 1.x depends on `zbus`"),
+        (
+            ("other@1", "zvariant@4"),
+            "`other` 1.x depends on `zvariant`",
+        ),
+        (
+            ("pohunek-cli@0", "secret-service@4"),
+            "`pohunek-cli` 0.x depends on `secret-service` 4",
+        ),
+    ] {
+        let violations = legacy_zbus_violations(&synthetic_metadata(&[extra]));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "{extra:?} must be rejected as `{expected}`; got {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn legacy_zbus_policy_asks_for_the_ignores_to_go_once_the_chain_is_gone() {
+    let mut metadata = synthetic_metadata(&[]);
+    for node in metadata["resolve"]["nodes"].as_array_mut().expect("nodes") {
+        node["deps"] = serde_json::json!([]);
+    }
+    let violations = legacy_zbus_violations(&metadata);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("no legacy zbus consumer remains")),
+        "{violations:?}"
     );
 }
