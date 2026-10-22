@@ -3139,13 +3139,16 @@ async fn a_turn_that_finished_before_the_session_stopped_is_still_reported() {
     );
 }
 
+/// A turn window no stop of a test session can outlast.
+const WINDOW_NO_RUN_REACHES_MS: u64 = 3_600_000;
+
 #[tokio::test]
 async fn a_turn_still_inside_its_window_is_dropped_when_the_session_stops() {
     let registry = turn_registry();
-    registry
-        .turn_events()
-        .flap_window_handle()
-        .store(3_000, std::sync::atomic::Ordering::Relaxed);
+    registry.turn_events().flap_window_handle().store(
+        WINDOW_NO_RUN_REACHES_MS,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let mut edges = registry
         .turn_events()
         .take_edge_receiver()
