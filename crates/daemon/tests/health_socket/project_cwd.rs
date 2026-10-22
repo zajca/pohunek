@@ -333,3 +333,22 @@ async fn a_project_session_launched_in_the_checkout_follows_its_directory_out() 
     );
     rig.finish().await;
 }
+
+#[tokio::test]
+async fn a_project_session_that_entered_a_repository_follows_its_directory_out() {
+    let mut rig = ProjectRig::start("pcwd-reenter").await;
+    let checkout = rig.repo.cwd().to_path_buf();
+    let outside = rig.outside.to_path_buf();
+    let session: SessionInfo =
+        serde_json::from_value(ok_payload(rig.new_session(Some(outside.clone())).await))
+            .expect("session info");
+    rig.move_session_to(&session.id, &checkout).await;
+
+    let moved = rig.move_session_to(&session.id, &outside).await;
+
+    assert_eq!(
+        moved.project_id, None,
+        "after entering a repository the session follows its directory like any other"
+    );
+    rig.finish().await;
+}

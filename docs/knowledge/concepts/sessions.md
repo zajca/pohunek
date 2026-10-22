@@ -816,9 +816,10 @@ kept when detection still finds a repository. A session started by reference
 (`--project`/`--repo`) whose launch directory lies outside every repository
 (`session new --cwd`) keeps its `project_id`/`repo`/`branch` while the observed
 cwd also resolves to no project; an observed cwd inside a repository follows
-it. A by-reference session launched inside a repository follows its cwd
-exactly like any other session, so a `cd` to a directory outside every
-repository clears the association.
+it, and from then on the session follows its cwd like any other session. A
+by-reference session launched inside a repository does the same from the
+start, so a `cd` to a directory outside every repository clears the
+association.
 
 Every managed `SessionInfo` has a `runtime` object distinct from its agent
 `state` and `activity`. Runtime state is one of `starting`, `live`,

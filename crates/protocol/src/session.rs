@@ -302,8 +302,9 @@ pub struct SessionNewParams {
     pub rows: u16,
     /// Project to run in, by `<id|label>` reference (see `docs/design/projects.md`).
     /// The daemon resolves it against **its own** project store and turns it into a
-    /// host-local checkout, so no filesystem path crosses the wire — this is the
-    /// only target option for a remote host. With `branch` it picks the worktree's
+    /// host-local checkout, so the reference itself carries no filesystem path;
+    /// the only path sent next to it is an explicit absolute `cwd`, which the
+    /// target host resolves. With `branch` it picks the worktree's
     /// source repository (the project's `repo_root`); without `branch` the agent
     /// runs in-place in that checkout. Takes precedence over `cwd` auto-detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
