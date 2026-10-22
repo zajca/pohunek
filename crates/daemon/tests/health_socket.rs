@@ -7108,7 +7108,10 @@ async fn event_log_rotates_within_the_configured_retention() {
         tokio::fs::metadata(&rotated).await.ok()
     })
     .await;
-    // The server is down before the listing, so no rotation races it.
+    // Stopping the server does not quiesce the journal writer: the harness
+    // drains hold a token that is never cancelled and the writer queue may
+    // still hold events, so a rotation can rename a file during the listing
+    // below. The `NotFound` arm tolerates that; keep it.
     let _ = shutdown.send(());
     let _ = handle.await;
     let mut journal_files = 0;

@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use package::PackageDigest;
 use pohunek_service_config::preflight::{PreflightReport, Verdict, CODE_RUNTIME_SOURCE_NOT_SERVED};
+use pohunek_test_support::time::TIMER_TICK;
 use pohunek_test_support::wait::wait_until;
 use protocol::{
     PackageBindProfileParams, PackageBindStatus, PackageErrorKind, PackageInstallStatus,
@@ -5688,6 +5689,9 @@ async fn a_worker_that_answers_inside_the_admission_wait_admits_the_report() {
     }
 
     released.reconnect().await;
+    // The admission is asleep until its next retry; the held clock moves only
+    // by this step, which stays inside the admission wait.
+    tokio::time::advance(crate::session::WORKER_CONNECT_RETRY + TIMER_TICK).await;
     admission
         .await
         .expect("the admission task joins")

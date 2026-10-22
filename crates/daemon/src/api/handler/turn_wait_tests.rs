@@ -365,10 +365,43 @@ pub(super) async fn settled_cursor(fixture: &Fixture, session: &str) -> String {
     let wait = fixture.spawn_wait(json!({
         "session_ids": [session], "until": ["turn_completed"], "timeout_ms": 1
     }));
-    settle().await;
-    tokio::time::advance(TIMER_TICK).await;
-    let result = ok(joined(wait).await);
+    let result = ok(finish_short_wait(wait).await);
     result["cursor"].as_str().expect("cursor").to_owned()
+}
+
+/// Wait duration of the 1 ms waits the scenarios use to read a cursor or to
+/// check that no event follows one.
+const SHORT_WAIT: Duration = Duration::from_millis(1);
+
+/// Upper bound on the clock steps [`finish_short_wait`] takes.
+const SHORT_WAIT_STEPS: usize = 8;
+
+/// Joins a [`SHORT_WAIT`] wait on the paused clock.
+///
+/// A wait that finds its answer at once finishes without a step. One that runs
+/// to its deadline needs the clock moved past it: with the clock held by an
+/// auto-advance inhibitor nothing else moves it, so the wait would otherwise
+/// last until the inhibitor's real-time ceiling.
+///
+/// # Panics
+///
+/// Panics when the wait is still running after [`SHORT_WAIT_STEPS`] steps.
+pub(super) async fn finish_short_wait(
+    wait: JoinHandle<Result<Value, ProtocolError>>,
+) -> Result<Value, ProtocolError> {
+    for _ in 0..SHORT_WAIT_STEPS {
+        settle().await;
+        if wait.is_finished() {
+            break;
+        }
+        tokio::time::advance(SHORT_WAIT + TIMER_TICK).await;
+    }
+    settle().await;
+    assert!(
+        wait.is_finished(),
+        "the short wait did not end at its deadline"
+    );
+    joined(wait).await
 }
 
 fn assert_progress_fields(progress: &Value, session: &str) {

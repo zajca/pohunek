@@ -260,7 +260,16 @@ impl ProcessInspector for PollBlindInspector {
         }
         match self.frozen_view(pid, |last_seen| last_seen.markers.clone()) {
             Some(markers) => Ok(markers),
-            None => self.host.ownership_markers(pid),
+            // A process the scenario does not own whose environment the host
+            // withholds (a non-dumpable helper of the developer's session, such
+            // as `op`) reads as a foreign process with no markers. Left
+            // unreadable, one that started after the worker would keep the
+            // removal unconfirmed by the rule under test elsewhere; the
+            // scenario's own bystander is the `unreadable_pid` above.
+            None => match self.host.ownership_markers(pid) {
+                Err(ProcwatchError::PermissionDenied { .. }) => Ok(OwnershipMarkers::default()),
+                other => other,
+            },
         }
     }
 
