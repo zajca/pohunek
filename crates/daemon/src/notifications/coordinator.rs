@@ -109,7 +109,7 @@ pub(crate) fn existed_at(record: &NotificationRecord, as_of: Option<&ResolveAsOf
         return true;
     };
     source_priority(&record.source) == SourcePriority::Projector
-        || created_at_of(record).map_or(true, |created_at| created_at <= as_of.wall)
+        || created_at_of(record).is_none_or(|created_at| created_at <= as_of.wall)
 }
 
 /// The creation time of `record`; an unreadable one is logged, and the callers
