@@ -113,6 +113,14 @@ The `[hooks] stderr_tail_bytes = 4096` key is the number of bytes of a failing
 It is a whole number in `0..=32768`; `0` disables the capture, and a value
 above the ceiling makes the daemon refuse startup with the named configuration
 error.
+The optional `[hooks] required = ["post-create"]` key lists the hook events whose
+failure aborts the operation instead of becoming a warning. Only `post-create`
+can be required in this release; another known event, an unknown name or a
+repeated entry makes the configuration load fail with the named key, and
+`pohunek service check` reports it. The installer omits the key while it is
+empty, so a previous release still reads the file. A previous release that reads
+a file with the key reports it as an unknown key and does not enforce it. See
+the hooks guide in [worktrees](../concepts/worktrees.md).
 The `[events]` table bounds the event journal `<data>/events/events.jsonl`:
 `max_file_bytes = 33554432` (one file, `1048576..=1073741824`),
 `max_files = 8` (files kept including the active one, `2..=64`) and

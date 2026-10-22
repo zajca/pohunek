@@ -50,6 +50,7 @@
 //!
 //! [hooks]
 //! stderr_tail_bytes = 4096                         # 0..=32768; 0 disables the capture
+//! required = ["post-create"]                       # optional; omitted while empty
 //!
 //! [events]                                        # bounds <data>/events/events.jsonl
 //! max_file_bytes = 33554432                        # 1048576..=1073741824; one journal file
@@ -73,6 +74,13 @@
 //! `[hooks]` bounds how much of a failing worktree-create hook's stderr the
 //! daemon keeps for the `session.new` warning. See
 //! [`DEFAULT_HOOK_STDERR_TAIL_BYTES`] and [`MAX_HOOK_STDERR_TAIL_BYTES`].
+//!
+//! `hooks.required` lists the hook events whose failure aborts the operation
+//! instead of becoming a warning; see [`RequiredHook`]. The key is optional,
+//! the default is an empty list, and the writer omits it while it is empty, so
+//! a previous release still reads the file unless the operator set it. A
+//! previous release that reads a file with the key reports it as an unknown key
+//! and does not enforce it.
 //!
 //! # Compatibility
 //!
@@ -755,6 +763,37 @@ impl UpgradeSource {
     }
 }
 
+/// A lifecycle hook event whose failure aborts the operation it belongs to.
+///
+/// Only the events listed here can be named in `hooks.required`; every other
+/// known event is refused at load as unsupported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RequiredHook {
+    /// A failing `post-create` hook aborts `session.new` and rolls the create back.
+    PostCreate,
+}
+
+impl RequiredHook {
+    /// The event's name as `service.toml` and the hook file name spell it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PostCreate => "post-create",
+        }
+    }
+}
+
+/// Every lifecycle hook event name, whether or not it can be required.
+const HOOK_EVENT_NAMES: [&str; 7] = [
+    "pre-create",
+    "post-create",
+    "pre-remove",
+    "post-remove",
+    "session-start",
+    "session-stop",
+    "agent-state",
+];
+
 /// Unvalidated values for [`ServiceConfig::new`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigSpec {
@@ -784,6 +823,8 @@ pub struct ConfigSpec {
     /// Bytes of a failing worktree-create hook's stderr kept for its warning;
     /// 0 disables the capture.
     pub hook_stderr_tail_bytes: u32,
+    /// Hook events whose failure aborts the operation; each event at most once.
+    pub hook_required: Vec<RequiredHook>,
     /// Size, count and age bounds of the event journal.
     pub event_retention: EventRetention,
     /// Open-file limit applied to supervised jobs.
@@ -809,6 +850,7 @@ pub struct ServiceConfig {
     input_timing: InputTiming,
     wait_timing: WaitTiming,
     hook_stderr_tail_bytes: u32,
+    hook_required: Vec<RequiredHook>,
     event_retention: EventRetention,
     open_files: u64,
     unknown: UnknownKeys,
@@ -880,6 +922,7 @@ impl ServiceConfig {
                 max: u64::from(MAX_HOOK_STDERR_TAIL_BYTES),
             });
         }
+        validate_required_hooks(&spec.hook_required)?;
         validate_event_retention(spec.event_retention)?;
         if !(MIN_OPEN_FILES..=MAX_OPEN_FILES).contains(&spec.open_files) {
             return Err(ConfigError::OutOfRange {
@@ -904,6 +947,7 @@ impl ServiceConfig {
             input_timing: spec.input_timing,
             wait_timing: spec.wait_timing,
             hook_stderr_tail_bytes: spec.hook_stderr_tail_bytes,
+            hook_required: spec.hook_required,
             event_retention: spec.event_retention,
             open_files: spec.open_files,
             unknown: UnknownKeys::default(),
@@ -1079,6 +1123,11 @@ impl ServiceConfig {
             waits: RawWaits::from(self.wait_timing),
             hooks: RawHooks {
                 stderr_tail_bytes: self.hook_stderr_tail_bytes,
+                required: self
+                    .hook_required
+                    .iter()
+                    .map(|hook| hook.as_str().to_owned())
+                    .collect(),
             },
             events: RawEvents::from(self.event_retention),
             limits: RawLimits {
@@ -1113,6 +1162,7 @@ impl ServiceConfig {
             input_timing: self.input_timing,
             wait_timing: self.wait_timing,
             hook_stderr_tail_bytes: self.hook_stderr_tail_bytes,
+            hook_required: self.hook_required.clone(),
             event_retention: self.event_retention,
             open_files: self.open_files,
         }
@@ -1256,6 +1306,13 @@ impl ServiceConfig {
     #[must_use]
     pub fn hook_stderr_tail_bytes(&self) -> u32 {
         self.hook_stderr_tail_bytes
+    }
+
+    /// Returns the hook events whose failure aborts the operation; empty when
+    /// `hooks.required` is absent.
+    #[must_use]
+    pub fn hook_required(&self) -> &[RequiredHook] {
+        &self.hook_required
     }
 
     /// Returns the size, count and age bounds of the event journal.
@@ -1549,12 +1606,15 @@ fn is_default_keepalive_count(value: &u32) -> bool {
 #[derive(Debug, Serialize, Deserialize)]
 struct RawHooks {
     stderr_tail_bytes: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    required: Vec<String>,
 }
 
 impl RawHooks {
     /// The documented value assigned to a previous schema, which has no `[hooks]`.
     const DEFAULT: Self = Self {
         stderr_tail_bytes: DEFAULT_HOOK_STDERR_TAIL_BYTES,
+        required: Vec::new(),
     };
 }
 
@@ -1816,7 +1876,10 @@ impl RawConfig {
                 keepalive_interval_ms: default_keepalive_interval_ms() + 1,
                 keepalive_count: default_keepalive_count() + 1,
             },
-            hooks: RawHooks::DEFAULT,
+            hooks: RawHooks {
+                stderr_tail_bytes: DEFAULT_HOOK_STDERR_TAIL_BYTES,
+                required: vec![String::new()],
+            },
             events: RawEvents::DEFAULT,
             limits: RawLimits { open_files: 0 },
         }
@@ -2124,6 +2187,7 @@ fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
             },
         },
         hook_stderr_tail_bytes: raw.hooks.stderr_tail_bytes,
+        hook_required: parse_required_hooks(&raw.hooks.required)?,
         event_retention: EventRetention {
             max_file_bytes: raw.events.max_file_bytes,
             max_files: raw.events.max_files,
@@ -2426,6 +2490,36 @@ fn validate_keepalive_timing(keepalive: KeepaliveTiming) -> Result<(), ConfigErr
             min: u64::from(MIN_KEEPALIVE_COUNT),
             max: u64::from(MAX_KEEPALIVE_COUNT),
         });
+    }
+    Ok(())
+}
+
+/// Resolves the `hooks.required` entries to the events a release can require.
+///
+/// An entry that is no hook event fails without being echoed. A known event
+/// this release cannot require names itself in the error.
+fn parse_required_hooks(entries: &[String]) -> Result<Vec<RequiredHook>, ConfigError> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| match entry.as_str() {
+            "post-create" => Ok(RequiredHook::PostCreate),
+            other => match HOOK_EVENT_NAMES.iter().find(|name| **name == other) {
+                Some(event) => Err(ConfigError::UnsupportedRequiredHook { index, event }),
+                None => Err(ConfigError::InvalidHookEvent { index }),
+            },
+        })
+        .collect()
+}
+
+/// Rejects an event listed twice in `hooks.required`.
+fn validate_required_hooks(hooks: &[RequiredHook]) -> Result<(), ConfigError> {
+    for (index, hook) in hooks.iter().enumerate() {
+        if let Some(first) = hooks.iter().position(|earlier| earlier == hook) {
+            if first != index {
+                return Err(ConfigError::DuplicateRequiredHook { index, first });
+            }
+        }
     }
     Ok(())
 }

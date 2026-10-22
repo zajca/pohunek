@@ -21,6 +21,8 @@ mod official_runtimes;
 mod project_cwd;
 #[path = "../src/procwatch/readable_host.rs"]
 mod readable_host;
+#[path = "health_socket/required_hooks.rs"]
+mod required_hooks;
 #[path = "support/root_reporter.rs"]
 mod root_reporter;
 #[path = "health_socket/session_metadata.rs"]

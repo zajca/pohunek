@@ -783,6 +783,7 @@ fn apply_service_settings(config: &mut SessionRegistryConfig, service: &ServiceC
     apply_input_timing(config, service.input_timing());
     apply_wait_timing(config, service.wait_timing());
     config.hook_stderr_tail_bytes = service.hook_stderr_tail_bytes();
+    config.hook_required = service.hook_required().to_vec();
     config.event_retention = service.event_retention();
 }
 

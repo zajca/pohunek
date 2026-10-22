@@ -352,8 +352,10 @@ config) and failure mode (a missing hook is skipped; a missing prompt is an erro
 ## B.1 The hook set
 
 React-only scripts the daemon runs at lifecycle points. Per the design decision,
-**v1 hooks never alter behavior** — they observe and cause side effects; the
-operation proceeds regardless of hook outcome (failure → non-fatal warning).
+**v1 hooks do not alter behavior by default** — they observe and cause side
+effects; the operation proceeds regardless of hook outcome (failure → non-fatal
+warning). A host can require `post-create` (`[hooks] required`, #670); then its
+failure ends `session.new` after the rollback (B.4).
 
 | Hook | Fires at (file:line) | cwd | Context (env) | Typical use |
 |---|---|---|---|---|
@@ -452,7 +454,9 @@ discipline is enforced in **one place** for every event:
   *output*, not the hook's own outbound `curl`). Clearing the env is the **primary**
   secret-safety control; the discard rule complements it. See
   [Security & trust](#security--trust).
-- failure/timeout/spawn-error → a **non-fatal** `SessionWarning`. `SessionWarningKind`
+- failure/timeout/spawn-error → a **non-fatal** `SessionWarning` (an error,
+  `hook_required_failed`, for a `post-create` the host lists in
+  `[hooks] required`). `SessionWarningKind`
   serializes today as a bare string (unit variants `fetch`/`base_branch_fallback`/
   `setup_script`, `protocol/src/session.rs:278`; CLI maps each to a label,
   `cli/src/commands/session.rs:795`), so the new kind is a **unit variant `Hook`**
@@ -541,22 +545,25 @@ default 4096, `0..=32768`, `0` disables the capture) while the hook runs:
 
 ## B.4 Semantics (resolved for v1, open to review)
 
-- **React-only, never veto.** No hook can abort an operation in v1 (honors the "jen
-  reagovat" decision). A failing `pre-create` does **not** stop creation; a failing
-  `pre-remove` does **not** stop removal. (A future opt-in "blocking" hook with a
-  defined error class is noted in [Open questions](#open-questions).)
+- **React-only by default.** A failing hook is a warning and does not stop the
+  operation (honors the "jen reagovat" decision). A host opts a hook into
+  blocking with `service.toml` `[hooks] required`; only `post-create` can be
+  required (#670), and a failure ends `session.new` with `hook_required_failed`
+  after the rollback below. `pre-create` and the remove hooks never block
+  (`pre-remove` is #747).
 - **Create hooks fire on fresh-create only, not reuse.** Matches the setup script,
   which never runs on a reused worktree (`worktree/mod.rs:216` early-returns before
   `:269`).
 - **Remove hooks are best-effort.** `cleanup_session`/`cleanup_project` already drop
   the binding even when `git worktree remove` fails; hooks fit that contract and
   never block binding cleanup.
-- **`post-create` must be idempotent / tolerate a hook-silent rollback.** The
-  `post-create` seam (`:269`) runs **before** the binding is persisted (`:284`); if
-  the persist fails the worktree is rolled back via `worktree_remove` (`:290`)
-  **without firing any remove hook**. So a `post-create` side effect can leak; v1
-  requires `post-create` effects to be idempotent/self-healing. Moving the seam to
-  after `:284` is an alternative noted in [Open questions](#open-questions).
+- **`post-create` must be idempotent.** The binding is persisted before `git
+  worktree add`, and `post-create` runs after it. A create that fails afterwards
+  (a required `post-create`, a launch failure) is compensated through
+  `compensate_abandoned_create`, which runs `pre-remove` and `post-remove` and
+  drops the binding and the record. A `post-create` that already ran can
+  therefore be followed by the remove pair, and a retried create runs it again,
+  so its effects must be idempotent.
 - **No `worktree.*` protocol method is introduced.** Worktrees are still created only
   as a side effect of `session.new`; hooks fire inside that flow.
 
@@ -1208,9 +1215,9 @@ RFC contains genuinely breaking changes; none of them carry a compat shim.
    project's actions (instead of fixed `$mod+i`/`$mod+p` keybinds). Nice-to-have.
 3. **Per-project file vs sections** for any host-side per-project overrides
    (`projects/<id>.toml` vs `[project.<id>]` sections). Both viable.
-4. **Opt-in blocking hooks.** Should a future `pre-create`/`pre-remove` veto via a
-   documented exit code + error class? Out of scope for v1; `worktree/mod.rs:256` is
-   the seam.
+4. **Opt-in blocking hooks.** `post-create` is blockable per host
+   (`[hooks] required`, error `hook_required_failed`, #670). Whether
+   `pre-remove` (#747) and the other events follow is open.
 5. **`<event>.d/` directories** (multiple ordered scripts per event) — single-file
    form first.
 6. **`post-create` seam placement** — before vs after the binding persist (`:284`),

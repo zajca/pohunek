@@ -473,6 +473,9 @@ pub struct SessionRegistryConfig {
     /// `session.new` warning (`hooks.stderr_tail_bytes`); 0 discards it.
     /// Defaults to [`DEFAULT_HOOK_STDERR_TAIL_BYTES`].
     pub hook_stderr_tail_bytes: u32,
+    /// Hook events whose failure aborts the operation (`hooks.required`);
+    /// empty requires nothing.
+    pub hook_required: Vec<pohunek_service_config::RequiredHook>,
     /// How long a background process may keep a captured hook's stderr open
     /// after the hook ended before the daemon hands the stderr to a drain
     /// process.
@@ -624,6 +627,7 @@ impl Default for SessionRegistryConfig {
             session_tmp_root: None,
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
             hook_stderr_tail_bytes: DEFAULT_HOOK_STDERR_TAIL_BYTES,
+            hook_required: Vec::new(),
             hook_stderr_release_grace: DEFAULT_HOOK_STDERR_RELEASE_GRACE,
             event_log_dir: None,
             event_retention: pohunek_service_config::DEFAULT_EVENT_RETENTION,
@@ -2227,19 +2231,22 @@ impl SessionRegistry {
         // Worktree binding needs both a root for the trees and the shared store;
         // it is enabled only when both are configured (no silent default path).
         let worktree = match (&config.worktree_root, &store) {
-            (Some(root), Some(store)) => Some(Arc::new(WorktreeManager::new(
-                root.clone(),
-                Arc::clone(store),
-                config.hook_timeout,
-                usize::try_from(config.hook_stderr_tail_bytes)
-                    .ok()
-                    .and_then(NonZeroUsize::new)
-                    .map(|tail| HookStderrCapture {
-                        tail,
-                        release_grace: config.hook_stderr_release_grace,
-                    }),
-                config.config_dir.clone(),
-            ))),
+            (Some(root), Some(store)) => Some(Arc::new(
+                WorktreeManager::new(
+                    root.clone(),
+                    Arc::clone(store),
+                    config.hook_timeout,
+                    usize::try_from(config.hook_stderr_tail_bytes)
+                        .ok()
+                        .and_then(NonZeroUsize::new)
+                        .map(|tail| HookStderrCapture {
+                            tail,
+                            release_grace: config.hook_stderr_release_grace,
+                        }),
+                    config.config_dir.clone(),
+                )
+                .with_required_hooks(&config.hook_required),
+            )),
             _ => None,
         };
         // The project manager shares the same store as resume/worktree records, so
