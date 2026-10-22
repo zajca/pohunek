@@ -125,10 +125,11 @@ pub(crate) enum CliError {
     )]
     AgentSkillNotEmbedded,
 
-    /// A remote `session new` named no target. No filesystem path crosses the
-    /// wire to another host, so a remote session must be referenced by `--project`
-    /// (or, for first-introduction, `--repo` with a path valid on that host). Fails
-    /// fast before any connection is dialed (design Decision 1).
+    /// A remote `session new` named no target. The CLI's own directory means
+    /// nothing on another host, so a remote session must be referenced by
+    /// `--project` (or, for first-introduction, `--repo` with a path valid on that
+    /// host); an explicit `--cwd` names a path on that host. Fails fast before any
+    /// connection is dialed (design Decision 1).
     #[error(
         "starting a session on a remote host requires a --project reference \
          (or --repo with a path valid on that host)"

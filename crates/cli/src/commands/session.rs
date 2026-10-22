@@ -3172,8 +3172,8 @@ mod tests {
 
     #[test]
     fn prepare_new_args_remote_without_project_or_repo_is_rejected() {
-        // No filesystem path crosses the wire to a remote host: a remote start must
-        // name a --project (or --repo), and is rejected before any dial.
+        // The CLI's own directory means nothing on a remote host: a remote start
+        // must name a --project (or --repo), and is rejected before any dial.
         let err = prepare_new_args("host-b", new_args("shell", Some(PathBuf::from("/x"))))
             .expect_err("remote without a target is rejected");
         assert!(

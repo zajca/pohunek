@@ -375,7 +375,7 @@ fn a_daemon_that_ignores_the_directory_is_refused_before_the_session_is_created(
     );
     let message = run.document["err"]["msg"].as_str().unwrap_or_default();
     assert!(message.contains("session_new_cwd_supported"), "{message}");
-    assert!(message.contains("daemon"), "{message}");
+    assert!(message.contains("upgrade the daemon"), "{message}");
     assert!(
         run.session_new().is_none(),
         "no session may start in an unrequested directory: {:?}",

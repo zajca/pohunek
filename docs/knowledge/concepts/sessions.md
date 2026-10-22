@@ -813,13 +813,18 @@ the new cwd is inside another registered active worktree, `worktree_path`,
 `branch`, and project metadata move to that worktree; if it is outside every
 known worktree, `worktree_path` is cleared while git `repo`/`branch` metadata is
 kept when detection still finds a repository. A session started by reference
-(`--project`/`--repo`) whose launch directory lies outside every repository
-(`session new --cwd`) keeps its `project_id`/`repo`/`branch` while the observed
-cwd also resolves to no project; an observed cwd inside a repository follows
-it, and from then on the session follows its cwd like any other session. A
-by-reference session launched inside a repository does the same from the
-start, so a `cd` to a directory outside every repository clears the
-association.
+(`--project`/`--repo`, `session new --cwd`) in a directory outside every
+repository remembers the reference's association (`project_id`, `repo`,
+`branch`) in memory. While its observed cwd provably lies outside every
+repository it holds that association, also when it returns there after
+following another repository. An observed cwd inside a repository follows that
+repository, and an observed cwd the daemon cannot read, or whose repository
+state it cannot determine (a missing directory, a failed or timed-out `git`
+call), follows the cwd and clears the association. Every other session, one
+started inside a repository, one not started by reference, and any session
+after a daemon restart (the memory does not survive it), follows its cwd
+exactly: a `cd` outside every repository clears the association. The decision
+is taken under the same lock that applies the cwd.
 
 Every managed `SessionInfo` has a `runtime` object distinct from its agent
 `state` and `activity`. Runtime state is one of `starting`, `live`,

@@ -306,7 +306,8 @@ pub struct SessionNewParams {
     /// the only path sent next to it is an explicit absolute `cwd`, which the
     /// target host resolves. With `branch` it picks the worktree's
     /// source repository (the project's `repo_root`); without `branch` the agent
-    /// runs in-place in that checkout. Takes precedence over `cwd` auto-detection.
+    /// runs in-place, in `cwd` when one is given and otherwise in that checkout.
+    /// Takes precedence over `cwd` auto-detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub project: Option<String>,
