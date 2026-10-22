@@ -2617,7 +2617,7 @@ selects by itself.
 |---|---|---|
 | Nothing selected, or H selected and its root missing or not loading; H enabled or disabled | gap `official_package_not_serving`, no package entry, profile left unbound | remove H, then the follow-up; Pi: install or update step |
 | H unselected or selected, root altered | refusal with the root-invalid code | `--remove-modified` removal of H, then the follow-up |
-| H selected and not official (hand-edited registry) | gap | remove H, then the follow-up (H is the obstacle whatever its source) |
+| H selected and not official (hand-edited registry) | gap; refusal when its root is altered | remove H (`--remove-modified` when altered), then the follow-up (H is the obstacle whatever its source) |
 | Another version X selected, enabled, root missing or not loading | gap | restore X with `plugin install`, or `plugin select <package> --digest <H>`; or, while H is not pinned, remove H with the follow-up |
 | X selected, root altered | refusal for X | removal of X with `--remove-modified`, then the upgrade again, which names the removal of H |
 | A non-official S selected | gap | `plugin select <package> --digest <digest>`; or, while H is not pinned, remove H with the follow-up |
@@ -2626,14 +2626,16 @@ selects by itself.
 
 A pinned O (a host profile names its package and digest, or a session record holds it) cannot
 be removed: the registry refuses the removal while the pin stands. The hint then names the
-pin first: "a host profile (`<name>.toml`) or a session record pins it, so the registry refuses
+pin first: "the host profile `<name>.toml` pins it" or "a session record pins it", "so the registry refuses
 its removal until the pin is released", with the exit "remove the `package` and `digest`
 lines from `<name>.toml` in the host profile directory" or "remove the sessions launched from
 it" (no command releases a pin), and then the removal and the follow-up. A reserved runtime
-that only the pinning session used gets no "run the upgrade again". A hint that offers
-the removal of H beside another obstacle X does so only while nothing pins H. A runtime that
-is used only by `--detect` gets no command in a gap and the removal in a refusal. A runtime
-nothing uses gets "the fix is a release that gives the package a new version".
+that only the pinning session used gets no "run the upgrade again", because the plain upgrade
+no longer plans it once the sessions are gone. A hint that offers
+the removal of H beside another obstacle X does so only while nothing pins H. A reserved runtime that
+is used only by `--detect` gets no command in a gap and the removal in a refusal; a reserved
+runtime nothing uses gets "the fix is a release that gives the package a new version". A Pi
+always gets the commands, because its install and select run by hand whatever uses it.
 A profile that pins another installed version P keeps the command: the uninstall is accepted
 with P retained, and the next apply installs the release's archive and repins the profile
 from P.

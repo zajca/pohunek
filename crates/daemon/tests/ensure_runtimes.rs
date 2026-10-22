@@ -5710,10 +5710,42 @@ const CELLS: &[Cell] = &[
         ..BASE
     },
     Cell {
+        id: "R6 altered holder pinned by the only session",
+        runtimes: CLAUDE,
+        profile: false,
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Altered)],
+        pin: Some((Holder, PinKind::Session)),
+        outcome: Outcome::Refusal,
+        steps: &[Release, RemoveModified(Holder)],
+        end: End::Removed,
+        ..BASE
+    },
+    Cell {
+        id: "R12 older selected, altered, pinned by the only session",
+        runtimes: CLAUDE,
+        profile: false,
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::Altered)],
+        pin: Some((Older, PinKind::Session)),
+        outcome: Outcome::Refusal,
+        steps: &[Release, RemoveModified(Older)],
+        end: End::Removed,
+        ..BASE
+    },
+    Cell {
         id: "R7 selected holder not official",
         installs: &[(Holder, true, true)],
         damage: &[(Holder, Damage::NonOfficial)],
         steps: &[Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R7 selected holder not official, altered",
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::NonOfficial), (Holder, Damage::Altered)],
+        outcome: Outcome::Refusal,
+        steps: &[RemoveModified(Holder)],
         ..BASE
     },
     Cell {
@@ -6136,7 +6168,8 @@ async fn run_cell(cell: &Cell, runtime: &str) {
         !matches!(cell.end, End::Removed | End::Present),
         "{label}: {detail}"
     );
-    let pins_named = detail.contains("pin it, so the registry refuses its removal");
+    let pins_named =
+        detail.contains("it, so the registry refuses its removal until the pin is released");
     assert_eq!(
         pins_named,
         cell.steps.iter().any(|step| matches!(step, Release)),

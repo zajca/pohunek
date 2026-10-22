@@ -2736,6 +2736,12 @@ fn held_selection(plan: &PlanInputs<'_>, blocked: &Blocked<'_>) -> Option<(Packa
                     Health::Damaged(kind) => Held::Damaged(kind, selected.clone()),
                 }
             }
+            // The registry refuses the plain uninstall of the altered root of a
+            // selected holder whatever its source.
+            _ if *selected == holder => match health_of(plan, selected) {
+                Health::Damaged(kind) => Held::Damaged(kind, selected.clone()),
+                Health::Present | Health::Install => Held::NotOfficial(selected.clone()),
+            },
             _ => Held::NotOfficial(selected.clone()),
         },
     };
@@ -2814,7 +2820,7 @@ fn held_hint(
         if named && !plan.retained.contains(holder) {
             let altered = matches!(health_of(plan, holder), Health::Damaged(_));
             let command = uninstall_command(id, holder, altered);
-            let follow = follow_up(plan, blocked, holder, holder, reserved, reasons, altered)
+            let follow = follow_up(plan, blocked, holder, holder, reserved, reasons)
                 .map(|step| format!(", then {step}"))
                 .unwrap_or_default();
             let _ = write!(
@@ -2880,7 +2886,7 @@ fn removal_clause(
 ) -> String {
     let pin = pin_release(plan, obstacle).unwrap_or_default();
     let command = uninstall_command(blocked.id, obstacle, altered);
-    let follow = follow_up(plan, blocked, obstacle, holder, reserved, reasons, altered)
+    let follow = follow_up(plan, blocked, obstacle, holder, reserved, reasons)
         .map(|step| format!(", then {step}"))
         .unwrap_or_default();
     format!("; {pin}remove it with `{command}`{follow}")
@@ -2904,10 +2910,14 @@ fn pin_release(plan: &PlanInputs<'_>, digest: &PackageDigest) -> Option<String> 
     let mut who = Vec::new();
     let mut exit = Vec::new();
     if !profiles.is_empty() {
-        who.push(format!("the host profile {}", profiles.join(", ")));
+        let names = profiles
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        who.push(format!("the host profile {names}"));
         exit.push(format!(
-            "remove the package and digest lines from {} in the host profile directory",
-            profiles.join(", ")
+            "remove the `package` and `digest` lines from {names} in the host profile directory"
         ));
     }
     if session {
@@ -2918,8 +2928,13 @@ fn pin_release(plan: &PlanInputs<'_>, digest: &PackageDigest) -> Option<String> 
         who.push("a host profile or session".to_owned());
         exit.push("release the pin".to_owned());
     }
+    let verb = if profiles.len() + usize::from(session) > 1 {
+        "pin"
+    } else {
+        "pins"
+    };
     Some(format!(
-        "{} pin it, so the registry refuses its removal until the pin is released: {}; then ",
+        "{} {verb} it, so the registry refuses its removal until the pin is released: {}; then ",
         who.join(" and "),
         exit.join(" and ")
     ))
@@ -2935,20 +2950,24 @@ fn follow_up(
     holder: &PackageDigest,
     reserved: bool,
     reasons: &[UseReason],
-    refusal: bool,
 ) -> Option<String> {
     let upgrade = "run the upgrade again".to_owned();
-    // The holder stays recorded, so the next upgrade names the next step.
-    if removed != holder {
-        return Some(upgrade);
-    }
     if reserved {
+        // Detection alone is a use only for a runtime nothing else uses, so the
+        // three modes name the same step.
         let used_after = reasons.iter().any(|reason| match reason {
             UseReason::Profile | UseReason::Integration => true,
             UseReason::Session => !plan.pins.session.contains(removed),
             UseReason::Detected | UseReason::Installed => false,
         });
-        return (used_after || refusal).then_some(upgrade);
+        let detected_only = reasons
+            .iter()
+            .all(|reason| matches!(reason, UseReason::Detected));
+        return (used_after || detected_only).then_some(upgrade);
+    }
+    // The holder stays recorded, so the next upgrade names the next step.
+    if removed != holder {
+        return Some(upgrade);
     }
     let state = plan.state?;
     let kept = state.selected(blocked.id).is_some_and(|selected| {

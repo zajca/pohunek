@@ -867,7 +867,7 @@ upgrade does not install a Pi package again once none is installed.
 When no enabled official selection serves beside the recorded package (nothing is selected,
 or the recorded package itself is the selected one and its root is missing or does not load), the upgrade installs nothing,
 leaves the runtime and reports the gap `official_package_not_serving`; for a runtime
-that is used, the detail names the removal of the obstacle (the selected package, or the
+that is used (a Pi always), the detail names the removal of the obstacle (the selected package, or the
 recorded one when nothing is selected) with `pohunek plugin uninstall <package> --digest
 <digest> --yes`, and `--remove-modified` for an altered root, which is a refusal. A host
 profile or session record that pins the obstacle is named first, with how to release it, because the registry
