@@ -77,7 +77,7 @@ pub(super) struct Fixture {
     state: DaemonState,
     pub(super) sessions: SessionRegistry,
     root: tempfile::TempDir,
-    _projector: NotificationProjector,
+    projector: std::sync::Mutex<Option<NotificationProjector>>,
     _coordinator: AttentionCoordinatorTask,
 }
 
@@ -85,6 +85,18 @@ impl Fixture {
     /// The notification service the daemon components share.
     pub(super) fn notifications(&self) -> &crate::notifications::NotificationService {
         self.state.notifications.as_ref().expect("notifications")
+    }
+
+    /// Ends the projector as a daemon shutdown does: it drains what it was
+    /// sent and stops.
+    pub(super) async fn end_projector(&self) {
+        let projector = self
+            .projector
+            .lock()
+            .expect("projector slot is never poisoned")
+            .take()
+            .expect("the projector runs");
+        projector.shutdown().await;
     }
 
     /// Builds the daemon components with the default notification policy.
@@ -137,7 +149,7 @@ impl Fixture {
             state,
             sessions,
             root,
-            _projector: projector,
+            projector: std::sync::Mutex::new(Some(projector)),
             _coordinator: coordinator,
         }
     }

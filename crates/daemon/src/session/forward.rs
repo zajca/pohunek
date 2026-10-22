@@ -31,6 +31,31 @@ use super::{
 use crate::agent::ResolvedAgent;
 use crate::runtime::{Worker, WorkerError};
 
+/// What a bound release's forward left behind.
+pub(super) struct ForwardedRelease {
+    pub(super) outcome: Forwarded<SessionReleaseAgentResult>,
+    /// Whether the forward already logged `session.active_identity.forward_failed`
+    /// for this release, so the daemon's own decision does not log it again.
+    pub(super) failure_logged: bool,
+}
+
+/// Why a report or release is not offered to the worker.
+struct ForwardRefusal {
+    /// Whether the refusal logged `session.active_identity.forward_failed`.
+    failure_logged: bool,
+}
+
+impl ForwardRefusal {
+    /// A report or release that cannot be forwarded and logged no failure.
+    const QUIET: Self = Self {
+        failure_logged: false,
+    };
+    /// A forward whose worker did not answer within the bound.
+    const LOGGED: Self = Self {
+        failure_logged: true,
+    };
+}
+
 /// What became of a report or release offered to the worker.
 pub(super) enum Forwarded<T> {
     /// The worker answered, and the answer is the public result.
@@ -107,12 +132,13 @@ impl SessionRegistry {
         activity: Option<(AgentActivity, &str)>,
         guard: &mut Option<CommitGuard>,
     ) -> Forwarded<SessionReportAgentResult> {
-        let Some(target) = self
+        let Ok(target) = self
             .forward_target(
                 &params.session_id,
                 params.pid,
                 params.monotonic_sequence,
                 attested_start,
+                ForwardedOperation::Report,
             )
             .await
         else {
@@ -190,7 +216,9 @@ impl SessionRegistry {
                     Forwarded::MemoryOnly
                 }
                 Err(_elapsed) => {
-                    registry.note_forward_timed_out(&id, deadline).await;
+                    registry
+                        .note_forward_timed_out(&id, deadline, ForwardedOperation::Report)
+                        .await;
                     // A request that never left was not seen by the worker.
                     if task_sent.load(std::sync::atomic::Ordering::Acquire) {
                         Forwarded::Unacknowledged(Unacknowledged::Report(Box::new(
@@ -243,17 +271,24 @@ impl SessionRegistry {
         resolved: &ResolvedAgent,
         attested_start: Option<u64>,
         guard: &mut Option<CommitGuard>,
-    ) -> Forwarded<SessionReleaseAgentResult> {
-        let Some(target) = self
+    ) -> ForwardedRelease {
+        let target = match self
             .forward_target(
                 &params.session_id,
                 params.pid,
                 params.monotonic_sequence,
                 attested_start,
+                ForwardedOperation::Release,
             )
             .await
-        else {
-            return Forwarded::MemoryOnly;
+        {
+            Ok(target) => target,
+            Err(refusal) => {
+                return ForwardedRelease {
+                    outcome: Forwarded::MemoryOnly,
+                    failure_logged: refusal.failure_logged,
+                };
+            }
         };
         let release = ForwardedActiveRelease {
             provider: resolved.base.as_str().to_owned(),
@@ -287,7 +322,7 @@ impl SessionRegistry {
                 worker.release_active_identity_tracked(release, &task_sent),
             )
             .await;
-            let forwarded = match outcome {
+            let (forwarded, failure_logged) = match outcome {
                 Ok(Ok(ActiveIdentityOutcome::Accepted { revision })) => {
                     Box::pin(registry.commit_forwarded(
                         &id,
@@ -296,7 +331,10 @@ impl SessionRegistry {
                         ForwardedContext::Release(context),
                     ))
                     .await;
-                    Forwarded::Answered(SessionReleaseAgentResult { released: true })
+                    (
+                        Forwarded::Answered(SessionReleaseAgentResult { released: true }),
+                        false,
+                    )
                 }
                 Ok(Ok(ActiveIdentityOutcome::Rejected { reason })) => {
                     debug!(
@@ -304,49 +342,59 @@ impl SessionRegistry {
                         reason = ?reason,
                         "the worker rejected a forwarded active-agent release"
                     );
-                    if registry.identity_is_memory_only(&id).await {
+                    let forwarded = if registry.identity_is_memory_only(&id).await {
                         Forwarded::MemoryOnly
                     } else {
                         Forwarded::Answered(SessionReleaseAgentResult { released: false })
-                    }
+                    };
+                    (forwarded, false)
                 }
                 Ok(Err(error @ WorkerError::AnswerLost(_))) => {
                     registry
                         .note_forward_failed(&id, ForwardedOperation::Release, &error)
                         .await;
-                    Forwarded::Unacknowledged(Unacknowledged::Release(Box::new(
-                        registry.unacknowledged_release(&id, context).await,
-                    )))
+                    (
+                        Forwarded::Unacknowledged(Unacknowledged::Release(Box::new(
+                            registry.unacknowledged_release(&id, context).await,
+                        ))),
+                        true,
+                    )
                 }
                 Ok(Err(error)) => {
                     registry
                         .note_forward_failed(&id, ForwardedOperation::Release, &error)
                         .await;
-                    Forwarded::MemoryOnly
+                    (Forwarded::MemoryOnly, true)
                 }
                 Err(_elapsed) => {
-                    registry.note_forward_timed_out(&id, deadline).await;
+                    registry
+                        .note_forward_timed_out(&id, deadline, ForwardedOperation::Release)
+                        .await;
                     // A request that never left was not seen by the worker.
-                    if task_sent.load(std::sync::atomic::Ordering::Acquire) {
+                    let forwarded = if task_sent.load(std::sync::atomic::Ordering::Acquire) {
                         Forwarded::Unacknowledged(Unacknowledged::Release(Box::new(
                             registry.unacknowledged_release(&id, context).await,
                         )))
                     } else {
                         Forwarded::MemoryOnly
-                    }
+                    };
+                    (forwarded, true)
                 }
             };
-            (forwarded, held)
+            (forwarded, held, failure_logged)
         });
         match task.await {
-            Ok((forwarded, held)) => {
+            Ok((forwarded, held, failure_logged)) => {
                 if matches!(
                     forwarded,
                     Forwarded::MemoryOnly | Forwarded::Unacknowledged(_)
                 ) {
                     *guard = held;
                 }
-                forwarded
+                ForwardedRelease {
+                    outcome: forwarded,
+                    failure_logged,
+                }
             }
             Err(error) => {
                 warn!(
@@ -355,10 +403,14 @@ impl SessionRegistry {
                     cause = %error,
                     "forwarding an active-agent release did not finish; tracking what it sent"
                 );
-                if sent_flag.load(std::sync::atomic::Ordering::Acquire) {
+                let outcome = if sent_flag.load(std::sync::atomic::Ordering::Acquire) {
                     Forwarded::Unacknowledged(Unacknowledged::Release(pending))
                 } else {
                     Forwarded::MemoryOnly
+                };
+                ForwardedRelease {
+                    outcome,
+                    failure_logged: true,
                 }
             }
         }
@@ -496,24 +548,25 @@ impl SessionRegistry {
         }
     }
 
-    /// The worker and subject of a forwardable report, or `None` after noting
-    /// why the report stays memory-only.
+    /// The worker and subject of a forwardable report, or the refusal after
+    /// noting why the report stays memory-only.
     async fn forward_target(
         &self,
         id: &SessionId,
         pid: Option<u32>,
         monotonic_sequence: Option<protocol::ReportSequence>,
         attested_start: Option<u64>,
-    ) -> Option<ForwardTarget> {
+        operation: ForwardedOperation,
+    ) -> Result<ForwardTarget, ForwardRefusal> {
         let (Some(pid), Some(sequence)) = (pid, monotonic_sequence) else {
             self.note_not_durable(id, NotDurableCause::Unbound).await;
-            return None;
+            return Err(ForwardRefusal::QUIET);
         };
         let worker = {
             let sessions = self.inner.sessions.lock().await;
-            let entry = sessions.get(id)?;
+            let entry = sessions.get(id).ok_or(ForwardRefusal::QUIET)?;
             if is_terminal(entry.info.state) {
-                return None;
+                return Err(ForwardRefusal::QUIET);
             }
             match &entry.runtime {
                 RuntimeHandle::Worker(worker) => worker.clone(),
@@ -521,18 +574,19 @@ impl SessionRegistry {
                     drop(sessions);
                     self.note_not_durable(id, NotDurableCause::ForwardFailed)
                         .await;
-                    return None;
+                    return Err(ForwardRefusal::QUIET);
                 }
             }
         };
         let Some(version) = self.within_worker_bound(worker.selected_version()).await else {
-            self.note_forward_timed_out(id, self.forward_bound()).await;
-            return None;
+            self.note_forward_timed_out(id, self.forward_bound(), operation)
+                .await;
+            return Err(ForwardRefusal::LOGGED);
         };
         if version < ACTIVE_IDENTITY_FORWARD_VERSION {
             self.note_not_durable(id, NotDurableCause::WorkerProtocolV7)
                 .await;
-            return None;
+            return Err(ForwardRefusal::QUIET);
         }
         let Some(instance) = self
             .within_worker_bound(worker.worker_instance_id())
@@ -542,18 +596,18 @@ impl SessionRegistry {
         else {
             self.note_not_durable(id, NotDurableCause::ForwardFailed)
                 .await;
-            return None;
+            return Err(ForwardRefusal::QUIET);
         };
         let start_identity = if let Some(start) = attested_start {
             start
         } else {
             let Ok(Some(current)) = self.inner.inspector.identity(pid) else {
                 self.note_not_durable(id, NotDurableCause::Unbound).await;
-                return None;
+                return Err(ForwardRefusal::QUIET);
             };
             current.start_identity.get()
         };
-        Some(ForwardTarget {
+        Ok(ForwardTarget {
             worker,
             instance,
             process: ProcessIdentity {
@@ -691,15 +745,27 @@ impl SessionRegistry {
         }
     }
 
-    /// Records that a forward exceeded its configured bound, so the report
-    /// stays memory-only.
-    async fn note_forward_timed_out(&self, id: &SessionId, deadline: std::time::Duration) {
-        warn!(
-            name: "session.active_identity.forward_failed",
-            session_id = %id.0,
-            deadline_ms = deadline.as_millis(),
-            "the worker did not answer a forwarded active-agent operation in time; keeping it in memory only"
-        );
+    /// Records that a forward exceeded its configured bound.
+    async fn note_forward_timed_out(
+        &self,
+        id: &SessionId,
+        deadline: std::time::Duration,
+        operation: ForwardedOperation,
+    ) {
+        match operation {
+            ForwardedOperation::Report => warn!(
+                name: "session.active_identity.forward_failed",
+                session_id = %id.0,
+                deadline_ms = deadline.as_millis(),
+                "the worker did not answer a forwarded active-agent report in time; keeping it in memory only"
+            ),
+            ForwardedOperation::Release => warn!(
+                name: "session.active_identity.forward_failed",
+                session_id = %id.0,
+                deadline_ms = deadline.as_millis(),
+                "the worker did not answer a forwarded active-agent release in time; the daemon ends a memory claim and leaves a claim the worker journaled to the worker's journal"
+            ),
+        }
         self.note_not_durable(id, NotDurableCause::ForwardFailed)
             .await;
     }
@@ -806,7 +872,7 @@ impl SessionRegistry {
                 name: "session.active_identity.forward_failed",
                 session_id = %id.0,
                 cause = %error,
-                "forwarding an active-agent release failed; the worker's journal decides the claim"
+                "forwarding an active-agent release failed; the daemon ends a memory claim and leaves a claim the worker journaled to the worker's journal"
             ),
         }
         self.note_not_durable(id, NotDurableCause::ForwardFailed)

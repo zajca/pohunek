@@ -2,7 +2,7 @@
 
 // Rust guideline compliant 2026-10-12
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use protocol::{
@@ -14,6 +14,7 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -36,6 +37,20 @@ const PROJECTOR_SOURCE_ID_PREFIX: &str = "projector";
 /// owner-private JSONL appends through [`NotificationService`]. Five seconds
 /// matches the daemon event-log shutdown budget and bounds a wedged filesystem.
 const PROJECTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Delay before the projector retries the epoch seed of sessions whose inputs
+/// wait for it.
+///
+/// A failed seed is a failed blocking read of the in-memory notification
+/// index, so a short fixed delay retries it without a busy loop.
+pub(crate) const SEED_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Inputs the projector keeps per session while its epoch seed fails.
+///
+/// A session produces a handful of inputs per turn, so the bound is reached
+/// only by an outage that lasts for many turns. The oldest input is dropped
+/// with a warning then, to bound memory.
+const MAX_DEFERRED_INPUTS_PER_SESSION: usize = 256;
 
 /// Derives durable notifications from session lifecycle events.
 #[derive(Debug)]
@@ -99,6 +114,9 @@ fn spawn_projector_task(
                     drain_buffered_events(&sessions, &notifications, &attention, &mut events, &mut turn_edges, &mut state).await;
                     break;
                 }
+                () = seed_retry_due(state.seed_retry_at) => {
+                    state.retry_deferred(&notifications, &attention).await;
+                }
                 edge = next_turn_edge(&mut turn_edges) => match edge {
                     Some(edge) => {
                         state.handle_turn_edge_blocking(&notifications, &attention, edge).await;
@@ -119,6 +137,14 @@ fn spawn_projector_task(
             }
         }
     })
+}
+
+/// Completes when the seed retry is due; pending forever while none waits.
+async fn seed_retry_due(retry_at: Option<Instant>) {
+    match retry_at {
+        Some(retry_at) => tokio::time::sleep_until(retry_at).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// The next turn change, pending forever once the channel is gone.
@@ -161,6 +187,8 @@ async fn drain_buffered_events(
             }
         }
     }
+    state.retry_deferred(notifications, attention).await;
+    state.warn_unprojected();
 }
 
 async fn resync_from_registry(
@@ -332,6 +360,15 @@ fn event_subject(event: &Event) -> Option<(SessionId, Option<AgentActivity>)> {
     }
 }
 
+/// The session a `session.stopped` event names. The projector does not seed
+/// for it, but it queues behind the inputs the session already waits with.
+fn stopped_subject(event: &Event) -> Option<SessionId> {
+    (event.event() == event::SESSION_STOPPED)
+        .then(|| parse_projector_payload::<SessionPayload>(event))
+        .flatten()
+        .map(|payload| payload.session.id)
+}
+
 /// Whether a stored terminal record keyed by transition epoch reports the
 /// runtime generation `session` ends. Such a record names no generation, so it
 /// counts only when it was created after the generation started. A generation
@@ -367,6 +404,20 @@ struct ProjectorState {
     /// are keyed by transition epoch, by session, until the session's first
     /// lifecycle observation in this process.
     epoch_keyed_terminal_records: HashMap<SessionId, HashMap<NotificationKind, OffsetDateTime>>,
+    /// The inputs of sessions whose epoch seed failed, in arrival order. A
+    /// session with a backlog queues every further input behind it, so the
+    /// inputs project in the order they arrived once the seed succeeds.
+    deferred: HashMap<SessionId, VecDeque<DeferredInput>>,
+    /// When the seed of the sessions in `deferred` is retried next.
+    seed_retry_at: Option<Instant>,
+}
+
+/// An input of one session the projector keeps until its epoch seed succeeds.
+#[derive(Debug)]
+enum DeferredInput {
+    Event(Event),
+    Snapshot(Box<SessionInfo>),
+    Edge(TurnEdge),
 }
 
 impl ProjectorState {
@@ -376,13 +427,33 @@ impl ProjectorState {
         attention: &AttentionCoordinator,
         event: &Event,
     ) {
-        if let Some((session_id, activity)) = event_subject(event) {
-            if !self
-                .seed_transition_epochs(notifications, &session_id)
-                .await
-            {
+        let seeded_subject = event_subject(event);
+        let ordered_subject = seeded_subject
+            .as_ref()
+            .map(|(session_id, _)| session_id.clone())
+            .or_else(|| stopped_subject(event));
+        if let Some(session_id) = ordered_subject {
+            if self.deferred.contains_key(&session_id) {
+                self.defer(&session_id, DeferredInput::Event(event.clone()));
                 return;
             }
+        }
+        if let Some((session_id, _)) = &seeded_subject {
+            if !self.seed_transition_epochs(notifications, session_id).await {
+                self.defer(session_id, DeferredInput::Event(event.clone()));
+                return;
+            }
+        }
+        self.project_event(notifications, attention, event).await;
+    }
+
+    async fn project_event(
+        &mut self,
+        notifications: &NotificationService,
+        attention: &AttentionCoordinator,
+        event: &Event,
+    ) {
+        if let Some((session_id, activity)) = event_subject(event) {
             self.confirm_blocked_replay(notifications, &session_id, activity)
                 .await;
         }
@@ -397,12 +468,27 @@ impl ProjectorState {
         attention: &AttentionCoordinator,
         session: &SessionInfo,
     ) {
-        if !self
-            .seed_transition_epochs(notifications, &session.id)
-            .await
+        if self.deferred.contains_key(&session.id)
+            || !self
+                .seed_transition_epochs(notifications, &session.id)
+                .await
         {
+            self.defer(
+                &session.id,
+                DeferredInput::Snapshot(Box::new(session.clone())),
+            );
             return;
         }
+        self.project_session_snapshot(notifications, attention, session)
+            .await;
+    }
+
+    async fn project_session_snapshot(
+        &mut self,
+        notifications: &NotificationService,
+        attention: &AttentionCoordinator,
+        session: &SessionInfo,
+    ) {
         self.confirm_blocked_replay(notifications, &session.id, session.activity)
             .await;
         for pending in self.pending_session_snapshot(notifications, attention, session) {
@@ -419,6 +505,30 @@ impl ProjectorState {
         attention: &AttentionCoordinator,
         edge: TurnEdge,
     ) {
+        let session_id = match &edge {
+            TurnEdge::Started(session_id, _) | TurnEdge::Ended(session_id, _) => session_id.clone(),
+        };
+        if self.deferred.contains_key(&session_id) {
+            self.defer(&session_id, DeferredInput::Edge(edge));
+            return;
+        }
+        if matches!(edge, TurnEdge::Ended(..))
+            && !self
+                .seed_transition_epochs(notifications, &session_id)
+                .await
+        {
+            self.defer(&session_id, DeferredInput::Edge(edge));
+            return;
+        }
+        self.project_turn_edge(notifications, attention, edge).await;
+    }
+
+    async fn project_turn_edge(
+        &mut self,
+        notifications: &NotificationService,
+        attention: &AttentionCoordinator,
+        edge: TurnEdge,
+    ) {
         let (session_id, turn) = match edge {
             TurnEdge::Started(session_id, _) => {
                 attention.resolve(turn_dedupe_key(&session_id));
@@ -427,9 +537,6 @@ impl ProjectorState {
             TurnEdge::Ended(session_id, turn) => (session_id, turn),
         };
         let session_id = &session_id;
-        if !self.seed_transition_epochs(notifications, session_id).await {
-            return;
-        }
         let pending = self.prepare_derived(
             notifications,
             DerivedNotification {
@@ -456,6 +563,85 @@ impl ProjectorState {
                 },
             )
             .await;
+        }
+    }
+
+    /// Keeps `input` of `session_id` behind the inputs it waits for and arms
+    /// the seed retry.
+    ///
+    /// Consecutive snapshots collapse into the newest one, which states the
+    /// session's current condition. A backlog at its bound drops its oldest
+    /// input.
+    fn defer(&mut self, session_id: &SessionId, input: DeferredInput) {
+        let backlog = self.deferred.entry(session_id.clone()).or_default();
+        match (backlog.back_mut(), input) {
+            (Some(DeferredInput::Snapshot(newest)), DeferredInput::Snapshot(snapshot)) => {
+                *newest = snapshot;
+            }
+            (_, input) => {
+                if backlog.len() >= MAX_DEFERRED_INPUTS_PER_SESSION {
+                    backlog.pop_front();
+                    warn!(
+                        session_id = %session_id.0,
+                        limit = MAX_DEFERRED_INPUTS_PER_SESSION,
+                        "projector backlog of a session whose epoch seed keeps failing is full; dropping its oldest input"
+                    );
+                }
+                backlog.push_back(input);
+            }
+        }
+        self.seed_retry_at
+            .get_or_insert_with(|| Instant::now() + SEED_RETRY_DELAY);
+    }
+
+    /// Retries the seed of every session with a backlog and projects the
+    /// backlog of each one that seeds, in arrival order.
+    async fn retry_deferred(
+        &mut self,
+        notifications: &NotificationService,
+        attention: &AttentionCoordinator,
+    ) {
+        self.seed_retry_at = None;
+        let waiting: Vec<SessionId> = self.deferred.keys().cloned().collect();
+        for session_id in waiting {
+            if !self
+                .seed_transition_epochs(notifications, &session_id)
+                .await
+            {
+                continue;
+            }
+            let Some(backlog) = self.deferred.remove(&session_id) else {
+                continue;
+            };
+            for input in backlog {
+                match input {
+                    DeferredInput::Event(event) => {
+                        self.project_event(notifications, attention, &event).await;
+                    }
+                    DeferredInput::Snapshot(session) => {
+                        self.project_session_snapshot(notifications, attention, &session)
+                            .await;
+                    }
+                    DeferredInput::Edge(edge) => {
+                        self.project_turn_edge(notifications, attention, edge).await;
+                    }
+                }
+            }
+        }
+        if !self.deferred.is_empty() {
+            self.seed_retry_at = Some(Instant::now() + SEED_RETRY_DELAY);
+        }
+    }
+
+    /// Logs the inputs that are still waiting for a seed when the projector
+    /// ends.
+    fn warn_unprojected(&self) {
+        for (session_id, backlog) in &self.deferred {
+            warn!(
+                session_id = %session_id.0,
+                inputs = backlog.len(),
+                "projector ended while the epoch seed of a session kept failing; its inputs are not projected"
+            );
         }
     }
 
@@ -754,9 +940,9 @@ impl ProjectorState {
     ///
     /// The store is read off the async runtime.
     ///
-    /// Returns whether the session is seeded. An unseeded session's event is
+    /// Returns whether the session is seeded. An unseeded session's input is
     /// not projected, because its transition could reuse a stored key; the
-    /// next event of the session tries again.
+    /// caller keeps the input and the projector retries the seed.
     async fn seed_transition_epochs(
         &mut self,
         notifications: &NotificationService,
@@ -781,7 +967,7 @@ impl ProjectorState {
                 warn!(
                     session_id = %session_id.0,
                     %error,
-                    "projector epoch seeding task failed; the session's event is not projected"
+                    "projector epoch seeding task failed; the session's inputs wait for the next retry"
                 );
                 return false;
             }

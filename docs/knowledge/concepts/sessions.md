@@ -329,7 +329,13 @@ one that arrives after its turn was reported, within twice the debounce window
 (at least 2 seconds) of the record reaching the inbox, adds no second inbox record
 (a waiting `session.wait_turn` may still see one more turn event). The kind stays
 disabled for the inbox by default; enable it with `notifications policy set` for
-a manager that follows many sessions.
+a manager that follows many sessions. The projector reads a session's stored
+records once before it projects the session's first input, so its keys continue
+those of the store. When that read fails, the session's inputs (events,
+snapshots and turn changes) wait in order and are projected after a retry that
+runs every second, so the notifications they derive arrive late. Only an outage
+that outlasts the bound of 256 inputs per session (the oldest is dropped with a
+warning) or the daemon's shutdown loses them.
 
 Unread `turn_completed` rows are bounded per session. A newer
 `turn:<session_id>` record acknowledges any older unread turn for that key with
@@ -766,7 +772,8 @@ also covers a report the worker refused. A report that is unbound (an SDK or
 remote client, an older hook), that meets a protocol 7 worker, or whose forward
 failed is held in memory and logged once per session and cause as
 `session.active_identity.not_durable` (`unbound`, `worker_protocol_v7`,
-`forward_failed`; a failed forward also logs `forward_failed` at WARN; an
+`forward_failed`; a failed forward also logs `forward_failed` at WARN, once for
+a release (it ends a memory claim and never a claim the worker journaled); an
 accepted forward whose snapshot was not read or applied in time logs
 `session.active_identity.commit_deferred` at WARN, and the next sync commits
 it). It

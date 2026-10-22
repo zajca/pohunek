@@ -21490,6 +21490,190 @@ generation "$1"
             let _ = fixture.registry.stop(&created.id).await;
         }
 
+        /// The `session.active_identity.forward_failed` events logged on the
+        /// test thread, by message.
+        ///
+        /// The scenarios run on a current-thread runtime, so the forward task
+        /// logs on the thread whose default subscriber this installs.
+        #[derive(Clone, Default)]
+        struct ForwardFailedLog(Arc<std::sync::Mutex<Vec<String>>>);
+
+        /// Name of the event a failed forward of an active-agent operation logs.
+        const FORWARD_FAILED_EVENT: &str = "session.active_identity.forward_failed";
+
+        impl ForwardFailedLog {
+            /// Installs this capture as the thread's default subscriber, after
+            /// the process-wide anchor dispatcher that
+            /// `crate::runtime::lifecycle::tests::LogCapture` explains.
+            fn install(&self) -> tracing::subscriber::DefaultGuard {
+                use tracing_subscriber::layer::SubscriberExt as _;
+                static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+                ANCHOR.get_or_init(|| {
+                    tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new())
+                });
+                tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+            }
+
+            /// The messages logged so far, in order.
+            fn messages(&self) -> Vec<String> {
+                self.0.lock().expect("forward failure log").clone()
+            }
+        }
+
+        /// The `message` field of a logged event.
+        #[derive(Default)]
+        struct LoggedMessage(String);
+
+        impl tracing::field::Visit for LoggedMessage {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ForwardFailedLog {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().name() != FORWARD_FAILED_EVENT {
+                    return;
+                }
+                let mut message = LoggedMessage::default();
+                event.record(&mut message);
+                self.0.lock().expect("forward failure log").push(message.0);
+            }
+        }
+
+        /// A bound release of the session's root process; `monotonic` orders it
+        /// at the worker and `seq` against the public reports.
+        fn forwardable_release(
+            created: &SessionInfo,
+            seq: u64,
+            monotonic: u64,
+        ) -> protocol::SessionReleaseAgentParams {
+            protocol::SessionReleaseAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                seq: Some(protocol::ReportSequence::new(seq)),
+                pid: Some(created.pid),
+                pid_start_identity: forwardable_report(created).pid_start_identity,
+                monotonic_sequence: Some(protocol::ReportSequence::new(monotonic)),
+                retryable_admission: false,
+            }
+        }
+
+        /// Message of the event a failed release forward logs when the worker's
+        /// connection broke after the request left.
+        const RELEASE_FORWARD_FAILED: &str = "forwarding an active-agent release failed; the daemon ends a memory claim and leaves a claim the worker journaled to the worker's journal";
+
+        /// Message of the event a release forward logs when the worker did not
+        /// answer within the bound.
+        const RELEASE_FORWARD_TIMED_OUT: &str = "the worker did not answer a forwarded active-agent release in time; the daemon ends a memory claim and leaves a claim the worker journaled to the worker's journal";
+
+        /// Message of the event a release the daemon cannot forward logs over a
+        /// journaled claim.
+        const RELEASE_NOT_FORWARDABLE: &str = "a release could not be forwarded and does not end a claim the worker journaled; ignoring";
+
+        /// Fails the forward of a bound release over a claim the worker journaled
+        /// (`journaled`) or the daemon holds in memory, and returns the release's
+        /// answer with the `forward_failed` events it logged.
+        async fn failed_release_forward(
+            answer: Answer,
+            journaled: bool,
+        ) -> (protocol::SessionReleaseAgentResult, Vec<String>) {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            let report = if journaled {
+                forwardable_report(&created)
+            } else {
+                unbound_report(&created, 2_000)
+            };
+            assert!(fixture.registry.report_agent(report).await.recorded);
+            assert_eq!(claim_is_journaled(&fixture, &created.id).await, journaled);
+            let logs = ForwardFailedLog::default();
+            let _subscriber = logs.install();
+            let release = forwardable_release(&created, 2_010, 2);
+            let (released, stopped) = {
+                let registry = fixture.registry.clone();
+                stop_worker_at_forward(&fixture, &created, 1, answer, async move {
+                    registry.release_agent(release).await
+                })
+                .await
+            };
+            drop(stopped);
+            let _ = fixture.registry.stop(&created.id).await;
+            (released, logs.messages())
+        }
+
+        /// A release whose forward failed over a memory claim ends it, and the
+        /// failure is logged once without naming the worker's journal as the
+        /// decider.
+        #[tokio::test]
+        async fn a_release_lost_in_transit_over_a_memory_claim_logs_one_true_event() {
+            let (released, events) = failed_release_forward(Answer::Lost, false).await;
+            assert!(released.released, "the daemon ends its own memory claim");
+            assert_eq!(events, [RELEASE_FORWARD_FAILED]);
+        }
+
+        /// The same release over a claim the worker journaled leaves the claim
+        /// and still logs the failure once.
+        #[tokio::test]
+        async fn a_release_lost_in_transit_over_a_journaled_claim_logs_one_event() {
+            let (released, events) = failed_release_forward(Answer::Lost, true).await;
+            assert!(!released.released, "the journal keeps the claim");
+            assert_eq!(events, [RELEASE_FORWARD_FAILED]);
+        }
+
+        /// A release that timed out over a memory claim ends it and logs the
+        /// timeout once.
+        #[tokio::test]
+        async fn a_release_that_timed_out_over_a_memory_claim_logs_one_true_event() {
+            let (released, events) = failed_release_forward(Answer::Busy, false).await;
+            assert!(released.released);
+            assert_eq!(events, [RELEASE_FORWARD_TIMED_OUT]);
+        }
+
+        /// A release that timed out over a journaled claim leaves the claim and
+        /// logs the timeout once.
+        #[tokio::test]
+        async fn a_release_that_timed_out_over_a_journaled_claim_logs_one_event() {
+            let (released, events) = failed_release_forward(Answer::Busy, true).await;
+            assert!(!released.released);
+            assert_eq!(events, [RELEASE_FORWARD_TIMED_OUT]);
+        }
+
+        /// A release the daemon never offers to the worker logs its own event
+        /// when it cannot end a journaled claim.
+        #[tokio::test]
+        async fn an_unforwardable_release_over_a_journaled_claim_logs_one_event() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            assert!(
+                fixture
+                    .registry
+                    .report_agent(forwardable_report(&created))
+                    .await
+                    .recorded
+            );
+            let logs = ForwardFailedLog::default();
+            let _subscriber = logs.install();
+            let unbound = protocol::SessionReleaseAgentParams {
+                pid: None,
+                pid_start_identity: None,
+                monotonic_sequence: None,
+                ..forwardable_release(&created, 2_010, 2)
+            };
+
+            assert!(!fixture.registry.release_agent(unbound).await.released);
+
+            assert_eq!(logs.messages(), [RELEASE_NOT_FORWARDABLE]);
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
         /// T1 / V6: a forwarded report whose answer timed out and that the worker
         /// journaled afterwards does not replace the newer memory report made
         /// after it.
