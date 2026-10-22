@@ -414,3 +414,70 @@ fn failed_exec_reports_terminal_recovery_syscall_errors() {
         );
     }
 }
+
+/// A foreground group whose only member is an unreaped zombie answers the
+/// real group probe with `EPERM` on macOS, and the real membership query finds
+/// no live member, so the terminal goes back to the shell.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_foreground_group_left_with_only_a_zombie_returns_the_terminal_to_the_shell() {
+    let session = Session::launch_with_failure(false, MISSING_COMMAND, Some("zombie_group"));
+    let shell = i32::try_from(session.shell.process_id().expect("shell pid")).expect("pid");
+    assert_ne!(line(&session.path("lock.status")), "0");
+    let diagnostics = session.recovery_diagnostics();
+    for expected in [
+        format!("killpg=Some(Err({}))", nix::errno::Errno::EPERM as i32),
+        "live_members=Some(Ok(false))".to_owned(),
+        ":Zombie".to_owned(),
+        "mask_block=Ok(())".to_owned(),
+    ] {
+        assert!(
+            diagnostics.contains(&expected),
+            "missing {expected:?}: {diagnostics}"
+        );
+    }
+    assert_eq!(session.foreground(), Some(shell), "{diagnostics}");
+}
+
+/// A group the probe cannot signal and whose membership is live, or cannot
+/// be established, keeps the terminal.
+#[test]
+fn a_not_signalable_group_with_a_live_or_unknown_membership_keeps_the_terminal() {
+    let eperm = nix::errno::Errno::EPERM as i32;
+    let interrupted = nix::errno::Errno::EINTR as i32;
+    let mut rows = vec![
+        (
+            "killpg=EPERM,members=live",
+            "live_members=Some(Ok(true))".to_owned(),
+        ),
+        (
+            "killpg=EPERM,members",
+            format!("live_members=Some(Err({interrupted}))"),
+        ),
+    ];
+    // Linux answers `EPERM` only for a group with a member it may not signal.
+    if cfg!(target_os = "linux") {
+        rows.push(("killpg=EPERM", "live_members=Some(Ok(true))".to_owned()));
+    }
+    for (faults, members) in rows {
+        let session = Session::launch_with_failure(false, MISSING_COMMAND, Some(faults));
+        let shell = i32::try_from(session.shell.process_id().expect("shell pid")).expect("pid");
+        assert_ne!(line(&session.path("lock.status")), "0");
+        let diagnostics = session.recovery_diagnostics();
+        let foreground = session
+            .foreground()
+            .expect("the terminal still has a group");
+        for expected in [
+            format!("killpg=Some(Err({eperm}))"),
+            members,
+            "reclaim=[not attempted]".to_owned(),
+            format!("foreground_after=Ok({foreground})"),
+        ] {
+            assert!(
+                diagnostics.contains(&expected),
+                "{faults}: missing {expected:?}: {diagnostics}"
+            );
+        }
+        assert_ne!(foreground, shell, "{faults}: {diagnostics}");
+    }
+}

@@ -40,6 +40,7 @@ pub mod ledger;
 mod legacy_store;
 pub mod manager_env;
 pub mod preflight;
+mod process_group;
 pub mod record;
 pub mod report;
 mod rollback;
@@ -603,12 +604,21 @@ impl Terminal {
     ///
     /// The child may have taken it before its `exec` failed, and the spawn
     /// reaps that child, so its group has no member left. The terminal is
-    /// taken back only from a group without members, never from a live one
-    /// that took it meanwhile.
+    /// taken back only from a group without a live member, never from a live
+    /// one that took it meanwhile. `ESRCH` says the group is gone. On Darwin
+    /// `EPERM` says `killpg1` found the group and counted no member it may
+    /// signal: a group that holds only zombies, but also a live group of
+    /// another user, so a membership query decides (see `process_group`).
     fn recover(self) -> String {
         let stdin = std::io::stdin();
+        #[cfg(all(feature = "test-util", target_os = "macos"))]
+        if self.was_foreground() && injected("zombie_group") {
+            plant_zombie_foreground(&stdin, self.own);
+        }
         let before = recovery_call("tcgetpgrp", || nix::unistd::tcgetpgrp(&stdin));
         let mut probe = None;
+        let mut members = None;
+        let mut detail = None;
         let mut reclaim = None;
         if self.was_foreground() {
             if let Ok(current) = before {
@@ -616,7 +626,22 @@ impl Terminal {
                     let result =
                         recovery_call("killpg", || nix::sys::signal::killpg(current, None));
                     probe = Some(result.map_err(raw_errno));
-                    if result == Err(nix::errno::Errno::ESRCH) {
+                    let gone = match result {
+                        Err(nix::errno::Errno::ESRCH) => true,
+                        Err(nix::errno::Errno::EPERM) => {
+                            let found = live_members(current);
+                            members = Some(
+                                found
+                                    .as_ref()
+                                    .map(|found| found.live)
+                                    .map_err(|errno| raw_errno(*errno)),
+                            );
+                            detail = found.as_ref().ok().map(|found| found.detail.clone());
+                            matches!(found, Ok(ref found) if !found.live)
+                        }
+                        _ => false,
+                    };
+                    if gone {
                         reclaim = Some(claim_from_background(&stdin, self.own));
                     }
                 }
@@ -626,7 +651,8 @@ impl Terminal {
         let after = nix::unistd::tcgetpgrp(&stdin);
         format!(
             "owner_pgid={} initial_tty={:?} initial_foreground={:?} \
-             foreground_before={:?} killpg={probe:?} reclaim=[{}] foreground_after={:?}",
+             foreground_before={:?} killpg={probe:?} live_members={members:?} \
+             group_members={detail:?} reclaim=[{}] foreground_after={:?}",
             self.own,
             self.tty.map_err(raw_errno),
             self.foreground
@@ -719,17 +745,85 @@ fn raw_errno(error: nix::errno::Errno) -> i32 {
     error as i32
 }
 
-/// A failed recovery syscall, injected only into the real CLI's test build.
+/// Comma-separated recovery faults to inject, only into the real CLI's test
+/// build: `<step>` fails the step with `EINTR`, `killpg=EPERM` makes the
+/// group probe answer `EPERM`, `members=live` makes the membership query
+/// report a live member, and `zombie_group` (macOS) hands the terminal to a
+/// group whose only member is a zombie before the recovery probes it.
 #[cfg(feature = "test-util")]
 pub const RECOVERY_FAILURE_ENV: &str = "POHUNEK_TEST_SERVICE_LOCK_RECOVERY_FAILURE";
 
+/// Whether the test build injects the fault `name`.
+#[cfg(feature = "test-util")]
+fn injected(name: &str) -> bool {
+    std::env::var(RECOVERY_FAILURE_ENV).is_ok_and(|faults| faults.split(',').any(|f| f == name))
+}
+
 fn recovery_call<T>(operation: &str, call: impl FnOnce() -> nix::Result<T>) -> nix::Result<T> {
     #[cfg(feature = "test-util")]
-    if std::env::var(RECOVERY_FAILURE_ENV).is_ok_and(|value| value == operation) {
-        return Err(nix::errno::Errno::EINTR);
+    {
+        if injected(operation) {
+            return Err(nix::errno::Errno::EINTR);
+        }
+        if injected(&format!("{operation}=EPERM")) {
+            return Err(nix::errno::Errno::EPERM);
+        }
     }
     let _ = operation;
     call()
+}
+
+/// The members of the foreground group `group` and whether any is alive.
+fn live_members(group: nix::unistd::Pid) -> nix::Result<process_group::Membership> {
+    #[cfg(feature = "test-util")]
+    if injected("members=live") {
+        return Ok(process_group::Membership {
+            live: true,
+            detail: "[injected]".to_owned(),
+        });
+    }
+    recovery_call("members", || process_group::membership(group))
+}
+
+/// Makes the foreground group a group whose only member is an unreaped
+/// zombie, so the real group probe and membership query run against it.
+///
+/// The child exits at once; `waitid` with `WNOWAIT` returns when it is a
+/// zombie and leaves it unreaped. The terminal moves to its group as a
+/// background process would move it.
+#[cfg(all(feature = "test-util", target_os = "macos"))]
+#[expect(
+    unsafe_code,
+    reason = "waitid with WNOWAIT has no safe wrapper that leaves the child unreaped"
+)]
+fn plant_zombie_foreground(stdin: &std::io::Stdin, owner: nix::unistd::Pid) {
+    use std::os::unix::process::CommandExt as _;
+
+    let child = std::process::Command::new("/usr/bin/true")
+        .process_group(0)
+        .spawn()
+        .expect("spawn the zombie member");
+    let pid = libc::id_t::from(child.id());
+    // SAFETY: `info` is a plain-data buffer; the child is this process's own.
+    let waited = unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            &raw mut info,
+            libc::WEXITED | libc::WNOWAIT,
+        )
+    };
+    assert_eq!(waited, 0, "the zombie member exits");
+    let group = nix::unistd::Pid::from_raw(i32::try_from(pid).expect("pid"));
+    let claim = claim_from_background(stdin, group);
+    assert_eq!(
+        claim.handoff,
+        Some(Ok(())),
+        "the terminal moves to {group} from {owner}"
+    );
+    // The zombie stays unreaped for the rest of this short-lived process.
+    std::mem::forget(child);
 }
 
 /// The terminal's foreground, handed to the child's process group.

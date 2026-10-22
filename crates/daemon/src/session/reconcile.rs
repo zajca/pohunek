@@ -21526,7 +21526,10 @@ generation "$1"
         /// The scenarios run on a current-thread runtime, so the forward task
         /// logs on the thread whose default subscriber this installs.
         #[derive(Clone, Default)]
-        struct ForwardFailedLog(Arc<std::sync::Mutex<Vec<String>>>);
+        struct ForwardFailedLog(
+            Arc<std::sync::Mutex<Vec<String>>>,
+            Arc<std::sync::Mutex<Vec<String>>>,
+        );
 
         /// Name of the event a failed forward of an active-agent operation logs.
         const FORWARD_FAILED_EVENT: &str = "session.active_identity.forward_failed";
@@ -21548,6 +21551,16 @@ generation "$1"
             fn messages(&self) -> Vec<String> {
                 self.0.lock().expect("forward failure log").clone()
             }
+
+            /// Every event the subscriber saw, with the thread that emitted it,
+            /// to tell a missing event from one emitted elsewhere.
+            fn trace(&self) -> String {
+                let events = self.1.lock().expect("event trace").join("\n  ");
+                format!(
+                    "test thread {:?}; events seen:\n  {events}",
+                    std::thread::current().id()
+                )
+            }
         }
 
         /// The `message` field of a logged event.
@@ -21568,11 +21581,18 @@ generation "$1"
                 event: &tracing::Event<'_>,
                 _context: tracing_subscriber::layer::Context<'_, S>,
             ) {
+                let mut message = LoggedMessage::default();
+                event.record(&mut message);
+                self.1.lock().expect("event trace").push(format!(
+                    "{} {} on {:?}: {}",
+                    event.metadata().level(),
+                    event.metadata().name(),
+                    std::thread::current().id(),
+                    message.0
+                ));
                 if event.metadata().name() != FORWARD_FAILED_EVENT {
                     return;
                 }
-                let mut message = LoggedMessage::default();
-                event.record(&mut message);
                 self.0.lock().expect("forward failure log").push(message.0);
             }
         }
@@ -21614,7 +21634,7 @@ generation "$1"
         async fn failed_release_forward(
             answer: Answer,
             journaled: bool,
-        ) -> (protocol::SessionReleaseAgentResult, Vec<String>) {
+        ) -> (protocol::SessionReleaseAgentResult, Vec<String>, String) {
             let fixture = codex_fixture(FORWARD_CONNECT);
             let (created, _job, _) = fixture.create_agent("codex-agent").await;
             let report = if journaled {
@@ -21636,7 +21656,7 @@ generation "$1"
             };
             drop(stopped);
             let _ = fixture.registry.stop(&created.id).await;
-            (released, logs.messages())
+            (released, logs.messages(), logs.trace())
         }
 
         /// A release whose forward failed over a memory claim ends it, and the
@@ -21644,36 +21664,36 @@ generation "$1"
         /// decider.
         #[tokio::test]
         async fn a_release_lost_in_transit_over_a_memory_claim_logs_one_true_event() {
-            let (released, events) = failed_release_forward(Answer::Lost, false).await;
+            let (released, events, trace) = failed_release_forward(Answer::Lost, false).await;
             assert!(released.released, "the daemon ends its own memory claim");
-            assert_eq!(events, [RELEASE_FORWARD_FAILED]);
+            assert_eq!(events, [RELEASE_FORWARD_FAILED], "{trace}");
         }
 
         /// The same release over a claim the worker journaled leaves the claim
         /// and still logs the failure once.
         #[tokio::test]
         async fn a_release_lost_in_transit_over_a_journaled_claim_logs_one_event() {
-            let (released, events) = failed_release_forward(Answer::Lost, true).await;
+            let (released, events, trace) = failed_release_forward(Answer::Lost, true).await;
             assert!(!released.released, "the journal keeps the claim");
-            assert_eq!(events, [RELEASE_FORWARD_FAILED]);
+            assert_eq!(events, [RELEASE_FORWARD_FAILED], "{trace}");
         }
 
         /// A release that timed out over a memory claim ends it and logs the
         /// timeout once.
         #[tokio::test]
         async fn a_release_that_timed_out_over_a_memory_claim_logs_one_true_event() {
-            let (released, events) = failed_release_forward(Answer::Busy, false).await;
+            let (released, events, trace) = failed_release_forward(Answer::Busy, false).await;
             assert!(released.released);
-            assert_eq!(events, [RELEASE_FORWARD_TIMED_OUT]);
+            assert_eq!(events, [RELEASE_FORWARD_TIMED_OUT], "{trace}");
         }
 
         /// A release that timed out over a journaled claim leaves the claim and
         /// logs the timeout once.
         #[tokio::test]
         async fn a_release_that_timed_out_over_a_journaled_claim_logs_one_event() {
-            let (released, events) = failed_release_forward(Answer::Busy, true).await;
+            let (released, events, trace) = failed_release_forward(Answer::Busy, true).await;
             assert!(!released.released);
-            assert_eq!(events, [RELEASE_FORWARD_TIMED_OUT]);
+            assert_eq!(events, [RELEASE_FORWARD_TIMED_OUT], "{trace}");
         }
 
         /// A release the daemon never offers to the worker logs its own event
