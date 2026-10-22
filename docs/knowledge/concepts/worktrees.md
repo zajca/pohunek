@@ -46,9 +46,9 @@ also runs a few unlocked git steps, each with its own 30-second bound). A wait
 that runs out is reported like the operation's own failure, with the text
 "waiting for another worktree operation on the same repository": as the `fetch`
 warning when the base exists locally, as `base_branch_fetch_failed` when it does
-not, and as a failed create or removal for an add or remove. The ordering holds within one
-daemon; another daemon, or a manual `git worktree add` on the same repository,
-is not ordered with it.
+not, and as a failed create or removal for an add or remove. The ordering holds
+within one daemon; another daemon, or a manual `git worktree add` on the same
+repository, is not ordered with it.
 
 Worktrees are useful when an agent should make branch-scoped edits without
 touching the main checkout. They also make remote project sessions practical:

@@ -455,9 +455,10 @@ masquerade as complete host support.
 The GitHub tracker orders the work from the completed shared platform and secure
 path foundations through native process and peer identity, PTY portability,
 launchd, integrations, clients, distribution, and final native acceptance.
-These are work items within one complete release scope. No intermediate merge
-advertises partial macOS support as a reduced product. macOS on Apple Silicon
-is supported; the open items of #100 and #102-#105 are ordinary follow-ups.
+These are work items within one complete release scope. The owner decision
+in the status line supersedes the rule that no merge advertises partial macOS
+support. macOS on Apple Silicon is supported; the open items of #100 and
+#102-#105 are ordinary follow-ups.
 
 ## Release acceptance
 
@@ -471,5 +472,5 @@ sessions. It records OS, architecture, hardware, deadlines, and resource use,
 including at least 20 concurrent sessions and five simultaneous attaches.
 
 Missing native hardware, launchd login context, or pinned
-agent runtime is a visible open gate, never a green skip. Public macOS support is
-declared only after #105 is complete.
+agent runtime is a visible open gate, never a green skip. The owner decision in
+the status line supersedes the rule that public macOS support waits for #105.
