@@ -1,6 +1,6 @@
 ---
 name: pohunek
-description: 'Operate Pohunek safely from an agent: discover hosts and sessions, target exactly, read JSON state, subscribe to events, and defer destructive actions and approvals to the owner.'
+description: "Operate Pohunek safely from an agent: discover hosts and sessions, target exactly, read JSON state, subscribe to events, and defer destructive actions and approvals to the owner."
 ---
 
 <!-- @generated: do not edit; run `cargo xtask agent-skill generate` -->

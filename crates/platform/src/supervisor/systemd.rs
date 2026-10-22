@@ -99,7 +99,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use zbus::proxy::CacheProperties;
-use zbus::zvariant::{OwnedObjectPath, Value};
+use zbus::{OwnedObjectPath, Variant};
 
 use super::{
     Activation, DaemonSupervisor, DefinitionFacts, Error, ExitEvidence, JobDefinition, JobExit,
@@ -326,7 +326,7 @@ impl Supervisor for SystemdSupervisor {
 
             let (key, name) = self.unit_name(id)?;
             let properties = worker_properties(&self.namespace, &key, definition)?;
-            let auxiliary: Vec<(&str, Vec<(&str, Value<'_>)>)> = Vec::new();
+            let auxiliary: Vec<(&str, Vec<(&str, Variant<'_>)>)> = Vec::new();
             let manager = self.bus.manager(OPERATION).await?;
             let _job: OwnedObjectPath = manager
                 .call(
@@ -1100,20 +1100,29 @@ impl Bus {
     async fn connect_to(address: Option<&str>, call_timeout: Duration) -> Result<Self, Error> {
         const OPERATION: &str = "connect";
 
+        // An unusable address is reported by `build()`, which classifies it
+        // as unavailable like every other connection failure.
         let builder = match address {
             Some(address) => zbus::connection::Builder::address(address),
             None => zbus::connection::Builder::session(),
-        }
-        .map_err(|source| unavailable(OPERATION, source))?;
+        };
         let connection = builder
             .method_timeout(call_timeout)
             .build()
             .await
-            .map_err(|source| match classify(&source) {
-                Fault::TimedOut => Error::Timeout {
-                    operation: OPERATION,
-                },
-                _ => unavailable(OPERATION, source),
+            .map_err(|source| {
+                // The connect failure's text quotes the address, which the
+                // caller's environment supplies; only the I/O cause is kept.
+                let source = match source {
+                    zbus::Error::Connection(io, _address) => zbus::Error::InputOutput(io),
+                    other => other,
+                };
+                match classify(&source) {
+                    Fault::TimedOut => Error::Timeout {
+                        operation: OPERATION,
+                    },
+                    _ => unavailable(OPERATION, source),
+                }
             })?;
         Ok(Self { connection })
     }
@@ -1121,9 +1130,8 @@ impl Bus {
     async fn manager(&self, operation: &'static str) -> Result<zbus::Proxy<'_>, Error> {
         zbus::proxy::Builder::new(&self.connection)
             .destination(DESTINATION)
-            .and_then(|builder| builder.path(MANAGER_PATH))
-            .and_then(|builder| builder.interface(MANAGER_INTERFACE))
-            .map_err(|source| bus_error(operation, source))?
+            .path(MANAGER_PATH)
+            .interface(MANAGER_INTERFACE)
             .cache_properties(CacheProperties::No)
             .build()
             .await
@@ -1138,9 +1146,8 @@ impl Bus {
     ) -> Result<zbus::Proxy<'_>, Error> {
         zbus::proxy::Builder::new(&self.connection)
             .destination(DESTINATION)
-            .and_then(|builder| builder.path(path))
-            .and_then(|builder| builder.interface(interface))
-            .map_err(|source| bus_error(operation, source))?
+            .path(path)
+            .interface(interface)
             .cache_properties(CacheProperties::No)
             .build()
             .await
@@ -1490,7 +1497,7 @@ fn worker_properties(
     namespace: &Namespace,
     key: &WorkerKey,
     definition: &JobDefinition,
-) -> Result<Vec<(&'static str, Value<'static>)>, Error> {
+) -> Result<Vec<(&'static str, Variant<'static>)>, Error> {
     if definition.restart() != RestartPolicy::Never {
         return Err(Error::InvalidDefinition {
             detail: "a worker generation must never restart".to_owned(),
@@ -1521,7 +1528,7 @@ fn worker_properties(
     Ok(vec![
         (
             "Description",
-            Value::from(format!(
+            Variant::from(format!(
                 "Pohunek session worker {} generation {}",
                 key.session_id(),
                 key.generation()
@@ -1529,28 +1536,28 @@ fn worker_properties(
         ),
         (
             "ExecStartEx",
-            Value::from(vec![(executable, argv, vec![NO_ENV_EXPAND.to_owned()])]),
+            Variant::from(vec![(executable, argv, vec![NO_ENV_EXPAND.to_owned()])]),
         ),
-        ("Type", Value::from("notify")),
-        ("NotifyAccess", Value::from("main")),
-        ("KillMode", Value::from("control-group")),
-        ("SendSIGHUP", Value::from(true)),
-        ("Slice", Value::from(namespace.sessions_slice())),
-        ("Restart", Value::from("no")),
+        ("Type", Variant::from("notify")),
+        ("NotifyAccess", Variant::from("main")),
+        ("KillMode", Variant::from("control-group")),
+        ("SendSIGHUP", Variant::from(true)),
+        ("Slice", Variant::from(namespace.sessions_slice())),
+        ("Restart", Variant::from("no")),
         (
             "TimeoutStartUSec",
-            Value::from(microseconds(definition.start_timeout())?),
+            Variant::from(microseconds(definition.start_timeout())?),
         ),
         (
             "TimeoutStopUSec",
-            Value::from(microseconds(definition.exit_timeout())?),
+            Variant::from(microseconds(definition.exit_timeout())?),
         ),
-        ("Environment", Value::from(environment)),
-        ("WorkingDirectory", Value::from(working_directory)),
-        ("LimitNOFILE", Value::from(definition.open_files())),
-        ("LimitNOFILESoft", Value::from(definition.open_files())),
-        ("StandardOutput", Value::from("journal")),
-        ("StandardError", Value::from("journal")),
+        ("Environment", Variant::from(environment)),
+        ("WorkingDirectory", Variant::from(working_directory)),
+        ("LimitNOFILE", Variant::from(definition.open_files())),
+        ("LimitNOFILESoft", Variant::from(definition.open_files())),
+        ("StandardOutput", Variant::from("journal")),
+        ("StandardError", Variant::from("journal")),
     ])
 }
 
@@ -2090,6 +2097,14 @@ mod tests {
         assert!(error.is_bus_address_invalid(), "{error}");
         assert!(!error.is_no_bus(), "{error}");
 
+        // A transport this build does not carry is an unusable address too: it
+        // is never executed and never reads as an absent bus.
+        let error = read_user_manager_environment(Some("unixexec:path=/bin/true"), timeout)
+            .await
+            .expect_err("the transport is not supported");
+        assert!(error.is_bus_address_invalid(), "{error}");
+        assert!(!error.is_no_bus(), "{error}");
+
         let socket = dir.path().join("hang-up-bus");
         let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind the socket");
         std::thread::spawn(move || {
@@ -2147,16 +2162,16 @@ mod tests {
         let properties =
             worker_properties(&namespace(), &key(), &definition).expect("worker properties");
         let executable = "/opt/pohunek/libexec/pohunek/1.0.0/pohunek-sessiond".to_owned();
-        let expected: Vec<(&str, Value<'static>)> = vec![
+        let expected: Vec<(&str, Variant<'static>)> = vec![
             (
                 "Description",
-                Value::from(format!(
+                Variant::from(format!(
                     "Pohunek session worker {SESSION} generation abcd2345"
                 )),
             ),
             (
                 "ExecStartEx",
-                Value::from(vec![(
+                Variant::from(vec![(
                     executable.clone(),
                     vec![
                         executable,
@@ -2168,33 +2183,33 @@ mod tests {
                     vec!["no-env-expand".to_owned()],
                 )]),
             ),
-            ("Type", Value::from("notify")),
-            ("NotifyAccess", Value::from("main")),
-            ("KillMode", Value::from("control-group")),
-            ("SendSIGHUP", Value::from(true)),
+            ("Type", Variant::from("notify")),
+            ("NotifyAccess", Variant::from("main")),
+            ("KillMode", Variant::from("control-group")),
+            ("SendSIGHUP", Variant::from(true)),
             (
                 "Slice",
-                Value::from("pohunek-0123456789ab-sessions.slice".to_owned()),
+                Variant::from("pohunek-0123456789ab-sessions.slice".to_owned()),
             ),
-            ("Restart", Value::from("no")),
-            ("TimeoutStartUSec", Value::from(45_000_000_u64)),
-            ("TimeoutStopUSec", Value::from(30_000_000_u64)),
+            ("Restart", Variant::from("no")),
+            ("TimeoutStartUSec", Variant::from(45_000_000_u64)),
+            ("TimeoutStopUSec", Variant::from(30_000_000_u64)),
             (
                 "Environment",
-                Value::from(vec![
+                Variant::from(vec![
                     "HOME=/home/u".to_owned(),
                     "XDG_RUNTIME_DIR=/run/user/1000".to_owned(),
                 ]),
             ),
-            ("WorkingDirectory", Value::from("/home/u".to_owned())),
-            ("LimitNOFILE", Value::from(8_192_u64)),
-            ("LimitNOFILESoft", Value::from(8_192_u64)),
-            ("StandardOutput", Value::from("journal")),
-            ("StandardError", Value::from("journal")),
+            ("WorkingDirectory", Variant::from("/home/u".to_owned())),
+            ("LimitNOFILE", Variant::from(8_192_u64)),
+            ("LimitNOFILESoft", Variant::from(8_192_u64)),
+            ("StandardOutput", Variant::from("journal")),
+            ("StandardError", Variant::from("journal")),
         ];
         assert_eq!(properties, expected);
         assert_eq!(
-            zbus::zvariant::Signature::from(properties[1].1.value_signature()).to_string(),
+            zbus::Signature::from(properties[1].1.value_signature()).to_string(),
             "a(sasas)"
         );
     }
@@ -2213,7 +2228,7 @@ mod tests {
         let definition = JobDefinition::new(hostile.clone()).expect("valid definition");
         let properties =
             worker_properties(&namespace(), &key(), &definition).expect("worker properties");
-        let Value::Array(commands) = &properties[1].1 else {
+        let Variant::Array(commands) = &properties[1].1 else {
             panic!("ExecStartEx is an array");
         };
         let rendered = format!("{commands:?}");
@@ -2557,7 +2572,6 @@ mod tests {
     fn method_error(name: &'static str) -> zbus::Error {
         let name = zbus::names::OwnedErrorName::try_from(name).expect("valid D-Bus error name");
         let message = zbus::Message::method_call("/org/example/Test", "Inspect")
-            .expect("valid method call")
             .build(&())
             .expect("build method call");
         zbus::Error::MethodError(name, None, message)

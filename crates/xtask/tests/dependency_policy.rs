@@ -328,19 +328,19 @@ fn assert_diagnostics(output: &std::process::Output, expected: &[&str]) {
     }
 }
 
-/// zbus must stay on its runtime-agnostic backend. Cargo unifies features across
-/// the graph, so a `tokio` feature on any member makes zbus require a Tokio
-/// reactor for every consumer; the GUI's theme detection drives zbus from a
-/// non-Tokio thread and panics at startup with "there is no reactor running".
-#[test]
-fn zbus_is_never_built_with_its_tokio_backend() {
+/// Offline `cargo metadata` of the whole workspace, covering every target and,
+/// when `all_features` is set, every optional dependency edge.
+fn workspace_metadata(all_features: bool) -> serde_json::Value {
     let env = TestEnv::new().expect("hermetic test environment");
     let root = pohunek_test_support::workspace_root();
-    let output = host_cargo(&env)
+    let mut command = host_cargo(&env);
+    command
         .current_dir(&root)
-        .args(["metadata", "--locked", "--offline", "--format-version", "1"])
-        .output()
-        .expect("workspace metadata");
+        .args(["metadata", "--locked", "--offline", "--format-version", "1"]);
+    if all_features {
+        command.arg("--all-features");
+    }
+    let output = command.output().expect("workspace metadata");
     assert!(
         output.status.success(),
         "workspace metadata failed; this offline resolution covers the crates of every \
@@ -349,10 +349,16 @@ fn zbus_is_never_built_with_its_tokio_backend() {
          cargo said: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("metadata JSON");
-    // Third-party crates may bring their own zbus major (the CLI's keyring
-    // pulls zbus 4); only the zbus that workspace members link against matters.
+    serde_json::from_slice(&output.stdout).expect("metadata JSON")
+}
+
+/// zbus must stay on its runtime-agnostic backend. Cargo unifies features across
+/// the graph, so a `tokio` feature on any member makes zbus require a Tokio
+/// reactor for every consumer; the GUI's theme detection drives zbus from a
+/// non-Tokio thread and panics at startup with "there is no reactor running".
+#[test]
+fn zbus_is_never_built_with_its_tokio_backend() {
+    let metadata = workspace_metadata(false);
     let nodes = metadata["resolve"]["nodes"]
         .as_array()
         .expect("resolve nodes");
@@ -379,11 +385,78 @@ fn zbus_is_never_built_with_its_tokio_backend() {
             !features.iter().any(|feature| feature == "tokio"),
             "zbus resolved with its `tokio` feature; that makes the GUI panic at startup \
              (\"there is no reactor running\") because its theme detection uses zbus off \
-             a Tokio runtime. Keep the workspace dependency on `async-io`."
+             a Tokio runtime. Keep the workspace dependency on `default-rt`."
         );
         assert!(
-            features.iter().any(|feature| feature == "async-io"),
-            "zbus needs the runtime-agnostic `async-io` backend"
+            features.iter().any(|feature| feature == "default-rt"),
+            "zbus needs the runtime-agnostic `default-rt` backend"
         );
     }
+}
+
+/// zbus below 6 and its split-out `zvariant`/`zbus_names` crates are
+/// unmaintained (RUSTSEC-2026-0370, -0371, -0372). Workspace members link zbus
+/// 6; the only remaining consumers of the legacy family are `keyring 3` (its
+/// own `zbus 4` dependency) and `secret-service 4` behind it, the CLI's Linux
+/// Secret Service backend, which `.cargo/audit.toml` ignores for exactly that
+/// chain. Any other path to those
+/// crates is a new dependency on an unmaintained crate.
+#[test]
+fn legacy_zbus_family_is_reachable_only_through_the_keyring_secret_service_chain() {
+    use std::collections::BTreeMap;
+
+    let metadata = workspace_metadata(true);
+    // package id -> (name, major version)
+    let packages: BTreeMap<&str, (&str, u64)> = metadata["packages"]
+        .as_array()
+        .expect("packages")
+        .iter()
+        .map(|package| {
+            let version = package["version"].as_str().expect("package version");
+            let major = version
+                .split('.')
+                .next()
+                .and_then(|major| major.parse().ok())
+                .expect("numeric major version");
+            (
+                package["id"].as_str().expect("package id"),
+                (package["name"].as_str().expect("package name"), major),
+            )
+        })
+        .collect();
+    let is_legacy = |id: &str| match packages[id] {
+        ("zbus" | "zbus_macros", major) => major < 6,
+        ("zvariant" | "zvariant_derive" | "zvariant_utils" | "zbus_names", _) => true,
+        _ => false,
+    };
+    let nodes = metadata["resolve"]["nodes"]
+        .as_array()
+        .expect("resolve nodes");
+    let mut legacy_found = false;
+    for node in nodes {
+        let parent = node["id"].as_str().expect("node id");
+        let (parent_name, parent_major) = packages[parent];
+        for dependency in node["deps"].as_array().expect("node deps") {
+            let child = dependency["pkg"].as_str().expect("dependency id");
+            if !is_legacy(child) || is_legacy(parent) {
+                continue;
+            }
+            legacy_found = true;
+            assert!(
+                matches!(
+                    (parent_name, parent_major),
+                    ("secret-service", 4) | ("keyring", 3)
+                ),
+                "`{parent_name}` {parent_major}.x depends on `{}`, part of the unmaintained \
+                 zbus < 6 family; only keyring 3 and secret-service 4 may, and the family must \
+                 otherwise be zbus 6 (workspace dependency `zbus`)",
+                packages[child].0
+            );
+        }
+    }
+    assert!(
+        legacy_found,
+        "no legacy zbus consumer remains: remove the RUSTSEC-2026-0370/0371/0372 ignores from \
+         .cargo/audit.toml and this test"
+    );
 }

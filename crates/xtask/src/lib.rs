@@ -99,7 +99,7 @@ pub enum XtaskError {
     },
     UnsupportedFileType(PathBuf),
     Json(serde_json::Error),
-    Yaml(serde_yaml::Error),
+    Yaml(serde_saphyr::SerializeError),
     Package(::package::ArchiveError),
     /// A compatibility attestation input was refused.
     Attestation(attestation::AttestationError),

@@ -122,14 +122,14 @@ fn read_utf8(path: &Path) -> Result<String, XtaskError> {
     })
 }
 
-/// Appends `value` as the YAML scalar `serde_yaml` chooses for it. Quoted styles
+/// Appends `value` as the YAML scalar `serde_saphyr` chooses for it. Quoted styles
 /// kick in whenever a plain scalar would be unsafe (a `: ` inside the
 /// description, for example), so the emitted frontmatter always parses.
 fn push_yaml_scalar(output: &mut String, value: &str) -> Result<(), XtaskError> {
-    let serialized = serde_yaml::to_string(value).map_err(XtaskError::Yaml)?;
+    let serialized = serde_saphyr::to_string(&value).map_err(XtaskError::Yaml)?;
     let Some(scalar) = serialized.strip_suffix('\n') else {
         return Err(XtaskError::Usage(format!(
-            "serde_yaml emitted an unexpected document for `{value}`"
+            "serde_saphyr emitted an unexpected document for `{value}`"
         )));
     };
     output.push_str(scalar);
@@ -212,27 +212,24 @@ mod tests {
         let rendered = String::from_utf8(render(root.path()).expect("render skill"))
             .expect("rendered skill is UTF-8");
         let parsed = frontmatter_mapping(&rendered);
+        assert_eq!(parsed.get("name"), Some(&serde_json::json!(SKILL_NAME)));
         assert_eq!(
-            parsed.get(serde_yaml::Value::from("name")),
-            Some(&serde_yaml::Value::String(SKILL_NAME.into()))
-        );
-        assert_eq!(
-            parsed.get(serde_yaml::Value::from("description")),
-            Some(&serde_yaml::Value::String(SKILL_DESCRIPTION.into()))
+            parsed.get("description"),
+            Some(&serde_json::json!(SKILL_DESCRIPTION))
         );
     }
 
-    fn frontmatter_mapping(rendered: &str) -> serde_yaml::Mapping {
+    fn frontmatter_mapping(rendered: &str) -> serde_json::Map<String, serde_json::Value> {
         let without_opener = rendered
             .strip_prefix("---\n")
             .expect("rendered skill must open its frontmatter");
         let (frontmatter, _) = without_opener
             .split_once("\n---\n")
             .expect("rendered skill must close its frontmatter");
-        let value: serde_yaml::Value =
-            serde_yaml::from_str(frontmatter).expect("rendered frontmatter must be valid YAML");
+        let value: serde_json::Value =
+            serde_saphyr::from_str(frontmatter).expect("rendered frontmatter must be valid YAML");
         value
-            .as_mapping()
+            .as_object()
             .cloned()
             .expect("rendered frontmatter must be a YAML mapping")
     }

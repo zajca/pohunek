@@ -12,4 +12,21 @@ ignore = [
     # wayland-scanner accepts quick-xml >= 0.41.0.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # Dated 2026-10-23, tracked in #1504. zvariant, zvariant_derive and
+    # zbus_names are merged into zbus 6, which the workspace links. The only
+    # remaining consumer is the CLI's Linux Secret Service backend:
+    # keyring 3 -> zbus 4 and keyring 3 -> secret-service 4 -> zbus 4. No
+    # keyring/secret-service release on zbus 6 exists (secret-service 5
+    # requires zbus 5). xtask's dependency_policy test fails if any other
+    # crate or version pulls zbus < 6 or these crates. Remove these ignores
+    # once keyring's Secret Service stack is on zbus 6.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
+    # Dated 2026-10-23, tracked in #1505. smartstring is locked only through
+    # the optional `ts` feature (ts-rs `format` -> dprint-plugin-typescript
+    # =0.95 -> swc) used by `cargo xtask ts`; no shipped binary links it.
+    # Remove this ignore once ts-rs drops the dependency or the bindings
+    # are formatted another way.
+    "RUSTSEC-2026-0249",
 ]
