@@ -229,22 +229,13 @@ pub(crate) fn read_stdin_input() -> Result<String, CliError> {
     read_bounded_input(std::io::stdin().lock())
 }
 
-/// Resolve an exact session display name to its unique stable id.
+/// Resolve an exact session display name to its unique stable id on the host an
+/// operation pinned for all its connections.
 ///
 /// Exact ids always win. Unknown values are left unchanged so the daemon emits
 /// its canonical not-found error. Ambiguity is rejected locally with sorted id
 /// candidates, which makes retries deterministic across list ordering.
-pub(crate) async fn resolve_target(
-    host: &str,
-    paths: &Paths,
-    target: &Target,
-) -> Result<Target, CliError> {
-    let client = Client::connect(host, paths).await?;
-    resolve_target_on(client, target).await
-}
-
-/// [`resolve_target`] on the host an operation pinned for all its connections.
-async fn resolve_target_pinned(
+pub(crate) async fn resolve_target_pinned(
     host: &PinnedHost,
     paths: &Paths,
     target: &Target,
@@ -733,12 +724,12 @@ pub(crate) async fn run_list(
 /// resolved, the daemon rejects the request, or the payload does not match the
 /// contract.
 pub(crate) async fn run_inspect(
-    host: &str,
+    host: &PinnedHost,
     paths: &Paths,
     target: &Target,
     json: bool,
 ) -> Result<(), CliError> {
-    let mut client = Client::connect(host, paths).await?;
+    let mut client = Client::connect_pinned(host, paths).await?;
     let info = client
         .call::<method::SessionInspect>(SessionId(target.session_id.clone()))
         .await?;
@@ -763,12 +754,12 @@ pub(crate) async fn run_inspect(
 /// resolved, the daemon rejects the request, or the payload does not match the
 /// contract.
 pub(crate) async fn run_stop(
-    host: &str,
+    host: &PinnedHost,
     paths: &Paths,
     target: &Target,
     json: bool,
 ) -> Result<(), CliError> {
-    let mut sdk = Client::connect(host, paths).await?.into_sdk();
+    let mut sdk = Client::connect_pinned(host, paths).await?.into_sdk();
     let stop = with_wait_notice(
         sdk.session_stop(SessionId(target.session_id.clone())),
         json,
@@ -797,14 +788,14 @@ pub(crate) async fn run_stop(
 /// resolved, the daemon rejects the fork, or the payload does not match the
 /// contract.
 pub(crate) async fn run_fork(
-    host: &str,
+    host: &PinnedHost,
     paths: &Paths,
     target: &Target,
     name: Option<String>,
     accept_profile_change: bool,
     json: bool,
 ) -> Result<(), CliError> {
-    let mut sdk = Client::connect(host, paths).await?.into_sdk();
+    let mut sdk = Client::connect_pinned(host, paths).await?.into_sdk();
     let forked = with_wait_notice(
         sdk.session_fork(fork_params(
             target,
@@ -852,13 +843,13 @@ pub(crate) async fn run_fork(
 /// resolved, the daemon rejects the request, or the payload does not match the
 /// contract.
 pub(crate) async fn run_remove(
-    host: &str,
+    host: &PinnedHost,
     paths: &Paths,
     target: &Target,
     accept_unconfirmed_cleanup: bool,
     json: bool,
 ) -> Result<(), CliError> {
-    let mut sdk = Client::connect(host, paths).await?.into_sdk();
+    let mut sdk = Client::connect_pinned(host, paths).await?.into_sdk();
     let session_id = SessionId(target.session_id.clone());
     let notice = || {
         format!(
@@ -894,7 +885,7 @@ pub(crate) async fn run_remove(
 /// resolved, the daemon rejects the request, or the payload does not match the
 /// contract.
 pub(crate) async fn run_input(
-    host: &str,
+    host: &PinnedHost,
     paths: &Paths,
     target: &Target,
     text: &str,
@@ -902,7 +893,7 @@ pub(crate) async fn run_input(
     timeout_ms: Option<u32>,
     json: bool,
 ) -> Result<(), CliError> {
-    let mut client = Client::connect(host, paths).await?;
+    let mut client = Client::connect_pinned(host, paths).await?;
     let params = input_params(target, text, wait_until, timeout_ms);
     let input = if params.wait.is_some() {
         let mut cancellation = ProcessCancellation::install()?;
@@ -923,12 +914,12 @@ pub(crate) async fn run_input(
 }
 
 pub(crate) async fn run_screen(
-    host: &str,
+    host: &PinnedHost,
     paths: &Paths,
     target: &Target,
     json: bool,
 ) -> Result<(), CliError> {
-    let client = Client::connect(host, paths).await?;
+    let client = Client::connect_pinned(host, paths).await?;
     let result = client
         .into_sdk()
         .session_screen(SessionScreenParams::new(SessionId(
@@ -946,12 +937,12 @@ pub(crate) async fn run_screen(
 }
 
 pub(crate) async fn run_detection(
-    host: &str,
+    host: &PinnedHost,
     paths: &Paths,
     target: &Target,
     json: bool,
 ) -> Result<(), CliError> {
-    let client = Client::connect(host, paths).await?;
+    let client = Client::connect_pinned(host, paths).await?;
     let result = client
         .into_sdk()
         .session_detection(SessionDetectionParams::new(SessionId(
@@ -1008,7 +999,7 @@ pub(crate) fn parse_read_lines(value: &str) -> Result<u32, String> {
 }
 
 pub(crate) async fn run_read(
-    host: &str,
+    host: &PinnedHost,
     paths: &Paths,
     target: &Target,
     args: ReadArgs,
@@ -1023,7 +1014,7 @@ pub(crate) async fn run_read(
     .map_err(|error| CliError::InvalidObservation {
         detail: error.to_string(),
     })?;
-    let mut client = Client::connect(host, paths).await?;
+    let mut client = Client::connect_pinned(host, paths).await?;
     let result = client.call::<method::SessionRead>(params).await?;
     if json {
         print!("{}", crate::commands::render_json(&result)?);
@@ -1336,13 +1327,13 @@ fn render_turn_progress(progress: &SessionTurnProgress) -> String {
 }
 
 pub(crate) async fn run_resume(
-    host: &str,
+    host: &PinnedHost,
     paths: &Paths,
     target: &Target,
     accept_profile_change: bool,
     json: bool,
 ) -> Result<(), CliError> {
-    let mut sdk = Client::connect(host, paths).await?.into_sdk();
+    let mut sdk = Client::connect_pinned(host, paths).await?.into_sdk();
     let result = with_wait_notice(
         sdk.session_resume_with(resume_params(target, accept_profile_change)),
         json,
@@ -1387,14 +1378,14 @@ async fn with_wait_notice<T>(
 }
 
 pub(crate) async fn run_resize(
-    host: &str,
+    host: &PinnedHost,
     paths: &Paths,
     target: &Target,
     cols: u16,
     rows: u16,
     json: bool,
 ) -> Result<(), CliError> {
-    let client = Client::connect(host, paths).await?;
+    let client = Client::connect_pinned(host, paths).await?;
     let result = client
         .into_sdk()
         .session_resize(SessionResizeParams {
@@ -1415,13 +1406,13 @@ pub(crate) async fn run_resize(
 }
 
 pub(crate) async fn run_metadata(
-    host: &str,
+    host: &PinnedHost,
     paths: &Paths,
     target: &Target,
     metadata: BTreeMap<String, Option<String>>,
     json: bool,
 ) -> Result<(), CliError> {
-    let client = Client::connect(host, paths).await?;
+    let client = Client::connect_pinned(host, paths).await?;
     let result = client
         .into_sdk()
         .session_set_metadata(SessionSetMetadataParams {
@@ -1459,13 +1450,13 @@ pub(crate) async fn run_runtime_inventory(
 
 /// Set (`Some`) or clear (`None`) a session's display name on the target host.
 pub(crate) async fn run_rename(
-    host: &str,
+    host: &PinnedHost,
     paths: &Paths,
     target: &Target,
     name: Option<String>,
     json: bool,
 ) -> Result<(), CliError> {
-    let mut client = Client::connect(host, paths).await?;
+    let mut client = Client::connect_pinned(host, paths).await?;
     let renamed = client
         .call::<method::SessionRename>(rename_params(target, name))
         .await?;
@@ -1494,13 +1485,13 @@ pub(crate) async fn run_rename(
 /// resolved, the daemon rejects the request (e.g. the session has no bound
 /// worktree), or the payload does not match the contract.
 pub(crate) async fn run_diff(
-    host: &str,
+    host: &PinnedHost,
     paths: &Paths,
     target: &Target,
     base: Option<String>,
     json: bool,
 ) -> Result<(), CliError> {
-    let mut client = Client::connect(host, paths).await?;
+    let mut client = Client::connect_pinned(host, paths).await?;
     let result = client
         .call::<method::SessionDiff>(diff_params(target, base))
         .await?;
@@ -3724,7 +3715,7 @@ mod tests {
 
             let remove = tokio::spawn(async move {
                 run_remove(
-                    LOCAL_HOST,
+                    &PinnedHost::local(),
                     &paths,
                     &target,
                     accept_unconfirmed_cleanup,
@@ -3776,21 +3767,31 @@ mod tests {
                 "stop",
                 pohunek_client::SESSION_STOP_REQUEST_BUDGET_MS,
                 "session_stop_outcome_unknown",
-                |paths, target, json| Box::pin(run_stop(LOCAL_HOST, paths, target, json)),
+                |paths, target, json| {
+                    Box::pin(
+                        async move { run_stop(&PinnedHost::local(), paths, target, json).await },
+                    )
+                },
             ),
             (
                 "fork",
                 pohunek_client::SESSION_FORK_REQUEST_BUDGET_MS,
                 "session_fork_outcome_unknown",
                 |paths, target, json| {
-                    Box::pin(run_fork(LOCAL_HOST, paths, target, None, false, json))
+                    Box::pin(async move {
+                        run_fork(&PinnedHost::local(), paths, target, None, false, json).await
+                    })
                 },
             ),
             (
                 "remove",
                 pohunek_client::SESSION_REMOVE_REQUEST_BUDGET_MS,
                 "session_remove_outcome_unknown",
-                |paths, target, json| Box::pin(run_remove(LOCAL_HOST, paths, target, false, json)),
+                |paths, target, json| {
+                    Box::pin(async move {
+                        run_remove(&PinnedHost::local(), paths, target, false, json).await
+                    })
+                },
             ),
         ];
         let inhibitor = AutoAdvanceInhibitor::new();

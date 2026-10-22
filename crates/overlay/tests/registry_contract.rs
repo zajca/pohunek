@@ -94,6 +94,18 @@ impl MemoryTransport {
         }
     }
 
+    /// A collision whose provider reports no candidate hosts.
+    fn add_unlisted_collision(&mut self, host: &str) {
+        self.resolutions.insert(
+            host.to_owned(),
+            Err(OverlayError::PeerCollision {
+                host: host.to_owned(),
+                overlay: self.id.clone(),
+                candidates: Vec::new(),
+            }),
+        );
+    }
+
     fn add_collision(&mut self, host: &str) {
         self.resolutions.insert(
             host.to_owned(),
@@ -360,7 +372,7 @@ async fn ipv6_literals_distinguish_unqualified_peers_qualifiers_and_socket_addre
 
     assert!(matches!(
         registry.resolve_host("fd00::2").await,
-        Err(RegistryError::AmbiguousHost { host, candidates })
+        Err(RegistryError::AmbiguousHost { host, candidates, .. })
             if host == "fd00::2"
                 && candidates.iter().map(|c| c.overlay.as_str()).eq(["first", "second"])
     ));
@@ -452,4 +464,36 @@ async fn a_name_this_machine_shares_with_a_peer_on_another_overlay_names_both() 
         Some("local"),
         "this machine is selected by `local`, never by an overlay name"
     );
+}
+
+#[tokio::test]
+async fn a_collision_without_listed_hosts_stays_multiple_hosts_beside_known_peers() {
+    let listener = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let address = "100.64.0.2".parse().expect("peer address");
+    let mut unlisted = MemoryTransport::new("unlisted", listener);
+    unlisted.add_unlisted_collision("build");
+    let mut healthy = MemoryTransport::new("healthy", listener);
+    healthy.add_member(address);
+    healthy.add_peer("build", Some("healthy-build"), Some(address));
+    let registry = OverlayRegistry::new(vec![
+        configured(unlisted, 17001),
+        configured(healthy, 17002),
+    ])
+    .expect("registry");
+
+    for ambiguous in [
+        registry
+            .resolve_host("build")
+            .await
+            .expect_err("a collision beside a healthy peer is ambiguous"),
+        registry
+            .resolve_target("build")
+            .await
+            .expect_err("a collision beside a healthy peer is ambiguous"),
+    ] {
+        assert_eq!(
+            ambiguous.to_string(),
+            "host 'build' matches multiple hosts on overlay healthy: peer build.example"
+        );
+    }
 }

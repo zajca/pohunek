@@ -2032,12 +2032,16 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 }
                 SessionAction::Inspect { target, json } => {
                     let host = effective_host(&global_host, Some(&target));
-                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    let host = client::PinnedHost::resolve(&host).await?;
+                    let target =
+                        commands::session::resolve_target_pinned(&host, &paths, &target).await?;
                     commands::session::run_inspect(&host, &paths, &target, json).await?;
                 }
                 SessionAction::Stop { target, json } => {
                     let host = effective_host(&global_host, Some(&target));
-                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    let host = client::PinnedHost::resolve(&host).await?;
+                    let target =
+                        commands::session::resolve_target_pinned(&host, &paths, &target).await?;
                     commands::session::run_stop(&host, &paths, &target, json).await?;
                 }
                 SessionAction::Fork {
@@ -2047,7 +2051,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     json,
                 } => {
                     let host = effective_host(&global_host, Some(&target));
-                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    let host = client::PinnedHost::resolve(&host).await?;
+                    let target =
+                        commands::session::resolve_target_pinned(&host, &paths, &target).await?;
                     commands::session::run_fork(
                         &host,
                         &paths,
@@ -2064,7 +2070,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     json,
                 } => {
                     let host = effective_host(&global_host, Some(&target));
-                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    let host = client::PinnedHost::resolve(&host).await?;
+                    let target =
+                        commands::session::resolve_target_pinned(&host, &paths, &target).await?;
                     commands::session::run_remove(
                         &host,
                         &paths,
@@ -2088,7 +2096,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     } else {
                         text.expect("clap requires positional text or --stdin")
                     };
-                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    let host = client::PinnedHost::resolve(&host).await?;
+                    let target =
+                        commands::session::resolve_target_pinned(&host, &paths, &target).await?;
                     commands::session::run_input(
                         &host,
                         &paths,
@@ -2102,12 +2112,16 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 }
                 SessionAction::Screen { target, json } => {
                     let host = effective_host(&global_host, Some(&target));
-                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    let host = client::PinnedHost::resolve(&host).await?;
+                    let target =
+                        commands::session::resolve_target_pinned(&host, &paths, &target).await?;
                     commands::session::run_screen(&host, &paths, &target, json).await?;
                 }
                 SessionAction::Detection { target, json } => {
                     let host = effective_host(&global_host, Some(&target));
-                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    let host = client::PinnedHost::resolve(&host).await?;
+                    let target =
+                        commands::session::resolve_target_pinned(&host, &paths, &target).await?;
                     commands::session::run_detection(&host, &paths, &target, json).await?;
                 }
                 SessionAction::Read {
@@ -2118,7 +2132,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     json,
                 } => {
                     let host = effective_host(&global_host, Some(&target));
-                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    let host = client::PinnedHost::resolve(&host).await?;
+                    let target =
+                        commands::session::resolve_target_pinned(&host, &paths, &target).await?;
                     commands::session::run_read(
                         &host,
                         &paths,
@@ -2223,7 +2239,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     json,
                 } => {
                     let host = effective_host(&global_host, Some(&target));
-                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    let host = client::PinnedHost::resolve(&host).await?;
+                    let target =
+                        commands::session::resolve_target_pinned(&host, &paths, &target).await?;
                     commands::session::run_resume(
                         &host,
                         &paths,
@@ -2240,7 +2258,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     json,
                 } => {
                     let host = effective_host(&global_host, Some(&target));
-                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    let host = client::PinnedHost::resolve(&host).await?;
+                    let target =
+                        commands::session::resolve_target_pinned(&host, &paths, &target).await?;
                     commands::session::run_resize(&host, &paths, &target, cols, rows, json).await?;
                 }
                 SessionAction::Metadata {
@@ -2250,7 +2270,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     json,
                 } => {
                     let host = effective_host(&global_host, Some(&target));
-                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    let host = client::PinnedHost::resolve(&host).await?;
+                    let target =
+                        commands::session::resolve_target_pinned(&host, &paths, &target).await?;
                     let mut metadata = std::collections::BTreeMap::new();
                     for (key, value) in set {
                         if metadata.insert(key.clone(), Some(value)).is_some() {
@@ -2275,14 +2297,18 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     json,
                 } => {
                     let host = effective_host(&global_host, Some(&target));
-                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    let host = client::PinnedHost::resolve(&host).await?;
+                    let target =
+                        commands::session::resolve_target_pinned(&host, &paths, &target).await?;
                     // `--clear` (or no name) clears it; a positional name sets it.
                     let new_name = if clear { None } else { name };
                     commands::session::run_rename(&host, &paths, &target, new_name, json).await?;
                 }
                 SessionAction::Diff { target, base, json } => {
                     let host = effective_host(&global_host, Some(&target));
-                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    let host = client::PinnedHost::resolve(&host).await?;
+                    let target =
+                        commands::session::resolve_target_pinned(&host, &paths, &target).await?;
                     commands::session::run_diff(&host, &paths, &target, base, json).await?;
                 }
                 SessionAction::Policy { action } => match action {

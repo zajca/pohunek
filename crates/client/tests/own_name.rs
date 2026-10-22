@@ -245,7 +245,44 @@ async fn a_name_this_machine_shares_with_a_peer_is_ambiguous_and_dials_nothing()
     )
     .await
     .expect_err("an ambiguous name never connects");
-    assert_eq!(error.to_protocol_error().code, "overlay_host_ambiguous");
+    let structured = error.to_protocol_error();
+    assert_eq!(structured.code, "overlay_host_ambiguous");
+    assert_eq!(
+        structured.msg, "host 'twin' matches multiple hosts",
+        "a provider that lists no candidates is neither counted nor named as one host"
+    );
+    assert_eq!(seen(&daemons.local) + seen(&daemons.tcp), 0);
+}
+
+#[tokio::test]
+async fn one_fqdn_on_two_overlays_keeps_both_overlay_qualified_selectors() {
+    let daemons = daemons().await;
+    let overlays = ["one", "two"].map(|id| {
+        let peer = ResolvedPeer {
+            peer_id: None,
+            display_name: Some(PEER_NAME.to_owned()),
+            fqdn: Some(format!("{PEER_NAME}.overlay.test")),
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        };
+        let transport = StubOverlay {
+            id: OverlayId::new(id).expect("overlay id"),
+            peer: Some(peer),
+        };
+        ConfiguredTransport::new(Arc::new(transport), daemons.port).expect("configured transport")
+    });
+    let error = Client::connect_with_registry_and_options(
+        PEER_NAME,
+        &daemons.socket,
+        OverlayRegistry::new(overlays.to_vec()).expect("registry"),
+        options(),
+    )
+    .await
+    .expect_err("one name on two overlays never connects");
+    let structured = error.to_protocol_error();
+    assert_eq!(structured.code, "overlay_host_ambiguous");
+    let recover = structured.recover.expect("recovery hint");
+    assert!(recover.contains("one:fqdn~"), "{recover}");
+    assert!(recover.contains("two:fqdn~"), "{recover}");
     assert_eq!(seen(&daemons.local) + seen(&daemons.tcp), 0);
 }
 

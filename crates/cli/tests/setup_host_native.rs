@@ -154,6 +154,31 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     entries
 }
 
+/// Asserts that the install command a Hermes gap detail names parses against
+/// the real clap tree once its `<mode>` and `<host>` placeholders are filled.
+fn assert_gap_command_parses(gap: &str) {
+    let command = gap
+        .split('`')
+        .nth(1)
+        .unwrap_or_else(|| panic!("the gap names a command in backticks: {gap}"));
+    let tokens: Vec<&str> = command
+        .split_whitespace()
+        .map(|token| match token {
+            "<mode>" => "read_only",
+            "<host>" => "local",
+            other => other,
+        })
+        .collect();
+    assert_eq!(
+        &tokens[..4],
+        ["pohunek", "integration", "install", "--agent"],
+        "the gap names the install form: {gap}"
+    );
+    if let Err(error) = pohunek_cli::command().try_get_matches_from(&tokens) {
+        panic!("the gap command does not parse ({error}): {gap}");
+    }
+}
+
 /// Creates an unmarked Hermes home with one owner file in it.
 fn unmarked_hermes_home(installation: &Installation) -> PathBuf {
     let home = installation.root.join("home").join(HERMES_HOME);
@@ -244,14 +269,9 @@ async fn unmarked_hermes_home_is_a_gap_and_existing_config_is_kept() {
             .all(|home| home.status == "gap"),
         "both are unmarked, so both are gaps"
     );
-    let gap = host_plan.preview.hermes_homes[0]
-        .detail
-        .clone()
-        .unwrap_or_default();
-    assert!(
-        gap.contains("pohunek integration hermes install"),
-        "the gap names its install command: {gap}"
-    );
+    for home in &host_plan.preview.hermes_homes {
+        assert_gap_command_parses(home.detail.as_deref().unwrap_or_default());
+    }
 
     let outcome = apply(&installation.context, host_plan, &planner)
         .await

@@ -38,8 +38,9 @@ Use these commands for orientation:
   consumer that fans out to all hosts adds the explicit local target through its
   Unix socket and skips that record, so this machine is contacted once. A remote
   `--host` is resolved once per operation that opens several connections
-  (`attach`, `session output`, `session wait`, `assistant`) and pinned to the
-  peer identity it selected, so a renamed short name is never followed midway; a
+  (`attach`, `assistant`, `session output`, `session wait`, and every
+  `session <action> <name>` command that looks the session name up first) and
+  pinned to the peer identity it selected, so a renamed short name is never followed midway; a
   peer with no peer id and no FQDN fails with `host_identity_unpinnable`.
 - `pohunek host list --json` to list known live peers. These commands need the
   local overlay CLI/state, but do not connect to local `pohunekd`; a short

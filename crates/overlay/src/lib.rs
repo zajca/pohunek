@@ -132,12 +132,19 @@ pub enum RegistryError {
     #[error("overlay '{0}' is not configured")]
     OverlayNotConfigured(OverlayId),
     /// A selector matched more than one host, on one overlay or across several.
-    #[error("host '{host}' matches {} hosts{}", candidates.len(), describe_candidates(candidates))]
+    #[error(
+        "host '{host}' matches {}{}",
+        matched_hosts(candidates, *unlisted),
+        describe_candidates(candidates)
+    )]
     AmbiguousHost {
         /// User-provided host selector.
         host: String,
-        /// Every host the selector matched.
+        /// Every host the selector matched that a provider listed.
         candidates: Vec<HostCandidate>,
+        /// Whether a provider reported a collision without listing its hosts,
+        /// so `candidates` is a lower bound.
+        unlisted: bool,
     },
     /// No configured overlay knows the requested host.
     #[error("host '{0}' was not found in any configured overlay")]
@@ -326,6 +333,15 @@ impl HostCandidate {
         } else {
             format!("{}:{selector}", self.overlay)
         })
+    }
+}
+
+/// How many hosts an ambiguity names: the count when every candidate is listed
+/// and there are at least two, otherwise `multiple hosts`.
+fn matched_hosts(candidates: &[HostCandidate], unlisted: bool) -> String {
+    match candidates.len() {
+        count if count >= 2 && !unlisted => format!("{count} hosts"),
+        _ => "multiple hosts".to_owned(),
     }
 }
 
@@ -736,6 +752,8 @@ impl OverlayRegistry {
         let mut routes = Vec::new();
         let mut failures = Vec::new();
         let mut collisions = Vec::new();
+        let mut collided = false;
+        let mut unlisted = false;
         let results = join_all(self.entries().iter().map(|entry| async move {
             (
                 entry.id().clone(),
@@ -755,17 +773,21 @@ impl OverlayRegistry {
                 }),
                 Err(OverlayError::HostUnknown { .. }) => {}
                 Err(error @ OverlayError::PeerCollision { .. }) => {
-                    collisions.extend(collision_candidates(&overlay, host, &error));
+                    collided = true;
+                    let listed = collision_candidates(&overlay, &error);
+                    unlisted |= listed.is_empty();
+                    collisions.extend(listed);
                     failures.push(OverlayFailure { overlay, error });
                 }
                 Err(error) => failures.push(OverlayFailure { overlay, error }),
             }
         }
-        if !collisions.is_empty() {
+        if collided {
             collisions.extend(routes.iter().map(route_candidate));
             return Err(RegistryError::AmbiguousHost {
                 host: host.to_owned(),
                 candidates: collisions,
+                unlisted,
             });
         }
         match routes.len() {
@@ -773,6 +795,7 @@ impl OverlayRegistry {
             count if count > 1 => Err(RegistryError::AmbiguousHost {
                 host: host.to_owned(),
                 candidates: routes.iter().map(route_candidate).collect(),
+                unlisted: false,
             }),
             _ if failures.is_empty() => Err(RegistryError::HostUnknown(host.to_owned())),
             _ => Err(RegistryError::HostUnavailable {
@@ -811,10 +834,14 @@ impl OverlayRegistry {
             Err(OverlayError::HostUnknown { .. }) => {
                 Err(RegistryError::HostUnknown(host.to_owned()))
             }
-            Err(error @ OverlayError::PeerCollision { .. }) => Err(RegistryError::AmbiguousHost {
-                host: host.to_owned(),
-                candidates: collision_candidates(&overlay, host, &error),
-            }),
+            Err(error @ OverlayError::PeerCollision { .. }) => {
+                let candidates = collision_candidates(&overlay, &error);
+                Err(RegistryError::AmbiguousHost {
+                    host: host.to_owned(),
+                    unlisted: candidates.is_empty(),
+                    candidates,
+                })
+            }
             Err(error) => Err(RegistryError::HostUnavailable {
                 host: host.to_owned(),
                 failures: vec![OverlayFailure { overlay, error }],
@@ -844,6 +871,8 @@ impl OverlayRegistry {
         let mut routes = Vec::new();
         let mut failures = Vec::new();
         let mut collisions = Vec::new();
+        let mut collided = false;
+        let mut unlisted = false;
         let results = join_all(self.entries().iter().map(|entry| async move {
             (
                 entry.id().clone(),
@@ -864,13 +893,16 @@ impl OverlayRegistry {
                 }),
                 Err(OverlayError::HostUnknown { .. }) => {}
                 Err(error @ OverlayError::PeerCollision { .. }) => {
-                    collisions.extend(collision_candidates(&overlay, host, &error));
+                    collided = true;
+                    let listed = collision_candidates(&overlay, &error);
+                    unlisted |= listed.is_empty();
+                    collisions.extend(listed);
                     failures.push(OverlayFailure { overlay, error });
                 }
                 Err(error) => failures.push(OverlayFailure { overlay, error }),
             }
         }
-        if !collisions.is_empty() || (!local_overlays.is_empty() && !routes.is_empty()) {
+        if collided || (!local_overlays.is_empty() && !routes.is_empty()) {
             // Named by the selector: the error path starts no further provider
             // I/O, which a timeout could turn into a different outcome.
             collisions.extend(local_overlays.into_iter().map(|overlay| HostCandidate {
@@ -881,6 +913,7 @@ impl OverlayRegistry {
             return Err(RegistryError::AmbiguousHost {
                 host: host.to_owned(),
                 candidates: collisions,
+                unlisted,
             });
         }
         if !local_overlays.is_empty() {
@@ -891,6 +924,7 @@ impl OverlayRegistry {
             count if count > 1 => Err(RegistryError::AmbiguousHost {
                 host: host.to_owned(),
                 candidates: routes.iter().map(route_candidate).collect(),
+                unlisted: false,
             }),
             _ if failures.is_empty() => Err(RegistryError::HostUnknown(host.to_owned())),
             _ => Err(RegistryError::HostUnavailable {
@@ -930,10 +964,14 @@ impl OverlayRegistry {
             Err(OverlayError::HostUnknown { .. }) => {
                 Err(RegistryError::HostUnknown(host.to_owned()))
             }
-            Err(error @ OverlayError::PeerCollision { .. }) => Err(RegistryError::AmbiguousHost {
-                host: host.to_owned(),
-                candidates: collision_candidates(&overlay, host, &error),
-            }),
+            Err(error @ OverlayError::PeerCollision { .. }) => {
+                let candidates = collision_candidates(&overlay, &error);
+                Err(RegistryError::AmbiguousHost {
+                    host: host.to_owned(),
+                    unlisted: candidates.is_empty(),
+                    candidates,
+                })
+            }
             Err(error) => Err(RegistryError::HostUnavailable {
                 host: host.to_owned(),
                 failures: vec![OverlayFailure { overlay, error }],
@@ -971,28 +1009,13 @@ fn route_candidate(route: &OverlayRoute) -> HostCandidate {
     }
 }
 
-/// The hosts a provider's collision error names, or the selector itself when
-/// the provider reports none.
-fn collision_candidates(
-    overlay: &OverlayId,
-    host: &str,
-    error: &OverlayError,
-) -> Vec<HostCandidate> {
+/// The hosts a provider's collision error names; empty when the provider
+/// reports none, so the ambiguity keeps its unknown candidate set.
+fn collision_candidates(overlay: &OverlayId, error: &OverlayError) -> Vec<HostCandidate> {
     let reported = match error {
         OverlayError::PeerCollision { candidates, .. } => candidates.as_slice(),
         _ => &[],
     };
-    if reported.is_empty() {
-        return vec![HostCandidate {
-            overlay: overlay.clone(),
-            identity: CandidateIdentity {
-                local: false,
-                name: host.to_owned(),
-                selector: None,
-                selector_is_peer_id: false,
-            },
-        }];
-    }
     reported
         .iter()
         .map(|identity| HostCandidate {
