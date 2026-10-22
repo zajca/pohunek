@@ -357,7 +357,6 @@ impl NotificationStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let contributes = source_priority(&candidate.source) != SourcePriority::Projector;
 
         if let Some(existing) = find_existing_source(&state.records, &candidate) {
             return Ok(CreateOutcome::Existing(existing));
@@ -369,37 +368,8 @@ impl NotificationStore {
             .filter(|dedupe_key| is_turn_dedupe_key(dedupe_key))
             .filter(|_| candidate.kind == NotificationKind::TurnCompleted)
         {
-            let updated = supersede_unread_records(
-                &state.records,
-                dedupe_key,
-                candidate.kind,
-                &candidate.id,
-                &candidate.created_at,
-            );
-            if updated.is_empty() {
-                append_action_locked(
-                    &self.path,
-                    &mut state,
-                    StoreAction::Created {
-                        record: candidate.clone(),
-                    },
-                )?;
-                note_contribution(&mut state, contributes, &candidate.id.0, minted);
-                return Ok(CreateOutcome::Created(candidate));
-            }
-            append_action_locked(
-                &self.path,
-                &mut state,
-                StoreAction::CreatedWithUpdates {
-                    record: candidate.clone(),
-                    updated: updated.clone(),
-                },
-            )?;
-            note_contribution(&mut state, contributes, &candidate.id.0, minted);
-            return Ok(CreateOutcome::CreatedWithUpdates {
-                record: candidate,
-                updated,
-            });
+            let dedupe_key = dedupe_key.to_owned();
+            return self.create_superseding_turns(&mut state, candidate, &dedupe_key, minted);
         }
 
         if let Some(dedupe_key) = candidate.dedupe_key.as_deref() {
@@ -430,7 +400,7 @@ impl NotificationStore {
                                 record: updated.clone(),
                             },
                         )?;
-                        note_contribution(&mut state, contributes, &updated.id.0, minted);
+                        note_contribution(&mut state, &candidate, &updated.id.0, minted);
                         return Ok(CreateOutcome::Updated(updated));
                     }
                     (
@@ -438,7 +408,7 @@ impl NotificationStore {
                         SourcePriority::Provider,
                     )
                     | (SourcePriority::Projector, SourcePriority::Projector) => {
-                        note_contribution(&mut state, contributes, &existing.id.0, minted);
+                        note_contribution(&mut state, &candidate, &existing.id.0, minted);
                         return Ok(CreateOutcome::Existing(existing));
                     }
                     (SourcePriority::User, _)
@@ -457,8 +427,50 @@ impl NotificationStore {
                 record: candidate.clone(),
             },
         )?;
-        note_contribution(&mut state, contributes, &candidate.id.0, minted);
+        note_contribution(&mut state, &candidate, &candidate.id.0, minted);
         Ok(CreateOutcome::Created(candidate))
+    }
+
+    /// Creates a `turn_completed` record that supersedes the unread ones of its
+    /// session key.
+    fn create_superseding_turns(
+        &self,
+        state: &mut StoreState,
+        candidate: NotificationRecord,
+        dedupe_key: &str,
+        minted: Instant,
+    ) -> Result<CreateOutcome, NotificationError> {
+        let updated = supersede_unread_records(
+            &state.records,
+            dedupe_key,
+            candidate.kind,
+            &candidate.id,
+            &candidate.created_at,
+        );
+        if updated.is_empty() {
+            append_action_locked(
+                &self.path,
+                state,
+                StoreAction::Created {
+                    record: candidate.clone(),
+                },
+            )?;
+            note_contribution(state, &candidate, &candidate.id.0, minted);
+            return Ok(CreateOutcome::Created(candidate));
+        }
+        append_action_locked(
+            &self.path,
+            state,
+            StoreAction::CreatedWithUpdates {
+                record: candidate.clone(),
+                updated: updated.clone(),
+            },
+        )?;
+        note_contribution(state, &candidate, &candidate.id.0, minted);
+        Ok(CreateOutcome::CreatedWithUpdates {
+            record: candidate,
+            updated,
+        })
     }
 
     /// Supersede unread `turn_completed` records consumed by visible attention.
@@ -833,10 +845,15 @@ fn append_action_locked(
     Ok(())
 }
 
-/// Records that another producer than the projector contributed to the record
-/// `id` at `minted`, keeping the newest contribution.
-fn note_contribution(state: &mut StoreState, contributes: bool, id: &str, minted: Instant) {
-    if contributes {
+/// Records that `candidate`, when it is not the projector's, contributed to the
+/// record `id` at `minted`, keeping the newest contribution.
+fn note_contribution(
+    state: &mut StoreState,
+    candidate: &NotificationRecord,
+    id: &str,
+    minted: Instant,
+) {
+    if source_priority(&candidate.source) != SourcePriority::Projector {
         let newest = state.contributions.entry(id.to_owned()).or_insert(minted);
         *newest = (*newest).max(minted);
     }
@@ -846,21 +863,20 @@ fn note_contribution(state: &mut StoreState, contributes: bool, id: &str, minted
 /// `as_of` an earlier moment is applied.
 ///
 /// The projector derives its records in the order its inputs arrive, so one
-/// that is visible to a resolve always precedes that resolve's input. Other
-/// producers are ordered by the instant they minted their newest contribution.
+/// that is visible to a resolve always precedes that resolve's input; it holds
+/// no contribution. Other producers are ordered by the instant they minted the
+/// record's newest contribution.
 fn existed_at(
     state: &StoreState,
     record: &NotificationRecord,
     as_of: Option<&ResolveAsOf>,
 ) -> bool {
-    let Some(as_of) = as_of else {
-        return true;
-    };
-    source_priority(&record.source) == SourcePriority::Projector
-        || state
+    as_of.is_none_or(|as_of| {
+        state
             .contributions
             .get(&record.id.0)
             .is_none_or(|contributed| *contributed <= as_of.minted_before)
+    })
 }
 
 fn find_existing_source(

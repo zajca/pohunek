@@ -837,7 +837,9 @@ mod tests {
     /// An arrival that precedes everything the test mints from now on.
     fn arrival_before_now() -> ResolveAsOf {
         ResolveAsOf {
-            minted_before: StdInstant::now() - Duration::from_secs(60),
+            minted_before: StdInstant::now()
+                .checked_sub(Duration::from_secs(60))
+                .expect("a monotonic clock that has run for a minute"),
             monotonic: tokio::time::Instant::now(),
         }
     }
