@@ -256,10 +256,21 @@ pub(super) fn create_remote_worktree(
         }
         Action::Reset { local, backup } => {
             move_branch(repository, branch, local, remote, Some(backup))?;
-            worktree_add_existing(repository, path, branch)
-                .map_err(|message| worktree_add_error(branch, &message))
+            worktree_add_existing(repository, path, branch).map_err(|message| {
+                note_backup(worktree_add_error(branch, &message), branch, backup)
+            })
         }
     }
+}
+
+/// `err` plus the name of the backup ref, for a failure after the branch was
+/// reset: the old head is only reachable through that ref.
+pub(crate) fn note_backup(mut err: ProtocolError, branch: &str, backup: &str) -> ProtocolError {
+    err.msg = format!(
+        "{}; branch {branch:?} was already reset to the remote head and its previous head is kept as {backup:?}",
+        err.msg
+    );
+    err
 }
 
 /// Fail when the worktree at `path` did not start at `expected`.
@@ -271,20 +282,28 @@ pub(super) fn create_remote_worktree(
 /// # Errors
 ///
 /// `worktree_add_failed` naming the commit the worktree is at.
-pub(super) fn verify_start(path: &Path, branch: &str, expected: &str) -> Result<(), ProtocolError> {
-    let head = git_capture(path, &["rev-parse", "--verify", "HEAD"])
-        .map_err(|message| inspect_error(&message))?;
-    if head == expected {
-        return Ok(());
-    }
-    Err(error(
-        ErrorClass::Runtime,
-        "worktree_add_failed",
-        format!(
-            "local branch {branch:?} moved concurrently; the worktree is at {head} instead of {expected}"
+pub(super) fn verify_start(
+    path: &Path,
+    branch: &str,
+    source: &WorktreeSource,
+) -> Result<(), ProtocolError> {
+    let expected = source.commit.as_str();
+    let err = match git_capture(path, &["rev-parse", "--verify", "HEAD"]) {
+        Ok(head) if head == expected => return Ok(()),
+        Ok(head) => error(
+            ErrorClass::Runtime,
+            "worktree_add_failed",
+            format!(
+                "local branch {branch:?} moved concurrently; the worktree is at {head} instead of {expected}"
+            ),
+            Some("retry the session".to_owned()),
         ),
-        Some("retry the session".to_owned()),
-    ))
+        Err(message) => inspect_error(&message),
+    };
+    Err(match &source.backup_ref {
+        Some(backup) => note_backup(err, branch, backup),
+        None => err,
+    })
 }
 
 /// Move `refs/heads/<branch>` from `old` to `new` while holding the repository's

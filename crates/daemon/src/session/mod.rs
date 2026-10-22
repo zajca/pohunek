@@ -63,8 +63,8 @@ use crate::store::{
 };
 use crate::time::now_rfc3339;
 use crate::worktree::{
-    canonical_or_original, run_hook, HookContext, HookEvent, HookStderrCapture, HookStderrTail,
-    WorktreeCleanup, WorktreeManager, WorktreeRequest,
+    canonical_or_original, note_backup, run_hook, HookContext, HookEvent, HookStderrCapture,
+    HookStderrTail, WorktreeCleanup, WorktreeManager, WorktreeRequest,
 };
 use native_attestation::{attest_report_caller, unattested, NativeReportRefusal};
 use reconcile::LossClassification;
@@ -2809,6 +2809,7 @@ impl SessionRegistry {
         let registry = self.clone();
         self.spawn_create(async move {
             let extended_input_ready_wait = params.extended_input_ready_wait.unwrap_or(false);
+            let branch = params.branch.clone();
             let (info, pending_initial_input, source) = Box::pin(registry.create_transaction(
                 id,
                 params,
@@ -2820,7 +2821,8 @@ impl SessionRegistry {
             .await?;
             let session = registry
                 .complete_create(info, pending_initial_input, extended_input_ready_wait)
-                .await?;
+                .await
+                .map_err(|err| note_kept_backup(err, branch.as_deref(), source.as_ref()))?;
             Ok((session, source))
         })?
         .await
@@ -3198,14 +3200,20 @@ impl SessionRegistry {
         };
         let (spec, pending_initial_input) = match prepared {
             Ok(prepared) => prepared,
-            Err(mut error) => {
+            Err(error) => {
+                let mut error =
+                    note_kept_backup(error, params.branch.as_deref(), worktree_source.as_ref());
                 if !self.compensate_abandoned_create(&id).await {
                     error.msg = unfinished_compensation_message(&error.msg, &id);
                 }
                 return Err(error);
             }
         };
-        let info = Box::pin(self.clone().run_pty_registration(spec, guard)).await?;
+        let info = Box::pin(self.clone().run_pty_registration(spec, guard))
+            .await
+            .map_err(|err| {
+                note_kept_backup(err, params.branch.as_deref(), worktree_source.as_ref())
+            })?;
         Ok((
             with_hook_stderr_tails(info, hook_stderr_tails),
             pending_initial_input,
@@ -7563,6 +7571,23 @@ fn create_intent_record(
             reason: None,
         },
     })
+}
+
+/// `err` plus the backup ref of a `branch_source: remote` reset, when the request
+/// made one: the failed create leaves the branch at the remote head, so the old
+/// head is reachable only through that ref.
+fn note_kept_backup(
+    err: ProtocolError,
+    branch: Option<&str>,
+    source: Option<&protocol::WorktreeSource>,
+) -> ProtocolError {
+    match (
+        branch,
+        source.and_then(|source| source.backup_ref.as_deref()),
+    ) {
+        (Some(branch), Some(backup)) => note_backup(err, branch, backup),
+        _ => err,
+    }
 }
 
 /// Extends a failed create's error `msg` with the compensation it left

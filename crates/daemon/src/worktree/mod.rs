@@ -58,6 +58,7 @@ mod remote;
 mod stderr_drain;
 mod stderr_tail;
 
+pub(crate) use remote::note_backup;
 use remote::{create_remote_worktree, plan_remote_branch, verify_start, RemotePlan};
 use stderr_tail::{CaptureSettings, HookOrigin, StderrCapture};
 
@@ -594,7 +595,7 @@ impl WorktreeManager {
         if let Some(source) = &source {
             // The checkout exists and its binding stays, so the session's
             // compensation removes it.
-            verify_start(&path, &req.branch, &source.commit)?;
+            verify_start(&path, &req.branch, source)?;
         }
         // Post-create hook (replaces the legacy `.pohunek/setup` script, which it
         // still falls back to): runs IN the freshly created worktree.

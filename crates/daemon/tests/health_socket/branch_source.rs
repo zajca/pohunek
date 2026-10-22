@@ -34,15 +34,22 @@ struct Rig {
 
 impl Rig {
     async fn start(tag: &str) -> Self {
+        Self::start_with_post_create(tag, None).await
+    }
+
+    /// `post_create` is the body of a host-global `post-create` hook.
+    async fn start_with_post_create(tag: &str, post_create: Option<&str>) -> Self {
         let repo = init_git_repo();
         let origin = temp_dir(&format!("{tag}-origin"));
         let worktree_root = temp_dir(&format!("{tag}-wt"));
         let state = temp_dir(&format!("{tag}-state"));
         let socket = temp_socket(tag);
+        let config_dir = post_create.map(|body| host_post_create_hook(&socket, body));
         let config = SessionRegistryConfig {
             shell_command: support::hermetic_shell(),
             worktree_root: Some(worktree_root.to_path_buf()),
             store_path: Some(state.join("metadata.jsonl")),
+            config_dir,
             ..SessionRegistryConfig::default()
         };
         let (shutdown, server, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
@@ -637,21 +644,7 @@ async fn a_failed_add_after_a_fast_forward_keeps_the_fast_forward() {
     let main = rig.main.clone();
     let remote = rig.origin_commit(BRANCH, "remote.txt");
     rig.local_branch(BRANCH, &main);
-    // The hook occupies the target directory, so `git worktree add` fails.
-    let repo_slug = pohunek_daemon::worktree::branch_slug(
-        &rig.repo
-            .cwd()
-            .file_name()
-            .expect("repository directory name")
-            .to_string_lossy(),
-    );
-    let root = rig.worktree_root.display().to_string();
-    install_pre_create_hook(
-        &rig,
-        &format!(
-            "#!/bin/sh\nd=\"{root}/$POHUNEK_SESSION_ID-{repo_slug}-{BRANCH}\"\nmkdir -p \"$d\"\n: > \"$d/blocker\"\n"
-        ),
-    );
+    block_worktree_directory(&rig);
 
     let error = err_payload(rig.remote_session(None).await);
 
@@ -661,6 +654,104 @@ async fn a_failed_add_after_a_fast_forward_keeps_the_fast_forward() {
         Some(remote),
         "the fast-forward loses no commit and stays"
     );
+    rig.assert_nothing_left(false).await;
+    rig.stop().await;
+}
+
+/// Occupies the worktree directory of the session, so `git worktree add` fails.
+fn block_worktree_directory(rig: &Rig) {
+    let repo_slug = pohunek_daemon::worktree::branch_slug(
+        &rig.repo
+            .cwd()
+            .file_name()
+            .expect("repository directory name")
+            .to_string_lossy(),
+    );
+    let root = rig.worktree_root.display().to_string();
+    install_pre_create_hook(
+        rig,
+        &format!(
+            "#!/bin/sh\nd=\"{root}/$POHUNEK_SESSION_ID-{repo_slug}-{BRANCH}\"\nmkdir -p \"$d\"\n: > \"$d/blocker\"\n"
+        ),
+    );
+}
+
+#[tokio::test]
+async fn a_failed_add_after_a_reset_names_the_backup_that_holds_the_old_head() {
+    let mut rig = Rig::start("bs-reset-add-fails").await;
+    let main = rig.main.clone();
+    let remote = rig.origin_commit(BRANCH, "remote.txt");
+    rig.local_branch(BRANCH, &main);
+    let local = rig.local_commit(BRANCH, "local.txt");
+    block_worktree_directory(&rig);
+
+    let error = err_payload(rig.remote_session(Some(OnDiverged::BackupReset)).await);
+
+    let backup = Rig::backup_name(&local);
+    assert_eq!(error.code, "worktree_add_failed", "{}", error.msg);
+    assert!(error.msg.contains(&backup), "{}", error.msg);
+    assert_eq!(rig.rev("refs/heads/feat"), Some(remote));
+    assert_eq!(
+        rig.rev(&format!("refs/heads/{backup}")),
+        Some(local),
+        "the backup keeps the old head"
+    );
+    rig.assert_nothing_left(false).await;
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn a_branch_that_moves_after_a_reset_still_names_the_backup() {
+    let mut rig = Rig::start("bs-reset-verify-fails").await;
+    let main = rig.main.clone();
+    let remote = rig.origin_commit(BRANCH, "remote.txt");
+    rig.local_branch(BRANCH, &main);
+    let local = rig.local_commit(BRANCH, "local.txt");
+    // Once the reset has committed, the repository's own hook moves the branch
+    // again, so the checkout starts somewhere other than the planned commit.
+    let hook = rig.repo.cwd().join(".git/hooks/reference-transaction");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = committed ] || exit 0\nwhile read old new ref; do\n  if [ \"$ref\" = refs/heads/{BRANCH} ] && [ \"$new\" = {remote} ]; then\n    git update-ref refs/heads/{BRANCH} {main}\n  fi\ndone\n"
+        ),
+    )
+    .expect("write the reference-transaction hook");
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("make the hook executable");
+
+    let error = err_payload(rig.remote_session(Some(OnDiverged::BackupReset)).await);
+
+    let backup = Rig::backup_name(&local);
+    assert_eq!(error.code, "worktree_add_failed", "{}", error.msg);
+    assert!(error.msg.contains("moved concurrently"), "{}", error.msg);
+    assert!(error.msg.contains(&backup), "{}", error.msg);
+    assert_eq!(rig.rev(&format!("refs/heads/{backup}")), Some(local));
+    rig.assert_nothing_left(true).await;
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn a_failure_after_the_worktree_is_bound_still_names_the_backup() {
+    // The post-create hook deletes the worktree it runs in, so the agent cannot
+    // start there and the create fails after the bind.
+    let mut rig = Rig::start_with_post_create(
+        "bs-reset-spawn-fails",
+        Some("#!/bin/sh\nrm -rf \"$(pwd -P)\"\nexit 0\n"),
+    )
+    .await;
+    let main = rig.main.clone();
+    let remote = rig.origin_commit(BRANCH, "remote.txt");
+    rig.local_branch(BRANCH, &main);
+    let local = rig.local_commit(BRANCH, "local.txt");
+
+    let error = err_payload(rig.remote_session(Some(OnDiverged::BackupReset)).await);
+
+    let backup = Rig::backup_name(&local);
+    assert_eq!(error.code, "session_cwd_missing", "{}", error.msg);
+    assert!(error.msg.contains(&backup), "{}", error.msg);
+    assert_eq!(rig.rev("refs/heads/feat"), Some(remote));
+    assert_eq!(rig.rev(&format!("refs/heads/{backup}")), Some(local));
     rig.assert_nothing_left(false).await;
     rig.stop().await;
 }
