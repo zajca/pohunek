@@ -96,22 +96,23 @@ pub(super) struct PtySessionSpec {
     pub(super) package_authority: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
 }
 
-/// Whether `path` is an absolute path of an existing directory on this host.
-async fn is_usable_dir(path: &std::path::Path) -> bool {
+/// The canonical form of `path` when it is an absolute path of an existing
+/// directory on this host.
+///
+/// The canonical path is the one the process tree reports for it, so a later
+/// cwd observation of the session compares equal to the launch directory.
+async fn canonical_usable_dir(path: &std::path::Path) -> Option<PathBuf> {
     if !path.is_absolute() {
-        return false;
+        return None;
     }
     let probe = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        std::fs::metadata(&probe).is_ok_and(|metadata| metadata.is_dir())
+        std::fs::canonicalize(&probe)
+            .ok()
+            .filter(|canonical| canonical.is_dir())
     })
     .await
-    .unwrap_or(false)
-}
-
-/// `cwd` when it is a usable launch directory, else `None`.
-async fn usable_launch_dir(cwd: &std::path::Path) -> Option<PathBuf> {
-    is_usable_dir(cwd).await.then(|| cwd.to_path_buf())
+    .unwrap_or(None)
 }
 
 /// Checks the launch directory a caller named for a project-bound session.
@@ -127,13 +128,12 @@ async fn validated_launch_dir(cwd: &std::path::Path) -> Result<PathBuf, Protocol
             cwd.display()
         )));
     }
-    if !is_usable_dir(cwd).await {
-        return Err(ProtocolError::bad_request(format!(
+    canonical_usable_dir(cwd).await.ok_or_else(|| {
+        ProtocolError::bad_request(format!(
             "session.new cwd '{}' is not an existing directory on the host",
             cwd.display()
-        )));
-    }
-    Ok(cwd.to_path_buf())
+        ))
+    })
 }
 
 fn next_runtime_generation(
@@ -322,7 +322,7 @@ impl SessionRegistry {
                 if params.project.is_some() || params.repo.is_some() {
                     Some(validated_launch_dir(cwd).await?)
                 } else {
-                    usable_launch_dir(cwd).await
+                    canonical_usable_dir(cwd).await
                 }
             }
             _ => None,

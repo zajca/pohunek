@@ -614,6 +614,7 @@ pub(crate) async fn run_new(
 ) -> Result<(), CliError> {
     // Resolve the target shape before dialing: defaults the local cwd, and rejects
     // a remote start that names no project/repo (fail fast, no connection).
+    let cwd_requested = args.cwd.is_some();
     let args = prepare_new_args(host, args)?;
 
     match confirmation_decision(host, json, yes) {
@@ -640,13 +641,15 @@ pub(crate) async fn run_new(
         None => Client::connect(host, paths).await?,
     };
     // A daemon that predates the behavior would start the session in the
-    // project checkout, so the request is refused before it is sent.
-    if needs_cwd_support(&args) {
+    // checkout root or the project checkout, so the request is refused before it
+    // is sent.
+    if cwd_requested {
         let capabilities = client.call::<method::HostInspect>(()).await?;
         if !capabilities.session_new_cwd_supported {
             return Err(CliError::SessionNewCwdUnsupported {
                 host: host.to_owned(),
                 daemon_version: capabilities.daemon_version,
+                cli_version: env!("CARGO_PKG_VERSION"),
             });
         }
     }
@@ -1801,60 +1804,92 @@ const IMPLICIT_ROOT_LOOKUP_POLL: Duration = Duration::from_millis(10);
 /// The directory a local start without `--cwd` runs in: the root of the git
 /// work tree around `dir`, so standing in a subdirectory still starts the
 /// session at the checkout root, or `dir` itself outside any work tree.
+///
+/// A lookup that fails for any other reason (git missing, too slow, refusing
+/// the directory) warns on stderr and starts the session in `dir`.
 fn implicit_launch_dir(dir: &Path) -> PathBuf {
-    work_tree_root(dir).unwrap_or_else(|| dir.to_path_buf())
+    match work_tree_root(dir) {
+        Ok(Some(root)) => root,
+        Ok(None) => dir.to_path_buf(),
+        Err(reason) => {
+            eprintln!(
+                "pohunek: warning: could not find the git work tree root of {} ({reason}); \
+                 the session starts in that directory",
+                dir.display()
+            );
+            dir.to_path_buf()
+        }
+    }
 }
 
-/// `git rev-parse --show-toplevel` in `dir`, canonicalized; `None` when git is
-/// missing, `dir` is outside a work tree, or the lookup exceeds
-/// [`IMPLICIT_ROOT_LOOKUP_TIMEOUT`].
-fn work_tree_root(dir: &Path) -> Option<PathBuf> {
+/// `git rev-parse --show-toplevel` in `dir`, canonicalized.
+///
+/// `Ok(None)` when `dir` is outside a work tree; `Err` with the reason when git
+/// cannot be run, exceeds [`IMPLICIT_ROOT_LOOKUP_TIMEOUT`], or fails otherwise.
+fn work_tree_root(dir: &Path) -> Result<Option<PathBuf>, String> {
     let mut command = std::process::Command::new("git");
     // `GIT_*` variables (`GIT_DIR`, `GIT_WORK_TREE`, ...) redirect git away from
-    // the directory it is asked about.
+    // the directory it is asked about; only the ceiling, which limits where it
+    // looks, is kept. The C locale makes its messages stable.
     for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("GIT_") {
-            command.env_remove(name);
+        let name_text = name.to_string_lossy();
+        if name_text.starts_with("GIT_") && name_text != GIT_CEILING_VARIABLE {
+            command.env_remove(&name);
         }
     }
     let mut child = command
+        .env("LC_ALL", "C")
         .arg("-C")
         .arg(dir)
         .args(["rev-parse", "--show-toplevel"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
-        .ok()?;
+        .map_err(|error| format!("cannot run git: {error}"))?;
     let deadline = std::time::Instant::now() + IMPLICIT_ROOT_LOOKUP_TIMEOUT;
     let status = loop {
-        match child.try_wait().ok()? {
+        match child.try_wait().map_err(|error| format!("git: {error}"))? {
             Some(status) => break status,
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return Err("git did not answer in time".to_owned());
             }
             None => std::thread::sleep(IMPLICIT_ROOT_LOOKUP_POLL),
         }
     };
-    if !status.success() {
-        return None;
-    }
     let mut output = String::new();
-    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut output).ok()?;
+    if let Some(mut stdout) = child.stdout.take() {
+        std::io::Read::read_to_string(&mut stdout, &mut output)
+            .map_err(|error| format!("git output: {error}"))?;
+    }
+    let mut diagnostics = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut diagnostics);
+    }
+    if !status.success() {
+        if NOT_A_WORK_TREE_MESSAGES
+            .iter()
+            .any(|message| diagnostics.contains(message))
+        {
+            return Ok(None);
+        }
+        return Err(format!("git: {}", diagnostics.trim()));
+    }
     let root = PathBuf::from(output.trim());
     if root.as_os_str().is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(root.canonicalize().unwrap_or(root))
+    Ok(Some(root.canonicalize().unwrap_or(root)))
 }
 
-/// Whether the requested `cwd` only takes effect on a daemon that honors it
-/// for a project-bound session.
-fn needs_cwd_support(args: &NewArgs) -> bool {
-    args.cwd.is_some() && (args.project.is_some() || args.repo.is_some())
-}
+/// Git variable that bounds the upward search for a repository.
+const GIT_CEILING_VARIABLE: &str = "GIT_CEILING_DIRECTORIES";
+
+/// What git prints (in the C locale) for a directory outside any work tree: no
+/// repository at all, or a bare repository.
+const NOT_A_WORK_TREE_MESSAGES: [&str; 2] = ["not a git repository", "must be run in a work tree"];
 
 fn list_params(filters: &[ListFilter]) -> SessionListParams {
     SessionListParams {

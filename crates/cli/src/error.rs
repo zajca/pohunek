@@ -148,18 +148,20 @@ pub(crate) enum CliError {
         cwd: PathBuf,
     },
 
-    /// The host's daemon predates `session new --cwd` for a project-bound
-    /// session and would start it in the project checkout instead.
+    /// The host's daemon predates `session new --cwd` and would start the
+    /// session in the checkout instead of the requested directory.
     #[error(
         "host '{host}' runs daemon {daemon_version}, which does not advertise \
-         `session_new_cwd_supported`: it would ignore --cwd for a --project/--repo session; \
-         no session was created"
+         `session_new_cwd_supported`: --cwd needs a daemon of release {cli_version} (this CLI) \
+         or newer; no session was created"
     )]
     SessionNewCwdUnsupported {
         /// The host as the user typed it.
         host: String,
         /// Version the host's daemon reported.
         daemon_version: String,
+        /// Version of this CLI, the oldest release known to honor `--cwd`.
+        cli_version: &'static str,
     },
 
     /// A remote `project add` named no PATH. A local path is meaningless on
@@ -419,8 +421,8 @@ impl CliError {
                 "session_new_cwd_unsupported",
                 self.to_string(),
                 Some(
-                    "update and restart the pohunek daemon on that host to the release of this \
-                     CLI, or start the session without --cwd"
+                    "update and restart the pohunek daemon on that host to this CLI's release, \
+                     or start the session without --cwd"
                         .to_owned(),
                 ),
             ),

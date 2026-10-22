@@ -9,6 +9,10 @@
 
 use super::*;
 
+/// Interval at which the daemon reads the cwd of a session's focus process,
+/// short so a scenario observes a `cd` promptly.
+const PROCWATCH_POLL: Duration = Duration::from_millis(50);
+
 /// A started daemon with one registered project.
 struct ProjectRig {
     control: Framed<UnixStream, LinesCodec>,
@@ -29,6 +33,7 @@ impl ProjectRig {
         let config = SessionRegistryConfig {
             shell_command: support::hermetic_shell(),
             store_path: Some(state.join("metadata.jsonl")),
+            procwatch_poll: PROCWATCH_POLL,
             ..SessionRegistryConfig::default()
         };
         let (shutdown, server, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
@@ -59,6 +64,19 @@ impl ProjectRig {
         params.cwd = cwd;
         params.project = Some(self.project.id.clone());
         create_session_with_params(&mut self.control, params).await
+    }
+
+    /// Types `cd <dir>` into the session and returns its info once the daemon
+    /// observed the new directory.
+    async fn move_session_to(&mut self, id: &SessionId, dir: &Path) -> SessionInfo {
+        input_session(&mut self.control, id, &format!("cd '{}'\n", dir.display())).await;
+        let target = dir.canonicalize().expect("canonical target directory");
+        let control = tokio::sync::Mutex::new(&mut self.control);
+        wait_until("the daemon to observe the new directory", || async {
+            let info = inspect_session(&mut *control.lock().await, id).await;
+            (info.cwd == target).then_some(info)
+        })
+        .await
     }
 
     async fn session_count(&mut self) -> usize {
@@ -222,5 +240,65 @@ async fn a_detected_project_session_starts_in_the_requested_subdirectory() {
     .expect("session info");
 
     assert_same_directory(&session.cwd, &nested, "the requested subdirectory");
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn a_project_session_keeps_its_project_when_it_moves_outside_every_repository() {
+    let mut rig = ProjectRig::start("pcwd-keeps").await;
+    let first = rig.outside.to_path_buf();
+    let second = rig.outside.join("second");
+    std::fs::create_dir(&second).expect("create the second directory");
+    let session: SessionInfo =
+        serde_json::from_value(ok_payload(rig.new_session(Some(first)).await))
+            .expect("session info");
+
+    let moved = rig.move_session_to(&session.id, &second).await;
+
+    assert_eq!(
+        moved.project_id.as_deref(),
+        Some(rig.project.id.as_str()),
+        "an observed directory outside every repository keeps the reference's project"
+    );
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn a_project_session_follows_a_directory_inside_another_repository() {
+    let mut rig = ProjectRig::start("pcwd-follows").await;
+    let other_repo = init_git_repo();
+    let session: SessionInfo = serde_json::from_value(ok_payload(
+        rig.new_session(Some(rig.outside.to_path_buf())).await,
+    ))
+    .expect("session info");
+
+    let moved = rig.move_session_to(&session.id, other_repo.cwd()).await;
+
+    assert_ne!(
+        moved.project_id.as_deref(),
+        Some(rig.project.id.as_str()),
+        "a directory inside another repository changes the association"
+    );
+    assert!(moved.project_id.is_some(), "{moved:?}");
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn a_symlinked_launch_directory_is_stored_in_canonical_form() {
+    let mut rig = ProjectRig::start("pcwd-symlink").await;
+    let real = rig.outside.join("real");
+    let link = rig.outside.join("link");
+    std::fs::create_dir(&real).expect("create the real directory");
+    std::os::unix::fs::symlink(&real, &link).expect("create the symlink");
+
+    let session: SessionInfo =
+        serde_json::from_value(ok_payload(rig.new_session(Some(link)).await))
+            .expect("session info");
+
+    assert_eq!(
+        session.cwd,
+        real.canonicalize().expect("canonical real directory"),
+        "the stored launch directory is the path the process tree reports"
+    );
     rig.finish().await;
 }

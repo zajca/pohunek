@@ -234,11 +234,15 @@ fn a_relative_directory_is_made_absolute_against_the_cli_directory() {
 /// Runs `session new` without a directory from `dir`, a path below the
 /// environment root, against a fixture daemon, and returns the `cwd` it sent.
 fn implicit_directory_sent_from(env: &TestEnv, dir: &Path) -> PathBuf {
-    implicit_directory_sent_with(env, dir, &[])
+    implicit_directory_sent_with(env, dir, &[]).0
 }
 
 /// [`implicit_directory_sent_from`] with extra environment variables set.
-fn implicit_directory_sent_with(env: &TestEnv, dir: &Path, vars: &[(&str, &Path)]) -> PathBuf {
+fn implicit_directory_sent_with(
+    env: &TestEnv,
+    dir: &Path,
+    vars: &[(&str, &Path)],
+) -> (PathBuf, String) {
     let served = serve_local(&env.root().join("run/pohunek/daemon.sock"), false);
     let output = env
         .command(pohunek_test_support::bin_exe("pohunek"))
@@ -257,7 +261,10 @@ fn implicit_directory_sent_with(env: &TestEnv, dir: &Path, vars: &[(&str, &Path)
         .iter()
         .find(|(method, _)| method == protocol::method::SESSION_NEW)
         .expect("session.new was sent");
-    PathBuf::from(params["cwd"].as_str().expect("an implicit cwd"))
+    (
+        PathBuf::from(params["cwd"].as_str().expect("an implicit cwd")),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
 }
 
 #[test]
@@ -299,7 +306,7 @@ fn an_implicit_start_ignores_git_redirection_variables() {
         .expect("run git init");
     assert!(init.status.success(), "git init failed");
 
-    let sent = implicit_directory_sent_with(&env, &nested, &[("GIT_WORK_TREE", &other)]);
+    let (sent, _) = implicit_directory_sent_with(&env, &nested, &[("GIT_WORK_TREE", &other)]);
 
     assert_eq!(
         sent.canonicalize().expect("canonical sent cwd"),
@@ -314,11 +321,45 @@ fn an_implicit_start_outside_a_work_tree_sends_the_cli_directory() {
     let plain = env.root().join("plain");
     fs::create_dir_all(&plain).expect("create the plain directory");
 
-    let sent = implicit_directory_sent_from(&env, &plain);
+    let (sent, stderr) =
+        implicit_directory_sent_with(&env, &plain, &[("GIT_CEILING_DIRECTORIES", env.root())]);
 
     assert_eq!(
         sent.canonicalize().expect("canonical sent cwd"),
         plain.canonicalize().expect("canonical plain directory")
+    );
+    assert!(
+        stderr.is_empty(),
+        "outside a work tree is not a failure: {stderr}"
+    );
+}
+
+#[test]
+fn an_implicit_start_warns_when_the_work_tree_root_cannot_be_found() {
+    let env = private_environment();
+    let repo = env.root().join("repo");
+    let nested = repo.join("nested");
+    let no_git = env.root().join("no-git");
+    fs::create_dir_all(&nested).expect("create the nested directory");
+    fs::create_dir_all(&no_git).expect("create the empty PATH directory");
+    let init = env
+        .command("git")
+        .args(["-c", "init.defaultBranch=main", "init", "-q"])
+        .arg(&repo)
+        .output()
+        .expect("run git init");
+    assert!(init.status.success(), "git init failed");
+
+    let (sent, stderr) = implicit_directory_sent_with(&env, &nested, &[("PATH", &no_git)]);
+
+    assert_eq!(
+        sent.canonicalize().expect("canonical sent cwd"),
+        nested.canonicalize().expect("canonical nested directory"),
+        "without git the session starts where the CLI stands"
+    );
+    assert!(
+        stderr.contains("could not find the git work tree root"),
+        "{stderr}"
     );
 }
 
@@ -332,11 +373,40 @@ fn a_daemon_that_ignores_the_directory_is_refused_before_the_session_is_created(
         "{}",
         run.document
     );
+    let message = run.document["err"]["msg"].as_str().unwrap_or_default();
+    assert!(message.contains("session_new_cwd_supported"), "{message}");
+    assert!(message.contains(env!("CARGO_PKG_VERSION")), "{message}");
     assert!(
         run.session_new().is_none(),
         "no session may start in an unrequested directory: {:?}",
         run.served
     );
+}
+
+#[test]
+fn a_repo_directory_is_refused_by_a_daemon_that_ignores_it() {
+    let run = run_local(&["--repo", "/srv/repo", "--cwd", "/srv/elsewhere"], false);
+
+    assert_eq!(
+        run.error_code(),
+        "session_new_cwd_unsupported",
+        "{}",
+        run.document
+    );
+    assert!(run.session_new().is_none(), "{:?}", run.served);
+}
+
+#[test]
+fn a_directory_without_a_project_is_refused_by_a_daemon_that_ignores_it() {
+    let run = run_local(&["--cwd", "/srv/repo/nested"], false);
+
+    assert_eq!(
+        run.error_code(),
+        "session_new_cwd_unsupported",
+        "{}",
+        run.document
+    );
+    assert!(run.session_new().is_none(), "{:?}", run.served);
 }
 
 #[test]

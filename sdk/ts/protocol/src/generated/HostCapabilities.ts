@@ -57,12 +57,13 @@ export type HostCapabilities = {
    */
   session_wait_turn_supported?: boolean;
   /**
-   * Whether `session.new` starts a project-bound in-place session in the
-   * requested `cwd` (with `project` or `repo`), refusing a missing directory.
+   * Whether `session.new` starts an in-place session in the requested `cwd`:
+   * an absolute path of an existing directory, also below a checkout root
+   * and with `project` or `repo`, where a missing directory is refused.
    *
    * A daemon that predates the behavior omits the field, which decodes as
-   * `false`; it ignores `cwd` for such a session. `false` is likewise omitted
-   * on the wire.
+   * `false`; it starts such a session in the checkout. `false` is likewise
+   * omitted on the wire.
    */
   session_new_cwd_supported?: boolean;
 };

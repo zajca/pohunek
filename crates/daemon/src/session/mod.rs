@@ -4883,18 +4883,42 @@ impl SessionRegistry {
             .is_some_and(|entry| cwd_evidence_moves(entry, cwd, observed_at))
     }
 
+    /// The association an observed `cwd` gives the session, or `None` when the
+    /// session keeps its current one.
+    ///
+    /// A session created by reference outside every repository holds an
+    /// association its cwd does not explain. An observed cwd that resolves to
+    /// no project leaves it alone, while an observed cwd inside a repository
+    /// replaces it as before.
     async fn resolve_cwd_association(
         &self,
         id: &SessionId,
         cwd: PathBuf,
     ) -> Option<CwdAssociation> {
         let store = self.inner.store.clone();
+        let current = {
+            let sessions = self.inner.sessions.lock().await;
+            sessions.get(id).map(|entry| {
+                let associated = entry.info.project_id.is_some() || entry.info.repo.is_some();
+                (entry.info.cwd.clone(), associated)
+            })
+        };
         match tokio::task::spawn_blocking(move || {
-            resolve_cwd_association(cwd.as_path(), store.as_deref())
+            let resolved = resolve_cwd_association(cwd.as_path(), store.as_deref())?;
+            if resolved == CwdAssociation::default() {
+                if let Some((current_cwd, true)) = current {
+                    let explained =
+                        resolve_cwd_association(current_cwd.as_path(), store.as_deref())?;
+                    if explained == CwdAssociation::default() {
+                        return Ok(None);
+                    }
+                }
+            }
+            Ok::<_, ProtocolError>(Some(resolved))
         })
         .await
         {
-            Ok(Ok(association)) => Some(association),
+            Ok(Ok(association)) => association,
             Ok(Err(err)) => {
                 warn!(
                     session_id = %id.0,
