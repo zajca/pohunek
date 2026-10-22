@@ -1,5 +1,15 @@
 <p align="center">
-  <img src="assets/pohunek_github_hero.png" alt="pohunek — multihost management daemon for coding agents. I herd. They code." />
+  <img src="assets/pohunek_github_hero.png" alt="pohunek: headless multihost backbone for coding agents. I herd. They code. Engraving of a farmhand steering a plow pulled by three server cabinets labelled codex, claude and hermes." />
+</p>
+
+<p align="center">
+  <a href="https://pohunek.dev"><b>pohunek.dev</b></a>
+  ·
+  <a href="https://pohunek.dev/docs/">Docs</a>
+  ·
+  <a href="https://pohunek.dev/install/">Install</a>
+  ·
+  <a href="https://pohunek.dev/surfaces/">Surfaces</a>
 </p>
 
 <p align="center">
