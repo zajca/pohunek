@@ -106,16 +106,17 @@ rather than failing the inventory it appears in. The shared
 secure-path contract preserves XDG config/data/state/cache precedence and adds a
 short, owner-private macOS runtime default without moving durable host identity.
 Native Apple Silicon CI compiles and tests these shared contracts with a macOS
-14 deployment target, but this does not mean complete macOS host or client
-support is available. Intel Macs are outside the current release scope. Darwin
+14 deployment target, and macOS on Apple Silicon is a supported platform.
+CI and release acceptance run on macOS 15 only, and Intel Macs are outside
+the current release scope. Darwin
 kernel peer identity and the session worker's portable PTY readiness are in
 place: the worker waits for PTY output with one `poll(2)` implementation shared
 by both targets, and its complete test suite runs natively. The daemon and CLI
-build and test natively on macOS too. Client integration, signed
-artifacts, and the remaining native acceptance stay explicitly deferred through
-issues #101-#105 under the `Complete macOS support` milestone and macOS
-Project. The issue hierarchy, milestone, and Project own delivery scope,
-sequencing, and status; the accepted macOS RFC records design constraints
+build and test natively on macOS too. Release archives are ad-hoc
+signed and not notarized. The open items of #100 and #102-#105 are ordinary
+follow-ups tracked under the `Complete macOS support` milestone and macOS
+Project. The issue hierarchy, milestone, and Project own
+delivery scope, sequencing, and status; the accepted macOS RFC records design constraints
 rather than live tracking state.
 
 Session workers are native service jobs, one per worker generation, supervised

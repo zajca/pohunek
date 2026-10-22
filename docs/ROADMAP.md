@@ -189,7 +189,7 @@ open.
 
 Native Apple Silicon hosts, macOS 14.0 minimum target tested on macOS 15
 (#1224), launchd-owned durable workers ([RFC](design/macos-support-rfc.md)); Intel Macs are out of scope.
-**7/12;** the milestone has 6 open and 6 closed issues. Landed: platform
+**Supported** on Apple Silicon (#1464); the milestone has 6 open and 6 closed issues. Landed: platform
 contracts (#95), runtime paths (#96), process inspection (#97), peer identity
 (#98), portable PTY I/O (#99), external observation and integrations (#101), and
 ad-hoc signed archives with a Homebrew tap (#481). Open:
@@ -205,8 +205,8 @@ ad-hoc signed archives with a Homebrew tap (#481). Open:
 - installation and release artifacts
   [#104](https://github.com/zajca/pohunek/issues/104) — rescoped to ad-hoc
   signing; real-Mac install/upgrade/uninstall acceptance remains.
-- support gate [#105](https://github.com/zajca/pohunek/issues/105) — 0/1 (#355),
-  blocked by #100, #102, #103, #104.
+- follow-up [#105](https://github.com/zajca/pohunek/issues/105) — native
+  durability, security and cross-stack acceptance; #355 is closed.
 
 The core part covers CLI, daemon, worker, SDK, and archives; the macOS GUI and
 owner web control center are tracked in `zajca/pohunek-work`.

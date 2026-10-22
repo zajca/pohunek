@@ -28,9 +28,8 @@ Every CLI, daemon, and relay archive is packed deterministically
 it, the host OS and architecture, and member permissions before they run or
 change anything.
 
-macOS on Apple Silicon (macOS 14 or newer, tested on macOS 15) is not yet a
-published platform: public macOS support is declared only when the final
-native acceptance gate (#105) passes. Each release already publishes
+macOS on Apple Silicon (macOS 14 or newer, tested on macOS 15) is a supported
+platform. Each release publishes
 `pohunek-cli-<v>-aarch64-apple-darwin.tar.gz` and
 `pohunek-daemon-<v>-aarch64-apple-darwin.tar.gz`, each with a `.sha256`. They are
 ad-hoc signed (the `MANIFEST` says `signing adhoc`), not notarized, and carry no
