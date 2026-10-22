@@ -39,6 +39,12 @@ impl Rig {
 
     /// `post_create` is the body of a host-global `post-create` hook.
     async fn start_with_post_create(tag: &str, post_create: Option<&str>) -> Self {
+        Self::start_hooked(tag, post_create, false).await
+    }
+
+    /// Like [`Self::start_with_post_create`], with `post-create` listed in
+    /// `hooks.required` when `required`.
+    async fn start_hooked(tag: &str, post_create: Option<&str>, required: bool) -> Self {
         let repo = init_git_repo();
         let origin = temp_dir(&format!("{tag}-origin"));
         let worktree_root = temp_dir(&format!("{tag}-wt"));
@@ -50,6 +56,11 @@ impl Rig {
             worktree_root: Some(worktree_root.to_path_buf()),
             store_path: Some(state.join("metadata.jsonl")),
             config_dir,
+            hook_required: if required {
+                vec![pohunek_service_config::RequiredHook::PostCreate]
+            } else {
+                Vec::new()
+            },
             ..SessionRegistryConfig::default()
         };
         let (shutdown, server, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
@@ -303,6 +314,32 @@ fn worktree_head(rig: &Rig, session: &SessionInfo) -> String {
         session.worktree_path.as_deref().expect("worktree path"),
         &["rev-parse", "HEAD"],
     )
+}
+
+/// A failing required `post-create` hook after a diverged branch was reset
+/// still names the backup ref that keeps the previous head, and the rollback
+/// leaves that ref and the reset branch in place.
+#[tokio::test]
+async fn a_failing_required_hook_after_a_reset_names_the_backup_ref() {
+    let mut rig = Rig::start_hooked("bs-required", Some("#!/bin/sh\nexit 1\n"), true).await;
+    let main = rig.main.clone();
+    let remote = rig.origin_commit(BRANCH, "remote.txt");
+    rig.local_branch(BRANCH, &main);
+    let local = rig.local_commit(BRANCH, "local.txt");
+    let backup = Rig::backup_name(&local);
+
+    let error = err_payload(rig.remote_session(Some(OnDiverged::BackupReset)).await);
+
+    assert_eq!(error.code, "hook_required_failed", "{}", error.msg);
+    assert!(
+        error.msg.contains(&format!("{backup:?}")) && error.msg.contains("already reset"),
+        "the error names the backup ref: {}",
+        error.msg
+    );
+    assert_eq!(rig.rev(&format!("refs/heads/{backup}")), Some(local));
+    assert_eq!(rig.rev("refs/heads/feat"), Some(remote), "the reset stands");
+    rig.assert_nothing_left(true).await;
+    rig.stop().await;
 }
 
 #[tokio::test]

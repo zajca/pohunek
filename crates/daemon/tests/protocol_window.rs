@@ -21,7 +21,7 @@ use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo};
 use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::notifications::{AttentionCoordinator, NotificationService};
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
-use pohunek_daemon::session::SessionRegistry;
+use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_test_support::wait::{self, wait_until};
 use pohunek_test_support::worker_binary;
 use protocol::{method, Request, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
@@ -136,8 +136,14 @@ struct Daemon {
 
 impl Daemon {
     async fn start(tag: &str) -> Self {
+        Self::start_with(tag, |_config, _dir| {}).await
+    }
+
+    /// Starts a daemon whose registry configuration `tweak` adjusts; it receives
+    /// the test's socket directory, which it may use for its own files.
+    async fn start_with(tag: &str, tweak: impl FnOnce(&mut SessionRegistryConfig, &Path)) -> Self {
         let socket = TestSocket::new(tag);
-        let (shutdown, handle, daemon_instance_id) = spawn_server(&socket).await;
+        let (shutdown, handle, daemon_instance_id) = spawn_server(&socket, tweak).await;
         Self {
             socket,
             shutdown,
@@ -157,7 +163,10 @@ impl Daemon {
 }
 
 /// Spawns the control server over a registry backed by a real worker binary.
-async fn spawn_server(socket: &Path) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>, String) {
+async fn spawn_server(
+    socket: &Path,
+    tweak: impl FnOnce(&mut SessionRegistryConfig, &Path),
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>, String) {
     // Short, because the worker nests its control socket below it.
     let worker_home_dir =
         pohunek_test_support::tempdir_with_prefix("pw-h-").expect("create the worker home");
@@ -179,6 +188,10 @@ async fn spawn_server(socket: &Path) -> (oneshot::Sender<()>, tokio::task::JoinH
         worker_environment
             .supervision(worker_binary())
             .with_environment_source(support::hermetic_environment_source()),
+    );
+    tweak(
+        &mut config,
+        socket.parent().expect("test socket has an isolated parent"),
     );
     let registry = SessionRegistry::new_with_launcher_and_inspector(
         config,
@@ -743,6 +756,64 @@ async fn a_typed_error_on_a_previous_version_connection_is_answered_in_that_vers
     assert_eq!(response["err"]["code"], "session_not_found", "{response}");
     assert!(response.get("ok").is_none(), "{response}");
 
+    daemon.stop().await;
+}
+
+/// A failing required `post-create` hook is answered to a protocol 3 client as
+/// a protocol 3 error that carries the code this release added.
+#[tokio::test]
+async fn a_required_hook_failure_is_answered_in_the_previous_version() {
+    let repo = pohunek_test_support::env::TestEnv::new().expect("create the repository");
+    let git = |args: &[&str]| {
+        let out = repo.command("git").args(args).output().expect("run git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["-c", "init.defaultBranch=main", "init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.cwd().join("README.md"), "init\n").expect("write README");
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+
+    let daemon = Daemon::start_with("window-required-hook", |config, dir| {
+        let hooks = dir.join("config/hooks");
+        std::fs::create_dir_all(&hooks).expect("create the host hook directory");
+        let hook = hooks.join("post-create");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("write the hook");
+        std::fs::create_dir(dir.join("worktrees")).expect("create the worktree root");
+        config.config_dir = Some(dir.join("config"));
+        config.worktree_root = Some(dir.join("worktrees"));
+        config.store_path = Some(dir.join("metadata.jsonl"));
+        config.hook_required = vec![pohunek_service_config::RequiredHook::PostCreate];
+    })
+    .await;
+    let mut client = daemon.connect().await;
+
+    let response = exchange(
+        &mut client,
+        &previous_request(
+            "new-required-hook",
+            method::SESSION_NEW,
+            json!({
+                "agent": "shell",
+                "repo": repo.cwd(),
+                "branch": "b",
+                "cols": 80,
+                "rows": 24,
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(response["v"], PREVIOUS_VERSION, "{response}");
+    assert_eq!(response["id"], "new-required-hook", "{response}");
+    assert_eq!(
+        response["err"]["code"], "hook_required_failed",
+        "{response}"
+    );
+    assert_eq!(response["err"]["class"], "runtime", "{response}");
+    assert!(response.get("ok").is_none(), "{response}");
     daemon.stop().await;
 }
 

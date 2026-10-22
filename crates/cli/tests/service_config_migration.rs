@@ -196,6 +196,20 @@ impl Host {
         }
     }
 
+    /// A current-schema file whose `[hooks]` table sets `required` to `entries`.
+    fn current_with_required(entries: &'static str) -> Self {
+        Self {
+            template: SCHEMA_THREE_TEMPLATE,
+            repair: Box::new(move |template| {
+                waits_file(template, 7, 300_000, 1_800_000).replace(
+                    "stderr_tail_bytes = 4096",
+                    &format!("stderr_tail_bytes = 4096\nrequired = {entries}"),
+                )
+            }),
+            temporary: temp_root(),
+        }
+    }
+
     /// The same configuration with `schema_version` replaced.
     fn schema_of(version: u32) -> Self {
         Self {
@@ -591,6 +605,32 @@ fn check_refuses_a_turn_wait_outside_its_bounds() {
                 .and_then(Value::as_str)
                 .is_some_and(|message| message.contains(key) && message.contains("5000..=3600000")),
             "{refusal:?}: the refusal names {key} and its bounds"
+        );
+    }
+}
+
+#[test]
+fn check_refuses_an_invalid_required_hook_list_naming_the_key() {
+    for entries in [
+        "[\"after-create\"]",
+        "[\"pre-remove\"]",
+        "[\"post-create\", \"post-create\"]",
+    ] {
+        let host = Host::current_with_required(entries);
+        let (success, envelope) = check(&host);
+        assert!(!success, "{envelope}: {entries} is refused");
+        let refusal = envelope.get("err").expect("the refusal document");
+        assert_eq!(
+            refusal.get("code").and_then(Value::as_str),
+            Some("service_config_invalid"),
+            "{refusal:?}"
+        );
+        assert!(
+            refusal
+                .get("msg")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("hooks.required")),
+            "{refusal:?}: the refusal names the key"
         );
     }
 }

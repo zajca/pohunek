@@ -12,8 +12,8 @@ use pohunek_platform::filesystem::FsError;
 use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::Namespace;
 use pohunek_service_config::{
-    ConfigError, ConfigSpec, Deadlines, InputTiming, KeepaliveTiming, ServiceConfig, WaitTiming,
-    DEFAULT_EVENT_RETENTION, DEFAULT_HOOK_STDERR_TAIL_BYTES, DEFAULT_INPUT_TIMING,
+    ConfigError, ConfigSpec, Deadlines, InputTiming, KeepaliveTiming, RequiredHook, ServiceConfig,
+    WaitTiming, DEFAULT_EVENT_RETENTION, DEFAULT_HOOK_STDERR_TAIL_BYTES, DEFAULT_INPUT_TIMING,
     DEFAULT_KEEPALIVE_TIMING, DEFAULT_WAIT_TIMING, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES,
     MAX_DEADLINE, MAX_HOOK_STDERR_TAIL_BYTES, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
 };
@@ -176,6 +176,7 @@ fn spec() -> ConfigSpec {
         input_timing: DEFAULT_INPUT_TIMING,
         wait_timing: DEFAULT_WAIT_TIMING,
         hook_stderr_tail_bytes: DEFAULT_HOOK_STDERR_TAIL_BYTES,
+        hook_required: Vec::new(),
         event_retention: DEFAULT_EVENT_RETENTION,
         open_files: 8192,
     }
@@ -1456,6 +1457,92 @@ fn hook_stderr_tail_is_bounded_and_zero_disables_the_capture() {
             "{written}"
         );
     }
+}
+
+/// `GOLDEN` with `required = <entries>` added to its `[hooks]` table.
+fn with_required(entries: &str) -> String {
+    replace(
+        GOLDEN,
+        "stderr_tail_bytes = 4096",
+        &format!("stderr_tail_bytes = 4096\nrequired = {entries}"),
+    )
+}
+
+#[test]
+fn required_post_create_round_trips_and_is_not_an_unknown_key() {
+    let fixture = Fixture::new();
+    let loaded = fixture
+        .load(&with_required("[\"post-create\"]"))
+        .expect("a required post-create loads");
+    assert_eq!(loaded.hook_required(), [RequiredHook::PostCreate]);
+    assert!(loaded.unknown_keys().is_empty(), "required is a known key");
+    loaded.write(&fixture.path()).expect("write the config");
+    let written = fs::read_to_string(fixture.path()).expect("read the written config");
+    assert!(
+        written.contains("required = [\"post-create\"]"),
+        "{written}"
+    );
+    let reloaded = ServiceConfig::load(&fixture.path()).expect("reload the written config");
+    assert_eq!(reloaded.hook_required(), [RequiredHook::PostCreate]);
+}
+
+#[test]
+fn an_absent_or_empty_required_list_requires_nothing_and_is_not_written() {
+    let fixture = Fixture::new();
+    for text in [GOLDEN.to_owned(), with_required("[]")] {
+        let loaded = fixture.load(&text).expect("no required hook loads");
+        assert!(loaded.hook_required().is_empty());
+        loaded.write(&fixture.path()).expect("write the config");
+        let written = fs::read_to_string(fixture.path()).expect("read the written config");
+        assert!(
+            !written.contains("required ="),
+            "a previous release must still read the file: {written}"
+        );
+    }
+}
+
+#[test]
+fn an_invalid_required_list_names_its_key_and_entry_without_echoing_the_value() {
+    let fixture = Fixture::new();
+    let unknown = fixture.load(&with_required("[\"after-create\"]"));
+    let Err(ConfigError::InvalidHookEvent { index: 0 }) = unknown else {
+        panic!("an unknown event is refused: {unknown:?}");
+    };
+    let message = unknown.expect_err("refused").to_string();
+    assert!(message.contains("hooks.required entry 0"), "{message}");
+    assert!(!message.contains("after-create"), "{message}");
+
+    for event in ["pre-create", "pre-remove", "post-remove", "session-start"] {
+        let result = fixture.load(&with_required(&format!("[\"{event}\"]")));
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::UnsupportedRequiredHook { index: 0, event: named }) if named == event
+            ),
+            "{event}: {result:?}"
+        );
+    }
+
+    let duplicate = fixture.load(&with_required("[\"post-create\", \"post-create\"]"));
+    assert!(
+        matches!(
+            duplicate,
+            Err(ConfigError::DuplicateRequiredHook { index: 1, first: 0 })
+        ),
+        "{duplicate:?}"
+    );
+
+    let mistyped = fixture.load(&with_required("\"post-create\""));
+    assert!(
+        matches!(mistyped, Err(ConfigError::Parse { .. })),
+        "{mistyped:?}"
+    );
+
+    let non_string = fixture.load(&with_required("[7]"));
+    assert!(
+        matches!(non_string, Err(ConfigError::Parse { .. })),
+        "{non_string:?}"
+    );
 }
 
 #[test]

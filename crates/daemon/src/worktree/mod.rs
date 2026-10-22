@@ -307,6 +307,9 @@ pub struct WorktreeManager {
     /// (`<config_dir>/hooks/<event>`). `None` disables that layer; in-repo hooks
     /// still run.
     config_dir: Option<PathBuf>,
+    /// Create-side hook events whose failure aborts the create instead of
+    /// becoming a warning (`hooks.required`).
+    required_hooks: Vec<HookEvent>,
 }
 
 impl WorktreeManager {
@@ -328,7 +331,21 @@ impl WorktreeManager {
             hook_timeout,
             hook_stderr,
             config_dir,
+            required_hooks: Vec::new(),
         }
+    }
+
+    /// Makes a failure of each listed hook event abort the create it belongs
+    /// to instead of becoming a warning.
+    #[must_use]
+    pub fn with_required_hooks(mut self, hooks: &[pohunek_service_config::RequiredHook]) -> Self {
+        self.required_hooks = hooks
+            .iter()
+            .map(|hook| match hook {
+                pohunek_service_config::RequiredHook::PostCreate => HookEvent::PostCreate,
+            })
+            .collect();
+        self
     }
 
     /// The shared metadata store, for inspection/tests.
@@ -497,6 +514,10 @@ impl WorktreeManager {
     /// The binding is persisted before the checkout exists, so a daemon killed
     /// at any later point leaves a checkout its session's compensation can find
     /// ([`Self::compensate_session`]); a failed `git worktree add` drops it again.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one linear create sequence: hook, binding, add, hook"
+    )]
     fn create_and_bind(
         &self,
         req: &WorktreeRequest,
@@ -529,7 +550,7 @@ impl WorktreeManager {
         // / foreign-conflict branches above all returned before here). The worktree
         // does not exist yet, so it runs IN THE REPOSITORY — `POHUNEK_BASE_BRANCH`
         // is already resolved and available.
-        self.run_worktree_hook(
+        let _pre_create = self.run_worktree_hook(
             HookEvent::PreCreate,
             &repository,
             req,
@@ -599,7 +620,7 @@ impl WorktreeManager {
         }
         // Post-create hook (replaces the legacy `.pohunek/setup` script, which it
         // still falls back to): runs IN the freshly created worktree.
-        self.run_worktree_hook(
+        if let Some(failure) = self.run_worktree_hook(
             HookEvent::PostCreate,
             &path,
             req,
@@ -608,7 +629,15 @@ impl WorktreeManager {
             &base_branch,
             &mut warnings,
             &mut stderr_tails,
-        );
+        ) {
+            return Err(post_create_error(
+                &failure,
+                &warnings,
+                &stderr_tails,
+                req,
+                source.as_ref(),
+            ));
+        }
 
         Ok(WorktreeBound {
             path,
@@ -625,6 +654,9 @@ impl WorktreeManager {
     /// Fire a create-side worktree hook (`pre`/`post-create`) from the request
     /// context, bounded by `hook_timeout` and composed with the host-global layer.
     /// A failing hook's stderr tail goes to `stderr_tails` when capture is on.
+    ///
+    /// Returns the failure of the first script that did not succeed when `event`
+    /// is a required hook; the scripts after it do not run then.
     // The create hook needs the event, the hook-lookup dir, the request, the repo,
     // the optional worktree, the base branch, and the warning sink — all distinct
     // inputs with no natural grouping struct beyond the request itself.
@@ -642,7 +674,7 @@ impl WorktreeManager {
         base_branch: &str,
         warnings: &mut Vec<SessionWarning>,
         stderr_tails: &mut Vec<HookStderrTail>,
-    ) {
+    ) -> Option<RequiredHookFailure> {
         let ctx = HookContext {
             session_id: req.session_id.clone(),
             project_id: req.project_id.clone(),
@@ -654,7 +686,7 @@ impl WorktreeManager {
             stop_reason: None,
             activity: None,
         };
-        run_hook(
+        run_hook_layers(
             event,
             in_repo_dir,
             &ctx,
@@ -665,7 +697,8 @@ impl WorktreeManager {
                 capture,
                 tails: stderr_tails,
             }),
-        );
+            self.required_hooks.contains(&event),
+        )
     }
 
     /// Fire a remove-side worktree hook (`pre`/`post-remove`) from a persisted
@@ -2120,15 +2153,55 @@ pub(crate) fn run_hook(
     timeout: Duration,
     config_dir: Option<&Path>,
     warnings: &mut Vec<SessionWarning>,
-    mut stderr_tails: Option<StderrTails<'_>>,
+    stderr_tails: Option<StderrTails<'_>>,
 ) {
+    let _never_required = run_hook_layers(
+        event,
+        in_repo_dir,
+        ctx,
+        timeout,
+        config_dir,
+        warnings,
+        stderr_tails,
+        false,
+    );
+}
+
+/// The first script of a required hook that did not succeed.
+#[derive(Debug)]
+pub(crate) struct RequiredHookFailure {
+    layer: HookLayer,
+    /// The failing script's warning detail: its path and how it ended. It never
+    /// carries the hook's output.
+    detail: String,
+    /// Scripts of the later layer that did not run because of the failure.
+    not_run: Vec<PathBuf>,
+}
+
+/// [`run_hook`], stopping at the first script that does not succeed when
+/// `required` is set and returning its failure.
+// Same inputs as `run_hook` plus the `required` switch.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the hook inputs of `run_hook` plus one switch"
+)]
+fn run_hook_layers(
+    event: HookEvent,
+    in_repo_dir: &Path,
+    ctx: &HookContext,
+    timeout: Duration,
+    config_dir: Option<&Path>,
+    warnings: &mut Vec<SessionWarning>,
+    mut stderr_tails: Option<StderrTails<'_>>,
+    required: bool,
+) -> Option<RequiredHookFailure> {
     let env = hook_env(event, ctx);
     let cwd = &ctx.cwd_or(in_repo_dir);
     // Host-global layer first (composed, not overridden).
     if let Some(config_dir) = config_dir {
         let host_script = config_dir.join("hooks").join(event.as_env());
         if host_script.is_file() {
-            run_timed_hook(
+            let outcome = run_timed_hook(
                 &HookRun {
                     event,
                     layer: HookLayer::Host,
@@ -2141,10 +2214,19 @@ pub(crate) fn run_hook(
                 warnings,
                 stderr_tails.as_mut(),
             );
+            if required && outcome != HookRunOutcome::Succeeded {
+                return Some(RequiredHookFailure {
+                    layer: HookLayer::Host,
+                    detail: last_warning_detail(warnings, outcome),
+                    not_run: resolve_in_repo_hook(event, in_repo_dir)
+                        .into_iter()
+                        .collect(),
+                });
+            }
         }
     }
     if let Some(in_repo_script) = resolve_in_repo_hook(event, in_repo_dir) {
-        run_timed_hook(
+        let outcome = run_timed_hook(
             &HookRun {
                 event,
                 layer: HookLayer::Repository,
@@ -2157,7 +2239,94 @@ pub(crate) fn run_hook(
             warnings,
             stderr_tails.as_mut(),
         );
+        if required && outcome != HookRunOutcome::Succeeded {
+            return Some(RequiredHookFailure {
+                layer: HookLayer::Repository,
+                detail: last_warning_detail(warnings, outcome),
+                not_run: Vec::new(),
+            });
+        }
     }
+    None
+}
+
+/// The detail of the warning the script that just failed recorded, which names
+/// the script and how it ended.
+fn last_warning_detail(warnings: &[SessionWarning], outcome: HookRunOutcome) -> String {
+    warnings
+        .last()
+        .and_then(|warning| warning.detail.clone())
+        .unwrap_or_else(|| format!("the hook {}", outcome.as_str()))
+}
+
+/// The `hook_required_failed` error of a required `post-create` hook, with the
+/// stderr tail of the script that failed (the last warning's).
+///
+/// The checkout and its binding stay: the session's compensation removes them
+/// and runs the remove hooks.
+fn post_create_error(
+    failure: &RequiredHookFailure,
+    warnings: &[SessionWarning],
+    stderr_tails: &[HookStderrTail],
+    req: &WorktreeRequest,
+    source: Option<&WorktreeSource>,
+) -> ProtocolError {
+    let tail = stderr_tails
+        .iter()
+        .find(|tail| tail.warning + 1 == warnings.len())
+        .map(|tail| tail.text.as_str());
+    let backup = source.and_then(|source| source.backup_ref.as_deref());
+    required_hook_error(
+        HookEvent::PostCreate,
+        failure,
+        tail,
+        (req.branch.as_str(), backup),
+    )
+}
+
+/// The `hook_required_failed` error of a required `event` hook that did not
+/// succeed.
+///
+/// `branch` and `backup` are the create's branch and the ref that keeps its
+/// previous head when a remote-sourced create already reset it; the error names
+/// that ref like every other failure after the reset.
+fn required_hook_error(
+    event: HookEvent,
+    failure: &RequiredHookFailure,
+    stderr_tail: Option<&str>,
+    (branch, backup): (&str, Option<&str>),
+) -> ProtocolError {
+    let mut msg = format!(
+        "the required {} hook failed on the {} layer: {}",
+        event.as_env(),
+        failure.layer.as_str(),
+        failure.detail
+    );
+    if !failure.not_run.is_empty() {
+        let skipped: Vec<_> = failure
+            .not_run
+            .iter()
+            .map(|script| script.display().to_string())
+            .collect();
+        msg = format!("{msg}; not run because of it: {}", skipped.join(", "));
+    }
+    let mut err = ProtocolError::new(
+        ErrorClass::Runtime,
+        "hook_required_failed",
+        msg,
+        Some(format!(
+            "fix the hook, or remove {} from hooks.required in service.toml",
+            event.as_env()
+        )),
+    );
+    if let Some(backup) = backup {
+        err = note_backup(err, branch, backup);
+    }
+    if let Some(tail) = stderr_tail {
+        err.msg.push_str("; stderr tail:\n");
+        err.msg.push_str(tail);
+    }
+    err
 }
 
 /// Records a hook that could not be spawned as a non-fatal `Hook` warning.
@@ -2249,7 +2418,7 @@ fn run_timed_hook(
     run: &HookRun<'_>,
     warnings: &mut Vec<SessionWarning>,
     stderr_tails: Option<&mut StderrTails<'_>>,
-) {
+) -> HookRunOutcome {
     info!(
         session_id = %run.session_id,
         event = run.event.as_env(),
@@ -2269,6 +2438,7 @@ fn run_timed_hook(
         outcome = outcome.as_str(),
         "hook finished"
     );
+    outcome
 }
 
 impl HookContext {

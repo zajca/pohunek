@@ -128,7 +128,7 @@ duration (`duration_ms`) and outcome. `session.new` answers only after its
 so these lines show whether a slow create was waiting on a hook.
 
 A failing `pre-create` or `post-create` hook leaves a `hook` warning on the
-session. In the `session.new` result its `detail` also carries the last
+session (unless the host requires `post-create`, below). In the `session.new` result its `detail` also carries the last
 `hooks.stderr_tail_bytes` bytes of the hook's stderr (`service.toml`, default
 4096, `0` disables), sanitized and marked when cut, so the caller can see why
 setup failed. The stored session and the logs keep the warning without that
@@ -146,6 +146,21 @@ drain cannot start, the daemon keeps discarding and logs a WARN instead. A hook
 that starts long-lived processes can still redirect their stderr
 (`>/dev/null 2>&1` or a log file); `hooks.stderr_tail_bytes = 0` keeps hook
 stderr on `/dev/null`.
+
+A host can make `post-create` required with `[hooks] required = ["post-create"]`
+in `service.toml`; a cloned repository cannot. A required `post-create` that
+exits non-zero, outlives the hook timeout or cannot be spawned fails
+`session.new` with `hook_required_failed` instead of leaving a warning. The
+first failing script ends the hook: a repository script after a failing host
+script does not run, and the error names it. The create is rolled back like any
+failed create (the remove hooks run, no PTY starts, no initial input is sent,
+`session-start` does not fire, and no session, binding or worktree directory
+remains), and the created branch is kept. When the create had already reset a
+diverged branch with `--from-remote`, the error names the backup ref that keeps
+its previous head. A reused worktree runs no `post-create`, so the setting does
+not apply to it. A required hook that outlasts the client's request timeout
+ends the call with the outcome-unknown error while the daemon rolls back: check
+`session list` before retrying.
 
 A host or repository `pre-remove` hook runs inside the worktree before
 `pohunek session rm` deletes it, and `post-remove` runs in the repository

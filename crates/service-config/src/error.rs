@@ -192,6 +192,40 @@ pub enum ConfigError {
         /// Zero-based position of its first occurrence.
         first: usize,
     },
+    /// `hooks.required` names a string that is not a lifecycle hook event.
+    ///
+    /// The entry is not echoed: a hand-edited file may hold a secret there.
+    #[error(
+        "service config key hooks.required entry {index} is not a hook event; \
+         the events are pre-create, post-create, pre-remove, post-remove, \
+         session-start, session-stop and agent-state"
+    )]
+    InvalidHookEvent {
+        /// Zero-based position of the rejected entry.
+        index: usize,
+    },
+    /// `hooks.required` names a hook event this release cannot require.
+    #[error(
+        "service config key hooks.required entry {index} ({event}) cannot be required in \
+         this release; only post-create can"
+    )]
+    UnsupportedRequiredHook {
+        /// Zero-based position of the rejected entry.
+        index: usize,
+        /// The known event the entry names.
+        event: &'static str,
+    },
+    /// A hook event appears more than once in `hooks.required`.
+    #[error(
+        "service config key hooks.required entry {index} repeats entry {first}; \
+         list each event once"
+    )]
+    DuplicateRequiredHook {
+        /// Zero-based position of the repeated entry.
+        index: usize,
+        /// Zero-based position of its first occurrence.
+        first: usize,
+    },
     /// `environment.search_path` holds an entry or value the job `PATH` cannot carry.
     #[error("service config key environment.search_path is invalid: {detail}")]
     InvalidSearchPath {

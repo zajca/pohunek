@@ -51,6 +51,7 @@ pub(crate) fn write_service_file(
         input_timing: DEFAULT_INPUT_TIMING,
         wait_timing: DEFAULT_WAIT_TIMING,
         hook_stderr_tail_bytes: DEFAULT_HOOK_STDERR_TAIL_BYTES,
+        hook_required: Vec::new(),
         event_retention: DEFAULT_EVENT_RETENTION,
         open_files: OPEN_FILES,
     })
