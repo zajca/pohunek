@@ -5223,6 +5223,51 @@ fn assert_held_runtime_left(host: &Host, runtime: &str, details: &[&str]) -> Str
         .expect("the plan's gap")
 }
 
+/// What the plan, the apply and the detecting plan of `host` say for `runtime`
+/// when a root-invalid refusal stops it: exactly that refusal, whose detail
+/// contains `hint`, no package entry or profile action, and the registry and
+/// the profile unchanged.
+fn assert_held_runtime_refused(host: &Host, runtime: &str, hint: &str) {
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let profile = fs::read_to_string(host.profiles_dir().join(format!("{runtime}.toml"))).ok();
+    let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
+    for (label, report) in [
+        ("plan", host.step(true)),
+        ("apply", host.step(false)),
+        ("detect", host.detect_step()),
+    ] {
+        assert_eq!(
+            refusal_codes(&report),
+            [root_refusal.as_str()],
+            "{runtime} {label}"
+        );
+        assert!(
+            report.refusals[0].detail.contains(hint),
+            "{runtime} {label}: {}",
+            report.refusals[0].detail
+        );
+        assert!(
+            report
+                .packages
+                .iter()
+                .all(|package| package.runtime != runtime),
+            "{runtime} {label}: {:?}",
+            report.packages
+        );
+        assert!(report.profiles.is_empty(), "{runtime} {label}");
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry,
+        "{runtime}"
+    );
+    assert_eq!(
+        fs::read_to_string(host.profiles_dir().join(format!("{runtime}.toml"))).ok(),
+        profile,
+        "{runtime}"
+    );
+}
+
 /// Runs the remedy the gap detail names for the holder: the uninstall the
 /// registry accepts with the plan's retained set (here, nothing is pinned), then
 /// the next apply installs the release archive and binds the profile.
@@ -5308,14 +5353,64 @@ async fn a_selected_holder_without_its_root_is_left_and_its_uninstall_lets_the_r
     }
 }
 
-/// Row 3 for Pi: the upgrade never installs an absent Pi package, so the detail
-/// names no command and says so.
+/// Row 3 for Pi: the upgrade plans Pi only while an enabled official selection
+/// manages it, so the remedy has two steps. The gap names the uninstall of the
+/// holder and then `plugin install` of the release's Pi archive; the registry
+/// accepts both, and the next upgrade finds Pi serving.
 #[tokio::test]
-async fn a_selected_pi_holder_without_its_root_is_left_with_no_command() {
+async fn a_selected_pi_holder_without_its_root_is_left_and_two_commands_install_the_release() {
     let holder = official_runtimes::variant_archive("pi", RELEASE_VERSION);
     let release = holder_release("pi");
     let host = host_with_holder("pi", &[(&holder, true, true)], &release).await;
     host.write_profile("work", "base = \"pi\"\n");
+    host.remove_package_root(holder.1.as_str());
+    let profile = host.profile_text_of("work");
+
+    let detail = assert_held_runtime_left(
+        &host,
+        "pi",
+        &[
+            &uninstall_command("pi", &holder.1),
+            "pohunek plugin install runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json --yes",
+        ],
+    );
+
+    assert!(
+        !detail.contains("does not install a Pi package again"),
+        "{detail}"
+    );
+    pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+        .expect("the package store")
+        .registry()
+        .uninstall(&holder.1, &package::registry::RetainedDigests::new())
+        .expect("the registry accepts the hinted uninstall");
+    host.catalog
+        .install_release_package(
+            &host.plugins_dir(),
+            host.env.root(),
+            &host.release_dir(),
+            "pi",
+        )
+        .await;
+    let next = host.step(false);
+    assert!(next.refusals.is_empty(), "{:?}", next.refusals);
+    assert_eq!(pi_package(&next).status, PackageStatus::Present);
+    assert_eq!(pi_package(&next).digest, release.1.as_str());
+    assert!(
+        next.gaps.iter().all(|gap| gap.runtime != "pi"),
+        "{:?}",
+        next.gaps
+    );
+    assert_eq!(host.profile_text_of("work"), profile);
+}
+
+/// Row 3 for a Pi that nothing uses: no command, and the detail says the
+/// upgrade does not install a Pi package again.
+#[tokio::test]
+async fn a_selected_pi_holder_without_its_root_that_nothing_uses_is_left_with_no_command() {
+    let holder = official_runtimes::variant_archive("pi", RELEASE_VERSION);
+    let release = holder_release("pi");
+    let host = host_with_holder("pi", &[(&holder, true, true)], &release).await;
     host.remove_package_root(holder.1.as_str());
 
     let detail = assert_held_runtime_left(&host, "pi", &["a release that gives the package"]);
@@ -5359,29 +5454,14 @@ async fn a_selected_holder_with_an_altered_root_is_refused_and_its_removal_lets_
         let release = holder_release(runtime);
         let host = host_with_holder(runtime, &[(&holder, true, true)], &release).await;
         host.alter_package_root(&holder.1);
-        let registry = fs::read(host.registry_path()).expect("the registry record");
-        let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
-
-        let plan = host.step(true);
-        let applied = host.step(false);
-
-        for report in [&plan, &applied] {
-            assert_eq!(refusal_codes(report), [root_refusal.as_str()], "{runtime}");
-            assert!(
-                report.refusals[0].detail.contains(&format!(
-                    "pohunek plugin uninstall pohunek.runtime.{runtime} --digest {} \
-                     --remove-modified --yes",
-                    holder.1.as_str()
-                )),
-                "{}",
-                report.refusals[0].detail
-            );
-            assert!(report.packages.is_empty(), "{runtime}");
-        }
-        assert_eq!(
-            fs::read(host.registry_path()).expect("the registry record"),
-            registry,
-            "{runtime}"
+        assert_held_runtime_refused(
+            &host,
+            runtime,
+            &format!(
+                "pohunek plugin uninstall pohunek.runtime.{runtime} --digest {} \
+                 --remove-modified --yes",
+                holder.1.as_str()
+            ),
         );
         pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
             .expect("the package store")
@@ -5407,16 +5487,10 @@ async fn a_selected_pi_holder_with_an_altered_root_is_refused() {
     let release = holder_release("pi");
     let host = host_with_holder("pi", &[(&holder, true, true)], &release).await;
     host.alter_package_root(&holder.1);
-    let registry = fs::read(host.registry_path()).expect("the registry record");
-    let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
-
-    for report in [host.step(true), host.step(false)] {
-        assert_eq!(refusal_codes(&report), [root_refusal.as_str()]);
-        assert!(report.packages.is_empty());
-    }
-    assert_eq!(
-        fs::read(host.registry_path()).expect("the registry record"),
-        registry
+    assert_held_runtime_refused(
+        &host,
+        "pi",
+        &format!("--digest {} --remove-modified --yes", holder.1.as_str()),
     );
 }
 
@@ -5476,25 +5550,10 @@ async fn a_selected_version_with_an_altered_root_beside_a_holder_is_refused() {
         )
         .await;
         host.alter_package_root(&selected.1);
-        let registry = fs::read(host.registry_path()).expect("the registry record");
-        let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
-
-        for report in [host.step(true), host.step(false), host.detect_step()] {
-            assert_eq!(refusal_codes(&report), [root_refusal.as_str()], "{runtime}");
-            assert!(
-                report.refusals[0].detail.contains(&format!(
-                    "--digest {} --remove-modified --yes",
-                    selected.1.as_str()
-                )),
-                "{}",
-                report.refusals[0].detail
-            );
-            assert!(report.packages.is_empty(), "{runtime}");
-        }
-        assert_eq!(
-            fs::read(host.registry_path()).expect("the registry record"),
-            registry,
-            "{runtime}"
+        assert_held_runtime_refused(
+            &host,
+            runtime,
+            &format!("--digest {} --remove-modified --yes", selected.1.as_str()),
         );
     }
 }
@@ -5730,29 +5789,14 @@ async fn an_unselected_holder_with_an_altered_root_is_refused_and_its_removal_le
         let release = holder_release(runtime);
         let host = host_with_holder(runtime, &[(&holder, enabled, false)], &release).await;
         host.alter_package_root(&holder.1);
-        let registry = fs::read(host.registry_path()).expect("the registry record");
-        let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
-
-        let plan = host.step(true);
-        let applied = host.step(false);
-        let detected = host.detect_step();
-
-        for report in [&plan, &applied, &detected] {
-            assert_eq!(refusal_codes(report), [root_refusal.as_str()]);
-            assert!(
-                report.refusals[0].detail.contains(&format!(
-                    "pohunek plugin uninstall pohunek.runtime.{runtime} --digest {} \
-                     --remove-modified --yes",
-                    holder.1.as_str()
-                )),
-                "{}",
-                report.refusals[0].detail
-            );
-            assert!(report.packages.is_empty());
-        }
-        assert_eq!(
-            fs::read(host.registry_path()).expect("the registry record"),
-            registry
+        assert_held_runtime_refused(
+            &host,
+            runtime,
+            &format!(
+                "pohunek plugin uninstall pohunek.runtime.{runtime} --digest {} \
+                 --remove-modified --yes",
+                holder.1.as_str()
+            ),
         );
         pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
             .expect("the package store")
@@ -5768,4 +5812,90 @@ async fn an_unselected_holder_with_an_altered_root_is_refused_and_its_removal_le
         assert_eq!(package.status, PackageStatus::Installed);
         assert_eq!(package.digest, release.1.as_str());
     }
+}
+
+/// Row 1 where only a session record, or only an installed hook, uses the
+/// runtime: the gap still names the uninstall, and the next apply installs the
+/// release archive (no profile exists to bind).
+#[tokio::test]
+async fn a_holder_beside_a_runtime_used_only_by_a_session_or_a_hook_names_the_uninstall() {
+    for use_by in ["session", "hook"] {
+        let runtime = "claude";
+        let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+        let release = holder_release(runtime);
+        let host = host_with_holder(runtime, &[(&holder, true, false)], &release).await;
+        fs::remove_file(host.profiles_dir().join(format!("{runtime}.toml")))
+            .expect("remove the profile");
+        match use_by {
+            "session" => host.write_store(PACKAGE_SESSION_STORE),
+            _ => host.write_claude_hook(),
+        }
+
+        let detail =
+            assert_held_runtime_left(&host, runtime, &[&uninstall_command(runtime, &holder.1)]);
+
+        pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+            .expect("the package store")
+            .registry()
+            .uninstall(&holder.1, &package::registry::RetainedDigests::new())
+            .unwrap_or_else(|error| panic!("{use_by}: {error:?}: {detail}"));
+        let applied = host.step(false);
+        assert!(
+            applied.refusals.is_empty(),
+            "{use_by}: {:?}",
+            applied.refusals
+        );
+        let package = applied
+            .packages
+            .iter()
+            .find(|package| package.runtime == runtime)
+            .unwrap_or_else(|| panic!("{use_by}: {:?}", applied.packages));
+        assert_eq!(package.status, PackageStatus::Installed, "{use_by}");
+        assert_eq!(package.digest, release.1.as_str(), "{use_by}");
+    }
+}
+
+/// Row 3 for Pi with an older version installed beside the holder: `plugin
+/// install` would leave the release unselected, so the gap names `plugin
+/// update`, and after the uninstall and the update Pi serves the release.
+#[tokio::test]
+async fn a_selected_pi_holder_without_its_root_beside_another_version_names_the_update() {
+    let older = official_runtimes::variant_archive("pi", PI_OLDER_VERSION);
+    let holder = official_runtimes::variant_archive("pi", RELEASE_VERSION);
+    let release = holder_release("pi");
+    let host = host_with_holder(
+        "pi",
+        &[(&older, true, false), (&holder, true, true)],
+        &release,
+    )
+    .await;
+    host.write_profile("work", "base = \"pi\"\n");
+    host.remove_package_root(holder.1.as_str());
+
+    assert_held_runtime_left(
+        &host,
+        "pi",
+        &[
+            &uninstall_command("pi", &holder.1),
+            "pohunek plugin update pohunek.runtime.pi runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json --yes",
+        ],
+    );
+
+    pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+        .expect("the package store")
+        .registry()
+        .uninstall(&holder.1, &package::registry::RetainedDigests::new())
+        .expect("the registry accepts the hinted uninstall");
+    host.catalog
+        .install_release_package(
+            &host.plugins_dir(),
+            host.env.root(),
+            &host.release_dir(),
+            "pi",
+        )
+        .await;
+    let next = host.step(false);
+    assert!(next.refusals.is_empty(), "{:?}", next.refusals);
+    assert_eq!(pi_package(&next).status, PackageStatus::Present);
+    assert_eq!(pi_package(&next).digest, release.1.as_str());
 }

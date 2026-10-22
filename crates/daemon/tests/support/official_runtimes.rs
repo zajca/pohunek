@@ -244,6 +244,37 @@ impl OfficialCatalog {
         assert_eq!(&result.package.digest, digest, "{runtime}");
     }
 
+    /// Installs the release package of `runtime` from the extracted release
+    /// directory `release` into `plugins_dir`, enabled and selected, as
+    /// `pohunek plugin install packages/<runtime>.tar.zst --catalog
+    /// runtime-catalog.json --yes` does.
+    pub(crate) async fn install_release_package(
+        &self,
+        plugins_dir: &Path,
+        scratch: &Path,
+        release: &Path,
+        runtime: &str,
+    ) {
+        let registry = installer_registry(
+            self.configure(installer_config(scratch), plugins_dir.to_path_buf()),
+        );
+        let result = registry
+            .package_install(PackageInstallParams {
+                archive_path: path_string(
+                    &release.join("packages").join(format!("{runtime}.tar.zst")),
+                ),
+                trust: PackageTrust::Catalog {
+                    catalog_path: path_string(&release.join("runtime-catalog.json")),
+                },
+                enable: true,
+                select: true,
+                dry_run: false,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("the release {runtime} package installs: {error:?}"));
+        assert_eq!(result.status, PackageInstallStatus::Installed, "{runtime}");
+    }
+
     /// Installs the official Codex, Claude and Hermes packages into the plugin root
     /// `plugins_dir` before the registry or daemon binary under test opens it.
     ///

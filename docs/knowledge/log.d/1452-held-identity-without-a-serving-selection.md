@@ -7,8 +7,10 @@
   package whose root is missing or does not load, or a non-official selection leaves the
   runtime with the gap `official_package_not_serving` (exit 0, nothing written); a selected
   package with an altered root is refused with `plugin uninstall --remove-modified`. For a
-  reserved runtime that is used and whose recorded package nothing pins, and that is
+  runtime that is used and whose recorded package nothing pins, and that is
   either unselected or the selected package itself, the gap names
   `plugin uninstall <package> --digest <digest> --yes`, after which the next upgrade installs
-  the release's archive. No wire type changes.
+  the release's archive of a reserved runtime; for Pi the gap then names `plugin install` (or
+  `plugin update` when another Pi version is installed) of the release's archive. No wire
+  type changes.
 - Docs: `public-api.md` (the holder table), `install.md` and the update runbook.

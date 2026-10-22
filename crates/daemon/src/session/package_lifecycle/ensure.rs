@@ -1054,6 +1054,15 @@ fn update_command(package: &PackageId, runtime: &RuntimeId) -> String {
     )
 }
 
+/// The `plugin install` command that installs the release's package of
+/// `runtime` from the extracted release archive, enabled and selected.
+fn install_command(runtime: &RuntimeId) -> String {
+    format!(
+        "pohunek plugin install runtime/{PACKAGES_DIR}/{runtime}{ARCHIVE_SUFFIX} \
+         --catalog runtime/{CATALOG_FILE} --yes"
+    )
+}
+
 /// The runtimes that are not reserved (Pi) whose official package the step
 /// keeps current: one is installed from the official catalog, selected and
 /// enabled, and the release catalog lists a package of the same id for it.
@@ -2665,9 +2674,10 @@ fn held_leaves(plan: &PlanInputs<'_>, prepared: &Prepared, reserved: bool) -> bo
 ///
 /// Where the holder itself is the obstacle (nothing selected, or it is the
 /// selected package and does not load), the uninstall command is named for a
-/// reserved runtime that a profile, session or integration uses and whose
-/// holder nothing pins: the registry accepts that uninstall, and the next plain
-/// upgrade installs the release's archive.
+/// runtime that a profile, session or integration uses and whose holder
+/// nothing pins: the registry accepts that uninstall, and the next plain
+/// upgrade installs the release's archive of a reserved runtime. Pi is
+/// installed again with `plugin install` of the release's archive.
 fn held_left_detail(
     plan: &PlanInputs<'_>,
     prepared: &Prepared,
@@ -2705,12 +2715,33 @@ fn held_left_detail(
         "the release's package has the same version ({version}) as an installed one under \
          another archive, and {cause}, so nothing is installed and the runtime is left as it is"
     );
-    if reserved && used && !plan.retained.contains(holder) {
-        return format!(
-            "{lead}; remove the installed one with `pohunek plugin uninstall {id} --digest {} \
-             --yes`, then run the upgrade again",
+    if used && !plan.retained.contains(holder) {
+        let uninstall = format!(
+            "`pohunek plugin uninstall {id} --digest {} --yes`",
             selector_digest(holder)
         );
+        // The upgrade plans Pi only while an enabled official selection manages
+        // it, so Pi is installed again by hand after the uninstall. `plugin
+        // install` selects the package only when no other version is installed;
+        // `plugin update` always does.
+        let then = if reserved {
+            "run the upgrade again".to_owned()
+        } else {
+            let runtime = prepared.definition.runtime_id();
+            let other_version = plan.state.is_some_and(|state| {
+                state
+                    .packages()
+                    .iter()
+                    .any(|record| record.identity().id == *id && record.digest() != holder)
+            });
+            let command = if other_version {
+                update_command(id, runtime)
+            } else {
+                install_command(runtime)
+            };
+            format!("install the release's package with `{command}`")
+        };
+        return format!("{lead}; remove the installed one with {uninstall}, then {then}");
     }
     let pi = if reserved {
         ""
