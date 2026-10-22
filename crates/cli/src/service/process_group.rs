@@ -63,7 +63,8 @@ mod imp {
     enum State {
         Alive,
         Zombie,
-        /// Gone between the listing and the query.
+        /// No longer findable, as a process that ended and was reaped since the
+        /// listing.
         Ended,
     }
 
@@ -92,7 +93,8 @@ mod imp {
             let written = libc::proc_pidinfo(
                 pid,
                 libc::PROC_PIDTBSDINFO,
-                0,
+                // A nonzero argument makes the lookup include zombies.
+                1,
                 std::ptr::from_mut(&mut info).cast(),
                 size,
             );
