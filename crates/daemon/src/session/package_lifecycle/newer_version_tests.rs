@@ -1294,6 +1294,59 @@ async fn assert_repin_during_recovery(tag: &str, fork: bool) {
         .expect("remove the session");
 }
 
+/// A metadata edit made while a resume relaunches is in the reply, the session
+/// and the record the relaunch commits.
+#[tokio::test]
+async fn a_metadata_edit_during_a_resume_survives_the_relaunch() {
+    let old = CLAUDE.older();
+    let session = stopped_on("meta-during-resume", &CLAUDE, &old, CLAUDE.old_version).await;
+    let restarted = restart(&session.fixture).await;
+    let gate = arm_definition_hold(&restarted.registry);
+    let task = tokio::spawn({
+        let registry = restarted.registry.clone();
+        let id = session.id.clone();
+        async move { registry.resume_with(&id, ProfileChange::Refuse).await }
+    });
+    gate.entered.notified().await;
+    restarted
+        .registry
+        .set_metadata(
+            &session.id,
+            std::collections::BTreeMap::from([("ticket".to_owned(), Some("new".to_owned()))]),
+        )
+        .await
+        .expect("edit the metadata");
+    gate.release.notify_one();
+    let recovered = task
+        .await
+        .expect("recovery task")
+        .expect("the resume completes");
+
+    let expected = std::collections::BTreeMap::from([("ticket".to_owned(), "new".to_owned())]);
+    assert_eq!(recovered.metadata, expected, "the reply carries the edit");
+    assert_eq!(
+        restarted
+            .registry
+            .inspect(&session.id)
+            .await
+            .expect("inspect")
+            .metadata,
+        expected
+    );
+    let durable = crate::store::Store::new(session.store_path.clone())
+        .load_sessions()
+        .expect("read the durable records")
+        .into_iter()
+        .find(|record| record.session_id == session.id.0)
+        .expect("the session has a durable record");
+    assert_eq!(durable.info.metadata, expected);
+    restarted
+        .registry
+        .remove(&session.id)
+        .await
+        .expect("remove the session");
+}
+
 #[tokio::test]
 async fn a_repin_during_a_resume_leaves_the_binding_and_the_profile_revision_consistent() {
     assert_repin_during_recovery("repin-during-resume", false).await;

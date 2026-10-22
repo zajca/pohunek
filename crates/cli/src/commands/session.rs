@@ -1644,15 +1644,26 @@ fn idle_stop_unsupported(error: &CliError) -> bool {
 /// `connected` is the version the daemon reported, when it answered `daemon.health`.
 ///
 /// The upgrade target is this CLI's own release, which serves the methods it
-/// calls, so the hint names no release number of its own.
+/// calls. A daemon whose version is not older than the CLI's (an unreleased
+/// build) is told to upgrade to a release that includes the default instead,
+/// because naming the version it already runs would contradict the hint.
 fn idle_stop_upgrade_hint(connected: Option<&str>) -> String {
     let daemon = connected.map_or_else(
         || "the connected daemon".to_owned(),
         |version| format!("the connected daemon (version {version})"),
     );
+    let cli = env!("CARGO_PKG_VERSION");
+    let older = connected
+        .and_then(|version| semver::Version::parse(version).ok())
+        .zip(semver::Version::parse(cli).ok())
+        .is_none_or(|(daemon, cli)| daemon < cli);
+    let target = if older {
+        format!("this CLI's release ({cli})")
+    } else {
+        "a release that includes it".to_owned()
+    };
     format!(
-        "{daemon} predates --idle-stop-after; upgrade the daemon to this CLI's release ({cli}) and retry. Nothing was changed",
-        cli = env!("CARGO_PKG_VERSION"),
+        "{daemon} predates --idle-stop-after; upgrade the daemon to {target} and retry. Nothing was changed"
     )
 }
 
