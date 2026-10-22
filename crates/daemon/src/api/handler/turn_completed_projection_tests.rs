@@ -1474,7 +1474,7 @@ async fn events_of_a_session_whose_seed_failed_project_in_their_arrival_order() 
 }
 
 /// The approval report a Claude `PermissionRequest` hook sends for `session`.
-async fn approval_report(fixture: &Fixture, session: &str) {
+async fn approval_report(fixture: &Fixture, session: &str, number: u32) {
     ok(fixture
         .call(
             method::NOTIFICATION_CREATE,
@@ -1482,14 +1482,14 @@ async fn approval_report(fixture: &Fixture, session: &str) {
                 "source": {
                     "provider": "claude",
                     "provider_event": "PermissionRequest",
-                    "host_local_source_id": format!("claude-permission-{session}")
+                    "host_local_source_id": format!("claude-permission-{session}-{number}")
                 },
                 "kind": "approval_required",
                 "severity": "action_required",
                 "title": "Approval required",
                 "body": "Claude waits for a tool approval.",
                 "session_id": session,
-                "source_id": format!("claude:{session}:permission:1"),
+                "source_id": format!("claude:{session}:permission:{number}"),
                 "dedupe_key": format!("attention:{session}")
             }),
         )
@@ -1550,7 +1550,7 @@ async fn an_approval_raised_while_the_seed_failed_is_not_acknowledged_by_the_rep
     // the seed recovers.
     fixture.activity(&session, "working").await;
     settle().await;
-    approval_report(&fixture, &session).await;
+    approval_report(&fixture, &session, 1).await;
     flush_window().await;
     let records = approval_records(&fixture).await;
     assert_eq!(records.len(), 1, "{records:?}");
@@ -1577,7 +1577,7 @@ async fn a_pending_approval_survives_the_resume_replayed_after_it() {
 
     fixture.activity(&session, "working").await;
     settle().await;
-    approval_report(&fixture, &session).await;
+    approval_report(&fixture, &session, 1).await;
     settle().await;
     recover_seeds(&fixture);
     assert!(
@@ -1594,6 +1594,36 @@ async fn a_pending_approval_survives_the_resume_replayed_after_it() {
     let records = approval_records(&fixture).await;
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0]["status"], "unread", "{records:?}");
+    finish(&fixture, inhibitor, &session).await;
+}
+
+#[tokio::test]
+async fn an_approval_that_absorbed_a_later_one_is_not_acknowledged_by_the_replayed_resume() {
+    let fixture = enabled_fixture();
+    fail_all_seeds(&fixture);
+    let session = fixture.session("seed-fails-absorbed").await;
+    fixture.activity(&session, "idle").await;
+    let inhibitor = pause_clock().await;
+
+    // Approval A is visible when the resume queues; approval B arrives after
+    // it and is merged into A.
+    approval_report(&fixture, &session, 1).await;
+    flush_window().await;
+    fixture.activity(&session, "working").await;
+    settle().await;
+    approval_report(&fixture, &session, 2).await;
+    flush_window().await;
+    let records = approval_records(&fixture).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+
+    recover_seeds(&fixture);
+    retry_and_flush().await;
+    let records = approval_records(&fixture).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        records[0]["status"], "unread",
+        "the agent waits on the later approval: {records:?}"
+    );
     finish(&fixture, inhibitor, &session).await;
 }
 

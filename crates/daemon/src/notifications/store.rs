@@ -1,10 +1,11 @@
 //! Append-only notification store.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use protocol::{
     NotificationId, NotificationKind, NotificationListParams, NotificationListResult,
@@ -14,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::{
-    apply_status, existed_at, inside_attention_window, is_attention_dedupe_key, is_attention_kind,
+    apply_status, inside_attention_window, is_attention_dedupe_key, is_attention_kind,
     is_turn_dedupe_key, is_valid_status_transition, parse_timestamp, same_source_namespace,
     source_priority, NotificationError, ResolveAsOf, SourcePriority, TURN_DEDUPE_KEY_PREFIX,
 };
@@ -70,6 +71,10 @@ struct StoreState {
     records: BTreeMap<String, NotificationRecord>,
     action_count: usize,
     source_warning_logged: bool,
+    /// When another producer than the projector last contributed to a record:
+    /// created it, or had a report merge into it. In memory only; a record
+    /// without an entry counts as contributed to before any moment.
+    contributions: HashMap<String, Instant>,
 }
 
 #[derive(Debug)]
@@ -140,6 +145,7 @@ impl NotificationStore {
                 records: replayed.records,
                 action_count: replayed.action_count,
                 source_warning_logged: false,
+                contributions: HashMap::new(),
             }),
         })
     }
@@ -345,11 +351,13 @@ impl NotificationStore {
         &self,
         candidate: NotificationRecord,
         attention_window_secs: u64,
+        minted: Instant,
     ) -> Result<CreateOutcome, NotificationError> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let contributes = source_priority(&candidate.source) != SourcePriority::Projector;
 
         if let Some(existing) = find_existing_source(&state.records, &candidate) {
             return Ok(CreateOutcome::Existing(existing));
@@ -376,6 +384,7 @@ impl NotificationStore {
                         record: candidate.clone(),
                     },
                 )?;
+                note_contribution(&mut state, contributes, &candidate.id.0, minted);
                 return Ok(CreateOutcome::Created(candidate));
             }
             append_action_locked(
@@ -386,6 +395,7 @@ impl NotificationStore {
                     updated: updated.clone(),
                 },
             )?;
+            note_contribution(&mut state, contributes, &candidate.id.0, minted);
             return Ok(CreateOutcome::CreatedWithUpdates {
                 record: candidate,
                 updated,
@@ -420,6 +430,7 @@ impl NotificationStore {
                                 record: updated.clone(),
                             },
                         )?;
+                        note_contribution(&mut state, contributes, &updated.id.0, minted);
                         return Ok(CreateOutcome::Updated(updated));
                     }
                     (
@@ -427,6 +438,7 @@ impl NotificationStore {
                         SourcePriority::Provider,
                     )
                     | (SourcePriority::Projector, SourcePriority::Projector) => {
+                        note_contribution(&mut state, contributes, &existing.id.0, minted);
                         return Ok(CreateOutcome::Existing(existing));
                     }
                     (SourcePriority::User, _)
@@ -445,6 +457,7 @@ impl NotificationStore {
                 record: candidate.clone(),
             },
         )?;
+        note_contribution(&mut state, contributes, &candidate.id.0, minted);
         Ok(CreateOutcome::Created(candidate))
     }
 
@@ -685,7 +698,7 @@ impl NotificationStore {
                         record.status,
                         NotificationStatus::Unread | NotificationStatus::Read
                     )
-                    && existed_at(record, as_of)
+                    && existed_at(&state, record, as_of)
             })
             .map(|record| record.id.0.clone())
             .collect();
@@ -705,6 +718,16 @@ impl NotificationStore {
             )?;
             resolved.push(record);
         }
+        // A record that is no longer active needs no contribution time.
+        let state = &mut *state;
+        state.contributions.retain(|id, _| {
+            state.records.get(id).is_some_and(|record| {
+                matches!(
+                    record.status,
+                    NotificationStatus::Unread | NotificationStatus::Read
+                )
+            })
+        });
         Ok(resolved)
     }
 
@@ -810,6 +833,36 @@ fn append_action_locked(
     Ok(())
 }
 
+/// Records that another producer than the projector contributed to the record
+/// `id` at `minted`, keeping the newest contribution.
+fn note_contribution(state: &mut StoreState, contributes: bool, id: &str, minted: Instant) {
+    if contributes {
+        let newest = state.contributions.entry(id.to_owned()).or_insert(minted);
+        *newest = (*newest).max(minted);
+    }
+}
+
+/// Whether `record` existed, with every contribution it holds, when a resolve
+/// `as_of` an earlier moment is applied.
+///
+/// The projector derives its records in the order its inputs arrive, so one
+/// that is visible to a resolve always precedes that resolve's input. Other
+/// producers are ordered by the instant they minted their newest contribution.
+fn existed_at(
+    state: &StoreState,
+    record: &NotificationRecord,
+    as_of: Option<&ResolveAsOf>,
+) -> bool {
+    let Some(as_of) = as_of else {
+        return true;
+    };
+    source_priority(&record.source) == SourcePriority::Projector
+        || state
+            .contributions
+            .get(&record.id.0)
+            .is_none_or(|contributed| *contributed <= as_of.minted_before)
+}
+
 fn find_existing_source(
     records: &BTreeMap<String, NotificationRecord>,
     candidate: &NotificationRecord,
@@ -878,8 +931,6 @@ fn upgrade_projector(
     mut existing: NotificationRecord,
     replacement: &NotificationRecord,
 ) -> NotificationRecord {
-    // The record now carries the provider's report, created when it arrived.
-    existing.created_at.clone_from(&replacement.created_at);
     existing.source.clone_from(&replacement.source);
     existing.kind = replacement.kind;
     existing.severity = replacement.severity;
@@ -1198,14 +1249,14 @@ mod tests {
         first.kind = NotificationKind::TurnCompleted;
         first.dedupe_key = Some("turn:s-1".to_owned());
         store
-            .create_or_dedupe(first, 120)
+            .create_or_dedupe(first, 120, std::time::Instant::now())
             .expect("first turn create");
 
         let mut second = record("n-2", "2026-07-03T11:00:00Z");
         second.kind = NotificationKind::TurnCompleted;
         second.dedupe_key = Some("turn:s-1".to_owned());
         store
-            .create_or_dedupe(second, 120)
+            .create_or_dedupe(second, 120, std::time::Instant::now())
             .expect("second turn create");
 
         let log = std::fs::read_to_string(store.path()).expect("read notification log");
