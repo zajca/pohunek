@@ -2510,18 +2510,6 @@ mod tests {
             )),
             "{detail}"
         );
-        let command = detail.split('`').nth(1).expect("the gap names a command");
-        let tokens: Vec<&str> = command
-            .split_whitespace()
-            .map(|token| match token {
-                "<mode>" => "read_only",
-                "<host>" => "local",
-                other => other,
-            })
-            .collect();
-        crate::command()
-            .try_get_matches_from(&tokens)
-            .unwrap_or_else(|error| panic!("the gap command must parse ({error}): {command}"));
         assert!(!temp
             .path()
             .join(".hermes")

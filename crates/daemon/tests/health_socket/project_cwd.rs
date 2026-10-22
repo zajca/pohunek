@@ -388,6 +388,9 @@ async fn a_project_session_does_not_keep_its_project_on_unreadable_repository_ev
 /// outside every repository. `PATH` is narrowed only after the session exists.
 #[tokio::test]
 async fn a_project_session_does_not_keep_its_project_when_git_is_unavailable() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let mut rig = ProjectRig::start("pcwd-no-git").await;
     let second = rig.outside.join("second");
     std::fs::create_dir(&second).expect("create the second directory");
@@ -405,6 +408,78 @@ async fn a_project_session_does_not_keep_its_project_when_git_is_unavailable() {
     assert_eq!(
         moved.project_id, None,
         "a git that cannot answer never keeps the reference's project"
+    );
+    rig.finish().await;
+}
+
+/// The first `PATH` entry holding an executable `git`.
+fn real_git() -> PathBuf {
+    let path = std::env::var_os("PATH").expect("PATH is set");
+    std::env::split_paths(&path)
+        .map(|directory| directory.join("git"))
+        .find(|candidate| candidate.is_file())
+        .expect("git on PATH")
+}
+
+/// K5: a session without a launch marker never pays for the confirmation that
+/// a directory lies outside every repository, which only the marker consumes.
+/// The confirmation is the one `git` call that runs under `LC_ALL=C`, so the
+/// daemon's own locale is set to something else and a recording `git` in front
+/// of the real one tells the calls apart.
+#[tokio::test]
+async fn a_session_without_a_launch_marker_runs_no_outside_confirmation() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let mut rig = ProjectRig::start("pcwd-no-confirm").await;
+    let alpha = rig.outside.join("alpha-dir");
+    let beta = rig.outside.join("beta-dir");
+    std::fs::create_dir(&alpha).expect("create the unmarked session's target");
+    std::fs::create_dir(&beta).expect("create the marked session's target");
+    let unmarked: SessionInfo =
+        serde_json::from_value(ok_payload(rig.new_session(None).await)).expect("session info");
+    let marked: SessionInfo = serde_json::from_value(ok_payload(
+        rig.new_session(Some(rig.outside.to_path_buf())).await,
+    ))
+    .expect("session info");
+
+    let mut environment = ProcessEnv::lock();
+    let real = real_git();
+    let recorder = temp_dir("pcwd-no-confirm-git");
+    let log = recorder.join("git.log");
+    write_executable(
+        &recorder.join("git"),
+        &format!(
+            "#!/bin/sh\nprintf '%s %s\\n' \"${{LC_ALL-unset}}\" \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            real.display()
+        ),
+    );
+    let path = std::env::var_os("PATH").expect("PATH is set");
+    let mut entries = vec![recorder.to_path_buf()];
+    entries.extend(std::env::split_paths(&path));
+    environment.set("PATH", std::env::join_paths(entries).expect("join PATH"));
+    environment.set("LC_ALL", "pohunek-test-locale");
+
+    rig.move_session_to(&unmarked.id, &alpha).await;
+    rig.move_session_to(&marked.id, &beta).await;
+    drop(environment);
+
+    let calls = std::fs::read_to_string(&log).expect("the recording git ran");
+    let confirmations = |directory: &str| {
+        calls
+            .lines()
+            .filter(|line| line.starts_with("C ") && line.contains(directory))
+            .count()
+    };
+    assert!(
+        confirmations("beta-dir") > 0,
+        "the marked session's directory is confirmed: {calls}"
+    );
+    assert_eq!(
+        confirmations("alpha-dir"),
+        0,
+        "no session marker, no confirmation: {calls}"
     );
     rig.finish().await;
 }

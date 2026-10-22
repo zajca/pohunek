@@ -394,6 +394,20 @@ async fn a_resumed_by_reference_session_keeps_its_reference_outside_every_reposi
     );
 }
 
+/// A session that has captured a native id keeps a metadata edit in its durable
+/// session record.
+#[tokio::test]
+async fn metadata_set_on_a_native_bound_session_is_written_to_its_durable_record() {
+    let mut rig = ClaudeRig::new("claude-metadata-durable").await;
+    rig.transcript(LAUNCH);
+    rig.report("startup", LAUNCH).await;
+    let id = rig.session.id.clone();
+
+    super::session_metadata::set_edited_key(&mut rig.control, &id).await;
+    super::session_metadata::assert_native_session_edit_is_durable(&rig.store_path, &id);
+    rig.finish(None).await;
+}
+
 #[tokio::test]
 async fn claude_clear_recovery_selects_the_verified_new_conversation() {
     assert_conversation_switch("clear", CLEAR).await;

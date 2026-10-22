@@ -17,6 +17,9 @@ use serde_json::{json, Value};
 /// The smallest idle time the daemon accepts, and the one the scenarios use.
 const MIN_SECS: u64 = 60;
 
+/// The version the fixture daemon reports in `daemon.health`.
+const FIXTURE_DAEMON_VERSION: &str = "0.35.2";
+
 /// A default well above the minimum.
 const DEFAULT_SECS: u64 = 900;
 
@@ -218,7 +221,7 @@ fn serve_fixture_daemon(
                         request.id(),
                         json!({
                             "status": "ok",
-                            "daemon_version": "0.35.2",
+                            "daemon_version": FIXTURE_DAEMON_VERSION,
                             "protocol_version": PROTOCOL_VERSION.get(),
                         }),
                     ),
@@ -324,7 +327,8 @@ fn a_daemon_of_the_previous_release_refuses_the_idle_default_and_keeps_its_reten
         refused["err"]["recover"]
             .as_str()
             .is_some_and(|hint| hint.contains("upgrade the daemon")
-                && hint.contains("0.36.0")
+                && hint.contains(&format!("(version {FIXTURE_DAEMON_VERSION})"))
+                && hint.contains("release 0.36.0 or later")
                 && hint.contains("Nothing was changed")),
         "{refused}"
     );

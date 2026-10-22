@@ -4936,15 +4936,27 @@ impl SessionRegistry {
     /// The association an observed `cwd` resolves to and whether `cwd` provably
     /// lies outside every repository, or `None` when resolving it failed and the
     /// session keeps its current association.
+    ///
+    /// Only a session with a launch marker consumes the outside confirmation, so
+    /// any other session skips the extra `git` call. The marker never changes
+    /// after the session is created, so reading it here cannot go stale.
     async fn resolve_cwd_association(
         &self,
         id: &SessionId,
         cwd: PathBuf,
     ) -> Option<(CwdAssociation, bool)> {
         let store = self.inner.store.clone();
+        let marked = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|entry| entry.reference_launch.is_some());
         match tokio::task::spawn_blocking(move || {
             let resolved = resolve_cwd_association(cwd.as_path(), store.as_deref())?;
-            let outside = resolved == CwdAssociation::default()
+            let outside = marked
+                && resolved == CwdAssociation::default()
                 && crate::project::detect::confirmed_outside_repository(&cwd);
             Ok::<_, ProtocolError>((resolved, outside))
         })
@@ -4970,6 +4982,43 @@ impl SessionRegistry {
         }
     }
 
+    /// Writes `metadata` into the durable record of `id` before the session
+    /// shows it, so a refused write leaves both unchanged.
+    ///
+    /// The store replaces only the metadata of the record it reads under its
+    /// write lock ([`Store::replace_session_metadata`]), so a stop, removal, or
+    /// exit that persisted meanwhile keeps its state.
+    async fn commit_session_metadata(
+        &self,
+        id: &SessionId,
+        metadata: &BTreeMap<String, String>,
+        updated_at: &str,
+    ) -> Result<(), ProtocolError> {
+        let Some(store) = self.inner.store.clone() else {
+            return Ok(());
+        };
+        let session_id = id.0.clone();
+        let metadata = metadata.clone();
+        let updated_at = updated_at.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.replace_session_metadata(&session_id, &metadata, &updated_at)
+        })
+        .await
+        .map_err(|_join_error| {
+            runtime_error(
+                "session_store_failed",
+                format!("metadata commit task panicked for {}", id.0),
+            )
+        })?
+        .map_err(|error| {
+            runtime_error(
+                "session_store_failed",
+                format!("failed to write the metadata of {}: {error}", id.0),
+            )
+        })?;
+        Ok(())
+    }
+
     /// Merge owner-controlled metadata into a session and return the updated info.
     pub async fn set_metadata(
         &self,
@@ -4984,6 +5033,10 @@ impl SessionRegistry {
             .filter_map(|(key, value)| Some((key.clone(), value.clone()?)))
             .collect();
         idle_stop::validate_opt_in(&patch, self.inner.config.idle_stop_min_secs)?;
+        // The sessions lock is held from the merge through the store write to the
+        // in-memory edit, so a record writer that builds its record from the
+        // entry cannot interleave and write the previous metadata over the edit.
+        let persist = self.inner.persist_lock.lock().await;
         let (info, has_native) = {
             let mut sessions = self.inner.sessions.lock().await;
             let entry = sessions
@@ -5001,12 +5054,16 @@ impl SessionRegistry {
                 }
             }
             validate_session_metadata(&candidate)?;
+            let updated_at = timestamp_now();
+            self.commit_session_metadata(id, &candidate, &updated_at)
+                .await?;
             entry.info.metadata = candidate;
-            entry.info.updated_at = timestamp_now();
+            entry.info.updated_at = updated_at;
             let has_native =
                 entry.info.native_session_id.is_some() || entry.info.native_session_path.is_some();
             (entry.info.clone(), has_native)
         };
+        drop(persist);
 
         if has_native {
             self.persist_resume_binding(id).await;

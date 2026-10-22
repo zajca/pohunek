@@ -245,7 +245,10 @@ the cross-surface convention for tying a session to a work item: every client
 and the launch scripts write exactly these five keys through the shared
 `pohunek_prompt::link` implementation, so a link is byte-identical regardless
 of which surface created the session. The daemon treats all metadata as
-opaque owner-controlled strings.
+opaque owner-controlled strings. An edit through `session.set_metadata` is
+written to the session's durable record before the session shows it, for every
+session, with or without a native id, so it survives a daemon restart; a write
+the store refuses fails the call with `session_store_failed` and changes nothing.
 
 The `session.list` protocol request can filter this metadata with exact-value
 (`metadata_eq`) and key-presence (`metadata_has`) predicates. Equality compares

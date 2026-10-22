@@ -223,68 +223,99 @@ fn session_input_reaches_the_peer_the_name_first_selected() {
 }
 
 #[test]
-fn every_other_name_resolving_command_reaches_the_peer_the_name_first_selected() {
-    let commands: [(&str, &[&str], &str); 10] = [
-        (
-            "inspect",
-            &["inspect", SESSION_NAME, "--json"],
-            protocol::method::SESSION_INSPECT,
-        ),
-        (
-            "detection",
-            &["detection", SESSION_NAME, "--json"],
-            protocol::method::SESSION_DETECTION,
-        ),
-        (
-            "read",
-            &["read", SESSION_NAME, "--json"],
-            protocol::method::SESSION_READ,
-        ),
-        (
-            "resume",
-            &["resume", SESSION_NAME, "--json"],
-            protocol::method::SESSION_RESUME,
-        ),
-        (
-            "fork",
-            &["fork", SESSION_NAME, "--json"],
-            protocol::method::SESSION_FORK,
-        ),
-        (
-            "rm",
-            &["rm", SESSION_NAME, "--json"],
-            protocol::method::SESSION_REMOVE,
-        ),
-        (
+fn the_inspect_command_reaches_the_peer_the_name_first_selected() {
+    assert_pinned(
+        "inspect",
+        &["inspect", SESSION_NAME, "--json"],
+        protocol::method::SESSION_INSPECT,
+    );
+}
+
+#[test]
+fn the_detection_command_reaches_the_peer_the_name_first_selected() {
+    assert_pinned(
+        "detection",
+        &["detection", SESSION_NAME, "--json"],
+        protocol::method::SESSION_DETECTION,
+    );
+}
+
+#[test]
+fn the_read_command_reaches_the_peer_the_name_first_selected() {
+    assert_pinned(
+        "read",
+        &["read", SESSION_NAME, "--json"],
+        protocol::method::SESSION_READ,
+    );
+}
+
+#[test]
+fn the_resume_command_reaches_the_peer_the_name_first_selected() {
+    assert_pinned(
+        "resume",
+        &["resume", SESSION_NAME, "--json"],
+        protocol::method::SESSION_RESUME,
+    );
+}
+
+#[test]
+fn the_fork_command_reaches_the_peer_the_name_first_selected() {
+    assert_pinned(
+        "fork",
+        &["fork", SESSION_NAME, "--json"],
+        protocol::method::SESSION_FORK,
+    );
+}
+
+#[test]
+fn the_rm_command_reaches_the_peer_the_name_first_selected() {
+    assert_pinned(
+        "rm",
+        &["rm", SESSION_NAME, "--json"],
+        protocol::method::SESSION_REMOVE,
+    );
+}
+
+#[test]
+fn the_resize_command_reaches_the_peer_the_name_first_selected() {
+    assert_pinned(
+        "resize",
+        &[
             "resize",
-            &[
-                "resize",
-                SESSION_NAME,
-                "--cols",
-                "100",
-                "--rows",
-                "30",
-                "--json",
-            ],
-            protocol::method::SESSION_RESIZE,
-        ),
-        (
-            "metadata",
-            &["metadata", SESSION_NAME, "--set", "k=v", "--json"],
-            protocol::method::SESSION_SET_METADATA,
-        ),
-        (
-            "rename",
-            &["rename", SESSION_NAME, "beta", "--json"],
-            protocol::method::SESSION_RENAME,
-        ),
-        (
-            "diff",
-            &["diff", SESSION_NAME, "--json"],
-            protocol::method::SESSION_DIFF,
-        ),
-    ];
-    for (label, args, method) in commands {
-        assert_pinned(label, args, method);
-    }
+            SESSION_NAME,
+            "--cols",
+            "100",
+            "--rows",
+            "30",
+            "--json",
+        ],
+        protocol::method::SESSION_RESIZE,
+    );
+}
+
+#[test]
+fn the_metadata_command_reaches_the_peer_the_name_first_selected() {
+    assert_pinned(
+        "metadata",
+        &["metadata", SESSION_NAME, "--set", "k=v", "--json"],
+        protocol::method::SESSION_SET_METADATA,
+    );
+}
+
+#[test]
+fn the_rename_command_reaches_the_peer_the_name_first_selected() {
+    assert_pinned(
+        "rename",
+        &["rename", SESSION_NAME, "beta", "--json"],
+        protocol::method::SESSION_RENAME,
+    );
+}
+
+#[test]
+fn the_diff_command_reaches_the_peer_the_name_first_selected() {
+    assert_pinned(
+        "diff",
+        &["diff", SESSION_NAME, "--json"],
+        protocol::method::SESSION_DIFF,
+    );
 }

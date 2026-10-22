@@ -1218,13 +1218,6 @@ impl SessionRegistry {
         // without project context until its next persist.
         let project_id = binding.project_id.clone();
         let is_linked_worktree = binding.is_linked_worktree;
-        let reference_launch = self
-            .inner
-            .sessions
-            .lock()
-            .await
-            .get(&id)
-            .and_then(|entry| entry.reference_launch.clone());
         self.register_pty_session(
             PtySessionSpec {
                 id,
@@ -1248,7 +1241,9 @@ impl SessionRegistry {
                 worktree_path,
                 metadata: binding.metadata,
                 warnings: outdated_hooks,
-                reference_launch,
+                // The live entry's launch marker is carried when the resumed entry
+                // is installed.
+                reference_launch: None,
                 initial_input_pending: false,
                 prompt_in_argv: false,
                 package_authority,

@@ -1091,6 +1091,40 @@ impl Store {
             .with_value(true))
     }
 
+    /// Replaces the owner metadata of one session's current record, in the
+    /// record and in its embedded recovery binding, and leaves every other
+    /// field as persisted.
+    ///
+    /// The record is re-read under the write lock, so a state a concurrent
+    /// stop, removal, or exit persisted is kept. Returns whether a record was
+    /// updated; no record at all is a no-op success.
+    pub fn replace_session_metadata(
+        &self,
+        session_id: &str,
+        metadata: &BTreeMap<String, String>,
+        updated_at: &str,
+    ) -> io::Result<StoreMutation<bool>> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (resume, worktrees, projects, mut sessions) = self.read_all()?;
+        let Some(record) = sessions
+            .iter_mut()
+            .find(|record| record.session_id == session_id)
+        else {
+            return Ok(StoreMutation::Synced(false));
+        };
+        record.info.metadata.clone_from(metadata);
+        updated_at.clone_into(&mut record.info.updated_at);
+        if let Some(recovery) = record.recovery.as_mut() {
+            recovery.metadata.clone_from(metadata);
+        }
+        Ok(self
+            .write_all(&resume, &worktrees, &projects, &sessions)?
+            .with_value(true))
+    }
+
     /// Removes one logical session and preserves every other record kind.
     pub fn remove_session(&self, session_id: &str) -> io::Result<StoreMutation<bool>> {
         let _guard = self
