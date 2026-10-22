@@ -957,7 +957,7 @@ struct SessionEntry {
     /// The association a session created by `project`/`repo` in a directory
     /// outside every repository starts with. Held in memory only, so a session
     /// adopted after a daemon restart has none.
-    reference_launch: Option<CwdAssociation>,
+    reference_launch: Option<Box<CwdAssociation>>,
     /// Daemon instance holding the create's undelivered initial input; the
     /// running session's record then carries the `initial_input` marker
     /// naming that instance.
@@ -4879,7 +4879,7 @@ impl SessionRegistry {
             // outside every repository; unconfirmed evidence follows the cwd.
             let association = association.map(|(resolved, outside)| {
                 match (outside, entry.reference_launch.as_ref()) {
-                    (true, Some(reference)) => reference.clone(),
+                    (true, Some(reference)) => CwdAssociation::clone(reference),
                     _ => resolved,
                 }
             });

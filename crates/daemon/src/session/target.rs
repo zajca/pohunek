@@ -1044,12 +1044,14 @@ impl SessionRegistry {
             observed_agents: Vec::new(),
             bound_reporter: None,
             cwd_observed_at: crate::time::now(),
-            reference_launch: reference_outside_repository.then(|| CwdAssociation {
-                project_id: info.project_id.clone(),
-                is_linked_worktree: info.is_linked_worktree,
-                repo: info.repo.clone(),
-                branch: info.branch.clone(),
-                worktree_path: info.worktree_path.clone(),
+            reference_launch: reference_outside_repository.then(|| {
+                Box::new(CwdAssociation {
+                    project_id: info.project_id.clone(),
+                    is_linked_worktree: info.is_linked_worktree,
+                    repo: info.repo.clone(),
+                    branch: info.branch.clone(),
+                    worktree_path: info.worktree_path.clone(),
+                })
             }),
             initial_input_owner: initial_input_pending
                 .then(|| self.daemon_instance_id().to_owned()),
