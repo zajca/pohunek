@@ -29,7 +29,8 @@ use pohunek_cli::service::{Backend, Engine, VERSION};
 use pohunek_platform::process::{HostInspector, ProcessIdentity, ProcessInspector as _};
 use pohunek_platform::supervisor::ServiceObservation;
 use pohunek_service_config::{
-    InputTiming, DEFAULT_HOOK_STDERR_TAIL_BYTES, DEFAULT_INPUT_TIMING, DEFAULT_WAIT_TIMING,
+    InputTiming, DEFAULT_EVENT_RETENTION, DEFAULT_HOOK_STDERR_TAIL_BYTES, DEFAULT_INPUT_TIMING,
+    DEFAULT_WAIT_TIMING,
 };
 
 /// Version directory the upgrade installs this build under.
@@ -486,6 +487,7 @@ async fn upgrade_migrates_the_previous_release_config_over_a_stopped_daemon() {
         current.hook_stderr_tail_bytes(),
         DEFAULT_HOOK_STDERR_TAIL_BYTES
     );
+    assert_eq!(current.event_retention(), DEFAULT_EVENT_RETENTION);
     assert!(
         !backup_path(&installation).exists(),
         "the backup goes with the record"
@@ -577,6 +579,7 @@ async fn upgrade_migrates_a_schema_three_config_keeping_its_input_timing() {
         current.hook_stderr_tail_bytes(),
         DEFAULT_HOOK_STDERR_TAIL_BYTES
     );
+    assert_eq!(current.event_retention(), DEFAULT_EVENT_RETENTION);
     assert!(
         !backup_path(&installation).exists(),
         "the backup goes with the record"

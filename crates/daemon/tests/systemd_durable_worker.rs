@@ -610,6 +610,10 @@ impl Fixture {
     /// Lays out an isolated installation: XDG tree, versioned worker binary,
     /// and an explicit `service.toml` whose namespace names the fixture's
     /// transient units.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one literal spells every ConfigSpec field of the test installation"
+    )]
     fn new(worker_bin: &Path) -> Self {
         // One number names the fixture: the pid in the high bits and the
         // sub-second nanoseconds (below 2^30) in the low bits. The session ids
@@ -670,6 +674,7 @@ impl Fixture {
             input_timing: pohunek_service_config::DEFAULT_INPUT_TIMING,
             wait_timing: pohunek_service_config::DEFAULT_WAIT_TIMING,
             hook_stderr_tail_bytes: pohunek_service_config::DEFAULT_HOOK_STDERR_TAIL_BYTES,
+            event_retention: pohunek_service_config::DEFAULT_EVENT_RETENTION,
             open_files: OPEN_FILES,
         })
         .expect("valid fixture service configuration");

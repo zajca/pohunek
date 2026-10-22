@@ -1182,6 +1182,7 @@ fn service_config(
         input_timing: pohunek_service_config::DEFAULT_INPUT_TIMING,
         wait_timing: pohunek_service_config::DEFAULT_WAIT_TIMING,
         hook_stderr_tail_bytes: pohunek_service_config::DEFAULT_HOOK_STDERR_TAIL_BYTES,
+        event_retention: pohunek_service_config::DEFAULT_EVENT_RETENTION,
         open_files: OPEN_FILES,
     })
     .expect("valid service configuration")

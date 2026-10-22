@@ -479,6 +479,9 @@ pub struct SessionRegistryConfig {
     /// Directory for the append-only event log (`<data_dir>/events`). `None`
     /// disables event logging. Started via [`SessionRegistry::spawn_event_log`].
     pub event_log_dir: Option<PathBuf>,
+    /// Size, count and age bounds of the event journal under
+    /// [`Self::event_log_dir`].
+    pub event_retention: pohunek_service_config::EventRetention,
     /// Durable session policy document (`<data_dir>/session-policy.json`).
     /// `None` keeps the retention policy in memory only, which is what unit
     /// tests that never persist a policy use.
@@ -609,6 +612,7 @@ impl Default for SessionRegistryConfig {
             hook_stderr_tail_bytes: DEFAULT_HOOK_STDERR_TAIL_BYTES,
             hook_stderr_release_grace: DEFAULT_HOOK_STDERR_RELEASE_GRACE,
             event_log_dir: None,
+            event_retention: pohunek_service_config::DEFAULT_EVENT_RETENTION,
             retention_policy_path: None,
             log_dir: None,
             config_dir: None,
@@ -2292,6 +2296,12 @@ impl SessionRegistry {
         self.inner.config.config_dir.as_deref()
     }
 
+    /// Size, count and age bounds the event journal is opened with.
+    #[must_use]
+    pub fn event_retention(&self) -> pohunek_service_config::EventRetention {
+        self.inner.config.event_retention
+    }
+
     /// The resolved host agent-profile registry (Part C), for `host.inspect` to
     /// enumerate the launchable agent names + probe each profile's program.
     #[must_use]
@@ -2631,7 +2641,10 @@ impl SessionRegistry {
         let Some(dir) = &self.inner.config.event_log_dir else {
             return Ok(());
         };
-        let log = Arc::new(crate::events::EventLog::open(dir)?);
+        let log = Arc::new(crate::events::EventLog::open(
+            dir,
+            self.inner.config.event_retention,
+        )?);
         let handle = crate::events::spawn_drain(
             log,
             self.subscribe(),

@@ -2,6 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use pohunek_logging::{remove_family, Error, Files, Legacy, Policy, Writer};
 
@@ -255,4 +256,93 @@ fn remove_family_preserves_unrelated_files_and_symlinks() {
         .unwrap()
         .file_type()
         .is_symlink());
+}
+
+const DAY: Duration = Duration::from_hours(24);
+
+fn age_file(path: &Path, age: Duration) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open file to age")
+        .set_modified(SystemTime::now() - age)
+        .expect("set modification time");
+}
+
+#[test]
+fn startup_prunes_rotated_and_active_files_past_the_age_bound_only() {
+    let temp =
+        pohunek_test_support::tempdir_with_prefix("log-age-open-").expect("create test directory");
+    let dir = temp.path();
+    for name in ["a.jsonl", "a.jsonl.1", "a.jsonl.2"] {
+        fs::write(dir.join(name), b"x\n").unwrap();
+    }
+    age_file(&dir.join("a.jsonl.2"), 3 * DAY);
+    age_file(&dir.join("a.jsonl.1"), Duration::from_hours(1));
+    let policy = Policy::new(64, 4).unwrap().with_max_age(DAY);
+
+    Writer::open(dir, files("a.jsonl"), policy).unwrap();
+
+    assert_eq!(
+        family_files(dir, "a.jsonl")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        ["a.jsonl", "a.jsonl.1"]
+    );
+
+    age_file(&dir.join("a.jsonl"), 2 * DAY);
+    Writer::open(dir, files("a.jsonl"), policy).unwrap();
+    assert!(
+        !dir.join("a.jsonl").exists(),
+        "an active file whose last write is past the age bound is removed at open"
+    );
+    assert!(dir.join("a.jsonl.1").exists());
+}
+
+#[test]
+fn rotation_prunes_rotated_files_past_the_age_bound() {
+    let temp = pohunek_test_support::tempdir_with_prefix("log-age-rotate-")
+        .expect("create test directory");
+    let dir = temp.path();
+    let policy = Policy::new(16, 4).unwrap().with_max_age(DAY);
+    let mut writer = Writer::open(dir, files("a.jsonl"), policy).unwrap();
+    writer.write_all(b"0123456789\n").unwrap();
+    writer.write_all(b"0123456789\n").unwrap();
+    assert!(dir.join("a.jsonl.1").exists());
+    age_file(&dir.join("a.jsonl.1"), 2 * DAY);
+
+    writer.write_all(b"0123456789\n").unwrap();
+
+    assert_eq!(
+        family_files(dir, "a.jsonl")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        ["a.jsonl", "a.jsonl.1"],
+        "the expired file is gone and the just-rotated one is kept"
+    );
+    assert!(
+        fs::metadata(dir.join("a.jsonl.1"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            > SystemTime::now() - Duration::from_hours(1),
+        "the surviving .1 is the freshly rotated file"
+    );
+}
+
+#[test]
+fn a_zero_age_bound_means_no_age_bound() {
+    let temp =
+        pohunek_test_support::tempdir_with_prefix("log-age-zero-").expect("create test directory");
+    let dir = temp.path();
+    fs::write(dir.join("a.jsonl.1"), b"x\n").unwrap();
+    age_file(&dir.join("a.jsonl.1"), 400 * DAY);
+    let policy = Policy::new(64, 4).unwrap().with_max_age(Duration::ZERO);
+
+    Writer::open(dir, files("a.jsonl"), policy).unwrap();
+
+    assert!(dir.join("a.jsonl.1").exists());
+    assert_eq!(policy.max_age(), None);
 }

@@ -12,7 +12,7 @@
 //! # Schema
 //!
 //! ```toml
-//! schema_version = 6
+//! schema_version = 7
 //! prefix = "/home/u/.local"                       # absolute install prefix
 //! active_version = "0.31.6"                       # <prefix>/libexec/pohunek/<version>
 //!
@@ -47,6 +47,11 @@
 //!
 //! [hooks]
 //! stderr_tail_bytes = 4096                         # 0..=32768; 0 disables the capture
+//!
+//! [events]                                        # bounds <data>/events/events.jsonl
+//! max_file_bytes = 33554432                        # 1048576..=1073741824; one journal file
+//! max_files = 8                                    # 2..=64; including the active file
+//! max_age_days = 14                                # 1..=3650
 //!
 //! [limits]
 //! open_files = 8192                                # 256..=1048576
@@ -96,6 +101,15 @@
 //! default, so a release that adds one still writes files the previous
 //! release can read, unless the operator set the new key.
 //!
+//! `[events]` bounds the daemon's event journal: a file rotates before it would
+//! exceed `max_file_bytes`, at most `max_files` files (the active one included)
+//! are kept, and a rotated file whose last write is older than `max_age_days`
+//! is pruned when the daemon starts and after each rotation; an active file whose
+//! last write is older is removed when the daemon starts. See
+//! [`EventRetention`] and [`DEFAULT_EVENT_RETENTION`]. The first start with
+//! these bounds removes, without reading it, a journal file above
+//! `max_file_bytes` left by an earlier release.
+//!
 //! # Upgrades
 //!
 //! A normal load accepts only [`SCHEMA_VERSION`]. The installer reads the
@@ -104,7 +118,7 @@
 //! has neither `[input]` nor `[waits]`, schema 3 has no `[waits]` and no
 //! `input.write_stall_timeout_ms`, schema 4 has no
 //! `input.write_stall_timeout_ms`, and none of them nor schema 5 has
-//! `[hooks]`. Every value a previous file records is kept. The previous
+//! `[hooks]`, and none of schemas 2 to 6 has `[events]`. Every value a previous file records is kept. The previous
 //! schemas are read in their exact shapes: no release that wrote one could
 //! write an unknown key, so an unknown key in such a file is refused.
 //!
@@ -183,9 +197,10 @@ pub use error::ConfigError;
 /// so an older binary never half-understands a newer installation and a newer
 /// binary never reads a file that lacks keys it requires. Version 3 holds
 /// `[input]`; version 4 adds `[waits]`; version 5 adds
-/// `input.write_stall_timeout_ms`; version 6 adds `[hooks]`. Schemas 2, 3, 4
-/// and 5 are read only through [`ServiceConfig::load_upgrade_source`].
-pub const SCHEMA_VERSION: u32 = 6;
+/// `input.write_stall_timeout_ms`; version 6 adds `[hooks]`; version 7 adds
+/// `[events]`. Schemas 2 to 6 are read only through
+/// [`ServiceConfig::load_upgrade_source`].
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Input timings written on fresh installs and assigned explicitly when
 /// upgrading a schema-2, schema-3 or schema-4 service file, which lack some
@@ -235,6 +250,43 @@ pub const DEFAULT_HOOK_STDERR_TAIL_BYTES: u32 = 4096;
 /// 1 MiB control line together with the rest of the session. 32 KiB is also
 /// several hundred lines, more than anyone reads in a warning.
 pub const MAX_HOOK_STDERR_TAIL_BYTES: u32 = 32 * 1024;
+
+/// Event-journal retention written on fresh installs, assigned when upgrading
+/// a schema-2 to schema-6 file, and used by a daemon without `service.toml`.
+///
+/// Eight 32 MiB files cap the journal at 256 MiB, the same family bound as
+/// `pohunekd.jsonl`. A journal without heartbeat refreshes grows by a few tens
+/// of megabytes per day, so 14 days of rotated files fit well inside it.
+pub const DEFAULT_EVENT_RETENTION: EventRetention = EventRetention {
+    max_file_bytes: 32 * 1024 * 1024,
+    max_files: 8,
+    max_age: Duration::from_secs(14 * SECONDS_PER_DAY),
+};
+
+/// Seconds in one day, the unit of `events.max_age_days`.
+const SECONDS_PER_DAY: u64 = 86_400;
+
+/// Smallest accepted `events.max_file_bytes`.
+///
+/// A control-plane event carries a full session record, up to a few hundred
+/// kilobytes; a file below this could not hold one, and the journal would
+/// replace such an event with a notice.
+pub const MIN_EVENT_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Largest accepted `events.max_file_bytes`.
+pub const MAX_EVENT_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Smallest accepted `events.max_files`, so a rotation keeps the previous file.
+pub const MIN_EVENT_FILES: u32 = 2;
+
+/// Largest accepted `events.max_files`.
+pub const MAX_EVENT_FILES: u32 = 64;
+
+/// Smallest accepted `events.max_age_days`.
+pub const MIN_EVENT_AGE_DAYS: u64 = 1;
+
+/// Largest accepted `events.max_age_days`: ten years.
+pub const MAX_EVENT_AGE_DAYS: u64 = 3650;
 
 /// Shortest accepted `[waits]` value.
 ///
@@ -498,6 +550,24 @@ pub struct WaitTiming {
     pub turn_max: Duration,
 }
 
+/// Event-journal retention recorded in `[events]`.
+///
+/// [`ServiceConfig::new`] keeps `max_file_bytes` within
+/// [`MIN_EVENT_FILE_BYTES`]`..=`[`MAX_EVENT_FILE_BYTES`], `max_files` within
+/// [`MIN_EVENT_FILES`]`..=`[`MAX_EVENT_FILES`], and `max_age` a whole number of
+/// days within [`MIN_EVENT_AGE_DAYS`]`..=`[`MAX_EVENT_AGE_DAYS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EventRetention {
+    /// Largest size of one journal file; the journal rotates before a write
+    /// would cross it.
+    pub max_file_bytes: u64,
+    /// Journal files kept, the active one included.
+    pub max_files: u32,
+    /// Age after which a rotated journal file is pruned, and after which the
+    /// active file is removed at start.
+    pub max_age: Duration,
+}
+
 /// A key or table of `service.toml` that this version does not know.
 ///
 /// The value never enters this type, so no warning built from it can leak a
@@ -641,6 +711,8 @@ pub struct ConfigSpec {
     /// Bytes of a failing worktree-create hook's stderr kept for its warning;
     /// 0 disables the capture.
     pub hook_stderr_tail_bytes: u32,
+    /// Size, count and age bounds of the event journal.
+    pub event_retention: EventRetention,
     /// Open-file limit applied to supervised jobs.
     pub open_files: u64,
 }
@@ -664,6 +736,7 @@ pub struct ServiceConfig {
     input_timing: InputTiming,
     wait_timing: WaitTiming,
     hook_stderr_tail_bytes: u32,
+    event_retention: EventRetention,
     open_files: u64,
     unknown: UnknownKeys,
 }
@@ -734,6 +807,7 @@ impl ServiceConfig {
                 max: u64::from(MAX_HOOK_STDERR_TAIL_BYTES),
             });
         }
+        validate_event_retention(spec.event_retention)?;
         if !(MIN_OPEN_FILES..=MAX_OPEN_FILES).contains(&spec.open_files) {
             return Err(ConfigError::OutOfRange {
                 key: "limits.open_files",
@@ -757,6 +831,7 @@ impl ServiceConfig {
             input_timing: spec.input_timing,
             wait_timing: spec.wait_timing,
             hook_stderr_tail_bytes: spec.hook_stderr_tail_bytes,
+            event_retention: spec.event_retention,
             open_files: spec.open_files,
             unknown: UnknownKeys::default(),
         })
@@ -798,7 +873,7 @@ impl ServiceConfig {
     /// # Errors
     ///
     /// Returns the same trust and validation errors as [`Self::load`], and
-    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2, 3, 4, 5, or
+    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2, 3, 4, 5, 6, or
     /// [`SCHEMA_VERSION`].
     pub fn load_upgrade_source(path: &Path) -> Result<UpgradeSource, ConfigError> {
         Self::load_upgrade_source_bytes(path, read_config_text(path)?.as_bytes())
@@ -816,7 +891,7 @@ impl ServiceConfig {
     ///
     /// Returns [`ConfigError::Parse`] for bytes that are not UTF-8, invalid
     /// TOML, or a missing, unknown, or mistyped key, and
-    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2, 3, 4, 5, or
+    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2, 3, 4, 5, 6, or
     /// [`SCHEMA_VERSION`].
     pub fn load_upgrade_source_bytes(
         path: &Path,
@@ -931,6 +1006,7 @@ impl ServiceConfig {
             hooks: RawHooks {
                 stderr_tail_bytes: self.hook_stderr_tail_bytes,
             },
+            events: RawEvents::from(self.event_retention),
             limits: RawLimits {
                 open_files: self.open_files,
             },
@@ -963,6 +1039,7 @@ impl ServiceConfig {
             input_timing: self.input_timing,
             wait_timing: self.wait_timing,
             hook_stderr_tail_bytes: self.hook_stderr_tail_bytes,
+            event_retention: self.event_retention,
             open_files: self.open_files,
         }
     }
@@ -1107,6 +1184,12 @@ impl ServiceConfig {
         self.hook_stderr_tail_bytes
     }
 
+    /// Returns the size, count and age bounds of the event journal.
+    #[must_use]
+    pub fn event_retention(&self) -> EventRetention {
+        self.event_retention
+    }
+
     /// Returns the open-file limit for supervised jobs.
     #[must_use]
     pub fn open_files(&self) -> u64 {
@@ -1163,6 +1246,24 @@ fn write_config_text(path: &Path, text: &str) -> Result<(), ConfigError> {
 /// environment.
 #[derive(Debug, Serialize, Deserialize)]
 struct RawConfig {
+    schema_version: u32,
+    prefix: String,
+    active_version: String,
+    namespace: RawNamespace,
+    deadlines: RawDeadlines,
+    environment: RawEnvironment,
+    sweep: RawSweep,
+    input: RawInput,
+    waits: RawWaits,
+    hooks: RawHooks,
+    events: RawEvents,
+    limits: RawLimits,
+}
+
+/// Exact on-disk schema-6 shape accepted only for an explicit upgrade.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfigV6 {
     schema_version: u32,
     prefix: String,
     active_version: String,
@@ -1324,6 +1425,37 @@ impl RawHooks {
     };
 }
 
+/// On-disk `[events]` table.
+#[derive(Debug, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the keys are the three retention limits"
+)]
+struct RawEvents {
+    max_file_bytes: u64,
+    max_files: u32,
+    max_age_days: u64,
+}
+
+impl RawEvents {
+    /// The documented value assigned to a previous schema, which has no `[events]`.
+    const DEFAULT: Self = Self {
+        max_file_bytes: DEFAULT_EVENT_RETENTION.max_file_bytes,
+        max_files: DEFAULT_EVENT_RETENTION.max_files,
+        max_age_days: DEFAULT_EVENT_RETENTION.max_age.as_secs() / SECONDS_PER_DAY,
+    };
+}
+
+impl From<EventRetention> for RawEvents {
+    fn from(retention: EventRetention) -> Self {
+        Self {
+            max_file_bytes: retention.max_file_bytes,
+            max_files: retention.max_files,
+            max_age_days: retention.max_age.as_secs() / SECONDS_PER_DAY,
+        }
+    }
+}
+
 /// On-disk `[limits]` table.
 #[derive(Debug, Serialize, Deserialize)]
 struct RawLimits {
@@ -1365,6 +1497,10 @@ fn parse(path: &Path, text: &str) -> Result<ServiceConfig, ConfigError> {
 ///
 /// A previous schema gets the documented defaults for the tables it lacks
 /// and keeps every value it records.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per previous schema, each spelling its exact shape"
+)]
 fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32), ConfigError> {
     let parse_error = |error: toml::de::Error| ConfigError::Parse {
         path: path.to_path_buf(),
@@ -1389,6 +1525,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 },
                 waits: RawWaits::from(DEFAULT_WAIT_TIMING),
                 hooks: RawHooks::DEFAULT,
+                events: RawEvents::DEFAULT,
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 2);
@@ -1412,6 +1549,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 },
                 waits: previous.waits,
                 hooks: RawHooks::DEFAULT,
+                events: RawEvents::DEFAULT,
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 4);
@@ -1431,11 +1569,32 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 input: previous.input,
                 waits: previous.waits,
                 hooks: RawHooks::DEFAULT,
+                events: RawEvents::DEFAULT,
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 5);
             refuse_unknown_keys(path, text, 5)?;
             Ok((config_from_raw(raw)?, 5))
+        }
+        Some(toml::Value::Integer(6)) => {
+            let previous: RawConfigV6 = toml::from_str(text).map_err(parse_error)?;
+            let raw = RawConfig {
+                schema_version: SCHEMA_VERSION,
+                prefix: previous.prefix,
+                active_version: previous.active_version,
+                namespace: previous.namespace,
+                deadlines: previous.deadlines,
+                environment: previous.environment,
+                sweep: previous.sweep,
+                input: previous.input,
+                waits: previous.waits,
+                hooks: previous.hooks,
+                events: RawEvents::DEFAULT,
+                limits: previous.limits,
+            };
+            debug_assert_eq!(previous.schema_version, 6);
+            refuse_unknown_keys(path, text, 6)?;
+            Ok((config_from_raw(raw)?, 6))
         }
         Some(toml::Value::Integer(3)) => {
             let previous: RawConfigV3 = toml::from_str(text).map_err(parse_error)?;
@@ -1454,6 +1613,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 },
                 waits: RawWaits::from(DEFAULT_WAIT_TIMING),
                 hooks: RawHooks::DEFAULT,
+                events: RawEvents::DEFAULT,
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 3);
@@ -1521,6 +1681,7 @@ impl RawConfig {
                 turn_max_ms: 0,
             },
             hooks: RawHooks::DEFAULT,
+            events: RawEvents::DEFAULT,
             limits: RawLimits { open_files: 0 },
         }
     }
@@ -1784,6 +1945,15 @@ fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
     .map_err(|source| ConfigError::InvalidSearchPath {
         detail: source.to_string(),
     })?;
+    let max_age_days = raw.events.max_age_days;
+    if max_age_days > MAX_EVENT_AGE_DAYS {
+        return Err(ConfigError::OutOfRange {
+            key: "events.max_age_days",
+            value: max_age_days,
+            min: MIN_EVENT_AGE_DAYS,
+            max: MAX_EVENT_AGE_DAYS,
+        });
+    }
     ServiceConfig::new(ConfigSpec {
         prefix: PathBuf::from(raw.prefix),
         active_version: raw.active_version,
@@ -1813,6 +1983,11 @@ fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
             turn_max: Duration::from_millis(raw.waits.turn_max_ms),
         },
         hook_stderr_tail_bytes: raw.hooks.stderr_tail_bytes,
+        event_retention: EventRetention {
+            max_file_bytes: raw.events.max_file_bytes,
+            max_files: raw.events.max_files,
+            max_age: Duration::from_secs(max_age_days * SECONDS_PER_DAY),
+        },
         open_files: raw.limits.open_files,
     })
 }
@@ -2012,6 +2187,43 @@ fn validate_duration(key: &'static str, value: Duration) -> Result<(), ConfigErr
             value: u64::try_from(value.as_millis()).unwrap_or(u64::MAX),
             min: 1,
             max: millis(MAX_DEADLINE),
+        });
+    }
+    Ok(())
+}
+
+/// Validates each `[events]` bound.
+fn validate_event_retention(retention: EventRetention) -> Result<(), ConfigError> {
+    if !(MIN_EVENT_FILE_BYTES..=MAX_EVENT_FILE_BYTES).contains(&retention.max_file_bytes) {
+        return Err(ConfigError::OutOfRange {
+            key: "events.max_file_bytes",
+            value: retention.max_file_bytes,
+            min: MIN_EVENT_FILE_BYTES,
+            max: MAX_EVENT_FILE_BYTES,
+        });
+    }
+    if !(MIN_EVENT_FILES..=MAX_EVENT_FILES).contains(&retention.max_files) {
+        return Err(ConfigError::OutOfRange {
+            key: "events.max_files",
+            value: u64::from(retention.max_files),
+            min: u64::from(MIN_EVENT_FILES),
+            max: u64::from(MAX_EVENT_FILES),
+        });
+    }
+    if !retention.max_age.as_secs().is_multiple_of(SECONDS_PER_DAY)
+        || retention.max_age.subsec_nanos() != 0
+    {
+        return Err(ConfigError::Precision {
+            key: "events.max_age_days",
+        });
+    }
+    let days = retention.max_age.as_secs() / SECONDS_PER_DAY;
+    if !(MIN_EVENT_AGE_DAYS..=MAX_EVENT_AGE_DAYS).contains(&days) {
+        return Err(ConfigError::OutOfRange {
+            key: "events.max_age_days",
+            value: days,
+            min: MIN_EVENT_AGE_DAYS,
+            max: MAX_EVENT_AGE_DAYS,
         });
     }
     Ok(())

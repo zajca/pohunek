@@ -1560,7 +1560,7 @@ Runtime state under the user data directory:
   notifications/
     notifications.jsonl    # durable notification action log (0600)
     policy.json             # notification, retention, and compaction policy (0600)
-  events/                  # local append-only event log (audit/debug, not replicated)
+  events/                  # local bounded event journal (audit/debug, not replicated)
   worktrees/               # managed git worktrees
 ```
 
@@ -1628,7 +1628,11 @@ internally tagged by `kind` — `session` (logical intent, launch and runtime
 binding), `worktree`, and `project` — sharing one
 serialization lock and one atomic temp+rename write path, so a write of one
 record kind can never corrupt or drop another and any single update is
-crash-atomic. The event log is the local audit/debug trail. None of these is
+crash-atomic. The event log is the local audit/debug trail: `events/events.jsonl`
+rotates by size and age under the `[events]` retention of `service.toml`
+(`max_file_bytes`, `max_files`, `max_age_days`), omits `agent_state` events that
+restate a session's last journaled state, and is written by one dedicated
+thread so no tokio worker waits on the filesystem. None of these is
 replicated across hosts by the shipped owner paths — each host's daemon is
 authoritative and is answered live (see "High-Level Architecture"). The
 planned relay may persist a reconstructible, explicitly stale session-catalog

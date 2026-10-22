@@ -762,6 +762,15 @@ fn apply_input_timing(config: &mut SessionRegistryConfig, timing: InputTiming) {
     config.input_write_stall_timeout = timing.write_stall_timeout;
 }
 
+/// Applies every registry setting `service.toml` carries to `config`.
+fn apply_service_settings(config: &mut SessionRegistryConfig, service: &ServiceConfig) {
+    config.worker_connect_deadline = service.deadlines().worker_connect;
+    apply_input_timing(config, service.input_timing());
+    apply_wait_timing(config, service.wait_timing());
+    config.hook_stderr_tail_bytes = service.hook_stderr_tail_bytes();
+    config.event_retention = service.event_retention();
+}
+
 /// Applies the validated `session.wait_turn` default and ceiling.
 fn apply_wait_timing(config: &mut SessionRegistryConfig, timing: WaitTiming) {
     config.turn_wait_default = timing.turn_default;
@@ -803,10 +812,7 @@ async fn build_session_registry(
                 &paths.runtime_dir,
             )?;
             let deadlines = service.deadlines();
-            config.worker_connect_deadline = deadlines.worker_connect;
-            apply_input_timing(&mut config, service.input_timing());
-            apply_wait_timing(&mut config, service.wait_timing());
-            config.hook_stderr_tail_bytes = service.hook_stderr_tail_bytes();
+            apply_service_settings(&mut config, &service);
             let (supervisor, worker_logs) = native_supervisor(&service, paths).await?;
             info!(
                 service.namespace = %service.namespace(),
@@ -1013,9 +1019,11 @@ fn spawn_event_logs(
     notifications: &NotificationService,
 ) -> Result<EventLogDrains, DaemonError> {
     let log = Arc::new(
-        EventLog::open(events_dir).map_err(|source| DaemonError::Directory {
-            path: events_dir.to_path_buf(),
-            source,
+        EventLog::open(events_dir, sessions.event_retention()).map_err(|source| {
+            DaemonError::Directory {
+                path: events_dir.to_path_buf(),
+                source,
+            }
         })?,
     );
     let shutdown = CancellationToken::new();
@@ -1802,8 +1810,9 @@ mod supervision_tests {
     use pohunek_test_support::process_env::ProcessEnv;
 
     use super::{
-        env_bool, parse_service_config, select_supervision, warn_unknown_service_keys,
-        worker_working_directory, SupervisionMode, OBSERVE_EXTERNAL_AGENTS_ENV,
+        apply_service_settings, env_bool, parse_service_config, select_supervision,
+        warn_unknown_service_keys, worker_working_directory, SupervisionMode,
+        OBSERVE_EXTERNAL_AGENTS_ENV,
     };
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
@@ -1845,7 +1854,7 @@ mod supervision_tests {
             .expect("chmod config directory");
         let file = dir.path().join(pohunek_service_config::FILE_NAME);
         let text = format!(
-            "schema_version = 6\nprefix = \"/home/u/.local\"\nactive_version = \"0.35.2\"\n\
+            "schema_version = 7\nprefix = \"/home/u/.local\"\nactive_version = \"0.35.2\"\n\
              future_top = \"{SECRET}\"\n\
              [namespace]\nuid = 1000\nstate_root = \"/home/u/.local/state/pohunek\"\n\
              runtime_root = \"/run/user/1000/pohunek\"\n\
@@ -1858,6 +1867,7 @@ mod supervision_tests {
              write_stall_timeout_ms = 3000\n\
              [waits]\nturn_default_ms = 300000\nturn_max_ms = 1800000\n\
              [hooks]\nstderr_tail_bytes = 4096\n\
+             [events]\nmax_file_bytes = 33554432\nmax_files = 8\nmax_age_days = 14\n\
              [limits]\nopen_files = 8192\nopen_file = \"{SECRET}\"\n"
         );
         std::fs::write(&file, text).expect("write service.toml");
@@ -1886,6 +1896,50 @@ mod supervision_tests {
         assert!(logged.contains("limits.open_files"), "{logged}");
         assert!(logged.contains(&file.display().to_string()), "{logged}");
         assert!(!logged.contains(SECRET), "{logged}");
+    }
+
+    #[test]
+    fn service_toml_events_retention_reaches_the_registry_the_journal_opens_with() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use pohunek_service_config::{EventRetention, ServiceConfig};
+
+        let dir = pohunek_test_support::tempdir().expect("config directory");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod config directory");
+        let file = dir.path().join(pohunek_service_config::FILE_NAME);
+        let text = String::from(
+            "schema_version = 7\nprefix = \"/home/u/.local\"\nactive_version = \"0.35.2\"\n\
+             [namespace]\nuid = 1000\nstate_root = \"/home/u/.local/state/pohunek\"\n\
+             runtime_root = \"/run/user/1000/pohunek\"\n\
+             [deadlines]\nworker_connect_ms = 10000\nworker_initialize_ms = 45000\n\
+             launchctl_command_ms = 10000\nworker_exit_timeout_ms = 30000\n\
+             daemon_exit_timeout_ms = 30000\ndaemon_restart_throttle_ms = 5000\n\
+             [environment]\nsearch_path = []\nallowlist = [\"PATH\"]\n\
+             [sweep]\ngrace_ms = 5000\n\
+             [input]\ninitial_startup_grace_ms = 5000\nsubmit_delay_ms = 150\n\
+             write_stall_timeout_ms = 3000\n\
+             [waits]\nturn_default_ms = 300000\nturn_max_ms = 1800000\n\
+             [hooks]\nstderr_tail_bytes = 4096\n\
+             [events]\nmax_file_bytes = 2097152\nmax_files = 3\nmax_age_days = 2\n\
+             [limits]\nopen_files = 8192\n",
+        );
+        std::fs::write(&file, text).expect("write service.toml");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod service.toml");
+        let service = ServiceConfig::load(&file).expect("the file loads");
+
+        let mut config = pohunek_daemon::session::SessionRegistryConfig::default();
+        apply_service_settings(&mut config, &service);
+        let sessions = pohunek_daemon::session::SessionRegistry::new(config);
+
+        let expected = EventRetention {
+            max_file_bytes: 2_097_152,
+            max_files: 3,
+            max_age: std::time::Duration::from_hours(48),
+        };
+        assert_ne!(expected, pohunek_service_config::DEFAULT_EVENT_RETENTION);
+        assert_eq!(sessions.event_retention(), expected);
     }
 
     #[test]

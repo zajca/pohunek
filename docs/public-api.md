@@ -2279,7 +2279,7 @@ for #496 raised it to 3, and the `[waits]` table added for #858 (`turn_default_m
 and `turn_max_ms`, the default timeout and the ceiling of `session.wait_turn`,
 each in `5000..=3600000` with the default at most the ceiling; fresh installs
 and migrations write 300000 and 1800000) raised it to 4: the current release
-refuses to serve a schema-2, schema-3, schema-4 or schema-5 file to the daemon, reads it
+refuses to serve a schema-2 to schema-6 file to the daemon, reads it
 only at the `pohunek service upgrade` boundary, and upgrades it as a migration
 that assigns the defaults of the missing keys and tables and keeps every
 recorded value. The input write stall bound (`[input] write_stall_timeout_ms`, 3000 ms on fresh
@@ -2288,13 +2288,18 @@ migrated the same way, with only the stall bound assigned. The `[hooks]` table
 (`stderr_tail_bytes`, the bytes of a failing worktree-create hook's stderr kept
 for the `session.new` warning, `0..=32768` with 0 disabling the capture, 4096
 on fresh installs and migrations) raised it to 6; a schema-5 file is migrated
-the same way, with only the hooks default assigned.
+the same way, with only the hooks default assigned. The `[events]` table
+(`max_file_bytes`, `max_files` and `max_age_days`, the size, count and age
+bounds of the event journal; 33554432, 8 and 14 on fresh installs and
+migrations) raised it to 7: the table is required, so under the rule below it
+is a breaking change and not an optional additive key; a schema-6 file is
+migrated the same way, with only the events defaults assigned.
 `service.toml` tolerates keys this version does not know (#1401). The
 `schema_version` changes only for a breaking change: a removed or renamed key, a
 changed meaning or unit, or validation that rejects a file that was valid
 before. An additive optional key with a documented default does not change it,
 and the writer omits such a key while it equals the default, so the previous
-release still reads a file this release rewrote. A schema-6 file with an
+release still reads a file this release rewrote. A schema-7 file with an
 unknown key or table loads; the key is ignored, and the daemon logs one
 `service_config.unknown_key` warning per key at start (key path, line and file,
 never the value; a worker generation logs it at debug only). `pohunek service
@@ -2309,12 +2314,12 @@ key, because an older binary must not skip a setting that moves a root or
 narrows the environment; a new setting there or among the top-level identity
 keys bumps the schema. A missing required key stays an error, with a "did you
 mean" hint when an unknown key of the same table resembles it, and an invalid
-value of a known key fails whatever unknown keys surround it. The schema 2 to 5
+value of a known key fails whatever unknown keys surround it. The schema 2 to 6
 upgrade sources are read in their exact shapes and still refuse an unknown key.
 The status report carries the same additive `warnings` list.
 `service check` and the success reports of `pohunek service upgrade` name that
 migration in an additive `config_schema_migration` field (the source schema,
-`2`, `3`, `4` or `5`, or `null` when no migration runs); the check runs it read-only. The migration stops the daemon before it rewrites
+`2`, `3`, `4`, `5` or `6`, or `null` when no migration runs); the check runs it read-only. The migration stops the daemon before it rewrites
 `service.toml`, carries the exact pre-upgrade bytes in an owner-private backup
 digest-verified against its transaction record, and restores those bytes on
 rollback; a resume or rollback that cannot prove the exact pre-upgrade bytes

@@ -584,7 +584,10 @@ async fn spawn_server_with_config(
     tokio::task::JoinHandle<()>,
     std::path::PathBuf,
 ) {
-    let event_log_dir = config.event_log_dir.clone();
+    let event_log_dir = config
+        .event_log_dir
+        .clone()
+        .map(|dir| (dir, config.event_retention));
     let (registry, worker_home_dir) = worker_backed_registry(socket, config);
     serve_registry(socket, version, event_log_dir, registry, worker_home_dir).await
 }
@@ -626,7 +629,10 @@ async fn spawn_server_serving_official_runtimes_in(
     let dir = socket.parent().expect("test socket has an isolated parent");
     let catalog = official_runtimes::OfficialCatalog::new();
     let config = catalog.configure(config, dir.join("plugins"));
-    let event_log_dir = config.event_log_dir.clone();
+    let event_log_dir = config
+        .event_log_dir
+        .clone()
+        .map(|dir| (dir, config.event_retention));
     let (registry, worker_home_dir) = worker_backed_registry_in(socket, config, environment);
     catalog.install(&registry, dir).await;
     serve_registry(socket, version, event_log_dir, registry, worker_home_dir).await
@@ -637,7 +643,7 @@ async fn spawn_server_serving_official_runtimes_in(
 async fn serve_registry(
     socket: &std::path::Path,
     version: &str,
-    event_log_dir: Option<PathBuf>,
+    event_log_dir: Option<(PathBuf, pohunek_service_config::EventRetention)>,
     registry: SessionRegistry,
     worker_home_dir: tempfile::TempDir,
 ) -> (
@@ -648,8 +654,8 @@ async fn serve_registry(
     let worker_home = worker_home_dir.path().to_path_buf();
     let notifications = NotificationService::open(&notification_data_dir(socket))
         .expect("notification service opens");
-    if let Some(event_log_dir) = event_log_dir {
-        let log = Arc::new(EventLog::open(&event_log_dir).expect("event log opens"));
+    if let Some((event_log_dir, retention)) = event_log_dir {
+        let log = Arc::new(EventLog::open(&event_log_dir, retention).expect("event log opens"));
         let _session_log = spawn_drain(
             Arc::clone(&log),
             registry.subscribe(),
@@ -7068,6 +7074,64 @@ async fn a_worktree_removed_before_the_agent_starts_fails_closed() {
 
     let _ = shutdown.send(());
     let _ = handle.await;
+}
+
+/// The daemon opens its event journal with the retention of its configuration:
+/// session traffic rotates the journal and every file stays within the bound.
+#[tokio::test]
+async fn event_log_rotates_within_the_configured_retention() {
+    const MAX_FILE_BYTES: u64 = 16 * 1024;
+    const MAX_FILES: u32 = 3;
+    let events_parent = temp_dir("eventlog-retention");
+    let events_dir = events_parent.join("events");
+    let socket = temp_socket("eventlog-retention");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "exec sleep 30"]),
+        event_log_dir: Some(events_dir.clone()),
+        event_retention: pohunek_service_config::EventRetention {
+            max_file_bytes: MAX_FILE_BYTES,
+            max_files: MAX_FILES,
+            max_age: Duration::from_hours(24),
+        },
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut control = connect(&socket).await;
+    for _ in 0..40 {
+        let created = create_session(&mut control, &socket).await;
+        let _ = resize_session(&mut control, &created.id, 100, 40).await;
+    }
+
+    let rotated = events_dir.join("events.jsonl.1");
+    wait_until("the journal to rotate", || async {
+        tokio::fs::metadata(&rotated).await.ok()
+    })
+    .await;
+    // The server is down before the listing, so no rotation races it.
+    let _ = shutdown.send(());
+    let _ = handle.await;
+    let mut journal_files = 0;
+    for entry in std::fs::read_dir(&events_dir).expect("read events dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("events.jsonl")
+            && Path::new(&name).extension().is_none_or(|ext| ext != "lock")
+        {
+            journal_files += 1;
+            // The journal writer may still rotate; a file renamed away between
+            // the listing and the stat is not a bound violation.
+            match entry.metadata() {
+                Ok(metadata) => assert!(
+                    metadata.len() <= MAX_FILE_BYTES,
+                    "{name} exceeds the configured bound"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("stat {name}: {error}"),
+            }
+        }
+    }
+    assert!(journal_files <= MAX_FILES, "{journal_files} journal files");
 }
 
 /// Milestone-9 checkpoint (event log): the daemon's append-only event log records

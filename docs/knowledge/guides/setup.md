@@ -61,7 +61,7 @@ registers one daemon job: the systemd user unit
 `pohunek-<ns>-daemon.service` plus the slice `pohunek-<ns>-sessions.slice` on
 Linux, or the launchd agent
 `~/Library/LaunchAgents/io.github.zajca.pohunek.<ns>.daemon.plist` on macOS.
-The owner-private `service.toml` (schema 6) records `[input]`
+The owner-private `service.toml` (schema 7) records `[input]`
 `initial_startup_grace_ms = 5000`, `submit_delay_ms = 150` and
 `write_stall_timeout_ms = 3000` on a fresh
 install. These host-wide values control the maximum wait for an input-ready
@@ -102,6 +102,22 @@ The `[hooks] stderr_tail_bytes = 4096` key is the number of bytes of a failing
 It is a whole number in `0..=32768`; `0` disables the capture, and a value
 above the ceiling makes the daemon refuse startup with the named configuration
 error.
+The `[events]` table bounds the event journal `<data>/events/events.jsonl`:
+`max_file_bytes = 33554432` (one file, `1048576..=1073741824`),
+`max_files = 8` (files kept including the active one, `2..=64`) and
+`max_age_days = 14` (`1..=3650`). A file rotates to `events.jsonl.1` (and so on)
+before a write would cross `max_file_bytes`; the oldest file is deleted beyond
+`max_files`; a rotated file whose last write is older than `max_age_days` is
+deleted when the daemon starts and after each rotation, and an `events.jsonl`
+last written longer ago than `max_age_days` is removed when the daemon starts. The journal therefore
+never exceeds `max_file_bytes * max_files`. The journal does not record
+`agent_state` events that restate a session's last journaled activity and
+source. The first start with these bounds removes, without reading it, an
+`events.jsonl` above `max_file_bytes` (an earlier release let it grow without
+limit) and logs one WARN with its path and size to `pohunekd.jsonl` (the same
+WARN covers an age-expired active file); the
+history it held is not kept. A daemon started without `service.toml` uses the
+values above.
 `<ns>` is a 12-hex-digit namespace derived from the user ID and the state and
 runtime roots, so separate installations never touch each other's jobs.
 They never share a prefix either: the first install claims it in

@@ -38,12 +38,12 @@
 //!
 //! # Config migration
 //!
-//! A `service.toml` written by a previous release (`schema_version` 2, 3, 4 or 5,
+//! A `service.toml` written by a previous release (`schema_version` 2, 3, 4, 5 or 6,
 //! in contrast to this crate's [`SCHEMA_VERSION`]) is read only at the
 //! upgrade boundary, through `ServiceConfig::load_upgrade_source`, which
 //! assigns the documented defaults to the keys that schema lacks (input
-//! timings, the write stall bound, turn-wait timings, and the `[hooks]` stderr
-//! tail size) explicitly. Its upgrade is a dedicated
+//! timings, the write stall bound, turn-wait timings, the `[hooks]` stderr
+//! tail size, and the `[events]` journal retention) explicitly. Its upgrade is a dedicated
 //! migration flavor of the transaction, journaled in the record's
 //! `config_backup` (`source_schema_version` and the SHA-256 of the exact
 //! pre-upgrade bytes), with two consequences for ordering:
@@ -648,7 +648,7 @@ impl<'a> Engine<'a> {
         let (gated, job_path) = self.adoption_gate(&plan, &release, version).await?;
         let (resume, rolled_back) = self.resolve_plan(plan).await?;
         // The file is read as an upgrade source, so a previous release's
-        // schema-2, schema-3, schema-4 or schema-5 installation upgrades into this one
+        // schema-2 to schema-6 installation upgrades into this one
         // instead of being refused: the migration below carries its exact bytes
         // and schema.
         let source = load_config_for_upgrade(&config_path)?.ok_or(Error::NotInstalled {
@@ -884,7 +884,7 @@ impl<'a> Engine<'a> {
         let config_path = self.context.config_path();
         // The uninstall reads the installed configuration as an upgrade
         // source, so it removes a previous release's schema-2, schema-3,
-        // schema-4 or schema-5 installation with this version as well, without
+        // schema-4, schema-5 or schema-6 installation with this version as well, without
         // a migration.
         let config = match (
             load_config_for_upgrade(&config_path)?.map(|source| source.config),
