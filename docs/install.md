@@ -381,8 +381,9 @@ one: the runtime is left as you set it with the gap `official_package_not_servin
 hint is `pohunek plugin enable <package> --digest <digest>`; the next upgrade then proceeds
 as for any enabled package. The release's own package that you installed with `--no-enable`
 or disabled, while another version is selected, is not enabled or selected by the upgrade
-either; the selected version keeps serving (a newer Pi version is kept silently, and
-an altered root of that package is refused with `plugin uninstall --remove-modified`: beside any ordered enabled selection for claude, codex and hermes, beside an older one only for Pi, and when no enabled selection serves the runtime (for Pi that is an enabled selection that cannot load; a Pi without an enabled selection is judged only under `--detect`, which drops a Pi nothing uses first)). An enabled unordered one that cannot load is left as it is too,
+either; while an enabled selection loads, it keeps serving. [The case table](public-api.md#disabled-release-package-case-table)
+gives the outcome for every state of the selection and of that package's root,
+including when an altered root is refused with `plugin uninstall --remove-modified`. An enabled unordered one that cannot load is left as it is too,
 with the same gap and a repair hint.
 The trust model and the package classes are described
 in [the architecture](architecture.md#runtime-packages-and-trust) and the

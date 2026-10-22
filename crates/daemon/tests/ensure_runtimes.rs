@@ -4047,3 +4047,608 @@ async fn a_registry_with_a_foreign_package_for_pi_is_updated_without_touching_it
         .expect("the foreign record");
     assert_eq!(record["enabled"], true);
 }
+
+/// An archive of a runtime package and its digest.
+type Archive = (Vec<u8>, PackageDigest);
+
+/// Sequence of the release catalog a staged host publishes, above the
+/// sequences the staged installs record.
+const STAGED_RELEASE_SEQUENCE: u64 = 100;
+
+/// The state of the root of the release's own package, recorded disabled.
+#[derive(Clone, Copy)]
+enum ReleaseRoot {
+    Intact,
+    Missing,
+    Altered,
+}
+
+/// A host whose `runtime` has the package `selected` installed, enabled and
+/// selected and the release's own package `release` installed and recorded
+/// disabled, as `plugin install --no-enable` leaves it, with its root in the
+/// state `root`. A reserved runtime has a profile that uses it; Pi is planned
+/// because its enabled selection is managed.
+async fn host_beside_a_disabled_release(
+    runtime: &str,
+    selected: &Archive,
+    release: &Archive,
+    root: ReleaseRoot,
+) -> Host {
+    let host = Host::new();
+    let plugins = host.plugins_dir();
+    let scratch = host.env.root().to_path_buf();
+    for (sequence, archive, flags) in [
+        (
+            1,
+            selected,
+            official_runtimes::InstallFlags {
+                enable: true,
+                select: true,
+            },
+        ),
+        (
+            2,
+            release,
+            official_runtimes::InstallFlags {
+                enable: false,
+                select: false,
+            },
+        ),
+    ] {
+        host.catalog
+            .install_archive(&plugins, &scratch, runtime, archive, sequence, flags)
+            .await;
+    }
+    host.publish_archives(
+        STAGED_RELEASE_SEQUENCE,
+        &[(runtime, &release.0, &release.1)],
+    );
+    if runtime != "pi" {
+        host.write_profile(runtime, &format!("base = \"{runtime}\"\n"));
+    }
+    match root {
+        ReleaseRoot::Intact => {}
+        ReleaseRoot::Missing => host.remove_package_root(release.1.as_str()),
+        ReleaseRoot::Altered => host.alter_package_root(&release.1),
+    }
+    host.put_program(runtime);
+    host
+}
+
+/// One line naming what `report` says about `runtime`: its refusals with the
+/// digest their command removes, its gaps with the command their hint names,
+/// and the status of its package entry.
+fn judged(
+    report: &EnsureReport,
+    runtime: &str,
+    selected: &PackageDigest,
+    release: &PackageDigest,
+) -> String {
+    let mut parts = Vec::new();
+    for refusal in report.refusals.iter().filter(|r| r.subject == runtime) {
+        let target = if refusal.detail.contains(release.as_str()) {
+            "release"
+        } else if refusal.detail.contains(selected.as_str()) {
+            "selected"
+        } else {
+            "-"
+        };
+        parts.push(format!("refused {} ({target})", refusal.code));
+    }
+    for gap in report
+        .gaps
+        .iter()
+        .filter(|g| g.runtime == runtime && g.code != CODE_GAP_CONFIG_HOME_MISSING)
+    {
+        let hint = [
+            ("restore", gap.detail.contains("plugin install")),
+            (
+                "enable selected",
+                gap.detail.contains(&enable_command(runtime, selected)),
+            ),
+            (
+                "enable release",
+                gap.detail.contains(&enable_command(runtime, release)),
+            ),
+            ("select", gap.detail.contains("plugin select")),
+            ("update", gap.detail.contains("plugin update")),
+            ("doctor", gap.detail.contains("plugin doctor")),
+        ]
+        .into_iter()
+        .filter_map(|(name, named)| named.then_some(name))
+        .collect::<Vec<_>>();
+        let hint = if hint.is_empty() {
+            "-".to_owned()
+        } else {
+            hint.join(", ")
+        };
+        parts.push(format!("gap {} ({hint})", gap.code));
+    }
+    for package in report.packages.iter().filter(|p| p.runtime == runtime) {
+        let which = if package.digest == selected.as_str() {
+            "selected"
+        } else {
+            "release"
+        };
+        parts.push(format!("package {:?} ({which})", package.status));
+    }
+    if parts.is_empty() {
+        "nothing".to_owned()
+    } else {
+        parts.join("; ")
+    }
+}
+
+/// How the selected version of a matrix row orders against the release's.
+#[derive(Clone, Copy)]
+enum Order {
+    Older,
+    Newer,
+    Unordered,
+}
+
+/// What a matrix row does to the selected package once it is installed.
+#[derive(Clone, Copy)]
+enum SelectedState {
+    Loads,
+    RootMissing,
+    RootAltered,
+    Disabled,
+    DisabledAltered,
+    Unselected,
+}
+
+/// A selection state of the package, the state of the release's disabled
+/// package beside it, and the line [`judged`] gives for it by a reserved
+/// runtime's plan and apply, its `--detect` plan, and the same for Pi.
+struct MatrixRow {
+    label: &'static str,
+    order: Order,
+    state: SelectedState,
+    release_root: ReleaseRoot,
+    reserved: &'static str,
+    reserved_detect: &'static str,
+    pi: &'static str,
+    pi_detect: &'static str,
+}
+
+const REFUSED_RELEASE: &str = "refused package_root_invalid (release)";
+const REFUSED_SELECTED: &str = "refused package_root_invalid (selected)";
+const REFUSED_NO_SERVER: &str = "refused release_runtime_catalog_unavailable (-)";
+const KEPT: &str = "package Kept (selected)";
+const GAP_ENABLE_SELECTED: &str = "gap official_package_not_serving (enable selected)";
+const GAP_ENABLE_RELEASE: &str = "gap official_package_not_serving (enable release)";
+const GAP_REPAIR_SELECTED: &str = "gap official_package_not_serving (restore, select)";
+const GAP_RESTORE_ENABLE_RELEASE: &str =
+    "gap official_package_not_serving (restore, enable release)";
+const GAP_NOT_SELECTED: &str = "gap official_package_not_serving (update)";
+const GAP_DOCTOR: &str = "gap official_package_not_serving (doctor)";
+const GAP_UNORDERED: &str = "gap plugin_update_version_unordered (-); package Kept (selected)";
+const GAP_KEPT_ENABLE_RELEASE: &str =
+    "gap official_package_not_serving (enable release); package Kept (selected)";
+const GAP_KEPT_RESTORE_ENABLE_RELEASE: &str =
+    "gap official_package_not_serving (restore, enable release); package Kept (selected)";
+
+/// The rows of the case table in `docs/public-api.md`, in its order.
+const MATRIX: &[MatrixRow] = &[
+    MatrixRow {
+        label: "1 older, loads, release root altered",
+        order: Order::Older,
+        state: SelectedState::Loads,
+        release_root: ReleaseRoot::Altered,
+        reserved: REFUSED_RELEASE,
+        reserved_detect: REFUSED_RELEASE,
+        pi: REFUSED_RELEASE,
+        pi_detect: REFUSED_RELEASE,
+    },
+    MatrixRow {
+        label: "2 newer, loads, release root altered",
+        order: Order::Newer,
+        state: SelectedState::Loads,
+        release_root: ReleaseRoot::Altered,
+        reserved: REFUSED_RELEASE,
+        reserved_detect: REFUSED_RELEASE,
+        pi: KEPT,
+        pi_detect: KEPT,
+    },
+    MatrixRow {
+        label: "3 older, loads, release root intact",
+        order: Order::Older,
+        state: SelectedState::Loads,
+        release_root: ReleaseRoot::Intact,
+        reserved: GAP_KEPT_ENABLE_RELEASE,
+        reserved_detect: GAP_KEPT_ENABLE_RELEASE,
+        pi: GAP_KEPT_ENABLE_RELEASE,
+        pi_detect: GAP_KEPT_ENABLE_RELEASE,
+    },
+    MatrixRow {
+        label: "4 newer, loads, release root intact",
+        order: Order::Newer,
+        state: SelectedState::Loads,
+        release_root: ReleaseRoot::Intact,
+        reserved: GAP_KEPT_ENABLE_RELEASE,
+        reserved_detect: GAP_KEPT_ENABLE_RELEASE,
+        pi: KEPT,
+        pi_detect: KEPT,
+    },
+    MatrixRow {
+        label: "5 older, loads, release root missing",
+        order: Order::Older,
+        state: SelectedState::Loads,
+        release_root: ReleaseRoot::Missing,
+        reserved: GAP_KEPT_RESTORE_ENABLE_RELEASE,
+        reserved_detect: GAP_KEPT_RESTORE_ENABLE_RELEASE,
+        pi: GAP_KEPT_RESTORE_ENABLE_RELEASE,
+        pi_detect: GAP_KEPT_RESTORE_ENABLE_RELEASE,
+    },
+    MatrixRow {
+        label: "6 newer, loads, release root missing",
+        order: Order::Newer,
+        state: SelectedState::Loads,
+        release_root: ReleaseRoot::Missing,
+        reserved: GAP_KEPT_RESTORE_ENABLE_RELEASE,
+        reserved_detect: GAP_KEPT_RESTORE_ENABLE_RELEASE,
+        pi: KEPT,
+        pi_detect: KEPT,
+    },
+    MatrixRow {
+        label: "7 unordered, loads, release root altered",
+        order: Order::Unordered,
+        state: SelectedState::Loads,
+        release_root: ReleaseRoot::Altered,
+        reserved: GAP_UNORDERED,
+        reserved_detect: GAP_UNORDERED,
+        pi: GAP_UNORDERED,
+        pi_detect: GAP_UNORDERED,
+    },
+    MatrixRow {
+        label: "8 unordered, root missing, release root altered",
+        order: Order::Unordered,
+        state: SelectedState::RootMissing,
+        release_root: ReleaseRoot::Altered,
+        reserved: GAP_REPAIR_SELECTED,
+        reserved_detect: GAP_REPAIR_SELECTED,
+        pi: GAP_REPAIR_SELECTED,
+        pi_detect: GAP_REPAIR_SELECTED,
+    },
+    MatrixRow {
+        label: "9 unordered, root altered, release root altered",
+        order: Order::Unordered,
+        state: SelectedState::RootAltered,
+        release_root: ReleaseRoot::Altered,
+        reserved: REFUSED_SELECTED,
+        reserved_detect: REFUSED_SELECTED,
+        pi: REFUSED_SELECTED,
+        pi_detect: REFUSED_SELECTED,
+    },
+    MatrixRow {
+        label: "10 older, root missing, release root altered",
+        order: Order::Older,
+        state: SelectedState::RootMissing,
+        release_root: ReleaseRoot::Altered,
+        reserved: REFUSED_RELEASE,
+        reserved_detect: REFUSED_RELEASE,
+        pi: REFUSED_RELEASE,
+        pi_detect: REFUSED_RELEASE,
+    },
+    MatrixRow {
+        label: "11 older, root altered, release root altered",
+        order: Order::Older,
+        state: SelectedState::RootAltered,
+        release_root: ReleaseRoot::Altered,
+        reserved: REFUSED_RELEASE,
+        reserved_detect: REFUSED_RELEASE,
+        pi: REFUSED_RELEASE,
+        pi_detect: REFUSED_RELEASE,
+    },
+    MatrixRow {
+        label: "12 newer, root missing, release root altered",
+        order: Order::Newer,
+        state: SelectedState::RootMissing,
+        release_root: ReleaseRoot::Altered,
+        reserved: REFUSED_RELEASE,
+        reserved_detect: REFUSED_RELEASE,
+        pi: REFUSED_NO_SERVER,
+        pi_detect: REFUSED_NO_SERVER,
+    },
+    MatrixRow {
+        label: "13 newer, root altered, release root altered",
+        order: Order::Newer,
+        state: SelectedState::RootAltered,
+        release_root: ReleaseRoot::Altered,
+        reserved: REFUSED_RELEASE,
+        reserved_detect: REFUSED_RELEASE,
+        pi: REFUSED_NO_SERVER,
+        pi_detect: REFUSED_NO_SERVER,
+    },
+    MatrixRow {
+        label: "14 older, root missing, release root intact",
+        order: Order::Older,
+        state: SelectedState::RootMissing,
+        release_root: ReleaseRoot::Intact,
+        reserved: GAP_ENABLE_RELEASE,
+        reserved_detect: GAP_ENABLE_RELEASE,
+        pi: GAP_ENABLE_RELEASE,
+        pi_detect: GAP_ENABLE_RELEASE,
+    },
+    MatrixRow {
+        label: "15 older, root missing, release root missing",
+        order: Order::Older,
+        state: SelectedState::RootMissing,
+        release_root: ReleaseRoot::Missing,
+        reserved: GAP_RESTORE_ENABLE_RELEASE,
+        reserved_detect: GAP_RESTORE_ENABLE_RELEASE,
+        pi: GAP_RESTORE_ENABLE_RELEASE,
+        pi_detect: GAP_RESTORE_ENABLE_RELEASE,
+    },
+    MatrixRow {
+        label: "16 newer, root missing, release root intact",
+        order: Order::Newer,
+        state: SelectedState::RootMissing,
+        release_root: ReleaseRoot::Intact,
+        reserved: GAP_ENABLE_RELEASE,
+        reserved_detect: GAP_ENABLE_RELEASE,
+        pi: REFUSED_NO_SERVER,
+        pi_detect: REFUSED_NO_SERVER,
+    },
+    MatrixRow {
+        label: "17 newer, root missing, release root missing",
+        order: Order::Newer,
+        state: SelectedState::RootMissing,
+        release_root: ReleaseRoot::Missing,
+        reserved: GAP_RESTORE_ENABLE_RELEASE,
+        reserved_detect: GAP_RESTORE_ENABLE_RELEASE,
+        pi: REFUSED_NO_SERVER,
+        pi_detect: REFUSED_NO_SERVER,
+    },
+    MatrixRow {
+        label: "18 older, disabled, release root altered",
+        order: Order::Older,
+        state: SelectedState::Disabled,
+        release_root: ReleaseRoot::Altered,
+        reserved: GAP_ENABLE_SELECTED,
+        reserved_detect: GAP_ENABLE_SELECTED,
+        pi: GAP_ENABLE_SELECTED,
+        pi_detect: GAP_ENABLE_SELECTED,
+    },
+    MatrixRow {
+        label: "19 newer, disabled, release root altered",
+        order: Order::Newer,
+        state: SelectedState::Disabled,
+        release_root: ReleaseRoot::Altered,
+        reserved: GAP_ENABLE_SELECTED,
+        reserved_detect: GAP_ENABLE_SELECTED,
+        pi: GAP_ENABLE_SELECTED,
+        pi_detect: GAP_ENABLE_SELECTED,
+    },
+    MatrixRow {
+        label: "20 older, disabled, root altered, release root altered",
+        order: Order::Older,
+        state: SelectedState::DisabledAltered,
+        release_root: ReleaseRoot::Altered,
+        reserved: REFUSED_SELECTED,
+        reserved_detect: REFUSED_SELECTED,
+        pi: GAP_DOCTOR,
+        pi_detect: REFUSED_SELECTED,
+    },
+    MatrixRow {
+        label: "21 nothing selected, release root altered",
+        order: Order::Older,
+        state: SelectedState::Unselected,
+        release_root: ReleaseRoot::Altered,
+        reserved: REFUSED_RELEASE,
+        reserved_detect: REFUSED_RELEASE,
+        pi: GAP_NOT_SELECTED,
+        pi_detect: REFUSED_RELEASE,
+    },
+    MatrixRow {
+        label: "22 nothing selected, release root missing",
+        order: Order::Older,
+        state: SelectedState::Unselected,
+        release_root: ReleaseRoot::Missing,
+        reserved: GAP_RESTORE_ENABLE_RELEASE,
+        reserved_detect: GAP_RESTORE_ENABLE_RELEASE,
+        pi: GAP_NOT_SELECTED,
+        pi_detect: GAP_RESTORE_ENABLE_RELEASE,
+    },
+    MatrixRow {
+        label: "23 nothing selected, release root intact",
+        order: Order::Older,
+        state: SelectedState::Unselected,
+        release_root: ReleaseRoot::Intact,
+        reserved: GAP_ENABLE_RELEASE,
+        reserved_detect: GAP_ENABLE_RELEASE,
+        pi: GAP_NOT_SELECTED,
+        pi_detect: GAP_ENABLE_RELEASE,
+    },
+];
+
+/// Runs every [`MATRIX`] row for each of `runtimes`: the plan and the apply
+/// must say `without_detect`'s line of the row, the `--detect` plan `with_detect`'s, and the
+/// registry stays as staged and the profile is pinned only in the kept rows.
+async fn assert_matrix(
+    runtimes: &[&str],
+    without_detect: fn(&MatrixRow) -> &'static str,
+    with_detect: fn(&MatrixRow) -> &'static str,
+) {
+    for runtime in runtimes {
+        for row in MATRIX {
+            let release = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+            let version = match row.order {
+                Order::Older => "1.0.1",
+                Order::Newer => "2.1.0",
+                Order::Unordered => "2.0",
+            };
+            let selected = official_runtimes::variant_archive(runtime, version);
+            let host =
+                host_beside_a_disabled_release(runtime, &selected, &release, row.release_root)
+                    .await;
+            match row.state {
+                SelectedState::Loads => {}
+                SelectedState::RootMissing => host.remove_package_root(selected.1.as_str()),
+                SelectedState::RootAltered => host.alter_package_root(&selected.1),
+                SelectedState::Disabled => host.disable_package(&selected.1),
+                SelectedState::DisabledAltered => {
+                    host.disable_package(&selected.1);
+                    host.alter_package_root(&selected.1);
+                }
+                SelectedState::Unselected => {
+                    let mut registry: serde_json::Value =
+                        serde_json::from_slice(&fs::read(host.registry_path()).expect("registry"))
+                            .expect("registry json");
+                    registry["selected"] = serde_json::json!({});
+                    fs::write(host.registry_path(), registry.to_string())
+                        .expect("write the registry");
+                }
+            }
+            let registry = fs::read(host.registry_path()).expect("the registry record");
+            let profile = (*runtime != "pi").then(|| host.profile_text_of(runtime));
+            let context = format!("{runtime} row {}", row.label);
+
+            let plan = host.step(true);
+            let detected = host.detect_step();
+            let applied = host.step(false);
+
+            for (mode, report, expected) in [
+                ("plan", &plan, without_detect(row)),
+                ("apply", &applied, without_detect(row)),
+                ("detect", &detected, with_detect(row)),
+            ] {
+                assert_eq!(
+                    judged(report, runtime, &selected.1, &release.1),
+                    expected,
+                    "{context} {mode}: {report:?}"
+                );
+            }
+            assert_eq!(
+                fs::read(host.registry_path()).expect("the registry record"),
+                registry,
+                "{context}"
+            );
+            if let Some(profile) = profile {
+                // The apply pins an unpinned profile to the package it keeps
+                // and leaves it alone whenever the runtime is left or refused.
+                if without_detect(row).contains("package Kept") {
+                    let pinned = host.profile_text_of(runtime);
+                    assert!(pinned.contains(selected.1.as_str()), "{context}: {pinned}");
+                    assert!(!pinned.contains(release.1.as_str()), "{context}: {pinned}");
+                } else {
+                    assert_eq!(host.profile_text_of(runtime), profile, "{context}");
+                }
+            }
+            // A runtime nothing uses whose program is off the search path is
+            // dropped by the detecting plan with its refusals and gaps. A
+            // reserved runtime is used by its profile, which is removed here;
+            // Pi is used by an enabled selection, so only the rows without
+            // one are checked.
+            let unused = *runtime != "pi"
+                || !matches!(
+                    row.state,
+                    SelectedState::Loads | SelectedState::RootMissing | SelectedState::RootAltered
+                );
+            if unused {
+                fs::remove_file(programs_dir(&host).join(runtime)).expect("remove the program");
+                if *runtime != "pi" {
+                    fs::remove_file(host.profiles_dir().join(format!("{runtime}.toml")))
+                        .expect("remove the profile");
+                }
+                assert_eq!(
+                    judged(&host.detect_step(), runtime, &selected.1, &release.1),
+                    "gap agent_not_on_search_path (-)",
+                    "{context} unused and off the search path"
+                );
+            }
+        }
+    }
+}
+
+/// The case table of the reserved runtime `claude`, whose profile uses it:
+/// what the plan, the apply and the `--detect` plan say for each state of the
+/// selected package beside the release's disabled one.
+#[tokio::test]
+async fn claude_judges_the_disabled_release_package_by_the_selection_state() {
+    assert_matrix(&["claude"], |row| row.reserved, |row| row.reserved_detect).await;
+}
+
+/// The case table of the reserved runtime `codex`.
+#[tokio::test]
+async fn codex_judges_the_disabled_release_package_by_the_selection_state() {
+    assert_matrix(&["codex"], |row| row.reserved, |row| row.reserved_detect).await;
+}
+
+/// The case table of the reserved runtime `hermes`.
+#[tokio::test]
+async fn hermes_judges_the_disabled_release_package_by_the_selection_state() {
+    assert_matrix(&["hermes"], |row| row.reserved, |row| row.reserved_detect).await;
+}
+
+/// The case table of Pi, which the upgrade plans only while an enabled
+/// selection serves it or `--detect` lists it.
+#[tokio::test]
+async fn pi_judges_the_disabled_release_package_by_the_selection_state() {
+    assert_matrix(&["pi"], |row| row.pi, |row| row.pi_detect).await;
+}
+
+/// Detail of the claim refusal of a disabled package the upgrade cannot enable.
+const DISABLED_CLAIM_DETAIL: &str =
+    "the disabled package cannot be enabled while another package serves this runtime id";
+
+/// A Pi selection that cannot load and is older than the release's, beside the
+/// release's own package recorded disabled with its root intact, while a
+/// third-party package serves `pi`: enabling the release's package would fail,
+/// so the plan and the apply refuse it with the runtime-conflict code and
+/// change nothing, and the `--detect` plan reports the claim as a gap.
+#[tokio::test]
+async fn a_disabled_release_package_that_another_package_serves_is_refused_beside_an_unloadable_selection(
+) {
+    let release = official_runtimes::variant_archive("pi", RELEASE_VERSION);
+    let selected = official_runtimes::variant_archive("pi", "1.0.1");
+    let host = host_beside_a_disabled_release("pi", &selected, &release, ReleaseRoot::Intact).await;
+    host.remove_package_root(selected.1.as_str());
+    official_runtimes::preinstall_third_party(
+        &host.plugins_dir(),
+        host.env.root(),
+        "pi",
+        "acme.runtime.pi",
+    )
+    .await;
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let conflict = ProtocolError::from(PackageErrorKind::RuntimeConflict).code;
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+    let detected = host.detect_step();
+
+    for report in [&plan, &applied] {
+        assert_eq!(
+            refusal_codes(report),
+            [conflict.as_str()],
+            "{:?}",
+            report.refusals
+        );
+        assert_eq!(report.refusals[0].subject, "pi");
+        assert_eq!(report.refusals[0].detail, DISABLED_CLAIM_DETAIL);
+        assert!(
+            !gap_codes(report).contains(&("pi", CODE_GAP_SERVED_BY_OTHER_PACKAGE)),
+            "{:?}",
+            report.gaps
+        );
+        assert!(report.packages.is_empty(), "{:?}", report.packages);
+    }
+    assert!(detected.refusals.is_empty(), "{:?}", detected.refusals);
+    let gap = detected
+        .gaps
+        .iter()
+        .find(|gap| gap.runtime == "pi" && gap.code == CODE_GAP_SERVED_BY_OTHER_PACKAGE)
+        .unwrap_or_else(|| panic!("{:?}", detected.gaps));
+    assert_eq!(gap.detail, DISABLED_CLAIM_DETAIL);
+    assert!(
+        !gap_codes(&detected).contains(&("pi", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)),
+        "{:?}",
+        detected.gaps
+    );
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+}

@@ -2349,11 +2349,11 @@ command by cause: `pohunek plugin update` for a package that is not selected,
 Pi included; `plugin update` would refuse a newer selection as a downgrade), and
 `pohunek plugin install` or `plugin select` for an unordered selection that does not
 load; when an enabled version still serves the runtime beside a disabled release
-package it keeps serving and the gap names the release package, except that a release
-package with an altered root is refused with its uninstall command (beside any ordered enabled selection for claude, codex and hermes, beside an older
-one only for Pi, and when no enabled selection serves the runtime (for Pi that is an enabled selection that cannot load; a Pi without an enabled selection is judged only under `--detect`, which drops a Pi nothing uses first)), a selected Pi
-version newer than the release's is kept silently and a selected version that cannot be
-ordered against the release's reports `plugin_update_version_unordered`; under `--detect`
+package it keeps serving and the gap names the release package; the
+[case table](#disabled-release-package-case-table) gives the outcome for every state of
+the selection and of the release package's root, the refusal of an altered root and the
+kept newer Pi version included, and the unordered selection reports
+`plugin_update_version_unordered`; under `--detect`
 the gap is dropped with a runtime the detecting plan drops, that is one nothing uses,
 no profile has as its base, and whose program is off the search path), and
 `plugin_update_version_unordered` (the selected version of an official package, of
@@ -2380,6 +2380,103 @@ existing home of a planned runtime whose hooks the setup installs, whether or no
 hooks are present yet (Pi declares none). Each distinct home appears once. `reason`
 values are `profile`, `session`, `integration`, `detected` and `installed`. The report layout
 stays at `report_version` 1.
+
+<a id="disabled-release-package-case-table"></a>
+**Disabled release package: case table**
+
+The step never installs, selects or enables a package you disabled, and never
+re-enables the release's own package when it is recorded and disabled
+(`plugin install --no-enable`, `plugin disable`). The plan and the apply give the
+same outcome for a row. "S" is the selected version of the release package's id; "R"
+is the release's own package, recorded, official and disabled, with the state of its
+root in the third column. A reserved runtime is `claude`, `codex` or `hermes`, used by
+a profile; Pi is planned only while an enabled S exists, or under `--detect`.
+
+| Outcome | Meaning |
+| --- | --- |
+| refused R, refused S | Refusal `package_root_invalid`; its detail names `pohunek plugin uninstall <package> --digest <R or S digest> --remove-modified --yes`. |
+| kept | Package entry `kept` with S; nothing is installed, selected or enabled, and no gap is reported. The apply pins an unpinned profile of a reserved runtime to S, as for any kept selection. |
+| kept, gap enable R | `kept`, and the gap `official_package_not_serving` naming `pohunek plugin enable <package> --digest <R digest>`. |
+| kept, gap restore, then enable R | As kept, gap enable R, with `plugin install` of R's archive before the enable. |
+| kept, gap unordered | `kept`, and the gap `plugin_update_version_unordered`. |
+| gap enable R, gap enable S | No package entry; the gap `official_package_not_serving` naming `plugin enable` for that digest. |
+| gap restore, then enable R | As gap enable R, with `plugin install` of R's archive before the enable. |
+| gap repair S | The gap `official_package_not_serving` for an enabled, unordered S that cannot load: `plugin install` of that version's archive, or `plugin select` of another installed version. |
+| refused, no server | Refusal `release_runtime_catalog_unavailable`: S is kept and no installed package serves the runtime. |
+| gap doctor | The gap `official_package_not_serving`, pointing to `pohunek plugin doctor`. |
+| gap not selected | The gap `official_package_not_serving` saying the package is installed but not selected, with `pohunek plugin update`. |
+
+| # | Selected version S | Root of R | claude, codex, hermes | Pi | Pi with `--detect` |
+| --- | --- | --- | --- | --- | --- |
+| 1 | enabled, loads, older than R | altered | refused R | refused R | as Pi |
+| 2 | enabled, loads, newer than R | altered | refused R | kept | as Pi |
+| 3 | enabled, loads, older than R | intact | kept, gap enable R | kept, gap enable R | as Pi |
+| 4 | enabled, loads, newer than R | intact | kept, gap enable R | kept | as Pi |
+| 5 | enabled, loads, older than R | missing | kept, gap restore, then enable R | kept, gap restore, then enable R | as Pi |
+| 6 | enabled, loads, newer than R | missing | kept, gap restore, then enable R | kept | as Pi |
+| 7 | enabled, loads, version unordered against R's | not examined | kept, gap unordered | kept, gap unordered | as Pi |
+| 8 | enabled, root missing, unordered | not examined | gap repair S | gap repair S | as Pi |
+| 9 | enabled, root altered, unordered | not examined | refused S | refused S | as Pi |
+| 10 | enabled, root missing, older than R | altered | refused R | refused R | as Pi |
+| 11 | enabled, root altered, older than R | altered | refused R | refused R | as Pi |
+| 12 | enabled, root missing, newer than R | altered | refused R | refused, no server | as Pi |
+| 13 | enabled, root altered, newer than R | altered | refused R | refused, no server | as Pi |
+| 14 | enabled, root missing, older than R | intact | gap enable R | gap enable R | as Pi |
+| 15 | enabled, root missing, older than R | missing | gap restore, then enable R | gap restore, then enable R | as Pi |
+| 16 | enabled, root missing, newer than R | intact | gap enable R | refused, no server | as Pi |
+| 17 | enabled, root missing, newer than R | missing | gap restore, then enable R | refused, no server | as Pi |
+| 18 | disabled, older than R | not examined | gap enable S | gap enable S | as Pi |
+| 19 | disabled, newer than R | not examined | gap enable S | gap enable S | as Pi |
+| 20 | disabled, older than R, root altered | not examined | refused S | gap doctor | refused S |
+| 21 | none selected | altered | refused R | gap not selected | refused R |
+| 22 | none selected | missing | gap restore, then enable R | gap not selected | gap restore, then enable R |
+| 23 | none selected | intact | gap enable R | gap not selected | gap enable R |
+
+How to read it:
+
+- A disabled S (rows 18-20) is judged alone, whatever its version and even when it is
+  R itself; R is not examined. An enabled S whose version cannot be ordered against
+  R's (rows 7-9) is judged alone too. For these rows the table shows the outcome with
+  R's root altered, the state that would be refused if R were examined.
+- Otherwise R is examined. While S loads it keeps serving beside R, and the plan
+  reports R's state: an altered root is refused, an intact or missing root is the gap
+  that names `plugin enable` (rows 1-6). Pi keeps a newer S that loads silently and
+  does not examine R beside it (rows 2, 4 and 6). When S cannot load, or there is none,
+  R decides alone (rows 10-17 for a reserved runtime, rows 10, 11, 14 and 15 for Pi,
+  and rows 21-23 for a reserved runtime and for Pi under `--detect`); Pi keeps a newer S that cannot load and then refuses it because no
+  package serves the runtime id (rows 12, 13, 16 and 17).
+- A disabled package the plan examines (R, or a disabled S) is refused when its root
+  is altered, gets the restore-then-enable hint when its root is missing, and the
+  enable hint when it can be enabled. When a third-party Pi package serves the
+  runtime id (a third party cannot claim a reserved id) the plan cannot enable it: a
+  disabled R beside an older enabled Pi S that cannot load is refused with
+  `package_runtime_conflict` and the detail "the disabled package cannot be enabled
+  while another package serves this runtime id", which `--detect` reports as the gap
+  `runtime_served_by_other_package`; a disabled Pi S is examined only under `--detect`
+  (see the next item), where the same claim is that gap.
+- Pi without an enabled S (rows 18-23) is not planned without `--detect`: its package
+  gets only the gap of the managed-runtime check (`plugin enable`, `plugin doctor`
+  when the package cannot be enabled, or `plugin update` when it is not selected).
+  `--detect` lists Pi, so it is judged as a reserved runtime is, which changes rows 20-23.
+- `--detect` changes no cell of a reserved runtime. A runtime nothing uses whose
+  program is off the search path is dropped by the detecting plan with its refusals
+  and gaps, leaving only `agent_not_on_search_path` (every reserved row; the Pi rows
+  without an enabled S, 18-23).
+- S cannot have the release's version under another digest while R is recorded: the
+  registry holds one digest per package version, so a second digest is refused with
+  `package_identity_installed`.
+
+The scenarios are `claude_judges_the_disabled_release_package_by_the_selection_state`,
+`codex_judges_the_disabled_release_package_by_the_selection_state`,
+`hermes_judges_the_disabled_release_package_by_the_selection_state` and
+`pi_judges_the_disabled_release_package_by_the_selection_state` (rows 1-23; plan,
+`--detect` plan and apply, registry unchanged, profile pinned only in the kept rows),
+`a_disabled_release_package_that_another_package_serves_is_refused_beside_an_unloadable_selection`
+(the claim), `a_disabled_pi_selection_beside_a_third_party_server_is_a_gap_without_detect`
+and `a_disabled_pi_selection_beside_a_third_party_server_is_reported_as_claimed` (a claimed
+S), all in `crates/daemon/tests/ensure_runtimes.rs`, and
+`install_refuses_an_identity_installed_from_another_archive` in
+`crates/package/tests/registry.rs`.
 
 `pohunek service upgrade` and `pohunek service check` of an existing service run
 a read-only preflight before any effect by invoking `pohunekd upgrade-preflight`
