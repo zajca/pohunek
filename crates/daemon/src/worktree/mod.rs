@@ -1620,7 +1620,7 @@ fn fetch_into_ref(repo: &Path, source: &str, fetch_ref: &str) -> Result<FetchedB
     // Fetch diagnostics are not parsed: a successful fetch already owns its ref.
     let output = run_output_bounded_then(
         cmd,
-        GIT_COMMAND_TIMEOUT,
+        fetch_command_timeout(),
         OutputPolicy::StatusOnly,
         move || drop(guard),
     )?;
@@ -1776,6 +1776,23 @@ impl Drop for Waiting<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// How long the `git fetch` process may run: the git command bound, or the
+/// bound a test injected for its thread.
+fn fetch_command_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(timeout) = FETCH_COMMAND_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
+        return timeout;
+    }
+    GIT_COMMAND_TIMEOUT
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only bound on this thread's `git fetch` process.
+    static FETCH_COMMAND_TIMEOUT_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// How long a fetch waits for the admin lock: the git command bound, or the

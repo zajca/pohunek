@@ -11,6 +11,21 @@ readonly EXPECTED_ARCHIVE_FORMAT="git archive --format=tar"
 readonly PYTHON_MINIMUM_MINOR=11
 readonly PYTHON_MAXIMUM_MINOR=14
 
+# Network bounds of the git fetch and the CPython download; uv keeps its own
+# defaults (30 s read timeout, 3 retries). The download finishes, retries a
+# bounded number of times or fails with a message naming it. The git fetch has
+# no total cap and no connect timeout, only the stall bound: a transfer slower
+# than NETWORK_STALL_BYTES per second for NETWORK_STALL_SECONDS counts as
+# stalled, and a connect that never completes waits for libcurl's own default.
+# The last progress line names the phase, and the CI step timeout is the outer
+# backstop.
+readonly NETWORK_ATTEMPTS=3
+readonly NETWORK_RETRY_DELAY_SECONDS=5
+readonly NETWORK_CONNECT_TIMEOUT_SECONDS=30
+readonly NETWORK_STALL_SECONDS=60
+readonly NETWORK_STALL_BYTES=1024
+readonly DOWNLOAD_MAX_SECONDS=120
+
 # Pinned CPython runtime of the Hermes venv: a python-build-standalone
 # `install_only_stripped` build, downloaded and verified here rather than taken
 # from the host. Its macOS build is not a framework build, so the venv's
@@ -28,6 +43,11 @@ readonly PYTHON_STANDALONE_SHA256_AARCH64_DARWIN="25baa97c65b3f0aa90e21131b4f9e8
 fail() {
   printf '%s: %s\n' "$SCRIPT_NAME" "$1" >&2
   exit 1
+}
+
+# Progress marker on stderr: the last line of a hung run names the phase.
+phase() {
+  printf '%s: %s\n' "$SCRIPT_NAME" "$1" >&2
 }
 
 if [[ "$#" -ne "$REQUIRED_ARGUMENTS" ]]; then
@@ -247,8 +267,17 @@ python_root="$install_root/python"
 
 git init --quiet "$source_root" >&2
 git -C "$source_root" remote add origin "${repository}.git"
-git -C "$source_root" -c credential.helper= -c core.askPass= \
-  fetch --quiet --no-tags --depth=1 origin "refs/tags/$tag:refs/tags/$tag" >&2
+fetch_attempt=1
+phase "fetching the locked tag $tag (attempt $fetch_attempt of $NETWORK_ATTEMPTS)"
+until git -C "$source_root" -c credential.helper= -c core.askPass= \
+  -c http.lowSpeedLimit="$NETWORK_STALL_BYTES" -c http.lowSpeedTime="$NETWORK_STALL_SECONDS" \
+  fetch --quiet --no-tags --depth=1 origin "refs/tags/$tag:refs/tags/$tag" >&2; do
+  [[ "$fetch_attempt" -lt "$NETWORK_ATTEMPTS" ]] \
+    || fail "cannot fetch the locked tag $tag from $repository after $NETWORK_ATTEMPTS attempts (a transfer below $NETWORK_STALL_BYTES bytes/s for $NETWORK_STALL_SECONDS s counts as stalled)"
+  fetch_attempt=$((fetch_attempt + 1))
+  sleep "$NETWORK_RETRY_DELAY_SECONDS"
+  phase "fetching the locked tag $tag (attempt $fetch_attempt of $NETWORK_ATTEMPTS)"
+done
 
 observed_commit="$(git -C "$source_root" rev-parse --verify "refs/tags/$tag^{commit}")"
 [[ "$observed_commit" == "$commit" ]] || fail "locked tag does not resolve to the locked commit"
@@ -263,12 +292,18 @@ observed_archive_sha256="$(sha256_of "$archive_path")"
 git -C "$source_root" checkout --quiet --detach "$commit" >&2
 
 # `-q` keeps a caller's curlrc out of the download; the digest check below is
-# what makes the archive trusted.
+# what makes the archive trusted. The timeouts and the bounded retry keep a
+# silent network from holding the step.
 python_archive_name="cpython-${PYTHON_STANDALONE_VERSION}+${PYTHON_STANDALONE_RELEASE}-${python_target}-${PYTHON_STANDALONE_FLAVOR}.tar.gz"
+phase "downloading the pinned CPython runtime $python_archive_name"
 curl -q --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+  --connect-timeout "$NETWORK_CONNECT_TIMEOUT_SECONDS" \
+  --max-time "$DOWNLOAD_MAX_SECONDS" \
+  --speed-limit "$NETWORK_STALL_BYTES" --speed-time "$NETWORK_STALL_SECONDS" \
+  --retry "$((NETWORK_ATTEMPTS - 1))" --retry-delay "$NETWORK_RETRY_DELAY_SECONDS" \
   --output "$python_archive_path" \
   "$PYTHON_STANDALONE_BASE_URL/$PYTHON_STANDALONE_RELEASE/${python_archive_name//+/%2B}" \
-  || fail "cannot download the pinned CPython runtime $python_archive_name"
+  || fail "cannot download the pinned CPython runtime $python_archive_name (connect timeout ${NETWORK_CONNECT_TIMEOUT_SECONDS}s, ${DOWNLOAD_MAX_SECONDS}s per attempt, $NETWORK_ATTEMPTS attempts)"
 observed_python_archive_sha256="$(sha256_of "$python_archive_path")"
 [[ "$observed_python_archive_sha256" == "$python_archive_sha256" ]] \
   || fail "pinned CPython runtime archive SHA-256 does not match the reviewed digest"
@@ -304,11 +339,13 @@ fi
 # from substituting a downloaded interpreter. --frozen is intentional: newer
 # uv releases re-resolve and reject this historical lock under --locked, while
 # frozen consumes its exact hash-pinned resolution without modifying it.
+phase "installing the locked Hermes dependencies with uv"
 UV_CACHE_DIR="$uv_cache_root" \
   UV_NO_CONFIG=1 \
   UV_PYTHON_DOWNLOADS=never \
   UV_PROJECT_ENVIRONMENT="$venv_root" \
-  uv sync --extra all --frozen --project "$source_root" >&2
+  uv sync --extra all --frozen --project "$source_root" >&2 \
+  || fail "cannot install the locked Hermes dependencies"
 # The cache is only an install-time input: the environment holds its own
 # copies or hard links, and the cache's absolute links would leave a
 # verified stage.

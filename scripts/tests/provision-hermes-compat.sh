@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 provision="$script_root/scripts/provision-hermes-compat"
-test_root="$(mktemp -d /tmp/pohunek-hermes-provision-test.XXXXXX)"
+test_root="$(mktemp -d "${TMPDIR:-/tmp}/pohunek-hermes-provision-test.XXXXXX")"
 
 cleanup() {
   rm -rf -- "$test_root"
@@ -19,14 +19,21 @@ cp "$script_root/compat/hermes/compatibility-lock.json" "$copy_root/compat/herme
 # The real python3 path is resolved here because the fakes' PATH is restricted.
 real_python="$(command -v python3)"
 git_marker="$test_root/git-started"
+git_calls="$test_root/git-calls"
+sleep_calls="$test_root/sleep-calls"
 credential_marker="$test_root/credential-environment-leaked"
 cat >"$fake_bin/git" <<EOF
 #!/usr/bin/env bash
 touch "$git_marker"
+printf '%s\n' "\$*" >>"$git_calls"
 if [[ -n "\${PIP_INDEX_URL:-}" || -n "\${UV_INDEX_URL:-}" ]]; then
   touch "$credential_marker"
 fi
-exit 99
+# Local repository setup succeeds; only the network fetch fails.
+case " \$* " in
+  *" fetch "*) exit 99 ;;
+esac
+exit 0
 EOF
 cat >"$fake_bin/uv" <<'EOF'
 #!/usr/bin/env bash
@@ -36,7 +43,12 @@ cat >"$fake_bin/python3" <<EOF
 #!/usr/bin/env bash
 exec "$real_python" "\$@"
 EOF
-chmod 0755 "$fake_bin/git" "$fake_bin/python3" "$fake_bin/uv"
+# The retry delay is recorded, not slept.
+cat >"$fake_bin/sleep" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$sleep_calls"
+EOF
+chmod 0755 "$fake_bin/git" "$fake_bin/python3" "$fake_bin/uv" "$fake_bin/sleep"
 
 # A modified lock must fail before any upstream command can execute.
 printf '\n' >>"$copy_root/compat/hermes/compatibility-lock.json"
@@ -69,6 +81,14 @@ if [[ -e "$credential_marker" ]]; then
   printf '%s\n' 'credential-bearing package index environment reached Git' >&2
   exit 1
 fi
+# A failing fetch is retried a bounded number of times, each attempt with a
+# stall bound, and then fails naming the tag and the attempt count.
+test "$(grep -c " fetch " "$git_calls")" -eq 3
+test "$(grep -c 'http.lowSpeedTime=60' "$git_calls")" -eq 3
+test "$(grep -c 'http.lowSpeedLimit=1024' "$git_calls")" -eq 3
+test "$(wc -l <"$sleep_calls")" -eq 2
+grep -Fq 'cannot fetch the locked tag v2026.8.3 from https://github.com/NousResearch/hermes-agent after 3 attempts' "$test_root/stderr"
+grep -Fq 'fetching the locked tag v2026.8.3 (attempt 3 of 3)' "$test_root/stderr"
 
 # Hosts with only BSD userland (macOS) have `shasum` but no `sha256sum` and no
 # `realpath`. Run the provisioner with a PATH that offers exactly those tools:
@@ -84,6 +104,7 @@ make_restricted_bin() {
   ln -s "$fake_bin/git" "$dir/git"
   ln -s "$fake_bin/python3" "$dir/python3"
   ln -s "$fake_bin/uv" "$dir/uv"
+  ln -s "$fake_bin/sleep" "$dir/sleep"
 }
 
 bsd_bin="$test_root/bsd-bin"
@@ -177,6 +198,15 @@ if grep -Ev '^[[:space:]]*#' "$provision" | grep -Eq 'readarray|mapfile|realpath
   printf '%s\n' 'provisioner uses a bash 4 or GNU-only feature' >&2
   exit 1
 fi
+
+# The CPython download is bounded by connect, total and stall timeouts and a
+# bounded retry, and a failed uv install names its phase (uv keeps its own
+# defaults).
+grep -Fq -- '--connect-timeout "$NETWORK_CONNECT_TIMEOUT_SECONDS"' "$provision"
+grep -Fq -- '--max-time "$DOWNLOAD_MAX_SECONDS"' "$provision"
+grep -Fq -- '--speed-limit "$NETWORK_STALL_BYTES" --speed-time "$NETWORK_STALL_SECONDS"' "$provision"
+grep -Fq -- '--retry "$((NETWORK_ATTEMPTS - 1))"' "$provision"
+grep -Fq 'cannot install the locked Hermes dependencies' "$provision"
 
 # Keep the historical-lock workaround explicit and reject an accidental return
 # to the re-resolving mode that failed during the M2 evidence capture.

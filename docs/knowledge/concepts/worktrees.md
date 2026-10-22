@@ -42,7 +42,7 @@ lacks. `--reset-diverged` instead keeps the old local head as
 `backup/<b>-<short-sha>` and resets `<b>` to the remote head, so no local commit
 becomes unreachable; a taken backup name fails with `backup_ref_exists` (a ref that already holds the
 old head is reused, never reported as taken or advised to be deleted), and every
-failure after the reset names the backup ref. A branch checked out in another worktree is never moved (`worktree_branch_in_use`).
+failure after the reset names the backup ref. A branch checked out in another worktree, or in the middle of a rebase or bisect there, is never moved (`worktree_branch_in_use`); a shorthand such as `@{-1}` is an `invalid_branch`.
 A missing `origin` or remote branch (`remote_branch_not_found`) and a failed
 fetch (`branch_fetch_failed`) fail the create instead of warning. The result
 names the commit the worktree was built from in `worktree_source`. The flag
