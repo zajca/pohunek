@@ -56,4 +56,13 @@ export type HostCapabilities = {
    * snapshot round-trips unchanged.
    */
   session_wait_turn_supported?: boolean;
+  /**
+   * Whether `session.new` starts a project-bound in-place session in the
+   * requested `cwd` (with `project` or `repo`), refusing a missing directory.
+   *
+   * A daemon that predates the behavior omits the field, which decodes as
+   * `false`; it ignores `cwd` for such a session. `false` is likewise omitted
+   * on the wire.
+   */
+  session_new_cwd_supported?: boolean;
 };

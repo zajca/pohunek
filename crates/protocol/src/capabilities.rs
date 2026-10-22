@@ -102,4 +102,12 @@ pub struct HostCapabilities {
     /// snapshot round-trips unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_wait_turn_supported: bool,
+    /// Whether `session.new` starts a project-bound in-place session in the
+    /// requested `cwd` (with `project` or `repo`), refusing a missing directory.
+    ///
+    /// A daemon that predates the behavior omits the field, which decodes as
+    /// `false`; it ignores `cwd` for such a session. `false` is likewise omitted
+    /// on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_new_cwd_supported: bool,
 }

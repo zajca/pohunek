@@ -287,6 +287,12 @@ pub struct SessionNewParams {
     #[cfg_attr(feature = "ts", ts(optional))]
     pub name: Option<String>,
     /// Working directory for the session. If omitted, the daemon chooses one.
+    ///
+    /// For an in-place session (no `branch`) it is the directory the session
+    /// starts in when it is an absolute path of an existing directory on the
+    /// daemon's host. With `project` or `repo` anything else fails with
+    /// `bad_request`; without them the project is detected from it. A daemon
+    /// advertises that it honors it as `session_new_cwd_supported`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub cwd: Option<PathBuf>,

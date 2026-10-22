@@ -800,7 +800,8 @@ reuse is distinguished by kernel process-start identity, including delayed exit
 notifications from the replaced process.
 
 The same runtime model keeps `cwd` current. A session starts with its launch
-directory, then procwatch reads the cwd of the focus process on each tick: the
+directory (the project checkout, or the directory `session new --cwd` named for a
+project-bound session), then procwatch reads the cwd of the focus process on each tick: the
 active nested-agent PID when one is bound, otherwise the root PTY child. OSC 7
 terminal output is accepted as an immediate cwd hint, but procwatch remains
 authoritative and overwrites a hint that a later read of the process cwd

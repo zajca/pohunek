@@ -135,6 +135,33 @@ pub(crate) enum CliError {
     )]
     RemoteTargetRequired,
 
+    /// `session new --cwd` together with `--branch`: the session runs in its
+    /// worktree, so the directory cannot be honored. Fails before any connection.
+    #[error("--cwd cannot be combined with --branch: a worktree session runs in its worktree")]
+    CwdWithWorktree,
+
+    /// A remote `session new --cwd` named a relative path. The path is read on
+    /// the remote host, where the CLI's own current directory means nothing.
+    #[error("--cwd '{}' must be an absolute path on the remote host", cwd.display())]
+    RemoteCwdNotAbsolute {
+        /// The relative path as typed.
+        cwd: PathBuf,
+    },
+
+    /// The host's daemon predates `session new --cwd` for a project-bound
+    /// session and would start it in the project checkout instead.
+    #[error(
+        "host '{host}' runs daemon {daemon_version}, which does not advertise \
+         `session_new_cwd_supported`: it would ignore --cwd for a --project/--repo session; \
+         no session was created"
+    )]
+    SessionNewCwdUnsupported {
+        /// The host as the user typed it.
+        host: String,
+        /// Version the host's daemon reported.
+        daemon_version: String,
+    },
+
     /// A remote `project add` named no PATH. A local path is meaningless on
     /// another host, so a remote add must give a path valid on that host; fails
     /// fast before any connection is dialed.
@@ -372,6 +399,28 @@ impl CliError {
                 Some(
                     "pass --project <id|label> from `pohunek --host <host> project list` \
                      (or --repo with a path valid on that host the first time)"
+                        .to_owned(),
+                ),
+            ),
+            CliError::CwdWithWorktree => ProtocolError::new(
+                ErrorClass::Configuration,
+                "cwd_with_worktree",
+                self.to_string(),
+                Some("drop --cwd, or drop --branch to run in a directory".to_owned()),
+            ),
+            CliError::RemoteCwdNotAbsolute { .. } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "remote_cwd_not_absolute",
+                self.to_string(),
+                Some("pass an absolute --cwd path that exists on that host".to_owned()),
+            ),
+            CliError::SessionNewCwdUnsupported { .. } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "session_new_cwd_unsupported",
+                self.to_string(),
+                Some(
+                    "update and restart the pohunek daemon on that host to the release of this \
+                     CLI, or start the session without --cwd"
                         .to_owned(),
                 ),
             ),

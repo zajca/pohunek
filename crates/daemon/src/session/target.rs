@@ -96,6 +96,46 @@ pub(super) struct PtySessionSpec {
     pub(super) package_authority: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
 }
 
+/// Whether `path` is an absolute path of an existing directory on this host.
+async fn is_usable_dir(path: &std::path::Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let probe = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        std::fs::metadata(&probe).is_ok_and(|metadata| metadata.is_dir())
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// `cwd` when it is a usable launch directory, else `None`.
+async fn usable_launch_dir(cwd: &std::path::Path) -> Option<PathBuf> {
+    is_usable_dir(cwd).await.then(|| cwd.to_path_buf())
+}
+
+/// Checks the launch directory a caller named for a project-bound session.
+///
+/// # Errors
+///
+/// Returns `bad_request` naming the path when it is relative, missing, or not a
+/// directory.
+async fn validated_launch_dir(cwd: &std::path::Path) -> Result<PathBuf, ProtocolError> {
+    if !cwd.is_absolute() {
+        return Err(ProtocolError::bad_request(format!(
+            "session.new cwd '{}' must be an absolute path on the host",
+            cwd.display()
+        )));
+    }
+    if !is_usable_dir(cwd).await {
+        return Err(ProtocolError::bad_request(format!(
+            "session.new cwd '{}' is not an existing directory on the host",
+            cwd.display()
+        )));
+    }
+    Ok(cwd.to_path_buf())
+}
+
 fn next_runtime_generation(
     registration: &PtyRegistration,
 ) -> Result<protocol::RuntimeGeneration, ProtocolError> {
@@ -272,6 +312,22 @@ impl SessionRegistry {
             ));
         }
 
+        // The directory the caller named is where an in-place session starts. A
+        // project-bound request must name a usable one; without a project
+        // reference a directory that is not usable falls through to detection
+        // and the launch's own missing-directory report. A worktree session
+        // runs in the worktree, so `cwd` does not apply to it.
+        let launch_dir = match params.cwd.as_deref() {
+            Some(cwd) if params.branch.is_none() => {
+                if params.project.is_some() || params.repo.is_some() {
+                    Some(validated_launch_dir(cwd).await?)
+                } else {
+                    usable_launch_dir(cwd).await
+                }
+            }
+            _ => None,
+        };
+
         // Phase 1: resolve the project (by reference, else by detecting a path).
         let (project, detected) = self.resolve_project(params).await?;
 
@@ -289,7 +345,12 @@ impl SessionRegistry {
                      use --branch to create a worktree",
                 ));
             }
-            return Ok(Self::in_place_target(project, detected, fallback_cwd));
+            return Ok(Self::in_place_target(
+                project,
+                detected,
+                fallback_cwd,
+                launch_dir,
+            ));
         };
 
         // Worktree-per-session. The source repo is an explicit `--repo`, else the
@@ -333,7 +394,8 @@ impl SessionRegistry {
     }
 
     /// Build the in-place (no-worktree) target: run the agent in the project's
-    /// checkout as-is (Decision 3), or in `fallback_cwd` when no project resolved.
+    /// checkout as-is (Decision 3), in `launch_dir` when the caller named one for
+    /// a project-bound session, or in `fallback_cwd` when no project resolved.
     ///
     /// A bare project never reaches here: [`Self::resolve_target`] refuses an
     /// in-place start on a bare repo (no working tree to run in) and steers the
@@ -342,8 +404,9 @@ impl SessionRegistry {
         project: Option<ProjectRecord>,
         detected: Option<DetectedProject>,
         fallback_cwd: PathBuf,
+        launch_dir: Option<PathBuf>,
     ) -> TargetResolution {
-        let (launch_cwd, project_id, is_linked_worktree) = match (project, detected) {
+        let (checkout_cwd, project_id, is_linked_worktree) = match (project, detected) {
             // Detected from a path: launch in this work tree's root.
             (Some(record), Some(detected)) => (
                 detected.checkout_path,
@@ -355,11 +418,11 @@ impl SessionRegistry {
                 let id = record.id();
                 (record.repo_root, Some(id), Some(false))
             }
-            // No project: a plain shell in the fallback cwd (today's behavior).
+            // No project: a plain shell in the fallback cwd.
             (None, _) => (fallback_cwd, None, None),
         };
         TargetResolution {
-            launch_cwd,
+            launch_cwd: launch_dir.unwrap_or(checkout_cwd),
             repo: None,
             branch: None,
             worktree_path: None,

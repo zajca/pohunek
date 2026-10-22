@@ -1146,7 +1146,8 @@ enum SessionAction {
         /// character or an over-long name.
         #[arg(long)]
         name: Option<String>,
-        /// Working directory for the session.
+        /// Directory the session starts in (an existing directory on the target
+        /// host; with --project or --repo it may lie outside the checkout).
         #[arg(long)]
         cwd: Option<PathBuf>,
         /// Initial terminal width in columns.

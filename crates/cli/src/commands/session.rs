@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -351,7 +351,7 @@ pub(crate) struct NewArgs {
     pub agent: String,
     /// Owner-set display name for the session, or `None` to show it by id.
     pub name: Option<String>,
-    /// Working directory (ignored when a worktree is bound).
+    /// Directory the session starts in; refused together with a worktree branch.
     pub cwd: Option<PathBuf>,
     /// Initial terminal columns.
     pub cols: u16,
@@ -639,6 +639,17 @@ pub(crate) async fn run_new(
         }
         None => Client::connect(host, paths).await?,
     };
+    // A daemon that predates the behavior would start the session in the
+    // project checkout, so the request is refused before it is sent.
+    if needs_cwd_support(&args) {
+        let capabilities = client.call::<method::HostInspect>(()).await?;
+        if !capabilities.session_new_cwd_supported {
+            return Err(CliError::SessionNewCwdUnsupported {
+                host: host.to_owned(),
+                daemon_version: capabilities.daemon_version,
+            });
+        }
+    }
     let result = client
         .call::<method::SessionNew>(new_params(&args)?)
         .await
@@ -1753,26 +1764,96 @@ fn build_new_request(args: &NewArgs) -> Result<Request, CliError> {
 
 /// Prepare the `session new` args for the target host (design Decision 1).
 ///
-/// Local: send the CLI's **own** `current_dir()` as `cwd` (unless the user pinned
-/// `--cwd`) so the daemon auto-detects the project we are standing in. Remote: send
-/// **no** local path — a filesystem path is meaningless on another host — and
-/// require a `--project` reference (or `--repo` for first-introduction), failing
-/// fast before any connection is dialed.
+/// A requested `--cwd` is checked before any connection: it conflicts with
+/// `--branch` (the session runs in its worktree), a remote one must be absolute
+/// (the path is read on that host), and a local relative one is made absolute
+/// against the CLI's own directory. Without `--cwd`, a local start that names
+/// neither `--project` nor `--repo` sends the root of the git work tree around the
+/// CLI's directory (the directory itself outside a work tree) so the daemon
+/// auto-detects the project we are standing in. A remote start sends
+/// no default path and requires a `--project` reference (or `--repo` for
+/// first-introduction), failing fast before any connection is dialed.
 fn prepare_new_args(host: &str, args: NewArgs) -> Result<NewArgs, CliError> {
     let remote = !is_local_host(host);
-    if remote {
-        if args.project.is_none() && args.repo.is_none() {
-            return Err(CliError::RemoteTargetRequired);
-        }
-        // Drop any local --cwd: it cannot be resolved on the remote host.
-        Ok(NewArgs { cwd: None, ..args })
-    } else {
-        let cwd = match args.cwd {
-            Some(cwd) => Some(cwd),
-            None => Some(std::env::current_dir()?),
-        };
-        Ok(NewArgs { cwd, ..args })
+    if remote && args.project.is_none() && args.repo.is_none() {
+        return Err(CliError::RemoteTargetRequired);
     }
+    let cwd = match args.cwd {
+        Some(_) if args.branch.is_some() => return Err(CliError::CwdWithWorktree),
+        Some(cwd) if cwd.is_absolute() => Some(cwd),
+        Some(cwd) if remote => return Err(CliError::RemoteCwdNotAbsolute { cwd }),
+        Some(cwd) => Some(std::env::current_dir()?.join(cwd)),
+        None if !remote && args.project.is_none() && args.repo.is_none() => {
+            Some(implicit_launch_dir(&std::env::current_dir()?))
+        }
+        None => None,
+    };
+    Ok(NewArgs { cwd, ..args })
+}
+
+/// Longest the work-tree root lookup of [`implicit_launch_dir`] may take: an
+/// unresponsive git must not stall a session start that does not need it.
+const IMPLICIT_ROOT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Poll interval while waiting for the work-tree root lookup to finish.
+const IMPLICIT_ROOT_LOOKUP_POLL: Duration = Duration::from_millis(10);
+
+/// The directory a local start without `--cwd` runs in: the root of the git
+/// work tree around `dir`, so standing in a subdirectory still starts the
+/// session at the checkout root, or `dir` itself outside any work tree.
+fn implicit_launch_dir(dir: &Path) -> PathBuf {
+    work_tree_root(dir).unwrap_or_else(|| dir.to_path_buf())
+}
+
+/// `git rev-parse --show-toplevel` in `dir`, canonicalized; `None` when git is
+/// missing, `dir` is outside a work tree, or the lookup exceeds
+/// [`IMPLICIT_ROOT_LOOKUP_TIMEOUT`].
+fn work_tree_root(dir: &Path) -> Option<PathBuf> {
+    let mut command = std::process::Command::new("git");
+    // `GIT_*` variables (`GIT_DIR`, `GIT_WORK_TREE`, ...) redirect git away from
+    // the directory it is asked about.
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(name);
+        }
+    }
+    let mut child = command
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + IMPLICIT_ROOT_LOOKUP_TIMEOUT;
+    let status = loop {
+        match child.try_wait().ok()? {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => std::thread::sleep(IMPLICIT_ROOT_LOOKUP_POLL),
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut output = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut output).ok()?;
+    let root = PathBuf::from(output.trim());
+    if root.as_os_str().is_empty() {
+        return None;
+    }
+    Some(root.canonicalize().unwrap_or(root))
+}
+
+/// Whether the requested `cwd` only takes effect on a daemon that honors it
+/// for a project-bound session.
+fn needs_cwd_support(args: &NewArgs) -> bool {
+    args.cwd.is_some() && (args.project.is_some() || args.repo.is_some())
 }
 
 fn list_params(filters: &[ListFilter]) -> SessionListParams {
@@ -3046,19 +3127,6 @@ mod tests {
     }
 
     #[test]
-    fn prepare_new_args_local_defaults_cwd_to_current_dir() {
-        // A local session sends the CLI's own cwd so the daemon auto-detects the
-        // project we are standing in.
-        let prepared =
-            prepare_new_args(LOCAL_HOST, new_args("shell", None)).expect("local prepare succeeds");
-        assert_eq!(
-            prepared.cwd,
-            Some(std::env::current_dir().expect("cwd")),
-            "local defaults cwd to the CLI's own current dir"
-        );
-    }
-
-    #[test]
     fn prepare_new_args_local_respects_explicit_cwd() {
         let prepared = prepare_new_args(
             LOCAL_HOST,
@@ -3078,18 +3146,6 @@ mod tests {
             matches!(err, CliError::RemoteTargetRequired),
             "expected RemoteTargetRequired, got {err:?}"
         );
-    }
-
-    #[test]
-    fn prepare_new_args_remote_with_project_drops_local_cwd() {
-        let mut args = new_args("shell", Some(PathBuf::from("/local/path")));
-        args.project = Some("ui".to_owned());
-        let prepared = prepare_new_args("host-b", args).expect("remote with --project");
-        assert_eq!(
-            prepared.cwd, None,
-            "a local cwd must not be sent to a remote"
-        );
-        assert_eq!(prepared.project.as_deref(), Some("ui"));
     }
 
     #[test]

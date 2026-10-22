@@ -220,6 +220,7 @@ fn host_capabilities_for(
         output_read_supported: true,
         session_wait_supported: true,
         session_wait_turn_supported: true,
+        session_new_cwd_supported: true,
     }
 }
 
