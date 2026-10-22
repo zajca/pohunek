@@ -1307,3 +1307,86 @@ async fn prebump_notify_hooks_create_notifications_through_the_daemon_socket() {
     }
     daemon.stop().await;
 }
+
+/// The retention policy as release v0.35.2 decodes it: every field is required
+/// and an unknown one is refused (`SessionRetentionPolicy` at `v0.35.2`,
+/// `crates/protocol/src/session.rs`).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenRetentionPolicy {
+    enabled: bool,
+    sweep_interval_secs: u32,
+    terminal_ttl_secs: u32,
+    lost_ttl_secs: u32,
+    max_removals_per_sweep: u32,
+}
+
+/// `session.policy.get` and `session.policy.set` result of release v0.35.2.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenPolicyResult {
+    retention: FrozenRetentionPolicy,
+}
+
+/// Sends a current-version request and returns the response.
+async fn current_call(client: &mut Client, id: &str, method: &str, params: Value) -> Value {
+    let request = Request::new(id, method, params).expect("valid request");
+    let response = exchange(
+        client,
+        &serde_json::to_value(&request).expect("serialize request"),
+    )
+    .await;
+    assert_eq!(response["v"], PROTOCOL_VERSION.get(), "{response}");
+    assert!(response.get("err").is_none(), "{method}: {response}");
+    response
+}
+
+#[tokio::test]
+async fn a_previous_release_reads_and_rewrites_the_retention_policy_beside_an_idle_stop_default() {
+    let daemon = Daemon::start("window-idle-stop").await;
+    let mut client = daemon.connect().await;
+
+    let set = current_call(
+        &mut client,
+        "idle-set",
+        method::SESSION_IDLE_STOP_SET,
+        json!({"default_after_secs": 600}),
+    )
+    .await;
+    assert_eq!(set["ok"]["default_after_secs"], 600);
+
+    // A v0.35.2 client decodes the policy strictly: no new key may appear in it.
+    let policy = current_call(
+        &mut client,
+        "policy-get",
+        method::SESSION_POLICY_GET,
+        Value::Null,
+    )
+    .await;
+    let frozen: FrozenPolicyResult = serde_json::from_value(policy["ok"].clone())
+        .expect("the v0.35.2 decode accepts the policy");
+
+    // Its read-modify-write sends back exactly what it decoded.
+    let rewritten = current_call(
+        &mut client,
+        "policy-set",
+        method::SESSION_POLICY_SET,
+        json!({"retention": frozen.retention}),
+    )
+    .await;
+    serde_json::from_value::<FrozenPolicyResult>(rewritten["ok"].clone())
+        .expect("the v0.35.2 decode accepts the rewritten policy");
+
+    let idle = current_call(
+        &mut client,
+        "idle-get",
+        method::SESSION_IDLE_STOP_GET,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        idle["ok"]["default_after_secs"], 600,
+        "the rewrite kept the default"
+    );
+    daemon.stop().await;
+}

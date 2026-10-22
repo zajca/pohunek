@@ -8,11 +8,12 @@
 use protocol::{
     ErrorClass, ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams,
     SessionDetectionParams, SessionDiffParams, SessionForkParams, SessionForkResult, SessionId,
-    SessionInputParams, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
-    SessionPolicyParams, SessionPolicyResult, SessionReadParams, SessionReleaseAgentParams,
-    SessionRenameParams, SessionReportAgentParams, SessionReportNativeIdParams,
-    SessionResizeParams, SessionResumeParams, SessionResumeResult, SessionRetentionParams,
-    SessionScreenParams, SessionSetMetadataParams, SessionWaitParams, SessionWaitTurnParams,
+    SessionIdleStopParams, SessionInputParams, SessionListParams, SessionNewParams,
+    SessionNewResult, SessionOutputParams, SessionPolicyParams, SessionPolicyResult,
+    SessionReadParams, SessionReleaseAgentParams, SessionRenameParams, SessionReportAgentParams,
+    SessionReportNativeIdParams, SessionResizeParams, SessionResumeParams, SessionResumeResult,
+    SessionRetentionParams, SessionScreenParams, SessionSetMetadataParams, SessionWaitParams,
+    SessionWaitTurnParams,
 };
 
 use super::util::{error_value, ok_value, ok_value_bounded, parse_optional_params, parse_params};
@@ -216,6 +217,35 @@ pub(super) async fn handle_session_policy_set(
     };
     match sessions.set_retention_policy(params.retention).await {
         Ok(retention) => ok_value(request, &SessionPolicyResult { retention }),
+        Err(err) => error_value(request, err),
+    }
+}
+
+/// `session.idle_stop.get`: return the host default of the idle-stop duration.
+pub(super) fn handle_session_idle_stop_get(
+    request: &Request,
+    sessions: &SessionRegistry,
+) -> Response {
+    if !request.params().is_null() {
+        return error_value(
+            request,
+            ProtocolError::bad_request("session.idle_stop.get does not accept params"),
+        );
+    }
+    ok_value(request, &sessions.idle_stop_policy())
+}
+
+/// `session.idle_stop.set`: persist a replacement idle-stop default.
+pub(super) async fn handle_session_idle_stop_set(
+    request: &Request,
+    sessions: &SessionRegistry,
+) -> Response {
+    let params = match parse_params::<SessionIdleStopParams>(request) {
+        Ok(params) => params,
+        Err(err) => return error_value(request, err),
+    };
+    match sessions.set_idle_stop_policy(params).await {
+        Ok(result) => ok_value(request, &result),
         Err(err) => error_value(request, err),
     }
 }

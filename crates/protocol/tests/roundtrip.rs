@@ -3405,6 +3405,7 @@ fn host_capabilities_json_shape_roundtrips() {
         session_wait_supported: true,
         session_wait_turn_supported: true,
         session_new_cwd_supported: true,
+        session_idle_stop_supported: true,
     };
 
     let value = serde_json::to_value(&caps).expect("serialize host capabilities");
@@ -3433,7 +3434,8 @@ fn host_capabilities_json_shape_roundtrips() {
             "output_read_supported": true,
             "session_wait_supported": true,
             "session_wait_turn_supported": true,
-            "session_new_cwd_supported": true
+            "session_new_cwd_supported": true,
+            "session_idle_stop_supported": true
         })
     );
 
@@ -3468,6 +3470,10 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
     assert!(
         !caps.session_new_cwd_supported,
         "a host that omits the cwd flag ignores cwd on a project-bound session.new"
+    );
+    assert!(
+        !caps.session_idle_stop_supported,
+        "a host that omits the idle-stop flag does not serve session.idle_stop"
     );
 }
 

@@ -311,7 +311,8 @@ impl SessionRegistry {
                 &entry.info.metadata,
                 true,
             );
-            entry.info.activity = Some(transition.activity);
+            entry.set_activity(transition.activity);
+            self.wake_idle_stop();
             entry.info.state_source = transition.source;
             entry.info.updated_at = timestamp_now();
             let evidence = record_activity_evidence(

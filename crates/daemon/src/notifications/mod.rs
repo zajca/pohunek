@@ -637,6 +637,16 @@ impl NotificationService {
         self.inner.store.list(params)
     }
 
+    /// Whether `session_id` has an `agent_blocked` or `approval_required`
+    /// notification that is still `unread` or `read`.
+    ///
+    /// Records the debounce coordinator still holds are not stored yet and do not
+    /// count.
+    #[must_use]
+    pub fn has_active_attention(&self, session_id: &protocol::SessionId) -> bool {
+        self.inner.store.has_active_attention(session_id)
+    }
+
     /// Update a notification lifecycle status.
     ///
     /// # Errors

@@ -36,7 +36,7 @@ pub const POLICY_FILE_NAME: &str = "session-policy.json";
 const POLICY_TEMP_FILE_NAME: &str = "session-policy.json.tmp";
 
 /// Exact mode required of the policy file and accepted on read.
-const OWNER_PRIVATE_FILE_MODE: u32 = 0o600;
+pub(super) const OWNER_PRIVATE_FILE_MODE: u32 = 0o600;
 
 /// Exact mode required of the data directory holding the policy file.
 const OWNER_PRIVATE_DIRECTORY_MODE: u32 = 0o700;
@@ -46,7 +46,7 @@ const OWNER_PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 /// The document is a handful of scalar fields; 64 KiB is orders of magnitude
 /// above any legitimate encoding and bounds memory if the file is replaced by
 /// something larger.
-const MAX_POLICY_BYTES: usize = 64 * 1024;
+pub(super) const MAX_POLICY_BYTES: usize = 64 * 1024;
 
 /// Lower bound accepted for [`SessionRetentionPolicy::sweep_interval_secs`].
 ///
@@ -561,7 +561,7 @@ fn validate_policy(policy: &SessionRetentionPolicy) -> Result<(), ProtocolError>
     Ok(())
 }
 
-fn invalid_policy(message: String) -> ProtocolError {
+pub(super) fn invalid_policy(message: String) -> ProtocolError {
     ProtocolError::new(ErrorClass::Runtime, "invalid_session_policy", message, None)
 }
 
@@ -613,7 +613,10 @@ fn write_policy(path: &Path, policy: &SessionRetentionPolicy) -> Result<(), Prot
 }
 
 /// Opens the trusted directory holding the policy document.
-fn open_policy_dir(path: &Path, create: bool) -> Result<(TrustedDir, &str), ProtocolError> {
+pub(super) fn open_policy_dir(
+    path: &Path,
+    create: bool,
+) -> Result<(TrustedDir, &str), ProtocolError> {
     let parent = path.parent().ok_or_else(|| {
         policy_error(format!(
             "session policy path {} has no parent",
@@ -640,14 +643,14 @@ fn open_policy_dir(path: &Path, create: bool) -> Result<(TrustedDir, &str), Prot
     Ok((directory, name))
 }
 
-fn policy_io_error(path: &Path, error: &FsError) -> ProtocolError {
+pub(super) fn policy_io_error(path: &Path, error: &FsError) -> ProtocolError {
     policy_error(format!(
         "session policy at {} is not accessible: {error}",
         path.display()
     ))
 }
 
-fn policy_error(message: String) -> ProtocolError {
+pub(super) fn policy_error(message: String) -> ProtocolError {
     ProtocolError::new(
         ErrorClass::Runtime,
         "session_policy_store_error",
@@ -657,7 +660,7 @@ fn policy_error(message: String) -> ProtocolError {
 }
 
 /// Runs blocking policy I/O off the async runtime.
-async fn blocking<T, F>(work: F) -> Result<T, ProtocolError>
+pub(super) async fn blocking<T, F>(work: F) -> Result<T, ProtocolError>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, ProtocolError> + Send + 'static,

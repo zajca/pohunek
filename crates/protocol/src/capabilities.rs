@@ -111,4 +111,10 @@ pub struct HostCapabilities {
     /// omitted on the wire.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_new_cwd_supported: bool,
+    /// Whether the daemon serves `session.idle_stop.get` and
+    /// `session.idle_stop.set` and stops sessions opted in to idle stop.
+    ///
+    /// Omitted when `false`, like [`Self::session_wait_turn_supported`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_idle_stop_supported: bool,
 }

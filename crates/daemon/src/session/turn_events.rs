@@ -1057,6 +1057,17 @@ impl TurnEvents {
         })
     }
 
+    /// Whether a turn wait currently holds a slot on `session_id`.
+    pub(crate) fn has_waiters(&self, session_id: &SessionId) -> bool {
+        self.inner
+            .waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .per_session
+            .get(session_id)
+            .is_some_and(|count| *count > 0)
+    }
+
     /// Number of turn waits currently holding slots.
     ///
     /// Scenarios use it as the readiness signal that a wait is parked with its

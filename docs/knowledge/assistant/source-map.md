@@ -56,6 +56,7 @@ Current CLI and command surface:
 - `crates/cli/tests/prompt_link.rs`
 - `crates/cli/tests/standalone_discovery.rs`
 - `crates/cli/tests/session_process_api.rs`
+- `crates/cli/tests/session_idle_stop.rs` — `session policy` idle-stop default against a real daemon.
 - `crates/cli/tests/session_wait_turn.rs` — `session wait` turn mode against a real daemon.
 
 Assistant launch and prompt rendering:
@@ -529,6 +530,9 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/api/handler/session.rs`
 - `crates/daemon/src/session/mod.rs`
 - `crates/daemon/src/session/observation.rs`
+- `crates/daemon/src/session/idle_stop.rs` — idle stop of sessions opted in with
+  `pohunek.idle_stop_after_secs`: the host default record, the deadline task and
+  the guarded stop.
 - `crates/daemon/src/session/turn_wait.rs` — `session.wait_turn`: edge-triggered
   selection, `targets_ended`, `cursor_reset`, per-target progress.
 - `crates/daemon/src/session/turn_events.rs` — the in-memory turn-event journal,
@@ -796,6 +800,8 @@ Protocol contracts and transport:
 - `crates/protocol/src/envelope.rs`
 - `crates/protocol/src/decimal.rs`
 - `crates/protocol/src/limits.rs`
+- `crates/protocol/src/idle_stop.rs` — `session.idle_stop.get/set` types and the
+  `pohunek.idle_stop_after_secs` metadata value.
 - `crates/protocol/src/turn_wait.rs` — `session.wait_turn` params, result,
   cursor, and progress wire types.
 - `crates/protocol/src/lib.rs`

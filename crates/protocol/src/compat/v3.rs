@@ -73,6 +73,8 @@ pub(super) const INTRODUCED_METHODS: &[&str] = &[
     method::PACKAGE_UNINSTALL,
     method::PACKAGE_BIND_PROFILE,
     method::SESSION_WAIT_TURN,
+    method::SESSION_IDLE_STOP_GET,
+    method::SESSION_IDLE_STOP_SET,
     method::HOST_RESOLVE,
 ];
 

@@ -1502,7 +1502,7 @@ enum SessionAction {
         json: bool,
     },
 
-    /// Read or update the session retention policy.
+    /// Read or update the session retention policy and the idle-stop default.
     Policy {
         #[command(subcommand)]
         action: SessionPolicyAction,
@@ -1517,17 +1517,20 @@ enum SessionAction {
 
 #[derive(Debug, Subcommand)]
 enum SessionPolicyAction {
-    /// Show the session retention policy.
+    /// Show the session retention policy and the idle-stop default.
     Get {
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
     },
 
-    /// Update one or more session retention policy fields.
+    /// Update one or more session retention policy fields or the idle-stop
+    /// default.
     ///
     /// Unspecified fields keep their current value. The daemon applies the new
-    /// policy on its next sweep; no restart is needed.
+    /// policy on its next sweep; no restart is needed. The idle-stop default is
+    /// kept apart from the retention policy: naming only `--idle-stop-after`
+    /// leaves the retention policy untouched.
     #[command(group(
         clap::ArgGroup::new("session_policy_field")
             .required(true)
@@ -1539,6 +1542,7 @@ enum SessionPolicyAction {
                 "terminal_ttl_secs",
                 "lost_ttl_secs",
                 "max_removals_per_sweep",
+                "idle_stop_after",
             ])
     ))]
     Set {
@@ -1560,6 +1564,10 @@ enum SessionPolicyAction {
         /// Maximum sessions one sweep may remove.
         #[arg(long, value_name = "COUNT")]
         max_removals_per_sweep: Option<u32>,
+        /// Idle seconds after which a session opted in with
+        /// `pohunek.idle_stop_after_secs=default` is stopped; 0 clears it.
+        #[arg(long, value_name = "SECONDS")]
+        idle_stop_after: Option<u32>,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -2324,6 +2332,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                         terminal_ttl_secs,
                         lost_ttl_secs,
                         max_removals_per_sweep,
+                        idle_stop_after,
                         json,
                     } => {
                         let host = effective_host(&global_host, None);
@@ -2337,6 +2346,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                                 terminal_ttl_secs,
                                 lost_ttl_secs,
                                 max_removals_per_sweep,
+                                idle_stop_after,
                             },
                             json,
                         )

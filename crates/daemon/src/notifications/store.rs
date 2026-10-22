@@ -191,6 +191,26 @@ impl NotificationStore {
         state.records.values().cloned().collect()
     }
 
+    /// Whether `session_id` has an `agent_blocked` or `approval_required`
+    /// record the owner has not acknowledged, archived or deleted.
+    pub(crate) fn has_active_attention(&self, session_id: &protocol::SessionId) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.records.values().any(|record| {
+            record.session_id.as_ref() == Some(session_id)
+                && matches!(
+                    record.kind,
+                    NotificationKind::AgentBlocked | NotificationKind::ApprovalRequired
+                )
+                && matches!(
+                    record.status,
+                    NotificationStatus::Unread | NotificationStatus::Read
+                )
+        })
+    }
+
     /// Rewrite current records and bounded deleted terminal evidence atomically.
     ///
     /// Compaction is skipped below `minimum_actions` and when it would not

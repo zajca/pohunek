@@ -18,6 +18,8 @@ mod assistant;
 mod daemon;
 mod governance;
 mod host;
+#[cfg(test)]
+mod idle_stop_tests;
 mod integration;
 mod notification;
 mod package;
@@ -388,6 +390,12 @@ async fn handle_negotiated(
         method::SESSION_POLICY_GET => session::handle_session_policy_get(request, &state.sessions),
         method::SESSION_POLICY_SET => {
             session::handle_session_policy_set(request, &state.sessions).await
+        }
+        method::SESSION_IDLE_STOP_GET => {
+            session::handle_session_idle_stop_get(request, &state.sessions)
+        }
+        method::SESSION_IDLE_STOP_SET => {
+            session::handle_session_idle_stop_set(request, &state.sessions).await
         }
         method::SESSION_RETENTION_SWEEP => {
             session::handle_session_retention_sweep(request, &state.sessions).await

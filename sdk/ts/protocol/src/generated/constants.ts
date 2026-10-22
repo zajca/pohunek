@@ -20,6 +20,8 @@ export const PREVIOUS_VERSION_INTRODUCED_METHODS = [
   "package.uninstall",
   "package.bind_profile",
   "session.wait_turn",
+  "session.idle_stop.get",
+  "session.idle_stop.set",
   "host.resolve",
 ] as const;
 /** Keys the previous protocol version spelled differently, as [previous, current]. */

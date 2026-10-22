@@ -173,6 +173,8 @@ export type { SessionEvent } from "./SessionEvent";
 export type { SessionForkParams } from "./SessionForkParams";
 export type { SessionForkResult } from "./SessionForkResult";
 export type { SessionId } from "./SessionId";
+export type { SessionIdleStopParams } from "./SessionIdleStopParams";
+export type { SessionIdleStopResult } from "./SessionIdleStopResult";
 export type { SessionInfo } from "./SessionInfo";
 export type { SessionInputParams } from "./SessionInputParams";
 export type { SessionInputResult } from "./SessionInputResult";
