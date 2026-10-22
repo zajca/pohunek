@@ -123,7 +123,10 @@ impl SessionRegistry {
         match runtime {
             RuntimeHandle::Worker(worker) => {
                 worker
-                    .write(worker_input_fragments(writes, Duration::ZERO))
+                    .reserve_write(worker_input_fragments(writes, Duration::ZERO))
+                    .await
+                    .map_err(worker_error_to_protocol)?
+                    .commit(|| self.inner.turns.note_input(session_id))
                     .await
                     .map_err(worker_error_to_protocol)?;
             }
@@ -319,6 +322,7 @@ impl SessionRegistry {
     ) -> Result<InputActivitySnapshot, ProtocolError> {
         let (send_started_tx, send_started_rx) = tokio::sync::oneshot::channel();
         let registry = self.clone();
+        let turns = self.inner.turns.clone();
         let mut write = tokio::spawn(async move {
             let _input_guard = input_guard;
             let sessions = registry.inner.sessions.lock().await;
@@ -335,6 +339,7 @@ impl SessionRegistry {
             let completed_boundary = boundary.clone();
             reservation
                 .commit(move || {
+                    turns.note_input(&session_id);
                     let _result = send_started_tx.send(());
                     drop(sessions);
                 })
@@ -628,18 +633,21 @@ pub(super) fn plan_initial_input_delivery(
     initial_input: Option<String>,
 ) -> LaunchCommandPlan {
     if resolved.profile.is_none() && resolved.definition.prompt_arg() {
+        let prompt_in_argv = initial_input.is_some();
         if let Some(input) = initial_input {
             command.args.push(input);
         }
         return LaunchCommandPlan {
             command,
             pending_initial_input: None,
+            prompt_in_argv,
         };
     }
 
     LaunchCommandPlan {
         command,
         pending_initial_input: initial_input,
+        prompt_in_argv: false,
     }
 }
 

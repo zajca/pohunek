@@ -225,6 +225,16 @@ impl SessionRegistry {
         self.record_activity_scoped(id, None, transition).await;
     }
 
+    /// Feeds one detector transition, as the detector task does.
+    #[cfg(test)]
+    pub(crate) async fn feed_detector_activity(&self, id: &SessionId, activity: AgentActivity) {
+        let transition = ActivityTransition {
+            activity,
+            source: protocol::StateSource::Process,
+        };
+        self.record_activity(id, transition).await;
+    }
+
     pub(super) async fn record_detector_activity(
         &self,
         id: &SessionId,
@@ -279,12 +289,28 @@ impl SessionRegistry {
                 && entry.info.state_source == transition.source
                 && activity_already_recorded(entry, transition.activity, transition.source)
             {
+                // A turn that gave its input evidence back opens here.
+                if transition.activity == AgentActivity::Working {
+                    self.inner.turns.note_activity(
+                        id,
+                        entry.turn_owner(),
+                        entry.info.activity,
+                        transition.activity,
+                        &entry.info.metadata,
+                        true,
+                    );
+                }
                 return;
             }
 
-            self.inner
-                .turns
-                .note_activity(id, entry.info.activity, transition.activity);
+            self.inner.turns.note_activity(
+                id,
+                entry.turn_owner(),
+                entry.info.activity,
+                transition.activity,
+                &entry.info.metadata,
+                true,
+            );
             entry.info.activity = Some(transition.activity);
             entry.info.state_source = transition.source;
             entry.info.updated_at = timestamp_now();

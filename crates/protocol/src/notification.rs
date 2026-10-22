@@ -225,6 +225,33 @@ pub struct NotificationRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub superseded_by: Option<NotificationId>,
+    /// When the turn a `turn_completed` record reports started, as an RFC 3339
+    /// timestamp.
+    ///
+    /// Additive: an older daemon omits it, and an older client ignores it. The
+    /// daemon sets it from its own turn clock (the turn's first transition into
+    /// `working`); a client cannot supply it. Absent when this daemon did not
+    /// observe the turn start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub turn_started_at: Option<String>,
+    /// Milliseconds the reported turn lasted, from its first transition into
+    /// `working` to the moment the session left `working`.
+    ///
+    /// Additive: an older daemon omits it, and an older client ignores it. Set
+    /// only by the daemon, together with `turn_started_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub turn_duration_ms: Option<u64>,
+    /// Metadata of the linked session when the turn ended.
+    ///
+    /// Additive: an older daemon omits it, and an older client ignores it. A
+    /// verbatim copy of the session's owner-set metadata (at most the session
+    /// metadata limits), kept with the record after the session is removed.
+    /// Set only by the daemon on `turn_completed` records.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub session_metadata: BTreeMap<String, String>,
 }
 
 /// Parameters for `notification.create`.

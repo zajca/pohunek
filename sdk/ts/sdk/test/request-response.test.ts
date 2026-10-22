@@ -7,6 +7,7 @@ import {
   SUPPORTED_PROTOCOL_VERSIONS,
   CLIENT_PROTOCOL_VERSIONS,
   type HostGovernanceStatus,
+  type NotificationRecord,
   type ProtocolError,
   type SessionInfo,
 } from "@pohunek/protocol";
@@ -1448,3 +1449,29 @@ function withoutField(value: Record<string, unknown>, field: string): Record<str
   delete copy[field];
   return copy;
 }
+
+describe("notification turn stamp", () => {
+  test("turn_duration_ms decodes as a JSON number the caller can compute with", () => {
+    const line = okResponseLine("r1", {
+      record: {
+        id: "n-1",
+        source: { provider: "pohunek", provider_event: "agent_state", host_local_source_id: "p" },
+        kind: "turn_completed",
+        severity: "info",
+        status: "unread",
+        title: "Turn completed",
+        body: "b",
+        created_at: "2026-10-21T00:00:00Z",
+        turn_started_at: "2026-10-21T00:00:00Z",
+        turn_duration_ms: 3000,
+        session_metadata: { "work.issue": "955" },
+      },
+    });
+    const decoded = decodeResponse(JSON.parse(line)) as { ok: { record: NotificationRecord } };
+    const record = decoded.ok.record;
+    // The typed field must be a number (not bigint), as the wire carries it.
+    const seconds: number = (record.turn_duration_ms ?? 0) / 1000;
+    expect(typeof record.turn_duration_ms).toBe("number");
+    expect(seconds).toBe(3);
+  });
+});

@@ -45,6 +45,7 @@ use crate::procwatch::{
 use crate::project::detect::project_id;
 use crate::runtime::{Worker, WorkerError};
 use crate::session::event_concerns_other_session;
+use crate::session::{TurnEdge, TurnId, TurnVerdict};
 use pohunek_test_support::wait::{guard, wait_until, HANG_GUARD};
 
 use super::{
@@ -2221,6 +2222,1189 @@ impl ProcessInspector for MockInspector {
         }
         Ok(foreground)
     }
+}
+
+/// The turns that went idle since the last call.
+fn ended_turns(edges: &mut tokio::sync::mpsc::UnboundedReceiver<TurnEdge>) -> Vec<TurnId> {
+    std::iter::from_fn(|| edges.try_recv().ok())
+        .filter_map(|edge| match edge {
+            TurnEdge::Ended(_, id) => Some(id),
+            TurnEdge::Started(..) => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn start_up_output_seen_by_the_detector_is_not_a_turn() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+
+    // The banner prints (working), then the idle prompt matches.
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    let seen: Vec<TurnEdge> = std::iter::from_fn(|| edges.try_recv().ok()).collect();
+    assert!(seen.is_empty(), "start-up output opened a turn: {seen:?}");
+
+    // Once input reached the session, the next working edge is a turn.
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert_eq!(ended_turns(&mut edges).len(), 1);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// Input given to the session through `session.input`.
+async fn type_into(registry: &SessionRegistry, id: &SessionId, text: &str) {
+    registry
+        .input(protocol::SessionInputParams {
+            session_id: id.clone(),
+            text: text.to_owned(),
+            wait: None,
+        })
+        .await
+        .expect("input accepted");
+}
+
+#[tokio::test]
+async fn input_given_through_session_input_makes_the_output_it_causes_a_turn() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+
+    // The terminal echoes the input, which the detector sees as output; no
+    // idle was published before (the start-up grace), yet the echo of
+    // delivered input is a turn.
+    type_into(&registry, &created.id, "go").await;
+    let edge = tokio::time::timeout(Duration::from_secs(10), edges.recv())
+        .await
+        .expect("a turn started")
+        .expect("edge channel open");
+    assert!(matches!(edge, TurnEdge::Started(..)), "{edge:?}");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn the_input_a_turn_started_on_is_used_up_by_it() {
+    let registry = turn_registry();
+    registry
+        .turn_events()
+        .flap_window_handle()
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert_eq!(ended_turns(&mut edges).len(), 1);
+
+    // Output nobody asked for is not another turn.
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert!(ended_turns(&mut edges).is_empty());
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn output_without_input_continues_a_turn_inside_its_window() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    // The agent works on inside the settle window: the same turn, which then
+    // ends once more, with no second one.
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert_eq!(started_turns_and_ends(&mut edges), (1, 2));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn output_without_input_continues_a_turn_that_waited_for_approval() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Blocked))
+        .await;
+    // A keypress without a line end approves; the turn goes on and ends.
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert_eq!(started_turns_and_ends(&mut edges), (1, 1));
+    let _ = registry.stop(&created.id).await;
+}
+
+fn started_turns_and_ends(
+    edges: &mut tokio::sync::mpsc::UnboundedReceiver<TurnEdge>,
+) -> (usize, usize) {
+    let all: Vec<TurnEdge> = std::iter::from_fn(|| edges.try_recv().ok()).collect();
+    let started = all
+        .iter()
+        .filter(|edge| matches!(edge, TurnEdge::Started(..)))
+        .count();
+    (started, all.len() - started)
+}
+
+#[tokio::test]
+async fn the_input_a_running_turn_held_does_not_outlive_its_runtime() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    assert_eq!(started_turns(&mut edges).len(), 1);
+
+    // The runtime is re-adopted while the turn runs: its departure must not
+    // hand the old runtime's input to the new one's banner.
+    reinstall_entry(&registry, &created.id, None).await;
+    work_then_idle(&registry, &created.id).await;
+    assert_eq!(started_turns_and_ends(&mut edges), (0, 0));
+    let _ = registry.stop(&created.id).await;
+}
+
+/// The input evidence is armed when the send starts and nothing takes it back
+/// when the write then fails: the bytes may have reached the PTY, and the
+/// agent's answer is still a turn.
+#[tokio::test]
+async fn input_whose_write_failed_after_it_started_is_still_evidence() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+
+    // The send-start callback of the worker write is `note_input`; a failed
+    // exchange afterwards has no path back to the evidence.
+    registry.note_input(&created.id);
+    work_then_idle(&registry, &created.id).await;
+    assert_eq!(started_turns_and_ends(&mut edges), (1, 1));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn wait_turn_progress_follows_the_last_transition_into_working() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    let progress = || {
+        registry
+            .turn_events()
+            .existing_progress(&created.id)
+            .expect("progress")
+            .turn_started_nanos()
+    };
+
+    // An edge that opens no turn is still the last transition into `working`.
+    registry.turn_events().pin_wall_clock(10_000);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    assert_eq!(started_turns(&mut edges).len(), 0);
+    assert_eq!(progress(), Some(10_000));
+
+    // A turn that opens on a restatement is ordered after that edge without
+    // moving it: nothing transitioned.
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    registry.note_input(&created.id);
+    registry.turn_events().pin_wall_clock(20_000);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    assert_eq!(started_turns(&mut edges).len(), 1);
+    assert_eq!(progress(), Some(20_000));
+    let mut sessions = registry.inner.sessions.lock().await;
+    sessions
+        .get_mut(&created.id)
+        .expect("the session")
+        .agent_left(&registry.inner.turns);
+    drop(sessions);
+    registry.turn_events().pin_wall_clock(30_000);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    assert_eq!(started_turns(&mut edges).len(), 1);
+    assert_eq!(progress(), Some(20_000), "a restatement is no transition");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn turn_starts_never_decrease_when_the_wall_clock_steps_back_after_a_takeover() {
+    let registry = turn_registry();
+    registry
+        .turn_events()
+        .flap_window_handle()
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+
+    registry.turn_events().pin_wall_clock(100);
+    hook_report(&registry, &created.id, 1, Some(AgentActivity::Working)).await;
+    // The agent changes while working: the restated report opens the next
+    // turn at a later wall time, which the transition clock does not record.
+    registry.turn_events().pin_wall_clock(200);
+    let mut sessions = registry.inner.sessions.lock().await;
+    sessions
+        .get_mut(&created.id)
+        .expect("the session")
+        .agent_left(&registry.inner.turns);
+    drop(sessions);
+    hook_report(&registry, &created.id, 2, Some(AgentActivity::Working)).await;
+    hook_report(&registry, &created.id, 3, Some(AgentActivity::Idle)).await;
+    let takeover = ended_turns(&mut edges);
+    assert_eq!(takeover.len(), 1);
+
+    registry.turn_events().pin_wall_clock(150);
+    hook_report(&registry, &created.id, 4, Some(AgentActivity::Working)).await;
+    hook_report(&registry, &created.id, 5, Some(AgentActivity::Idle)).await;
+    let later = ended_turns(&mut edges);
+    assert_eq!(later.len(), 1);
+    let owner = registry.turn_owner(&created.id).await;
+    let start = |id| match registry.turn_events().settle(&created.id, id, owner) {
+        TurnVerdict::Surface(snapshot) => snapshot.started_nanos.expect("observed start"),
+        other => panic!("the turn ended: {other:?}"),
+    };
+    assert!(start(later[0]) > start(takeover[0]));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_resumed_runtime_banner_is_not_a_turn_until_input_reaches_it() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert_eq!(ended_turns(&mut edges).len(), 1);
+
+    // The session resumes on a new runtime: the old input says nothing about
+    // its banner, even though the session ran a turn before.
+    registry.note_input(&created.id);
+    reinstall_entry(&registry, &created.id, None).await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert!(
+        started_turns(&mut edges).is_empty() && ended_turns(&mut edges).is_empty(),
+        "the banner of the new runtime opened a turn"
+    );
+
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert_eq!(ended_turns(&mut edges).len(), 1);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn an_idle_session_adopted_after_a_restart_runs_the_turn_of_its_first_command() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+
+    // The daemon restarted: the session is adopted idle, with nothing
+    // observed about it yet.
+    reinstall_entry(&registry, &created.id, Some(AgentActivity::Idle)).await;
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert_eq!(ended_turns(&mut edges).len(), 1);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_replaced_agent_restating_working_opens_its_own_turn() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("the session");
+    entry.agent_left(&registry.inner.turns);
+    drop(sessions);
+    // The replacement starts working too: the restated activity still opens
+    // the turn its end is reported from.
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert_eq!(ended_turns(&mut edges).len(), 1, "the replacement's turn");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn another_process_of_the_same_agent_does_not_inherit_the_turn_of_the_one_it_replaced() {
+    let (registry, inspector, created) = mock_procwatch_registry("turn-process-replaced").await;
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    inspector.set_descendants(created.pid, vec![codex_fact(300, created.pid)]);
+    inspector.set_cwd(300, temp_dir("turn-process-first"));
+    inspector.set_foreground_group(created.pid, Some(300));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+
+    // The same process observed again keeps the turn it runs.
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert_eq!(ended_turns(&mut edges).len(), 1, "the same process's turn");
+
+    // Another process of the same agent is another owner: it neither finishes
+    // nor resumes what the first one ran.
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    inspector.set_descendants(created.pid, vec![codex_fact(301, created.pid)]);
+    inspector.set_cwd(301, temp_dir("turn-process-second"));
+    inspector.set_foreground_group(created.pid, Some(301));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert!(ended_turns(&mut edges).is_empty(), "the replaced turn");
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A shell session whose client submitted `codex exec ...`: the output after
+/// Enter opens the turn, and the agent is observed only afterwards. The
+/// agent's own work, which keeps the session working, must end in a turn
+/// without any further input.
+#[tokio::test]
+async fn an_agent_observed_after_the_opening_working_still_has_its_turn_reported() {
+    let (registry, inspector, created) = mock_procwatch_registry("turn-agent-after-open").await;
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    registry
+        .turn_events()
+        .flap_window_handle()
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    registry.turn_events().pin_wall_clock(10_000);
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    assert_eq!(started_turns(&mut edges).len(), 1);
+    registry.turn_events().pin_wall_clock(20_000);
+
+    inspector.set_descendants(created.pid, vec![codex_fact(300, created.pid)]);
+    inspector.set_cwd(300, temp_dir("turn-agent-after-open"));
+    inspector.set_foreground_group(created.pid, Some(300));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    let ended = ended_turns(&mut edges);
+    assert_eq!(
+        ended.len(),
+        1,
+        "the turn the user asked for was lost when the agent appeared"
+    );
+    // The turn that took over the input reports the start of the line the
+    // user submitted.
+    let owner = registry.turn_owner(&created.id).await;
+    let TurnVerdict::Surface(snapshot) =
+        registry.turn_events().settle(&created.id, ended[0], owner)
+    else {
+        panic!("the turn ended");
+    };
+    assert_eq!(snapshot.started_nanos, Some(10_000));
+    let _ = registry.stop(&created.id).await;
+}
+
+/// Reports `activity` of the hook agent `codex` to the session.
+async fn hook_report(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    seq: u64,
+    activity: Option<AgentActivity>,
+) {
+    let reported = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: id.clone(),
+            source: "pohunek:codex".to_owned(),
+            agent: "codex".to_owned(),
+            activity,
+            seq: Some(ReportSequence::new(seq)),
+            pid: None,
+            agent_session_id: None,
+            agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
+            retryable_admission: false,
+        })
+        .await;
+    assert!(reported.recorded);
+}
+
+/// Releases the hook agent `codex` of the session.
+async fn hook_release(registry: &SessionRegistry, id: &SessionId, seq: u64) {
+    let released = registry
+        .release_agent(SessionReleaseAgentParams {
+            session_id: id.clone(),
+            source: "pohunek:codex".to_owned(),
+            agent: "codex".to_owned(),
+            seq: Some(ReportSequence::new(seq)),
+            pid: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
+            retryable_admission: false,
+        })
+        .await;
+    assert!(released.released);
+}
+
+/// Makes the observed agent of `registry`'s session the process `pid`
+/// (or none), and scans.
+async fn observe_codex(
+    registry: &SessionRegistry,
+    inspector: &MockInspector,
+    created: &SessionInfo,
+    pid: Option<u32>,
+) {
+    match pid {
+        Some(pid) => {
+            inspector.set_descendants(created.pid, vec![codex_fact(pid, created.pid)]);
+            inspector.set_cwd(pid, temp_dir("turn-observed-agent"));
+            inspector.set_foreground_group(created.pid, Some(pid));
+        }
+        None => inspector.set_descendants(created.pid, Vec::new()),
+    }
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+}
+
+async fn work_then_idle(registry: &SessionRegistry, id: &SessionId) {
+    registry
+        .record_activity(id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(id, transition(AgentActivity::Idle))
+        .await;
+}
+
+#[tokio::test]
+async fn a_codex_that_exits_before_idle_still_has_its_turn_reported() {
+    let (registry, inspector, created) = mock_procwatch_registry("turn-agent-exits").await;
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    observe_codex(&registry, &inspector, &created, Some(300)).await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    // codex exits while the session still works: the shell prompt that
+    // follows is the end of the line the user submitted.
+    observe_codex(&registry, &inspector, &created, None).await;
+    work_then_idle(&registry, &created.id).await;
+    assert_eq!(ended_turns(&mut edges).len(), 1);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_hook_claim_replacing_an_observed_one_leaves_the_input_to_the_next_turn() {
+    let (registry, inspector, created) = mock_procwatch_registry("turn-claim-replaced").await;
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    observe_codex(&registry, &inspector, &created, Some(300)).await;
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    hook_report(&registry, &created.id, 1, None).await;
+    work_then_idle(&registry, &created.id).await;
+    assert_eq!(ended_turns(&mut edges).len(), 1);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_released_claim_leaves_the_input_to_the_turn_of_the_next_owner() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    hook_report(&registry, &created.id, 1, None).await;
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    hook_release(&registry, &created.id, 1).await;
+    work_then_idle(&registry, &created.id).await;
+    assert_eq!(ended_turns(&mut edges).len(), 1);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_replacement_process_after_a_resumed_turn_runs_a_new_turn_not_the_old_one() {
+    let (registry, inspector, created) = mock_procwatch_registry("turn-process-swap").await;
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    observe_codex(&registry, &inspector, &created, Some(300)).await;
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    let first = started_turns(&mut edges);
+    assert_eq!(first.len(), 1);
+    ended_turns(&mut edges);
+
+    observe_codex(&registry, &inspector, &created, Some(301)).await;
+    work_then_idle(&registry, &created.id).await;
+    let ended = ended_turns(&mut edges);
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert!(ended[0] > first[0], "the old turn was reported again");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_turn_that_ends_blocked_leaves_the_input_to_the_next_working() {
+    let registry = turn_registry();
+    registry
+        .turn_events()
+        .flap_window_handle()
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Blocked))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert!(ended_turns(&mut edges).is_empty(), "the blocked turn ended");
+
+    work_then_idle(&registry, &created.id).await;
+    assert_eq!(ended_turns(&mut edges).len(), 1, "the later turn");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_reported_activity_is_no_input_for_a_later_detector_turn() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    hook_report(&registry, &created.id, 1, Some(AgentActivity::Working)).await;
+    hook_report(&registry, &created.id, 2, Some(AgentActivity::Idle)).await;
+    hook_release(&registry, &created.id, 2).await;
+    started_turns_and_ends(&mut edges);
+
+    work_then_idle(&registry, &created.id).await;
+    assert_eq!(started_turns_and_ends(&mut edges), (0, 0));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_reported_turn_takes_the_input_it_answers() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    registry.note_input(&created.id);
+    hook_report(&registry, &created.id, 1, Some(AgentActivity::Working)).await;
+    hook_report(&registry, &created.id, 2, Some(AgentActivity::Idle)).await;
+    hook_release(&registry, &created.id, 2).await;
+    assert_eq!(started_turns_and_ends(&mut edges), (1, 1));
+
+    // The input was used up by the reported turn: the prompt that follows the
+    // agent's exit is not another one.
+    work_then_idle(&registry, &created.id).await;
+    assert_eq!(started_turns_and_ends(&mut edges), (0, 0));
+    let _ = registry.stop(&created.id).await;
+}
+
+/// The `agent_state` events the registry broadcast since `events` was taken.
+fn agent_states(events: &mut tokio::sync::broadcast::Receiver<protocol::Event>) -> usize {
+    std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|event| event.event() == protocol::event::AGENT_STATE)
+        .count()
+}
+
+#[tokio::test]
+async fn a_restated_working_emits_no_agent_state() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    let mut events = registry.subscribe();
+
+    // Without input the activity edge is an event, its restatements are not
+    // and open no turn.
+    for _ in 0..4 {
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Working))
+            .await;
+    }
+    assert_eq!(agent_states(&mut events), 1);
+    assert_eq!(started_turns_and_ends(&mut edges), (0, 0));
+
+    // A turn that gave its input back opens on a restatement, silently.
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    assert_eq!(started_turns(&mut edges).len(), 1);
+    agent_states(&mut events);
+    let mut sessions = registry.inner.sessions.lock().await;
+    sessions
+        .get_mut(&created.id)
+        .expect("the session")
+        .agent_left(&registry.inner.turns);
+    drop(sessions);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    assert_eq!(started_turns(&mut edges).len(), 1);
+    assert_eq!(agent_states(&mut events), 0);
+    let _ = registry.stop(&created.id).await;
+}
+
+/// The turns that opened since the last call.
+fn started_turns(edges: &mut tokio::sync::mpsc::UnboundedReceiver<TurnEdge>) -> Vec<TurnId> {
+    std::iter::from_fn(|| edges.try_recv().ok())
+        .filter_map(|edge| match edge {
+            TurnEdge::Started(_, id) => Some(id),
+            TurnEdge::Ended(..) => None,
+        })
+        .collect()
+}
+
+fn turn_registry() -> SessionRegistry {
+    SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    })
+}
+
+/// Installs a rebuilt entry of `id` the way a re-adoption does: counters from
+/// zero, a fresh incarnation, `activity` as persisted.
+async fn reinstall_entry(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    activity: Option<AgentActivity>,
+) {
+    let mut rebuilt = registry.inner.sessions.lock().await[id].clone();
+    rebuilt.entry_incarnation = super::next_entry_incarnation();
+    rebuilt.agent_incarnation = 0;
+    rebuilt.activity_revision = 0;
+    rebuilt.info.activity = activity;
+    registry.install_session_entry(id, rebuilt).await;
+}
+
+#[tokio::test]
+async fn a_re_adopted_working_session_runs_its_own_unobserved_turn() {
+    let registry = turn_registry();
+    registry
+        .turn_events()
+        .flap_window_handle()
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    let old = started_turns(&mut edges)[0];
+
+    // Re-adoption after the runtime was unavailable: the rebuilt entry shows
+    // the persisted `working`, and nothing of the old entry carries over.
+    reinstall_entry(&registry, &created.id, Some(AgentActivity::Working)).await;
+    let adopted = started_turns(&mut edges);
+    assert_eq!(adopted.len(), 1, "{adopted:?}");
+    assert!(adopted[0] > old, "ids keep counting up");
+    let owner = registry.turn_owner(&created.id).await;
+    assert_eq!(
+        registry.turn_events().settle(&created.id, old, owner),
+        TurnVerdict::Drop,
+        "the old entry's turn departed"
+    );
+
+    // Installing the same entry again opens nothing: its turn is running.
+    let current = registry.inner.sessions.lock().await[&created.id].clone();
+    registry.install_session_entry(&created.id, current).await;
+    assert!(started_turns(&mut edges).is_empty());
+
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert_eq!(ended_turns(&mut edges), adopted);
+    let TurnVerdict::Surface(snapshot) =
+        registry
+            .turn_events()
+            .settle(&created.id, adopted[0], owner)
+    else {
+        panic!("the adopted turn ended");
+    };
+    assert_eq!((snapshot.started_nanos, snapshot.length), (None, None));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_turn_that_finished_before_the_session_stopped_is_still_reported() {
+    let registry = turn_registry();
+    registry
+        .turn_events()
+        .flap_window_handle()
+        .store(3_000, std::sync::atomic::Ordering::Relaxed);
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    let ended = ended_turns(&mut edges);
+    assert_eq!(ended.len(), 1, "{ended:?}");
+
+    // The window passes without a flush, then the session stops: the report
+    // that was waiting for the flush still finds a finished turn.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(4)).await;
+    tokio::time::resume();
+    let _ = registry.stop(&created.id).await;
+    assert!(
+        matches!(
+            registry.turn_events().settle(&created.id, ended[0], None),
+            TurnVerdict::Surface(_)
+        ),
+        "a turn that went idle a full window before the stop was lost"
+    );
+}
+
+/// A turn window no stop of a test session can outlast.
+const WINDOW_NO_RUN_REACHES_MS: u64 = 3_600_000;
+
+#[tokio::test]
+async fn a_turn_still_inside_its_window_is_dropped_when_the_session_stops() {
+    let registry = turn_registry();
+    registry.turn_events().flap_window_handle().store(
+        WINDOW_NO_RUN_REACHES_MS,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    let ended = ended_turns(&mut edges);
+    let _ = registry.stop(&created.id).await;
+    assert_eq!(
+        registry.turn_events().settle(&created.id, ended[0], None),
+        TurnVerdict::Drop
+    );
+}
+
+#[tokio::test]
+async fn input_to_a_removed_session_arms_nothing() {
+    let registry = turn_registry();
+    let created = registry.create(params()).await.expect("create session");
+    let _ = registry.stop(&created.id).await;
+    registry.remove(&created.id).await.expect("remove session");
+    registry.note_input(&created.id);
+    assert!(
+        registry
+            .turn_events()
+            .existing_progress(&created.id)
+            .is_none(),
+        "the removed session's progress came back"
+    );
+}
+
+#[tokio::test]
+async fn working_seen_from_another_source_keeps_the_running_turn() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(
+            &created.id,
+            ActivityTransition {
+                activity: AgentActivity::Working,
+                source: protocol::StateSource::Screen,
+            },
+        )
+        .await;
+    registry
+        .record_activity(
+            &created.id,
+            ActivityTransition {
+                activity: AgentActivity::Idle,
+                source: protocol::StateSource::Screen,
+            },
+        )
+        .await;
+    let edges: Vec<TurnEdge> = std::iter::from_fn(|| edges.try_recv().ok()).collect();
+    assert!(
+        matches!(
+            edges.as_slice(),
+            [TurnEdge::Started(..), TurnEdge::Ended(..)]
+        ),
+        "one turn opened and ended once: {edges:?}"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_rebuilt_idle_entry_does_not_complete_the_turn_of_the_one_it_replaced() {
+    let registry = turn_registry();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    started_turns(&mut edges);
+
+    reinstall_entry(&registry, &created.id, Some(AgentActivity::Idle)).await;
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert_eq!(
+        ended_turns(&mut edges).len(),
+        1,
+        "only the rebuilt entry's own turn"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_runtime_lost_without_proof_abandons_the_turn_it_can_no_longer_observe() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(temp_store_path("turn-runtime-lost")),
+        ..SessionRegistryConfig::default()
+    });
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, expected) = live_worker_and_identity(&registry, &created.id).await;
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    let turn = started_turns(&mut edges)[0];
+
+    let mut outcome = super::RuntimeTransitionOutcome::RetryableConcurrentChange;
+    for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
+        outcome = registry
+            .mark_worker_unavailable(
+                &created.id,
+                &expected,
+                crate::session::Unavailability::lost(crate::session::LossProof::Unproven, None),
+                crate::session::supervision::RUNTIME_LOST,
+            )
+            .await;
+        if !matches!(
+            outcome,
+            super::RuntimeTransitionOutcome::RetryableConcurrentChange
+        ) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        matches!(outcome, super::RuntimeTransitionOutcome::Applied(_)),
+        "{outcome:?}"
+    );
+    let owner = registry.turn_owner(&created.id).await;
+    assert_eq!(
+        registry.turn_events().settle(&created.id, turn, owner),
+        TurnVerdict::Drop
+    );
+    stop_test_worker(worker).await;
+}
+
+#[tokio::test]
+async fn a_turn_never_starts_before_the_one_that_ran_when_the_wall_clock_steps_back() {
+    let registry = turn_registry();
+    registry
+        .turn_events()
+        .flap_window_handle()
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let created = registry.create(params()).await.expect("create session");
+    let progress = || {
+        registry
+            .turn_events()
+            .existing_progress(&created.id)
+            .expect("progress")
+    };
+
+    registry.turn_events().pin_wall_clock(10_000);
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    let first = progress().turn_started_nanos();
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    registry.turn_events().pin_wall_clock(5_000);
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    assert_eq!(first, Some(10_000));
+    assert_eq!(progress().turn_started_nanos(), Some(10_001));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_restarted_daemon_counts_turns_from_one_and_knows_no_earlier_turn() {
+    let registry = turn_registry();
+    registry
+        .turn_events()
+        .flap_window_handle()
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    for _ in 0..2 {
+        registry.note_input(&created.id);
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Working))
+            .await;
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Idle))
+            .await;
+    }
+    let before = ended_turns(&mut edges);
+    assert_eq!(before.len(), 2);
+
+    let restarted = turn_registry();
+    let mut restarted_edges = restarted
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let other = restarted.create(params()).await.expect("create session");
+    restarted.note_input(&other.id);
+    restarted
+        .record_activity(&other.id, transition(AgentActivity::Idle))
+        .await;
+    restarted
+        .record_activity(&other.id, transition(AgentActivity::Working))
+        .await;
+    restarted
+        .record_activity(&other.id, transition(AgentActivity::Idle))
+        .await;
+    assert_eq!(ended_turns(&mut restarted_edges), vec![TurnId::numbered(1)]);
+    let owner = restarted.turn_owner(&other.id).await;
+    assert_eq!(
+        restarted.turn_events().settle(&other.id, before[1], owner),
+        TurnVerdict::Drop,
+        "a pending report of the earlier instance names a turn this one never ran"
+    );
+    let _ = registry.stop(&created.id).await;
+    let _ = restarted.stop(&other.id).await;
 }
 
 #[tokio::test]
@@ -5765,6 +6949,54 @@ async fn session_input_wait_rejects_blocked_session_before_delivery() {
 }
 
 #[tokio::test]
+async fn rejected_input_is_no_evidence_for_a_turn() {
+    let agents_dir = temp_agents_dir_with(
+        "input-rejected-no-turn",
+        "input-wait-codex",
+        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        agents_dir: Some(agents_dir),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let mut create = params();
+    create.agent = "input-wait-codex".to_owned();
+    let created = registry.create(create).await.expect("create agent session");
+
+    let error = registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "refused".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: Some(Vec::new()),
+                timeout_ms: Some(500),
+            }),
+        })
+        .await
+        .expect_err("delayed provider wait must fail before delivery");
+    assert_eq!(error.code, "session_input_wait_unsupported");
+
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert_eq!(
+        started_turns_and_ends(&mut edges),
+        (0, 0),
+        "input that was never delivered armed a turn"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
 async fn session_input_wait_rejects_delayed_provider_framing_before_delivery() {
     let agents_dir = temp_agents_dir_with(
         "input-wait-delayed-provider",
@@ -7527,6 +8759,148 @@ async fn a_forwarded_claim_label_becomes_the_active_agent_only_when_it_resolves_
     let _ = registry.stop(&created.id).await;
 }
 
+/// A session with a forwarded `codex` claim and a turn the detector opened
+/// under it; the profile `tuned` is a second agent over the same provider.
+async fn forwarded_turn_session() -> (
+    SessionRegistry,
+    SessionInfo,
+    pohunek_worker_protocol::InspectSnapshot,
+    pohunek_worker_protocol::ProcessIdentity,
+    tokio::sync::mpsc::UnboundedReceiver<TurnEdge>,
+) {
+    let agents_dir = temp_agents_dir_with(
+        "forwarded-turn",
+        "tuned",
+        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+    );
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            agents_dir: Some(agents_dir),
+            stop_grace: Duration::from_millis(50),
+            procwatch_poll: Duration::from_mins(1),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    let edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect worker");
+    let root = snapshot.child_process.expect("worker child");
+    forward_claim(&registry, &created.id, &mut snapshot, root, (1, None)).await;
+    registry.note_input(&created.id);
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    (registry, created, snapshot, root, edges)
+}
+
+/// Applies the forwarded claim `(sequence, label)` of `root` to the session.
+async fn forward_claim(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    snapshot: &mut pohunek_worker_protocol::InspectSnapshot,
+    root: pohunek_worker_protocol::ProcessIdentity,
+    (sequence, label): (u64, Option<&str>),
+) {
+    snapshot.active_identity = Some(pohunek_worker_protocol::ActiveIdentityClaim {
+        provider: "codex".to_owned(),
+        process: root,
+        sequence,
+        expires_at: native_report_expiry(),
+        reference_kind: None,
+        native_reference: None,
+        agent: label.map(str::to_owned),
+        origin: Some(pohunek_worker_protocol::ClaimOrigin::Forwarded),
+        reported_session: None,
+    });
+    assert_eq!(
+        registry.apply_worker_metadata_snapshot(id, snapshot).await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+}
+
+#[tokio::test]
+async fn a_forwarded_claim_of_another_agent_does_not_complete_the_turn_it_replaced() {
+    let (registry, created, mut snapshot, root, mut edges) =
+        Box::pin(forwarded_turn_session()).await;
+    assert_eq!(started_turns(&mut edges).len(), 1);
+
+    forward_claim(
+        &registry,
+        &created.id,
+        &mut snapshot,
+        root,
+        (2, Some("tuned")),
+    )
+    .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert!(
+        ended_turns(&mut edges).is_empty(),
+        "the replacement's idle completed the turn of the claim it replaced"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_forwarded_claim_of_another_agent_runs_its_own_turn() {
+    let (registry, created, mut snapshot, root, mut edges) =
+        Box::pin(forwarded_turn_session()).await;
+    let first = started_turns(&mut edges);
+
+    forward_claim(
+        &registry,
+        &created.id,
+        &mut snapshot,
+        root,
+        (2, Some("tuned")),
+    )
+    .await;
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Working))
+        .await;
+    let second = started_turns(&mut edges);
+    assert_eq!(second.len(), 1, "the replacement continued the old turn");
+    assert!(second[0] > first[0]);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_forwarded_release_does_not_leave_its_turn_to_the_next_idle() {
+    let (registry, created, mut snapshot, root, mut edges) =
+        Box::pin(forwarded_turn_session()).await;
+    assert_eq!(started_turns(&mut edges).len(), 1);
+
+    snapshot.active_identity = None;
+    snapshot.active_identity_release = Some(pohunek_worker_protocol::ReleasedIdentityClaim {
+        provider: "codex".to_owned(),
+        process: root,
+        sequence: 2,
+    });
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    registry
+        .record_activity(&created.id, transition(AgentActivity::Idle))
+        .await;
+    assert!(
+        ended_turns(&mut edges).is_empty(),
+        "the idle after the release completed the turn of the released claim"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
 /// A release carries the provider of the claim it ends, so it clears a claim
 /// whose provider was relabelled to a profile.
 #[tokio::test]
@@ -9173,6 +10547,7 @@ fn initial_input_is_a_prompt_argument_only_for_bare_codex_and_claude() {
 
         assert_eq!(plan.command.args, expected_args, "{agent}");
         assert_eq!(plan.pending_initial_input.as_deref(), pending, "{agent}");
+        assert_eq!(plan.prompt_in_argv, pending.is_none(), "{agent}");
     }
 }
 
@@ -14216,14 +15591,14 @@ async fn reconnect_classifies_a_worker_socket_that_accepts_and_never_answers() {
     let started = Instant::now();
     let reconnected = tokio::time::timeout(
         UNANSWERED_RECONNECT_BOUND,
-        registry.reconnect_worker(
+        Box::pin(registry.reconnect_worker(
             &created.id,
             &expected,
             &socket,
             &tokio_util::sync::CancellationToken::new(),
             &WorkerError::Protocol("test disconnect".to_owned()),
             UNANSWERED_CONNECT_DEADLINE,
-        ),
+        )),
     )
     .await
     .expect("the reconnect loop classifies an unanswered worker instead of hanging");
@@ -21176,6 +22551,60 @@ fn assert_assigned_binding_persisted(store: &crate::store::Store, id: &SessionId
         Some(vec!["--session-id".to_owned(), reference.to_owned()]),
         "the assignment is frozen into the binding"
     );
+}
+
+/// A hook-less runtime takes its first prompt as a launch argument: the
+/// daemon never writes it, yet the output that answers it is a turn, while
+/// the banner of a launch without a prompt is not.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_prompt_in_the_launch_arguments_makes_the_first_answer_a_turn() {
+    let dir = temp_dir("argv-prompt-turn");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let registry = assigned_registry(
+        &script,
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+        &temp_store_path("argv-prompt-turn"),
+        None,
+    );
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let launch = |input: Option<&str>| SessionNewParams {
+        agent: "pi".to_owned(),
+        cwd: Some(dir.clone()),
+        input: input.map(str::to_owned),
+        ..params()
+    };
+
+    let bare = registry.create(launch(None)).await.expect("create bare");
+    registry
+        .record_activity(&bare.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&bare.id, transition(AgentActivity::Idle))
+        .await;
+    assert!(
+        started_turns(&mut edges).is_empty(),
+        "the banner of a launch without a prompt opened a turn"
+    );
+
+    let prompted = registry
+        .create(launch(Some("hello")))
+        .await
+        .expect("create prompted");
+    wait_for_file_contains(&marker, "hello\n").await;
+    registry
+        .record_activity(&prompted.id, transition(AgentActivity::Working))
+        .await;
+    registry
+        .record_activity(&prompted.id, transition(AgentActivity::Idle))
+        .await;
+    assert_eq!(ended_turns(&mut edges).len(), 1);
+    let _ = registry.stop(&bare.id).await;
+    let _ = registry.stop(&prompted.id).await;
 }
 
 #[cfg(unix)]

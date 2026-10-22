@@ -2087,7 +2087,8 @@ Each progress entry carries `state`, `activity` (omitted when unknown),
 `last_output_at` (the last terminal output this daemon observed, omitted when
 none), `output_advanced` (output arrived after the cursor was issued, or after
 the call started without a cursor), and `turn_started_at` (the last transition
-into `working` this daemon observed, omitted when none). A timeout with
+into `working` this daemon observed, omitted when none; after a resumed turn it
+can be later than the `turn_started_at` of the turn's notification). A timeout with
 `output_advanced: true` and `activity: "working"` reads as "still working, wait
 again"; a long-quiet `last_output_at` reads as "stuck or waiting on an empty
 prompt, investigate".
@@ -2122,7 +2123,8 @@ Event sources:
   provider with a hook schema (Claude, Codex, Hermes) whose report the
   session's runtime admits, for a session this daemon holds (the worker relays
   its hook socket reports the same way); and the daemon projector's
-  `agent_blocked` for a detected blocked activity. A create from any other
+  `agent_blocked` for a detected blocked activity and its `turn_completed` for
+  a session whose activity goes from `working` to `idle`. A create from any other
   producer, or naming a session the daemon does not hold, is handled by the
   inbox only and records no turn event. Trusted signals are recorded whether or
   not the notification policy keeps an inbox record. With the default policy,
@@ -2134,10 +2136,33 @@ Event sources:
   signal for the same session and kind, so it arrives no earlier than that
   window after the agent stops, and later when signals repeat. An
   `agent_blocked` or `approval_required` is dropped when the session resumes
-  work or ends inside the window. A `turn_completed` is dropped when the
-  session is `working` when its window ends: that is the stale stop of an
-  earlier turn, and the running turn reports its own stop. A turn that starts
+  work or ends inside the window. A `turn_completed` report that names no turn
+  is dropped when the session is `working` when its window ends: that is the
+  stale stop of an earlier turn, and the running turn reports its own stop. A
+  report of a turn the daemon runs is held until that turn is over. A turn that starts
   and stops within the window (a short turn) is recorded once, after its stop.
+- A turn ends, for the projector, when activity goes `working` to `idle`; a
+  turn that ends `blocked`, an idle that no `working` preceded (start-up, an
+  empty prompt) and a session whose runtime was replaced mid-turn report no
+  `turn_completed`. A `working` the daemon infers from terminal output opens a
+  turn only while the session's current runtime holds input evidence:
+  `session.input`, a line submitted by an attached client, or an initial
+  prompt (including one in the launch arguments) arms it, and an agent report
+  does not. The turn that opens takes the evidence; if that turn is abandoned
+  (its agent or process changed, it ended `blocked`) the evidence goes back
+  and the next turn takes it, with the abandoned turn's start. The start-up
+  banner, or the repaint of a resumed or re-adopted session, is no turn: a
+  resume, replacement or re-adoption starts without any evidence. A report
+  of `working` opens its turn with or without evidence. Output without
+  evidence still continues a turn that is settling or waiting for approval. The report is held for the debounce window, so an idle that
+  lasts less than `attention_debounce_secs` before the session works again
+  reports nothing. A hook `Stop` and the projector's idle edge of one turn are
+  one inbox record; a hook report that arrives after its turn was reported, within
+  twice `attention_debounce_secs` (at least 2 seconds) of the record reaching the
+  inbox, adds no second record, though a waiting `session.wait_turn` may see one more turn
+  event. A daemon restart during a turn, or during the window, can lose that
+  turn's report. A runtime without managed hooks (a shell, Hermes without its
+  plugin) now completes `until: ["turn_completed"]` waits too.
 - `exited` is recorded when a session the daemon holds moves from a running
   state into a terminal lifecycle state, at the moment the terminal state
   becomes visible; a wait that sees every target terminal therefore already
@@ -2810,6 +2835,25 @@ Important fields:
   notifications use `turn:<session_id>`.
 - `read_at`, `acked_at`, `archived_at`, `deleted_at`: lifecycle timestamps set
   by status transitions.
+- `turn_started_at`, `turn_duration_ms`, `session_metadata`: optional, on a
+  `turn_completed` that the daemon stamps: the projector's, and a provider hook
+  report that attaches to a turn the session's current agent runs.
+  `turn_started_at` is the daemon's clock reading of the turn's first transition
+  into `working`; a turn that waited in `blocked` and resumed, or went `idle`
+  and worked again within the settle window, is still one turn.
+  `turn_duration_ms` runs from it to the moment the session left `working`, on
+  the monotonic clock; `session_metadata` is a verbatim copy of the session's
+  owner-set metadata at that moment, kept after the session is removed. The
+  daemon gives every turn an identity of its own and decides which turn a
+  report ends: the projector's report names its turn, and a provider hook
+  report (which carries no identity) attaches to the newest turn of the
+  current agent that can still end. Such a report is held, and evaluated again
+  every window, until its turn is over for good, so one turn is one record.
+  A turn whose agent or runtime leaves while it works, that ends `blocked`, or
+  whose session ends is never reported; a turn that had already gone idle when
+  its agent or runtime left is reported as it ended. A hook report that
+  attaches to no turn (a turn the daemon did not observe) carries none of these fields. A producer cannot send
+  these fields: `notification.create` ignores them.
 - `superseded_by`: optional replacement link. Older unread `turn_completed`
   records are acknowledged with `superseded_by` pointing at the newer turn or
   attention record that made them stale.
@@ -2890,7 +2934,10 @@ compatibility shim.
 
 Default policy enables `agent_blocked`, `approval_required`, and `error`.
 `turn_completed`, `session_finished`, and `system` are implemented but disabled
-by default. The default policy has no per-provider entries, so every provider,
+by default. The daemon emits one `turn_completed` per finished turn of every
+session, so enabling it (`notifications policy set`) is meant for managers and
+dashboards, not for interactive inboxes; with the kind disabled, the turn is
+still recorded for `session.wait_turn`. The default policy has no per-provider entries, so every provider,
 whatever runtime it names, uses `enabled` until an override is set for it. A
 policy file the daemon already persisted is loaded as written, including any
 per-provider entries it holds; those overrides keep shadowing `enabled` for
@@ -2949,7 +2996,12 @@ committed.
 
 `turn:<session_id>` has different semantics: it is not time-window deduped. A
 new unread `turn_completed` for the same session acknowledges any older unread
-turn immediately and sets the older record's `superseded_by` to the newer id.
+turn immediately and sets the older record's `superseded_by` to the newer id;
+each turn keeps its own record, and the record of a finished turn is
+acknowledged when the next turn starts. Reports of one turn are merged while
+pending and add nothing once the turn was reported; reports of different turns
+are never merged. A provider report that names no turn right after the
+session's turn reached the inbox, within that repeat window, does not add a second inbox record.
 The older record remains in history but disappears from default unread inbox
 views. When an attention record for the same session becomes visible, it
 acknowledges any unread `turn:<session_id>` twin with `superseded_by` pointing at
@@ -2971,7 +3023,10 @@ held pending rather than persisted immediately when they carry
 notification id and returns `notification.create` result `created: true` with
 the full record, but the record is not written to the store and does not appear
 in `notification.list` until it flushes. No `notification_created` event is
-emitted for a pending record.
+emitted for a pending record. A `turn_completed` record is stamped with
+`turn_started_at`, `turn_duration_ms` and `session_metadata` when it flushes, so
+the record in the `notification.create` result does not carry them; the one in
+`notification.list` and the events does.
 
 The daemon holds the pending record for `attention_debounce_secs`. If the
 session enters `working` or reaches a terminal lifecycle state within that

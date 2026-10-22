@@ -1272,6 +1272,9 @@ mod tests {
             archived_at: None,
             deleted_at: None,
             superseded_by: None,
+            turn_started_at: None,
+            turn_duration_ms: None,
+            session_metadata: BTreeMap::new(),
         }
     }
 

@@ -102,6 +102,19 @@ pub(super) async fn handle_notification_create(
         Ok(admitted) => admitted,
         Err(response) => return response,
     };
+    // The daemon alone says which turn a report ends, so a producer's turn
+    // report is attached here, never by its sender: to the turn the session's
+    // current agent can still end, or to none, which leaves it without a
+    // stamp.
+    let turn = match (hook_claim, params.session_id.as_ref(), params.kind) {
+        (true, Some(session_id), protocol::NotificationKind::TurnCompleted) => {
+            sessions.attach_turn_report(session_id).await
+        }
+        _ => None,
+    };
+    // A report that attaches to no turn is still a turn signal for a held
+    // session, as it is for the daemon's own blind spots (a turn the detector
+    // did not see); `session.wait_turn` is at-least-once for such turns.
     let turn_signal = match (hook_claim, params.session_id.as_ref()) {
         (true, Some(session_id)) => sessions.holds(session_id).await,
         _ => false,
@@ -123,6 +136,9 @@ pub(super) async fn handle_notification_create(
                 .prepare_deferred(params)
                 .map_err(|err| err.to_protocol_error())?;
             deferred.signal = turn_signal;
+            if let Some(turn) = turn {
+                deferred = deferred.for_turn(turn);
+            }
             let refusal = deferred.policy_refusal();
             let record = deferred.record.clone();
             if deferred.inbox || deferred.signal {

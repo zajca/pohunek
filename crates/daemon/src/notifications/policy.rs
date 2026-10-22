@@ -245,6 +245,9 @@ mod tests {
                 .then(|| "2026-01-02T00:00:00Z".to_owned()),
             deleted_at: None,
             superseded_by: None,
+            turn_started_at: None,
+            turn_duration_ms: None,
+            session_metadata: BTreeMap::new(),
         }
     }
 

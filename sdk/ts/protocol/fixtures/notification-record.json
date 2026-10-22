@@ -14,6 +14,9 @@
   "project_id": "p-fixture",
   "read_at": "2026-07-08T00:02:00Z",
   "session_id": "s-fixture-1",
+  "session_metadata": {
+    "work.issue": "955"
+  },
   "severity": "action_required",
   "source": {
     "host_local_source_id": "hook-fixture-1",
@@ -23,5 +26,7 @@
   "source_id": "provider-fixture-1",
   "status": "unread",
   "superseded_by": "n-fixture-2",
-  "title": "Approval required"
+  "title": "Approval required",
+  "turn_duration_ms": 1500,
+  "turn_started_at": "2026-10-20T10:00:00Z"
 }

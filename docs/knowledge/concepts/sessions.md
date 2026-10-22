@@ -59,9 +59,17 @@ daemon holds and from the daemon's own projector, and are independent of the
 notification policy: a `turn_completed` the inbox drops (the default) still
 completes the wait. An event is recorded when the attention debounce window
 (5 seconds by default) has passed since the last report, so it arrives no
-earlier than that after the agent stops. A `turn_completed` whose window ends
-while the session is `working` is a stale stop and is dropped; a short turn
-that starts and stops inside one window is still recorded once.
+earlier than that after the agent stops. A `turn_completed` report that names no turn
+is a stale stop and is dropped when the session is `working` as its window
+ends; the report of a turn the daemon runs is held until that turn is over. A
+short turn that starts and stops inside one window is still recorded once.
+
+The daemon opens a turn on a `working` it infers from terminal output only
+while the session's runtime holds input evidence (`session.input`, a line an
+attached client submitted, an initial prompt); agent reports never arm it. The
+turn that opens takes the evidence and gives it back when it is abandoned, so
+the next turn answers the same input. The start-up banner, or the repaint of a
+resumed or re-adopted session, is therefore no turn.
 
 The CLI turn mode takes up to 32 targets that must all be on one host (targets
 on different hosts are a usage error before any request; run one wait per
@@ -294,8 +302,9 @@ seconds by default) instead of being persisted immediately; `notification.create
 still reports `created: true` with a minted id, but the record does not appear
 in `notification.list` and no `notification_created` event fires while it is
 pending. If the session enters `working` or reaches a terminal lifecycle state
-inside that window, the pending record is dropped entirely and nothing is ever
-created — the same self-resolve edge described above, applied before the record
+inside that window, a pending record that is not tied to a turn the daemon runs
+is dropped entirely and nothing is ever created (the reports of a running turn
+follow that turn instead, see below) — the same self-resolve edge described above, applied before the record
 surfaces rather than after. Only a genuinely outstanding session signal, still unresolved once
 the window elapses, is committed and broadcast. This is distinct from
 `attention_dedupe_window_secs`, which merges duplicate attention reports across
@@ -305,8 +314,22 @@ window elapses the daemon also records the session turn event that
 the kind, when the report came from the projector or from an admitted provider
 hook for a session the daemon holds; a create whose kind the policy disables
 still answers `notification_kind_disabled`. The turn event does not use the
-inbox's stale-stop suppression after resumed work: a `turn_completed` is
-dropped instead when the session is `working` as its window ends.
+inbox's stale-stop suppression after resumed work: a `turn_completed` that
+names no turn is dropped instead when the session is `working` as its window
+ends.
+
+The projector emits a `turn_completed` for every session whose activity goes
+`working` to `idle`, so runtimes without managed hooks report turns too. It
+reports nothing for a turn that ends `blocked`, for an idle that no `working`
+preceded, or when the session works again inside the debounce window. The
+daemon stamps the record with `turn_started_at`, `turn_duration_ms` and a copy
+of the session metadata (`session_metadata`) that stays readable after
+`session rm`; a hook report of the same turn is merged with the projector's, and
+one that arrives after its turn was reported, within twice the debounce window
+(at least 2 seconds) of the record reaching the inbox, adds no second inbox record
+(a waiting `session.wait_turn` may still see one more turn event). The kind stays
+disabled for the inbox by default; enable it with `notifications policy set` for
+a manager that follows many sessions.
 
 Unread `turn_completed` rows are bounded per session. A newer
 `turn:<session_id>` record acknowledges any older unread turn for that key with

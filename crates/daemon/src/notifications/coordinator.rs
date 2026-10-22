@@ -45,7 +45,7 @@ use tracing::{debug, warn};
 use super::{
     is_turn_dedupe_key, source_priority, DeferredNotification, NotificationService, SourcePriority,
 };
-use crate::session::{SessionRegistry, TurnEvents};
+use crate::session::{SessionRegistry, TurnEvents, TurnId, TurnVerdict};
 use protocol::AgentActivity;
 
 /// Maximum time to wait for the coordinator task to stop on shutdown.
@@ -165,6 +165,11 @@ impl AttentionCoordinatorTask {
     }
 }
 
+/// What a pending entry is for: the dedupe key of its session notification and,
+/// for a `turn_completed` of a turn the daemon runs, that turn. Reports of
+/// different turns are different entries and never merge.
+type PendingKey = (String, Option<TurnId>);
+
 /// A session notification held until its debounce deadline.
 #[derive(Debug)]
 struct Pending {
@@ -172,6 +177,9 @@ struct Pending {
     inbox: Option<NotificationRecord>,
     /// Best trusted record, recorded as a turn event on flush.
     signal: Option<NotificationRecord>,
+    /// How soon after its turn reached the inbox a report that names no turn
+    /// repeats it, as of the report's arrival.
+    repeat_window: Duration,
     /// Monotonic generation stamped when this entry was last (re)armed.
     ///
     /// A [`DelayQueue`] expiry only flushes when its token carries the current
@@ -180,10 +188,18 @@ struct Pending {
     generation: u64,
 }
 
+/// Shortest wait before a held report is evaluated again, so a zero settle
+/// window cannot turn the wait for the end of a turn into a busy loop.
+const HELD_REPORT_RECHECK_FLOOR: Duration = Duration::from_secs(1);
+
+/// Least time within which a provider report that names no turn repeats the
+/// turn the inbox just received, whatever the debounce window.
+const REPEAT_REPORT_FLOOR: Duration = Duration::from_secs(2);
+
 /// Value stored in the [`DelayQueue`] identifying which pending entry a timer arms.
 #[derive(Debug)]
 struct FlushToken {
-    dedupe_key: String,
+    key: PendingKey,
     generation: u64,
 }
 
@@ -197,8 +213,9 @@ async fn run(
     mut commands: mpsc::UnboundedReceiver<Command>,
 ) {
     let turns = sessions.turn_events();
+    notifications.bind_attention_window(turns.flap_window_handle());
     let mut queue: DelayQueue<FlushToken> = DelayQueue::new();
-    let mut pending: HashMap<String, Pending> = HashMap::new();
+    let mut pending: HashMap<PendingKey, Pending> = HashMap::new();
     let mut recently_resolved_turns: HashMap<String, Instant> = HashMap::new();
     // Global monotonic generation: never reused, so a token from a resolved and
     // re-deferred key can never be mistaken for a current entry.
@@ -216,23 +233,27 @@ async fn run(
                         &mut queue,
                         &mut generation,
                         &mut recently_resolved_turns,
-                        &notifications,
+                        (&notifications, &turns),
                         *deferred,
                     );
                 }
                 Some(Command::Resolve(dedupe_key)) => {
                     resolve(
                         &mut pending,
+                        &mut queue,
                         &mut recently_resolved_turns,
                         &notifications,
+                        (&sessions, &turns),
                         &dedupe_key,
-                    );
+                    )
+                    .await;
                 }
                 Some(Command::Shutdown) | None => break,
             },
             Some(expired) = queue.next(), if !queue.is_empty() => {
                 flush(
                     &mut pending,
+                    &mut queue,
                     &notifications,
                     (&sessions, &turns),
                     &expired.into_inner(),
@@ -245,17 +266,18 @@ async fn run(
 
 /// Hold `deferred` pending, applying cross-producer priority and (re)arming the timer.
 fn defer(
-    pending: &mut HashMap<String, Pending>,
+    pending: &mut HashMap<PendingKey, Pending>,
     queue: &mut DelayQueue<FlushToken>,
     generation: &mut u64,
     recently_resolved_turns: &mut HashMap<String, Instant>,
-    notifications: &NotificationService,
+    (notifications, turns): (&NotificationService, &TurnEvents),
     deferred: DeferredNotification,
 ) {
     let DeferredNotification {
         record,
         mut inbox,
         signal,
+        turn,
     } = deferred;
     let Some(dedupe_key) = record.dedupe_key.clone() else {
         // Debounced creates always carry a dedupe key; without one the record
@@ -269,16 +291,26 @@ fn defer(
     };
     let debounce = Duration::from_secs(u64::from(notifications.policy().attention_debounce_secs));
     prune_recently_resolved_turns(recently_resolved_turns, debounce);
-    if inbox
+    let repeat_window = (debounce * 2).max(REPEAT_REPORT_FLOOR);
+    let repeats_reported_turn = turn.is_none()
+        && record.kind == protocol::NotificationKind::TurnCompleted
+        && record
+            .session_id
+            .as_ref()
+            .is_some_and(|session_id| turns.recently_reported(session_id, repeat_window));
+    if turn.is_none()
+        && inbox
         && record.kind == protocol::NotificationKind::TurnCompleted
         && is_turn_dedupe_key(&dedupe_key)
-        && recently_resolved_turns
-            .remove(&dedupe_key)
-            .is_some_and(|resolved_at| resolved_at.elapsed() <= debounce)
+        && source_priority(&record.source) != SourcePriority::Projector
+        && (repeats_reported_turn
+            || recently_resolved_turns
+                .remove(&dedupe_key)
+                .is_some_and(|resolved_at| resolved_at.elapsed() <= debounce))
     {
-        // A turn report right after the session resumed is the stale stop of
-        // the previous turn for the inbox. The turn signal is judged at flush
-        // time by the session's activity instead.
+        // A provider turn report that names no turn, right after the session
+        // resumed or right after its turn reached the inbox, repeats a turn
+        // the inbox already holds; it stays a turn signal.
         inbox = false;
     }
     if !inbox && !signal {
@@ -290,8 +322,9 @@ fn defer(
     // dedupe remains the final authority at flush time. The inbox candidate
     // only ever considers records the policy keeps, and a create that adds no
     // inbox record re-arms the timer only while no inbox candidate is pending.
-    let existing = pending.remove(&dedupe_key);
-    let (existing_inbox, existing_signal, existing_generation) = match existing {
+    // Reports of one turn merge; reports of other turns are other entries.
+    let key = (dedupe_key, turn);
+    let (existing_inbox, existing_signal, existing_generation) = match pending.remove(&key) {
         Some(entry) => (entry.inbox, entry.signal, Some(entry.generation)),
         None => (None, None, None),
     };
@@ -313,7 +346,7 @@ fn defer(
         let current = *generation;
         queue.insert(
             FlushToken {
-                dedupe_key: dedupe_key.clone(),
+                key: key.clone(),
                 generation: current,
             },
             debounce,
@@ -321,10 +354,11 @@ fn defer(
         current
     });
     pending.insert(
-        dedupe_key,
+        key,
         Pending {
             inbox: inbox_record,
             signal: signal_record,
+            repeat_window,
             generation,
         },
     );
@@ -341,20 +375,55 @@ fn prefer(
     }
 }
 
-/// Cancel any pending entry for `dedupe_key` and acknowledge visible records.
-fn resolve(
-    pending: &mut HashMap<String, Pending>,
+/// Cancel the pending entries that name no turn for `dedupe_key` and
+/// acknowledge visible records.
+///
+/// An entry for a turn the daemon runs is not cancelled: the state of its turn
+/// decides whether it surfaces.
+async fn resolve(
+    pending: &mut HashMap<PendingKey, Pending>,
+    queue: &mut DelayQueue<FlushToken>,
     recently_resolved_turns: &mut HashMap<String, Instant>,
     notifications: &NotificationService,
+    (sessions, turns): (&SessionRegistry, &TurnEvents),
     dedupe_key: &str,
 ) {
+    // A turn that closed because its successor opened surfaces before the
+    // resolve, which then acknowledges it like any visible record of the session.
+    let closed: Vec<FlushToken> = pending
+        .iter()
+        .filter(|((key, turn), _)| key == dedupe_key && turn.is_some())
+        .map(|(key, entry)| FlushToken {
+            key: key.clone(),
+            generation: entry.generation,
+        })
+        .collect();
+    for token in closed {
+        let Some(turn) = token.key.1 else { continue };
+        let Some(session_id) = pending
+            .get(&token.key)
+            .and_then(|entry| entry.signal.as_ref().or(entry.inbox.as_ref()))
+            .and_then(|record| record.session_id.clone())
+        else {
+            continue;
+        };
+        let owner = sessions.turn_owner(&session_id).await;
+        if matches!(
+            turns.settle(&session_id, turn, owner),
+            TurnVerdict::Surface(_)
+        ) {
+            flush(pending, queue, notifications, (sessions, turns), &token).await;
+        }
+    }
     // A pending entry that is cancelled never becomes visible. Its DelayQueue
     // timer may still fire, but the generation guard in `flush` makes that a
     // no-op, so the token is left to expire on its own rather than tracked.
     // The stale-turn suppression belongs to the inbox: a cancelled entry that
     // held only a turn signal counts as no pending inbox record, so the
     // resolve still arms the suppression for the next turn report.
-    let removed_inbox = pending.remove(dedupe_key).and_then(|entry| entry.inbox);
+    let removed_inbox = pending
+        .remove(&(dedupe_key.to_owned(), None))
+        .and_then(|entry| entry.inbox);
     if removed_inbox.is_none() && is_turn_dedupe_key(dedupe_key) {
         let debounce =
             Duration::from_secs(u64::from(notifications.policy().attention_debounce_secs));
@@ -384,23 +453,95 @@ fn prune_recently_resolved_turns(
 /// The inbox record is committed first, so a waiter woken by the turn event
 /// already finds the inbox record its event names.
 async fn flush(
-    pending: &mut HashMap<String, Pending>,
+    pending: &mut HashMap<PendingKey, Pending>,
+    queue: &mut DelayQueue<FlushToken>,
     notifications: &NotificationService,
     (sessions, turns): (&SessionRegistry, &TurnEvents),
     token: &FlushToken,
 ) {
     let is_current = pending
-        .get(&token.dedupe_key)
+        .get(&token.key)
         .is_some_and(|entry| entry.generation == token.generation);
     if !is_current {
         // Superseded by a later defer or already resolved; the record must not
         // surface from this stale timer.
         return;
     }
-    if let Some(entry) = pending.remove(&token.dedupe_key) {
-        let committed = entry.inbox.and_then(|record| commit(notifications, record));
+    let Some(entry) = pending.get(&token.key) else {
+        return;
+    };
+    let Some(turn) = token.key.1 else {
+        let Some(entry) = pending.remove(&token.key) else {
+            return;
+        };
+        // A report that names no turn can outlive the flush of the stamped
+        // record of its turn (its agent left within the settle window): it
+        // then repeats that record, which it must not supersede.
+        let repeat_window = entry.repeat_window;
+        let repeats_reported_turn = entry.inbox.as_ref().is_some_and(|record| {
+            record.kind == protocol::NotificationKind::TurnCompleted
+                && source_priority(&record.source) != SourcePriority::Projector
+                && record
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|session_id| turns.recently_reported(session_id, repeat_window))
+        });
+        let inbox = entry.inbox.filter(|_| !repeats_reported_turn);
+        let committed = inbox.and_then(|record| commit(notifications, record));
         if let Some(signal) = entry.signal {
-            record_turn((sessions, turns), &signal, committed.as_ref()).await;
+            record_turn((sessions, turns), &signal, committed.as_ref(), false).await;
+        }
+        return;
+    };
+
+    // A report of a turn the daemon runs surfaces once the turn is over for
+    // good, whatever the report's own age.
+    let session_id = entry
+        .signal
+        .as_ref()
+        .or(entry.inbox.as_ref())
+        .and_then(|record| record.session_id.clone());
+    let Some(session_id) = session_id else {
+        pending.remove(&token.key);
+        return;
+    };
+    let owner = sessions.turn_owner(&session_id).await;
+    match turns.settle(&session_id, turn, owner) {
+        TurnVerdict::Drop => {
+            pending.remove(&token.key);
+        }
+        TurnVerdict::Hold(after) => {
+            turns.note_held_recheck();
+            let wait = after.unwrap_or_else(|| {
+                Duration::from_secs(u64::from(notifications.policy().attention_debounce_secs))
+                    .max(HELD_REPORT_RECHECK_FLOOR)
+            });
+            queue.insert(
+                FlushToken {
+                    key: token.key.clone(),
+                    generation: token.generation,
+                },
+                wait,
+            );
+        }
+        TurnVerdict::Surface(snapshot) => {
+            let Some(entry) = pending.remove(&token.key) else {
+                return;
+            };
+            let committed = match entry.inbox {
+                Some(mut record) if !snapshot.inbox_reported => {
+                    DeferredNotification::stamp(&mut record, &snapshot);
+                    commit(notifications, record)
+                }
+                _ => None,
+            };
+            let signaled = match entry.signal {
+                Some(signal) if !snapshot.signal_reported => {
+                    record_turn((sessions, turns), &signal, committed.as_ref(), true).await
+                }
+                _ => false,
+            };
+            turns.mark_reported(&session_id, turn, committed.is_some(), signaled);
         }
     }
 }
@@ -423,33 +564,36 @@ fn commit(
 
 /// Record the turn event a flushed session signal stands for.
 ///
-/// A `turn_completed` signal is dropped while the session is working: it is
-/// the stale stop of an earlier turn, and the running turn reports its own
-/// stop. The event names the committed inbox record only when that record is
-/// of the same kind; a signal the policy dropped while another kind surfaced
-/// names no record.
+/// A `turn_completed` signal that names no turn is dropped while the session is
+/// working: it is the stale stop of an earlier turn, and the running turn
+/// reports its own stop. The event names the committed inbox record only when
+/// that record is of the same kind; a signal the policy dropped while another
+/// kind surfaced names no record. Returns whether a turn event was recorded.
 async fn record_turn(
     (sessions, turns): (&SessionRegistry, &TurnEvents),
     signal: &NotificationRecord,
     committed: Option<&NotificationRecord>,
-) {
+    names_turn: bool,
+) -> bool {
     let (Some(session_id), Some(kind)) = (signal.session_id.as_ref(), turn_kind(signal.kind))
     else {
-        return;
+        return false;
     };
     if kind == SessionTurnEventKind::TurnCompleted
+        && !names_turn
         && sessions.current_activity(session_id).await == Some(AgentActivity::Working)
     {
         debug!(
             session_id = %session_id.0,
             "stale turn_completed signal dropped while the session works"
         );
-        return;
+        return false;
     }
     let notification_id: Option<NotificationId> = committed
         .filter(|record| record.kind == signal.kind)
         .map(|record| record.id.clone());
     turns.record(session_id, kind, notification_id);
+    true
 }
 
 /// The turn event kind a debounced notification kind stands for.

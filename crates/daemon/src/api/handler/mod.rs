@@ -24,6 +24,8 @@ mod package;
 mod project;
 mod session;
 #[cfg(test)]
+mod turn_completed_projection_tests;
+#[cfg(test)]
 mod turn_wait_tests;
 mod util;
 mod worktree;

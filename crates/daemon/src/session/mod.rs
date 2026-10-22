@@ -126,7 +126,9 @@ use resume::ResumeSnapshot;
 pub(crate) use target::ActiveSupervision;
 use target::{build_launch_command, LaunchCommandPlan, PtySessionSpec, TargetResolution};
 pub use tmpdir::store_session_tmp_root;
-pub(crate) use turn_events::TurnEvents;
+pub(crate) use turn_events::{
+    rfc3339_from_nanos, TurnEdge, TurnEvents, TurnId, TurnOwner, TurnSnapshot, TurnVerdict,
+};
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 /// Time to retain a failed raw attach outcome for one control-plane lookup.
@@ -867,6 +869,11 @@ struct SessionEntry {
     info: SessionInfo,
     /// Monotonic in-memory cursor advanced for every emitted activity report.
     activity_revision: u64,
+    /// Distinguishes this entry from every other the registry built for the
+    /// session, so a turn run under a replaced entry is known to have left.
+    entry_incarnation: u64,
+    /// Bumped whenever the agent the entry presents leaves or changes.
+    agent_incarnation: u64,
     /// Bounded runtime-scoped activity history for input-wait evidence.
     activity_evidence: VecDeque<ActivityEvidence>,
     /// Serializes complete input framing transactions for this logical session.
@@ -949,7 +956,29 @@ struct SessionEntry {
     initial_input_owner: Option<String>,
 }
 
+/// Source of [`SessionEntry::entry_incarnation`]; never repeats in a process.
+static NEXT_ENTRY_INCARNATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_entry_incarnation() -> u64 {
+    NEXT_ENTRY_INCARNATION.fetch_add(1, Ordering::Relaxed)
+}
+
 impl SessionEntry {
+    /// Who runs the session's turns now.
+    fn turn_owner(&self) -> TurnOwner {
+        TurnOwner {
+            entry: self.entry_incarnation,
+            agent: self.agent_incarnation,
+        }
+    }
+
+    /// Notes that the agent the entry presents left or changed, so the turn it
+    /// ran departs.
+    fn agent_left(&mut self, turns: &TurnEvents) {
+        self.agent_incarnation += 1;
+        turns.depart(&self.info.id, self.turn_owner());
+    }
+
     /// Stops the detector, process watcher, and worker exit watcher of this
     /// entry's runtime.
     ///
@@ -1141,6 +1170,19 @@ struct ActiveAgentReport {
     observed: bool,
     /// Where the claim came from and what orders it.
     origin: ClaimOrigin,
+}
+
+impl ActiveAgentReport {
+    /// Whether `self` comes from another agent than `held`: another source or
+    /// runtime, or another process of the same one. A pid or start identity
+    /// the held report did not know yet is a binding, not a replacement.
+    fn replaces(&self, held: &ActiveAgentReport) -> bool {
+        let differs = |a: Option<u64>, b: Option<u64>| a.zip(b).is_some_and(|(a, b)| a != b);
+        held.source != self.source
+            || held.agent != self.agent
+            || differs(held.pid.map(u64::from), self.pid.map(u64::from))
+            || differs(held.start_identity, self.start_identity)
+    }
 }
 
 type NativeIdentityReport = crate::store::NativeIdentityOrdering;
@@ -1434,6 +1476,7 @@ fn clear_agent_presentation(info: &mut SessionInfo) {
 
 /// Clears the agent presentation of `info` and the entry-side agent state.
 fn clear_entry_agent(entry: &mut SessionEntry) {
+    entry.agent_incarnation += 1;
     clear_agent_presentation(&mut entry.info);
     entry.active_agent = None;
     entry.last_agent_report = None;
@@ -3466,6 +3509,7 @@ impl SessionRegistry {
             metadata: params.metadata.clone(),
             warnings,
             initial_input_pending: plan.pending_initial_input.is_some(),
+            prompt_in_argv: plan.prompt_in_argv,
             package_authority: None,
         };
         Ok((spec, plan.pending_initial_input))
@@ -4034,9 +4078,14 @@ impl SessionRegistry {
         activity: AgentActivity,
         activity_epoch: &str,
     ) -> Option<ActivityEvidence> {
-        self.inner
-            .turns
-            .note_activity(session_id, entry.info.activity, activity);
+        self.inner.turns.note_activity(
+            session_id,
+            entry.turn_owner(),
+            entry.info.activity,
+            activity,
+            &entry.info.metadata,
+            false,
+        );
         entry.info.activity = Some(activity);
         entry.info.state_source = StateSource::Report;
         record_activity_evidence(entry, activity, StateSource::Report, activity_epoch)
@@ -4309,6 +4358,13 @@ impl SessionRegistry {
             if let Some(operation) = unacknowledged.take() {
                 claim::attach_unacknowledged(entry, operation);
             }
+            if entry
+                .active_agent
+                .as_ref()
+                .is_none_or(|active| report.replaces(active))
+            {
+                entry.agent_left(&self.inner.turns);
+            }
             entry.active_agent = Some(report.clone());
             entry.last_agent_report = Some(report);
             entry.info.active_agent = Some(resolved.name.clone());
@@ -4489,7 +4545,8 @@ impl SessionRegistry {
             );
             return None;
         }
-        let released = Self::end_memory_claim(entry, params, agent, report_sequence);
+        let released =
+            Self::end_memory_claim(entry, params, agent, report_sequence, &self.inner.turns);
         if let Some(operation) = unacknowledged {
             claim::attach_unacknowledged(entry, operation);
         }
@@ -4503,6 +4560,7 @@ impl SessionRegistry {
         params: &SessionReleaseAgentParams,
         agent: &str,
         report_sequence: Option<u64>,
+        turns: &TurnEvents,
     ) -> Option<SessionInfo> {
         let active = entry.active_agent.as_ref()?;
         if claim::is_journaled(entry) {
@@ -4542,7 +4600,7 @@ impl SessionRegistry {
                 shadow,
             },
         };
-        Some(clear_active_agent(entry, tombstone))
+        Some(clear_active_agent(entry, tombstone, turns))
     }
 
     /// List all known sessions, with each session's `project_label` enriched from
@@ -4627,6 +4685,29 @@ impl SessionRegistry {
     /// Whether the registry holds a managed session `id`.
     pub(crate) async fn holds(&self, id: &SessionId) -> bool {
         self.inner.sessions.lock().await.contains_key(id)
+    }
+
+    /// Records that input reached the runtime of session `id`.
+    pub(crate) fn note_input(&self, id: &SessionId) {
+        self.inner.turns.note_input(id);
+    }
+
+    /// Who runs the session's turns now, or `None` when the session is gone.
+    pub(crate) async fn turn_owner(&self, id: &SessionId) -> Option<TurnOwner> {
+        self.inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .map(SessionEntry::turn_owner)
+    }
+
+    /// The turn a provider report with no identity belongs to, when the
+    /// session runs one.
+    pub(crate) async fn attach_turn_report(&self, id: &SessionId) -> Option<TurnId> {
+        let sessions = self.inner.sessions.lock().await;
+        let owner = sessions.get(id)?.turn_owner();
+        self.inner.turns.attach_report(id, owner)
     }
 
     /// The current activity of managed session `id`, when it has one.
@@ -5704,16 +5785,15 @@ impl SessionRegistry {
                         }
                     }
                     Err(error) => {
-                        let Some(reconnected) = registry
-                            .reconnect_worker(
-                                &id,
-                                &expected,
-                                &socket_path,
-                                &cancel,
-                                &error,
-                                registry.inner.config.worker_connect_deadline,
-                            )
-                            .await
+                        let Some(reconnected) = Box::pin(registry.reconnect_worker(
+                            &id,
+                            &expected,
+                            &socket_path,
+                            &cancel,
+                            &error,
+                            registry.inner.config.worker_connect_deadline,
+                        ))
+                        .await
                         else {
                             return;
                         };
@@ -5899,6 +5979,7 @@ impl SessionRegistry {
         reason: &str,
     ) -> RuntimeTransitionOutcome {
         let state = classification.state();
+        let activity_is_lost = classification.proof().is_some();
         let (base, candidate) = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(id) else {
@@ -5925,6 +6006,7 @@ impl SessionRegistry {
             candidate.info.updated_at = timestamp_now();
             (base, candidate)
         };
+        let lost_owner = candidate.turn_owner();
         let durable_base = match self.load_durable_session_record(id).await {
             Ok(Some(record)) => record,
             Ok(None) => base.clone(),
@@ -5935,9 +6017,15 @@ impl SessionRegistry {
         } else {
             RuntimeMetadataPolicy::Live
         };
-        let outcome = self
-            .commit_runtime_transition(id, expected, &base, &durable_base, candidate, policy)
-            .await;
+        let outcome = Box::pin(self.commit_runtime_transition(
+            id,
+            expected,
+            &base,
+            &durable_base,
+            candidate,
+            policy,
+        ))
+        .await;
         if let RuntimeTransitionOutcome::RetryablePersistenceFailure(store_error) = &outcome {
             warn!(
                 session_id = %id.0,
@@ -5946,6 +6034,11 @@ impl SessionRegistry {
             );
         }
         if let RuntimeTransitionOutcome::Applied(info) = &outcome {
+            if activity_is_lost {
+                // The session shows no activity now, so a running turn can no
+                // longer be seen to end.
+                self.inner.turns.abandon_running(id, lost_owner);
+            }
             reconcile::warn_unavailable(&id.0, Some(&expected.worker_id), state, reason, "");
             let event_name = match state {
                 RuntimeState::Lost | RuntimeState::Incompatible => event::SESSION_RUNTIME_LOST,
@@ -6188,6 +6281,11 @@ impl SessionRegistry {
             let mut sessions = self.inner.sessions.lock().await;
             self.set_unpersisted(&id.0, None);
             self.inner.turns.observe_state(id, entry.info.state);
+            self.inner.turns.new_generation(id);
+            self.inner.turns.depart(id, entry.turn_owner());
+            if entry.info.activity == Some(AgentActivity::Working) {
+                self.inner.turns.adopt(id, entry.turn_owner());
+            }
             sessions.insert(id.clone(), entry)
         };
         if let Some(replaced) = replaced {
@@ -7799,7 +7897,12 @@ fn bind_report_process(
     }
 }
 
-fn clear_active_agent(entry: &mut SessionEntry, tombstone: ActiveAgentReport) -> SessionInfo {
+fn clear_active_agent(
+    entry: &mut SessionEntry,
+    tombstone: ActiveAgentReport,
+    turns: &TurnEvents,
+) -> SessionInfo {
+    entry.agent_left(turns);
     let activity_reported = entry
         .active_agent
         .as_ref()
