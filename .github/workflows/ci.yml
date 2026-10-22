@@ -1938,6 +1938,7 @@ jobs:
       - name: Provision locked Hermes runtime
         id: hermes
         shell: bash
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           cache_dir="${{ runner.temp }}/hermes-compat-cache"
@@ -2950,9 +2951,14 @@ jobs:
 
       # Staged and verified as in the Linux job. /bin (bash 3.2) comes first
       # on the PATH the provisioner inherits through `compat stage-upstream`.
+      # A cache hit takes about 1.5 minutes (copy, cargo index update, xtask
+      # build, verification) and a miss adds the provisioner's bounded
+      # downloads; the step timeout turns a hang in either path into a failure
+      # within minutes instead of the job timeout.
       - name: Provision locked Hermes runtime
         id: hermes
         shell: /bin/bash {0}
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           cache_dir="${{ runner.temp }}/hermes-compat-cache"

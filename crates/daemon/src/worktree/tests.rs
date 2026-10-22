@@ -2767,3 +2767,53 @@ fn a_fetch_with_a_pipe_holding_hook_uses_the_remote_tip_and_removes_its_ref() {
         .iter()
         .all(|warning| warning.kind != SessionWarningKind::Fetch));
 }
+
+/// Bound on the `git fetch` process in the scenario where the remote never
+/// answers.
+#[cfg(unix)]
+const SHORT_FETCH_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg(unix)]
+#[test]
+fn a_remote_branch_fetch_that_times_out_is_a_fetch_failure_and_skips_ls_remote() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let upstream = init_repo("remote-fetch-timeout-upstream");
+    let downstream = clone_of(&upstream, "remote-fetch-timeout-downstream");
+    // The remote's upload-pack records each start and then blocks on its input,
+    // which git keeps open until it kills the process group.
+    let tools = unique_dir("remote-fetch-timeout-tools");
+    let calls = tools.join("calls");
+    let script = tools.join("upload-pack");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\necho started >> '{}'\ncat\n", calls.display()),
+    )
+    .expect("write the upload-pack stand-in");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("make it executable");
+    git_in(
+        &downstream,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            &script.display().to_string(),
+        ],
+    );
+    super::FETCH_COMMAND_TIMEOUT_OVERRIDE
+        .with(|timeout| timeout.set(Some(SHORT_FETCH_COMMAND_TIMEOUT)));
+
+    let error = super::remote::plan_remote_branch(&downstream, "main", None)
+        .expect_err("the fetch times out");
+
+    assert_eq!(error.code, "branch_fetch_failed", "{error:?}");
+    assert!(error.msg.contains("timed out"), "{error:?}");
+    // `ls-remote` would start the upload-pack a second time.
+    assert_eq!(
+        fs::read_to_string(&calls)
+            .expect("the upload-pack ran")
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(leftover_fetch_refs(&downstream), "");
+}

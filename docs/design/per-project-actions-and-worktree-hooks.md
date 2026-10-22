@@ -506,9 +506,11 @@ failed; without its output nobody can tell *why*. Its stderr is therefore a pipe
 and the daemon keeps the last `hooks.stderr_tail_bytes` bytes (`service.toml`,
 default 4096, `0..=32768`, `0` disables the capture) while the hook runs:
 
-- **Only the `session.new` result carries it.** When the hook exits non-zero, times
+- **Only the `session.new` response carries it.** When the hook exits non-zero, times
   out, or cannot be waited for, the `hook` warning in the `session.new` result gets
-  `; stderr tail:` and the tail appended to its `detail`. The warning stored on the
+  `; stderr tail:` and the tail appended to its `detail`; for a required `post-create`
+  hook (#670) the tail instead ends the `msg` of the `hook_required_failed` error.
+  The warning stored on the
   session (`session show`, `session.list`, the metadata store) keeps the detail
   without the tail, and no log line or event carries it. A successful hook's stderr
   is discarded. Remove-side and session-level hooks keep `/dev/null`: their warnings

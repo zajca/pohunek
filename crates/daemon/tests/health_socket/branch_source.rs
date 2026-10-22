@@ -1025,3 +1025,279 @@ async fn a_branch_that_moves_under_an_unswapped_start_is_not_reported_as_planned
     rig.assert_nothing_left(true).await;
     rig.stop().await;
 }
+
+/// Leaves `BRANCH` mid-conflicting-rebase in a linked worktree and returns its
+/// pre-rebase tip.
+///
+/// `main` gets a commit that clashes with the one `BRANCH` carries, then
+/// `git rebase main` stops on the conflict. The returned guard keeps the
+/// worktree's directory alive.
+fn begin_conflicting_rebase(rig: &Rig) -> (String, TestDir) {
+    let clash = rig.repo.cwd().join("clash.txt");
+    std::fs::write(&clash, "main\n").expect("write the clash file");
+    rig.git(&["add", "."]);
+    rig.git(&["commit", "-q", "-m", "main clash"]);
+    rig.git(&["branch", BRANCH, "main~1"]);
+    let keep = temp_dir("bs-rebase-worktree");
+    let dir = keep.join("wt");
+    rig.git(&["worktree", "add", "-q", &dir.display().to_string(), BRANCH]);
+    std::fs::write(dir.join("clash.txt"), "feat\n").expect("write the clash file");
+    rig.git_in(&dir, &["add", "."]);
+    rig.git_in(&dir, &["commit", "-q", "-m", "feat clash"]);
+    let tip = rig.git_in(&dir, &["rev-parse", "HEAD"]);
+    let rebase = rig
+        .repo
+        .command("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["rebase", "main"])
+        .output()
+        .expect("run git rebase");
+    assert!(
+        !rebase.status.success(),
+        "the rebase must stop on a conflict"
+    );
+    (tip, keep)
+}
+
+/// A pre-create hook that records that it ran.
+fn install_marker_hook(rig: &Rig) -> PathBuf {
+    let marker = rig.origin.join("pre-create-ran");
+    install_pre_create_hook(rig, &format!("#!/bin/sh\n: > \"{}\"\n", marker.display()));
+    marker
+}
+
+#[tokio::test]
+async fn a_branch_mid_rebase_in_another_worktree_is_not_moved() {
+    {
+        let mut rig = Rig::start("bs-rebase-linked").await;
+        let (tip, _keep) = begin_conflicting_rebase(&rig);
+        rig.git(&[
+            "push",
+            "-q",
+            "origin",
+            &format!("{tip}:refs/heads/{BRANCH}"),
+        ]);
+        rig.origin_commit(BRANCH, "remote.txt");
+        let marker = install_marker_hook(&rig);
+
+        let error = err_payload(rig.remote_session(None).await);
+
+        assert_eq!(error.code, "worktree_branch_in_use", "{}", error.msg);
+        assert!(error.msg.contains("rebase"), "{}", error.msg);
+        assert_eq!(rig.rev("refs/heads/feat"), Some(tip), "the branch stays");
+        assert!(!marker.exists(), "refused before the pre-create hook");
+        rig.assert_no_fetch_refs();
+        assert!(rig.sessions().await.is_empty());
+        rig.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn a_diverged_branch_mid_rebase_is_neither_backed_up_nor_reset() {
+    let mut rig = Rig::start("bs-rebase-diverged").await;
+    let (tip, _keep) = begin_conflicting_rebase(&rig);
+    rig.git(&["fetch", "-q", "origin"]);
+    rig.origin_commit(BRANCH, "remote.txt");
+
+    let error = err_payload(rig.remote_session(Some(OnDiverged::BackupReset)).await);
+
+    assert_eq!(error.code, "worktree_branch_in_use", "{}", error.msg);
+    assert_eq!(rig.rev("refs/heads/feat"), Some(tip));
+    rig.assert_no_backup_refs();
+    rig.assert_no_fetch_refs();
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn a_branch_under_bisect_in_another_worktree_is_not_moved() {
+    let mut rig = Rig::start("bs-bisect").await;
+    let main = rig.main.clone();
+    rig.git(&["branch", BRANCH, &main]);
+    let keep = temp_dir("bs-bisect-worktree");
+    let dir = keep.join("wt");
+    rig.git(&["worktree", "add", "-q", &dir.display().to_string(), BRANCH]);
+    for index in 0..3 {
+        rig.git_in(
+            &dir,
+            &["commit", "-q", "--allow-empty", "-m", &format!("c{index}")],
+        );
+    }
+    let tip = rig.git_in(&dir, &["rev-parse", "HEAD"]);
+    rig.git_in(&dir, &["bisect", "start"]);
+    rig.git_in(&dir, &["bisect", "bad", "HEAD"]);
+    rig.git_in(&dir, &["bisect", "good", "HEAD~2"]);
+    rig.git(&[
+        "push",
+        "-q",
+        "origin",
+        &format!("{tip}:refs/heads/{BRANCH}"),
+    ]);
+    rig.origin_commit(BRANCH, "remote.txt");
+
+    let error = err_payload(rig.remote_session(None).await);
+
+    assert_eq!(error.code, "worktree_branch_in_use", "{}", error.msg);
+    assert!(error.msg.contains("bisect"), "{}", error.msg);
+    assert_eq!(rig.rev("refs/heads/feat"), Some(tip));
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn a_rebase_of_another_branch_does_not_block_the_request() {
+    let mut rig = Rig::start("bs-rebase-other").await;
+    let (_tip, _keep) = begin_conflicting_rebase(&rig);
+    // The rebase holds `feat`; the request names a branch it does not hold.
+    rig.git(&["branch", "other", "main~1"]);
+    let remote = rig.origin_commit("other", "remote.txt");
+    let mut params = rig.params(Some(BranchSource::Remote), None);
+    params.branch = Some("other".to_owned());
+
+    let (session, worktree_source) = started(rig.new_session(params).await);
+
+    assert_eq!(
+        worktree_source.map(|source| source.commit),
+        Some(remote.clone())
+    );
+    assert_eq!(worktree_head(&rig, &session), remote);
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn the_previous_branch_shorthand_is_an_invalid_branch() {
+    let mut rig = Rig::start("bs-previous").await;
+    rig.origin_commit(BRANCH, "remote.txt");
+    rig.git(&["checkout", "-q", "-b", "previous"]);
+    rig.git(&["checkout", "-q", "main"]);
+    assert_eq!(rig.git(&["rev-parse", "--abbrev-ref", "@{-1}"]), "previous");
+
+    let mut params = rig.params(Some(BranchSource::Remote), None);
+    params.branch = Some("@{-1}".to_owned());
+    let error = err_payload(rig.new_session(params).await);
+
+    assert_eq!(error.code, "invalid_branch", "{}", error.msg);
+    rig.assert_nothing_left(true).await;
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn an_in_use_branch_is_refused_before_the_pre_create_hook_runs() {
+    let mut rig = Rig::start("bs-in-use-early").await;
+    let main = rig.main.clone();
+    rig.origin_commit(BRANCH, "remote.txt");
+    rig.local_branch(BRANCH, &main);
+    rig.git(&["checkout", "-q", BRANCH]);
+    let marker = install_marker_hook(&rig);
+
+    let error = err_payload(rig.remote_session(None).await);
+
+    assert_eq!(error.code, "worktree_branch_in_use");
+    assert!(!marker.exists(), "no hook side effect for a doomed request");
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn a_branch_checked_out_after_the_plan_is_refused_under_the_lock() {
+    let mut rig = Rig::start("bs-in-use-late").await;
+    let main = rig.main.clone();
+    rig.origin_commit(BRANCH, "remote.txt");
+    rig.local_branch(BRANCH, &main);
+    let keep = temp_dir("bs-in-use-late-wt");
+    // The plan saw a free branch; the hook then checks it out elsewhere.
+    install_pre_create_hook(
+        &rig,
+        &format!(
+            "#!/bin/sh\ngit -C \"$POHUNEK_REPO\" worktree add -q \"{}\" {BRANCH}\n",
+            keep.join("wt").display()
+        ),
+    );
+
+    let error = err_payload(rig.remote_session(None).await);
+
+    assert_eq!(error.code, "worktree_branch_in_use", "{}", error.msg);
+    assert_eq!(rig.rev("refs/heads/feat"), Some(main), "the branch stays");
+    rig.assert_no_fetch_refs();
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn a_backup_that_appears_after_the_plan_with_another_head_is_reported_as_taken() {
+    let mut rig = Rig::start("bs-settle-a").await;
+    let main = rig.main.clone();
+    rig.origin_commit(BRANCH, "remote.txt");
+    rig.local_branch(BRANCH, &main);
+    let local = rig.local_commit(BRANCH, "local.txt");
+    let backup = Rig::backup_name(&local);
+    install_pre_create_hook(
+        &rig,
+        &format!("#!/bin/sh\ngit -C \"$POHUNEK_REPO\" update-ref refs/heads/{backup} {main}\n"),
+    );
+
+    let error = err_payload(rig.remote_session(Some(OnDiverged::BackupReset)).await);
+
+    assert_eq!(error.code, "backup_ref_exists", "{}", error.msg);
+    assert_eq!(rig.rev("refs/heads/feat"), Some(local));
+    assert_eq!(rig.rev(&format!("refs/heads/{backup}")), Some(main));
+    rig.assert_nothing_left(true).await;
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn a_branch_moved_to_the_remote_head_without_a_backup_names_the_old_head() {
+    let mut rig = Rig::start("bs-settle-b").await;
+    let main = rig.main.clone();
+    let remote = rig.origin_commit(BRANCH, "remote.txt");
+    rig.local_branch(BRANCH, &main);
+    let local = rig.local_commit(BRANCH, "local.txt");
+    install_pre_create_hook(
+        &rig,
+        &format!("#!/bin/sh\ngit -C \"$POHUNEK_REPO\" update-ref refs/heads/{BRANCH} {remote}\n"),
+    );
+
+    let error = err_payload(rig.remote_session(Some(OnDiverged::BackupReset)).await);
+
+    assert_eq!(error.code, "worktree_add_failed", "{}", error.msg);
+    assert!(
+        error.msg.contains("backup does not hold") && error.msg.contains(&local),
+        "{}",
+        error.msg
+    );
+    assert!(
+        !error.recover.as_deref().unwrap_or("").contains("delete"),
+        "{error:?}"
+    );
+    assert_eq!(rig.rev("refs/heads/feat"), Some(remote));
+    rig.assert_no_backup_refs();
+    rig.assert_nothing_left(true).await;
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn a_reset_that_fails_with_no_ref_changed_reports_the_update_error() {
+    let mut rig = Rig::start("bs-settle-c").await;
+    let main = rig.main.clone();
+    rig.origin_commit(BRANCH, "remote.txt");
+    rig.local_branch(BRANCH, &main);
+    let local = rig.local_commit(BRANCH, "local.txt");
+    // A stale lock file makes the whole transaction fail while the branch
+    // stays at its old head and no backup exists.
+    install_pre_create_hook(
+        &rig,
+        &format!(
+            "#!/bin/sh\n: > \"$(git -C \"$POHUNEK_REPO\" rev-parse --absolute-git-dir)/refs/heads/{BRANCH}.lock\"\n"
+        ),
+    );
+
+    let error = err_payload(rig.remote_session(Some(OnDiverged::BackupReset)).await);
+
+    assert_eq!(error.code, "worktree_add_failed", "{}", error.msg);
+    assert!(
+        error.msg.contains("could not update local branch"),
+        "{}",
+        error.msg
+    );
+    assert_eq!(rig.rev("refs/heads/feat"), Some(local));
+    rig.assert_no_backup_refs();
+    rig.assert_nothing_left(true).await;
+    rig.stop().await;
+}

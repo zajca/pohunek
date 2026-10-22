@@ -9,7 +9,9 @@
 
 // Rust guideline compliant 2026-06-26
 
-use std::path::Path;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use protocol::{
     ErrorClass, OnDiverged, ProtocolError, SessionWarning, SessionWarningKind, WorktreeSource,
@@ -140,10 +142,11 @@ pub(super) fn plan_remote_branch(
             ));
         }
     };
-    if matches!(action, Action::FastForward { .. } | Action::Reset { .. })
-        && checked_out_elsewhere(repository, branch).map_err(|message| inspect_error(&message))?
-    {
-        return Err(branch_in_use_error(branch));
+    // Refusing here, before the pre-create hook, keeps a doomed request free of
+    // hook side effects; `move_branch` repeats the check under the admin lock,
+    // which is what closes the race with a concurrent `git worktree add`.
+    if matches!(action, Action::FastForward { .. } | Action::Reset { .. }) {
+        refuse_held_branch(repository, branch)?;
     }
     Ok(RemotePlan { fetched, action })
 }
@@ -329,9 +332,7 @@ fn move_branch(
     let lock = admin_lock(repository).map_err(|message| inspect_error(&message))?;
     let _guard =
         lock_within(&lock, GIT_COMMAND_TIMEOUT).map_err(|message| inspect_error(&message))?;
-    if checked_out_elsewhere(repository, branch).map_err(|message| inspect_error(&message))? {
-        return Err(branch_in_use_error(branch));
-    }
+    refuse_held_branch(repository, branch)?;
     let moves = Move {
         branch_ref: format!("refs/heads/{branch}"),
         backup_ref: backup.map(|name| format!("refs/heads/{name}")),
@@ -493,15 +494,146 @@ fn update_refs(repository: &Path, script: &str) -> Result<(), String> {
     }
 }
 
-/// Whether any worktree of the repository, including the main checkout, has
-/// `branch` checked out.
-fn checked_out_elsewhere(repository: &Path, branch: &str) -> Result<bool, String> {
+/// Refuse with `worktree_branch_in_use` when another worktree holds `branch`.
+fn refuse_held_branch(repository: &Path, branch: &str) -> Result<(), ProtocolError> {
+    match branch_holder(repository, branch).map_err(|message| inspect_error(&message))? {
+        None => Ok(()),
+        Some(Holder::CheckedOut) => Err(branch_in_use_error(branch)),
+        Some(Holder::Operation(operation)) => Err(error(
+            ErrorClass::Runtime,
+            "worktree_branch_in_use",
+            format!(
+                "branch {branch:?} is being {} in another worktree",
+                operation.participle()
+            ),
+            Some(format!(
+                "finish or abort the {} there, or use a different branch for this session",
+                operation.noun()
+            )),
+        )),
+    }
+}
+
+/// How another worktree holds a branch.
+#[derive(Debug, PartialEq, Eq)]
+enum Holder {
+    /// The branch is the worktree's checked-out HEAD.
+    CheckedOut,
+    /// The worktree's HEAD is detached while a rebase or bisect that started on
+    /// the branch is in progress.
+    Operation(Operation),
+}
+
+/// A multi-step git operation that leaves HEAD detached and returns to its
+/// branch when it ends.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Operation {
+    Rebase,
+    Bisect,
+}
+
+impl Operation {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Rebase => "rebase",
+            Self::Bisect => "bisect",
+        }
+    }
+
+    fn participle(self) -> &'static str {
+        match self {
+            Self::Rebase => "rebased",
+            Self::Bisect => "bisected",
+        }
+    }
+}
+
+/// What holds `branch` in any worktree of the repository, including the main
+/// checkout.
+///
+/// `git worktree list` reports a worktree in the middle of a rebase or bisect
+/// as detached, so the per-worktree state files are read as well, the way git's
+/// own branch-in-use check does. `git update-ref` has no such check.
+fn branch_holder(repository: &Path, branch: &str) -> Result<Option<Holder>, String> {
     let listing = git_capture(repository, &["worktree", "list", "--porcelain"])?;
     let wanted = format!("refs/heads/{branch}");
-    Ok(listing.lines().any(|line| {
+    if listing.lines().any(|line| {
         line.strip_prefix("branch ")
             .is_some_and(|name| name == wanted)
-    }))
+    }) {
+        return Ok(Some(Holder::CheckedOut));
+    }
+    let common = PathBuf::from(git_capture(
+        repository,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?);
+    let mut git_dirs = vec![common.clone()];
+    match fs::read_dir(common.join("worktrees")) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry
+                    .map_err(|err| format!("cannot list the worktree admin directories: {err}"))?
+                    .path();
+                if path.is_dir() {
+                    git_dirs.push(path);
+                }
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(format!("cannot list the worktree admin directories: {err}")),
+    }
+    for git_dir in git_dirs {
+        if let Some(operation) = operation_on_branch(&git_dir, branch)? {
+            return Ok(Some(Holder::Operation(operation)));
+        }
+    }
+    Ok(None)
+}
+
+/// The rebase or bisect in progress in the worktree whose git directory is
+/// `git_dir`, if it started on `branch`.
+///
+/// A `rebase-apply` directory with an `applying` file is `git am`, not a rebase.
+fn operation_on_branch(git_dir: &Path, branch: &str) -> Result<Option<Operation>, String> {
+    let rebase_head = if git_dir.join("rebase-apply").exists() {
+        if git_dir.join("rebase-apply/applying").exists() {
+            None
+        } else {
+            read_state(&git_dir.join("rebase-apply/head-name"))?
+        }
+    } else {
+        read_state(&git_dir.join("rebase-merge/head-name"))?
+    };
+    if rebase_head
+        .as_deref()
+        .is_some_and(|name| name.strip_prefix("refs/heads/").unwrap_or(name) == branch)
+    {
+        return Ok(Some(Operation::Rebase));
+    }
+    // `rebase --update-refs` moves the other branches of a stack when it ends;
+    // each record of the file is the ref name followed by its two object ids.
+    let wanted = format!("refs/heads/{branch}");
+    if read_state(&git_dir.join("rebase-merge/update-refs"))?
+        .is_some_and(|refs| refs.lines().any(|line| line == wanted))
+    {
+        return Ok(Some(Operation::Rebase));
+    }
+    if git_dir.join("BISECT_LOG").exists()
+        && read_state(&git_dir.join("BISECT_START"))?.as_deref() == Some(branch)
+    {
+        return Ok(Some(Operation::Bisect));
+    }
+    Ok(None)
+}
+
+/// The trimmed content of a git state file, or `None` when it does not exist.
+/// A file that exists but cannot be read is an error: it may name the branch.
+fn read_state(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content.trim().to_owned())),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("cannot read {}: {err}", path.display())),
+    }
 }
 
 /// Reject a name git does not accept as a branch before any remote work.
@@ -510,7 +642,9 @@ fn check_branch_name(repository: &Path, branch: &str) -> Result<(), ProtocolErro
     cmd.args(["check-ref-format", "--branch", branch]);
     let output =
         run_output_bounded(cmd, GIT_COMMAND_TIMEOUT).map_err(|message| inspect_error(&message))?;
-    if output.status.success() {
+    // `--branch` also expands shorthands such as `@{-1}` to the branch they
+    // name and prints the result; only a literal branch name is accepted.
+    if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == branch {
         return Ok(());
     }
     Err(error(
@@ -660,4 +794,143 @@ fn backup_exists(backup: &str, why: &str) -> ProtocolError {
         format!("cannot keep the local head as {backup:?}: {why}"),
         Some("delete or rename that ref, then retry".to_owned()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::{operation_on_branch, Operation};
+
+    /// A git directory holding the given files (relative path, content).
+    fn git_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = pohunek_test_support::tempdir().expect("create a git directory");
+        for (path, content) in files {
+            let full = dir.path().join(path);
+            fs::create_dir_all(full.parent().expect("parent")).expect("create the directory");
+            fs::write(full, content).expect("write the state file");
+        }
+        dir
+    }
+
+    fn operation(files: &[(&str, &str)]) -> Option<Operation> {
+        let dir = git_dir(files);
+        operation_on_branch(dir.path(), "feat").expect("read the state")
+    }
+
+    #[test]
+    fn an_interactive_or_merge_rebase_of_the_branch_is_detected() {
+        let files = [("rebase-merge/head-name", "refs/heads/feat\n")];
+        assert_eq!(operation(&files), Some(Operation::Rebase));
+    }
+
+    #[test]
+    fn an_apply_rebase_of_the_branch_is_detected() {
+        let files = [("rebase-apply/head-name", "refs/heads/feat\n")];
+        assert_eq!(operation(&files), Some(Operation::Rebase));
+    }
+
+    #[test]
+    fn a_rebase_of_another_or_a_detached_head_is_not_a_hold() {
+        assert_eq!(
+            operation(&[("rebase-merge/head-name", "refs/heads/other\n")]),
+            None
+        );
+        assert_eq!(
+            operation(&[("rebase-merge/head-name", "detached HEAD\n")]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_branch_a_rebase_will_update_is_held_by_that_rebase() {
+        let files = [
+            ("rebase-merge/head-name", "refs/heads/upper\n"),
+            (
+                "rebase-merge/update-refs",
+                "refs/heads/feat\n1111111111111111111111111111111111111111\n2222222222222222222222222222222222222222\n",
+            ),
+        ];
+        assert_eq!(operation(&files), Some(Operation::Rebase));
+    }
+
+    #[test]
+    fn git_am_is_not_a_rebase_of_the_branch() {
+        let files = [
+            ("rebase-apply/applying", ""),
+            ("rebase-apply/head-name", "refs/heads/feat\n"),
+        ];
+        assert_eq!(operation(&files), None);
+    }
+
+    #[test]
+    fn a_bisect_started_on_the_branch_is_detected_only_while_it_runs() {
+        assert_eq!(
+            operation(&[
+                ("BISECT_LOG", "git bisect start\n"),
+                ("BISECT_START", "feat\n")
+            ]),
+            Some(Operation::Bisect)
+        );
+        assert_eq!(operation(&[("BISECT_START", "feat\n")]), None);
+        assert_eq!(
+            operation(&[("BISECT_LOG", ""), ("BISECT_START", "other\n")]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_clean_git_directory_holds_nothing() {
+        assert_eq!(operation(&[]), None);
+    }
+
+    #[test]
+    fn the_main_checkout_mid_rebase_holds_its_branch() {
+        use super::{branch_holder, Holder};
+
+        let repo = pohunek_test_support::tempdir().expect("create a repository");
+        let git = |args: &[&str]| {
+            pohunek_test_support::process_env::command("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["-c", "user.email=t@example.com", "-c", "user.name=T"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .expect("run git")
+        };
+        let write = |content: &str| {
+            fs::write(repo.path().join("clash.txt"), content).expect("write the clash file");
+        };
+        assert!(git(&["init", "-q", "-b", "main"]).status.success());
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&["checkout", "-q", "-b", "feat"]);
+        write("feat\n");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "feat"]);
+        git(&["checkout", "-q", "main"]);
+        write("main\n");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "main"]);
+        git(&["checkout", "-q", "feat"]);
+        assert!(
+            !git(&["rebase", "main"]).status.success(),
+            "stops on the conflict"
+        );
+
+        let holder = branch_holder(repo.path(), "feat").expect("inspect");
+
+        assert_eq!(holder, Some(Holder::Operation(Operation::Rebase)));
+        assert_eq!(branch_holder(repo.path(), "main").expect("inspect"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_state_file_is_an_error_not_an_absent_hold() {
+        // A directory where the file belongs fails the read with something other
+        // than "not found".
+        let dir = git_dir(&[]);
+        fs::create_dir_all(dir.path().join("rebase-merge/head-name")).expect("create the dir");
+        operation_on_branch(dir.path(), "feat").expect_err("the read fails");
+    }
 }
