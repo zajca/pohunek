@@ -154,6 +154,12 @@ pub enum ConfigError {
         /// The rejected key.
         key: &'static str,
     },
+    /// A duration is not a whole number of seconds, the kernel's granularity.
+    #[error("service config key {key} must be a whole number of seconds")]
+    WholeSeconds {
+        /// The rejected key.
+        key: &'static str,
+    },
     /// The environment allowlist is empty or too long.
     #[error("service config key environment.allowlist has {count} entries; expected 1..={max}")]
     AllowlistSize {

@@ -23,6 +23,7 @@
 //! prelude, then the connection switches from newline JSON to raw PTY bytes.
 
 mod handler;
+mod keepalive;
 
 use std::ffi::{OsStr, OsString};
 use std::future::Future;
@@ -464,9 +465,14 @@ impl RemoteServer {
     /// [`serve_connection`] used by the Unix server. The loop never returns an
     /// error for a single bad connection; transient accept errors are logged and
     /// the loop continues. The peer address is logged at info on each accept.
+    /// Each accepted connection gets the TCP keepalive of
+    /// [`SessionRegistry::remote_keepalive`](crate::session::SessionRegistry::remote_keepalive),
+    /// so a peer that vanishes without closing the connection fails its read
+    /// and releases the slot of an in-flight wait.
     pub async fn serve(self, shutdown: impl std::future::Future<Output = ()>) {
         tokio::pin!(shutdown);
         let state = self.state.clone();
+        let keepalive = state.sessions.remote_keepalive();
         loop {
             tokio::select! {
                 () = &mut shutdown => {
@@ -477,6 +483,7 @@ impl RemoteServer {
                     match accepted {
                         Ok((stream, peer)) => {
                             info!(peer = %peer, "remote control connection accepted");
+                            keepalive::apply(&stream, peer, keepalive);
                             let state = state.clone();
                             tokio::spawn(async move {
                                 if let Err(err) = Box::pin(serve_connection(stream, state)).await {

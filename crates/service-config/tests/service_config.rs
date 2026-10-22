@@ -12,10 +12,10 @@ use pohunek_platform::filesystem::FsError;
 use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::Namespace;
 use pohunek_service_config::{
-    ConfigError, ConfigSpec, Deadlines, InputTiming, ServiceConfig, WaitTiming,
+    ConfigError, ConfigSpec, Deadlines, InputTiming, KeepaliveTiming, ServiceConfig, WaitTiming,
     DEFAULT_EVENT_RETENTION, DEFAULT_HOOK_STDERR_TAIL_BYTES, DEFAULT_INPUT_TIMING,
-    DEFAULT_WAIT_TIMING, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES, MAX_DEADLINE,
-    MAX_HOOK_STDERR_TAIL_BYTES, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
+    DEFAULT_KEEPALIVE_TIMING, DEFAULT_WAIT_TIMING, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES,
+    MAX_DEADLINE, MAX_HOOK_STDERR_TAIL_BYTES, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
 };
 use tempfile::TempDir;
 
@@ -241,6 +241,7 @@ fn golden_example_parses_into_typed_values() {
         WaitTiming {
             turn_default: Duration::from_mins(5),
             turn_max: Duration::from_mins(30),
+            keepalive: DEFAULT_KEEPALIVE_TIMING,
         }
     );
     assert_eq!(config.wait_timing(), DEFAULT_WAIT_TIMING);
@@ -657,6 +658,7 @@ fn upgrade_source_migrates_schema_four_keeping_its_values_and_adding_the_stall_d
         WaitTiming {
             turn_default: Duration::from_mins(2),
             turn_max: Duration::from_mins(45),
+            keepalive: DEFAULT_KEEPALIVE_TIMING,
         }
     );
     assert_eq!(
@@ -769,6 +771,7 @@ fn upgrade_source_migrates_schema_five_keeping_its_values_and_adding_the_hooks_d
         WaitTiming {
             turn_default: Duration::from_mins(2),
             turn_max: Duration::from_mins(45),
+            keepalive: DEFAULT_KEEPALIVE_TIMING,
         }
     );
     assert_eq!(
@@ -1103,6 +1106,7 @@ fn upgrade_source_migrates_schema_three_keeping_input_and_adding_default_waits()
         WaitTiming {
             turn_default: Duration::from_mins(5),
             turn_max: Duration::from_mins(30),
+            keepalive: DEFAULT_KEEPALIVE_TIMING,
         }
     );
     assert_eq!(
@@ -1301,6 +1305,7 @@ fn wait_timings_are_bounded_and_ordered() {
             WaitTiming {
                 turn_default: Duration::from_millis(default_ms),
                 turn_max: Duration::from_millis(max_ms),
+                keepalive: DEFAULT_KEEPALIVE_TIMING,
             }
         );
     }
@@ -1343,6 +1348,7 @@ fn custom_wait_timing_is_loaded_and_preserved_on_write() {
         WaitTiming {
             turn_default: Duration::from_secs(120),
             turn_max: Duration::from_mins(45),
+            keepalive: DEFAULT_KEEPALIVE_TIMING,
         }
     );
     loaded
@@ -2500,4 +2506,151 @@ fn a_rewrite_that_outgrows_the_load_bound_is_refused_and_leaves_the_file() {
         "{result:?}"
     );
     assert_eq!(fs::read_to_string(&path).expect("read"), text);
+}
+
+/// Replaces the `[waits]` table of the golden file with `extra` keyed lines
+/// appended after the turn keys.
+fn with_keepalive_keys(extra: &str) -> String {
+    replace(
+        GOLDEN,
+        "turn_max_ms = 1800000",
+        &format!("turn_max_ms = 1800000\n{extra}"),
+    )
+}
+
+/// The `[waits]` keepalive bounds, from the crate contract: idle and interval
+/// 1000..=600000 ms in whole seconds, count 1..=10.
+#[test]
+fn keepalive_values_outside_their_bounds_are_refused_by_key() {
+    let fixture = Fixture::new();
+    for (line, key, value, min, max) in [
+        (
+            "keepalive_idle_ms = 0",
+            "waits.keepalive_idle_ms",
+            0,
+            1_000,
+            600_000,
+        ),
+        (
+            "keepalive_idle_ms = 600000\nkeepalive_interval_ms = 601000",
+            "waits.keepalive_interval_ms",
+            601_000,
+            1_000,
+            600_000,
+        ),
+        (
+            "keepalive_idle_ms = 601000",
+            "waits.keepalive_idle_ms",
+            601_000,
+            1_000,
+            600_000,
+        ),
+        (
+            "keepalive_interval_ms = 0",
+            "waits.keepalive_interval_ms",
+            0,
+            1_000,
+            600_000,
+        ),
+        ("keepalive_count = 0", "waits.keepalive_count", 0, 1, 10),
+        ("keepalive_count = 11", "waits.keepalive_count", 11, 1, 10),
+    ] {
+        match fixture.load(&with_keepalive_keys(line)) {
+            Err(ConfigError::OutOfRange {
+                key: rejected,
+                value: rejected_value,
+                min: rejected_min,
+                max: rejected_max,
+            }) => assert_eq!(
+                (rejected, rejected_value, rejected_min, rejected_max),
+                (key, value, min, max),
+                "{line}"
+            ),
+            other => panic!("{line}: {other:?}"),
+        }
+    }
+    for line in [
+        "keepalive_idle_ms = 1000\nkeepalive_interval_ms = 1000\nkeepalive_count = 1",
+        "keepalive_idle_ms = 600000\nkeepalive_interval_ms = 600000\nkeepalive_count = 10",
+    ] {
+        fixture
+            .load(&with_keepalive_keys(line))
+            .unwrap_or_else(|error| panic!("{line}: bounds are inclusive: {error:?}"));
+    }
+}
+
+/// The kernel options take whole seconds, so a sub-second value is refused
+/// rather than rounded.
+#[test]
+fn keepalive_times_must_be_whole_seconds() {
+    let fixture = Fixture::new();
+    for (line, key) in [
+        ("keepalive_idle_ms = 30500", "waits.keepalive_idle_ms"),
+        (
+            "keepalive_interval_ms = 10001",
+            "waits.keepalive_interval_ms",
+        ),
+    ] {
+        match fixture.load(&with_keepalive_keys(line)) {
+            Err(ConfigError::WholeSeconds { key: rejected }) => assert_eq!(rejected, key),
+            other => panic!("{line}: {other:?}"),
+        }
+    }
+}
+
+/// A file without the optional keys means the documented defaults, and a
+/// rewrite does not add them, so a release that predates them still reads it.
+#[test]
+fn a_file_without_keepalive_keys_loads_the_defaults_and_rewrites_unchanged() {
+    let fixture = Fixture::new();
+    let loaded = fixture.load(GOLDEN).expect("load the golden file");
+    assert_eq!(loaded.wait_timing().keepalive, DEFAULT_KEEPALIVE_TIMING);
+    assert_eq!(
+        DEFAULT_KEEPALIVE_TIMING.slot_lifetime_bound(),
+        Duration::from_secs(60)
+    );
+    let rendered = loaded.to_toml();
+    assert!(!rendered.contains("keepalive"), "{rendered}");
+    let reloaded = fixture.load(&rendered).expect("reload the rendered file");
+    assert_eq!(reloaded, loaded);
+}
+
+/// Non-default keepalive keys are loaded, written back, and known keys.
+#[test]
+fn non_default_keepalive_keys_round_trip_and_are_not_unknown() {
+    let fixture = Fixture::new();
+    let text = with_keepalive_keys(
+        "keepalive_idle_ms = 45000\nkeepalive_interval_ms = 15000\nkeepalive_count = 5",
+    );
+    let loaded = fixture.load(&text).expect("load custom keepalive keys");
+    assert_eq!(
+        loaded.wait_timing().keepalive,
+        KeepaliveTiming {
+            idle: Duration::from_secs(45),
+            interval: Duration::from_secs(15),
+            count: 5,
+        }
+    );
+    assert!(
+        loaded.unknown_keys().is_empty(),
+        "{:?}",
+        loaded.unknown_keys()
+    );
+    let rendered = loaded.to_toml();
+    for line in [
+        "keepalive_idle_ms = 45000",
+        "keepalive_interval_ms = 15000",
+        "keepalive_count = 5",
+    ] {
+        assert!(rendered.contains(line), "{line} in {rendered}");
+    }
+    let reloaded = fixture.load(&rendered).expect("reload the rendered file");
+    assert_eq!(reloaded, loaded);
+
+    let only_count = fixture
+        .load(&with_keepalive_keys("keepalive_count = 5"))
+        .expect("a single key is enough");
+    let rendered = only_count.to_toml();
+    assert!(rendered.contains("keepalive_count = 5"), "{rendered}");
+    assert!(!rendered.contains("keepalive_idle_ms"), "{rendered}");
 }

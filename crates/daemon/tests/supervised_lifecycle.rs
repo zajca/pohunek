@@ -37,7 +37,7 @@ use pohunek_platform::process::ProcessIdentity;
 use pohunek_platform::supervisor::{
     JobDefinition, JobLogs, JobSpec, Namespace, RestartPolicy, Supervisor, WorkerKey,
 };
-use pohunek_service_config::WaitTiming;
+use pohunek_service_config::{WaitTiming, DEFAULT_KEEPALIVE_TIMING};
 use pohunek_worker_protocol::{
     ControlCode, ControlError, ControlMessage, ControlReader, ControlResponse, ControlWriter,
     ResponseKind,
@@ -345,6 +345,7 @@ async fn two_workers_survive_graceful_restart_and_sigkill() {
 const CONFIGURED_WAITS: WaitTiming = WaitTiming {
     turn_default: Duration::from_secs(5),
     turn_max: Duration::from_mins(1),
+    keepalive: DEFAULT_KEEPALIVE_TIMING,
 };
 
 #[tokio::test(flavor = "multi_thread")]

@@ -44,6 +44,9 @@
 //! [waits]                                          # milliseconds, 5000..=3600000
 //! turn_default_ms = 300000                         # at most turn_max_ms
 //! turn_max_ms = 1800000
+//! keepalive_idle_ms = 30000                        # optional; whole seconds, 1000..=600000
+//! keepalive_interval_ms = 10000                    # optional; whole seconds, 1000..=600000
+//! keepalive_count = 3                              # optional; 1..=10
 //!
 //! [hooks]
 //! stderr_tail_bytes = 4096                         # 0..=32768; 0 disables the capture
@@ -63,6 +66,9 @@
 //! `[waits]` bounds `session.wait_turn`: `turn_default_ms` applies when a
 //! caller omits its timeout, and `turn_max_ms` is the ceiling a requested
 //! timeout may not exceed. See [`WaitTiming`] and [`DEFAULT_WAIT_TIMING`].
+//! The three optional `keepalive_*` keys configure the TCP keepalive of every
+//! overlay control connection; see [`KeepaliveTiming`] and
+//! [`DEFAULT_KEEPALIVE_TIMING`].
 //!
 //! `[hooks]` bounds how much of a failing worktree-create hook's stderr the
 //! daemon keeps for the `session.new` warning. See
@@ -231,6 +237,23 @@ pub const DEFAULT_INPUT_TIMING: InputTiming = InputTiming {
 pub const DEFAULT_WAIT_TIMING: WaitTiming = WaitTiming {
     turn_default: Duration::from_mins(5),
     turn_max: Duration::from_mins(30),
+    keepalive: DEFAULT_KEEPALIVE_TIMING,
+};
+
+/// TCP keepalive of an overlay control connection when `[waits]` names none.
+///
+/// A client host that vanishes (network loss, suspend) sends neither data nor
+/// a FIN, so a wait it started would hold its waiter slot until its own
+/// deadline. Thirty seconds of silence, then three unanswered probes ten
+/// seconds apart, end the connection about a minute after the peer went away
+/// (`idle + interval * count`) while costing a healthy idle connection one
+/// small probe per half minute. A shorter idle time would probe the
+/// connections of agents that merely think for a while; a longer one lets a
+/// dead peer keep a slot noticeably longer.
+pub const DEFAULT_KEEPALIVE_TIMING: KeepaliveTiming = KeepaliveTiming {
+    idle: Duration::from_secs(30),
+    interval: Duration::from_secs(10),
+    count: 3,
 };
 
 /// Stderr tail size written on fresh installs, assigned when upgrading a
@@ -303,6 +326,28 @@ pub const MIN_TURN_WAIT: Duration = Duration::from_secs(5);
 /// closing its connection is still released within the hour. It is not
 /// [`MAX_DEADLINE`]: turn waits are not native job timeouts.
 pub const MAX_TURN_WAIT: Duration = Duration::from_hours(1);
+
+/// Shortest accepted `waits.keepalive_idle_ms` and `waits.keepalive_interval_ms`.
+///
+/// The kernel options take whole seconds, so one second is both the unit and
+/// the smallest value that is not a zero (which the kernel rejects).
+pub const MIN_KEEPALIVE_TIME: Duration = Duration::from_secs(1);
+
+/// Longest accepted `waits.keepalive_idle_ms` and `waits.keepalive_interval_ms`.
+///
+/// Ten minutes: a longer probe schedule no longer bounds a waiter slot in a
+/// useful time next to the one-hour [`MAX_TURN_WAIT`], and it stays far below
+/// the largest value the Linux kernel accepts (32767 seconds).
+pub const MAX_KEEPALIVE_TIME: Duration = Duration::from_mins(10);
+
+/// Smallest accepted `waits.keepalive_count`.
+pub const MIN_KEEPALIVE_COUNT: u32 = 1;
+
+/// Largest accepted `waits.keepalive_count`.
+///
+/// Ten unanswered probes already mean a dead peer; the kernel accepts up to
+/// 127 on Linux.
+pub const MAX_KEEPALIVE_COUNT: u32 = 10;
 
 /// File name of the configuration inside the application config directory.
 pub const FILE_NAME: &str = "service.toml";
@@ -548,6 +593,34 @@ pub struct WaitTiming {
     pub turn_default: Duration,
     /// Longest timeout a `session.wait_turn` call may request.
     pub turn_max: Duration,
+    /// TCP keepalive of every overlay control connection.
+    pub keepalive: KeepaliveTiming,
+}
+
+/// TCP keepalive of an overlay control connection, recorded in `[waits]`.
+///
+/// A connection whose peer vanished without closing it is dropped, and the
+/// waiter slot of its in-flight wait released, after at most
+/// [`slot_lifetime_bound`](Self::slot_lifetime_bound) of silence.
+/// [`ServiceConfig::new`] keeps `idle` and `interval` a whole number of
+/// seconds within [`MIN_KEEPALIVE_TIME`]`..=`[`MAX_KEEPALIVE_TIME`] and
+/// `count` within [`MIN_KEEPALIVE_COUNT`]`..=`[`MAX_KEEPALIVE_COUNT`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KeepaliveTiming {
+    /// Silence on an established connection before the first probe.
+    pub idle: Duration,
+    /// Time between unanswered probes.
+    pub interval: Duration,
+    /// Unanswered probes after which the connection is dropped.
+    pub count: u32,
+}
+
+impl KeepaliveTiming {
+    /// How long a vanished peer can keep its connection: `idle + interval * count`.
+    #[must_use]
+    pub fn slot_lifetime_bound(&self) -> Duration {
+        self.idle + self.interval * self.count
+    }
 }
 
 /// Event-journal retention recorded in `[events]`.
@@ -1398,10 +1471,30 @@ struct RawInputWithoutStall {
 }
 
 /// On-disk `[waits]` table in milliseconds.
+///
+/// The keepalive keys are optional: a file that lacks one means its default,
+/// and the writer omits one that equals its default, so a file written
+/// without a deliberate keepalive setting stays readable by a release that
+/// predates the keys.
 #[derive(Debug, Serialize, Deserialize)]
 struct RawWaits {
     turn_default_ms: u64,
     turn_max_ms: u64,
+    #[serde(
+        default = "default_keepalive_idle_ms",
+        skip_serializing_if = "is_default_keepalive_idle_ms"
+    )]
+    keepalive_idle_ms: u64,
+    #[serde(
+        default = "default_keepalive_interval_ms",
+        skip_serializing_if = "is_default_keepalive_interval_ms"
+    )]
+    keepalive_interval_ms: u64,
+    #[serde(
+        default = "default_keepalive_count",
+        skip_serializing_if = "is_default_keepalive_count"
+    )]
+    keepalive_count: u32,
 }
 
 impl From<WaitTiming> for RawWaits {
@@ -1409,8 +1502,47 @@ impl From<WaitTiming> for RawWaits {
         Self {
             turn_default_ms: millis(timing.turn_default),
             turn_max_ms: millis(timing.turn_max),
+            keepalive_idle_ms: millis(timing.keepalive.idle),
+            keepalive_interval_ms: millis(timing.keepalive.interval),
+            keepalive_count: timing.keepalive.count,
         }
     }
+}
+
+fn default_keepalive_idle_ms() -> u64 {
+    millis(DEFAULT_KEEPALIVE_TIMING.idle)
+}
+
+fn default_keepalive_interval_ms() -> u64 {
+    millis(DEFAULT_KEEPALIVE_TIMING.interval)
+}
+
+fn default_keepalive_count() -> u32 {
+    DEFAULT_KEEPALIVE_TIMING.count
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_keepalive_idle_ms(value: &u64) -> bool {
+    *value == default_keepalive_idle_ms()
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_keepalive_interval_ms(value: &u64) -> bool {
+    *value == default_keepalive_interval_ms()
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_default_keepalive_count(value: &u32) -> bool {
+    *value == default_keepalive_count()
 }
 
 /// On-disk `[hooks]` table.
@@ -1680,6 +1812,9 @@ impl RawConfig {
             waits: RawWaits {
                 turn_default_ms: 0,
                 turn_max_ms: 0,
+                keepalive_idle_ms: default_keepalive_idle_ms() + 1,
+                keepalive_interval_ms: default_keepalive_interval_ms() + 1,
+                keepalive_count: default_keepalive_count() + 1,
             },
             hooks: RawHooks::DEFAULT,
             events: RawEvents::DEFAULT,
@@ -1982,6 +2117,11 @@ fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
         wait_timing: WaitTiming {
             turn_default: Duration::from_millis(raw.waits.turn_default_ms),
             turn_max: Duration::from_millis(raw.waits.turn_max_ms),
+            keepalive: KeepaliveTiming {
+                idle: Duration::from_millis(raw.waits.keepalive_idle_ms),
+                interval: Duration::from_millis(raw.waits.keepalive_interval_ms),
+                count: raw.waits.keepalive_count,
+            },
         },
         hook_stderr_tail_bytes: raw.hooks.stderr_tail_bytes,
         event_retention: EventRetention {
@@ -2252,6 +2392,39 @@ fn validate_wait_timing(timing: WaitTiming) -> Result<(), ConfigError> {
         return Err(ConfigError::WaitDefaultAboveMax {
             default_ms: millis(timing.turn_default),
             max_ms: millis(timing.turn_max),
+        });
+    }
+    validate_keepalive_timing(timing.keepalive)
+}
+
+/// Validates the `[waits]` keepalive keys against the kernel's whole-second
+/// granularity and the documented bounds.
+fn validate_keepalive_timing(keepalive: KeepaliveTiming) -> Result<(), ConfigError> {
+    for (key, value) in [
+        ("waits.keepalive_idle_ms", keepalive.idle),
+        ("waits.keepalive_interval_ms", keepalive.interval),
+    ] {
+        if !value.subsec_nanos().is_multiple_of(NANOS_PER_MILLI) {
+            return Err(ConfigError::Precision { key });
+        }
+        if !(MIN_KEEPALIVE_TIME..=MAX_KEEPALIVE_TIME).contains(&value) {
+            return Err(ConfigError::OutOfRange {
+                key,
+                value: u64::try_from(value.as_millis()).unwrap_or(u64::MAX),
+                min: millis(MIN_KEEPALIVE_TIME),
+                max: millis(MAX_KEEPALIVE_TIME),
+            });
+        }
+        if value.subsec_millis() != 0 {
+            return Err(ConfigError::WholeSeconds { key });
+        }
+    }
+    if !(MIN_KEEPALIVE_COUNT..=MAX_KEEPALIVE_COUNT).contains(&keepalive.count) {
+        return Err(ConfigError::OutOfRange {
+            key: "waits.keepalive_count",
+            value: u64::from(keepalive.count),
+            min: u64::from(MIN_KEEPALIVE_COUNT),
+            max: u64::from(MAX_KEEPALIVE_COUNT),
         });
     }
     Ok(())

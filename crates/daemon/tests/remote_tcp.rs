@@ -2089,3 +2089,254 @@ async fn bind_rejects_non_netbird_address() {
         }
     }
 }
+
+/// Daemon log lines captured in memory, shared by the keepalive scenarios.
+static CAPTURED_LOG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Appends what the daemon logs to [`CAPTURED_LOG`].
+struct CapturedLogWriter;
+
+impl std::io::Write for CapturedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        CAPTURED_LOG
+            .lock()
+            .expect("the log capture lock is never poisoned")
+            .push_str(&String::from_utf8_lossy(buf));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Routes the daemon's debug-level logs into [`CAPTURED_LOG`] for this process.
+fn capture_daemon_log() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(|| CapturedLogWriter)
+            .init();
+    });
+}
+
+/// The captured log lines that mention `needle`.
+fn captured_log_lines(needle: &str) -> Vec<String> {
+    CAPTURED_LOG
+        .lock()
+        .expect("the log capture lock is never poisoned")
+        .lines()
+        .filter(|line| line.contains(needle))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Connects a client to `addr` and returns the daemon's log line about that
+/// connection's keepalive, found by the client's own address.
+async fn keepalive_log_for_new_connection(
+    addr: SocketAddr,
+    message: &str,
+) -> (Framed<TcpStream, LinesCodec>, String) {
+    let client = connect_tcp(addr).await;
+    let peer = client
+        .get_ref()
+        .local_addr()
+        .expect("the client socket has a local address");
+    let peer_field = format!("peer={peer}");
+    let line =
+        pohunek_test_support::wait::wait_until("the keepalive log line of the client", || {
+            let found = captured_log_lines(&peer_field)
+                .into_iter()
+                .find(|line| line.contains(message));
+            async move { found }
+        })
+        .await;
+    (client, line)
+}
+
+/// Every accepted overlay connection reports the documented keepalive defaults.
+#[tokio::test]
+async fn remote_keepalive_applies_the_documented_defaults() {
+    capture_daemon_log();
+    let (addr, _socket, shutdown, handle) =
+        spawn_dual_servers("keepalive-default", "0.0.0", shell_config()).await;
+
+    let (_client, line) = keepalive_log_for_new_connection(addr, "remote keepalive applied").await;
+
+    for field in [
+        "keepalive.enabled=true",
+        "keepalive.idle_s=30",
+        "keepalive.interval_s=10",
+        "keepalive.count=3",
+    ] {
+        assert!(line.contains(field), "expected {field} in: {line}");
+    }
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// The keepalive of `service.toml` reaches the socket of an accepted connection.
+#[tokio::test]
+async fn remote_keepalive_applies_the_configured_values() {
+    capture_daemon_log();
+    let config = SessionRegistryConfig {
+        remote_keepalive: pohunek_service_config::KeepaliveTiming {
+            idle: Duration::from_secs(45),
+            interval: Duration::from_secs(15),
+            count: 5,
+        },
+        ..shell_config()
+    };
+    let (addr, _socket, shutdown, handle) =
+        spawn_dual_servers("keepalive-configured", "0.0.0", config).await;
+
+    let (_client, line) = keepalive_log_for_new_connection(addr, "remote keepalive applied").await;
+
+    for field in [
+        "keepalive.enabled=true",
+        "keepalive.idle_s=45",
+        "keepalive.interval_s=15",
+        "keepalive.count=5",
+    ] {
+        assert!(line.contains(field), "expected {field} in: {line}");
+    }
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// A socket-option error is logged with the peer and the errno and does not
+/// stop the daemon from serving the connection.
+///
+/// The idle time exceeds the largest value the Linux kernel accepts
+/// (32767 s), which `service.toml` validation never lets through.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn remote_keepalive_setup_failure_keeps_serving_the_connection() {
+    capture_daemon_log();
+    let config = SessionRegistryConfig {
+        remote_keepalive: pohunek_service_config::KeepaliveTiming {
+            idle: Duration::from_secs(40_000),
+            interval: Duration::from_secs(10),
+            count: 3,
+        },
+        ..shell_config()
+    };
+    let (addr, _socket, shutdown, handle) =
+        spawn_dual_servers("keepalive-failure", "0.0.0", config).await;
+
+    let (mut client, line) =
+        keepalive_log_for_new_connection(addr, "remote keepalive setup failed").await;
+
+    assert!(line.contains("WARN"), "the failure is a warning: {line}");
+    assert!(
+        line.contains(&format!("errno={}", libc::EINVAL)),
+        "the warning names the errno: {line}"
+    );
+    let health = Request::make("health", method::DAEMON_HEALTH, Value::Null);
+    let payload = ok_payload(exchange(&mut client, &health).await);
+    assert_eq!(payload["daemon_version"], "0.0.0");
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// A `session.wait_turn` request line that a live shell session never satisfies.
+fn held_turn_wait_line(session_id: &SessionId, timeout_ms: u32, id: &str) -> String {
+    let request = Request::make(
+        id,
+        method::SESSION_WAIT_TURN,
+        serde_json::json!({
+            "session_ids": [session_id],
+            "until": ["turn_completed"],
+            "timeout_ms": timeout_ms,
+        }),
+    );
+    serde_json::to_string(&request).expect("serialize session.wait_turn")
+}
+
+/// Whether `session_id`'s only turn waiter slot is taken, asked on a fresh
+/// connection with a probe that returns at once either way.
+async fn turn_slot_taken(addr: SocketAddr, session_id: &SessionId) -> bool {
+    let mut probe = connect_tcp(addr).await;
+    let request: ProtocolRequest =
+        serde_json::from_str(&held_turn_wait_line(session_id, 1, "slot-probe"))
+            .expect("parse the probe request");
+    match exchange(&mut probe, &request).await.into_result() {
+        Ok(result) => {
+            assert_eq!(result["reason"], "timeout", "an admitted probe times out");
+            false
+        }
+        Err(error) => {
+            assert_eq!(error.code, "session_waiter_limit_reached");
+            true
+        }
+    }
+}
+
+/// A peer that resets its connection during `session.wait_turn` frees the turn
+/// waiter slot long before the wait's own deadline.
+///
+/// The reset surfaces on the daemon as the read error that a failed keepalive
+/// probe also produces.
+#[tokio::test]
+async fn wait_turn_over_tcp_releases_its_slot_when_the_peer_resets() {
+    /// Far beyond the harness hang guard, so only a cancelled wait frees the slot.
+    const HELD_WAIT_TIMEOUT_MS: u32 = 600_000;
+    let config = SessionRegistryConfig {
+        turn_session_waiters: 1,
+        ..shell_config()
+    };
+    let (addr, socket, shutdown, handle) =
+        spawn_dual_servers("keepalive-reset", "0.0.0", config).await;
+    let mut control = connect_unix(&socket).await;
+    let session = create_session(&mut control, &socket).await;
+
+    let line = held_turn_wait_line(&session.id, HELD_WAIT_TIMEOUT_MS, "held-wait");
+    let holder = tokio::sync::Mutex::new(connect_tcp(addr).await);
+    holder
+        .lock()
+        .await
+        .send(line.clone())
+        .await
+        .expect("send the held wait");
+    pohunek_test_support::wait::wait_until("the held wait to own the turn slot", || async {
+        if turn_slot_taken(addr, &session.id).await {
+            return Some(());
+        }
+        // A probe that held the slot while the wait arrived makes the daemon
+        // refuse the wait; it is sent again.
+        let mut holder = holder.lock().await;
+        if let Some(reply) = futures::FutureExt::now_or_never(holder.next()) {
+            let reply = reply
+                .expect("the held wait connection stays open")
+                .expect("response framing ok");
+            let response: Response = serde_json::from_str(&reply).expect("parse response");
+            assert_eq!(
+                response.into_result().expect_err("a refused wait").code,
+                "session_waiter_limit_reached"
+            );
+            holder
+                .send(line.clone())
+                .await
+                .expect("resend the held wait");
+        }
+        None
+    })
+    .await;
+
+    let stream = holder.into_inner().into_inner();
+    socket2::SockRef::from(&stream)
+        .set_linger(Some(Duration::ZERO))
+        .expect("a zero linger turns the close into a reset");
+    drop(stream);
+
+    pohunek_test_support::wait::wait_until(
+        "the reset connection's turn slot to be released",
+        || async { (!turn_slot_taken(addr, &session.id).await).then_some(()) },
+    )
+    .await;
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
