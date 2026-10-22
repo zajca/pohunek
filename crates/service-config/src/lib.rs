@@ -857,16 +857,17 @@ impl ServiceConfig {
         parse(path, &read_config_text(path)?)
     }
 
-    /// Reads a current, schema-5, schema-4, schema-3, or schema-2 service file for an installer upgrade.
+    /// Reads a current or a schema-6, -5, -4, -3, or -2 service file for an installer upgrade.
     ///
     /// Schema 2 has no `[input]` or `[waits]` table, schema 3 no `[waits]`
     /// and no `input.write_stall_timeout_ms`, schema 4 no
-    /// `input.write_stall_timeout_ms`, and none of them nor schema 5 a
-    /// `[hooks]` table. This method supplies the documented
-    /// [`DEFAULT_INPUT_TIMING`], [`DEFAULT_WAIT_TIMING`] and
-    /// [`DEFAULT_HOOK_STDERR_TAIL_BYTES`] explicitly for
-    /// the missing keys and tables and keeps every recorded value; normal
-    /// daemon and worker loads still require every key of the current schema. The caller must preserve the source
+    /// `input.write_stall_timeout_ms`, schemas 2 to 5 no `[hooks]` table, and
+    /// schemas 2 to 6 no `[events]` table. This method supplies the documented
+    /// [`DEFAULT_INPUT_TIMING`], [`DEFAULT_WAIT_TIMING`],
+    /// [`DEFAULT_HOOK_STDERR_TAIL_BYTES`] and [`DEFAULT_EVENT_RETENTION`]
+    /// explicitly for the missing keys and tables and keeps every recorded
+    /// value; normal daemon and worker loads still require every key of the
+    /// current schema. The caller must preserve the source
     /// schema across the transaction and restore it if the old daemon is
     /// restarted on rollback.
     ///

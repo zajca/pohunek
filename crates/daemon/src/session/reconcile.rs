@@ -21077,13 +21077,39 @@ generation "$1"
             busy
         }
 
+        /// Whether every thread of process `pid` is in the stopped state.
+        #[cfg(target_os = "linux")]
+        fn all_threads_stopped(pid: i32) -> bool {
+            let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+                return false;
+            };
+            tasks.flatten().all(|task| {
+                std::fs::read_to_string(task.path().join("stat")).is_ok_and(|stat| {
+                    // The state is the first field after the parenthesized name.
+                    stat.rsplit_once(')')
+                        .and_then(|(_, rest)| rest.split_whitespace().next())
+                        == Some("T")
+                })
+            })
+        }
+
         /// A worker stopped with `SIGSTOP` answers nothing until it is continued.
         struct StoppedWorker(i32);
 
         impl StoppedWorker {
+            /// Stops the worker and returns once every thread of it has stopped.
+            ///
+            /// `SIGSTOP` stops a multi-threaded process only when one thread
+            /// dequeues it and wakes the others, so on a loaded host the
+            /// threads that did not dequeue it may still answer a request.
             fn stop(pid: u32) -> Self {
                 let pid = i32::try_from(pid).expect("worker pid");
                 kill(Pid::from_raw(pid), Signal::SIGSTOP).expect("stop the worker");
+                // No procfs elsewhere: the stop is then only as prompt as the signal.
+                #[cfg(target_os = "linux")]
+                pohunek_test_support::wait::poll_until("every worker thread to stop", || {
+                    all_threads_stopped(pid).then_some(())
+                });
                 Self(pid)
             }
         }

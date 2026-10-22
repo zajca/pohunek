@@ -1740,6 +1740,8 @@ struct MockInspectorState {
     identity_after_cwd: HashMap<Pid, (usize, ProcessIdentity)>,
     identity_errors: HashMap<Pid, std::io::ErrorKind>,
     non_running: HashSet<ProcessIdentity>,
+    /// Pids whose liveness check answers `true` whatever their identity reads.
+    always_running: HashSet<Pid>,
     exits: HashMap<Pid, Vec<tokio::sync::watch::Sender<bool>>>,
     immediate_exits: HashSet<Pid>,
     /// Pids whose exit watch cannot be armed; the flag marks the process as
@@ -1974,6 +1976,17 @@ impl MockInspector {
             .insert(pid, identity);
     }
 
+    /// Makes the liveness check of `pid` answer `true` whatever its identity
+    /// reads, so a background rescan cannot retire a root the scenario made
+    /// unreadable.
+    fn keep_running(&self, pid: Pid) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .always_running
+            .insert(pid);
+    }
+
     fn set_not_running(&self, identity: ProcessIdentity) {
         self.inner
             .lock()
@@ -2068,6 +2081,15 @@ impl ProcessInspector for MockInspector {
             .contains(&identity)
         {
             return Ok(false);
+        }
+        if self
+            .inner
+            .lock()
+            .expect("mock inspector lock")
+            .always_running
+            .contains(&identity.pid)
+        {
+            return Ok(true);
         }
         Ok(self.identity(identity.pid)? == Some(identity))
     }
@@ -26510,6 +26532,10 @@ async fn a_release_naming_another_start_identity_ends_no_journaled_claim() {
             .recorded
     );
     let _worker = without_forward(&registry, &created.id).await;
+    // The process reads as gone to the release's identity check; the procwatch
+    // rescan the session's output requests must still find the root alive, or
+    // it retires the claim whenever it happens to run after this point.
+    inspector.keep_running(created.pid);
     inspector.set_identity(created.pid, None);
 
     for claimed in [start + 1, start] {

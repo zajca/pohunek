@@ -13,8 +13,8 @@ use protocol::{method, AgentActivity, NotificationKindPolicy, SessionId};
 use serde_json::{json, Value};
 
 use super::turn_wait_tests::{
-    debounce, every_provider, fresh_cursor, joined, ok, pause_clock, settle, Fixture, CLOCK_STEP,
-    FLUSH_SLACK, LONG_WAIT_MS,
+    debounce, every_provider, finish_short_wait, fresh_cursor, ok, pause_clock, settle, Fixture,
+    CLOCK_STEP, FLUSH_SLACK, LONG_WAIT_MS,
 };
 use crate::notifications::{default_policy, SEED_RETRY_DELAY};
 use crate::session::SessionRegistryConfig;
@@ -107,7 +107,7 @@ async fn turn_events_after(fixture: &Fixture, session: &str, cursor: &str) -> Ve
             "session_ids": [session], "until": ["turn_completed"],
             "after": cursor, "timeout_ms": 1
         }));
-        let result = ok(joined(wait).await);
+        let result = ok(finish_short_wait(wait).await);
         if result["reason"] != "event" {
             return events;
         }

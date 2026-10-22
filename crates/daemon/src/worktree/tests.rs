@@ -731,14 +731,20 @@ fn a_base_fetch_runs_while_another_fetch_holds_the_repository_lock() {
     let fetched = std::thread::scope(|scope| {
         // Dropped on unwind too, before the scope waits for the fetch.
         let _other_fetch = share_within(&lock, TEST_LOCK_WAIT).expect("share the lock");
-        let fetch = scope.spawn(|| super::fetch_origin(&downstream, "stacked/base"));
+        // A shared request takes the lock on its first attempt, so the short
+        // bound only ends a fetch that queues behind the guard held here: that
+        // fetch fails at once with the lock-timeout error.
+        let fetch = scope.spawn(|| {
+            super::FETCH_LOCK_WAIT_OVERRIDE.with(|wait| wait.set(Some(SHORT_FETCH_LOCK_WAIT)));
+            super::fetch_origin(&downstream, "stacked/base")
+        });
         pohunek_test_support::wait::poll_until(
             "the fetch to finish beside the other fetch",
             || fetch.is_finished().then_some(()),
         );
         fetch.join().expect("fetch thread")
     })
-    .expect("the fetch succeeds beside another fetch");
+    .expect("the fetch shares the repository lock with another fetch");
     assert_eq!(fetched.commit, tip);
 }
 
