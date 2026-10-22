@@ -21,6 +21,8 @@ mod project_cwd;
 mod readable_host;
 #[path = "support/root_reporter.rs"]
 mod root_reporter;
+#[path = "health_socket/session_metadata.rs"]
+mod session_metadata;
 mod support;
 
 use std::collections::BTreeMap;

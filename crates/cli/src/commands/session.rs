@@ -1580,17 +1580,44 @@ fn idle_stop_unsupported(error: &CliError) -> bool {
     }
 }
 
-/// Recovery hint for a daemon that does not know the idle-stop default.
-const IDLE_STOP_METHOD_UPGRADE_HINT: &str =
-    "the daemon predates --idle-stop-after, which needs a daemon of release 0.36.0 or later; upgrade the daemon and retry. Nothing was changed";
+/// First release whose daemon serves the idle-stop methods.
+const IDLE_STOP_MIN_DAEMON_RELEASE: &str = "0.36.0";
 
-/// Adds an upgrade hint to a `method_not_found` answer for the idle-stop
-/// default. Errors relayed from a remote daemon keep their host.
-fn missing_idle_stop_method_hint(error: CliError) -> CliError {
-    let add_hint = |mut source: protocol::ProtocolError| {
-        if source.code == "method_not_found" {
-            source.recover = Some(IDLE_STOP_METHOD_UPGRADE_HINT.to_owned());
+/// Recovery hint for a daemon that does not know the idle-stop default;
+/// `connected` is the version the daemon reported, when it answered `daemon.health`.
+fn idle_stop_upgrade_hint(connected: Option<&str>) -> String {
+    let daemon = connected.map_or_else(
+        || "the connected daemon".to_owned(),
+        |version| format!("the connected daemon (version {version})"),
+    );
+    format!(
+        "{daemon} predates --idle-stop-after, which needs a daemon of release {IDLE_STOP_MIN_DAEMON_RELEASE} or later; upgrade the daemon and retry. Nothing was changed"
+    )
+}
+
+/// Adds an upgrade hint naming the connected daemon's version to a
+/// `method_not_found` answer for the idle-stop default. Errors relayed from a
+/// remote daemon keep their host.
+async fn missing_idle_stop_method_hint(client: &mut Client, error: CliError) -> CliError {
+    let is_missing = |source: &protocol::ProtocolError| source.code == "method_not_found";
+    let missing = match &error {
+        CliError::Protocol(source) => is_missing(source),
+        CliError::Client(pohunek_client::ClientError::RemoteProtocol { source, .. }) => {
+            is_missing(source)
         }
+        _ => false,
+    };
+    if !missing {
+        return error;
+    }
+    let connected = client
+        .call::<method::DaemonHealth>(())
+        .await
+        .ok()
+        .map(|health| health.daemon_version);
+    let hint = idle_stop_upgrade_hint(connected.as_deref());
+    let add_hint = |mut source: protocol::ProtocolError| {
+        source.recover = Some(hint.clone());
         source
     };
     match error {
@@ -1691,10 +1718,10 @@ pub(crate) async fn run_policy_set(
 ) -> Result<(), CliError> {
     let mut client = Client::connect(host, paths).await?;
     if let Some(secs) = args.idle_stop_after {
-        let served = client
-            .call::<method::SessionIdleStopGet>(())
-            .await
-            .map_err(missing_idle_stop_method_hint)?;
+        let served = match client.call::<method::SessionIdleStopGet>(()).await {
+            Ok(served) => served,
+            Err(error) => return Err(missing_idle_stop_method_hint(&mut client, error).await),
+        };
         if secs != 0 && secs < served.min_after_secs {
             return Err(CliError::Protocol(protocol::ProtocolError::new(
                 protocol::ErrorClass::Daemon,
@@ -1721,19 +1748,22 @@ pub(crate) async fn run_policy_set(
     };
     let idle_stop = match args.idle_stop_after {
         Some(secs) => Some(
-            client
+            match client
                 .call::<method::SessionIdleStopSet>(SessionIdleStopParams {
                     default_after_secs: Some(secs),
                 })
                 .await
-                .map_err(missing_idle_stop_method_hint)
-                .map_err(|error| {
-                    if retention_written {
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    let error = missing_idle_stop_method_hint(&mut client, error).await;
+                    return Err(if retention_written {
                         note_retention_landed(error)
                     } else {
                         error
-                    }
-                })?,
+                    });
+                }
+            },
         ),
         None => None,
     };

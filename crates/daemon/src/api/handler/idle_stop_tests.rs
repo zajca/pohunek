@@ -696,10 +696,19 @@ async fn a_stored_value_an_older_daemon_accepted_disarms_the_session_and_blocks_
     world.activity(0, "idle").await;
 
     world.elapse(10 * LIMIT_SECS).await;
-    world.elapse(10 * LIMIT_SECS).await;
     world
         .assert_running(0, "a stored value that opts in nothing")
         .await;
+    // An edit of another key wakes the task for a second pass that sees the
+    // same invalid value.
+    ok(world
+        .fixture
+        .call(
+            method::SESSION_SET_METADATA,
+            json!({"session_id": world.id(0), "metadata": {"work.issue": "956"}}),
+        )
+        .await);
+    world.quiesce().await;
     assert_eq!(
         logs.text().matches("session.idle_stop.ignored").count()
             + logs
@@ -709,13 +718,6 @@ async fn a_stored_value_an_older_daemon_accepted_disarms_the_session_and_blocks_
         1,
         "the ignored value is reported once, not on every pass"
     );
-    ok(world
-        .fixture
-        .call(
-            method::SESSION_SET_METADATA,
-            json!({"session_id": world.id(0), "metadata": {"work.issue": "956"}}),
-        )
-        .await);
     // Replacing the value with a valid one arms the session.
     ok(world.opt_in(0, &LIMIT_SECS.to_string()).await);
     let mut world = world;
