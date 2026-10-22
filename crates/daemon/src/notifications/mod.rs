@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use protocol::{
     event, ErrorClass, Event, NotificationCreateParams, NotificationCreateResult,
@@ -26,6 +27,7 @@ use tokio::sync::broadcast;
 
 use crate::session::{rfc3339_from_nanos, TurnId, TurnSnapshot};
 
+pub(crate) use coordinator::ResolveAsOf;
 #[doc(inline)]
 pub use coordinator::{AttentionCoordinator, AttentionCoordinatorTask};
 #[doc(inline)]
@@ -62,6 +64,8 @@ pub(crate) struct DeferredNotification {
     /// The turn the record reports, when it reports one the daemon runs.
     /// Producers meet on it; only the daemon says which it is.
     pub(crate) turn: Option<TurnId>,
+    /// When the record was minted, on a monotonic clock.
+    pub(crate) minted: Instant,
 }
 
 impl DeferredNotification {
@@ -707,15 +711,16 @@ impl NotificationService {
     /// # Errors
     ///
     /// Returns a [`NotificationError`] when the store append fails.
-    pub fn resolve_session_notifications(
+    pub(crate) fn resolve_session_notifications(
         &self,
         dedupe_key: &str,
+        as_of: Option<&ResolveAsOf>,
     ) -> Result<Vec<NotificationRecord>, NotificationError> {
         let now = timestamp_now();
         let resolved = self
             .inner
             .store
-            .resolve_session_notifications(dedupe_key, &now)?;
+            .resolve_session_notifications(dedupe_key, &now, as_of)?;
         for record in &resolved {
             self.emit_updated(record);
         }
@@ -884,8 +889,9 @@ impl NotificationService {
     pub(crate) fn commit_deferred(
         &self,
         record: NotificationRecord,
+        minted: Instant,
     ) -> Result<NotificationCreateResult, NotificationError> {
-        self.commit_record(record)
+        self.commit_record(record, minted)
     }
 
     fn create_with_metadata_at(
@@ -894,7 +900,7 @@ impl NotificationService {
         created_at: String,
     ) -> Result<NotificationCreateResult, NotificationError> {
         let record = self.build_record(params, created_at)?;
-        self.commit_record(record)
+        self.commit_record(record, Instant::now())
     }
 
     fn build_record(
@@ -964,18 +970,20 @@ impl NotificationService {
             inbox,
             signal: false,
             turn: None,
+            minted: Instant::now(),
         })
     }
 
     fn commit_record(
         &self,
         record: NotificationRecord,
+        minted: Instant,
     ) -> Result<NotificationCreateResult, NotificationError> {
         let window = self.policy().attention_dedupe_window_secs;
         match self
             .inner
             .store
-            .create_or_dedupe(record, u64::from(window))?
+            .create_or_dedupe(record, u64::from(window), minted)?
         {
             store::CreateOutcome::Created(record) => {
                 self.emit_created(&record);

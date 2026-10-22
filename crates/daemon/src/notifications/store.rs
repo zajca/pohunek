@@ -1,10 +1,11 @@
 //! Append-only notification store.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use protocol::{
     NotificationId, NotificationKind, NotificationListParams, NotificationListResult,
@@ -16,7 +17,7 @@ use tracing::warn;
 use super::{
     apply_status, inside_attention_window, is_attention_dedupe_key, is_attention_kind,
     is_turn_dedupe_key, is_valid_status_transition, parse_timestamp, same_source_namespace,
-    source_priority, NotificationError, SourcePriority, TURN_DEDUPE_KEY_PREFIX,
+    source_priority, NotificationError, ResolveAsOf, SourcePriority, TURN_DEDUPE_KEY_PREFIX,
 };
 
 /// Directory under the daemon data dir holding notification state.
@@ -70,6 +71,10 @@ struct StoreState {
     records: BTreeMap<String, NotificationRecord>,
     action_count: usize,
     source_warning_logged: bool,
+    /// When another producer than the projector last contributed to a record:
+    /// created it, or had a report merge into it. In memory only; a record
+    /// without an entry counts as contributed to before any moment.
+    contributions: HashMap<String, Instant>,
 }
 
 #[derive(Debug)]
@@ -140,6 +145,7 @@ impl NotificationStore {
                 records: replayed.records,
                 action_count: replayed.action_count,
                 source_warning_logged: false,
+                contributions: HashMap::new(),
             }),
         })
     }
@@ -345,6 +351,7 @@ impl NotificationStore {
         &self,
         candidate: NotificationRecord,
         attention_window_secs: u64,
+        minted: Instant,
     ) -> Result<CreateOutcome, NotificationError> {
         let mut state = self
             .state
@@ -361,35 +368,8 @@ impl NotificationStore {
             .filter(|dedupe_key| is_turn_dedupe_key(dedupe_key))
             .filter(|_| candidate.kind == NotificationKind::TurnCompleted)
         {
-            let updated = supersede_unread_records(
-                &state.records,
-                dedupe_key,
-                candidate.kind,
-                &candidate.id,
-                &candidate.created_at,
-            );
-            if updated.is_empty() {
-                append_action_locked(
-                    &self.path,
-                    &mut state,
-                    StoreAction::Created {
-                        record: candidate.clone(),
-                    },
-                )?;
-                return Ok(CreateOutcome::Created(candidate));
-            }
-            append_action_locked(
-                &self.path,
-                &mut state,
-                StoreAction::CreatedWithUpdates {
-                    record: candidate.clone(),
-                    updated: updated.clone(),
-                },
-            )?;
-            return Ok(CreateOutcome::CreatedWithUpdates {
-                record: candidate,
-                updated,
-            });
+            let dedupe_key = dedupe_key.to_owned();
+            return self.create_superseding_turns(&mut state, candidate, &dedupe_key, minted);
         }
 
         if let Some(dedupe_key) = candidate.dedupe_key.as_deref() {
@@ -420,6 +400,7 @@ impl NotificationStore {
                                 record: updated.clone(),
                             },
                         )?;
+                        note_contribution(&mut state, &candidate, &updated.id.0, minted);
                         return Ok(CreateOutcome::Updated(updated));
                     }
                     (
@@ -427,6 +408,7 @@ impl NotificationStore {
                         SourcePriority::Provider,
                     )
                     | (SourcePriority::Projector, SourcePriority::Projector) => {
+                        note_contribution(&mut state, &candidate, &existing.id.0, minted);
                         return Ok(CreateOutcome::Existing(existing));
                     }
                     (SourcePriority::User, _)
@@ -445,7 +427,50 @@ impl NotificationStore {
                 record: candidate.clone(),
             },
         )?;
+        note_contribution(&mut state, &candidate, &candidate.id.0, minted);
         Ok(CreateOutcome::Created(candidate))
+    }
+
+    /// Creates a `turn_completed` record that supersedes the unread ones of its
+    /// session key.
+    fn create_superseding_turns(
+        &self,
+        state: &mut StoreState,
+        candidate: NotificationRecord,
+        dedupe_key: &str,
+        minted: Instant,
+    ) -> Result<CreateOutcome, NotificationError> {
+        let updated = supersede_unread_records(
+            &state.records,
+            dedupe_key,
+            candidate.kind,
+            &candidate.id,
+            &candidate.created_at,
+        );
+        if updated.is_empty() {
+            append_action_locked(
+                &self.path,
+                state,
+                StoreAction::Created {
+                    record: candidate.clone(),
+                },
+            )?;
+            note_contribution(state, &candidate, &candidate.id.0, minted);
+            return Ok(CreateOutcome::Created(candidate));
+        }
+        append_action_locked(
+            &self.path,
+            state,
+            StoreAction::CreatedWithUpdates {
+                record: candidate.clone(),
+                updated: updated.clone(),
+            },
+        )?;
+        note_contribution(state, &candidate, &candidate.id.0, minted);
+        Ok(CreateOutcome::CreatedWithUpdates {
+            record: candidate,
+            updated,
+        })
     }
 
     /// Supersede unread `turn_completed` records consumed by visible attention.
@@ -656,7 +681,8 @@ impl NotificationStore {
     /// `turn:<session_id>`, marks `unread` and `read` `turn_completed` records
     /// as `acknowledged`. Records already acknowledged, archived, deleted, or
     /// unrelated to the key prefix are left untouched, so repeated calls are
-    /// idempotent.
+    /// idempotent. With `as_of`, records that other producers created after
+    /// that moment are left untouched too.
     ///
     /// # Errors
     ///
@@ -665,6 +691,7 @@ impl NotificationStore {
         &self,
         dedupe_key: &str,
         now: &str,
+        as_of: Option<&ResolveAsOf>,
     ) -> Result<Vec<NotificationRecord>, NotificationError> {
         let mut state = self
             .state
@@ -683,6 +710,7 @@ impl NotificationStore {
                         record.status,
                         NotificationStatus::Unread | NotificationStatus::Read
                     )
+                    && existed_at(&state, record, as_of)
             })
             .map(|record| record.id.0.clone())
             .collect();
@@ -702,6 +730,16 @@ impl NotificationStore {
             )?;
             resolved.push(record);
         }
+        // A record that is no longer active needs no contribution time.
+        let state = &mut *state;
+        state.contributions.retain(|id, _| {
+            state.records.get(id).is_some_and(|record| {
+                matches!(
+                    record.status,
+                    NotificationStatus::Unread | NotificationStatus::Read
+                )
+            })
+        });
         Ok(resolved)
     }
 
@@ -805,6 +843,40 @@ fn append_action_locked(
     apply_action(&mut state.records, action);
     state.action_count += 1;
     Ok(())
+}
+
+/// Records that `candidate`, when it is not the projector's, contributed to the
+/// record `id` at `minted`, keeping the newest contribution.
+fn note_contribution(
+    state: &mut StoreState,
+    candidate: &NotificationRecord,
+    id: &str,
+    minted: Instant,
+) {
+    if source_priority(&candidate.source) != SourcePriority::Projector {
+        let newest = state.contributions.entry(id.to_owned()).or_insert(minted);
+        *newest = (*newest).max(minted);
+    }
+}
+
+/// Whether `record` existed, with every contribution it holds, when a resolve
+/// `as_of` an earlier moment is applied.
+///
+/// The projector derives its records in the order its inputs arrive, so one
+/// that is visible to a resolve always precedes that resolve's input; it holds
+/// no contribution. Other producers are ordered by the instant they minted the
+/// record's newest contribution.
+fn existed_at(
+    state: &StoreState,
+    record: &NotificationRecord,
+    as_of: Option<&ResolveAsOf>,
+) -> bool {
+    as_of.is_none_or(|as_of| {
+        state
+            .contributions
+            .get(&record.id.0)
+            .is_none_or(|contributed| *contributed <= as_of.minted_before)
+    })
 }
 
 fn find_existing_source(
@@ -1129,7 +1201,7 @@ mod tests {
         store.append_created(other).expect("append other session");
 
         let resolved = store
-            .resolve_session_notifications("attention:s-1", "2026-07-03T10:05:00Z")
+            .resolve_session_notifications("attention:s-1", "2026-07-03T10:05:00Z", None)
             .expect("resolve attention");
 
         assert_eq!(resolved.len(), 2);
@@ -1165,13 +1237,13 @@ mod tests {
         store.append_created(errored).expect("append error");
 
         let first = store
-            .resolve_session_notifications("attention:s-1", "2026-07-03T10:05:00Z")
+            .resolve_session_notifications("attention:s-1", "2026-07-03T10:05:00Z", None)
             .expect("first resolve");
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].id.0, "n-1");
 
         let second = store
-            .resolve_session_notifications("attention:s-1", "2026-07-03T10:06:00Z")
+            .resolve_session_notifications("attention:s-1", "2026-07-03T10:06:00Z", None)
             .expect("second resolve");
         assert!(second.is_empty());
 
@@ -1193,14 +1265,14 @@ mod tests {
         first.kind = NotificationKind::TurnCompleted;
         first.dedupe_key = Some("turn:s-1".to_owned());
         store
-            .create_or_dedupe(first, 120)
+            .create_or_dedupe(first, 120, std::time::Instant::now())
             .expect("first turn create");
 
         let mut second = record("n-2", "2026-07-03T11:00:00Z");
         second.kind = NotificationKind::TurnCompleted;
         second.dedupe_key = Some("turn:s-1".to_owned());
         store
-            .create_or_dedupe(second, 120)
+            .create_or_dedupe(second, 120, std::time::Instant::now())
             .expect("second turn create");
 
         let log = std::fs::read_to_string(store.path()).expect("read notification log");
@@ -1247,7 +1319,7 @@ mod tests {
         store.append_created(attention).expect("append attention");
 
         let resolved = store
-            .resolve_session_notifications("turn:s-1", "2026-07-03T10:05:00Z")
+            .resolve_session_notifications("turn:s-1", "2026-07-03T10:05:00Z", None)
             .expect("resolve turn");
 
         assert_eq!(resolved.len(), 1);
