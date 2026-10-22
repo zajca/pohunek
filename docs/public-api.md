@@ -2291,8 +2291,9 @@ on fresh installs and migrations) raised it to 6; a schema-5 file is migrated
 the same way, with only the hooks default assigned. The `[events]` table
 (`max_file_bytes`, `max_files` and `max_age_days`, the size, count and age
 bounds of the event journal; 33554432, 8 and 14 on fresh installs and
-migrations) raised it to 7; a schema-6 file is migrated the same way, with only
-the events defaults assigned.
+migrations) raised it to 7: the table is required, so under the rule below it
+is a breaking change and not an optional additive key; a schema-6 file is
+migrated the same way, with only the events defaults assigned.
 `service.toml` tolerates keys this version does not know (#1401). The
 `schema_version` changes only for a breaking change: a removed or renamed key, a
 changed meaning or unit, or validation that rejects a file that was valid

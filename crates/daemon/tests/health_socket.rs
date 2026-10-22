@@ -7108,6 +7108,9 @@ async fn event_log_rotates_within_the_configured_retention() {
         tokio::fs::metadata(&rotated).await.ok()
     })
     .await;
+    // The server is down before the listing, so no rotation races it.
+    let _ = shutdown.send(());
+    let _ = handle.await;
     let mut journal_files = 0;
     for entry in std::fs::read_dir(&events_dir).expect("read events dir") {
         let entry = entry.expect("dir entry");
@@ -7116,16 +7119,19 @@ async fn event_log_rotates_within_the_configured_retention() {
             && Path::new(&name).extension().is_none_or(|ext| ext != "lock")
         {
             journal_files += 1;
-            assert!(
-                entry.metadata().expect("metadata").len() <= MAX_FILE_BYTES,
-                "{name} exceeds the configured bound"
-            );
+            // The journal writer may still rotate; a file renamed away between
+            // the listing and the stat is not a bound violation.
+            match entry.metadata() {
+                Ok(metadata) => assert!(
+                    metadata.len() <= MAX_FILE_BYTES,
+                    "{name} exceeds the configured bound"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("stat {name}: {error}"),
+            }
         }
     }
     assert!(journal_files <= MAX_FILES, "{journal_files} journal files");
-
-    let _ = shutdown.send(());
-    let _ = handle.await;
 }
 
 /// Milestone-9 checkpoint (event log): the daemon's append-only event log records

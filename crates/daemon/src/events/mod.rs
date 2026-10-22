@@ -218,7 +218,8 @@ fn write_line(writer: &mut Writer, event: &Event) -> io::Result<()> {
 /// A refresh differs from the previous journaled event of its session only in
 /// `revision`. Any other difference (activity, source, runtime, epoch) is a
 /// transition and is journaled. The remembered state is per session and is
-/// forgotten when the session stops or is removed, and across daemon restarts.
+/// forgotten when the session stops or is removed, when the journal records a
+/// gap (`events_dropped`), and across daemon restarts.
 #[derive(Debug, Default)]
 struct HeartbeatFilter {
     last_state: HashMap<String, Value>,
@@ -229,6 +230,11 @@ impl HeartbeatFilter {
     fn admits(&mut self, event: &Event) -> bool {
         match event.event() {
             protocol::event::AGENT_STATE => self.admits_agent_state(event.payload()),
+            EVENT_DROPPED => {
+                // Events were lost; the remembered states may be stale.
+                self.last_state.clear();
+                true
+            }
             protocol::event::SESSION_STOPPED | protocol::event::SESSION_REMOVED => {
                 if let Some(id) = event.payload()["session"]["id"].as_str() {
                     self.last_state.remove(id);
@@ -535,6 +541,24 @@ mod tests {
                 "session_updated",
                 "session_stopped",
             ],
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recorded_gap_makes_the_next_agent_state_journal_again() {
+        let (_root, dir) = events_dir("gap");
+        let gap = crate::events::event(EVENT_DROPPED, json!({ "dropped": 3 }));
+        let events = vec![
+            agent_state("s-1", "idle", "screen", 1),
+            agent_state("s-1", "idle", "screen", 2),
+            gap,
+            agent_state("s-1", "idle", "screen", 3),
+        ];
+        let log = journal(&dir, retention(1 << 20, 2), events).await;
+
+        assert_eq!(
+            names(&read_lines(log.path())),
+            ["agent_state", EVENT_DROPPED, "agent_state"]
         );
     }
 

@@ -733,7 +733,7 @@ mod tests {
         assert!(working_directory_check(Platform::MacOs, &ok).is_none());
     }
 
-    /// A schema-6 `service.toml` with the given extra lines in `[limits]`.
+    /// A current-schema (7) `service.toml` with the given extra lines in `[limits]`.
     fn service_toml(extra_limits: &str) -> String {
         format!(
             r#"schema_version = 7
