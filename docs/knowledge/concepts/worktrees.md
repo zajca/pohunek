@@ -39,15 +39,16 @@ Set one when the branch is first pushed, with `git push -u origin <branch>`.
 Worktree operations on one repository wait for each other. Adding, removing and
 pruning worktrees run one at a time, and a base-branch fetch waits for a running
 add or prune and holds those back while it runs (fetches run side by side).
-Each wait is bounded by the git command timeout (30 seconds), and the git
-command that follows has its own 30 seconds, so one operation can take up to
-about 60 seconds (a fetch also runs a few unlocked git steps, each with its own
-30-second bound). A wait that runs out is reported like the operation's own failure, with the text "waiting for
-another worktree operation on the same repository": as the `fetch` warning when
-the base exists locally, as `base_branch_fetch_failed` when it does not, and as
-a failed create or removal for an add or remove. The ordering holds within one
-daemon; another daemon, or a manual `git worktree add` on the same repository,
-is not ordered with it.
+Each wait is bounded by the git command timeout (30 seconds). Finding the lock
+(a `git rev-parse --git-common-dir`) and the git command that follows each have
+their own 30 seconds, so one operation can take up to about 90 seconds (a fetch
+also runs a few unlocked git steps, each with its own 30-second bound). A wait
+that runs out is reported like the operation's own failure, with the text
+"waiting for another worktree operation on the same repository": as the `fetch`
+warning when the base exists locally, as `base_branch_fetch_failed` when it does
+not, and as a failed create or removal for an add or remove. The ordering holds
+within one daemon; another daemon, or a manual `git worktree add` on the same
+repository, is not ordered with it.
 
 Worktrees are useful when an agent should make branch-scoped edits without
 touching the main checkout. They also make remote project sessions practical:
