@@ -5540,6 +5540,10 @@ const PI: &[&str] = &["pi"];
 
 /// One cell of the holder contract table: a state beside the holder, the outcome
 /// in plan, apply and `--detect`, and the remedy the hint names.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is one independent use of the runtime in the table"
+)]
 struct Cell {
     id: &'static str,
     runtimes: &'static [&'static str],
@@ -6035,8 +6039,10 @@ async fn cell_host(cell: &Cell, runtime: &str) -> (Host, Vec<(Role, Archive)>, A
         archives
             .iter()
             .find(|(candidate, _)| *candidate == role)
-            .map(|(_, archive)| archive.1.clone())
-            .unwrap_or_else(|| role_archive(runtime, role).1)
+            .map_or_else(
+                || role_archive(runtime, role).1,
+                |(_, archive)| archive.1.clone(),
+            )
     };
     let profile = cell_profile(runtime);
     if runtime == "pi" {
@@ -6076,6 +6082,10 @@ async fn cell_host(cell: &Cell, runtime: &str) -> (Host, Vec<(Role, Archive)>, A
 
 /// Runs the cell for `runtime`: the outcome in plan, apply and `--detect`, then
 /// the remedy the hint names, step by step as the CLI sends it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one remedy, read top to bottom: outcome, hint, steps, end"
+)]
 async fn run_cell(cell: &Cell, runtime: &str) {
     let label = format!("{} [{runtime}]", cell.id);
     let (host, archives, release) = cell_host(cell, runtime).await;
@@ -6083,8 +6093,10 @@ async fn run_cell(cell: &Cell, runtime: &str) {
         archives
             .iter()
             .find(|(candidate, _)| *candidate == role)
-            .map(|(_, archive)| archive.1.clone())
-            .unwrap_or_else(|| role_archive(runtime, role).1)
+            .map_or_else(
+                || role_archive(runtime, role).1,
+                |(_, archive)| archive.1.clone(),
+            )
     };
     let detail = match cell.outcome {
         Outcome::Gap => assert_held_runtime_left(&host, runtime, &[]),

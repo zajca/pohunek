@@ -13,6 +13,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -20,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use package::catalog_state::CatalogState;
 use package::registry::{PackageSource, RegistryState, RetainedDigests};
 use package::verify::VerifyError;
-use package::{PackageDigest, VerifiedCatalog, MAX_CATALOG_BYTES};
+use package::{PackageDigest, VerifiedCatalog, VerifiedEntry, MAX_CATALOG_BYTES};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Gap, IntegrationAction, PackageAction, PackageStatus,
     ProfileAction, ProfileStatus, Refusal, SelectedPackage, UseReason, CODE_GAP_AGENT_NOT_ON_PATH,
@@ -1188,32 +1189,7 @@ fn managed_runtimes(
                 && record.identity().id == *entry.package_id()
         });
         if installed {
-            let detail = match disabled_selected_package(state, entry.package_id()) {
-                Some(disabled) => disabled_package_detail(
-                    entry.package_id(),
-                    &disabled,
-                    disabled_state(plan, &disabled, runtime),
-                ),
-                None => {
-                    let blocked = Blocked {
-                        id: entry.package_id(),
-                        version: entry.version().as_str(),
-                        digest: entry.digest(),
-                        runtime,
-                    };
-                    match held_selection(plan, &blocked) {
-                        Some((holder, held)) if !matches!(held, Held::Serving) => {
-                            held_hint(plan, &blocked, &holder, &held, false, &[]).detail
-                        }
-                        _ => format!(
-                            "an official package of this runtime is installed but not selected \
-                             and enabled, so the upgrade leaves it as you set it; update it \
-                             with: {}",
-                            update_command(entry.package_id(), runtime)
-                        ),
-                    }
-                }
-            };
+            let detail = unserved_package_detail(plan, state, entry);
             report.gap(
                 runtime.as_str(),
                 CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
@@ -1222,6 +1198,40 @@ fn managed_runtimes(
         }
     }
     Ok(managed)
+}
+
+/// The gap detail for the release catalog's `entry`, whose official package is
+/// installed but neither selected nor enabled: the state of a disabled
+/// selection, the hint of a recorded holder, or the update that selects it.
+fn unserved_package_detail(
+    plan: &PlanInputs<'_>,
+    state: &RegistryState,
+    entry: &VerifiedEntry,
+) -> String {
+    let runtime = entry.runtime_id();
+    if let Some(disabled) = disabled_selected_package(state, entry.package_id()) {
+        return disabled_package_detail(
+            entry.package_id(),
+            &disabled,
+            disabled_state(plan, &disabled, runtime),
+        );
+    }
+    let blocked = Blocked {
+        id: entry.package_id(),
+        version: entry.version().as_str(),
+        digest: entry.digest(),
+        runtime,
+    };
+    match held_selection(plan, &blocked) {
+        Some((holder, held)) if !matches!(held, Held::Serving) => {
+            held_hint(plan, &blocked, &holder, &held, false, &[]).detail
+        }
+        _ => format!(
+            "an official package of this runtime is installed but not selected and enabled, so \
+             the upgrade leaves it as you set it; update it with: {}",
+            update_command(entry.package_id(), runtime)
+        ),
+    }
 }
 
 /// Plans the package of every used runtime.
@@ -2807,9 +2817,10 @@ fn held_hint(
             let follow = follow_up(plan, blocked, holder, holder, reserved, reasons, altered)
                 .map(|step| format!(", then {step}"))
                 .unwrap_or_default();
-            detail.push_str(&format!(
+            let _ = write!(
+                detail,
                 "; or remove the same-version installed one with `{command}`{follow}"
-            ));
+            );
         }
         HeldHint {
             refusal: None,
@@ -2917,7 +2928,6 @@ fn pin_release(plan: &PlanInputs<'_>, digest: &PackageDigest) -> Option<String> 
 /// What follows the removal of `removed`: the next upgrade, or for a Pi that
 /// keeps no enabled official selection the install of the release's package by
 /// hand. `None` when the plain upgrade would not plan the runtime again.
-#[expect(clippy::too_many_arguments, reason = "one state, read in one place")]
 fn follow_up(
     plan: &PlanInputs<'_>,
     blocked: &Blocked<'_>,
