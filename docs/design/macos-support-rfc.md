@@ -1,8 +1,8 @@
 # Complete macOS Host and Client Support RFC
 
-Status: accepted product contract; platform and secure-path foundations
-implemented by #95 and #96; complete macOS support remains deferred through
-#97-#105.
+Status: accepted product contract; macOS on Apple Silicon is supported. The
+open items of #100 and #102-#105 are ordinary follow-ups. The text below is
+design history.
 
 ## Tracking authority
 
@@ -456,8 +456,8 @@ The GitHub tracker orders the work from the completed shared platform and secure
 path foundations through native process and peer identity, PTY portability,
 launchd, integrations, clients, distribution, and final native acceptance.
 These are work items within one complete release scope. No intermediate merge
-advertises partial macOS support as a reduced product, and #105 remains the
-release closure gate.
+advertises partial macOS support as a reduced product. macOS on Apple Silicon
+is supported; the open items of #100 and #102-#105 are ordinary follow-ups.
 
 ## Release acceptance
 

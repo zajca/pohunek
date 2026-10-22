@@ -1589,8 +1589,8 @@ Important fields:
   timeout); a wait that runs out is reported the same way, with the text
   "waiting for another worktree operation on the same repository" in the `fetch`
   warning's `detail` or in the `base_branch_fetch_failed` message; the ordering
-  covers one daemon only. `kind` is `native_recovery` for a session whose stored native recovery record could
-  not be completed after an upgrade: it cannot resume or fork, `message` says to
+  covers one daemon only. `kind` is `native_recovery` for a session whose stored
+  native recovery record could not be completed after an upgrade: it cannot resume or fork, `message` says to
   start a new session and resume the native conversation, and `detail` carries
   the stored native reference. `hook` also marks a launch (new, resume or fork)
   whose agent's installed Claude or Codex hook assets differ from the ones the

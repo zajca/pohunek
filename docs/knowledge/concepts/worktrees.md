@@ -45,8 +45,8 @@ their own 30 seconds, so one operation can take up to about 90 seconds (a fetch
 also runs a few unlocked git steps, each with its own 30-second bound). A wait
 that runs out is reported like the operation's own failure, with the text
 "waiting for another worktree operation on the same repository": as the `fetch`
-warning when the base exists locally, as `base_branch_fetch_failed` when it does not, and as
-a failed create or removal for an add or remove. The ordering holds within one
+warning when the base exists locally, as `base_branch_fetch_failed` when it does
+not, and as a failed create or removal for an add or remove. The ordering holds within one
 daemon; another daemon, or a manual `git worktree add` on the same repository,
 is not ordered with it.
 
