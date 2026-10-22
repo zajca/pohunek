@@ -2253,7 +2253,7 @@ impl ProcessInspector for MockInspector {
 fn ended_turns(edges: &mut tokio::sync::mpsc::UnboundedReceiver<TurnEdge>) -> Vec<TurnId> {
     std::iter::from_fn(|| edges.try_recv().ok())
         .filter_map(|edge| match edge {
-            TurnEdge::Ended(_, id) => Some(id),
+            TurnEdge::Ended(_, id, _) => Some(id),
             TurnEdge::Started(..) => None,
         })
         .collect()
@@ -3044,7 +3044,7 @@ async fn a_restated_working_emits_no_agent_state() {
 fn started_turns(edges: &mut tokio::sync::mpsc::UnboundedReceiver<TurnEdge>) -> Vec<TurnId> {
     std::iter::from_fn(|| edges.try_recv().ok())
         .filter_map(|edge| match edge {
-            TurnEdge::Started(_, id) => Some(id),
+            TurnEdge::Started(_, id, _) => Some(id),
             TurnEdge::Ended(..) => None,
         })
         .collect()

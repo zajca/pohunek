@@ -956,7 +956,7 @@ impl SessionRegistry {
                         runtime: runtime.clone(),
                     }),
                 );
-                let _ = self.inner.events.send(event);
+                self.publish(event);
             }
             if updated.3 {
                 self.emit_background_state(&updated.1);
@@ -1047,7 +1047,7 @@ impl SessionRegistry {
                     entry: entry.clone(),
                 }),
             );
-            let _ = self.inner.events.send(event);
+            self.publish(event);
         }
         let tmpdir_owners = tmpdir_owners(
             &records,
@@ -2135,7 +2135,7 @@ impl SessionRegistry {
             event::SESSION_RUNTIME_DISCOVERED,
             event_payload(RuntimeInventoryEvent { entry }),
         );
-        let _ = self.inner.events.send(event);
+        self.publish(event);
     }
 
     /// Records that a live worker was adopted while its job is proven absent.
@@ -2213,7 +2213,7 @@ impl SessionRegistry {
             event::SESSION_RUNTIME_DISCOVERED,
             event_payload(RuntimeInventoryEvent { entry }),
         );
-        let _ = self.inner.events.send(event);
+        self.publish(event);
     }
 
     /// Classifies a running session whose worker control connection is gone.

@@ -43,6 +43,7 @@ use crate::agent::{
 };
 use crate::catalog_anchor::CatalogTrust;
 use crate::detect::{identify_agent, ActivityTransition, Detector, DetectorConfig, Manifest};
+use crate::events::ProducedEvent;
 use crate::external::{
     external_session_id, ExternalSessionChange, ExternalSessions, TranscriptCandidate,
     TranscriptIndex, EXTERNAL_TERMINAL_COLS, EXTERNAL_TERMINAL_ROWS,
@@ -128,6 +129,8 @@ use resume::ResumeSnapshot;
 pub(crate) use target::ActiveSupervision;
 use target::{build_launch_command, LaunchCommandPlan, PtySessionSpec, TargetResolution};
 pub use tmpdir::store_session_tmp_root;
+#[cfg(test)]
+pub(crate) use turn_events::EdgeStamp;
 pub(crate) use turn_events::{
     rfc3339_from_nanos, TurnEdge, TurnEvents, TurnId, TurnOwner, TurnSnapshot, TurnVerdict,
 };
@@ -727,6 +730,9 @@ struct SessionRegistryInner {
     /// overrides (Part C). Built from `config.agents_dir` at construction.
     profiles: ProfileRegistry,
     events: broadcast::Sender<Event>,
+    /// The same events with the instant each was published, for the consumers
+    /// that order an event against other producers' records.
+    produced_events: broadcast::Sender<ProducedEvent>,
     /// Unified metadata store (resume + worktree bindings), present when
     /// persistence is configured. Shared (`Arc`) with [`Self::worktree`] so both
     /// record kinds live in one file behind one serialization point.
@@ -2307,6 +2313,7 @@ impl SessionRegistry {
             .observe_external_agents
             .then(|| ExternalSessions::observer_config(config.procwatch_poll));
         let (events, _) = broadcast::channel(128);
+        let (produced_events, _) = broadcast::channel(128);
         // One unified store instance, shared (`Arc`) with the worktree manager so
         // resume and worktree records live in one file behind one serialization
         // point.
@@ -2379,6 +2386,7 @@ impl SessionRegistry {
                 launcher,
                 profiles,
                 events,
+                produced_events,
                 store,
                 persist_lock: Mutex::new(()),
                 #[cfg(test)]
@@ -2466,6 +2474,24 @@ impl SessionRegistry {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.inner.events.subscribe()
+    }
+
+    /// Subscribe to the session lifecycle events, each with the instant it was
+    /// published.
+    #[must_use]
+    pub(crate) fn subscribe_produced(&self) -> broadcast::Receiver<ProducedEvent> {
+        self.inner.produced_events.subscribe()
+    }
+
+    /// Publishes `event` to every subscriber, stamping the moment it is
+    /// produced, before any subscriber's queue holds it.
+    fn publish(&self, event: Event) {
+        let produced = std::time::Instant::now();
+        let _ = self.inner.produced_events.send(ProducedEvent {
+            event: event.clone(),
+            produced,
+        });
+        let _ = self.inner.events.send(event);
     }
 
     /// The host config directory (`$XDG_CONFIG_HOME/pohunek` or `~/.config/pohunek`),
@@ -4710,7 +4736,7 @@ impl SessionRegistry {
                 event::AGENT_STATE,
                 event_payload(evidence.event(params.session_id.clone())),
             );
-            let _ = self.inner.events.send(event);
+            self.publish(event);
         }
         Ok(SessionReportAgentResult { recorded: true })
     }
@@ -7278,7 +7304,7 @@ impl SessionRegistry {
                 runtime: event_runtime(info),
             }),
         );
-        let _ = self.inner.events.send(event);
+        self.publish(event);
     }
 
     fn emit(&self, name: &str, info: &SessionInfo) {
@@ -7291,7 +7317,7 @@ impl SessionRegistry {
                 session: info.clone(),
             }),
         );
-        let _ = self.inner.events.send(event);
+        self.publish(event);
     }
 
     fn emit_native_recovered(
@@ -7311,7 +7337,7 @@ impl SessionRegistry {
                 worker_instance_id,
             }),
         );
-        let _ = self.inner.events.send(event);
+        self.publish(event);
     }
 }
 

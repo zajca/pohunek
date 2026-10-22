@@ -51,6 +51,17 @@ pub(crate) fn event(name: &str, payload: serde_json::Value) -> Event {
         .expect("daemon events use valid names and object payloads")
 }
 
+/// An event with the instant the daemon published it.
+///
+/// The instant is on the clock other producers stamp their notification
+/// records with, so a consumer can order the event against them whatever its
+/// own queue delays.
+#[derive(Debug, Clone)]
+pub(crate) struct ProducedEvent {
+    pub(crate) event: Event,
+    pub(crate) produced: std::time::Instant,
+}
+
 /// File name of the active journal file inside the events directory.
 const EVENT_LOG_NAME: &str = "events.jsonl";
 

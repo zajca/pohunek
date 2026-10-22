@@ -291,7 +291,7 @@ impl SessionRegistry {
                 stream_id: stream_id.to_owned(),
             }),
         );
-        let _ = self.inner.events.send(event);
+        self.publish(event);
     }
 }
 

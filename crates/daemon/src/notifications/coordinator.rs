@@ -93,6 +93,15 @@ impl ResolveAsOf {
             monotonic: Instant::now(),
         }
     }
+
+    /// The moment `produced`, when the input was produced earlier than it is
+    /// handled. The stale-stop suppression window starts when it is handled.
+    pub(crate) fn at(produced: StdInstant) -> Self {
+        Self {
+            minted_before: produced,
+            monotonic: Instant::now(),
+        }
+    }
 }
 
 /// Clonable command sink for the session notification debounce coordinator.

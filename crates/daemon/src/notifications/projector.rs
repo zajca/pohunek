@@ -3,7 +3,7 @@
 // Rust guideline compliant 2026-10-12
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 
 use protocol::{
     event, AgentActivity, Event, NotificationCreateParams, NotificationKind, NotificationSeverity,
@@ -18,6 +18,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use crate::events::ProducedEvent;
 use crate::session::{SessionRegistry, TurnEdge, TurnId};
 
 use super::{
@@ -77,7 +78,7 @@ impl NotificationProjector {
             sessions.clone(),
             notifications,
             attention,
-            sessions.subscribe(),
+            sessions.subscribe_produced(),
             shutdown.clone(),
         );
         Self { shutdown, handle }
@@ -102,7 +103,7 @@ fn spawn_projector_task(
     sessions: SessionRegistry,
     notifications: NotificationService,
     attention: AttentionCoordinator,
-    mut events: broadcast::Receiver<Event>,
+    mut events: broadcast::Receiver<ProducedEvent>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -125,7 +126,7 @@ fn spawn_projector_task(
                     None => turn_edges = None,
                 },
                 received = events.recv() => match received {
-                    Ok(event) => state.handle_event_blocking(&notifications, &attention, &event).await,
+                    Ok(ProducedEvent { event, produced }) => state.handle_produced_event_blocking(&notifications, &attention, &event, produced).await,
                     Err(broadcast::error::RecvError::Lagged(dropped)) => {
                         warn!(
                             dropped,
@@ -160,7 +161,7 @@ async fn drain_buffered_events(
     sessions: &SessionRegistry,
     notifications: &NotificationService,
     attention: &AttentionCoordinator,
-    events: &mut broadcast::Receiver<Event>,
+    events: &mut broadcast::Receiver<ProducedEvent>,
     turn_edges: &mut Option<mpsc::UnboundedReceiver<TurnEdge>>,
     state: &mut ProjectorState,
 ) {
@@ -171,9 +172,9 @@ async fn drain_buffered_events(
     }
     loop {
         match events.try_recv() {
-            Ok(event) => {
+            Ok(ProducedEvent { event, produced }) => {
                 state
-                    .handle_event_blocking(notifications, attention, &event)
+                    .handle_produced_event_blocking(notifications, attention, &event, produced)
                     .await;
             }
             Err(broadcast::error::TryRecvError::Lagged(dropped)) => {
@@ -432,11 +433,25 @@ enum DeferredInput {
 }
 
 impl ProjectorState {
+    #[cfg(test)]
     async fn handle_event_blocking(
         &mut self,
         notifications: &NotificationService,
         attention: &AttentionCoordinator,
         event: &Event,
+    ) {
+        self.handle_produced_event_blocking(notifications, attention, event, StdInstant::now())
+            .await;
+    }
+
+    /// Projects `event`, which was produced at `produced`; the input keeps
+    /// that moment as its arrival while it waits for a seed.
+    async fn handle_produced_event_blocking(
+        &mut self,
+        notifications: &NotificationService,
+        attention: &AttentionCoordinator,
+        event: &Event,
+        produced: StdInstant,
     ) {
         let seeded_subject = event_subject(event);
         let ordered_subject = seeded_subject
@@ -445,17 +460,30 @@ impl ProjectorState {
             .or_else(|| stopped_subject(event));
         if let Some(session_id) = ordered_subject {
             if self.deferred.contains_key(&session_id) {
-                self.defer(&session_id, DeferredInput::Event(event.clone()));
+                self.defer(
+                    &session_id,
+                    DeferredInput::Event(event.clone()),
+                    ResolveAsOf::at(produced),
+                );
                 return;
             }
         }
         if let Some((session_id, _)) = &seeded_subject {
             if !self.seed_transition_epochs(notifications, session_id).await {
-                self.defer(session_id, DeferredInput::Event(event.clone()));
+                self.defer(
+                    session_id,
+                    DeferredInput::Event(event.clone()),
+                    ResolveAsOf::at(produced),
+                );
                 return;
             }
         }
-        self.project_event(notifications, attention, event).await;
+        self.project_event(
+            notifications,
+            &attention.as_of(ResolveAsOf::at(produced)),
+            event,
+        )
+        .await;
     }
 
     async fn project_event(
@@ -487,6 +515,7 @@ impl ProjectorState {
             self.defer(
                 &session.id,
                 DeferredInput::Snapshot(Box::new(session.clone())),
+                ResolveAsOf::now(),
             );
             return;
         }
@@ -517,10 +546,13 @@ impl ProjectorState {
         edge: TurnEdge,
     ) {
         let session_id = match &edge {
-            TurnEdge::Started(session_id, _) | TurnEdge::Ended(session_id, _) => session_id.clone(),
+            TurnEdge::Started(session_id, ..) | TurnEdge::Ended(session_id, ..) => {
+                session_id.clone()
+            }
         };
+        let arrived = ResolveAsOf::at(edge.happened_at());
         if self.deferred.contains_key(&session_id) {
-            self.defer(&session_id, DeferredInput::Edge(edge));
+            self.defer(&session_id, DeferredInput::Edge(edge), arrived);
             return;
         }
         if matches!(edge, TurnEdge::Ended(..))
@@ -528,10 +560,11 @@ impl ProjectorState {
                 .seed_transition_epochs(notifications, &session_id)
                 .await
         {
-            self.defer(&session_id, DeferredInput::Edge(edge));
+            self.defer(&session_id, DeferredInput::Edge(edge), arrived);
             return;
         }
-        self.project_turn_edge(notifications, attention, edge).await;
+        self.project_turn_edge(notifications, &attention.as_of(arrived), edge)
+            .await;
     }
 
     async fn project_turn_edge(
@@ -541,11 +574,11 @@ impl ProjectorState {
         edge: TurnEdge,
     ) {
         let (session_id, turn) = match edge {
-            TurnEdge::Started(session_id, _) => {
+            TurnEdge::Started(session_id, ..) => {
                 attention.resolve(turn_dedupe_key(&session_id));
                 return;
             }
-            TurnEdge::Ended(session_id, turn) => (session_id, turn),
+            TurnEdge::Ended(session_id, turn, _) => (session_id, turn),
         };
         let session_id = &session_id;
         let pending = self.prepare_derived(
@@ -577,15 +610,14 @@ impl ProjectorState {
         }
     }
 
-    /// Keeps `input` of `session_id` behind the inputs it waits for and arms
-    /// the seed retry.
+    /// Keeps `input` of `session_id`, which arrived at `arrived`, behind the
+    /// inputs it waits for and arms the seed retry.
     ///
     /// Consecutive snapshots collapse into the newest one, which states the
     /// session's current condition. A backlog at its bound drops its oldest
     /// input.
-    fn defer(&mut self, session_id: &SessionId, input: DeferredInput) {
+    fn defer(&mut self, session_id: &SessionId, input: DeferredInput, arrived: ResolveAsOf) {
         let backlog = self.deferred.entry(session_id.clone()).or_default();
-        let arrived = ResolveAsOf::now();
         match (backlog.back_mut(), input) {
             (
                 Some(Deferred {
@@ -989,6 +1021,8 @@ impl ProjectorState {
                     %error,
                     "projector epoch seeding task failed; the session's inputs wait for the next retry"
                 );
+                #[cfg(test)]
+                notifications.note_projector_seed_failed();
                 return false;
             }
         };
@@ -1228,6 +1262,7 @@ fn session_agent_kind(session: &SessionInfo) -> RuntimeRef {
 
 #[cfg(test)]
 mod tests {
+    use crate::notifications::ResolveAsOf;
     use std::collections::BTreeMap;
 
     use protocol::{
@@ -1423,6 +1458,7 @@ mod tests {
         state.defer(
             &session.id,
             DeferredInput::Snapshot(Box::new(session.clone())),
+            ResolveAsOf::now(),
         );
         let first = state.deferred[&session.id][0].arrived;
         tokio::time::advance(std::time::Duration::from_secs(3)).await;
@@ -1430,6 +1466,7 @@ mod tests {
         state.defer(
             &session.id,
             DeferredInput::Snapshot(Box::new(session.clone())),
+            ResolveAsOf::now(),
         );
         let backlog = &state.deferred[&session.id];
         assert_eq!(backlog.len(), 1);
@@ -1609,6 +1646,7 @@ mod tests {
                 crate::session::TurnEdge::Started(
                     SessionId("s-1".to_owned()),
                     crate::session::TurnId::numbered(1),
+                    crate::session::EdgeStamp::now(),
                 ),
             )
             .await;

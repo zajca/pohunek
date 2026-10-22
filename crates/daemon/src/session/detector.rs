@@ -336,7 +336,7 @@ impl SessionRegistry {
             event::AGENT_STATE,
             event_payload(evidence.event(id.clone())),
         );
-        let _ = self.inner.events.send(event);
+        self.publish(event);
     }
 }
 
