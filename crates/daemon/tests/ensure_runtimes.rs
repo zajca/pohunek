@@ -5314,6 +5314,7 @@ async fn a_selected_pi_holder_without_its_root_is_left_with_no_command() {
     let holder = official_runtimes::variant_archive("pi", RELEASE_VERSION);
     let release = holder_release("pi");
     let host = host_with_holder("pi", &[(&holder, true, true)], &release).await;
+    host.write_profile("work", "base = \"pi\"\n");
     host.remove_package_root(holder.1.as_str());
 
     let detail = assert_held_runtime_left(&host, "pi", &["a release that gives the package"]);
@@ -5545,7 +5546,10 @@ async fn a_newer_pi_selection_without_its_root_beside_a_holder_keeps_its_refusal
     host.remove_package_root(selected.1.as_str());
     let registry = fs::read(host.registry_path()).expect("the registry record");
 
-    for report in [host.step(true), host.step(false)] {
+    for program in ["pi", SAME_VERSION_PROGRAM] {
+        fs::remove_file(programs_dir(&host).join(program)).expect("remove the program");
+    }
+    for report in [host.step(true), host.step(false), host.detect_step()] {
         assert_eq!(
             refusal_codes(&report),
             [CODE_RELEASE_CATALOG_UNAVAILABLE],
@@ -5679,4 +5683,30 @@ async fn a_profile_pinned_to_an_older_version_beside_the_holder_gets_the_whole_r
             "{runtime}"
         );
     }
+}
+
+/// A reserved runtime that only `--detect` plans is not planned by the plain
+/// upgrade, so the detecting plan names no uninstall command for the holder.
+#[tokio::test]
+async fn a_runtime_planned_only_by_detection_beside_a_holder_gets_no_uninstall_command() {
+    let runtime = "claude";
+    let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+    let release = holder_release(runtime);
+    let host = host_with_holder(runtime, &[(&holder, true, false)], &release).await;
+    fs::remove_file(host.profiles_dir().join(format!("{runtime}.toml")))
+        .expect("remove the profile");
+
+    let detected = host.detect_step();
+
+    let gap = detected
+        .gaps
+        .iter()
+        .find(|gap| gap.runtime == runtime && gap.code == CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)
+        .unwrap_or_else(|| panic!("{:?}", detected.gaps));
+    assert!(!gap.detail.contains("`pohunek"), "{}", gap.detail);
+    assert!(
+        gap.detail.contains("a release that gives the package"),
+        "{}",
+        gap.detail
+    );
 }
