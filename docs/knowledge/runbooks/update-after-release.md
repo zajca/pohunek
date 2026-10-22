@@ -864,6 +864,12 @@ no unpinned profile is bound to it by the upgrade (the next upgrade then install
 release's archive). The profile the earlier upgrade bound normally pins it, no command
 releases that pin, and the detail then names no command. For Pi it never names one: the
 upgrade does not install a Pi package again once none is installed.
+When no enabled official selection serves beside the recorded package (nothing is selected,
+or the selected package's root is missing or does not load), the upgrade installs nothing,
+leaves the runtime and reports the gap `official_package_not_serving`; for a reserved runtime
+that is used and whose recorded package nothing pins, the detail names the same uninstall
+command. A selected package with an altered root, the recorded one or another version, is
+refused with `plugin uninstall --remove-modified`.
 A selected package you disabled is never replaced, selected or enabled, whatever its
 version is (older, newer, equal under another digest or unordered; the release's own
 package counts too): the plan plans nothing for that runtime and reports the gap

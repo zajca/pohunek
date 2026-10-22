@@ -1410,7 +1410,13 @@ fn decide_selection(
     {
         return Selection::Leave;
     }
-    selection_outcome(plan, prepared, subject, report, reserved)
+    let used = reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            UseReason::Profile | UseReason::Session | UseReason::Integration
+        )
+    });
+    selection_outcome(plan, prepared, subject, report, reserved, used)
 }
 
 /// Under `--detect`, a runtime the plan would leave untouched (its package is
@@ -1433,7 +1439,8 @@ fn passes_detect_gate_before_leaving(
         || matches!(
             unordered_selection(plan, prepared),
             Some((Serving::Broken | Serving::Damaged(_), _))
-        );
+        )
+        || held_leaves(plan, prepared, reserved);
     !left
         || detect_on_search_path(
             report,
@@ -2514,6 +2521,7 @@ fn selection_outcome(
     subject: &str,
     report: &mut Report,
     reserved: bool,
+    used: bool,
 ) -> Selection {
     let id = &prepared.identity.id;
     if let Some(digest) = disabled_package(plan, prepared) {
@@ -2574,14 +2582,138 @@ fn selection_outcome(
             reason: KeepReason::Ordered,
         };
     }
-    match same_version_holder(plan, prepared) {
-        Some(holder) if selection_serves(plan, prepared) => Selection::Keep {
+    let Some((holder, held)) = held_selection(plan, prepared) else {
+        return Selection::Replace;
+    };
+    match held {
+        Held::Serving => Selection::Keep {
             reason: KeepReason::SameVersionOtherDigest(same_version_detail(
                 plan, prepared, &holder, reserved,
             )),
         },
-        _ => Selection::Replace,
+        Held::Damaged(kind, selected) => {
+            refuse_damaged(report, subject, kind, id, &selected);
+            Selection::Leave
+        }
+        held => {
+            let detail = held_left_detail(plan, prepared, &holder, &held, reserved, used);
+            report_not_serving(report, subject, detail);
+            Selection::Leave
+        }
     }
+}
+
+/// What the selection of a package id is when the registry holds the release
+/// package's id and version under another digest, the holder.
+enum Held {
+    /// An enabled official selection serves the runtime: it is kept.
+    Serving,
+    /// No version of the package is selected.
+    NoSelection,
+    /// The selected package is not an enabled official one.
+    NotOfficial,
+    /// The enabled official selection's root is missing or does not load.
+    Broken(PackageDigest),
+    /// The enabled official selection's root is present and altered or damaged.
+    Damaged(PackageErrorKind, PackageDigest),
+}
+
+/// The holder of the release package's identity and the state of the selection
+/// beside it; `None` when the registry holds no such digest, so the release's
+/// archive can be installed.
+fn held_selection(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<(PackageDigest, Held)> {
+    let holder = same_version_holder(plan, prepared)?;
+    let state = plan.state?;
+    let held = match state.selected(&prepared.identity.id) {
+        None => Held::NoSelection,
+        Some(selected) if *selected == prepared.digest => return None,
+        Some(selected) => match state.package(selected) {
+            Some(record) if record.source() == PackageSource::Official && record.enabled() => {
+                match health_of(plan, selected) {
+                    Health::Present => Held::Serving,
+                    Health::Install => Held::Broken(selected.clone()),
+                    Health::Damaged(kind) => Held::Damaged(kind, selected.clone()),
+                }
+            }
+            _ => Held::NotOfficial,
+        },
+    };
+    Some((holder, held))
+}
+
+/// Whether [`selection_outcome`] reaches the holder check and leaves the runtime
+/// untouched there.
+fn held_leaves(plan: &PlanInputs<'_>, prepared: &Prepared, reserved: bool) -> bool {
+    unordered_selection(plan, prepared).is_none()
+        && (reserved || replaces_newer(plan, prepared).is_none())
+        && matches!(
+            held_selection(plan, prepared),
+            Some((
+                _,
+                Held::NoSelection | Held::NotOfficial | Held::Broken(_) | Held::Damaged(..)
+            ))
+        )
+}
+
+/// The gap detail for a runtime the upgrade leaves because the registry holds
+/// the release package's id and version under the digest `holder`, and no
+/// enabled official selection serves.
+///
+/// Where the holder itself is the obstacle (nothing selected, or it is the
+/// selected package and does not load), the uninstall command is named for a
+/// reserved runtime that a profile, session or integration uses and whose
+/// holder nothing pins: the registry accepts that uninstall, and the next plain
+/// upgrade installs the release's archive.
+fn held_left_detail(
+    plan: &PlanInputs<'_>,
+    prepared: &Prepared,
+    holder: &PackageDigest,
+    held: &Held,
+    reserved: bool,
+    used: bool,
+) -> String {
+    let id = &prepared.identity.id;
+    let version = prepared.identity.version.as_str();
+    let cause = match held {
+        Held::NoSelection => "no version of the package is selected",
+        Held::Broken(selected) if selected == holder => {
+            "the selected package's root is missing or does not load"
+        }
+        Held::Broken(_) => {
+            return format!(
+                "the release's package has the same version ({version}) as an installed one \
+                 under another archive, so it cannot be installed, and the selected version's \
+                 package root is missing or does not load, so the upgrade leaves it; restore it \
+                 with `pohunek plugin install` of that version's archive, or select another \
+                 installed version with: pohunek plugin select {id} --digest <digest>"
+            );
+        }
+        Held::NotOfficial | Held::Serving | Held::Damaged(..) => {
+            return format!(
+                "the release's package has the same version ({version}) as an installed one \
+                 under another archive, so it cannot be installed, and the selected package is \
+                 not an enabled official one, so the upgrade leaves it; select an official \
+                 version with: pohunek plugin select {id} --digest <digest>"
+            );
+        }
+    };
+    let lead = format!(
+        "the release's package has the same version ({version}) as an installed one under \
+         another archive, and {cause}, so nothing is installed and the runtime is left as it is"
+    );
+    if reserved && used && !plan.retained.contains(holder) {
+        return format!(
+            "{lead}; remove the installed one with `pohunek plugin uninstall {id} --digest {} \
+             --yes`, then run the upgrade again",
+            selector_digest(holder)
+        );
+    }
+    let pi = if reserved {
+        ""
+    } else {
+        "; the upgrade does not install a Pi package again once none is installed"
+    };
+    format!("{lead}; the fix is a release that gives the package a new version{pi}")
 }
 
 /// Why a selected package stays instead of being replaced.

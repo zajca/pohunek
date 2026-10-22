@@ -2586,7 +2586,33 @@ How to read it:
   under another digest and an enabled, loadable S serves the runtime (R is not
   recorded), the plan and the apply keep S (status `kept`) with the gap
   `plugin_update_same_version_other_digest` and write nothing, for a reserved runtime and
-  for Pi; a disabled S is row 18-20's outcome.
+  for Pi, except that a newer Pi S is kept silently, with no gap, as beside any release
+  package it would replace; a disabled S is row 18-20's outcome. When no enabled official S
+  serves beside that recorded package (the holder H), the release's archive still cannot be
+  installed, so the plan and the apply agree and write nothing (the holder table below).
+
+The holder table lists what the plan, the apply and `--detect` say for a runtime whose
+release package's id and version the registry records as H under another digest and
+that no enabled, loadable official S serves. A runtime nothing uses whose program is off the
+search path is dropped before it is judged, as in the table above.
+
+| State beside H | Outcome | Hint |
+|---|---|---|
+| Reserved: nothing selected, H enabled or disabled | gap `official_package_not_serving`, no package entry, profile left unbound | `plugin uninstall <package> --digest <H> --yes`, then the next upgrade installs the release's archive and binds the profile |
+| Reserved: H is selected, enabled and its root is missing or does not load | gap `official_package_not_serving` | the same uninstall (the registry unrecords a package without a root) |
+| Pi: H is selected, enabled and its root is missing or does not load | gap `official_package_not_serving` | no command: the upgrade does not install a Pi package again once none is installed |
+| H is selected, enabled and its root is altered | refusal with the root-invalid code | `plugin uninstall <package> --digest <H> --remove-modified --yes`, then the next upgrade installs the release's archive |
+| Another version S is selected, enabled, and its root is missing or does not load | gap `official_package_not_serving` | restore S with `plugin install`, or `plugin select <package> --digest <digest>` |
+| S is selected, enabled, and its root is altered | refusal for S | `plugin uninstall <package> --digest <S> --remove-modified --yes` |
+| The selected package is not official (a registry edited by hand) | gap `official_package_not_serving` | `plugin select <package> --digest <digest>` |
+
+The uninstall command of the first two rows is named only for a reserved runtime that a
+profile, session or installed hook makes the plain upgrade plan, and only while no session or
+host profile pins H (the registry refuses the uninstall of a pinned package); otherwise the
+detail names no command and says the fix is a release that gives the package a new version.
+A profile that pins another installed version P keeps the command: the uninstall is accepted
+with P retained, and the next apply installs the release's archive and repins the profile
+from P.
 
 The scenarios are `claude_judges_the_disabled_release_package_by_the_selection_state`,
 `codex_judges_the_disabled_release_package_by_the_selection_state`,
@@ -2598,7 +2624,20 @@ The scenarios are `claude_judges_the_disabled_release_package_by_the_selection_s
 and `a_disabled_pi_selection_beside_a_third_party_server_is_reported_as_claimed` (a claimed
 S), all in `crates/daemon/tests/ensure_runtimes.rs`, and
 `install_refuses_an_identity_installed_from_another_archive` in
-`crates/package/tests/registry.rs`.
+`crates/package/tests/registry.rs`. The holder rows have the scenarios
+`a_holder_with_no_selected_version_is_left_and_its_uninstall_lets_the_release_install`,
+`a_selected_holder_without_its_root_is_left_and_its_uninstall_lets_the_release_install`,
+`a_selected_pi_holder_without_its_root_is_left_with_no_command`,
+`a_holder_that_a_profile_pins_is_left_with_no_uninstall_command`,
+`a_selected_holder_with_an_altered_root_is_refused_and_its_removal_lets_the_release_install`,
+`a_selected_pi_holder_with_an_altered_root_is_refused`,
+`a_selected_version_without_its_root_beside_a_holder_is_left_with_the_select_hint`,
+`a_selected_version_with_an_altered_root_beside_a_holder_is_refused`,
+`a_non_official_selection_beside_a_holder_is_left_with_the_select_hint`,
+`a_newer_pi_selection_without_its_root_beside_a_holder_keeps_its_refusal`,
+`a_detecting_plan_drops_an_unused_runtime_before_judging_its_holder`, the newer-Pi keep
+`a_newer_pi_selection_beside_a_holder_of_the_release_version_is_kept_silently`, and the pinned
+older version `a_profile_pinned_to_an_older_version_beside_the_holder_gets_the_whole_remedy`.
 
 `pohunek service upgrade` and `pohunek service check` of an existing service run
 a read-only preflight before any effect by invoking `pohunekd upgrade-preflight`

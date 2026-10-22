@@ -7,7 +7,9 @@
   runtime, the plan and the apply keep that selection, write nothing and report the
   gap `plugin_update_same_version_other_digest`. Its detail names the uninstall
   command of the recorded package only where that is proven to work (the selected
-  package of a reserved runtime that no profile or session pins), and otherwise says the
-  fix is a release with a new version. The gap code is additive: an older client reads it as an unknown
+  package of a reserved runtime that a profile, session or hook makes the plain upgrade
+  plan, that no profile or session pins and that the upgrade does not bind to a profile),
+  and otherwise says the fix is a release with a new version. A newer Pi selection is
+  kept silently, with no gap. The gap code is additive: an older client reads it as an unknown
   string.
 - Docs: `install.md`, `public-api.md` and the update runbook.

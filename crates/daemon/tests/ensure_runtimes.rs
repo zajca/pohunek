@@ -5091,3 +5091,592 @@ fn a_session_record_that_pins_the_holder_withdraws_the_uninstall_hint() {
         assert_same_version_hint(&gap.detail, runtime, Hint::NewVersion);
     }
 }
+
+/// A host staged for the holder table: each of `installs` (archive, enabled,
+/// selected) is recorded through the catalog in order, and `release` (the
+/// holders' package id and version under another digest) is published. A
+/// reserved runtime has a profile over it, and every runtime has its program on
+/// the search path.
+async fn host_with_holder(
+    runtime: &str,
+    installs: &[(&Archive, bool, bool)],
+    release: &Archive,
+) -> Host {
+    let host = Host::new();
+    let plugins = host.plugins_dir();
+    let scratch = host.env.root().to_path_buf();
+    for (index, (archive, enable, select)) in installs.iter().enumerate() {
+        let flags = official_runtimes::InstallFlags {
+            enable: *enable,
+            select: *select,
+        };
+        host.catalog
+            .install_archive(
+                &plugins,
+                &scratch,
+                runtime,
+                archive,
+                u64::try_from(index + 1).expect("a small index"),
+                flags,
+            )
+            .await;
+    }
+    host.publish_archives(
+        STAGED_RELEASE_SEQUENCE,
+        &[(runtime, &release.0, &release.1)],
+    );
+    if runtime != "pi" {
+        host.write_profile(runtime, &format!("base = \"{runtime}\"\n"));
+    }
+    host.put_program(runtime);
+    host.put_program(SAME_VERSION_PROGRAM);
+    host
+}
+
+/// The release archive of `runtime` with the holders' version and another digest.
+fn holder_release(runtime: &str) -> Archive {
+    official_runtimes::variant_archive_with_program(runtime, RELEASE_VERSION, SAME_VERSION_PROGRAM)
+}
+
+/// Rewrites the source of the recorded package `digest`, as a registry edited by
+/// hand would carry it.
+fn set_package_source(host: &Host, digest: &PackageDigest, source: &str) {
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(host.registry_path()).expect("registry"))
+            .expect("registry json");
+    for record in registry["packages"].as_array_mut().expect("packages") {
+        if record["digest"] == digest.as_str() {
+            record["source"] = serde_json::Value::String(source.to_owned());
+        }
+    }
+    fs::write(host.registry_path(), registry.to_string()).expect("write the registry");
+}
+
+/// What the plan, the apply and the detecting plan of `host` say for `runtime`
+/// when the holder leaves it untouched: no refusal, no package entry, no profile
+/// action, one `official_package_not_serving` gap that contains every text of
+/// `details`, and the registry and the profile unchanged. Returns the plan's
+/// gap detail.
+fn assert_held_runtime_left(host: &Host, runtime: &str, details: &[&str]) -> String {
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let profile = fs::read_to_string(host.profiles_dir().join(format!("{runtime}.toml"))).ok();
+    let plan = host.step(true);
+    let applied = host.step(false);
+    let detected = host.detect_step();
+    let mut plan_detail = String::new();
+    for (label, report) in [("plan", &plan), ("apply", &applied), ("detect", &detected)] {
+        assert!(
+            report.refusals.is_empty(),
+            "{runtime} {label}: {:?}",
+            report.refusals
+        );
+        assert!(
+            report
+                .packages
+                .iter()
+                .all(|package| package.runtime != runtime),
+            "{runtime} {label}: {:?}",
+            report.packages
+        );
+        assert!(report.profiles.is_empty(), "{runtime} {label}");
+        let gaps: Vec<_> = report
+            .gaps
+            .iter()
+            .filter(|gap| gap.runtime == runtime && gap.code != CODE_GAP_CONFIG_HOME_MISSING)
+            .collect();
+        assert_eq!(gaps.len(), 1, "{runtime} {label}: {gaps:?}");
+        assert_eq!(gaps[0].code, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING);
+        for text in details {
+            assert!(
+                gaps[0].detail.contains(text),
+                "{runtime} {label}: {}",
+                gaps[0].detail
+            );
+        }
+        if label == "plan" {
+            plan_detail = gaps[0].detail.clone();
+        }
+    }
+    assert_eq!(
+        plan.gaps
+            .iter()
+            .find(|gap| gap.runtime == runtime)
+            .map(|gap| &gap.detail),
+        applied
+            .gaps
+            .iter()
+            .find(|gap| gap.runtime == runtime)
+            .map(|gap| &gap.detail),
+        "{runtime}: the plan and the apply say the same"
+    );
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry,
+        "{runtime}"
+    );
+    assert_eq!(
+        fs::read_to_string(host.profiles_dir().join(format!("{runtime}.toml"))).ok(),
+        profile,
+        "{runtime}"
+    );
+    plan_detail
+}
+
+/// Runs the remedy the gap detail names for the holder: the uninstall the
+/// registry accepts with the plan's retained set (here, nothing is pinned), then
+/// the next apply installs the release archive and binds the profile.
+fn assert_uninstall_remedy_installs_the_release(
+    host: &Host,
+    runtime: &str,
+    holder: &PackageDigest,
+    release: &PackageDigest,
+    detail: &str,
+) {
+    assert!(
+        detail.contains(&uninstall_command(runtime, holder)),
+        "{runtime}: {detail}"
+    );
+    pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+        .expect("the package store")
+        .registry()
+        .uninstall(holder, &package::registry::RetainedDigests::new())
+        .expect("the registry accepts the hinted uninstall");
+    let applied = host.step(false);
+    assert!(
+        applied.refusals.is_empty(),
+        "{runtime}: {:?}",
+        applied.refusals
+    );
+    let package = applied
+        .packages
+        .iter()
+        .find(|package| package.runtime == runtime)
+        .unwrap_or_else(|| panic!("{runtime}: {:?}", applied.packages));
+    assert_eq!(package.status, PackageStatus::Installed, "{runtime}");
+    assert_eq!(package.digest, release.as_str(), "{runtime}");
+    assert_eq!(
+        profile_status(&applied.profiles, runtime),
+        ProfileStatus::Bound,
+        "{runtime}"
+    );
+}
+
+/// Rows 1 and 2: the holder is recorded, enabled or disabled, and no version is
+/// selected. The runtime is left with a gap that names the uninstall, and the
+/// whole remedy installs the release.
+#[tokio::test]
+async fn a_holder_with_no_selected_version_is_left_and_its_uninstall_lets_the_release_install() {
+    for runtime in ["claude", "codex", "hermes"] {
+        for enabled in [true, false] {
+            let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+            let release = holder_release(runtime);
+            let host = host_with_holder(runtime, &[(&holder, enabled, false)], &release).await;
+
+            let detail = assert_held_runtime_left(
+                &host,
+                runtime,
+                &["no version of the package is selected"],
+            );
+
+            assert_uninstall_remedy_installs_the_release(
+                &host, runtime, &holder.1, &release.1, &detail,
+            );
+        }
+    }
+}
+
+/// Row 3: the selected package is the holder and its root is missing. The
+/// registry unrecords a package without a root, so the uninstall is accepted.
+#[tokio::test]
+async fn a_selected_holder_without_its_root_is_left_and_its_uninstall_lets_the_release_install() {
+    for runtime in ["claude", "codex", "hermes"] {
+        let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+        let release = holder_release(runtime);
+        let host = host_with_holder(runtime, &[(&holder, true, true)], &release).await;
+        host.remove_package_root(holder.1.as_str());
+
+        let detail = assert_held_runtime_left(
+            &host,
+            runtime,
+            &["the selected package's root is missing or does not load"],
+        );
+
+        assert_uninstall_remedy_installs_the_release(
+            &host, runtime, &holder.1, &release.1, &detail,
+        );
+    }
+}
+
+/// Row 3 for Pi: the upgrade never installs an absent Pi package, so the detail
+/// names no command and says so.
+#[tokio::test]
+async fn a_selected_pi_holder_without_its_root_is_left_with_no_command() {
+    let holder = official_runtimes::variant_archive("pi", RELEASE_VERSION);
+    let release = holder_release("pi");
+    let host = host_with_holder("pi", &[(&holder, true, true)], &release).await;
+    host.remove_package_root(holder.1.as_str());
+
+    let detail = assert_held_runtime_left(&host, "pi", &["a release that gives the package"]);
+
+    assert!(!detail.contains("`pohunek"), "{detail}");
+    assert!(
+        detail.contains("does not install a Pi package again"),
+        "{detail}"
+    );
+}
+
+/// A pinned holder cannot be uninstalled: the detail names no command.
+#[tokio::test]
+async fn a_holder_that_a_profile_pins_is_left_with_no_uninstall_command() {
+    let runtime = "claude";
+    let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+    let release = holder_release(runtime);
+    let host = host_with_holder(runtime, &[(&holder, true, true)], &release).await;
+    host.write_profile(
+        runtime,
+        &format!(
+            "base = \"{runtime}\"\npackage = \"pohunek.runtime.{runtime}\"\ndigest = \"{}\"\n",
+            holder.1.as_str()
+        ),
+    );
+    host.remove_package_root(holder.1.as_str());
+
+    let detail = assert_held_runtime_left(&host, runtime, &["a release that gives the package"]);
+
+    assert!(!detail.contains("`pohunek"), "{detail}");
+}
+
+/// Row 4: the selected holder's root is altered. Plan and apply refuse with the
+/// uninstall of the holder, the registry accepts it, and the next apply installs
+/// the release archive.
+#[tokio::test]
+async fn a_selected_holder_with_an_altered_root_is_refused_and_its_removal_lets_the_release_install(
+) {
+    for runtime in ["claude", "codex", "hermes"] {
+        let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+        let release = holder_release(runtime);
+        let host = host_with_holder(runtime, &[(&holder, true, true)], &release).await;
+        host.alter_package_root(&holder.1);
+        let registry = fs::read(host.registry_path()).expect("the registry record");
+        let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
+
+        let plan = host.step(true);
+        let applied = host.step(false);
+
+        for report in [&plan, &applied] {
+            assert_eq!(refusal_codes(report), [root_refusal.as_str()], "{runtime}");
+            assert!(
+                report.refusals[0].detail.contains(&format!(
+                    "pohunek plugin uninstall pohunek.runtime.{runtime} --digest {} \
+                     --remove-modified --yes",
+                    holder.1.as_str()
+                )),
+                "{}",
+                report.refusals[0].detail
+            );
+            assert!(report.packages.is_empty(), "{runtime}");
+        }
+        assert_eq!(
+            fs::read(host.registry_path()).expect("the registry record"),
+            registry,
+            "{runtime}"
+        );
+        pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+            .expect("the package store")
+            .registry()
+            .remove_modified(&holder.1, &package::registry::RetainedDigests::new())
+            .expect("the registry accepts the hinted removal");
+        let next = host.step(false);
+        assert!(next.refusals.is_empty(), "{runtime}: {:?}", next.refusals);
+        let package = next
+            .packages
+            .iter()
+            .find(|package| package.runtime == runtime)
+            .expect("the runtime package");
+        assert_eq!(package.status, PackageStatus::Installed, "{runtime}");
+        assert_eq!(package.digest, release.1.as_str(), "{runtime}");
+    }
+}
+
+/// Row 4 for Pi: the same refusal, with the registry unchanged.
+#[tokio::test]
+async fn a_selected_pi_holder_with_an_altered_root_is_refused() {
+    let holder = official_runtimes::variant_archive("pi", RELEASE_VERSION);
+    let release = holder_release("pi");
+    let host = host_with_holder("pi", &[(&holder, true, true)], &release).await;
+    host.alter_package_root(&holder.1);
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
+
+    for report in [host.step(true), host.step(false)] {
+        assert_eq!(refusal_codes(&report), [root_refusal.as_str()]);
+        assert!(report.packages.is_empty());
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+}
+
+/// Row 5: another version is selected and its root is missing, while the holder
+/// is recorded unselected. The existing restore-or-select hint stays.
+#[tokio::test]
+async fn a_selected_version_without_its_root_beside_a_holder_is_left_with_the_select_hint() {
+    for (runtime, version) in [
+        ("claude", "1.0.1"),
+        ("codex", "2.1.0"),
+        ("hermes", "1.0.1"),
+        ("pi", PI_OLDER_VERSION),
+    ] {
+        let selected = official_runtimes::variant_archive(runtime, version);
+        let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+        let release = holder_release(runtime);
+        let host = host_with_holder(
+            runtime,
+            &[(&selected, true, true), (&holder, true, false)],
+            &release,
+        )
+        .await;
+        host.remove_package_root(selected.1.as_str());
+
+        let detail = assert_held_runtime_left(
+            &host,
+            runtime,
+            &[
+                "package root is missing or does not load",
+                &format!("pohunek plugin select pohunek.runtime.{runtime} --digest"),
+            ],
+        );
+
+        assert!(
+            !detail.contains(&uninstall_command(runtime, &holder.1)),
+            "{runtime}: {detail}"
+        );
+    }
+}
+
+/// Row 6: another version is selected and its root is altered, while the holder
+/// is recorded unselected. The existing refusal names the selected version.
+#[tokio::test]
+async fn a_selected_version_with_an_altered_root_beside_a_holder_is_refused() {
+    for (runtime, version) in [
+        ("claude", "1.0.1"),
+        ("codex", "2.1.0"),
+        ("pi", PI_OLDER_VERSION),
+    ] {
+        let selected = official_runtimes::variant_archive(runtime, version);
+        let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+        let release = holder_release(runtime);
+        let host = host_with_holder(
+            runtime,
+            &[(&selected, true, true), (&holder, true, false)],
+            &release,
+        )
+        .await;
+        host.alter_package_root(&selected.1);
+        let registry = fs::read(host.registry_path()).expect("the registry record");
+        let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
+
+        for report in [host.step(true), host.step(false)] {
+            assert_eq!(refusal_codes(&report), [root_refusal.as_str()], "{runtime}");
+            assert!(
+                report.refusals[0].detail.contains(&format!(
+                    "--digest {} --remove-modified --yes",
+                    selected.1.as_str()
+                )),
+                "{}",
+                report.refusals[0].detail
+            );
+            assert!(report.packages.is_empty(), "{runtime}");
+        }
+        assert_eq!(
+            fs::read(host.registry_path()).expect("the registry record"),
+            registry,
+            "{runtime}"
+        );
+    }
+}
+
+/// Row 7: the selected package is not official (a registry edited by hand; a
+/// reserved id cannot be installed by `plugin install` that way). The runtime is
+/// left, with the select hint and no uninstall command.
+#[tokio::test]
+async fn a_non_official_selection_beside_a_holder_is_left_with_the_select_hint() {
+    let runtime = "claude";
+    let selected = official_runtimes::variant_archive(runtime, "1.0.1");
+    let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+    let release = holder_release(runtime);
+    let host = host_with_holder(
+        runtime,
+        &[(&selected, true, true), (&holder, true, false)],
+        &release,
+    )
+    .await;
+    set_package_source(&host, &selected.1, "explicit_digest");
+
+    let detail = assert_held_runtime_left(
+        &host,
+        runtime,
+        &[
+            "not an enabled official one",
+            "pohunek plugin select pohunek.runtime.claude --digest",
+        ],
+    );
+
+    assert!(
+        !detail.contains(&uninstall_command(runtime, &holder.1)),
+        "{detail}"
+    );
+}
+
+/// Row 8: a newer Pi selection whose root is missing beside a holder keeps its
+/// existing refusal, in the plan and in the apply.
+#[tokio::test]
+async fn a_newer_pi_selection_without_its_root_beside_a_holder_keeps_its_refusal() {
+    let selected = official_runtimes::variant_archive("pi", PI_NEWER_VERSION);
+    let holder = official_runtimes::variant_archive("pi", RELEASE_VERSION);
+    let release = holder_release("pi");
+    let host = host_with_holder(
+        "pi",
+        &[(&selected, true, true), (&holder, true, false)],
+        &release,
+    )
+    .await;
+    host.remove_package_root(selected.1.as_str());
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+
+    for report in [host.step(true), host.step(false)] {
+        assert_eq!(
+            refusal_codes(&report),
+            [CODE_RELEASE_CATALOG_UNAVAILABLE],
+            "{:?}",
+            report.refusals
+        );
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+}
+
+/// A detecting plan drops a runtime nothing uses whose program is off the search
+/// path before it judges the holder, as it does for the other left states.
+#[tokio::test]
+async fn a_detecting_plan_drops_an_unused_runtime_before_judging_its_holder() {
+    for state in ["no selection", "root missing", "other root missing"] {
+        let runtime = "codex";
+        let selected = official_runtimes::variant_archive(runtime, "1.0.1");
+        let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+        let release = holder_release(runtime);
+        let installs: Vec<(&Archive, bool, bool)> = match state {
+            "no selection" => vec![(&holder, true, false)],
+            "root missing" => vec![(&holder, true, true)],
+            _ => vec![(&selected, true, true), (&holder, true, false)],
+        };
+        let host = host_with_holder(runtime, &installs, &release).await;
+        match state {
+            "root missing" => host.remove_package_root(holder.1.as_str()),
+            "other root missing" => host.remove_package_root(selected.1.as_str()),
+            _ => {}
+        }
+        fs::remove_file(host.profiles_dir().join(format!("{runtime}.toml")))
+            .expect("remove the profile");
+        for program in [runtime, SAME_VERSION_PROGRAM] {
+            fs::remove_file(programs_dir(&host).join(program)).expect("remove the program");
+        }
+
+        let detected = host.detect_step();
+
+        assert!(
+            detected.refusals.is_empty(),
+            "{state}: {:?}",
+            detected.refusals
+        );
+        assert!(
+            detected
+                .packages
+                .iter()
+                .all(|package| package.runtime != runtime),
+            "{state}: {:?}",
+            detected.packages
+        );
+        assert!(
+            !gap_codes(&detected).contains(&(runtime, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)),
+            "{state}: {:?}",
+            detected.gaps
+        );
+    }
+}
+
+/// A host profile pins another installed, older version P beside the selected
+/// holder. The plan keeps the holder and names its uninstall, because only P is
+/// retained; the registry accepts that uninstall with the plan's retained set,
+/// and the next apply installs the release archive and repins the profile from
+/// P, judging the retained P against the release package.
+#[tokio::test]
+async fn a_profile_pinned_to_an_older_version_beside_the_holder_gets_the_whole_remedy() {
+    for runtime in ["claude", "codex", "hermes"] {
+        let older = official_runtimes::variant_archive(runtime, "1.0.1");
+        let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+        let release = holder_release(runtime);
+        let host = host_with_holder(
+            runtime,
+            &[(&older, true, true), (&holder, true, true)],
+            &release,
+        )
+        .await;
+        host.write_profile(
+            runtime,
+            &format!(
+                "base = \"{runtime}\"\npackage = \"pohunek.runtime.{runtime}\"\ndigest = \"{}\"\n",
+                older.1.as_str()
+            ),
+        );
+        let profile = host.profile_text_of(runtime);
+
+        let plan = host.step(true);
+        let applied = host.step(false);
+
+        for report in [&plan, &applied] {
+            assert!(
+                report.refusals.is_empty(),
+                "{runtime}: {:?}",
+                report.refusals
+            );
+            let gap = report
+                .gaps
+                .iter()
+                .find(|gap| gap.runtime == runtime)
+                .unwrap_or_else(|| panic!("{runtime}: {:?}", report.gaps));
+            assert_eq!(gap.code, CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST);
+            assert_same_version_hint(&gap.detail, runtime, Hint::Uninstall(&holder.1));
+        }
+        assert_eq!(host.profile_text_of(runtime), profile, "{runtime}");
+
+        let mut retained = package::registry::RetainedDigests::new();
+        retained.insert(older.1.clone());
+        pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+            .expect("the package store")
+            .registry()
+            .uninstall(&holder.1, &retained)
+            .expect("the registry accepts the hinted uninstall");
+        let next = host.step(false);
+
+        assert!(next.refusals.is_empty(), "{runtime}: {:?}", next.refusals);
+        let package = next
+            .packages
+            .iter()
+            .find(|package| package.runtime == runtime)
+            .unwrap_or_else(|| panic!("{runtime}: {:?}", next.packages));
+        assert_eq!(package.status, PackageStatus::Installed, "{runtime}");
+        assert_eq!(package.digest, release.1.as_str(), "{runtime}");
+        let repinned = &next.profiles[0];
+        assert_eq!(repinned.status, ProfileStatus::Repinned, "{runtime}");
+        assert_eq!(repinned.previous_digest.as_deref(), Some(older.1.as_str()));
+        assert_eq!(repinned.digest, release.1.as_str(), "{runtime}");
+        assert!(
+            host.profile_text_of(runtime).contains(release.1.as_str()),
+            "{runtime}"
+        );
+    }
+}
