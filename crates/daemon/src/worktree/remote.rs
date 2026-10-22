@@ -180,8 +180,13 @@ fn relate(
             )),
         )),
         Some(OnDiverged::BackupReset) => {
-            if let Some(why) = backup_obstruction(repository, &backup)? {
-                return Err(backup_exists(&backup, &why));
+            // A backup that already holds the local head is reused by the update.
+            let holds_local =
+                ref_head(repository, &format!("refs/heads/{backup}"))?.as_deref() == Some(&local);
+            if !holds_local {
+                if let Some(why) = backup_obstruction(repository, &backup)? {
+                    return Err(backup_exists(&backup, &why));
+                }
             }
             Ok(Action::Reset { local, backup })
         }
@@ -310,8 +315,10 @@ pub(super) fn verify_start(
 /// worktree admin lock, first keeping `old` as `refs/heads/<backup>` when asked.
 ///
 /// The lock keeps a concurrent `git worktree add` from checking the branch out
-/// between the in-use check and the update. A branch that is no longer at `old`
-/// is left alone and no backup is made.
+/// between the in-use check and the update. A failed update is classified by the
+/// refs it left behind ([`settle`]), never by the failure itself: a transaction
+/// that timed out after committing, or one a concurrent identical request
+/// applied first, counts as applied.
 fn move_branch(
     repository: &Path,
     branch: &str,
@@ -325,41 +332,152 @@ fn move_branch(
     if checked_out_elsewhere(repository, branch).map_err(|message| inspect_error(&message))? {
         return Err(branch_in_use_error(branch));
     }
-    let branch_ref = format!("refs/heads/{branch}");
-    let backup_ref = backup.map(|name| format!("refs/heads/{name}"));
+    let moves = Move {
+        branch_ref: format!("refs/heads/{branch}"),
+        backup_ref: backup.map(|name| format!("refs/heads/{name}")),
+        branch,
+        old,
+        new,
+    };
     // One transaction: the backup (which must not exist yet) and the compare-and-
     // swap reset both apply or neither does.
-    let mut lines = vec!["start".to_owned()];
-    if let Some(backup_ref) = &backup_ref {
-        lines.push(format!("create {backup_ref} {old}"));
-    }
-    lines.push(format!("update {branch_ref} {new} {old}"));
-    lines.extend(["prepare".to_owned(), "commit".to_owned()]);
-    let script = lines.join("\n") + "\n";
-    let Err(message) = update_refs(repository, &script) else {
+    let Err(message) = update_refs(repository, &moves.script(true)) else {
         return Ok(());
     };
-    if let Some(name) = backup {
-        if let Some(why) = backup_obstruction(repository, name)? {
-            return Err(backup_exists(name, &why));
+    match settle(repository, &moves, false)? {
+        Settled::Applied => Ok(()),
+        Settled::BackupHoldsOld => {
+            // A concurrent request already made the backup of this very head;
+            // the reset only has to verify it.
+            let Err(message) = update_refs(repository, &moves.script(false)) else {
+                return Ok(());
+            };
+            match settle(repository, &moves, true)? {
+                Settled::Applied => Ok(()),
+                Settled::BackupHoldsOld | Settled::Failed => Err(moves.update_failed(&message)),
+            }
         }
+        Settled::Failed => Err(moves.update_failed(&message)),
     }
-    let still_at_old = rev_parse_commit(repository, &branch_ref).is_ok_and(|head| head == old);
-    Err(if still_at_old {
+}
+
+/// The ref update of [`move_branch`].
+struct Move<'a> {
+    branch_ref: String,
+    backup_ref: Option<String>,
+    branch: &'a str,
+    old: &'a str,
+    new: &'a str,
+}
+
+impl Move<'_> {
+    /// The `update-ref --stdin` script: create the backup (or verify the one that
+    /// already holds `old`), then swap the branch.
+    fn script(&self, create_backup: bool) -> String {
+        let mut lines = vec!["start".to_owned()];
+        if let Some(backup_ref) = &self.backup_ref {
+            let verb = if create_backup { "create" } else { "verify" };
+            lines.push(format!("{verb} {backup_ref} {}", self.old));
+        }
+        lines.push(format!(
+            "update {} {} {}",
+            self.branch_ref, self.new, self.old
+        ));
+        lines.extend(["prepare".to_owned(), "commit".to_owned()]);
+        lines.join("\n") + "\n"
+    }
+
+    fn update_failed(&self, message: &str) -> ProtocolError {
         error(
             ErrorClass::Runtime,
             "worktree_add_failed",
-            format!("could not update local branch {branch:?}: {message}"),
+            format!("could not update local branch {:?}: {message}", self.branch),
             None,
         )
-    } else {
-        error(
-            ErrorClass::Runtime,
-            "worktree_add_failed",
-            format!("local branch {branch:?} moved concurrently; no backup or reset was applied"),
-            Some("retry the session".to_owned()),
-        )
-    })
+    }
+}
+
+/// What a failed update left behind.
+enum Settled {
+    /// The branch is at `new` and the backup (if any) holds `old`.
+    Applied,
+    /// The branch is still at `old` and the requested backup already holds it.
+    BackupHoldsOld,
+    /// Nothing was applied (the error is built by the caller or returned).
+    Failed,
+}
+
+/// Classify a failed update by the refs it left.
+///
+/// A backup that holds `old` is never reported as an obstruction and never
+/// advised to be deleted: it may be the only ref that still reaches `old`.
+///
+/// # Errors
+///
+/// `backup_ref_exists` for a backup name that is taken by something else while
+/// the branch is still at `old`, and `worktree_add_failed` naming a concurrent
+/// move (and the backup holding `old`, if any) for any other position.
+fn settle(repository: &Path, moves: &Move<'_>, retried: bool) -> Result<Settled, ProtocolError> {
+    // A ref that cannot be read is an error, not an absent ref: the update may
+    // have committed, so the old head is named for recovery.
+    let unreadable = |mut err: ProtocolError| {
+        err.msg = format!(
+            "{}; the previous head of {:?} was {}{}",
+            err.msg,
+            moves.branch,
+            moves.old,
+            moves
+                .backup_ref
+                .as_deref()
+                .map_or_else(String::new, |backup| format!(
+                    ", kept as {:?} if the update committed",
+                    backup.trim_start_matches("refs/heads/")
+                ))
+        );
+        err
+    };
+    let head = ref_head(repository, &moves.branch_ref).map_err(unreadable)?;
+    let backup_holds_old = match &moves.backup_ref {
+        Some(backup) => {
+            ref_head(repository, backup).map_err(unreadable)?.as_deref() == Some(moves.old)
+        }
+        None => false,
+    };
+    if head.as_deref() == Some(moves.new) && (moves.backup_ref.is_none() || backup_holds_old) {
+        return Ok(Settled::Applied);
+    }
+    if head.as_deref() == Some(moves.old) {
+        if backup_holds_old && !retried {
+            return Ok(Settled::BackupHoldsOld);
+        }
+        if let Some(backup) = &moves.backup_ref {
+            let name = backup.trim_start_matches("refs/heads/");
+            if !backup_holds_old {
+                if let Some(why) = backup_obstruction(repository, name)? {
+                    return Err(backup_exists(name, &why));
+                }
+            }
+        }
+        return Ok(Settled::Failed);
+    }
+    let kept = match &moves.backup_ref {
+        Some(backup) if backup_holds_old => format!(
+            "; the local head {} is kept as {:?}",
+            moves.old,
+            backup.trim_start_matches("refs/heads/")
+        ),
+        Some(_) if head.as_deref() == Some(moves.new) => format!(
+            "; it is at {} but the backup does not hold {}, the previous head",
+            moves.new, moves.old
+        ),
+        _ => "; no backup or reset was applied".to_owned(),
+    };
+    Err(error(
+        ErrorClass::Runtime,
+        "worktree_add_failed",
+        format!("local branch {:?} moved concurrently{kept}", moves.branch),
+        Some("retry the session".to_owned()),
+    ))
 }
 
 /// Apply a `git update-ref --stdin` script, bounded by [`GIT_COMMAND_TIMEOUT`].
@@ -438,6 +556,19 @@ fn backup_obstruction(repository: &Path, backup: &str) -> Result<Option<String>,
     if ref_exists(repository, &format!("refs/heads/{backup}"))? {
         return Ok(Some("the ref already exists".to_owned()));
     }
+    let below = git_capture(
+        repository,
+        &[
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname)",
+            &format!("refs/heads/{backup}/"),
+        ],
+    )
+    .map_err(|message| inspect_error(&message))?;
+    if !below.is_empty() {
+        return Ok(Some(format!("the branch {below:?} lies below that name")));
+    }
     let mut prefix = String::new();
     let mut parts = backup.split('/').peekable();
     while let Some(part) = parts.next() {
@@ -463,6 +594,26 @@ fn ref_exists(repository: &Path, name: &str) -> Result<bool, ProtocolError> {
     match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
+        _ => Err(inspect_error(&output_failure_message(&output))),
+    }
+}
+
+/// The commit `name` points to, or `None` when the ref does not exist.
+fn ref_head(repository: &Path, name: &str) -> Result<Option<String>, ProtocolError> {
+    let mut cmd = git_command(repository).map_err(|message| inspect_error(&message))?;
+    cmd.args([
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("{name}^{{commit}}"),
+    ]);
+    let output =
+        run_output_bounded(cmd, GIT_COMMAND_TIMEOUT).map_err(|message| inspect_error(&message))?;
+    match output.status.code() {
+        Some(0) => Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        )),
+        Some(1) => Ok(None),
         _ => Err(inspect_error(&output_failure_message(&output))),
     }
 }

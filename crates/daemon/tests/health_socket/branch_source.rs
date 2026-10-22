@@ -757,6 +757,157 @@ async fn a_failure_after_the_worktree_is_bound_still_names_the_backup() {
 }
 
 #[tokio::test]
+async fn a_reset_that_a_concurrent_request_applied_first_is_a_success_and_keeps_the_backup() {
+    let mut rig = Rig::start("bs-reset-raced").await;
+    let main = rig.main.clone();
+    let remote = rig.origin_commit(BRANCH, "remote.txt");
+    rig.local_branch(BRANCH, &main);
+    let local = rig.local_commit(BRANCH, "local.txt");
+    let backup = Rig::backup_name(&local);
+    // Between the plan and the update, an identical request makes the backup
+    // and resets the branch; the transaction then fails on the stale old value.
+    install_pre_create_hook(
+        &rig,
+        &format!(
+            "#!/bin/sh\ncd \"$POHUNEK_REPO\"\ngit update-ref refs/heads/{backup} {local}\ngit update-ref refs/heads/{BRANCH} {remote}\n"
+        ),
+    );
+
+    let (session, worktree_source) =
+        started(rig.remote_session(Some(OnDiverged::BackupReset)).await);
+
+    assert_eq!(
+        worktree_source,
+        Some(WorktreeSource {
+            backup_ref: Some(backup.clone()),
+            ..source("origin/feat", &remote)
+        })
+    );
+    assert_eq!(worktree_head(&rig, &session), remote);
+    assert_eq!(rig.rev(&format!("refs/heads/{backup}")), Some(local));
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn a_backup_that_already_holds_the_local_head_is_reused_not_reported_as_taken() {
+    let mut rig = Rig::start("bs-backup-reused").await;
+    let main = rig.main.clone();
+    let remote = rig.origin_commit(BRANCH, "remote.txt");
+    rig.local_branch(BRANCH, &main);
+    let local = rig.local_commit(BRANCH, "local.txt");
+    let backup = Rig::backup_name(&local);
+    // The branch is still at its old head when the transaction runs, but the
+    // backup name was taken by a ref that holds exactly that head.
+    install_pre_create_hook(
+        &rig,
+        &format!("#!/bin/sh\ngit -C \"$POHUNEK_REPO\" update-ref refs/heads/{backup} {local}\n"),
+    );
+
+    let (session, worktree_source) =
+        started(rig.remote_session(Some(OnDiverged::BackupReset)).await);
+
+    assert_eq!(
+        worktree_source.and_then(|source| source.backup_ref),
+        Some(backup.clone())
+    );
+    assert_eq!(worktree_head(&rig, &session), remote);
+    assert_eq!(rig.rev(&format!("refs/heads/{backup}")), Some(local));
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn a_branch_that_moves_elsewhere_after_the_backup_was_made_names_it_and_never_advises_deleting_it(
+) {
+    let mut rig = Rig::start("bs-backup-moved").await;
+    let main = rig.main.clone();
+    rig.origin_commit(BRANCH, "remote.txt");
+    rig.local_branch(BRANCH, &main);
+    let local = rig.local_commit(BRANCH, "local.txt");
+    let backup = Rig::backup_name(&local);
+    install_pre_create_hook(
+        &rig,
+        &format!(
+            "#!/bin/sh\ncd \"$POHUNEK_REPO\"\ngit update-ref refs/heads/{backup} {local}\ngit update-ref refs/heads/{BRANCH} {main}\n"
+        ),
+    );
+
+    let error = err_payload(rig.remote_session(Some(OnDiverged::BackupReset)).await);
+
+    assert_eq!(error.code, "worktree_add_failed", "{}", error.msg);
+    assert!(error.msg.contains(&backup), "{}", error.msg);
+    assert!(
+        !error.msg.contains("no backup")
+            && !error.recover.as_deref().unwrap_or("").contains("delete"),
+        "{error:?}"
+    );
+    assert_eq!(rig.rev(&format!("refs/heads/{backup}")), Some(local));
+    rig.assert_nothing_left(true).await;
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn a_fast_forward_that_a_concurrent_request_applied_first_is_a_success() {
+    let mut rig = Rig::start("bs-ff-raced").await;
+    let main = rig.main.clone();
+    let remote = rig.origin_commit(BRANCH, "remote.txt");
+    rig.local_branch(BRANCH, &main);
+    install_pre_create_hook(
+        &rig,
+        &format!("#!/bin/sh\ngit -C \"$POHUNEK_REPO\" update-ref refs/heads/{BRANCH} {remote}\n"),
+    );
+
+    let (session, worktree_source) = started(rig.remote_session(None).await);
+
+    assert_eq!(
+        worktree_source.map(|source| source.commit),
+        Some(remote.clone())
+    );
+    assert_eq!(worktree_head(&rig, &session), remote);
+    assert_eq!(rig.rev("refs/heads/feat"), Some(remote));
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn a_ref_below_the_backup_name_refuses_the_reset() {
+    let mut rig = Rig::start("bs-backup-below").await;
+    let main = rig.main.clone();
+    rig.origin_commit(BRANCH, "remote.txt");
+    rig.local_branch(BRANCH, &main);
+    let local = rig.local_commit(BRANCH, "local.txt");
+    let backup = Rig::backup_name(&local);
+    rig.git(&["branch", &format!("{backup}/x"), &main]);
+
+    let error = err_payload(rig.remote_session(Some(OnDiverged::BackupReset)).await);
+
+    assert_eq!(error.code, "backup_ref_exists", "{}", error.msg);
+    assert_eq!(rig.rev("refs/heads/feat"), Some(local));
+    rig.assert_nothing_left(true).await;
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn a_backup_that_holds_the_local_head_at_plan_time_is_reused() {
+    let mut rig = Rig::start("bs-backup-present").await;
+    let main = rig.main.clone();
+    let remote = rig.origin_commit(BRANCH, "remote.txt");
+    rig.local_branch(BRANCH, &main);
+    let local = rig.local_commit(BRANCH, "local.txt");
+    let backup = Rig::backup_name(&local);
+    rig.git(&["branch", &backup, &local]);
+
+    let (session, worktree_source) =
+        started(rig.remote_session(Some(OnDiverged::BackupReset)).await);
+
+    assert_eq!(
+        worktree_source.and_then(|source| source.backup_ref),
+        Some(backup.clone())
+    );
+    assert_eq!(worktree_head(&rig, &session), remote);
+    assert_eq!(rig.rev(&format!("refs/heads/{backup}")), Some(local));
+    rig.stop().await;
+}
+
+#[tokio::test]
 async fn a_project_default_base_is_ignored_in_remote_mode() {
     let mut rig = Rig::start("bs-project-base").await;
     let remote = rig.origin_commit(BRANCH, "remote.txt");
