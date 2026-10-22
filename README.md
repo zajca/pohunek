@@ -21,8 +21,8 @@ the right worktree, and tells you or your tooling when one of them needs
 attention.
 
 > **Status: pre-1.0, experimental.** Wire shapes, config files, and on-disk
-> metadata may change freely between releases. Linux-first; macOS on Apple
-> Silicon is in progress.
+> metadata may change freely between releases. Runs on Linux x86_64 and on
+> macOS on Apple Silicon.
 
 ## Two machines, one minute
 
@@ -150,8 +150,7 @@ Rules:
 1. Detect the OS and CPU. Linux x86_64 uses the latest release's
    pohunek-daemon-<version>-x86_64-unknown-linux-gnu.tar.gz (or -musl).
    macOS 14 or newer on Apple Silicon (tested on macOS 15) uses
-   `brew install zajca/pohunek/pohunek`; tell me that macOS support is not
-   declared final yet. For anything else, stop and tell me.
+   `brew install zajca/pohunek/pohunek`. For anything else, stop and tell me.
 2. Verify every download with its .sha256 file and, when `gh` is available,
    `gh attestation verify <file> --repo zajca/pohunek`. Stop on any mismatch.
 3. Before changing anything, run `pohunek service check --json` (from the
@@ -192,9 +191,7 @@ projects, agent profiles, and remote hosts.
   publishes glibc and MUSL CLI and daemon archives. Unpack the daemon archive
   and run `./packaging/install-daemon.sh`.
 - **macOS (Apple Silicon, macOS 14 or newer, tested on macOS 15):**
-  `brew install zajca/pohunek/pohunek`, then `pohunek service install`. The
-  archives are published, but macOS support is declared only after its
-  acceptance gate ([#105](https://github.com/zajca/pohunek/issues/105)) passes.
+  `brew install zajca/pohunek/pohunek`, then `pohunek service install`.
 - **From source (Rust 1.96+):**
   `cargo build --release --locked --bin pohunek --bin pohunekd --bin pohunek-sessiond`.
 
@@ -270,7 +267,7 @@ public source of truth for scope, order, and status.
 | **More agents** — [#50](https://github.com/zajca/pohunek/issues/50), [#227](https://github.com/zajca/pohunek/issues/227) | Pi and OpenCode 2.x as further first-class runtimes. | Pi ships as an official runtime package; its end-to-end acceptance and OpenCode are open. |
 | **Delegated task runs** — [#182](https://github.com/zajca/pohunek/issues/182), [WS1–WS8](https://github.com/zajca/pohunek/issues/219) | Tasks and turns over ordinary sessions: causal turn settlement, a blocking `task.wait`, typed results with repository evidence and checks, and an optional MCP adapter. Agents can then delegate work to other agents reliably. | RFC accepted; implementation started with the WS1 protocol |
 | **Durability and detection** — [#420–#426](https://github.com/zajca/pohunek/issues/426), [#59–#67](https://github.com/zajca/pohunek/issues/67) | Recovery from crashes and host-wide session loss in one action, and explainable, arbitrated `working` / `blocked` / `idle` detection. | In progress: `lost` classification and recovery binding landed; one-action recovery and detection work are open. |
-| **macOS** — [#94](https://github.com/zajca/pohunek/issues/94) | Native Apple Silicon hosts with launchd-owned durable workers. | In progress: archives and a Homebrew tap ship; support is declared after [#105](https://github.com/zajca/pohunek/issues/105). |
+| **macOS** — [#94](https://github.com/zajca/pohunek/issues/94) | Native Apple Silicon hosts with launchd-owned durable workers. | Supported: archives and a Homebrew tap ship; the remaining items of the [#105](https://github.com/zajca/pohunek/issues/105) acceptance gate are follow-ups. |
 | **Optional team relay** — [#56](https://github.com/zajca/pohunek/issues/56) | A public, multi-team control plane: hosts open the WireGuard link to the relay themselves, and the relay adds team ACLs, routing, and audit. The direct owner path stays first-class, and the relay is to move to its own repository ([#417](https://github.com/zajca/pohunek/issues/417)). | Foundation (authentication, credentials) implemented; transport and team surfaces pending |
 | **Dark factory** — [#185](https://github.com/zajca/pohunek/issues/185), [FS0–FS8](https://github.com/zajca/pohunek/issues/233) | Unattended manager/auditor delegation over the team relay, built as a client of the relay. | Design |
 
