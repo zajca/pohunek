@@ -882,22 +882,39 @@ impl ProfileRegistry {
         skip: Option<&str>,
     ) -> std::io::Result<RetainedDigests> {
         let mut pinned = RetainedDigests::new();
+        for (_name, digest) in self.pinning_profiles(skip)? {
+            pinned.insert(digest);
+        }
+        Ok(pinned)
+    }
+
+    /// The host profiles that pin a package digest, by name, read by the scan
+    /// of [`Self::pinned_digests`] and without the profile named `skip`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::pinned_digests`].
+    pub(crate) fn pinning_profiles(
+        &self,
+        skip: Option<&str>,
+    ) -> std::io::Result<Vec<(String, PackageDigest)>> {
+        let mut pinning = Vec::new();
         let Some(dir) = &self.dir else {
-            return Ok(pinned);
+            return Ok(pinning);
         };
         for (stem, path) in scanned_profile_files(dir)? {
             if skip == Some(stem.as_str()) {
                 continue;
             }
             match read_binding(dir, &stem, &path) {
-                Ok(Some(binding)) => pinned.insert(binding.digest),
+                Ok(Some(binding)) => pinning.push((stem, binding.digest)),
                 Ok(None) => {}
                 Err(err) => {
                     warn!(profile = %stem, error = %err, "agent profile pins no package digest");
                 }
             }
         }
-        Ok(pinned)
+        Ok(pinning)
     }
 }
 

@@ -13,6 +13,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -20,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use package::catalog_state::CatalogState;
 use package::registry::{PackageSource, RegistryState, RetainedDigests};
 use package::verify::VerifyError;
-use package::{PackageDigest, VerifiedCatalog, MAX_CATALOG_BYTES};
+use package::{PackageDigest, VerifiedCatalog, VerifiedEntry, MAX_CATALOG_BYTES};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Gap, IntegrationAction, PackageAction, PackageStatus,
     ProfileAction, ProfileStatus, Refusal, SelectedPackage, UseReason, CODE_GAP_AGENT_NOT_ON_PATH,
@@ -249,6 +250,25 @@ struct Gathered {
     official: Vec<OfficialProfile>,
 }
 
+/// The packages that host profiles and session records pin, by source.
+struct Pins {
+    /// Each host profile with the digest it pins.
+    profiles: Vec<(String, PackageDigest)>,
+    /// The session records, each with the official runtime it launched and the
+    /// digest it pins.
+    sessions: Vec<SessionRecord>,
+}
+
+/// Reads the pins of the host profiles and the session records.
+fn read_pins(store_path: &Path, profiles: &ProfileRegistry) -> Result<Pins, EnsureError> {
+    Ok(Pins {
+        profiles: profiles
+            .pinning_profiles(None)
+            .map_err(EnsureError::Profiles)?,
+        sessions: read_store(store_path)?.records,
+    })
+}
+
 /// What the plan reads from the registries and the store.
 struct PlanInputs<'a> {
     /// The registry as it is; `None` without a package store, where nothing
@@ -259,6 +279,8 @@ struct PlanInputs<'a> {
     planning: Option<&'a Context>,
     /// The digests a session or a profile still pins.
     retained: &'a RetainedDigests,
+    /// Which profiles and sessions pin them.
+    pins: &'a Pins,
     /// The launch base environment the config homes of the planned definitions
     /// are resolved with, as a launch resolves them.
     base: &'a BaseEnv,
@@ -581,10 +603,12 @@ fn compute(inputs: &EnsureInputs, detect: bool) -> Result<Computed, EnsureError>
         .base()
         .map_err(|error| EnsureError::Registry(error.to_string()))?;
     let retained = retained_pins(&inputs.store_path, &profiles, None)?;
+    let pins = read_pins(&inputs.store_path, &profiles)?;
     let plan = PlanInputs {
         state: state.as_ref(),
         planning: planning.as_ref(),
         retained: &retained,
+        pins: &pins,
         base: &base,
     };
     let release = load_release(inputs, &catalog_state);
@@ -720,8 +744,9 @@ fn gather(
             uses.add(&runtime, UseReason::Integration);
         }
     }
-    for runtime in read_store(&inputs.store_path)?.runtimes {
-        uses.add(&runtime, UseReason::Session);
+    let store = read_store(&inputs.store_path)?;
+    for runtime in store.runtimes() {
+        uses.add(runtime, UseReason::Session);
     }
     Ok(Gathered {
         uses,
@@ -917,12 +942,31 @@ fn session_runtime(binding: &crate::store::ResumeBinding) -> Option<RuntimeId> {
     is_official(&runtime).then_some(runtime)
 }
 
+/// One session record of the metadata store.
+struct SessionRecord {
+    /// The record's official runtime, whatever its state.
+    runtime: Option<RuntimeId>,
+    /// The package digest the record pins.
+    pin: Option<PackageDigest>,
+}
+
 /// What the metadata store's records use and pin.
 struct StoreView {
-    /// The official runtime of every session record, whatever its state.
-    runtimes: Vec<RuntimeId>,
+    records: Vec<SessionRecord>,
+}
+
+impl StoreView {
+    /// The official runtime of every record.
+    fn runtimes(&self) -> impl Iterator<Item = &RuntimeId> {
+        self.records
+            .iter()
+            .filter_map(|record| record.runtime.as_ref())
+    }
+
     /// The package digests the records pin.
-    pins: Vec<PackageDigest>,
+    fn pins(&self) -> impl Iterator<Item = &PackageDigest> {
+        self.records.iter().filter_map(|record| record.pin.as_ref())
+    }
 }
 
 /// Reads the metadata store through the startup migration's dry run, so records
@@ -939,23 +983,23 @@ fn read_store(store_path: &Path) -> Result<StoreView, EnsureError> {
         .filter_map(|session| session.recovery.as_ref())
         .chain(dry.resume.iter())
         .collect();
-    let runtimes = bindings
+    let records = bindings
         .iter()
-        .filter_map(|binding| session_runtime(binding))
-        .collect();
-    let pins = bindings
-        .iter()
-        .filter_map(|binding| match binding.launch_binding.binding() {
-            Some(launch) => match &launch.provenance {
-                protocol::BindingProvenance::Package { package_digest, .. } => {
+        .map(|binding| SessionRecord {
+            runtime: session_runtime(binding),
+            pin: match binding
+                .launch_binding
+                .binding()
+                .map(|launch| &launch.provenance)
+            {
+                Some(protocol::BindingProvenance::Package { package_digest, .. }) => {
                     Some(package_digest.clone())
                 }
-                protocol::BindingProvenance::Builtin { .. } => None,
+                Some(protocol::BindingProvenance::Builtin { .. }) | None => None,
             },
-            None => None,
         })
         .collect();
-    Ok(StoreView { runtimes, pins })
+    Ok(StoreView { records })
 }
 
 /// Digests every installed package a session or profile still pins, excluding
@@ -970,7 +1014,7 @@ pub(in crate::session) fn retained_pins(
     let mut retained = profiles
         .pinned_digests_excluding(skip)
         .map_err(EnsureError::Profiles)?;
-    retained.extend(read_store(store_path)?.pins);
+    retained.extend(read_store(store_path)?.pins().cloned());
     Ok(retained)
 }
 
@@ -1050,6 +1094,15 @@ fn catalog_plan(release: Option<&Release<'_>>, state: &CatalogState) -> CatalogP
 fn update_command(package: &PackageId, runtime: &RuntimeId) -> String {
     format!(
         "pohunek plugin update {package} runtime/{PACKAGES_DIR}/{runtime}{ARCHIVE_SUFFIX} \
+         --catalog runtime/{CATALOG_FILE} --yes"
+    )
+}
+
+/// The `plugin install` command that installs the release's package of
+/// `runtime` from the extracted release archive, enabled and selected.
+fn install_command(runtime: &RuntimeId) -> String {
+    format!(
+        "pohunek plugin install runtime/{PACKAGES_DIR}/{runtime}{ARCHIVE_SUFFIX} \
          --catalog runtime/{CATALOG_FILE} --yes"
     )
 }
@@ -1149,18 +1202,7 @@ fn managed_runtimes(
                 && record.identity().id == *entry.package_id()
         });
         if installed {
-            let detail = match disabled_selected_package(state, entry.package_id()) {
-                Some(disabled) => disabled_package_detail(
-                    entry.package_id(),
-                    &disabled,
-                    disabled_state(plan, &disabled, runtime),
-                ),
-                None => format!(
-                    "an official package of this runtime is installed but not selected and \
-                     enabled, so the upgrade leaves it as you set it; update it with: {}",
-                    update_command(entry.package_id(), runtime)
-                ),
-            };
+            let detail = unserved_package_detail(plan, state, entry);
             report.gap(
                 runtime.as_str(),
                 CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
@@ -1169,6 +1211,40 @@ fn managed_runtimes(
         }
     }
     Ok(managed)
+}
+
+/// The gap detail for the release catalog's `entry`, whose official package is
+/// installed but neither selected nor enabled: the state of a disabled
+/// selection, the hint of a recorded holder, or the update that selects it.
+fn unserved_package_detail(
+    plan: &PlanInputs<'_>,
+    state: &RegistryState,
+    entry: &VerifiedEntry,
+) -> String {
+    let runtime = entry.runtime_id();
+    if let Some(disabled) = disabled_selected_package(state, entry.package_id()) {
+        return disabled_package_detail(
+            entry.package_id(),
+            &disabled,
+            disabled_state(plan, &disabled, runtime),
+        );
+    }
+    let blocked = Blocked {
+        id: entry.package_id(),
+        version: entry.version().as_str(),
+        digest: entry.digest(),
+        runtime,
+    };
+    match held_selection(plan, &blocked) {
+        Some((holder, held)) if !matches!(held, Held::Serving) => {
+            held_hint(plan, &blocked, &holder, &held, false, &[]).detail
+        }
+        _ => format!(
+            "an official package of this runtime is installed but not selected and enabled, so \
+             the upgrade leaves it as you set it; update it with: {}",
+            update_command(entry.package_id(), runtime)
+        ),
+    }
 }
 
 /// Plans the package of every used runtime.
@@ -1410,7 +1486,7 @@ fn decide_selection(
     {
         return Selection::Leave;
     }
-    selection_outcome(plan, prepared, subject, report, reserved)
+    selection_outcome(plan, prepared, subject, report, reserved, reasons)
 }
 
 /// Under `--detect`, a runtime the plan would leave untouched (its package is
@@ -1433,7 +1509,8 @@ fn passes_detect_gate_before_leaving(
         || matches!(
             unordered_selection(plan, prepared),
             Some((Serving::Broken | Serving::Damaged(_), _))
-        );
+        )
+        || held_leaves(plan, prepared, reserved);
     !left
         || detect_on_search_path(
             report,
@@ -2514,6 +2591,7 @@ fn selection_outcome(
     subject: &str,
     report: &mut Report,
     reserved: bool,
+    reasons: &[UseReason],
 ) -> Selection {
     let id = &prepared.identity.id;
     if let Some(digest) = disabled_package(plan, prepared) {
@@ -2574,14 +2652,365 @@ fn selection_outcome(
             reason: KeepReason::Ordered,
         };
     }
-    match same_version_holder(plan, prepared) {
-        Some(holder) if selection_serves(plan, prepared) => Selection::Keep {
+    let blocked = Blocked::of(prepared);
+    let Some((holder, held)) = held_selection(plan, &blocked) else {
+        return Selection::Replace;
+    };
+    if matches!(held, Held::Serving) {
+        return Selection::Keep {
             reason: KeepReason::SameVersionOtherDigest(same_version_detail(
                 plan, prepared, &holder, reserved,
             )),
-        },
-        _ => Selection::Replace,
+        };
     }
+    let hint = held_hint(plan, &blocked, &holder, &held, reserved, reasons);
+    match hint.refusal {
+        Some(kind) => {
+            // The refusal supersedes the gap that `managed_runtimes` reported.
+            report.gaps.retain(|gap| {
+                gap.runtime != subject || gap.code != CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING
+            });
+            report.refuse(subject, &ProtocolError::from(kind).code, &hint.detail);
+        }
+        None => report_not_serving(report, subject, hint.detail),
+    }
+    Selection::Leave
+}
+
+/// The release package that a recorded holder blocks.
+struct Blocked<'a> {
+    id: &'a PackageId,
+    version: &'a str,
+    digest: &'a PackageDigest,
+    runtime: &'a RuntimeId,
+}
+
+impl<'a> Blocked<'a> {
+    fn of(prepared: &'a Prepared) -> Self {
+        Self {
+            id: &prepared.identity.id,
+            version: prepared.identity.version.as_str(),
+            digest: &prepared.digest,
+            runtime: prepared.definition.runtime_id(),
+        }
+    }
+}
+
+/// What the selection of a package id is when the registry holds the release
+/// package's id and version under another digest, the holder.
+enum Held {
+    /// An enabled official selection serves the runtime: it is kept.
+    Serving,
+    /// No version of the package is selected.
+    NoSelection,
+    /// The selected package is not an enabled official one.
+    NotOfficial(PackageDigest),
+    /// The enabled official selection's root is missing or does not load.
+    Broken(PackageDigest),
+    /// The package's root is present and altered or damaged; the package is the
+    /// enabled official selection, or the unselected holder.
+    Damaged(PackageErrorKind, PackageDigest),
+}
+
+/// The digest the registry records under the release package's id and version
+/// when it is not the release's digest, whatever its source, flags and
+/// selection: the registry keeps one digest per identity.
+fn holder_of(plan: &PlanInputs<'_>, blocked: &Blocked<'_>) -> Option<PackageDigest> {
+    plan.state?
+        .packages()
+        .iter()
+        .find(|record| {
+            record.identity().id == *blocked.id
+                && record.identity().version.as_str() == blocked.version
+                && record.digest() != blocked.digest
+        })
+        .map(|record| record.digest().clone())
+}
+
+/// The holder of the release package's identity and the state of the selection
+/// beside it; `None` when the registry holds no such digest, so the release's
+/// archive can be installed.
+fn held_selection(plan: &PlanInputs<'_>, blocked: &Blocked<'_>) -> Option<(PackageDigest, Held)> {
+    let holder = holder_of(plan, blocked)?;
+    let state = plan.state?;
+    let held = match state.selected(blocked.id) {
+        // The registry refuses the plain uninstall of an unselected holder whose
+        // root is altered.
+        None => match health_of(plan, &holder) {
+            Health::Damaged(kind) => Held::Damaged(kind, holder.clone()),
+            Health::Present | Health::Install => Held::NoSelection,
+        },
+        Some(selected) if selected == blocked.digest => return None,
+        Some(selected) => match state.package(selected) {
+            Some(record) if record.source() == PackageSource::Official && record.enabled() => {
+                match health_of(plan, selected) {
+                    Health::Present => Held::Serving,
+                    Health::Install => Held::Broken(selected.clone()),
+                    Health::Damaged(kind) => Held::Damaged(kind, selected.clone()),
+                }
+            }
+            // The registry refuses the plain uninstall of the altered root of a
+            // selected holder whatever its source.
+            _ if *selected == holder => match health_of(plan, selected) {
+                Health::Damaged(kind) => Held::Damaged(kind, selected.clone()),
+                Health::Present | Health::Install => Held::NotOfficial(selected.clone()),
+            },
+            _ => Held::NotOfficial(selected.clone()),
+        },
+    };
+    Some((holder, held))
+}
+
+/// Whether [`selection_outcome`] reaches the holder check and leaves the runtime
+/// untouched there.
+fn held_leaves(plan: &PlanInputs<'_>, prepared: &Prepared, reserved: bool) -> bool {
+    unordered_selection(plan, prepared).is_none()
+        && (reserved || replaces_newer(plan, prepared).is_none())
+        && matches!(
+            held_selection(plan, &Blocked::of(prepared)),
+            Some((
+                _,
+                Held::NoSelection | Held::NotOfficial(_) | Held::Broken(_) | Held::Damaged(..)
+            ))
+        )
+}
+
+/// How a runtime left or refused beside a holder is reported.
+struct HeldHint {
+    /// The refusal code kind; `None` for the gap `official_package_not_serving`.
+    refusal: Option<PackageErrorKind>,
+    detail: String,
+}
+
+/// The one hint for a runtime that the holder of the release's package keeps
+/// from being installed.
+///
+/// The obstacle is the digest that stops the runtime serving: the selected
+/// package, or the holder when nothing is selected. The hint names, in order,
+/// the release of a pin on the obstacle (an edit, since no command unpins), the
+/// removal of the obstacle, and what follows it: the next upgrade, or for a Pi
+/// that keeps no enabled official selection the install of the release's
+/// package by hand. A reserved runtime that no profile, session or hook uses
+/// gets no command, because the plain upgrade would not plan it again.
+fn held_hint(
+    plan: &PlanInputs<'_>,
+    blocked: &Blocked<'_>,
+    holder: &PackageDigest,
+    held: &Held,
+    reserved: bool,
+    reasons: &[UseReason],
+) -> HeldHint {
+    let id = blocked.id;
+    let same = format!(
+        "the release's package has the same version ({}) as an installed one under another \
+         archive",
+        blocked.version
+    );
+    let used = reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            UseReason::Profile | UseReason::Session | UseReason::Integration
+        )
+    });
+    let named = !reserved || used;
+    let direct = |cause: &str| {
+        let lead = format!(
+            "{same}, and {cause}, so nothing is installed and the runtime is left as it is"
+        );
+        let detail = if named {
+            let clause = removal_clause(plan, blocked, holder, holder, false, reserved, reasons);
+            format!("{lead}{clause}")
+        } else {
+            format!("{lead}; the fix is a release that gives the package a new version")
+        };
+        HeldHint {
+            refusal: None,
+            detail,
+        }
+    };
+    let beside = |tail: String| {
+        let mut detail = format!("{same}, so it cannot be installed, and {tail}");
+        if named && !plan.retained.contains(holder) {
+            let altered = matches!(health_of(plan, holder), Health::Damaged(_));
+            let command = uninstall_command(id, holder, altered);
+            let follow = follow_up(plan, blocked, holder, holder, reserved, reasons)
+                .map(|step| format!(", then {step}"))
+                .unwrap_or_default();
+            let _ = write!(
+                detail,
+                "; or remove the same-version installed one with `{command}`{follow}"
+            );
+        }
+        HeldHint {
+            refusal: None,
+            detail,
+        }
+    };
+    match held {
+        Held::Serving => direct("an enabled official selection serves"),
+        Held::Damaged(kind, obstacle) => {
+            let clause = removal_clause(plan, blocked, holder, obstacle, true, reserved, reasons);
+            HeldHint {
+                refusal: Some(*kind),
+                detail: format!(
+                    "the installed package root of this runtime is altered or damaged{clause}"
+                ),
+            }
+        }
+        Held::NoSelection => direct("no version of the package is selected"),
+        Held::Broken(selected) if selected == holder => {
+            direct("the selected package's root is missing or does not load")
+        }
+        Held::NotOfficial(selected) if selected == holder => {
+            direct("the selected package is not an official one")
+        }
+        Held::Broken(_) => beside(format!(
+            "the selected version's package root is missing or does not load, so the upgrade \
+             leaves it; restore it by installing that version's archive again, or select \
+             another installed version with: pohunek plugin select {id} --digest <digest>"
+        )),
+        Held::NotOfficial(_) => beside(format!(
+            "the selected package is not an enabled official one, so the upgrade leaves it; \
+             select an official version with: pohunek plugin select {id} --digest <digest>"
+        )),
+    }
+}
+
+/// `pohunek plugin uninstall` of `digest`, with `--remove-modified` for a root
+/// that is altered.
+fn uninstall_command(id: &PackageId, digest: &PackageDigest, altered: bool) -> String {
+    let modified = if altered { " --remove-modified" } else { "" };
+    format!(
+        "pohunek plugin uninstall {id} --digest {}{modified} --yes",
+        selector_digest(digest)
+    )
+}
+
+/// The clause that releases a pin on the obstacle, removes it and says what
+/// follows, starting with `; `.
+fn removal_clause(
+    plan: &PlanInputs<'_>,
+    blocked: &Blocked<'_>,
+    holder: &PackageDigest,
+    obstacle: &PackageDigest,
+    altered: bool,
+    reserved: bool,
+    reasons: &[UseReason],
+) -> String {
+    let pin = pin_release(plan, obstacle).unwrap_or_default();
+    let command = uninstall_command(blocked.id, obstacle, altered);
+    let follow = follow_up(plan, blocked, obstacle, holder, reserved, reasons)
+        .map(|step| format!(", then {step}"))
+        .unwrap_or_default();
+    format!("; {pin}remove it with `{command}`{follow}")
+}
+
+/// Who pins `digest` and how to release the pin, with the trailing `; then `;
+/// `None` when nothing pins it. There is no command that unpins: a profile is
+/// edited, and a session pin goes with the sessions.
+fn pin_release(plan: &PlanInputs<'_>, digest: &PackageDigest) -> Option<String> {
+    if !plan.retained.contains(digest) {
+        return None;
+    }
+    let profiles: Vec<String> = plan
+        .pins
+        .profiles
+        .iter()
+        .filter(|(_, pinned)| pinned == digest)
+        .map(|(name, _)| format!("{name}.toml"))
+        .collect();
+    let session = plan
+        .pins
+        .sessions
+        .iter()
+        .any(|record| record.pin.as_ref() == Some(digest));
+    let mut who = Vec::new();
+    let mut exit = Vec::new();
+    if !profiles.is_empty() {
+        let names = profiles
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        who.push(format!("the host profile {names}"));
+        exit.push(format!(
+            "remove the `package` and `digest` lines from {names} in the host profile directory"
+        ));
+    }
+    if session {
+        who.push("a session record".to_owned());
+        exit.push("remove the sessions launched from it".to_owned());
+    }
+    if who.is_empty() {
+        who.push("a host profile or session".to_owned());
+        exit.push("release the pin".to_owned());
+    }
+    let verb = if profiles.len() + usize::from(session) > 1 {
+        "pin"
+    } else {
+        "pins"
+    };
+    Some(format!(
+        "{} {verb} it, so the registry refuses its removal until the pin is released: {}; then ",
+        who.join(" and "),
+        exit.join(" and ")
+    ))
+}
+
+/// What follows the removal of `removed`: the next upgrade, or for a Pi that
+/// keeps no enabled official selection the install of the release's package by
+/// hand. `None` when the plain upgrade would not plan the runtime again.
+fn follow_up(
+    plan: &PlanInputs<'_>,
+    blocked: &Blocked<'_>,
+    removed: &PackageDigest,
+    holder: &PackageDigest,
+    reserved: bool,
+    reasons: &[UseReason],
+) -> Option<String> {
+    let upgrade = "run the upgrade again".to_owned();
+    if reserved {
+        // Detection alone is a use only for a runtime nothing else uses, so the
+        // three modes name the same step.
+        let used_after = reasons.iter().any(|reason| match reason {
+            UseReason::Profile | UseReason::Integration => true,
+            // Another record of the runtime that does not pin the package keeps
+            // it used after the pinning sessions are gone.
+            UseReason::Session => plan.pins.sessions.iter().any(|record| {
+                record.runtime.as_ref() == Some(blocked.runtime)
+                    && record.pin.as_ref() != Some(removed)
+            }),
+            UseReason::Detected | UseReason::Installed => false,
+        });
+        let detected_only = reasons
+            .iter()
+            .all(|reason| matches!(reason, UseReason::Detected));
+        return (used_after || detected_only).then_some(upgrade);
+    }
+    // The holder stays recorded, so the next upgrade names the next step.
+    if removed != holder {
+        return Some(upgrade);
+    }
+    let state = plan.state?;
+    let kept = state.selected(blocked.id).is_some_and(|selected| {
+        selected != removed
+            && state.package(selected).is_some_and(|record| {
+                record.source() == PackageSource::Official && record.enabled()
+            })
+    });
+    if kept {
+        return Some(upgrade);
+    }
+    let other_version = state
+        .packages()
+        .iter()
+        .any(|record| record.identity().id == *blocked.id && record.digest() != removed);
+    let command = if other_version {
+        update_command(blocked.id, blocked.runtime)
+    } else {
+        install_command(blocked.runtime)
+    };
+    Some(format!("install the release's package with `{command}`"))
 }
 
 /// Why a selected package stays instead of being replaced.
@@ -2595,19 +3024,6 @@ enum KeepReason {
     /// The registry holds the release package's id and version under another
     /// digest, which `package.install` refuses to sit beside; the gap detail.
     SameVersionOtherDigest(String),
-}
-
-/// The digest the registry records under the release package's id and version
-/// when it is not the release's digest, whatever its source, flags and
-/// selection: the registry keeps one digest per identity.
-fn same_version_holder(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<PackageDigest> {
-    plan.state?
-        .packages()
-        .iter()
-        .find(|record| {
-            record.identity() == &prepared.identity && record.digest() != &prepared.digest
-        })
-        .map(|record| record.digest().clone())
 }
 
 /// The gap detail for a release package whose id and version the registry

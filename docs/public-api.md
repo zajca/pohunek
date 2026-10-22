@@ -2586,7 +2586,59 @@ How to read it:
   under another digest and an enabled, loadable S serves the runtime (R is not
   recorded), the plan and the apply keep S (status `kept`) with the gap
   `plugin_update_same_version_other_digest` and write nothing, for a reserved runtime and
-  for Pi; a disabled S is row 18-20's outcome.
+  for Pi, except that a newer Pi S is kept silently, with no gap, as beside any release
+  package it would replace; a disabled S is row 18-20's outcome. When no enabled official S
+  serves beside that recorded package (the holder H), the release's archive still cannot be
+  installed, so the plan and the apply agree and write nothing (the holder table below).
+
+The holder table lists what the plan, the apply and `--detect` say for a runtime whose
+release package's id and version the registry records as H under another digest and
+that no enabled, loadable official S serves. A runtime nothing uses whose program is off the
+search path is dropped before it is judged, as in the table above. Plan and apply are one
+computation (a left or refused runtime has no planned entry), so the table has two columns:
+plan and apply (P/A), and `--detect` (D); every cell below holds in plan, apply and
+`--detect` unless a row says otherwise, and the registry and the host profiles are
+byte-identical afterwards.
+
+One function renders every hint of the table, for the planned-runtime check and for the
+managed-runtime check of Pi alike. The obstacle O is the selected digest, or H when nothing is
+selected. The hint names, in this order: the release of every pin on O (below), the removal of
+O (`pohunek plugin uninstall <package> --digest <O> --yes`, with `--remove-modified` exactly
+when O's root is altered), and the follow-up after the removal. The follow-up is "run the
+upgrade again" when the plain upgrade plans the runtime again (a reserved runtime that a
+profile, hook or a session that does not pin O uses, or a Pi that keeps another enabled
+official selection); for a Pi that keeps none it is the install of the release's package,
+`pohunek plugin install runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json --yes`
+(`plugin update` with the same arguments when another Pi version is recorded, because
+`install` selects only the first), whatever uses Pi, because the command installs and
+selects by itself.
+
+| State beside H | Outcome | Hint |
+|---|---|---|
+| Nothing selected, or H selected and its root missing or not loading; H enabled or disabled | gap `official_package_not_serving`, no package entry, profile left unbound | remove H, then the follow-up; Pi: install or update step |
+| H unselected or selected, root altered | refusal with the root-invalid code | `--remove-modified` removal of H, then the follow-up |
+| H selected and not official (hand-edited registry) | gap; refusal when its root is altered | remove H (`--remove-modified` when altered), then the follow-up (H is the obstacle whatever its source) |
+| Another version X selected, enabled, root missing or not loading | gap | restore X with `plugin install`, or `plugin select <package> --digest <H>`; or, while H is not pinned, remove H with the follow-up |
+| X selected, root altered | refusal for X | removal of X with `--remove-modified`, then the upgrade again, which names the removal of H |
+| A non-official S selected | gap | `plugin select <package> --digest <digest>`; or, while H is not pinned, remove H with the follow-up |
+| Pi without an enabled official selection (not planned without `--detect`), nothing selected or a non-official S | gap (plan, apply and `--detect`); an altered H is a gap in plan and apply and a refusal under `--detect` | the same renderer, so the Pi row above applies and no command fails beside H |
+| Newer Pi X selected, root missing or altered | the existing refusal for X | unchanged |
+
+A pinned O (a host profile holds its `digest`, usually beside its `package`, or a session record holds it) cannot
+be removed: the registry refuses the removal while the pin stands. The hint then names the
+pin first: "the host profile `<name>.toml` pins it" or "a session record pins it", "so the registry refuses
+its removal until the pin is released", with the exit "remove the `package` and `digest`
+lines (the `digest` line pins) from `<name>.toml` in the host profile directory" or "remove the sessions launched from
+it" (no command releases a pin), and then the removal and the follow-up. A reserved runtime
+that only the pinning session used gets no "run the upgrade again", because the plain upgrade
+no longer plans it once the sessions are gone. A hint that offers
+the removal of H beside another obstacle X does so only while nothing pins H. A reserved runtime that
+is used only by `--detect` gets no command in a gap and the removal in a refusal; a reserved
+runtime nothing uses gets "the fix is a release that gives the package a new version". A Pi
+always gets the commands, because its install and select run by hand whatever uses it.
+A profile that pins another installed version P keeps the command: the uninstall is accepted
+with P retained, and the next apply installs the release's archive and repins the profile
+from P.
 
 The scenarios are `claude_judges_the_disabled_release_package_by_the_selection_state`,
 `codex_judges_the_disabled_release_package_by_the_selection_state`,
@@ -2598,7 +2650,20 @@ The scenarios are `claude_judges_the_disabled_release_package_by_the_selection_s
 and `a_disabled_pi_selection_beside_a_third_party_server_is_reported_as_claimed` (a claimed
 S), all in `crates/daemon/tests/ensure_runtimes.rs`, and
 `install_refuses_an_identity_installed_from_another_archive` in
-`crates/package/tests/registry.rs`.
+`crates/package/tests/registry.rs`. The holder cells are rows of one table in the same file,
+run by `the_holder_contract_table_holds_for_the_reserved_runtimes` and
+`the_holder_contract_table_holds_for_pi`: each row runs plan, apply and `--detect`, counts
+that the hint names exactly the commands the row lists, in order, runs every one of them as
+the CLI sends it (the registry refuses the removal while the pin stands and accepts it after
+the pin is released), and ends with the release installed and the profile bound (reserved),
+the release's package present (Pi) or the chain of the next hint. Beside the table:
+`an_unselected_altered_pi_holder_is_a_gap_without_detect_and_a_refusal_with_it`,
+`a_runtime_planned_only_by_detection_with_an_altered_holder_is_refused_with_its_removal`,
+`a_runtime_planned_only_by_detection_beside_a_holder_gets_no_uninstall_command`,
+`a_newer_pi_selection_without_its_root_beside_a_holder_keeps_its_refusal`,
+`a_detecting_plan_drops_an_unused_runtime_before_judging_its_holder`, the newer-Pi keep
+`a_newer_pi_selection_beside_a_holder_of_the_release_version_is_kept_silently`, and the pinned
+older version `a_profile_pinned_to_an_older_version_beside_the_holder_gets_the_whole_remedy`.
 
 `pohunek service upgrade` and `pohunek service check` of an existing service run
 a read-only preflight before any effect by invoking `pohunekd upgrade-preflight`

@@ -864,6 +864,19 @@ no unpinned profile is bound to it by the upgrade (the next upgrade then install
 release's archive). The profile the earlier upgrade bound normally pins it, no command
 releases that pin, and the detail then names no command. For Pi it never names one: the
 upgrade does not install a Pi package again once none is installed.
+When no enabled official selection serves beside the recorded package (nothing is selected,
+or the recorded package itself is the selected one and its root is missing or does not load), the upgrade installs nothing,
+leaves the runtime and reports the gap `official_package_not_serving`; for a runtime
+that is used (a Pi always), the detail names the removal of the obstacle (the selected package, or the
+recorded one when nothing is selected) with `pohunek plugin uninstall <package> --digest
+<digest> --yes`, and `--remove-modified` for an altered root, which is a refusal. A host
+profile or session record that pins the obstacle is named first, with how to release it, because the registry
+refuses the removal while it stands. The detail ends with what follows: run the upgrade again, or for a Pi
+that keeps no enabled official selection `pohunek plugin install runtime/packages/pi.tar.zst
+--catalog runtime/runtime-catalog.json --yes` (`plugin update` with the same arguments when
+another Pi version is installed), because the upgrade does not plan such a Pi. Another selected
+version that does not load, or a non-official selection, gets `plugin install` or
+`plugin select` next to that removal while nothing pins the recorded package.
 A selected package you disabled is never replaced, selected or enabled, whatever its
 version is (older, newer, equal under another digest or unordered; the release's own
 package counts too): the plan plans nothing for that runtime and reports the gap
