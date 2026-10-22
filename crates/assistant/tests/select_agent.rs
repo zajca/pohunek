@@ -74,6 +74,7 @@ fn capabilities(runtimes: Vec<AgentRuntime>) -> HostCapabilities {
         session_wait_turn_supported: true,
         session_new_cwd_supported: true,
         session_idle_stop_supported: true,
+        session_new_branch_source_supported: true,
     }
 }
 
@@ -681,6 +682,8 @@ fn launch_params(requested: Option<&str>) -> LaunchParams {
         repo: None,
         branch: None,
         base_branch: None,
+        branch_source: None,
+        on_diverged: None,
         cols: 80,
         rows: 24,
         no_snapshot: true,

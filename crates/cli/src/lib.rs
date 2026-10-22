@@ -294,6 +294,12 @@ struct AssistantArgs {
     /// Base branch the worktree's branch is created from.
     #[arg(long)]
     base_branch: Option<String>,
+    /// Start the worktree from `origin/<branch>` (see `session new --from-remote`).
+    #[arg(long, requires = "branch", conflicts_with = "base_branch")]
+    from_remote: bool,
+    /// With `--from-remote`, keep a diverged local branch as a backup and reset it.
+    #[arg(long, requires = "from_remote")]
+    reset_diverged: bool,
     /// Skip the remote start confirmation prompt.
     #[arg(long)]
     yes: bool,
@@ -1177,6 +1183,17 @@ enum SessionAction {
         /// branch, then the repository's HEAD, when missing.
         #[arg(long)]
         base_branch: Option<String>,
+        /// Fetch `origin/<branch>` and start the worktree from it instead of
+        /// from a possibly stale local branch: a local branch that is behind is
+        /// fast-forwarded, one that is ahead is used as it is (with a warning),
+        /// and a diverged one is refused unless `--reset-diverged` is given.
+        /// Requires `--branch`; excludes `--base-branch`.
+        #[arg(long, requires = "branch", conflicts_with = "base_branch")]
+        from_remote: bool,
+        /// With `--from-remote`, keep a diverged local branch as
+        /// `backup/<branch>-<short-sha>` and reset the branch to the remote head.
+        #[arg(long, requires = "from_remote")]
+        reset_diverged: bool,
         /// Initial text to inject into the session after the PTY is spawned.
         #[arg(long)]
         input: Option<String>,
@@ -1978,6 +1995,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     repo,
                     branch,
                     base_branch,
+                    from_remote,
+                    reset_diverged,
                     input,
                     input_stdin,
                     request_timeout_ms,
@@ -2005,6 +2024,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                             repo,
                             branch,
                             base_branch,
+                            from_remote,
+                            reset_diverged,
                             input,
                             request_timeout_ms,
                             meta,
@@ -2865,6 +2886,8 @@ fn resolve_assistant_options(
         repo: args.repo,
         branch: args.branch,
         base_branch: args.base_branch,
+        from_remote: args.from_remote,
+        reset_diverged: args.reset_diverged,
         yes: args.yes,
         json: args.json,
         print_prompt: args.print_prompt,

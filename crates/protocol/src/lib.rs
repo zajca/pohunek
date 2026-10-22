@@ -143,15 +143,15 @@ pub use runtime_id::{
 #[doc(inline)]
 pub use session::{
     AgentActivity, AgentStateEvent, AttachEvent, AttachHeader, BackgroundItem, BackgroundKind,
-    BackgroundStateEvent, BackgroundStatus, CwdSource, DetectionRegionKind, DetectionRegionPreview,
-    ForkCwdMode, ObservationParamsError, RuntimeExit, RuntimeInventoryEntry, RuntimeInventoryEvent,
-    RuntimeInventoryResult, RuntimeInventoryStatus, RuntimeState, SessionAttachParams,
-    SessionAttachResult, SessionBackground, SessionCapabilities, SessionCapabilityRefusals,
-    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
-    SessionDiffParams, SessionDiffResult, SessionEvent, SessionForkParams, SessionForkResult,
-    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
-    SessionListFilter, SessionListParams, SessionNativeRecoveredEvent, SessionNewParams,
-    SessionNewResult, SessionOutputGap, SessionOutputParams, SessionOutputResult,
+    BackgroundStateEvent, BackgroundStatus, BranchSource, CwdSource, DetectionRegionKind,
+    DetectionRegionPreview, ForkCwdMode, ObservationParamsError, OnDiverged, RuntimeExit,
+    RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryResult, RuntimeInventoryStatus,
+    RuntimeState, SessionAttachParams, SessionAttachResult, SessionBackground, SessionCapabilities,
+    SessionCapabilityRefusals, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
+    SessionDetectionResult, SessionDiffParams, SessionDiffResult, SessionEvent, SessionForkParams,
+    SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
+    SessionInputWait, SessionListFilter, SessionListParams, SessionNativeRecoveredEvent,
+    SessionNewParams, SessionNewResult, SessionOutputGap, SessionOutputParams, SessionOutputResult,
     SessionPolicyParams, SessionPolicyResult, SessionReadFormat, SessionReadParams,
     SessionReadResult, SessionReadSource, SessionReleaseAgentParams, SessionReleaseAgentResult,
     SessionRemoveResult, SessionRenameParams, SessionRenameResult, SessionReportAgentParams,
@@ -163,7 +163,7 @@ pub use session::{
     SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
     SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind, SubagentInfo,
     SubagentLifecycle, SubagentStateEvent, TerminalCursor, TerminalDimensions,
-    TerminalDimensionsError, UnconfirmedProcess,
+    TerminalDimensionsError, UnconfirmedProcess, WorktreeSource,
 };
 #[doc(inline)]
 pub use turn_wait::{

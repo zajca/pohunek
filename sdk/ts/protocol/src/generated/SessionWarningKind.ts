@@ -13,4 +13,5 @@ export type SessionWarningKind =
   | "base_branch_fallback"
   | "setup_script"
   | "hook"
-  | "native_recovery";
+  | "native_recovery"
+  | "branch_ahead_of_remote";

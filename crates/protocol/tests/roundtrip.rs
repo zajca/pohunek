@@ -844,6 +844,8 @@ fn session_new_params_json_shape_roundtrips() {
         base_branch: None,
         input: None,
         extended_input_ready_wait: None,
+        branch_source: None,
+        on_diverged: None,
         metadata: BTreeMap::new(),
     };
 
@@ -876,6 +878,8 @@ fn session_new_params_roundtrips_with_metadata() {
         base_branch: None,
         input: None,
         extended_input_ready_wait: None,
+        branch_source: None,
+        on_diverged: None,
         metadata: metadata(&[("owner", "cli"), ("ticket", "DMD-1356")]),
     };
 
@@ -912,6 +916,8 @@ fn session_new_params_roundtrips_with_worktree_fields() {
         base_branch: Some("main".to_owned()),
         input: None,
         extended_input_ready_wait: None,
+        branch_source: None,
+        on_diverged: None,
         metadata: BTreeMap::new(),
     };
 
@@ -946,6 +952,8 @@ fn session_new_params_roundtrips_with_initial_input() {
         base_branch: None,
         input: Some("run tests".to_owned()),
         extended_input_ready_wait: None,
+        branch_source: None,
+        on_diverged: None,
         metadata: BTreeMap::new(),
     };
 
@@ -3409,6 +3417,7 @@ fn host_capabilities_json_shape_roundtrips() {
         session_wait_turn_supported: true,
         session_new_cwd_supported: true,
         session_idle_stop_supported: true,
+        session_new_branch_source_supported: true,
     };
 
     let value = serde_json::to_value(&caps).expect("serialize host capabilities");
@@ -3438,6 +3447,7 @@ fn host_capabilities_json_shape_roundtrips() {
             "session_wait_supported": true,
             "session_wait_turn_supported": true,
             "session_new_cwd_supported": true,
+            "session_new_branch_source_supported": true,
             "session_idle_stop_supported": true
         })
     );

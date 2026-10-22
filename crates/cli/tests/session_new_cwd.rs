@@ -1,8 +1,11 @@
-//! `pohunek session new --cwd` against a fixture daemon.
+//! `pohunek session new --cwd` and the branch source options against a
+//! fixture daemon.
 //!
 //! The built CLI starts sessions on a fixture daemon that records every
-//! request. The scenarios pin what the CLI sends for a requested directory,
-//! and that it refuses what the host cannot honor before it creates a session.
+//! request. The scenarios pin what the CLI sends for a requested directory
+//! and for `--from-remote`/`--reset-diverged`, what it prints of the worktree
+//! source, and that it refuses what the host cannot honor or the options
+//! forbid before it creates a session.
 
 #![cfg(unix)]
 
@@ -33,6 +36,15 @@ const PRIVATE_DIR_MODE: u32 = 0o700;
 /// Id of the session the fixture daemon reports as created.
 const SESSION_ID: &str = "s-cwd-1";
 
+/// Commit the fixture daemon reports a remote-mode worktree was built at.
+const REMOTE_COMMIT: &str = "1111111111111111111111111111111111111111";
+
+/// Previous local head the fixture daemon reports as fast-forwarded.
+const PREVIOUS_COMMIT: &str = "2222222222222222222222222222222222222222";
+
+/// Backup ref the fixture daemon reports for a reset branch.
+const BACKUP_REF: &str = "backup/feat-222222222222";
+
 /// Requests the fixture daemon served: method and params, in arrival order.
 type Served = Arc<Mutex<Vec<(String, Value)>>>;
 
@@ -50,6 +62,7 @@ fn capabilities(cwd_supported: bool) -> Value {
     });
     if cwd_supported {
         value["session_new_cwd_supported"] = json!(true);
+        value["session_new_branch_source_supported"] = json!(true);
     }
     value
 }
@@ -81,7 +94,16 @@ fn result_for(request: &Request, cwd_supported: bool) -> Value {
         protocol::method::HOST_INSPECT => capabilities(cwd_supported),
         protocol::method::SESSION_NEW => {
             let cwd = request.params()["cwd"].as_str().unwrap_or("/project/root");
-            session(cwd)
+            let mut result = session(cwd);
+            if request.params()["branch_source"] == "remote" {
+                result["worktree_source"] = json!({
+                    "ref": "origin/feat",
+                    "commit": REMOTE_COMMIT,
+                    "fast_forwarded_from": PREVIOUS_COMMIT,
+                    "backup_ref": BACKUP_REF
+                });
+            }
+            result
         }
         other => panic!("the CLI sent an unexpected request: {other}"),
     }
@@ -503,4 +525,121 @@ mod remote {
         );
         assert!(run.served.is_empty(), "{:?}", run.served);
     }
+}
+
+/// Runs `pohunek session new --agent shell <args>` (no `--json`) against a
+/// fixture daemon and returns the process output with the requests served.
+fn run_plain(args: &[&str]) -> (std::process::Output, Vec<(String, Value)>) {
+    let env = private_environment();
+    let root = env.root().to_path_buf();
+    let served = serve_local(&root.join("run/pohunek/daemon.sock"), true);
+    let output = env
+        .command(pohunek_test_support::bin_exe("pohunek"))
+        .args(["session", "new", "--agent", "shell"])
+        .args(args)
+        .output()
+        .expect("run pohunek session new");
+    let served = served.lock().expect("served requests").clone();
+    (output, served)
+}
+
+#[test]
+fn from_remote_sends_the_branch_source_and_reports_the_worktree_source() {
+    let run = run_local(
+        &[
+            "--repo",
+            "/srv/repo",
+            "--branch",
+            "feat",
+            "--from-remote",
+            "--reset-diverged",
+        ],
+        true,
+    );
+
+    let params = run.session_new().expect("session.new was sent");
+    assert_eq!(params["branch_source"], "remote");
+    assert_eq!(params["on_diverged"], "backup_reset");
+    assert_eq!(
+        run.document["ok"]["worktree_source"],
+        json!({
+            "ref": "origin/feat",
+            "commit": REMOTE_COMMIT,
+            "fast_forwarded_from": PREVIOUS_COMMIT,
+            "backup_ref": BACKUP_REF
+        }),
+        "{}",
+        run.document
+    );
+
+    let (output, _) = run_plain(&["--repo", "/srv/repo", "--branch", "feat", "--from-remote"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    for line in [
+        format!("worktree source: origin/feat at {REMOTE_COMMIT}"),
+        format!("fast-forwarded from: {PREVIOUS_COMMIT}"),
+        format!("previous local head kept as: {BACKUP_REF}"),
+    ] {
+        assert!(stdout.contains(&line), "missing {line:?} in {stdout}");
+    }
+}
+
+#[test]
+fn without_the_options_nothing_about_the_branch_source_is_sent() {
+    let run = run_local(&["--repo", "/srv/repo", "--branch", "feat"], true);
+
+    let params = run.session_new().expect("session.new was sent");
+    assert!(params.get("branch_source").is_none(), "{params}");
+    assert!(params.get("on_diverged").is_none(), "{params}");
+    assert!(run.document["ok"].get("worktree_source").is_none());
+}
+
+#[test]
+fn branch_source_options_that_contradict_each_other_are_refused_before_any_connection() {
+    for args in [
+        vec!["--repo", "/srv/repo", "--from-remote"],
+        vec![
+            "--repo",
+            "/srv/repo",
+            "--branch",
+            "feat",
+            "--from-remote",
+            "--base-branch",
+            "main",
+        ],
+        vec![
+            "--repo",
+            "/srv/repo",
+            "--branch",
+            "feat",
+            "--reset-diverged",
+        ],
+    ] {
+        let (output, served) = run_plain(&args);
+        assert!(!output.status.success(), "{args:?} must be refused");
+        assert!(served.is_empty(), "{args:?} reached the daemon: {served:?}");
+    }
+}
+
+#[test]
+fn from_remote_is_refused_by_a_daemon_that_ignores_it() {
+    let run = run_local(
+        &["--repo", "/srv/repo", "--branch", "feat", "--from-remote"],
+        false,
+    );
+
+    assert_eq!(
+        run.error_code(),
+        "session_new_branch_source_unsupported",
+        "{}",
+        run.document
+    );
+    assert!(
+        run.document["err"]["msg"]
+            .as_str()
+            .is_some_and(|message| message.contains("session_new_branch_source_supported")),
+        "{}",
+        run.document
+    );
+    assert!(run.session_new().is_none(), "no session.new was sent");
 }

@@ -869,6 +869,8 @@ fn build_menu_new_session_request(
             base_branch: None,
             input: None,
             extended_input_ready_wait: None,
+            branch_source: None,
+            on_diverged: None,
             metadata: std::collections::BTreeMap::new(),
         },
     )

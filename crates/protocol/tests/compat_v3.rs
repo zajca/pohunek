@@ -580,9 +580,9 @@ fn current_events_downgrade_to_the_protocol_3_golden() {
 }
 
 /// The session of the first `method` fixture in its current spelling, with a
-/// real `NativeRecovery` warning appended; also returns the warnings of the
+/// real warning of `kind` appended; also returns the warnings of the
 /// golden, which are what a protocol 3 client must still receive.
-fn session_with_native_recovery_warning(method: &str) -> (Value, Value) {
+fn session_with_warning(method: &str, kind: SessionWarningKind) -> (Value, Value) {
     let results = fixtures(RESULTS, "results.json");
     let golden = results
         .entries
@@ -597,9 +597,9 @@ fn session_with_native_recovery_warning(method: &str) -> (Value, Value) {
         &mut current
     };
     let warning = serde_json::to_value(SessionWarning {
-        kind: SessionWarningKind::NativeRecovery,
-        message: "native recovery is unavailable".to_owned(),
-        detail: Some("native session id: native-1".to_owned()),
+        kind,
+        message: "a warning from a later release".to_owned(),
+        detail: Some("detail".to_owned()),
     })
     .expect("serialize the warning");
     session["warnings"]
@@ -615,9 +615,25 @@ fn session_with_native_recovery_warning(method: &str) -> (Value, Value) {
 }
 
 #[test]
-fn a_native_recovery_warning_is_withheld_from_protocol_3_and_kept_on_protocol_4() {
-    for method in [method::SESSION_LIST, method::SESSION_NEW] {
-        let (current, golden_warnings) = session_with_native_recovery_warning(method);
+fn warnings_added_after_protocol_3_are_withheld_from_it_and_kept_on_protocol_4() {
+    for (method, kind, wire) in [
+        (
+            method::SESSION_LIST,
+            SessionWarningKind::NativeRecovery,
+            "native_recovery",
+        ),
+        (
+            method::SESSION_NEW,
+            SessionWarningKind::NativeRecovery,
+            "native_recovery",
+        ),
+        (
+            method::SESSION_NEW,
+            SessionWarningKind::BranchAheadOfRemote,
+            "branch_ahead_of_remote",
+        ),
+    ] {
+        let (current, golden_warnings) = session_with_warning(method, kind);
 
         let downgraded =
             result(v3(), method, current.clone()).expect("adapter translates the result");
@@ -632,7 +648,7 @@ fn a_native_recovery_warning_is_withheld_from_protocol_3_and_kept_on_protocol_4(
             .map(|warnings| warnings.iter().filter_map(|w| w["kind"].as_str()).collect())
             .unwrap_or_default();
         assert!(
-            !kinds.contains(&"native_recovery"),
+            !kinds.contains(&wire),
             "{method}: protocol 3 never knew the kind: {kinds:?}"
         );
         assert_eq!(

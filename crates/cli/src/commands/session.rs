@@ -365,6 +365,10 @@ pub(crate) struct NewArgs {
     pub branch: Option<String>,
     /// Base branch the worktree's branch is created from.
     pub base_branch: Option<String>,
+    /// Start the worktree from `origin/<branch>` (`--from-remote`).
+    pub from_remote: bool,
+    /// Keep a diverged local branch as a backup and reset it (`--reset-diverged`).
+    pub reset_diverged: bool,
     /// Initial text to inject into the spawned PTY.
     pub input: Option<String>,
     /// Optional daemon response timeout for this creation request.
@@ -643,10 +647,16 @@ pub(crate) async fn run_new(
     // A daemon that predates the behavior would start the session in the
     // checkout root or the project checkout, so the request is refused before it
     // is sent.
-    if cwd_requested {
+    if cwd_requested || args.from_remote {
         let capabilities = client.call::<method::HostInspect>(()).await?;
-        if !capabilities.session_new_cwd_supported {
+        if cwd_requested && !capabilities.session_new_cwd_supported {
             return Err(CliError::SessionNewCwdUnsupported {
+                host: host.to_owned(),
+                daemon_version: capabilities.daemon_version,
+            });
+        }
+        if args.from_remote && !capabilities.session_new_branch_source_supported {
+            return Err(CliError::SessionNewBranchSourceUnsupported {
                 host: host.to_owned(),
                 daemon_version: capabilities.daemon_version,
             });
@@ -677,12 +687,19 @@ pub(crate) async fn run_new(
     }
 
     if json {
+        let mut value = serde_json::to_value(info)?;
+        if let (Some(source), Some(object)) = (&result.worktree_source, value.as_object_mut()) {
+            object.insert("worktree_source".to_owned(), serde_json::to_value(source)?);
+        }
         print!(
             "{}",
-            crate::commands::render_json_with_v3_identity(method::SESSION_NEW, info)?
+            crate::commands::render_json_with_v3_identity(method::SESSION_NEW, &value)?
         );
     } else {
-        print!("{}", render_new_human(info));
+        print!(
+            "{}",
+            render_new_human(info, result.worktree_source.as_ref())
+        );
     }
     Ok(())
 }
@@ -1969,6 +1986,10 @@ fn new_params(args: &NewArgs) -> Result<SessionNewParams, CliError> {
         base_branch: args.base_branch.clone(),
         input: args.input.clone(),
         extended_input_ready_wait: None,
+        branch_source: args.from_remote.then_some(protocol::BranchSource::Remote),
+        on_diverged: args
+            .reset_diverged
+            .then_some(protocol::OnDiverged::BackupReset),
         metadata: parse_meta_pairs(&args.meta)?,
     })
 }
@@ -2226,7 +2247,7 @@ fn build_diff_request(target: &Target, base: Option<String>) -> Result<Request, 
     request_with_params(method::SESSION_DIFF, &diff_params(target, base))
 }
 
-fn render_new_human(info: &SessionInfo) -> String {
+fn render_new_human(info: &SessionInfo, source: Option<&protocol::WorktreeSource>) -> String {
     let mut output = format!(
         "session {} created (state: {})\n",
         info.id.0,
@@ -2239,6 +2260,19 @@ fn render_new_human(info: &SessionInfo) -> String {
             .map(|b| format!(" (branch {b})"))
             .unwrap_or_default();
         let _ = writeln!(output, "  worktree: {}{branch}", path.display());
+    }
+    if let Some(source) = source {
+        let _ = writeln!(
+            output,
+            "  worktree source: {} at {}",
+            source.source_ref, source.commit
+        );
+        if let Some(previous) = &source.fast_forwarded_from {
+            let _ = writeln!(output, "  fast-forwarded from: {previous}");
+        }
+        if let Some(backup) = &source.backup_ref {
+            let _ = writeln!(output, "  previous local head kept as: {backup}");
+        }
     }
     write_warnings(&mut output, &info.warnings);
     output
@@ -2980,6 +3014,7 @@ fn warning_kind_label(kind: SessionWarningKind) -> &'static str {
         SessionWarningKind::SetupScript => "setup_script",
         SessionWarningKind::Hook => "hook",
         SessionWarningKind::NativeRecovery => "native_recovery",
+        SessionWarningKind::BranchAheadOfRemote => "branch_ahead_of_remote",
         SessionWarningKind::Unknown => "unknown",
     }
 }
@@ -3046,6 +3081,8 @@ mod tests {
             repo: None,
             branch: None,
             base_branch: None,
+            from_remote: false,
+            reset_diverged: false,
             input: None,
             request_timeout_ms: None,
             meta: Vec::new(),
@@ -3139,6 +3176,8 @@ mod tests {
             repo: Some(PathBuf::from("/workspace/repo")),
             branch: Some("feature/login".to_owned()),
             base_branch: Some("main".to_owned()),
+            from_remote: false,
+            reset_diverged: false,
             input: Some("Fix #1234".to_owned()),
             request_timeout_ms: None,
             meta: vec![
@@ -3787,7 +3826,7 @@ mod tests {
             },
         ];
 
-        let output = render_new_human(&session);
+        let output = render_new_human(&session, None);
 
         assert!(
             output.starts_with("session s-42 created (state: running)\n"),

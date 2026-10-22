@@ -111,6 +111,13 @@ pub struct HostCapabilities {
     /// omitted on the wire.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_new_cwd_supported: bool,
+    /// Whether `session.new` honors `branch_source` and `on_diverged`.
+    ///
+    /// A daemon that predates them ignores both and checks out the local branch
+    /// as it is, so a client checks this flag before it sends either. Omitted
+    /// when `false`, which is how an older daemon decodes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_new_branch_source_supported: bool,
     /// Whether the daemon serves `session.idle_stop.get` and
     /// `session.idle_stop.set` and stops sessions opted in to idle stop.
     ///

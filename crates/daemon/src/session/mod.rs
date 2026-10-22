@@ -63,8 +63,8 @@ use crate::store::{
 };
 use crate::time::now_rfc3339;
 use crate::worktree::{
-    canonical_or_original, run_hook, HookContext, HookEvent, HookStderrCapture, HookStderrTail,
-    WorktreeCleanup, WorktreeManager, WorktreeRequest,
+    canonical_or_original, note_backup, run_hook, HookContext, HookEvent, HookStderrCapture,
+    HookStderrTail, WorktreeCleanup, WorktreeManager, WorktreeRequest,
 };
 use native_attestation::{attest_report_caller, unattested, NativeReportRefusal};
 use reconcile::LossClassification;
@@ -2788,6 +2788,21 @@ impl SessionRegistry {
     /// failed create whose compensation cannot finish stays listed as
     /// `create_compensation_pending` for the supervision retry.
     pub async fn create(&self, params: SessionNewParams) -> Result<SessionInfo, ProtocolError> {
+        self.create_with_source(params)
+            .await
+            .map(|(session, _source)| session)
+    }
+
+    /// [`Self::create`], also returning the commit a `branch_source: remote`
+    /// worktree was built from (`None` for every other session).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_source(
+        &self,
+        params: SessionNewParams,
+    ) -> Result<(SessionInfo, Option<protocol::WorktreeSource>), ProtocolError> {
         self.ensure_migration_settled()?;
         validate_new_params(&params)?;
         idle_stop::validate_opt_in(&params.metadata, self.inner.config.idle_stop_min_secs)?;
@@ -2836,7 +2851,8 @@ impl SessionRegistry {
         let registry = self.clone();
         self.spawn_create(async move {
             let extended_input_ready_wait = params.extended_input_ready_wait.unwrap_or(false);
-            let (info, pending_initial_input) = Box::pin(registry.create_transaction(
+            let branch = params.branch.clone();
+            let (info, pending_initial_input, source) = Box::pin(registry.create_transaction(
                 id,
                 params,
                 resolved,
@@ -2845,9 +2861,11 @@ impl SessionRegistry {
                 fallback_cwd,
             ))
             .await?;
-            registry
+            let session = registry
                 .complete_create(info, pending_initial_input, extended_input_ready_wait)
                 .await
+                .map_err(|err| note_kept_backup(err, branch.as_deref(), source.as_ref()))?;
+            Ok((session, source))
         })?
         .await
         .map_err(|_join_error| {
@@ -3174,7 +3192,14 @@ impl SessionRegistry {
         profile_revision: Option<host::ProfileRevision>,
         validated_program: Option<crate::agent::ValidatedLaunchProgram>,
         fallback_cwd: PathBuf,
-    ) -> Result<(SessionInfo, Option<String>), ProtocolError> {
+    ) -> Result<
+        (
+            SessionInfo,
+            Option<String>,
+            Option<protocol::WorktreeSource>,
+        ),
+        ProtocolError,
+    > {
         // Verified and held before anything is persisted, so a package that
         // fails verification launches nothing and leaves no record.
         let _package_launch = self.guard_package_launch(&resolved.definition).await?;
@@ -3182,9 +3207,11 @@ impl SessionRegistry {
         let intent = create_intent_record(&id, &params, &resolved, &fallback_cwd)?;
         self.write_session_record(intent).await?;
         let mut hook_stderr_tails = Vec::new();
+        let mut worktree_source = None;
         let prepared = match self.resolve_target(&id, &params, fallback_cwd).await {
             Ok(mut target) => {
                 hook_stderr_tails = std::mem::take(&mut target.hook_stderr_tails);
+                worktree_source = target.worktree_source.take();
                 #[cfg(test)]
                 self.hold_bound_create(&id).await;
                 if let Err(error) = self
@@ -3215,17 +3242,24 @@ impl SessionRegistry {
         };
         let (spec, pending_initial_input) = match prepared {
             Ok(prepared) => prepared,
-            Err(mut error) => {
+            Err(error) => {
+                let mut error =
+                    note_kept_backup(error, params.branch.as_deref(), worktree_source.as_ref());
                 if !self.compensate_abandoned_create(&id).await {
                     error.msg = unfinished_compensation_message(&error.msg, &id);
                 }
                 return Err(error);
             }
         };
-        let info = Box::pin(self.clone().run_pty_registration(spec, guard)).await?;
+        let info = Box::pin(self.clone().run_pty_registration(spec, guard))
+            .await
+            .map_err(|err| {
+                note_kept_backup(err, params.branch.as_deref(), worktree_source.as_ref())
+            })?;
         Ok((
             with_hook_stderr_tails(info, hook_stderr_tails),
             pending_initial_input,
+            worktree_source,
         ))
     }
 
@@ -7468,6 +7502,24 @@ fn validate_new_params(params: &SessionNewParams) -> Result<(), ProtocolError> {
             "session.new: --project and --repo are mutually exclusive (both name the target repository)",
         ));
     }
+    if params.branch_source == Some(protocol::BranchSource::Remote) {
+        if params.branch.is_none() {
+            return Err(ProtocolError::bad_request(
+                "session.new branch_source remote requires branch",
+            ));
+        }
+        if params.base_branch.is_some() {
+            return Err(ProtocolError::bad_request(
+                "session.new branch_source remote excludes base_branch (the commit comes from origin/<branch>)",
+            ));
+        }
+    }
+    if params.on_diverged.is_some() && params.branch_source != Some(protocol::BranchSource::Remote)
+    {
+        return Err(ProtocolError::bad_request(
+            "session.new on_diverged requires branch_source remote",
+        ));
+    }
     validate_session_metadata(&params.metadata)?;
     validate_session_name(params.name.as_deref())?;
     Ok(())
@@ -7574,6 +7626,23 @@ fn create_intent_record(
             reason: None,
         },
     })
+}
+
+/// `err` plus the backup ref of a `branch_source: remote` reset, when the request
+/// made one: the failed create leaves the branch at the remote head, so the old
+/// head is reachable only through that ref.
+fn note_kept_backup(
+    err: ProtocolError,
+    branch: Option<&str>,
+    source: Option<&protocol::WorktreeSource>,
+) -> ProtocolError {
+    match (
+        branch,
+        source.and_then(|source| source.backup_ref.as_deref()),
+    ) {
+        (Some(branch), Some(backup)) => note_backup(err, branch, backup),
+        _ => err,
+    }
 }
 
 /// Extends a failed create's error `msg` with the compensation it left

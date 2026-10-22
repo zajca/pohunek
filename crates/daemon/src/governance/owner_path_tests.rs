@@ -541,6 +541,8 @@ where
             base_branch: None,
             input: None,
             extended_input_ready_wait: None,
+            branch_source: None,
+            on_diverged: None,
             metadata: BTreeMap::default(),
         })
         .expect("serialize real session parameters"),

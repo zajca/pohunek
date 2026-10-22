@@ -2452,6 +2452,16 @@ function readSessionNewParams(request: ControlRequest): SessionNewParams | undef
   if (params.base_branch !== undefined && (!hasRepo || !hasBranch)) {
     return undefined;
   }
+  const remote = params.branch_source === "remote";
+  if (params.branch_source !== undefined && !remote && params.branch_source !== "local") {
+    return undefined;
+  }
+  if (params.on_diverged !== undefined && (params.on_diverged !== "backup_reset" || !remote)) {
+    return undefined;
+  }
+  if (remote && (!hasBranch || params.base_branch !== undefined)) {
+    return undefined;
+  }
   return params;
 }
 

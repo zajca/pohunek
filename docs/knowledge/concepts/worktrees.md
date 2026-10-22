@@ -31,6 +31,24 @@ that must not let the agent act on another commit starts the session without
 `--input`, checks `warnings`, and only then sends the prompt with
 `session input`.
 
+`pohunek session new --branch <b> --from-remote` takes the branch from `origin`
+instead of the local copy, so a stale local branch cannot reach the agent. The
+daemon fetches `origin/<b>` and then, by how the local branch `<b>` relates to
+the fetched commit: creates `<b>` there when it is missing, uses it when equal,
+fast-forwards it when it is behind, uses the local head with a
+`branch_ahead_of_remote` warning when it is ahead (its commits are not on the
+remote), and refuses with `branch_diverged` when both have commits the other
+lacks. `--reset-diverged` instead keeps the old local head as
+`backup/<b>-<short-sha>` and resets `<b>` to the remote head, so no local commit
+becomes unreachable; a taken backup name fails with `backup_ref_exists` (a ref that already holds the
+old head is reused, never reported as taken or advised to be deleted), and every
+failure after the reset names the backup ref. A branch checked out in another worktree is never moved (`worktree_branch_in_use`).
+A missing `origin` or remote branch (`remote_branch_not_found`) and a failed
+fetch (`branch_fetch_failed`) fail the create instead of warning. The result
+names the commit the worktree was built from in `worktree_source`. The flag
+excludes `--base-branch`, and git's upstream configuration of the branch is not
+changed.
+
 A branch the worktree creates from a base has no upstream. The base is fetched
 into a temporary ref, not a remote-tracking branch, and an upstream set to a
 base with another name would make a plain `git push` target the base branch.

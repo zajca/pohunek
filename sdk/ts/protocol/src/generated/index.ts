@@ -16,6 +16,7 @@ export type { BackgroundRevision } from "./BackgroundRevision";
 export type { BackgroundStateEvent } from "./BackgroundStateEvent";
 export type { BackgroundStatus } from "./BackgroundStatus";
 export type { BindingProvenance } from "./BindingProvenance";
+export type { BranchSource } from "./BranchSource";
 export type { ConceptDeprecation } from "./ConceptDeprecation";
 export type { ConceptIntent } from "./ConceptIntent";
 export type { ConceptMeta } from "./ConceptMeta";
@@ -90,6 +91,7 @@ export type { NotificationStatus } from "./NotificationStatus";
 export type { NotificationUpdateParams } from "./NotificationUpdateParams";
 export type { NotificationUpdateResult } from "./NotificationUpdateResult";
 export type { NotificationUpdatedEvent } from "./NotificationUpdatedEvent";
+export type { OnDiverged } from "./OnDiverged";
 export type { OutputOffset } from "./OutputOffset";
 export type { OwnerRevision } from "./OwnerRevision";
 export type { PackageBindProfileParams } from "./PackageBindProfileParams";
@@ -244,6 +246,7 @@ export type { TerminalWatermark } from "./TerminalWatermark";
 export type { UnconfirmedProcess } from "./UnconfirmedProcess";
 export type { WorktreeRemoveParams } from "./WorktreeRemoveParams";
 export type { WorktreeRemoveResult } from "./WorktreeRemoveResult";
+export type { WorktreeSource } from "./WorktreeSource";
 
 export type JsonValue =
   | null
