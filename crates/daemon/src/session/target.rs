@@ -1062,7 +1062,7 @@ impl SessionRegistry {
             initial_input_owner: initial_input_pending
                 .then(|| self.daemon_instance_id().to_owned()),
         };
-        let committed_metadata = match self.commit_session_entry(&id, entry).await {
+        let committed_metadata = match Box::pin(self.commit_session_entry(&id, entry)).await {
             Ok(metadata) => metadata,
             Err(error) => {
                 self.stop_uncommitted_runtime(&id, &started.handle).await;

@@ -4214,8 +4214,7 @@ async fn an_entry_built_before_a_metadata_edit_carries_it_when_committed() {
         &crate::session::Unavailability::other(RuntimeState::Reconnecting),
         "fixture",
     );
-    let committed = registry
-        .commit_session_entry(&id, entry)
+    let committed = Box::pin(registry.commit_session_entry(&id, entry))
         .await
         .expect("commit the stale entry");
 
@@ -4234,6 +4233,7 @@ async fn an_entry_built_before_a_metadata_edit_carries_it_when_committed() {
 async fn a_classification_of_a_record_read_before_a_metadata_edit_keeps_the_edit() {
     let (registry, id, stale, store_path) =
         session_edited_after_its_record_was_read("meta-stale-classify").await;
+    let mut events = registry.subscribe();
     assert!(
         registry
             .insert_unavailable_record(stale, RuntimeState::Reconnecting, "fixture")
@@ -4242,8 +4242,138 @@ async fn a_classification_of_a_record_read_before_a_metadata_edit_keeps_the_edit
     );
 
     let expected = metadata(&[("ticket", "new")]);
+    assert_eq!(
+        next_session_updated(&mut events).await.metadata,
+        expected,
+        "the announced session carries the edit"
+    );
     let (live, durable) = metadata_in_memory_and_store(&registry, &id, store_path).await;
     assert_eq!((live, durable), (expected.clone(), expected));
+}
+
+fn armed_snapshot_window_hold(
+    registry: &SessionRegistry,
+) -> crate::runtime::lifecycle::tests::StartGate {
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *registry
+        .inner
+        .snapshot_window_hold
+        .lock()
+        .expect("snapshot window hold is never poisoned") = Some(gate.clone());
+    gate
+}
+
+/// A worker metadata projection that took its memory snapshot before a
+/// metadata edit does not write the older metadata over the edit.
+#[tokio::test]
+async fn a_worker_snapshot_parked_before_a_metadata_edit_does_not_overwrite_it() {
+    let (registry, inspector, created, store_path) =
+        mock_direct_stored_registry("meta-snapshot-window").await;
+    let start = root_start_identity(&inspector, &created);
+    let worker = session_worker(&registry, &created.id).await;
+    assert!(
+        registry
+            .report_agent(bound_report(&created, start, 1, "native-one"))
+            .await
+            .recorded
+    );
+    let snapshot = worker.inspect().await.expect("inspect worker");
+
+    let gate = armed_snapshot_window_hold(&registry);
+    let written = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *registry
+        .inner
+        .first_store_write_hold
+        .lock()
+        .expect("first store write hold is never poisoned") = Some(written.clone());
+    let parked = tokio::spawn({
+        let registry = registry.clone();
+        let id = created.id.clone();
+        async move {
+            registry
+                .apply_worker_metadata_snapshot(&id, &snapshot)
+                .await
+        }
+    });
+    guard("the projection to park", gate.entered.notified()).await;
+    registry
+        .set_metadata(&created.id, metadata_patch(&[("ticket", Some("new"))]))
+        .await
+        .expect("edit the metadata");
+    gate.release.notify_one();
+    let expected = metadata(&[("ticket", "new")]);
+    guard("the first store write", written.entered.notified()).await;
+    assert_eq!(
+        crate::store::Store::new(store_path.clone())
+            .load_sessions()
+            .expect("read the durable records")
+            .into_iter()
+            .find(|record| record.session_id == created.id.0)
+            .expect("the session has a durable record")
+            .info
+            .metadata,
+        expected,
+        "the projection's own write keeps the edit, before any later rebase"
+    );
+    written.release.notify_one();
+    parked.await.expect("parked projection");
+
+    let (live, durable) = metadata_in_memory_and_store(&registry, &created.id, store_path).await;
+    assert_eq!((live, durable), (expected.clone(), expected));
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A startup adoption of a record read before a metadata edit keeps the edit in
+/// the store, the adopted session and the announcement.
+#[tokio::test]
+async fn an_adoption_of_a_record_read_before_a_metadata_edit_keeps_the_edit() {
+    let (registry, _inspector, created, store_path) =
+        mock_direct_stored_registry("meta-adoption").await;
+    let worker = session_worker(&registry, &created.id).await;
+    let stale = registry
+        .load_durable_session_record(&created.id)
+        .await
+        .expect("read the record")
+        .expect("the session has a durable record");
+    let snapshot = worker.inspect().await.expect("inspect worker");
+    registry
+        .set_metadata(&created.id, metadata_patch(&[("ticket", Some("new"))]))
+        .await
+        .expect("edit the metadata");
+    let mut events = registry.subscribe();
+
+    let pending =
+        Box::pin(registry.adopt_live_record(created.id.clone(), worker, stale, snapshot, false))
+            .await;
+    assert!(!pending, "the worker is adopted");
+
+    let expected = metadata(&[("ticket", "new")]);
+    let announced = guard("the reconnected event", async {
+        loop {
+            let event = events.recv().await.expect("receive session event");
+            if event.event() == protocol::event::SESSION_RUNTIME_RECONNECTED {
+                break event;
+            }
+        }
+    })
+    .await;
+    let announced: SessionInfo =
+        serde_json::from_value(announced.payload()["session"].clone()).expect("session payload");
+    assert_eq!(
+        announced.metadata, expected,
+        "the announcement carries the edit"
+    );
+    let (live, durable) = metadata_in_memory_and_store(&registry, &created.id, store_path).await;
+    assert_eq!((live, durable), (expected.clone(), expected));
+    let _ = registry.stop(&created.id).await;
 }
 
 #[tokio::test]
@@ -16948,7 +17078,7 @@ async fn commit_runtime_candidate(
         .expect("candidate runtime id");
     let info = entry.info.clone();
     barrier.wait().await;
-    registry.commit_session_entry(&id, entry).await?;
+    Box::pin(registry.commit_session_entry(&id, entry)).await?;
     registry.emit(protocol::event::SESSION_UPDATED, &info);
     Ok(worker_instance_id)
 }

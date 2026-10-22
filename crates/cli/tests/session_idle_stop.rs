@@ -17,8 +17,9 @@ use serde_json::{json, Value};
 /// The smallest idle time the daemon accepts, and the one the scenarios use.
 const MIN_SECS: u64 = 60;
 
-/// The version the fixture daemon reports in `daemon.health`.
-const FIXTURE_DAEMON_VERSION: &str = "0.35.2";
+/// The version the fixture daemon reports in `daemon.health`: the CLI's own, so
+/// it is never older than the CLI whichever release the workspace is at.
+const FIXTURE_DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A daemon version older than every CLI release the workspace builds.
 const OLDER_DAEMON_VERSION: &str = "0.1.0";

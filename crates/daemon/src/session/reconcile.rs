@@ -651,6 +651,8 @@ impl SessionRegistry {
                     .is_some_and(|active| active.activity_reported),
             )
         };
+        #[cfg(test)]
+        self.hold_snapshot_window().await;
         // A snapshot older than the identity revision already committed for
         // this worker instance cannot change the active identity; everything
         // else it carries still applies.
@@ -733,6 +735,17 @@ impl SessionRegistry {
         }
         let mut candidate = memory_base.clone();
         preserve_durable_worker_metadata(&durable_base, &mut candidate);
+        // The snapshot above may predate a `set_metadata` edit that the durable
+        // base already holds; the owner's metadata is not the worker's to change.
+        candidate
+            .info
+            .metadata
+            .clone_from(&durable_base.info.metadata);
+        if let (Some(recovery), Some(durable)) =
+            (candidate.recovery.as_mut(), durable_base.recovery.as_ref())
+        {
+            recovery.metadata.clone_from(&durable.metadata);
+        }
         // The journaled reference is trusted by its generation binding, not by
         // the liveness of the processes the identity claims name.
         import_native_reference(&mut candidate, snapshot);
@@ -790,6 +803,8 @@ impl SessionRegistry {
                 return metadata_write_failure_outcome(&error);
             }
         }
+        #[cfg(test)]
+        self.hold_first_store_write().await;
 
         let (current_after_store, pinned) = {
             let sessions = self.inner.sessions.lock().await;
@@ -3896,7 +3911,7 @@ impl SessionRegistry {
     /// that answers but cannot be adopted leaves the session `Conflict`, and
     /// the re-check classifies it from fresh evidence once the worker or its
     /// job is gone.
-    async fn adopt_live_record(
+    pub(super) async fn adopt_live_record(
         &self,
         id: SessionId,
         worker: Worker,
@@ -4278,7 +4293,7 @@ impl SessionRegistry {
         let (classified, entry) = self.unavailable_entry(record.clone(), &classification, reason);
         // Boxed so the entry does not widen the futures of the callers.
         let entry = Box::new(entry);
-        let info = entry.info.clone();
+        let mut info = entry.info.clone();
         // A placeholder that already logged this very classification does not
         // log it again once the write succeeds.
         let logged = self
@@ -4295,19 +4310,14 @@ impl SessionRegistry {
             .await
             .get(&id)
             .is_some_and(|current| current.info.background.is_some());
-        if let Err(error) = self.write_record_and_install(&id, classified, *entry).await {
-            tracing::warn!(session_id = %id.0, error = %error, "failed to persist runtime classification");
-            Box::pin(self.list_pending(&record)).await;
-            return false;
+        match self.write_record_and_install(&id, classified, *entry).await {
+            Ok(metadata) => info.metadata = metadata,
+            Err(error) => {
+                tracing::warn!(session_id = %id.0, error = %error, "failed to persist runtime classification");
+                Box::pin(self.list_pending(&record)).await;
+                return false;
+            }
         }
-        // The installed entry carries the metadata of the entry it replaced.
-        let info = self
-            .inner
-            .sessions
-            .lock()
-            .await
-            .get(&id)
-            .map_or(info, |installed| installed.info.clone());
         if !logged {
             warn_unavailable(&id.0, info_worker_id(&info), state, reason, "");
         }

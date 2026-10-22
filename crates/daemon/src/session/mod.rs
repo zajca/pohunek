@@ -815,6 +815,10 @@ struct SessionRegistryInner {
     definition_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     #[cfg(test)]
     entry_record_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    #[cfg(test)]
+    snapshot_window_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    #[cfg(test)]
+    first_store_write_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     /// Parks an adopted detector refresh between resolving the runtime sources
     /// and applying them.
     #[cfg(test)]
@@ -1797,7 +1801,9 @@ impl SessionRegistry {
     /// Every unconditional record write goes through here or through
     /// [`Self::write_record_and_install`] or [`Self::write_entry_record`]; a
     /// write conditional on the durable record is a compare-and-swap in the
-    /// store and needs none of them.
+    /// store and needs none of them; the worker metadata projection, whose
+    /// candidate starts from a memory snapshot, takes the owner's metadata from
+    /// the durable base it compares against.
     async fn write_session_record(&self, mut record: SessionRecord) -> Result<(), ProtocolError> {
         let _persist = self.inner.persist_lock.lock().await;
         self.carry_registered_metadata(&mut record, None).await;
@@ -2410,6 +2416,10 @@ impl SessionRegistry {
                 definition_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 entry_record_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                snapshot_window_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                first_store_write_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 refresh_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
@@ -3532,6 +3542,38 @@ impl SessionRegistry {
         let gate = self
             .inner
             .metadata_apply_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Parks a worker metadata projection after it took its memory snapshot
+    /// and before it loads the durable record, when a test armed the hold.
+    #[cfg(test)]
+    pub(super) async fn hold_snapshot_window(&self) {
+        let gate = self
+            .inner
+            .snapshot_window_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Parks a worker metadata projection after its first store write and
+    /// before it compares memory again, when a test armed the hold.
+    #[cfg(test)]
+    pub(super) async fn hold_first_store_write(&self) {
+        let gate = self
+            .inner
+            .first_store_write_hold
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -5251,7 +5293,7 @@ impl SessionRegistry {
             .collect();
         idle_stop::validate_opt_in(&patch, self.inner.config.idle_stop_min_secs)?;
         // `persist_lock` is held from the merge through the store write to the
-        // in-memory edit, and the sessions lock is held across them, so a record
+        // in-memory edit, and the sessions lock is held across them, so an
         // unconditional record writer cannot interleave and write the previous
         // metadata over the edit.
         let persist = self.inner.persist_lock.lock().await;
