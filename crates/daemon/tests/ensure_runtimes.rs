@@ -5720,6 +5720,14 @@ const CELLS: &[Cell] = &[
         ..BASE
     },
     Cell {
+        id: "R9 older selected, root missing, holder pinned, select hint",
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::Missing)],
+        pin: Some((Holder, PinKind::Profile)),
+        select: true,
+        ..BASE
+    },
+    Cell {
         id: "R9 older selected, root missing, select hint",
         installs: &[(Older, true, true), (Holder, true, false)],
         damage: &[(Older, Damage::Missing)],
@@ -6083,6 +6091,12 @@ async fn run_cell(cell: &Cell, runtime: &str) {
         Outcome::Refusal => assert_held_runtime_refused(&host, runtime, ""),
     };
     if cell.select {
+        // A pinned holder cannot be removed, so only the select is named.
+        assert_eq!(
+            detail.contains("`pohunek plugin uninstall"),
+            cell.pin.is_none(),
+            "{label}: {detail}"
+        );
         assert_select_hint_makes_the_holder_serve(&host, runtime, &digest(Holder));
         return;
     }
@@ -6102,6 +6116,12 @@ async fn run_cell(cell: &Cell, runtime: &str) {
     assert_eq!(
         detail.matches("`pohunek ").count(),
         commands,
+        "{label}: {detail}"
+    );
+    // The follow-up names the next upgrade only where the runtime is planned again.
+    assert_eq!(
+        detail.contains("run the upgrade again"),
+        !matches!(cell.end, End::Removed | End::Present),
         "{label}: {detail}"
     );
     let pins_named = detail.contains("pin it, so the registry refuses its removal");
@@ -6266,6 +6286,11 @@ async fn an_unselected_altered_pi_holder_is_a_gap_without_detect_and_a_refusal_w
     }
     let detected = host.detect_step();
     assert_eq!(detected.refusals.len(), 1, "{:?}", detected.refusals);
+    assert_eq!(
+        not_serving_detail(&detected, "pi"),
+        None,
+        "the refusal supersedes the managed gap"
+    );
     let detail = &detected.refusals[0].detail;
     assert!(
         detail.contains(&hint) && detail.contains(install),
