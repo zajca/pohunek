@@ -570,10 +570,17 @@ async fn path_settings_only_the_unit_file_holds_leave_the_recorded_path() {
     assert!(job.path_drop_in.is_none());
 }
 
+/// A store value no temp path or message text can contain by chance.
+const SECRET_STORE_VALUE: &str = "/sentinel-store-value-7f3a91";
+
 #[tokio::test]
 async fn an_environment_file_store_variable_is_refused() {
     let scratch = pohunek_test_support::tempdir().expect("scratch directory");
-    let file = file_in(&scratch, "store.env", "CLAUDE_CONFIG_DIR=/e\n");
+    let file = file_in(
+        &scratch,
+        "store.env",
+        &format!("CLAUDE_CONFIG_DIR={SECRET_STORE_VALUE}\n"),
+    );
     let text = format!("[Service]\nEnvironmentFile={file}\n");
     let (_dir, mut unit) = loaded_with(&[("10-file.conf", &text)], &[]);
     unit.environment_files = vec![(file.clone(), false)];
@@ -591,7 +598,10 @@ async fn an_environment_file_store_variable_is_refused() {
             && text.contains("Move the assignment to an Environment= line of a drop-in"),
         "{text}"
     );
-    assert!(!text.contains("/e"), "values stay out: {text}");
+    assert!(
+        !text.contains(SECRET_STORE_VALUE),
+        "values stay out: {text}"
+    );
 }
 
 #[tokio::test]

@@ -4049,6 +4049,87 @@ async fn set_metadata_merges_deletes_updates_timestamp_and_emits_event() {
     let _ = registry.stop(&created.id).await;
 }
 
+fn armed_entry_record_hold(
+    registry: &SessionRegistry,
+) -> crate::runtime::lifecycle::tests::StartGate {
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *registry
+        .inner
+        .entry_record_hold
+        .lock()
+        .expect("entry record hold is never poisoned") = Some(gate.clone());
+    gate
+}
+
+/// A record writer of a registered session that parked between its snapshot and
+/// its write keeps a metadata edit out of that window: the edit commits after the
+/// write, so the durable record and the session end with the edit.
+#[tokio::test]
+async fn a_metadata_edit_cannot_land_between_a_record_snapshot_and_its_write() {
+    let store_path = temp_store_path("meta-snapshot-window");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(SessionNewParams {
+            metadata: metadata(&[("ticket", "old")]),
+            ..params()
+        })
+        .await
+        .expect("create session");
+    let gate = armed_entry_record_hold(&registry);
+    let writer = {
+        let registry = registry.clone();
+        let id = created.id.clone();
+        tokio::spawn(async move { registry.persist_failed_recovery_rollback(&id).await })
+    };
+    gate.entered.notified().await;
+    assert!(
+        registry.inner.persist_lock.try_lock().is_err(),
+        "the parked writer holds the lock a metadata edit takes first"
+    );
+    let editor = {
+        let registry = registry.clone();
+        let id = created.id.clone();
+        tokio::spawn(async move {
+            registry
+                .set_metadata(&id, metadata_patch(&[("ticket", Some("new"))]))
+                .await
+        })
+    };
+    gate.release.notify_one();
+    writer.await.expect("writer task");
+    editor
+        .await
+        .expect("editor task")
+        .expect("the edit is accepted");
+
+    let expected = metadata(&[("ticket", "new")]);
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect")
+            .metadata,
+        expected
+    );
+    let durable = crate::store::Store::new(store_path)
+        .load_sessions()
+        .expect("read the durable records")
+        .into_iter()
+        .find(|record| record.session_id == created.id.0)
+        .expect("the session has a durable record");
+    assert_eq!(durable.info.metadata, expected);
+    let _ = registry.stop(&created.id).await;
+}
+
 #[tokio::test]
 async fn operations_on_an_unknown_session_return_session_not_found() {
     let registry = SessionRegistry::default();

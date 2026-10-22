@@ -34,8 +34,11 @@ the previous result. A retained-history `gap` means older requested bytes were
 evicted; a runtime change means discard old cursors and restart from a fresh
 screen or tail. Waiting calls use dedicated connections. Closing the
 connection releases the waiter slots of an in-flight `session.wait`, waited
-`session.output`, or `session.wait_turn` at once; the timeout stays the
-guaranteed release bound for a client that vanishes without closing it.
+`session.output`, or `session.wait_turn` at once. A client that vanishes
+without closing an overlay (TCP) connection is released by TCP keepalive within
+`idle + interval x count` (60 s by default, `service.toml` `[waits]`
+`keepalive_*` keys); the timeout stays the release bound for a client that
+pipelines another request behind the wait.
 
 To follow agents across turns, a client runs `pohunek session wait <target>...
 [--until <kinds>] [--after <cursor>] [--timeout <duration>] --json` (turn mode,

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/pohunek_github_hero.png" alt="pohunek: headless multihost backbone for coding agents. I herd. They code. Engraving of a farmhand steering a plow pulled by three server cabinets labelled codex, claude and hermes." />
+  <img src="assets/pohunek_github_hero.png" alt="pohunek: headless multihost backbone for coding agents. I herd. They code. Engraving of a farmhand boy with a whip steering a plow pulled by three server cabinets labelled codex, claude and hermes." />
 </p>
 
 <p align="center">

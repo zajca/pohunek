@@ -2628,7 +2628,7 @@ A pinned O (a host profile holds its `digest`, usually beside its `package`, or 
 be removed: the registry refuses the removal while the pin stands. The hint then names the
 pin first: "the host profile `<name>.toml` pins it" or "a session record pins it", "so the registry refuses
 its removal until the pin is released", with the exit "remove the `package` and `digest`
-lines (the `digest` line pins) from `<name>.toml` in the host profile directory" or "remove the sessions launched from
+lines from `<name>.toml` in the host profile directory" (the `digest` line is what pins) or "remove the sessions launched from
 it" (no command releases a pin), and then the removal and the follow-up. A reserved runtime
 that only the pinning session used gets no "run the upgrade again", because the plain upgrade
 no longer plans it once the sessions are gone. A hint that offers

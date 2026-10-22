@@ -630,6 +630,43 @@ async fn spawn_server_serving_official_runtimes_in(
     tokio::task::JoinHandle<()>,
     std::path::PathBuf,
 ) {
+    serve_official_runtimes(socket, version, config, environment, true).await
+}
+
+/// [`spawn_server_serving_official_runtimes`] for a daemon that restarts over
+/// the plugin directory of an earlier one: the official packages are already
+/// installed there, so none is installed again, and startup reconciles its
+/// sessions.
+async fn respawn_server_serving_official_runtimes(
+    socket: &std::path::Path,
+    version: &str,
+    config: SessionRegistryConfig,
+) -> (
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+    std::path::PathBuf,
+) {
+    serve_official_runtimes(
+        socket,
+        version,
+        config,
+        support::hermetic_environment_source(),
+        false,
+    )
+    .await
+}
+
+async fn serve_official_runtimes(
+    socket: &std::path::Path,
+    version: &str,
+    config: SessionRegistryConfig,
+    environment: EnvironmentSource,
+    install: bool,
+) -> (
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+    std::path::PathBuf,
+) {
     let dir = socket.parent().expect("test socket has an isolated parent");
     let catalog = official_runtimes::OfficialCatalog::new();
     let config = catalog.configure(config, dir.join("plugins"));
@@ -638,7 +675,14 @@ async fn spawn_server_serving_official_runtimes_in(
         .clone()
         .map(|dir| (dir, config.event_retention));
     let (registry, worker_home_dir) = worker_backed_registry_in(socket, config, environment);
-    catalog.install(&registry, dir).await;
+    if install {
+        catalog.install(&registry, dir).await;
+    } else {
+        registry
+            .reconcile_workers()
+            .await
+            .expect("startup reconciles the sessions of the earlier daemon");
+    }
     serve_registry(socket, version, event_log_dir, registry, worker_home_dir).await
 }
 
