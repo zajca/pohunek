@@ -26,12 +26,13 @@ use pohunek_service_config::runtimes::{
     ProfileAction, ProfileStatus, Refusal, SelectedPackage, UseReason, CODE_GAP_AGENT_NOT_ON_PATH,
     CODE_GAP_CONFIG_HOME_MISSING, CODE_GAP_CONFIG_HOME_SYMLINK,
     CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING, CODE_GAP_SERVED_BY_OTHER_PACKAGE,
-    CODE_GAP_UPDATE_VERSION_UNORDERED, CODE_PACKAGE_ARCHIVE_INVALID,
-    CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION,
-    CODE_PINNED_TARGET_NOT_OFFICIAL, CODE_PINNED_TO_NEWER_VERSION,
-    CODE_PINNED_TO_NON_OFFICIAL_PACKAGE, CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_TO_SAME_VERSION,
-    CODE_PINNED_VERSION_UNKNOWN, CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE,
-    CODE_SERVICE_CONFIG_UNREADABLE, ENSURE_REPORT_VERSION,
+    CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST, CODE_GAP_UPDATE_VERSION_UNORDERED,
+    CODE_PACKAGE_ARCHIVE_INVALID, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
+    CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION, CODE_PINNED_TARGET_NOT_OFFICIAL,
+    CODE_PINNED_TO_NEWER_VERSION, CODE_PINNED_TO_NON_OFFICIAL_PACKAGE,
+    CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_TO_SAME_VERSION, CODE_PINNED_VERSION_UNKNOWN,
+    CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE,
+    ENSURE_REPORT_VERSION,
 };
 use pohunek_worker_protocol::BaseEnv;
 use protocol::{
@@ -604,6 +605,7 @@ fn compute(inputs: &EnsureInputs, detect: bool) -> Result<Computed, EnsureError>
     }
     let planned = plan_packages(&uses, release.as_ref(), &plan, &mut report)?;
     report.forget_undetected_gaps();
+    settle_same_version_gaps(&mut report, &planned, &unpinned);
     let binds = plan_binds(
         &profiles,
         &plan,
@@ -1324,11 +1326,8 @@ fn plan_runtime(
     let reserved = is_reserved(&runtime);
     match decide_selection(plan, &prepared, &subject, &mut reasons, report, reserved) {
         Selection::Leave => return Ok(None),
-        Selection::Keep { unordered } => {
-            let kept = KeptSelection {
-                unordered,
-                reserved,
-            };
+        Selection::Keep { reason } => {
+            let kept = KeptSelection { reason, reserved };
             return Ok(plan_kept_selection(
                 plan, &prepared, &subject, runtime, reasons, kept, report,
             ));
@@ -1443,18 +1442,18 @@ fn passes_detect_gate_before_leaving(
 }
 
 /// How the selected version of a runtime stays.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct KeptSelection {
-    /// Its version has no order against the release's.
-    unordered: bool,
+    /// Why the selection stays.
+    reason: KeepReason,
     /// The runtime is reserved.
     reserved: bool,
 }
 
 /// Plans a runtime whose selected version stays. A reserved runtime goes
 /// through the checks of a detecting plan as for the release's package, judged
-/// against the kept package's own program and config home; the unordered gap
-/// is reported only when the keep is planned. The entry names the version the
+/// against the kept package's own program and config home; the unordered and
+/// the same-version gaps are reported only when the keep is planned. The entry names the version the
 /// release offers.
 fn plan_kept_selection(
     plan: &PlanInputs<'_>,
@@ -1478,12 +1477,16 @@ fn plan_kept_selection(
         config_home_gap(plan, &entry.definition, report);
     }
     entry.release_version = Some(prepared.identity.version.as_str().to_owned());
-    if kept.unordered {
-        report.gap(
+    match kept.reason {
+        KeepReason::Unordered => report.gap(
             subject,
             CODE_GAP_UPDATE_VERSION_UNORDERED,
             "the selected version cannot be ordered against the release's, so it is kept",
-        );
+        ),
+        KeepReason::SameVersionOtherDigest(detail) => {
+            report.gap(subject, CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST, &detail);
+        }
+        KeepReason::Ordered => {}
     }
     Some(entry)
 }
@@ -2485,9 +2488,8 @@ const DIGEST_PREFIX: &str = "sha256:";
 enum Selection {
     /// The release's package is planned over it.
     Replace,
-    /// The selected package stays and serves the runtime; `unordered` when
-    /// its version has no order against the release's.
-    Keep { unordered: bool },
+    /// The selected package stays and serves the runtime, for `reason`.
+    Keep { reason: KeepReason },
     /// The runtime is not planned: the selection is disabled or does not load.
     Leave,
 }
@@ -2501,7 +2503,9 @@ enum Selection {
 /// runtime: it is kept and reported when it serves, and left, with a gap, when
 /// it cannot load. A newer ordered version is kept only for a runtime that is
 /// not reserved (Pi); a reserved runtime's is replaced and reported through
-/// `replaces_newer`.
+/// `replaces_newer`, unless the registry holds the release package's id and
+/// version under another digest: the release's archive cannot be installed
+/// then, so the serving selection is kept with a gap.
 fn selection_outcome(
     plan: &PlanInputs<'_>,
     prepared: &Prepared,
@@ -2515,7 +2519,11 @@ fn selection_outcome(
         return Selection::Leave;
     }
     match unordered_selection(plan, prepared) {
-        Some((Serving::Loadable, _)) => return Selection::Keep { unordered: true },
+        Some((Serving::Loadable, _)) => {
+            return Selection::Keep {
+                reason: KeepReason::Unordered,
+            }
+        }
         Some((Serving::Damaged(kind), selected)) => {
             refuse_damaged(report, subject, kind, id, &selected);
             return Selection::Leave;
@@ -2552,15 +2560,127 @@ fn selection_outcome(
                 disabled_package_detail(id, &digest, state)
             );
             report.gap(subject, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING, &detail);
-            return Selection::Keep { unordered: false };
+            return Selection::Keep {
+                reason: KeepReason::Ordered,
+            };
         }
         leave_disabled(plan, report, subject, prepared, &digest);
         return Selection::Leave;
     }
     if !reserved && replaces_newer(plan, prepared).is_some() {
-        Selection::Keep { unordered: false }
+        return Selection::Keep {
+            reason: KeepReason::Ordered,
+        };
+    }
+    match same_version_holder(plan, prepared) {
+        Some(holder) if selection_serves(plan, prepared) => Selection::Keep {
+            reason: KeepReason::SameVersionOtherDigest(same_version_detail(
+                plan, prepared, &holder, reserved,
+            )),
+        },
+        _ => Selection::Replace,
+    }
+}
+
+/// Why a selected package stays instead of being replaced.
+#[derive(Clone)]
+enum KeepReason {
+    /// Its version is ordered against the release's and is not older, or the
+    /// release's own package is disabled.
+    Ordered,
+    /// Its version has no order against the release's.
+    Unordered,
+    /// The registry holds the release package's id and version under another
+    /// digest, which `package.install` refuses to sit beside; the gap detail.
+    SameVersionOtherDigest(String),
+}
+
+/// The digest the registry records under the release package's id and version
+/// when it is not the release's digest, whatever its source, flags and
+/// selection: the registry keeps one digest per identity.
+fn same_version_holder(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<PackageDigest> {
+    plan.state?
+        .packages()
+        .iter()
+        .find(|record| {
+            record.identity() == &prepared.identity && record.digest() != &prepared.digest
+        })
+        .map(|record| record.digest().clone())
+}
+
+/// The gap detail for a release package whose id and version the registry
+/// holds under the digest `holder`.
+///
+/// The uninstall command is named only where the registry accepts it for the
+/// selected holder of a reserved runtime: its package verifies and no session or
+/// host profile pins it. [`settle_same_version_gaps`] withdraws the command where
+/// the upgrade itself pins the holder or does not plan the runtime again.
+fn same_version_detail(
+    plan: &PlanInputs<'_>,
+    prepared: &Prepared,
+    holder: &PackageDigest,
+    reserved: bool,
+) -> String {
+    let version = prepared.identity.version.as_str();
+    let removable = reserved
+        && plan
+            .state
+            .and_then(|state| state.selected(&prepared.identity.id))
+            == Some(holder)
+        && !plan.retained.contains(holder)
+        && matches!(health_of(plan, holder), Health::Present);
+    if removable {
+        return format!(
+            "the release's package has the same version ({version}) as the installed one under \
+             another archive, so the selected package is kept; remove the installed one with \
+             `pohunek plugin uninstall {} --digest {} --yes`, then run the upgrade again",
+            prepared.identity.id,
+            selector_digest(holder)
+        );
+    }
+    same_version_plain_detail(version, reserved)
+}
+
+/// The same-version gap detail that names no command: no command releases the
+/// pin on the holder, or the upgrade does not install the package again.
+fn same_version_plain_detail(version: &str, reserved: bool) -> String {
+    let pi = if reserved {
+        ""
     } else {
-        Selection::Replace
+        "; the upgrade does not install a Pi package again once none is installed"
+    };
+    format!(
+        "the release's package has the same version ({version}) as an installed one under \
+         another archive, so the selected package keeps serving and nothing is installed; the \
+         fix is a release that gives the package a new version{pi}"
+    )
+}
+
+/// Withdraws the uninstall command from a same-version gap whose runtime the
+/// next plain upgrade does not install again, or whose holder this plan pins: a
+/// runtime planned only by `--detect`, or one with an unpinned profile that the
+/// plan binds to the kept package.
+fn settle_same_version_gaps(report: &mut Report, planned: &[Planned], unpinned: &[Unpinned]) {
+    for entry in planned {
+        let runtime = entry.runtime.as_str();
+        let used = entry.reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                UseReason::Profile | UseReason::Session | UseReason::Integration
+            )
+        });
+        let bound = unpinned.iter().any(|profile| profile.base == entry.runtime);
+        if used && !bound {
+            continue;
+        }
+        let Some(version) = entry.release_version.as_deref() else {
+            continue;
+        };
+        for gap in report.gaps.iter_mut().filter(|gap| {
+            gap.runtime == runtime && gap.code == CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST
+        }) {
+            gap.detail = same_version_plain_detail(version, is_reserved(&entry.runtime));
+        }
     }
 }
 

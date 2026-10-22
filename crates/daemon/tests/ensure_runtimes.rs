@@ -26,12 +26,12 @@ use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, PackageStatus, ProfileAction, ProfileStatus, SelectedPackage,
     UseReason, CODE_DAEMON_RUNNING, CODE_GAP_AGENT_NOT_ON_PATH, CODE_GAP_CONFIG_HOME_MISSING,
     CODE_GAP_CONFIG_HOME_SYMLINK, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING,
-    CODE_GAP_SERVED_BY_OTHER_PACKAGE, CODE_GAP_UPDATE_VERSION_UNORDERED,
-    CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION,
-    CODE_PINNED_TO_NEWER_VERSION, CODE_PINNED_TO_NON_OFFICIAL_PACKAGE,
-    CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_VERSION_UNKNOWN, CODE_PROFILE_NOT_MIGRATABLE,
-    CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE, DETECT_FLAG, DRY_RUN_FLAG,
-    ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
+    CODE_GAP_SERVED_BY_OTHER_PACKAGE, CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST,
+    CODE_GAP_UPDATE_VERSION_UNORDERED, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
+    CODE_PINNED_DIFFERS_FROM_KEPT_SELECTION, CODE_PINNED_TO_NEWER_VERSION,
+    CODE_PINNED_TO_NON_OFFICIAL_PACKAGE, CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_VERSION_UNKNOWN,
+    CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE,
+    DETECT_FLAG, DRY_RUN_FLAG, ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
 };
 use pohunek_test_support::bin_exe;
 use pohunek_test_support::env::TestEnv;
@@ -440,6 +440,12 @@ impl Host {
         fs::write(&store, content).expect("write the metadata store");
         fs::set_permissions(&store, fs::Permissions::from_mode(0o600))
             .expect("secure the metadata store");
+    }
+
+    /// Removes the Claude hooks directory `write_claude_hook` created.
+    fn remove_claude_hook(&self) {
+        fs::remove_dir_all(self.env.home().join(".claude").join("hooks"))
+            .expect("remove the Claude hooks");
     }
 
     /// A managed Claude state hook in the default Claude config home, as an
@@ -4651,4 +4657,403 @@ async fn a_disabled_release_package_that_another_package_serves_is_refused_besid
         fs::read(host.registry_path()).expect("the registry record"),
         registry
     );
+}
+
+/// The program the release's archive declares instead of the installed one: the
+/// same package id and version with another digest.
+const SAME_VERSION_PROGRAM: &str = "same-version-alt";
+
+/// The uninstall command a same-version gap hint names for the holder `digest`.
+fn uninstall_command(runtime: &str, digest: &PackageDigest) -> String {
+    let hex = digest
+        .as_str()
+        .strip_prefix("sha256:")
+        .expect("a sha256 digest");
+    format!("pohunek plugin uninstall pohunek.runtime.{runtime} --digest {hex} --yes")
+}
+
+/// What a same-version gap detail names.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hint<'a> {
+    /// The uninstall command of the holder.
+    Uninstall(&'a PackageDigest),
+    /// No command: the fix is a release with a new version.
+    NewVersion,
+}
+
+/// Asserts the same-version gap `detail` of `runtime` names `hint`.
+fn assert_same_version_hint(detail: &str, runtime: &str, hint: Hint<'_>) {
+    match hint {
+        Hint::Uninstall(holder) => assert!(
+            detail.contains(&uninstall_command(runtime, holder)),
+            "{runtime}: {detail}"
+        ),
+        Hint::NewVersion => {
+            assert!(!detail.contains("`pohunek"), "{runtime}: {detail}");
+            assert!(detail.contains("a new version"), "{runtime}: {detail}");
+        }
+    }
+}
+
+/// Asserts that the plan and the apply of `host` keep the selection `serving`
+/// of `runtime` (release version `version`) beside the release package under
+/// another digest of the same version: status `kept`, one gap with `hint`, no
+/// refusal, no `replaces_newer`, and the registry and the profile unchanged.
+fn assert_same_version_kept(
+    host: &Host,
+    runtime: &str,
+    serving: &PackageDigest,
+    version: &str,
+    hint: Hint<'_>,
+) {
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let profile = fs::read_to_string(host.profiles_dir().join(format!("{runtime}.toml"))).ok();
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(
+            report.refusals.is_empty(),
+            "{runtime}: {:?}",
+            report.refusals
+        );
+        let package = report
+            .packages
+            .iter()
+            .find(|package| package.runtime == runtime)
+            .unwrap_or_else(|| panic!("{runtime}: {:?}", report.packages));
+        assert_eq!(package.status, PackageStatus::Kept, "{runtime}");
+        assert_eq!(package.digest, serving.as_str(), "{runtime}");
+        assert_eq!(
+            package.release_version.as_deref(),
+            Some(version),
+            "{runtime}"
+        );
+        assert_eq!(package.replaces_newer, None, "{runtime}");
+        assert!(
+            report.profiles.is_empty(),
+            "{runtime}: {:?}",
+            report.profiles
+        );
+        let gaps: Vec<_> = report
+            .gaps
+            .iter()
+            .filter(|gap| gap.runtime == runtime)
+            .collect();
+        assert_eq!(gaps.len(), 1, "{runtime}: {gaps:?}");
+        assert_eq!(gaps[0].code, CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST);
+        assert_same_version_hint(&gaps[0].detail, runtime, hint);
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry,
+        "{runtime}"
+    );
+    assert_eq!(
+        fs::read_to_string(host.profiles_dir().join(format!("{runtime}.toml"))).ok(),
+        profile,
+        "{runtime}"
+    );
+}
+
+/// The enabled selection of a reserved runtime has the release's version under
+/// another digest, and the profile the earlier upgrade bound pins it: the plan
+/// and the apply keep it with a gap that names no command, because no command
+/// releases the profile's pin.
+#[test]
+fn a_pinned_selection_of_the_release_version_under_another_digest_is_kept_without_a_command() {
+    for runtime in ["claude", "codex", "hermes"] {
+        let installed = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+        let release = official_runtimes::variant_archive_with_program(
+            runtime,
+            RELEASE_VERSION,
+            SAME_VERSION_PROGRAM,
+        );
+        let host = Host::new();
+        host.publish_archives(1, &[(runtime, &installed.0, &installed.1)]);
+        host.write_profile(runtime, &format!("base = \"{runtime}\"\n"));
+        let first = host.step(false);
+        assert!(first.refusals.is_empty(), "{runtime}: {first:?}");
+        host.publish_archives(2, &[(runtime, &release.0, &release.1)]);
+
+        assert_same_version_kept(
+            &host,
+            runtime,
+            &installed.1,
+            RELEASE_VERSION,
+            Hint::NewVersion,
+        );
+    }
+}
+
+/// The same for Pi, whose selection a newer release would update: no command,
+/// and the detail says the upgrade does not install a removed Pi package again.
+#[tokio::test]
+async fn an_enabled_pi_selection_of_the_release_version_under_another_digest_is_kept_with_a_gap() {
+    let host = Host::with_installed_pi().await;
+    let installed = Host::installed_pi_digest();
+    let (bytes, digest) = official_runtimes::variant_archive_with_program(
+        "pi",
+        PI_INSTALLED_VERSION,
+        SAME_VERSION_PROGRAM,
+    );
+    host.publish_archives(1, &[("pi", &bytes, &digest)]);
+    host.write_profile(
+        "work",
+        &format!("base = \"pi\"\n{}", official_runtimes::profile_pin("pi")),
+    );
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let profile = host.profile_text_of("work");
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        let pi = pi_package(report);
+        assert_eq!(pi.status, PackageStatus::Kept);
+        assert_eq!(pi.digest, installed.as_str());
+        assert_eq!(pi.release_version.as_deref(), Some(PI_INSTALLED_VERSION));
+        let gaps: Vec<_> = report
+            .gaps
+            .iter()
+            .filter(|gap| gap.runtime == "pi")
+            .collect();
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].code, CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST);
+        assert_same_version_hint(&gaps[0].detail, "pi", Hint::NewVersion);
+        assert!(
+            gaps[0]
+                .detail
+                .contains("does not install a Pi package again"),
+            "{}",
+            gaps[0].detail
+        );
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+    assert_eq!(host.profile_text_of("work"), profile);
+}
+
+/// A newer Pi selection beside a recorded holder of the release's version is
+/// kept silently, as beside any other release package it would replace.
+#[tokio::test]
+async fn a_newer_pi_selection_beside_a_holder_of_the_release_version_is_kept_silently() {
+    let host = Host::with_installed_pi().await;
+    host.publish_pi(PI_NEWER_VERSION, 1);
+    let updated = host.step(false);
+    assert!(updated.refusals.is_empty(), "{:?}", updated.refusals);
+    let newer = official_runtimes::variant_archive("pi", PI_NEWER_VERSION).1;
+    let (bytes, digest) = official_runtimes::variant_archive_with_program(
+        "pi",
+        PI_INSTALLED_VERSION,
+        SAME_VERSION_PROGRAM,
+    );
+    host.publish_archives(2, &[("pi", &bytes, &digest)]);
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        let pi = pi_package(report);
+        assert_eq!(pi.status, PackageStatus::Kept);
+        assert_eq!(pi.digest, newer.as_str());
+        assert!(
+            report.gaps.iter().all(|gap| gap.runtime != "pi"),
+            "{:?}",
+            report.gaps
+        );
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+}
+
+/// A version older or newer than the release's is selected and the release's
+/// version is recorded under another digest, unselected, enabled or disabled:
+/// the selection is kept without a replacement warning, as the release's archive
+/// cannot be installed beside the holder.
+#[test]
+fn a_recorded_holder_of_the_release_version_beside_another_selection_keeps_the_selection() {
+    for (label, version) in [("older", "1.0.1"), ("newer", "2.1.0")] {
+        for disable_holder in [false, true] {
+            let runtime = "claude";
+            let selected = official_runtimes::variant_archive(runtime, version);
+            let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+            let release = official_runtimes::variant_archive_with_program(
+                runtime,
+                RELEASE_VERSION,
+                SAME_VERSION_PROGRAM,
+            );
+            let host = Host::new();
+            host.write_profile(runtime, "base = \"claude\"\n");
+            host.publish_archives(1, &[(runtime, &selected.0, &selected.1)]);
+            assert!(host.step(false).refusals.is_empty(), "{label}");
+            host.publish_archives(2, &[(runtime, &holder.0, &holder.1)]);
+            assert!(host.step(false).refusals.is_empty(), "{label}");
+            pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+                .expect("the package store")
+                .registry()
+                .select(&selected.1)
+                .expect("select the other version");
+            if disable_holder {
+                host.disable_package(&holder.1);
+            }
+            host.write_claude_hook();
+            host.publish_archives(3, &[(runtime, &release.0, &release.1)]);
+
+            assert_same_version_kept(
+                &host,
+                runtime,
+                &selected.1,
+                RELEASE_VERSION,
+                Hint::NewVersion,
+            );
+        }
+    }
+}
+
+/// No profile or session pins the holder: the gap names the uninstall, and the
+/// whole sequence works. The registry refuses the uninstall while the holder is
+/// retained, the uninstall succeeds without it, and the next apply installs the
+/// release's archive. The detecting plan reports the same gap.
+#[test]
+fn an_unpinned_holder_gets_the_uninstall_hint_and_the_next_apply_installs_the_release() {
+    let runtime = "claude";
+    let installed = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+    let release = official_runtimes::variant_archive_with_program(
+        runtime,
+        RELEASE_VERSION,
+        SAME_VERSION_PROGRAM,
+    );
+    let host = Host::new();
+    host.write_claude_hook();
+    host.publish_archives(1, &[(runtime, &installed.0, &installed.1)]);
+    let first = host.step(false);
+    assert!(first.refusals.is_empty(), "{first:?}");
+    assert!(
+        first.profiles.is_empty(),
+        "no profile exists to pin the package: {:?}",
+        first.profiles
+    );
+    host.publish_archives(2, &[(runtime, &release.0, &release.1)]);
+
+    let plan = host.step(true);
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    let gap = plan
+        .gaps
+        .iter()
+        .find(|gap| gap.runtime == runtime)
+        .expect("the same-version gap");
+    assert_eq!(gap.code, CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST);
+    assert_same_version_hint(&gap.detail, runtime, Hint::Uninstall(&installed.1));
+
+    host.put_program(runtime);
+    let detected = host.detect_step();
+    assert!(
+        detected
+            .gaps
+            .iter()
+            .any(|gap| gap.runtime == runtime
+                && gap.code == CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST),
+        "{:?}",
+        detected.gaps
+    );
+
+    let store = pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+        .expect("the package store");
+    let registry = store.registry();
+    let mut retained = package::registry::RetainedDigests::new();
+    retained.insert(installed.1.clone());
+    assert!(matches!(
+        registry.uninstall(&installed.1, &retained),
+        Err(package::registry::RegistryError::StillReferenced)
+    ));
+    registry
+        .uninstall(&installed.1, &package::registry::RetainedDigests::new())
+        .expect("uninstall the holder");
+    let applied = host.step(false);
+
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    let package = applied
+        .packages
+        .iter()
+        .find(|package| package.runtime == runtime)
+        .expect("the runtime package");
+    assert_eq!(package.status, PackageStatus::Installed);
+    assert_eq!(package.digest, release.1.as_str());
+}
+
+/// An unpinned profile over the runtime is bound to the kept package by the same
+/// apply, so the holder is pinned afterwards: the plan and the apply name no
+/// command, and their details are the same.
+#[test]
+fn an_unpinned_profile_that_the_apply_binds_to_the_holder_withdraws_the_uninstall_hint() {
+    let runtime = "claude";
+    let installed = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+    let release = official_runtimes::variant_archive_with_program(
+        runtime,
+        RELEASE_VERSION,
+        SAME_VERSION_PROGRAM,
+    );
+    let host = Host::new();
+    host.write_claude_hook();
+    host.publish_archives(1, &[(runtime, &installed.0, &installed.1)]);
+    assert!(host.step(false).refusals.is_empty());
+    host.write_profile(runtime, "base = \"claude\"\n");
+    host.publish_archives(2, &[(runtime, &release.0, &release.1)]);
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    let details: Vec<&str> = [&plan, &applied]
+        .iter()
+        .map(|report| {
+            let gap = report
+                .gaps
+                .iter()
+                .find(|gap| gap.runtime == runtime)
+                .expect("the same-version gap");
+            assert_eq!(gap.code, CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST);
+            assert_same_version_hint(&gap.detail, runtime, Hint::NewVersion);
+            gap.detail.as_str()
+        })
+        .collect();
+    assert_eq!(details[0], details[1]);
+}
+
+/// A reserved runtime planned only by `--detect` is not planned by the plain
+/// upgrade, so the detecting plan names no uninstall command for it.
+#[test]
+fn a_runtime_planned_only_by_detection_gets_no_uninstall_hint() {
+    let runtime = "claude";
+    let installed = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+    let release = official_runtimes::variant_archive_with_program(
+        runtime,
+        RELEASE_VERSION,
+        SAME_VERSION_PROGRAM,
+    );
+    let host = Host::new();
+    host.write_claude_hook();
+    host.publish_archives(1, &[(runtime, &installed.0, &installed.1)]);
+    assert!(host.step(false).refusals.is_empty());
+    host.remove_claude_hook();
+    host.publish_archives(2, &[(runtime, &release.0, &release.1)]);
+    host.put_program(runtime);
+
+    let detected = host.detect_step();
+
+    let gap = detected
+        .gaps
+        .iter()
+        .find(|gap| gap.runtime == runtime && gap.code == CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST)
+        .unwrap_or_else(|| panic!("{:?}", detected.gaps));
+    assert_same_version_hint(&gap.detail, runtime, Hint::NewVersion);
 }
