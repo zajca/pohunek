@@ -5153,526 +5153,6 @@ fn set_package_source(host: &Host, digest: &PackageDigest, source: &str) {
     fs::write(host.registry_path(), registry.to_string()).expect("write the registry");
 }
 
-/// What the plan, the apply and the detecting plan of `host` say for `runtime`
-/// when the holder leaves it untouched: no refusal, no package entry, no profile
-/// action, one `official_package_not_serving` gap that contains every text of
-/// `details`, and the registry and the profile unchanged. Returns the plan's
-/// gap detail.
-fn assert_held_runtime_left(host: &Host, runtime: &str, details: &[&str]) -> String {
-    let registry = fs::read(host.registry_path()).expect("the registry record");
-    let profile = fs::read_to_string(host.profiles_dir().join(format!("{runtime}.toml"))).ok();
-    let plan = host.step(true);
-    let applied = host.step(false);
-    let detected = host.detect_step();
-    for (label, report) in [("plan", &plan), ("apply", &applied), ("detect", &detected)] {
-        assert!(
-            report.refusals.is_empty(),
-            "{runtime} {label}: {:?}",
-            report.refusals
-        );
-        assert!(
-            report
-                .packages
-                .iter()
-                .all(|package| package.runtime != runtime),
-            "{runtime} {label}: {:?}",
-            report.packages
-        );
-        assert!(report.profiles.is_empty(), "{runtime} {label}");
-        let gaps: Vec<_> = report
-            .gaps
-            .iter()
-            .filter(|gap| gap.runtime == runtime && gap.code != CODE_GAP_CONFIG_HOME_MISSING)
-            .collect();
-        assert_eq!(gaps.len(), 1, "{runtime} {label}: {gaps:?}");
-        assert_eq!(gaps[0].code, CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING);
-        for text in details {
-            assert!(
-                gaps[0].detail.contains(text),
-                "{runtime} {label}: {}",
-                gaps[0].detail
-            );
-        }
-    }
-    assert_eq!(
-        plan.gaps
-            .iter()
-            .find(|gap| gap.runtime == runtime)
-            .map(|gap| &gap.detail),
-        applied
-            .gaps
-            .iter()
-            .find(|gap| gap.runtime == runtime)
-            .map(|gap| &gap.detail),
-        "{runtime}: the plan and the apply say the same"
-    );
-    assert_eq!(
-        fs::read(host.registry_path()).expect("the registry record"),
-        registry,
-        "{runtime}"
-    );
-    assert_eq!(
-        fs::read_to_string(host.profiles_dir().join(format!("{runtime}.toml"))).ok(),
-        profile,
-        "{runtime}"
-    );
-    plan.gaps
-        .iter()
-        .find(|gap| gap.runtime == runtime)
-        .map(|gap| gap.detail.clone())
-        .expect("the plan's gap")
-}
-
-/// What the plan, the apply and the detecting plan of `host` say for `runtime`
-/// when a root-invalid refusal stops it: exactly that refusal, whose detail
-/// contains `hint`, no package entry or profile action, and the registry and
-/// the profile unchanged.
-fn assert_held_runtime_refused(host: &Host, runtime: &str, hint: &str) {
-    let registry = fs::read(host.registry_path()).expect("the registry record");
-    let profile = fs::read_to_string(host.profiles_dir().join(format!("{runtime}.toml"))).ok();
-    let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
-    for (label, report) in [
-        ("plan", host.step(true)),
-        ("apply", host.step(false)),
-        ("detect", host.detect_step()),
-    ] {
-        assert_eq!(
-            refusal_codes(&report),
-            [root_refusal.as_str()],
-            "{runtime} {label}"
-        );
-        assert!(
-            report.refusals[0].detail.contains(hint),
-            "{runtime} {label}: {}",
-            report.refusals[0].detail
-        );
-        assert!(
-            report
-                .packages
-                .iter()
-                .all(|package| package.runtime != runtime),
-            "{runtime} {label}: {:?}",
-            report.packages
-        );
-        assert!(report.profiles.is_empty(), "{runtime} {label}");
-    }
-    assert_eq!(
-        fs::read(host.registry_path()).expect("the registry record"),
-        registry,
-        "{runtime}"
-    );
-    assert_eq!(
-        fs::read_to_string(host.profiles_dir().join(format!("{runtime}.toml"))).ok(),
-        profile,
-        "{runtime}"
-    );
-}
-
-/// Runs the remedy the gap detail names for the holder: the uninstall the
-/// registry accepts with the plan's retained set (here, nothing is pinned), then
-/// the next apply installs the release archive and binds the profile.
-fn assert_uninstall_remedy_installs_the_release(
-    host: &Host,
-    runtime: &str,
-    holder: &PackageDigest,
-    release: &PackageDigest,
-    detail: &str,
-) {
-    assert!(
-        detail.contains(&uninstall_command(runtime, holder)),
-        "{runtime}: {detail}"
-    );
-    assert!(
-        detail.ends_with("then run the upgrade again"),
-        "{runtime}: {detail}"
-    );
-    assert!(!detail.contains("plugin install"), "{runtime}: {detail}");
-    pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
-        .expect("the package store")
-        .registry()
-        .uninstall(holder, &package::registry::RetainedDigests::new())
-        .expect("the registry accepts the hinted uninstall");
-    let applied = host.step(false);
-    assert!(
-        applied.refusals.is_empty(),
-        "{runtime}: {:?}",
-        applied.refusals
-    );
-    let package = applied
-        .packages
-        .iter()
-        .find(|package| package.runtime == runtime)
-        .unwrap_or_else(|| panic!("{runtime}: {:?}", applied.packages));
-    assert_eq!(package.status, PackageStatus::Installed, "{runtime}");
-    assert_eq!(package.digest, release.as_str(), "{runtime}");
-    assert_eq!(
-        profile_status(&applied.profiles, runtime),
-        ProfileStatus::Bound,
-        "{runtime}"
-    );
-}
-
-/// Rows 1 and 2: the holder is recorded, enabled or disabled, and no version is
-/// selected. The runtime is left with a gap that names the uninstall, and the
-/// whole remedy installs the release.
-#[tokio::test]
-async fn a_holder_with_no_selected_version_is_left_and_its_uninstall_lets_the_release_install() {
-    for runtime in ["claude", "codex", "hermes"] {
-        for enabled in [true, false] {
-            let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
-            let release = holder_release(runtime);
-            let host = host_with_holder(runtime, &[(&holder, enabled, false)], &release).await;
-
-            let detail = assert_held_runtime_left(
-                &host,
-                runtime,
-                &["no version of the package is selected"],
-            );
-
-            assert_uninstall_remedy_installs_the_release(
-                &host, runtime, &holder.1, &release.1, &detail,
-            );
-        }
-    }
-}
-
-/// Row 3: the selected package is the holder and its root is missing. The
-/// registry unrecords a package without a root, so the uninstall is accepted.
-#[tokio::test]
-async fn a_selected_holder_without_its_root_is_left_and_its_uninstall_lets_the_release_install() {
-    for runtime in ["claude", "codex", "hermes"] {
-        let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
-        let release = holder_release(runtime);
-        let host = host_with_holder(runtime, &[(&holder, true, true)], &release).await;
-        host.remove_package_root(holder.1.as_str());
-
-        let detail = assert_held_runtime_left(
-            &host,
-            runtime,
-            &["the selected package's root is missing or does not load"],
-        );
-
-        assert_uninstall_remedy_installs_the_release(
-            &host, runtime, &holder.1, &release.1, &detail,
-        );
-    }
-}
-
-/// Row 3 for Pi: the upgrade plans Pi only while an enabled official selection
-/// manages it, so the remedy has two steps. The gap names the uninstall of the
-/// holder and then `plugin install` of the release's Pi archive; the registry
-/// accepts both, and the next upgrade finds Pi serving.
-#[tokio::test]
-async fn a_selected_pi_holder_without_its_root_is_left_and_two_commands_install_the_release() {
-    let holder = official_runtimes::variant_archive("pi", RELEASE_VERSION);
-    let release = holder_release("pi");
-    let host = host_with_holder("pi", &[(&holder, true, true)], &release).await;
-    host.write_profile("work", "base = \"pi\"\n");
-    host.remove_package_root(holder.1.as_str());
-    let profile = host.profile_text_of("work");
-
-    let detail = assert_held_runtime_left(
-        &host,
-        "pi",
-        &[
-            &uninstall_command("pi", &holder.1),
-            "pohunek plugin install runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json --yes",
-        ],
-    );
-
-    assert!(
-        !detail.contains("does not install a Pi package again"),
-        "{detail}"
-    );
-    pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
-        .expect("the package store")
-        .registry()
-        .uninstall(&holder.1, &package::registry::RetainedDigests::new())
-        .expect("the registry accepts the hinted uninstall");
-    host.catalog
-        .install_release_package(
-            &host.plugins_dir(),
-            host.env.root(),
-            &host.release_dir(),
-            "pi",
-        )
-        .await;
-    let next = host.step(false);
-    assert!(next.refusals.is_empty(), "{:?}", next.refusals);
-    assert_eq!(pi_package(&next).status, PackageStatus::Present);
-    assert_eq!(pi_package(&next).digest, release.1.as_str());
-    assert!(
-        next.gaps.iter().all(|gap| gap.runtime != "pi"),
-        "{:?}",
-        next.gaps
-    );
-    assert_eq!(host.profile_text_of("work"), profile);
-}
-
-/// Row 3 for a Pi that nothing uses: no command, and the detail says the
-/// upgrade does not install a Pi package again.
-#[tokio::test]
-async fn a_selected_pi_holder_without_its_root_that_nothing_uses_is_left_with_no_command() {
-    let holder = official_runtimes::variant_archive("pi", RELEASE_VERSION);
-    let release = holder_release("pi");
-    let host = host_with_holder("pi", &[(&holder, true, true)], &release).await;
-    host.remove_package_root(holder.1.as_str());
-
-    let detail = assert_held_runtime_left(&host, "pi", &["a release that gives the package"]);
-
-    assert!(!detail.contains("`pohunek"), "{detail}");
-    assert!(
-        detail.contains("does not install a Pi package again"),
-        "{detail}"
-    );
-}
-
-/// A pinned holder cannot be uninstalled: the detail names no command.
-#[tokio::test]
-async fn a_holder_that_a_profile_pins_is_left_with_no_uninstall_command() {
-    let runtime = "claude";
-    let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
-    let release = holder_release(runtime);
-    let host = host_with_holder(runtime, &[(&holder, true, true)], &release).await;
-    host.write_profile(
-        runtime,
-        &format!(
-            "base = \"{runtime}\"\npackage = \"pohunek.runtime.{runtime}\"\ndigest = \"{}\"\n",
-            holder.1.as_str()
-        ),
-    );
-    host.remove_package_root(holder.1.as_str());
-
-    let detail = assert_held_runtime_left(&host, runtime, &["a release that gives the package"]);
-
-    assert!(!detail.contains("`pohunek"), "{detail}");
-}
-
-/// Row 4: the selected holder's root is altered. Plan and apply refuse with the
-/// uninstall of the holder, the registry accepts it, and the next apply installs
-/// the release archive.
-#[tokio::test]
-async fn a_selected_holder_with_an_altered_root_is_refused_and_its_removal_lets_the_release_install(
-) {
-    for runtime in ["claude", "codex", "hermes"] {
-        let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
-        let release = holder_release(runtime);
-        let host = host_with_holder(runtime, &[(&holder, true, true)], &release).await;
-        host.alter_package_root(&holder.1);
-        assert_held_runtime_refused(
-            &host,
-            runtime,
-            &format!(
-                "pohunek plugin uninstall pohunek.runtime.{runtime} --digest {} \
-                 --remove-modified --yes",
-                holder.1.as_str()
-            ),
-        );
-        pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
-            .expect("the package store")
-            .registry()
-            .remove_modified(&holder.1, &package::registry::RetainedDigests::new())
-            .expect("the registry accepts the hinted removal");
-        let next = host.step(false);
-        assert!(next.refusals.is_empty(), "{runtime}: {:?}", next.refusals);
-        let package = next
-            .packages
-            .iter()
-            .find(|package| package.runtime == runtime)
-            .expect("the runtime package");
-        assert_eq!(package.status, PackageStatus::Installed, "{runtime}");
-        assert_eq!(package.digest, release.1.as_str(), "{runtime}");
-    }
-}
-
-/// Row 4 for Pi: the refusal names the removal and then the install (or, with
-/// another Pi version installed, the update) of the release's archive, because
-/// the upgrade does not plan Pi without a selection. The registry accepts the
-/// removal and the install, and the next upgrade finds Pi at the release digest.
-#[tokio::test]
-async fn a_selected_pi_holder_with_an_altered_root_is_refused_and_two_commands_install_the_release()
-{
-    for with_older in [false, true] {
-        let older = official_runtimes::variant_archive("pi", PI_OLDER_VERSION);
-        let holder = official_runtimes::variant_archive("pi", RELEASE_VERSION);
-        let release = holder_release("pi");
-        let host = if with_older {
-            host_with_holder(
-                "pi",
-                &[(&older, true, false), (&holder, true, true)],
-                &release,
-            )
-            .await
-        } else {
-            host_with_holder("pi", &[(&holder, true, true)], &release).await
-        };
-        host.alter_package_root(&holder.1);
-        let step = if with_older {
-            "pohunek plugin update pohunek.runtime.pi runtime/packages/pi.tar.zst"
-        } else {
-            "pohunek plugin install runtime/packages/pi.tar.zst"
-        };
-
-        assert_held_runtime_refused(
-            &host,
-            "pi",
-            &format!(
-                "--digest {} --remove-modified --yes`, then install the release's package \
-                 with `{step} --catalog runtime/runtime-catalog.json --yes`",
-                holder.1.as_str()
-            ),
-        );
-
-        pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
-            .expect("the package store")
-            .registry()
-            .remove_modified(&holder.1, &package::registry::RetainedDigests::new())
-            .expect("the registry accepts the hinted removal");
-        host.catalog
-            .install_release_package(
-                &host.plugins_dir(),
-                host.env.root(),
-                &host.release_dir(),
-                "pi",
-            )
-            .await;
-        let next = host.step(false);
-        assert!(next.refusals.is_empty(), "{:?}", next.refusals);
-        assert_eq!(
-            pi_package(&next).status,
-            PackageStatus::Present,
-            "{with_older}"
-        );
-        assert_eq!(pi_package(&next).digest, release.1.as_str(), "{with_older}");
-    }
-}
-
-/// Row 5: another version is selected and its root is missing, while the holder
-/// is recorded unselected. The existing restore-or-select hint stays.
-#[tokio::test]
-async fn a_selected_version_without_its_root_beside_a_holder_is_left_with_the_select_hint() {
-    for (runtime, version) in [
-        ("claude", "1.0.1"),
-        ("codex", "2.1.0"),
-        ("hermes", "1.0.1"),
-        ("pi", PI_OLDER_VERSION),
-    ] {
-        let selected = official_runtimes::variant_archive(runtime, version);
-        let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
-        let release = holder_release(runtime);
-        let host = host_with_holder(
-            runtime,
-            &[(&selected, true, true), (&holder, true, false)],
-            &release,
-        )
-        .await;
-        host.remove_package_root(selected.1.as_str());
-
-        let detail = assert_held_runtime_left(
-            &host,
-            runtime,
-            &[
-                "package root is missing or does not load",
-                &format!("pohunek plugin select pohunek.runtime.{runtime} --digest"),
-            ],
-        );
-
-        assert!(
-            !detail.contains(&uninstall_command(runtime, &holder.1)),
-            "{runtime}: {detail}"
-        );
-        assert_select_hint_makes_the_holder_serve(&host, runtime, &holder.1);
-    }
-}
-
-/// Runs the select the gap names: the registry selects the holder, and the next
-/// plan keeps it as the serving selection.
-fn assert_select_hint_makes_the_holder_serve(host: &Host, runtime: &str, holder: &PackageDigest) {
-    pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
-        .expect("the package store")
-        .registry()
-        .select(holder)
-        .expect("the registry accepts the hinted select");
-    let plan = host.step(true);
-    assert!(plan.refusals.is_empty(), "{runtime}: {:?}", plan.refusals);
-    let package = plan
-        .packages
-        .iter()
-        .find(|package| package.runtime == runtime)
-        .unwrap_or_else(|| panic!("{runtime}: {:?}", plan.packages));
-    assert_eq!(package.status, PackageStatus::Kept, "{runtime}");
-    assert_eq!(package.digest, holder.as_str(), "{runtime}");
-}
-
-/// Row 6: another version is selected and its root is altered, while the holder
-/// is recorded unselected. The existing refusal names the selected version.
-#[tokio::test]
-async fn a_selected_version_with_an_altered_root_beside_a_holder_is_refused() {
-    for (runtime, version) in [
-        ("claude", "1.0.1"),
-        ("codex", "2.1.0"),
-        ("pi", PI_OLDER_VERSION),
-    ] {
-        let selected = official_runtimes::variant_archive(runtime, version);
-        let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
-        let release = holder_release(runtime);
-        let host = host_with_holder(
-            runtime,
-            &[(&selected, true, true), (&holder, true, false)],
-            &release,
-        )
-        .await;
-        host.alter_package_root(&selected.1);
-        assert_held_runtime_refused(
-            &host,
-            runtime,
-            &format!("--digest {} --remove-modified --yes", selected.1.as_str()),
-        );
-        if runtime != "pi" {
-            // The removal leaves the holder unselected: row 1 names its uninstall.
-            pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
-                .expect("the package store")
-                .registry()
-                .remove_modified(&selected.1, &package::registry::RetainedDigests::new())
-                .expect("the registry accepts the hinted removal");
-            assert_held_runtime_left(&host, runtime, &[&uninstall_command(runtime, &holder.1)]);
-        }
-    }
-}
-
-/// Row 7: the selected package is not official (a registry edited by hand; a
-/// reserved id cannot be installed by `plugin install` that way). The runtime is
-/// left, with the select hint and no uninstall command.
-#[tokio::test]
-async fn a_non_official_selection_beside_a_holder_is_left_with_the_select_hint() {
-    let runtime = "claude";
-    let selected = official_runtimes::variant_archive(runtime, "1.0.1");
-    let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
-    let release = holder_release(runtime);
-    let host = host_with_holder(
-        runtime,
-        &[(&selected, true, true), (&holder, true, false)],
-        &release,
-    )
-    .await;
-    set_package_source(&host, &selected.1, "explicit_digest");
-
-    let detail = assert_held_runtime_left(
-        &host,
-        runtime,
-        &[
-            "not an enabled official one",
-            "pohunek plugin select pohunek.runtime.claude --digest",
-        ],
-    );
-
-    assert!(
-        !detail.contains(&uninstall_command(runtime, &holder.1)),
-        "{detail}"
-    );
-    assert_select_hint_makes_the_holder_serve(&host, runtime, &holder.1);
-}
-
 /// Row 8: a newer Pi selection whose root is missing beside a holder keeps its
 /// existing refusal, in the plan and in the apply.
 #[tokio::test]
@@ -5860,115 +5340,946 @@ async fn a_runtime_planned_only_by_detection_beside_a_holder_gets_no_uninstall_c
     );
 }
 
-/// Rows 1 and 2 with an altered holder root: the uninstall the registry accepts
-/// needs `--remove-modified`, so the plan and the apply refuse with it, and the
-/// whole remedy installs the release.
-#[tokio::test]
-async fn an_unselected_holder_with_an_altered_root_is_refused_and_its_removal_lets_the_release_install(
-) {
-    let runtime = "claude";
-    for enabled in [true, false] {
-        let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
-        let release = holder_release(runtime);
-        let host = host_with_holder(runtime, &[(&holder, enabled, false)], &release).await;
-        host.alter_package_root(&holder.1);
-        assert_held_runtime_refused(
-            &host,
-            runtime,
-            &format!(
-                "pohunek plugin uninstall pohunek.runtime.{runtime} --digest {} \
-                 --remove-modified --yes",
-                holder.1.as_str()
-            ),
-        );
-        pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
-            .expect("the package store")
-            .registry()
-            .remove_modified(&holder.1, &package::registry::RetainedDigests::new())
-            .expect("the registry accepts the hinted removal");
-        let next = host.step(false);
-        let package = next
-            .packages
-            .iter()
-            .find(|package| package.runtime == runtime)
-            .expect("the runtime package");
-        assert_eq!(package.status, PackageStatus::Installed);
-        assert_eq!(package.digest, release.1.as_str());
-    }
-}
-
-/// Row 1 where only a session record, or only an installed hook, uses the
-/// runtime: the gap still names the uninstall, and the next apply installs the
-/// release archive (no profile exists to bind).
-#[tokio::test]
-async fn a_holder_beside_a_runtime_used_only_by_a_session_or_a_hook_names_the_uninstall() {
-    for use_by in ["session", "hook"] {
-        let runtime = "claude";
-        let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
-        let release = holder_release(runtime);
-        let host = host_with_holder(runtime, &[(&holder, true, false)], &release).await;
-        fs::remove_file(host.profiles_dir().join(format!("{runtime}.toml")))
-            .expect("remove the profile");
-        match use_by {
-            "session" => host.write_store(PACKAGE_SESSION_STORE),
-            _ => host.write_claude_hook(),
-        }
-
-        let detail =
-            assert_held_runtime_left(&host, runtime, &[&uninstall_command(runtime, &holder.1)]);
-
-        pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
-            .expect("the package store")
-            .registry()
-            .uninstall(&holder.1, &package::registry::RetainedDigests::new())
-            .unwrap_or_else(|error| panic!("{use_by}: {error:?}: {detail}"));
-        let applied = host.step(false);
-        assert!(
-            applied.refusals.is_empty(),
-            "{use_by}: {:?}",
-            applied.refusals
-        );
-        let package = applied
-            .packages
-            .iter()
-            .find(|package| package.runtime == runtime)
-            .unwrap_or_else(|| panic!("{use_by}: {:?}", applied.packages));
-        assert_eq!(package.status, PackageStatus::Installed, "{use_by}");
-        assert_eq!(package.digest, release.1.as_str(), "{use_by}");
-    }
-}
-
-/// Row 3 for Pi with an older version installed beside the holder: `plugin
-/// install` would leave the release unselected, so the gap names `plugin
-/// update`, and after the uninstall and the update Pi serves the release.
-#[tokio::test]
-async fn a_selected_pi_holder_without_its_root_beside_another_version_names_the_update() {
-    let older = official_runtimes::variant_archive("pi", PI_OLDER_VERSION);
-    let holder = official_runtimes::variant_archive("pi", RELEASE_VERSION);
-    let release = holder_release("pi");
-    let host = host_with_holder(
-        "pi",
-        &[(&older, true, false), (&holder, true, true)],
-        &release,
-    )
-    .await;
-    host.write_profile("work", "base = \"pi\"\n");
-    host.remove_package_root(holder.1.as_str());
-
-    assert_held_runtime_left(
-        &host,
-        "pi",
-        &[
-            &uninstall_command("pi", &holder.1),
-            "pohunek plugin update pohunek.runtime.pi runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json --yes",
-        ],
-    );
-
+/// Runs the select the gap names: the registry selects the holder, and the next
+/// plan keeps it as the serving selection.
+fn assert_select_hint_makes_the_holder_serve(host: &Host, runtime: &str, holder: &PackageDigest) {
     pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
         .expect("the package store")
         .registry()
-        .uninstall(&holder.1, &package::registry::RetainedDigests::new())
-        .expect("the registry accepts the hinted uninstall");
+        .select(holder)
+        .expect("the registry accepts the hinted select");
+    let plan = host.step(true);
+    assert!(plan.refusals.is_empty(), "{runtime}: {:?}", plan.refusals);
+    let package = plan
+        .packages
+        .iter()
+        .find(|package| package.runtime == runtime)
+        .unwrap_or_else(|| panic!("{runtime}: {:?}", plan.packages));
+    assert_eq!(package.status, PackageStatus::Kept, "{runtime}");
+    assert_eq!(package.digest, holder.as_str(), "{runtime}");
+}
+
+/// Every host profile with its text, sorted by name.
+fn profiles_snapshot(host: &Host) -> Vec<(String, String)> {
+    let mut all: Vec<(String, String)> = fs::read_dir(host.profiles_dir())
+        .expect("the profiles directory")
+        .map(|entry| {
+            let entry = entry.expect("a profile entry");
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                fs::read_to_string(entry.path()).expect("the profile text"),
+            )
+        })
+        .collect();
+    all.sort();
+    all
+}
+
+/// The gap detail of `runtime` in `report`, when it has one
+/// `official_package_not_serving` gap.
+fn not_serving_detail(report: &EnsureReport, runtime: &str) -> Option<String> {
+    let gaps: Vec<_> = report
+        .gaps
+        .iter()
+        .filter(|gap| gap.runtime == runtime && gap.code == CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)
+        .collect();
+    (gaps.len() == 1).then(|| gaps[0].detail.clone())
+}
+
+/// What the plan, the apply and the detecting plan of `host` say for `runtime`
+/// when the holder leaves it untouched: no refusal, no package entry, no profile
+/// action, one `official_package_not_serving` gap whose detail is the same in
+/// all three and contains every text of `details`, and the registry and the
+/// profiles unchanged. Returns the gap detail.
+fn assert_held_runtime_left(host: &Host, runtime: &str, details: &[&str]) -> String {
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let profiles = profiles_snapshot(host);
+    let plan = host.step(true);
+    let applied = host.step(false);
+    let detected = host.detect_step();
+    let mut seen = Vec::new();
+    for (label, report) in [("plan", &plan), ("apply", &applied), ("detect", &detected)] {
+        assert!(
+            report.refusals.is_empty(),
+            "{runtime} {label}: {:?}",
+            report.refusals
+        );
+        assert!(
+            report
+                .packages
+                .iter()
+                .all(|package| package.runtime != runtime),
+            "{runtime} {label}: {:?}",
+            report.packages
+        );
+        assert!(report.profiles.is_empty(), "{runtime} {label}");
+        let detail = not_serving_detail(report, runtime)
+            .unwrap_or_else(|| panic!("{runtime} {label}: {:?}", report.gaps));
+        for text in details {
+            assert!(detail.contains(text), "{runtime} {label}: {detail}");
+        }
+        seen.push(detail);
+    }
+    assert!(
+        seen.iter().all(|detail| *detail == seen[0]),
+        "{runtime}: the three modes say the same: {seen:?}"
+    );
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry,
+        "{runtime}"
+    );
+    assert_eq!(profiles_snapshot(host), profiles, "{runtime}");
+    seen.swap_remove(0)
+}
+
+/// What the plan, the apply and the detecting plan of `host` say for `runtime`
+/// when a root-invalid refusal stops it: exactly that refusal with the same
+/// detail in all three, containing `hint`, no package entry or profile action,
+/// and the registry and the profiles unchanged. Returns the detail.
+fn assert_held_runtime_refused(host: &Host, runtime: &str, hint: &str) -> String {
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let profiles = profiles_snapshot(host);
+    let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
+    let mut seen = Vec::new();
+    for (label, report) in [
+        ("plan", host.step(true)),
+        ("apply", host.step(false)),
+        ("detect", host.detect_step()),
+    ] {
+        assert_eq!(
+            refusal_codes(&report),
+            [root_refusal.as_str()],
+            "{runtime} {label}"
+        );
+        assert!(
+            report.refusals[0].detail.contains(hint),
+            "{runtime} {label}: {}",
+            report.refusals[0].detail
+        );
+        assert!(
+            report
+                .packages
+                .iter()
+                .all(|package| package.runtime != runtime),
+            "{runtime} {label}: {:?}",
+            report.packages
+        );
+        assert!(report.profiles.is_empty(), "{runtime} {label}");
+        seen.push(report.refusals[0].detail.clone());
+    }
+    assert!(
+        seen.iter().all(|detail| *detail == seen[0]),
+        "{runtime}: the three modes say the same: {seen:?}"
+    );
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry,
+        "{runtime}"
+    );
+    assert_eq!(profiles_snapshot(host), profiles, "{runtime}");
+    seen.swap_remove(0)
+}
+
+/// The archive a cell installs for a role: the holder has the release's version
+/// under another digest, the others are older or newer versions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Holder,
+    Older,
+    Newer,
+}
+
+/// What a cell does to the root or the record of a package.
+#[derive(Clone, Copy)]
+enum Damage {
+    Missing,
+    Altered,
+    NonOfficial,
+}
+
+/// What pins the package of a cell.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PinKind {
+    Profile,
+    Session,
+}
+
+/// One step of a remedy: the release of a pin, or a command the hint names.
+#[derive(Clone, Copy)]
+enum Cmd {
+    Release,
+    Uninstall(Role),
+    RemoveModified(Role),
+    Install,
+    Update,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Gap,
+    Refusal,
+}
+
+/// Where a remedy ends.
+#[derive(Clone, Copy)]
+enum End {
+    /// The next apply installs the release archive.
+    Installed,
+    /// The next plain step finds Pi at the release digest.
+    Present,
+    /// The removal is accepted; the runtime is no longer used.
+    Removed,
+    /// The next plan names the next step of the same-version holder.
+    Chain,
+}
+
+const RESERVED: &[&str] = &["claude", "codex", "hermes"];
+const CLAUDE: &[&str] = &["claude"];
+const PI: &[&str] = &["pi"];
+
+/// One cell of the holder contract table: a state beside the holder, the outcome
+/// in plan, apply and `--detect`, and the remedy the hint names.
+struct Cell {
+    id: &'static str,
+    runtimes: &'static [&'static str],
+    /// (role, enabled, selected), installed in order through the catalog.
+    installs: &'static [(Role, bool, bool)],
+    damage: &'static [(Role, Damage)],
+    pin: Option<(Role, PinKind)>,
+    /// A host profile uses the runtime.
+    profile: bool,
+    /// An installed hook uses the runtime.
+    hook: bool,
+    /// A session record that pins no package uses the runtime.
+    store: bool,
+    outcome: Outcome,
+    steps: &'static [Cmd],
+    end: End,
+    /// Proves the select the hint names instead of the removal remedy.
+    select: bool,
+}
+
+const BASE: Cell = Cell {
+    id: "",
+    runtimes: RESERVED,
+    installs: &[],
+    damage: &[],
+    pin: None,
+    profile: true,
+    hook: false,
+    store: false,
+    outcome: Outcome::Gap,
+    steps: &[],
+    end: End::Installed,
+    select: false,
+};
+
+use Cmd::{Install, Release, RemoveModified, Uninstall, Update};
+use Role::{Holder, Newer, Older};
+
+const CELLS: &[Cell] = &[
+    Cell {
+        id: "R1 nothing selected",
+        installs: &[(Holder, true, false)],
+        steps: &[Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R1 holder disabled",
+        installs: &[(Holder, false, false)],
+        steps: &[Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R1 holder root missing",
+        installs: &[(Holder, true, false)],
+        damage: &[(Holder, Damage::Missing)],
+        steps: &[Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R1 hook only",
+        runtimes: CLAUDE,
+        profile: false,
+        hook: true,
+        installs: &[(Holder, true, false)],
+        steps: &[Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R1 session only",
+        runtimes: CLAUDE,
+        profile: false,
+        store: true,
+        installs: &[(Holder, true, false)],
+        steps: &[Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R2 altered, nothing selected",
+        installs: &[(Holder, true, false)],
+        damage: &[(Holder, Damage::Altered)],
+        outcome: Outcome::Refusal,
+        steps: &[RemoveModified(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R2 altered, holder disabled",
+        installs: &[(Holder, false, false)],
+        damage: &[(Holder, Damage::Altered)],
+        outcome: Outcome::Refusal,
+        steps: &[RemoveModified(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R3 selected, root missing",
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Missing)],
+        steps: &[Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R4 selected, altered",
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Altered)],
+        outcome: Outcome::Refusal,
+        steps: &[RemoveModified(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R5 selected holder pinned by a profile",
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Missing)],
+        pin: Some((Holder, PinKind::Profile)),
+        steps: &[Release, Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R5 unselected holder pinned by a profile",
+        installs: &[(Holder, true, false)],
+        pin: Some((Holder, PinKind::Profile)),
+        steps: &[Release, Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R5 holder pinned by a session, hook uses it",
+        runtimes: CLAUDE,
+        profile: false,
+        hook: true,
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Missing)],
+        pin: Some((Holder, PinKind::Session)),
+        steps: &[Release, Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R5 holder pinned by the only session",
+        runtimes: CLAUDE,
+        profile: false,
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Missing)],
+        pin: Some((Holder, PinKind::Session)),
+        steps: &[Release, Uninstall(Holder)],
+        end: End::Removed,
+        ..BASE
+    },
+    Cell {
+        id: "R6 altered holder pinned by a profile",
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Altered)],
+        pin: Some((Holder, PinKind::Profile)),
+        outcome: Outcome::Refusal,
+        steps: &[Release, RemoveModified(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R6 altered holder pinned by a session, hook uses it",
+        runtimes: CLAUDE,
+        profile: false,
+        hook: true,
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Altered)],
+        pin: Some((Holder, PinKind::Session)),
+        outcome: Outcome::Refusal,
+        steps: &[Release, RemoveModified(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R7 selected holder not official",
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::NonOfficial)],
+        steps: &[Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R9 older selected, root missing",
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::Missing)],
+        steps: &[Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R9 older selected, root missing, select hint",
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::Missing)],
+        select: true,
+        ..BASE
+    },
+    Cell {
+        id: "R9 newer selected, root missing",
+        installs: &[(Newer, true, true), (Holder, true, false)],
+        damage: &[(Newer, Damage::Missing)],
+        steps: &[Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R10 older selected, root missing, holder altered",
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::Missing), (Holder, Damage::Altered)],
+        steps: &[RemoveModified(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R11 older selected, altered",
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::Altered)],
+        outcome: Outcome::Refusal,
+        steps: &[RemoveModified(Older)],
+        end: End::Chain,
+        ..BASE
+    },
+    Cell {
+        id: "R12 older selected, altered, pinned",
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::Altered)],
+        pin: Some((Older, PinKind::Profile)),
+        outcome: Outcome::Refusal,
+        steps: &[Release, RemoveModified(Older)],
+        end: End::Chain,
+        ..BASE
+    },
+    Cell {
+        id: "R13 non-official selected",
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::NonOfficial)],
+        steps: &[Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "R13 non-official selected, select hint",
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::NonOfficial)],
+        select: true,
+        ..BASE
+    },
+    Cell {
+        id: "R14 non-official selected, holder altered",
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::NonOfficial), (Holder, Damage::Altered)],
+        steps: &[RemoveModified(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "P1 selected, root missing",
+        runtimes: PI,
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Missing)],
+        steps: &[Uninstall(Holder), Install],
+        end: End::Present,
+        ..BASE
+    },
+    Cell {
+        id: "P2 selected, root missing, older recorded",
+        runtimes: PI,
+        installs: &[(Older, true, false), (Holder, true, true)],
+        damage: &[(Holder, Damage::Missing)],
+        steps: &[Uninstall(Holder), Update],
+        end: End::Present,
+        ..BASE
+    },
+    Cell {
+        id: "P3 managed only",
+        runtimes: PI,
+        profile: false,
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Missing)],
+        steps: &[Uninstall(Holder), Install],
+        end: End::Present,
+        ..BASE
+    },
+    Cell {
+        id: "P4 selected, altered",
+        runtimes: PI,
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Altered)],
+        outcome: Outcome::Refusal,
+        steps: &[RemoveModified(Holder), Install],
+        end: End::Present,
+        ..BASE
+    },
+    Cell {
+        id: "P4 selected, altered, older recorded",
+        runtimes: PI,
+        installs: &[(Older, true, false), (Holder, true, true)],
+        damage: &[(Holder, Damage::Altered)],
+        outcome: Outcome::Refusal,
+        steps: &[RemoveModified(Holder), Update],
+        end: End::Present,
+        ..BASE
+    },
+    Cell {
+        id: "P5 selected, root missing, pinned",
+        runtimes: PI,
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Missing)],
+        pin: Some((Holder, PinKind::Profile)),
+        steps: &[Release, Uninstall(Holder), Install],
+        end: End::Present,
+        ..BASE
+    },
+    Cell {
+        id: "P5 selected, altered, pinned",
+        runtimes: PI,
+        installs: &[(Holder, true, true)],
+        damage: &[(Holder, Damage::Altered)],
+        pin: Some((Holder, PinKind::Profile)),
+        outcome: Outcome::Refusal,
+        steps: &[Release, RemoveModified(Holder), Install],
+        end: End::Present,
+        ..BASE
+    },
+    Cell {
+        id: "P7 older selected, root missing",
+        runtimes: PI,
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::Missing)],
+        steps: &[Uninstall(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "P7 older selected, root missing, select hint",
+        runtimes: PI,
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::Missing)],
+        select: true,
+        ..BASE
+    },
+    Cell {
+        id: "P8 older selected, root missing, holder altered",
+        runtimes: PI,
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::Missing), (Holder, Damage::Altered)],
+        steps: &[RemoveModified(Holder)],
+        ..BASE
+    },
+    Cell {
+        id: "P9 older selected, altered",
+        runtimes: PI,
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::Altered)],
+        outcome: Outcome::Refusal,
+        steps: &[RemoveModified(Older)],
+        end: End::Chain,
+        ..BASE
+    },
+    Cell {
+        id: "P10 older selected, altered, pinned",
+        runtimes: PI,
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::Altered)],
+        pin: Some((Older, PinKind::Profile)),
+        outcome: Outcome::Refusal,
+        steps: &[Release, RemoveModified(Older)],
+        end: End::Chain,
+        ..BASE
+    },
+    Cell {
+        id: "P13 nothing selected",
+        runtimes: PI,
+        installs: &[(Holder, true, false)],
+        steps: &[Uninstall(Holder), Install],
+        end: End::Present,
+        ..BASE
+    },
+    Cell {
+        id: "P13 nothing selected, holder disabled",
+        runtimes: PI,
+        installs: &[(Holder, false, false)],
+        steps: &[Uninstall(Holder), Install],
+        end: End::Present,
+        ..BASE
+    },
+    Cell {
+        id: "P15 nothing selected, holder pinned",
+        runtimes: PI,
+        installs: &[(Holder, true, false)],
+        pin: Some((Holder, PinKind::Profile)),
+        steps: &[Release, Uninstall(Holder), Install],
+        end: End::Present,
+        ..BASE
+    },
+    Cell {
+        id: "P16 non-official selected",
+        runtimes: PI,
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::NonOfficial)],
+        steps: &[Uninstall(Holder), Update],
+        end: End::Present,
+        ..BASE
+    },
+    Cell {
+        id: "P16 non-official selected, select hint",
+        runtimes: PI,
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::NonOfficial)],
+        select: true,
+        ..BASE
+    },
+    Cell {
+        id: "P17 non-official selected, holder altered",
+        runtimes: PI,
+        installs: &[(Older, true, true), (Holder, true, false)],
+        damage: &[(Older, Damage::NonOfficial), (Holder, Damage::Altered)],
+        steps: &[RemoveModified(Holder), Update],
+        end: End::Present,
+        ..BASE
+    },
+];
+
+/// The archive of a role for `runtime`.
+fn role_archive(runtime: &str, role: Role) -> Archive {
+    let pi = runtime == "pi";
+    let version = match (role, pi) {
+        (Role::Holder, _) => RELEASE_VERSION,
+        (Role::Older, true) => PI_OLDER_VERSION,
+        (Role::Older, false) => "1.0.1",
+        (Role::Newer, true) => PI_NEWER_VERSION,
+        (Role::Newer, false) => "2.1.0",
+    };
+    official_runtimes::variant_archive(runtime, version)
+}
+
+/// The profile that uses `runtime` in a cell: `work` for Pi.
+fn cell_profile(runtime: &str) -> &str {
+    if runtime == "pi" {
+        "work"
+    } else {
+        runtime
+    }
+}
+
+/// The profile text that pins `digest`.
+fn pinned_profile(runtime: &str, digest: &PackageDigest) -> String {
+    format!(
+        "base = \"{runtime}\"\npackage = \"pohunek.runtime.{runtime}\"\ndigest = \"{}\"\n",
+        digest.as_str()
+    )
+}
+
+/// The command text a step names, as the hint spells it.
+fn step_text(runtime: &str, step: Cmd, digest: &dyn Fn(Role) -> PackageDigest) -> Option<String> {
+    let hex = |role: Role| {
+        digest(role)
+            .as_str()
+            .strip_prefix("sha256:")
+            .expect("a sha256 digest")
+            .to_owned()
+    };
+    match step {
+        Cmd::Release => None,
+        Cmd::Uninstall(role) => Some(format!(
+            "pohunek plugin uninstall pohunek.runtime.{runtime} --digest {} --yes",
+            hex(role)
+        )),
+        Cmd::RemoveModified(role) => Some(format!(
+            "pohunek plugin uninstall pohunek.runtime.{runtime} --digest {} --remove-modified --yes",
+            hex(role)
+        )),
+        Cmd::Install => Some(format!(
+            "pohunek plugin install runtime/packages/{runtime}.tar.zst --catalog \
+             runtime/runtime-catalog.json --yes"
+        )),
+        Cmd::Update => Some(format!(
+            "pohunek plugin update pohunek.runtime.{runtime} runtime/packages/{runtime}.tar.zst \
+             --catalog runtime/runtime-catalog.json --yes"
+        )),
+    }
+}
+
+/// Builds the host of a cell for `runtime` and returns it with the archive of
+/// each role and the release archive.
+async fn cell_host(cell: &Cell, runtime: &str) -> (Host, Vec<(Role, Archive)>, Archive) {
+    let archives: Vec<(Role, Archive)> = cell
+        .installs
+        .iter()
+        .map(|(role, _, _)| (*role, role_archive(runtime, *role)))
+        .collect();
+    let installs: Vec<(&Archive, bool, bool)> = cell
+        .installs
+        .iter()
+        .zip(&archives)
+        .map(|((_, enabled, selected), (_, archive))| (archive, *enabled, *selected))
+        .collect();
+    let release = holder_release(runtime);
+    let host = host_with_holder(runtime, &installs, &release).await;
+    let digest = |role: Role| -> PackageDigest {
+        archives
+            .iter()
+            .find(|(candidate, _)| *candidate == role)
+            .map(|(_, archive)| archive.1.clone())
+            .unwrap_or_else(|| role_archive(runtime, role).1)
+    };
+    let profile = cell_profile(runtime);
+    if runtime == "pi" {
+        if cell.profile {
+            host.write_profile(profile, "base = \"pi\"\n");
+        }
+    } else if !cell.profile {
+        fs::remove_file(host.profiles_dir().join(format!("{profile}.toml")))
+            .expect("remove the profile");
+    }
+    if cell.hook {
+        host.write_claude_hook();
+    }
+    if cell.store {
+        host.write_store(PACKAGE_SESSION_STORE);
+    }
+    for (role, damage) in cell.damage {
+        match damage {
+            Damage::Missing => host.remove_package_root(digest(*role).as_str()),
+            Damage::Altered => host.alter_package_root(&digest(*role)),
+            Damage::NonOfficial => set_package_source(&host, &digest(*role), "explicit_digest"),
+        }
+    }
+    if let Some((role, kind)) = cell.pin {
+        match kind {
+            PinKind::Profile => {
+                host.write_profile(profile, &pinned_profile(runtime, &digest(role)));
+            }
+            PinKind::Session => host.write_store(
+                &PACKAGE_SESSION_STORE
+                    .replace(&format!("sha256:{}", "a".repeat(64)), digest(role).as_str()),
+            ),
+        }
+    }
+    (host, archives, release)
+}
+
+/// Runs the cell for `runtime`: the outcome in plan, apply and `--detect`, then
+/// the remedy the hint names, step by step as the CLI sends it.
+async fn run_cell(cell: &Cell, runtime: &str) {
+    let label = format!("{} [{runtime}]", cell.id);
+    let (host, archives, release) = cell_host(cell, runtime).await;
+    let digest = |role: Role| -> PackageDigest {
+        archives
+            .iter()
+            .find(|(candidate, _)| *candidate == role)
+            .map(|(_, archive)| archive.1.clone())
+            .unwrap_or_else(|| role_archive(runtime, role).1)
+    };
+    let detail = match cell.outcome {
+        Outcome::Gap => assert_held_runtime_left(&host, runtime, &[]),
+        Outcome::Refusal => assert_held_runtime_refused(&host, runtime, ""),
+    };
+    if cell.select {
+        assert_select_hint_makes_the_holder_serve(&host, runtime, &digest(Holder));
+        return;
+    }
+
+    // Every command the hint names is a step, in order, and no other is named.
+    let mut at = 0;
+    let mut commands = 0;
+    for step in cell.steps {
+        if let Some(text) = step_text(runtime, *step, &digest) {
+            let found = detail[at..]
+                .find(&text)
+                .unwrap_or_else(|| panic!("{label}: `{text}` is not named in order: {detail}"));
+            at += found + text.len();
+            commands += 1;
+        }
+    }
+    assert_eq!(
+        detail.matches("`pohunek ").count(),
+        commands,
+        "{label}: {detail}"
+    );
+    let pins_named = detail.contains("pin it, so the registry refuses its removal");
+    assert_eq!(
+        pins_named,
+        cell.steps.iter().any(|step| matches!(step, Release)),
+        "{label}: {detail}"
+    );
+
+    let store = pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+        .expect("the package store");
+    let registry = store.registry();
+    let mut retained = package::registry::RetainedDigests::new();
+    if let Some((role, _)) = cell.pin {
+        retained.insert(digest(role));
+    }
+    for step in cell.steps {
+        match step {
+            Release => {
+                let target = cell
+                    .steps
+                    .iter()
+                    .find_map(|next| match next {
+                        Uninstall(role) | RemoveModified(role) => Some(digest(*role)),
+                        _ => None,
+                    })
+                    .expect("a removal follows the release of the pin");
+                assert!(
+                    matches!(
+                        registry.uninstall(&target, &retained),
+                        Err(package::registry::RegistryError::StillReferenced)
+                    ),
+                    "{label}: the removal is refused while the pin stands"
+                );
+                let (_, kind) = cell.pin.expect("a pinned cell");
+                match kind {
+                    PinKind::Profile => {
+                        host.write_profile(
+                            cell_profile(runtime),
+                            &format!("base = \"{runtime}\"\n"),
+                        );
+                    }
+                    PinKind::Session => {
+                        fs::remove_file(host.store_path()).expect("remove the session records");
+                    }
+                }
+                retained = package::registry::RetainedDigests::new();
+            }
+            Uninstall(role) => {
+                registry
+                    .uninstall(&digest(*role), &retained)
+                    .unwrap_or_else(|error| {
+                        panic!("{label}: the uninstall is accepted: {error:?}")
+                    });
+            }
+            RemoveModified(role) => {
+                registry
+                    .remove_modified(&digest(*role), &retained)
+                    .unwrap_or_else(|error| panic!("{label}: the removal is accepted: {error:?}"));
+            }
+            Install | Update => {
+                host.catalog
+                    .install_release_package(
+                        &host.plugins_dir(),
+                        host.env.root(),
+                        &host.release_dir(),
+                        runtime,
+                    )
+                    .await;
+            }
+        }
+    }
+    match cell.end {
+        End::Installed => {
+            let applied = host.step(false);
+            assert!(
+                applied.refusals.is_empty(),
+                "{label}: {:?}",
+                applied.refusals
+            );
+            let package = applied
+                .packages
+                .iter()
+                .find(|package| package.runtime == runtime)
+                .unwrap_or_else(|| panic!("{label}: {:?}", applied.packages));
+            assert_eq!(package.status, PackageStatus::Installed, "{label}");
+            assert_eq!(package.digest, release.1.as_str(), "{label}");
+            if runtime != "pi" && cell.profile {
+                assert_eq!(
+                    profile_status(&applied.profiles, runtime),
+                    ProfileStatus::Bound,
+                    "{label}"
+                );
+            }
+        }
+        End::Present => {
+            let next = host.step(false);
+            assert!(next.refusals.is_empty(), "{label}: {:?}", next.refusals);
+            assert_eq!(pi_package(&next).status, PackageStatus::Present, "{label}");
+            assert_eq!(pi_package(&next).digest, release.1.as_str(), "{label}");
+        }
+        End::Removed => {}
+        End::Chain => {
+            let holder = uninstall_command(runtime, &digest(Holder));
+            let next = if runtime == "pi" {
+                vec![
+                    holder.as_str(),
+                    "pohunek plugin install runtime/packages/pi.tar.zst",
+                ]
+            } else {
+                vec![holder.as_str()]
+            };
+            assert_held_runtime_left(&host, runtime, &next);
+        }
+    }
+}
+
+/// Every cell of the holder contract table that applies to the reserved runtimes.
+#[tokio::test]
+async fn the_holder_contract_table_holds_for_the_reserved_runtimes() {
+    for cell in CELLS {
+        for runtime in cell.runtimes.iter().filter(|runtime| **runtime != "pi") {
+            run_cell(cell, runtime).await;
+        }
+    }
+}
+
+/// Every cell of the holder contract table that applies to Pi.
+#[tokio::test]
+async fn the_holder_contract_table_holds_for_pi() {
+    for cell in CELLS {
+        if cell.runtimes.contains(&"pi") {
+            run_cell(cell, "pi").await;
+        }
+    }
+}
+
+/// An unmanaged Pi whose unselected holder is altered: plan and apply report the
+/// gap (Pi is not planned without an enabled official selection), the detecting
+/// plan refuses (it lists Pi), and both name the removal and the install.
+#[tokio::test]
+async fn an_unselected_altered_pi_holder_is_a_gap_without_detect_and_a_refusal_with_it() {
+    let holder = official_runtimes::variant_archive("pi", RELEASE_VERSION);
+    let release = holder_release("pi");
+    let host = host_with_holder("pi", &[(&holder, true, false)], &release).await;
+    host.alter_package_root(&holder.1);
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let hint = format!(
+        "pohunek plugin uninstall pohunek.runtime.pi --digest {} --remove-modified --yes",
+        holder.1.as_str().strip_prefix("sha256:").expect("a digest")
+    );
+    let install = "pohunek plugin install runtime/packages/pi.tar.zst --catalog \
+                   runtime/runtime-catalog.json --yes";
+
+    for report in [host.step(true), host.step(false)] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        let detail = not_serving_detail(&report, "pi").expect("the gap");
+        assert!(
+            detail.contains(&hint) && detail.contains(install),
+            "{detail}"
+        );
+    }
+    let detected = host.detect_step();
+    assert_eq!(detected.refusals.len(), 1, "{:?}", detected.refusals);
+    let detail = &detected.refusals[0].detail;
+    assert!(
+        detail.contains(&hint) && detail.contains(install),
+        "{detail}"
+    );
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+    pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+        .expect("the package store")
+        .registry()
+        .remove_modified(&holder.1, &package::registry::RetainedDigests::new())
+        .expect("the registry accepts the hinted removal");
     host.catalog
         .install_release_package(
             &host.plugins_dir(),
@@ -5977,92 +6288,43 @@ async fn a_selected_pi_holder_without_its_root_beside_another_version_names_the_
             "pi",
         )
         .await;
-    let next = host.step(false);
-    assert!(next.refusals.is_empty(), "{:?}", next.refusals);
-    assert_eq!(pi_package(&next).status, PackageStatus::Present);
-    assert_eq!(pi_package(&next).digest, release.1.as_str());
+    assert_eq!(pi_package(&host.step(false)).status, PackageStatus::Present);
 }
 
-/// Rows 1, 2 and 7 for Pi: Pi is planned only while an enabled official selection
-/// manages it, so with nothing selected or a non-official selection the holder
-/// check is never reached. Plan and apply agree on the managed-runtime gap and
-/// write nothing.
+/// A reserved runtime that only `--detect` plans, with an altered holder: the
+/// detecting plan refuses (setup is blocked) and names the removal and the next
+/// upgrade, and after the removal a detecting plan plans the install.
 #[tokio::test]
-async fn a_pi_without_an_enabled_official_selection_beside_a_holder_is_not_planned() {
-    for state in ["no selection", "disabled holder", "non-official selection"] {
-        let older = official_runtimes::variant_archive("pi", PI_OLDER_VERSION);
-        let holder = official_runtimes::variant_archive("pi", RELEASE_VERSION);
-        let release = holder_release("pi");
-        let host = match state {
-            "no selection" => host_with_holder("pi", &[(&holder, true, false)], &release).await,
-            "disabled holder" => host_with_holder("pi", &[(&holder, false, false)], &release).await,
-            _ => {
-                let host = host_with_holder(
-                    "pi",
-                    &[(&older, true, true), (&holder, true, false)],
-                    &release,
-                )
-                .await;
-                set_package_source(&host, &older.1, "explicit_digest");
-                host
-            }
-        };
-        let registry = fs::read(host.registry_path()).expect("the registry record");
+async fn a_runtime_planned_only_by_detection_with_an_altered_holder_is_refused_with_its_removal() {
+    let runtime = "claude";
+    let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
+    let release = holder_release(runtime);
+    let host = host_with_holder(runtime, &[(&holder, true, true)], &release).await;
+    fs::remove_file(host.profiles_dir().join(format!("{runtime}.toml")))
+        .expect("remove the profile");
+    host.alter_package_root(&holder.1);
 
-        for report in [host.step(true), host.step(false)] {
-            assert!(report.refusals.is_empty(), "{state}: {:?}", report.refusals);
-            assert!(report.packages.is_empty(), "{state}: {:?}", report.packages);
-            assert!(
-                gap_codes(&report).contains(&("pi", CODE_GAP_OFFICIAL_PACKAGE_NOT_SERVING)),
-                "{state}: {:?}",
-                report.gaps
-            );
-        }
-        assert_eq!(
-            fs::read(host.registry_path()).expect("the registry record"),
-            registry,
-            "{state}"
-        );
-    }
-}
+    let detected = host.detect_step();
 
-/// A host profile pins the altered package, the holder or the selected version:
-/// the registry refuses its removal, so the refusal names no removal command.
-#[tokio::test]
-async fn an_altered_package_that_a_profile_pins_is_refused_without_a_removal_command() {
-    for (runtime, other_selected, profile) in [
-        ("claude", false, "claude"),
-        ("claude", true, "claude"),
-        ("pi", false, "work"),
-    ] {
-        let older = official_runtimes::variant_archive(runtime, "1.0.1");
-        let holder = official_runtimes::variant_archive(runtime, RELEASE_VERSION);
-        let release = holder_release(runtime);
-        let (installs, altered): (Vec<(&Archive, bool, bool)>, &Archive) = if other_selected {
-            (vec![(&older, true, true), (&holder, true, false)], &older)
-        } else {
-            (vec![(&holder, true, true)], &holder)
-        };
-        let host = host_with_holder(runtime, &installs, &release).await;
-        host.write_profile(
-            profile,
-            &format!(
-                "base = \"{runtime}\"\npackage = \"pohunek.runtime.{runtime}\"\ndigest = \"{}\"\n",
-                altered.1.as_str()
-            ),
-        );
-        host.alter_package_root(&altered.1);
-
-        assert_held_runtime_refused(
-            &host,
-            runtime,
-            "pins it, so the registry refuses its removal",
-        );
-
-        let detail = host.step(true).refusals[0].detail.clone();
-        assert!(
-            !detail.contains("`pohunek plugin uninstall"),
-            "{runtime}: {detail}"
-        );
-    }
+    assert_eq!(detected.refusals.len(), 1, "{:?}", detected.refusals);
+    let detail = &detected.refusals[0].detail;
+    assert!(
+        detail.contains(&format!(
+            "pohunek plugin uninstall pohunek.runtime.{runtime} --digest {} --remove-modified --yes`, then run the upgrade again",
+            holder.1.as_str().strip_prefix("sha256:").expect("a digest")
+        )),
+        "{detail}"
+    );
+    pohunek_daemon::agent::host::PackageStore::open(&host.plugins_dir())
+        .expect("the package store")
+        .registry()
+        .remove_modified(&holder.1, &package::registry::RetainedDigests::new())
+        .expect("the registry accepts the hinted removal");
+    let after = host.detect_step();
+    let package = after
+        .packages
+        .iter()
+        .find(|package| package.runtime == runtime)
+        .expect("the detecting plan plans the runtime");
+    assert_eq!(package.digest, release.1.as_str());
 }
