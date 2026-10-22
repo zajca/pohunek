@@ -2624,11 +2624,11 @@ selects by itself.
 | Pi without an enabled official selection (not planned without `--detect`), nothing selected or a non-official S | gap (plan, apply and `--detect`); an altered H is a gap in plan and apply and a refusal under `--detect` | the same renderer, so the Pi row above applies and no command fails beside H |
 | Newer Pi X selected, root missing or altered | the existing refusal for X | unchanged |
 
-A pinned O (a host profile names its package and digest, or a session record holds it) cannot
+A pinned O (a host profile holds its `digest`, usually beside its `package`, or a session record holds it) cannot
 be removed: the registry refuses the removal while the pin stands. The hint then names the
 pin first: "the host profile `<name>.toml` pins it" or "a session record pins it", "so the registry refuses
 its removal until the pin is released", with the exit "remove the `package` and `digest`
-lines from `<name>.toml` in the host profile directory" or "remove the sessions launched from
+lines (the `digest` line pins) from `<name>.toml` in the host profile directory" or "remove the sessions launched from
 it" (no command releases a pin), and then the removal and the follow-up. A reserved runtime
 that only the pinning session used gets no "run the upgrade again", because the plain upgrade
 no longer plans it once the sessions are gone. A hint that offers
