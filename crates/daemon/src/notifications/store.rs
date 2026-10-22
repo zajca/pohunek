@@ -878,6 +878,8 @@ fn upgrade_projector(
     mut existing: NotificationRecord,
     replacement: &NotificationRecord,
 ) -> NotificationRecord {
+    // The record now carries the provider's report, created when it arrived.
+    existing.created_at.clone_from(&replacement.created_at);
     existing.source.clone_from(&replacement.source);
     existing.kind = replacement.kind;
     existing.severity = replacement.severity;

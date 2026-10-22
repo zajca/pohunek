@@ -109,7 +109,23 @@ pub(crate) fn existed_at(record: &NotificationRecord, as_of: Option<&ResolveAsOf
         return true;
     };
     source_priority(&record.source) == SourcePriority::Projector
-        || parse_timestamp(&record.created_at).map_or(true, |created_at| created_at <= as_of.wall)
+        || created_at_of(record).map_or(true, |created_at| created_at <= as_of.wall)
+}
+
+/// The creation time of `record`; an unreadable one is logged, and the callers
+/// then treat the record as one that existed.
+fn created_at_of(record: &NotificationRecord) -> Option<OffsetDateTime> {
+    match parse_timestamp(&record.created_at) {
+        Ok(created_at) => Some(created_at),
+        Err(error) => {
+            warn!(
+                id = %record.id.0,
+                %error,
+                "notification has an unreadable creation time; a resolve as of an earlier moment treats it as existing then"
+            );
+            None
+        }
+    }
 }
 
 /// Clonable command sink for the session notification debounce coordinator.
@@ -389,7 +405,7 @@ fn defer(
     // Reports of one turn merge; reports of other turns are other entries.
     let key = (dedupe_key, turn);
     let foreign_at = (source_priority(&record.source) != SourcePriority::Projector)
-        .then(|| parse_timestamp(&record.created_at).ok())
+        .then(|| created_at_of(&record))
         .flatten();
     let (existing_inbox, existing_signal, existing_generation, existing_foreign) =
         match pending.remove(&key) {
@@ -451,6 +467,10 @@ fn prefer(
 
 /// Cancel the pending entries that name no turn for `dedupe_key` and
 /// acknowledge visible records.
+///
+/// A resolve `as_of` an earlier moment leaves alone the pending entry another
+/// producer refreshed after it and the visible records that producer created
+/// after it.
 ///
 /// An entry for a turn the daemon runs is not cancelled: the state of its turn
 /// decides whether it surfaces.
@@ -1183,5 +1203,26 @@ mod tests {
             1,
             "a window that ended before the resolve was applied suppresses nothing"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resolve_as_of_leaves_a_hook_report_that_upgraded_a_projector_record() {
+        let service = service("as-of-upgraded");
+        let (coordinator, _task) = spawn(&service);
+
+        service
+            .create(projector_params("s-1"))
+            .expect("create a projector record");
+        let as_of = ResolveAsOf::now();
+        let upgraded = service
+            .create(provider_params("s-1"))
+            .expect("a hook report upgrades the projector record");
+        assert!(!upgraded.created, "the report merged into the record");
+        coordinator.as_of(as_of).resolve("attention:s-1".to_owned());
+        settle().await;
+
+        let listed = list(&service);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, NotificationStatus::Unread);
     }
 }
