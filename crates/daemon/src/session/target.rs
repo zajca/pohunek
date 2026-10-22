@@ -229,6 +229,22 @@ pub(super) struct TargetResolution {
     pub(super) hook_stderr_tails: Vec<HookStderrTail>,
 }
 
+impl TargetResolution {
+    /// The association the session returns to outside every repository, when
+    /// it was created by reference in a directory outside every repository.
+    pub(super) fn reference_launch(&self) -> Option<Box<CwdAssociation>> {
+        self.reference_outside_repository.then(|| {
+            Box::new(CwdAssociation {
+                project_id: self.project_id.clone(),
+                is_linked_worktree: self.is_linked_worktree,
+                repo: self.repo.clone(),
+                branch: self.branch.clone(),
+                worktree_path: self.worktree_path.clone(),
+            })
+        })
+    }
+}
+
 impl SessionRegistry {
     /// Roll back the worktrees bound for a create whose runtime never ran or
     /// is proven ended, removing each checkout and its binding so the branch

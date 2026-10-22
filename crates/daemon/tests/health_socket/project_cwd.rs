@@ -385,8 +385,7 @@ async fn a_project_session_does_not_keep_its_project_on_unreadable_repository_ev
 }
 
 /// K4: when `git` cannot answer, the walk alone is not evidence of being
-/// outside every repository. Each scenario runs in its own process, so
-/// narrowing `PATH` affects only this daemon.
+/// outside every repository. `PATH` is narrowed only after the session exists.
 #[tokio::test]
 async fn a_project_session_does_not_keep_its_project_when_git_is_unavailable() {
     let mut rig = ProjectRig::start("pcwd-no-git").await;
@@ -397,9 +396,11 @@ async fn a_project_session_does_not_keep_its_project_when_git_is_unavailable() {
     ))
     .expect("session info");
     let no_git = temp_dir("pcwd-no-git-path");
-    std::env::set_var("PATH", &*no_git);
+    let mut environment = pohunek_test_support::process_env::ProcessEnv::lock();
+    environment.set("PATH", &*no_git);
 
     let moved = rig.move_session_to(&session.id, &second).await;
+    drop(environment);
 
     assert_eq!(
         moved.project_id, None,

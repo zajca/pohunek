@@ -3427,6 +3427,7 @@ impl SessionRegistry {
         validated_program: Option<crate::agent::ValidatedLaunchProgram>,
         target: TargetResolution,
     ) -> Result<(PtySessionSpec, Option<String>), ProtocolError> {
+        let reference_launch = target.reference_launch();
         let TargetResolution {
             launch_cwd,
             repo,
@@ -3435,7 +3436,6 @@ impl SessionRegistry {
             project_id,
             is_linked_worktree,
             warnings,
-            reference_outside_repository,
             ..
         } = target;
         let base = RuntimeRef::from(resolved.base.clone());
@@ -3502,15 +3502,6 @@ impl SessionRegistry {
                 .map_or(&[][..], |(_, argv)| argv.as_slice()),
             params.input.clone(),
         )?;
-        let reference_launch = reference_outside_repository.then(|| {
-            Box::new(CwdAssociation {
-                project_id: project_id.clone(),
-                is_linked_worktree,
-                repo: repo.clone(),
-                branch: branch.clone(),
-                worktree_path: worktree_path.clone(),
-            })
-        });
         let spec = PtySessionSpec {
             id: id.clone(),
             registration: target::PtyRegistration::Create,
@@ -6355,9 +6346,16 @@ impl SessionRegistry {
     ///
     /// The watchers of a replaced entry are cancelled, so re-adopting or
     /// reclassifying a runtime never leaves a second watcher set on it.
-    async fn install_session_entry(&self, id: &SessionId, entry: SessionEntry) {
+    async fn install_session_entry(&self, id: &SessionId, mut entry: SessionEntry) {
         let replaced = {
             let mut sessions = self.inner.sessions.lock().await;
+            // A rebuilt entry of the same session keeps the launch association
+            // the live one held.
+            if entry.reference_launch.is_none() {
+                entry.reference_launch = sessions
+                    .get(id)
+                    .and_then(|live| live.reference_launch.clone());
+            }
             self.set_unpersisted(&id.0, None);
             self.inner.turns.observe_state(id, entry.info.state);
             self.inner.turns.new_generation(id);
