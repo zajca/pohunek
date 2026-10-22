@@ -42,6 +42,7 @@ tokio = { workspace = true }
 # from the workspace default and drives the control-socket line framing.
 tokio-util = { workspace = true, features = ["rt", "time"] }
 futures = { workspace = true }
+socket2 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }

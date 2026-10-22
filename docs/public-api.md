@@ -1938,9 +1938,14 @@ globally and 8 per session. When the client closes the connection (EOF on the
 read side) while a `session.wait`, a `session.output` with `wait_ms`, or a
 `session.wait_turn` is in flight, the daemon cancels that read-only wait,
 releases its slots, and closes the connection without a reply; closing only the write side counts as closing.
-Other methods, including `session.input` with `wait`, run to completion. The
-timeout stays the guaranteed release bound for a peer that vanishes without
-closing the connection, and for a client that pipelines another request line
+Other methods, including `session.input` with `wait`, run to completion. Every
+accepted overlay (TCP) connection has TCP keepalive set from the `service.toml`
+`[waits]` keys `keepalive_idle_ms`, `keepalive_interval_ms` and
+`keepalive_count` (30 s, 10 s and 3 by default, Linux and macOS): a peer that
+vanishes without closing the connection fails its read and releases the slot
+of an in-flight wait within `idle + interval x count` (60 s by default)
+instead of at the wait's deadline. The Unix socket is unchanged. The timeout
+stays the release bound for a client that pipelines another request line
 behind the wait: that line is answered in order after the wait's reply, and
 the read side is not watched again until then.
 
@@ -2184,8 +2189,11 @@ at the start, or a target removed during the wait),
 waiter pool is separate from the `session.wait` pool: a call takes one global
 slot and one slot on every target, all or none, and releases them when the
 call returns or when the client closes the connection during the wait (no
-reply is sent then). The timeout stays the guaranteed release bound for a
-client that vanishes without closing the connection. `session.wait` is a
+reply is sent then). A client that vanishes without closing an overlay
+connection frees its slot within the connection's keepalive bound, `idle +
+interval x count` of the `service.toml` `[waits]` `keepalive_*` keys (60 s by
+default); the timeout stays the release bound for a client that pipelines
+another request line behind the wait. `session.wait` is a
 separate method with its own 8,000 ms limit.
 
 A protocol 3 connection does not define the method: the daemon answers
@@ -2355,7 +2363,13 @@ the same way, with only the hooks default assigned. The `[events]` table
 bounds of the event journal; 33554432, 8 and 14 on fresh installs and
 migrations) raised it to 7: the table is required, so under the rule below it
 is a breaking change and not an optional additive key; a schema-6 file is
-migrated the same way, with only the events defaults assigned.
+migrated the same way, with only the events defaults assigned. The optional
+`[waits]` keys `keepalive_idle_ms` and `keepalive_interval_ms` (whole seconds
+written in milliseconds, `1000..=600000`, 30000 and 10000 by default) and
+`keepalive_count` (`1..=10`, 3 by default) set the TCP keepalive of every
+overlay connection the daemon accepts (#862); they are additive optional keys,
+so they leave `schema_version` at 7 and the writer omits each while it equals
+its default.
 `service.toml` tolerates keys this version does not know (#1401). The
 `schema_version` changes only for a breaking change: a removed or renamed key, a
 changed meaning or unit, or validation that rejects a file that was valid

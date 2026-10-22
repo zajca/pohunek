@@ -92,6 +92,8 @@ toml_edit = "0.22"
 regex = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "fs", "time", "process"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+# Per-socket TCP keepalive options and their read-back on accepted overlay connections.
+socket2 = { version = "0.6", features = ["all"] }
 futures = "0.3"
 keyring = { version = "3", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

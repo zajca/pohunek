@@ -853,11 +853,11 @@ the local Unix socket; over TCP (the NetBird overlay) a vanished peer sends
 nothing, and without traffic the kernel notices only after its retransmission
 or keepalive timeouts. The control protocol is one request line and one
 response line, and the clients decode the first line as the final response,
-so the daemon sends no application-level heartbeat. Every overlay wait
-connection instead sets per-socket TCP keepalive
-(`tasks.wait_keepalive_idle_ms`, `tasks.wait_keepalive_interval_ms`,
-`tasks.wait_keepalive_count`; supported on Linux and macOS), and a keepalive
-failure or a peer EOF releases the slot. Slot lifetime is thus bounded by
+so the daemon sends no application-level heartbeat. Every accepted overlay
+connection instead sets per-socket TCP keepalive from the `service.toml`
+`[waits]` keys `keepalive_idle_ms`, `keepalive_interval_ms` and
+`keepalive_count` (#862; supported on Linux and macOS; tasks add no second
+set of keys), and a keepalive failure or a peer EOF releases the slot. Slot lifetime is thus bounded by
 the client's liveness plus the configured keepalive detection time, not by
 `tasks.max_wait_ms`.
 
@@ -3049,8 +3049,6 @@ present, no detection-only settlement for OpenCode, and the share of
    `tasks.attach_fence_grace_ms`,
    `tasks.evidence_drain_settle_ms`,
    `tasks.unconfined_release_grace_ms`,
-   `tasks.wait_keepalive_idle_ms`,
-   `tasks.wait_keepalive_interval_ms`, `tasks.wait_keepalive_count`,
    `tasks.store_max_bytes`, `tasks.max_turns_per_task`,
    `tasks.max_tasks_retained`,
    `tasks.worktree_hold_max_age`, `tasks.record_max_bytes`,
@@ -3065,6 +3063,8 @@ present, no detection-only settlement for OpenCode, and the share of
    `tasks.turn_deadline` overrides and
    `tasks.metadata_retention`, and whether per-profile overrides may exceed
    the host ceiling. All are required configuration validated at startup.
+   The wait keepalive is not among them: it reuses the `[waits]`
+   `keepalive_*` keys of `service.toml` (§8.3).
 2. Whether investigation mode should refuse to start when a profile declares
    only `provider_rules` enforcement for an untrusted project.
 

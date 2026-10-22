@@ -786,10 +786,12 @@ fn apply_service_settings(config: &mut SessionRegistryConfig, service: &ServiceC
     config.event_retention = service.event_retention();
 }
 
-/// Applies the validated `session.wait_turn` default and ceiling.
+/// Applies the validated `session.wait_turn` default and ceiling and the
+/// overlay connection keepalive.
 fn apply_wait_timing(config: &mut SessionRegistryConfig, timing: WaitTiming) {
     config.turn_wait_default = timing.turn_default;
     config.turn_wait_max = timing.turn_max;
+    config.remote_keepalive = timing.keepalive;
 }
 
 /// Logs one warning per key of `service.toml` this version does not know.
@@ -1955,6 +1957,52 @@ mod supervision_tests {
         };
         assert_ne!(expected, pohunek_service_config::DEFAULT_EVENT_RETENTION);
         assert_eq!(sessions.event_retention(), expected);
+    }
+
+    #[test]
+    fn service_toml_keepalive_reaches_the_registry_the_remote_server_reads() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::Duration;
+
+        use pohunek_service_config::{KeepaliveTiming, ServiceConfig};
+
+        let dir = pohunek_test_support::tempdir().expect("config directory");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod config directory");
+        let file = dir.path().join(pohunek_service_config::FILE_NAME);
+        let text = String::from(
+            "schema_version = 7\nprefix = \"/home/u/.local\"\nactive_version = \"0.35.2\"\n\
+             [namespace]\nuid = 1000\nstate_root = \"/home/u/.local/state/pohunek\"\n\
+             runtime_root = \"/run/user/1000/pohunek\"\n\
+             [deadlines]\nworker_connect_ms = 10000\nworker_initialize_ms = 45000\n\
+             launchctl_command_ms = 10000\nworker_exit_timeout_ms = 30000\n\
+             daemon_exit_timeout_ms = 30000\ndaemon_restart_throttle_ms = 5000\n\
+             [environment]\nsearch_path = []\nallowlist = [\"PATH\"]\n\
+             [sweep]\ngrace_ms = 5000\n\
+             [input]\ninitial_startup_grace_ms = 5000\nsubmit_delay_ms = 150\n\
+             write_stall_timeout_ms = 3000\n\
+             [waits]\nturn_default_ms = 300000\nturn_max_ms = 1800000\n\
+             keepalive_idle_ms = 45000\nkeepalive_interval_ms = 15000\nkeepalive_count = 5\n\
+             [hooks]\nstderr_tail_bytes = 4096\n\
+             [events]\nmax_file_bytes = 33554432\nmax_files = 8\nmax_age_days = 14\n\
+             [limits]\nopen_files = 8192\n",
+        );
+        std::fs::write(&file, text).expect("write service.toml");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod service.toml");
+        let service = ServiceConfig::load(&file).expect("the file loads");
+
+        let mut config = pohunek_daemon::session::SessionRegistryConfig::default();
+        apply_service_settings(&mut config, &service);
+        let sessions = pohunek_daemon::session::SessionRegistry::new(config);
+
+        let expected = KeepaliveTiming {
+            idle: Duration::from_secs(45),
+            interval: Duration::from_secs(15),
+            count: 5,
+        };
+        assert_ne!(expected, pohunek_service_config::DEFAULT_KEEPALIVE_TIMING);
+        assert_eq!(sessions.remote_keepalive(), expected);
     }
 
     #[test]

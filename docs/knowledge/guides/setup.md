@@ -97,6 +97,17 @@ milliseconds in `5000..=3600000`, and the default must not exceed the
 ceiling; a violation makes the daemon refuse startup with the named
 configuration error. A daemon started without `service.toml` uses the same
 5 min and 30 min.
+Three optional `[waits]` keys set the TCP keepalive of every connection the
+daemon accepts on an overlay (NetBird) address: `keepalive_idle_ms = 30000`,
+`keepalive_interval_ms = 10000` and `keepalive_count = 3`. A client host that
+vanishes without closing its connection (network loss, suspend) then frees the
+waiter slot of its in-flight `session.wait_turn` within
+`idle + interval x count`, 60 s by default, instead of at the wait's deadline.
+The two times are whole seconds written in milliseconds, each in
+`1000..=600000`, and the count is in `1..=10`; a violation makes the daemon
+refuse startup with the named configuration error. The installer omits a key
+that equals its default, and the same defaults apply to a daemon started
+without `service.toml`. The Unix control socket is unaffected.
 The `[hooks] stderr_tail_bytes = 4096` key is the number of bytes of a failing
 `pre-create` or `post-create` hook's stderr kept for the `session.new` warning.
 It is a whole number in `0..=32768`; `0` disables the capture, and a value

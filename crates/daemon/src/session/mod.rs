@@ -484,6 +484,8 @@ pub struct SessionRegistryConfig {
     /// Size, count and age bounds of the event journal under
     /// [`Self::event_log_dir`].
     pub event_retention: pohunek_service_config::EventRetention,
+    /// TCP keepalive applied to every accepted overlay control connection.
+    pub remote_keepalive: pohunek_service_config::KeepaliveTiming,
     /// Durable session policy document (`<data_dir>/session-policy.json`).
     /// `None` keeps the retention policy in memory only, which is what unit
     /// tests that never persist a policy use.
@@ -625,6 +627,7 @@ impl Default for SessionRegistryConfig {
             hook_stderr_release_grace: DEFAULT_HOOK_STDERR_RELEASE_GRACE,
             event_log_dir: None,
             event_retention: pohunek_service_config::DEFAULT_EVENT_RETENTION,
+            remote_keepalive: pohunek_service_config::DEFAULT_KEEPALIVE_TIMING,
             retention_policy_path: None,
             idle_stop_policy_path: None,
             idle_stop_min_secs: idle_stop::DEFAULT_IDLE_STOP_MIN_SECS,
@@ -2337,6 +2340,12 @@ impl SessionRegistry {
     #[must_use]
     pub fn event_retention(&self) -> pohunek_service_config::EventRetention {
         self.inner.config.event_retention
+    }
+
+    /// TCP keepalive the remote control server sets on each accepted connection.
+    #[must_use]
+    pub fn remote_keepalive(&self) -> pohunek_service_config::KeepaliveTiming {
+        self.inner.config.remote_keepalive
     }
 
     /// The resolved host agent-profile registry (Part C), for `host.inspect` to
