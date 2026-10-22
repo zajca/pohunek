@@ -4139,7 +4139,7 @@ impl SessionRegistry {
         });
         let (detector_preview, detector_preview_rx) = mpsc::channel(1);
         let (input_ready_tx, input_ready) = watch::channel(false);
-        let info = record.info.clone();
+        let mut info = record.info.clone();
         let entry = SessionEntry {
             info: info.clone(),
             activity_revision: 0,
@@ -4186,12 +4186,14 @@ impl SessionRegistry {
             initial_input_owner: initial_input_owner(&record),
         };
         let listed = record.clone();
-        if let Err(error) = self.write_session_record(record).await {
-            tracing::warn!(session_id = %id.0, error = %error, "failed to commit reconciled worker");
-            Box::pin(self.list_pending(&listed)).await;
-            return true;
+        match self.write_record_and_install(&id, record, entry).await {
+            Ok(metadata) => info.metadata = metadata,
+            Err(error) => {
+                tracing::warn!(session_id = %id.0, error = %error, "failed to commit reconciled worker");
+                Box::pin(self.list_pending(&listed)).await;
+                return true;
+            }
         }
-        self.install_session_entry(&id, entry).await;
         let expected = RuntimeWatchIdentity::from_info(&info)
             .expect("reconciled live runtime has a complete watcher identity");
         self.spawn_detector(DetectorInputs {
@@ -4277,11 +4279,6 @@ impl SessionRegistry {
         // Boxed so the entry does not widen the futures of the callers.
         let entry = Box::new(entry);
         let info = entry.info.clone();
-        if let Err(error) = self.write_session_record(classified).await {
-            tracing::warn!(session_id = %id.0, error = %error, "failed to persist runtime classification");
-            Box::pin(self.list_pending(&record)).await;
-            return false;
-        }
         // A placeholder that already logged this very classification does not
         // log it again once the write succeeds.
         let logged = self
@@ -4298,7 +4295,19 @@ impl SessionRegistry {
             .await
             .get(&id)
             .is_some_and(|current| current.info.background.is_some());
-        self.install_session_entry(&id, *entry).await;
+        if let Err(error) = self.write_record_and_install(&id, classified, *entry).await {
+            tracing::warn!(session_id = %id.0, error = %error, "failed to persist runtime classification");
+            Box::pin(self.list_pending(&record)).await;
+            return false;
+        }
+        // The installed entry carries the metadata of the entry it replaced.
+        let info = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(&id)
+            .map_or(info, |installed| installed.info.clone());
         if !logged {
             warn_unavailable(&id.0, info_worker_id(&info), state, reason, "");
         }
@@ -4365,7 +4374,7 @@ impl SessionRegistry {
         clippy::too_many_lines,
         reason = "one struct literal initializes every entry field"
     )]
-    fn unavailable_entry(
+    pub(super) fn unavailable_entry(
         &self,
         mut record: SessionRecord,
         classification: &Unavailability,

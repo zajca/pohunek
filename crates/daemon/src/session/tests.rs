@@ -4133,6 +4133,119 @@ async fn a_metadata_edit_cannot_land_between_a_record_snapshot_and_its_write() {
     let _ = registry.stop(&created.id).await;
 }
 
+/// A stopped session whose durable record was read before a metadata edit: the
+/// registry, the session and the record as it was before the edit.
+async fn session_edited_after_its_record_was_read(
+    tag: &str,
+) -> (
+    SessionRegistry,
+    SessionId,
+    crate::store::SessionRecord,
+    PathBuf,
+) {
+    let store_path = temp_store_path(tag);
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(SessionNewParams {
+            metadata: metadata(&[("ticket", "old")]),
+            ..params()
+        })
+        .await
+        .expect("create session");
+    let _ = registry.stop(&created.id).await;
+    let stale = registry
+        .load_durable_session_record(&created.id)
+        .await
+        .expect("read the record")
+        .expect("the session has a durable record");
+    registry
+        .set_metadata(&created.id, metadata_patch(&[("ticket", Some("new"))]))
+        .await
+        .expect("edit the metadata");
+    (registry, created.id, stale, store_path)
+}
+
+/// The metadata of `id` in memory and in the durable record at `store_path`.
+async fn metadata_in_memory_and_store(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    store_path: PathBuf,
+) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    let live = registry.inspect(id).await.expect("inspect").metadata;
+    let durable = crate::store::Store::new(store_path)
+        .load_sessions()
+        .expect("read the durable records")
+        .into_iter()
+        .find(|record| record.session_id == id.0)
+        .expect("the session has a durable record")
+        .info
+        .metadata;
+    (live, durable)
+}
+
+/// The preparing record of a relaunch, built before an edit, does not write the
+/// older metadata over it.
+#[tokio::test]
+async fn a_record_built_before_a_metadata_edit_does_not_overwrite_it_when_written() {
+    let (registry, id, stale, store_path) =
+        session_edited_after_its_record_was_read("meta-stale-write").await;
+    registry
+        .write_session_record(stale)
+        .await
+        .expect("write the stale record");
+
+    let expected = metadata(&[("ticket", "new")]);
+    let (live, durable) = metadata_in_memory_and_store(&registry, &id, store_path).await;
+    assert_eq!((live, durable), (expected.clone(), expected));
+}
+
+/// The entry a relaunch commits, built before an edit, carries the edit.
+#[tokio::test]
+async fn an_entry_built_before_a_metadata_edit_carries_it_when_committed() {
+    let (registry, id, stale, store_path) =
+        session_edited_after_its_record_was_read("meta-stale-commit").await;
+    let (_, entry) = registry.unavailable_entry(
+        stale,
+        &crate::session::Unavailability::other(RuntimeState::Reconnecting),
+        "fixture",
+    );
+    let committed = registry
+        .commit_session_entry(&id, entry)
+        .await
+        .expect("commit the stale entry");
+
+    let expected = metadata(&[("ticket", "new")]);
+    assert_eq!(
+        committed, expected,
+        "the caller reports the committed metadata"
+    );
+    let (live, durable) = metadata_in_memory_and_store(&registry, &id, store_path).await;
+    assert_eq!((live, durable), (expected.clone(), expected));
+}
+
+/// A supervision retry classifies a record it read before an edit without
+/// writing the older metadata over the edit.
+#[tokio::test]
+async fn a_classification_of_a_record_read_before_a_metadata_edit_keeps_the_edit() {
+    let (registry, id, stale, store_path) =
+        session_edited_after_its_record_was_read("meta-stale-classify").await;
+    assert!(
+        registry
+            .insert_unavailable_record(stale, RuntimeState::Reconnecting, "fixture")
+            .await,
+        "the classification is committed"
+    );
+
+    let expected = metadata(&[("ticket", "new")]);
+    let (live, durable) = metadata_in_memory_and_store(&registry, &id, store_path).await;
+    assert_eq!((live, durable), (expected.clone(), expected));
+}
+
 #[tokio::test]
 async fn operations_on_an_unknown_session_return_session_not_found() {
     let registry = SessionRegistry::default();

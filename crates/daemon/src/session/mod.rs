@@ -735,7 +735,10 @@ struct SessionRegistryInner {
     /// (or two resizes) racing on the same session cannot leave a stale binding:
     /// each persister re-reads current state under this lock, so the last writer
     /// wins with the freshest size. Held across the (blocking) store I/O instead
-    /// of the sessions lock, keeping that hot lock free of binding writes.
+    /// of the sessions lock, keeping that hot lock free of binding writes. It
+    /// also serializes every unconditional session-record write against
+    /// [`SessionRegistry::set_metadata`], so a metadata edit is never overwritten
+    /// by a record built from an earlier snapshot.
     persist_lock: Mutex<()>,
     /// Test hook that drops every resume-binding write, standing for a daemon
     /// that died between the session record and its projection.
@@ -1747,7 +1750,8 @@ impl SessionRegistry {
         }
     }
 
-    async fn write_session_record(&self, record: SessionRecord) -> Result<(), ProtocolError> {
+    /// Writes `record` to the store as it is. Callers hold `persist_lock`.
+    async fn store_session_record(&self, record: SessionRecord) -> Result<(), ProtocolError> {
         let Some(store) = self.inner.store.clone() else {
             return Ok(());
         };
@@ -1787,6 +1791,71 @@ impl SessionRegistry {
             })
     }
 
+    /// Writes `record` under `persist_lock`, carrying the metadata of the
+    /// session's registered entry into it (see [`Self::carry_registered_metadata`]).
+    ///
+    /// Every unconditional record write goes through here or through
+    /// [`Self::write_record_and_install`] or [`Self::write_entry_record`]; a
+    /// write conditional on the durable record is a compare-and-swap in the
+    /// store and needs none of them.
+    async fn write_session_record(&self, mut record: SessionRecord) -> Result<(), ProtocolError> {
+        let _persist = self.inner.persist_lock.lock().await;
+        self.carry_registered_metadata(&mut record, None).await;
+        self.store_session_record(record).await
+    }
+
+    /// Writes `record` and installs `entry` for `id`, with `persist_lock` held
+    /// across both and the metadata of the entry being replaced carried into
+    /// the record and the new entry.
+    ///
+    /// Returns the metadata the installed entry holds, which a caller that
+    /// already built a `SessionInfo` from `entry` must use in place of the
+    /// metadata it read.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error of [`Self::store_session_record`]; the entry is
+    /// not installed then.
+    async fn write_record_and_install(
+        &self,
+        id: &SessionId,
+        mut record: SessionRecord,
+        mut entry: SessionEntry,
+    ) -> Result<BTreeMap<String, String>, ProtocolError> {
+        let _persist = self.inner.persist_lock.lock().await;
+        self.carry_registered_metadata(&mut record, Some(&mut entry))
+            .await;
+        self.store_session_record(record).await?;
+        let installed = entry.info.metadata.clone();
+        self.install_session_entry(id, entry).await;
+        Ok(installed)
+    }
+
+    /// Replaces the metadata of `record` (and of `entry`, when given) with the
+    /// metadata of the entry registered for the same session, if any.
+    ///
+    /// A record rebuilt from an earlier snapshot (a relaunch, a supervision
+    /// retry) would otherwise carry the metadata of that snapshot over an edit
+    /// [`Self::set_metadata`] committed meanwhile. Callers hold `persist_lock`,
+    /// which `set_metadata` holds from its merge through its store write.
+    async fn carry_registered_metadata(
+        &self,
+        record: &mut SessionRecord,
+        entry: Option<&mut SessionEntry>,
+    ) {
+        let sessions = self.inner.sessions.lock().await;
+        let Some(registered) = sessions.get(&SessionId(record.session_id.clone())) else {
+            return;
+        };
+        record.info.metadata.clone_from(&registered.info.metadata);
+        if let Some(recovery) = record.recovery.as_mut() {
+            recovery.metadata.clone_from(&registered.info.metadata);
+        }
+        if let Some(entry) = entry {
+            entry.info.metadata.clone_from(&registered.info.metadata);
+        }
+    }
+
     /// Builds the record of the registered session `id` and writes it, with
     /// `persist_lock` held from before the snapshot until the write returns.
     ///
@@ -1794,15 +1863,12 @@ impl SessionRegistry {
     /// store write, so a metadata edit lands either before the snapshot (and
     /// the record carries it) or after the write (and replaces the record's
     /// metadata); it never lands in between and loses to the older snapshot.
-    /// The removal intent and the recovery rollback write through here. A
-    /// write conditional on the durable record needs no such lock; the
-    /// relaunch of a resume and the supervision retry rebuild a record
-    /// without it.
+    /// The removal intent and the recovery rollback write through here.
     ///
     /// # Errors
     ///
     /// Returns `session_not_found` when `id` is not registered, or the store
-    /// error of [`Self::write_session_record`].
+    /// error of [`Self::store_session_record`].
     async fn write_entry_record(
         &self,
         id: &SessionId,
@@ -1814,11 +1880,12 @@ impl SessionRegistry {
             let entry = sessions
                 .get_mut(id)
                 .ok_or_else(|| session_not_found(&id.0))?;
-            build(entry)
+            let record = build(entry);
+            #[cfg(test)]
+            self.hold_entry_record_write().await;
+            record
         };
-        #[cfg(test)]
-        self.hold_entry_record_write().await;
-        self.write_session_record(record).await
+        self.store_session_record(record).await
     }
 
     async fn write_session_record_if_current(
@@ -5185,8 +5252,8 @@ impl SessionRegistry {
         idle_stop::validate_opt_in(&patch, self.inner.config.idle_stop_min_secs)?;
         // `persist_lock` is held from the merge through the store write to the
         // in-memory edit, and the sessions lock is held across them, so a record
-        // writer that goes through [`Self::write_entry_record`] cannot
-        // interleave and write the previous metadata over the edit.
+        // unconditional record writer cannot interleave and write the previous
+        // metadata over the edit.
         let persist = self.inner.persist_lock.lock().await;
         let (info, has_native) = {
             let mut sessions = self.inner.sessions.lock().await;

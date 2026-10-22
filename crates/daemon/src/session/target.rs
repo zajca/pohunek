@@ -976,7 +976,7 @@ impl SessionRegistry {
         let root_pid = started.root_process.pid;
 
         let now = timestamp_now();
-        let info = SessionInfo {
+        let mut info = SessionInfo {
             id: id.clone(),
             external: Some(false),
             capabilities,
@@ -1062,29 +1062,33 @@ impl SessionRegistry {
             initial_input_owner: initial_input_pending
                 .then(|| self.daemon_instance_id().to_owned()),
         };
-        if let Err(error) = self.commit_session_entry(&id, entry).await {
-            self.stop_uncommitted_runtime(&id, &started.handle).await;
-            return Err(match lifecycle.abandon(&generation, error).await {
-                cleaned @ LaunchFailure::Cleaned(_) => cleaned,
-                LaunchFailure::Unavailable(error) => {
-                    // The half-launched runtime could not be retired, so the
-                    // job may still be live; the preparing record stays
-                    // classified for reconciliation instead of being deleted
-                    // or killed.
-                    // The retry is scheduled whether or not the listing was
-                    // committed.
-                    let _persisted = self
-                        .insert_unavailable_record(
-                            preparing_record,
-                            RuntimeState::Reconnecting,
-                            SUPERVISION_UNAVAILABLE,
-                        )
-                        .await;
-                    self.schedule_supervision_retry(&id);
-                    LaunchFailure::Unavailable(error)
-                }
-            });
-        }
+        let committed_metadata = match self.commit_session_entry(&id, entry).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.stop_uncommitted_runtime(&id, &started.handle).await;
+                return Err(match lifecycle.abandon(&generation, error).await {
+                    cleaned @ LaunchFailure::Cleaned(_) => cleaned,
+                    LaunchFailure::Unavailable(error) => {
+                        // The half-launched runtime could not be retired, so the
+                        // job may still be live; the preparing record stays
+                        // classified for reconciliation instead of being deleted
+                        // or killed.
+                        // The retry is scheduled whether or not the listing was
+                        // committed.
+                        let _persisted = self
+                            .insert_unavailable_record(
+                                preparing_record,
+                                RuntimeState::Reconnecting,
+                                SUPERVISION_UNAVAILABLE,
+                            )
+                            .await;
+                        self.schedule_supervision_retry(&id);
+                        LaunchFailure::Unavailable(error)
+                    }
+                });
+            }
+        };
+        info.metadata = committed_metadata;
         if prompt_in_argv {
             self.inner.turns.note_input(&id);
         }
@@ -1137,11 +1141,9 @@ impl SessionRegistry {
         &self,
         id: &SessionId,
         entry: SessionEntry,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<BTreeMap<String, String>, ProtocolError> {
         let committed = Self::session_record(id, &entry, DesiredState::Running, None);
-        self.write_session_record(committed).await?;
-        self.install_session_entry(id, entry).await;
-        Ok(())
+        self.write_record_and_install(id, committed, entry).await
     }
 
     async fn stop_uncommitted_runtime(&self, id: &SessionId, runtime: &RuntimeHandle) {

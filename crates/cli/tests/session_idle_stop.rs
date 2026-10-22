@@ -20,6 +20,9 @@ const MIN_SECS: u64 = 60;
 /// The version the fixture daemon reports in `daemon.health`.
 const FIXTURE_DAEMON_VERSION: &str = "0.35.2";
 
+/// A daemon version older than every CLI release the workspace builds.
+const OLDER_DAEMON_VERSION: &str = "0.1.0";
+
 /// A default well above the minimum.
 const DEFAULT_SECS: u64 = 900;
 
@@ -190,6 +193,7 @@ enum IdleStop {
 fn serve_fixture_daemon(
     listener: UnixListener,
     idle_stop: IdleStop,
+    daemon_version: &'static str,
 ) -> std::thread::JoinHandle<Vec<String>> {
     std::thread::spawn(move || {
         let mut methods = Vec::new();
@@ -221,7 +225,7 @@ fn serve_fixture_daemon(
                         request.id(),
                         json!({
                             "status": "ok",
-                            "daemon_version": FIXTURE_DAEMON_VERSION,
+                            "daemon_version": daemon_version,
                             "protocol_version": PROTOCOL_VERSION.get(),
                         }),
                     ),
@@ -303,11 +307,36 @@ fn end_fixture_daemon(
     server.join().expect("the fixture daemon ends")
 }
 
+/// A daemon older than the CLI is pointed at the CLI's release.
+#[test]
+fn an_older_daemon_is_told_to_upgrade_to_the_cli_release() {
+    let env = TestEnv::new().expect("private CLI environment");
+    let (listener, socket) = bind_fixture_socket(&env);
+    let server = serve_fixture_daemon(listener, IdleStop::Unknown, OLDER_DAEMON_VERSION);
+
+    let (code, refused) = run_cli(
+        &env,
+        &["session", "policy", "set", "--idle-stop-after", "900"],
+    );
+    end_fixture_daemon(server, &socket);
+
+    assert_ne!(code, Some(0), "{refused}");
+    assert!(
+        refused["err"]["recover"].as_str().is_some_and(|hint| hint
+            .contains(&format!("(version {OLDER_DAEMON_VERSION})"))
+            && hint.contains(&format!(
+                "to this CLI's release ({})",
+                env!("CARGO_PKG_VERSION")
+            ))),
+        "{refused}"
+    );
+}
+
 #[test]
 fn a_daemon_of_the_previous_release_refuses_the_idle_default_and_keeps_its_retention_policy() {
     let env = TestEnv::new().expect("private CLI environment");
     let (listener, socket) = bind_fixture_socket(&env);
-    let server = serve_fixture_daemon(listener, IdleStop::Unknown);
+    let server = serve_fixture_daemon(listener, IdleStop::Unknown, FIXTURE_DAEMON_VERSION);
 
     // Naming a retention field beside the idle default writes nothing.
     let (code, refused) = run_cli(
@@ -328,10 +357,8 @@ fn a_daemon_of_the_previous_release_refuses_the_idle_default_and_keeps_its_reten
             .as_str()
             .is_some_and(|hint| hint.contains("upgrade the daemon")
                 && hint.contains(&format!("(version {FIXTURE_DAEMON_VERSION})"))
-                && hint.contains(&format!(
-                    "to this CLI's release ({})",
-                    env!("CARGO_PKG_VERSION")
-                ))
+                && hint.contains("to a release that includes it")
+                && !hint.contains("this CLI's release")
                 && hint.contains("Nothing was changed")),
         "{refused}"
     );
@@ -373,7 +400,7 @@ fn a_daemon_of_the_previous_release_refuses_the_idle_default_and_keeps_its_reten
 fn a_refused_idle_default_after_the_retention_write_says_which_half_landed() {
     let env = TestEnv::new().expect("private CLI environment");
     let (listener, socket) = bind_fixture_socket(&env);
-    let server = serve_fixture_daemon(listener, IdleStop::WriteFails);
+    let server = serve_fixture_daemon(listener, IdleStop::WriteFails, FIXTURE_DAEMON_VERSION);
 
     let (code, failed) = run_cli(
         &env,
