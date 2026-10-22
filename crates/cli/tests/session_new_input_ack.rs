@@ -28,6 +28,9 @@ const PRIVATE_DIR_MODE: u32 = 0o700;
 /// Id of the session the fixture daemon reports as created.
 const SESSION_ID: &str = "s-ack-1";
 
+/// Commit the fixture daemon reports a remote-mode worktree started at.
+const REMOTE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
 /// Requests the fixture daemon served: method and params, in arrival order.
 type Served = Arc<Mutex<Vec<(String, Value)>>>;
 
@@ -35,6 +38,7 @@ type Served = Arc<Mutex<Vec<(String, Value)>>>;
 #[derive(Clone, Copy)]
 struct Daemon {
     ack_supported: bool,
+    branch_source_supported: bool,
     prompt_delivered: Option<bool>,
 }
 
@@ -53,10 +57,13 @@ fn capabilities(daemon: Daemon) -> Value {
     if daemon.ack_supported {
         value["session_new_input_ack_supported"] = json!(true);
     }
+    if daemon.branch_source_supported {
+        value["session_new_branch_source_supported"] = json!(true);
+    }
     value
 }
 
-fn session_new_result(daemon: Daemon) -> Value {
+fn session_new_result(request: &Request, daemon: Daemon) -> Value {
     let mut value = json!({
         "id": SESSION_ID,
         "agent": "shell",
@@ -75,6 +82,9 @@ fn session_new_result(daemon: Daemon) -> Value {
     if let Some(delivered) = daemon.prompt_delivered {
         value["prompt_delivered"] = json!(delivered);
     }
+    if request.params()["branch_source"] == "remote" {
+        value["worktree_source"] = json!({"ref": "origin/feat", "commit": REMOTE_COMMIT});
+    }
     value
 }
 
@@ -86,7 +96,7 @@ fn result_for(request: &Request, daemon: Daemon) -> Value {
             "protocol_version": PROTOCOL_VERSION.get()
         }),
         protocol::method::HOST_INSPECT => capabilities(daemon),
-        protocol::method::SESSION_NEW => session_new_result(daemon),
+        protocol::method::SESSION_NEW => session_new_result(request, daemon),
         other => panic!("the CLI sent an unexpected request: {other}"),
     }
 }
@@ -215,6 +225,7 @@ fn run_local_with(input_args: &[&str], stdin: Option<&str>, args: &[&str], daemo
 
 const ACK_DAEMON: Daemon = Daemon {
     ack_supported: true,
+    branch_source_supported: true,
     prompt_delivered: Some(true),
 };
 
@@ -299,6 +310,7 @@ fn a_host_without_the_capability_is_refused_before_a_session_is_created() {
         &["--input-ack-timeout-ms", "500", "--json"],
         Daemon {
             ack_supported: false,
+            branch_source_supported: true,
             prompt_delivered: None,
         },
     );
@@ -333,4 +345,85 @@ fn the_flag_needs_an_initial_input_and_a_value_in_range() {
         served.lock().expect("served requests").is_empty(),
         "a usage error contacts no daemon"
     );
+}
+
+/// Arguments that start the session from `origin/feat` and ask for the
+/// acknowledgement, both capability-gated through one `host.inspect`.
+const FROM_REMOTE_ACK_ARGS: [&str; 7] = [
+    "--repo",
+    "/srv/repo",
+    "--branch",
+    "feat",
+    "--from-remote",
+    "--input-ack-timeout-ms",
+    "250",
+];
+
+fn host_inspect_calls(run: &Run) -> usize {
+    run.served
+        .iter()
+        .filter(|(method, _)| method == protocol::method::HOST_INSPECT)
+        .count()
+}
+
+#[test]
+fn from_remote_with_an_acknowledgement_reports_both_outcomes_in_json() {
+    let mut args = FROM_REMOTE_ACK_ARGS.to_vec();
+    args.push("--json");
+    let run = run_local(&args, ACK_DAEMON);
+
+    let document = run.document();
+    assert_eq!(document["ok"]["prompt_delivered"], true, "{document}");
+    assert_eq!(
+        document["ok"]["worktree_source"],
+        json!({"ref": "origin/feat", "commit": REMOTE_COMMIT}),
+        "{document}"
+    );
+    let params = run.session_new().expect("session.new was sent");
+    assert_eq!(params["branch_source"], "remote");
+    assert_eq!(params["input_ack_timeout_ms"], 250);
+    assert_eq!(params["input"], "hello");
+    assert_eq!(host_inspect_calls(&run), 1, "{:?}", run.served);
+}
+
+#[test]
+fn from_remote_with_an_acknowledgement_prints_both_outcomes_for_humans() {
+    let run = run_local(&FROM_REMOTE_ACK_ARGS, ACK_DAEMON);
+
+    assert!(run.output.status.success(), "{}", run.stdout());
+    for line in [
+        format!("worktree source: origin/feat at {REMOTE_COMMIT}"),
+        "prompt delivered: yes".to_owned(),
+    ] {
+        assert!(run.stdout().contains(&line), "{line:?} in {}", run.stdout());
+    }
+    assert_eq!(host_inspect_calls(&run), 1, "{:?}", run.served);
+}
+
+#[test]
+fn a_host_lacking_either_capability_is_refused_before_a_session_is_created() {
+    for (daemon, code) in [
+        (
+            Daemon {
+                branch_source_supported: false,
+                ..ACK_DAEMON
+            },
+            "session_new_branch_source_unsupported",
+        ),
+        (
+            Daemon {
+                ack_supported: false,
+                ..ACK_DAEMON
+            },
+            "session_new_input_ack_unsupported",
+        ),
+    ] {
+        let mut args = FROM_REMOTE_ACK_ARGS.to_vec();
+        args.push("--json");
+        let run = run_local(&args, daemon);
+
+        assert_eq!(run.document()["err"]["code"], code, "{}", run.stdout());
+        assert!(run.session_new().is_none(), "no session was requested");
+        assert_eq!(host_inspect_calls(&run), 1, "{:?}", run.served);
+    }
 }
