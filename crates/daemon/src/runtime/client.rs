@@ -159,6 +159,7 @@ pub struct StopWaits {
 pub(crate) struct WriteReservation {
     inner: OwnedMutexGuard<Inner>,
     request: Option<ControlRequest>,
+    worker: Worker,
 }
 
 impl Drop for WriteReservation {
@@ -655,13 +656,30 @@ impl Worker {
         fragments: Vec<InputFragment>,
     ) -> Result<WriteReservation, WorkerError> {
         let mut inner = Arc::clone(&self.inner).lock_owned().await;
+        let request = self.prepare_plan(&mut inner, fragments)?;
+        // Counted only once the reservation exists, so every failed
+        // preparation above leaves the count untouched.
+        inner.input_holds.fetch_add(1, Ordering::AcqRel);
+        Ok(WriteReservation {
+            inner,
+            request: Some(request),
+            worker: self.clone(),
+        })
+    }
+
+    /// Prepares one input plan on the locked control connection.
+    fn prepare_plan(
+        &self,
+        inner: &mut Inner,
+        fragments: Vec<InputFragment>,
+    ) -> Result<ControlRequest, WorkerError> {
         // A torn stream cannot carry the prepared plan; fail before the
         // caller starts waiting for its acknowledgement.
-        reconcile_interrupted_send(&mut inner);
+        reconcile_interrupted_send(inner);
         if inner.stream_state == StreamState::Torn {
             return Err(WorkerError::TornStream);
         }
-        let scope = scope(&inner)?;
+        let scope = scope(inner)?;
         let sequence = inner.next_write_sequence;
         inner.next_write_sequence = sequence.checked_add(1).ok_or_else(|| {
             WorkerError::Protocol("worker input sequence was exhausted".to_owned())
@@ -670,15 +688,9 @@ impl Worker {
         let plan = InputPlan::new(write_id, fragments)
             .map_err(|error| WorkerError::Protocol(error.to_string()))?;
         let request_id = self.next_request_id("write")?;
-        // Counted only once the reservation exists, so every failed
-        // preparation above leaves the count untouched.
-        inner.input_holds.fetch_add(1, Ordering::AcqRel);
-        Ok(WriteReservation {
-            inner,
-            request: Some(ControlRequest {
-                request_id,
-                kind: RequestKind::WritePlan { scope, plan },
-            }),
+        Ok(ControlRequest {
+            request_id,
+            kind: RequestKind::WritePlan { scope, plan },
         })
     }
 
@@ -1099,12 +1111,41 @@ impl WriteReservation {
     where
         F: FnOnce(),
     {
+        self.commit_retaining(send_started).await
+    }
+
+    /// [`Self::commit`] that keeps the control connection reserved, so the
+    /// caller can prepare and commit a follow-up plan with
+    /// [`Self::prepare_next`] before anything else uses the connection.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::commit`].
+    pub(crate) async fn commit_retaining<F>(&mut self, send_started: F) -> Result<u64, WorkerError>
+    where
+        F: FnOnce(),
+    {
         let request = self.request.take().expect("a reservation commits once");
         let response = exchange_locked(&mut self.inner, request, send_started).await?;
         match response {
             ResponseKind::WriteCompleted { acknowledgement } => Ok(acknowledgement.bytes_written),
             other => response_error(other),
         }
+    }
+
+    /// Prepares the next plan on the connection this reservation still holds.
+    /// The previous plan must have been committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError`] for a torn stream or invalid plan framing.
+    pub(crate) fn prepare_next(
+        &mut self,
+        fragments: Vec<InputFragment>,
+    ) -> Result<(), WorkerError> {
+        debug_assert!(self.request.is_none(), "the previous plan was committed");
+        self.request = Some(self.worker.prepare_plan(&mut self.inner, fragments)?);
+        Ok(())
     }
 }
 

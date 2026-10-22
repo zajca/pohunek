@@ -660,9 +660,10 @@ pub struct SessionInputParams {
 
 /// Optional delivery-wait contract attached to a `session.input` request.
 ///
-/// Agents that require delayed submit framing reject this contract before any
-/// input bytes are written because activity cannot be revalidated inside the
-/// worker-owned delay.
+/// Agents that require delayed submit framing are served by two daemon-paced
+/// worker writes (body, then Enter after the delay) so activity is revalidated
+/// before Enter is written. On such agents an `idle` target is satisfied only
+/// by `idle` evidence that follows `working` evidence after the submit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionInputWait.ts"))]
@@ -707,6 +708,12 @@ pub struct SessionInputResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub activity_revision: Option<ActivityRevision>,
+    /// `true` when a waited input's Enter was written and the requested
+    /// activity was observed after it. Absent for fire-and-forget input and
+    /// from daemons that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub submitted: Option<bool>,
 }
 
 /// Reports an invalid bounded-observation request.

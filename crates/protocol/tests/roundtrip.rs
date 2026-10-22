@@ -1300,6 +1300,7 @@ fn session_input_result_json_shape_roundtrips() {
         runtime: None,
         activity_epoch: None,
         activity_revision: None,
+        submitted: None,
     };
     let value = serde_json::to_value(&omitted).expect("serialize omitted input result");
     assert_eq!(value, json!({ "accepted": true }));
@@ -1316,6 +1317,7 @@ fn session_input_result_json_shape_roundtrips() {
         ),
         activity_epoch: Some("d-epoch-1".to_owned()),
         activity_revision: Some(ActivityRevision::new(7)),
+        submitted: Some(true),
     };
     let value = serde_json::to_value(&populated).expect("serialize populated input result");
     assert_eq!(
@@ -1329,7 +1331,8 @@ fn session_input_result_json_shape_roundtrips() {
                 "runtime_generation": "3"
             },
             "activity_epoch": "d-epoch-1",
-            "activity_revision": "7"
+            "activity_revision": "7",
+            "submitted": true
         })
     );
     let back = line_roundtrip(&populated);

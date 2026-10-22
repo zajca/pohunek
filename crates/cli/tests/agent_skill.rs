@@ -392,31 +392,25 @@ fn safety_predicates_survive_remote_and_value_forms() {
     );
 }
 
-/// Waited input (`--until`/`--timeout`) fails with
-/// `session_input_wait_unsupported` for the default coding agents: codex,
-/// claude, and hermes submit with a non-zero delay, and only zero-delay
-/// profiles such as `shell` support it. The artifact must explain the
-/// limitation and never recommend the waited form for a generic target.
+/// Waited input (`--until`/`--timeout`) works for the default coding agents
+/// through daemon-paced submit. The artifact must explain how to confirm the
+/// agent started (`--until working`) and what `session_input_not_submitted`
+/// means.
 #[test]
-fn session_input_examples_avoid_waited_input_for_coding_agents() {
-    for example in collect_pohunek_examples(EMBEDDED_SKILL) {
-        let Some(matches) = parse_example(example.line, &example.command) else {
-            continue;
-        };
-        let Some(("input", args)) = session_args(&matches) else {
-            continue;
-        };
+fn session_input_artifact_explains_waited_input_for_coding_agents() {
+    for needle in [
+        "--until working",
+        "submitted: true",
+        "session_input_not_submitted",
+    ] {
         assert!(
-            !supplied_on_command_line(args, "wait_until"),
-            "artifact example at line {} uses waited input, which fails with \
-             session_input_wait_unsupported for the default coding agents",
-            example.line
+            EMBEDDED_SKILL.contains(needle),
+            "artifact must explain waited input for delayed-submit agent profiles: {needle}"
         );
     }
     assert!(
-        EMBEDDED_SKILL.contains("session_input_wait_unsupported"),
-        "artifact must explain the waited-input limitation for non-zero-delay \
-         agent profiles"
+        !EMBEDDED_SKILL.contains("session_input_wait_unsupported"),
+        "the daemon no longer returns session_input_wait_unsupported"
     );
 }
 

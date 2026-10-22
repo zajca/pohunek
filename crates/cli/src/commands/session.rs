@@ -2886,9 +2886,14 @@ fn render_input_human(session_id: &str, result: &SessionInputResult) -> String {
     } else {
         "rejected"
     };
+    let submitted = if result.submitted == Some(true) {
+        " submitted=true"
+    } else {
+        ""
+    };
     match (result.activity, result.activity_source) {
         (Some(activity), Some(source)) => format!(
-            "session {session_id}: input {disposition} activity={} source={}\n",
+            "session {session_id}: input {disposition}{submitted} activity={} source={}\n",
             activity_label(activity),
             state_source_label(source)
         ),
@@ -3816,6 +3821,7 @@ mod tests {
                 runtime: None,
                 activity_epoch: None,
                 activity_revision: None,
+                submitted: None,
             },
         );
 
@@ -3839,6 +3845,7 @@ mod tests {
                 ),
                 activity_epoch: Some("d-epoch-1".to_owned()),
                 activity_revision: Some(protocol::ActivityRevision::new(2)),
+                submitted: None,
             },
         );
 

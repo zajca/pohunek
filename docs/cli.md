@@ -104,7 +104,7 @@ cannot be pinned: the operation fails before its first connection with
 | `pohunek session list` | List sessions, including a `running/recent` subagent count and a `BACKGROUND` column of compact per-kind counts of the latest background snapshot (`a` subagent, `s` shell, `m` monitor, `w` workflow, `t` teammate, `o` every other kind; zero kinds omitted; `-` when no snapshot has been reported, `0` when the latest snapshot lists no task). Example row: `2a 2s 1m`. Repeat `--filter state=running`, `--meta-eq key=value`, and `--meta-has key` to combine predicates with AND. Metadata values split at the first `=` and may be empty; keys are opaque. `-q` prints ids only. |
 | `pohunek session inspect <target>` | Full logical session record: agent state, current/recent subagents, runtime state and generation, cwd, project, branch, worktree, recovery binding. Adds `background_items` (`<none>` without a snapshot, `0` for an empty one) and `background_observed` (age of the snapshot, `<none>` without one), then one line per subagent with its background label and age, and one `background [<kind>]: <status> <program> <label> first seen >= <age>` line per other background item. An absent program or label prints `-`. Labels and programs are escaped for the terminal. |
 | `pohunek attach <target>` | Attach the current terminal; `Ctrl-]` detaches. |
-| `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing; use `--stdin` for non-argv input. `--until <activity>` (repeatable) and `--timeout <ms>` wait for the agent's reaction in the same call, for zero-delay profiles only. |
+| `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing; use `--stdin` for non-argv input. `--until <activity>` (repeatable) and `--timeout <ms>` wait for the agent's reaction in the same call; `--until working` confirms that the agent started on the input (`submitted: true`). |
 | `pohunek session screen <target>` | Read the current rendered terminal; `--json` preserves runtime identity, watermark, geometry, cursor, and visible lines. A stopped or finished session answers `session_terminal_unavailable`. |
 | `pohunek session read <target> [--source <source>] [--lines <n>] [--format <format>] [--json]` | Read a bounded terminal capture; the source defaults to the current visible screen. |
 | `pohunek session resize <target> --cols <n> --rows <n> [--json]` | Resize a managed session terminal. |
@@ -338,15 +338,18 @@ does.
 `session input` can also wait for the agent's reaction in the same call:
 `--until` names the activities that end the wait (repeatable, default `idle`
 and `blocked`) and `--timeout` bounds it to `1..8000` ms (default 8000). The
-whole wait contract is validated before any text is delivered. The waited form
-works only for agent profiles whose submit framing has no delay, such as
-`shell`: Codex, Claude Code, and Hermes submit with a delay and fail with
-`session_input_wait_unsupported` before any bytes are written. For them, send
-the input and then wait with `session wait`:
+whole wait contract is validated before any text is delivered. Agent profiles
+whose submit framing has a delay (Codex, Claude Code, Hermes) are served by two
+daemon-paced writes: the daemon types the text, waits out the delay, re-checks
+the agent, and only then presses Enter. Use `--until working` to confirm that the
+agent started on the input; an `idle` target on such a profile counts only after
+`working` followed the submit, because the prompt box reads as idle until Enter
+is written. A `--timeout` that is not longer than the profile's submit delay writes nothing and fails with `session_input_timeout`. A successful waited input reports `submitted: true`. To follow a
+whole turn, wait with `session wait`:
 
 ```bash
 pohunek session input s-01J00000000000000000000000 'make test' \
-  --until idle --timeout 5000 --json          # a zero-delay shell profile
+  --until working --timeout 5000 --json       # the agent started on it
 
 pohunek session input s-01J00000000000000000000000 'Continue.' --json
 pohunek session wait s-01J00000000000000000000000 \
@@ -354,9 +357,12 @@ pohunek session wait s-01J00000000000000000000000 \
 ```
 
 A waited input refuses a blocked agent with `session_agent_blocked`: an approval
-is pending and belongs to the operator. `session_input_timeout` means delivery
-or the target activity did not arrive before the deadline; the text may already
-have been delivered, so inspect the session instead of resending it.
+is pending and belongs to the operator. `session_input_not_submitted` means the
+agent turned blocked after the text was typed, or the deadline or a shutdown
+arrived before Enter: Enter was not written and the text may remain in the
+agent's input box (it cannot be retracted). `session_input_timeout` means
+delivery or the target activity did not arrive before the deadline; the text may
+already have been delivered, so inspect the session instead of resending it.
 `session_input_stalled` means the agent stopped reading its terminal: the PTY
 accepted no byte for `input.write_stall_timeout_ms` (service.toml, 3000 ms by
 default), and part of the text may already have reached the agent. See

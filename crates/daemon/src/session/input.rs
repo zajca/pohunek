@@ -2,7 +2,9 @@
 
 use pohunek_worker_protocol::{InputFragment as WorkerInputFragment, SecretBytes};
 
-use protocol::{ActivityRevision, AgentStateEvent, SessionRuntimeIdentity};
+use protocol::{
+    ActivityRevision, AgentStateEvent, InputNotSubmittedReason, SessionRuntimeIdentity,
+};
 
 use crate::agent::host::{RuntimeDefinition, RuntimeHost};
 use crate::runtime::WriteReservation;
@@ -36,12 +38,83 @@ pub(super) struct InputSubmission {
     pub(super) activity_epoch: String,
     pub(super) after_revision: ActivityRevision,
     pub(super) deadline: tokio::time::Instant,
+    /// Delayed-submit framing: until Enter is written the prompt box still
+    /// shows the typed text and reads as `idle`, so an `idle` target counts
+    /// only after `working` evidence above `after_revision`.
+    pub(super) idle_requires_working: bool,
+}
+
+/// Phase of a daemon-paced submit that the waiting caller and the writing
+/// task agree on without a lock. A caller that gives up before Enter claims
+/// the submit guarantees Enter is never written.
+#[derive(Debug, Default)]
+struct SubmitProgress {
+    state: std::sync::atomic::AtomicU8,
+    abandon: tokio_util::sync::CancellationToken,
+    reason: std::sync::OnceLock<InputNotSubmittedReason>,
+}
+
+impl SubmitProgress {
+    const BODY_PHASE: u8 = 0;
+    const ENTER_CLAIMED: u8 = 1;
+    const ABANDONED: u8 = 2;
+
+    /// Claims the right to write Enter; `false` once the caller abandoned.
+    fn claim_enter(&self) -> bool {
+        self.state
+            .compare_exchange(
+                Self::BODY_PHASE,
+                Self::ENTER_CLAIMED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Stops the submit before Enter; `false` when Enter was already claimed.
+    fn abandon(&self, reason: InputNotSubmittedReason) -> bool {
+        let _ignored = self.reason.set(reason);
+        let abandoned = self
+            .state
+            .compare_exchange(
+                Self::BODY_PHASE,
+                Self::ABANDONED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok();
+        if abandoned {
+            self.abandon.cancel();
+        }
+        abandoned
+    }
+
+    fn not_submitted(&self) -> ProtocolError {
+        ProtocolError::session_input_not_submitted(
+            self.reason
+                .get()
+                .copied()
+                .unwrap_or(InputNotSubmittedReason::DeadlineElapsed),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct InputWritePlan {
     pub(super) body: Vec<u8>,
     pub(super) submit_delay: Duration,
+}
+
+impl InputSubmission {
+    /// The deadline error: delayed-submit input reports that Enter was
+    /// written, since the submission exists only once its Enter was acknowledged.
+    fn timeout_error(&self, session_id: &SessionId) -> ProtocolError {
+        if self.idle_requires_working {
+            ProtocolError::session_input_timeout_after_enter(&session_id.0)
+        } else {
+            ProtocolError::session_input_timeout()
+        }
+    }
 }
 
 impl SessionRegistry {
@@ -65,6 +138,7 @@ impl SessionRegistry {
                 runtime: None,
                 activity_epoch: None,
                 activity_revision: None,
+                submitted: None,
             });
         };
 
@@ -190,6 +264,18 @@ impl SessionRegistry {
             .expect("input send hold test lock") = Some(boundary);
     }
 
+    /// Parks the next delayed-submit input between its body write and the
+    /// submit delay: the write meets `boundary` once after the body was
+    /// acknowledged and again before the delay starts.
+    #[cfg(test)]
+    pub(super) fn hold_next_submit_delay(&self, boundary: std::sync::Arc<tokio::sync::Barrier>) {
+        *self
+            .inner
+            .input_delay_hold
+            .lock()
+            .expect("input delay hold test lock") = Some(boundary);
+    }
+
     #[cfg(test)]
     fn take_input_send_hold(&self) -> Option<std::sync::Arc<tokio::sync::Barrier>> {
         self.inner
@@ -231,7 +317,23 @@ impl SessionRegistry {
             (worker, entry.input_rules, runtime)
         };
         let writes = build_input_writes(text, rules)?;
-        validate_wait_framing(writes.submit_delay)?;
+        if !writes.submit_delay.is_zero() {
+            return self
+                .write_delayed_waited_input(
+                    session_id,
+                    worker,
+                    writes,
+                    DelayedSubmit {
+                        input_guard,
+                        runtime,
+                        deadline,
+                        ack_delay: plan_ack_delay,
+                    },
+                    #[cfg(test)]
+                    send_boundary,
+                )
+                .await;
+        }
         let reservation = self
             .reserve_worker_before_deadline(
                 &worker,
@@ -258,7 +360,160 @@ impl SessionRegistry {
             activity_epoch: self.daemon_instance_id().to_owned(),
             after_revision: boundary.revision,
             deadline,
+            idle_requires_working: false,
         })
+    }
+
+    /// Waited input for delayed-submit framing: the daemon writes the body,
+    /// waits out the delay, re-checks the agent and only then writes Enter, so
+    /// a prompt that appears during the delay is never answered by Enter.
+    /// The session input gate and the worker connection stay held across both
+    /// writes.
+    async fn write_delayed_waited_input(
+        &self,
+        session_id: &SessionId,
+        worker: Worker,
+        writes: InputWritePlan,
+        submit: DelayedSubmit,
+        #[cfg(test)] send_boundary: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    ) -> Result<InputSubmission, ProtocolError> {
+        let DelayedSubmit {
+            input_guard,
+            runtime,
+            deadline,
+            ack_delay,
+        } = submit;
+        let delay = writes.submit_delay;
+        let reservation = self
+            .reserve_worker_before_deadline(&worker, vec![body_fragment(writes.body)], deadline)
+            .await?;
+        let progress = std::sync::Arc::new(SubmitProgress::default());
+        let (body_started_tx, body_started_rx) = tokio::sync::oneshot::channel();
+        let mut write = tokio::spawn(run_delayed_submit(
+            self.clone(),
+            DelayedSubmitRun {
+                session_id: session_id.clone(),
+                runtime: runtime.clone(),
+                delay,
+                ack_delay,
+                deadline,
+                progress: std::sync::Arc::clone(&progress),
+                body_started_tx,
+                #[cfg(test)]
+                send_boundary,
+                #[cfg(test)]
+                delay_boundary: self
+                    .inner
+                    .input_delay_hold
+                    .lock()
+                    .expect("input delay hold test lock")
+                    .take(),
+            },
+            reservation,
+            input_guard,
+        ));
+        tokio::pin!(body_started_rx);
+
+        tokio::select! {
+            biased;
+            started = &mut body_started_rx => {
+                if started.is_err() {
+                    let boundary = worker_write_task_result(write.await)?;
+                    return self.delayed_submission(session_id, runtime, boundary, deadline).await;
+                }
+            }
+            result = &mut write => {
+                let boundary = worker_write_task_result(result)?;
+                return self.delayed_submission(session_id, runtime, boundary, deadline).await;
+            }
+            () = self.inner.daemon_shutdown.cancelled() => {
+                write.abort();
+                let _result = write.await;
+                return Err(input_wait_shutdown_error(
+                    "daemon shutdown cancelled input before worker delivery",
+                ));
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                write.abort();
+                let _result = write.await;
+                return Err(ProtocolError::session_input_timeout());
+            }
+        }
+
+        let result = tokio::select! {
+            biased;
+            result = &mut write => worker_write_task_result(result),
+            () = self.inner.daemon_shutdown.cancelled() => {
+                return Err(Self::give_up_delayed_submit(
+                    write,
+                    &progress,
+                    InputNotSubmittedReason::DaemonShuttingDown,
+                    input_wait_shutdown_error(
+                        "daemon shutdown cancelled input after worker delivery began",
+                    ),
+                ));
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(Self::give_up_delayed_submit(
+                    write,
+                    &progress,
+                    InputNotSubmittedReason::DeadlineElapsed,
+                    ProtocolError::session_input_timeout(),
+                ));
+            }
+        };
+        self.delayed_submission(session_id, runtime, result?, deadline)
+            .await
+    }
+
+    async fn delayed_submission(
+        &self,
+        session_id: &SessionId,
+        runtime: SessionRuntimeIdentity,
+        boundary: InputActivitySnapshot,
+        deadline: tokio::time::Instant,
+    ) -> Result<InputSubmission, ProtocolError> {
+        self.input_activity_snapshot(session_id, Some(&runtime))
+            .await?;
+        Ok(InputSubmission {
+            runtime,
+            activity_epoch: self.daemon_instance_id().to_owned(),
+            after_revision: boundary.revision,
+            deadline,
+            idle_requires_working: true,
+        })
+    }
+
+    /// Ends a delayed submit whose caller ran out of time. Before Enter is
+    /// claimed the submit stops with `session_input_not_submitted`; once Enter
+    /// was claimed its acknowledgement is consumed in the background and the
+    /// caller gets `after_enter`.
+    fn give_up_delayed_submit(
+        write: tokio::task::JoinHandle<Result<InputActivitySnapshot, ProtocolError>>,
+        progress: &SubmitProgress,
+        reason: InputNotSubmittedReason,
+        after_enter: ProtocolError,
+    ) -> ProtocolError {
+        if progress.abandon(reason) {
+            tokio::spawn(async move {
+                match write.await {
+                    Ok(Err(error)) if error.code == "session_input_not_submitted" => {}
+                    Ok(Err(error)) => warn!(
+                        error = %error,
+                        "worker input failed after the submit was abandoned before Enter"
+                    ),
+                    Ok(Ok(_boundary)) => warn!("Enter was written after the submit was abandoned"),
+                    Err(error) => warn!(
+                        error = %error,
+                        "worker input task failed after the submit was abandoned before Enter"
+                    ),
+                }
+            });
+            ProtocolError::session_input_not_submitted(reason)
+        } else {
+            shield_worker_ack(write);
+            after_enter
+        }
     }
 
     async fn input_gate(
@@ -432,7 +687,7 @@ impl SessionRegistry {
                     {
                         return Ok(result);
                     }
-                    return Err(ProtocolError::session_input_timeout());
+                    return Err(submission.timeout_error(session_id));
                 }
                 received = events.recv() => match received {
                     Err(broadcast::error::RecvError::Closed) => {
@@ -504,16 +759,34 @@ impl SessionRegistry {
         if current_runtime != submission.runtime {
             return Err(ProtocolError::session_runtime_changed());
         }
+        let after_submit = |evidence: &&ActivityEvidence| {
+            evidence.runtime == submission.runtime
+                && evidence.activity_epoch == submission.activity_epoch
+                && evidence.revision > submission.after_revision
+                && evidence.observed_at <= submission.deadline
+        };
+        let first_working = submission
+            .idle_requires_working
+            .then(|| {
+                entry
+                    .activity_evidence
+                    .iter()
+                    .filter(after_submit)
+                    .filter(|evidence| evidence.activity == AgentActivity::Working)
+                    .map(|evidence| evidence.revision)
+                    .min()
+            })
+            .flatten();
         Ok(entry
             .activity_evidence
             .iter()
+            .filter(after_submit)
             .filter(|evidence| {
-                evidence.runtime == submission.runtime
-                    && evidence.activity_epoch == submission.activity_epoch
-                    && evidence.revision > submission.after_revision
-                    && evidence.observed_at <= submission.deadline
-                    && targets.contains(&evidence.activity)
+                targets.contains(&evidence.activity)
                     && event_revision.is_none_or(|revision| evidence.revision == revision)
+                    && (!submission.idle_requires_working
+                        || evidence.activity != AgentActivity::Idle
+                        || first_working.is_some_and(|working| working < evidence.revision))
             })
             .min_by_key(|evidence| evidence.revision)
             .cloned()
@@ -589,6 +862,7 @@ fn input_wait_result(evidence: ActivityEvidence) -> SessionInputResult {
         runtime: Some(evidence.runtime),
         activity_epoch: Some(evidence.activity_epoch),
         activity_revision: Some(evidence.revision),
+        submitted: Some(true),
     }
 }
 
@@ -723,12 +997,127 @@ fn reject_blocked_wait(activity: Option<AgentActivity>) -> Result<(), ProtocolEr
     }
 }
 
-fn validate_wait_framing(submit_delay: Duration) -> Result<(), ProtocolError> {
-    if submit_delay.is_zero() {
-        Ok(())
-    } else {
-        Err(ProtocolError::session_input_wait_unsupported())
+fn body_fragment(body: Vec<u8>) -> WorkerInputFragment {
+    WorkerInputFragment {
+        bytes: SecretBytes::new(body),
+        delay_after_ms: 0,
     }
+}
+
+fn enter_fragment(acknowledgement_delay: Duration) -> WorkerInputFragment {
+    WorkerInputFragment {
+        bytes: SecretBytes::new(SUBMIT.to_vec()),
+        delay_after_ms: duration_millis(acknowledgement_delay),
+    }
+}
+
+/// Everything a delayed waited input carries into its writing task.
+struct DelayedSubmit {
+    input_guard: tokio::sync::OwnedMutexGuard<()>,
+    runtime: SessionRuntimeIdentity,
+    deadline: tokio::time::Instant,
+    ack_delay: Duration,
+}
+
+struct DelayedSubmitRun {
+    session_id: SessionId,
+    runtime: SessionRuntimeIdentity,
+    delay: Duration,
+    ack_delay: Duration,
+    deadline: tokio::time::Instant,
+    progress: std::sync::Arc<SubmitProgress>,
+    body_started_tx: tokio::sync::oneshot::Sender<()>,
+    #[cfg(test)]
+    send_boundary: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    delay_boundary: Option<std::sync::Arc<tokio::sync::Barrier>>,
+}
+
+/// Writes the body, waits `delay`, re-checks the agent under the session lock
+/// and writes Enter, returning the activity boundary captured immediately
+/// before Enter's send began. The task owns the input gate until its last
+/// acknowledgement is consumed, so it outlives a caller that gave up.
+async fn run_delayed_submit(
+    registry: SessionRegistry,
+    run: DelayedSubmitRun,
+    mut reservation: WriteReservation,
+    input_guard: tokio::sync::OwnedMutexGuard<()>,
+) -> Result<InputActivitySnapshot, ProtocolError> {
+    let _input_guard = input_guard;
+    let DelayedSubmitRun {
+        session_id,
+        runtime,
+        delay,
+        ack_delay,
+        deadline,
+        progress,
+        body_started_tx,
+        #[cfg(test)]
+        send_boundary,
+        #[cfg(test)]
+        delay_boundary,
+    } = run;
+
+    let sessions = registry.inner.sessions.lock().await;
+    let entry = sessions
+        .get(&session_id)
+        .ok_or_else(|| session_not_found(&session_id.0))?;
+    let snapshot = input_activity_snapshot_for_entry(entry, &session_id, Some(&runtime))?;
+    reject_blocked_wait(snapshot.activity)?;
+    // A deadline that cannot outlast the submit delay would strand the typed
+    // body in the input box, so nothing is written.
+    if deadline.saturating_duration_since(tokio::time::Instant::now()) <= delay {
+        return Err(ProtocolError::session_input_timeout());
+    }
+    reservation
+        .commit_retaining(move || {
+            let _result = body_started_tx.send(());
+            drop(sessions);
+        })
+        .await
+        .map_err(worker_error_to_protocol)?;
+
+    #[cfg(test)]
+    if let Some(delay_boundary) = delay_boundary {
+        delay_boundary.wait().await;
+        delay_boundary.wait().await;
+    }
+    tokio::select! {
+        biased;
+        () = progress.abandon.cancelled() => return Err(progress.not_submitted()),
+        () = tokio::time::sleep(delay) => {}
+    }
+
+    let sessions = registry.inner.sessions.lock().await;
+    let entry = sessions
+        .get(&session_id)
+        .ok_or_else(|| session_not_found(&session_id.0))?;
+    let boundary = input_activity_snapshot_for_entry(entry, &session_id, Some(&runtime))?;
+    if boundary.activity == Some(AgentActivity::Blocked) {
+        return Err(ProtocolError::session_input_not_submitted(
+            InputNotSubmittedReason::AgentBlocked,
+        ));
+    }
+    reservation
+        .prepare_next(vec![enter_fragment(ack_delay)])
+        .map_err(worker_error_to_protocol)?;
+    #[cfg(test)]
+    if let Some(send_boundary) = send_boundary {
+        send_boundary.wait().await;
+        send_boundary.wait().await;
+    }
+    if !progress.claim_enter() {
+        return Err(progress.not_submitted());
+    }
+    let turns = registry.inner.turns.clone();
+    reservation
+        .commit_retaining(move || {
+            turns.note_input(&session_id);
+            drop(sessions);
+        })
+        .await
+        .map_err(worker_error_to_protocol)?;
+    Ok(boundary)
 }
 
 pub(super) fn worker_input_fragments(

@@ -4688,13 +4688,11 @@ with open({received:?}, "wb") as capture:
     let _ = handle.await;
 }
 
-/// The public waited-input result reveals whether the selected runtime's
-/// framing needs a delayed submit: a nonzero delay refuses the wait before
-/// writing, while zero can deliver and observe the fake agent's blocked OSC.
+/// Waited input through the public API under the given submit delays: the
+/// daemon delivers body and Enter for a zero and for a nonzero delay alike.
 ///
 /// With `delivered`, the capture is read once the fake agent has read the whole
-/// input, which it may still be doing when the wait times out; a refused input
-/// is never written, so its capture is read at once.
+/// input, which it may still be doing when the wait times out.
 async fn waited_input_with_host_submit_delay(
     runtime: RuntimeRef,
     host_delay: Duration,
@@ -4820,12 +4818,14 @@ async fn host_zero_submit_delay_does_not_override_non_opted_in_codex() {
         return;
     }
     let (response, captured) =
-        waited_input_with_host_submit_delay(RuntimeRef::codex(), Duration::ZERO, None, false).await;
+        waited_input_with_host_submit_delay(RuntimeRef::codex(), Duration::ZERO, None, true).await;
     let error = response
         .into_result()
-        .expect_err("Codex keeps its descriptor delay");
-    assert_eq!(error.code, "session_input_wait_unsupported");
-    assert_eq!(captured, Some(Vec::new()));
+        .expect_err("the fake agent leaves the activity wait incomplete");
+    assert_eq!(error.code, "session_input_timeout");
+    // Codex frames the body as a bracketed paste, so the fake agent's first
+    // six bytes are the paste start.
+    assert_eq!(captured, Some(b"\x1b[200~".to_vec()));
 }
 
 #[tokio::test]
@@ -4837,14 +4837,14 @@ async fn per_runtime_submit_delay_override_wins_over_host_zero() {
         RuntimeRef::claude(),
         Duration::ZERO,
         Some(Duration::from_millis(40)),
-        false,
+        true,
     )
     .await;
     let error = response
         .into_result()
-        .expect_err("per-runtime delay takes precedence");
-    assert_eq!(error.code, "session_input_wait_unsupported");
-    assert_eq!(captured, Some(Vec::new()));
+        .expect_err("the fake agent leaves the activity wait incomplete");
+    assert_eq!(error.code, "session_input_timeout");
+    assert_eq!(captured, Some(b"hello\r".to_vec()));
 }
 
 #[tokio::test]

@@ -6990,6 +6990,15 @@ async fn rejected_input_is_no_evidence_for_a_turn() {
     let mut create = params();
     create.agent = "input-wait-codex".to_owned();
     let created = registry.create(create).await.expect("create agent session");
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .expect("session entry")
+        .info
+        .activity = Some(AgentActivity::Blocked);
 
     let error = registry
         .input(protocol::SessionInputParams {
@@ -7001,8 +7010,8 @@ async fn rejected_input_is_no_evidence_for_a_turn() {
             }),
         })
         .await
-        .expect_err("delayed provider wait must fail before delivery");
-    assert_eq!(error.code, "session_input_wait_unsupported");
+        .expect_err("blocked wait must fail before delivery");
+    assert_eq!(error.code, "session_agent_blocked");
 
     registry
         .record_activity(&created.id, transition(AgentActivity::Working))
@@ -7018,56 +7027,395 @@ async fn rejected_input_is_no_evidence_for_a_turn() {
     let _ = registry.stop(&created.id).await;
 }
 
-#[tokio::test]
-async fn session_input_wait_rejects_delayed_provider_framing_before_delivery() {
-    let agents_dir = temp_agents_dir_with(
-        "input-wait-delayed-provider",
-        "input-wait-codex",
-        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
-    );
+const DELAYED_SUBMIT_TUI: &str = "while IFS= read -r line; do echo got:$line; done";
+
+/// Registry with a `delayed-codex` and a `delayed-claude` profile whose fake
+/// TUI answers `got:<line>` only once it receives Enter, so the screen shows
+/// whether Enter was written.
+fn delayed_submit_registry(tag: &str) -> SessionRegistry {
+    let body = format!("program = \"/bin/sh\"\nargs = [\"-c\", '{DELAYED_SUBMIT_TUI}']\n");
+    let agents_dir =
+        temp_agents_dir_with(tag, "delayed-codex", &format!("base = \"codex\"\n{body}"));
     std::fs::write(
-        agents_dir.join("input-wait-claude.toml"),
-        pin_official_base("base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n"),
+        agents_dir.join("delayed-claude.toml"),
+        pin_official_base(&format!("base = \"claude\"\n{body}")),
     )
     .expect("write Claude profile");
-    let registry = SessionRegistry::new(SessionRegistryConfig {
+    SessionRegistry::new(SessionRegistryConfig {
         shell_command: hermetic_shell(),
         agents_dir: Some(agents_dir),
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
-    });
+    })
+}
 
-    for agent in ["input-wait-codex", "input-wait-claude"] {
-        let mut create = params();
-        create.agent = agent.to_owned();
-        let created = registry.create(create).await.expect("create agent session");
-        let marker = format!("unsafe-wait-{agent}");
+async fn create_delayed_session(registry: &SessionRegistry, agent: &str) -> SessionId {
+    let mut create = params();
+    create.agent = agent.to_owned();
+    registry
+        .create(create)
+        .await
+        .expect("create delayed-submit session")
+        .id
+}
 
-        let error = registry
-            .input(protocol::SessionInputParams {
-                session_id: created.id.clone(),
-                text: marker.clone(),
-                wait: Some(protocol::SessionInputWait {
-                    until: Some(Vec::new()),
-                    timeout_ms: Some(500),
-                }),
-            })
+fn spawn_waited_input(
+    registry: &SessionRegistry,
+    session_id: &SessionId,
+    text: &str,
+    until: Vec<AgentActivity>,
+    timeout_ms: u32,
+) -> tokio::task::JoinHandle<Result<protocol::SessionInputResult, protocol::ProtocolError>> {
+    tokio::spawn({
+        let registry = registry.clone();
+        let session_id = session_id.clone();
+        let text = text.to_owned();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id,
+                    text,
+                    wait: Some(protocol::SessionInputWait {
+                        until: Some(until),
+                        timeout_ms: Some(timeout_ms),
+                    }),
+                })
+                .await
+        }
+    })
+}
+
+#[tokio::test]
+async fn delayed_wait_input_reports_submitted_once_the_agent_works() {
+    let registry = delayed_submit_registry("delayed-wait-working");
+    for agent in ["delayed-codex", "delayed-claude"] {
+        let id = create_delayed_session(&registry, agent).await;
+        let request = spawn_waited_input(
+            &registry,
+            &id,
+            "ack-marker",
+            vec![AgentActivity::Working],
+            5_000,
+        );
+        wait_for_session_output(&registry, &id, &["got:"]).await;
+        assert!(
+            report_input_activity(&registry, &id, AgentActivity::Working, 1)
+                .await
+                .recorded,
+            "agent={agent}"
+        );
+
+        let result = request
             .await
-            .expect_err("delayed provider wait must fail before delivery");
-
-        assert_eq!(error.code, "session_input_wait_unsupported");
-        registry
-            .input(protocol::SessionInputParams {
-                session_id: created.id.clone(),
-                text: "next-input".to_owned(),
-                wait: None,
-            })
-            .await
-            .expect("fire-and-forget keeps provider framing");
-        let output = wait_for_session_output(&registry, &created.id, &["got:next-input"]).await;
-        assert!(!output.contains(&marker), "output={output:?}");
-        let _ = registry.stop(&created.id).await;
+            .expect("waited input task joins")
+            .expect("working after Enter acknowledges the input");
+        assert_eq!(result.submitted, Some(true), "agent={agent}");
+        assert_eq!(
+            result.activity,
+            Some(AgentActivity::Working),
+            "agent={agent}"
+        );
+        assert!(result.activity_revision.is_some(), "agent={agent}");
+        let _ = registry.stop(&id).await;
     }
+}
+
+#[tokio::test]
+async fn delayed_wait_input_times_out_after_enter_when_the_agent_never_works() {
+    let registry = delayed_submit_registry("delayed-wait-timeout");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let request = spawn_waited_input(
+        &registry,
+        &id,
+        "idle-marker",
+        vec![AgentActivity::Working],
+        400,
+    );
+
+    let error = request
+        .await
+        .expect("waited input task joins")
+        .expect_err("no activity after Enter must time out");
+    assert_eq!(error.code, "session_input_timeout");
+    assert!(error.msg.contains(&id.0), "msg={}", error.msg);
+    assert!(error.msg.contains("Enter was written"), "msg={}", error.msg);
+    let output = wait_for_session_output(&registry, &id, &["got:"]).await;
+    assert!(output.contains("idle-marker"), "output={output:?}");
+    let _ = registry.stop(&id).await;
+}
+
+#[tokio::test]
+async fn delayed_wait_input_never_writes_enter_when_the_agent_blocks_during_the_delay() {
+    let registry = delayed_submit_registry("delayed-wait-blocked");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let request = spawn_waited_input(
+        &registry,
+        &id,
+        "approval-marker",
+        vec![AgentActivity::Working],
+        5_000,
+    );
+    delay_boundary.wait().await;
+    assert!(
+        report_input_activity(&registry, &id, AgentActivity::Blocked, 1)
+            .await
+            .recorded
+    );
+    delay_boundary.wait().await;
+
+    let error = request
+        .await
+        .expect("waited input task joins")
+        .expect_err("blocked agent must not receive Enter");
+    assert_eq!(error.code, "session_input_not_submitted");
+    assert!(error.msg.contains("blocked"), "msg={}", error.msg);
+    let output = read_session_output_after_rejection(&registry, &id).await;
+    assert!(
+        !output.contains("got:"),
+        "Enter reached the agent: {output:?}"
+    );
+    let _ = registry.stop(&id).await;
+}
+
+#[tokio::test]
+async fn delayed_wait_idle_target_ignores_the_pre_submit_idle_screen() {
+    let registry = delayed_submit_registry("delayed-wait-idle");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    assert!(
+        report_input_activity(&registry, &id, AgentActivity::Idle, 1)
+            .await
+            .recorded
+    );
+
+    // Default targets (idle, blocked): idle evidence without prior working
+    // evidence does not acknowledge the input.
+    let request = spawn_waited_input(&registry, &id, "idle-only", Vec::new(), 500);
+    wait_for_session_output(&registry, &id, &["got:"]).await;
+    assert!(
+        report_input_activity(&registry, &id, AgentActivity::Idle, 2)
+            .await
+            .recorded
+    );
+    let error = request
+        .await
+        .expect("waited input task joins")
+        .expect_err("idle without working must not acknowledge");
+    assert_eq!(error.code, "session_input_timeout");
+
+    let request = spawn_waited_input(&registry, &id, "worked", vec![AgentActivity::Idle], 5_000);
+    wait_for_session_output(&registry, &id, &["got:worked"]).await;
+    assert!(
+        report_input_activity(&registry, &id, AgentActivity::Working, 3)
+            .await
+            .recorded
+    );
+    assert!(
+        report_input_activity(&registry, &id, AgentActivity::Idle, 4)
+            .await
+            .recorded
+    );
+    let result = request
+        .await
+        .expect("waited input task joins")
+        .expect("idle after working acknowledges the input");
+    assert_eq!(result.activity, Some(AgentActivity::Idle));
+    assert_eq!(result.submitted, Some(true));
+    let _ = registry.stop(&id).await;
+}
+
+#[tokio::test]
+async fn delayed_wait_input_deadline_during_the_delay_leaves_the_text_unsubmitted() {
+    let registry = delayed_submit_registry("delayed-wait-deadline");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let request = spawn_waited_input(
+        &registry,
+        &id,
+        "late-marker",
+        vec![AgentActivity::Working],
+        300,
+    );
+    delay_boundary.wait().await;
+
+    let error = request
+        .await
+        .expect("waited input task joins")
+        .expect_err("deadline before Enter must not submit");
+    assert_eq!(error.code, "session_input_not_submitted");
+    delay_boundary.wait().await;
+    let output = wait_for_session_output(&registry, &id, &["late-marker"]).await;
+    assert!(
+        !output.contains("got:"),
+        "Enter reached the agent: {output:?}"
+    );
+    let _ = registry.stop(&id).await;
+}
+
+#[tokio::test]
+async fn delayed_wait_input_deadline_after_the_recheck_never_writes_enter() {
+    let registry = delayed_submit_registry("delayed-wait-claim");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let send_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_input_send(Arc::clone(&send_boundary));
+    let request = spawn_waited_input(
+        &registry,
+        &id,
+        "claim-marker",
+        vec![AgentActivity::Working],
+        300,
+    );
+    // The writing task passed its re-check and waits at the Enter boundary.
+    send_boundary.wait().await;
+
+    let error = request
+        .await
+        .expect("waited input task joins")
+        .expect_err("deadline before Enter is claimed must not submit");
+    assert_eq!(error.code, "session_input_not_submitted");
+    send_boundary.wait().await;
+    let output = wait_for_session_output(&registry, &id, &["claim-marker"]).await;
+    assert!(
+        !output.contains("got:"),
+        "Enter reached the agent: {output:?}"
+    );
+    let _ = registry.stop(&id).await;
+}
+
+#[tokio::test]
+async fn delayed_wait_input_with_a_deadline_inside_the_delay_writes_nothing() {
+    let registry = delayed_submit_registry("delayed-wait-short");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let request = spawn_waited_input(
+        &registry,
+        &id,
+        "short-marker",
+        vec![AgentActivity::Working],
+        1,
+    );
+
+    let error = request
+        .await
+        .expect("waited input task joins")
+        .expect_err("a deadline inside the submit delay must refuse before typing");
+    assert_eq!(error.code, "session_input_timeout");
+    let output = read_session_output_after_rejection(&registry, &id).await;
+    assert!(!output.contains("short-marker"), "output={output:?}");
+    let _ = registry.stop(&id).await;
+}
+
+#[tokio::test]
+async fn delayed_wait_input_shutdown_during_the_delay_leaves_the_text_unsubmitted() {
+    let registry = delayed_submit_registry("delayed-wait-shutdown");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let request = spawn_waited_input(
+        &registry,
+        &id,
+        "down-marker",
+        vec![AgentActivity::Working],
+        5_000,
+    );
+    delay_boundary.wait().await;
+    registry.begin_daemon_shutdown();
+
+    let error = request
+        .await
+        .expect("waited input task joins")
+        .expect_err("shutdown before Enter must not submit");
+    assert_eq!(error.code, "session_input_not_submitted");
+    delay_boundary.wait().await;
+    let output = wait_for_session_output(&registry, &id, &["down-marker"]).await;
+    assert!(
+        !output.contains("got:"),
+        "Enter reached the agent: {output:?}"
+    );
+    let _ = registry.stop(&id).await;
+}
+
+#[tokio::test]
+async fn delayed_wait_input_never_writes_enter_after_the_session_stopped_running() {
+    let registry = delayed_submit_registry("delayed-wait-not-running");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let request = spawn_waited_input(
+        &registry,
+        &id,
+        "gone-marker",
+        vec![AgentActivity::Working],
+        5_000,
+    );
+    delay_boundary.wait().await;
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&id)
+        .expect("session entry")
+        .info
+        .state = SessionState::Stopped;
+    delay_boundary.wait().await;
+
+    let error = request
+        .await
+        .expect("waited input task joins")
+        .expect_err("a stopped session must not receive Enter");
+    assert_eq!(error.code, "session_not_running");
+    let output = read_session_output_after_rejection(&registry, &id).await;
+    assert!(
+        !output.contains("got:"),
+        "Enter reached the agent: {output:?}"
+    );
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&id)
+        .expect("session entry")
+        .info
+        .state = SessionState::Running;
+    let _ = registry.stop(&id).await;
+}
+
+#[tokio::test]
+async fn delayed_wait_input_holds_the_session_gate_across_body_and_enter() {
+    let registry = delayed_submit_registry("delayed-wait-gate");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let request = spawn_waited_input(
+        &registry,
+        &id,
+        "first-marker",
+        vec![AgentActivity::Working],
+        5_000,
+    );
+    delay_boundary.wait().await;
+    let input_gate = {
+        let sessions = registry.inner.sessions.lock().await;
+        Arc::clone(&sessions.get(&id).expect("session entry").input_gate)
+    };
+    input_gate
+        .try_lock_owned()
+        .expect_err("the gate stays held between the body and Enter");
+    delay_boundary.wait().await;
+    wait_for_session_output(&registry, &id, &["got:"]).await;
+    assert!(
+        report_input_activity(&registry, &id, AgentActivity::Working, 1)
+            .await
+            .recorded
+    );
+    request
+        .await
+        .expect("waited input task joins")
+        .expect("working acknowledges the input");
+    let _ = registry.stop(&id).await;
 }
 
 #[tokio::test]
@@ -7281,6 +7629,7 @@ async fn session_input_wait_serializes_activity_snapshot_with_send_start() {
         .expect("post-send activity settles the wait");
 
     assert!(result.activity_revision > Some(submission.after_revision));
+    assert_eq!(result.submitted, Some(true));
     let _ = registry.stop(&created.id).await;
 }
 
@@ -7758,6 +8107,7 @@ async fn session_input_wait_timeout_recheck_rejects_evidence_after_deadline() {
         activity_epoch: registry.daemon_instance_id().to_owned(),
         after_revision: snapshot.revision,
         deadline,
+        idle_requires_working: false,
     };
     tokio::time::advance(Duration::from_millis(11)).await;
     assert!(
@@ -7812,6 +8162,7 @@ async fn session_input_wait_retains_pre_deadline_evidence_after_late_same_activi
         activity_epoch: registry.daemon_instance_id().to_owned(),
         after_revision: snapshot.revision,
         deadline,
+        idle_requires_working: false,
     };
     tokio::time::advance(Duration::from_millis(5)).await;
     assert!(
@@ -9829,6 +10180,7 @@ async fn session_input_wait_resnapshots_after_broadcast_lag() {
         activity_epoch: registry.daemon_instance_id().to_owned(),
         after_revision: submitted_revision.revision,
         deadline: tokio::time::Instant::now() + Duration::from_millis(250),
+        idle_requires_working: false,
     };
 
     let result = registry
@@ -9891,6 +10243,7 @@ async fn session_input_wait_uses_rapid_target_event_after_latest_state_changes()
         activity_epoch: registry.daemon_instance_id().to_owned(),
         after_revision: submitted.revision,
         deadline: tokio::time::Instant::now() + Duration::from_millis(250),
+        idle_requires_working: false,
     };
 
     let result = registry
@@ -10032,6 +10385,7 @@ async fn an_input_wait_into_an_idle_session_settles_on_the_restated_idle() {
         activity_epoch: registry.daemon_instance_id().to_owned(),
         after_revision: boundary.revision,
         deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+        idle_requires_working: false,
     };
 
     let waiting = {
@@ -10081,6 +10435,7 @@ async fn a_wait_on_one_session_settles_through_a_burst_of_another_sessions_event
         activity_epoch: registry.daemon_instance_id().to_owned(),
         after_revision: boundary.revision,
         deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+        idle_requires_working: false,
     };
     let waiting = {
         let registry = registry.clone();
@@ -10174,6 +10529,7 @@ async fn session_input_wait_rejects_replaced_runtime() {
         activity_epoch: registry.daemon_instance_id().to_owned(),
         after_revision: submitted.revision,
         deadline: tokio::time::Instant::now() + Duration::from_millis(250),
+        idle_requires_working: false,
     };
     let replacement = {
         let mut sessions = registry.inner.sessions.lock().await;
@@ -10224,6 +10580,7 @@ async fn session_input_wait_rejects_runtime_exit() {
         activity_epoch: registry.daemon_instance_id().to_owned(),
         after_revision: submitted.revision,
         deadline: tokio::time::Instant::now() + Duration::from_millis(250),
+        idle_requires_working: false,
     };
     registry.stop(&created.id).await.expect("stop session");
 
@@ -10263,6 +10620,7 @@ async fn duplicate_agent_report_sequence_is_idempotent_for_input_waits() {
         activity_epoch: registry.daemon_instance_id().to_owned(),
         after_revision: submitted.revision,
         deadline: tokio::time::Instant::now() + Duration::from_millis(250),
+        idle_requires_working: false,
     };
     assert!(
         report_input_activity(&registry, &created.id, AgentActivity::Idle, 7)
