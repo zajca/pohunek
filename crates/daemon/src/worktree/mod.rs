@@ -1587,9 +1587,11 @@ fn worktree_remove(repo: &Path, path: &Path) -> Result<(), String> {
 /// an add or prune (and the add's `post-checkout` hook), and an add, remove or
 /// prune waits behind an in-flight fetch, for up to that budget each. A wait
 /// that runs out is reported like the operation's own failure. The git command
-/// that follows a granted lock has its own [`GIT_COMMAND_TIMEOUT`], so one
-/// locked operation takes up to twice that bound (lock wait plus command); a
-/// fetch also runs a few unlocked git steps, each with its own bound.
+/// that follows a granted lock has its own [`GIT_COMMAND_TIMEOUT`], and so
+/// does the `git rev-parse --git-common-dir` lookup that finds the lock. One
+/// locked operation therefore takes up to three times that bound (lookup, lock
+/// wait, command); a fetch also runs a few unlocked git steps, each with its
+/// own bound.
 static ADMIN_LOCKS: Mutex<Option<HashMap<PathBuf, Arc<AdminLock>>>> = Mutex::new(None);
 
 /// The lock of one repository's `worktrees/` admin directory.

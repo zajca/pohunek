@@ -49,7 +49,7 @@ The following invariants span both domains:
 |---|---|---|
 | Standalone Unix-socket owner operation | Shipped in public protocol v4 | Existing daemon, CLI, and SDK |
 | Direct configured-overlay operation, including NetBird | Shipped in public protocol v4 | Existing daemon and clients; generic overlay work completed in [#69](https://github.com/zajca/pohunek/issues/69) |
-| Shared Linux/macOS platform, secure path, and portable filesystem contracts with native Darwin CI | Shipped; Linux and Apple Silicon macOS (deployment target 14.0, accepted on macOS 15) are supported platforms | [#95](https://github.com/zajca/pohunek/issues/95)-[#96](https://github.com/zajca/pohunek/issues/96); open macOS follow-ups [#100](https://github.com/zajca/pohunek/issues/100) and [#102](https://github.com/zajca/pohunek/issues/102)-[#105](https://github.com/zajca/pohunek/issues/105) |
+| Shared Linux/macOS platform, secure path, and portable filesystem contracts with native Darwin CI | Shipped; Linux and Apple Silicon macOS (deployment target 14.0, tested on macOS 15) are supported platforms | [#95](https://github.com/zajca/pohunek/issues/95)-[#96](https://github.com/zajca/pohunek/issues/96); open macOS follow-ups [#100](https://github.com/zajca/pohunek/issues/100) and [#102](https://github.com/zajca/pohunek/issues/102)-[#105](https://github.com/zajca/pohunek/issues/105) |
 | Local/direct-overlay browser client transport | External client in `zajca/pohunek-work`; the SDK ships the `WsTransport` client and a loopback test relay | Team web mode is separate work in [#86](https://github.com/zajca/pohunek/issues/86) |
 | Stable host identity, one exact principal-or-team owner, checked revisions, local lifecycle, and safe v4 inspection | Shipped host-local foundation; no relay API or mutation surface | [#81](https://github.com/zajca/pohunek/issues/81) |
 | Rust relay foundation: PostgreSQL, lease fencing, recovery quarantine, protected initial Owner/service-account provisioning, generic OIDC, HTTPS auth/account/credential operations, provider-neutral account linking, and native credential CLI | Implemented reduced foundation; no host link, routing, attach, or team administration API | [#85](https://github.com/zajca/pohunek/issues/85) and [#107](https://github.com/zajca/pohunek/issues/107); follow-up [#108](https://github.com/zajca/pohunek/issues/108), [#92](https://github.com/zajca/pohunek/issues/92), and [#86](https://github.com/zajca/pohunek/issues/86) |
@@ -390,8 +390,7 @@ implementation shared by both targets, and the worker's complete test suite,
 including idle-CPU and descriptor-release evidence, runs on the native runner.
 The daemon and CLI also build and test on that runner, including the
 real-launchd supervision suite. macOS on Apple Silicon is a supported
-platform. Release archives are ad-hoc
-signed and not notarized. The open items of #100 and #102-#105 are ordinary
+platform. Release archives are ad-hoc signed and not notarized. The open items of #100 and #102-#105 are ordinary
 follow-ups.
 
 The host daemon is the local control plane for one machine, written in Rust.

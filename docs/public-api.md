@@ -1582,11 +1582,12 @@ Important fields:
   and cannot be fetched fails the create with `invalid_base_branch` (it does not
   exist) or `base_branch_fetch_failed` (the fetch from `origin` failed; the
   message names git's failure). Worktree operations in one repository wait for
-  each other for up to the git command timeout, and the git command that follows
-  has its own timeout, so one operation can take up to about twice that bound (a
-  fetch also runs a few unlocked git steps, each with its own timeout); a wait
-  that runs out is reported the same way, with the text "waiting for another worktree operation
-  on the same repository" in the `fetch` warning's `detail` or in the
+  each other for up to the git command timeout; finding the lock (a
+  `git rev-parse --git-common-dir`) and the git command that follows each have
+  their own timeout, so one operation can take up to about three times that
+  bound (a fetch also runs a few unlocked git steps, each with its own
+  timeout); a wait that runs out is reported the same way, with the text
+  "waiting for another worktree operation on the same repository" in the `fetch` warning's `detail` or in the
   `base_branch_fetch_failed` message; the ordering covers one daemon only. `kind` is
   `native_recovery` for a session whose stored native recovery record could
   not be completed after an upgrade: it cannot resume or fork, `message` says to
