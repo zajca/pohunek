@@ -40,6 +40,7 @@ pub mod ledger;
 mod legacy_store;
 pub mod manager_env;
 pub mod preflight;
+mod process_group;
 pub mod record;
 pub mod report;
 mod rollback;
@@ -603,12 +604,16 @@ impl Terminal {
     ///
     /// The child may have taken it before its `exec` failed, and the spawn
     /// reaps that child, so its group has no member left. The terminal is
-    /// taken back only from a group without members, never from a live one
-    /// that took it meanwhile.
+    /// taken back only from a group without a live member, never from a live
+    /// one that took it meanwhile. `ESRCH` says the group is gone; `EPERM`
+    /// also says so on Darwin, where the terminal keeps the emptied group
+    /// findable, but it is the answer for a live group of another user as
+    /// well, so a membership query decides.
     fn recover(self) -> String {
         let stdin = std::io::stdin();
         let before = recovery_call("tcgetpgrp", || nix::unistd::tcgetpgrp(&stdin));
         let mut probe = None;
+        let mut members = None;
         let mut reclaim = None;
         if self.was_foreground() {
             if let Ok(current) = before {
@@ -616,7 +621,16 @@ impl Terminal {
                     let result =
                         recovery_call("killpg", || nix::sys::signal::killpg(current, None));
                     probe = Some(result.map_err(raw_errno));
-                    if result == Err(nix::errno::Errno::ESRCH) {
+                    let gone = match result {
+                        Err(nix::errno::Errno::ESRCH) => true,
+                        Err(nix::errno::Errno::EPERM) => {
+                            let live = live_members(current);
+                            members = Some(live.map_err(raw_errno));
+                            live == Ok(false)
+                        }
+                        _ => false,
+                    };
+                    if gone {
                         reclaim = Some(claim_from_background(&stdin, self.own));
                     }
                 }
@@ -626,7 +640,8 @@ impl Terminal {
         let after = nix::unistd::tcgetpgrp(&stdin);
         format!(
             "owner_pgid={} initial_tty={:?} initial_foreground={:?} \
-             foreground_before={:?} killpg={probe:?} reclaim=[{}] foreground_after={:?}",
+             foreground_before={:?} killpg={probe:?} live_members={members:?} \
+             reclaim=[{}] foreground_after={:?}",
             self.own,
             self.tty.map_err(raw_errno),
             self.foreground
@@ -719,17 +734,40 @@ fn raw_errno(error: nix::errno::Errno) -> i32 {
     error as i32
 }
 
-/// A failed recovery syscall, injected only into the real CLI's test build.
+/// Comma-separated recovery faults to inject, only into the real CLI's test
+/// build: `<step>` fails the step with `EINTR`, `killpg=EPERM` makes the
+/// group probe answer `EPERM`, and `members=live` makes the membership query
+/// report a live member.
 #[cfg(feature = "test-util")]
 pub const RECOVERY_FAILURE_ENV: &str = "POHUNEK_TEST_SERVICE_LOCK_RECOVERY_FAILURE";
 
+/// Whether the test build injects the fault `name`.
+#[cfg(feature = "test-util")]
+fn injected(name: &str) -> bool {
+    std::env::var(RECOVERY_FAILURE_ENV).is_ok_and(|faults| faults.split(',').any(|f| f == name))
+}
+
 fn recovery_call<T>(operation: &str, call: impl FnOnce() -> nix::Result<T>) -> nix::Result<T> {
     #[cfg(feature = "test-util")]
-    if std::env::var(RECOVERY_FAILURE_ENV).is_ok_and(|value| value == operation) {
-        return Err(nix::errno::Errno::EINTR);
+    {
+        if injected(operation) {
+            return Err(nix::errno::Errno::EINTR);
+        }
+        if injected(&format!("{operation}=EPERM")) {
+            return Err(nix::errno::Errno::EPERM);
+        }
     }
     let _ = operation;
     call()
+}
+
+/// Whether the foreground group `group` has a live member.
+fn live_members(group: nix::unistd::Pid) -> nix::Result<bool> {
+    #[cfg(feature = "test-util")]
+    if injected("members=live") {
+        return Ok(true);
+    }
+    recovery_call("members", || process_group::has_live_member(group))
 }
 
 /// The terminal's foreground, handed to the child's process group.

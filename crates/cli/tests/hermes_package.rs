@@ -1355,8 +1355,13 @@ try:
     reporter = Reporter('hermes')
     original_send = reporter._send
     identity_responses = []
+    send_errors = []
     def capture_worker_identity(endpoint, message):
-        response = original_send(endpoint, message)
+        try:
+            response = original_send(endpoint, message)
+        except BaseException as send_error:
+            send_errors.append(type(send_error).__name__)
+            raise
         if endpoint == reporter._worker_socket and message.get('type') == 'identity_report':
             identity_responses.append(response)
         return response
@@ -1365,6 +1370,8 @@ try:
         status.write('reporter_active=' + str(reporter.active) + '\n')
         status.write('executable=' + os.path.basename(actual_executable()) + '\n')
     reporter.identity('s4b-provider-child-spoof')
+    if not identity_responses:
+        raise RuntimeError('the worker did not answer the identity report; send errors=' + ','.join(send_errors) + '; reporter failures=' + str(reporter.failures))
     claim_response = identity_responses[-1]
     barrier = socket.create_connection(({host:?}, {port}), timeout={STARTUP_BARRIER_SECONDS})
     barrier.sendall((str(os.getpid()) + ' ' + str(reporter.active) + ' ' + str(reporter.failures) + ' ' + os.path.basename(actual_executable()) + ' ' + str(os.getppid()) + ' ' + str(claim_response.get('launch_identity_accepted')) + ' ' + str(claim_response.get('launch_identity_status')) + '\n').encode('ascii'))
@@ -1372,7 +1379,7 @@ try:
     barrier.close()
 except BaseException as error:
     with open({child_marker:?}, 'a', encoding='ascii') as status:
-        status.write('error=' + type(error).__name__ + '\n')
+        status.write('error=' + type(error).__name__ + ': ' + str(error) + '\n')
     raise
 ",
             child_marker = child_marker.to_string_lossy(),
