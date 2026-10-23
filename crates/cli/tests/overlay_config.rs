@@ -409,6 +409,14 @@ fn an_untrusted_file_or_directory_fails_before_any_provider_call() {
     assert_invalid(&fixture.run(&["host", "list", "--json"]), &link);
     assert!(!fixture.netbird_was_consulted(), "symlink");
 
+    // A dangling symlink is something at the path, not an absent file.
+    let fixture = Fixture::new();
+    let dir = fixture.make_config_dir(0o700);
+    let dangling = dir.join("overlays.toml");
+    symlink(dir.join("missing-target.toml"), &dangling).expect("create the dangling symlink");
+    assert_invalid(&fixture.run(&["host", "list", "--json"]), &dangling);
+    assert!(!fixture.netbird_was_consulted(), "dangling symlink");
+
     // A FIFO is refused without blocking on an open.
     let fixture = Fixture::new();
     let dir = fixture.make_config_dir(0o700);
@@ -480,6 +488,17 @@ fn an_absent_file_under_an_unsafe_directory_uses_the_defaults() {
         );
     }
 
+    // The environment override still applies on top of the defaults.
+    let fixture = Fixture::new();
+    fixture.make_config_dir(0o777);
+    let output = fixture
+        .command()
+        .env("POHUNEK_REMOTE_PORT", ENV_PORT.to_string())
+        .args(["host", "list", "--json"])
+        .output()
+        .expect("run host list");
+    assert_eq!(host_records(&output)[0]["port"], ENV_PORT);
+
     // The config home reached through a symlink (stow, home-manager).
     let fixture = Fixture::new();
     fixture.make_config_dir(0o700);
@@ -501,7 +520,7 @@ fn an_absent_file_under_an_unsafe_directory_uses_the_defaults() {
 #[test]
 fn a_present_file_under_a_symlinked_config_home_is_refused() {
     let fixture = Fixture::new();
-    let path = fixture.write_config("providers = [\"netbird\"]\n", 0o600);
+    fixture.write_config("providers = [\"netbird\"]\n", 0o600);
     let link = fixture.env.root().join("config-link");
     symlink(fixture.env.config_home(), &link).expect("symlink the config home");
     let output = fixture
@@ -511,6 +530,5 @@ fn a_present_file_under_a_symlinked_config_home_is_refused() {
         .output()
         .expect("run host list");
     assert_invalid(&output, &link.join("pohunek/overlays.toml"));
-    let _ = path;
     assert!(!fixture.netbird_was_consulted());
 }
