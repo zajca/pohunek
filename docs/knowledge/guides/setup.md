@@ -250,9 +250,16 @@ carries the remediation. When `pohunek doctor` reaches the daemon, a check both 
 fails; optional capabilities are at most `warn`.
 
 Linux: `bin:git` (required), `bin:codex`, `bin:claude`, the socket, state and
-log directory writability checks, `netbird_cli`, and `schema_version`. The
-provider and port the remote listener uses come from the optional
+log directory writability checks, one `<overlay>_cli` check per configured
+overlay (`netbird_cli` for the default NetBird overlay), and `schema_version`.
+The provider and port the remote listener uses come from the optional
 `overlays.toml`; see [Remote hosts](remote-hosts.md#overlay-configuration).
+A provider CLI that is missing or untrusted fails its check when
+`overlays.toml` lists the provider and only warns for the NetBird default of an
+absent file. `pohunek doctor` adds `overlay_config`, which warns "restart the
+daemon to apply" when the running daemon serves another overlay or port than the
+file configures, and the daemon adds `overlay_<overlay>_listener` with its port
+and the listener address its provider reports.
 Executables count only when they are regular files the effective user can execute according to the kernel (`faccessat` with `X_OK`); a file it cannot execute is skipped and the `PATH` search continues. The writability probes create a randomly named file exclusively (never following a planted symlink) and remove it.
 
 macOS adds the following checks. The daemon report also includes redacted

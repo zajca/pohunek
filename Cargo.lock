@@ -3017,7 +3017,7 @@ dependencies = [
 name = "pohunek-hostcheck"
 version = "0.36.0"
 dependencies = [
- "pohunek-netbird",
+ "pohunek-overlay",
  "pohunek-paths",
  "pohunek-platform",
  "pohunek-protocol",

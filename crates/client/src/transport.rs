@@ -338,7 +338,12 @@ enum ClientInner {
 #[derive(Debug, Clone)]
 enum Endpoint {
     Local(PathBuf),
-    Remote { host: String, addr: SocketAddr },
+    Remote {
+        host: String,
+        /// Overlay the address was resolved through, when known.
+        overlay: Option<String>,
+        addr: SocketAddr,
+    },
 }
 
 #[derive(Debug)]
@@ -434,7 +439,13 @@ impl Client {
                     route.addr.ip(),
                     port.map_or(route.addr.port(), NonZeroU16::get),
                 );
-                Self::connect_trusted_tcp_addr_with_options(host, addr, options).await
+                Self::connect_overlay_addr(
+                    host.to_owned(),
+                    Some(route.overlay.to_string()),
+                    addr,
+                    options,
+                )
+                .await
             }
         }
     }
@@ -460,11 +471,11 @@ impl Client {
                 display,
             } => {
                 let registry = crate::default_overlay_registry()?;
-                let addr =
+                let (overlay, addr) =
                     resolve_remote_addr(pinned_route.clone(), options.connect_timeout, registry)
                         .await
                         .map_err(|error| name_typed_host(error, pinned_route, display))?;
-                Self::connect_trusted_tcp_addr_with_options(display.as_str(), addr, options).await
+                Self::connect_overlay_addr(display.clone(), Some(overlay), addr, options).await
             }
         }
     }
@@ -510,13 +521,26 @@ impl Client {
         addr: SocketAddr,
         options: ClientOptions,
     ) -> Result<Self, ClientError> {
+        Self::connect_overlay_addr(host.into(), None, addr, options).await
+    }
+
+    /// Connect to a daemon on `addr`, which `overlay` resolved when it is known.
+    async fn connect_overlay_addr(
+        host: String,
+        overlay: Option<String>,
+        addr: SocketAddr,
+        options: ClientOptions,
+    ) -> Result<Self, ClientError> {
         let origin = options.origin_source.resolve()?;
-        let host = host.into();
-        let stream = connect_tcp(&host, addr, options.connect_timeout).await?;
+        let stream = connect_tcp(&host, overlay.as_deref(), addr, options.connect_timeout).await?;
 
         Ok(Self {
             inner: ClientInner::Remote(Conn::new(stream, Some(host.clone()), options)),
-            endpoint: Endpoint::Remote { host, addr },
+            endpoint: Endpoint::Remote {
+                host,
+                overlay,
+                addr,
+            },
             options,
             selected_version: None,
             origin,
@@ -1121,12 +1145,18 @@ impl Client {
                     origin: self.origin.clone(),
                 })
             }
-            Endpoint::Remote { host, addr } => {
-                let stream = connect_tcp(host, *addr, options.connect_timeout).await?;
+            Endpoint::Remote {
+                host,
+                overlay,
+                addr,
+            } => {
+                let stream =
+                    connect_tcp(host, overlay.as_deref(), *addr, options.connect_timeout).await?;
                 Ok(Self {
                     inner: ClientInner::Remote(Conn::new(stream, Some(host.clone()), options)),
                     endpoint: Endpoint::Remote {
                         host: host.clone(),
+                        overlay: overlay.clone(),
                         addr: *addr,
                     },
                     options,
@@ -1183,9 +1213,11 @@ impl Client {
             Endpoint::Local(socket_path) => {
                 connect_raw_local_with_options(socket_path, self.options).await?
             }
-            Endpoint::Remote { host, addr } => {
-                connect_raw_tcp_addr_with_options(host, *addr, self.options).await?
-            }
+            Endpoint::Remote {
+                host,
+                overlay,
+                addr,
+            } => connect_raw_overlay_addr(host, overlay.as_deref(), *addr, self.options).await?,
         };
         stream.write_attach_header(stream_id).await?;
         Ok(stream)
@@ -1647,8 +1679,9 @@ pub async fn connect_raw_with_options(
         connect_raw_local_with_options(socket_path, options).await
     } else {
         let registry = crate::default_overlay_registry()?;
-        let addr = resolve_remote_addr(host.to_owned(), options.connect_timeout, registry).await?;
-        connect_raw_tcp_addr_with_options(host, addr, options).await
+        let (overlay, addr) =
+            resolve_remote_addr(host.to_owned(), options.connect_timeout, registry).await?;
+        connect_raw_overlay_addr(host, Some(&overlay), addr, options).await
     }
 }
 
@@ -1684,10 +1717,20 @@ pub async fn connect_raw_tcp_addr_with_options(
     addr: SocketAddr,
     options: ClientOptions,
 ) -> Result<RawStream, ClientError> {
+    connect_raw_overlay_addr(&host.into(), None, addr, options).await
+}
+
+/// Open a raw, unframed TCP connection to `addr`, which `overlay` resolved when
+/// it is known.
+async fn connect_raw_overlay_addr(
+    host: &str,
+    overlay: Option<&str>,
+    addr: SocketAddr,
+    options: ClientOptions,
+) -> Result<RawStream, ClientError> {
     options.origin_source.resolve()?;
-    let host = host.into();
     Ok(RawStream::Remote(
-        connect_tcp(&host, addr, options.connect_timeout).await?,
+        connect_tcp(host, overlay, addr, options.connect_timeout).await?,
     ))
 }
 
@@ -1810,19 +1853,24 @@ fn map_unix_connect_error(socket_path: &Path, source: io::Error) -> ClientError 
 
 async fn connect_tcp(
     host: &str,
+    overlay: Option<&str>,
     addr: SocketAddr,
     connect_timeout: Duration,
 ) -> Result<TcpStream, ClientError> {
+    let unreachable = |source: io::Error| ClientError::HostUnreachable {
+        host: host.to_owned(),
+        overlay: overlay.map(str::to_owned),
+        address: addr.ip(),
+        port: addr.port(),
+        source,
+    };
     match tokio::time::timeout(connect_timeout, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => Ok(stream),
-        Ok(Err(source)) => Err(ClientError::HostUnreachable {
-            host: host.to_owned(),
-            source,
-        }),
-        Err(_elapsed) => Err(ClientError::HostUnreachable {
-            host: host.to_owned(),
-            source: timeout_error("daemon tcp connect", connect_timeout),
-        }),
+        Ok(Err(source)) => Err(unreachable(source)),
+        Err(_elapsed) => Err(unreachable(timeout_error(
+            "daemon tcp connect",
+            connect_timeout,
+        ))),
     }
 }
 
@@ -2111,14 +2159,17 @@ async fn resolve_remote_addr(
     host: String,
     connect_timeout: Duration,
     registry: OverlayRegistry,
-) -> Result<SocketAddr, ClientError> {
+) -> Result<(String, SocketAddr), ClientError> {
     let target = RemoteTarget::parse(&host)?;
     match tokio::time::timeout(connect_timeout, registry.resolve_host(target.selector)).await {
         Ok(result) => result
             .map(|route| {
-                SocketAddr::new(
-                    route.addr.ip(),
-                    target.port.map_or(route.addr.port(), NonZeroU16::get),
+                (
+                    route.overlay.to_string(),
+                    SocketAddr::new(
+                        route.addr.ip(),
+                        target.port.map_or(route.addr.port(), NonZeroU16::get),
+                    ),
                 )
             })
             .map_err(ClientError::from),
@@ -2661,6 +2712,7 @@ mod tests {
             )),
             endpoint: Endpoint::Remote {
                 host: "fixture-remote".to_owned(),
+                overlay: None,
                 addr: address,
             },
             options,

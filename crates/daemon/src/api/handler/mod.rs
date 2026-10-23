@@ -84,6 +84,9 @@ pub struct DaemonState {
     pub attention: Option<AttentionCoordinator>,
     /// TTL-cached `NetBird` host discovery, shared across connections.
     pub discovery: DiscoveryCache,
+    /// Whether the configured overlays were listed in `overlays.toml`, which
+    /// makes a missing provider CLI a doctor failure rather than a warning.
+    pub overlays_from_file: bool,
     /// The transport the connections served with this state arrive on.
     pub transport: ControlTransport,
     /// The kernel-attested peer of the one local connection this state serves.
@@ -120,6 +123,7 @@ impl DaemonState {
             notifications: None,
             attention: None,
             discovery,
+            overlays_from_file: false,
             transport: ControlTransport::default(),
             control_peer: None,
         }
@@ -140,6 +144,13 @@ impl DaemonState {
     #[must_use]
     pub fn with_control_peer(mut self, peer: Option<Arc<ControlPeer>>) -> Self {
         self.control_peer = peer;
+        self
+    }
+
+    /// Record whether the configured overlays were listed in `overlays.toml`.
+    #[must_use]
+    pub fn with_overlays_from_file(mut self, from_file: bool) -> Self {
+        self.overlays_from_file = from_file;
         self
     }
 
@@ -430,6 +441,8 @@ async fn handle_negotiated(
                 request,
                 &state.governance,
                 &state.sessions,
+                state.discovery.registry(),
+                state.overlays_from_file,
                 state.transport,
             )
             .await

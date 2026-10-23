@@ -3,7 +3,9 @@
 //! A CLI test loads the library with `LD_PRELOAD` to reach a fixture daemon on
 //! `127.0.0.1` through the real `NetBird` resolver, which refuses a loopback peer.
 //! `POHUNEK_TEST_CONNECT_REDIRECT_PORT` replaces the redirected port when the
-//! fixture listens elsewhere than the dialed port.
+//! fixture listens elsewhere than the dialed port. `POHUNEK_TEST_CONNECT_REFUSE`
+//! makes the connection fail with `ECONNREFUSED` instead, as a peer whose daemon
+//! is not listening does.
 
 // Rust guideline compliant 2026-10-14
 
@@ -26,6 +28,7 @@ pub(crate) fn build(dir: &Path) -> (PathBuf, PathBuf) {
         r#"#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <stdio.h>
@@ -57,6 +60,10 @@ int connect(int fd, const struct sockaddr *address, socklen_t length) {
                     (void)write(output, line, (size_t)count);
                     (void)close(output);
                 }
+            }
+            if (getenv("POHUNEK_TEST_CONNECT_REFUSE") != NULL) {
+                errno = ECONNREFUSED;
+                return -1;
             }
             struct sockaddr_in redirected = *original;
             redirected.sin_addr.s_addr = htonl(0x7f000001U);

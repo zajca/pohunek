@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use hostcheck::{StandardCheckInputs, Supervision, WorkerCandidate, WorkerSource};
+use hostcheck::{OverlayChecks, StandardCheckInputs, Supervision, WorkerCandidate, WorkerSource};
 use protocol::{
     DoctorCheck, DoctorReport, DoctorStatus, IntegrationDoctorParams, IntegrationFindingCode,
     IntegrationInstallState, QuarantineReason, RuntimeId, MAX_CONTROL_LINE_BYTES,
@@ -36,7 +36,12 @@ pub struct DoctorReportError;
 ///
 /// `supervision` is the worker supervision the daemon runs with, or `None`
 /// when it has none. `catalog_trust` is what the daemon loaded to authorize
-/// official packages.
+/// official packages. `overlays` is the state of the overlays the daemon was
+/// started with.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Each argument is a distinct piece of daemon state the report reads."
+)]
 pub(crate) async fn report(
     paths: &Paths,
     governance: &HostGovernanceService,
@@ -44,16 +49,28 @@ pub(crate) async fn report(
     catalog_trust: &CatalogTrust,
     profiles: &crate::agent::ProfileRegistry,
     base_env: pohunek_worker_protocol::BaseEnv,
+    overlays: OverlayChecks<'_>,
     include_profile_homes: bool,
 ) -> Result<DoctorReport, DoctorReportError> {
     let paths = paths.clone();
+    let listener_checks = hostcheck::overlay_checks::listener_checks(overlays);
+    let overlay_diagnostics = overlays.diagnostics.to_vec();
+    let overlays_from_file = overlays.from_file;
     let mode = supervision_mode(supervision.as_ref());
     let worker = supervision.map(|active| WorkerCandidate {
         path: active.worker_executable,
         source: WorkerSource::Supervision,
     });
     let mut checks = tokio::task::spawn_blocking(move || {
-        let mut checks = standard_checks(&paths, worker.as_ref(), mode);
+        let mut checks = standard_checks(
+            &paths,
+            worker.as_ref(),
+            mode,
+            OverlayChecks {
+                diagnostics: &overlay_diagnostics,
+                from_file: overlays_from_file,
+            },
+        );
         let readiness = worker_readiness_check(worker.as_ref());
         if let Some(existing) = checks
             .iter_mut()
@@ -67,6 +84,7 @@ pub(crate) async fn report(
     })
     .await
     .map_err(|_error| DoctorReportError)?;
+    checks.extend(listener_checks);
     let profiles = profiles.clone();
     checks.extend(
         tokio::task::spawn_blocking(move || {
@@ -615,6 +633,7 @@ fn standard_checks(
     paths: &Paths,
     worker: Option<&WorkerCandidate>,
     supervision: Supervision,
+    overlays: OverlayChecks<'_>,
 ) -> Vec<DoctorCheck> {
     let home_dir = std::env::var_os(pohunek_paths::HOME).map(PathBuf::from);
     hostcheck::standard_checks(StandardCheckInputs {
@@ -627,6 +646,7 @@ fn standard_checks(
         worker,
         access_dirs: &[],
         supervision,
+        overlays,
     })
 }
 
@@ -864,6 +884,7 @@ mod tests {
             &CatalogTrust::Absent,
             &crate::agent::ProfileRegistry::default(),
             pohunek_worker_protocol::BaseEnv::default(),
+            OverlayChecks::NONE,
             false,
         )
         .await
@@ -940,6 +961,7 @@ mod tests {
             &CatalogTrust::Invalid(AnchorFault::TooLarge),
             &crate::agent::ProfileRegistry::default(),
             pohunek_worker_protocol::BaseEnv::default(),
+            OverlayChecks::NONE,
             false,
         )
         .await

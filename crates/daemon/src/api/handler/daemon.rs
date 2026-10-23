@@ -1,5 +1,6 @@
 //! Daemon-scoped methods: `daemon.health` and `daemon.doctor`.
 
+use overlay::OverlayRegistry;
 use protocol::{ProtocolError, Request, Response};
 
 use super::util::{error_value, ok_value, selected_version};
@@ -25,6 +26,8 @@ pub(super) async fn handle_daemon_doctor(
     request: &Request,
     governance: &HostGovernanceService,
     sessions: &SessionRegistry,
+    overlays: &OverlayRegistry,
+    overlays_from_file: bool,
     transport: ControlTransport,
 ) -> Response {
     if !request.params().is_null() {
@@ -47,6 +50,8 @@ pub(super) async fn handle_daemon_doctor(
             );
         }
     };
+    let overlay_diagnostics =
+        pohunek_client::diagnose_overlays(overlays, hostcheck::OVERLAY_PROBE_BUDGET).await;
     match crate::doctor::report(
         &paths,
         governance,
@@ -54,6 +59,10 @@ pub(super) async fn handle_daemon_doctor(
         sessions.catalog_trust(),
         sessions.profiles(),
         sessions.inspect_base_environment(),
+        hostcheck::OverlayChecks {
+            diagnostics: &overlay_diagnostics,
+            from_file: overlays_from_file,
+        },
         transport == ControlTransport::Local,
     )
     .await

@@ -48,12 +48,35 @@ port = 18722
 - `POHUNEK_REMOTE_PORT` overrides `port` in the process that sees it, for
   development and tests. A service-started daemon does not receive it; put a
   port both sides must use in the file.
+- `pohunek doctor` checks the configured overlay and compares the file with the
+  running daemon; see [Diagnostics](#diagnostics).
 - A daemon of an older release ignores the file and binds the environment value
   or 18722, and so does a client of an earlier release (a CLI on another host,
   a Rust client pinned to an earlier tag such as the `pohunek-work` gateway).
   Upgrade every client and restart every daemon before you set `port`, or those
   clients dial a port nothing listens on; a pinned client adopts the file when
   it bumps its pin.
+
+### Diagnostics
+
+- `pohunek doctor` runs one `<overlay>_cli` check for each configured overlay
+  (`netbird_cli` with the default). A provider CLI that is missing or untrusted
+  is a `fail` when `overlays.toml` lists the provider, with the fix in the
+  detail (install it, or remove the provider from the file and restart the
+  daemon), and a `warn` for the NetBird default of an absent file.
+- The daemon adds `overlay_<overlay>_listener`: the port it was configured with
+  and the listener address the provider reports now. It is the provider's state,
+  not proof that the daemon has bound the address; the daemon log says
+  `serving control protocol over overlay` once it has.
+- `overlay_config` compares the file with the running daemon. A change to
+  `overlays.toml` applies after a daemon restart, so a difference reads
+  "restart the daemon to apply". A `POHUNEK_REMOTE_PORT` in your shell changes
+  the port the CLI would use and is named in the warning.
+- A refused or timed-out connection to a resolved peer reports
+  `host_unreachable` with the overlay, the address and the port that were
+  dialled, for example `overlay netbird at 100.64.0.8:18722`. When the overlay is
+  known the hint adds that the remote host's `overlays.toml` must list it: a host
+  whose daemon works over another overlay does not listen on this one.
 
 Remote behavior is host-aware. The CLI uses `--host <host>` for commands that
 target a host, and session targets can use `<host>/<session-id>`.

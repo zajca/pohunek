@@ -16,7 +16,11 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use hostcheck::{AccessDir, Platform, StandardCheckInputs, Supervision, WorkerCandidate};
+use hostcheck::{
+    AccessDir, OverlayChecks, Platform, ReportedOverlay, StandardCheckInputs, Supervision,
+    WorkerCandidate,
+};
+use pohunek_client::{ClientError, OverlayConfig};
 use protocol::{DoctorCheck, DoctorReport as Report, DoctorStatus as Status};
 
 use crate::client::Client;
@@ -41,6 +45,9 @@ const JOB_FAILED: &str = "failed";
 
 /// Name of the check that reports `service.toml` keys this version does not know.
 const SERVICE_CONFIG_UNKNOWN_KEYS_CHECK: &str = "service_config_unknown_keys";
+
+/// Name of the check that reports `overlays.toml` and compares it with the daemon.
+const OVERLAY_CONFIG_CHECK: &str = "overlay_config";
 
 /// Run `doctor`. Returns `true` if the environment is healthy (no fatal checks).
 ///
@@ -77,6 +84,17 @@ pub(crate) async fn diagnose(paths: &Paths) -> Result<Report, CliError> {
             path,
         })
         .collect();
+    let overlay_config = OverlayConfig::load_from(&paths.config_dir);
+    let overlay_diagnostics = match overlay_config.as_ref().map(OverlayConfig::registry) {
+        Ok(Ok(registry)) => {
+            pohunek_client::diagnose_overlays(&registry, hostcheck::OVERLAY_PROBE_BUDGET).await
+        }
+        Ok(Err(_)) | Err(_) => Vec::new(),
+    };
+    let overlays = OverlayChecks {
+        diagnostics: &overlay_diagnostics,
+        from_file: overlay_config.as_ref().is_ok_and(OverlayConfig::from_file),
+    };
     let mut checks = hostcheck::standard_checks(StandardCheckInputs {
         socket_dir: &paths.runtime_dir,
         state_dir: &paths.data_dir,
@@ -87,6 +105,7 @@ pub(crate) async fn diagnose(paths: &Paths) -> Result<Report, CliError> {
         worker: worker.as_ref(),
         access_dirs: &access_dirs,
         supervision,
+        overlays,
     });
     let platform = hostcheck::current_platform();
     checks.extend(working_directory_check(platform, &working_dir));
@@ -123,6 +142,14 @@ pub(crate) async fn diagnose(paths: &Paths) -> Result<Report, CliError> {
         // still answers.
         checks.push(launchd_job_check(job_status, connected, supervision));
     }
+    checks.push(overlay_config_check(
+        &overlay_config,
+        remote
+            .as_deref()
+            .map(hostcheck::overlay_checks::reported_overlays)
+            .as_deref(),
+        std::env::var_os(pohunek_client::REMOTE_PORT_ENV).is_some(),
+    ));
     match remote {
         Some(remote) => {
             reconcile_launchd_checks(&mut checks, &remote);
@@ -131,6 +158,85 @@ pub(crate) async fn diagnose(paths: &Paths) -> Result<Report, CliError> {
         None => checks.push(unavailable_daemon_check()),
     }
     Ok(Report::from_checks(checks))
+}
+
+/// Report `overlays.toml` and whether the running daemon serves the same overlay.
+///
+/// `daemon` is what the daemon reported, or `None` when it did not answer. A
+/// daemon that reports no overlay is older than the report and cannot be
+/// compared. `port_override` notes that `POHUNEK_REMOTE_PORT` in this shell
+/// changes the port the file would give.
+fn overlay_config_check(
+    config: &Result<OverlayConfig, ClientError>,
+    daemon: Option<&[ReportedOverlay]>,
+    port_override: bool,
+) -> DoctorCheck {
+    let config = match config {
+        Ok(config) => config,
+        Err(error) => {
+            return DoctorCheck::new(
+                OVERLAY_CONFIG_CHECK,
+                Status::Fail,
+                format!("{error}; fix or remove the file and run 'pohunek doctor' again"),
+            );
+        }
+    };
+    let expected = config
+        .providers()
+        .iter()
+        .map(|id| format!("{id} on port {}", config.port()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = if config.from_file() {
+        "overlays.toml"
+    } else {
+        "the default (no overlays.toml)"
+    };
+    let reported = daemon.filter(|reported| !reported.is_empty());
+    let Some(reported) = reported else {
+        return DoctorCheck::new(
+            OVERLAY_CONFIG_CHECK,
+            Status::Ok,
+            format!("{source} configures {expected}"),
+        );
+    };
+    let agrees = reported.len() == config.providers().len()
+        && config.providers().iter().all(|id| {
+            reported.iter().any(|overlay| {
+                overlay.id == *id && overlay.port.is_none_or(|port| port == config.port())
+            })
+        });
+    if agrees {
+        return DoctorCheck::new(
+            OVERLAY_CONFIG_CHECK,
+            Status::Ok,
+            format!("{source} configures {expected}, as the running daemon serves"),
+        );
+    }
+    let running = reported
+        .iter()
+        .map(|overlay| match overlay.port {
+            Some(port) => format!("{} on port {port}", overlay.id),
+            None => overlay.id.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let note = if port_override {
+        format!(
+            " ({} is set in this shell and overrides the port of the file)",
+            pohunek_client::REMOTE_PORT_ENV
+        )
+    } else {
+        String::new()
+    };
+    DoctorCheck::new(
+        OVERLAY_CONFIG_CHECK,
+        Status::Warn,
+        format!(
+            "{source} configures {expected}{note} but the running daemon serves {running}; \
+             restart the daemon to apply"
+        ),
+    )
 }
 
 /// Report a current directory that cannot be determined.

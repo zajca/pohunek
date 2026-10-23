@@ -451,8 +451,12 @@ async fn run() -> Result<(), DaemonError> {
     // The overlay configuration decides which network the remote listener
     // binds, so an unusable one stops the daemon before any lock, store
     // migration or worker adoption.
-    let registry = pohunek_client::overlay_registry_from(&paths.config_dir)
+    let overlay_config = pohunek_client::OverlayConfig::load_from(&paths.config_dir)
         .map_err(DaemonError::OverlayConfiguration)?;
+    let registry = overlay_config
+        .registry()
+        .map_err(DaemonError::OverlayConfiguration)?;
+    let overlays_from_file = overlay_config.from_file();
 
     // 2. Acquire the durable data authority before opening any state service.
     // State and data roots are configured independently, so each needs its own
@@ -604,6 +608,7 @@ async fn run() -> Result<(), DaemonError> {
         Arc::clone(&governance),
         discovery.clone(),
     )
+    .with_overlays_from_file(overlays_from_file)
     .with_notifications(notifications.clone())
     .with_attention_coordinator(attention_coordinator.clone());
     let server = ControlServer::bind_with_state(&paths.socket, state).await?;
@@ -617,6 +622,7 @@ async fn run() -> Result<(), DaemonError> {
         governance,
         discovery,
     )
+    .with_overlays_from_file(overlays_from_file)
     .with_notifications(notifications.clone())
     .with_attention_coordinator(attention_coordinator.clone());
     // Reconciliation and every required local listener are ready. A manual

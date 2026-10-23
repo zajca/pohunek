@@ -56,6 +56,8 @@ mod notifications_policy;
 mod notifications_watch;
 #[path = "overlay_config.rs"]
 mod overlay_config;
+#[path = "overlay_diagnostics.rs"]
+mod overlay_diagnostics;
 #[path = "overlay_service_daemon_port.rs"]
 mod overlay_service_daemon_port;
 #[path = "pi_frame_properties.rs"]

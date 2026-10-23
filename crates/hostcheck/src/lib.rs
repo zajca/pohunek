@@ -2,7 +2,7 @@
 //! `daemon.doctor` RPC.
 //!
 //! Both the CLI doctor and the daemon need to probe the same things: binaries
-//! on `PATH`, directory writability, and `NetBird` state, but on potentially
+//! on `PATH`, directory writability, and overlay provider state, but on potentially
 //! different hosts (the CLI describes the local host; `daemon.doctor` describes the host
 //! that owns the agent runtime). The probe logic is identical, so it lives here
 //! once and produces [`protocol::DoctorCheck`] values that both callers embed
@@ -27,17 +27,19 @@ use protocol::{DoctorCheck, DoctorStatus};
 
 pub mod executable;
 pub mod macos;
+pub mod overlay_checks;
 pub mod worker_probe;
 
 pub use executable::{is_executable_file, resolve_executable};
 pub use macos::{
     apply_supervision, doctor_request_timeout, AGENT_RUNTIME_PROBE_BUDGET, LAUNCHD_CHECKS,
-    PROBE_BUDGET, REPLY_HEADROOM,
+    OVERLAY_PROBE_BUDGET, PROBE_BUDGET, REPLY_HEADROOM,
 };
 pub use macos::{
     resolve_worker_candidate, AccessDir, DomainProbe, MacosFacts, ProcessRunner, RunOutcome,
     Runner, Supervision, WorkerCandidate, WorkerSource, WORKER_EXECUTABLE_CHECK,
 };
+pub use overlay_checks::{OverlayChecks, ReportedOverlay};
 pub use pohunek_paths::Platform;
 pub use worker_probe::WORKER_PROBE_DEADLINE;
 
@@ -94,6 +96,8 @@ pub struct StandardCheckInputs<'a> {
     pub access_dirs: &'a [AccessDir<'a>],
     /// How the daemon supervises workers (macOS launchd checks).
     pub supervision: Supervision,
+    /// The configured overlays whose provider CLI is checked.
+    pub overlays: OverlayChecks<'a>,
 }
 
 /// The platform the binary was compiled for.
@@ -125,10 +129,10 @@ pub fn standard_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
     }
 }
 
-/// The Linux probe list: agents, directories, and `NetBird`.
+/// The Linux probe list: agents, directories, and the configured overlays.
 #[must_use]
 pub fn linux_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
-    vec![
+    let mut checks = vec![
         binary("git", true),
         binary("codex", false),
         binary("claude", false),
@@ -143,13 +147,14 @@ pub fn linux_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
             "state data directory",
         ),
         dir_writable("log_dir_writable", inputs.log_dir, "log directory"),
-        netbird(),
-        DoctorCheck::new(
-            "schema_version",
-            DoctorStatus::Warn,
-            "not available yet (SQLite store is a later milestone)",
-        ),
-    ]
+    ];
+    checks.extend(overlay_checks::cli_checks(inputs.overlays));
+    checks.push(DoctorCheck::new(
+        "schema_version",
+        DoctorStatus::Warn,
+        "not available yet (SQLite store is a later milestone)",
+    ));
+    checks
 }
 
 /// Resolve a binary name against the `PATH` environment variable.
@@ -198,42 +203,6 @@ pub fn binary_with_path(
             status,
             format!("'{name}' not found on PATH{missing_hint}"),
         )
-    }
-}
-
-/// Check `NetBird` availability.
-///
-/// `NetBird` is *optional*: remote hosts need it, but local-only use is fully
-/// valid, so its absence is a `warn`, never a `fail`. The CLI is located by the
-/// same resolver the daemon and client use to run it, so the verdict cannot
-/// disagree with the spawn. When it is present we additionally probe local
-/// state: a resolvable self `NetBird` IP yields `ok`; an unreadable state
-/// (daemon down / not logged in) is a `warn`.
-#[must_use]
-pub fn netbird() -> DoctorCheck {
-    match netbird::run_status() {
-        Ok(status) => match status.self_netbird_ip() {
-            Some(ip) => DoctorCheck::new(
-                "netbird_cli",
-                DoctorStatus::Ok,
-                format!("found; this host's NetBird IP is {ip}"),
-            ),
-            None => DoctorCheck::new(
-                "netbird_cli",
-                DoctorStatus::Warn,
-                "found, but no NetBird IP resolved (not logged in or daemon down)",
-            ),
-        },
-        Err(netbird::NetbirdError::CliMissing) => DoctorCheck::new(
-            "netbird_cli",
-            DoctorStatus::Warn,
-            "'netbird' not found on PATH; NetBird is optional (remote hosts need it)",
-        ),
-        Err(err) => DoctorCheck::new(
-            "netbird_cli",
-            DoctorStatus::Warn,
-            format!("found, but local state is unavailable: {err}"),
-        ),
     }
 }
 
