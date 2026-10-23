@@ -5,6 +5,1502 @@ Each change records its entry as its own fragment under `log.d/`, named
 `## Unreleased` sections, and `scripts/release` files them under the release
 heading. Entries are newest first.
 
+## 0.36.0
+
+### 2026-10-23, zbus 6 and unmaintained dependencies, #1406
+
+- A session bus address with the `unixexec:` transport (for example in
+  `DBUS_SESSION_BUS_ADDRESS`) is now rejected as an unusable address: the
+  systemd supervisor is built on zbus 6, which compiles that transport only
+  behind a feature the build leaves off. Before, the address ran the named
+  program. `pohunek service` reports the condition without quoting the address.
+- The embedded agent `SKILL.md` is regenerated: its frontmatter `description`
+  is double-quoted instead of single-quoted (same value), so the embedded bytes
+  and the `content_sha256` that `agent-skill` reports change.
+- `.cargo/audit.toml` carries four dated (2026-10-23) ignores for
+  unmaintained-crate advisories: RUSTSEC-2026-0370, -0371 and -0372 (zvariant,
+  zbus_names, zvariant_derive; only through `keyring` 3 and its `secret-service`
+  4, tracked in #1504) and RUSTSEC-2026-0249 (smartstring; only through the
+  optional `ts` bindings feature, tracked in #1505).
+
+### 2026-10-23, rejected forwarded agent operations, #1418
+
+- A forwarded `session.report_agent` or `session.release_agent` whose answer was
+  lost or timed out stays pending until the daemon knows what the worker did with
+  it. When the worker rejected it after the bound (a stale sequence, a process
+  outside the PTY tree, a release that matches no claim, a journal write fault),
+  the daemon now drops the operation as soon as it reads a snapshot taken after
+  the worker handled the request that still shows the identity revision the
+  request was sent at. Until then the operation held the journal, so a
+  `session.report_agent` for the claim the worker really holds was answered
+  `recorded: false`; it is now admitted once the rejection is read, which is
+  at the next periodic worker sync after the worker answered. A snapshot
+  read earlier, or one that shows a newer revision, still leaves the operation
+  pending. No protocol, store or worker change.
+
+### 2026-10-23, macOS rollback PATH after a reboot, #1447
+
+On macOS a rollback of an interrupted upgrade is no longer refused after a reboot when the upgrade journaled the launchd default `PATH` of the unloaded daemon job but the persisted configuration (`user.plist`) cannot be shown to be the active one. A forward gate (upgrade, resume, `service check`) still refuses with `service_manager_environment_unavailable`; a rollback goes on with the persisted `PATH` (launchd's standard `PATH` when the file's content cannot be read) and prints one `warning:` line saying that the `PATH` is a stand-in. A persisted configuration that is provably the active one (older than the boot) no longer prints the warning. See the [upgrade runbook](runbooks/update-after-release.md#the-journal-of-an-interrupted-upgrade) and `docs/public-api.md`.
+
+### 2026-10-23, identity report timing, #1475
+
+The Hermes hook reporter now records, per worker message type, the elapsed time and outcome of its last private send (`Reporter.worker_sends`), and the Hermes package test child prints it when the worker did not answer an identity report. The worker logs one `worker.identity.answered` event per identity report with `identity.lock_wait_us`, `identity.persist_us` (durable journal write) and `identity.answer_us`. The hook deadline (0.25 s default, 1.0 s maximum) and the worker protocol are unchanged; the numbers decide whether the deadline or the worker's answer path needs a product change.
+
+### 2026-10-23, detector working latch, #1486
+
+A turn whose working title or working frame is replaced by an idle one inside a
+single output chunk now publishes `working` before the idle state, so
+`session input --until working` and `session new --input-ack-timeout-ms` see a
+fast turn. The detector evaluates an agent manifest at each OSC title or
+progress event and at each ordered screen observation point of the chunk; the
+generic shell manifest is unchanged. Under an agent manifest the terminal
+observer now stays armed after startup (`ScreenTracker::resume_observation`).
+
+The Hermes package (1.0.2) reads the bare staff prompt as working only on the
+last non-empty line, so an old transcript prompt exposed by a partial idle
+redraw does not latch.
+The Codex package (1.2.2) reads a working title only when the spinner is
+followed by a thread or project name, so the `<spinner> | <project>` title of an
+idle unnamed thread's title generation no longer reads as a turn.
+
+### 2026-10-23, prompt-submit delivery evidence, #1486
+
+- A Claude session now reports each submitted prompt to its worker from a
+  `UserPromptSubmit` hook (state hook action `prompt-submit`). The report is
+  delivery evidence for a waited `session.input`, never activity: it moves no
+  activity revision, emits no `agent_state` event and opens or closes no turn.
+  The hook drains the prompt without decoding it, prints nothing, exits 0 on
+  every path and makes one worker attempt with no daemon fallback. The worker
+  applies it only from the session's launch process (a nested `claude -p`, other
+  providers and a shell-hosted Claude are refused) and only with a sequence
+  ahead of the last applied one; the sequence stays in memory.
+- `session.input` gains the optional `wait.allow_prompt_accepted` and the
+  result field `prompt_accepted`. An opted-in `working` wait is answered by an
+  acceptance that started after the worker wrote Enter, for the same runtime and
+  before the deadline, when the agent was not `working` at the boundary; the
+  result then carries `prompt_accepted: true` and no activity, source or
+  revision. An acceptance never answers `idle`. `session new
+  --input-ack-timeout-ms` counts it as the acknowledgement. The CLI always opts
+  in and prints `prompt_accepted=true source=prompt-submit-hook`. A daemon that
+  predates the field answers on activity alone; a protocol 3 connection drops
+  the option. Only Claude sessions on worker protocol 8 or later with the admitted hook schema carry the field. A parallel user hook that
+  blocks the prompt can still discard it after the report. Without any evidence the wait ends in `session_input_timeout`
+  whose message names both kinds of evidence.
+- Worker protocol 8 adds `WriteAck.submit_mark_ns` and
+  `InspectSnapshot.prompt_accepted_sequence`; a version-7 connection sees
+  neither. Hook schema `identity-subagent-v1` gains the `prompt_accepted`
+  action for Claude. The integration version is 15 for every managed hook asset:
+  reinstall the Claude and Codex hooks (`pohunek integration install`, or
+  `pohunek service upgrade`); until then `integration.status` reports them
+  `outdated` and waits get no acceptance.
+
+### 2026-10-23, projector inputs ordered by production, #1507
+
+An input that ends a notification condition now acts on the records that
+existed when the registry produced it, not when the projector got to it. An
+approval a provider hook created while the projector was blocked in a slow or
+failing session seed is no longer cancelled by the resume produced before it.
+
+### 2026-10-23, Hermes working screen, #1524
+
+The Hermes package (1.0.3) reads the staff prompt followed by the interrupt
+placeholder (`⚕ ❯ msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel`, the
+line Hermes 0.20.0 paints into an empty composer while a turn runs) as
+`working`, as the last non-empty line apart from the rule chrome. Before, only
+the bare staff prompt matched, so a real working screen was not read as
+`working` by the screen rule. The compact layout, which drops the arrow, is
+read the same way.
+
+### 2026-10-23, Claude Code 2.1.309 and program status, #1525
+
+The Claude package verifies Claude Code 2.1.309 (lock, npm tree, captures and
+the UserPromptSubmit golden) and keeps the 2.1.289 captures as the previous
+verified release in `compat/claude/screens/n-1/`. Its manifest opts in to OSC
+7501 program-status records (`app = "claude-code"`, `answer_probe = true`): a
+Claude session reports working, blocked and idle from Claude's own records,
+a visible dialog still wins, and the API-key dialog is a visible blocker. The
+spinner rule needs one verb word and an optional timer, so a transcript bullet
+no longer reads as a running turn, and the process matchers accept the native
+installer's `claude/versions/<release>` image. Package version 1.1.0.
+
+### 2026-10-23, Codex 0.164.0 and OSC 7501 opt-in, #1525
+
+The Codex package is verified on Codex 0.164.0 and opts in to OSC 7501 program
+status (`app = "codex"`, no probe answer: Codex reports on its own). Codex
+0.163.0 and later therefore report working, idle and blocked through the
+record; a background terminal that outlives its turn reads idle
+(`background_terminals_idle`). The captures of 0.160.0, the supported minimum,
+stay as the previous set. The package drops the rules for strings no Codex
+release draws (`workspace_trust_prompt`, `allow command?`, `yes (y)`). See the
+[Codex package guide](guides/codex-package.md).
+
+### 2026-10-23, Pi 1.4.0 and program status, #1525
+
+The Pi package (1.0.4) is verified on Pi 1.4.0 and opts in to OSC 7501 program
+status: the session worker answers Pi's probe, and Pi's records decide the
+activity while a visible dialog still reads `blocked`. Pi 1.0.x keeps working
+from the screen alone; its captures stay as the previous release in
+`compat/pi/screens/n-1/`.
+
+A session no longer keeps an `osc_progress` activity after the agent that
+reported it leaves or is replaced: the activity is cleared (`state_source`
+`process`) and the new manifest's reading replaces it (#1550).
+
+### 2026-10-23, OSC 7501 program-status engine, #1525
+
+A detection manifest can opt in to OSC 7501 program-status records with a
+`[program_status]` table (`app`, optional `answer_probe`) and the rule flag
+`overrides_program_status`. The detector holds the latest root record of that
+app and arbitrates it with the screen rules; the evidence is reported as
+`state_source = osc_progress`. With `answer_probe = true` the session worker
+answers the program's 7501 probe (the daemon sets the new additive
+`Initialize` field `answers_program_status_probe`) and drops the attached
+terminal's duplicate reply. `session.detection` does not show the record
+yet, because older clients cannot decode a new region kind. The Pi, Codex and Claude packages opt in
+(see their own entries); the other official runtimes behave as
+before. See [runtime packages](guides/runtime-packages.md) and
+[sessions](concepts/sessions.md).
+
+### 2026-10-23, resize after a daemon restart, #1529
+
+A resize of a session whose worker survived a daemon restart (crash, `service upgrade`, manual restart) could be silently ignored: the PTY kept its old size, so an attached agent TUI rendered for the wrong width and height, and `pohunek session resize` still printed the requested size. The daemon numbered its resizes from 1 again under one constant source id while the worker kept the highest sequence it had accepted, and dropped every resize at or below it until the new daemon's counter caught up. The daemon now sends resizes under a source id bound to its controller lease (`daemon-resize-<lease id>`), which a 0.35.x worker accepts unchanged, so the fix applies to live workers without restarting them. A new worker also clears its recorded resize sequences when it grants a lease. The daemon logs a warning when the dimensions a worker reports differ from the requested ones, and `pohunek session resize` prints the applied size. Until a build with the fix runs, detach (`Ctrl-]`) and reattach once the terminal has its final size; the attach dimensions are always applied. See `docs/architecture.md`.
+
+### 2026-10-23, ctutils advisory RUSTSEC-2026-0385, #1530
+
+- `Cargo.lock` moves `ctutils` from 0.4.2 to 0.4.5, the patched release for
+  RUSTSEC-2026-0385. The crate is reached only through `digest` from the
+  `sqlx-postgres` stack used by `pohunek-relay`. No manifest, protocol, store or
+  report change.
+
+### 2026-10-23, native-installer launch agent, #1537
+
+The `NamedForProvider` launch-agent rule also designates a process whose
+symlink-resolved executable is a release image of the provider's native
+installer, `<provider>/versions/<release>` (Claude Code's
+`~/.local/share/claude/versions/2.1.309`). Before, only an executable file name
+containing the provider name qualified, so `SessionStart` identity binding
+failed for a native-layout Claude.
+
+### 2026-10-23, rollback after a completed 0.36 upgrade, #1549
+
+Rolling back from a completed 0.36 upgrade to 0.35.2 is not supported: 0.36
+writes `service.toml` schema 7, store schema 11 and a newer runtime catalog, and
+selects official packages that 0.35.2 cannot read (Codex 1.3.0, Pi 1.0.4 and
+Claude 1.1.0). A failed `service upgrade` still
+rolls back automatically. When going back is unavoidable, restore the older
+packages and profile pins under 0.36 first; the ordered procedure is in
+[update after release](runbooks/update-after-release.md#roll-back-after-a-completed-036-upgrade).
+
+### 2026-10-22, required post-create hook, #670
+
+`service.toml` `[hooks] required = ["post-create"]` makes a failing `post-create`
+hook abort `session.new` with the new error code `hook_required_failed`
+instead of leaving a `hook` warning. The failing script ends the hook (a later
+repository script does not run), the create is rolled back with the remove
+hooks, and the error names the event, the layer, the script, how it ended, the
+scripts that did not run, the stderr tail and, after a `--from-remote` reset,
+the backup ref. The key is optional and omitted while empty, so the schema does
+not change; an invalid, unsupported or repeated entry fails the configuration
+load, and `pohunek service check` reports it. See the hooks guide in
+[worktrees](concepts/worktrees.md), [setup](guides/setup.md) and
+`docs/public-api.md`.
+
+### 2026-10-22, overlay TCP keepalive frees long-wait slots, #862
+
+Every connection the daemon accepts on an overlay (NetBird) address now has TCP keepalive set from three optional `service.toml` `[waits]` keys: `keepalive_idle_ms` (default 30000), `keepalive_interval_ms` (10000) and `keepalive_count` (3). A client host that vanishes without closing its connection fails its read and releases the waiter slot of an in-flight `session.wait_turn`, `session.wait` or `session.output` wait within `idle + interval x count` (60 s by default) instead of at the wait's deadline. The two times are whole seconds in `1000..=600000` ms and the count is `1..=10`; the installer omits a key that equals its default, so `schema_version` stays 7. A failed socket option is logged as a warning (`remote keepalive setup failed`, with the peer and the errno) and the connection is still served. See [setup](guides/setup.md) and `docs/public-api.md` (`session.wait_turn`).
+
+### 2026-10-22, waited input on delayed-submit agents, #953
+
+`session input --until` no longer fails with `session_input_wait_unsupported`
+for Codex, Claude Code, and Hermes. The daemon types the text, waits out the
+submit delay, re-checks the agent, and only then writes Enter. A success reports
+`submitted: true`; `--until working` confirms the agent started on the input,
+and an `idle` target counts only after `working` followed the submit. A blocked
+agent, an elapsed deadline, or a shutdown before Enter fails with the new
+`session_input_not_submitted`; the typed text may remain in the input box.
+
+### 2026-10-22, session new prompt delivery, #953
+
+`pohunek session new --input-ack-timeout-ms <1..8000>` (with `--input` or
+`--input-stdin`) reports whether the agent started working on the initial
+input: `--json` gains a top-level `prompt_delivered`, the human output prints
+`prompt delivered: yes/no`, and the session is kept either way. The daemon
+advertises `session_new_input_ack_supported` in `host.inspect`; a host without
+it is refused before the session is created. The Rust and TypeScript clients
+extend the `session.new` response budget by the window.
+
+### 2026-10-22, session new from the remote branch, #954
+
+`pohunek session new --branch <b> --from-remote` (`SessionNewParams.branch_source:
+remote`) fetches `origin/<b>` and starts the worktree from it: a local branch that
+is behind is fast-forwarded, one that is ahead is used with a
+`branch_ahead_of_remote` warning, and a diverged one is refused with
+`branch_diverged` unless `--reset-diverged` (`on_diverged: backup_reset`) keeps it
+as `backup/<b>-<short-sha>` and resets it. The result carries `worktree_source`.
+`pohunek assistant` takes the same flags, and a host whose daemon does not advertise
+`session_new_branch_source_supported` is refused with
+`session_new_branch_source_unsupported`. New errors: `branch_fetch_failed`, `remote_branch_not_found`, `branch_diverged`,
+`backup_ref_exists`. See [Worktrees](concepts/worktrees.md).
+
+### 2026-10-22, idle stop of opted-in sessions, #956
+
+A session whose metadata carries `pohunek.idle_stop_after_secs` (`default` or a number of seconds, at least 60) is stopped once its agent has been idle that long; the worktree is kept and the `session-stop` hook fires. The host default behind `default` is set with `pohunek session policy set --idle-stop-after <seconds>` and lives in its own record, `session-idle-stop.json`, served by `session.idle_stop.get` and `session.idle_stop.set`; the retention policy keeps its shape. Pending `agent_blocked` or `approval_required` notifications and waiting callers hold a stop. The stop is logged at INFO (`session.idle_stop.stopped`) and recorded as a `system` notification only when the notification policy keeps `system` records. See [sessions](concepts/sessions.md#idle-stop) and `docs/public-api.md`.
+
+### 2026-10-22, failed-exec terminal recovery on macOS, #1289
+
+After a failed `pohunek service lock` exec, the terminal goes back to the
+shell when the child's foreground group has no live member. On macOS the
+liveness probe `killpg(group, 0)` ends in `killpg1` (`bsd/kern/kern_sig.c`),
+which skips zombies and system processes and answers `EPERM` for a group it
+found but counted no member of; that is also the answer for a live group of
+another user. The recovery used to treat only `ESRCH` as an empty group, so a
+group left with only a zombie kept the terminal. On macOS an `EPERM` probe now
+lists the group's members (`libproc`) and the terminal is taken back only when
+none is alive; a zombie is not alive, a membership query that fails keeps the
+terminal where it is, and a live group is never taken from. On Linux `EPERM`
+means a live member of another user, so the terminal stays. The failure
+message gains `live_members=` and `group_members=` (each member with its
+state), which show what a group still held when the recovery did not reclaim.
+The member the macOS CI run actually saw is not established: the reclaim
+covers a group with zombie members, and any other member kind still keeps the
+terminal and is reported in `group_members=`.
+
+### 2026-10-22, bounded event journal, #1364
+
+- The event journal `<data>/events/events.jsonl` is bounded. `service.toml`
+  schema 7 adds the required `[events]` table (`max_file_bytes` 33554432,
+  `max_files` 8, `max_age_days` 14): the journal rotates to `events.jsonl.N`
+  before a write would cross `max_file_bytes`, keeps at most `max_files` files
+  and deletes rotated files older than `max_age_days`; an `events.jsonl` last
+  written longer ago than that is removed at start. `pohunek service
+  upgrade` migrates schemas 2 to 6 and writes these values; a daemon without
+  `service.toml` uses them.
+- The first start removes an `events.jsonl` above `max_file_bytes` without
+  reading it and logs one WARN with its path and size to `pohunekd.jsonl`. The
+  history in that file is not kept; nothing in the daemon reads the journal.
+- `agent_state` events that restate a session's last journaled activity,
+  source, runtime and epoch (only `revision` changed) are no longer journaled.
+- A dedicated writer thread owns the journal files, so event logging no longer
+  runs filesystem writes on a tokio worker. When the writer cannot keep up, the
+  drain waits and the broadcast lag is recorded as an `events_dropped` line.
+
+### 2026-10-22, ambiguous host hint, #1379
+
+The `overlay_host_ambiguous` hint offers a per-overlay `fqdn~` selector when only
+another overlay carries the same name, and a provider collision that lists no
+candidates reads `matches multiple hosts` instead of a count of one. See
+[remote hosts](guides/remote-hosts.md).
+
+### 2026-10-22, Hermes gap hint, #1386
+
+The Hermes gap hint of `service upgrade` and `setup` names the install command
+`pohunek integration install --agent hermes`, which parses. See
+[setup](guides/setup.md).
+
+### 2026-10-22, session commands pin the host, #1391
+
+Every `session <action> <name>` command (`inspect`, `stop`, `fork`, `rm`,
+`input`, `screen`, `detection`, `read`, `resume`, `resize`, `metadata`, `rename`,
+`diff`) looks the remote peer up once, so the session-name lookup and the action
+reach the same peer; a peer that cannot be pinned fails with
+`host_identity_unpinnable`. See [remote hosts](guides/remote-hosts.md).
+
+### 2026-10-22, session new --cwd, #1399
+
+`session new --cwd` takes effect for a project-bound session: with `--project`
+or `--repo` the session starts in the requested directory, inside the checkout or
+anywhere else on the target host, and keeps the project association of the
+reference. A missing or non-directory path, a relative remote path and `--cwd`
+with `--branch` are refused before a session is created, and a host whose daemon
+does not advertise `session_new_cwd_supported` is refused with
+`session_new_cwd_unsupported` for every explicit `--cwd`. The daemon stores the
+canonical launch directory. A by-reference session started outside every
+repository holds its create-time association (the project) in memory while its observed cwd
+provably lies outside every repository (`git` reports no repository), also after following another repository
+and returning; unreadable evidence, a daemon restart and every other session
+follow the cwd as before. See [sessions](concepts/sessions.md).
+Without `--project`/`--repo`, an explicit `--cwd` below a checkout now starts the
+session in that directory; the CLI sends the work-tree root itself for a start
+without `--cwd`. An older CLI with this daemon sends its own directory for such
+a start, which now starts in that directory instead of the checkout root.
+An older CLI sends its own directory as `cwd` for every start on the same host,
+also with `--project` or `--repo`, and sends no `cwd` to a remote host. After a
+partial upgrade, an older CLI against this daemon on the same host therefore
+starts a `--project` session in the caller's directory instead of the project
+checkout. `pohunek service upgrade` updates both.
+
+### 2026-10-22, stop terminal commit failure, #1402
+
+- A `session stop` or `session rm` whose worker ended the session but whose
+  terminal commit failed (a store outage) no longer leaves the session
+  paused: the error is returned, the session stays monitored, the stop or
+  removal intent stays pending, and the daemon commits `stopped` as soon as
+  the store accepts the write, without a restart. See
+  [sessions](concepts/sessions.md).
+
+### 2026-10-22, release forward failure log, #1439
+
+- One failed forward of `session.release_agent` logs one
+  `session.active_identity.forward_failed` WARN, and its text holds for both
+  claim kinds: the daemon ends a memory claim and leaves a claim the worker
+  journaled to the worker's journal. See [sessions](concepts/sessions.md).
+
+### 2026-10-22, release package under the same version and another digest, #1445
+
+- `pohunek service upgrade`, `service check` and `pohunekd ensure-official-runtimes`
+  no longer plan an install that the registry refuses with
+  `package_identity_installed`. When the registry records the release package's id
+  and version under another digest and an enabled, loadable selection serves the
+  runtime, the plan and the apply keep that selection, write nothing and report the
+  gap `plugin_update_same_version_other_digest`. Its detail names the uninstall
+  command of the recorded package only where that is proven to work (the selected
+  package of a reserved runtime that a profile, session or hook makes the plain upgrade
+  plan, that no profile or session pins and that the upgrade does not bind to a profile),
+  and otherwise says the fix is a release with a new version. A newer Pi selection is
+  kept silently, with no gap. The gap code is additive: an older client reads it as an unknown
+  string.
+- Docs: `install.md`, `public-api.md` and the update runbook.
+
+### 2026-10-22, projector epoch seed retry, #1446
+
+- When the notification projector cannot read a session's stored records on
+  its first input, it keeps that input and the ones after it in order and
+  projects them after a retry (every second, and once more when the daemon
+  shuts down), instead of dropping the derived notification. A session that
+  keeps failing holds at most 256 inputs. See [sessions](concepts/sessions.md).
+
+### 2026-10-22, worktree lock wait bound, #1449
+
+A worktree operation that takes the repository's admin lock waits for it for up to the git command timeout and then runs its git command under its own timeout; finding the lock is a third bounded git step (see #1471), so one operation can take up to about three times that bound. A base-branch fetch also runs a few unlocked git steps, each with its own bound. See [worktrees](concepts/worktrees.md) and `docs/public-api.md`.
+
+### 2026-10-22, release package identity recorded beside no serving selection, #1452, #1455, #1480
+
+- `pohunek service upgrade`, `service check` and `pohunekd ensure-official-runtimes`
+  no longer plan an install that fails with `package_identity_installed` when the
+  registry records the release package's id and version under another digest and no
+  enabled, loadable official selection serves the runtime. Nothing selected, a selected
+  package whose root is missing or does not load, or a non-official selection leaves the
+  runtime with the gap `official_package_not_serving` (exit 0, nothing written); a selected
+  package with an altered root is refused with `plugin uninstall --remove-modified`. One
+  renderer builds every hint, for Pi's managed-runtime check too (#1480): it names the
+  release of a profile or session pin on the obstacle, the removal of the obstacle and
+  what follows (the next upgrade, or for a Pi that keeps no enabled official selection
+  `plugin install`, `plugin update` when another Pi version is installed). No wire type
+  changes.
+- Docs: `public-api.md` (the holder table), `install.md` and the update runbook.
+
+### 2026-10-22, projector backlog resolve, #1463
+
+- An input the projector kept while its epoch seed failed acts on what existed
+  when the input arrived. When the retry replays it, the turn that opens, the
+  agent that resumes or the session that stops no longer acknowledges or
+  cancels a record a provider hook created in between, such as the report of the
+  turn that just ended or a newer approval request. See
+  [sessions](concepts/sessions.md).
+
+### 2026-10-22, macOS on Apple Silicon is supported, #1464
+
+macOS on Apple Silicon is a supported platform (deployment target 14.0, tested on macOS 15); install, upgrade, and removal are in [install on macOS](runbooks/install-on-macos.md).
+
+### 2026-10-22, session metadata edits survive a restart, #1469
+
+`session.set_metadata` writes the edited metadata to the session's durable record for every session, also one without a native id, before the session shows it. A daemon restart therefore adopts the session with the edited metadata, and a write the store refuses fails the call with `session_store_failed` and leaves the metadata unchanged. See [sessions](concepts/sessions.md) and `docs/public-api.md`.
+
+### 2026-10-22, worktree lock bound includes the lock lookup, #1471
+
+A worktree add, remove, or prune takes three bounded steps: the `git rev-parse --git-common-dir` that finds the repository's admin lock, the wait for that lock, and the git command itself. Each is bounded by the git command timeout, so one operation can take up to about three times that bound (about 90 seconds). A base-branch fetch takes the same lock for its fetch command and also runs a few unlocked git steps. See [worktrees](concepts/worktrees.md) and `docs/public-api.md`.
+
+### 2026-10-22, idle-stop upgrade hint names the daemon version, #1472
+
+`pohunek session policy set --idle-stop-after` against a daemon that predates the idle-stop default fails with `method_not_found`; its upgrade hint now names the connected daemon's version, read from the `daemon.health` answer of the same connection. See `docs/cli.md`.
+
+### 2026-10-22, overlay keepalive release bound, #1483
+
+The sessions concept page states the release bound of a waiter slot held by an overlay (TCP) client that vanishes without closing its connection: TCP keepalive releases it within `idle + interval x count` (60 s by default), and the wait's timeout stays the bound only for a client that pipelines another request behind the wait. See [sessions](concepts/sessions.md).
+
+### 2026-10-22, session record writers and idle-stop upgrade hint, #1484
+
+The removal intent and the native-recovery rollback now write the session record under the lock a `session.set_metadata` edit holds, so a metadata edit cannot be overwritten by an older snapshot of the record. The upgrade hint of `pohunek session policy set --idle-stop-after` against a daemon without the idle-stop default names this CLI's release as the upgrade target instead of a fixed release number. See `docs/cli.md`.
+
+### 2026-10-22, session record writers keep metadata edits, #1484
+
+Every unconditional write of a session record, including the relaunch of a resume and the supervision retry that classifies a runtime, takes the lock a `session.set_metadata` edit holds and carries the metadata of the session's registered entry into the record and the entry it installs. A metadata edit acknowledged while such a write is in flight is therefore no longer lost to an older snapshot of the record. The same holds for the worker's projection of its own snapshot into the record: a metadata edit committed while a worker snapshot is being applied is kept, and the projection retries against the edited record instead of overwriting it. The upgrade hint of `pohunek session policy set --idle-stop-after` names a release that includes the default, without a number, when the connected daemon's version is not older than the CLI's. See `docs/cli.md`.
+
+### 2026-10-22, session new from remote edge cases, #1488
+
+`session.new` with `branch_source: "remote"` now also refuses with
+`worktree_branch_in_use` when another worktree (or the main checkout) is in the
+middle of a rebase or bisect that started on the branch, or when the branch is
+listed in the `update-refs` of a rebase in another worktree (`git rebase
+--update-refs` moves the other branches of its stack when it ends);
+`git worktree list` shows such a worktree as detached, so the per-worktree
+rebase and bisect state is read as well. A `branch` value that git expands, such as `@{-1}`, is an
+`invalid_branch`. The in-use check stays in two places on purpose: before the
+pre-create hook, so a doomed request has no hook side effects, and under the
+repository's worktree lock, which excludes the daemon's own concurrent worktree
+adds; a `git worktree add` run in a terminal is not excluded, and a branch it
+checks out in that window is still moved, though no commit becomes
+unreachable. See [worktrees](concepts/worktrees.md).
+
+### 2026-10-22, bounded Hermes provisioning, #1494
+
+`scripts/provision-hermes-compat` bounds its network phases: the locked-tag
+`git fetch` retries up to three times with a stall bound (below 1 KiB/s for
+60 s), the pinned CPython download has connect, stall and total timeouts and a
+bounded retry, and each phase prints a progress line and fails with a message
+naming it. The `Provision locked Hermes runtime` steps of both pinned Hermes
+compatibility jobs carry a 15 minute step timeout.
+
+### 2026-10-22, required hook documentation, #1496
+
+The `service.toml` schema paragraph of `docs/public-api.md` now lists the
+optional `[hooks] required` key (additive, omitted while empty, ignored by a
+previous release), and the stderr-tail section of the hooks design note names
+the `hook_required_failed` error `msg` as the second place the `session.new`
+response carries the tail.
+
+### 2026-10-22, session new from remote with prompt acknowledgement, #1497
+
+A CLI scenario now runs `pohunek session new --from-remote
+--input-ack-timeout-ms` together against a fixture daemon: the JSON document
+carries both `worktree_source` and `prompt_delivered`, the human output prints
+both lines, the two capability checks share one `host.inspect`, and a host
+lacking either capability is refused before a session is created.
+
+### 2026-10-21, upgrade preflight repairs native recovery, #1100
+
+- The upgrade preflight runs reconciliation's native-recovery repair on every
+  record and its resume binding before it merges them, over the profiles and
+  runtimes the new daemon will have (the planned profile texts included). The
+  repair is read-only. A binding that waits for the runtime registry is no
+  longer reported at risk when startup would complete it, so the upgrade stops
+  asking for `--accept-runtime-loss` where resume would succeed.
+- A binding the repair cannot complete is reported `would_lose_recovery` with the
+  new code `native_recovery_unrepairable`, whose `detail` names the reason. It
+  has no acceptance scope, so accepting it is one-time.
+  `native_recovery_unverified` is reported only by a daemon older than this
+  change, when it judges a rollback; the CLI does not match on either code.
+- No store, journal or report schema change.
+
+### 2026-10-21, hook report identity and retryable admission, #1128, #1150
+
+- Two sessions that fired the same hook event in the same millisecond lost one
+  notification, because the managed Claude and Codex hooks keyed it by event
+  and timestamp only. The key is now
+  `hook:<agent>:<session id>:<event>:<event id>`, and an event without a payload
+  id gets a random per-invocation id that the worker route, the daemon fallback
+  and every retry share. The store's merge rule is unchanged; the fix ships in
+  the scripts, which `pohunek service upgrade` reinstalls.
+- A hook report refused only because the session's worker was unreachable is no
+  longer lost. `notification.create`, `session.report_agent`,
+  `session.release_agent` and `session.report_native_id` accept an optional
+  `retryable_admission`; with it the daemon waits 250 ms instead of the worker
+  connect deadline and answers `hook_schema_unavailable`, and the managed hooks
+  retry for up to the hook timeout minus 2 s. Daemons announce it with
+  `POHUNEK_HOOK_ADMISSION_RETRY` in a session's environment; reports of an
+  older session carry no new field. The hooks' `daemon_refused` trace now
+  fires for a daemon error (it checked the wrong key before), and
+  `daemon_retry` and `daemon_retry_exhausted` are new.
+
+### 2026-10-21, service upgrade updates the Pi package, #1222
+
+- `pohunek service upgrade` and `service check` keep an installed official Pi
+  package current. When the official Pi package is installed from the official
+  catalog, selected and enabled, and the release catalog lists a package of the
+  same id for this platform, the plan installs and selects the release's version
+  (use reason `installed`, a new value) and keeps the older version installed.
+  Host profiles pinned to the older official version are repinned; unpinned
+  profiles stay unpinned.
+- The upgrade never installs an absent Pi package, never enables or selects one
+  the operator turned off, and never downgrades a selected version newer than the
+  release's: the plan reports it as `kept`, with the new `release_version` field
+  naming the release's version. A selected version that cannot be ordered against
+  the release's (not semver) is kept too, with the gap
+  `plugin_update_version_unordered`, the code `plugin update` reports.
+- An official package of a non-reserved runtime that the release does not list,
+  or that is installed but not serving, is a gap (`official_package_unavailable_for_platform`,
+  the new `official_package_not_serving`) with the `pohunek plugin update`
+  command. `service check` and `service upgrade` print gaps. The report layout
+  stays at `report_version` 2; both additions are additive.
+- Docs: `install.md`, the Pi package guide and the update runbook state the Pi
+  behaviour and the manual command.
+
+### 2026-10-21, a lost runtime reports how its worker ended, #1330
+
+- `SessionRuntime` gains an optional `exit` (`RuntimeExit`: an open `cause`
+  string, `signal`, `code`). On Linux the daemon reads the failed worker job's
+  verdict from the systemd user manager before it retires the job, so a worker
+  killed for memory shows `cause=oom_kill`. The field is absent after a host
+  restart, on macOS (#1343) and when the read fails. It is an additive optional
+  field: no protocol version or worker-protocol change, hidden from protocol 3
+  peers. Store schema 11, a no-op migration from 10: a runtime written before
+  it records no exit. A release that predates schema 11 refuses the newer
+  store; roll back with the `metadata.jsonl.pre-schema-10` backup the migration
+  takes (sessions created since are lost) or keep the newer release; see
+  [debugging session runtime](runbooks/debug-session-runtime.md) and
+  [update after release](runbooks/update-after-release.md).
+
+### 2026-10-21, clients recover from a timed-out request, #1371
+
+- A TypeScript SDK `Client` is no longer unusable for good after one request
+  timeout. The failed call still rejects (`requestTimeout`, and never resent,
+  reads included), and the next call opens a fresh control connection, learns
+  the daemon's protocol version again and sends only its own request; a late
+  reply of the old connection is never delivered, concurrent callers share one
+  reconnect, and the version probe of a fresh connection has its own
+  `requestTimeoutMs`. The Rust `Client` does the same. Closed clients, consumed
+  subscriptions and incompatible protocol versions stay refused.
+
+### 2026-10-21, daemon unit environment, #1383
+
+On Linux the daemon job is judged with what its unit's drop-ins give it, also when `service.toml` records a `PATH`: a drop-in `Environment=PATH=` replaces the recorded one (with a warning), a drop-in `Environment=` replaces the user manager's value of an allowlisted store variable (#1384), and a drop-in or `EnvironmentFile=` that sets, resets or removes a bootstrap key (`HOME`, `XDG_*`) is refused with `service_manager_environment_unavailable` (#1394). An `EnvironmentFile=` that assigns a judged variable is refused ("move it to a drop-in `Environment=` line"). An unreachable user manager now refuses a recorded `PATH` as it refuses an unrecorded one, so `service_manager_variables_unread` is macOS only. A run of backslashes at the end of a drop-in line continues it only when its length is odd, as systemd reads it, so such lines are no longer refused (#1434). On macOS a job that is not loaded and has no journaled default uses the persisted launchd configuration only when `user.plist` is older than the boot; a forward gate refuses otherwise and a rollback continues with a warning (#1093). See the [upgrade runbook](runbooks/update-after-release.md#the-journal-of-an-interrupted-upgrade) and `docs/public-api.md`.
+
+### 2026-10-21, tolerant service.toml, #1401
+
+`service.toml` accepts keys and tables this version does not know instead of
+failing the load, so an additive setting no longer forces a schema bump and a
+daemon older than the file still starts. The daemon logs one
+`service_config.unknown_key` warning per key (path, line and file, never the
+value); `pohunek service status`, `service check`, `service upgrade` and the new
+`service_config_unknown_keys` doctor check report them with a "did you mean"
+hint. The installer keeps them when it rewrites the file. Unknown keys in
+`[namespace]` and `[environment]` stay hard errors, `schema_version` stays 6,
+and the schema 2 to 5 upgrade sources stay strict.
+An interrupted schema 2 to 5 migration resumes when the rewritten target differs from the expected one only in its header comment; a different body is still refused with `service_config_backup_invalid`.
+
+A rewrite renders the kept unknown keys from the parsed items in their original order and checks that the result parses again; a file whose unknown part cannot be written back is refused at load with a fixed message. `service upgrade` refuses a rendering above the 64 KiB load bound before it starts a transaction, and a rollback leaves a file that never left the previous version untouched.
+
+### 2026-10-21, unordered selected versions are kept for every runtime, #1425
+
+- `pohunek service upgrade` and `service check` keep the selected official
+  version of `claude`, `codex` and `hermes` when it cannot be ordered against the
+  release's (for example `2.0` against `1.0.3`), as they do for Pi. The plan
+  reports the gap `plugin_update_version_unordered` and the retained package
+  with the version the release offers. A selected version that is newer and
+  ordered keeps its behaviour: for a reserved runtime the release's package
+  replaces it and the plan warns.
+- A host profile pinned to a digest other than a kept selection stays as it is
+  and is reported `kept` with the new reason `pinned_differs_from_kept_selection`.
+- A disabled unordered selection, or an enabled one whose package does not
+  load, is left untouched (gap `official_package_not_serving`, with the repair
+  step for the second), never replaced or enabled. `pohunek setup`
+  prints the retained-package line as `service check` does.
+- The profile scan behind the upgrade plan is sorted by name, independent of the
+  order the filesystem returns the agents directory in (#1413).
+- Docs: `install.md`, `public-api.md` and the update runbook.
+
+### 2026-10-21, disabled packages are never re-enabled by an upgrade, #1427
+
+- Before: `pohunek service upgrade` and `service check` installed, selected and
+  enabled the release's package for `claude`, `codex` and `hermes` when the
+  selected official version had been disabled with `plugin disable` and was older
+  or newer than the release's (a newer one was downgraded), or was the release's
+  own package. They also enabled and selected the release's own package when it
+  was recorded and disabled (`plugin install --no-enable`, `plugin disable`) while
+  another enabled version was selected (#1432).
+- After: a selected package you disabled, or the release's own package
+  recorded as disabled, is left as set, whatever its version, for every
+  runtime. When an enabled version still serves the runtime, it keeps serving
+  (package entry and integrations stay, nothing is downgraded) and the gap says
+  so. The plan reports the gap `official_package_not_serving` with
+  `pohunek plugin enable <package> --digest <digest>`, lists no package, no
+  integration and no profile change for the runtime, and the next upgrade
+  proceeds as for any enabled package once you enable it. For an official Pi
+  package the hint is the same instead of `plugin update`, which refuses a newer
+  selection as a downgrade. The operator is the one who leaves a package
+  selected and disabled: an install records the enabled flag and the selection
+  in one registry commit (the one other writer, the loader-rejection disable of
+  a fresh install, is reported by the state of its root like any disabled
+  package). A disabled package whose root is missing is hinted with
+  `plugin install` of its archive before the enable; one whose root is altered
+  is refused with `plugin uninstall --remove-modified`.
+- `pohunek setup` (the detecting plan) no longer reports
+  `official_package_not_serving` for a runtime it drops: one nothing uses, that
+  no profile has as its base, and whose program is off the search path,
+  whatever the state of its package (an unselected Pi package's `plugin update`
+  gap included).
+- A host profile pinned elsewhere beside a kept unordered selection is reported
+  with the precise reason (`pinned_version_unknown`, `pinned_to_non_official_package`,
+  `pinned_to_other_package`); `pinned_differs_from_kept_selection` remains for an
+  official version of the same package (#1431).
+- Docs: `install.md`, `cli.md`, `public-api.md`, the update runbook and the Pi
+  package guide.
+
+### 2026-10-21, disabled release package case table, #1443
+
+- Docs: the prose sentence that said when the altered root of a disabled release
+  package is refused is replaced by one case table in `public-api.md` ("Disabled
+  release package: case table"), derived from the upgrade plan's selection logic.
+  Each row is a state of the selected version (enabled and loading, enabled and
+  unloadable, unordered, disabled, none) crossed with the state of the release
+  package's root and with the class of runtime (`claude`/`codex`/`hermes`, Pi) and
+  `--detect`. `install.md` and the update runbook point to it. No behavior changed.
+- Scenarios assert every row for a reserved runtime and for Pi, and the refusal of
+  a disabled release package that a third-party package shadows beside an
+  unloadable Pi selection.
+
+### 2026-10-20, session rm hook warnings, #747
+
+`session.remove` returns an optional `warnings` list. A failing or timed-out
+worktree `pre-remove` or `post-remove` hook no longer vanishes with the removed
+session record: `pohunek session rm` prints it as `warning [hook]: ...` and
+`--json` carries it in `warnings`. The removal itself is unchanged and is never
+blocked by a hook. The hooks guide in [worktrees](concepts/worktrees.md)
+documents the `post-create` / `pre-remove` pair and that both must be
+idempotent. See `docs/public-api.md`.
+
+### 2026-10-20, daemon-emitted turn_completed, #955
+
+- The projector reports a `turn_completed` when a session's activity goes
+  `working` to `idle`, held for `attention_debounce_secs`, so runtimes without
+  managed hooks report finished turns and complete `session.wait_turn` on
+  `turn_completed`. A hook report and the projector's report of one turn are one
+  event; a turn that ends `blocked` reports nothing.
+- `NotificationRecord` gains the optional, daemon-set fields `turn_started_at`,
+  `turn_duration_ms` and `session_metadata`. They are additive: an older client
+  ignores them, and a producer cannot send them.
+- The kind stays disabled for the inbox by default; see
+  [sessions](concepts/sessions.md).
+- Each turn has a daemon-side identity and owner; the projector reports a turn
+  from an internal edge, and a turn whose agent or runtime leaves while it
+  works is never reported. `session.wait_turn` is at-least-once for turns the daemon did not
+  observe.
+- A `working` inferred from terminal output opens a turn only while the
+  session's runtime holds input evidence (delivered input, never an agent
+  report). The turn takes the evidence and gives it back when abandoned, with
+  its start; a new runtime generation or the end of the session discards it.
+  The repeat window of an unstamped hook report is anchored at the inbox commit
+  of the newest turn.
+
+### 2026-10-20, TypeScript SDK host resolution, #961
+
+The daemon answers `host.resolve`, which maps a host route to this machine or to
+one pinned overlay peer with the selector rules of the CLI and the Rust client;
+it is served on the local Unix socket only. The TypeScript SDK exposes
+`resolveHost` and `connectHost`, and `attachRaw` reaches remote hosts through
+them.
+
+### 2026-10-20, daemon job PATH overrides, #1091 #1092
+
+On Linux (`ExecSearchPath=` included) the PATH of a daemon job that records none is the systemd user manager's,
+replaced by an `ExecSearchPath=` or an `Environment=PATH=` of a drop-in of the daemon unit (the install replaces the unit file itself, so a `PATH` set only there does not count). Drop-ins of a unit with no file (before the first install, or after a rollback or migration removed it) are read from disk the way systemd reads them: file-name order across directories, a higher-priority directory first for a shared name, a `/dev/null` link disabling its name, hidden and backup files skipped. An
+`EnvironmentFile=` that sets `PATH`, `PassEnvironment=PATH`, `UnsetEnvironment=PATH`,
+a masked or broken unit and a drop-in line of a unit with no file that the CLI cannot read are refused with
+`service_manager_environment_unavailable` and a message naming the file or directive
+to change. On macOS the upgrade journal records the boot identity next to the launchd
+default (`launchd_boot_identity`, the boot session UUID); after a reboot the persisted configuration is used only when `user.plist` was last modified before the current boot,
+and a journal without the marker also needs the persisted value to equal the journaled default.
+See the [upgrade runbook](runbooks/update-after-release.md) and `docs/public-api.md`.
+
+### 2026-10-20, session annotation with a transcript path, #1101
+
+- The session annotation a forwarded claim carries (`reported_session`) gains the
+  optional `transcript_path`, which rides beside an id annotation and is omitted
+  when unset. The worker bounds and journals it with the annotation, and the
+  daemon's projection of a forwarded claim sets both `active_agent_session_id`
+  and `active_agent_session_path` from it, so a report that names a provider
+  session id and its transcript keeps both public fields. A path annotation
+  carries no second path. The journal schema stays 4 and an older reader or
+  writer ignores or omits the field.
+
+### 2026-10-20, host pin and local host record, #1111
+
+A remote `--host` is resolved once per operation that opens several connections
+(`attach` with its re-attach, status line and menu actions, `session output`,
+`session wait`, `assistant`) and pinned to the peer identity it selected; a peer
+with no peer id and no FQDN fails with `host_identity_unpinnable`. `host list
+--json` and `host discover --json` list this machine as a record with `local:
+true`, and `pohunek_client::Client::connect` maps this machine's own overlay
+name to the local daemon. See [remote hosts](guides/remote-hosts.md).
+
+### 2026-10-20, installed version directories verified before they run, #1141
+
+`pohunek service upgrade`, `service install`, a rollback, `service check` and
+`pohunek setup` on an installed host verify an installed version directory used as a
+source (`--from`, or the directory holding the CLI) or as a rollback or setup
+target, with its three binaries, catalog trust anchor and `runtime/` tree,
+before anything from it runs or is copied: owned by you, correct modes, no
+symbolic links, single-linked and present. A version directory that stopped
+being exactly what publishing creates, for example one made group-writable
+afterwards, fails with `service_version_untrusted` naming the offending entry
+before the daemon, its preflight or the runtime step runs.
+
+### 2026-10-20, ambiguous host message, #1164
+
+`overlay_host_ambiguous` now lists the hosts a selector matched, for example
+`host 'build' matches 2 hosts on overlay netbird: this machine (build.a.test),
+peer build.b.test`, instead of the overlay list in debug formatting. The
+`recover` text names the selector of each host: `<overlay>:<selector>` for a peer, `local` for this machine.
+The error code is unchanged. See [sessions](concepts/sessions.md).
+
+### 2026-10-20, session new stdin confirmation, #1168
+
+`pohunek session new --input-stdin` on a remote `--host` without `--yes` now
+fails with `confirmation_required` before it reads stdin or contacts the
+daemon. Stdin already holds the input, so the confirmation prompt used to read
+EOF and report `confirmation_declined`. The rule matches
+`pohunek assistant --request-stdin`. See [sessions](concepts/sessions.md).
+
+### 2026-10-20, release runs the docs check on the folded tree, #1191
+
+`scripts/release` runs `cargo xtask docs check`, which includes the
+knowledge-log check, on the folded and bumped tree before it commits or pushes
+the release commit. A failure stops the release, restores the tree and leaves
+nothing pushed. `scripts/release --dry-run` folds and bumps a temporary export
+of `HEAD` and runs the same check, so a fold that removes a path a page cites,
+such as `docs/knowledge/log.d`, shows up before the release.
+
+### 2026-10-20, update-after-release runbook describes the hook reinstall, #1197
+
+The "Managed hook assets after an upgrade" section of the
+[update after release](runbooks/update-after-release.md) runbook describes what
+`pohunek service upgrade` does: it reinstalls the integration hooks of every
+listed config home once the new daemon is ready, reports each home as
+`installed`, `failed` or `gap`, and never rolls the upgrade back for a failure.
+The installer wrapper and daemon start do not rewrite hooks, so
+`pohunek integration doctor` (with `--profile` or `--all-profiles`) remains the
+check for homes reported as a gap, homes without hooks before the upgrade, and
+installs that bypassed `service upgrade`.
+
+### 2026-10-20, newer-version adoption trust and single resolution, #1203, #1204
+
+A release package whose digest the registry records under another trust source
+(for example `explicit_digest`) is no longer treated as the official newer pin
+or adopter: the upgrade preflight now agrees with resume, which refuses such a
+profile with `agent_profile_changed`. Resume and fork resolve the recovery
+definition once and build the profile check on it, so a profile repinned
+while an operation runs cannot record a revision that describes another
+package version than the one launched. See
+[update after release](runbooks/update-after-release.md).
+
+### 2026-10-20, CLI reference checked against the command tree, #1290
+
+`cargo xtask docs check` holds the command examples of `README.md`,
+`AGENTS.md`, `docs/` and `.agents/` to the clap tree (`doc-commands`), requires
+`docs/cli.md` to show every leaf command (`cli-reference-coverage`), and
+compares its list of commands without `--json` with the tree
+(`json-exceptions`). `docs/cli.md` documents the `relay`, `migration`,
+`subscribe`, `session read|resize|metadata|runtime-inventory|policy|retention`
+and `assistant project|update` commands, and the Hermes install command is
+`pohunek integration install --agent hermes` in
+[setup](guides/setup.md) and the CLI guide.
+
+### 2026-10-20, hand-maintained user doc facts checked, #1294
+
+`cargo xtask docs check` compares the crate table of `docs/development.md` with
+the workspace members (`crate-table`), the package list and any stated package
+count of `README.md`, `docs/install.md` and `docs/features.md` with
+`runtime-packages/` (`package-lists`), and requires every `docs/*.md` page and
+knowledge page to be reachable from `docs/README.md` or
+[the index](index.md) (`doc-index`). The Apple Silicon daemon archive carries
+the runtime catalog and the four official packages, as the Linux daemon
+archives do.
+
+### 2026-10-20, a lost runtime with an observed end is a failed session, #1330
+
+- A session whose runtime was lost with an end the daemon observed (the worker's
+  job ended and was retired, a host restart, or an answering worker whose child process is gone)
+  is `failed` with no activity and still reports `runtime.state=lost` with its
+  `loss_reason`. `session wait-turn` ends with `exited`, `session stop` returns
+  `stopped: false`, and `session resume` still recovers it. A loss without that
+  proof keeps the session state and clears only the activity. Operations that
+  need a running session still answer `session_runtime_lost`. No protocol,
+  store or worker-protocol version changes; see
+  [debugging session runtime](runbooks/debug-session-runtime.md).
+
+### 2026-10-20, idle session load, #1365 #1366
+
+The daemon publishes `agent_state` only when a session's activity or its source
+changes, so an idle session no longer produces an event and a revision every
+800 ms; a session with a pending `session.input` wait still gets
+its unchanged activity restated as newer evidence. Input and session waiters
+ignore events that name another session before they lock the registry, and the
+detector skips the manifest evaluation on a tick over unchanged terminal
+context. Procwatch scans each session's process tree on a blocking thread and
+waits up to `procwatch_idle_poll_max` (5 s) between scans of a quiet session
+whose tree has not changed.
+
+### 2026-10-20, fork, stop and remove response budgets, #1381
+
+- `session.fork`, `session.stop`, `session.remove` and
+  `session.remove_accepting_unconfirmed` no longer run under the clients' 5 s
+  default response timeout. The Rust client, the CLI (including the attach
+  menu) and the TypeScript SDK wait on a dedicated connection for 30 minutes
+  (fork), 90 minutes (stop) and 110 minutes (remove: the stop plus the worktree
+  hooks at their 5 minute timeout). An elapsed deadline is the transport error
+  `session_fork_outcome_unknown`, `session_stop_outcome_unknown` or
+  `session_remove_outcome_unknown` (a retried fork creates a second child; a
+  repeated stop is harmless). The CLI prints a waiting notice on stderr after
+  5 s, never with `--json`. An explicit request timeout still overrides the
+  budgets. The TypeScript SDK also gives `session.resume` its budget and the
+  `sessionResume/Fork/Stop/RemoveOutcomeUnknown` error kinds.
+- The daemon bounds its wait for a worker's stop answer (four stop graces, the
+  kill reap deadline, the worker's terminal-commit wait and a margin); a worker
+  that stays silent ends the stop or removal with `worker_operation_failed`.
+
+### 2026-10-19, durable knowledge materialization, #287
+
+Knowledge bundle materialization synchronizes the extracted files and directories
+before publication and the cache directory after the atomic rename. Failed
+synchronization is reported and retryable. Incomplete versions are moved aside
+within the private cache and rebuilt, while cache cleanup preserves active
+extractions and collects abandoned temporary directories. Legacy temporary
+directories use a conservative age bound under the shared materialization lock.
+See [the assistant architecture](concepts/architecture.md).
+
+### 2026-10-19, observation stream cancellation, #303
+
+Documented why a cancelled worker observation frame read cannot desynchronize
+its one-shot stream: competing wakes finish the stream instead of resuming a
+partial frame. Runtime behavior is unchanged.
+
+### 2026-10-19, Purge session-derived artifact copies, #548
+
+- Service uninstall with `--purge` also removes recognized crashed metadata-store
+  write copies and imported legacy-manifest archives. Writers and purge share
+  the artifact-name grammar. Recognized temp/archive symlinks are unlinked
+  without following their targets; unrelated data entries and pending manifests
+  remain and are reported as byte-escaped display strings in `kept_purge_entries`,
+  including Unix filenames that are not valid UTF-8.
+
+### 2026-10-19, durable public agent reports, #1101
+
+- A bound `session.report_agent` or `session.release_agent` (it carries `pid` and
+  `monotonic_sequence`) for a live session whose worker negotiated protocol 8 is
+  forwarded into the worker, which validates the subject, journals the claim and
+  acknowledges after the journal write. The daemon then commits the claim through
+  the projection of the worker's snapshot, so the identity, its detector
+  configuration and the record survive a restart without any other record write.
+  The managed Claude and Codex hooks send the bound fields on their daemon-socket
+  fallback, so their fallback reports become durable too.
+- `recorded: false` now also answers a report the worker refused. A report that is
+  unbound, that meets a protocol 7 worker, or whose forward failed keeps today's
+  memory-only behavior and answers `recorded: true` when the daemon accepts it; a
+  failed forward logs `session.active_identity.forward_failed` at WARN, and each
+  memory-only cause logs `session.active_identity.not_durable` once per session.
+  An accepted forward whose snapshot was not read or applied in time logs
+  `session.active_identity.commit_deferred` at WARN; the next sync commits it.
+- A per-session commit guard and a fence on the worker's identity revision order a
+  worker snapshot against a forwarded commit: a snapshot read before the commit can
+  no longer replace the forwarded identity or its release. Sessions of workers
+  that predate protocol 8 keep the old, unordered behavior until they end.
+- A forwarded report keeps both public session fields: a report that names a
+  session id and a transcript path journals both, and the activity it carries is
+  applied once the worker has acknowledged the claim, and only while that claim is
+  still the session's. A claim is identified by provider, pid, process start
+  identity and sequence; the worker's journal is the truth for a journaled claim.
+- A release that cannot be forwarded never ends a claim the worker journaled
+  (`released: false`, WARN `session.active_identity.forward_failed`): the journal
+  and the exit watch of the reporting process end it. A memory report replaces a
+  journaled claim only from the same process (pid and start identity) with a newer
+  public sequence. A release of a process that already exited is forwarded with
+  the start identity its hook claimed.
+- A report that names its pid but not its start identity contends with a
+  journaled claim under the start identity the host reports for the pid, so a
+  reporter that predates the bound fields keeps reporting. The Hermes reporter
+  now sends `pid_start_identity` and `monotonic_sequence` with its activity
+  reports and its release fallback. The public order of a forwarded report whose
+  identity commit was deferred is kept until the sync that adopts the claim, and a
+  snapshot that re-projects an unchanged claim updates the agent label the report
+  carries.
+- A release a worker snapshot carries for another provider or process ends nothing
+  the daemon holds: a memory claim, its activity, a memory release and an observed
+  claim stay. A forwardable report or release is ordered against a memory claim or a
+  memory release of the same source before it is forwarded, so a delayed older one
+  cannot reach the worker's journal and win. procwatch tells two journaled claims of
+  one process apart by their claim key, and a forwarded report records its public
+  order on the active claim and on the last report alike. A worker without identity
+  revisions (protocol 7) cannot be forwarded to: its journaled claim is not held by
+  the journal, and a newer public report of the same process stays the active claim
+  across syncs. A replacing claim that inherits the replaced claim's reported
+  activity is tracked in #1377.
+- Every claim-changing public operation is checked, forwarded and committed under
+  the per-session identity-commit guard, so an operation made while another one is
+  in flight is ordered against the result instead of against a stale claim. The
+  public order of a claim (source, label, sequence) is recorded when the claim is
+  adopted, also for the release tombstone, and a claim waiting for its commit is
+  held for the memory-report and release rules. The worker call of a forward and
+  the snapshot read of its commit are bounded by `worker_connect_ms`; a worker
+  that does not answer leaves the report memory-only. A protocol 7 snapshot of
+  another process generation behind the same pid replaces a memory report.
+- A memory report or release recorded while a forwarded operation waits for its
+  commit is ordered after that operation: it carries the newest accepted worker
+  revision as its floor, so the adoption of the operation and later projections
+  of the same identity do not replace or clear it. A waiting release holds the
+  journal empty for the admission of reports, and a memory claim above a waiting
+  report can be released. A request that timed out before it was written leaves nothing pending. An operation whose answer timed out or was lost after the request was sent stays pending with
+  an unknown revision until a newer revision is committed, and a memory claim
+  recorded after it holds against the snapshot that carries it. Pending
+  operations and memory claims are in memory only.
+
+### 2026-10-19, bound agent reports on the public socket, #1101
+
+- `session.report_agent` accepts the optional `pid_start_identity` and
+  `monotonic_sequence`, and `session.release_agent` the optional `pid`,
+  `pid_start_identity` and `monotonic_sequence`. Both identities are decimal
+  strings; the sequence is on the session host's `CLOCK_MONOTONIC` clock and is
+  separate from the wall-clock `seq`. The change is additive: a client that
+  sends none of them is served as before.
+- The daemon checks a claimed `pid_start_identity` against the process the host
+  reads for the `pid`. A report that names an identity without a `pid`, a
+  process that no longer runs, or a process that started differently answers
+  `recorded: false` and changes nothing. A confirmed identity binds the active
+  claim to that process directly. A release whose process already exited is not
+  checked and still applies; one whose identity the host contradicts answers
+  `released: false`.
+- The managed Claude and Codex state hooks send the new fields on their
+  daemon-socket fallback. The daemon forwards a report that carries them into the
+  worker (see the entry on durable public agent reports).
+
+### 2026-10-19, worker-side forwarded active identity, #1101
+
+- Worker protocol 8 adds `RecordActiveIdentity` and `ReleaseActiveIdentity`: the
+  controller forwards a public agent report or release into the worker, which
+  validates the subject like a hook claim (hook schema, claim expiry, PTY-tree
+  membership and start identity of the process, ordering against every earlier
+  claim of that process), journals it and acknowledges after the journal write.
+  A refusal is an answer, not an error; a journal write failure is a
+  non-retryable runtime fault. The daemon sends them for a bound public agent
+  report or release (see the entry on durable public agent reports).
+- The journal gains the optional claim fields `agent`, `origin` and
+  `reported_session` and the optional `active_identity_revision`, which counts
+  every change of the active identity or its release, hook or forwarded. The
+  journal schema stays 4. A forwarded claim keeps no native reference, so an
+  older reader sees a provider-only active claim. A connection that negotiated
+  protocol 7 gets a snapshot without the new fields.
+- The daemon's projection of a worker's active identity gives a forwarded claim
+  the profile label it was reported under when the label resolves to a profile
+  of the claim's provider, and otherwise keeps the provider and logs
+  `session.active_identity.label_unresolved`. The claim's session annotation
+  becomes the active agent's session id or path and never a native reference.
+- A forwarded release that names the exact pid and start identity of the
+  journaled owner is accepted although that process has exited; any other
+  subject must still be a live member of the PTY tree.
+
+### 2026-10-19, worker protocol window 7..=8, #1101
+
+- The private worker protocol window changes: `PREVIOUS_VERSION` is now 7 (was 6)
+  and `CURRENT_VERSION` is now 8 (was 7). Protocol 8 adds no wire change yet; it opens the
+  window for the forwarded active identity of #1101. A worker that negotiated
+  protocol 6 (started by a 0.34.x daemon and still running) is outside the
+  window: the daemon does not adopt it, and the upgrade preflight reports its
+  session as `would_not_be_adopted` with `worker_protocol_incompatible`, so the
+  upgrade refuses without `--accept-runtime-loss`.
+- Protocol 7 is the floor, so `Initialize` always carries the base environment
+  and the input stall bound, a stalled write is always `session_input_stalled`
+  and a missing launch directory is always `session_cwd_missing`. The
+  inherit-the-worker-environment launch mode of protocol 5 is gone.
+
+### 2026-10-19, descendant agent claims, #1107
+
+Procwatch keeps a hook-reported agent PID and active native reference when the
+reporter is not an observed agent itself, such as the Codex binary below its
+`node` wrapper, or is an observed agent below the agent the foreground selects
+or below an agent launch root. A scan that proves the reporter (it runs, keeps
+the claim's start identity, is not owned by another session, and descends from
+an observed same-runtime agent or an agent launch root without another runtime
+in between) binds the claim to that process generation. A bound claim ends only
+with the exit of that generation: failed collections, failed probes, a reporter
+missing from a scan and the exit of other agents leave it in place, and a hook
+refresh keeps the binding. A claim whose probe is inconclusive stays up to the
+claim TTL. A scan that began before a claim was admitted neither binds nor refutes it;
+the rescan the admission requests decides, and a claim projected from the
+worker's journal requests that rescan.
+See [session identity](concepts/sessions.md).
+
+### 2026-10-19, durable acceptance of upgrade risk, #1221
+
+`pohunek service upgrade --accept-runtime-loss` now records what it accepted.
+The new daemon's preflight binds each at-risk verdict of a loaded record to an
+`acceptance_scope` (`v1:` and a digest of the session, generation, worker
+instance, launch pin, native reference and capabilities), and the completed
+upgrade writes the scoped verdicts of its final gate to
+`<state>/pohunek/service-accepted-risks.json`. At the next upgrade the identical
+session, list, verdict, code and scope is reported as previously accepted and no
+longer blocks; a new session, a changed scope or a verdict without a scope still
+needs the flag. Accepting never changes a session or retires its recovery.
+`service check` reads the file and writes nothing; a ledger for another version,
+namespace, store, scheme or schema is ignored with a warning, and an unsafe or
+corrupt one fails with `service_accepted_risks_invalid`. The install transaction
+record is schema 5 and schema 4 records still load. See
+[the update runbook](runbooks/update-after-release.md#upgrade-preflight) and
+`docs/public-api.md`.
+
+### 2026-10-19, Codex visible startup dialogs, #1267
+
+- Codex package 1.2.1 adds precise visible login-selection, API-key-entry and
+  incompatible-background-settings blockers, and extends folder trust to the
+  captured 20-column wrapping. Full headings and choices/entry hints are
+  required; quoted transcript and partial-dialog cases do not match.
+- Real daemon API scenarios install the official package and replay captured
+  Codex 0.160.0 bytes through a real PTY at 80/160 columns and 20/30 for folder
+  trust. Held dialogs outrank stale idle titles, refuse and roll back without
+  task bytes; explicit dismissal plus fresh idle evidence delivers once.
+- Descriptor schema, readiness enum and `manifest_idle` semantics stay
+  unchanged. Positive initialized-screen readiness remains the unscheduled
+  proposal [#1298](https://github.com/zajca/pohunek/issues/1298).
+- This changes the `pohunek.runtime.codex` package digest; after release, host
+  profiles pinned to its old digest are repinned during upgrade. See the
+  [Codex package guide](guides/codex-package.md).
+
+### 2026-10-19, Hook trace acknowledgement fixture, #1273
+
+- The hook trace success scenario checks explicit Unix-socket acknowledgements
+  without depending on worker journal fsync latency; real-worker replay
+  scenarios continue to check admission and persisted subagent state.
+- The runtime debugging guide clarifies that a hook timeout means no answer
+  arrived within the deadline, not that the worker rejected the claim.
+
+### 2026-10-19, controller lease cleanup, #1282
+
+Worker control-connection cleanup releases only the exact owner and lease ID
+still held by that connection. A released controller finishing its response
+cannot revoke a replacement controller from the same daemon process, and stale
+cleanup no longer advances the data-stream lease epoch.
+
+### 2026-10-19, unlimited descriptor limits, #1285
+
+Worker launch accepts an unlimited soft descriptor limit when the platform
+provides a finite descriptor maximum. The pre-exec isolation sweep still covers
+that maximum and any already-open descriptor above it, and fails closed when
+no finite bound can be obtained.
+
+### 2026-10-19, failed-exec terminal recovery evidence, #1289
+
+A failed `pohunek service lock` exec retains the original spawn error and the
+`service_io_failed` error code, with the terminal owner PGID, initial ownership,
+foreground PGIDs before/after recovery, and the result or numeric errno of
+recovery operations. A skipped operation is identified rather than presented
+as success. The existing ownership checks, single handback attempt, and command
+exit behavior are unchanged; this records evidence for the intermittent macOS
+recovery failure rather than claiming it fixed. See `docs/cli.md`.
+
+### 2026-10-18, subprocess worker descriptor isolation, #302
+
+The development/test subprocess worker launcher preserves only its explicit
+standard streams across exec. Inheritable harness descriptors are marked
+close-on-exec before the real worker starts, using Linux close_range with a
+bounded fallback on older kernels and macOS. The parent captures both the
+soft descriptor limit and existing descriptors above a lowered limit. The real-daemon
+startup scenario checks an inheritable sentinel is present in the daemon but
+absent from its live worker, while retaining session removal and worker cleanup.
+
+### 2026-10-18, bounded git output drain, #556
+
+Git commands used by worktree binding and session diff drain inherited output
+pipes for at most 250 ms after git exits, retaining at most 8 MiB per stream.
+Worktree admin commands release the repository lock as soon as git exits and
+may use its exit status with partial diagnostics, logging one warning when
+capture is incomplete. Commands that parse or return git output fail explicitly
+on an expired drain deadline or capture overflow; `session.diff` returns
+`session_diff_failed`. No reader threads survive the call and no process group
+is signalled after its leader is reaped. See `docs/public-api.md`.
+
+Incomplete diagnostics redact credential-bearing URLs before escaping capture,
+including a trailing authority cut before its `@`. Successful fetches use their
+exit status despite incomplete diagnostics, so the fetched tip stays pinned
+until binding completes and the owned temporary fetch ref is then removed.
+
+### 2026-10-18, strict manifest-idle input readiness for Codex, #1114
+
+- The `[input] ready` descriptor key accepts `manifest_idle` next to
+  `screen_idle`: the session's initial input is written only when the
+  detection manifest's current winning evidence is idle from a screen region
+  or the terminal title. OSC progress, debounced activity, process bytes,
+  hooks, a bracketed-paste enable and the elapsed grace never release a
+  `manifest_idle` prompt; the wait runs the full configured grace and its
+  timeout still fails `session.new` with `session_input_not_ready` and rolls
+  the session back.
+- The Codex package (now 1.2.0) declares `ready = "manifest_idle"`, with a
+  `startup_update_prompt` blocker rule in
+  [the Codex guide](guides/codex-package.md): Codex enables bracketed paste
+  long before its composer reads input, and its startup update popup
+  (`Update available` with `1. Update now` / `2. Skip` / `3. Skip until next
+  version`) would have taken a prompt released by the paste signal or a stale
+  title. The rule matches the measured popup at 80, 100 and 160 columns
+  (repository captures under `compat/codex/screens/update-popup/`)
+  and outranks the title's idle rule.
+- Old descriptors stay compatible: `bracketed_paste` (the default) and
+  `screen_idle` behave exactly as before, and a host profile over a
+  `manifest_idle` base whose override manifest has no idle rule on a screen or
+  title region keeps the strict readiness instead of downgrading to
+  `bracketed_paste`, so the input is refused rather than released by a signal
+  the runtime did not declare.
+- A `manifest_idle` wait stays latched closed once a visible blocker is
+  sighted: only idle evidence that arrives after that sighting releases the
+  prompt. OSC title arrivals are ordered against screen updates inside each
+  PTY chunk, so a title received before a clear cannot be mistaken for a
+  later ready signal. The sighting happens while the output chunk is still
+  being consumed: the screen context is observed before completed VT controls
+  or potential character wrapping can erase a blocker, and again after the
+  final byte. A complete popup drawn and cleared inside one chunk is therefore
+  recorded before its clear. Sighting the blocker again (a partial repaint
+  that keeps it on screen, or a full-context observation before new bytes after a
+  reconfigure or resize) raises the barrier anew, so a fresh title received
+  while the blocker holds cannot arm future readiness. A repeated reception
+  of the same idle title counts as a fresh arrival for readiness only; the
+  activity classification keeps its title-change semantics, and an eligible
+  fresh screen idle rule releases the same way.
+- Screen freshness includes identical character redraws, observed with the
+  same `vte` state machine as the terminal grid. A clear and identical composer
+  repaint count as fresh screen evidence whether received together or split
+  into PTY chunks. Control-only output, incomplete UTF-8 and characters ignored
+  by `vt100` cannot refresh stale screen evidence. Zero-width callbacks do not
+  count as redraws; actual combining changes still count through the text diff.
+  The blocker barrier still
+  rejects screen output received while a title blocker holds. Screen text
+  changes and character redraws affect strict input freshness; the debounced
+  activity classifier retains its existing final-text-change semantics.
+- This changes the `pohunek.runtime.codex` package digest; after release,
+  service upgrade repins host profiles from the old digest to the released
+  package digest.
+- Ordered screen observation runs only while initial input is pending. Sessions
+  without initial input and adopted sessions never enable it; readiness success,
+  timeout, shutdown or cancellation ends it before delivery or rollback, and
+  reconfiguration cannot re-arm it. Formatting-only chunks do not trigger
+  per-control screen scraping, and SGR between printable fragments does not
+  split observations.
+  Pending text still gets observed before cursor movement, erasure or scrolling
+  can hide a popup within one chunk; relying only on the final frame would miss
+  the coalesced popup regression.
+
+### 2026-10-18, terminal notification compaction, #1138
+
+Deleted daemon-projected `error` and `session_finished` notifications stay deleted
+after compaction and daemon restart. Compaction preserves at most one invisible
+deleted snapshot per terminal kind for each durable session's current runtime
+generation, including the timestamp needed for older epoch-keyed records. A later
+eligible compaction drops evidence when its session is removed or advances
+generation. While session metadata is unreadable or contains rejected or torn
+records, compaction keeps every terminal tombstone and warns once, but still
+compacts action history and unrelated deleted records. Complete metadata restores
+the per-generation bound. Public protocol and persisted record shapes are unchanged.
+
+### 2026-10-18, Linux empty-environ exec window never reads as unmarked, #1176
+
+- The Linux process reader no longer decides a zero-byte
+  `/proc/<pid>/environ` read on its own. The kernel returns end-of-file both
+  for a task without a memory map and while a freshly exec'd image has not
+  published its environment region yet, so an agent seen inside that exec
+  window previously read as a process with no ownership markers, and the
+  runtime sweep treated a live worker child as foreign. A lost runtime's
+  cleanup could therefore be confirmed while the child survived.
+- An empty environ read is now decided by the `/proc/<pid>/stat`
+  environment-region bounds (fields 50 and 51, `env_start`/`env_end`): an
+  ended or vanished task reads as unmarked as before. Kernel threads are
+  positively identified by `PF_KTHREAD` in stat field 9 and remain unmarked,
+  so a newer kernel thread cannot block cleanup when running as UID 0. A published zero-length
+  region on a live task is a genuinely empty environment and reads as
+  unmarked, and every other live task — an unpublished region, a reversed or
+  half-published one, or a published nonempty region that contradicts the
+  empty read — is `Unobservable`, never unmarked. A contradictory pair is
+  reread a bounded number of times, which usually recovers the markers;
+  exhaustion stays unobservable. The runtime sweep classifies such a process
+  as unreadable, so cleanup stays unconfirmed until the markers say
+  otherwise.
+- Regression scenarios in `pohunek-platform` drive the production reader and
+  the actual sweep selection together against controlled procfs observations
+  (unpublished, contradictory, recovered, genuinely empty, ended and
+  vanished), so a future change cannot reintroduce the window.
+
+### 2026-10-18, wrapper version-probe guidance, #1196
+
+Launch refusals and doctor now explain that a wrapper program must answer its
+runtime package's version-probe arguments without the profile's fixed arguments.
+Unparseable output, failed probes and releases outside the supported range keep
+their distinct diagnostics; raw probe output is never included. Probe execution,
+isolation, limits and executable resolution are unchanged. The
+[profile guide](concepts/agent-profiles.md#wrapper-programs-and-version-probes)
+shows conforming direnv-style and Python bridge wrappers for new launches and
+resumes.
+
+### 2026-10-18, upgrade preflight session risk, #1198
+
+Upgrade and rollback refusals count live and stopped at-risk sessions separately
+and label each listed session. The upgrade and check help describe both groups.
+An owner-requested stop or removal is not itself an adoption loss, whether the
+runtime is alive or dead (#1221 D1+D2); retained native recovery of a stop is
+still judged, and process identity and foreign-runtime protections remain
+conservative. See [the upgrade preflight runbook](runbooks/update-after-release.md#upgrade-preflight).
+
+### 2026-10-18, a response budget for plugin install and update, #1205
+
+- `pohunek plugin install` and `pohunek plugin update` now give one daemon
+  response up to 30 s (named `INSTALL_RESPONSE_TIMEOUT` in the plugin command
+  module) instead of the SDK's 5 s default: validating and unpacking a whole
+  package archive can exceed 5 s on a slow host, which failed the command with
+  `request_timeout` while the daemon went on installing. `plugin link`,
+  `list`, `inspect` and every other command keep the default, there is no
+  retry, and the SDK default is unchanged. The budget is the CLI's tolerance
+  for a slower install, not a daemon install deadline; a timed-out command may
+  still have installed server-side, so reconcile with `pohunek plugin list`.
+- [Runtime packages](guides/runtime-packages.md) documents the budget, and the
+  release consumer suite gains a regression guard that drives the real CLI and
+  daemon through a transparent Unix-socket relay holding the daemon's real
+  `package.install` responses for 6 s: install and update succeed past the
+  former 5 s budget, and without the budget the delayed preview response
+  times out.
+
+### 2026-10-18, parallel macOS archive smoke phases, #1259
+
+The macOS synthetic-archive scenarios run in a separate job from the real
+archive smoke. CI starts the scenarios alongside the rehearsal build, before
+bundle assembly. The evidence verdict requires their result and the real
+archive smoke; nightly evidence lists both jobs. Isolation remains mandatory.
+A rehearsal now starts four macOS jobs instead of three. Rows retain their
+producer barrier because their inputs cross the reusable build workflow boundary.
+
+### 2026-10-17, release build runs one job per target, #1208
+
+- `release-build.yml` builds the Linux archives in one job per target,
+  `Build x86_64-unknown-linux-gnu (cli daemon relay)` and
+  `Build x86_64-unknown-linux-musl (cli daemon)`, instead of one job per
+  component. Each component keeps its own `cargo build` invocation and is
+  staged and archived before the next one builds, so the components share the
+  compiled dependencies without changing each other's binaries. The artifact
+  names `build-<component>-<target>` are unchanged, and the release path
+  (`release.yml`) uses the same jobs.
+- The runtime package job also packs the TypeScript SDK tarballs, after it has
+  uploaded the package archives and their evidence. The artifact
+  `sdk-release-assets` is unchanged.
+- A rehearsal builds and signs both macOS components in one job, each with the
+  same `packaging/macos/build-release <component>` invocation as the release's
+  `stage-macos` job. A rehearsal now runs 12 runner jobs.
+
+### 2026-10-17, pushes to main drain instead of cancelling, #1209
+
+- The `ci.yml` concurrency group for pushes to `main` no longer cancels the
+  run in progress. Each started main run completes, and GitHub keeps only the
+  newest push pending behind it, replacing an older pending push. Merges that
+  land during one main run are tested together by the next run, on the newest
+  of them.
+- A new push to a pull request still cancels that PR's run in progress.
+  Schedule and dispatch runs keep their own groups.
+- This revises #477 decision 4 ("a newer merge cancels the post-merge run in
+  progress"). The coordinator no longer pauses merges twice a day for a
+  `main` checkpoint.
+
+### 2026-10-17, one macOS release daemon build per CI run, #1210
+
+- A new `macos-release-build` job in `ci.yml` builds the `aarch64-apple-darwin`
+  release daemon binaries (`pohunek`, `pohunekd`, `pohunek-sessiond`) with
+  `packaging/macos/build-release daemon` once per run and uploads them as the
+  `macos-release-daemon` artifact. It runs whenever `macos-package` or
+  `hermes-compatibility-macos` runs.
+- `macos-package` packages version A and `hermes-compatibility-macos` packages
+  its daemon archive from the downloaded binaries; neither compiles them. A
+  main run builds the release daemon twice (version A once, version B once)
+  instead of three times.
+- The nightly cold rebuild in `macos-package` now compares its rebuild with the
+  builder's binaries, which were built on another runner at the same checkout
+  path.
+- `scripts/ci-evidence.json` requires the builder in main and nightly evidence.
+  `scripts/tests/test_ci_tiers.py` checks that the builder runs exactly when one
+  of its consumers runs, and that the consumers download its artifact and
+  never build version A themselves.
+
+### 2026-10-17, docs-only pull requests skip the build gates, #1218
+
+- A pull request whose every changed file is prose (no Rust tests and no gate
+  but `docs check`) skips `fmt + clippy`, `darwin-check`, `doctests`,
+  `build bins`, `SDK workspace`, `cargo-audit` and `cargo-shear`. A failed or
+  skipped selection runs them all, and the `test selection verdict` job fails
+  a run where one of them was skipped any other way. `build tests` and
+  `real systemd supervision` still run on such a pull request.
+
+### 2026-10-17, pull request CI runs the affected tests, #1218
+
+- Pull request CI runs only the Linux tests a change can affect. A
+  `test selection` job judges the change with the selector of the merge base
+  (`cargo xtask affected ci`), and the fast shards, the heavy job, and the
+  relay DB job run their shard narrowed to the selected packages. A run
+  narrows only when the test pipeline (`.github/`, `.config/nextest.toml`,
+  and `scripts/`) equals the merge base's.
+  Pushes to `main`, the nightly run, dispatch runs, and any change to the
+  pipeline or an unmapped path still run every test. The
+  `test selection check` job proves that the planned shards hold every
+  selected test, and the `test selection verdict` job fails a run that
+  skipped a test job without a narrowed selection.
+
+### 2026-10-17, the nightly run checks the test selection's file map, #1218
+
+- The nightly CI run includes a test selection audit. It runs every
+  package's tests in a checkout that holds only the files whose change
+  selects that package. A test that reads any other file fails the audit, and
+  so does a package that runs fewer tests than in the full checkout. The audit
+  is required nightly evidence for a release.
+
+### 2026-10-17, the macOS lane follows the pull request's test selection, #1225
+
+- On a pull request, the macOS lane runs only the lane tests the change can
+  affect, and the knowledge bundle under `docs/knowledge/` no longer starts or
+  selects the lane: its readers all run on Linux, where the selection still
+  closes over them. A pull request whose lane selection holds no lane package
+  starts no macOS lane job. Any dependency input, a failed selection, and
+  every push, nightly and dispatch run still run the whole lane.
+
+### 2026-10-17, each test runs at most once per OS in a CI run, #1226
+
+- The `macOS tier packages (arm64)` job leaves out the xtask Hermes harness
+  tests (`kind(lib) and test(hermes)`), which the Hermes macOS job runs in every
+  run that starts the tier. That is 115 tests, 208 s of macOS test time per
+  main run.
+- The macOS lane leaves out the `hermes_package` binary whenever the Hermes
+  macOS job runs in the same run: always on `main` and nightly, and on a pull
+  request when its `hermes_macos` filter matches. The Hermes job runs that
+  binary with the ignored real-Hermes tests.
+  Under that condition the `test selection verdict` fails a run whose Hermes
+  macOS job did not pass.
+- `scripts/test-partitions run-macos|run-macos-tier --skip-owned-by
+  hermes-macos` implements both, from one `OWNED_ELSEWHERE` selection.
+- A new `test duplicates (same OS)` job in the main and nightly tiers runs
+  `scripts/test-duplicates` over every JUnit report of `ci.yml`'s own test
+  jobs; the release rehearsal's reports are not read. It fails on an
+  unlisted same-OS duplicate. The four Linux runtime-package duplicates are
+  listed in `scripts/test-duplicates.json` until their per-test environment
+  audit is done.
+
+### 2026-10-17, the cli integration tests build as one test binary, #1228
+
+- The integration tests of `pohunek-cli` are modules of one test binary, `all`
+  (`crates/cli/tests/all.rs`), instead of one binary per file. The dependency
+  graph links once for the crate: a `src/lib.rs` edit relinks 4 binaries
+  instead of 51, and the crate's nextest archive shrinks from about 549 MB to
+  97 MB. Editing a test file now recompiles the whole test crate (about 6.5 s
+  instead of 0.2-1.3 s). `release_consumer` and `release_upgrade` stay their
+  own test binaries.
+- The nextest overrides, the `test-partitions` buckets, the CI jobs and
+  `dev-bootstrap` select a former binary's tests as `binary(=all) and
+  test(/^<file>::/)`; the selected tests are unchanged.
+- Tests that re-run their own binary build the `--exact` filter with
+  `pohunek_test_support::exact_test_filter(module_path!(), ..)`, and the
+  `exact_filter_guard` xtask test refuses a literal `--exact` in integration
+  test code.
+
+### 2026-10-17, ci-evidence reads its config from the checked commit, #1243
+
+- `scripts/ci-evidence --sha S` takes its required jobs and steps from
+  `scripts/ci-evidence.json` in the tree of S, read from the local checkout when
+  it holds S and otherwise from the contents API, instead of the copy next to
+  the script. A check run from a branch whose config differs from S's now
+  applies S's own requirements in both directions. A commit whose config cannot
+  be read refuses the evidence; `--config` still names a file to use instead.
+
+### 2026-10-17, row launchd guard leaves Spotlight application workers out, #1246
+
+- `scripts/release-workflow/run-rows` leaves the Spotlight metadata workers of
+  the shared and the application kind (`com.apple.mdworker.shared.<UUID>`,
+  `com.apple.mdworker.application.<UUID>`) out of the launchd comparison, in
+  both directions. A macOS row no longer fails when Spotlight starts or retires
+  such a worker during the row; any other added or removed job still fails it.
+- The program of an added launchd job is looked up in the process's, the login
+  session's (`gui/<uid>`) and the user's (`user/<uid>`) domain, and the job log
+  names every added job with its label and program path, or "not described",
+  never another field of `launchctl print`.
+
+### 2026-10-17, pinned tool downloads back off between retries, #1248
+
+- `setup-mold`, `setup-sccache` and `setup-zig` no longer pass `--retry-delay`
+  to curl, so curl backs off exponentially between retries (1, 2, 4 ... s).
+  Six retries span 63 s, so a short outage of the release CDN (504) no longer
+  fails a required job. A fixed 2 s delay spent all retries in about 10 s.
+
+### 2026-10-17, script tests no longer race git's background maintenance, #1251
+
+- The repository's script tests create their throwaway git repositories with
+  git's automatic maintenance turned off. The background maintenance that
+  `git commit` starts could otherwise still be writing into `.git` while a
+  test removed the repository, which failed the test intermittently with
+  "Directory not empty".
+
+### 2026-10-17, CI test jobs install the Rust toolchain before their tests, #1256
+
+- The fast test shards and the relay database job install the pinned Rust
+  toolchain before they run tests from the nextest archive. A test that runs
+  `cargo` no longer makes rustup install the toolchain while tests run, which
+  failed tests intermittently when several of them started the install at once.
+
+### 2026-10-16, the release rehearsal runs in the nightly tier, not on push to main, #1207
+
+- The release rehearsal (`release-rehearsal-build` and `release-rehearsal` in
+  `ci.yml`) runs on the daily schedule, on a `tier=nightly` dispatch, and on a
+  pull request that changes a `release_rehearsal` filter input. Push to `main`
+  and a `tier=main` dispatch no longer run it, which takes about 30 jobs, 7-8 of
+  them on macOS, out of every main run.
+- `scripts/ci-evidence.json` requires the rehearsal jobs only in the nightly
+  tier. A release still carries them: `scripts/release` requires both main and
+  nightly evidence on the release commit.
+- The `release_rehearsal` filter also lists `scripts/provision-hermes-compat`,
+  `scripts/smoke-hermes-plugin-release`, `scripts/tests/test_smoke_archive.py`,
+  `.cargo/**`, `package.json` and `bun.lock`. `scripts/tests/test_ci_tiers.py`
+  checks that every path the rehearsal workflows and their scripts read matches
+  the filter or is a named exception: the product crates, `docs/knowledge/**`,
+  the documents copied into every archive, and the SDK package sources. A
+  rehearsal-only failure in those surfaces in the nightly tier.
+
+### 2026-10-16, release evidence rows run in one job per runner, #1208
+
+- The release evidence workflow runs its compatibility rows in one job per
+  runner, `Rows on ubuntu-latest` and `Rows on macos-15`, instead of one job per
+  (runtime x target) row plus a separate consumer build per OS. Each job builds
+  the release consumer and xtask once and runs its rows in sequence through
+  `scripts/release-workflow/run-rows`. The release path (`release.yml`) uses the
+  same workflow.
+- Each row runs in a fresh, owner-only root. After each row `run-rows` fails it
+  for a process, root, user service, launchd job or keychain item it left
+  behind. It stops the job when the row changed the account or anything a later
+  row trusts, or when the guards could not check it; any other failing row does
+  not stop the next one. A row over its 15-minute limit has its process group
+  killed.
+- The attestation and JUnit file names and the `attestation-*` pattern are
+  unchanged. The artifacts are per runner: `attestation-<os>`,
+  `matrix-junit-<os>` and the new `row-results-<os>`, from which the evidence
+  verdict names every planned row that did not pass or sent no result. See
+  [the release bundle](concepts/release-bundle.md).
+
+### 2026-10-16, CI evidence by tested tree, #1215
+
+- Every `ci.yml` run records the git tree its jobs check out as a
+  `tested-tree-<tree>` artifact. `scripts/ci-evidence`, and with it
+  `scripts/release`, accept a `workflow_dispatch` run of this repository as
+  main or nightly evidence for another commit with the same tree, when the
+  recorded tree matches and every required job passed. A completed run on the
+  commit itself still decides, and pull-request, push, and schedule runs never
+  match by tree. The report says whether the evidence matched by `sha` or by
+  `tree`.
+
+### 2026-10-16, macOS 14 or newer, tested on macOS 15, #1224
+
+- Native macOS archives support macOS 14 or newer on Apple Silicon and are
+  tested on macOS 15. The deployment target stays 14.0, and the daemon
+  installer refuses an older macOS. CI and release acceptance run on
+  macOS 15 only; there is no macOS 14 test runner. See
+  [the macOS install runbook](runbooks/install-on-macos.md).
+
+### 2026-10-16, ci-timings tiers measures completion, push vs dispatch and runner platforms, #1234
+
+- `scripts/ci-timings tiers` reports five tiers:
+  - `pr`;
+  - `main_push` and `main_dispatch` (`tier=main`);
+  - `nightly_schedule` and `nightly_dispatch` (`tier=nightly`).
+- A run counts as complete only when it reached a verdict: `success`,
+  `failure`, `timed_out` or `startup_failure`. Cancelled runs no longer count.
+  Each tier reports its conclusions and its completion share among finished
+  runs.
+- Each tier also reports, from the runner labels of the REST jobs stored in
+  the snapshot:
+  - started jobs and macOS jobs per complete run;
+  - job queue p50/p90 per runner platform.
+
+  An all-runs job queue covers every selected run.
+- `--window` also takes UTC timestamps, for example
+  `2026-10-15T06:39Z..2026-10-16T13:42Z`, and the end covers its whole minute.
+- `gh` server errors and secondary rate limits are retried
+  (`--gh-attempts`, `--gh-retry-delay`).
+- A fetch that fails part way keeps what it fetched in the snapshot, so the
+  next run resumes there. A failed REST job lookup is reported, and the jobs
+  it concerns count as `unknown` platform.
+
 ## 0.35.2
 
 ### 2026-10-16, official runtime packages accept every release up to the next major, #1195

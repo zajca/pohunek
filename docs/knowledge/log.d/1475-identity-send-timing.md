@@ -1,3 +1,0 @@
-## Unreleased (2026-10-23, identity report timing, #1475)
-
-The Hermes hook reporter now records, per worker message type, the elapsed time and outcome of its last private send (`Reporter.worker_sends`), and the Hermes package test child prints it when the worker did not answer an identity report. The worker logs one `worker.identity.answered` event per identity report with `identity.lock_wait_us`, `identity.persist_us` (durable journal write) and `identity.answer_us`. The hook deadline (0.25 s default, 1.0 s maximum) and the worker protocol are unchanged; the numbers decide whether the deadline or the worker's answer path needs a product change.
