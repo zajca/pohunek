@@ -2969,9 +2969,11 @@ const OVERSIZED_INPUT_LINES: usize = 1_700;
 /// Bytes per oversized input line.
 const OVERSIZED_INPUT_LINE_BYTES: usize = 78;
 
-/// Bytes a Linux PTY can hold for a program that does not read: the tty
-/// layer's buffer limit plus the line-discipline queue.
-const PTY_UNREAD_INPUT_CAPACITY: usize = 64 * 1024 + 4 * 1024;
+/// Bound the oversized input must exceed: 96 KiB, above what a Linux PTY holds
+/// for a program that does not read, even on a kernel with 64 KiB pages
+/// (`TTY_BUFFER_PAGE` about 32 KiB), which would hold at most about 84 KiB
+/// with the twofold buffer slack. The 134 KB input stays larger.
+const PTY_UNREAD_INPUT_CAPACITY: usize = 96 * 1024;
 
 const _: () = assert!(
     OVERSIZED_INPUT_LINES * (OVERSIZED_INPUT_LINE_BYTES + 1) > PTY_UNREAD_INPUT_CAPACITY
