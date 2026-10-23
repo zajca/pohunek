@@ -4166,6 +4166,7 @@ impl SessionRegistry {
             // The snapshot's identity state was applied above, so its revision
             // is the newest this entry has committed.
             identity_fence: adopted_fence,
+            identity_observed: None,
             pending_activity: None,
             pending_release: None,
             displaced_pending: Vec::new(),
@@ -4457,6 +4458,7 @@ impl SessionRegistry {
             input_gate: Arc::new(Mutex::new(())),
             identity_commit: Arc::new(Mutex::new(())),
             identity_fence: None,
+            identity_observed: None,
             pending_activity: None,
             pending_release: None,
             displaced_pending: Vec::new(),
@@ -22371,6 +22373,412 @@ generation "$1"
                 claim_state(&fixture, &created.id).await,
                 (true, Some(protocol::AgentActivity::Blocked))
             );
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// The claim of the session's root process the worker journaled and the
+        /// daemon committed, with nothing left pending.
+        async fn hold_a_committed_claim(fixture: &Fixture, created: &SessionInfo) {
+            assert!(
+                fixture
+                    .registry
+                    .report_agent(report_at(created, 5, 2_000))
+                    .await
+                    .recorded
+            );
+            assert!(claim_is_journaled(fixture, &created.id).await);
+            assert_eq!(tracked_operations(fixture, &created.id).await, 0);
+        }
+
+        /// A report of a process outside the session's PTY tree, which the
+        /// worker rejects after the daemon forwarded it.
+        fn report_of_another_process(created: &SessionInfo) -> protocol::SessionReportAgentParams {
+            protocol::SessionReportAgentParams {
+                source: "pohunek:codex-other".to_owned(),
+                pid: Some(std::process::id()),
+                pid_start_identity: None,
+                monotonic_sequence: Some(protocol::ReportSequence::new(1)),
+                seq: Some(protocol::ReportSequence::new(2_020)),
+                ..forwardable_report(created)
+            }
+        }
+
+        /// Reads a snapshot of the session's worker the way the periodic sync
+        /// does and hands it to the registry.
+        async fn observe_worker(fixture: &Fixture, created: &SessionInfo) {
+            let worker =
+                crate::session::tests::session_worker(&fixture.registry, &created.id).await;
+            let (snapshot, order) = worker.inspect_ordered().await.expect("the worker answers");
+            fixture
+                .registry
+                .observe_worker_identity(&created.id, &snapshot, order)
+                .await;
+        }
+
+        async fn journaled_claim_sequence(fixture: &Fixture, id: &SessionId) -> Option<u64> {
+            let sessions = fixture.registry.inner.sessions.lock().await;
+            match &sessions.get(id)?.active_agent.as_ref()?.origin {
+                crate::session::claim::ClaimOrigin::Journaled { key, .. } => Some(key.sequence),
+                crate::session::claim::ClaimOrigin::Memory { .. } => None,
+            }
+        }
+
+        async fn worker_instance_of(fixture: &Fixture, id: &SessionId) -> Option<String> {
+            fixture
+                .registry
+                .inspect(id)
+                .await
+                .expect("inspect the session")
+                .runtime
+                .and_then(|runtime| runtime.worker_instance_id)
+        }
+
+        async fn wait_until_nothing_is_tracked(fixture: &Fixture, id: &SessionId) {
+            wait_until("the forwarded operation to be settled", || async {
+                (tracked_operations(fixture, id).await == 0).then_some(())
+            })
+            .await;
+        }
+
+        /// A report the worker rejects after the daemon gave up waiting for the
+        /// answer, in a worker that is stopped when it is forwarded.
+        async fn lose_a_rejected_report(fixture: &Fixture, created: &SessionInfo) -> StoppedWorker {
+            let registry = fixture.registry.clone();
+            let report = report_of_another_process(created);
+            let (lost, stopped) =
+                stop_worker_at_forward(fixture, created, 2, Answer::Timeout, async move {
+                    registry.report_agent(report).await
+                })
+                .await;
+            assert!(
+                !lost.recorded,
+                "the claim the worker holds is not replaced by another process"
+            );
+            assert_eq!(tracked_operations(fixture, &created.id).await, 1);
+            stopped
+        }
+
+        /// 1418 row 1: while the worker has not handled the forward, the
+        /// request may still be queued, so the journal stays held by it.
+        #[tokio::test]
+        async fn a_forward_the_worker_has_not_handled_keeps_the_journal_held() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            hold_a_committed_claim(&fixture, &created).await;
+
+            let stopped = lose_a_rejected_report(&fixture, &created).await;
+
+            assert!(
+                !memory_report_is_recorded(&fixture, unbound_report(&created, 2_010)).await,
+                "a report for the claim the worker holds waits for the forward"
+            );
+            assert_eq!(tracked_operations(&fixture, &created.id).await, 1);
+            drop(stopped);
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// 1418 rows 2 and 7: the periodic sync reads the worker after it
+        /// rejected the forward; the snapshot changes nothing the daemon
+        /// projects, yet it drops the forward, so a memory report for the claim
+        /// the worker holds is admitted.
+        #[tokio::test]
+        async fn a_report_the_worker_rejected_after_the_bound_stops_holding_the_journal() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            hold_a_committed_claim(&fixture, &created).await;
+            let stopped = lose_a_rejected_report(&fixture, &created).await;
+
+            drop(stopped);
+            wait_until_nothing_is_tracked(&fixture, &created.id).await;
+
+            assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_010)).await);
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// 1418 row 14: the same for a release the worker rejects, which held
+        /// the journal as released.
+        #[tokio::test]
+        async fn a_release_the_worker_rejected_after_the_bound_stops_holding_the_journal() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            hold_a_committed_claim(&fixture, &created).await;
+            let registry = fixture.registry.clone();
+            let release = release_at(&created, 1, 2_010);
+            let (released, stopped) =
+                stop_worker_at_forward(&fixture, &created, 1, Answer::Timeout, async move {
+                    registry.release_agent(release).await
+                })
+                .await;
+            assert!(!released.released);
+            assert_eq!(tracked_operations(&fixture, &created.id).await, 1);
+            assert!(
+                !memory_report_is_recorded(&fixture, unbound_report(&created, 2_005)).await,
+                "the journal counts as released while the release may be queued"
+            );
+
+            drop(stopped);
+            wait_until_nothing_is_tracked(&fixture, &created.id).await;
+
+            assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_005)).await);
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// 1418 row 5: a snapshot read before the forward was sent says nothing
+        /// about it, wherever it is applied.
+        #[tokio::test]
+        async fn a_snapshot_read_before_the_forward_does_not_drop_it() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            hold_a_committed_claim(&fixture, &created).await;
+            let worker =
+                crate::session::tests::session_worker(&fixture.registry, &created.id).await;
+            let (before, before_order) = worker.inspect_ordered().await.expect("a snapshot");
+            let stopped = lose_a_rejected_report(&fixture, &created).await;
+
+            fixture
+                .registry
+                .observe_worker_identity(&created.id, &before, before_order)
+                .await;
+
+            assert_eq!(tracked_operations(&fixture, &created.id).await, 1);
+            assert!(!memory_report_is_recorded(&fixture, unbound_report(&created, 2_010)).await);
+            drop(stopped);
+            wait_until_nothing_is_tracked(&fixture, &created.id).await;
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// 1418 row 6: a snapshot read before the forward that shows a newer
+        /// revision is not the worker rejecting it either.
+        #[tokio::test]
+        async fn an_older_snapshot_with_a_newer_revision_does_not_drop_the_forward() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            hold_a_committed_claim(&fixture, &created).await;
+            let worker =
+                crate::session::tests::session_worker(&fixture.registry, &created.id).await;
+            let (mut before, before_order) = worker.inspect_ordered().await.expect("a snapshot");
+            let stopped = lose_a_rejected_report(&fixture, &created).await;
+            before.active_identity_revision = before.active_identity_revision.map(|r| r + 3);
+
+            fixture
+                .registry
+                .observe_worker_identity(&created.id, &before, before_order)
+                .await;
+
+            assert_eq!(tracked_operations(&fixture, &created.id).await, 1);
+            drop(stopped);
+            wait_until_nothing_is_tracked(&fixture, &created.id).await;
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// 1418 row 4: the worker journaled the forward after the bound, so the
+        /// snapshot shows a newer revision. The forward is not dropped, and the
+        /// claim is adopted once the daemon commits it.
+        #[tokio::test]
+        async fn a_forward_the_worker_journaled_after_the_bound_is_adopted_not_dropped() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            hold_a_committed_claim(&fixture, &created).await;
+            allow_imports(&fixture, false);
+            let registry = fixture.registry.clone();
+            let report = report_at(&created, 6, 2_020);
+            let (lost, stopped) =
+                stop_worker_at_forward(&fixture, &created, 2, Answer::Timeout, async move {
+                    registry.report_agent(report).await
+                })
+                .await;
+            assert!(lost.recorded);
+            drop(stopped);
+
+            observe_worker(&fixture, &created).await;
+
+            assert_eq!(tracked_operations(&fixture, &created.id).await, 1);
+            assert!(!memory_report_is_recorded(&fixture, unbound_report(&created, 2_015)).await);
+            allow_imports(&fixture, true);
+            sync_after_continue(&fixture, &created).await;
+            assert_eq!(tracked_operations(&fixture, &created.id).await, 0);
+            assert_eq!(
+                journaled_claim_sequence(&fixture, &created.id).await,
+                Some(6)
+            );
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// 1418 row 8: the snapshot that shows the rejection is read before the
+        /// timed-out forward is attached to its session; the forward is dropped
+        /// as soon as it is attached, without another snapshot.
+        #[tokio::test]
+        async fn a_rejection_observed_before_the_forward_is_attached_drops_it() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            hold_a_committed_claim(&fixture, &created).await;
+            fixture
+                .registry
+                .inner
+                .sessions
+                .lock()
+                .await
+                .get(&created.id)
+                .expect("the session")
+                .cancel_runtime_watchers();
+            let worker = fixture
+                .launcher
+                .worker_process_id(&created.id.0)
+                .await
+                .expect("the worker runs");
+            let gate = crate::runtime::lifecycle::tests::StartGate {
+                session_id: None,
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+            };
+            let attach = crate::runtime::lifecycle::tests::StartGate {
+                session_id: None,
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+            };
+            *fixture
+                .registry
+                .inner
+                .attach_hold
+                .lock()
+                .expect("attach hold is never poisoned") = Some(attach.clone());
+            *fixture
+                .registry
+                .inner
+                .report_hold
+                .lock()
+                .expect("report hold is never poisoned") = Some(gate.clone());
+            let registry = fixture.registry.clone();
+            let report = report_of_another_process(&created);
+            let operation = tokio::spawn(async move { registry.report_agent(report).await });
+            for point in 0..2 {
+                tokio::time::timeout(HANG_GUARD, gate.entered.notified())
+                    .await
+                    .expect("the report reaches its parking point");
+                if point == 0 {
+                    gate.release.notify_waiters();
+                }
+            }
+            let stopped = fixture.stop_worker(worker);
+            *fixture
+                .registry
+                .inner
+                .report_hold
+                .lock()
+                .expect("report hold is never poisoned") = None;
+            gate.release.notify_waiters();
+            tokio::time::timeout(HANG_GUARD, attach.entered.notified())
+                .await
+                .expect("the timed-out forward waits to be attached");
+            drop(stopped);
+
+            observe_worker(&fixture, &created).await;
+            assert_eq!(tracked_operations(&fixture, &created.id).await, 0);
+            attach.release.notify_waiters();
+            let lost = tokio::time::timeout(HANG_GUARD, operation)
+                .await
+                .expect("the report ends")
+                .expect("the report finishes");
+
+            assert!(!lost.recorded);
+            assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_010)).await);
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// 1418 row 9: the connection to the worker is lost after the request
+        /// was written. The worker rejects it and ends the connection; the
+        /// daemon reconnects to the same worker instance, and the first
+        /// snapshot of the new connection drops the forward.
+        #[tokio::test]
+        async fn a_rejection_is_read_after_the_daemon_reconnects_to_the_worker() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            hold_a_committed_claim(&fixture, &created).await;
+            let instance = worker_instance_of(&fixture, &created.id).await;
+            let stopped = lose_a_rejected_report(&fixture, &created).await;
+            crate::session::tests::session_worker(&fixture.registry, &created.id)
+                .await
+                .sever_connection();
+
+            drop(stopped);
+            wait_until_nothing_is_tracked(&fixture, &created.id).await;
+
+            assert_eq!(worker_instance_of(&fixture, &created.id).await, instance);
+            assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_010)).await);
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// 1418 row 10: the same when the worker journaled the forward: the
+        /// first snapshot of the new connection shows a newer revision, so the
+        /// forward is adopted.
+        #[tokio::test]
+        async fn a_forward_journaled_before_the_daemon_reconnects_is_adopted() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            hold_a_committed_claim(&fixture, &created).await;
+            let registry = fixture.registry.clone();
+            let report = report_at(&created, 6, 2_020);
+            let (lost, stopped) =
+                stop_worker_at_forward(&fixture, &created, 2, Answer::Timeout, async move {
+                    registry.report_agent(report).await
+                })
+                .await;
+            assert!(lost.recorded);
+            crate::session::tests::session_worker(&fixture.registry, &created.id)
+                .await
+                .sever_connection();
+
+            drop(stopped);
+            wait_until_nothing_is_tracked(&fixture, &created.id).await;
+
+            assert_eq!(
+                journaled_claim_sequence(&fixture, &created.id).await,
+                Some(6)
+            );
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// 1418 row 3: the worker answers the forward with a journal fault, so
+        /// nothing is journaled and the revision stays; the forward is dropped
+        /// like any other rejection.
+        #[tokio::test]
+        async fn a_forward_the_worker_failed_to_journal_is_dropped() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            /// Restores the permissions of the journal directory when dropped.
+            struct Writable(PathBuf);
+            impl Drop for Writable {
+                fn drop(&mut self) {
+                    let _ =
+                        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+                }
+            }
+
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            hold_a_committed_claim(&fixture, &created).await;
+            let directory = fixture.journal_dir(&created.id);
+            let restore = Writable(directory.clone());
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+                .expect("make the journal directory read-only");
+            assert!(
+                std::fs::write(directory.join("probe"), b"").is_err(),
+                "this host cannot make the journal unwritable (running as root?)"
+            );
+            let registry = fixture.registry.clone();
+            let report = report_at(&created, 6, 2_020);
+            let (lost, stopped) =
+                stop_worker_at_forward(&fixture, &created, 2, Answer::Timeout, async move {
+                    registry.report_agent(report).await
+                })
+                .await;
+            assert!(lost.recorded);
+            assert_eq!(tracked_operations(&fixture, &created.id).await, 1);
+
+            drop(stopped);
+            wait_until_nothing_is_tracked(&fixture, &created.id).await;
+
+            drop(restore);
             let _ = fixture.registry.stop(&created.id).await;
         }
 

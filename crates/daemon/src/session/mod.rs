@@ -833,6 +833,10 @@ struct SessionRegistryInner {
     /// resolving its agent and committing it.
     #[cfg(test)]
     report_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Parks the next unacknowledged forwarded operation between its forward
+    /// and its attachment to the session.
+    #[cfg(test)]
+    attach_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     /// Replaces the bound of a forward to the worker while armed.
     #[cfg(test)]
     forward_bound: std::sync::Mutex<Option<Duration>>,
@@ -934,6 +938,10 @@ struct SessionEntry {
     /// instance that counted it. A snapshot read before that commit carries a
     /// smaller revision and cannot replace the identity.
     identity_fence: Option<IdentityFence>,
+    /// Newest snapshot of the worker's identity this daemon read, applied or
+    /// not; it tells a forwarded request the worker rejected from one it has
+    /// not handled yet.
+    identity_observed: Option<claim::IdentityObservation>,
     /// Public order and activity of an accepted forwarded report whose
     /// identity the daemon has not committed yet; the claim counts as held.
     pending_activity: Option<Box<PendingActivity>>,
@@ -2433,6 +2441,8 @@ impl SessionRegistry {
                 #[cfg(test)]
                 report_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
+                attach_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
                 forward_bound: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 metadata_apply_hold: std::sync::Mutex::new(None),
@@ -3560,6 +3570,22 @@ impl SessionRegistry {
         }
     }
 
+    /// Parks a report whose forward left an unacknowledged operation before the
+    /// operation is attached to its session, when a test armed the hold.
+    #[cfg(test)]
+    async fn hold_unacknowledged_attach(&self) {
+        let gate = self
+            .inner
+            .attach_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
     /// Parks a worker metadata projection of a reported agent between
     /// resolving its detector configuration and committing it, when a test
     /// armed the hold.
@@ -4575,7 +4601,11 @@ impl SessionRegistry {
                     .await
                 {
                     Forwarded::Answered(result) => return Ok(result),
-                    Forwarded::Unacknowledged(operation) => *unacknowledged = Some(operation),
+                    Forwarded::Unacknowledged(operation) => {
+                        *unacknowledged = Some(operation);
+                        #[cfg(test)]
+                        self.hold_unacknowledged_attach().await;
+                    }
                     Forwarded::MemoryOnly => {}
                 }
                 if commit_guard.is_none() {
@@ -6178,10 +6208,13 @@ impl SessionRegistry {
                 let mut retry_delay = WORKER_CONNECT_RETRY;
                 let inspected = tokio::select! {
                     () = cancel.cancelled() => return,
-                    inspected = worker.inspect() => inspected,
+                    inspected = worker.inspect_ordered() => inspected,
                 };
                 match inspected {
-                    Ok(snapshot) => {
+                    Ok((snapshot, order)) => {
+                        registry
+                            .observe_worker_identity(&id, &snapshot, order)
+                            .await;
                         let worker_metadata = worker_metadata_fingerprint(&snapshot);
                         let initial_empty_metadata =
                             metadata.is_initial() && worker_metadata_is_empty(&worker_metadata);

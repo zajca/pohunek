@@ -27620,6 +27620,7 @@ async fn the_activity_of_a_superseded_claim_is_dropped() {
             activity: Some(AgentActivity::Working),
             epoch: "epoch".to_owned(),
             admitted: crate::session::claim::next_admission(),
+            sent: None,
         }));
     };
 
@@ -27914,6 +27915,7 @@ async fn activity_waiting_for_a_replaced_worker_instance_is_dropped() {
             activity: Some(AgentActivity::Blocked),
             epoch: "epoch".to_owned(),
             admitted: crate::session::claim::next_admission(),
+            sent: None,
         }));
     };
 
@@ -29808,6 +29810,7 @@ fn blocked_pending(
         activity: Some(AgentActivity::Blocked),
         epoch: "epoch".to_owned(),
         admitted: crate::session::claim::next_admission(),
+        sent: None,
     }
 }
 

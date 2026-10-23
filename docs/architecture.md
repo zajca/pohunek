@@ -521,6 +521,14 @@ origin and annotation. A connection that negotiated v7 sees none of those fields
 so the claim reads as a provider-only active claim there and in an older reader
 of the journal.
 
+Two properties of the private worker protocol carry the daemon's proof that a
+forwarded request was rejected, so a change to either needs the settlement rule
+below revisited. First, the worker handles the requests of one control
+connection strictly in the order they were written and writes each response
+before it reads the next request. Second, the worker grants its controller lease
+under a fresh lease id and refuses another controller until the holder's
+connection ended, which is after the request it was handling finished.
+
 The inspect snapshot also reports `drains_streams_on_terminal_ack` (absent means
 false): a worker that sets it lets attached data streams finish before it
 answers `AcknowledgeTerminal`, and the daemon acknowledges no worker that omits it.
@@ -551,7 +559,16 @@ the worker accepted as its floor, so the adoption of that operation and every
 later projection at or below it leave the memory claim alone; a revision above
 it replaces it. A request that timed out before it was written leaves nothing pending. An operation whose answer timed out, or was lost after the request was sent, stays pending with an
 unknown revision, and a memory claim recorded after it holds against the
-snapshot whose change is that operation, at any revision. The worker call and the snapshot read that follow it are
+snapshot whose change is that operation, at any revision. The daemon stamps each
+request it completes writing on a worker connection with the position of its
+connection among the leases it acquired and its position on that connection, and
+keeps the newest snapshot it read (applied or not) with the stamp of its
+request. A snapshot read after the worker handled a pending operation's request
+that still shows the identity revision the operation was sent at proves the
+worker did not journal it: the operation is dropped as rejected, and the journal
+is judged by the claim it really holds. A snapshot read earlier, or one that
+shows a newer revision, leaves the operation pending until its revision settles
+it; a changed worker instance makes it obsolete. The worker call and the snapshot read that follow it are
 bounded by the worker connect deadline (`service.toml` `worker_connect_ms`); a
 timeout keeps the report memory-only or leaves the commit to the next sync. A fence of the newest committed identity
 revision (per worker instance, in memory) makes a snapshot read before a commit

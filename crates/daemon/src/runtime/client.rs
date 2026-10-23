@@ -1,8 +1,8 @@
 //! Private client for one durable session worker.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use pohunek_worker_protocol::{
@@ -28,6 +28,27 @@ const INPUT_WRITE_ID_PREFIX: &str = "input";
 /// healthy local worker should respond promptly. Bounding it prevents an
 /// unresponsive worker from indefinitely retaining the dimension-order gate.
 const ATTACH_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Controller connections acquired by this process, counted in the order their
+/// leases were granted.
+static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Where a request stands in the order a worker handles them.
+///
+/// A worker handles the requests of one control connection strictly in the
+/// order they were written, and it grants its controller lease to the next
+/// connection only after the previous connection ended. So of two stamps taken
+/// by this process for the same worker instance, the higher one was written
+/// after the lower one was handled or abandoned. `connection` comes first so
+/// the derived order is that of a lease, then of a request within it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExchangeOrder {
+    connection: u64,
+    exchange: u64,
+}
+
+/// The stamp of a request, set once its frame was completely written.
+pub type SentAt = OnceLock<ExchangeOrder>;
 
 /// Errors raised while controlling a durable worker.
 #[derive(Debug, thiserror::Error)]
@@ -130,6 +151,10 @@ pub struct Worker {
     socket_path: PathBuf,
     counters: Arc<Counters>,
     dimension_order: Arc<Mutex<()>>,
+    /// A duplicate of the control socket that [`Self::sever_connection`] shuts
+    /// down without taking the connection.
+    #[cfg(test)]
+    severable: Arc<std::os::fd::OwnedFd>,
 }
 
 /// Counters shared by every clone of a [`Worker`].
@@ -179,6 +204,11 @@ struct Inner {
     lease_id: LeaseId,
     capabilities: Vec<Capability>,
     next_write_sequence: u64,
+    /// Position of this connection's lease among the leases this process
+    /// acquired.
+    connection: u64,
+    /// Requests completely written on this connection so far.
+    exchanges: u64,
     /// Byte-stream state between exchanges; see [`StreamState`].
     stream_state: StreamState,
     /// Shared send-phase marker the send guard flips when a future is
@@ -362,6 +392,15 @@ impl Worker {
                     path: socket_path.clone(),
                     source,
                 })?;
+        #[cfg(test)]
+        let severable = Arc::new(
+            std::os::fd::AsFd::as_fd(&stream)
+                .try_clone_to_owned()
+                .map_err(|source| WorkerError::Socket {
+                    path: socket_path.clone(),
+                    source,
+                })?,
+        );
         let (read_half, write_half) = stream.into_split();
         let mut reader = ControlReader::new(read_half);
         let mut writer = ControlWriter::new(write_half);
@@ -438,6 +477,10 @@ impl Worker {
                 lease_id,
                 capabilities,
                 next_write_sequence: 1,
+                // Counted only now that the lease is granted, so a later
+                // connection always has the higher number.
+                connection: CONNECTIONS.fetch_add(1, Ordering::AcqRel) + 1,
+                exchanges: 0,
                 stream_state: StreamState::Ready,
                 send_state: Arc::new(AtomicU8::new(SEND_IDLE)),
                 input_holds: Arc::clone(&input_holds),
@@ -448,7 +491,23 @@ impl Worker {
                 input_holds,
             }),
             dimension_order: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            severable,
         })
+    }
+
+    /// Closes the connection to the worker while the worker keeps running, as
+    /// a daemon-side network failure does: the worker reads the end of its
+    /// connection after every request already written, and every exchange of
+    /// this connection fails. It does not wait for an exchange in flight.
+    #[cfg(test)]
+    pub(crate) fn sever_connection(&self) {
+        let socket = std::os::fd::AsFd::as_fd(self.severable.as_ref())
+            .try_clone_to_owned()
+            .expect("duplicate the control socket");
+        std::os::unix::net::UnixStream::from(socket)
+            .shutdown(std::net::Shutdown::Both)
+            .expect("shut the control socket down");
     }
 
     /// Whether an exchange holds the control connection right now.
@@ -497,6 +556,41 @@ impl Worker {
                     .worker_instance_id
                     .clone_from(&snapshot.worker_instance_id);
                 Ok(*snapshot)
+            }
+            other => response_error(other),
+        }
+    }
+
+    /// [`Self::inspect`] that also returns where its request stands in the
+    /// order the worker handles them: the snapshot reflects every request that
+    /// was written with a lower [`ExchangeOrder`].
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::inspect`] does.
+    pub async fn inspect_ordered(&self) -> Result<(InspectSnapshot, ExchangeOrder), WorkerError> {
+        let mut inner = self.inner.lock().await;
+        let lease_id = inner.lease_id.clone();
+        let sent = SentAt::new();
+        let response = exchange_tracked(
+            &mut inner,
+            ControlRequest {
+                request_id: self.next_request_id("inspect")?,
+                kind: RequestKind::Inspect { lease_id },
+            },
+            || {},
+            &sent,
+        )
+        .await?;
+        match response {
+            ResponseKind::Inspected { snapshot } => {
+                inner
+                    .worker_instance_id
+                    .clone_from(&snapshot.worker_instance_id);
+                let order = *sent
+                    .get()
+                    .expect("a request whose response was read was completely written");
+                Ok((*snapshot, order))
             }
             other => response_error(other),
         }
@@ -851,13 +945,13 @@ impl Worker {
         &self,
         report: ForwardedActiveReport,
     ) -> Result<ActiveIdentityOutcome, WorkerError> {
-        self.record_active_identity_tracked(report, &AtomicBool::new(false))
+        self.record_active_identity_tracked(report, &SentAt::new())
             .await
     }
 
-    /// [`Self::record_active_identity`] that sets `sent` once the request was completely
-    /// written, so a caller that gives up waiting knows whether the worker may
-    /// have seen it.
+    /// [`Self::record_active_identity`] that sets `sent` to the request's
+    /// [`ExchangeOrder`] once it was completely written, so a caller that gives
+    /// up waiting knows whether the worker may have seen it, and where.
     ///
     /// # Errors
     ///
@@ -865,7 +959,7 @@ impl Worker {
     pub async fn record_active_identity_tracked(
         &self,
         report: ForwardedActiveReport,
-        sent: &AtomicBool,
+        sent: &SentAt,
     ) -> Result<ActiveIdentityOutcome, WorkerError> {
         let mut inner = self.inner.lock().await;
         require_active_identity_forwarding(inner.selected_version)?;
@@ -892,13 +986,13 @@ impl Worker {
         &self,
         release: ForwardedActiveRelease,
     ) -> Result<ActiveIdentityOutcome, WorkerError> {
-        self.release_active_identity_tracked(release, &AtomicBool::new(false))
+        self.release_active_identity_tracked(release, &SentAt::new())
             .await
     }
 
-    /// [`Self::release_active_identity`] that sets `sent` once the request was completely
-    /// written, so a caller that gives up waiting knows whether the worker may
-    /// have seen it.
+    /// [`Self::release_active_identity`] that sets `sent` to the request's
+    /// [`ExchangeOrder`] once it was completely written, so a caller that gives
+    /// up waiting knows whether the worker may have seen it, and where.
     ///
     /// # Errors
     ///
@@ -906,7 +1000,7 @@ impl Worker {
     pub async fn release_active_identity_tracked(
         &self,
         release: ForwardedActiveRelease,
-        sent: &AtomicBool,
+        sent: &SentAt,
     ) -> Result<ActiveIdentityOutcome, WorkerError> {
         let mut inner = self.inner.lock().await;
         require_active_identity_forwarding(inner.selected_version)?;
@@ -1465,12 +1559,12 @@ async fn request_forwarded(
     inner: &mut Inner,
     request_id: RequestId,
     kind: RequestKind,
-    sent: &AtomicBool,
+    sent: &SentAt,
 ) -> Result<ResponseKind, WorkerError> {
     exchange_tracked(inner, ControlRequest { request_id, kind }, || {}, sent)
         .await
         .map_err(|error| {
-            if sent.load(Ordering::Acquire) {
+            if sent.get().is_some() {
                 WorkerError::AnswerLost(Box::new(error))
             } else {
                 error
@@ -1515,17 +1609,17 @@ async fn exchange_locked<F>(
 where
     F: FnOnce(),
 {
-    exchange_tracked(inner, request, send_started, &AtomicBool::new(false)).await
+    exchange_tracked(inner, request, send_started, &SentAt::new()).await
 }
 
 /// [`exchange_locked`] that reports through `completed` whether the request was
-/// completely written, so a caller can tell a failure that precedes the worker
-/// seeing it from one that follows.
+/// completely written, and at which [`ExchangeOrder`], so a caller can tell a
+/// failure that precedes the worker seeing it from one that follows.
 async fn exchange_tracked<F>(
     inner: &mut Inner,
     request: ControlRequest,
     send_started: F,
-    completed: &AtomicBool,
+    completed: &SentAt,
 ) -> Result<ResponseKind, WorkerError>
 where
     F: FnOnce(),
@@ -1535,7 +1629,11 @@ where
     let send = SendGuard::arm(Arc::clone(&inner.send_state));
     send_started();
     send_request(&mut inner.writer, request).await?;
-    completed.store(true, Ordering::Release);
+    inner.exchanges += 1;
+    let _ = completed.set(ExchangeOrder {
+        connection: inner.connection,
+        exchange: inner.exchanges,
+    });
     // No await separates the completed send from the marker, so a dropped
     // caller can only abandon the response, never tear the stream.
     inner.stream_state = StreamState::Unread(expected.clone());
