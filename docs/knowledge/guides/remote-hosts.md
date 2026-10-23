@@ -49,8 +49,11 @@ port = 18722
   development and tests. A service-started daemon does not receive it; put a
   port both sides must use in the file.
 - A daemon of an older release ignores the file and binds the environment value
-  or 18722. Upgrade and restart the remote host's daemon before you set `port`
-  there, or the CLI dials a port nothing listens on.
+  or 18722, and so does a client of an earlier release (a CLI on another host,
+  a Rust client pinned to an earlier tag such as the `pohunek-work` gateway).
+  Upgrade every client and restart every daemon before you set `port`, or those
+  clients dial a port nothing listens on; a pinned client adopts the file when
+  it bumps its pin.
 
 Remote behavior is host-aware. The CLI uses `--host <host>` for commands that
 target a host, and session targets can use `<host>/<session-id>`.

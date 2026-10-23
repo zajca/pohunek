@@ -114,10 +114,6 @@ async fn load_status(id: &OverlayId) -> Result<NetbirdStatus, OverlayError> {
 fn map_error(error: NetbirdError, id: &OverlayId) -> OverlayError {
     match error {
         NetbirdError::CliMissing => OverlayError::CliMissing(id.clone()),
-        NetbirdError::InvalidConfig(detail) => OverlayError::InvalidConfig {
-            overlay: id.clone(),
-            detail,
-        },
         NetbirdError::StateUnavailable(detail) | NetbirdError::Parse(detail) => {
             OverlayError::StateUnavailable {
                 overlay: id.clone(),

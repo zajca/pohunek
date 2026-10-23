@@ -111,10 +111,6 @@ pub enum DaemonError {
         reason: String,
     },
 
-    /// Configured overlay registry could not be constructed safely.
-    #[error("overlay configuration failed: {0}")]
-    OverlayConfig(#[from] overlay::OverlayError),
-
     /// `overlays.toml` or the remote port override is unusable.
     ///
     /// The message carries the stable `overlay_configuration_invalid` code the

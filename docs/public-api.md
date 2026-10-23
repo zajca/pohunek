@@ -4473,6 +4473,12 @@ clients should use it rather than hand-writing protocol framing.
 Public exports:
 
 - `protocol`: re-export of `pohunek-protocol`.
+- `default_overlay_registry`, `overlay_registry_from`, `OverlayConfig`,
+  `OVERLAY_CONFIG_FILE`, `DEFAULT_REMOTE_PORT` and `REMOTE_PORT_ENV`: the
+  overlay configuration loader and registry builder ("Overlay configuration"
+  below). They moved here from `pohunek-netbird`, which is not a pinned crate.
+  A configuration failure is `ClientError::OverlayConfiguration`
+  (`overlay_configuration_invalid`, `configuration` class).
 - `Client`: framed request/response and subscription client.
 - `ClientOptions`: `request_timeout` and `connect_timeout`, both defaulting to
   5 seconds, and `origin_source`, set with `with_origin_source`. A typed
@@ -4611,8 +4617,11 @@ raised. The daemon validates the file before it takes a lock, migrates the store
 or adopts a worker, and exits with the same code in its error text. The daemon
 reads the file at start, so a change applies after a daemon restart. A CLI of
 this release reads `port` from the file while an older daemon still binds the
-environment value or 18722: set `port` only after the daemon is upgraded and
-restarted.
+environment value or 18722, and so does a client of an earlier release (a CLI
+on another host, or a Rust client pinned to an earlier tag such as the
+`pohunek-work` gateway): set `port` only after every daemon and every client that
+dials those hosts runs this release and the daemons are restarted. A pinned
+client adopts the file when it bumps its pin.
 
 Public daemon construction is registry-explicit. `DaemonState::new` and
 `ControlServer::bind` require a validated `OverlayRegistry`, and the shared
