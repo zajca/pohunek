@@ -804,13 +804,7 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
             result
         }
         protocol::method::SESSION_INPUT if matches!(scenario, Scenario::PromptAcceptedInput) => {
-            json!({
-                "accepted": true,
-                "submitted": true,
-                "prompt_accepted": true,
-                "runtime": {"worker_instance_id": "runtime-fixture-1", "runtime_generation": "3"},
-                "activity_epoch": "daemon-fixture-epoch"
-            })
+            prompt_accepted_input_result()
         }
         protocol::method::SESSION_INPUT => json!({"accepted": true}),
         protocol::method::HOST_INSPECT => host_capabilities(),
@@ -818,6 +812,18 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
         method => panic!("unexpected fixture method: {method}"),
     };
     Response::ok(PROTOCOL_VERSION, request.id(), ok).expect("valid success response")
+}
+
+/// The success a daemon answers an opted-in `working` wait with when only the
+/// agent's prompt-submit hook acknowledged the input.
+fn prompt_accepted_input_result() -> Value {
+    json!({
+        "accepted": true,
+        "submitted": true,
+        "prompt_accepted": true,
+        "runtime": {"worker_instance_id": "runtime-fixture-1", "runtime_generation": "3"},
+        "activity_epoch": "daemon-fixture-epoch"
+    })
 }
 
 /// Host capabilities that report no runtime, so an explicit `--agent` stays

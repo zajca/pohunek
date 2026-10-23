@@ -3222,6 +3222,10 @@ fn prompts(inputs: &[Value]) -> Vec<String> {
 /// [`PROMPT_SUBMIT_GOLDEN`] for review.
 #[tokio::test]
 #[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one real session carries every prompt-submit fact, so its hooks and stub are started once"
+)]
 async fn a_real_claude_prompt_submit_hook_reports_once_per_prompt_from_the_launch_process_only() {
     require_real_claude();
     let fixture = Fixture::start(Seed::Trusted).await;

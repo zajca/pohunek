@@ -6234,9 +6234,8 @@ impl SessionRegistry {
                 match inspected {
                     Ok((snapshot, order)) => {
                         registry
-                            .observe_worker_identity(&id, &snapshot, order)
+                            .observe_worker_snapshot(&id, &snapshot, order)
                             .await;
-                        registry.observe_prompt_accepted(&id, &snapshot).await;
                         let worker_metadata = worker_metadata_fingerprint(&snapshot);
                         let initial_empty_metadata =
                             metadata.is_initial() && worker_metadata_is_empty(&worker_metadata);
