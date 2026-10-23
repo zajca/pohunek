@@ -191,7 +191,7 @@ pub fn validate_bundle(
             }
         };
 
-        let concept = match serde_yaml::from_str::<Concept>(frontmatter) {
+        let concept = match serde_saphyr::from_str::<Concept>(frontmatter) {
             Ok(concept) => concept,
             Err(error) => {
                 issues.push(BundleValidationIssue::InvalidFrontmatter {

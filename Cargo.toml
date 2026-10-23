@@ -75,7 +75,7 @@ pohunek-session-worker = { path = "crates/session-worker" }
 async-io = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+serde-saphyr = "2"
 httparse = "1.10"
 include_dir = "0.7"
 sha2 = "0.10"
@@ -120,10 +120,9 @@ proptest = "1"
 # launchd job definitions are XML property lists built from `plist::Value`;
 # serde support is not needed.
 plist = { version = "1.10", default-features = false }
-# The runtime-agnostic async-io backend runs on any thread. The `tokio` backend
-# panics when a consumer in the same dependency graph (the GUI theme detector)
-# drives zbus outside a Tokio runtime, because cargo unifies the feature.
-zbus = { version = "5.16", default-features = false, features = ["async-io"] }
+# `default-rt` is zbus's own runtime: a connection builds without a Tokio runtime
+# or an explicit runtime argument (xtask's dependency_policy test pins it).
+zbus = { version = "6", default-features = false, features = ["proxy", "default-rt"] }
 pulldown-cmark = "0.12"
 # Session identifiers need durable, globally collision-resistant generation.
 ulid = "1"

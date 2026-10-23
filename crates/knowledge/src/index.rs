@@ -98,7 +98,7 @@ fn parse_concept_meta(
     let path = path.into();
     let frontmatter = frontmatter(content)
         .ok_or_else(|| BundleIndexError::new(path.clone(), "missing frontmatter"))?;
-    serde_yaml::from_str::<Concept>(frontmatter)
+    serde_saphyr::from_str::<Concept>(frontmatter)
         .map(Into::into)
         .map_err(|err| BundleIndexError::new(path, format!("invalid frontmatter: {err}")))
 }

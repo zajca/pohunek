@@ -933,13 +933,13 @@ fn test_job_scripts() -> std::collections::BTreeSet<String> {
         pohunek_test_support::workspace_root().join(".github/workflows/ci.yml"),
     )
     .expect("read the CI workflow");
-    let workflow: serde_yaml::Value = serde_yaml::from_str(&text).expect("parse the CI workflow");
+    let workflow: serde_json::Value = serde_saphyr::from_str(&text).expect("parse the CI workflow");
     let script =
         regex::Regex::new(r"scripts/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*").expect("script pattern");
     let mut scripts = std::collections::BTreeSet::new();
     for job in SELECTED_JOBS {
         let steps = workflow["jobs"][job]["steps"]
-            .as_sequence()
+            .as_array()
             .unwrap_or_else(|| panic!("job {job} has steps"));
         for step in steps {
             if let Some(run) = step["run"].as_str() {
