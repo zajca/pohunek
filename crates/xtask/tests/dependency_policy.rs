@@ -354,7 +354,8 @@ fn workspace_metadata(all_features: bool) -> serde_json::Value {
 
 /// Without `default-rt` (and without `tokio`), `zbus::connection::Builder::build`
 /// reports `Error::Unsupported` unless a runtime is passed to it; the systemd
-/// backend passes none, so every zbus the workspace links needs `default-rt`.
+/// backend passes none, so every zbus a workspace member depends on directly
+/// needs `default-rt`.
 #[test]
 fn zbus_keeps_its_default_runtime() {
     let metadata = workspace_metadata(false);
@@ -569,6 +570,7 @@ fn legacy_zbus_policy_rejects_any_other_consumer_of_the_chain() {
             "`pohunek-relay` 0.x depends on `keyring` 3",
         ),
         (("other@1", "zbus@4"), "`other` 1.x depends on `zbus`"),
+        (("other@1", "zbus@5"), "`other` 1.x depends on `zbus`"),
         (
             ("other@1", "zvariant@4"),
             "`other` 1.x depends on `zvariant`",
