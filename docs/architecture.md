@@ -1398,10 +1398,10 @@ above that mark, it names the submission's runtime, the daemon received it
 before the deadline, and the agent was not `working` at the boundary: a busy
 agent queues the input, and its own `working` evidence answers. The result then
 carries `prompt_accepted: true` and no activity, source or revision, because
-no activity was observed. An opted-in result of a Claude session states `prompt_accepted` whatever
-answered it; any other session (another runtime, an older worker) gets no submit mark, no
-field and the
-generic timeout message. An acceptance never answers an `idle` target and never stands in
+no activity was observed. An opted-in result of a Claude session on worker protocol 8 or later whose hook
+schema admits the prompt action states `prompt_accepted` whatever answered it;
+any other session (another runtime, an older worker) gets no submit mark, no
+field and the generic timeout message. An acceptance never answers an `idle` target and never stands in
 for the `working` evidence delayed-submit framing needs first: the daemon
 imports it up to one 100 ms poll after the agent read the prompt, before the
 agent drew a spinner, so an `idle` restatement in that gap would read as a
