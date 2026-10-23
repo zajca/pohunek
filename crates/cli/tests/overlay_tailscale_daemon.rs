@@ -147,6 +147,14 @@ fn redirected_port(line: &str, original: &str) -> u16 {
         .expect("the redirected loopback port")
 }
 
+/// A usable-looking address the unsafe-state documents carry, so a bind in an
+/// unsafe state is told apart from the bind of the usable document.
+const UNSAFE_STATE_ADDRESS: &str = "100.64.0.66";
+
+fn unsafe_state() -> Status {
+    Status::running(UNSAFE_STATE_ADDRESS, vec![])
+}
+
 fn usable() -> Status {
     Status::running(SELF_ADDRESS, vec![])
 }
@@ -212,11 +220,17 @@ fn the_daemon_binds_the_ipv4_address_and_serves_peers_on_both_families() {
 fn an_unsafe_listener_address_is_never_bound() {
     let ipv6_only = Node::peer("self-box", "nSELF00001CNTRL", &["fd7a:115c:a1e0::7"]);
     let cases: Vec<(&str, Status)> = vec![
-        ("NeedsLogin", usable().with_state("NeedsLogin")),
-        ("InUseOtherUser", usable().with_state("InUseOtherUser")),
-        ("NeedsMachineAuth", usable().with_state("NeedsMachineAuth")),
-        ("Stopped", usable().with_state("Stopped")),
-        ("userspace networking", usable().userspace()),
+        ("NeedsLogin", unsafe_state().with_state("NeedsLogin")),
+        (
+            "InUseOtherUser",
+            unsafe_state().with_state("InUseOtherUser"),
+        ),
+        (
+            "NeedsMachineAuth",
+            unsafe_state().with_state("NeedsMachineAuth"),
+        ),
+        ("Stopped", unsafe_state().with_state("Stopped")),
+        ("userspace networking", unsafe_state().userspace()),
         ("no IPv4 address", usable().with_this(ipv6_only)),
         (
             "ChromeOS range address",
@@ -280,7 +294,7 @@ fn a_listed_overlay_retries_for_its_cli_and_follows_an_address_change() {
 }
 
 /// With no `overlays.toml` the `NetBird` default stays disabled while its CLI
-/// is missing, as before the Tailscale provider existed.
+/// is missing.
 #[test]
 fn the_unconfigured_default_stays_disabled_without_its_cli() {
     let host = Host::new(false);

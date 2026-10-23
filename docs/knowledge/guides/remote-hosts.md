@@ -206,8 +206,9 @@ macOS-specific routing, bridging, or relay mode.
   node's IPv4 address and only while Tailscale is `Running` on a kernel
   interface: userspace networking (`tailscaled --tun=userspace-networking`) has
   no interface to bind and is reported as `tailscale_state_unavailable`. Peers
-  that are expired, not in the network map or shared in from another user are
-  not selectable; tagged peers are. Name a peer by its short MagicDNS name, its
+  that are expired, not in the network map or flagged `ShareeNode` (nodes of
+  users you shared a machine to) are not selectable; nodes other users share
+  into your tailnet are; tagged peers are. Name a peer by its short MagicDNS name, its
   full name, `tailscale:<name>` or its node ID. The remote listener has no
   authentication beyond reachability, so tailnet ACLs decide who can reach it.
   Allow TCP on the configured port between your hosts.

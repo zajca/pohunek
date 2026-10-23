@@ -1633,7 +1633,7 @@ provider. It reads `tailscale status --json` through the same trusted
 executable lookup and cancellable subprocess as NetBird, parses only the fields
 it needs from the unstable format, and treats the stable node `ID` as the peer
 identity. The listener binds the node's IPv4 address and only while Tailscale
-runs on a kernel interface; peers shared in from another user, expired peers and
+runs on a kernel interface; `ShareeNode` peers, expired peers and
 peers outside the network map are not selectable, and the ChromeOS and service
 addresses of the CGNAT range are never node addresses.
 

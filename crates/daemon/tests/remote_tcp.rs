@@ -2250,6 +2250,8 @@ async fn bind_refuses_non_unicast_targets_whatever_the_provider_says() {
         "224.0.0.1",
         "ff02::1",
         "255.255.255.255",
+        "::ffff:127.0.0.1",
+        "::ffff:0.0.0.0",
     ] {
         let address: IpAddr = literal.parse().expect("valid IP literal");
         let transport = ScriptedOverlay::reporting(address);

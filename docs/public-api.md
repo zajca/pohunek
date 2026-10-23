@@ -4661,7 +4661,7 @@ the listener has no address (`tailscale_listener_address_missing`) and the
 discovery and resolution calls fail with `tailscale_state_unavailable`, because
 a dial in the `100.64.0.0/10` range would otherwise leave through the default
 route. A peer is selectable when it is in the network map, its key has not
-expired, it was not shared in from another tailnet user (`ShareeNode`), and the
+expired, it is not flagged `ShareeNode` (a node of a user this tailnet shared a machine to), and the
 status lists an address Tailscale assigns for that exact peer: IPv4 in
 `100.64.0.0/10` or IPv6 in `fd7a:115c:a1e0::/48`, never the ChromeOS block
 `100.115.92.0/23`, the service addresses `100.100.100.100` and

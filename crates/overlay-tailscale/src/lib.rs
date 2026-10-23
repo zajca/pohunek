@@ -11,7 +11,7 @@
 //! - Pick this host's IPv4 listener address, failing closed unless Tailscale is
 //!   running on a kernel interface ([`TailscaleTransport`]).
 //! - Select the peers an owner may route to: in the netmap, not expired, not
-//!   shared in from another tailnet user, with an address Tailscale assigns
+//!   flagged `ShareeNode` (a node of a user this tailnet shared a machine to), with an address Tailscale assigns
 //!   that the status lists for that exact peer.
 //!
 //! Tailscale assigns node addresses from `100.64.0.0/10` and `fd7a:115c:a1e0::/48`.

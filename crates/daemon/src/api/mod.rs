@@ -658,18 +658,12 @@ where
     Ok(())
 }
 
-/// Maps one read from the control codec to the next request line.
-///
-/// `None` ends the connection: the client closed its side, or sent a line
-/// longer than [`MAX_CONTROL_LINE_BYTES`], which is logged.
-///
-/// # Errors
-///
-/// Returns the transport error of a failed read.
 /// Names the address category that is never a remote listener address:
 /// unspecified, loopback, link-local, multicast or the IPv4 broadcast.
 fn forbidden_bind_category(ip: std::net::IpAddr) -> Option<&'static str> {
     use std::net::IpAddr;
+    // An IPv4-mapped IPv6 address binds as the IPv4 address it wraps.
+    let ip = ip.to_canonical();
     if ip.is_unspecified() {
         Some("unspecified")
     } else if ip.is_loopback() {
@@ -686,6 +680,14 @@ fn forbidden_bind_category(ip: std::net::IpAddr) -> Option<&'static str> {
     }
 }
 
+/// Maps one read from the control codec to the next request line.
+///
+/// `None` ends the connection: the client closed its side, or sent a line
+/// longer than [`MAX_CONTROL_LINE_BYTES`], which is logged.
+///
+/// # Errors
+///
+/// Returns the transport error of a failed read.
 fn read_control_line(
     item: Option<Result<String, LinesCodecError>>,
 ) -> Result<Option<String>, io::Error> {

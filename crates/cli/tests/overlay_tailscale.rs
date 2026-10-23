@@ -286,25 +286,9 @@ fn ineligible_peers_are_neither_listed_nor_selectable() {
     let (peers, _) = records(&fixture.run(&["host", "list", "--refresh", "--json"]));
     assert_eq!(
         names(&peers),
-        [
-            "chromeos",
-            "good",
-            "lan",
-            "loopback",
-            "noaddress",
-            "service"
-        ],
-        "sharee, expired and out-of-netmap peers are dropped"
+        ["good"],
+        "shared, expired, out-of-netmap and address-less peers are dropped"
     );
-    for name in ["chromeos", "service", "lan", "loopback", "noaddress"] {
-        let peer = record(&peers, name);
-        assert_eq!(
-            peer["address"],
-            Value::Null,
-            "{name} has no dialable address"
-        );
-        assert_eq!(peer["classification"], "candidate", "{name}");
-    }
     assert_eq!(record(&peers, "good")["address"], "100.64.0.10");
 
     for selector in [

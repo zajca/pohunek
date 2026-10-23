@@ -1,7 +1,7 @@
 //! Peer selection and name resolution over one status snapshot.
 //!
 //! A peer is selectable only when the netmap holds it, its key has not
-//! expired, it was not shared in from another tailnet user, and the status
+//! expired, it is not flagged `ShareeNode` (a node of a user this tailnet shared a machine to), and the status
 //! lists an address Tailscale assigns for that exact peer. Tagged peers are
 //! selectable like user-owned ones. The identity is the stable node `ID`; the
 //! map key and `HostName` are never used.

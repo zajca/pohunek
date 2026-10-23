@@ -216,7 +216,7 @@ async fn only_selectable_peers_resolve() {
         .filter_map(|peer| peer.display_name.clone())
         .collect::<Vec<_>>();
     listed.sort();
-    assert_eq!(listed, ["alpha", "bravo", "lan"]);
+    assert_eq!(listed, ["alpha", "bravo"]);
     let local = snapshot.local.expect("this host is reported");
     assert_eq!(local.fqdn.as_deref(), Some("self-box.tail-test.ts.net"));
     assert_eq!(local.address, Some(address("100.64.0.7")));

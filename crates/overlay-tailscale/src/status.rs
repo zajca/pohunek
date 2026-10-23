@@ -5,8 +5,9 @@
 //! change. Parsing is defensive: unknown fields are ignored, every field the
 //! mapping uses is optional, and a Go `nil` slice or pointer arrives as `null`
 //! and reads as empty. A field that is absent reads as its zero value, which
-//! is the safe side for each flag: not running, no kernel interface, not in the
-//! netmap.
+//! is the safe side for `BackendState`, `TUN` and `InNetworkMap`; the
+//! `omitempty` flags `Expired` and `ShareeNode` read as unset when absent, which
+//! the format forces.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -97,7 +98,7 @@ pub(crate) struct Node {
     /// Whether the peer's node key has expired.
     #[serde(rename = "Expired")]
     expired: Option<bool>,
-    /// Whether the peer exists only because a node was shared to this tailnet.
+    /// Whether the peer is a node of a user this tailnet shared a machine to.
     #[serde(rename = "ShareeNode")]
     shared_in: Option<bool>,
 }
