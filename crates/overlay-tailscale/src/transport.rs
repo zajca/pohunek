@@ -186,15 +186,12 @@ fn resolved_peer(peer: &Node) -> ResolvedPeer {
     }
 }
 
-/// Selectable peers with a dial address, and offline peers without one. An
-/// offline peer is listed without an address so discovery does not probe it;
-/// naming it explicitly still resolves it.
+/// Selectable peers that have an address to dial. An offline peer is listed
+/// without its address so discovery does not probe it.
 fn discover_from_status(status: &TailscaleStatus) -> Vec<DiscoveredPeer> {
     status
         .peer_nodes()
-        .filter(|peer| {
-            peers::is_selectable(peer) && (!peer.online() || peers::dial_address(peer).is_some())
-        })
+        .filter(|peer| peers::is_selectable(peer) && peers::dial_address(peer).is_some())
         .map(|peer| DiscoveredPeer {
             peer_id: peer.id().map(str::to_owned),
             display_name: peer.fqdn().and_then(peers::short_name).map(str::to_owned),

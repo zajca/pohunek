@@ -280,6 +280,10 @@ fn ineligible_peers_are_neither_listed_nor_selectable() {
             Node::peer("lan", "nLAN0000001CNTRL", &["10.0.0.9"]),
             Node::peer("loopback", "nLOOP000001CNTRL", &["127.0.0.1"]),
             Node::peer("noaddress", "nNOADD00001CNTRL", &[]),
+            Node::peer("via6", "nVIA6000001CNTRL", &["fd7a:115c:a1e0:b1a::5"]),
+            Node::peer("service6", "nSERV600001CNTRL", &["fd7a:115c:a1e0::53"]),
+            Node::peer("offlan", "nOFFLA00001CNTRL", &["10.0.0.9"]).offline(),
+            Node::peer("offchrome", "nOFFCH00001CNTRL", &["100.115.92.6"]).offline(),
         ],
     );
     let fixture = Fixture::new(&status);
@@ -287,7 +291,7 @@ fn ineligible_peers_are_neither_listed_nor_selectable() {
     assert_eq!(
         names(&peers),
         ["good"],
-        "shared, expired, out-of-netmap and address-less peers are dropped"
+        "ineligible peers and peers without an in-range address are dropped, online or not"
     );
     assert_eq!(record(&peers, "good")["address"], "100.64.0.10");
 
@@ -300,6 +304,10 @@ fn ineligible_peers_are_neither_listed_nor_selectable() {
         "lan",
         "loopback",
         "noaddress",
+        "via6",
+        "service6",
+        "offlan",
+        "offchrome",
         "nSHARE00001CNTRL",
         "tailscale:shared",
         &peer_selector("nEXPIR00001CNTRL"),
@@ -307,6 +315,8 @@ fn ineligible_peers_are_neither_listed_nor_selectable() {
         "100.64.0.11",
         "100.115.92.5",
         "100.100.100.100",
+        "fd7a:115c:a1e0:b1a::5",
+        "fd7a:115c:a1e0::53",
         // Listed for no peer.
         "100.64.0.99",
         "127.0.0.1",

@@ -559,7 +559,7 @@ python3 scripts/test-partitions --archive-file nextest-archive.tar.zst run heavy
 python3 scripts/test-partitions --archive-file A check-macos   # 14-package macOS set: exact lane/tier/bucket partition
 python3 scripts/test-partitions --archive-file A check-macos --scope lane  # PR lane archive: its 9 packages only
 python3 scripts/test-partitions --archive-file A run-macos     # PR macOS lane: 9 packages, profile macos
-python3 scripts/test-partitions --archive-file A run-macos-tier  # main/nightly macOS tier: client, netbird, package, xtask
+python3 scripts/test-partitions --archive-file A run-macos-tier  # main/nightly macOS tier: client, netbird, overlay-tailscale, package, xtask
 python3 scripts/test-partitions --archive-file A audit-sparse --selector target/debug/xtask --report-dir R  # nightly G3: each package from its own sparse tree
 ```
 

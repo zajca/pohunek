@@ -100,7 +100,7 @@ pub(crate) struct Node {
     expired: Option<bool>,
     /// Whether the peer is a node of a user this tailnet shared a machine to.
     #[serde(rename = "ShareeNode")]
-    shared_in: Option<bool>,
+    sharee: Option<bool>,
 }
 
 impl Node {
@@ -139,7 +139,7 @@ impl Node {
     }
 
     pub(crate) fn sharee_node(&self) -> bool {
-        self.shared_in.unwrap_or(false)
+        self.sharee.unwrap_or(false)
     }
 }
 
