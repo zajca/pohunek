@@ -386,6 +386,36 @@ downgrades this way: an override manifest without an eligible idle rule keeps
 the strict readiness, so the input is refused instead of released by a signal
 the runtime did not declare.
 
+## Declaring program status
+
+A detection manifest opts in to OSC 7501 program-status evidence with a table:
+
+```toml
+[program_status]
+app = "my-agent"      # 1-32 characters of [A-Za-z0-9_.+-]
+answer_probe = true   # optional, default false
+```
+
+`app` names the program whose root records the detector holds; records of any
+other app, records without an app and records of children (an `id=` pair) are
+ignored. `answer_probe = true` makes the session worker answer the program's
+`ESC ] 7501 ; ? ESC \` probe, which programs such as Claude Code and Pi wait
+for before they report; leave it off for a program that reports without a probe
+(Codex). A rule may set `overrides_program_status = true`: when it is the screen
+winner it beats a non-blocked record (for a state the program reports
+misleadingly). The table and the flag are rejected when malformed, and a rule
+flag without the table is an error.
+
+The record is arbitrated with the screen rules (a visible dialog always wins
+over a non-blocked record; a `blocked` record always wins; `working` reads
+working; `done`, `idle` and `error` read idle), reported as `state_source =
+osc_progress`, never used for input readiness, and dropped on `clear`, on a
+detector reconfigure and after a lag resync. See "Agent state detection" in
+`docs/architecture.md`. A host profile can switch the feature off for a
+program that has an own switch (`PI_PROGRAM_STATUS=0`,
+`CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`); detection is then screen-only. Official
+packages do not declare the table yet.
+
 ## Versioning official packages
 
 The `version` of an official package's `runtime.toml` names its archive. Two

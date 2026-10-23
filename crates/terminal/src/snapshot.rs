@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::program_status::{ProbeSpan, PROGRAM_STATUS_COMMAND};
+
 // Rust guideline compliant 2026-07-23
 
 /// Maximum OSC value retained in memory.
@@ -68,6 +70,13 @@ impl TerminalTracker {
         self.osc.feed(bytes);
     }
 
+    /// Takes the OSC 7501 probes completed since the previous call.
+    ///
+    /// Spans are offsets in the stream fed to this tracker, in order.
+    pub fn take_probes(&mut self) -> Vec<ProbeSpan> {
+        std::mem::take(&mut self.osc.probes)
+    }
+
     /// Updates the modeled terminal dimensions.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.parser.screen_mut().set_size(rows, cols);
@@ -112,6 +121,13 @@ struct OscTracker {
     payload: Vec<u8>,
     title: Option<String>,
     progress: Option<String>,
+    /// Bytes fed so far; the index of the byte being advanced.
+    consumed: u64,
+    /// Index of the latest `ESC` seen in the ground state.
+    escape_at: u64,
+    /// Index of the `ESC` that introduced the current OSC.
+    osc_start: u64,
+    probes: Vec<ProbeSpan>,
 }
 
 impl OscTracker {
@@ -122,12 +138,17 @@ impl OscTracker {
             payload: Vec::new(),
             title: None,
             progress: None,
+            consumed: 0,
+            escape_at: 0,
+            osc_start: 0,
+            probes: Vec::new(),
         }
     }
 
     fn feed(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             self.advance(byte);
+            self.consumed += 1;
         }
     }
 
@@ -135,11 +156,13 @@ impl OscTracker {
         match self.state {
             OscState::Ground => {
                 if byte == 0x1b {
+                    self.escape_at = self.consumed;
                     self.state = OscState::Escape;
                 }
             }
             OscState::Escape => {
                 self.state = if byte == b']' {
+                    self.osc_start = self.escape_at;
                     self.command.clear();
                     self.payload.clear();
                     OscState::Command
@@ -196,6 +219,15 @@ impl OscTracker {
         match command {
             Some("0" | "2") => self.title = Some(payload),
             Some("9") => self.progress = Some(payload),
+            Some(number)
+                if number.as_bytes() == PROGRAM_STATUS_COMMAND
+                    && self.payload.first() == Some(&b'?') =>
+            {
+                self.probes.push(ProbeSpan {
+                    start: self.osc_start,
+                    end: self.consumed + 1,
+                });
+            }
             _ => {}
         }
         self.state = OscState::Ground;

@@ -23,6 +23,7 @@ use pohunek_platform::process::{
     ProcessIdentity as OsProcessIdentity, ProcessInspector, SkipReason, Skipped, SpawnId,
     StartIdentity, SweepReport, SweepRequest, MAX_SWEEP_GRACE,
 };
+use pohunek_terminal::strip_probe_replies;
 use pohunek_worker_protocol as protocol;
 use pohunek_worker_protocol::is_task_text;
 use protocol::{
@@ -1373,6 +1374,7 @@ async fn initialize_request(
         subscriber_bytes,
         input_dedup_entries: dedup_entries,
         input_stall: Some(Duration::from_millis(initialize.input_policy.stall_ms())),
+        answer_program_status_probe: initialize.answers_program_status_probe,
         stop_grace,
         kill_reap_deadline,
         terminal_retention: retention,
@@ -1496,6 +1498,7 @@ fn spawn_pty(command: Command, config: &WorkerConfig) -> Result<PtyOwner, PtyErr
         config.subscriber_bytes,
         config.input_dedup_entries,
         config.input_stall,
+        config.answer_program_status_probe,
     )
 }
 
@@ -3164,6 +3167,13 @@ where
                     ).await;
                 }
                 let bytes_written = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                // The worker answers the probe itself; the terminal's own
+                // reply would reach the program a second time.
+                let bytes = if pty.answers_program_status_probe() {
+                    strip_probe_replies(&bytes).into_owned()
+                } else {
+                    bytes
+                };
                 pending_write = Some(PendingAttachWrite {
                     write_id,
                     bytes_written,
@@ -9044,6 +9054,7 @@ mod tests {
             config.subscriber_bytes,
             config.input_dedup_entries,
             config.input_stall,
+            config.answer_program_status_probe,
         )
         .expect("spawn PTY");
         let mut subscriber = pty.subscribe_output(Some(0)).expect("subscribe output");
@@ -9753,6 +9764,199 @@ mod tests {
         )
         .await
         .expect("stop fixture PTY");
+    }
+
+    /// The program-status probe reply the worker writes, as hex.
+    const PROBE_REPLY_HEX: &str = "1b5d373530313b3f1b5c";
+    /// Byte length of the probe reply.
+    const PROBE_REPLY_BYTES: usize = 10;
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one attach stream scenario: spawn, serve, send frames, collect the dump"
+    )]
+    /// Sends `frames` as attach input to a PTY whose program prints a probe and
+    /// dumps the next `count` bytes of its input as hex, and returns the dump.
+    async fn attach_input_dump(frames: &[&[u8]], count: usize) -> String {
+        let owner = crate::LeaseOwner {
+            daemon_id: "daemon-probe".to_owned(),
+            peer_pid: std::process::id(),
+            peer_start_identity: "7500".to_owned(),
+        };
+        let (server, fixture_pty, directory) = launch_claim_fixture().await;
+        let mut config = crate::WorkerConfig::new();
+        config.answer_program_status_probe = true;
+        let script = format!(
+            "stty raw -echo; printf '\\033]7501;?\\033\\\\'; printf ARMED; printf 'DUMP:'; \
+             head -c {count} | od -An -v -tx1 | tr -d ' \\n'; printf ':END'"
+        );
+        let pty = super::spawn_pty(
+            crate::Command {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), script],
+                env: crate::test_support::child_env(),
+                cwd: directory.path().to_path_buf(),
+                cols: 80,
+                rows: 24,
+            },
+            &config,
+        )
+        .expect("spawn probing PTY");
+        let subscriber = pty.subscribe_output(None).expect("output subscriber");
+        let stream_id = StreamId::new("a-probe").expect("stream id");
+        let worker_instance_id = WorkerInstanceId::new("runtime-claim").expect("runtime id");
+        let (worker_in, mut client_in) = tokio::io::duplex(CLIENT_BUFFER);
+        let (mut worker_out, mut client_out) = tokio::io::duplex(CLIENT_BUFFER);
+        let (_lease_tx, mut lease_rx) = watch::channel(0_u64);
+        let served_pty = pty.clone();
+        let served_owner = owner.clone();
+        let served_stream = stream_id.clone();
+        let served_instance = worker_instance_id.clone();
+        let stream = tokio::spawn(async move {
+            serve_stream_data(
+                &server.shared,
+                &served_pty,
+                worker_in,
+                &mut worker_out,
+                CURRENT_VERSION,
+                &served_stream,
+                &served_instance,
+                StreamMode::Attach,
+                subscriber,
+                0,
+                &mut lease_rx,
+                &owner_peer(&served_owner),
+                &served_owner,
+            )
+            .await
+        });
+
+        let mut output = Vec::new();
+        let mut read_until =
+            async |client_out: &mut tokio::io::DuplexStream,
+                   done: &dyn Fn(&[u8], &FrameKind) -> bool| {
+                loop {
+                    let frame = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        protocol::read_frame(client_out),
+                    )
+                    .await
+                    .expect("the worker answers in time")
+                    .expect("read frame")
+                    .expect("stream stays open");
+                    if matches!(
+                        frame.header().kind,
+                        FrameKind::Output { .. } | FrameKind::Replay { .. }
+                    ) {
+                        output.extend_from_slice(frame.payload());
+                    }
+                    if done(&output, &frame.header().kind) {
+                        return;
+                    }
+                }
+            };
+        read_until(&mut client_out, &|output, _| {
+            String::from_utf8_lossy(output).contains("ARMED")
+        })
+        .await;
+        for (index, bytes) in frames.iter().enumerate() {
+            let sequence = index + 1;
+            let write_id =
+                WriteId::new(format!("{ATTACH_INPUT_PREFIX}{stream_id}-{sequence}")).expect("id");
+            let mut encoded = Vec::new();
+            protocol::write_frame(
+                &mut encoded,
+                &protocol::DataFrame::new(
+                    FrameHeader {
+                        version: CURRENT_VERSION,
+                        stream_id: stream_id.clone(),
+                        worker_instance_id: worker_instance_id.clone(),
+                        kind: FrameKind::Input {
+                            write_id: write_id.clone(),
+                        },
+                    },
+                    bytes.to_vec(),
+                )
+                .expect("input frame"),
+            )
+            .await
+            .expect("encode input frame");
+            client_in.write_all(&encoded).await.expect("send input");
+            read_until(&mut client_out, &|_, kind| {
+                matches!(kind, FrameKind::InputAck { write_id: acked, .. } if *acked == write_id)
+            })
+            .await;
+        }
+        read_until(&mut client_out, &|output, _| {
+            String::from_utf8_lossy(output).contains(":END")
+        })
+        .await;
+
+        drop(client_in);
+        stream
+            .await
+            .expect("stream task")
+            .expect("client EOF ends the stream cleanly");
+        for pty in [&pty, &fixture_pty] {
+            pty.stop(
+                "test-cleanup",
+                server_stop_grace(),
+                crate::WorkerConfig::new().kill_reap_deadline,
+            )
+            .await
+            .expect("stop PTY");
+        }
+        let text = String::from_utf8_lossy(&output).into_owned();
+        let from = text.find("DUMP:").expect("dump start") + "DUMP:".len();
+        let end = text[from..].find(":END").expect("dump end");
+        text[from..from + end].to_owned()
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+
+        bytes.iter().fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+    }
+
+    /// The worker answers the probe itself, so the terminal's own reply inside
+    /// an attach input frame is dropped, and everything else in the frame (a
+    /// DA1 reply, keys) reaches the program in order.
+    #[tokio::test]
+    async fn an_attached_terminal_reply_to_an_answered_probe_is_dropped() {
+        let da1 = b"\x1b[?62;c";
+        let keys = b"KEYS";
+        let frame = [da1.as_slice(), pohunek_terminal::PROBE_REPLY, keys].concat();
+        let kept = hex_of(&[da1.as_slice(), keys].concat());
+        let count = da1.len() + keys.len() + PROBE_REPLY_BYTES;
+
+        let dump = attach_input_dump(&[&frame], count).await;
+
+        // The worker's own reply lands before or after the whole frame.
+        assert!(
+            dump == format!("{kept}{PROBE_REPLY_HEX}")
+                || dump == format!("{PROBE_REPLY_HEX}{kept}"),
+            "exactly one reply reaches the program: {dump}"
+        );
+    }
+
+    /// A reply split across two frames cannot be recognized and passes through.
+    #[tokio::test]
+    async fn an_attached_terminal_reply_split_across_frames_passes_through() {
+        let first = b"\x1b]7501";
+        let second = b";?\x1b\\KEYS";
+        let kept = hex_of(&[first.as_slice(), second.as_slice()].concat());
+        let count = first.len() + second.len() + PROBE_REPLY_BYTES;
+
+        let dump = attach_input_dump(&[first, second], count).await;
+
+        assert!(
+            dump == format!("{kept}{PROBE_REPLY_HEX}")
+                || dump == format!("{PROBE_REPLY_HEX}{kept}"),
+            "the split reply is forwarded unchanged: {dump}"
+        );
     }
 
     /// An observation stream proves its peer again after it stops waiting.
@@ -10613,6 +10817,7 @@ mod tests {
             hook_protocol_version: Version::new(1).expect("hook version"),
             public_protocol_version: 7,
             hook_schema: None,
+            answers_program_status_probe: false,
             input_policy: protocol::InputPolicy::new(500).expect("input policy"),
         }
     }

@@ -914,7 +914,19 @@ impl SessionRegistry {
             .await
             .map_err(LaunchFailure::Cleaned)?;
 
+        let pinned = self
+            .inner
+            .profiles
+            .runtimes()
+            .pinned_definition(&agent_base, &snapshot.launch_binding);
+        let default_detector_config = DetectorConfig::for_pinned(
+            self.inner.profiles.runtimes(),
+            &agent_base,
+            &snapshot.launch_binding,
+            manifest_override,
+        );
         let hook_schema = self.session_hook_schema(&agent_base, &snapshot.launch_binding);
+        let answers_program_status_probe = default_detector_config.answers_program_status_probe();
         let started = match self
             .start_runtime(
                 &lifecycle,
@@ -923,6 +935,7 @@ impl SessionRegistry {
                 &agent,
                 agent_base.clone(),
                 hook_schema,
+                answers_program_status_probe,
                 snapshot.native_ref_kind(),
                 command,
                 &transaction_id,
@@ -952,17 +965,6 @@ impl SessionRegistry {
         let runtime_watch_cancel = CancellationToken::new();
         let procwatch_rescan = Arc::new(Notify::new());
         let (detector_resize, detector_resize_rx) = watch::channel((rows, cols));
-        let pinned = self
-            .inner
-            .profiles
-            .runtimes()
-            .pinned_definition(&agent_base, &snapshot.launch_binding);
-        let default_detector_config = DetectorConfig::for_pinned(
-            self.inner.profiles.runtimes(),
-            &agent_base,
-            &snapshot.launch_binding,
-            manifest_override,
-        );
         let (detector_config, detector_config_rx) = watch::channel(DetectorConfigUpdate {
             generation: 0,
             config: default_detector_config.clone(),
@@ -1185,6 +1187,7 @@ impl SessionRegistry {
         agent: &str,
         agent_base: RuntimeRef,
         hook_schema: Option<&'static pohunek_worker_protocol::HookSchema>,
+        answers_program_status_probe: bool,
         reference_kind: Option<SessionRefKind>,
         command: LaunchCommand,
         transaction_id: &str,
@@ -1204,6 +1207,7 @@ impl SessionRegistry {
                 agent,
                 agent_base,
                 hook_schema,
+                answers_program_status_probe,
                 reference_kind,
                 command,
                 transaction_id,
@@ -1228,6 +1232,7 @@ impl SessionRegistry {
         agent: &str,
         agent_base: RuntimeRef,
         hook_schema: Option<&'static pohunek_worker_protocol::HookSchema>,
+        answers_program_status_probe: bool,
         reference_kind: Option<SessionRefKind>,
         command: LaunchCommand,
         transaction_id: &str,
@@ -1297,6 +1302,7 @@ impl SessionRegistry {
                     .expect("worker hook protocol version is nonzero"),
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: hook_schema.map(|schema| schema.id.to_owned()),
+                answers_program_status_probe,
             })
             .await
             .map_err(super::worker_error_to_protocol)?;

@@ -994,11 +994,14 @@ pub enum DetectionRegionKind {
     PromptBoxBody,
     /// Visible text after the last horizontal rule.
     AfterLastHorizontalRule,
+    /// Canonical form of the held OSC 7501 program-status record. The daemon
+    /// returns no preview of it while this enum is strict for older clients.
+    ProgramStatus,
 }
 
 impl DetectionRegionKind {
     /// All region kinds accepted by this protocol implementation.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::OscTitle,
         Self::OscProgress,
         Self::WholeRecent,
@@ -1009,6 +1012,7 @@ impl DetectionRegionKind {
         Self::AfterLastPromptMarker,
         Self::PromptBoxBody,
         Self::AfterLastHorizontalRule,
+        Self::ProgramStatus,
     ];
 }
 

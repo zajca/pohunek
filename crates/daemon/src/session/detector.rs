@@ -213,9 +213,19 @@ impl SessionRegistry {
             .await
             .map_err(|_receive_error| protocol::ProtocolError::session_terminal_unavailable())??;
 
+        // The program-status preview stays off the wire while
+        // `DetectionRegionKind` is a strict enum, so a client that predates the
+        // kind decodes every result.
+        let previews = previews
+            .into_iter()
+            .filter(|preview| preview.kind != protocol::DetectionRegionKind::ProgramStatus)
+            .collect();
         Ok(protocol::SessionDetectionResult {
             session_id: id.clone(),
-            supported_regions: protocol::DetectionRegionKind::ALL.to_vec(),
+            supported_regions: protocol::DetectionRegionKind::ALL
+                .into_iter()
+                .filter(|kind| *kind != protocol::DetectionRegionKind::ProgramStatus)
+                .collect(),
             previews,
         })
     }

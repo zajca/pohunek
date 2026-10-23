@@ -21,11 +21,12 @@ pub use machine::{ActivityEvidence, ActivityTransition, DetectionConfig, StateMa
 pub(crate) use manifest::MAX_MANIFEST_SOURCE_BYTES;
 pub use manifest::{
     Manifest, ManifestError, ManifestMatch, ManifestRegion, MatchContext, MatcherKind,
-    ProcessMatchers,
+    ProcessMatchers, ProgramStatusConfig,
 };
 pub use osc::{OscEvidence, OscParser};
 // The VT screen model lives in `pohunek-terminal` so the daemon and CLI share
 // one implementation instead of drifting copies.
+use pohunek_terminal::{ProgramState, ProgramStatusRecord, ProgramStatusReport};
 pub use pohunek_terminal::{ScreenObservation, ScreenRegion, ScreenTracker};
 
 const ESC: u8 = 0x1b;
@@ -60,6 +61,16 @@ pub struct DetectorConfig {
 }
 
 impl DetectorConfig {
+    /// Whether the session worker answers the runtime's OSC 7501 probe: the
+    /// manifest opts in with `[program_status] answer_probe = true`.
+    #[must_use]
+    pub fn answers_program_status_probe(&self) -> bool {
+        self.manifest
+            .as_ref()
+            .and_then(|manifest| manifest.program_status())
+            .is_some_and(ProgramStatusConfig::answer_probe)
+    }
+
     /// Production detector config using the embedded generic shell manifest.
     #[must_use]
     pub fn generic_shell() -> Self {
@@ -233,6 +244,10 @@ pub struct Detector {
     latest_title: Option<String>,
     latest_progress: Option<String>,
     latest_cwd_hint: Option<String>,
+    /// The latest root OSC 7501 record of the active manifest's app. Held until
+    /// a `clear`, a reconfigure or a lag resync; it carries no expiry because
+    /// programs report on change only.
+    program_status: Option<ProgramStatusRecord>,
     process_activity: ProcessActivityScanner,
     needs_visible_recheck: bool,
     /// Whether terminal context or the active manifest changed since the last
@@ -276,6 +291,7 @@ impl Detector {
             latest_title: None,
             latest_progress: None,
             latest_cwd_hint: None,
+            program_status: None,
             process_activity: ProcessActivityScanner::default(),
             needs_visible_recheck: false,
             context_dirty: true,
@@ -316,7 +332,16 @@ impl Detector {
 
         let has_process_activity = self.process_activity.observe(bytes);
         let recent_before = self.screen.recent_text();
-        let osc_events = self.osc.advance_with_offsets(bytes);
+        let mut osc_events = self.osc.advance_with_offsets(bytes);
+        // Without the opt-in a 7501 report is no event, so the screen is fed in
+        // the same segments as for any other output.
+        if self
+            .manifest
+            .as_ref()
+            .is_none_or(|manifest| manifest.program_status().is_none())
+        {
+            osc_events.retain(|(item, _end)| !matches!(item, OscEvidence::ProgramStatus(_)));
+        }
 
         // The screen is fed segment by segment, split at each completed OSC
         // event: every event is stamped against the screen as it looked where
@@ -327,7 +352,11 @@ impl Detector {
         // Under an agent manifest, a `Working` winner at one of those points is
         // remembered: a turn whose working title or frame is replaced by an idle
         // one inside the same chunk is still working evidence.
-        let mut latch = ChunkLatch::new(self.latch_gate_open(), recent_before.clone());
+        let mut latch = ChunkLatch::new(
+            self.latch_gate_open(),
+            recent_before.clone(),
+            self.program_status.clone(),
+        );
         let mut consumed = 0;
         for (item, end) in osc_events {
             self.feed_screen_segment(&bytes[consumed..end], &mut latch);
@@ -351,17 +380,23 @@ impl Detector {
             osc_title: osc_changes.title,
             osc_progress: osc_changes.progress,
         };
-        let hit = self.manifest_evidence(freshness);
+        let hit = self.activity_evidence(freshness);
         let has_structured_evidence = hit.is_some();
 
         let mut transitions = Vec::new();
         // Only a chunk that ends idle latches: transcript text drawn ahead of a
-        // dialog, or of a screen no rule names, must never read as working.
+        // dialog, or of a screen no rule names, must never read as working. An
+        // override winner also stops the latch while the held record is
+        // working, because the record's own working edge is already refused.
+        let record_working = self
+            .program_status
+            .as_ref()
+            .is_some_and(|record| record.state == ProgramState::Working);
         if let Some(sighted) = sighted_working {
-            if hit
-                .as_ref()
-                .is_some_and(|hit| hit.evidence.activity == AgentActivity::Idle)
-            {
+            if hit.as_ref().is_some_and(|hit| {
+                hit.evidence.activity == AgentActivity::Idle
+                    && !(hit.overrides_program_status && record_working)
+            }) {
                 push_transition(&mut transitions, self.state.observe_evidence(now, sighted));
             }
         }
@@ -402,6 +437,7 @@ impl Detector {
 
     /// Evaluates the context after a completed OSC event.
     fn latch_at_osc_point(&self, latch: &mut ChunkLatch) {
+        latch.program_status.clone_from(&self.program_status);
         if let Some(manifest) = self.manifest.as_deref() {
             latch.evaluate(
                 manifest,
@@ -543,6 +579,35 @@ impl Detector {
                 self.latest_cwd_hint = Some(path);
                 false
             }
+            OscEvidence::ProgramStatus(report) => self.apply_program_status(report),
+        }
+    }
+
+    /// Applies one OSC 7501 report in stream order. Returns whether it changed
+    /// the held record, which makes it a latch point like any OSC event.
+    ///
+    /// Only a root record naming the active manifest's app is held. A report
+    /// of a child (an `id=` pair) and a record of another app are ignored, and
+    /// a root `clear` drops the record.
+    fn apply_program_status(&mut self, report: ProgramStatusReport) -> bool {
+        let Some(program_status) = self
+            .manifest
+            .as_ref()
+            .and_then(|manifest| manifest.program_status())
+        else {
+            return false;
+        };
+        match report {
+            ProgramStatusReport::Record(record)
+                if record.app.as_deref() == Some(program_status.app()) =>
+            {
+                self.program_status = Some(record);
+                true
+            }
+            ProgramStatusReport::Clear => self.program_status.take().is_some(),
+            ProgramStatusReport::Record(_)
+            | ProgramStatusReport::Child
+            | ProgramStatusReport::Probe => false,
         }
     }
 
@@ -556,8 +621,11 @@ impl Detector {
         // A pending candidate needs repeated observations to confirm, so it
         // keeps evaluating even over unchanged context.
         if self.context_dirty || self.needs_visible_recheck || self.state.has_pending() {
-            if let Some(hit) = self.manifest_evidence(ContextFreshness::all()) {
-                self.sight_visible_blocker(&hit);
+            let screen_hit = self.manifest_evidence(ContextFreshness::all());
+            if let Some(hit) = &screen_hit {
+                self.sight_visible_blocker(hit);
+            }
+            if let Some(hit) = overlay_program_status(self.program_status.as_ref(), screen_hit) {
                 if hit.evidence.activity != AgentActivity::Working || self.needs_visible_recheck {
                     push_transition(
                         &mut transitions,
@@ -618,6 +686,7 @@ impl Detector {
         } else if !self.initial_input_pending {
             self.screen.finish_observation();
         }
+        self.program_status = None;
         self.process_activity.reset();
         self.state.clear_pending();
         self.needs_visible_recheck = true;
@@ -639,6 +708,7 @@ impl Detector {
         self.latest_title = None;
         self.latest_progress = None;
         self.latest_cwd_hint = None;
+        self.program_status = None;
         self.screen.reset();
         self.needs_visible_recheck = false;
         // The context these sequence points name is gone; only fresh arrivals
@@ -696,7 +766,7 @@ impl Detector {
         };
         let context = self.match_context(manifest, ContextFreshness::all());
 
-        manifest
+        let mut previews: Vec<_> = manifest
             .required_regions()
             .into_iter()
             .map(|region| DetectionRegionPreview {
@@ -704,7 +774,36 @@ impl Detector {
                 region: region.to_string(),
                 text: context.region_text(&region).unwrap_or_default().to_owned(),
             })
-            .collect()
+            .collect();
+        if manifest.program_status().is_some() {
+            previews.push(DetectionRegionPreview {
+                kind: protocol::DetectionRegionKind::ProgramStatus,
+                region: PROGRAM_STATUS_REGION.to_owned(),
+                text: self
+                    .program_status
+                    .as_ref()
+                    .map(ProgramStatusRecord::canonical)
+                    .unwrap_or_default(),
+            });
+        }
+        previews
+    }
+
+    /// The activity evidence: the screen winner, arbitrated with the held
+    /// program-status record. Readiness reads [`Self::manifest_evidence`]
+    /// instead, so a record never releases or holds a prompt.
+    fn activity_evidence(&self, freshness: ContextFreshness) -> Option<ManifestEvidenceHit> {
+        // A held record is arbitrated against the whole screen: a dialog that
+        // stays visible while the chunk changes nothing on screen must still win.
+        let freshness = if self.program_status.is_some() {
+            ContextFreshness::all()
+        } else {
+            freshness
+        };
+        overlay_program_status(
+            self.program_status.as_ref(),
+            self.manifest_evidence(freshness),
+        )
     }
 
     fn manifest_evidence(&self, freshness: ContextFreshness) -> Option<ManifestEvidenceHit> {
@@ -748,6 +847,9 @@ struct ChunkLatch {
     recent_before: String,
     /// Title and progress changes among the bytes consumed so far.
     osc_changes: OscChanges,
+    /// The program-status record as held at the latest point of the chunk, so
+    /// every point arbitrates with the record the stream had reached there.
+    program_status: Option<ProgramStatusRecord>,
     /// Whether characters were drawn at an earlier point of this chunk.
     drew: bool,
     evaluations: usize,
@@ -755,9 +857,10 @@ struct ChunkLatch {
 }
 
 impl ChunkLatch {
-    fn new(open: bool, recent_before: String) -> Self {
+    fn new(open: bool, recent_before: String, program_status: Option<ProgramStatusRecord>) -> Self {
         Self {
             open,
+            program_status,
             recent_before,
             osc_changes: OscChanges::default(),
             drew: false,
@@ -783,19 +886,26 @@ impl ChunkLatch {
         }
         self.evaluations += 1;
         self.drew |= drew_chars;
-        let freshness = ContextFreshness {
-            screen: self.drew || screen.recent_text() != self.recent_before,
-            osc_title: self.osc_changes.title,
-            osc_progress: self.osc_changes.progress,
+        let freshness = if self.program_status.is_some() {
+            ContextFreshness::all()
+        } else {
+            ContextFreshness {
+                screen: self.drew || screen.recent_text() != self.recent_before,
+                osc_title: self.osc_changes.title,
+                osc_progress: self.osc_changes.progress,
+            }
         };
-        let hit = manifest_hit(
-            manifest,
-            screen,
-            latest_title,
-            latest_progress,
-            0,
-            0,
-            freshness,
+        let hit = overlay_program_status(
+            self.program_status.as_ref(),
+            manifest_hit(
+                manifest,
+                screen,
+                latest_title,
+                latest_progress,
+                0,
+                0,
+                freshness,
+            ),
         );
         if let Some(hit) = hit.filter(|hit| hit.evidence.activity == AgentActivity::Working) {
             self.sighted = Some(hit.evidence);
@@ -914,6 +1024,7 @@ fn manifest_hit(
             source,
         },
         visible_blocker: matched.visible_blocker,
+        overrides_program_status: matched.overrides_program_status,
         arrival,
     })
 }
@@ -972,6 +1083,50 @@ impl ReadinessObserver<'_> {
     }
 }
 
+/// Region name of the program-status preview in `session.detection`.
+const PROGRAM_STATUS_REGION: &str = "program_status";
+
+/// Arbitrates the screen winner with the held program-status record.
+///
+/// A `blocked` record always wins. Otherwise a visible blocker, or a winner
+/// whose rule overrides the record, stays the screen result; any other screen
+/// result yields to the record: `working` reads working, and `done`, `idle`
+/// and `error` read idle. With no record the screen winner is returned as is.
+/// The record is included whatever the chunk's freshness: it is a state, not
+/// an event.
+fn overlay_program_status(
+    record: Option<&ProgramStatusRecord>,
+    screen: Option<ManifestEvidenceHit>,
+) -> Option<ManifestEvidenceHit> {
+    let Some(record) = record else {
+        return screen;
+    };
+    let from_record = |activity, visible_blocker| ManifestEvidenceHit {
+        evidence: ActivityEvidence {
+            activity,
+            source: StateSource::OscProgress,
+        },
+        visible_blocker,
+        overrides_program_status: false,
+        arrival: 0,
+    };
+    match record.state {
+        ProgramState::Blocked(_) => Some(from_record(AgentActivity::Blocked, true)),
+        state => {
+            if let Some(hit) = screen.filter(|hit| {
+                (hit.evidence.activity == AgentActivity::Blocked && hit.visible_blocker)
+                    || hit.overrides_program_status
+            }) {
+                return Some(hit);
+            }
+            Some(match state {
+                ProgramState::Working => from_record(AgentActivity::Working, false),
+                _ => from_record(AgentActivity::Idle, false),
+            })
+        }
+    }
+}
+
 /// A manifest match with the strict-latch inputs `input_ready` and the feed
 /// path need: the winning evidence, whether it names a visible blocker, and
 /// the arrival sequence of the winning source.
@@ -979,6 +1134,8 @@ impl ReadinessObserver<'_> {
 struct ManifestEvidenceHit {
     evidence: ActivityEvidence,
     visible_blocker: bool,
+    /// The winning rule beats a non-blocked program-status record.
+    overrides_program_status: bool,
     /// Sequence point of the winning source's most recent real arrival: the
     /// title's receipt for `osc_title`, the last screen text change for the
     /// screen regions.

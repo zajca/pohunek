@@ -9268,6 +9268,7 @@ while os.getppid() == parent:
                 hook_protocol_version: Version::new(1).expect("version"),
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: Some("identity-subagent-v1".to_owned()),
+                answers_program_status_probe: false,
             })
             .await
             .expect("initialize worker");
@@ -9689,6 +9690,7 @@ while os.getppid() == parent:
                 hook_protocol_version: Version::new(1).expect("version"),
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: Some("identity-v1".to_owned()),
+                answers_program_status_probe: false,
             })
             .await
             .expect("initialize Hermes worker");
@@ -10713,6 +10715,7 @@ while os.getppid() == parent:
                 hook_protocol_version: Version::new(1).expect("version"),
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: Some("identity-subagent-v1".to_owned()),
+                answers_program_status_probe: false,
             })
             .await
             .expect("initialize worker");

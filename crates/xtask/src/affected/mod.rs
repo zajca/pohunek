@@ -376,8 +376,8 @@ const RULES: &[Rule] = &[
     ),
     rule(
         Pattern::Dir("compat/pi"),
-        Effect::Packages(&["pohunek-cli", "xtask"]),
-        "Pi compatibility lock and captured screens read by pohunek-cli's pi_package and pi_frame_properties tests; lock and npm project read by xtask's upstream staging scenarios",
+        Effect::Packages(&["pohunek-cli", "pohunek-daemon", "xtask"]),
+        "Pi compatibility lock and captured screens read by pohunek-cli's pi_package and pi_frame_properties tests and replayed by the daemon's program_status_detector scenarios; lock and npm project read by xtask's upstream staging scenarios",
     ),
     rule(
         Pattern::Dir("crates"),
@@ -1641,9 +1641,12 @@ mod tests {
             ),
             (
                 "compat/pi/screens/widths/idle_w20.txt",
-                &["pohunek-cli", "xtask"],
+                &["pohunek-cli", "pohunek-daemon", "xtask"],
             ),
-            ("compat/pi/npm/package-lock.json", &["pohunek-cli", "xtask"]),
+            (
+                "compat/pi/npm/package-lock.json",
+                &["pohunek-cli", "pohunek-daemon", "xtask"],
+            ),
             (
                 "compat/claude/screens/idle.txt",
                 &["pohunek-daemon", "pohunek-cli", "xtask"],

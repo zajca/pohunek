@@ -193,6 +193,18 @@ pub(crate) const SCANS: &[(&str, &[&str], &str)] = &[
         "goldens and TOML files of the Claude package, read through helpers that take the path",
     ),
     (
+        "crates/daemon/tests/program_status_detector.rs",
+        &[
+            "runtime-packages/claude",
+            "runtime-packages/codex",
+            "runtime-packages/pi",
+            "compat/claude",
+            "compat/codex",
+            "compat/pi",
+        ],
+        "shipped manifests and captured screens of the Claude, Codex and Pi packages, read through helpers that take the path",
+    ),
+    (
         "crates/cli/tests/codex_package.rs",
         &["runtime-packages/codex", "compat/codex"],
         "goldens and TOML files of the Codex package, read through helpers that take the path",

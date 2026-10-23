@@ -8,8 +8,10 @@ use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::Notify;
 
-use pohunek_terminal::{TerminalSnapshot, TerminalTracker};
+use pohunek_terminal::{ProbeGuard, TerminalSnapshot, TerminalTracker};
 use pohunek_worker_protocol::MAX_DATA_PAYLOAD_BYTES;
+
+use crate::probe::ProbeReplies;
 
 /// Output-ring failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -211,6 +213,7 @@ impl OutputHub {
                 terminal_snapshot,
                 subscribers: Vec::new(),
                 completion: None,
+                probe: None,
             })),
             subscriber_limit,
             observation: Arc::new(Notify::new()),
@@ -232,6 +235,14 @@ impl OutputHub {
             return Ok(chunk);
         }
         state.terminal.feed(bytes);
+        let probes = state.terminal.take_probes();
+        if let Some(responder) = state.probe.as_mut() {
+            for span in probes {
+                if responder.guard.admit(span) {
+                    responder.replies.queue();
+                }
+            }
+        }
         let snapshot = Arc::new(state.terminal.snapshot(state.ring.next_offset));
         state.terminal_snapshot = Arc::clone(&snapshot);
         let mut retained = Vec::with_capacity(state.subscribers.len());
@@ -245,6 +256,23 @@ impl OutputHub {
         drop(state);
         self.observation.notify_waiters();
         Ok(chunk)
+    }
+
+    /// Starts queueing a reply for every answerable OSC 7501 probe.
+    ///
+    /// Call it before the first output is pushed, so no probe is missed.
+    pub(crate) fn answer_probes(&self) -> Arc<ProbeReplies> {
+        let replies = Arc::new(ProbeReplies::default());
+        lock(&self.inner).probe = Some(ProbeResponder {
+            guard: ProbeGuard::default(),
+            replies: Arc::clone(&replies),
+        });
+        replies
+    }
+
+    /// Whether [`Self::answer_probes`] armed the probe responder.
+    pub(crate) fn answers_probes(&self) -> bool {
+        lock(&self.inner).probe.is_some()
     }
 
     /// Atomically snapshots retained output and registers a live subscriber.
@@ -361,6 +389,9 @@ impl OutputHub {
             OutputCloseReason::Forced => OutputCompletion::ForcedClosed { next_offset },
         };
         state.completion = Some(completion);
+        if let Some(responder) = &state.probe {
+            responder.replies.close();
+        }
         for weak in state.subscribers.drain(..) {
             if let Some(queue) = weak.upgrade() {
                 queue.push_terminal(next_offset);
@@ -398,6 +429,14 @@ struct HubState {
     terminal_snapshot: Arc<TerminalSnapshot>,
     subscribers: Vec<Weak<SubscriberQueue>>,
     completion: Option<OutputCompletion>,
+    probe: Option<ProbeResponder>,
+}
+
+/// Decides and queues the replies to OSC 7501 probes found in the output.
+#[derive(Debug)]
+struct ProbeResponder {
+    guard: ProbeGuard,
+    replies: Arc<ProbeReplies>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

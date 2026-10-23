@@ -495,6 +495,24 @@ daemon uses that version's bounded replay attach path. A daemon upgrade must
 never make an otherwise live PTY unreachable merely because it cannot provide a
 newer terminal snapshot feature.
 
+A worker answers the OSC 7501 program-status probe for its own PTY when the
+daemon sets `answers_program_status_probe` in `Initialize` (an additive field: a
+worker that predates it ignores it and never answers). The daemon derives the
+flag from the manifest of the resolved launch, the profile's override manifest
+when there is one: it is true only when that manifest declares
+`[program_status]` with `answer_probe = true`. A shell session, Hermes, Codex
+(which never queries) and every manifest without the key behave exactly as
+before, and `cat` of a file that holds a probe types nothing into a shell. The
+reply is the fixed `ESC ] 7501 ; ? ESC \`, which carries no CR or LF. The reader
+thread never writes: the output hub queues one coalescing reply token before it
+fans a chunk out, and a dedicated task writes the reply through the write
+coordinator, so it lands between input plans and attach frames and is dropped
+after the control stall bound when the PTY does not read. The reply equals the
+query, so an echoing program would loop: after a reply was queued, an
+immediately following probe (no other output byte between) is not answered. The
+reply is no input evidence: it arms no input token, submits nothing and never
+touches the submit mark.
+
 Retained replay and terminal repaint payloads are split into contiguous frames
 bounded by the negotiated worker data payload. History capacity is independent
 of the per-frame allocation limit: increasing retained history must never
@@ -910,6 +928,15 @@ onto both the Unix socket and the NetBird TCP transport. Multiple clients may
 attach to one session; resize policy when sizes differ is defined by the daemon
 (last attach wins, with explicit resize control available).
 
+While a worker answers the 7501 probe, it is the only responder for its PTY: it
+drops every complete `ESC ] 7501 ; ? ... (BEL | ESC \)` reply found inside one
+attach input frame, keeping the rest of the frame in order. A reply split across
+frames passes through, which is harmless to the probing programs (they swallow
+an unexpected reply). The client's DA1 and every other reply are forwarded
+unchanged, and the control-plane `session.input` is not filtered. When a held
+paced input plan delays the worker's reply past the client's DA1, the program
+reads "no 7501" for that process and falls back to its screen output.
+
 If the private worker stream reports a typed failure, the daemon closes the raw
 pipe and retains that sanitized failure in a short-lived bounded result mailbox.
 The client consumes it once through `session.detach` and stops reconnecting that
@@ -1058,6 +1085,70 @@ priority order:
    flicker.
 4. **Process state.** Running vs exited, plus exit code for `done` / `failed`.
 
+**OSC 7501 program status (optional layer above the title).** A runtime whose
+detection manifest declares `[program_status] app = "<name>"` opts in to the
+program-status protocol: the program reports its own state as
+`ESC ] 7501 ; state=<working|blocked|done|idle|error|clear>[:app=..][:kind=..] ST`
+when it changes. This is terminal-stream evidence like a title, never a hook, and
+the screen rules stay the fallback.
+
+- **Parsing.** The detector holds the latest *root* record whose `app` equals the
+  manifest's. A record of a child (an `id=` pair, including a child `clear`), a
+  record of another app and a record without an app are ignored; a root `clear`
+  drops the held record. A malformed report is discarded whole: an unknown or
+  missing `state`, a key over 16 bytes, a payload over 4096 bytes, invalid base64
+  in `msg` or `title`, a decoded control character, or text over its decoded limit
+  (2048 bytes for `msg`, 192 for `title`). A malformed pair is skipped and an
+  unknown key ignored. `msg`, `title` and `progress` are validated and dropped:
+  they are never stored, logged or exposed. `kind` counts only with `blocked`. A
+  probe (`7501;?`) is never a record.
+- **Arbitration.** One fixed rule combines the held record with the screen
+  winner of today's evaluation, in `feed`, in `tick` and at every working-latch
+  point. The record is always included, whatever the chunk's freshness: it is a
+  state, not an event.
+
+  | held record | screen winner | result | source |
+  |---|---|---|---|
+  | none, or no `[program_status]` | any | the screen winner, as without the layer | as without |
+  | `blocked` (any kind) | any | `blocked`, a visible blocker | `osc_progress` |
+  | `working`, `done`, `idle`, `error` | a visible-blocker rule | that screen `blocked` | `screen` |
+  | `working`, `done`, `idle`, `error` | a rule with `overrides_program_status = true` | that screen result | `screen` |
+  | `working` | anything else | `working` | `osc_progress` |
+  | `done`, `idle`, `error` | anything else | `idle` | `osc_progress` |
+
+  A visible dialog therefore always beats a non-blocked record, so a forged or
+  stale record cannot hide a dialog the screen rules see. A held `working`
+  cannot be undone by a screen-only chunk, and a held `idle` beats a stale
+  working screen match. `done`, `idle` and `error` are one pohunek activity, so a
+  restated or changed one among them is no transition (`error` folds into idle).
+  Because a held record is structured evidence, the bytes-flowing fallback does
+  not fire under it.
+- **Lifetime.** A record carries no expiry. It ends with a root `clear`, with any
+  detector reconfigure (an agent switch, a nested agent's exit, a report, a
+  package refresh), with a lag resync, and with the runtime generation (a new
+  detector holds none). It is not persisted and not in `SessionInfo`. After an
+  adoption it is restored only when the retained output still covers it.
+- **Readiness.** Initial-input readiness and the idle barrier ignore the record:
+  they evaluate the screen winner alone, so a record never releases or holds a
+  prompt.
+- **Evidence.** A transition derived from a record takes the detector path of the
+  input-evidence rules: `working` opens a turn only by taking an armed input
+  token, and a record never arms one. A held record restated on later chunks
+  changes nothing.
+- **Wire.** The source is the existing `osc_progress` ("an OSC status report of
+  the program"), so older SDKs that validate the closed `StateSource` set keep
+  working. `session.detection` does not expose the record: the
+  `DetectionRegionKind` enum is strict on the wire, so the `program_status`
+  preview waits for the tolerant decode of #1337.
+- **Probe answer.** Programs such as Claude Code and Pi enable their reports only
+  after the terminal echoes the probe. The session worker answers it when the
+  launch's manifest sets `answer_probe = true` (see Durable Session Workers).
+
+Like forged titles and screen text, a forged record can set working or idle in a
+session whose screen shows no dialog the rules see, because the PTY tree is not
+an identity boundary ("Runtime Packages and Trust"). This is a documented limit,
+not a defect.
+
 States tracked: at least `working`, `blocked`/`waiting_approval`, `idle`, `done`,
 `failed`, each carrying a `source` field for signal strength. Detection rules are
 **data (TOML manifests)** so agents can be added or fixed without recompiling. The
@@ -1161,8 +1252,9 @@ Hooks have separate roles:
   revision, emits no `agent_state` event, opens or closes no turn, and never
   arms the input evidence of a turn.
 
-Live state remains detector-first: OSC, screen, PTY activity, and process state
-continue to drive normal activity transitions. Notification hooks still target
+Live state remains detector-first: OSC (titles, progress and the opt-in OSC 7501
+program-status records, terminal-stream evidence and never a hook), screen, PTY
+activity, and process state continue to drive normal activity transitions. Notification hooks still target
 the daemon and may be missed during daemon outage. A nested active-agent report is
 explicit hook evidence and uses the `report` state source when it supplies
 activity. While such a report is current, the detector can temporarily switch to
@@ -1308,10 +1400,10 @@ above that mark, it names the submission's runtime, the daemon received it
 before the deadline, and the agent was not `working` at the boundary: a busy
 agent queues the input, and its own `working` evidence answers. The result then
 carries `prompt_accepted: true` and no activity, source or revision, because
-no activity was observed. An opted-in result of a Claude session states `prompt_accepted` whatever
-answered it; any other session (another runtime, an older worker) gets no submit mark, no
-field and the
-generic timeout message. An acceptance never answers an `idle` target and never stands in
+no activity was observed. An opted-in result of a Claude session on worker protocol 8 or later whose hook
+schema admits the prompt action states `prompt_accepted` whatever answered it;
+any other session (another runtime, an older worker) gets no submit mark, no
+field and the generic timeout message. An acceptance never answers an `idle` target and never stands in
 for the `working` evidence delayed-submit framing needs first: the daemon
 imports it up to one 100 ms poll after the agent read the prompt, before the
 agent drew a spinner, so an `idle` restatement in that gap would read as a

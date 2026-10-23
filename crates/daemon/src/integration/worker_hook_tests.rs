@@ -163,6 +163,7 @@ fn initialize(
         hook_protocol_version: CURRENT_VERSION,
         public_protocol_version,
         hook_schema: Some(hook_schema.to_owned()),
+        answers_program_status_probe: false,
     }
 }
 

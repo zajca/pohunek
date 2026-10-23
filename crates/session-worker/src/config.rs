@@ -163,6 +163,8 @@ pub struct WorkerConfig {
     /// `None` keeps input writes unbounded, which is the behaviour for peers
     /// that do not send an input policy.
     pub input_stall: Option<Duration>,
+    /// Whether the worker answers the child's OSC 7501 program-status probe.
+    pub answer_program_status_probe: bool,
     /// Grace period between soft and hard stop.
     pub stop_grace: Duration,
     /// How long after the hard stop the root's death is awaited before the
@@ -208,6 +210,7 @@ impl WorkerConfig {
             data_token_ttl: DEFAULT_DATA_TOKEN_TTL,
             input_dedup_entries: DEFAULT_INPUT_DEDUP_ENTRIES,
             input_stall: None,
+            answer_program_status_probe: false,
             stop_grace: DEFAULT_STOP_GRACE,
             kill_reap_deadline: DEFAULT_KILL_REAP_DEADLINE,
             post_exit_drain_timeout: DEFAULT_POST_EXIT_DRAIN_TIMEOUT,

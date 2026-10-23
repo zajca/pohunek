@@ -687,6 +687,21 @@ pub struct Initialize {
     /// keeps the validation it was built with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_schema: Option<String>,
+    /// Whether the worker answers the child's OSC 7501 program-status probe.
+    ///
+    /// The daemon sets it from the resolved launch's manifest. A peer that
+    /// predates the field ignores it and never answers; an absent field means
+    /// `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub answers_program_status_probe: bool,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes a reference"
+)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Debug for Initialize {
@@ -709,6 +724,10 @@ impl Debug for Initialize {
             .field("hook_protocol_version", &self.hook_protocol_version)
             .field("public_protocol_version", &self.public_protocol_version)
             .field("hook_schema", &self.hook_schema)
+            .field(
+                "answers_program_status_probe",
+                &self.answers_program_status_probe,
+            )
             .finish()
     }
 }
@@ -1570,6 +1589,7 @@ mod tests {
             hook_protocol_version: CURRENT_VERSION,
             public_protocol_version: 1,
             hook_schema: None,
+            answers_program_status_probe: false,
         }
     }
 

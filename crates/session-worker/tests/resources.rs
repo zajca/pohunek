@@ -57,6 +57,7 @@ fn spawn(config: &WorkerConfig, script: &str, cwd: &Path) -> PtyOwner {
         config.subscriber_bytes,
         config.input_dedup_entries,
         config.input_stall,
+        config.answer_program_status_probe,
     )
     .expect("spawn PTY")
 }

@@ -343,6 +343,26 @@ impl WriteCoordinator {
             .map(|_receipt| ())
     }
 
+    /// Writes one worker-originated reply between plans and attach frames.
+    ///
+    /// The reply is no client input: it carries no write identifier, takes no
+    /// part in deduplication, and is bounded by the control stall like a
+    /// control plan, so a stalled PTY never holds the task for longer.
+    /// `on_locked` runs once the execution lock is held, before the write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputError`] when the lock wait stalls or the PTY writer fails.
+    pub(crate) async fn execute_reply(
+        &self,
+        reply: InputFragment,
+        on_locked: impl FnOnce(),
+    ) -> Result<(), InputError> {
+        self.execute_locked(&[reply], self.stall, on_locked)
+            .await
+            .map(|_receipt| ())
+    }
+
     /// Writes the fragments in order while holding the execution lock.
     ///
     /// `stall` bounds the lock wait and every write. `None` leaves both
@@ -351,6 +371,16 @@ impl WriteCoordinator {
         &self,
         fragments: &[InputFragment],
         stall: Option<Duration>,
+    ) -> Result<WriteReceipt, InputError> {
+        self.execute_locked(fragments, stall, || {}).await
+    }
+
+    /// [`Self::execute_once`] that calls `on_locked` after taking the lock.
+    async fn execute_locked(
+        &self,
+        fragments: &[InputFragment],
+        stall: Option<Duration>,
+        on_locked: impl FnOnce(),
     ) -> Result<WriteReceipt, InputError> {
         let total = fragments.iter().map(|fragment| fragment.bytes.len()).sum();
         let _execution = match stall {
@@ -366,6 +396,7 @@ impl WriteCoordinator {
             },
             None => self.execution.lock().await,
         };
+        on_locked();
         let mut written = 0;
         let mut submit_mark_ns = None;
         for (index, fragment) in fragments.iter().enumerate() {

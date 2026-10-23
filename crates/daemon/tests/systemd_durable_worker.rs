@@ -881,6 +881,7 @@ impl Fixture {
             hook_protocol_version: Version::new(1).expect("hook protocol version"),
             public_protocol_version: PROTOCOL_VERSION.get(),
             hook_schema: None,
+            answers_program_status_probe: false,
         }
     }
 

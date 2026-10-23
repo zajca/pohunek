@@ -1897,6 +1897,7 @@ mod tests {
             hook_protocol_version: pohunek_worker_protocol::CURRENT_VERSION,
             public_protocol_version: protocol::PROTOCOL_VERSION.get(),
             hook_schema: None,
+            answers_program_status_probe: false,
         }
     }
 
