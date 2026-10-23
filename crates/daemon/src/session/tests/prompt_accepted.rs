@@ -307,6 +307,13 @@ impl Rig {
         entry.info.activity = Some(AgentActivity::Working);
     }
 
+    /// Makes the session read as `idle` at the next input boundary.
+    async fn mark_idle(&self) {
+        let mut sessions = self.registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(self.id()).expect("live session");
+        entry.info.activity = Some(AgentActivity::Idle);
+    }
+
     /// Waits until the session holds `working` activity evidence.
     async fn wait_working_evidence(&self) {
         wait_until("working evidence", || async {
@@ -402,6 +409,7 @@ async fn an_acceptance_without_input_is_never_activity_a_revision_an_event_or_a_
     rig.wait_working_evidence().await;
     assert_eq!(rig.registry.inner.turns.latest(), turns, "no turn edge");
     fs::remove_file(&rig.noisy_flag).expect("stop the output");
+    rig.mark_idle().await;
 
     // The self-started records are older than the next Enter, so a waited input
     // whose own hook never reports does not match them.
