@@ -104,8 +104,8 @@ copies of that descriptor and its detection manifest in
   terminal title, so the idle, working and blocked rules read the title:
   a title that starts with a braille spinner and a space, followed by a thread
   or project name rather than the `|` separator, means `working` (the
-  `<spinner> | <project>` title of an idle unnamed thread's title generation is
-  idle); a title that
+  `<spinner> | <project>` title of an idle unnamed thread's title generation
+  asserts no state: the idle rule skips every spinner title); a title that
   contains `Action Required` (Codex writes `[ ! ] Action Required | <dir>`,
   alternating `[ . ]`) means `blocked` and outranks `working`; any other
   non-blank title means `idle`, read from the absence of a spinner and of

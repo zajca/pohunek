@@ -2604,30 +2604,89 @@ mod tests {
 
     #[test]
     fn a_full_idle_repaint_never_latches_working() {
+        for columns in [30, 120, 200] {
+            let started_at = instant();
+            let mut detector = claude_detector(8, columns, started_at);
+            detector.feed(started_at, CLAUDE_IDLE_FRAME.as_bytes());
+
+            let mut repaint = String::new();
+            for line in [
+                "\u{273b} Cogitated for 26s",
+                "\u{2500}\u{2500}\u{2500}\u{2500}",
+                "\u{276f} ",
+                "\u{2500}\u{2500}\u{2500}\u{2500}",
+                "  auto mode on",
+            ] {
+                let _ = write!(repaint, "\x1b[2K{line}\r\n");
+            }
+            let transitions =
+                detector.feed(started_at + Duration::from_millis(10), repaint.as_bytes());
+
+            assert!(
+                transitions
+                    .iter()
+                    .all(|transition| transition.activity != AgentActivity::Working),
+                "{columns} columns: {transitions:?}"
+            );
+            assert!(
+                detector.latch_evaluations > 0,
+                "{columns} columns: gate open"
+            );
+            assert_eq!(detector.latch_sightings, 0, "{columns} columns");
+        }
+    }
+
+    #[test]
+    fn a_blocker_outranking_a_spinner_at_an_intermediate_point_never_latches() {
         let started_at = instant();
         let mut detector = claude_detector(8, 120, started_at);
         detector.feed(started_at, CLAUDE_IDLE_FRAME.as_bytes());
+        let sightings = detector.latch_sightings;
+        let evaluations = detector.latch_evaluations;
 
-        let mut repaint = String::new();
-        for line in [
-            "\u{273b} Cogitated for 26s",
-            "\u{2500}\u{2500}\u{2500}\u{2500}",
-            "\u{276f} ",
-            "\u{2500}\u{2500}\u{2500}\u{2500}",
-            "  auto mode on",
-        ] {
-            let _ = write!(repaint, "\x1b[2K{line}\r\n");
-        }
-        let transitions = detector.feed(started_at + Duration::from_millis(10), repaint.as_bytes());
+        // The folder trust dialog (blocked, priority 980) is drawn before the
+        // spinner line (working, 960), so no point shows the spinner without
+        // the dialog; the chunk then ends on a different idle frame.
+        let chunk = format!(
+            "\x1b[2J\x1b[3;1HYes, I trust this folder\r\nNo, exit\r\nEnter to confirm\x1b[2;1H\u{2500}\u{2500}\u{2500}\u{2500}\x1b[1;1H\u{273b} Noodling\u{2026} (3s \u{b7} thinking){}",
+            CLAUDE_IDLE_FRAME.replace("26s", "40s")
+        );
+        let transitions = detector.feed(started_at + Duration::from_millis(10), chunk.as_bytes());
 
         assert!(
-            transitions
-                .iter()
-                .all(|transition| transition.activity != AgentActivity::Working),
+            detector.latch_evaluations > evaluations,
+            "the gate was open"
+        );
+        assert_eq!(detector.latch_sightings, sightings, "{transitions:?}");
+        assert!(transitions
+            .iter()
+            .all(|transition| transition.activity != AgentActivity::Working));
+    }
+
+    #[test]
+    fn a_stale_spinner_under_an_erased_dialog_latches_inside_a_running_turn() {
+        let started_at = instant();
+        let mut detector = claude_detector(10, 120, started_at);
+        // A dialog drawn under a spinner line that is still on screen: the
+        // spinner rule excludes dialog markers, so the screen reads blocked.
+        let dialog = "\x1b[2J\x1b[H\u{2733} Running\u{2026} (5s \u{b7} hooks)\r\nBash command\r\nsleep 45\r\nDo you want to proceed?\r\n\u{276f} 1. Yes\r\n  2. No\r\nesc to cancel";
+        detector.feed(started_at, dialog.as_bytes());
+        assert_eq!(
+            detector.state.published_activity(),
+            Some(AgentActivity::Blocked)
+        );
+
+        // The dialog is answered: it is erased and the idle prompt redrawn
+        // before the spinner line is rewritten. The point between the two
+        // still shows the stale spinner without a dialog.
+        let chunk = "\x1b[2;1H\x1b[J\u{2500}\u{2500}\u{2500}\u{2500}\r\n\u{276f} \r\n\u{2500}\u{2500}\u{2500}\u{2500}\r\n  auto mode on\x1b[1;1H\x1b[2K\u{273b} Cogitated for 9s";
+        let transitions = detector.feed(started_at + Duration::from_millis(10), chunk.as_bytes());
+
+        assert_eq!(
+            transitions.first(),
+            Some(&transition(AgentActivity::Working, StateSource::Screen)),
             "{transitions:?}"
         );
-        assert!(detector.latch_evaluations > 0, "the gate was open");
-        assert_eq!(detector.latch_sightings, 0);
     }
 
     #[test]

@@ -160,7 +160,8 @@ tag; the package tests compare the package with them.
     heading, each with `Allow once` and `Deny`, in the bottom 16 non-empty
     lines.
   - `active_turn_prompt` (`working`): the Hermes staff symbol `⚕` before the
-    prompt glyph as the last of the bottom 8 non-empty lines; `active_turn_progress` and
+    prompt glyph as the last of the bottom 8 non-empty lines, apart from the rule
+    chrome drawn below it; `active_turn_progress` and
     `tui_active_turn` (`working`): a `[thinking]` line, `◆ aggregating` or the
     TUI's `Ctrl+C to interrupt…` there.
   - `idle_prompt` and `tui_idle_status` (`idle`): the classic prompt glyph,
