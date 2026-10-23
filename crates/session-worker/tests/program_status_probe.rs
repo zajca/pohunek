@@ -265,7 +265,11 @@ async fn a_probe_reply_waits_for_a_paced_plan_and_coalesces() {
     // A second reply would sit in the input ahead of the marker.
     write_stream(&pty, b"Z").await;
     let output = output_until(&pty, ":END2").await;
-    assert_eq!(dump(&output, 2), "5a", "the two probes coalesced into one reply");
+    assert_eq!(
+        dump(&output, 2),
+        "5a",
+        "the two probes coalesced into one reply"
+    );
 }
 
 #[tokio::test]

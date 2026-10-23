@@ -222,16 +222,16 @@ fn captured(runtime: &str, name: &str) -> Vec<u8> {
     frame(title.as_deref(), &rows)
 }
 
-const WORKING: Option<(AgentActivity, StateSource)> =
-    Some((AgentActivity::Working, StateSource::OscProgress));
-const IDLE: Option<(AgentActivity, StateSource)> =
-    Some((AgentActivity::Idle, StateSource::OscProgress));
-const BLOCKED: Option<(AgentActivity, StateSource)> =
-    Some((AgentActivity::Blocked, StateSource::OscProgress));
+/// An activity and the source that reported it.
+type Observed = Option<(AgentActivity, StateSource)>;
+
+const WORKING: Observed = Some((AgentActivity::Working, StateSource::OscProgress));
+const IDLE: Observed = Some((AgentActivity::Idle, StateSource::OscProgress));
+const BLOCKED: Observed = Some((AgentActivity::Blocked, StateSource::OscProgress));
 
 #[test]
 fn every_record_state_is_held_whatever_the_terminator_and_the_chunking() {
-    let cases: [(&str, Option<(AgentActivity, StateSource)>, &str); 7] = [
+    let cases: [(&str, Observed, &str); 7] = [
         ("working", WORKING, "app=claude-code:state=working"),
         ("blocked", BLOCKED, "app=claude-code:state=blocked"),
         (
@@ -334,7 +334,7 @@ fn a_malformed_report_is_discarded_whole_and_the_next_one_parses() {
         let before = harness.activity();
 
         harness.feed(&record(&payload));
-        assert_eq!(harness.activity(), before, "{:.40}", payload);
+        assert_eq!(harness.activity(), before, "{payload:.40}");
         assert_eq!(harness.record_preview().as_deref(), Some(""));
 
         harness.feed(&claude_record("working"));

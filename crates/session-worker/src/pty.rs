@@ -248,7 +248,6 @@ pub struct PtyOwner {
     resize: Arc<AsyncMutex<ResizeState>>,
     cleanup: Arc<AsyncMutex<CleanupState>>,
     reap_tx: Arc<Mutex<Option<mpsc::Sender<()>>>>,
-    answers_program_status_probe: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -654,7 +653,6 @@ impl PtyOwner {
             })),
             cleanup: Arc::new(AsyncMutex::new(CleanupState::Active)),
             reap_tx: Arc::new(Mutex::new(Some(reap_tx))),
-            answers_program_status_probe,
         })
     }
 
@@ -664,7 +662,7 @@ impl PtyOwner {
     /// attached terminal's own reply is dropped from its input.
     #[must_use]
     pub fn answers_program_status_probe(&self) -> bool {
-        self.answers_program_status_probe
+        self.output.answers_probes()
     }
 
     /// Returns the retained root and process-group identity.

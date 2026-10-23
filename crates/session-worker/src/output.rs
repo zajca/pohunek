@@ -270,6 +270,11 @@ impl OutputHub {
         replies
     }
 
+    /// Whether [`Self::answer_probes`] armed the probe responder.
+    pub(crate) fn answers_probes(&self) -> bool {
+        lock(&self.inner).probe.is_some()
+    }
+
     /// Atomically snapshots retained output and registers a live subscriber.
     ///
     /// # Errors

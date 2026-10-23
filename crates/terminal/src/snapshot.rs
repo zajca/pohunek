@@ -219,13 +219,14 @@ impl OscTracker {
         match command {
             Some("0" | "2") => self.title = Some(payload),
             Some("9") => self.progress = Some(payload),
-            Some(number) if number.as_bytes() == PROGRAM_STATUS_COMMAND => {
-                if self.payload.first() == Some(&b'?') {
-                    self.probes.push(ProbeSpan {
-                        start: self.osc_start,
-                        end: self.consumed + 1,
-                    });
-                }
+            Some(number)
+                if number.as_bytes() == PROGRAM_STATUS_COMMAND
+                    && self.payload.first() == Some(&b'?') =>
+            {
+                self.probes.push(ProbeSpan {
+                    start: self.osc_start,
+                    end: self.consumed + 1,
+                });
             }
             _ => {}
         }

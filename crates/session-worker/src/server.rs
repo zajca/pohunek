@@ -9721,6 +9721,10 @@ mod tests {
     /// Byte length of the probe reply.
     const PROBE_REPLY_BYTES: usize = 10;
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one attach stream scenario: spawn, serve, send frames, collect the dump"
+    )]
     /// Sends `frames` as attach input to a PTY whose program prints a probe and
     /// dumps the next `count` bytes of its input as hex, and returns the dump.
     async fn attach_input_dump(frames: &[&[u8]], count: usize) -> String {
@@ -9859,7 +9863,12 @@ mod tests {
     }
 
     fn hex_of(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        use std::fmt::Write as _;
+
+        bytes.iter().fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
     }
 
     /// The worker answers the probe itself, so the terminal's own reply inside

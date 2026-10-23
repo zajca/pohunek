@@ -229,7 +229,7 @@ fn validate_text(encoded: &str, limit: usize) -> Option<()> {
         return None;
     }
     let text = std::str::from_utf8(&decoded).ok()?;
-    let has_control = text.chars().any(|ch| ch.is_control());
+    let has_control = text.chars().any(char::is_control);
     (!has_control).then_some(())
 }
 
