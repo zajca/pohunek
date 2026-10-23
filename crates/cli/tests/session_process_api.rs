@@ -2452,7 +2452,7 @@ fn remote_port_default_is_used_when_the_override_is_unset() {
     assert!(
         captured
             .lines()
-            .any(|line| line == format!("100.64.0.42:{}", netbird::DEFAULT_REMOTE_PORT)),
+            .any(|line| line == format!("100.64.0.42:{}", pohunek_client::DEFAULT_REMOTE_PORT)),
         "without POHUNEK_REMOTE_PORT the CLI must dial the default remote port: capture\n{captured}"
     );
     local_fixture.finish();
@@ -2471,10 +2471,10 @@ fn invalid_remote_port_fails_fast_before_probing_the_provider() {
             .env("POHUNEK_REMOTE_PORT", invalid)
             .args(remote_screen_args(true));
         let output = command.output().expect("run JSON pohunek with a bad port");
-        let document = assert_json_error(&output, "netbird_configuration_invalid");
+        let document = assert_json_error(&output, "overlay_configuration_invalid");
         let message = document["err"]["msg"].as_str().expect("error message");
         assert!(
-            message.contains(netbird::REMOTE_PORT_ENV),
+            message.contains(pohunek_client::REMOTE_PORT_ENV),
             "the message must name the misconfigured variable: {message}"
         );
         assert!(
@@ -2508,7 +2508,7 @@ fn invalid_remote_port_fails_loudly_in_human_mode() {
     );
     let combined = format!("{}{}", utf8(&output.stdout), utf8(&output.stderr));
     assert!(
-        combined.contains(netbird::REMOTE_PORT_ENV),
+        combined.contains(pohunek_client::REMOTE_PORT_ENV),
         "the human failure must name POHUNEK_REMOTE_PORT: {combined}"
     );
     assert!(
@@ -2528,10 +2528,10 @@ fn non_unicode_remote_port_value_is_a_user_visible_failure() {
     let raw_value = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
     let mut command = home.command();
     command
-        .env(netbird::REMOTE_PORT_ENV, raw_value)
+        .env(pohunek_client::REMOTE_PORT_ENV, raw_value)
         .args(remote_screen_args(true));
     let output = command.output().expect("run JSON pohunek");
-    let document = assert_json_error(&output, "netbird_configuration_invalid");
+    let document = assert_json_error(&output, "overlay_configuration_invalid");
     let message = document["err"]["msg"].as_str().expect("error message");
     assert!(
         message.contains("value is not valid Unicode"),

@@ -111,9 +111,12 @@ pub enum DaemonError {
         reason: String,
     },
 
-    /// Configured overlay registry could not be constructed safely.
-    #[error("overlay configuration failed: {0}")]
-    OverlayConfig(#[from] overlay::OverlayError),
+    /// `overlays.toml` or the remote port override is unusable.
+    ///
+    /// The message carries the stable `overlay_configuration_invalid` code the
+    /// CLI reports for the same failure, so an operator greps one name.
+    #[error("overlay_configuration_invalid: {0}")]
+    OverlayConfiguration(#[source] pohunek_client::ClientError),
 
     /// A configured overlay listener supervisor stopped before daemon shutdown.
     #[error("remote listener supervisor for overlay {overlay} stopped unexpectedly: {reason}")]

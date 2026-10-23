@@ -118,6 +118,17 @@ pub enum ClientError {
     #[error("daemon error: {0}")]
     Protocol(#[from] ProtocolError),
 
+    /// The overlay configuration file or the remote port override is unusable.
+    ///
+    /// The reason never quotes a value from the file.
+    #[error("overlay configuration {path} is invalid: {reason}", path = .path.display())]
+    OverlayConfiguration {
+        /// The configuration file, whether or not it exists.
+        path: PathBuf,
+        /// Why the configuration cannot be used, by cause only.
+        reason: String,
+    },
+
     /// One provider failed before a remote daemon could be dialed.
     #[error(transparent)]
     Overlay(#[from] overlay::OverlayError),
@@ -164,8 +175,8 @@ pub enum ClientError {
         host: String,
     },
 
-    /// A `NetBird` TCP connection to the host's daemon port could not be opened.
-    #[error("could not open a NetBird connection to host '{host}': {source}")]
+    /// An overlay TCP connection to the host's daemon port could not be opened.
+    #[error("could not open an overlay connection to host '{host}': {source}")]
     HostUnreachable {
         /// The requested host name.
         host: String,
@@ -349,6 +360,18 @@ impl ClientError {
                 ),
             ),
             ClientError::Protocol(err) => err.clone(),
+            ClientError::OverlayConfiguration { path, reason } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "overlay_configuration_invalid",
+                format!(
+                    "overlay configuration {} is invalid: {reason}",
+                    path.display()
+                ),
+                Some(format!(
+                    "fix or remove {} and retry; POHUNEK_REMOTE_PORT must be unset or a port number",
+                    path.display()
+                )),
+            ),
             ClientError::Overlay(error) => overlay_error_to_protocol(error),
             ClientError::OverlayRegistry(error) => registry_error_to_protocol(error),
             ClientError::OverlayDiscoveryFailed { failures } => {
@@ -376,7 +399,7 @@ impl ClientError {
                 "remote_discovery_failed",
                 format!("remote host discovery failed: {detail}"),
                 Some(
-                    "retry the remote request; if it persists, check the local NetBird state"
+                    "retry the remote request; if it persists, check the local overlay state"
                         .to_owned(),
                 ),
             ),

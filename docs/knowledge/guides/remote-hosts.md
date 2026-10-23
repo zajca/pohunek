@@ -15,6 +15,46 @@ implemented authentication and credential foundation, including native `pohunek
 relay` commands, but it provides no remote-host enrollment, routing, attach, or
 team client. Those commands do not alter the owner path described here.
 
+## Overlay configuration
+
+A host works over exactly one overlay provider. Without configuration that is
+NetBird on TCP port 18722. The optional owner-private file
+`~/.config/pohunek/overlays.toml` (`$XDG_CONFIG_HOME/pohunek/overlays.toml`)
+sets the provider and the port for the CLI, the daemon and Rust clients alike:
+
+```toml
+providers = ["netbird"]
+port = 18722
+```
+
+- `providers` lists exactly one id; `netbird` is the only known id. Several
+  entries are refused until one host can run several overlays (#1113).
+- `port` is optional and must be in `1..=65535`; it is the port the daemon
+  listens on and the CLI dials, on every host that reads the file.
+- When nothing exists at `overlays.toml`, the defaults apply and the directory
+  is not inspected (a symlinked or group-writable `~/.config` is fine): there
+  is no configuration to trust, and a writer in an unsafe directory can only
+  make a file appear, which is then refused, or delete it, which falls back to
+  the NetBird default. When anything exists at that path (file, symlink, FIFO),
+  every component of the directory path (`~/.config` included) must be a real
+  directory, not a symlink, owned by you or root and not writable by other
+  accounts. The file must be a regular file owned by you with mode
+  `0600`, UTF-8, at most 64 KiB, with no unknown key.
+- Any violation is `overlay_configuration_invalid`; the message names the file
+  and a line number, never a value from it. `pohunekd` exits with the same code
+  before it takes a lock or touches its store.
+- The daemon reads the file at start, so restart it after a change (restart
+  the service unit with the service manager; live workers keep running).
+- `POHUNEK_REMOTE_PORT` overrides `port` in the process that sees it, for
+  development and tests. A service-started daemon does not receive it; put a
+  port both sides must use in the file.
+- A daemon of an older release ignores the file and binds the environment value
+  or 18722, and so does a client of an earlier release (a CLI on another host,
+  a Rust client pinned to an earlier tag such as the `pohunek-work` gateway).
+  Upgrade every client and restart every daemon before you set `port`, or those
+  clients dial a port nothing listens on; a pinned client adopts the file when
+  it bumps its pin.
+
 Remote behavior is host-aware. The CLI uses `--host <host>` for commands that
 target a host, and session targets can use `<host>/<session-id>`.
 

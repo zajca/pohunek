@@ -1569,7 +1569,16 @@ Trust boundary:
 
 The daemon, SDK, CLI, and external browser gateways consume one configured overlay
 registry. Each entry has a stable overlay ID, a transport implementation, and
-its own non-zero daemon port. Daemon listeners run concurrently for every
+its own non-zero daemon port. The registry is built by one loader in
+`pohunek-client` from the owner-private `<config>/pohunek/overlays.toml`
+(`providers`, `port`; absent means NetBird on port 18722) with the
+`POHUNEK_REMOTE_PORT` development override. The file and its directory are read
+through the trusted-directory checks (owner, no foreign write access, mode
+`0600`, at most 64 KiB), and any problem is `overlay_configuration_invalid`
+before a provider is consulted. A host runs exactly one provider: the loader
+rejects a list of several, and the registry types stay multi-entry for
+[#1113](https://github.com/zajca/pohunek/issues/1113). The daemon validates the
+file first, before locks, store migration and worker adoption. Daemon listeners run concurrently for every
 entry; discovery aggregates providers concurrently while isolating a failed
 provider from healthy results. An unqualified selector matching multiple
 providers fails closed. A provider-qualified `<overlay>:<selector>` target is
@@ -1735,6 +1744,7 @@ Configuration under the user config directory:
 ```text
 ~/.config/pohunek/
   config.toml
+  overlays.toml            # optional overlay provider and remote port (0600)
 ```
 
 Runtime state under the user data directory:

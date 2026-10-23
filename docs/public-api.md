@@ -321,7 +321,7 @@ The daemon exposes the same protocol on two transports:
 | Transport | Endpoint | Security boundary |
 |---|---|---|
 | Local | Unix socket at the configured runtime path | Owner-only socket directory and mode |
-| Remote | One TCP listener per configured overlay, bound to that provider's validated local member address and port | Overlay reachability and provider policy; NetBird/WireGuard is the default production provider |
+| Remote | One TCP listener per configured overlay, bound to that provider's validated local member address and port. The provider and the port come from the owner-private `overlays.toml` (see "Overlay configuration" below); without the file the host works over NetBird on port 18722 | Overlay reachability and provider policy; NetBird/WireGuard is the default production provider |
 
 The local runtime path is a shared host/client contract, not a wire-protocol
 field. A valid absolute `XDG_RUNTIME_DIR` resolves the application root to
@@ -3693,9 +3693,8 @@ Canonical public codes currently emitted include:
 
 | Class | Codes |
 |---|---|
-| `configuration` | `paths_unavailable`, `netbird_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted`, `integration_trust_conflict`, `integration_home_ambiguous_owner` |
+| `configuration` | `paths_unavailable`, `overlay_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted`, `integration_trust_conflict`, `integration_home_ambiguous_owner` |
 | `daemon` | `version_mismatch`, `native_store_check_task_panicked`, `version_adapter_failed`, `daemon_protocol_too_old`, `version_translation_failed`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down`, `hook_schema_unavailable` |
-| `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `remote_discovery_failed` |
 | `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `host_identity_unpinnable`, `remote_discovery_failed` |
 | `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `agent_native_reference_missing`, `agent_native_store_relocated`, `native_identity_missing`, `native_identity_unverified`, `native_identity_uncertain`, `native_identity_evidence_unavailable`, `native_report_unattested`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `integration_no_managed_runtime`, `bundle_unavailable`,`assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `migration_manifest_missing`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `session_input_stalled`, `session_cwd_missing`, `session_tmpdir_unsafe`, `session_tmpdir_failed`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `base_branch_fetch_failed`, `worktree_branch_in_use`, `worktree_add_failed`, `hook_required_failed`, `branch_fetch_failed`, `remote_branch_not_found`, `branch_diverged`, `backup_ref_exists`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required`, `integration_update_incompatible` |
 
@@ -4474,6 +4473,12 @@ clients should use it rather than hand-writing protocol framing.
 Public exports:
 
 - `protocol`: re-export of `pohunek-protocol`.
+- `default_overlay_registry`, `overlay_registry_from`, `OverlayConfig`,
+  `OVERLAY_CONFIG_FILE`, `DEFAULT_REMOTE_PORT` and `REMOTE_PORT_ENV`: the
+  overlay configuration loader and registry builder ("Overlay configuration"
+  below). They moved here from `pohunek-netbird`, which is not a pinned crate.
+  A configuration failure is `ClientError::OverlayConfiguration`
+  (`overlay_configuration_invalid`, `configuration` class).
 - `Client`: framed request/response and subscription client.
 - `ClientOptions`: `request_timeout` and `connect_timeout`, both defaulting to
   5 seconds, and `origin_source`, set with `with_origin_source`. A typed
@@ -4578,6 +4583,45 @@ Public exports:
   overlay that reports its identity, and clients that fan out add their
   Unix-socket target explicitly and skip that record.
 - Raw and attach helpers: `connect_raw*` and `attach_raw*`.
+
+Overlay configuration: `default_overlay_registry()` builds the registry that
+the CLI, the daemon and external Rust clients share. It reads
+`<config>/pohunek/overlays.toml` (`XDG_CONFIG_HOME`, else `~/.config`):
+
+```toml
+providers = ["netbird"]   # exactly one overlay provider per host
+port = 18722              # optional; TCP port of the remote control listener
+```
+
+The file is optional. When it or its directory is absent the host works over
+`netbird` on port 18722. When nothing exists at the file path (no file, no symlink) the defaults apply
+and the directory is not inspected: there is no configuration to trust, and a
+writer in an unsafe directory can only make a file appear, which is then
+refused, or delete it, which falls back to the NetBird default. When anything
+exists there, every component of the directory path must be a real directory
+(no symlink) owned by the user or root and not writable by other accounts, and
+the file must be
+a regular file owned by the user with mode `0600` and at most 64 KiB, in
+UTF-8. Parsing is strict: unknown keys and wrong types fail. `providers` takes
+exactly one known id (`netbird`); several providers on one host are not
+supported yet and fail with a message that points to
+[#1113](https://github.com/zajca/pohunek/issues/1113). The environment variable
+`POHUNEK_REMOTE_PORT` overrides `port` for development and tests; a service-started
+daemon does not receive it, so a port that must reach both the daemon and the
+CLI belongs in the file. Every failure, including an unusable
+`POHUNEK_REMOTE_PORT`, is `overlay_configuration_invalid` (class
+`configuration`; before this code an unusable `POHUNEK_REMOTE_PORT` reported
+`netbird_configuration_invalid`). Its message names the file and at most a line
+number, never a value from the file, and no provider is consulted before it is
+raised. The daemon validates the file before it takes a lock, migrates the store
+or adopts a worker, and exits with the same code in its error text. The daemon
+reads the file at start, so a change applies after a daemon restart. A CLI of
+this release reads `port` from the file while an older daemon still binds the
+environment value or 18722, and so does a client of an earlier release (a CLI
+on another host, or a Rust client pinned to an earlier tag such as the
+`pohunek-work` gateway): set `port` only after every daemon and every client that
+dials those hosts runs this release and the daemons are restarted. A pinned
+client adopts the file when it bumps its pin.
 
 Public daemon construction is registry-explicit. `DaemonState::new` and
 `ControlServer::bind` require a validated `OverlayRegistry`, and the shared

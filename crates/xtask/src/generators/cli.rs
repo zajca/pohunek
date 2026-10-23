@@ -137,19 +137,19 @@ static COMMANDS: &[CommandDescriptor] = &[
     CommandDescriptor {
         id: "host",
         title: "pohunek host",
-        description: "Enumerate and inspect remote NetBird peers.",
+        description: "Enumerate and inspect remote overlay peers.",
         usage: "pohunek host <subcommand>",
         arguments: "",
         intents: &["help", "debug"],
         extra_body: "## Subcommands\n\n\
-                     - `pohunek host discover` — Enumerate NetBird peers and probe their daemons.\n\
+                     - `pohunek host discover` — Enumerate overlay peers and probe their daemons.\n\
                      - `pohunek host list` — List known hosts with their classification.\n\
                      - `pohunek host inspect` — Inspect one host's live capabilities.",
     },
     CommandDescriptor {
         id: "host-discover",
         title: "pohunek host discover",
-        description: "Enumerate NetBird peers and probe their daemons.",
+        description: "Enumerate overlay peers and probe their daemons.",
         usage: "pohunek host discover [--json]",
         arguments: "- `--json`: Emit machine-readable JSON instead of human text.",
         intents: &["debug", "help"],

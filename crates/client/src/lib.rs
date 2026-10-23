@@ -6,6 +6,7 @@ mod discovery;
 mod error;
 mod integration;
 mod notifications;
+mod overlay_config;
 mod transport;
 
 #[doc(inline)]
@@ -18,6 +19,10 @@ pub use error::ClientError;
 pub use overlay::{
     ConfiguredTransport, ExternalIdentity, ExternalIdentityKind, HostTarget, LocalIdentity,
     OverlayRegistry, RegistryError,
+};
+pub use overlay_config::{
+    default_overlay_registry, overlay_registry_from, OverlayConfig, DEFAULT_REMOTE_PORT,
+    OVERLAY_CONFIG_FILE, REMOTE_PORT_ENV,
 };
 pub use protocol;
 pub use transport::{
@@ -32,13 +37,3 @@ pub use transport::{
     SESSION_REMOVE_REQUEST_BUDGET_MS, SESSION_RESUME_REQUEST_BUDGET_MS,
     SESSION_STOP_REQUEST_BUDGET_MS, WORKTREE_HOOK_TIMEOUT_MS,
 };
-
-/// Load the production overlay registry from fail-fast provider configuration.
-///
-/// # Errors
-///
-/// Returns a typed provider configuration error when the registry cannot be
-/// constructed.
-pub fn default_overlay_registry() -> Result<OverlayRegistry, ClientError> {
-    netbird::configured_registry().map_err(ClientError::from)
-}

@@ -1,6 +1,7 @@
-//! `pohunek host` — discover, list, and inspect remote hosts over `NetBird`.
+//! `pohunek host` — discover, list, and inspect remote hosts over the configured
+//! overlay.
 //!
-//! `discover` and `list` enumerate the local host's `NetBird` peers and classify
+//! `discover` and `list` enumerate the local host's overlay peers and classify
 //! each by probing its daemon control port, so the operator (and any host-switching
 //! client) sees which peers run a compatible daemon. Discovery is performed
 //! directly by the CLI and uses its owner-private persistent cache, so it does
@@ -8,7 +9,7 @@
 //! *live* query against a specific host's daemon for its [`HostCapabilities`].
 //!
 //! Without a persistence store (out of scope for this milestone), the set of
-//! "known hosts" is exactly the set of live `NetBird` peers, so `list` and
+//! "known hosts" is exactly the set of live overlay peers, so `list` and
 //! `discover` share one core; they differ only in presentation.
 
 use std::fmt::Write as _;
@@ -19,11 +20,11 @@ use crate::client::Client;
 use crate::error::CliError;
 use crate::paths::Paths;
 
-/// Run `host discover` using local `NetBird` state and the standalone cache.
+/// Run `host discover` using local overlay state and the standalone cache.
 ///
 /// # Errors
 ///
-/// Returns [`CliError`] when `NetBird` state cannot be read, remote-port
+/// Returns [`CliError`] when the overlay state cannot be read, the overlay
 /// configuration is invalid, or the persistent cache cannot be safely used.
 pub(crate) async fn run_discover(refresh: bool, json: bool) -> Result<(), CliError> {
     let cache_dir = Paths::cache_dir_only()?;
@@ -39,7 +40,7 @@ pub(crate) async fn run_discover(refresh: bool, json: bool) -> Result<(), CliErr
 /// Run `host list`: the same discovery core as `discover`, emphasizing the
 /// name / IP / classification / version columns.
 ///
-/// Without a persistence store, "known hosts" are the live `NetBird` peers, so this
+/// Without a persistence store, "known hosts" are the live overlay peers, so this
 /// shares [`run_discover`]; the human rendering is identical for now.
 ///
 /// # Errors

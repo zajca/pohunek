@@ -54,6 +54,10 @@ mod notifications_list_paging;
 mod notifications_policy;
 #[path = "notifications_watch.rs"]
 mod notifications_watch;
+#[path = "overlay_config.rs"]
+mod overlay_config;
+#[path = "overlay_service_daemon_port.rs"]
+mod overlay_service_daemon_port;
 #[path = "pi_frame_properties.rs"]
 mod pi_frame_properties;
 #[path = "pi_package.rs"]

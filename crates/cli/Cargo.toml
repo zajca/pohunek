@@ -90,9 +90,6 @@ overlay = { workspace = true }
 pohunek-test-support = { workspace = true, features = ["catalog"] }
 # `plugin_daemon.rs` serves the real package lifecycle from an in-process daemon.
 pohunek-daemon = { path = "../daemon" }
-# `session_process_api.rs` asserts the real remote-port contract through the
-# process boundary, using the netbird crate's public constants.
-netbird = { workspace = true }
 # `host_pin_assistant.rs` answers `assistant.materialize` with the bundle identity
 # the assistant verifies.
 pohunek-knowledge = { workspace = true }

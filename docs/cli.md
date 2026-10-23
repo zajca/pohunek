@@ -74,7 +74,7 @@ cannot be pinned: the operation fails before its first connection with
 
 | Command | What it does |
 |---|---|
-| `pohunek doctor` | Environment health: binaries, socket, state dirs, NetBird, agents. |
+| `pohunek doctor` | Environment health: binaries, socket, state dirs, the overlay CLI, agents. |
 | `pohunek service install [--from <dir>] [--prefix <dir>] [--json]` | Install the daemon as a native login service (systemd user unit or launchd agent) from staged binaries into a versioned `libexec` directory and write `service.toml`. |
 | `pohunek service upgrade [--from <dir>] [--accept-runtime-loss] [--preflight-budget <SECONDS>] [--json]` | Switch to the staged version, restarting only the daemon; live workers keep their PID and PTY, and unreferenced old versions are removed. First runs a read-only preflight with the new binaries and refuses (`service_upgrade_sessions_at_risk`) while a live or stopped session would lose recovery or not be adopted, counting live and stopped risks separately and labelling each row with its kind and reason code; `--accept-runtime-loss` accepts that loss. Accepting records each verdict the daemon binds to an acceptance scope in `service-accepted-risks.json` once the upgrade completes, so the identical risk (same session, list, verdict, code and scope) is reported as previously accepted and no longer blocks the next upgrade; it changes no session, and a new session, a changed scope or a verdict without a scope still needs the flag. An owner-requested stop or removal is not itself a runtime-adoption loss, even while the runtime is alive; retained native recovery of a stop is still judged and identity checks remain conservative. A store the new daemon would refuse is never overridable (`service_upgrade_store_unusable`), nor is a preflight that cannot run (`service_upgrade_preflight_failed`), nor a service manager (systemd user manager or launchd) whose `PATH` cannot be read (`service_manager_environment_unavailable`). A service manager whose variables cannot be read for a job that records its `PATH` refuses an upgrade whose preflight judged a stopped session (`service_manager_variables_unread`) unless `--accept-runtime-loss` is given. The official runtime step adds five codes, none overridden by `--accept-runtime-loss`: `service_upgrade_runtimes_refused` (the release's plan cannot be applied; nothing was stopped), `service_upgrade_runtimes_failed` (the release's runtime step did not produce a finished report), `service_runtime_backup_invalid` (a registry, catalog state or host profile cannot be backed up exactly), `service_staged_runtime_invalid` (the release's `runtime/` tree is not the layout the release assembles, or a sealed release lists a `runtime/` file it does not carry), and `service_upgrade_runtimes_unconfirmed` (the step's daemon run could not be ended and its exit confirmed, so the upgrade is kept and not rolled back). Cancelling an upgrade at or after daemon registration checks whether the previous release can read the current store before changing the service, stops the new daemon, then checks again before starting the previous one. A refused rollback keeps its transaction (`service_rollback_store_unusable`, `service_rollback_sessions_at_risk`, or `service_rollback_preflight_failed`); store refusal is never overridable, while `--accept-runtime-loss` can accept unverified live or stopped-session recovery. The runtime plan also updates an installed, selected and enabled official Pi package (never installing an absent one) and reports a gap with the `plugin update` command for one that is installed but not selected. A selected package you disabled (any runtime, any version) is never replaced, selected or enabled by the runtime plan: it is left as set with a gap whose hint is `plugin enable <package> --digest <digest>`. The runtime plan repins host profiles pinned to an older version of the release's official package (`repin`, applied as `repinned`), lists the pinned profiles it keeps with a reason (`kept`), and says when it re-selects the release's package over a newer selected version. A stopped session that a newer official package version adopts is judged `adoptable_by_newer_package`. `service check` previews the refusal. `--json` carries the rollback preflight and `accepted_runtime_loss` in `rolled_back` (and at the top level when rollback is the only operation). |
 | `pohunek service uninstall [--stop-sessions] [--purge] [--json]` | Remove the service; refuses while sessions are live unless `--stop-sessions`, and keeps durable metadata unless `--purge`. With `--purge`, recognized store-write temps and imported legacy archives are removed too; unrecognized data entries are retained and reported as byte-escaped display strings in `kept_purge_entries`. It also refuses (`workflow_units_installed`) while a workflow plugin still has jobs or services recorded or the reaction dispatcher unit is recorded: disable the plugins it names first. |
@@ -123,7 +123,7 @@ cannot be pinned: the operation fails before its first connection with
 | `pohunek session rm <target> --accept-unconfirmed-cleanup` | Evict a session that `rm` refused with `runtime_supervision_ambiguous` only because same-user processes with unreadable environments may belong to its runtime (the refusal lists them). On macOS 27 the kernel withholds the environment of Apple platform binaries; the sweep reaps those the lost worker created (a `/bin/zsh` session root and its helpers) without this flag when the worker journaled its creation number in the current boot, and dismisses those created before the worker. When the worker also journaled its kernel coalitions (`worker_coalitions`, same boot), it dismisses every hidden process the kernel puts in other coalitions than the worker's, such as a launchd job, helper or another session's agent started after the worker. An orphan that re-executed after its creator died and a process whose creator exited after the worker started remain candidates once they have outlived the sweep grace (`sweep.grace_ms`, during which the sweep keeps re-reading the table for a process that is only passing; one removal waits at most one grace in total across all its runtimes, and on Linux a candidate that has already run longer than the grace and whose environment stays permission-denied is not waited for, while one whose environment reads as unobservable, such as a process replacing its executable, is waited for the whole grace; a removal left pending by such candidates is retried without rescanning until one of them exits), so the flag may still be needed after a lost runtime; the refusal lists each by pid and command name for you to judge. The same holds for every hidden process when the worker journaled no creation number or coalitions (a worker started by the previous release). Those candidates are never signalled and, if one carries the runtime marker, keep running unsupervised after the worktree, logs, and record are deleted. The consent covers one call, is never automatic, and without it the removal stays refused; inspect and end the listed processes, then retry, as the safe path. The result lists the accepted processes; a daemon without the method answers `method_not_found`. |
 | `pohunek project add / list / show / rename / rm` | Manage git-repo-aware project records. |
 | `pohunek project actions / action / prompt` | Resolve per-project launch recipes and prompt templates. |
-| `pohunek host discover / list / inspect` | Find NetBird peers running daemons (standalone cache; `--refresh`) and query live capabilities. |
+| `pohunek host discover / list / inspect` | Find peers of the configured overlay running daemons (standalone cache; `--refresh`) and query live capabilities. |
 | `pohunek host governance inspect <host>` | Read the safe stable host identity and local governance state; `--json` preserves explicit absence and canonical revisions. It does not mutate enrollment or ownership. |
 | `pohunek completions <bash\|zsh\|fish>` | Print static shell completion; add `--dynamic` for bounded host/session, package and workflow plugin candidates. |
 | `pohunek notifications list / watch` | Inspect or stream the durable inbox; `--all-hosts` fans out. |
@@ -153,7 +153,7 @@ cannot be pinned: the operation fails before its first connection with
 ### Working across hosts
 
 ```bash
-pohunek host discover                          # which NetBird peers run a daemon?
+pohunek host discover                          # which overlay peers run a daemon?
 pohunek host inspect buildbox --json           # agents/worktree capabilities, live
 
 pohunek session new --host buildbox --project myapp --agent codex \
@@ -166,7 +166,33 @@ pohunek notifications watch --all-hosts        # one triage stream for every mac
 ```
 
 Remote session starts ask for confirmation (skip with `--yes`); project
-references resolve on the *target* host. The only filesystem path the CLI
+references resolve on the *target* host.
+
+#### Overlay configuration
+
+A host works over one overlay provider. Without configuration that is NetBird
+on TCP port 18722. An owner-private `~/.config/pohunek/overlays.toml`
+(`$XDG_CONFIG_HOME/pohunek/overlays.toml`) names the provider and the port;
+both the CLI and the daemon read it:
+
+```toml
+providers = ["netbird"]   # exactly one provider; netbird is the only id so far
+port = 18722              # optional, 1..=65535
+```
+
+When nothing exists at that path the defaults apply and the directory is not
+inspected. When anything exists there, every component of the directory path
+must be a real directory (no symlink) owned by you or root and not writable by
+other accounts, and the file must be a regular file owned by you with mode `0600`. A problem with the
+file or the directory is `overlay_configuration_invalid`; the CLI and the daemon
+refuse to continue, and the message names the file, never a value in it. The
+daemon reads the file at start: restart it after a change. `POHUNEK_REMOTE_PORT`
+overrides `port` for the process that sees it; a service-started daemon does
+not, so put a port that both sides must use in the file. Upgrade every
+client and restart every daemon before you set `port`: a daemon or client of an
+earlier release (another host's CLI, a Rust client pinned to an earlier tag)
+ignores the file and keeps the environment value or 18722. See
+[Remote hosts](knowledge/guides/remote-hosts.md). The only filesystem path the CLI
 sends is an explicit absolute `session new --cwd`, which the target host
 resolves on its own filesystem.
 
