@@ -2733,6 +2733,11 @@ struct FakeLaunchd {
     boot: Mutex<Result<String, String>>,
     /// When the host reports it booted.
     boot_time: Mutex<Result<SystemTime, String>>,
+    /// How many times the boot time was asked for.
+    boot_time_reads: AtomicUsize,
+    /// A file to date after the boot while the given boot time read happens: the
+    /// write that lands between two datings of the persisted configuration.
+    change_at_boot_time_read: Mutex<Option<(usize, std::path::PathBuf)>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -2745,7 +2750,14 @@ impl FakeLaunchd {
             no_domain: false,
             boot: Mutex::new(Ok(FIRST_BOOT.to_owned())),
             boot_time: Mutex::new(Ok(boot_time())),
+            boot_time_reads: AtomicUsize::new(0),
+            change_at_boot_time_read: Mutex::new(None),
         }
+    }
+
+    /// Dates `path` after the boot while the `read`th boot time read happens.
+    fn change_at_boot_time_read(&self, read: usize, path: &std::path::Path) {
+        *self.change_at_boot_time_read.lock().expect("change") = Some((read, path.to_owned()));
     }
 
     /// Changes the boot time the host reports.
@@ -2802,6 +2814,17 @@ impl LaunchdJob for FakeLaunchd {
     }
 
     fn boot_time(&self) -> Result<SystemTime, String> {
+        let read = self.boot_time_reads.fetch_add(1, Ordering::SeqCst) + 1;
+        let change = self
+            .change_at_boot_time_read
+            .lock()
+            .expect("change")
+            .clone();
+        if let Some((at, path)) = change {
+            if read == at {
+                date(&path, Modified::AfterBoot).expect("date");
+            }
+        }
         self.boot_time.lock().expect("boot time").clone()
     }
 }
@@ -4137,6 +4160,51 @@ async fn an_unreadable_boot_or_file_time_is_treated_as_pending() {
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("persisted launchd configuration was used"));
     }
+}
+
+/// A write that lands between the dating of the persisted configuration and its
+/// read makes the date describe another configuration than the one read: a
+/// forward gate refuses, and a rollback goes on with the persisted value and says
+/// so. The second boot time read belongs to the dating that follows the read.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_configuration_changed_between_its_dating_and_its_read_is_treated_as_pending() {
+    const READ_AFTER_THE_FIRST_DATING: usize = 2;
+    let changed_between = |launchd: &FakeLaunchd, domain: &std::path::Path| {
+        launchd.change_at_boot_time_read(READ_AFTER_THE_FIRST_DATING, domain);
+    };
+
+    let mut harness = Harness::new();
+    let domain = unrecorded_install_with_domain_config(&mut harness).await;
+    let (result, judged) = upgrade_of_an_unloaded_job(
+        &mut harness,
+        &domain,
+        Some(PERSISTED_PATH),
+        dated_before_boot,
+        |launchd| changed_between(launchd, &domain),
+    )
+    .await;
+    let error = result.expect_err("a forward gate refuses");
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    assert!(judged.is_empty(), "nothing was judged: {judged:?}");
+    harness.assert_installed(V1);
+
+    let mut harness = Harness::new();
+    let domain = harness.root.join("user.plist");
+    let (result, judged) = rollback_without_a_journaled_default(
+        &mut harness,
+        |domain| date(domain, Modified::BeforeBoot).expect("date"),
+        |launchd| changed_between(launchd, &domain),
+    )
+    .await;
+    let report = result.expect("a rollback goes on");
+    assert!(
+        !judged.is_empty() && judged.iter().all(|path| path == PERSISTED_PATH),
+        "{judged:?}"
+    );
+    let warnings = report.rolled_back.expect("rolled back").warnings;
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("persisted launchd configuration was used"));
 }
 
 #[tokio::test]
@@ -11724,11 +11792,24 @@ async fn a_rollback_is_not_refused_while_it_journals_the_loaded_default() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn after_a_reboot_a_forward_gate_still_refuses_a_persisted_path_it_cannot_prove() {
-    let cases: [(&str, Modified); 2] = [
-        (PENDING_PATH, Modified::AfterBoot),
-        ("<not a property list", Modified::BeforeBoot),
+    // The configuration, its date, whether the host's boot time is readable, and
+    // what the refusal names.
+    let cases: [(&str, Modified, bool, &str); 3] = [
+        (PENDING_PATH, Modified::AfterBoot, true, "modified after"),
+        (
+            "<not a property list",
+            Modified::BeforeBoot,
+            true,
+            "not a property list",
+        ),
+        (
+            PENDING_PATH,
+            Modified::BeforeBoot,
+            false,
+            "the boot time cannot be read",
+        ),
     ];
-    for (content, modified) in cases {
+    for (content, modified, boot_time_readable, named) in cases {
         let mut harness = Harness::new();
         let (preflight, judged) =
             interrupted_upgrade_with_a_pending_plist(&mut harness, Step::Definition).await;
@@ -11737,6 +11818,9 @@ async fn after_a_reboot_a_forward_gate_still_refuses_a_persisted_path_it_cannot_
         date(&domain, modified).expect("date");
         let launchd = FakeLaunchd::new(Ok(not_loaded()));
         rebooted(&launchd);
+        if !boot_time_readable {
+            launchd.set_boot_time(Err("sysctl failed".to_owned()));
+        }
         harness.context = harness.context.clone().with_launchd_job(Arc::new(launchd));
 
         let error = crate::service::check_with_preflight(
@@ -11749,6 +11833,7 @@ async fn after_a_reboot_a_forward_gate_still_refuses_a_persisted_path_it_cannot_
         .await
         .expect_err("the check cannot tell the PATH");
         assert_eq!(error.code(), "service_manager_environment_unavailable");
+        assert!(error.to_string().contains(named), "{error}");
 
         let error = harness
             .engine()
@@ -11757,6 +11842,7 @@ async fn after_a_reboot_a_forward_gate_still_refuses_a_persisted_path_it_cannot_
             .await
             .expect_err("the resume cannot tell the PATH");
         assert_eq!(error.code(), "service_manager_environment_unavailable");
+        assert!(error.to_string().contains(named), "{error}");
         assert!(
             judged.lock().expect("search path lock").is_empty(),
             "nothing was judged"
