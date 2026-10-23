@@ -222,12 +222,16 @@ async fn an_echoed_probe_reply_is_not_answered_again() {
 #[tokio::test]
 async fn a_probe_reply_waits_for_a_paced_plan_and_coalesces() {
     let cwd = tempdir().expect("temp dir");
-    // The shell prints two probes after reading the plan's first fragment; the
-    // plan holds the input lock for its delay, so both replies queue behind it.
+    // The shell prints a probe after reading the plan's first fragment and a
+    // second one once the test opened the gate; the plan holds the input lock
+    // for its delay, so the second probe finds the first reply still pending.
+    let gate = cwd.path().join("go");
     let script = format!(
-        "stty raw -echo; head -c 1 >/dev/null; printf READY; printf '{PROBE_ST}x{PROBE_ST}'; {} {}",
-        read_dump(1, 1 + REPLY_BYTES),
-        read_dump(2, 1)
+        "stty raw -echo; head -c 1 >/dev/null; printf '{PROBE_ST}'; printf P1; \
+         while [ ! -e '{gate}' ]; do :; done; printf 'x{PROBE_ST}'; {dump1} {dump2}",
+        gate = gate.display(),
+        dump1 = read_dump(1, 1 + REPLY_BYTES),
+        dump2 = read_dump(2, 1)
     );
     let pty = spawn(&script, cwd.path(), true);
 
@@ -244,10 +248,13 @@ async fn a_probe_reply_waits_for_a_paced_plan_and_coalesces() {
             },
         ],
     };
-    pty.input()
-        .execute_control("namespace", 1, plan)
-        .await
-        .expect("paced plan");
+    let paced = {
+        let pty = pty.clone();
+        tokio::spawn(async move { pty.input().execute_control("namespace", 1, plan).await })
+    };
+    output_until(&pty, "P1").await;
+    std::fs::write(&gate, b"").expect("open the gate");
+    paced.await.expect("plan task").expect("paced plan");
     let output = output_until(&pty, ":END1").await;
 
     assert_eq!(
