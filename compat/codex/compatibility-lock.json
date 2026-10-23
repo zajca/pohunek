@@ -5,8 +5,8 @@
   "upstream": {
     "name": "OpenAI Codex CLI",
     "npm": "@openai/codex",
-    "release": "0.160.0",
-    "integrity": "sha512-kEtVGzjRAYAMOwJxN39bGcna7LT3IDQgq64NNJ/dDTfu4OzZaocJcyNb5/gGJ/IVF/Vj7oK7E2m3nmTan7lpjg==",
+    "release": "0.164.0",
+    "integrity": "sha512-TWj7UGyPRe3Pj/A3ddNAxs1te3a/W/xAd+J0LHrrFTmsSfahGMOLF/vn88D3QCIgAT3B1rm1y/Z3NYE0rx6cZQ==",
     "binary": "codex",
     "version_output": "codex-cli {release}"
   },
