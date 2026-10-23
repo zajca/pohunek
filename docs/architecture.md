@@ -1158,7 +1158,10 @@ published and after the first sighting, and it reaches the registry only as the
 ordinary activity transition. The generic shell manifest never latches because
 its working rules are loose substring matches. An agent manifest keeps the
 ordered screen observer alive after startup so the latch sees every byte; a
-manifest switched in under a shell resumes it. Bytes skipped on a broadcast lag cannot be latched.
+manifest switched in under a shell resumes it. A stale spinner line left visible
+under a dialog that a chunk erases before it redraws the idle prompt can latch;
+this happens only in a turn that was already running. Bytes skipped on a
+broadcast lag cannot be latched.
 Each detector task is scoped to the exact worker id, runtime id, and runtime
 generation that created its output stream. Cancellation is advisory; a final
 transition from a superseded detector is discarded instead of being stamped

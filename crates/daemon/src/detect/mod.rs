@@ -290,7 +290,8 @@ impl Detector {
         }
     }
 
-    /// Stops ordered startup observation once the initial-input wait resolves.
+    /// Ends the initial-input wait. Ordered startup observation stops with it
+    /// unless the manifest latches working sightings, which keep it armed.
     ///
     /// Reconfiguration never re-arms a completed wait.
     pub fn finish_initial_input(&mut self) {
@@ -2312,7 +2313,7 @@ mod tests {
         assert_eq!(
             detector.feed(
                 started_at,
-                "\x1b[2J\x1b[HBash command\r\nsleep 45\r\nDo you want to proceed?\r\n\u{276f} 1. Yes\r\n  2. No\r\nesc to cancel\r\n\u{2733} Running\u{2026} (5s \u{b7} hooks)".as_bytes(),
+                "\x1b[2J\x1b[H\u{2733} Running\u{2026} (5s \u{b7} hooks)\r\nBash command\r\nsleep 45\r\nDo you want to proceed?\r\n\u{276f} 1. Yes\r\n  2. No\r\nesc to cancel".as_bytes(),
             ),
             vec![transition(AgentActivity::Blocked, StateSource::Screen)]
         );
@@ -2448,12 +2449,19 @@ mod tests {
     fn a_lag_resync_fabricates_no_working_evidence() {
         let started_at = instant();
         let mut detector = claude_detector(3, 80, started_at);
-        detector.feed(started_at, idle_osc_title().as_bytes());
-
+        // A working title severed by the dropped chunks: its head arrived, its
+        // tail and terminator did not.
+        detector.feed(started_at, "\x1b]2;\u{280b} thi".as_bytes());
         detector.resync_after_lag();
+        let sightings = detector.latch_sightings;
 
-        assert!(detector
-            .tick(started_at + Duration::from_millis(100))
+        let transitions = detector.feed(
+            started_at + Duration::from_millis(10),
+            format!("nking\x07{}", idle_osc_title()).as_bytes(),
+        );
+
+        assert_eq!(detector.latch_sightings, sightings, "{transitions:?}");
+        assert!(transitions
             .iter()
             .all(|transition| transition.activity != AgentActivity::Working));
     }
@@ -2470,6 +2478,10 @@ mod tests {
                 .iter()
                 .all(|transition| transition.activity != AgentActivity::Working),
             "shell output stays on the byte path: {transitions:?}"
+        );
+        assert_eq!(
+            detector.latch_evaluations, 0,
+            "the shell latch gate is shut"
         );
     }
 
@@ -2796,6 +2808,23 @@ mod tests {
             transitions.first(),
             Some(&transition(AgentActivity::Working, StateSource::Screen)),
             "{transitions:?}"
+        );
+    }
+
+    #[test]
+    fn a_hermes_bare_working_prompt_above_its_rule_chrome_reads_working() {
+        let started_at = instant();
+        let mut detector = steady_detector(&RuntimeRef::hermes(), 12, 100, started_at);
+        let rule = "\u{2500}".repeat(60);
+
+        let transitions = detector.feed(
+            started_at,
+            format!("\x1b[2J\x1b[Hanswer\r\n\u{2695} \u{276f}\r\n{rule}\r\n\u{2500}").as_bytes(),
+        );
+
+        assert_eq!(
+            transitions,
+            vec![transition(AgentActivity::Working, StateSource::Screen)]
         );
     }
 

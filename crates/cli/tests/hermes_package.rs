@@ -85,7 +85,7 @@ const GOLDEN_ACTIVE_TURN_PROMPT: &str = "# Hermes staff symbol. The bottom-lines
 /// copy: the bare staff prompt counts as working only as the last non-empty
 /// line, so an old transcript prompt exposed by a partial idle redraw never
 /// reads as a working frame (#1486).
-const PACKAGE_ACTIVE_TURN_PROMPT: &str = "# Hermes staff symbol. The prompt must be the last non-empty line: old\n# transcript chrome that holds a bare staff prompt neither keeps the session\n# working after the prompt returns to idle nor reads as a working frame while\n# an idle redraw has erased and not yet reprinted the lines below it.\n[[rules]]\nid = \"active_turn_prompt\"\nstate = \"working\"\npriority = 700\nregion = \"bottom_non_empty_lines(8)\"\nregex = ['(?:\\A|\\n)[ \\t]*⚕[ \\t]+(?:❯|>|\\$|#|›|»|→)[ \\t]*\\z']\n";
+const PACKAGE_ACTIVE_TURN_PROMPT: &str = "# Hermes staff symbol. The prompt must be the last non-empty line apart from\n# the rule chrome drawn below it: old transcript chrome that holds a bare staff\n# prompt neither keeps the session working after the prompt returns to idle\n# nor reads as a working frame while an idle redraw has erased and not yet\n# reprinted the lines below it.\n[[rules]]\nid = \"active_turn_prompt\"\nstate = \"working\"\npriority = 700\nregion = \"bottom_non_empty_lines(8)\"\nregex = ['(?:\\A|\\n)[ \\t]*⚕[ \\t]+(?:❯|>|\\$|#|›|»|→)[ \\t]*(?:\\n[ \\t]*─+[ \\t]*)*\\z']\n";
 
 /// Package id the descriptor declares.
 const PACKAGE_ID: &str = "pohunek.runtime.hermes";
