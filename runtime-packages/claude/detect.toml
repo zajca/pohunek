@@ -6,15 +6,15 @@
 
 # The distribution binary is `claude`; the npm package installs the same
 # executable as `bin/claude.exe`. The native installer runs the release image
-# `<install root>/claude/versions/<release>`, whose process name is the release
-# (`2.1.309`). The command line is argv joined with spaces, so each pattern
+# `<install root>/claude/versions/<release>`, matched by its command line (the
+# kernel name is the release or `claude`, depending on how it was started). The command line is argv joined with spaces, so each pattern
 # names the program at its start. Through
 # `node` or `bun` the script follows the flag options and is named `claude`
 # (also `.js`, `.mjs`, `.cjs`) or lies inside the `@anthropic-ai/claude-code`
 # package; another script whose name merely contains the word `claude` is not
 # Claude.
 [process]
-comm = ['^claude(\.exe)?$', '^[0-9]+\.[0-9]+\.[0-9]+$']
+comm = ['^claude(\.exe)?$']
 cmdline = [
   '^(\S*/)?claude(\.exe)?($| )',
   '^(\S*/)?claude/versions/[0-9]+\.[0-9]+\.[0-9]+($| )',
@@ -44,9 +44,9 @@ regex = ['^[\x{2800}-\x{28FF}\x{25D0}\x{25D1}] ']
 # Live status spinner rendered above the prompt box while a turn runs, e.g.
 # "✻ Noodling… (12s · ↓ 1.2k tokens)", "✻ Herding… (3s · thinking with high
 # effort)" or a bare "* Jiving…" at the start of a turn. The line is one verb
-# and an optional elapsed timer, so a transcript bullet such as
-# "* Then it waits… (see below)" is not a spinner. The prompt box (`❯`) stays visible during work in current Claude
-# Code TUIs, so without this rule every screen render matches `live_prompt_box`
+# with an optional timer, or a longer message with an elapsed-time timer, so a
+# transcript bullet such as "* Then it waits… (see below)" is not a spinner.
+# The prompt box (`❯`) stays visible during work in current Claude Code TUIs, so without this rule every screen render matches `live_prompt_box`
 # and the published activity flaps to idle between OSC title updates. Must
 # outrank `live_prompt_box` (950) and stay below `live_blocked_form` (980).
 # Dialog markers are excluded so a visible approval prompt keeps winning as
@@ -56,7 +56,7 @@ id = "live_status_spinner"
 state = "working"
 priority = 960
 region = "whole_recent"
-line_regex = ['^[·✢✳✶✻✽*] \p{L}+…( \([0-9]+[smh]\b.*)?$']
+line_regex = ['^[·✢✳✶✻✽*] (?:[\p{L}\x27’-]+…|\S[^…]*… \([0-9]+[smh]\b.*)$']
 not = { any = [
   { contains = ["do you want to proceed?"] },
   { contains = ["esc to cancel"] },

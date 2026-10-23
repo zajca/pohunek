@@ -193,11 +193,12 @@ native executable of 2.1.309 from the distribution package, byte-identical
 also ran against the npm install. The darwin-arm64 executable of the same release is pinned by its own SHA-256 and runs in the aarch64-apple-darwin release-evidence row; the screen captures were not repeated on macOS. `crates/cli/tests/claude_package.rs` classifies every
 captured screen through the package manifest.
 
-- The idle, working and blocked states are read from the screen and the title.
-  Claude keeps its idle title (`✳ Claude Code`) while an approval or question
-  dialog is open, and the screen rules (`blocked`, priority 840 and above) win
-  over it. While a turn runs the title alternates `◐ Claude Code` and
-  `◑ Claude Code` every 960 ms (the title component of the 2.1.289 binary).
+- The idle, working and blocked states are read from the program-status
+  records and the screen, and without records also from the title. Release
+  2.1.289, which emits no records, keeps its idle title (`✳ Claude Code`) while
+  an approval or question dialog is open, and the screen rules (`blocked`,
+  priority 840 and above) win over it; while a turn runs its title alternates
+  `◐ Claude Code` and `◑ Claude Code` every 960 ms (captured in `n-1/`).
 - Claude runs a hook command as `/bin/sh -c <command>`. Where `/bin/sh` is dash
   (Debian, Ubuntu, so the hosted CI runner) the shell stays between Claude and
   the reporter script, so the script's `$PPID` is that shell and the worker
@@ -273,7 +274,7 @@ captured screen through the package manifest.
   fires `UserPromptSubmit` for turns it starts itself too (scheduled work,
   `/loop`, background agents reporting back); such a report matches no input
   unless it lands between a waited input's Enter write and Claude reading Enter.
-  The compatibility lock records the Claude Code run that exercised the hook.
+  The compatibility lock records the Claude Code runs that exercised the hook.
 - The `session` action (Claude `SessionStart`) forwards the hook input `source`
   as `session_source` in its identity report only when it is `startup`,
   `resume`, `clear` or `compact`; any other value, or none, omits the key.
@@ -294,7 +295,7 @@ captured screen through the package manifest.
   reason (`provider` `claude`, the action and a reason code) to the hook failure trace
   `pohunek-hooks.jsonl` in the pohunek log directory (see the
   [debug-session-runtime](../runbooks/debug-session-runtime.md) runbook).
-- `claude --version` prints `2.1.289 (Claude Code)`; the inventory shows the
+- `claude --version` prints `2.1.309 (Claude Code)`; the inventory shows the
   package's probe accepted the real release.
 - Environment that keeps a real Claude away from host state and services:
   `CLAUDE_CONFIG_DIR`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY` (dummy),
@@ -319,8 +320,9 @@ manifest opts in) and the daemon holds the latest root record.
   an `id=` and are ignored, so the root reads idle while background agents run.
 - A visible dialog on the screen always wins over a record that is not
   `blocked`: the folder trust, theme, login, API-key and permission dialogs stay
-  blocked, whatever a (forged or stale) record says. The API-key dialog is read
-  by its own visible-blocker rule for this reason.
+  blocked, whatever a (forged or stale) record says. The API-key dialog has
+  its own visible-blocker rule, because the rule that read it before has no
+  visible-blocker flag.
 - A held record ends with a root `state=clear`, with any detector
   reconfiguration (a nested agent exiting, a package refresh) and with the
   runtime. Initial-input readiness ignores the record: the prompt box decides.
@@ -330,8 +332,8 @@ manifest opts in) and the daemon holds the latest root record.
   `CLAUDE_CODE_SESSION_KIND=bg` session, or a probe whose reply lost the race
   against a client's DA1 reply) detection is screen-only exactly as before; the
   2.1.289 screens in `n-1/` keep the title rules evidenced.
-- Under a terminal multiplexer Claude does not enable the records; a Claude
-  started inside a shell session is screen-only because the shell session's
+- Under tmux Claude does not enable the records (screen and zellij were not
+  checked); a Claude started inside a shell session is screen-only because the shell session's
   manifest does not answer the probe.
 - The captured record sequences are `compat/claude/screens/<state>.program-status`
   (one ordered root record per line), recorded from the real agent by the
@@ -341,9 +343,11 @@ manifest opts in) and the daemon holds the latest root record.
 - Esc during a turn reports `idle` (`stopped`) in the binary; no capture of the
   `Interrupted` marker exists because the test client cannot send a bare Esc.
 
-The native installer runs `<root>/claude/versions/<release>`; the process name
-is the release (`2.1.309`), so the manifest's process matchers accept that
-form, and the worker designates such an image as the launch agent (a resolved
+The native installer runs `<root>/claude/versions/<release>`. The kernel name
+of a process started from the resolved image is the release (`2.1.309`), one
+started through the `claude` launcher symlink is named `claude`; either way the
+command line names `claude` or the image, which the manifest's process matchers
+accept. The worker designates such an image as the launch agent (a resolved
 executable in a `claude/versions/` directory), which `SessionStart` binding
 needs. The npm layout (`bin/claude.exe`) and the native layout both pass the
 SessionStart, resume, fork and UserPromptSubmit scenarios against 2.1.309.
@@ -413,7 +417,7 @@ Limits that remain:
 ## Not verified
 
 Releases other than 2.1.309 and 2.1.289 (the range above the lock is a policy, not a
-verification), the Esc interrupt marker, the attached client answering the probe itself, the Homebrew and the
+verification), the Esc interrupt marker, the attached client answering the probe itself, the
 Homebrew and apt installs (the npm install and the distribution package ship the
 same binary), macOS and Windows, a real login or a real model, plan mode,
 compaction, MCP and other dialogs, the `PermissionRequest` hook, terminals

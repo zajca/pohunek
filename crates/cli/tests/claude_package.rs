@@ -920,6 +920,9 @@ fn a_transcript_bullet_is_not_a_spinner_line() {
         "\u{2722} Architecting\u{2026} (16s)",
         "* Jiving\u{2026}",
         "\u{273b} Sau\u{e9}ing\u{2026} (1m 5s \u{b7} \u{2193} 2.6k tokens)",
+        "\u{2736} Dilly-dallying\u{2026} (4s \u{b7} \u{2193} 12 tokens)",
+        "\u{2733} Compacting conversation\u{2026} (12s)",
+        "\u{2722} Beboppin\u{2019}\u{2026}",
     ] {
         let mut rows = current_frame("idle").rows;
         rows.insert(2, line.to_owned());
@@ -1716,17 +1719,16 @@ fn the_process_matchers_accept_the_observed_claude_process_forms() {
     assert!(matchers.matches(&process("sh", &[npm, "--resume", "abc"])));
 
     // The native installer runs `<root>/claude/versions/<release>`: the kernel
-    // name is the release, the command line the image or the launcher.
+    // name stays `claude`, the command line is the image or the launcher.
     let image = "/home/user/.local/share/claude/versions/2.1.309";
-    assert!(matchers.matches(&process("2.1.309", &["other"])));
+    assert!(matchers.matches(&process("claude", &[image])));
     assert!(matchers.matches(&process("sh", &[image, "--resume", "abc"])));
-    assert!(matchers.matches(&process("2.1.309", &["claude"])));
+    assert!(!matchers.matches(&process("2.1.309", &["other"])));
     assert!(!matchers.matches(&process(
         "sh",
         &["/home/user/.local/share/codex/versions/0.164.0"]
     )));
     assert!(!matchers.matches(&process("sh", &["/work/claude/versions/cache.db"])));
-    assert!(!matchers.matches(&process("2.1", &["other"])));
 
     // A script that merely carries `claude` in its name is not Claude.
     for (comm, cmdline) in [
@@ -3093,8 +3095,14 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
         .process_matchers()
         .expect("the manifest declares process matchers");
     let fact = process_fact_of(launch_pid);
+    // The native installer's image, started by its resolved path, is named
+    // for its release.
+    let native_image = fact.cmdline.first().is_some_and(|argv0| {
+        argv0.contains("/claude/versions/")
+            && fact.comm.chars().all(|c| c.is_ascii_digit() || c == '.')
+    });
     assert!(
-        ["claude", "claude.exe"].contains(&fact.comm.as_str()),
+        native_image || ["claude", "claude.exe"].contains(&fact.comm.as_str()),
         "an unexpected Claude process name: {fact:?}"
     );
     assert!(

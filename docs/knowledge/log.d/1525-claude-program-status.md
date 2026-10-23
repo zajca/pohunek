@@ -8,4 +8,4 @@ Claude session reports working, blocked and idle from Claude's own records,
 a visible dialog still wins, and the API-key dialog is a visible blocker. The
 spinner rule needs one verb word and an optional timer, so a transcript bullet
 no longer reads as a running turn, and the process matchers accept the native
-installer's version-named process. Package version 1.1.0.
+installer's `claude/versions/<release>` image. Package version 1.1.0.
