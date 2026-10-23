@@ -12,7 +12,8 @@ use pohunek_worker_protocol::{
 };
 
 use super::{
-    controller_connection, expiry, launch_claim_fixture, launch_report, send_hook, Connection,
+    controller_connection, expiry, launch_claim_fixture, launch_claim_fixture_running,
+    launch_report, send_hook, Connection,
 };
 use crate::server::{inspect_snapshot, write_request, Server};
 use crate::PtyOwner;
@@ -226,6 +227,10 @@ async fn a_provider_the_schema_or_the_launch_runtime_does_not_admit_is_refused()
     stop(&server, &pty).await;
 }
 
+/// A PTY child that outlives every write of a scenario. A child that exits after
+/// its first line leaves no open slave, and a macOS PTY write then fails with EIO.
+const WRITE_TARGET_SCRIPT: &str = "sleep 600 & wait";
+
 fn scope(lease_id: &LeaseId) -> RuntimeScope {
     RuntimeScope {
         lease_id: lease_id.clone(),
@@ -270,7 +275,7 @@ async fn write(
 
 #[tokio::test]
 async fn the_acknowledgement_carries_the_submit_mark_only_from_protocol_8() {
-    let (server, pty, _directory) = launch_claim_fixture().await;
+    let (server, pty, _directory) = launch_claim_fixture_running(WRITE_TARGET_SCRIPT).await;
     let (mut connection, lease_id) = controller_connection(&server);
 
     let started = monotonic_nanos();
@@ -298,7 +303,7 @@ async fn the_acknowledgement_carries_the_submit_mark_only_from_protocol_8() {
 
 #[tokio::test]
 async fn the_acknowledgement_carries_no_submit_mark_for_a_runtime_without_prompt_reports() {
-    let (server, pty, _directory) = launch_claim_fixture().await;
+    let (server, pty, _directory) = launch_claim_fixture_running(WRITE_TARGET_SCRIPT).await;
     let (connection, lease_id) = controller_connection(&server);
 
     for (index, launch_runtime) in ["shell", "codex"].into_iter().enumerate() {
