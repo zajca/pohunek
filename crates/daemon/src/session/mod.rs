@@ -8499,7 +8499,7 @@ fn clear_active_agent(
     entry.info.active_agent_pid = None;
     entry.info.active_agent_session_id = None;
     entry.info.active_agent_session_path = None;
-    if activity_reported {
+    if activity_reported || entry.info.state_source == StateSource::OscProgress {
         entry.info.activity = None;
         entry.info.state_source = StateSource::Process;
     }
