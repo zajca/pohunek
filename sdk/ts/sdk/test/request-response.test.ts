@@ -1,4 +1,4 @@
-import { describe, expect, jest, test } from "bun:test";
+import { afterEach, describe, expect, jest, test } from "bun:test";
 import {
   MAX_CONTROL_LINE_BYTES,
   MAX_SESSION_WAIT_MS,
@@ -64,6 +64,12 @@ function healthStep(): ScriptStep {
     }),
   };
 }
+
+// A failing await between useFakeTimers and useRealTimers must not leave fake
+// timers installed for the next test.
+afterEach(() => {
+  jest.useRealTimers();
+});
 
 describe("Client request/response", () => {
   test("call decodes a typed session.list output and sends method params", async () => {
@@ -1385,7 +1391,10 @@ describe("Client request/response", () => {
       let firstCall: Promise<unknown>;
       try {
         firstCall = client.call("daemon.health", null);
-        await daemon.nextRequest();
+        await Promise.race([
+          daemon.nextRequest(),
+          firstCall.then(() => { throw new Error("first call settled before reaching the daemon"); }),
+        ]);
         jest.advanceTimersByTime(SHARED_REQUEST_TIMEOUT_MS);
       } finally {
         jest.useRealTimers();

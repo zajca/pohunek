@@ -4,7 +4,7 @@ import { once } from "node:events";
 import type { Readable } from "node:stream";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, jest, test } from "bun:test";
+import { afterEach, describe, expect, jest, test } from "bun:test";
 import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, CLIENT_PROTOCOL_VERSIONS, type ProtocolError, type ProtocolEvent, type SessionInfo } from "@pohunek/protocol";
 import { startTestRelay, type DaemonTarget, type TestRelayHandle } from "@pohunek/testkit/bun-relay";
 import {
@@ -54,6 +54,12 @@ interface RelayFixture {
   attach(streamId: string): Promise<RawStream>;
   close(): Promise<void>;
 }
+
+// A failing await between useFakeTimers and useRealTimers must not leave fake
+// timers installed for the next test.
+afterEach(() => {
+  jest.useRealTimers();
+});
 
 describe("WebSocket transport through relay", () => {
   test("call decodes a typed session.list output and sends method params", async () => {
@@ -189,7 +195,10 @@ describe("WebSocket transport through relay", () => {
       let firstCall: Promise<unknown>;
       try {
         firstCall = client.call("daemon.health", null);
-        await fixture.daemon.nextRequest();
+        await Promise.race([
+          fixture.daemon.nextRequest(),
+          firstCall.then(() => { throw new Error("first call settled before reaching the daemon"); }),
+        ]);
         jest.advanceTimersByTime(RELAY_REQUEST_TIMEOUT_MS);
       } finally {
         jest.useRealTimers();
