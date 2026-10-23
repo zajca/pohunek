@@ -4842,6 +4842,7 @@ while True:
             wait: Some(SessionInputWait {
                 until: Some(vec![AgentActivity::Blocked]),
                 timeout_ms: Some(2_000),
+                allow_prompt_accepted: None,
             }),
         })
         .expect("waited input params"),

@@ -406,6 +406,35 @@ fn session_new_input_ack_is_refused_for_protocol_3_and_other_requests_pass() {
 }
 
 #[test]
+fn session_input_prompt_opt_in_is_dropped_for_protocol_3_not_refused() {
+    let golden = json!({
+        "session_id": "s-42", "text": "hi",
+        "wait": {"until": ["working"], "timeout_ms": 500}
+    });
+    let opted_in = json!({
+        "session_id": "s-42", "text": "hi",
+        "wait": {"until": ["working"], "timeout_ms": 500, "allow_prompt_accepted": true}
+    });
+    assert_eq!(
+        downgrade_request_params(v3(), method::SESSION_INPUT, opted_in.clone())
+            .expect("the opt-in is dropped, not refused"),
+        golden,
+        "a protocol 3 daemon receives the request it understands"
+    );
+    assert_eq!(
+        downgrade_request_params(PROTOCOL_VERSION, method::SESSION_INPUT, opted_in.clone())
+            .expect("the current protocol keeps it"),
+        opted_in
+    );
+    let waitless = json!({"session_id": "s-42", "text": "hi"});
+    assert_eq!(
+        downgrade_request_params(v3(), method::SESSION_INPUT, waitless.clone())
+            .expect("a request without a wait"),
+        waitless
+    );
+}
+
+#[test]
 fn session_fork_gains_an_optional_override_that_protocol_3_requests_never_carry() {
     use protocol::SessionForkParams;
 

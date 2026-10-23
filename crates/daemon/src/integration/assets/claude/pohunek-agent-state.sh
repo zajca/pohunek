@@ -3,12 +3,13 @@
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # POHUNEK_INTEGRATION_ID=@POHUNEK_AGENT_ID@
-# POHUNEK_INTEGRATION_VERSION=14
+# POHUNEK_INTEGRATION_VERSION=15
 #
 # Session and subagent lifecycle hook: report active-agent identity, capture the
 # agent's native session id for direct-session resume, release active-agent
 # state on clean session exit, journal sanitized child state, and report the
-# main agent's background task list at the end of each turn.
+# main agent's background task list at the end of each turn, and report that a
+# submitted prompt was accepted.
 # Fire-and-forget: every failure exits 0 without output so the hook can never
 # break the agent. Inside a pohunek session with python3 available, a run that
 # does not deliver its report appends one bounded line per reason to the hook
@@ -18,7 +19,7 @@ set -eu
 
 action="${1:-}"
 case "$action" in
-  session|release|subagent-start|subagent-stop|stop) ;;
+  session|release|subagent-start|subagent-stop|stop|prompt-submit) ;;
   *) exit 0 ;;
 esac
 
@@ -83,12 +84,14 @@ ACTION_RELEASE = "release"
 ACTION_SUBAGENT_START = "subagent-start"
 ACTION_SUBAGENT_STOP = "subagent-stop"
 ACTION_STOP = "stop"
+ACTION_PROMPT_SUBMIT = "prompt-submit"
 ACTIONS = (
     ACTION_SESSION,
     ACTION_RELEASE,
     ACTION_SUBAGENT_START,
     ACTION_SUBAGENT_STOP,
     ACTION_STOP,
+    ACTION_PROMPT_SUBMIT,
 )
 TIMESTAMP_MS_FACTOR = 1000
 SOCKET_TIMEOUT_SECS = 0.5
@@ -105,6 +108,9 @@ MAX_HOOK_INPUT_BYTES = 65536
 # task, a description and command of up to 1000 characters each, so 64 KiB is
 # too small. 1 MiB holds a long final message plus MAX_SNAPSHOT_TASKS tasks.
 MAX_STOP_HOOK_INPUT_BYTES = 1048576
+# The prompt-submit input carries the user's prompt. It is read in chunks of
+# this size and discarded, so prompt text never reaches a decoder or a log.
+PROMPT_DRAIN_CHUNK_BYTES = 65536
 # Mirrors the worker's snapshot task bound; a longer list is not sent at all.
 MAX_SNAPSHOT_TASKS = 256
 # Fields every snapshot task must carry as non-empty strings; one bad task voids the list.
@@ -489,9 +495,23 @@ def snapshot_tasks(parsed):
     return tasks, None
 
 
+def drain_prompt_input():
+    # Reads the prompt to its end without keeping or decoding any of it, so the
+    # agent never blocks on a full pipe and an oversized prompt still reports.
+    try:
+        with os.fdopen(3, "rb") as handle:
+            while handle.read(PROMPT_DRAIN_CHUNK_BYTES):
+                pass
+    except OSError:
+        pass
+
+
 def read_hook_input():
     # The fields this action needs and None, or {} and the trace reason and
     # detail that voided the input.
+    if action == ACTION_PROMPT_SUBMIT:
+        drain_prompt_input()
+        return {}, None
     limit = MAX_STOP_HOOK_INPUT_BYTES if action == ACTION_STOP else MAX_HOOK_INPUT_BYTES
     try:
         with os.fdopen(3, "rb") as handle:
@@ -749,6 +769,29 @@ def send_worker_snapshot(tasks):
     })
 
 
+def send_worker_prompt():
+    # Reports prompt acceptance to the worker once. The prompt waits on this
+    # hook, so there is no retry and no daemon fallback.
+    problem = worker_route_problem()
+    if problem is not None:
+        trace(*problem)
+        return
+    start_identity = agent_start_identity()
+    if start_identity is None:
+        return
+    send_worker({
+        "type": "prompt_accepted",
+        "runtime_id": worker_instance_id,
+        "provider": agent,
+        "pid": agent_pid,
+        "start_identity": start_identity,
+        "sequence": sequence,
+        "expires_at": (
+            datetime.now(timezone.utc) + timedelta(seconds=IDENTITY_TTL_SECS)
+        ).isoformat().replace("+00:00", "Z"),
+    })
+
+
 def send_request(method, params, suffix):
     # Sends one daemon request; True when the daemon asked for a retry.
     if retry is not None:
@@ -830,6 +873,15 @@ if action == ACTION_SUBAGENT_START:
 
 if action == ACTION_SUBAGENT_STOP:
     send_worker_subagent("subagent_stop")
+    raise SystemExit(0)
+
+if action == ACTION_PROMPT_SUBMIT:
+    # The agent injects this hook's output into the prompt context, so nothing
+    # reaches stdout or stderr whatever fails.
+    try:
+        send_worker_prompt()
+    except Exception:
+        trace("prompt_report_failed")
     raise SystemExit(0)
 
 if action == ACTION_STOP:

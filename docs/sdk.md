@@ -152,3 +152,22 @@ const result = await client.sessionWaitTurn({
 });
 console.log(result.reason, result.event, result.progress);
 ```
+
+A waited input (Rust `Client::session_input`, TypeScript `client.sessionInput`)
+confirms that the agent started on the text when its `wait.until` names
+`working`. Set `wait.allow_prompt_accepted` to let a Claude session's
+prompt-submit hook answer that wait when no `working` activity was observed. The
+result then has `prompt_accepted: true` and no `activity`, `activity_source` or
+`activity_revision`; the SDK helpers accept that shape only from a caller that
+opted in and asked for `working`, and reject it otherwise. A daemon that
+predates the option answers on activity alone, so `prompt_accepted` is absent.
+
+```ts
+// TypeScript — `working` is answered by activity or by the prompt-submit hook.
+const input = await client.sessionInput({
+  session_id: "s-41",
+  text: "run the tests",
+  wait: { until: ["working"], timeout_ms: 5_000, allow_prompt_accepted: true },
+});
+console.log(input.prompt_accepted ?? false, input.activity);
+```

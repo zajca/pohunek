@@ -62,6 +62,14 @@ impl Debug for InputPlan {
     }
 }
 
+/// Outcome of one completed control write plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteReceipt {
+    /// `CLOCK_MONOTONIC` nanoseconds read immediately before the write of the
+    /// plan's last fragment. Absent for a plan without fragments.
+    pub submit_mark_ns: Option<u64>,
+}
+
 /// Input-plan execution failure.
 #[derive(Debug, thiserror::Error)]
 pub enum InputError {
@@ -205,7 +213,7 @@ impl WriteCoordinator {
         namespace_id: &str,
         sequence: u64,
         plan: InputPlan,
-    ) -> Result<(), InputError> {
+    ) -> Result<WriteReceipt, InputError> {
         let fingerprint = fingerprint(&plan);
         let action = {
             let mut state = lock(&self.state);
@@ -263,7 +271,7 @@ impl WriteCoordinator {
         &self,
         namespace_id: &str,
         plan: InputPlan,
-    ) -> Result<(), InputError> {
+    ) -> Result<WriteReceipt, InputError> {
         let fingerprint = fingerprint(&plan);
         let action = {
             let mut state = lock(&self.state);
@@ -332,6 +340,7 @@ impl WriteCoordinator {
         tokio::spawn(async move { coordinator.execute_once(&fragments, None).await })
             .await
             .map_err(|_join_error| InputError::WriterTask)?
+            .map(|_receipt| ())
     }
 
     /// Writes the fragments in order while holding the execution lock.
@@ -342,7 +351,7 @@ impl WriteCoordinator {
         &self,
         fragments: &[InputFragment],
         stall: Option<Duration>,
-    ) -> Result<(), InputError> {
+    ) -> Result<WriteReceipt, InputError> {
         let total = fragments.iter().map(|fragment| fragment.bytes.len()).sum();
         let _execution = match stall {
             Some(stall) => match tokio::time::timeout(stall, self.execution.lock()).await {
@@ -358,16 +367,22 @@ impl WriteCoordinator {
             None => self.execution.lock().await,
         };
         let mut written = 0;
-        for fragment in fragments {
+        let mut submit_mark_ns = None;
+        for (index, fragment) in fragments.iter().enumerate() {
             let bytes = fragment.bytes.clone();
             let writer = Arc::clone(&self.writer);
-            let (accepted, result) = tokio::task::spawn_blocking(move || {
+            let is_last = index + 1 == fragments.len();
+            let (accepted, mark, result) = tokio::task::spawn_blocking(move || {
                 let mut writer = lock(&writer);
+                // Read with the writer held so no other writer's bytes land
+                // between the reading and this fragment's write.
+                let mark = is_last.then(crate::background::monotonic_nanos);
                 let (accepted, result) = write_counted(&mut **writer, &bytes, stall);
-                (accepted, result.and_then(|()| writer.flush()))
+                (accepted, mark, result.and_then(|()| writer.flush()))
             })
             .await
             .map_err(|_join_error| InputError::WriterTask)?;
+            submit_mark_ns = mark.or(submit_mark_ns);
             written += accepted;
             match result {
                 Ok(()) => {}
@@ -387,7 +402,7 @@ impl WriteCoordinator {
                 tokio::time::sleep(fragment.delay_after).await;
             }
         }
-        Ok(())
+        Ok(WriteReceipt { submit_mark_ns })
     }
 
     fn complete(&self, write_id: &str) {
@@ -432,8 +447,8 @@ fn write_counted(
 
 #[derive(Debug)]
 enum Action {
-    Join(watch::Receiver<Option<Result<(), StoredError>>>),
-    Execute(watch::Sender<Option<Result<(), StoredError>>>),
+    Join(watch::Receiver<Option<Result<WriteReceipt, StoredError>>>),
+    Execute(watch::Sender<Option<Result<WriteReceipt, StoredError>>>),
 }
 
 #[derive(Debug)]
@@ -470,7 +485,7 @@ enum DedupMode {
 #[derive(Debug)]
 struct DedupEntry {
     fingerprint: [u8; 32],
-    result: watch::Receiver<Option<Result<(), StoredError>>>,
+    result: watch::Receiver<Option<Result<WriteReceipt, StoredError>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -522,8 +537,8 @@ impl StoredError {
 }
 
 async fn wait_result(
-    mut receiver: watch::Receiver<Option<Result<(), StoredError>>>,
-) -> Result<(), InputError> {
+    mut receiver: watch::Receiver<Option<Result<WriteReceipt, StoredError>>>,
+) -> Result<WriteReceipt, InputError> {
     loop {
         if let Some(result) = receiver.borrow().clone() {
             return result.map_err(StoredError::into_input);

@@ -1215,6 +1215,9 @@ fn validate_input_wait_result(
             detail: "the daemon reported that delivered input was not accepted",
         });
     }
+    if result.activity.is_none() && wait.allow_prompt_accepted == Some(true) {
+        return validate_prompt_only_result(wait, result);
+    }
     let activity = result.activity.ok_or(ClientError::InputWaitContract {
         detail: "the response omitted the post-submission activity",
     })?;
@@ -1239,6 +1242,36 @@ fn validate_input_wait_result(
     if !target_matches {
         return Err(ClientError::InputWaitContract {
             detail: "the response activity did not match the requested wait target",
+        });
+    }
+    Ok(())
+}
+
+/// Checks a result that carries no activity: valid only for a caller that
+/// opted in to a prompt acceptance, asked for `working`, and received the
+/// acceptance with its runtime and epoch and without any invented activity.
+fn validate_prompt_only_result(
+    wait: &protocol::SessionInputWait,
+    result: &SessionInputResult,
+) -> Result<(), ClientError> {
+    let until = wait.until.as_deref().unwrap_or_default();
+    if result.prompt_accepted != Some(true) {
+        return Err(ClientError::InputWaitContract {
+            detail: "the response omitted the post-submission activity",
+        });
+    }
+    if !until.contains(&protocol::AgentActivity::Working) {
+        return Err(ClientError::InputWaitContract {
+            detail: "a prompt acceptance does not satisfy the requested wait target",
+        });
+    }
+    if result.activity_source.is_some()
+        || result.activity_revision.is_some()
+        || result.runtime.is_none()
+        || result.activity_epoch.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(ClientError::InputWaitContract {
+            detail: "the prompt acceptance response omitted its runtime and epoch or carried partial activity evidence",
         });
     }
     Ok(())
@@ -2767,6 +2800,7 @@ mod tests {
             wait: Some(protocol::SessionInputWait {
                 until: Some(vec![protocol::AgentActivity::Idle]),
                 timeout_ms: None,
+                allow_prompt_accepted: None,
             }),
         };
 
@@ -2796,6 +2830,7 @@ mod tests {
             wait: Some(protocol::SessionInputWait {
                 until: Some(vec![protocol::AgentActivity::Idle]),
                 timeout_ms: None,
+                allow_prompt_accepted: None,
             }),
         };
 
@@ -2837,6 +2872,7 @@ mod tests {
                 wait: Some(protocol::SessionInputWait {
                     until: None,
                     timeout_ms: Some(100),
+                    allow_prompt_accepted: None,
                 }),
             })
             .await
@@ -2880,6 +2916,7 @@ mod tests {
                     wait: Some(protocol::SessionInputWait {
                         until: Some(vec![protocol::AgentActivity::Idle]),
                         timeout_ms: Some(timeout_ms),
+                        allow_prompt_accepted: None,
                     }),
                 })
                 .await
@@ -2920,6 +2957,7 @@ mod tests {
             wait: Some(protocol::SessionInputWait {
                 until: Some(vec![protocol::AgentActivity::Idle]),
                 timeout_ms: None,
+                allow_prompt_accepted: None,
             }),
         };
 
@@ -2934,6 +2972,121 @@ mod tests {
         );
         let request = server.await.expect("capture server");
         assert_eq!(request.method(), protocol::method::SESSION_INPUT);
+    }
+
+    /// The hook-only success the daemon answers an opted-in `working` wait with.
+    fn prompt_only_result() -> serde_json::Value {
+        serde_json::json!({
+            "accepted": true,
+            "submitted": true,
+            "prompt_accepted": true,
+            "runtime": {"worker_instance_id": "runtime-1", "runtime_generation": "1"},
+            "activity_epoch": "daemon-epoch",
+        })
+    }
+
+    /// Sends one waited input through a dedicated-connection fixture that
+    /// answers `result`, and returns the client's verdict with the request the
+    /// fixture captured.
+    async fn waited_input_against(
+        result: serde_json::Value,
+        until: Vec<protocol::AgentActivity>,
+        allow_prompt_accepted: Option<bool>,
+    ) -> (Result<SessionInputResult, ClientError>, Request) {
+        let (address, server) = spawn_probing_capture_server(result).await;
+        let mut client = Client::connect_trusted_tcp_addr_with_options(
+            "fixture-remote",
+            address,
+            no_origin_options(),
+        )
+        .await
+        .expect("connect remote");
+        let verdict = client
+            .session_input(SessionInputParams {
+                session_id: SessionId("s-target".to_owned()),
+                text: "hello".to_owned(),
+                wait: Some(protocol::SessionInputWait {
+                    until: Some(until),
+                    timeout_ms: None,
+                    allow_prompt_accepted,
+                }),
+            })
+            .await;
+        (verdict, server.await.expect("capture server"))
+    }
+
+    #[tokio::test]
+    async fn input_wait_accepts_a_prompt_only_success_from_an_opted_in_working_wait() {
+        let (verdict, request) = waited_input_against(
+            prompt_only_result(),
+            vec![protocol::AgentActivity::Working],
+            Some(true),
+        )
+        .await;
+
+        let result = verdict.expect("the acceptance satisfies the opted-in working wait");
+        assert_eq!(result.prompt_accepted, Some(true));
+        assert_eq!(result.activity, None);
+        assert_eq!(request.params()["wait"]["allow_prompt_accepted"], true);
+    }
+
+    #[tokio::test]
+    async fn input_wait_rejects_a_prompt_only_success_that_the_caller_did_not_earn() {
+        for (name, result, until, opt_in) in [
+            (
+                "not opted in",
+                prompt_only_result(),
+                vec![protocol::AgentActivity::Working],
+                None,
+            ),
+            (
+                "an idle wait",
+                prompt_only_result(),
+                vec![protocol::AgentActivity::Idle],
+                Some(true),
+            ),
+            (
+                "no acceptance claimed",
+                serde_json::json!({
+                    "accepted": true,
+                    "runtime": {"worker_instance_id": "runtime-1", "runtime_generation": "1"},
+                    "activity_epoch": "daemon-epoch",
+                }),
+                vec![protocol::AgentActivity::Working],
+                Some(true),
+            ),
+            (
+                "partial activity evidence",
+                {
+                    let mut partial = prompt_only_result();
+                    partial["activity_revision"] = serde_json::json!("3");
+                    partial
+                },
+                vec![protocol::AgentActivity::Working],
+                Some(true),
+            ),
+            (
+                "no epoch",
+                {
+                    let mut unscoped = prompt_only_result();
+                    unscoped
+                        .as_object_mut()
+                        .expect("object")
+                        .remove("activity_epoch");
+                    unscoped
+                },
+                vec![protocol::AgentActivity::Working],
+                Some(true),
+            ),
+        ] {
+            let (verdict, _request) = waited_input_against(result, until, opt_in).await;
+            let error = verdict.expect_err(name);
+            assert_eq!(
+                error.to_protocol_error().code,
+                "session_input_wait_contract_mismatch",
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3028,6 +3181,42 @@ mod tests {
             let request: Request = serde_json::from_str(&line).expect("decode request");
             write_test_response(&mut stream, &request, result).await;
             request
+        });
+        (address, server)
+    }
+
+    /// Like [`spawn_dedicated_capture_server`] for a request that may be
+    /// version dependent: the dedicated connection then first learns the
+    /// daemon's version with a `daemon.health` probe, which the fixture
+    /// answers, and the fixture returns the request that follows it.
+    async fn spawn_probing_capture_server(
+        result: Value,
+    ) -> (SocketAddr, tokio::task::JoinHandle<Request>) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind probing fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let (_idle_stream, _) = listener.accept().await.expect("accept shared client");
+            let (stream, _) = listener.accept().await.expect("accept dedicated client");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                stream.read_line(&mut line).await.expect("read request");
+                let request: Request = serde_json::from_str(&line).expect("decode request");
+                if request.method() == protocol::method::DAEMON_HEALTH {
+                    write_test_response(
+                        &mut stream,
+                        &request,
+                        serde_json::json!({"healthy": true}),
+                    )
+                    .await;
+                    continue;
+                }
+                write_test_response(&mut stream, &request, result).await;
+                return request;
+            }
         });
         (address, server)
     }

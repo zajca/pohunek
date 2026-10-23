@@ -410,6 +410,24 @@ impl ProtocolError {
         )
     }
 
+    /// The timeout of a waited input that may be satisfied by a prompt
+    /// acceptance: Enter was written and acknowledged while neither the
+    /// requested activity nor the agent's prompt-submit report followed it.
+    #[must_use]
+    pub fn session_input_timeout_unacknowledged(session_id: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "session_input_timeout",
+            format!(
+                "Enter was written to session {session_id}, but neither the requested activity nor a prompt acceptance followed it before the input deadline"
+            ),
+            Some(
+                "the input was submitted; inspect the current session before deciding whether to resend, and do not retry blindly"
+                    .to_owned(),
+            ),
+        )
+    }
+
     /// The rejection a daemon that cannot pace delayed-submit input returns for
     /// a waited input on such framing, before any byte is written. Daemons
     /// that pace it do not return this code; clients still recognize it.

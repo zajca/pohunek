@@ -2266,6 +2266,7 @@ fn input_params(
         wait: (!wait_until.is_empty() || timeout_ms.is_some()).then(|| SessionInputWait {
             until: Some(wait_until.to_vec()),
             timeout_ms,
+            allow_prompt_accepted: Some(true),
         }),
     }
 }
@@ -2981,6 +2982,10 @@ fn render_remove_human(session_id: &str, result: &SessionRemoveResult) -> String
     output
 }
 
+/// Source label shown when only the agent's prompt-submit hook acknowledged
+/// the input.
+const PROMPT_HOOK_SOURCE_LABEL: &str = "prompt-submit-hook";
+
 fn render_input_human(session_id: &str, result: &SessionInputResult) -> String {
     let disposition = if result.accepted {
         "accepted"
@@ -2997,6 +3002,9 @@ fn render_input_human(session_id: &str, result: &SessionInputResult) -> String {
             "session {session_id}: input {disposition}{submitted} activity={} source={}\n",
             activity_label(activity),
             state_source_label(source)
+        ),
+        _ if result.prompt_accepted == Some(true) => format!(
+            "session {session_id}: input {disposition}{submitted} prompt_accepted=true source={PROMPT_HOOK_SOURCE_LABEL}\n"
         ),
         _ => format!("session {session_id}: input {disposition}\n"),
     }
@@ -3930,6 +3938,7 @@ mod tests {
                 activity_epoch: None,
                 activity_revision: None,
                 submitted: None,
+                prompt_accepted: None,
             },
         );
 
@@ -3954,6 +3963,7 @@ mod tests {
                 activity_epoch: Some("d-epoch-1".to_owned()),
                 activity_revision: Some(protocol::ActivityRevision::new(2)),
                 submitted: None,
+                prompt_accepted: None,
             },
         );
 

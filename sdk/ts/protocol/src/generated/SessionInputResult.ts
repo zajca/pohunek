@@ -39,4 +39,12 @@ export type SessionInputResult = {
    * from daemons that predate the field.
    */
   submitted?: boolean;
+  /**
+   * Present only when the request set
+   * [`SessionInputWait::allow_prompt_accepted`]. `true` when the agent's
+   * prompt-submit hook reported acceptance of this input before the result;
+   * the activity fields are then absent unless activity evidence also
+   * arrived.
+   */
+  prompt_accepted?: boolean;
 };

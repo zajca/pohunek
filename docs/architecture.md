@@ -521,6 +521,13 @@ origin and annotation. A connection that negotiated v7 sees none of those fields
 so the claim reads as a provider-only active claim there and in an older reader
 of the journal.
 
+Private worker protocol v8 also carries prompt delivery evidence. The write
+acknowledgement reports `submit_mark_ns`, the worker's `CLOCK_MONOTONIC` reading
+taken just before the plan's last fragment is written, and the inspect snapshot
+reports `prompt_accepted_sequence`, the last applied prompt report of the
+runtime. A connection that negotiated v7 sees neither field, and the daemon then
+never matches an acceptance to a submission.
+
 Two properties of the private worker protocol carry the daemon's proof that a
 forwarded request was rejected, so a change to either needs the settlement rule
 below revisited. First, the worker handles the requests of one control
@@ -1053,7 +1060,7 @@ States tracked: at least `working`, `blocked`/`waiting_approval`, `idle`, `done`
 `blocked` signal is the trickiest and is validated per agent and agent-CLI
 version.
 
-Hooks have two separate roles:
+Hooks have separate roles:
 
 - **Native recovery binding.** A launch-agent `SessionStart` hook prefers the
   worker socket and posts the agent's session ID or transcript path. The worker
@@ -1135,6 +1142,19 @@ Hooks have two separate roles:
   and the reporters retry it within their hook timeout. Running children become `lost` when
   their PTY runtime terminates. This state is independent of the parent
   session's coarse `activity` and survives daemon and client reconnects.
+- **Prompt delivery evidence (Claude only).** The Claude state hook registered
+  for `UserPromptSubmit` sends the worker a `prompt_accepted` report for each
+  submitted prompt. The hook drains its input without decoding or keeping it,
+  prints nothing, exits 0 on every path and makes one worker attempt with no
+  daemon fallback; the report carries the provider, the reporting process and
+  the hook's own `CLOCK_MONOTONIC` start time. The worker accepts it only from
+  the process its journal names as the session's launch identity, so a nested
+  `claude -p`, another provider and a shell-hosted Claude are refused, and only
+  with a sequence ahead of the last applied one. It keeps that sequence in
+  memory, and the daemon reads it from the periodic inspect snapshot. It is
+  delivery evidence for a waited input, never activity: it moves no activity
+  revision, emits no `agent_state` event, opens or closes no turn, and never
+  arms the input evidence of a turn.
 
 Live state remains detector-first: OSC, screen, PTY activity, and process state
 continue to drive normal activity transitions. Notification hooks still target
@@ -1272,6 +1292,28 @@ exit returns `session_not_running`; replacement returns
 response unless it includes the matching activity, source, runtime identity,
 activity epoch, and activity revision, preventing a same-version daemon that
 ignored the additive `wait` request from confirming delivery.
+
+A caller that opts in with `wait.allow_prompt_accepted` lets prompt delivery
+evidence answer a `working` target when no `working` activity was observed.
+The worker reads `CLOCK_MONOTONIC` just before it writes the last fragment of
+the plan that carries Enter and returns it in the write acknowledgement
+(`submit_mark_ns`, worker protocol 8 and newer); the hook reads the same clock
+when it starts. A prompt acceptance answers the wait only when its sequence is
+above that mark, it names the submission's runtime, the daemon received it
+before the deadline, and the agent was not `working` at the boundary: a busy
+agent queues the input, and its own `working` evidence answers. The result then
+carries `prompt_accepted: true` and no activity, source or revision, because
+no activity was observed. An opted-in result states `prompt_accepted` whatever
+answered it. An acceptance never answers an `idle` target and never stands in
+for the `working` evidence delayed-submit framing needs first: the daemon
+imports it up to one 100 ms poll after the agent read the prompt, before the
+agent drew a spinner, so an `idle` restatement in that gap would read as a
+finished turn. When neither kind of evidence arrives the wait ends at its
+deadline with `session_input_timeout`, and for an opted-in `working` wait the
+message names both. `session new --input-ack-timeout-ms` counts an acceptance
+as the acknowledgement. A turn the agent starts on its own between the Enter
+write and the agent reading Enter makes the wait succeed on that report; the
+typed prompt is then queued, so an acceptance means submitted or queued.
 
 ### Hermes operator plugin
 

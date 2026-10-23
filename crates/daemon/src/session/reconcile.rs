@@ -446,6 +446,7 @@ impl JournalEvidence {
             hook_schema: self.hook_schema.clone(),
             background: None,
             active_identity_revision: None,
+            prompt_accepted_sequence: None,
             drains_streams_on_terminal_ack: false,
         })
     }
@@ -4161,6 +4162,8 @@ impl SessionRegistry {
             entry_incarnation: super::next_entry_incarnation(),
             agent_incarnation: 0,
             activity_evidence: VecDeque::new(),
+            prompt_acceptances: VecDeque::new(),
+            prompt_sequence_seen: None,
             input_gate: Arc::new(Mutex::new(())),
             identity_commit: Arc::new(Mutex::new(())),
             // The snapshot's identity state was applied above, so its revision
@@ -4455,6 +4458,8 @@ impl SessionRegistry {
             entry_incarnation: super::next_entry_incarnation(),
             agent_incarnation: 0,
             activity_evidence: VecDeque::new(),
+            prompt_acceptances: VecDeque::new(),
+            prompt_sequence_seen: None,
             input_gate: Arc::new(Mutex::new(())),
             identity_commit: Arc::new(Mutex::new(())),
             identity_fence: None,
@@ -11876,6 +11881,7 @@ while os.getppid() == parent:
             hook_schema: Some("identity-subagent-v1".to_owned()),
             background: None,
             active_identity_revision: None,
+            prompt_accepted_sequence: None,
             drains_streams_on_terminal_ack: false,
         }
     }
@@ -12191,6 +12197,7 @@ handler = "codex-hook-v1"
             handlers: &[],
             identity_providers: &[],
             subagent_providers: &["codex"],
+            prompt_providers: &[],
             actions: &[
                 pohunek_worker_protocol::HookAction::SubagentStart,
                 pohunek_worker_protocol::HookAction::SubagentStop,
@@ -12278,6 +12285,7 @@ handler = "codex-hook-v1"
             handlers: &[],
             identity_providers: &["codex", "claude"],
             subagent_providers: &[],
+            prompt_providers: &[],
             actions: &[HookAction::IdentityReport, HookAction::IdentityRelease],
             reference_kinds: &[
                 pohunek_worker_protocol::ReferenceKind::Id,
@@ -12340,6 +12348,7 @@ handler = "codex-hook-v1"
             handlers: &[],
             identity_providers: &["codex", "claude"],
             subagent_providers: &[],
+            prompt_providers: &[],
             actions: &[HookAction::IdentityReport],
             reference_kinds: &[ReferenceKind::Id, ReferenceKind::Path],
             ancestry: AncestryMatcher::ManagedPtyDescendant,

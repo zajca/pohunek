@@ -32,6 +32,7 @@ import {
   startTcpDaemon,
   startUnixDaemon,
   type MockDaemon,
+  type ScriptStep,
 } from "./mock-daemon";
 
 // The dedicated-routing scenarios prove that a call on a dedicated connection
@@ -46,6 +47,23 @@ const DEDICATED_REPLY_DELAY_MS = 1_500;
 const DEDICATED_WIRE_WAIT_MS = 3_000;
 // Bun's per-test timeout for a scenario with two delayed replies.
 const DEDICATED_SCENARIO_TIMEOUT_MS = 10_000;
+
+/**
+ * The `daemon.health` reply that selects the current protocol version. A
+ * delayed step leaves the connection open, so the request that follows the
+ * probe is served on it.
+ */
+function healthStep(): ScriptStep {
+  return {
+    kind: "delay",
+    ms: 0,
+    line: (line) => okResponseLine(requestIdFromLine(line), {
+      status: "ok",
+      daemon_version: "test",
+      protocol_version: PROTOCOL_VERSION,
+    }),
+  };
+}
 
 describe("Client request/response", () => {
   test("call decodes a typed session.list output and sends method params", async () => {
@@ -1044,6 +1062,89 @@ describe("Client request/response", () => {
       await client.close();
     } finally {
       await daemon.close();
+    }
+  });
+
+  test("an opted-in working wait accepts a prompt-only success", async () => {
+    const promptOnly = {
+      accepted: true,
+      submitted: true,
+      prompt_accepted: true,
+      runtime: { worker_instance_id: "runtime-target", runtime_generation: "1" },
+      activity_epoch: "d-epoch-1",
+    } as const;
+    const daemon = await startUnixDaemon([
+      healthStep(),
+      { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), promptOnly) },
+    ]);
+    try {
+      const client = await connectClient(daemon);
+
+      expect(await client.sessionInput({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until: ["working"], allow_prompt_accepted: true },
+      })).toEqual(promptOnly);
+
+      expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe("daemon.health");
+      const sent = parseRequestLine(await daemon.nextRequest());
+      expect(sent["method"]).toBe("session.input");
+      expect(sent["params"]).toEqual({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until: ["working"], allow_prompt_accepted: true },
+      });
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("a prompt-only success is rejected unless the caller earned it", async () => {
+    const promptOnly = {
+      accepted: true,
+      submitted: true,
+      prompt_accepted: true,
+      runtime: { worker_instance_id: "runtime-target", runtime_generation: "1" },
+      activity_epoch: "d-epoch-1",
+    };
+    const unscoped: Record<string, unknown> = { ...promptOnly };
+    delete unscoped["activity_epoch"];
+    const unclaimed: Record<string, unknown> = { ...promptOnly };
+    delete unclaimed["prompt_accepted"];
+    const cases = [
+      { name: "not opted in", result: promptOnly, until: ["working"], optIn: undefined, probes: false },
+      { name: "an idle wait", result: promptOnly, until: ["idle"], optIn: true, probes: true },
+      { name: "no acceptance claimed", result: unclaimed, until: ["working"], optIn: true, probes: true },
+      {
+        name: "partial activity evidence",
+        result: { ...promptOnly, activity_revision: "3" },
+        until: ["working"],
+        optIn: true,
+        probes: true,
+      },
+      { name: "no epoch", result: unscoped, until: ["working"], optIn: true, probes: true },
+    ] as const;
+    for (const { name, result, until, optIn, probes } of cases) {
+      const reply: ScriptStep = {
+        kind: "reply",
+        line: (line) => okResponseLine(requestIdFromLine(line), result),
+      };
+      const daemon = await startUnixDaemon(probes ? [healthStep(), reply] : [reply]);
+      try {
+        const client = await connectClient(daemon);
+        const error = await expectClientError(client.sessionInput({
+          session_id: "s-target",
+          text: "hello",
+          wait: optIn === undefined
+            ? { until: [...until] }
+            : { until: [...until], allow_prompt_accepted: optIn },
+        }));
+        expect(`${name}: ${error.toProtocolError().code}`).toBe(`${name}: session_input_wait_contract_mismatch`);
+        await client.close();
+      } finally {
+        await daemon.close();
+      }
     }
   });
 

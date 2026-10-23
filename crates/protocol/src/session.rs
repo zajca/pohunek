@@ -749,6 +749,14 @@ pub struct SessionInputWait {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub timeout_ms: Option<u32>,
+    /// Opts in to a `working` target being satisfied by the agent's own
+    /// prompt-submit hook when no `working` activity was observed. The result
+    /// then carries [`SessionInputResult::prompt_accepted`], and its activity
+    /// fields are absent. A daemon that predates the field ignores it and
+    /// answers on activity alone, without `prompt_accepted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub allow_prompt_accepted: Option<bool>,
 }
 
 /// Result returned by `session.input`.
@@ -784,6 +792,14 @@ pub struct SessionInputResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub submitted: Option<bool>,
+    /// Present only when the request set
+    /// [`SessionInputWait::allow_prompt_accepted`]. `true` when the agent's
+    /// prompt-submit hook reported acceptance of this input before the result;
+    /// the activity fields are then absent unless activity evidence also
+    /// arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub prompt_accepted: Option<bool>,
 }
 
 /// Reports an invalid bounded-observation request.

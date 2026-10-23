@@ -661,6 +661,9 @@ struct State {
     subagent_evidence: SubagentEvidence,
     /// Newest identity sequence of each recently reporting process.
     identity_marks: IdentityMarks,
+    /// Sequence of the last applied prompt-acceptance report of this runtime,
+    /// in the hooks' monotonic clock. It is kept in memory only.
+    prompt_accepted_sequence: Option<u64>,
 }
 
 impl State {
@@ -682,6 +685,7 @@ impl State {
             orphan_stops: OrphanStops::default(),
             subagent_evidence: SubagentEvidence::default(),
             identity_marks: IdentityMarks::default(),
+            prompt_accepted_sequence: None,
         }
     }
 }
@@ -1761,7 +1765,7 @@ async fn write_request(
             })
             .collect(),
     };
-    match control_input_id(&write_id, lease_id.as_str())? {
+    let receipt = match control_input_id(&write_id, lease_id.as_str())? {
         ControlInputId::Namespaced { sequence } => {
             pty.input()
                 .execute_control(lease_id.as_str(), sequence, local)
@@ -1770,10 +1774,14 @@ async fn write_request(
         ControlInputId::Legacy => pty.input().execute_legacy(&producer_id, local).await,
     }
     .map_err(input_control_error)?;
+    let reports_prompt_evidence = connection
+        .selected_version
+        .is_some_and(|version| version >= protocol::PROMPT_EVIDENCE_VERSION);
     Ok(ResponseKind::WriteCompleted {
         acknowledgement: WriteAck {
             write_id,
             bytes_written: byte_len,
+            submit_mark_ns: receipt.submit_mark_ns.filter(|_| reports_prompt_evidence),
         },
     })
 }
@@ -2076,6 +2084,9 @@ async fn inspect_snapshot(
         hook_schema: state.journal.hook_schema.clone(),
         background: state.journal.background.clone(),
         active_identity_revision: forwarding.then_some(state.journal.active_identity_revision),
+        prompt_accepted_sequence: state
+            .prompt_accepted_sequence
+            .filter(|_| version >= protocol::PROMPT_EVIDENCE_VERSION),
         drains_streams_on_terminal_ack: true,
     })
 }
@@ -3759,6 +3770,16 @@ enum HookRequest {
         outcome: Option<JournalSubagentPhase>,
     },
     SubagentSnapshot(SnapshotRequest),
+    PromptAccepted {
+        #[serde(rename = "runtime_id")]
+        worker_instance_id: String,
+        provider: String,
+        pid: u32,
+        start_identity: u64,
+        /// Monotonic time taken when the hook started, before it read its input.
+        sequence: u64,
+        expires_at: String,
+    },
     NotificationCreate {
         #[serde(rename = "runtime_id")]
         worker_instance_id: String,
@@ -4462,6 +4483,38 @@ where
                 .await
                 .map_err(|error| WorkerError::Protocol(error.to_string()));
         }
+        HookRequest::PromptAccepted {
+            worker_instance_id,
+            provider,
+            pid,
+            start_identity,
+            sequence,
+            expires_at,
+        } => {
+            let ok = apply_prompt_accepted(
+                &shared,
+                PromptAcceptedClaim {
+                    worker_instance_id: &worker_instance_id,
+                    provider: &provider,
+                    reporter: Reporter {
+                        pid,
+                        start_identity,
+                    },
+                    sequence,
+                    expires_at: &expires_at,
+                },
+                peer,
+            )
+            .await?;
+            return writer
+                .write(&HookResponse {
+                    ok,
+                    launch_identity_accepted: false,
+                    launch_identity_status: LaunchClaimStatus::NotApplicable,
+                })
+                .await
+                .map_err(|error| WorkerError::Protocol(error.to_string()));
+        }
         HookRequest::NotificationCreate {
             worker_instance_id,
             provider,
@@ -4575,6 +4628,99 @@ where
         );
     }
     written
+}
+
+/// One prompt-acceptance report as the hook sent it.
+struct PromptAcceptedClaim<'a> {
+    worker_instance_id: &'a str,
+    provider: &'a str,
+    reporter: Reporter,
+    /// Monotonic time the hook started at.
+    sequence: u64,
+    expires_at: &'a str,
+}
+
+/// Admits one prompt-acceptance report and keeps its sequence in memory.
+///
+/// A report is applied only for the current running runtime, from the process
+/// the worker journaled as the session's launch process, with a sequence ahead
+/// of the last applied one. It changes no journal field, identity or subagent
+/// row: the daemon reads the sequence from the next inspect snapshot as
+/// delivery evidence for a submitted prompt. The stored sequence is clamped to
+/// the worker clock, so a forged future reading cannot outrank later reports.
+///
+/// # Errors
+///
+/// Returns an error when the runtime has no hook schema ancestry after
+/// admission.
+async fn apply_prompt_accepted(
+    shared: &Shared,
+    claim: PromptAcceptedClaim<'_>,
+    peer: &PeerContext,
+) -> Result<bool, WorkerError> {
+    let mut guard = shared.state.lock().await;
+    let state = &mut *guard;
+    let current_runtime = state.worker_instance_id.as_ref().map(ToString::to_string);
+    let admitted = admit_hook(
+        state.hook_schema,
+        HookAction::PromptAccepted,
+        claim.provider,
+        state.launch_agent_base.as_deref(),
+    );
+    let inadmissible = hook_claim_admissible(
+        admitted.as_ref().err().copied(),
+        current_runtime.as_deref() == Some(claim.worker_instance_id),
+        state.phase == WireRuntimePhase::Running,
+    )
+    .or_else(|| (!valid_identity_expiry(claim.expires_at)).then_some(RejectReason::ClaimExpired));
+    if let Some(reason) = inadmissible {
+        reject_identity(shared, "prompt_accepted", reason, peer);
+        return Ok(false);
+    }
+    let process_valid = admitted.is_ok_and(|schema| {
+        state.pty.as_ref().is_some_and(|pty| {
+            hook_claim_valid(
+                shared,
+                "prompt_accepted",
+                peer,
+                schema.ancestry,
+                claim.reporter.pid,
+                claim.reporter.start_identity,
+                pty.identity().pid,
+            )
+        })
+    });
+    if !process_valid {
+        return Ok(false);
+    }
+    let rejection = match state.journal.launch_identity.as_ref() {
+        None => Some(RejectReason::LaunchIdentityPending),
+        Some(launch) if !is_reporter(&launch.process, claim.reporter) => {
+            Some(RejectReason::PromptReporterNotLaunch)
+        }
+        Some(_)
+            if state
+                .prompt_accepted_sequence
+                .is_some_and(|last| claim.sequence <= last) =>
+        {
+            Some(RejectReason::SequenceStale)
+        }
+        Some(_) => None,
+    };
+    if let Some(reason) = rejection {
+        reject_identity(shared, "prompt_accepted", reason, peer);
+        return Ok(false);
+    }
+    state.prompt_accepted_sequence = Some(crate::background::clamp_mark(claim.sequence));
+    event!(
+        name: "worker.prompt_accepted",
+        Level::INFO,
+        worker.id = %shared.worker_id,
+        session.id = %shared.session_id,
+        prompt.outcome = "applied",
+        "prompt acceptance recorded",
+    );
+    Ok(true)
 }
 
 /// Time an identity report spent before its answer, split by cause.
@@ -7672,6 +7818,7 @@ mod launch_layout_tests;
 mod tests {
     mod controller_cleanup;
     mod forwarded_identity;
+    mod prompt_accepted;
 
     use std::time::Duration;
 
@@ -8269,6 +8416,7 @@ mod tests {
             handlers: &[],
             identity_providers: &["claude"],
             subagent_providers: &["codex"],
+            prompt_providers: &[],
             actions: &[HookAction::SubagentStart],
             reference_kinds: &[],
             ancestry: protocol::AncestryMatcher::ManagedPtyDescendant,
@@ -8306,6 +8454,7 @@ mod tests {
             handlers: &[],
             identity_providers: &["claude"],
             subagent_providers: &["codex"],
+            prompt_providers: &[],
             actions: &[HookAction::SubagentStart, HookAction::SubagentStop],
             reference_kinds: &[],
             ancestry: protocol::AncestryMatcher::ManagedPtyDescendant,
@@ -8716,6 +8865,7 @@ mod tests {
             handlers: &[],
             identity_providers: &["hermes", "codex"],
             subagent_providers: &[],
+            prompt_providers: &[],
             actions: &[HookAction::IdentityReport],
             reference_kinds: &[],
             ancestry: protocol::AncestryMatcher::ManagedPtyDescendant,

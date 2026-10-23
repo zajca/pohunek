@@ -108,6 +108,12 @@ pub enum RejectReason {
     /// A forwarded report carries a label or session annotation outside its
     /// bounds.
     ForwardedFieldInvalid,
+    /// A prompt-acceptance report came from a process other than the session's
+    /// launch process.
+    PromptReporterNotLaunch,
+    /// A prompt-acceptance report arrived before the worker accepted a launch
+    /// identity, so there is no launch process to compare it with.
+    LaunchIdentityPending,
 }
 
 impl RejectReason {
@@ -135,6 +141,8 @@ impl RejectReason {
             Self::NotificationInvalid => "notification_invalid",
             Self::ReleaseUnmatched => "release_unmatched",
             Self::ForwardedFieldInvalid => "forwarded_field_invalid",
+            Self::PromptReporterNotLaunch => "prompt_reporter_not_launch",
+            Self::LaunchIdentityPending => "launch_identity_pending",
         }
     }
 }

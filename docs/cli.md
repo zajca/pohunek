@@ -104,7 +104,7 @@ cannot be pinned: the operation fails before its first connection with
 | `pohunek session list` | List sessions, including a `running/recent` subagent count and a `BACKGROUND` column of compact per-kind counts of the latest background snapshot (`a` subagent, `s` shell, `m` monitor, `w` workflow, `t` teammate, `o` every other kind; zero kinds omitted; `-` when no snapshot has been reported, `0` when the latest snapshot lists no task). Example row: `2a 2s 1m`. Repeat `--filter state=running`, `--meta-eq key=value`, and `--meta-has key` to combine predicates with AND. Metadata values split at the first `=` and may be empty; keys are opaque. `-q` prints ids only. |
 | `pohunek session inspect <target>` | Full logical session record: agent state, current/recent subagents, runtime state and generation, cwd, project, branch, worktree, recovery binding. Adds `background_items` (`<none>` without a snapshot, `0` for an empty one) and `background_observed` (age of the snapshot, `<none>` without one), then one line per subagent with its background label and age, and one `background [<kind>]: <status> <program> <label> first seen >= <age>` line per other background item. An absent program or label prints `-`. Labels and programs are escaped for the terminal. |
 | `pohunek attach <target>` | Attach the current terminal; `Ctrl-]` detaches. |
-| `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing; use `--stdin` for non-argv input. `--until <activity>` (repeatable) and `--timeout <ms>` wait for the agent's reaction in the same call; `--until working` confirms that the agent started on the input (`submitted: true`). |
+| `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing; use `--stdin` for non-argv input. `--until <activity>` (repeatable) and `--timeout <ms>` wait for the agent's reaction in the same call; `--until working` confirms that the agent started on the input (`submitted: true`), by activity or, on a Claude session, by the prompt-submit hook (`prompt_accepted: true`). |
 | `pohunek session screen <target>` | Read the current rendered terminal; `--json` preserves runtime identity, watermark, geometry, cursor, and visible lines. A stopped or finished session answers `session_terminal_unavailable`. |
 | `pohunek session read <target> [--source <source>] [--lines <n>] [--format <format>] [--json]` | Read a bounded terminal capture; the source defaults to the current visible screen. |
 | `pohunek session resize <target> --cols <n> --rows <n> [--json]` | Resize a managed session terminal. |
@@ -347,7 +347,13 @@ daemon-paced writes: the daemon types the text, waits out the delay, re-checks
 the agent, and only then presses Enter. Use `--until working` to confirm that the
 agent started on the input; an `idle` target on such a profile counts only after
 `working` followed the submit, because the prompt box reads as idle until Enter
-is written. A `--timeout` that is not longer than the profile's submit delay writes nothing and fails with `session_input_timeout`. A successful waited input reports `submitted: true`. To follow a
+is written. A `--timeout` that is not longer than the profile's submit delay writes nothing and fails with `session_input_timeout`. A successful waited input reports `submitted: true`. On a Claude
+session whose hooks are current, the prompt-submit hook also answers a
+`--until working` wait when no `working` activity was observed: the JSON result
+has `prompt_accepted: true` and no `activity`, and the human line reads
+`session s-… input accepted submitted=true prompt_accepted=true
+source=prompt-submit-hook`. If neither the activity nor that report arrives,
+the wait ends in `session_input_timeout` and the message says so. To follow a
 whole turn, wait with `session wait`:
 
 ```bash

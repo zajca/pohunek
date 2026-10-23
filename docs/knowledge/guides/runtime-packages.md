@@ -138,8 +138,9 @@ hook_schema = "identity-subagent-v1"
 Core owns the schemas: `identity-v1` (identity, release, notification; only the
 PTY root itself, reporting in process while it runs the frozen launch
 entrypoint, may set or update the launch identity) and
-`identity-subagent-v1` (the same plus subagent start and stop; the launch
-identity comes from the earliest process named for the provider). Under
+`identity-subagent-v1` (the same plus subagent start and stop, the subagent
+snapshot and, for Claude only, the prompt-accepted report; the launch identity
+comes from the earliest process named for the provider). Under
 `identity-subagent-v1` a hook, which runs as a descendant of the launch
 process, files that process's report, so any process the launch process
 starts can file it: the agent's process tree runs as the owner and is not an

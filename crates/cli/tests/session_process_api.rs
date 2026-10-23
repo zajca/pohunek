@@ -50,6 +50,7 @@ enum Scenario {
     OutputRuntimeChanged,
     SlowWait,
     SlowInput,
+    PromptAcceptedInput,
     NoReplyToNew,
     WaitTimeout,
     OutputLogSafety,
@@ -801,6 +802,15 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
             let mut result = session(SESSION_ID, Some(SESSION_NAME));
             result["applied_input"] = json!(true);
             result
+        }
+        protocol::method::SESSION_INPUT if matches!(scenario, Scenario::PromptAcceptedInput) => {
+            json!({
+                "accepted": true,
+                "submitted": true,
+                "prompt_accepted": true,
+                "runtime": {"worker_instance_id": "runtime-fixture-1", "runtime_generation": "3"},
+                "activity_epoch": "daemon-fixture-epoch"
+            })
         }
         protocol::method::SESSION_INPUT => json!({"accepted": true}),
         protocol::method::HOST_INSPECT => host_capabilities(),
@@ -1727,6 +1737,66 @@ fn process_signals_cancel_local_wait_while_wire_timeout_remains_bounded() {
             protocol::MAX_SESSION_WAIT_MS
         );
     }
+}
+
+#[test]
+fn waited_input_opts_in_to_the_prompt_hook_and_reports_which_evidence_answered() {
+    let home = TestHome::new();
+    let fixture = FixtureDaemon::start(&home.socket(), Scenario::PromptAcceptedInput);
+    let (output, requests) = run(
+        &home,
+        fixture,
+        &[
+            "session",
+            "input",
+            SESSION_ID,
+            "go",
+            "--until",
+            "working",
+            "--timeout",
+            "2000",
+            "--json",
+        ],
+    );
+
+    let ok = assert_json_success(&output);
+    assert_eq!(ok["prompt_accepted"], true);
+    assert!(
+        ok.get("activity").is_none(),
+        "no activity is invented: {ok}"
+    );
+    let _: protocol::SessionInputResult =
+        serde_json::from_value(ok).expect("strict typed session input JSON");
+    let sent = requests
+        .iter()
+        .find(|request| request.method() == protocol::method::SESSION_INPUT)
+        .expect("captured input request");
+    assert_eq!(sent.params()["wait"]["until"], json!(["working"]));
+    assert_eq!(sent.params()["wait"]["allow_prompt_accepted"], true);
+
+    let home = TestHome::new();
+    let fixture = FixtureDaemon::start(&home.socket(), Scenario::PromptAcceptedInput);
+    let (output, _requests) = run(
+        &home,
+        fixture,
+        &[
+            "session",
+            "input",
+            SESSION_ID,
+            "go",
+            "--until",
+            "working",
+            "--timeout",
+            "2000",
+        ],
+    );
+    assert!(output.status.success(), "{}", describe(&output));
+    assert_eq!(
+        utf8(&output.stdout),
+        format!(
+            "session {SESSION_ID}: input accepted submitted=true prompt_accepted=true source=prompt-submit-hook\n"
+        )
+    );
 }
 
 #[test]

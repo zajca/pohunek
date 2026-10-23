@@ -444,6 +444,7 @@ fn notification_create_params_json_shape_roundtrips() {
         wait: Some(SessionInputWait {
             until: Some(vec![AgentActivity::Idle, AgentActivity::Blocked]),
             timeout_ms: Some(MAX_SESSION_WAIT_MS),
+            allow_prompt_accepted: None,
         }),
     };
     let value = serde_json::to_value(&waiting).expect("serialize waiting input params");
@@ -459,6 +460,21 @@ fn notification_create_params_json_shape_roundtrips() {
         })
     );
     assert_eq!(line_roundtrip(&waiting), waiting);
+
+    let opted_in = SessionInputParams {
+        session_id: SessionId("s-42".to_owned()),
+        text: "write tests first".to_owned(),
+        wait: Some(SessionInputWait {
+            until: Some(vec![AgentActivity::Working]),
+            timeout_ms: None,
+            allow_prompt_accepted: Some(true),
+        }),
+    };
+    assert_eq!(
+        serde_json::to_value(&opted_in).expect("serialize opted-in input params")["wait"],
+        json!({ "until": ["working"], "allow_prompt_accepted": true })
+    );
+    assert_eq!(line_roundtrip(&opted_in), opted_in);
 
     let absent_until: SessionInputParams = serde_json::from_value(json!({
         "session_id": "s-42",
@@ -1313,6 +1329,7 @@ fn session_input_result_json_shape_roundtrips() {
         activity_epoch: None,
         activity_revision: None,
         submitted: None,
+        prompt_accepted: None,
     };
     let value = serde_json::to_value(&omitted).expect("serialize omitted input result");
     assert_eq!(value, json!({ "accepted": true }));
@@ -1330,6 +1347,7 @@ fn session_input_result_json_shape_roundtrips() {
         activity_epoch: Some("d-epoch-1".to_owned()),
         activity_revision: Some(ActivityRevision::new(7)),
         submitted: Some(true),
+        prompt_accepted: None,
     };
     let value = serde_json::to_value(&populated).expect("serialize populated input result");
     assert_eq!(
@@ -1349,6 +1367,34 @@ fn session_input_result_json_shape_roundtrips() {
     );
     let back = line_roundtrip(&populated);
     assert_eq!(back, populated);
+
+    let prompt_only = SessionInputResult {
+        accepted: true,
+        activity: None,
+        activity_source: None,
+        runtime: Some(
+            SessionRuntimeIdentity::new("runtime-42", RuntimeGeneration::new(3))
+                .expect("valid runtime identity"),
+        ),
+        activity_epoch: Some("d-epoch-1".to_owned()),
+        activity_revision: None,
+        submitted: Some(true),
+        prompt_accepted: Some(true),
+    };
+    assert_eq!(
+        serde_json::to_value(&prompt_only).expect("serialize hook-only input result"),
+        json!({
+            "accepted": true,
+            "runtime": {
+                "worker_instance_id": "runtime-42",
+                "runtime_generation": "3"
+            },
+            "activity_epoch": "d-epoch-1",
+            "submitted": true,
+            "prompt_accepted": true
+        })
+    );
+    assert_eq!(line_roundtrip(&prompt_only), prompt_only);
 }
 
 #[test]

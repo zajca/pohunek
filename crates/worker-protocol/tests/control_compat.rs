@@ -353,3 +353,77 @@ async fn the_stream_drain_field_defaults_to_false_and_an_unknown_one_is_ignored(
         assert_eq!(snapshot.drains_streams_on_terminal_ack, drains);
     }
 }
+
+#[tokio::test]
+async fn previous_worker_answers_without_the_prompt_evidence_fields_are_read_and_written_without_them(
+) {
+    let (reader, writer) = tokio::io::duplex(4096);
+    let mut writer = ControlWriter::new(writer);
+    let mut reader = ControlReader::new(reader);
+    let snapshot = json!({
+        "request_id": "request-1",
+        "type": "inspected",
+        "snapshot": {
+            "session_id": "s-1",
+            "worker_id": "worker-1",
+            "runtime_id": null,
+            "phase": "running",
+            "worker_process": {"pid": 1, "start_identity": 2},
+            "child_process": null,
+            "dimensions": null,
+            "history_start_offset": 0,
+            "next_offset": 0,
+            "exit": null,
+            "launch_identity": null,
+            "active_identity": null
+        }
+    });
+    let write = json!({
+        "request_id": "request-2",
+        "type": "write_completed",
+        "acknowledgement": {"write_id": "input-lease-1-1", "bytes_written": 6}
+    });
+    writer.write(&snapshot).await.expect("write the snapshot");
+    writer
+        .write(&write)
+        .await
+        .expect("write the acknowledgement");
+
+    let ResponseKind::Inspected { snapshot } = reader
+        .read::<ControlResponse>()
+        .await
+        .expect("read the snapshot")
+        .expect("response")
+        .kind
+    else {
+        panic!("an inspected response");
+    };
+    assert_eq!(snapshot.prompt_accepted_sequence, None);
+    assert!(serde_json::to_value(&snapshot)
+        .expect("serialize the snapshot")
+        .get("prompt_accepted_sequence")
+        .is_none());
+
+    let ResponseKind::WriteCompleted { acknowledgement } = reader
+        .read::<ControlResponse>()
+        .await
+        .expect("read the acknowledgement")
+        .expect("response")
+        .kind
+    else {
+        panic!("a write acknowledgement");
+    };
+    assert_eq!(acknowledgement.submit_mark_ns, None);
+    assert!(serde_json::to_value(&acknowledgement)
+        .expect("serialize the acknowledgement")
+        .get("submit_mark_ns")
+        .is_none());
+
+    // A version-seven decoder that knows neither field reads the version-eight
+    // spelling: neither struct rejects unknown fields.
+    let with_fields =
+        json!({"write_id": "input-lease-1-2", "bytes_written": 6, "submit_mark_ns": 12});
+    let tolerant: pohunek_worker_protocol::WriteAck =
+        serde_json::from_value(with_fields).expect("decode the version-eight acknowledgement");
+    assert_eq!(tolerant.submit_mark_ns, Some(12));
+}
