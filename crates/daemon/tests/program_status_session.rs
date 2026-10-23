@@ -135,10 +135,27 @@ done
     )
 }
 
+/// The shipped Claude manifest with its `[program_status]` table replaced by one
+/// that sets `answer_probe` as the scenario needs.
 fn opted_in_manifest(answer_probe: bool) -> String {
+    let mut in_table = false;
     let shipped =
         std::fs::read_to_string(workspace_root().join("runtime-packages/claude/detect.toml"))
-            .expect("read the shipped Claude manifest");
+            .expect("read the shipped Claude manifest")
+            .lines()
+            .filter(|line| {
+                if line.trim() == "[program_status]" {
+                    in_table = true;
+                } else if in_table && line.trim().is_empty() {
+                    in_table = false;
+                }
+                !in_table
+            })
+            .fold(String::new(), |mut source, line| {
+                source.push_str(line);
+                source.push('\n');
+                source
+            });
     format!("{shipped}\n[program_status]\napp = \"{APP}\"\nanswer_probe = {answer_probe}\n")
 }
 

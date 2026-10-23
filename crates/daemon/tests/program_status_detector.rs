@@ -1,7 +1,8 @@
 //! OSC 7501 program-status evidence in the activity detector.
 //!
-//! The official packages do not opt in yet, so each scenario appends a
-//! `[program_status]` table to the shipped manifest of a runtime and feeds the
+//! Claude's shipped manifest opts in; the other official packages do not yet,
+//! so their scenarios append a
+//! `[program_status]` table to the shipped manifest of a runtime and feed the
 //! detector the screens captured from the real agents (`compat/*/screens`)
 //! together with raw 7501 records, the way the session's output stream does.
 //! Time is a virtual `Instant`: nothing here sleeps.
@@ -522,7 +523,7 @@ fn a_manifest_without_the_table_ignores_records_and_rejects_a_stray_override() {
     let stray = format!(
         "{}\n[[rules]]\nid = \"x\"\nstate = \"idle\"\npriority = 1\nregion = \"whole_recent\"\n\
          contains = [\"x\"]\noverrides_program_status = true\n",
-        read("runtime-packages/claude/detect.toml")
+        plain_source("claude")
     );
     assert!(matches!(
         Manifest::parse_str(&stray),
@@ -546,7 +547,7 @@ fn claude_stale_spinner() -> Vec<u8> {
     frame(
         None,
         &[
-            "* Then it waits\u{2026} (see below)",
+            "* Waiting\u{2026}",
             &rule,
             "\u{276f} ",
             &rule,
