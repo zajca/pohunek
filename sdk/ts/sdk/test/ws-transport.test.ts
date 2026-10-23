@@ -4,7 +4,7 @@ import { once } from "node:events";
 import type { Readable } from "node:stream";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, jest, test } from "bun:test";
 import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, CLIENT_PROTOCOL_VERSIONS, type ProtocolError, type ProtocolEvent, type SessionInfo } from "@pohunek/protocol";
 import { startTestRelay, type DaemonTarget, type TestRelayHandle } from "@pohunek/testkit/bun-relay";
 import {
@@ -45,10 +45,6 @@ const RELAY_SOCKET_TIMEOUT_MS = 5_000;
 // runner (#494); this leaves ample headroom and stays below bun's 5 s test
 // timeout, so a lost reply fails as the client's `request_timeout`.
 const RELAY_REQUEST_TIMEOUT_MS = 2_000;
-// Request timeout of the scenario that asserts the timeout itself; the daemon
-// reply it waits for is delayed past it by `TIMEOUT_REPLY_DELAY_MS`.
-const TIMEOUT_TEST_REQUEST_MS = 20;
-const TIMEOUT_REPLY_DELAY_MS = 60;
 
 interface RelayFixture {
   daemon: MockDaemon;
@@ -58,6 +54,12 @@ interface RelayFixture {
   attach(streamId: string): Promise<RawStream>;
   close(): Promise<void>;
 }
+
+// A failing await between useFakeTimers and useRealTimers must not leave fake
+// timers installed for the next test.
+afterEach(() => {
+  jest.useRealTimers();
+});
 
 describe("WebSocket transport through relay", () => {
   test("call decodes a typed session.list output and sends method params", async () => {
@@ -178,20 +180,32 @@ describe("WebSocket transport through relay", () => {
 
   test("request timeout rejects and the next call opens a second relay socket", async () => {
     const fixture = await startRelayFixture([
-      {
-        kind: "delay",
-        ms: TIMEOUT_REPLY_DELAY_MS,
-        line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), { status: "ok" }),
-      },
+      { kind: "silent" },
       { kind: "reply", line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), { status: "second" }) },
     ]);
     try {
-      const client = await fixture.client(TIMEOUT_TEST_REQUEST_MS);
+      const client = await fixture.client();
 
-      const firstError = await expectClientError(client.call("daemon.health", null));
+      // The daemon never answers the first request, so the client's own timer
+      // is the only thing that ends it. Fake timers expire that timer on
+      // demand once the request reached the daemon, which means the timer is
+      // armed; real timers are restored before the second call, which then
+      // runs with the full relay request budget.
+      jest.useFakeTimers();
+      let firstCall: Promise<unknown>;
+      try {
+        firstCall = client.call("daemon.health", null);
+        await Promise.race([
+          fixture.daemon.nextRequest(),
+          firstCall.then(() => { throw new Error("first call settled before reaching the daemon"); }),
+        ]);
+        jest.advanceTimersByTime(RELAY_REQUEST_TIMEOUT_MS);
+      } finally {
+        jest.useRealTimers();
+      }
+      const firstError = await expectClientError(firstCall);
       expect(firstError.toProtocolError().class).toBe("transport");
       expect(firstError.toProtocolError().code).toBe("request_timeout");
-      await fixture.daemon.nextRequest();
 
       expect(await client.call("daemon.health", null)).toEqual({ status: "second" });
     } finally {

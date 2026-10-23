@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, jest, test } from "bun:test";
 import {
   MAX_CONTROL_LINE_BYTES,
   MAX_SESSION_WAIT_MS,
@@ -64,6 +64,12 @@ function healthStep(): ScriptStep {
     }),
   };
 }
+
+// A failing await between useFakeTimers and useRealTimers must not leave fake
+// timers installed for the next test.
+afterEach(() => {
+  jest.useRealTimers();
+});
 
 describe("Client request/response", () => {
   test("call decodes a typed session.list output and sends method params", async () => {
@@ -1371,22 +1377,32 @@ describe("Client request/response", () => {
 
   test("request timeout rejects and the next call reopens the connection", async () => {
     const daemon = await startUnixDaemon([
-      {
-        kind: "delay",
-        ms: 60,
-        line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), { status: "ok" }),
-      },
+      { kind: "silent" },
       { kind: "reply", line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), { status: "second" }) },
     ]);
     try {
-      const client = await connectClient(daemon, undefined, { requestTimeoutMs: 20 });
+      const client = await connectClient(daemon, undefined, { requestTimeoutMs: SHARED_REQUEST_TIMEOUT_MS });
 
-      const firstError = await expectClientError(client.call("daemon.health", null));
+      // The daemon never answers the first request. Fake timers expire the
+      // client's timer once the request reached the daemon (so the timer is
+      // armed); real timers are restored before the second call, which then
+      // runs with the full request budget.
+      jest.useFakeTimers();
+      let firstCall: Promise<unknown>;
+      try {
+        firstCall = client.call("daemon.health", null);
+        await Promise.race([
+          daemon.nextRequest(),
+          firstCall.then(() => { throw new Error("first call settled before reaching the daemon"); }),
+        ]);
+        jest.advanceTimersByTime(SHARED_REQUEST_TIMEOUT_MS);
+      } finally {
+        jest.useRealTimers();
+      }
+      const firstError = await expectClientError(firstCall);
       expect(firstError.toProtocolError().class).toBe("transport");
       expect(firstError.toProtocolError().code).toBe("request_timeout");
-      await daemon.nextRequest();
 
-      // The late reply of the first request dies with its connection.
       expect(await client.call("daemon.health", null)).toEqual({ status: "second" });
     } finally {
       await daemon.close();
