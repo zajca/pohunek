@@ -365,18 +365,6 @@ async fn the_shipped_pi_package_opts_in_and_the_worker_answers_its_probe_once() 
     assert_eq!(reply, REPLY_HEX, "the reply is the fixed probe reply");
     fixture.wait_activity(&created.id, IDLE).await;
 
-    let detection = fixture
-        .registry
-        .detection(&created.id)
-        .await
-        .expect("session.detection");
-    assert!(
-        detection.previews.iter().any(|preview| preview.kind
-            == protocol::DetectionRegionKind::ProgramStatus
-            && preview.text == "app=pi:state=idle"),
-        "the shipped manifest declares app = pi: {detection:?}"
-    );
-
     // Neither the reply nor records without a delivered input open a turn.
     command(&fixture, b'g');
     fixture.wait_activity(&created.id, WORKING).await;

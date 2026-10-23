@@ -77,7 +77,7 @@
 # manifest (`answer_probe`). The record is the root record of `app = "pi"`;
 # earlier releases emit none and are classified from the screen alone. Pi's own
 # confirms and the branch-summary border are not reported as blocked by the
-# record: the dialog rule above keeps the confirms blocked, and the
+# record: the dialog rule below keeps the confirms blocked, and the
 # branch-summary border reads idle, as Pi itself declares it. A dialog drawn
 # with ctx.ui.custom() has no screen rule and reads as the record says.
 [program_status]

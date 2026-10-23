@@ -2,7 +2,7 @@
 type: Guide
 id: guide/pi-package
 title: Pi runtime package
-description: Install and operate the official Pi coding agent runtime package (Pi 1.x from 1.0.0, verified on 1.0.2), including what was verified against a real Pi, how detection reads dialogs and selectors, how resume and fork work, where sessions may live, and what fails closed.
+description: Install and operate the official Pi coding agent runtime package (Pi 1.x from 1.0.0, verified on 1.4.0 with the 1.0.2 screens kept as the previous release), including what was verified against a real Pi, how detection reads dialogs and selectors, how resume and fork work, where sessions may live, and what fails closed.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
@@ -55,12 +55,27 @@ reserved, so either way of installing serves it.
 - Version: `pi --version` prints exactly the release on standard output
   (extension noise goes to standard error, which the probe discards). The
   descriptor accepts `[1.0.0, 2.0.0)`, the verified range's lower bound up to
-  the next major (only 1.0.2 is verified); any other release, or output that is not
+  the next major (1.4.0 is verified; the 1.0.2 captures stay in `compat/pi/screens/n-1/`
+  as the previous verified release); any other release, or output that is not
   one `MAJOR.MINOR.PATCH` line, refuses the launch with
   `agent_runtime_unsupported`. `host.inspect` shows `version` and `supported`.
   The probe runs under the `PATH` the launch will see (the daemon's forwarded
   environment overridden by the profile's `PATH`), so a profile that selects a
   Node installation is probed with that Node; every other variable is isolated.
+- Program status: the manifest declares `[program_status] app = "pi"` with
+  `answer_probe = true`. Pi 1.1.0 and later print an OSC 7501 probe at start and
+  report `working`, `done`, `idle`, `error`, `blocked` (kind `permission`,
+  `question` or `auth`) and `clear` only after the terminal answers; the session
+  worker answers once per probe, so a Pi launched by pohunek reports and its
+  records, not the screen, decide the activity (`state_source` `osc_progress`).
+  A visible dialog the screen rules see still wins over a non-blocked record, so
+  Pi's own confirms (project trust, missing cwd, branch summary, session import)
+  stay `blocked`. Pi 1.0.x prints no probe and is read from the screen alone.
+  Known limits: a dialog drawn with `ctx.ui.custom()` has no screen rule and
+  reads as Pi's record says (working during a run); the branch-summary busy
+  border reads `idle`, as Pi declares it; `error` reads as `idle`; a Pi nested
+  under a shell session gets no probe reply and stays screen-only; a profile
+  that sets `PI_PROGRAM_STATUS=0` also gives screen-only detection.
 - Native reference: `strategy = "assigned"` with `assign_fork = true`. The
   daemon generates a UUID, starts `pi --session-id <id>` (Pi creates the
   conversation with that id), resumes with `pi --session <id>`, and forks with
@@ -231,8 +246,15 @@ reserved, so either way of installing serves it.
 - The `pi-package` CI job installs exactly the locked release from npm, builds
   the archive with `cargo xtask package build`, and runs that file.
 
-Update procedure for a new Pi release: install it, rerun the real-Pi tests, move
-the lock (`release`, and `supported` if the range changes) and the descriptor's
-`min`/`below` together, refresh the captured screens (including the dialog and
-selector screens in `overlays/`) if the interface changed, and bump the package
-`version`.
+Update procedure for a new Pi release: stage it (`cargo xtask compat stage-upstream
+--runtime pi`), rerun the real-Pi tests, move the lock (`release`, and
+`supported` if the range changes) and the descriptor's `min`/`below` together,
+record the screens again (`record_the_pi_screens` with `POHUNEK_PI_E2E=1` and
+`POHUNEK_PI_CAPTURE_DIR`) and the program-status sequences (`POHUNEK_PI_UPDATE_GOLDENS=1`
+with the real-Pi program-status test, written to `compat/pi/screens/sequences/`),
+and bump the package `version`. The previous release's captures move to
+`compat/pi/screens/n-1/` and `min` rises to that release; the manifest tests run
+over both sets. Screens a loopback model and an extension cannot reach (retry,
+compaction, overflow, scrolled drafts, login and selector screens, the missing-cwd
+and fork questions) are carried over from the previous set until they are
+recorded again.

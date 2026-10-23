@@ -14,5 +14,5 @@
     "min": "1.0.0",
     "below": "2.0.0"
   },
-  "verified_with": "PTY run of the pinned release: session file layout (default store and PI_CODING_AGENT_SESSION_DIR), bracketed paste, idle and working screens, extension dialog, project trust, missing session cwd, login and selector screens, process name, session-id resume, and fork under an assigned session id resumed by that id"
+  "verified_with": "PTY run of the pinned release: session file layout (default store and PI_CODING_AGENT_SESSION_DIR), bracketed paste, idle, working and after-turn screens and the extension select, confirm, input and editor dialogs and the project-trust question recorded again at every width, OSC 7501 program-status records (turn, extension confirm and clean exit sequences, probe answered by the session worker), process name, session-id resume, and fork under an assigned session id resumed by that id; screens a loopback model and an extension cannot reach (retry, compaction, overflow, scrolled drafts, login, selector, missing-cwd and fork screens) are carried over from the previous release, whose complete set stays in compat/pi/screens/n-1"
 }
