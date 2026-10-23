@@ -96,8 +96,7 @@ int connect(int fd, const struct sockaddr *address, socklen_t length) {
             /* The fixture listens on IPv4 loopback, reached through the mapped form. */
             struct sockaddr_in6 redirected = *original;
             memset(&redirected.sin6_addr, 0, sizeof(redirected.sin6_addr));
-            redirected.sin6_addr.s6_addr[10] = 0xff;
-            redirected.sin6_addr.s6_addr[11] = 0xff;
+            redirected.sin6_addr.s6_addr[10] = redirected.sin6_addr.s6_addr[11] = 0xff;
             redirected.sin6_addr.s6_addr[12] = 127;
             redirected.sin6_addr.s6_addr[15] = 1;
             const char *port = getenv("POHUNEK_TEST_CONNECT_REDIRECT_PORT");
