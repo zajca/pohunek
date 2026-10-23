@@ -821,6 +821,10 @@ Protocol contracts and transport:
 - `crates/netbird/src/status.rs`
 - `crates/netbird/src/transport.rs`
 - `crates/overlay/src/lib.rs`
+- `crates/overlay-tailscale/src/lib.rs`
+- `crates/overlay-tailscale/src/status.rs`
+- `crates/overlay-tailscale/src/transport.rs`
+- `crates/overlay-tailscale/tests/provider.rs`
 - `crates/overlay/tests/registry_contract.rs`
 
 Assistant knowledge implementation work in progress:

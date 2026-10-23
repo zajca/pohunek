@@ -62,7 +62,10 @@ LANE_PACKAGES = (
     "pohunek-session-worker", "pohunek-service-config", "pohunek-test-support",
     "pohunek-daemon", "pohunek-cli", "pohunek-hostcheck",
 )
-TIER_PACKAGES = ("pohunek-client", "pohunek-netbird", "pohunek-package", "xtask")
+TIER_PACKAGES = (
+    "pohunek-client", "pohunek-netbird", "pohunek-overlay-tailscale", "pohunek-package",
+    "xtask",
+)
 MACOS_PACKAGES = LANE_PACKAGES + TIER_PACKAGES
 
 
@@ -136,7 +139,7 @@ OWNED_ELSEWHERE = {
     ),
 }
 # The scope of a check: its packages and the nextest selection of them.
-# `all` is the 13-package macOS set (the tier job); `lane` is the PR lane.
+# `all` is the 14-package macOS set (the tier job); `lane` is the PR lane.
 MACOS_SCOPES = {"all": (MACOS_PACKAGES, MACOS_SET), "lane": (LANE_PACKAGES, LANE_SET)}
 
 
@@ -679,7 +682,7 @@ def main():
     parser.add_argument("shard", nargs="?", choices=SHARDS)
     parser.add_argument(
         "--scope", choices=tuple(MACOS_SCOPES),
-        help="check-macos only: `all` (default) checks the 13-package set, `lane` the PR lane's 9 packages",
+        help="check-macos only: `all` (default) checks the 14-package set, `lane` the PR lane's 9 packages",
     )
     parser.add_argument(
         "--archive-file", type=Path,

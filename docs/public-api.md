@@ -321,7 +321,7 @@ The daemon exposes the same protocol on two transports:
 | Transport | Endpoint | Security boundary |
 |---|---|---|
 | Local | Unix socket at the configured runtime path | Owner-only socket directory and mode |
-| Remote | One TCP listener per configured overlay, bound to that provider's validated local member address and port. The provider and the port come from the owner-private `overlays.toml` (see "Overlay configuration" below); without the file the host works over NetBird on port 18722 | Overlay reachability and provider policy; NetBird/WireGuard is the default production provider |
+| Remote | One TCP listener per configured overlay, bound to that provider's validated local member address and port, which must also be the address the provider reports at bind time. The provider and the port come from the owner-private `overlays.toml` (see "Overlay configuration" below); without the file the host works over NetBird on port 18722 | Overlay reachability and provider policy; NetBird/WireGuard is the default production provider |
 
 The local runtime path is a shared host/client contract, not a wire-protocol
 field. A valid absolute `XDG_RUNTIME_DIR` resolves the application root to
@@ -4601,7 +4601,7 @@ the CLI, the daemon and external Rust clients share. It reads
 `<config>/pohunek/overlays.toml` (`XDG_CONFIG_HOME`, else `~/.config`):
 
 ```toml
-providers = ["netbird"]   # exactly one overlay provider per host
+providers = ["netbird"]   # exactly one overlay provider per host: "netbird" or "tailscale"
 port = 18722              # optional; TCP port of the remote control listener
 ```
 
@@ -4615,7 +4615,7 @@ exists there, every component of the directory path must be a real directory
 the file must be
 a regular file owned by the user with mode `0600` and at most 64 KiB, in
 UTF-8. Parsing is strict: unknown keys and wrong types fail. `providers` takes
-exactly one known id (`netbird`); several providers on one host are not
+exactly one known id (`netbird` or `tailscale`); several providers on one host are not
 supported yet and fail with a message that points to
 [#1113](https://github.com/zajca/pohunek/issues/1113). The environment variable
 `POHUNEK_REMOTE_PORT` overrides `port` for development and tests; a service-started
@@ -4651,6 +4651,27 @@ The daemon library ties the doctor's severity to the registry it serves:
 `OverlaySource` (`File` when `overlays.toml` listed the providers, `Default`
 for the NetBird default of an absent file; `OverlaySource::of(&OverlayConfig)`
 derives it), so no state carries a source its registry did not come from.
+
+The `tailscale` provider reads `tailscale status --json` from the local
+Tailscale CLI, found through the same trusted-executable lookup as the NetBird
+CLI (a missing or untrusted binary is `tailscale_cli_missing`). The listener
+address is the node's IPv4 address from `Self.TailscaleIPs`; without one, or
+while `BackendState` is not `Running`, or in userspace networking (`TUN` false),
+the listener has no address (`tailscale_listener_address_missing`) and the
+discovery and resolution calls fail with `tailscale_state_unavailable`, because
+a dial in the `100.64.0.0/10` range would otherwise leave through the default
+route. A peer is selectable when it is in the network map, its key has not
+expired, it was not shared in from another tailnet user (`ShareeNode`), and the
+status lists an address Tailscale assigns for that exact peer: IPv4 in
+`100.64.0.0/10` or IPv6 in `fd7a:115c:a1e0::/48`, never the ChromeOS block
+`100.115.92.0/23`, the service addresses `100.100.100.100` and
+`fd7a:115c:a1e0::53`, or the 4via6 range. Tagged peers are selectable. The
+`peer_id` is the stable node `ID` and survives re-keying; the name is the
+MagicDNS name without its trailing dot and the short name is its first label.
+`HostName` is never used. A peer is dialed on its IPv4 address when it has one,
+else on its IPv6 address; an offline peer is listed without an address and can
+still be named explicitly. Tailnet ACLs are the access control: the listener
+authenticates nothing beyond reachability.
 
 Public daemon construction is registry-explicit. `DaemonState::new` and
 `ControlServer::bind` require a validated `OverlayRegistry`, and the shared

@@ -23,11 +23,11 @@ NetBird on TCP port 18722. The optional owner-private file
 sets the provider and the port for the CLI, the daemon and Rust clients alike:
 
 ```toml
-providers = ["netbird"]
+providers = ["netbird"]   # or "tailscale"
 port = 18722
 ```
 
-- `providers` lists exactly one id; `netbird` is the only known id. Several
+- `providers` lists exactly one id, `netbird` or `tailscale`. Several
   entries are refused until one host can run several overlays (#1113).
 - `port` is optional and must be in `1..=65535`; it is the port the daemon
   listens on and the CLI dials, on every host that reads the file.
@@ -199,6 +199,18 @@ macOS-specific routing, bridging, or relay mode.
   On nix-darwin, `/run/current-system/sw/bin/netbird` is accepted when the
   `current-system` link and its macOS system directory have trusted ownership;
   Pohunek then runs the verified canonical target.
+- **Tailscale.** With `providers = ["tailscale"]` the host works over a
+  tailnet. Pohunek runs `tailscale status --json` (found like the `netbird` CLI
+  above, so the Homebrew and package-installer directories work on macOS); it
+  never enables Tailscale because its CLI is installed. The daemon listens on the
+  node's IPv4 address and only while Tailscale is `Running` on a kernel
+  interface: userspace networking (`tailscaled --tun=userspace-networking`) has
+  no interface to bind and is reported as `tailscale_state_unavailable`. Peers
+  that are expired, not in the network map or shared in from another user are
+  not selectable; tagged peers are. Name a peer by its short MagicDNS name, its
+  full name, `tailscale:<name>` or its node ID. The remote listener has no
+  authentication beyond reachability, so tailnet ACLs decide who can reach it.
+  Allow TCP on the configured port between your hosts.
 - **The listener.** The daemon binds its overlay listener only to the address
   the overlay reports for this host and re-binds when that address changes. The
   Unix socket stays available while the VPN is down, starting, or
@@ -210,10 +222,13 @@ macOS-specific routing, bridging, or relay mode.
   new connection, so a session is not created twice and committed input is not
   sent again. After wake, compare `worker_instance_id` before and after: the same id
   is continuity.
-- **Troubleshooting.** Run `netbird status` in the same shell. If the daemon
-  logged `overlay CLI missing; listener disabled`, fix the CLI lookup above and
-  restart the daemon; for a VPN that was not ready, wait one retry interval and
-  look for `serving control protocol over overlay`.
+- **Troubleshooting.** Run `netbird status` (or `tailscale status`) in the same
+  shell. Without an `overlays.toml` the NetBird default is not retried: if the
+  daemon logged `overlay CLI missing; listener disabled`, fix the CLI lookup
+  above and restart the daemon. For an overlay listed in `overlays.toml` the
+  daemon logs `overlay CLI missing; serving local-only and retrying` and binds as
+  soon as the CLI is found. For a VPN that was not ready, wait one retry
+  interval and look for `serving control protocol over overlay`.
 
 The future public team relay does not replace this direct overlay model and does
 not require NetBird. After host enrollment and transport work land, an enrolled

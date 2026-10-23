@@ -83,7 +83,7 @@ not (
   or (package(=pohunek-relay) and
     (kind(test) or test(/^(admission::|auth::service::|auth::parent_integrity_tests::|authorization::admin_tests::|lifecycle::|runtime::|server::credential_router_tests::|operator::)/)))
   or (package(=pohunek-cli) and
-    (test(/^hermes_integration::/) or (binary(=all) and test(/^hermes_/)) or (binary(=all) and test(/^session_process_api::/)) or (binary(=all) and test(/^plugin_catalog_install::/)) or (binary(=all) and test(/^doctor_worker_compat::/)) or (binary(=all) and test(/^session_background::/)) or (binary(=all) and test(/^session_background_work::/))))
+    (test(/^hermes_integration::/) or (binary(=all) and test(/^hermes_/)) or (binary(=all) and test(/^session_process_api::/)) or (binary(=all) and test(/^plugin_catalog_install::/)) or (binary(=all) and test(/^doctor_worker_compat::/)) or (binary(=all) and test(/^session_background::/)) or (binary(=all) and test(/^session_background_work::/)) or (binary(=all) and test(/^overlay_tailscale_daemon::/))))
   or (package(=pohunek-client) and binary(=netbird_cancellation))
   or (package(=pohunek-platform) and
     test(/^(shell_env::test_support::tests::|filesystem::tests::a_dropped_lock_is_free_while_|test_spawn::)/))

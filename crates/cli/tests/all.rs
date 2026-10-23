@@ -60,6 +60,10 @@ mod overlay_config;
 mod overlay_diagnostics;
 #[path = "overlay_service_daemon_port.rs"]
 mod overlay_service_daemon_port;
+#[path = "overlay_tailscale.rs"]
+mod overlay_tailscale;
+#[path = "overlay_tailscale_daemon.rs"]
+mod overlay_tailscale_daemon;
 #[path = "pi_frame_properties.rs"]
 mod pi_frame_properties;
 #[path = "pi_package.rs"]

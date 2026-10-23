@@ -24,6 +24,7 @@ members = [
     "crates/xtask",
     "crates/netbird",
     "crates/overlay",
+    "crates/overlay-tailscale",
     "crates/prompt",
     "crates/terminal",
     "crates/worker-protocol",
@@ -60,6 +61,7 @@ pohunek-logging = { path = "crates/logging" }
 pohunek-netbird = { path = "crates/netbird" }
 netbird = { package = "pohunek-netbird", path = "crates/netbird" }
 overlay = { package = "pohunek-overlay", path = "crates/overlay" }
+overlay-tailscale = { package = "pohunek-overlay-tailscale", path = "crates/overlay-tailscale" }
 pohunek-platform = { path = "crates/platform" }
 pohunek-package = { path = "crates/package" }
 pohunek-paths = { path = "crates/paths" }

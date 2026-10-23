@@ -6,8 +6,9 @@
 //! the original `100.64.0.0/10` bind target, then binds an ephemeral port on
 //! `127.0.0.1` instead, so the daemon serves and a client reaches it through a
 //! `connect()` redirect to that port. The original port never occupies a real
-//! socket, so a scenario can configure any port number without a collision. Nothing is
-//! linked into or enabled by a production binary.
+//! socket, so a scenario can configure any port number without a collision. An
+//! explicit IPv4 bind outside the range is recorded as `<ip>:<port> -> unredirected`
+//! and proceeds. Nothing is linked into or enabled by a production binary.
 
 // Rust guideline compliant 2026-10-23
 
@@ -81,6 +82,23 @@ int bind(int fd, const struct sockaddr *address, socklen_t length) {
                 }
             }
             return result;
+        }
+        if (original->sin_port != 0) {
+            /* An explicit IPv4 bind outside the overlay range proceeds as asked
+               and is recorded, so a scenario sees a listener on a real address. */
+            const char *capture = getenv("POHUNEK_TEST_BIND_CAPTURE");
+            if (capture != NULL) {
+                char ip[INET_ADDRSTRLEN];
+                char line[128];
+                inet_ntop(AF_INET, &original->sin_addr, ip, sizeof(ip));
+                int count = snprintf(line, sizeof(line), "%s:%u -> unredirected\n", ip,
+                                     ntohs(original->sin_port));
+                int output = open(capture, O_WRONLY | O_CREAT | O_APPEND, 0600);
+                if (output >= 0) {
+                    (void)write(output, line, (size_t)count);
+                    (void)close(output);
+                }
+            }
         }
     }
     return real_bind(fd, address, length);

@@ -176,7 +176,7 @@ on TCP port 18722. An owner-private `~/.config/pohunek/overlays.toml`
 both the CLI and the daemon read it:
 
 ```toml
-providers = ["netbird"]   # exactly one provider; netbird is the only id so far
+providers = ["netbird"]   # exactly one provider: "netbird" or "tailscale"
 port = 18722              # optional, 1..=65535
 ```
 

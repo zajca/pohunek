@@ -44,8 +44,8 @@ green run says the macOS code compiles and lints, not that it behaves; the CI
 job `macOS lint from Linux (aarch64-apple-darwin clippy)` runs the same
 script on every pull request, and the native jobs stay the behavior evidence.
 The `macOS tier packages (arm64)` job covers the other macOS packages,
-`pohunek-client`, `pohunek-netbird`, `pohunek-package`, and `xtask`, with
-`run-macos-tier` from a 13-package archive. `check-macos --scope all` checks
+`pohunek-client`, `pohunek-netbird`, `pohunek-overlay-tailscale`,
+`pohunek-package`, and `xtask`, with `run-macos-tier` from a 14-package archive. `check-macos --scope all` checks
 the full set. It never runs on a pull request: only pushes, the daily schedule,
 and `main` or `nightly` dispatches start it.
 The Hermes macOS job (`hermes-compatibility-macos`) runs the xtask Hermes
@@ -556,7 +556,7 @@ cargo clippy -p pohunek-daemon --all-targets  # lint one crate
 python3 scripts/test-partitions run cli       # exact CI shard: core/daemon/relay/cli/relay-db/heavy
 python3 scripts/test-partitions check         # exhaustive, disjoint nextest inventory check
 python3 scripts/test-partitions --archive-file nextest-archive.tar.zst run heavy  # CI mode: no compile
-python3 scripts/test-partitions --archive-file A check-macos   # 13-package macOS set: exact lane/tier/bucket partition
+python3 scripts/test-partitions --archive-file A check-macos   # 14-package macOS set: exact lane/tier/bucket partition
 python3 scripts/test-partitions --archive-file A check-macos --scope lane  # PR lane archive: its 9 packages only
 python3 scripts/test-partitions --archive-file A run-macos     # PR macOS lane: 9 packages, profile macos
 python3 scripts/test-partitions --archive-file A run-macos-tier  # main/nightly macOS tier: client, netbird, package, xtask

@@ -44,6 +44,7 @@ MACOS_PATH_OWNERSHIP = {
             "crates/hostcheck/**",
             "crates/netbird/**",
             "crates/overlay/**",
+            "crates/overlay-tailscale/**",
             "crates/prompt/**",
             "crates/assistant/**",
             "crates/package/**",
@@ -105,6 +106,7 @@ MACOS_PATH_OWNERSHIP = {
             "crates/hostcheck/**",
             "crates/netbird/**",
             "crates/overlay/**",
+            "crates/overlay-tailscale/**",
             "crates/prompt/**",
             "crates/relay-client/**",
             "crates/relay-protocol/**",
@@ -176,6 +178,7 @@ MACOS_PATH_OWNERSHIP = {
             "crates/client/**",
             "crates/netbird/**",
             "crates/overlay/**",
+            "crates/overlay-tailscale/**",
             "crates/hostcheck/**",
             "crates/knowledge/**",
             "crates/relay-client/**",
@@ -1006,7 +1009,7 @@ class MacosLanePackageSetTests(unittest.TestCase):
         self.assertEqual(len(archive), 1)
         packages = self.packages(archive[0])
         self.assertEqual(sorted(packages), sorted(self.partitions.MACOS_PACKAGES))
-        self.assertEqual(len(packages), 13)
+        self.assertEqual(len(packages), 14)
         self.assertIn("check-macos --scope all", tier)
         self.assertIn("run-macos-tier", tier)
         self.assertNotIn("cargo test", tier)
