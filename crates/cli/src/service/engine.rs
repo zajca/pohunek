@@ -1160,7 +1160,7 @@ impl<'a> Engine<'a> {
         // or an apply that fails rolls back with the job unloaded, so the default
         // observed now is journaled first.
         if !record.runtime_stop {
-            Box::pin(self.refresh_journaled_default(record)).await?;
+            Box::pin(self.refresh_journaled_default(record, PathUse::Forward)).await?;
         }
         let job = job_path(self.context, config, record.journal_default()).await?;
         let warnings = job_warnings(self.context, &job);
@@ -1430,7 +1430,7 @@ impl<'a> Engine<'a> {
         if let Some(hook) = &self.before_swap {
             (hook.0)();
         }
-        Box::pin(self.refresh_journaled_default(record)).await?;
+        Box::pin(self.refresh_journaled_default(record, PathUse::Forward)).await?;
         let job = job_path(self.context, config, record.journal_default()).await?;
         let warnings = job_warnings(self.context, &job);
         late.warnings.extend(warnings.iter().cloned());
@@ -1452,12 +1452,18 @@ impl<'a> Engine<'a> {
     /// read, so every later gate (a rollback after a failed swap or apply) judges
     /// the journaled one: this keeps it the value that was observed, not the one
     /// an earlier boot saw. A job whose default cannot be read leaves the journal.
+    /// `usage` is the side of the transaction the call belongs to: a rollback is
+    /// never refused for a `PATH` it cannot prove.
     ///
     /// # Errors
     ///
     /// Returns the store's error when the record cannot be saved.
     #[cfg(target_os = "macos")]
-    async fn refresh_journaled_default(&self, record: &mut Record) -> Result<(), Error> {
+    async fn refresh_journaled_default(
+        &self,
+        record: &mut Record,
+        usage: PathUse,
+    ) -> Result<(), Error> {
         // Only an upgrade replaces a job that exists, and a job that records its
         // `PATH` never reads the launchd default.
         if record.operation != Operation::Upgrade {
@@ -1485,7 +1491,7 @@ impl<'a> Engine<'a> {
                     path: &default,
                     boot_identity: None,
                 },
-                PathUse::Forward,
+                usage,
             )?;
         }
         if record.launchd_default_path.as_deref() == Some(default.as_str())
@@ -1504,6 +1510,7 @@ impl<'a> Engine<'a> {
     fn refresh_journaled_default(
         &self,
         _record: &mut Record,
+        _usage: PathUse,
     ) -> std::future::Ready<Result<(), Error>> {
         std::future::ready(Ok(()))
     }
@@ -1726,7 +1733,7 @@ impl<'a> Engine<'a> {
         if record.operation == Operation::Upgrade && rollback_stops_daemon(record) {
             // The stop unloads the job: journal the default it has now first.
             let mut journaled = record.clone();
-            Box::pin(self.refresh_journaled_default(&mut journaled)).await?;
+            Box::pin(self.refresh_journaled_default(&mut journaled, PathUse::Rollback)).await?;
             return Box::pin(self.rollback_journaled(&journaled)).await;
         }
         Box::pin(self.rollback_journaled(record)).await

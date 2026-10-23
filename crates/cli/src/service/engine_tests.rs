@@ -11692,6 +11692,33 @@ async fn an_unreadable_configuration_after_a_reboot_does_not_strand_a_rollback()
     harness.assert_installed(V1);
 }
 
+/// The rollback journals the default of the loaded job before it stops the job;
+/// with no readable boot identity and a `user.plist` that cannot prove the
+/// default, that step must not refuse the rollback.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_rollback_is_not_refused_while_it_journals_the_loaded_default() {
+    let mut harness = Harness::new();
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(PENDING_PATH)).expect("domain configuration");
+    harness.context = harness.context.clone().with_launchd_domain_config(&domain);
+    interrupted_upgrade_journal(&mut harness).await;
+    date(&domain, Modified::AfterBoot).expect("date");
+    let launchd = FakeLaunchd::new(Ok(loaded_job(CURRENT_PATH.to_owned())));
+    launchd.set_boot(Err("sysctl failed".to_owned()));
+    harness.context = harness.context.clone().with_launchd_job(Arc::new(launchd));
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(ScriptedPreflight::default()))
+        .upgrade(&harness.staged(V1), V1)
+        .await
+        .expect("the pending upgrade is rolled back");
+
+    assert!(harness.pending().is_none(), "the rollback finished");
+    harness.assert_installed(V1);
+}
+
 /// The same facts refuse the forward side of the transaction before any effect:
 /// the upgrade that resumes the pending one, and `service check` of it.
 #[cfg(target_os = "macos")]
