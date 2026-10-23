@@ -1961,9 +1961,10 @@ fn the_terminal_title_rules_read_idle_from_the_absence_of_a_spinner() {
         ("\u{2834} \u{2834} | project", working),
         ("\u{280b} my-thread | project", working),
         // The title-generation placeholder of an idle unnamed thread, and a
-        // spinner that names nothing, are not a running turn (#1486).
-        ("\u{2834} | project", idle),
-        ("\u{28ff} ", idle),
+        // spinner that names nothing, are not a running turn; the idle rule
+        // skips every spinner title, so they assert no state at all (#1486).
+        ("\u{2834} | project", None),
+        ("\u{28ff} ", None),
         ("[ ! ] Action Required | project", blocked),
         ("[ . ] Action Required | project", blocked),
         ("Action Required", blocked),
