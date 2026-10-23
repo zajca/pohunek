@@ -2449,6 +2449,26 @@ impl Fixture {
         );
     }
 
+    /// Lets later sessions run shell commands without a sandbox or a prompt.
+    /// The command sandbox needs unprivileged user namespaces, which a CI
+    /// runner may refuse, and a background terminal only exists once the
+    /// command has started.
+    fn run_commands_unsandboxed(&self) {
+        let path = self.codex_home.join("config.toml");
+        let config = fs::read_to_string(&path).expect("config.toml");
+        let relaxed = config
+            .replace(
+                "approval_policy = \"on-request\"",
+                "approval_policy = \"never\"",
+            )
+            .replace(
+                "sandbox_mode = \"read-only\"",
+                "sandbox_mode = \"danger-full-access\"",
+            );
+        assert_ne!(relaxed, config, "the policy keys are in the config");
+        fs::write(path, relaxed).expect("write config.toml");
+    }
+
     /// The inventory entry `host inspect local` reports for `profile`.
     async fn inventory_entry(&self, profile: &str) -> Value {
         let (code, host) = self.harness.json(&["host", "inspect", "local"]).await;
@@ -4685,6 +4705,7 @@ async fn capture_the_real_codex_background_terminal_screens() {
     let fixture = Fixture::start().await;
     fixture.install_integration().await;
 
+    fixture.run_commands_unsandboxed();
     let id = fixture
         .new_session_in("background", &recording.directory("cwd"))
         .await["id"]
@@ -5090,6 +5111,7 @@ async fn a_real_codex_is_read_through_program_status() {
     );
     fixture.stop(&id).await;
 
+    fixture.run_commands_unsandboxed();
     let id = fixture.new_session("background").await["id"]
         .as_str()
         .expect("session id")
