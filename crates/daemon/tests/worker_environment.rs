@@ -27,7 +27,8 @@ use pohunek_worker_protocol::{
     is_denylisted, read_frame, write_frame, AttachStart, BaseEnv, ControlCode, DaemonId, DataFrame,
     Dimensions, FrameHeader, FrameKind, Initialize, InitializeLimits, InputFragment, InputPolicy,
     LaunchIdentity, RuntimePhase, SecretBytes, SecretEnv, SessionId, StopPolicy, StreamId,
-    TransactionId, Version, WriteId, CURRENT_VERSION, PREVIOUS_VERSION,
+    TransactionId, Version, WriteId, CURRENT_VERSION, MAX_CONTROL_LINE_BYTES,
+    MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
 };
 
 /// Bounds waiting for the worker socket and the child's exit.
@@ -396,12 +397,26 @@ async fn previous_version_child_gets_the_base_environment_without_service_manage
 /// never reads.
 const SILENT_CHILD_STALL_MS: u64 = 300;
 
-/// Lines in the oversized write. Their total size exceeds the canonical input
-/// queue of the PTY on both Linux (4096 bytes) and macOS.
-const OVERSIZED_LINES: usize = 200;
+/// Lines in the oversized write, about 134 KB in all. A PTY whose program does
+/// not read takes more than its 4 KiB line-discipline queue: Linux also buffers
+/// up to 64 KiB in the tty layer, and a write that fits is accepted, and
+/// acknowledged, at once. The write is larger than both, so it always stays
+/// pending until the child reads.
+const OVERSIZED_LINES: usize = 1_700;
 
 /// Bytes per oversized write line.
 const OVERSIZED_LINE_BYTES: usize = 78;
+
+/// Bytes a Linux PTY can hold for a program that does not read: the tty
+/// layer's buffer limit plus the line-discipline queue.
+const PTY_UNREAD_INPUT_CAPACITY: usize = 64 * 1024 + 4 * 1024;
+
+const _: () = assert!(
+    OVERSIZED_LINES * (OVERSIZED_LINE_BYTES + 1) > PTY_UNREAD_INPUT_CAPACITY
+        && OVERSIZED_LINES * (OVERSIZED_LINE_BYTES + 1) <= MAX_DATA_PAYLOAD_BYTES
+        && OVERSIZED_LINES * (OVERSIZED_LINE_BYTES + 1) <= MAX_CONTROL_LINE_BYTES / 4,
+    "the oversized write must exceed what a PTY holds and fit one data frame and one control line (a byte array, about four JSON bytes per input byte)"
+);
 
 /// Initializes the fixture's worker with a child that never reads its
 /// terminal and the short input stall bound.
