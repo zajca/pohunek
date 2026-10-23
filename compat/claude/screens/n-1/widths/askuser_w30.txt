@@ -1,0 +1,24 @@
+
+           Claude Code
+ ▐▛███▛█   v2.1.289
+▝▜██████▀  Sonnet 4.5
+ ▝▝   ▝▝   API Usage Billing
+           /tmp/ph-sample/work
+
+
+❯ [question] ask
+──────────────────────────────
+ ☐ Flavor
+
+Which flavor do you want?
+
+❯ 1. Vanilla
+     Plain
+  2. Chocolate
+     Sweet
+  3. Type something.
+──────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to
+navigate · Esc to cancel

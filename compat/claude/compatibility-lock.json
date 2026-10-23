@@ -5,14 +5,14 @@
   "upstream": {
     "name": "Claude Code",
     "npm": "@anthropic-ai/claude-code",
-    "release": "2.1.289",
-    "integrity": "sha512-RQWjAlalf9aomgI3JaXDCdFPvmNVnRdjwMtYk5L+Lw1NWxCxbhY5T9F+w1xukqvJh/I2rR2+3hICZxhk0al1nA==",
+    "release": "2.1.309",
+    "integrity": "sha512-+lBYZRuXOJpiKJcRv/CK7gF+5UFNWyJE7hSxkgGUKDZOWgANl9MAabfTkrJk183Tp3B0Nv4xF/DU1t0BaKXOPw==",
     "scripts": true,
     "binary": "claude",
     "version_output": "{release} (Claude Code)",
     "sha256": {
-      "darwin-arm64": "03d66745e3bb69ec727d66023696f3820bc0a00a8a5ba725eb6706d0c67cbe69",
-      "linux-x64": "a186b99e4a9c88366cd49df2f7dad56c61fc306ef0140b19ee64b7c42a8d1348"
+      "darwin-arm64": "5eadc0009cdcdbc0d06e58110d7b2baf88ced6088b1c33a60a21217fe410619c",
+      "linux-x64": "4d704a8aecbe038affa3000f498ae17c1b4f753add8facb8764120affc99b658"
     }
   },
   "supported": {
