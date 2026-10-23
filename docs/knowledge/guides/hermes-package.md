@@ -18,7 +18,7 @@ directory holds exactly what the archive holds:
 
 ```text
 runtime-packages/hermes/
-  runtime.toml    runtime descriptor (package pohunek.runtime.hermes 1.0.2)
+  runtime.toml    runtime descriptor (package pohunek.runtime.hermes 1.0.3)
   detect.toml     detection manifest named by `detect_manifest`
   operator.toml   closed sidecar: every operator payload file and its SHA-256
   operator/       the operator plugin payload the sidecar lists
@@ -160,8 +160,13 @@ tag; the package tests compare the package with them.
     heading, each with `Allow once` and `Deny`, in the bottom 16 non-empty
     lines.
   - `active_turn_prompt` (`working`): the Hermes staff symbol `⚕` before the
-    prompt glyph as the last of the bottom 8 non-empty lines, apart from the rule
-    chrome drawn below it; `active_turn_progress` and
+    prompt glyph, optionally followed by the `msg=interrupt …` placeholder of an
+    empty composer during a turn (the compact layout, below 64 columns, has no
+    glyph; the empty composer is one row high, so a narrow terminal clips the
+    placeholder, and its first 15 columns `⚕ msg=interrupt` still read as
+    working while a narrower terminal leaves only the progress rules), as the
+    last of the bottom 8 non-empty lines, apart from the rule chrome drawn below
+    it; `active_turn_progress` and
     `tui_active_turn` (`working`): a `[thinking]` line, `◆ aggregating` or the
     TUI's `Ctrl+C to interrupt…` there.
   - `idle_prompt` and `tui_idle_status` (`idle`): the classic prompt glyph,

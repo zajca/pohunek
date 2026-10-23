@@ -42,17 +42,20 @@ visible_blocker = true
 contains = ["approval required", "Allow once", "Deny"]
 
 # During a model turn the classic prompt changes from the idle arrow to the
-# Hermes staff symbol. The prompt must be the last non-empty line apart from
-# the rule chrome drawn below it: old transcript chrome that holds a bare staff
-# prompt neither keeps the session working after the prompt returns to idle
-# nor reads as a working frame while an idle redraw has erased and not yet
+# Hermes staff symbol, and an empty composer shows the interrupt placeholder
+# after it (the compact layout, below 64 columns, drops the arrow). The empty
+# composer is always one row high, so a narrow terminal clips the placeholder
+# instead of wrapping it. The prompt must be the last non-empty line apart from
+# the rule chrome drawn below it: old transcript chrome that holds a staff
+# prompt neither keeps the session working after the prompt returns to idle nor
+# reads as a working frame while an idle redraw has erased and not yet
 # reprinted the lines below it.
 [[rules]]
 id = "active_turn_prompt"
 state = "working"
 priority = 700
 region = "bottom_non_empty_lines(8)"
-regex = ['(?:\A|\n)[ \t]*⚕[ \t]+(?:❯|>|\$|#|›|»|→)[ \t]*(?:\n[ \t]*─+[ \t]*)*\z']
+regex = ['(?:\A|\n)[ \t]*⚕[ \t]+(?:(?:❯|>|\$|#|›|»|→)[ \t]*(?:msg=interrupt[^\n]*)?|msg=interrupt[^\n]*)(?:\n[ \t]*─+[ \t]*)*\z']
 
 # Reasoning and tool progress are painted immediately above the prompt while a
 # turn is active. These bounded signatures cover narrow terminals where the

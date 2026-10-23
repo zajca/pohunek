@@ -82,16 +82,17 @@ const GOLDEN_MANIFEST: &str = "compat/hermes/builtin-v0.34/detect.toml";
 const GOLDEN_ACTIVE_TURN_PROMPT: &str = "# Hermes staff symbol. The bottom-lines bound prevents old transcript chrome\n# from keeping the session working after the prompt returns to idle.\n[[rules]]\nid = \"active_turn_prompt\"\nstate = \"working\"\npriority = 700\nregion = \"bottom_non_empty_lines(8)\"\nline_regex = ['^\\s*⚕\\s+(?:❯|>|\\$|#|›|»|→)\\s*$']\n";
 
 /// The one rule in which the package deliberately diverges from the built-in
-/// copy: the bare staff prompt counts as working only as the last non-empty
-/// line, so an old transcript prompt exposed by a partial idle redraw never
-/// reads as a working frame (#1486).
-const PACKAGE_ACTIVE_TURN_PROMPT: &str = "# Hermes staff symbol. The prompt must be the last non-empty line apart from\n# the rule chrome drawn below it: old transcript chrome that holds a bare staff\n# prompt neither keeps the session working after the prompt returns to idle\n# nor reads as a working frame while an idle redraw has erased and not yet\n# reprinted the lines below it.\n[[rules]]\nid = \"active_turn_prompt\"\nstate = \"working\"\npriority = 700\nregion = \"bottom_non_empty_lines(8)\"\nregex = ['(?:\\A|\\n)[ \\t]*⚕[ \\t]+(?:❯|>|\\$|#|›|»|→)[ \\t]*(?:\\n[ \\t]*─+[ \\t]*)*\\z']\n";
+/// copy: the staff prompt, bare or followed by the interrupt placeholder
+/// Hermes paints into an empty composer during a turn, counts as working only
+/// as the last non-empty line, so an old transcript prompt exposed by a partial
+/// idle redraw never reads as a working frame (#1486, #1524).
+const PACKAGE_ACTIVE_TURN_PROMPT: &str = "# Hermes staff symbol, and an empty composer shows the interrupt placeholder\n# after it (the compact layout, below 64 columns, drops the arrow). The empty\n# composer is always one row high, so a narrow terminal clips the placeholder\n# instead of wrapping it. The prompt must be the last non-empty line apart from\n# the rule chrome drawn below it: old transcript chrome that holds a staff\n# prompt neither keeps the session working after the prompt returns to idle nor\n# reads as a working frame while an idle redraw has erased and not yet\n# reprinted the lines below it.\n[[rules]]\nid = \"active_turn_prompt\"\nstate = \"working\"\npriority = 700\nregion = \"bottom_non_empty_lines(8)\"\nregex = ['(?:\\A|\\n)[ \\t]*⚕[ \\t]+(?:(?:❯|>|\\$|#|›|»|→)[ \\t]*(?:msg=interrupt[^\\n]*)?|msg=interrupt[^\\n]*)(?:\\n[ \\t]*─+[ \\t]*)*\\z']\n";
 
 /// Package id the descriptor declares.
 const PACKAGE_ID: &str = "pohunek.runtime.hermes";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.0.2";
+const PACKAGE_VERSION: &str = "1.0.3";
 
 /// Profile that pins the runtime package in the installation scenario.
 const PROFILE: &str = "hermes-package-test";
@@ -2076,14 +2077,14 @@ async fn an_unusable_selection_without_an_install_is_a_typed_source_error() {
     let hermes = HermesFixture::new(&harness.env);
 
     let mut alternate = package_entries();
-    set_version(&mut alternate, "1.0.3");
+    set_version(&mut alternate, "1.0.4");
     let (bytes, alternate_digest) = archive_of(&alternate);
-    let archive = write_archive(&harness, "hermes-1.0.3.tar.zst", &bytes);
+    let archive = write_archive(&harness, "hermes-1.0.4.tar.zst", &bytes);
     let catalog = write_catalog(
         &harness,
         &key,
         2,
-        vec![catalog_entry("1.0.3", &alternate_digest)],
+        vec![catalog_entry("1.0.4", &alternate_digest)],
     );
     update_package(&harness, &archive, &catalog, &alternate_digest).await;
     let (code, removed) = harness
@@ -2312,17 +2313,17 @@ async fn update_moves_an_install_to_the_newly_selected_package() {
     assert_eq!(hermes.status(&harness).await["outdated"], false);
 
     let mut second = package_entries();
-    set_version(&mut second, "1.0.3");
+    set_version(&mut second, "1.0.4");
     let mut skill = entry(&second, &format!("operator/{SKILL_PATH}")).to_vec();
     skill.extend_from_slice(b"\n<!-- second package version -->\n");
     replace_operator_file(&mut second, SKILL_PATH, skill.clone());
     let (bytes, second_digest) = archive_of(&second);
-    let archive = write_archive(&harness, "hermes-1.0.3.tar.zst", &bytes);
+    let archive = write_archive(&harness, "hermes-1.0.4.tar.zst", &bytes);
     let catalog = write_catalog(
         &harness,
         &key,
         2,
-        vec![catalog_entry("1.0.3", &second_digest)],
+        vec![catalog_entry("1.0.4", &second_digest)],
     );
     update_package(&harness, &archive, &catalog, &second_digest).await;
     let status = hermes.status(&harness).await;
