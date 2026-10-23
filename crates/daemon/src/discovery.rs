@@ -43,6 +43,12 @@ impl DiscoveryCache {
         }
     }
 
+    /// The configured overlay registry this cache discovers through.
+    #[must_use]
+    pub fn registry(&self) -> &OverlayRegistry {
+        &self.registry
+    }
+
     /// Return cached records or refresh the shared discovery engine.
     ///
     /// Peers are probed and classified for `asked`, the protocol range the

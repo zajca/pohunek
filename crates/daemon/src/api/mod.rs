@@ -62,7 +62,7 @@ use crate::session::{ControlPeer, RedeemedAttach, RedeemedRuntime, SessionRegist
 use handler::Dispatch;
 #[cfg(test)]
 pub(crate) use handler::{dispatch_line, Dispatch};
-pub use handler::{handle_request, ControlTransport, DaemonState, HealthInfo};
+pub use handler::{handle_request, ControlTransport, DaemonState, HealthInfo, OverlaySource};
 
 /// Directory mode for the runtime dir: owner rwx only (`0700`).
 ///
@@ -145,7 +145,13 @@ impl ControlServer {
     ) -> Result<Self, DaemonError> {
         Self::bind_with_state(
             socket_path,
-            DaemonState::new(health, SessionRegistry::default(), governance, registry),
+            DaemonState::new(
+                health,
+                SessionRegistry::default(),
+                governance,
+                registry,
+                crate::api::OverlaySource::Default,
+            ),
         )
         .await
     }

@@ -25,7 +25,7 @@ use pohunek_platform::filesystem::{StageOutcome, TrustedDir};
 use protocol::{DoctorCheck, DoctorStatus};
 
 use crate::executable::is_executable_file;
-use crate::{binary_with_path, netbird, StandardCheckInputs};
+use crate::{binary_with_path, overlay_checks, StandardCheckInputs};
 
 // Rust guideline compliant 2026-09-30
 
@@ -47,11 +47,20 @@ pub const LAUNCHCTL_DEADLINE: Duration = Duration::from_secs(10);
 /// Each agent version probe accepts the remaining aggregate budget.
 pub const AGENT_RUNTIME_PROBE_BUDGET: Duration = Duration::from_secs(4);
 
-/// Longest time the launchd, worker, and agent probes of one doctor run can block.
+/// Budget for the overlay provider probes in one doctor run.
+///
+/// A provider CLI normally answers in milliseconds; the budget only keeps a hung
+/// one from stalling the doctor, so a provider that has not answered is reported
+/// as unavailable.
+pub const OVERLAY_PROBE_BUDGET: Duration = Duration::from_secs(4);
+
+/// Longest time the launchd, worker, overlay, and agent probes of one doctor run
+/// can block.
 ///
 /// [`doctor_request_timeout`] derives the transport limit from this sum.
 pub const PROBE_BUDGET: Duration = LAUNCHCTL_DEADLINE
     .saturating_add(crate::WORKER_PROBE_DEADLINE)
+    .saturating_add(OVERLAY_PROBE_BUDGET)
     .saturating_add(AGENT_RUNTIME_PROBE_BUDGET);
 
 /// Time a `daemon.doctor` reply needs after the last probe finishes: framing,
@@ -411,7 +420,9 @@ pub fn standard_checks(inputs: &StandardCheckInputs<'_>, facts: &MacosFacts) -> 
             &state_root.join(WORKERS_SUBDIR),
         ),
         check_filesystem_access(inputs),
-        netbird(),
+    ];
+    checks.extend(overlay_checks::cli_checks(inputs.overlays));
+    checks.extend([
         DoctorCheck::new(
             "schema_version",
             DoctorStatus::Warn,
@@ -421,7 +432,7 @@ pub fn standard_checks(inputs: &StandardCheckInputs<'_>, facts: &MacosFacts) -> 
         check_login_shell(facts),
         check_desktop_notifications(facts),
         check_keychain(facts),
-    ];
+    ]);
     let launchd = [
         facts
             .launchd_domain
@@ -1129,6 +1140,8 @@ mod tests {
 
     use protocol::DoctorReport;
 
+    use crate::OverlayChecks;
+
     use super::*;
 
     /// Name prefix of every fixture root; short because each byte counts
@@ -1619,6 +1632,7 @@ mod tests {
             worker: Some(&worker),
             access_dirs: &[],
             supervision: Supervision::Native,
+            overlays: OverlayChecks::NONE,
         };
 
         let checks = standard_checks(&inputs, &f);
@@ -1715,6 +1729,7 @@ mod tests {
                 worker: None,
                 access_dirs: &[],
                 supervision,
+                overlays: OverlayChecks::NONE,
             };
             let mut facts = missing_domain.clone();
             if supervision == Supervision::Subprocess {
@@ -1846,14 +1861,18 @@ mod tests {
 
     #[test]
     fn the_doctor_request_timeout_outlasts_every_bounded_probe() {
-        // The service-manager, worker, and full agent-probe budgets must fit
-        // before the client deadline so the daemon's bounded result is delivered.
+        // The service-manager, worker, overlay, and full agent-probe budgets must
+        // fit before the client deadline so the daemon's bounded result is
+        // delivered.
         assert!(PROBE_BUDGET >= LAUNCHCTL_DEADLINE);
         assert!(doctor_request_timeout() > PROBE_BUDGET);
         assert_eq!(doctor_request_timeout(), PROBE_BUDGET + REPLY_HEADROOM);
         assert_eq!(
             PROBE_BUDGET,
-            LAUNCHCTL_DEADLINE + crate::WORKER_PROBE_DEADLINE + AGENT_RUNTIME_PROBE_BUDGET
+            LAUNCHCTL_DEADLINE
+                + crate::WORKER_PROBE_DEADLINE
+                + OVERLAY_PROBE_BUDGET
+                + AGENT_RUNTIME_PROBE_BUDGET
         );
         assert!(PROBE_BUDGET > Duration::from_secs(5));
     }
@@ -2066,6 +2085,7 @@ mod tests {
             worker: None,
             access_dirs,
             supervision: Supervision::Native,
+            overlays: OverlayChecks::NONE,
         }
     }
 
@@ -2209,6 +2229,13 @@ mod tests {
         let mut f = facts();
         f.path_var = Some(path_var);
         let config_dir = base.join("config");
+        let netbird = overlay::OverlayId::new("netbird").unwrap();
+        let diagnostics = [overlay::OverlayDiagnostic {
+            overlay: netbird.clone(),
+            port: 18722,
+            listener: None,
+            error: Some(overlay::OverlayError::ListenerAddressMissing(netbird)),
+        }];
         let inputs = StandardCheckInputs {
             socket_dir: &base.join("runtime"),
             state_dir: &base.join("data"),
@@ -2220,6 +2247,10 @@ mod tests {
             worker,
             access_dirs: &[],
             supervision: Supervision::Native,
+            overlays: OverlayChecks {
+                diagnostics: &diagnostics,
+                from_file: false,
+            },
         };
         standard_checks(&inputs, &f)
     }

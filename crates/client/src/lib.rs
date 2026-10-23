@@ -18,11 +18,11 @@ pub use discovery::{
 pub use error::ClientError;
 pub use overlay::{
     ConfiguredTransport, ExternalIdentity, ExternalIdentityKind, HostTarget, LocalIdentity,
-    OverlayRegistry, RegistryError,
+    OverlayDiagnostic, OverlayRegistry, RegistryError,
 };
 pub use overlay_config::{
-    default_overlay_registry, overlay_registry_from, OverlayConfig, DEFAULT_REMOTE_PORT,
-    OVERLAY_CONFIG_FILE, REMOTE_PORT_ENV,
+    default_overlay_registry, diagnose_overlays, overlay_registry_from, OverlayConfig,
+    DEFAULT_REMOTE_PORT, OVERLAY_CONFIG_FILE, REMOTE_PORT_ENV,
 };
 pub use protocol;
 pub use transport::{

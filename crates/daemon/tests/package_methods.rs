@@ -133,6 +133,7 @@ async fn spawn_servers(tag: &str) -> Servers {
         registry,
         governance,
         support::overlay_registry(),
+        pohunek_daemon::api::OverlaySource::Default,
     );
     let unix = ControlServer::bind_with_state(&socket, state.clone())
         .await

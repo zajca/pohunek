@@ -231,6 +231,7 @@ async fn spawn_server(
         registry,
         governance,
         support::overlay_registry(),
+        pohunek_daemon::api::OverlaySource::Default,
     )
     .with_notifications(notifications)
     .with_attention_coordinator(attention);

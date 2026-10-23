@@ -724,6 +724,7 @@ async fn serve_registry(
         registry,
         governance_service(socket).await,
         support::overlay_registry(),
+        pohunek_daemon::api::OverlaySource::Default,
     )
     .with_notifications(notifications);
     let server = ControlServer::bind_with_state(socket, state)

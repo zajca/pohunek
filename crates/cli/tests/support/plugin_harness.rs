@@ -591,6 +591,7 @@ async fn bind_server(
         registry,
         governance,
         overlay_registry(),
+        pohunek_daemon::api::OverlaySource::Default,
     );
     if let Some(notifications) = notifications {
         state = state.with_notifications(notifications);

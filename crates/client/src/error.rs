@@ -1,6 +1,7 @@
 //! Typed SDK client errors.
 
 use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -176,10 +177,19 @@ pub enum ClientError {
     },
 
     /// An overlay TCP connection to the host's daemon port could not be opened.
-    #[error("could not open an overlay connection to host '{host}': {source}")]
+    #[error(
+        "could not open an overlay connection to host '{host}' ({}): {source}",
+        describe_route(.overlay.as_deref(), *.address, *.port)
+    )]
     HostUnreachable {
         /// The requested host name.
         host: String,
+        /// Overlay the host was resolved through, when the caller knows it.
+        overlay: Option<String>,
+        /// Address that was dialled.
+        address: IpAddr,
+        /// Daemon port that was dialled.
+        port: u16,
         /// Underlying connection error.
         #[source]
         source: io::Error,
@@ -427,9 +437,23 @@ impl ClientError {
                         .to_owned(),
                 ),
             ),
-            ClientError::HostUnreachable { host, source } => {
+            ClientError::HostUnreachable {
+                host,
+                overlay,
+                address,
+                port,
+                source,
+            } => {
+                let route = describe_route(overlay.as_deref(), *address, *port);
                 let mut err = ProtocolError::host_unreachable(host);
-                err.msg = format!("{}: {source}", err.msg);
+                err.msg = format!("{} ({route}): {source}", err.msg);
+                if let Some(overlay) = overlay {
+                    err.recover = Some(format!(
+                        "check that the host is online, that its pohunek daemon is running and \
+                         that its overlays.toml lists '{overlay}' as its provider; a daemon \
+                         started with another provider does not listen on {overlay}"
+                    ));
+                }
                 err
             }
             ClientError::RemoteDaemonUnavailable { host } => {
@@ -661,6 +685,15 @@ fn ambiguity_hint(candidates: &[overlay::HostCandidate]) -> String {
     }
 }
 
+/// The overlay and socket address a failed connection dialled, for messages.
+fn describe_route(overlay: Option<&str>, address: IpAddr, port: u16) -> String {
+    let target = SocketAddr::new(address, port);
+    match overlay {
+        Some(overlay) => format!("overlay {overlay} at {target}"),
+        None => format!("at {target}"),
+    }
+}
+
 /// Message of a lifecycle deadline that elapsed while the daemon `action` was
 /// still pending.
 fn lifecycle_timeout_message(host: Option<&str>, timeout: Duration, action: &str) -> String {
@@ -808,11 +841,19 @@ mod tests {
                 "host unreachable names the host and appends the source",
                 ClientError::HostUnreachable {
                     host: "build-box".to_owned(),
+                    overlay: Some("netbird".to_owned()),
+                    address: "100.64.0.9".parse().expect("address"),
+                    port: 18722,
                     source: io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused"),
                 },
                 ErrorClass::Transport,
                 "host_unreachable",
-                vec!["build-box", "connection refused"],
+                vec![
+                    "build-box",
+                    "connection refused",
+                    "netbird",
+                    "100.64.0.9:18722",
+                ],
             ),
             (
                 "remote daemon unavailable names the host",

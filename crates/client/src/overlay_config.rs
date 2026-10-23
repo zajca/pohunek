@@ -29,9 +29,13 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
+use futures::future::join_all;
 use netbird::{NetbirdTransport, NETBIRD_OVERLAY_ID};
-use overlay::{ConfiguredTransport, OverlayRegistry, OverlayTransport};
+use overlay::{
+    ConfiguredTransport, OverlayDiagnostic, OverlayError, OverlayRegistry, OverlayTransport,
+};
 use pohunek_platform::filesystem::{FsError, TrustedDir};
 use serde::Deserialize;
 
@@ -122,6 +126,9 @@ struct RawConfig {
 pub struct OverlayConfig {
     providers: Vec<Provider>,
     port: u16,
+    /// `true` when the providers came from `overlays.toml`, `false` for the
+    /// `NetBird` default of an absent file.
+    from_file: bool,
 }
 
 impl OverlayConfig {
@@ -138,6 +145,15 @@ impl OverlayConfig {
     #[must_use]
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Whether the providers were listed in `overlays.toml`.
+    ///
+    /// `false` means the file is absent and the `NetBird` default applies, where
+    /// a missing provider CLI is not an error.
+    #[must_use]
+    pub fn from_file(&self) -> bool {
+        self.from_file
     }
 
     /// Load the configuration from the XDG config directory of this process.
@@ -171,6 +187,7 @@ impl OverlayConfig {
             None => Self {
                 providers: vec![Provider::Netbird],
                 port: DEFAULT_REMOTE_PORT,
+                from_file: false,
             },
         };
         if let Some(port) = port_override().map_err(invalid)? {
@@ -214,6 +231,32 @@ pub fn overlay_registry_from(config_dir: &Path) -> Result<OverlayRegistry, Clien
 /// Returns the errors of [`OverlayConfig::load`] and [`OverlayConfig::registry`].
 pub fn default_overlay_registry() -> Result<OverlayRegistry, ClientError> {
     OverlayConfig::load()?.registry()
+}
+
+/// Probe every overlay of `registry` for its listener state.
+///
+/// Each provider gets `budget` on its own: one that has not answered when it
+/// elapses is reported as unavailable, so a hung provider CLI neither outlasts a
+/// doctor request nor hides the state of a healthy one.
+pub async fn diagnose_overlays(
+    registry: &OverlayRegistry,
+    budget: Duration,
+) -> Vec<OverlayDiagnostic> {
+    join_all(registry.entries().iter().map(|entry| async move {
+        match tokio::time::timeout(budget, entry.diagnostic()).await {
+            Ok(diagnostic) => diagnostic,
+            Err(_elapsed) => OverlayDiagnostic {
+                overlay: entry.id().clone(),
+                port: entry.port(),
+                listener: None,
+                error: Some(OverlayError::StateUnavailable {
+                    overlay: entry.id().clone(),
+                    detail: format!("the provider did not answer within {budget:?}"),
+                }),
+            },
+        }
+    }))
+    .await
 }
 
 /// Resolve `<config_home>/pohunek`.
@@ -305,7 +348,11 @@ fn parse(text: &str) -> Result<OverlayConfig, String> {
             .filter(|port| *port != 0)
             .ok_or_else(|| "port must be a number in 1..=65535".to_owned())?,
     };
-    Ok(OverlayConfig { providers, port })
+    Ok(OverlayConfig {
+        providers,
+        port,
+        from_file: true,
+    })
 }
 
 /// Resolve [`REMOTE_PORT_ENV`]; `None` when it is unset.
