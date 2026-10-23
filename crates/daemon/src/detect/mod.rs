@@ -305,12 +305,20 @@ impl Detector {
         // that event's bytes ended, never against the chunk's final screen —
         // a title followed by a clear in one chunk arrived while the blocker
         // still held.
+        //
+        // Under an agent manifest, a `Working` winner at one of those points is
+        // remembered: a turn whose working title or frame is replaced by an idle
+        // one inside the same chunk is still working evidence.
         let mut osc_changes = OscChanges::default();
+        let mut sighted_working = None;
         let mut consumed = 0;
         for (item, end) in osc_events {
             self.feed_screen_segment(&bytes[consumed..end]);
             if self.apply_osc_event(item, &mut osc_changes) {
                 self.sight_full_context();
+                if sighted_working.is_none() && self.latches_working() {
+                    sighted_working = self.working_sighting(osc_changes, &recent_before);
+                }
             }
             consumed = end;
         }
@@ -328,6 +336,14 @@ impl Detector {
         let has_structured_evidence = hit.is_some();
 
         let mut transitions = Vec::new();
+        if let Some(sighted) = sighted_working {
+            if hit
+                .as_ref()
+                .is_none_or(|hit| hit.evidence.activity != AgentActivity::Working)
+            {
+                push_transition(&mut transitions, self.state.observe_evidence(now, sighted));
+            }
+        }
         if let Some(hit) = hit {
             push_transition(
                 &mut transitions,
@@ -340,6 +356,37 @@ impl Detector {
         }
 
         transitions
+    }
+
+    /// Whether intermediate working sightings inside a chunk are evaluated.
+    ///
+    /// Only an agent's own manifest latches: the generic shell manifest matches
+    /// `working` or `running` anywhere on screen, so a line printed and erased
+    /// within one chunk would fabricate working edges. Evaluation also stops
+    /// while `Working` is already published, which keeps busy output at one
+    /// evaluation per chunk.
+    fn latches_working(&self) -> bool {
+        !self.state.is_publishing_working()
+            && self
+                .manifest
+                .as_ref()
+                .is_some_and(|manifest| !Arc::ptr_eq(manifest, shared_generic_shell_manifest()))
+    }
+
+    /// The `Working` winner over the bytes consumed so far, if there is one.
+    fn working_sighting(
+        &self,
+        osc_changes: OscChanges,
+        recent_before: &str,
+    ) -> Option<ActivityEvidence> {
+        let freshness = ContextFreshness {
+            screen: self.screen.recent_text() != recent_before,
+            osc_title: osc_changes.title,
+            osc_progress: osc_changes.progress,
+        };
+        self.manifest_evidence(freshness)
+            .map(|hit| hit.evidence)
+            .filter(|evidence| evidence.activity == AgentActivity::Working)
     }
 
     /// Feeds a segment and stamps text changes or character redraws.
@@ -2128,6 +2175,157 @@ mod tests {
                 "\x1b[2J\x1b[H\u{2733} Running\u{2026} (5s \u{b7} hooks)\r\nBash command\r\nsleep 45\r\nDo you want to proceed?\r\n\u{276f} 1. Yes\r\n  2. No\r\nesc to cancel".as_bytes(),
             ),
             vec![transition(AgentActivity::Blocked, StateSource::Screen)]
+        );
+    }
+
+    /// Claude detector with the test debounce and an idle published state.
+    fn claude_detector(rows: u16, cols: u16, started_at: Instant) -> Detector {
+        let mut detector_config = package_config(&RuntimeRef::claude());
+        detector_config.detection = config().detection;
+        Detector::new(rows, cols, started_at, detector_config)
+    }
+
+    fn working_osc_title() -> &'static str {
+        "\x1b]2;\u{280b} thinking\x07"
+    }
+
+    fn idle_osc_title() -> &'static str {
+        "\x1b]2;\u{2733} Claude Code\x07"
+    }
+
+    #[test]
+    fn a_working_title_and_an_idle_title_in_one_chunk_still_yield_working_evidence() {
+        let started_at = instant();
+        let mut detector = claude_detector(3, 80, started_at);
+
+        let chunk = format!("{}{}", working_osc_title(), idle_osc_title());
+        let transitions = detector.feed(started_at, chunk.as_bytes());
+
+        assert_eq!(
+            transitions.first(),
+            Some(&transition(AgentActivity::Working, StateSource::OscTitle)),
+            "the working title sighted inside the chunk publishes working first: {transitions:?}"
+        );
+        assert_eq!(detector.latest_title(), Some("\u{2733} Claude Code"));
+    }
+
+    #[test]
+    fn a_latched_working_title_is_followed_by_the_chunk_end_idle_after_debounce() {
+        let started_at = instant();
+        let mut detector = claude_detector(3, 80, started_at);
+
+        let chunk = format!("{}{}", working_osc_title(), idle_osc_title());
+        detector.feed(started_at, chunk.as_bytes());
+        let mut transitions = Vec::new();
+        for step in 1..=10 {
+            transitions.extend(detector.tick(started_at + Duration::from_millis(100 * step)));
+        }
+
+        assert!(
+            transitions
+                .iter()
+                .any(|transition| transition.activity == AgentActivity::Idle),
+            "the chunk-end idle confirms through the ordinary debounce: {transitions:?}"
+        );
+    }
+
+    #[test]
+    fn the_working_latch_never_duplicates_a_published_working_state() {
+        let started_at = instant();
+        let mut detector = claude_detector(3, 80, started_at);
+        assert_eq!(
+            detector.feed(started_at, working_osc_title().as_bytes()),
+            vec![transition(AgentActivity::Working, StateSource::OscTitle)]
+        );
+
+        let chunk = format!("{}{}", working_osc_title(), idle_osc_title());
+        let transitions = detector.feed(started_at + Duration::from_millis(10), chunk.as_bytes());
+
+        assert!(
+            transitions
+                .iter()
+                .all(|transition| transition.activity != AgentActivity::Working),
+            "no second working edge while working is published: {transitions:?}"
+        );
+    }
+
+    #[test]
+    fn a_chunk_that_ends_on_a_working_title_publishes_one_working_edge() {
+        let started_at = instant();
+        let mut detector = claude_detector(3, 80, started_at);
+
+        let chunk = format!(
+            "{}{}{}",
+            working_osc_title(),
+            idle_osc_title(),
+            working_osc_title()
+        );
+        let transitions = detector.feed(started_at, chunk.as_bytes());
+
+        assert_eq!(
+            transitions,
+            vec![transition(AgentActivity::Working, StateSource::OscTitle)]
+        );
+    }
+
+    #[test]
+    fn a_working_title_followed_by_a_permission_dialog_latches_working_then_blocks() {
+        let started_at = instant();
+        let mut detector = claude_detector(10, 120, started_at);
+
+        let chunk = format!(
+            "{}\x1b[2J\x1b[HBash command\r\nsleep 45\r\nDo you want to proceed?\r\n\u{276f} 1. Yes\r\n  2. No\r\nesc to cancel{}",
+            working_osc_title(),
+            idle_osc_title()
+        );
+        let transitions = detector.feed(started_at, chunk.as_bytes());
+        assert_eq!(
+            transitions.first(),
+            Some(&transition(AgentActivity::Working, StateSource::OscTitle)),
+            "{transitions:?}"
+        );
+        let mut later = Vec::new();
+        for step in 1..=10 {
+            later.extend(detector.tick(started_at + Duration::from_millis(100 * step)));
+        }
+        assert!(
+            transitions
+                .iter()
+                .chain(later.iter())
+                .any(|transition| transition.activity == AgentActivity::Blocked),
+            "the dialog still resolves blocked: {transitions:?} {later:?}"
+        );
+    }
+
+    #[test]
+    fn a_lag_resync_fabricates_no_working_evidence() {
+        let started_at = instant();
+        let mut detector = claude_detector(3, 80, started_at);
+        detector.feed(started_at, idle_osc_title().as_bytes());
+
+        detector.resync_after_lag();
+
+        assert!(detector
+            .tick(started_at + Duration::from_millis(100))
+            .iter()
+            .all(|transition| transition.activity != AgentActivity::Working));
+    }
+
+    #[test]
+    fn the_generic_shell_manifest_never_latches_a_transient_working_title() {
+        let started_at = instant();
+        let mut detector = Detector::new(3, 80, started_at, config());
+
+        let transitions = detector.feed(
+            started_at,
+            b"\x1b]2;running\x07\x1b]2;bash\x07",
+        );
+
+        assert!(
+            transitions
+                .iter()
+                .all(|transition| transition.activity != AgentActivity::Working),
+            "shell output stays on the byte path: {transitions:?}"
         );
     }
 

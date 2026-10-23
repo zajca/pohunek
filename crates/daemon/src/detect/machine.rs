@@ -173,6 +173,13 @@ impl StateMachine {
         None
     }
 
+    /// Whether `Working` is the currently published activity.
+    #[must_use]
+    pub fn is_publishing_working(&self) -> bool {
+        self.published
+            .is_some_and(|published| published.transition.activity == AgentActivity::Working)
+    }
+
     /// Whether a debounced candidate is waiting for further confirmations.
     #[must_use]
     pub fn has_pending(&self) -> bool {
