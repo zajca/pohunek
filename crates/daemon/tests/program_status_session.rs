@@ -245,6 +245,7 @@ impl Fixture {
                 wait: Some(SessionInputWait {
                     until: Some(vec![until]),
                     timeout_ms: Some(WAIT_MS),
+                    allow_prompt_accepted: None,
                 }),
             })
             .await
