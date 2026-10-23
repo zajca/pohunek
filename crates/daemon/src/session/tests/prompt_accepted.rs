@@ -122,6 +122,8 @@ struct Rig {
     /// Present: the hook runs in a child shell of the agent, as the hook of a
     /// nested `claude -p` run by the agent would.
     nested_flag: PathBuf,
+    /// Present: the agent reports nothing for the line `b`.
+    skip_b_flag: PathBuf,
     hold_gate: fs::File,
     session: Option<SessionInfo>,
 }
@@ -135,6 +137,7 @@ impl Rig {
         let hold_flag = dir.join("hold");
         let noisy_flag = dir.join("noisy");
         let nested_flag = dir.join("nested");
+        let skip_b_flag = dir.join("skip-b");
         let hold_gate_path = dir.join("hold.gate");
         let hold_gate = hook_gate(&hold_gate_path);
         let script = dir.join("claude-agent.sh");
@@ -147,6 +150,7 @@ impl Rig {
                  printf '{{\"session_id\":\"{NATIVE_ID}\"}}' | sh '{adapter}' session\n\
                  printf 'ready\\n' >> '{state}'\n\
                  while IFS= read -r line; do\n\
+                   if [ -e '{skip_b}' ] && [ \"$line\" = b ]; then printf 'skipped\\n' >> '{state}'; continue; fi\n\
                    if [ -e '{skip}' ]; then printf 'skipped\\n' >> '{state}'; continue; fi\n\
                    if [ -e '{noisy}' ]; then printf 'streaming output\\n'; fi\n\
                    if [ -e '{hold}' ]; then printf 'parked\\n' >> '{parked}'; read -r gate < '{gate}'; fi\n\
@@ -160,6 +164,7 @@ impl Rig {
                 adapter = adapter.display(),
                 state = state.display(),
                 skip = skip_flag.display(),
+                skip_b = skip_b_flag.display(),
                 hold = hold_flag.display(),
                 parked = dir.join("hold.parked").display(),
                 noisy = noisy_flag.display(),
@@ -198,6 +203,7 @@ impl Rig {
             hold_flag,
             noisy_flag,
             nested_flag,
+            skip_b_flag,
             hold_gate,
             session: None,
         }
@@ -274,10 +280,21 @@ impl Rig {
         allow_prompt_accepted: Option<bool>,
     ) -> tokio::task::JoinHandle<Result<protocol::SessionInputResult, protocol::ProtocolError>>
     {
+        self.input_text(TYPED, until, timeout_ms, allow_prompt_accepted)
+    }
+
+    fn input_text(
+        &self,
+        text: &str,
+        until: Vec<AgentActivity>,
+        timeout_ms: u32,
+        allow_prompt_accepted: Option<bool>,
+    ) -> tokio::task::JoinHandle<Result<protocol::SessionInputResult, protocol::ProtocolError>>
+    {
         let registry = self.registry.clone();
         let params = protocol::SessionInputParams {
             session_id: self.id().clone(),
-            text: TYPED.to_owned(),
+            text: text.to_owned(),
             wait: Some(protocol::SessionInputWait {
                 until: Some(until),
                 timeout_ms: Some(timeout_ms),
@@ -623,4 +640,27 @@ async fn an_acceptance_after_the_runtime_ended_answers_nothing() {
         ),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn an_acceptance_between_the_body_and_enter_is_not_this_submissions() {
+    let rig = Rig::start("prompt-between-plans", 150).await;
+    // The body ends a line, so the agent reports it while Enter is still to be
+    // written; Enter's own line `b` reports nothing.
+    fs::write(&rig.skip_b_flag, b"").expect("lose the hook of Enter's line");
+    let parked = Arc::new(tokio::sync::Barrier::new(2));
+    rig.registry.hold_next_submit_delay(Arc::clone(&parked));
+    let waiting = rig.input_text("a\nb", vec![AgentActivity::Working], PATIENT_MS, Some(true));
+    reach_boundary(&parked).await;
+    rig.wait_hook_runs(1).await;
+    reach_boundary(&parked).await;
+
+    // The daemon reads the worker only once the submit released its control
+    // connection, so the report is imported after Enter's mark was taken.
+    let error = waiting
+        .await
+        .expect("wait task joins")
+        .expect_err("an acceptance older than Enter's mark answers nothing");
+    assert_eq!(error.code, "session_input_timeout");
+    rig.finish().await;
 }
