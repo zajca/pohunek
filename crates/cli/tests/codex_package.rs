@@ -5089,3 +5089,22 @@ async fn a_real_codex_is_read_through_program_status() {
     assert_ne!(stopped["ok"]["activity"], "working", "{stopped}");
     fixture.finish().await;
 }
+
+/// N1/A13: a release that writes no records keeps its blockers next to the
+/// background-terminal footer.
+#[test]
+fn a_weak_blocker_still_blocks_next_to_the_background_terminal_footer_without_a_record() {
+    let rows = dialog(&[
+        "\u{2022} Apply the patch? [y/n]",
+        "  1 background terminal running \u{b7} /ps to view \u{b7} /stop to close",
+        "\u{203a} Ask Codex to do anything",
+    ]);
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&frame_bytes(Some("work"), &rows));
+    assert_eq!(
+        run.activity(),
+        Some((AgentActivity::Blocked, StateSource::Screen)),
+        "{:?}",
+        run.published
+    );
+}
