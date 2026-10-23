@@ -111,13 +111,13 @@ done
 /// repeats it.
 fn nested_agent_script(dir: &Path) -> String {
     format!(
-        r#"#!/bin/sh
+        r"#!/bin/sh
 printf '\033]2;work\007'
 while [ ! -e '{}' ]; do
   printf '\033]7501;state=working:app={APP}\033\\'
   sleep 0.3
 done
-"#,
+",
         dir.join("stop").display()
     )
 }
