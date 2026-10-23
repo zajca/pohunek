@@ -18,7 +18,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-toml_edit = { workspace = true }
+toml_edit = { workspace = true, features = ["serde"] }
 tracing = { workspace = true }
 libc = { workspace = true }
 
