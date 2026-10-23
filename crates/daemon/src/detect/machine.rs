@@ -173,6 +173,13 @@ impl StateMachine {
         None
     }
 
+    /// The activity of the currently published transition, if any.
+    #[must_use]
+    pub fn published_activity(&self) -> Option<AgentActivity> {
+        self.published
+            .map(|published| published.transition.activity)
+    }
+
     /// Whether a debounced candidate is waiting for further confirmations.
     #[must_use]
     pub fn has_pending(&self) -> bool {

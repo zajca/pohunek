@@ -107,12 +107,25 @@ impl ScreenTracker {
         }
     }
 
-    /// Permanently ends character and ordered screen observations.
+    /// Ends character and ordered screen observations until
+    /// [`ScreenTracker::resume_observation`].
     ///
     /// Grid updates continue through `feed` or `feed_observed`; neither reports
     /// redraws or calls the observer after this, even after a reset.
     pub fn finish_observation(&mut self) {
         self.draw_parser = None;
+    }
+
+    /// Re-arms character and ordered screen observations after
+    /// [`ScreenTracker::finish_observation`]; a no-op while they are armed.
+    ///
+    /// The re-armed observer starts outside any escape sequence, so until the
+    /// first complete sequence it can add or drop an observation point. The
+    /// grid is unaffected.
+    pub fn resume_observation(&mut self) {
+        if self.draw_parser.is_none() {
+            self.draw_parser = Some(vte::Parser::new());
+        }
     }
 
     /// Whether the parsed terminal has bracketed paste enabled.

@@ -186,7 +186,9 @@ pub(crate) fn shared_generic_shell_manifest() -> &'static Arc<Manifest> {
     static MANIFEST: OnceLock<Arc<Manifest>> = OnceLock::new();
     MANIFEST.get_or_init(|| {
         Arc::new(
-            Manifest::parse_str(GENERIC_SHELL_MANIFEST).expect("generic shell manifest must parse"),
+            Manifest::parse_str(GENERIC_SHELL_MANIFEST)
+                .expect("generic shell manifest must parse")
+                .without_working_latch(),
         )
     })
 }
@@ -253,6 +255,12 @@ pub struct Detector {
     /// blocker — or a title received while the blocker still held — never
     /// does.
     idle_barrier: u64,
+    /// Manifest evaluations the working latch ran at intermediate points.
+    #[cfg(test)]
+    latch_evaluations: usize,
+    /// Chunks in which the working latch recorded a sighting.
+    #[cfg(test)]
+    latch_sightings: usize,
 }
 
 impl Detector {
@@ -275,10 +283,15 @@ impl Detector {
             title_seq: 0,
             screen_seq: 0,
             idle_barrier: 0,
+            #[cfg(test)]
+            latch_evaluations: 0,
+            #[cfg(test)]
+            latch_sightings: 0,
         }
     }
 
-    /// Stops ordered startup observation once the initial-input wait resolves.
+    /// Ends the initial-input wait. Ordered startup observation stops with it
+    /// unless the manifest latches working sightings, which keep it armed.
     ///
     /// Reconfiguration never re-arms a completed wait.
     pub fn finish_initial_input(&mut self) {
@@ -286,7 +299,12 @@ impl Detector {
             return;
         }
         self.initial_input_pending = false;
-        self.screen.finish_observation();
+        // An agent manifest keeps the ordered observer alive for the working
+        // latch: its parser must see every byte to stay in step with the
+        // stream.
+        if !self.latch_eligible() {
+            self.screen.finish_observation();
+        }
         self.context_dirty = true;
     }
 
@@ -305,16 +323,25 @@ impl Detector {
         // that event's bytes ended, never against the chunk's final screen —
         // a title followed by a clear in one chunk arrived while the blocker
         // still held.
-        let mut osc_changes = OscChanges::default();
+        //
+        // Under an agent manifest, a `Working` winner at one of those points is
+        // remembered: a turn whose working title or frame is replaced by an idle
+        // one inside the same chunk is still working evidence.
+        let mut latch = ChunkLatch::new(self.latch_gate_open(), recent_before.clone());
         let mut consumed = 0;
         for (item, end) in osc_events {
-            self.feed_screen_segment(&bytes[consumed..end]);
-            if self.apply_osc_event(item, &mut osc_changes) {
+            self.feed_screen_segment(&bytes[consumed..end], &mut latch);
+            if self.apply_osc_event(item, &mut latch.osc_changes) {
                 self.sight_full_context();
+                self.latch_at_osc_point(&mut latch);
             }
             consumed = end;
         }
-        self.feed_screen_segment(&bytes[consumed..]);
+        self.feed_screen_segment(&bytes[consumed..], &mut latch);
+        #[cfg(test)]
+        self.record_latch_counters(&latch);
+        let osc_changes = latch.osc_changes;
+        let sighted_working = latch.sighted;
 
         // Overall screen change keeps the debounced classification's
         // value-changed freshness semantics, unchanged for activity.
@@ -328,6 +355,16 @@ impl Detector {
         let has_structured_evidence = hit.is_some();
 
         let mut transitions = Vec::new();
+        // Only a chunk that ends idle latches: transcript text drawn ahead of a
+        // dialog, or of a screen no rule names, must never read as working.
+        if let Some(sighted) = sighted_working {
+            if hit
+                .as_ref()
+                .is_some_and(|hit| hit.evidence.activity == AgentActivity::Idle)
+            {
+                push_transition(&mut transitions, self.state.observe_evidence(now, sighted));
+            }
+        }
         if let Some(hit) = hit {
             push_transition(
                 &mut transitions,
@@ -342,6 +379,68 @@ impl Detector {
         transitions
     }
 
+    #[cfg(test)]
+    fn record_latch_counters(&mut self, latch: &ChunkLatch) {
+        self.latch_evaluations += latch.evaluations;
+        self.latch_sightings += usize::from(latch.sighted.is_some());
+    }
+
+    /// Whether the manifest takes part in the working latch.
+    fn latch_eligible(&self) -> bool {
+        self.manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.latches_working())
+    }
+
+    /// Whether this chunk evaluates intermediate working sightings.
+    ///
+    /// Evaluation stops while `Working` is already published, which keeps busy
+    /// output on the plain feed path.
+    fn latch_gate_open(&self) -> bool {
+        self.latch_eligible() && self.state.published_activity() != Some(AgentActivity::Working)
+    }
+
+    /// Evaluates the context after a completed OSC event.
+    fn latch_at_osc_point(&self, latch: &mut ChunkLatch) {
+        if let Some(manifest) = self.manifest.as_deref() {
+            latch.evaluate(
+                manifest,
+                &self.screen,
+                self.latest_title.as_deref(),
+                self.latest_progress.as_deref(),
+                false,
+            );
+        }
+    }
+
+    /// Feeds a segment through the ordered screen observer and evaluates the
+    /// working latch at every observation point. Returns whether characters
+    /// were drawn.
+    fn feed_screen_segment_latched(&mut self, bytes: &[u8], latch: &mut ChunkLatch) -> bool {
+        let Detector {
+            screen,
+            manifest,
+            latest_title,
+            latest_progress,
+            ..
+        } = self;
+        let Some(manifest) = manifest.as_deref() else {
+            return screen.feed(bytes);
+        };
+        let mut drew = false;
+        screen.feed_observed(bytes, &mut |screen: &ScreenTracker, observed| {
+            drew |= observed.drew_chars;
+            latch.evaluate(
+                manifest,
+                screen,
+                latest_title.as_deref(),
+                latest_progress.as_deref(),
+                observed.drew_chars,
+            );
+        });
+        drew
+    }
+
     /// Feeds a segment and stamps text changes or character redraws.
     ///
     /// A clear followed by an identical repaint is fresh screen evidence even
@@ -354,17 +453,25 @@ impl Detector {
     /// split printable runs into repeated grid observations. A complete
     /// blocker is recorded before its clear, and the final grid is observed
     /// even when the final byte is itself a control action.
-    fn feed_screen_segment(&mut self, bytes: &[u8]) {
+    fn feed_screen_segment(&mut self, bytes: &[u8], latch: &mut ChunkLatch) {
         if !self.initial_input_pending {
-            self.screen.feed(bytes);
+            if latch.open {
+                self.feed_screen_segment_latched(bytes, latch);
+            } else {
+                self.screen.feed(bytes);
+            }
             return;
         }
         if self.input_readiness == InputReadiness::ManifestIdle {
-            self.feed_screen_segment_observed(bytes);
+            self.feed_screen_segment_observed(bytes, latch);
             return;
         }
         let recent_before = self.screen.recent_text();
-        let drew_chars = self.screen.feed(bytes);
+        let drew_chars = if latch.open {
+            self.feed_screen_segment_latched(bytes, latch)
+        } else {
+            self.screen.feed(bytes)
+        };
         if self.screen.recent_text() != recent_before || drew_chars {
             self.strict_seq += 1;
             self.screen_seq = self.strict_seq;
@@ -379,7 +486,7 @@ impl Detector {
     /// The observer borrows the detector's sequence counters and OSC context
     /// field by field, so the screen tracker can be fed while the observer
     /// keeps mutating the counters.
-    fn feed_screen_segment_observed(&mut self, bytes: &[u8]) {
+    fn feed_screen_segment_observed(&mut self, bytes: &[u8], latch: &mut ChunkLatch) {
         let Detector {
             screen,
             strict_seq,
@@ -402,6 +509,15 @@ impl Detector {
         };
         screen.feed_observed(bytes, &mut |screen: &ScreenTracker, observed| {
             observer.observe(screen, observed);
+            if let Some(manifest) = manifest.as_deref() {
+                latch.evaluate(
+                    manifest,
+                    screen,
+                    latest_title.as_deref(),
+                    latest_progress.as_deref(),
+                    observed.drew_chars,
+                );
+            }
         });
     }
 
@@ -497,6 +613,11 @@ impl Detector {
         self.state = StateMachine::new(now, config.detection);
         self.manifest = config.manifest;
         self.input_readiness = config.input_readiness;
+        if self.latch_eligible() {
+            self.screen.resume_observation();
+        } else if !self.initial_input_pending {
+            self.screen.finish_observation();
+        }
         self.process_activity.reset();
         self.state.clear_pending();
         self.needs_visible_recheck = true;
@@ -615,6 +736,72 @@ impl Detector {
 struct OscChanges {
     title: bool,
     progress: bool,
+}
+
+/// The working latch of one `feed` call: a `Working` winner seen at an
+/// intermediate point of the chunk, before a later point hid it.
+struct ChunkLatch {
+    /// Whether further points are still evaluated: the gate was open at the
+    /// chunk start and nothing was sighted yet.
+    open: bool,
+    /// The screen text at the chunk start, for screen freshness.
+    recent_before: String,
+    /// Title and progress changes among the bytes consumed so far.
+    osc_changes: OscChanges,
+    /// Whether characters were drawn at an earlier point of this chunk.
+    drew: bool,
+    evaluations: usize,
+    sighted: Option<ActivityEvidence>,
+}
+
+impl ChunkLatch {
+    fn new(open: bool, recent_before: String) -> Self {
+        Self {
+            open,
+            recent_before,
+            osc_changes: OscChanges::default(),
+            drew: false,
+            evaluations: 0,
+            sighted: None,
+        }
+    }
+
+    /// Evaluates the manifest over the context at one point with the freshness
+    /// of the bytes consumed so far, so a cached title never latches on a
+    /// repaint and a visible blocker still outranks a stale spinner. A
+    /// `Working` winner is kept and closes the latch.
+    fn evaluate(
+        &mut self,
+        manifest: &Manifest,
+        screen: &ScreenTracker,
+        latest_title: Option<&str>,
+        latest_progress: Option<&str>,
+        drew_chars: bool,
+    ) {
+        if !self.open {
+            return;
+        }
+        self.evaluations += 1;
+        self.drew |= drew_chars;
+        let freshness = ContextFreshness {
+            screen: self.drew || screen.recent_text() != self.recent_before,
+            osc_title: self.osc_changes.title,
+            osc_progress: self.osc_changes.progress,
+        };
+        let hit = manifest_hit(
+            manifest,
+            screen,
+            latest_title,
+            latest_progress,
+            0,
+            0,
+            freshness,
+        );
+        if let Some(hit) = hit.filter(|hit| hit.evidence.activity == AgentActivity::Working) {
+            self.sighted = Some(hit.evidence);
+            self.open = false;
+        }
+    }
 }
 
 /// Builds the manifest match context over explicit context pieces.
@@ -921,6 +1108,7 @@ fn push_transition(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::time::{Duration, Instant};
 
     use protocol::{AgentActivity, RuntimeRef, StateSource};
@@ -2129,6 +2317,656 @@ mod tests {
             ),
             vec![transition(AgentActivity::Blocked, StateSource::Screen)]
         );
+    }
+
+    /// Steady-state detector of an official package runtime with the test
+    /// debounce: its initial input has resolved and nothing is published.
+    fn steady_detector(kind: &RuntimeRef, rows: u16, cols: u16, started_at: Instant) -> Detector {
+        let mut detector_config = package_config(kind);
+        detector_config.detection = config().detection;
+        let mut detector = Detector::new(rows, cols, started_at, detector_config);
+        detector.finish_initial_input();
+        detector
+    }
+
+    fn claude_detector(rows: u16, cols: u16, started_at: Instant) -> Detector {
+        steady_detector(&RuntimeRef::claude(), rows, cols, started_at)
+    }
+
+    /// A Claude screen with a live status spinner above the prompt box.
+    const CLAUDE_WORKING_FRAME: &str = "\x1b[2J\x1b[H\u{273b} Noodling\u{2026} (12s \u{b7} \u{2193} 1.2k tokens)\r\n\u{2500}\u{2500}\u{2500}\u{2500}\r\n\u{276f} \r\n\u{2500}\u{2500}\u{2500}\u{2500}\r\n  auto mode on";
+
+    /// A Claude screen of a finished turn at the prompt box.
+    const CLAUDE_IDLE_FRAME: &str = "\x1b[2J\x1b[H\u{273b} Cogitated for 26s\r\n\u{2500}\u{2500}\u{2500}\u{2500}\r\n\u{276f} \r\n\u{2500}\u{2500}\u{2500}\u{2500}\r\n  auto mode on";
+
+    fn working_osc_title() -> &'static str {
+        "\x1b]2;\u{280b} thinking\x07"
+    }
+
+    fn idle_osc_title() -> &'static str {
+        "\x1b]2;\u{2733} Claude Code\x07"
+    }
+
+    #[test]
+    fn a_working_title_and_an_idle_title_in_one_chunk_still_yield_working_evidence() {
+        let started_at = instant();
+        let mut detector = claude_detector(3, 80, started_at);
+
+        let chunk = format!("{}{}", working_osc_title(), idle_osc_title());
+        let transitions = detector.feed(started_at, chunk.as_bytes());
+
+        assert_eq!(
+            transitions.first(),
+            Some(&transition(AgentActivity::Working, StateSource::OscTitle)),
+            "the working title sighted inside the chunk publishes working first: {transitions:?}"
+        );
+        assert_eq!(detector.latest_title(), Some("\u{2733} Claude Code"));
+    }
+
+    #[test]
+    fn a_latched_working_title_is_followed_by_the_chunk_end_idle_after_debounce() {
+        let started_at = instant();
+        let mut detector = claude_detector(3, 80, started_at);
+
+        let chunk = format!("{}{}", working_osc_title(), idle_osc_title());
+        detector.feed(started_at, chunk.as_bytes());
+        let mut transitions = Vec::new();
+        for step in 1..=10 {
+            transitions.extend(detector.tick(started_at + Duration::from_millis(100 * step)));
+        }
+
+        assert!(
+            transitions
+                .iter()
+                .any(|transition| transition.activity == AgentActivity::Idle),
+            "the chunk-end idle confirms through the ordinary debounce: {transitions:?}"
+        );
+    }
+
+    #[test]
+    fn the_working_latch_never_duplicates_a_published_working_state() {
+        let started_at = instant();
+        let mut detector = claude_detector(3, 80, started_at);
+        assert_eq!(
+            detector.feed(started_at, working_osc_title().as_bytes()),
+            vec![transition(AgentActivity::Working, StateSource::OscTitle)]
+        );
+
+        let chunk = format!("{}{}", working_osc_title(), idle_osc_title());
+        let transitions = detector.feed(started_at + Duration::from_millis(10), chunk.as_bytes());
+
+        assert!(
+            transitions
+                .iter()
+                .all(|transition| transition.activity != AgentActivity::Working),
+            "no second working edge while working is published: {transitions:?}"
+        );
+    }
+
+    #[test]
+    fn a_chunk_that_ends_on_a_working_title_publishes_one_working_edge() {
+        let started_at = instant();
+        let mut detector = claude_detector(3, 80, started_at);
+
+        let chunk = format!(
+            "{}{}{}",
+            working_osc_title(),
+            idle_osc_title(),
+            working_osc_title()
+        );
+        let transitions = detector.feed(started_at, chunk.as_bytes());
+
+        assert_eq!(
+            transitions,
+            vec![transition(AgentActivity::Working, StateSource::OscTitle)]
+        );
+    }
+
+    #[test]
+    fn a_working_title_followed_by_a_permission_dialog_reports_blocked_alone() {
+        let started_at = instant();
+        let mut detector = claude_detector(10, 120, started_at);
+
+        let chunk = format!(
+            "{}\x1b[2J\x1b[HBash command\r\nsleep 45\r\nDo you want to proceed?\r\n\u{276f} 1. Yes\r\n  2. No\r\nesc to cancel{}",
+            working_osc_title(),
+            idle_osc_title()
+        );
+        let transitions = detector.feed(started_at, chunk.as_bytes());
+
+        assert!(
+            transitions
+                .iter()
+                .all(|transition| transition.activity != AgentActivity::Working),
+            "a chunk ending on a visible dialog never latches working: {transitions:?}"
+        );
+        assert!(transitions
+            .iter()
+            .any(|transition| transition.activity == AgentActivity::Blocked));
+    }
+
+    #[test]
+    fn a_lag_resync_fabricates_no_working_evidence() {
+        let started_at = instant();
+        let mut detector = claude_detector(3, 80, started_at);
+        // A working title severed by the dropped chunks: its head arrived, its
+        // tail and terminator did not.
+        detector.feed(started_at, "\x1b]2;\u{280b} thi".as_bytes());
+        detector.resync_after_lag();
+        let sightings = detector.latch_sightings;
+
+        let transitions = detector.feed(
+            started_at + Duration::from_millis(10),
+            format!("nking\x07{}", idle_osc_title()).as_bytes(),
+        );
+
+        assert_eq!(detector.latch_sightings, sightings, "{transitions:?}");
+        assert!(transitions
+            .iter()
+            .all(|transition| transition.activity != AgentActivity::Working));
+    }
+
+    #[test]
+    fn the_generic_shell_manifest_never_latches_a_transient_working_title() {
+        let started_at = instant();
+        let mut detector = Detector::new(3, 80, started_at, config());
+
+        let transitions = detector.feed(started_at, b"\x1b]2;running\x07\x1b]2;bash\x07");
+
+        assert!(
+            transitions
+                .iter()
+                .all(|transition| transition.activity != AgentActivity::Working),
+            "shell output stays on the byte path: {transitions:?}"
+        );
+        assert_eq!(
+            detector.latch_evaluations, 0,
+            "the shell latch gate is shut"
+        );
+    }
+
+    #[test]
+    fn a_working_frame_and_an_idle_frame_in_one_chunk_still_yield_working_evidence() {
+        let started_at = instant();
+        let mut detector = claude_detector(8, 120, started_at);
+
+        let chunk = format!("{CLAUDE_WORKING_FRAME}{CLAUDE_IDLE_FRAME}");
+        let transitions = detector.feed(started_at, chunk.as_bytes());
+
+        assert_eq!(
+            transitions.first(),
+            Some(&transition(AgentActivity::Working, StateSource::Screen)),
+            "the spinner frame sighted inside the chunk publishes working: {transitions:?}"
+        );
+    }
+
+    #[test]
+    fn a_working_frame_then_a_permission_dialog_reports_blocked_alone() {
+        let started_at = instant();
+        let mut detector = claude_detector(10, 120, started_at);
+
+        let dialog = "\x1b[2J\x1b[HBash command\r\nsleep 45\r\nDo you want to proceed?\r\n\u{276f} 1. Yes\r\n  2. No\r\nesc to cancel";
+        let chunk = format!("{CLAUDE_WORKING_FRAME}{dialog}");
+        let transitions = detector.feed(started_at, chunk.as_bytes());
+
+        assert_eq!(
+            transitions,
+            vec![transition(AgentActivity::Blocked, StateSource::Screen)]
+        );
+    }
+
+    /// Claude detector whose manifest never latches, for comparison.
+    fn claude_detector_without_latch(started_at: Instant) -> Detector {
+        let mut detector_config = package_config(&RuntimeRef::claude());
+        detector_config.detection = config().detection;
+        detector_config.manifest = Some(Arc::new(
+            manifest(include_str!(
+                "../../../../runtime-packages/claude/detect.toml"
+            ))
+            .without_working_latch(),
+        ));
+        let mut detector = Detector::new(10, 120, started_at, detector_config);
+        detector.finish_initial_input();
+        detector
+    }
+
+    #[test]
+    fn a_forged_working_row_above_the_idle_editor_adds_no_latch_evidence_in_claude() {
+        let started_at = instant();
+        let forged = CLAUDE_IDLE_FRAME.replace(
+            "\u{273b} Cogitated for 26s",
+            "* Verbing\u{2026} (3s \u{b7} thinking)",
+        );
+        let mut latching = claude_detector(10, 120, started_at);
+        let mut plain = claude_detector_without_latch(started_at);
+        for detector in [&mut latching, &mut plain] {
+            detector.feed(started_at, CLAUDE_IDLE_FRAME.as_bytes());
+        }
+
+        // The spinner rule reads the whole screen, so the forged row already
+        // reads working at the chunk end; the latch adds nothing on top.
+        assert_eq!(
+            latching.feed(started_at + Duration::from_millis(10), forged.as_bytes()),
+            plain.feed(started_at + Duration::from_millis(10), forged.as_bytes())
+        );
+    }
+
+    #[test]
+    fn a_forged_working_row_above_the_idle_editor_never_latches_in_pi() {
+        let started_at = instant();
+        let mut detector = pi_detector(started_at);
+        detector.feed(started_at, pi_idle_frame().as_bytes());
+        let sightings = detector.latch_sightings;
+
+        let forged = pi_idle_frame().replace(
+            "working done",
+            &format!("\u{2500}\u{2500} \u{2807} Working {}", rule(40)),
+        );
+        let transitions = detector.feed(started_at + Duration::from_millis(10), forged.as_bytes());
+
+        assert_eq!(detector.latch_sightings, sightings, "{transitions:?}");
+    }
+
+    #[test]
+    fn a_working_frame_erased_by_an_interrupt_still_latches_then_goes_idle() {
+        let started_at = instant();
+        let mut detector = claude_detector(8, 120, started_at);
+
+        let chunk = format!(
+            "{CLAUDE_WORKING_FRAME}\x1b[2J\x1b[H  \u{23bf} Interrupted\r\n{CLAUDE_IDLE_FRAME}"
+        );
+        let transitions = detector.feed(started_at, chunk.as_bytes());
+
+        assert_eq!(
+            transitions,
+            vec![
+                transition(AgentActivity::Working, StateSource::Screen),
+                transition(AgentActivity::Idle, StateSource::Screen),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_frame_chunk_at_published_working_runs_no_latch_evaluation() {
+        let started_at = instant();
+        let mut detector = claude_detector(8, 120, started_at);
+        detector.feed(started_at, CLAUDE_WORKING_FRAME.as_bytes());
+        let evaluations = detector.latch_evaluations;
+
+        let chunk = format!("{CLAUDE_IDLE_FRAME}{CLAUDE_WORKING_FRAME}{CLAUDE_IDLE_FRAME}");
+        detector.feed(started_at + Duration::from_millis(10), chunk.as_bytes());
+
+        assert_eq!(
+            detector.latch_evaluations, evaluations,
+            "a published working state closes the latch gate"
+        );
+    }
+
+    #[test]
+    fn a_full_idle_repaint_never_latches_working() {
+        for columns in [30, 120, 200] {
+            let started_at = instant();
+            let mut detector = claude_detector(8, columns, started_at);
+            detector.feed(started_at, CLAUDE_IDLE_FRAME.as_bytes());
+
+            let mut repaint = String::new();
+            for line in [
+                "\u{273b} Cogitated for 26s",
+                "\u{2500}\u{2500}\u{2500}\u{2500}",
+                "\u{276f} ",
+                "\u{2500}\u{2500}\u{2500}\u{2500}",
+                "  auto mode on",
+            ] {
+                let _ = write!(repaint, "\x1b[2K{line}\r\n");
+            }
+            let transitions =
+                detector.feed(started_at + Duration::from_millis(10), repaint.as_bytes());
+
+            assert!(
+                transitions
+                    .iter()
+                    .all(|transition| transition.activity != AgentActivity::Working),
+                "{columns} columns: {transitions:?}"
+            );
+            assert!(
+                detector.latch_evaluations > 0,
+                "{columns} columns: gate open"
+            );
+            assert_eq!(detector.latch_sightings, 0, "{columns} columns");
+        }
+    }
+
+    #[test]
+    fn a_blocker_outranking_a_spinner_at_an_intermediate_point_never_latches() {
+        let started_at = instant();
+        let mut detector = claude_detector(8, 120, started_at);
+        detector.feed(started_at, CLAUDE_IDLE_FRAME.as_bytes());
+        let sightings = detector.latch_sightings;
+        let evaluations = detector.latch_evaluations;
+
+        // The folder trust dialog (blocked, priority 980) is drawn before the
+        // spinner line (working, 960), so no point shows the spinner without
+        // the dialog; the chunk then ends on a different idle frame.
+        let chunk = format!(
+            "\x1b[2J\x1b[3;1HYes, I trust this folder\r\nNo, exit\r\nEnter to confirm\x1b[2;1H\u{2500}\u{2500}\u{2500}\u{2500}\x1b[1;1H\u{273b} Noodling\u{2026} (3s \u{b7} thinking){}",
+            CLAUDE_IDLE_FRAME.replace("26s", "40s")
+        );
+        let transitions = detector.feed(started_at + Duration::from_millis(10), chunk.as_bytes());
+
+        assert!(
+            detector.latch_evaluations > evaluations,
+            "the gate was open"
+        );
+        assert_eq!(detector.latch_sightings, sightings, "{transitions:?}");
+        assert!(transitions
+            .iter()
+            .all(|transition| transition.activity != AgentActivity::Working));
+    }
+
+    #[test]
+    fn a_stale_spinner_under_an_erased_dialog_latches_inside_a_running_turn() {
+        let started_at = instant();
+        let mut detector = claude_detector(10, 120, started_at);
+        // A dialog drawn under a spinner line that is still on screen: the
+        // spinner rule excludes dialog markers, so the screen reads blocked.
+        let dialog = "\x1b[2J\x1b[H\u{2733} Running\u{2026} (5s \u{b7} hooks)\r\nBash command\r\nsleep 45\r\nDo you want to proceed?\r\n\u{276f} 1. Yes\r\n  2. No\r\nesc to cancel";
+        detector.feed(started_at, dialog.as_bytes());
+        assert_eq!(
+            detector.state.published_activity(),
+            Some(AgentActivity::Blocked)
+        );
+
+        // The dialog is answered: it is erased and the idle prompt redrawn
+        // before the spinner line is rewritten. The point between the two
+        // still shows the stale spinner without a dialog.
+        let chunk = "\x1b[2;1H\x1b[J\u{2500}\u{2500}\u{2500}\u{2500}\r\n\u{276f} \r\n\u{2500}\u{2500}\u{2500}\u{2500}\r\n  auto mode on\x1b[1;1H\x1b[2K\u{273b} Cogitated for 9s";
+        let transitions = detector.feed(started_at + Duration::from_millis(10), chunk.as_bytes());
+
+        assert_eq!(
+            transitions.first(),
+            Some(&transition(AgentActivity::Working, StateSource::Screen)),
+            "{transitions:?}"
+        );
+    }
+
+    #[test]
+    fn a_cached_working_title_is_not_fresh_at_a_screen_repaint() {
+        let started_at = instant();
+        let mut detector = claude_detector(8, 120, started_at);
+        detector.feed(started_at, working_osc_title().as_bytes());
+        // A reconfigure restarts the published state and keeps the cached title.
+        let mut claude = package_config(&RuntimeRef::claude());
+        claude.detection = config().detection;
+        detector.reconfigure(started_at, claude);
+        assert_eq!(detector.latest_title(), Some("\u{280b} thinking"));
+        let sightings = detector.latch_sightings;
+        let evaluations = detector.latch_evaluations;
+
+        let transitions = detector.feed(
+            started_at + Duration::from_millis(10),
+            CLAUDE_IDLE_FRAME.as_bytes(),
+        );
+
+        assert!(
+            detector.latch_evaluations > evaluations,
+            "the gate was open"
+        );
+        assert_eq!(detector.latch_sightings, sightings, "{transitions:?}");
+    }
+
+    #[test]
+    fn a_shell_detector_switching_in_an_agent_manifest_resumes_the_latch() {
+        let started_at = instant();
+        let mut detector = Detector::new(8, 120, started_at, config());
+        detector.finish_initial_input();
+
+        let mut claude = package_config(&RuntimeRef::claude());
+        claude.detection = config().detection;
+        detector.reconfigure(started_at, claude);
+        let chunk = format!("{CLAUDE_WORKING_FRAME}{CLAUDE_IDLE_FRAME}");
+        let transitions = detector.feed(started_at, chunk.as_bytes());
+
+        assert_eq!(
+            transitions.first(),
+            Some(&transition(AgentActivity::Working, StateSource::Screen)),
+            "{transitions:?}"
+        );
+    }
+
+    #[test]
+    fn a_shell_session_never_latches_a_line_printed_and_erased_in_one_chunk() {
+        let started_at = instant();
+        let mut detector = Detector::new(3, 80, started_at, config());
+        detector.finish_initial_input();
+
+        let transitions = detector.feed(
+            started_at,
+            b"\x1b[2J\x1b[Hrunning tests\x1b[2K\r\x1b[2Kdone",
+        );
+
+        assert!(
+            transitions
+                .iter()
+                .all(|transition| transition.source == StateSource::Process),
+            "only the byte path may report: {transitions:?}"
+        );
+        assert_eq!(detector.latch_evaluations, 0);
+    }
+
+    fn rule(width: usize) -> String {
+        "\u{2500}".repeat(width)
+    }
+
+    /// Steady-state detector over the Pi package manifest.
+    fn pi_detector(started_at: Instant) -> Detector {
+        let mut detector_config = config();
+        detector_config.manifest = Some(shared_manifest(include_str!(
+            "../../../../runtime-packages/pi/detect.toml"
+        )));
+        let mut detector = Detector::new(24, 120, started_at, detector_config);
+        detector.finish_initial_input();
+        detector
+    }
+
+    /// A Pi frame whose working line carries the braille spinner.
+    fn pi_working_frame() -> String {
+        format!(
+            "\x1b[2J\x1b[Hsay hi\r\n\r\n{} \u{2807} Working {}\r\n{}\r\n~/work\r\n1.1%/128k (auto)      stub-model",
+            "\u{2500}\u{2500}",
+            rule(60),
+            rule(100)
+        )
+    }
+
+    /// A Pi frame of the idle editor between two rules.
+    fn pi_idle_frame() -> String {
+        format!(
+            "\x1b[2J\x1b[Hsay hi\r\n\r\nworking done\r\n\r\n{}\r\n\r\n{}\r\n~/work\r\n0.0%/128k (auto)      stub-model",
+            rule(100),
+            rule(100)
+        )
+    }
+
+    #[test]
+    fn a_codex_working_title_and_an_idle_title_in_one_chunk_still_yield_working_evidence() {
+        let started_at = instant();
+        let mut detector = steady_detector(&RuntimeRef::codex(), 8, 120, started_at);
+
+        let transitions = detector.feed(
+            started_at,
+            "\x1b]2;\u{280b} work\x07\x1b]2;work\x07".as_bytes(),
+        );
+
+        assert_eq!(
+            transitions.first(),
+            Some(&transition(AgentActivity::Working, StateSource::OscTitle)),
+            "{transitions:?}"
+        );
+    }
+
+    #[test]
+    fn a_codex_title_generation_spinner_on_an_idle_thread_never_latches_working() {
+        let started_at = instant();
+        let mut detector = steady_detector(&RuntimeRef::codex(), 8, 120, started_at);
+        let sightings = detector.latch_sightings;
+
+        // An idle unnamed thread spins its title-generation placeholder: the
+        // braille frame is followed by the separator, not by a thread name.
+        let transitions = detector.feed(
+            started_at,
+            "\x1b]2;\u{2834} | cxw\x07\x1b]2;cxw\x07".as_bytes(),
+        );
+
+        assert_eq!(detector.latch_sightings, sightings, "{transitions:?}");
+        assert!(transitions
+            .iter()
+            .all(|transition| transition.activity != AgentActivity::Working));
+    }
+
+    #[test]
+    fn a_codex_working_title_with_a_thread_name_still_latches_working() {
+        let started_at = instant();
+        let mut detector = steady_detector(&RuntimeRef::codex(), 8, 120, started_at);
+
+        for title in [
+            "\u{280b} cxw",
+            "\u{2834} \u{2834} | cxw",
+            "\u{280b} my-thread | cxw",
+        ] {
+            let transitions = detector.feed(
+                started_at,
+                format!("\x1b]2;{title}\x07\x1b]2;cxw\x07").as_bytes(),
+            );
+            assert_eq!(
+                transitions.first(),
+                Some(&transition(AgentActivity::Working, StateSource::OscTitle)),
+                "{title}: {transitions:?}"
+            );
+            detector.reconfigure(started_at, {
+                let mut config = package_config(&RuntimeRef::codex());
+                config.detection = self::config().detection;
+                config
+            });
+        }
+    }
+
+    #[test]
+    fn a_pi_working_frame_and_an_idle_frame_in_one_chunk_still_yield_working_evidence() {
+        let started_at = instant();
+        let mut detector = pi_detector(started_at);
+        detector.feed(started_at, pi_idle_frame().as_bytes());
+        let published = detector.state.published_activity();
+        assert_ne!(published, Some(AgentActivity::Working));
+
+        let chunk = format!(
+            "{}{}",
+            pi_working_frame(),
+            pi_idle_frame().replace("working done", "second turn done")
+        );
+        let transitions = detector.feed(started_at + Duration::from_millis(10), chunk.as_bytes());
+
+        assert_eq!(
+            transitions.first(),
+            Some(&transition(AgentActivity::Working, StateSource::Screen)),
+            "{transitions:?}"
+        );
+    }
+
+    #[test]
+    fn a_pi_idle_redraw_never_latches_working() {
+        let started_at = instant();
+        let mut detector = pi_detector(started_at);
+        detector.feed(started_at, pi_idle_frame().as_bytes());
+        let sightings = detector.latch_sightings;
+        let evaluations = detector.latch_evaluations;
+
+        // Bottom-up repaint: the lower editor rule and footer first, then the
+        // text above, with partial erasure in between.
+        let redraw = format!(
+            "\x1b[22;1H\x1b[J{}\r\n~/work\r\n0.0%/128k (auto)      stub-model\x1b[18;1H\x1b[J{}\r\n\r\n{}",
+            rule(100),
+            "working done",
+            rule(100)
+        );
+        let transitions = detector.feed(started_at + Duration::from_millis(10), redraw.as_bytes());
+
+        assert!(
+            detector.latch_evaluations > evaluations,
+            "the gate was open"
+        );
+        assert_eq!(detector.latch_sightings, sightings, "{transitions:?}");
+    }
+
+    #[test]
+    fn a_hermes_working_prompt_erased_to_an_idle_prompt_in_one_chunk_still_yields_working_evidence()
+    {
+        let started_at = instant();
+        let mut detector = steady_detector(&RuntimeRef::hermes(), 12, 80, started_at);
+        detector.feed(started_at, b"\x1b[2J\x1b[Hanswer\r\n\xe2\x9d\xaf ");
+
+        // The working prompt line is completed by an erase of its trailing
+        // text, then replaced by the idle prompt.
+        let chunk = "\x1b[2J\x1b[Hanswer\r\n\u{2695} \u{276f} trailing\r\x1b[4C\x1b[K\x1b[2J\x1b[Hanswer two\r\n\u{276f} ";
+        let transitions = detector.feed(started_at + Duration::from_millis(10), chunk.as_bytes());
+
+        assert_eq!(
+            transitions.first(),
+            Some(&transition(AgentActivity::Working, StateSource::Screen)),
+            "{transitions:?}"
+        );
+    }
+
+    #[test]
+    fn a_hermes_bare_working_prompt_above_its_rule_chrome_reads_working() {
+        let started_at = instant();
+        let mut detector = steady_detector(&RuntimeRef::hermes(), 12, 100, started_at);
+        let rule = "\u{2500}".repeat(60);
+
+        let transitions = detector.feed(
+            started_at,
+            format!("\x1b[2J\x1b[Hanswer\r\n\u{2695} \u{276f}\r\n{rule}\r\n\u{2500}").as_bytes(),
+        );
+
+        assert_eq!(
+            transitions,
+            vec![transition(AgentActivity::Working, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn a_hermes_idle_redraw_over_an_old_working_prompt_line_never_latches_working() {
+        let started_at = instant();
+        let mut detector = steady_detector(&RuntimeRef::hermes(), 14, 80, started_at);
+        // An old transcript line holds a bare staff prompt, far above the
+        // idle prompt.
+        let mut screen = String::from("\x1b[2J\x1b[H\u{2695} \u{276f}\r\n");
+        for line in 1..=8 {
+            let _ = write!(screen, "out {line}\r\n");
+        }
+        screen.push_str("\u{276f} ");
+        detector.feed(started_at, screen.as_bytes());
+        assert_eq!(
+            detector.state.published_activity(),
+            Some(AgentActivity::Idle),
+            "the finished frame reads idle"
+        );
+        let sightings = detector.latch_sightings;
+        let evaluations = detector.latch_evaluations;
+
+        // The redraw erases from the third row down, which leaves the old
+        // staff prompt inside the bottom window, then reprints the rest.
+        let mut redraw = String::from("\x1b[3;1H\x1b[J");
+        for line in 2..=8 {
+            let _ = write!(redraw, "out {line}\r\n");
+        }
+        redraw.push_str("\u{276f} ");
+        let transitions = detector.feed(started_at + Duration::from_millis(10), redraw.as_bytes());
+
+        assert!(
+            detector.latch_evaluations > evaluations,
+            "the gate was open"
+        );
+        assert_eq!(detector.latch_sightings, sightings, "{transitions:?}");
     }
 
     #[test]

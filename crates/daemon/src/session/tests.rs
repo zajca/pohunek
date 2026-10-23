@@ -29904,3 +29904,132 @@ async fn a_native_reference_change_adopts_the_newest_claim() {
     assert_eq!(info.activity, Some(AgentActivity::Blocked));
     let _ = registry.stop(&created.id).await;
 }
+
+/// A Claude-shaped TUI that answers one trigger with a working frame and an
+/// idle frame in a single write: a turn shorter than one output chunk.
+#[cfg(unix)]
+const FAST_TURN_TUI: &str = r#"
+import os, sys
+RULE = "─" * 4
+def frame(status):
+    return ("\x1b[2J\x1b[H" + status + "\r\n" + RULE + "\r\n❯ \r\n" + RULE + "\r\n  auto mode on").encode()
+os.write(1, frame("✻ Cogitated for 1s"))
+if sys.argv[1] == "-":
+    import termios
+    attrs = termios.tcgetattr(0)
+    attrs[3] &= ~termios.ECHO
+    termios.tcsetattr(0, termios.TCSANOW, attrs)
+    sys.stdin.readline()
+else:
+    with open(sys.argv[1]) as gate:
+        gate.readline()
+os.write(1, frame("✻ Noodling… (3s · ↓ 1.2k tokens)") + frame("✻ Cogitated for 4s"))
+import time
+time.sleep(60)
+"#;
+
+/// Registry whose `fast-turn` agent runs [`FAST_TURN_TUI`] under the Claude
+/// manifest; `trigger` is `-` for a stdin-driven turn or a fifo path.
+#[cfg(unix)]
+async fn fast_turn_session(tag: &str, trigger: &str) -> (SessionRegistry, SessionId) {
+    let root = temp_dir(tag);
+    let script = root.join("fast_turn.py");
+    std::fs::write(&script, FAST_TURN_TUI).expect("write the fast-turn TUI");
+    let agents_dir = temp_agents_dir_with(
+        tag,
+        "fast-turn",
+        &format!(
+            "base = \"claude\"\nprogram = \"python3\"\nargs = [\"{}\", \"{trigger}\"]\n",
+            script.display()
+        ),
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        agents_dir: Some(agents_dir),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    registry
+        .turn_events()
+        .flap_window_handle()
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let created = registry
+        .create(SessionNewParams {
+            agent: "fast-turn".to_owned(),
+            cwd: Some(root),
+            ..params()
+        })
+        .await
+        .expect("create the fast-turn session");
+    wait_until("the startup idle frame to be published", || async {
+        let info = registry.inspect(&created.id).await.ok()?;
+        (info.activity == Some(AgentActivity::Idle)).then_some(())
+    })
+    .await;
+    (registry, created.id)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fast_turn_inside_one_chunk_satisfies_an_input_wait_for_working_and_ends_one_turn() {
+    let registry_and_id = fast_turn_session("fast-turn-input", "-").await;
+    let (registry, id) = registry_and_id;
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+
+    let result = registry
+        .input(protocol::SessionInputParams {
+            session_id: id.clone(),
+            text: "go".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: Some(vec![AgentActivity::Working]),
+                timeout_ms: Some(5_000),
+            }),
+        })
+        .await
+        .expect("the wait for working is satisfied");
+    assert_eq!(result.activity, Some(AgentActivity::Working));
+
+    wait_until("the fast turn to end", || async {
+        let info = registry.inspect(&id).await.ok()?;
+        (info.activity == Some(AgentActivity::Idle)).then_some(())
+    })
+    .await;
+    assert_eq!(ended_turns(&mut edges).len(), 1);
+    let _ = registry.stop(&id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fast_turn_nobody_asked_for_edges_activity_but_opens_no_turn() {
+    let gate_dir = temp_dir("fast-turn-spontaneous-gate");
+    let gate_path = gate_dir.join("trigger.gate");
+    let mut gate = hook_gate(&gate_path);
+    let (registry, id) =
+        fast_turn_session("fast-turn-spontaneous", &gate_path.display().to_string()).await;
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+    let before = registry.inner.sessions.lock().await[&id].activity_revision;
+
+    gate.write_all(b"go\n").expect("trigger the fast turn");
+    wait_until("the latched working edge", || async {
+        (registry.inner.sessions.lock().await[&id].activity_revision > before).then_some(())
+    })
+    .await;
+    wait_until("the turn's idle edge", || async {
+        let info = registry.inspect(&id).await.ok()?;
+        (info.activity == Some(AgentActivity::Idle)).then_some(())
+    })
+    .await;
+
+    let seen: Vec<TurnEdge> = std::iter::from_fn(|| edges.try_recv().ok()).collect();
+    assert!(
+        seen.is_empty(),
+        "a turn nobody asked for opened one: {seen:?}"
+    );
+    let _ = registry.stop(&id).await;
+}

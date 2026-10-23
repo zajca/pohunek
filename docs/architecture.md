@@ -1145,6 +1145,23 @@ the active agent's manifest so Codex/Claude UI patterns are interpreted
 correctly inside the shell session. Releasing the active report clears the
 active fields and restores the shell/default detector manifest. See the resume
 model below.
+Under an agent manifest the detector also latches a working sighting inside one
+output chunk: it evaluates the manifest at each completed OSC title or progress
+event and at each ordered screen observation point, with the freshness of the
+bytes consumed so far, and a `Working` winner that a later point of the same
+chunk hides is published before the chunk-end evidence, but only when that
+chunk-end evidence is idle: a chunk that ends on a dialog or on a screen no rule
+names reports its own state alone, so transcript text drawn ahead of a dialog
+never reads as working. The latch is a local of
+one detector feed: it is not persisted, it closes while `Working` is already
+published and after the first sighting, and it reaches the registry only as the
+ordinary activity transition. The generic shell manifest never latches because
+its working rules are loose substring matches. An agent manifest keeps the
+ordered screen observer alive after startup so the latch sees every byte; a
+manifest switched in under a shell resumes it. A stale spinner line left visible
+under a dialog that a chunk erases before it redraws the idle prompt can latch;
+this happens only in a turn that was already running. Bytes skipped on a
+broadcast lag cannot be latched.
 Each detector task is scoped to the exact worker id, runtime id, and runtime
 generation that created its output stream. Cancellation is advisory; a final
 transition from a superseded detector is discarded instead of being stamped
