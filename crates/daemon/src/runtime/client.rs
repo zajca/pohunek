@@ -33,6 +33,12 @@ const ATTACH_READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// leases were granted.
 static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 
+/// The number of a connection whose lease was just granted. It is taken only
+/// then, so a later connection always has the higher number.
+fn next_connection() -> u64 {
+    CONNECTIONS.fetch_add(1, Ordering::AcqRel) + 1
+}
+
 /// Where a request stands in the order a worker handles them.
 ///
 /// A worker handles the requests of one control connection strictly in the
@@ -378,6 +384,10 @@ impl Worker {
         Ok(worker)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "negotiation, lease acquisition and the connection state are built in one handshake"
+    )]
     async fn connect_discovered_with_range(
         socket_path: impl AsRef<Path>,
         daemon_instance_id: &str,
@@ -470,9 +480,7 @@ impl Worker {
                 lease_id,
                 capabilities,
                 next_write_sequence: 1,
-                // Counted only now that the lease is granted, so a later
-                // connection always has the higher number.
-                connection: CONNECTIONS.fetch_add(1, Ordering::AcqRel) + 1,
+                connection: next_connection(),
                 exchanges: 0,
                 stream_state: StreamState::Ready,
                 send_state: Arc::new(AtomicU8::new(SEND_IDLE)),
