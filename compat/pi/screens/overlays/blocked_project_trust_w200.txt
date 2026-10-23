@@ -1,13 +1,13 @@
-Warning: No project session found with id '01a168b5-f350-7c10-9a9a-49588fb234b4'; creating a new session with that id.
+Warning: No project session found with id '01a168ff-cff4-7743-84ae-5a4588dfce20'; creating a new session with that id.
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
  Trust project folder?
- /tmp/ph-sample/project
+ /dev/shm/ph-pi/project
 
  This allows pi to load .pi settings and resources, install missing project packages, and execute project extensions.
 
  → Trust
-   Trust parent folder (/tmp/ph-sample)
+   Trust parent folder (/dev/shm/ph-pi)
    Trust (this session only)
    Do not trust
    Do not trust (this session only)

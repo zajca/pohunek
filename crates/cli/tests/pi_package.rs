@@ -2317,16 +2317,107 @@ fn recorded_source() -> &'static str {
     }
 }
 
-/// The retained raw output of the session, or `None` once its terminal is gone.
-async fn raw_output(fixture: &Fixture, id: &str) -> Option<Vec<u8>> {
-    let (code, output) = fixture.harness.json(&["session", "output", id]).await;
-    (code == 0).then(|| capture::output_bytes(&output))
+/// Bytes requested per `session output` page.
+const OUTPUT_PAGE_BYTES: &str = "65536";
+
+/// Milliseconds one follow read waits at the end of the output.
+const EXIT_FOLLOW_WAIT_MS: &str = "500";
+
+/// A JSON number or string as command-line text.
+fn scalar(value: &Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), str::to_owned)
+}
+
+/// The retained output of a session, read from offset 0 in explicit pages so
+/// that a long run cannot push the first records out of a newest-tail read.
+struct OutputReader {
+    id: String,
+    worker_instance_id: String,
+    runtime_generation: String,
+    cursor: String,
+    bytes: Vec<u8>,
+}
+
+impl OutputReader {
+    /// Opens a reader on the live runtime of `id`, or `None` once its
+    /// terminal is gone.
+    async fn open(fixture: &Fixture, id: &str) -> Option<Self> {
+        let (code, tail) = fixture.harness.json(&["session", "output", id]).await;
+        if code != 0 {
+            return None;
+        }
+        let ok = &tail["ok"];
+        Some(Self {
+            id: id.to_owned(),
+            worker_instance_id: ok["worker_instance_id"]
+                .as_str()
+                .expect("worker instance id")
+                .to_owned(),
+            runtime_generation: scalar(&ok["runtime_generation"]),
+            cursor: "0".to_owned(),
+            bytes: Vec::new(),
+        })
+    }
+
+    /// Appends every page after the cursor. A `wait_ms` keeps the last read
+    /// open at the end of the output, so an exit between two polls still
+    /// delivers its final bytes. Returns `false` once the runtime is gone.
+    async fn drain(&mut self, fixture: &Fixture, wait_ms: Option<&str>) -> bool {
+        loop {
+            let mut arguments = vec![
+                "session",
+                "output",
+                self.id.as_str(),
+                "--worker-instance-id",
+                self.worker_instance_id.as_str(),
+                "--runtime-generation",
+                self.runtime_generation.as_str(),
+                "--after-offset",
+                self.cursor.as_str(),
+                "--max-bytes",
+                OUTPUT_PAGE_BYTES,
+            ];
+            if let Some(wait_ms) = wait_ms {
+                arguments.extend(["--wait-ms", wait_ms]);
+            }
+            let (code, page) = fixture.harness.json(&arguments).await;
+            if code != 0 {
+                assert!(wait_ms.is_some(), "session output page: {page}");
+                return false;
+            }
+            let ok = &page["ok"];
+            assert!(
+                ok.get("gap").is_none(),
+                "output history was evicted: {page}"
+            );
+            self.bytes.extend(capture::output_bytes(&page));
+            self.cursor = scalar(&ok["next_offset"]);
+            if ok["has_more"] != true {
+                return true;
+            }
+        }
+    }
+
+    /// The ordered root program-status records read so far.
+    fn records(&self) -> Vec<String> {
+        capture::program_status_records(&self.bytes)
+    }
+}
+
+/// The whole retained output of the live session.
+async fn raw_output(fixture: &Fixture, id: &str) -> Vec<u8> {
+    let mut reader = OutputReader::open(fixture, id)
+        .await
+        .expect("session output");
+    assert!(reader.drain(fixture, None).await, "session output pages");
+    reader.bytes
 }
 
 /// The ordered root program-status records of the session's retained output.
 async fn program_status_of(fixture: &Fixture, id: &str) -> Vec<String> {
-    let raw = raw_output(fixture, id).await.expect("session output");
-    capture::program_status_records(&raw)
+    capture::program_status_records(&raw_output(fixture, id).await)
 }
 
 /// Compares the records of `raw` with the golden `<name>.program-status`, or
@@ -2341,6 +2432,58 @@ fn check_sequence(name: &str, raw: &[u8]) {
         .unwrap_or_else(|error| panic!("read the golden {name}: {error}"));
     let expected: Vec<&str> = golden.lines().collect();
     assert_eq!(capture::program_status_records(raw), expected, "{name}");
+}
+
+/// Pi clears its record when it exits, so no working state outlives it.
+async fn pi_clears_its_record_on_exit(fixture: &Fixture, reports: bool) {
+    let quit = fixture.new_session("quit").await;
+    let quit_id = quit["id"].as_str().expect("session id").to_owned();
+    fixture.wait_activity(&quit_id, "idle").await;
+    // The reader is opened and drained before `/quit`, then follows the
+    // output across the exit.
+    let mut quit_reader = if reports {
+        let mut reader = OutputReader::open(fixture, &quit_id)
+            .await
+            .expect("the quit session is live");
+        assert!(reader.drain(fixture, None).await, "pages before /quit");
+        Some(reader)
+    } else {
+        None
+    };
+    let (code, sent) = fixture
+        .harness
+        .json(&["session", "input", &quit_id, "/quit"])
+        .await;
+    assert_eq!(code, 0, "{sent}");
+    if let Some(reader) = quit_reader.as_mut() {
+        tokio::time::timeout(pohunek_test_support::wait::HANG_GUARD, async {
+            loop {
+                let alive = reader.drain(fixture, Some(EXIT_FOLLOW_WAIT_MS)).await;
+                if reader
+                    .records()
+                    .last()
+                    .is_some_and(|record| record == "clear")
+                {
+                    return;
+                }
+                assert!(alive, "Pi exited before its clear record was read");
+            }
+        })
+        .await
+        .expect("Pi to clear its record on exit");
+        let raw = reader.bytes.clone();
+        check_sequence("exit", &raw);
+    } else {
+        wait_until("the quit session to end", || async {
+            let (code, inspected) = fixture
+                .harness
+                .json(&["session", "inspect", &quit_id])
+                .await;
+            assert_eq!(code, 0, "{inspected}");
+            (inspected["ok"]["runtime"]["state"] != "live").then_some(())
+        })
+        .await;
+    }
 }
 
 /// Pi's records, as the worker's probe reply enables them, cover a turn, an
@@ -2377,7 +2520,7 @@ async fn a_real_pi_reports_its_turn_dialog_and_exit_through_program_status() {
     let settled = fixture.wait_activity(&id, "idle").await;
     assert_eq!(settled["state_source"], source, "{settled}");
     if reports {
-        check_sequence("turn", &raw_output(&fixture, &id).await.expect("output"));
+        check_sequence("turn", &raw_output(&fixture, &id).await);
     } else {
         assert!(program_status_of(&fixture, &id).await.is_empty());
     }
@@ -2390,7 +2533,7 @@ async fn a_real_pi_reports_its_turn_dialog_and_exit_through_program_status() {
     let blocked = fixture.wait_activity(&id, "blocked").await;
     assert_eq!(blocked["state_source"], source, "{blocked}");
     if reports {
-        check_sequence("dialog", &raw_output(&fixture, &id).await.expect("output"));
+        check_sequence("dialog", &raw_output(&fixture, &id).await);
     }
     fixture.stop(&id).await;
 
@@ -2419,42 +2562,7 @@ async fn a_real_pi_reports_its_turn_dialog_and_exit_through_program_status() {
     );
     fixture.stub.open_gate();
 
-    // Pi clears its record when it exits, so no working state outlives it.
-    let quit = fixture.new_session("quit").await;
-    let quit_id = quit["id"].as_str().expect("session id").to_owned();
-    fixture.wait_activity(&quit_id, "idle").await;
-    let (code, sent) = fixture
-        .harness
-        .json(&["session", "input", &quit_id, "/quit"])
-        .await;
-    assert_eq!(code, 0, "{sent}");
-    if reports {
-        // The output is readable only while the runtime is live, so the
-        // records are polled until the clear record shows. An exit that
-        // outruns the poll fails the test instead of hanging it.
-        let raw = wait_until("Pi to clear its record on exit", || async {
-            match raw_output(&fixture, &quit_id).await {
-                Some(raw) => capture::program_status_records(&raw)
-                    .last()
-                    .is_some_and(|record| record == "clear")
-                    .then_some(Some(raw)),
-                None => Some(None),
-            }
-        })
-        .await
-        .expect("Pi exited before its clear record was read");
-        check_sequence("exit", &raw);
-    } else {
-        wait_until("the quit session to end", || async {
-            let (code, inspected) = fixture
-                .harness
-                .json(&["session", "inspect", &quit_id])
-                .await;
-            assert_eq!(code, 0, "{inspected}");
-            (inspected["ok"]["runtime"]["state"] != "live").then_some(())
-        })
-        .await;
-    }
+    pi_clears_its_record_on_exit(&fixture, reports).await;
     assert!(!marker.exists(), "no dialog was answered");
     fixture.harness.stop().await;
 }
@@ -2556,6 +2664,169 @@ impl Fixture {
     }
 }
 
+/// Pi's program-status probe, which a terminal that supports the query
+/// answers with the same bytes.
+const PROBE: &[u8] = b"\x1b]7501;?\x1b\\";
+
+/// A terminal client attached to a session that answers every 7501 probe it
+/// sees in the output, as an emulator that supports the query does.
+struct AnsweringClient {
+    probes: Arc<std::sync::atomic::AtomicUsize>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    _control: std::os::unix::net::UnixStream,
+}
+
+impl AnsweringClient {
+    fn attach(socket: &Path, session: &str) -> Self {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        use std::sync::atomic::Ordering;
+
+        let mut control = std::os::unix::net::UnixStream::connect(socket).expect("connect");
+        let params = protocol::SessionAttachParams {
+            session_id: protocol::SessionId(session.to_owned()),
+            initial_dimensions: None,
+            origin_session_id: None,
+            origin_daemon_id: None,
+            origin_worker_id: None,
+        };
+        let request = protocol::Request::new(
+            "pi-attach",
+            protocol::method::SESSION_ATTACH,
+            serde_json::to_value(params).expect("attach params"),
+        )
+        .expect("a valid request");
+        writeln!(
+            control,
+            "{}",
+            serde_json::to_string(&request).expect("serialize the request")
+        )
+        .expect("send session.attach");
+        let mut line = String::new();
+        std::io::BufReader::new(&control)
+            .read_line(&mut line)
+            .expect("read the attach response");
+        let response: protocol::Response =
+            serde_json::from_str(&line).expect("parse the attach response");
+        let result: protocol::SessionAttachResult = serde_json::from_value(
+            response
+                .into_result()
+                .unwrap_or_else(|error| panic!("session.attach: {error}")),
+        )
+        .expect("attach result");
+        let mut raw = std::os::unix::net::UnixStream::connect(socket).expect("connect the stream");
+        writeln!(raw, "{{\"attach\":\"{}\"}}", result.stream_id).expect("send the header");
+        raw.set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("read timeout");
+
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = {
+            let (probes, stop) = (Arc::clone(&probes), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut window: Vec<u8> = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                while !stop.load(Ordering::SeqCst) {
+                    let count = match raw.read(&mut chunk) {
+                        Ok(0) => return,
+                        Ok(count) => count,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(_) => return,
+                    };
+                    window.extend_from_slice(&chunk[..count]);
+                    while let Some(at) = window.windows(PROBE.len()).position(|w| w == PROBE) {
+                        window.drain(..at + PROBE.len());
+                        probes.fetch_add(1, Ordering::SeqCst);
+                        if raw.write_all(PROBE).is_err() {
+                            return;
+                        }
+                    }
+                    let keep = window.len().saturating_sub(PROBE.len());
+                    window.drain(..keep);
+                }
+            })
+        };
+        Self {
+            probes,
+            stop,
+            thread: Some(thread),
+            _control: control,
+        }
+    }
+
+    /// Probes the client has seen and answered.
+    fn answered(&self) -> usize {
+        self.probes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for AnsweringClient {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _joined = thread.join();
+        }
+    }
+}
+
+/// A terminal client that answers Pi's probe itself leaves Pi's records and
+/// editor as they are without it: the worker is the only responder for the
+/// PTY, so a reply the client sends is dropped before it reaches Pi.
+///
+/// Needs a `pi` on `PATH` and `POHUNEK_PI_E2E=1`; the model is a loopback
+/// stub. A release that sends no probe has nothing to answer and is skipped.
+#[tokio::test]
+#[ignore = "needs a real `pi` on PATH; run with POHUNEK_PI_E2E=1 and --ignored"]
+async fn an_attached_client_answering_the_probe_does_not_change_pis_reports() {
+    require_real_pi();
+    if !pi_reports_program_status() {
+        return;
+    }
+    let fixture = Fixture::start().await;
+    fixture.install().await;
+    fixture.write_profile();
+
+    let launched = fixture.new_session("attached-reply").await;
+    let id = launched["id"].as_str().expect("session id").to_owned();
+    let client = AnsweringClient::attach(&fixture.harness.socket(), &id);
+    let idle = fixture.wait_activity(&id, "idle").await;
+    assert_eq!(idle["state_source"], "osc_progress", "{idle}");
+    assert!(
+        client.answered() >= 1,
+        "the client saw Pi's probe and replied; it attached after Pi started otherwise"
+    );
+
+    let (code, sent) = fixture
+        .harness
+        .json(&["session", "input", &id, PROMPT])
+        .await;
+    assert_eq!(code, 0, "{sent}");
+    let working = fixture.wait_activity(&id, "working").await;
+    assert_eq!(working["state_source"], "osc_progress", "{working}");
+    fixture.stub.open_gate();
+    let settled = fixture.wait_activity(&id, "idle").await;
+    assert_eq!(settled["state_source"], "osc_progress", "{settled}");
+
+    // The same records as a turn without a client, and no reply text in the
+    // editor.
+    check_sequence("turn", &raw_output(&fixture, &id).await);
+    let screen = fixture.screen(&id).await;
+    assert!(
+        screen.iter().all(|row| !row.contains("7501")),
+        "a probe reply reached Pi's editor: {screen:?}"
+    );
+    drop(client);
+    fixture.stop(&id).await;
+    fixture.harness.stop().await;
+}
+
 /// Records the screens of the `pi` on `PATH` that a loopback model and an
 /// extension can reach: the idle, working and after-turn editor at every
 /// width, the extension dialogs and Pi's project-trust question.
@@ -2576,7 +2847,8 @@ async fn record_the_pi_screens() {
     let marker = fixture.harness.env.root().join("approved");
     write_confirm_extension(&fixture, &marker);
     write_dialog_extension(&fixture);
-    let cwd = fixture.harness.env.cwd().to_path_buf();
+    let recording = capture::RecordingRoot::new("pi");
+    let cwd = recording.directory("cwd");
 
     for width in STATE_WIDTHS {
         let id = fixture
@@ -2615,7 +2887,7 @@ async fn record_the_pi_screens() {
         fixture.stop(&id).await;
     }
 
-    let project = fixture.harness.env.root().join("project");
+    let project = recording.directory("project");
     fs::create_dir_all(project.join(".pi/extensions")).expect("create the project extensions");
     fs::write(
         project.join(".pi/extensions/project.ts"),

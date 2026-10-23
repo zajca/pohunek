@@ -2320,6 +2320,10 @@ metadata store's canonical path (its directory resolved through
 a cache directory never share a root. It replaces a `TMPDIR` the allowlist
 forwards, so concurrent sessions never share temporary names; a profile that
 sets `TMPDIR` in its `[env]` keeps its own value and gets no private directory.
+A profile over an agent whose manifest declares `[program_status]` can switch the
+agent's program status off with the agent's own variable (`PI_PROGRAM_STATUS=0`
+for Pi, `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` for Claude); detection is then
+screen-only.
 The directory and the directories above it up to `session-tmp` have mode 0700 and must
 be directories of the daemon's user reached without a symlink; a launch whose
 directory fails that check fails with runtime-class `session_tmpdir_unsafe`,

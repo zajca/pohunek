@@ -69,9 +69,10 @@ reserved, so either way of installing serves it.
   worker answers each probe once, so a Pi launched by pohunek reports, and its
   records rather than the screen decide the activity (`state_source`
   `osc_progress`).
-  A visible dialog the screen rules see still wins over a non-blocked record, so
-  Pi's own confirms (project trust, missing cwd, branch summary, session import)
-  stay `blocked`. Pi 1.0.x prints no probe and is read from the screen alone.
+  A visible dialog the screen rules see still wins over a non-blocked record:
+  Pi's project-trust question is recorded on 1.4.0 and reads `blocked`. The
+  other own confirms (missing cwd, session import) are covered by screens from
+  earlier releases only; a confirm no rule matches reads as Pi's record says. Pi 1.0.x prints no probe and is read from the screen alone.
   Known limits: a dialog drawn with `ctx.ui.custom()` has no screen rule and
   reads as Pi's record says (working during a run); the branch-summary busy
   border reads `idle`, as Pi declares it; `error` reads as `idle`; a Pi nested

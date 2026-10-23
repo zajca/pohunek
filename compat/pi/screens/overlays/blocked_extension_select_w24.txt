@@ -20,5 +20,5 @@
  cancel
 
 ────────────────────────
-/mnt/m2_4t/t/ph-JZYp4...
+/dev/shm/ph-pi/cwd
 0.0%/128k (auto)  stub-m

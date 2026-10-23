@@ -1,4 +1,5 @@
- /project
+ Trust project folder?
+ /dev/shm/ph-pi/project
 
  This allows pi to load
  .pi settings and
@@ -9,8 +10,7 @@
 
  → Trust
    Trust parent folder
- (/mnt/m2_4t/t/ph-JZYp4
- 1)
+ (/dev/shm/ph-pi)
    Trust (this session
  only)
    Do not trust

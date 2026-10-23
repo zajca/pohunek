@@ -20,5 +20,5 @@ dialogs.ts
 ── ⠋ Working ───────
 
 ────────────────────
-/mnt/m2_4t/t/ph-J...
+/dev/shm/ph-pi/cwd
 1.1%/128k (auto)  st

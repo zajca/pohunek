@@ -26,15 +26,18 @@ use pohunek_daemon::procwatch::HostInspector;
 use pohunek_daemon::runtime::{
     EnvironmentSource, SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
 };
-use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
+use pohunek_daemon::session::{
+    RedeemedRuntime, SessionRegistry, SessionRegistryConfig, ShellCommand,
+};
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::{worker_binary, workspace_root};
+use pohunek_worker_protocol::{write_frame, DataFrame, FrameHeader, FrameKind, WriteId};
 use protocol::{
-    AgentActivity, SessionId, SessionInfo, SessionInputParams, SessionInputWait, SessionNewParams,
-    SessionTurnEventKind, SessionWaitTurnParams, SessionWaitTurnReason, StateSource, ENV_DAEMON_ID,
-    ENV_SESSION_ID,
+    AgentActivity, SessionAttachParams, SessionId, SessionInfo, SessionInputParams,
+    SessionInputWait, SessionNewParams, SessionTurnEventKind, SessionWaitTurnParams,
+    SessionWaitTurnReason, StateSource, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 
 const TEST_COLS: u16 = 100;
@@ -45,6 +48,7 @@ const REPLY_HEX: &str = "1b5d373530313b3f1b5c";
 const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 /// Turn waits: a turn event follows the attention debounce (5 seconds by
 /// default), so the absence of one is only proved by a wait that outlasts it.
+// timing-allowed: #1525 no later event marks the end of the debounce window; the wait is the only evidence of an absent turn event
 const NO_TURN_WAIT_MS: u32 = 8_000;
 /// Captured Pi screens the stand-in draws, relative to `compat/pi/screens`.
 const IDLE_SCREEN: &str = "idle.txt";
@@ -82,7 +86,7 @@ draw() {{
   awk 'NR>1{{printf "\r\n"}} {{printf "%s",$0}}' "$screens/$1"
 }}
 emit() {{
-  if [ "$mode" = reply ]; then printf '\033]7501;state=%s:app=pi\033\\' "$1"; fi
+  if [ "$mode" != old ]; then printf '\033]7501;state=%s:app=pi\033\\' "$1"; fi
 }}
 if [ "$mode" = reply ]; then
   printf '\033]7501;?\033\\'
@@ -155,12 +159,19 @@ impl Fixture {
             ("fake-reply-stdin", "reply", "stdin"),
             ("fake-reply-fifo", "reply", "fifo"),
             ("fake-old-fifo", "old", "fifo"),
+            ("fake-nested-fifo", "nested", "fifo"),
         ] {
+            // The nested stand-in runs under a shell session, whose manifest
+            // has no `[program_status]` table.
+            let (base, pin) = if mode == "nested" {
+                ("shell", String::new())
+            } else {
+                ("pi", official_runtimes::profile_pin("pi"))
+            };
             std::fs::write(
                 agents.join(format!("{name}.toml")),
                 format!(
-                    "base = \"pi\"\n{}program = \"{}\"\nargs = [\"{mode}\", \"{}\", \"{source}\", \"{}\"]\n\n[env]\nPATH = \"/usr/bin:/bin\"\n",
-                    official_runtimes::profile_pin("pi"),
+                    "base = \"{base}\"\n{pin}program = \"{}\"\nargs = [\"{mode}\", \"{}\", \"{source}\", \"{}\"]\n\n[env]\nPATH = \"/usr/bin:/bin\"\n",
                     program.display(),
                     scratch.display(),
                     screens.display(),
@@ -601,6 +612,96 @@ async fn a_pi_release_without_program_status_is_classified_from_the_screen() {
         !fixture.scratch_file("reply.hex").exists(),
         "an agent that sent no probe got no reply"
     );
+    let _ = fixture.registry.stop(&created.id).await;
+    fixture.end().await;
+}
+
+/// The probe reply an attached terminal would send for the probe it saw.
+const CLIENT_REPLY: &[u8] = b"\x1b]7501;?\x1b\\";
+
+#[tokio::test]
+async fn an_attached_clients_probe_reply_never_reaches_pi() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new().await;
+    let created = fixture.start("fake-reply-stdin").await;
+    fixture.wait_activity(&created.id, IDLE).await;
+    assert_eq!(
+        read_trimmed(&fixture.scratch_file("reply.hex")).as_deref(),
+        Some(REPLY_HEX),
+        "the worker answered the probe"
+    );
+
+    let attach = fixture
+        .registry
+        .attach(&SessionAttachParams {
+            session_id: created.id.clone(),
+            initial_dimensions: None,
+            origin_session_id: None,
+            origin_daemon_id: None,
+            origin_worker_id: None,
+        })
+        .await
+        .expect("open an attach stream");
+    let redeemed = fixture
+        .registry
+        .redeem_attach(&attach.stream_id)
+        .await
+        .expect("redeem the attach stream");
+    let RedeemedRuntime::Worker(mut data) = redeemed.runtime;
+
+    // The client's terminal answers the probe it saw in the replay and types
+    // the turn command in the same frame. The command runs only when the
+    // reply was dropped: a leaked reply would sit in the stand-in's pending
+    // line and the command would no longer match.
+    let mut bytes = CLIENT_REPLY.to_vec();
+    bytes.extend_from_slice(b"t\r");
+    let frame = DataFrame::new(
+        FrameHeader {
+            version: data.version,
+            stream_id: data.stream_id.clone(),
+            worker_instance_id: data.worker_instance_id.clone(),
+            kind: FrameKind::Input {
+                write_id: WriteId::new(format!("attach-{}-1", attach.stream_id)).expect("write id"),
+            },
+        },
+        bytes,
+    )
+    .expect("attach input frame");
+    write_frame(&mut data.stream, &frame)
+        .await
+        .expect("send the client's input");
+
+    fixture.wait_activity(&created.id, WORKING).await;
+    command(&fixture, b'd');
+    fixture.wait_activity(&created.id, IDLE).await;
+    let _ = fixture.registry.stop(&created.id).await;
+    fixture.end().await;
+}
+
+#[tokio::test]
+async fn a_nested_pi_record_does_not_make_a_shell_session_report_working() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new().await;
+    let created = fixture.start("fake-nested-fifo").await;
+    wait_screen(&fixture, &created.id, "say hi", false).await;
+
+    // The stand-in reports `working` as a nested Pi with PI_PROGRAM_STATUS=1
+    // would. The next screen change arrives after the record in the byte
+    // stream, so the record has been seen once it shows.
+    command(&fixture, b'g');
+    wait_screen(&fixture, &created.id, "say hi", true).await;
+    command(&fixture, b'r');
+    wait_screen(&fixture, &created.id, "say hi", false).await;
+    let info = fixture
+        .registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_ne!(info.state_source, StateSource::OscProgress, "{info:?}");
     let _ = fixture.registry.stop(&created.id).await;
     fixture.end().await;
 }

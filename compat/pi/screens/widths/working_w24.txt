@@ -20,5 +20,5 @@
 ── ⠋ Working ───────────
 
 ────────────────────────
-/mnt/m2_4t/t/ph-JZYp4...
+/dev/shm/ph-pi/cwd
 1.1%/128k (auto)  stub-m
