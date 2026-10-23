@@ -6374,8 +6374,7 @@ impl SessionRegistry {
             };
             let unreachable = match attempt {
                 Ok(Ok(worker)) => {
-                    match self
-                        .adopt_reconnected_worker(id, expected, worker.clone())
+                    match Box::pin(self.adopt_reconnected_worker(id, expected, worker.clone()))
                         .await
                     {
                         RuntimeTransitionOutcome::Applied(_) => return Some(worker),

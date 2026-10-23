@@ -16389,9 +16389,7 @@ async fn reconnect_rejects_a_replacement_worker_before_mutating_registry() {
     };
     let mut events = registry.subscribe();
 
-    let outcome = registry
-        .adopt_reconnected_worker(&created.id, &expected, worker)
-        .await;
+    let outcome = Box::pin(registry.adopt_reconnected_worker(&created.id, &expected, worker)).await;
 
     assert!(matches!(
         outcome,

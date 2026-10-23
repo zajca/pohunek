@@ -1308,9 +1308,12 @@ async fn a_hook_report_while_an_unpinned_sessions_runtime_is_reconnecting_is_adm
             .expect("reconnect the worker");
     assert!(
         matches!(
-            registry
-                .adopt_reconnected_worker(&released.id, &released.expected, reconnected)
-                .await,
+            Box::pin(registry.adopt_reconnected_worker(
+                &released.id,
+                &released.expected,
+                reconnected
+            ))
+            .await,
             crate::session::RuntimeTransitionOutcome::Applied(_)
         ),
         "the reconnected worker replaces the unavailable runtime"

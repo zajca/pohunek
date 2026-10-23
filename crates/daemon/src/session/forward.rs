@@ -711,7 +711,7 @@ impl SessionRegistry {
                 self.note_forwarded_release(id, revision, context).await;
             }
         }
-        self.commit_forwarded_snapshot(id, worker, revision).await;
+        Box::pin(self.commit_forwarded_snapshot(id, worker, revision)).await;
         self.settle_pending_activity(id).await;
     }
 

@@ -9,6 +9,6 @@
   request was sent at. Until then the operation held the journal, so a
   `session.report_agent` for the claim the worker really holds was answered
   `recorded: false`; it is now admitted once the rejection is read, which is
-  within one periodic worker sync (100 ms) of the worker answering. A snapshot
+  at the next periodic worker sync after the worker answered. A snapshot
   read earlier, or one that shows a newer revision, still leaves the operation
   pending. No protocol, store or worker change.

@@ -562,8 +562,8 @@ unknown revision, and a memory claim recorded after it holds against the
 snapshot whose change is that operation, at any revision. The daemon stamps each
 request it completes writing on a worker connection with the position of its
 connection among the leases it acquired and its position on that connection, and
-keeps the newest snapshot it read (applied or not) with the stamp of its
-request. A snapshot read after the worker handled a pending operation's request
+keeps the newest snapshot that its periodic worker sync or the commit of a
+forwarded operation read (applied or not) with the stamp of its request. A snapshot read after the worker handled a pending operation's request
 that still shows the identity revision the operation was sent at proves the
 worker did not journal it: the operation is dropped as rejected, and the journal
 is judged by the claim it really holds. A snapshot read earlier, or one that

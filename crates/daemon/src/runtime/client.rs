@@ -393,14 +393,7 @@ impl Worker {
                     source,
                 })?;
         #[cfg(test)]
-        let severable = Arc::new(
-            std::os::fd::AsFd::as_fd(&stream)
-                .try_clone_to_owned()
-                .map_err(|source| WorkerError::Socket {
-                    path: socket_path.clone(),
-                    source,
-                })?,
-        );
+        let severable = duplicate_socket(&stream, &socket_path)?;
         let (read_half, write_half) = stream.into_split();
         let mut reader = ControlReader::new(read_half);
         let mut writer = ControlWriter::new(write_half);
@@ -1693,6 +1686,21 @@ async fn exchange(
     let expected = request.request_id.clone();
     send_request(writer, request).await?;
     read_response(reader, &expected).await
+}
+
+/// A duplicate of `stream` that [`Worker::sever_connection`] shuts down.
+#[cfg(test)]
+fn duplicate_socket(
+    stream: &UnixStream,
+    socket_path: &Path,
+) -> Result<Arc<std::os::fd::OwnedFd>, WorkerError> {
+    std::os::fd::AsFd::as_fd(stream)
+        .try_clone_to_owned()
+        .map(Arc::new)
+        .map_err(|source| WorkerError::Socket {
+            path: socket_path.to_path_buf(),
+            source,
+        })
 }
 
 async fn send_request(

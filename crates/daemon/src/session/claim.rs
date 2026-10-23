@@ -546,9 +546,10 @@ pub(super) enum Unacknowledged {
 /// carries the activity it applies once adopted; an unacknowledged one takes
 /// the slot of its kind otherwise, and the one it replaces stays tracked.
 ///
-/// None is dropped before its revision settles it: each one needs its own
-/// forward to reach the worker and then wait out the worker bound, and the
-/// next applied snapshot settles every operation its revision covers.
+/// None is dropped to make room: each one needs its own forward to reach the
+/// worker and then wait out the worker bound. A snapshot's revision settles
+/// every operation it covers, and a snapshot read after the worker handled an
+/// operation's request without raising the revision drops that operation.
 pub(super) fn attach_unacknowledged(entry: &mut SessionEntry, operation: Unacknowledged) {
     let displaced = match operation {
         Unacknowledged::Report(pending) => match &entry.pending_activity {
