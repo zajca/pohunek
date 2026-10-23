@@ -2301,7 +2301,7 @@ fn pi_reports_program_status() -> bool {
         .output()
         .expect("run `pi --version`");
     let version = String::from_utf8(output.stdout).expect("UTF-8 version");
-    let mut parts = version.trim().split('.').map(|part| part.parse::<u64>());
+    let mut parts = version.trim().split('.').map(str::parse::<u64>);
     let major = parts.next().and_then(Result::ok).expect("major version");
     let minor = parts.next().and_then(Result::ok).expect("minor version");
     (major, minor) >= PROGRAM_STATUS_RELEASE
