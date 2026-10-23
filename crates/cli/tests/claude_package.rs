@@ -100,7 +100,7 @@ const GOLDEN_MANIFEST_NAME: &str = "claude";
 const PACKAGE_ID: &str = "pohunek.runtime.claude";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.0.2";
+const PACKAGE_VERSION: &str = "1.1.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -673,13 +673,15 @@ const CHANGED_613_RULES: [(&str, &[&str]); 4] = [
 ];
 
 /// Rules the package adds for #613, each with the rule it follows.
-const ADDED_613_RULES: [(&str, &str); 4] = [
+const ADDED_613_RULES: [(&str, &str); 5] = [
     // The `esc to interrupt` footer of a running turn.
     ("live_turn_footer", "live_status_spinner"),
     // The first-run and folder trust dialogs.
     ("theme_picker", "dynamic_workflow_prompt"),
     ("login_method_list", "theme_picker"),
     ("folder_trust_dialog", "login_method_list"),
+    // The API-key approval dialog, a visible blocker over a held record (#1525).
+    ("api_key_approval_dialog", "folder_trust_dialog"),
 ];
 
 /// The id of a manifest rule table.
@@ -766,6 +768,211 @@ fn the_package_manifest_file_is_the_golden_manifest_with_the_613_rules() {
             None => assert_eq!(package_rule, golden_rule, "{id} equals the golden rule"),
         }
     }
+}
+
+/// An OSC 7501 root record of Claude Code.
+fn record(state: &str) -> Vec<u8> {
+    format!("\x1b]7501;state={state}:app=claude-code\x1b\\").into_bytes()
+}
+
+/// The activity and source of the last transition a fresh detector emits for
+/// `chunks` fed in order.
+fn last_transition(
+    definition: &RuntimeDefinition,
+    columns: u16,
+    chunks: &[Vec<u8>],
+) -> Option<(AgentActivity, StateSource)> {
+    let started = Instant::now();
+    let mut detector = detector_for(definition, started, columns);
+    let mut seen = Vec::new();
+    for chunk in chunks {
+        seen.extend(detector.feed(started, chunk));
+    }
+    seen.last()
+        .map(|transition| (transition.activity, transition.source))
+}
+
+fn current_frame(name: &str) -> Frame {
+    load_frame(ScreenSet::Current, name, name, DEFAULT_COLUMNS)
+}
+
+/// The records a real Claude 2.1.309 reported, in order, while the capture
+/// scenarios ran: the turn lifecycle the manifest arbitrates on.
+#[test]
+fn the_captured_program_status_sequences_follow_the_claude_turn_lifecycle() {
+    let read = |name: &str| -> Vec<String> {
+        let path = ScreenSet::Current
+            .directory()
+            .join(format!("{name}.program-status"));
+        fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    let record = |state: &str| format!("app=claude-code:state={state}");
+    assert_eq!(read("idle"), [record("idle")]);
+    assert_eq!(
+        read("working_early"),
+        [record("idle"), record("working")],
+        "a running turn reports working"
+    );
+    assert_eq!(
+        read("idle_after_turn"),
+        [record("idle"), record("working"), record("done")],
+        "a finished turn reports done"
+    );
+    assert_eq!(
+        read("approval").last(),
+        Some(&record("blocked:kind=permission")),
+        "a tool approval reports a blocked permission"
+    );
+    assert_eq!(
+        read("askuser").last(),
+        Some(&record("blocked:kind=question")),
+        "a question reports a blocked question"
+    );
+}
+
+/// The held record and the real Claude screens: the record keeps a prompt box
+/// working while a turn runs, ends a stale spinner, and never hides a dialog
+/// the screen rules see. Records of a child agent or of another app change
+/// nothing.
+#[test]
+fn a_program_status_record_arbitrates_with_the_real_claude_screens() {
+    let definition = installed_definition();
+    let screen = |name: &str| frame_bytes(None, &current_frame(name).rows);
+    let after = |name: &str, state: &str| {
+        last_transition(&definition, DEFAULT_COLUMNS, &[screen(name), record(state)])
+    };
+
+    // A1: working while the prompt box reads idle.
+    assert_eq!(
+        after("idle", "working"),
+        Some((AgentActivity::Working, StateSource::OscProgress))
+    );
+    // A3: blocked outranks any screen.
+    assert_eq!(
+        after("idle", "blocked:kind=question"),
+        Some((AgentActivity::Blocked, StateSource::OscProgress))
+    );
+    // A4: a finished turn ends the spinner line the screen still shows.
+    for state in ["done", "idle", "error"] {
+        assert_eq!(
+            after("working_early", state),
+            Some((AgentActivity::Idle, StateSource::OscProgress)),
+            "{state} over a stale spinner"
+        );
+    }
+    // A2/S1: a visible dialog wins over a non-blocked record, a forged one included.
+    for dialog in ["trust", "approval", "askuser", "theme", "login", "apikey"] {
+        for state in ["working", "idle", "done"] {
+            assert_eq!(
+                after(dialog, state),
+                Some((AgentActivity::Blocked, StateSource::Screen)),
+                "{dialog} with a {state} record"
+            );
+        }
+    }
+    // A14, S2: a child record, another app and a malformed record change nothing.
+    let held = [screen("idle"), record("working")];
+    for ignored in [
+        &b"\x1b]7501;state=idle:app=claude-code:id=agent-1\x1b\\"[..],
+        b"\x1b]7501;state=clear:app=claude-code:id=agent-1\x1b\\",
+        b"\x1b]7501;state=idle:app=codex\x1b\\",
+        b"\x1b]7501;state=idle\x1b\\",
+        b"\x1b]7501;state=bogus:app=claude-code\x1b\\",
+    ] {
+        let mut chunks = held.to_vec();
+        chunks.push(ignored.to_vec());
+        assert_eq!(
+            last_transition(&definition, DEFAULT_COLUMNS, &chunks),
+            Some((AgentActivity::Working, StateSource::OscProgress)),
+            "{}",
+            String::from_utf8_lossy(ignored)
+        );
+    }
+    // A root clear drops the record: the screen speaks again.
+    let mut chunks = held.to_vec();
+    chunks.push(b"\x1b]7501;state=clear\x1b\\".to_vec());
+    chunks.push(screen("idle_after_turn"));
+    assert_eq!(
+        last_transition(&definition, DEFAULT_COLUMNS, &chunks),
+        Some((AgentActivity::Idle, StateSource::Screen))
+    );
+}
+
+/// A markdown bullet in the transcript is not the spinner line, so a finished
+/// turn that quotes one reads idle on the screen alone.
+#[test]
+fn a_transcript_bullet_is_not_a_spinner_line() {
+    let definition = installed_definition();
+    for set in ScreenSet::ALL {
+        let mut rows = load_frame(set, "idle_after_turn", "idle_after_turn", DEFAULT_COLUMNS).rows;
+        rows.insert(2, "* Then it waits\u{2026} (see below)".to_owned());
+        assert_eq!(
+            screen_activity(&definition, &rows, DEFAULT_COLUMNS),
+            Some(AgentActivity::Idle),
+            "{set:?}"
+        );
+    }
+    for line in [
+        "\u{2722} Architecting\u{2026} (16s)",
+        "* Jiving\u{2026}",
+        "\u{273b} Sau\u{e9}ing\u{2026} (1m 5s \u{b7} \u{2193} 2.6k tokens)",
+    ] {
+        let mut rows = current_frame("idle").rows;
+        rows.insert(2, line.to_owned());
+        assert_eq!(
+            screen_activity(&definition, &rows, DEFAULT_COLUMNS),
+            Some(AgentActivity::Working),
+            "{line}"
+        );
+    }
+}
+
+/// A13: with no record held (an older Claude, a profile that turns the title
+/// and records off, a probe that was never answered) the manifest reads every
+/// captured screen of both releases exactly as it does without the opt-in.
+#[test]
+fn without_a_record_every_captured_screen_reads_as_without_the_opt_in() {
+    let with = installed_definition();
+    let mut table = read_toml(&format!("{PACKAGE_DIR}/detect.toml"));
+    assert!(table.remove("program_status").is_some());
+    let without = Manifest::parse_str(&toml::to_string(&table).expect("the manifest serializes"))
+        .expect("the manifest without the opt-in parses");
+    let mut compared = 0_usize;
+    for frame in top_level_frames().into_iter().chain(width_frames()) {
+        for title in [frame.title.as_deref(), None] {
+            let started = Instant::now();
+            let bytes = frame_bytes(title, &frame.rows);
+            let mut baseline = Detector::new(
+                24,
+                frame.columns,
+                started,
+                DetectorConfig {
+                    detection: DetectionConfig {
+                        recheck_after: Duration::from_millis(100),
+                        confirmations: 1,
+                        cap: Duration::from_millis(700),
+                        stable_visible_refresh: Duration::from_millis(800),
+                        startup_grace: Duration::ZERO,
+                    },
+                    manifest: Some(Arc::new(without.clone())),
+                    input_readiness: with.input_readiness(),
+                },
+            );
+            assert_eq!(
+                transitions(&with, title, &frame.rows, frame.columns),
+                baseline.feed(started, &bytes),
+                "{} of {:?} with title {title:?}",
+                frame.name,
+                frame.set
+            );
+            compared += 1;
+        }
+    }
+    assert!(compared >= 250, "frames compared: {compared}");
 }
 
 #[test]
@@ -1370,7 +1577,8 @@ fn screen_rule(definition: &RuntimeDefinition, rows: &[String], columns: u16) ->
     let context = detector
         .region_previews()
         .into_iter()
-        // The program-status preview is no manifest region.
+        // The detector's previews also hold the program-status record, which is
+        // no manifest region.
         .filter_map(|preview| {
             let region: ManifestRegion = preview.region.parse().ok()?;
             Some((region, preview.text))
@@ -1448,7 +1656,7 @@ fn the_completed_turn_line_with_its_done_time_reads_idle_through_its_rule() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 10, "idle_after_turn at every width");
+    assert_eq!(checked, 20, "idle_after_turn at every width of both sets");
 }
 
 fn process(comm: &str, cmdline: &[&str]) -> ProcessFact {
@@ -1506,6 +1714,19 @@ fn the_process_matchers_accept_the_observed_claude_process_forms() {
     assert!(matchers.matches(&process("claude.exe", &[npm])));
     assert!(matchers.matches(&process("claude.exe", &["other"])));
     assert!(matchers.matches(&process("sh", &[npm, "--resume", "abc"])));
+
+    // The native installer runs `<root>/claude/versions/<release>`: the kernel
+    // name is the release, the command line the image or the launcher.
+    let image = "/home/user/.local/share/claude/versions/2.1.309";
+    assert!(matchers.matches(&process("2.1.309", &["other"])));
+    assert!(matchers.matches(&process("sh", &[image, "--resume", "abc"])));
+    assert!(matchers.matches(&process("2.1.309", &["claude"])));
+    assert!(!matchers.matches(&process(
+        "sh",
+        &["/home/user/.local/share/codex/versions/0.164.0"]
+    )));
+    assert!(!matchers.matches(&process("sh", &["/work/claude/versions/cache.db"])));
+    assert!(!matchers.matches(&process("2.1", &["other"])));
 
     // A script that merely carries `claude` in its name is not Claude.
     for (comm, cmdline) in [
@@ -1769,7 +1990,14 @@ fn the_package_manifest_behaves_like_the_builtin_manifest_on_every_frame() {
     let golden = golden_definition();
     let mut compared = 0_usize;
     let mut reclassified = BTreeSet::new();
-    for frame in top_level_frames().into_iter().chain(width_frames()) {
+    // The exceptions are the frames of the release the golden manifest was
+    // written for; the current release's screens are covered by the rule
+    // scenarios above.
+    let previous = ScreenSet::Previous;
+    for frame in top_level_frames_of(previous)
+        .into_iter()
+        .chain(width_frames_of(previous))
+    {
         let fed_titles = if frame.title.is_some() {
             vec![frame.title.as_deref(), None]
         } else {
@@ -2911,11 +3139,60 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
     fixture.finish().await;
 }
 
+/// R-rows of the program-status layer against a real Claude: a turn started
+/// with `--until working` is confirmed by the `working` record, the settled
+/// turn reads idle from the `done` record, both reported as `osc_progress`, and
+/// a `working` record is not kept once Claude exits.
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+async fn a_real_claude_turn_is_reported_through_program_status_records() {
+    require_real_claude();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    let id = fixture.new_session_id("records").await;
+    fixture.wait_activity(&id, "idle").await;
+
+    let prompt = format!("{} {PROMPT}", messages_stub::HOLD_MARKER);
+    let (code, started) = fixture
+        .harness
+        .json(&[
+            "session",
+            "input",
+            &id,
+            &prompt,
+            "--until",
+            "working",
+            "--timeout",
+            WAIT_SLICE_MS,
+        ])
+        .await;
+    assert_eq!(code, 0, "{started}");
+    let working = fixture.inspect(&id).await;
+    assert_eq!(working["activity"], "working", "{started}");
+    assert_eq!(working["state_source"], "osc_progress", "{working}");
+
+    fixture.stub.open_gate();
+    fixture
+        .wait_screen_line(&id, messages_stub::SECOND_CHUNK)
+        .await;
+    let idle = fixture.wait_activity(&id, "idle").await;
+    assert_eq!(idle["state_source"], "osc_progress", "{idle}");
+
+    // A `working` record does not outlive the process that reported it.
+    fixture
+        .input(&id, &format!("{} {PROMPT}", messages_stub::HOLD_MARKER))
+        .await;
+    fixture.wait_activity(&id, "working").await;
+    fixture.stop(&id).await;
+    let stopped = fixture.inspect(&id).await;
+    assert_ne!(stopped["activity"], "working", "{stopped}");
+    fixture.finish().await;
+}
+
 /// A reply held mid-stream: Claude draws the first paragraph and removes the
-/// status line, while the title keeps alternating its running-turn glyphs and
-/// the footer reads `esc to interrupt`. The daemon keeps the session working
-/// for longer than two title changes and the package manifest reads the live
-/// screen as working. The turn finishes once the stream gate opens.
+/// status line, its `working` record stays held and the footer reads `esc to
+/// interrupt`. The daemon keeps the session working for the whole watch and
+/// the package manifest reads the live screen as working. The turn finishes
+/// once the stream gate opens.
 #[tokio::test]
 #[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
 async fn a_real_claude_reply_held_mid_stream_reads_working() {
@@ -2944,9 +3221,10 @@ async fn a_real_claude_reply_held_mid_stream_reads_working() {
         "the second chunk waits for the stream gate: {rows:#?}"
     );
     let (title, _rows) = fixture.screen(&id).await;
-    assert!(
-        title.is_some_and(|title| title.starts_with(TURN_GLYPHS)),
-        "the title still shows a running turn"
+    assert_eq!(
+        title.as_deref(),
+        Some(PROGRAM_STATUS_TITLE),
+        "the title carries no turn glyph; the records report the turn"
     );
     let (code, waited) = fixture
         .harness
@@ -3914,7 +4192,10 @@ async fn a_real_claude_approval_prompt_is_blocked_by_the_screen() {
         .input(&id, &format!("{} run it", messages_stub::APPROVAL_MARKER))
         .await;
     let blocked = fixture.wait_activity(&id, "blocked").await;
-    assert_eq!(blocked["state_source"], "screen", "{blocked}");
+    assert_eq!(
+        blocked["state_source"], "osc_progress",
+        "Claude reports the permission prompt as a blocked record: {blocked}"
+    );
     let rows = fixture
         .wait_screen_line(&id, "Do you want to proceed?")
         .await;

@@ -144,6 +144,17 @@ regex = [
 ]
 
 [[rules]]
+id = "api_key_approval_dialog"
+state = "blocked"
+priority = 980
+region = "after_last_horizontal_rule"
+visible_blocker = true
+regex = [
+  '(?i)detected\s+a\s+custom\s+api\s+key',
+  '(?i)use\s+this\s+api\s+key',
+]
+
+[[rules]]
 id = "live_prompt_box"
 state = "idle"
 priority = 950

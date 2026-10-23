@@ -2,7 +2,7 @@
 type: Guide
 id: guide/claude-package
 title: Claude Code runtime package
-description: The official Claude Code runtime package source (Claude Code 2.x from 2.1.289), the only source of the claude runtime, what it declares, how its detection differs from the built-in Claude runtime of release 0.34.2, what was verified against a real Claude Code, and the detection limits that remain.
+description: The official Claude Code runtime package source (Claude Code 2.x from 2.1.289, verified on 2.1.309), the only source of the claude runtime, what it declares, how its detection differs from the built-in Claude runtime of release 0.34.2, what was verified against a real Claude Code, and the detection limits that remain.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
@@ -114,13 +114,14 @@ enumerated captured frames may read differently.
   and `pohunek doctor` warns about it.
 - Version: `version_probe = { parser = "semver-line-v1", args = ["--version"],
   min = "2.1.289", below = "3.0.0", line = "{version} (Claude Code)" }`.
-  `claude --version` prints `2.1.289 (Claude Code)` on standard output; any
+  `claude --version` prints `2.1.309 (Claude Code)` on standard output; any
   other wording, a pre-release or trailing text is unsupported. The lower bound
-  is the one release that was verified; the upper bound is the next major
-  release, as for the other packages, because hosts update Claude Code
-  independently of pohunek. Claude Code ships patch releases almost daily, so
-  only 2.1.289 was exercised; later 2.x releases are accepted by policy, not
-  verified. Moving `min` is a lock and descriptor change made together after a
+  is the previous verified release, whose captures stay in the repository; it
+  launches screen-only because it emits no program-status records. The upper
+  bound is the next major release, as for the other packages, because hosts
+  update Claude Code independently of pohunek. Claude Code ships patch releases
+  almost daily, so only 2.1.309 and 2.1.289 were exercised; other 2.x releases
+  are accepted by policy, not verified. Moving `min` is a lock and descriptor change made together after a
   real-Claude run of the new release.
 - Native reference: `strategy = "hook"`; resume is `claude --resume <id>`; fork
   is `claude --resume <id> --fork-session`.
@@ -167,7 +168,12 @@ loopback). With a seeded home Claude still sends the `HEAD /api/hello` to the
 base URL (the stub answers 404) but keeps running without network access, so
 every test except the first-run capture runs without egress.
 
-## Verified against a real Claude Code 2.1.289
+## Verified against a real Claude Code 2.1.309
+
+The locked release is 2.1.309; the screens of the previous verified release,
+2.1.289, stay in `compat/claude/screens/n-1/` and every screen scenario runs
+over both sets. The text below describes the captures of the locked release
+unless it names 2.1.289.
 
 The screens in `compat/claude/screens/` (named screens at 100 columns, widths 20
 to 200 in `widths/`, each with the OSC title Claude had set in a `.title` file)
@@ -182,7 +188,7 @@ network namespace with only loopback. They cover the theme picker, the API-key
 approval, the login method list, the folder trust dialog, the idle screen, a turn
 held before its first output, a streaming reply, the screen after a turn, a Bash
 tool approval and a multiple-choice question. The binary was the linux-x64
-native executable of 2.1.289 from the distribution package, byte-identical
+native executable of 2.1.309 from the distribution package, byte-identical
 (SHA-256 in the lock) to the one the npm package installs; the real-Claude tests
 also ran against the npm install. The darwin-arm64 executable of the same release is pinned by its own SHA-256 and runs in the aarch64-apple-darwin release-evidence row; the screen captures were not repeated on macOS. `crates/cli/tests/claude_package.rs` classifies every
 captured screen through the package manifest.
@@ -298,6 +304,50 @@ captured screen through the package manifest.
   `CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL` (without the last one a
   first interactive launch registers the official plugin marketplace).
 
+## Program status (OSC 7501)
+
+Claude Code 2.1.295 and later report their root state as OSC 7501 records
+(`ESC ] 7501 ; state=<state>:app=claude-code ST`) once the terminal answers the
+probe `ESC ] 7501 ; ? ST` with the same bytes. The manifest opts in with
+`[program_status] app = "claude-code"`, `answer_probe = true`, so the session
+worker answers the probe of a Claude session (and only of a session whose
+manifest opts in) and the daemon holds the latest root record.
+
+- Mapping: `working` reads working, `blocked` (`kind=permission` or
+  `question`) reads blocked, `done`, `idle` and `error` read idle. All are
+  reported as `state_source = osc_progress`. Records of background agents carry
+  an `id=` and are ignored, so the root reads idle while background agents run.
+- A visible dialog on the screen always wins over a record that is not
+  `blocked`: the folder trust, theme, login, API-key and permission dialogs stay
+  blocked, whatever a (forged or stale) record says. The API-key dialog is read
+  by its own visible-blocker rule for this reason.
+- A held record ends with a root `state=clear`, with any detector
+  reconfiguration (a nested agent exiting, a package refresh) and with the
+  runtime. Initial-input readiness ignores the record: the prompt box decides.
+- With the probe answered Claude sets the plain title `Claude Code` in every
+  state, so the title rules read nothing from it. Without a record (Claude
+  2.1.289 and older, `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`, a
+  `CLAUDE_CODE_SESSION_KIND=bg` session, or a probe whose reply lost the race
+  against a client's DA1 reply) detection is screen-only exactly as before; the
+  2.1.289 screens in `n-1/` keep the title rules evidenced.
+- Under a terminal multiplexer Claude does not enable the records; a Claude
+  started inside a shell session is screen-only because the shell session's
+  manifest does not answer the probe.
+- The captured record sequences are `compat/claude/screens/<state>.program-status`
+  (one ordered root record per line), recorded from the real agent by the
+  capture scenarios; `the_captured_program_status_sequences_follow_the_claude_turn_lifecycle`
+  pins them, and `a_program_status_record_arbitrates_with_the_real_claude_screens`
+  replays the arbitration over the real screens.
+- Esc during a turn reports `idle` (`stopped`) in the binary; no capture of the
+  `Interrupted` marker exists because the test client cannot send a bare Esc.
+
+The native installer runs `<root>/claude/versions/<release>`; the process name
+is the release (`2.1.309`), so the manifest's process matchers accept that
+form, and the worker designates such an image as the launch agent (a resolved
+executable in a `claude/versions/` directory), which `SessionStart` binding
+needs. The npm layout (`bin/claude.exe`) and the native layout both pass the
+SessionStart, resume, fork and UserPromptSubmit scenarios against 2.1.309.
+
 ## Detection beyond the built-in manifest
 
 The package manifest adds these rules to the v0.34.2 built-in one (#613). Each is
@@ -348,8 +398,8 @@ that fails without the rule.
 Limits that remain:
 
 - At 30 columns and fewer the footer is cut before `esc to interrupt` (`⏸ manual
-  mode on · esc to…`), so a streaming reply re-rendered there reads idle until
-  the next title change.
+  mode on · esc to…`), so a streaming reply re-rendered there reads idle on the
+  screen alone; the held `working` record keeps the session working.
 - Under a terminal multiplexer (`TMUX`, `STY` or `ZELLIJ` in Claude's
   environment) 2.1.289 keeps the static `✳` title during a turn (its
   `tengu_static_title_under_mux` switch, on by default); the screen rules are
@@ -362,8 +412,8 @@ Limits that remain:
 
 ## Not verified
 
-Releases other than 2.1.289 (the range above the lock is a policy, not a
-verification), the native installer's `~/.local/bin/claude` launcher and the
+Releases other than 2.1.309 and 2.1.289 (the range above the lock is a policy, not a
+verification), the Esc interrupt marker, the attached client answering the probe itself, the Homebrew and the
 Homebrew and apt installs (the npm install and the distribution package ship the
 same binary), macOS and Windows, a real login or a real model, plan mode,
 compaction, MCP and other dialogs, the `PermissionRequest` hook, terminals
@@ -470,12 +520,14 @@ established by the network namespace, not by Claude's own switches.
   seeded screens (run it without egress); without the directory variable the
   capture tests do nothing.
 - The `claude-package` CI job installs exactly the locked release from npm
-  (`@anthropic-ai/claude-code@2.1.289`, with install scripts enabled because the
+  (`@anthropic-ai/claude-code@2.1.309`, with install scripts enabled because the
   postinstall links the native binary; `--ignore-scripts` leaves a launcher that
   refuses to run), compares the native binary with the lock's SHA-256, builds the
   archive with `cargo xtask package build` and runs that file.
 
 Update procedure for a new Claude Code release: install it, rerun the
-real-Claude tests, recapture the screens if the interface changed, move the lock
-(release, SHA-256) and the descriptor's `min`/`below` together, and bump the
-package `version`.
+real-Claude tests (the SessionStart, resume, fork and UserPromptSubmit scenarios
+on both the npm and the native layout first), recapture the screens and the
+`.program-status` sequences, move the previous captures to `screens/n-1/`
+(deleting the older set), move the lock (release, SHA-256), raise the
+descriptor's `min` to the previous release and bump the package `version`.
