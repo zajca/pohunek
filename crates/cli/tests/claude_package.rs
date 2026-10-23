@@ -2235,6 +2235,10 @@ struct Fixture {
     harness: Harness,
     stub: MessagesStub,
     claude_home: PathBuf,
+    /// Working directory of the launched sessions.
+    cwd: PathBuf,
+    /// Prefix of every host path a recorded screen may show.
+    capture_root: PathBuf,
     /// Digest of the installed package archive.
     digest: PackageDigest,
 }
@@ -2243,6 +2247,12 @@ impl Fixture {
     /// Starts a fixture whose daemon serves `claude` from the installed
     /// official package, the only source of `claude`.
     async fn start(seed: Seed) -> Self {
+        Self::start_in(seed, None).await
+    }
+
+    /// Starts a fixture whose sessions run in `cwd` when given, so a recorded
+    /// screen shows a fixed path instead of the test's scratch directory.
+    async fn start_in(seed: Seed, cwd: Option<PathBuf>) -> Self {
         let key = test_key();
         let anchor =
             HostTrustAnchor::new(vec![root_of(&key, WINDOW_START, WINDOW_END)], Vec::new())
@@ -2253,11 +2263,23 @@ impl Fixture {
         let stub = MessagesStub::start();
         let claude_home = harness.env.root().join("claude-home");
         fs::create_dir_all(&claude_home).expect("create the Claude home");
+        let (cwd, capture_root) = match cwd {
+            Some(cwd) => {
+                let root = cwd.parent().expect("a recording directory has a root");
+                (cwd.clone(), root.to_path_buf())
+            }
+            None => (
+                harness.env.cwd().to_path_buf(),
+                harness.env.root().to_path_buf(),
+            ),
+        };
         let fixture = Self {
             processes,
             harness,
             stub,
             claude_home,
+            cwd,
+            capture_root,
             digest,
         };
         fixture.seed(seed);
@@ -2272,7 +2294,7 @@ impl Fixture {
         if seed == Seed::Fresh {
             return;
         }
-        let cwd = path_str(self.harness.env.cwd()).to_owned();
+        let cwd = path_str(&self.cwd).to_owned();
         let key = messages_stub::API_KEY;
         let suffix = &key[key.len() - APPROVED_KEY_SUFFIX_LEN..];
         let mut config = serde_json::json!({
@@ -2414,7 +2436,7 @@ impl Fixture {
     /// `session new` of `profile` in the fixture's working directory, at
     /// `columns` wide.
     async fn launch_at(&self, profile: &str, name: &str, columns: u16) -> (i32, Value) {
-        let cwd = self.harness.env.cwd().to_path_buf();
+        let cwd = self.cwd.clone();
         self.harness
             .json(&[
                 "session",
@@ -2843,7 +2865,7 @@ impl Fixture {
         capture::write_capture(
             directory,
             name,
-            path_str(self.harness.env.root()),
+            path_str(&self.capture_root),
             title.as_deref(),
             &rows,
         );
@@ -5423,7 +5445,8 @@ async fn capture_the_real_claude_first_run_screens() {
     let Some(directory) = capture_directory() else {
         return;
     };
-    let fixture = Fixture::start(Seed::Fresh).await;
+    let recording = capture::RecordingRoot::new("claude");
+    let fixture = Fixture::start_in(Seed::Fresh, Some(recording.directory("cwd"))).await;
     let id = fixture.new_session_id("first-run").await;
     fixture
         .wait_screen_line(&id, "Choose the text style that looks best")
@@ -5458,8 +5481,10 @@ async fn capture_the_real_claude_screens() {
         return;
     };
 
+    let recording = capture::RecordingRoot::new("claude");
+
     // Onboarded home, untrusted folder.
-    let fixture = Fixture::start(Seed::Onboarded).await;
+    let fixture = Fixture::start_in(Seed::Onboarded, Some(recording.directory("cwd"))).await;
     let id = fixture.new_session_id("trust").await;
     fixture.wait_screen_line(&id, "Quick safety check").await;
     fixture.capture(&directory, &id, "trust").await;
@@ -5468,7 +5493,7 @@ async fn capture_the_real_claude_screens() {
     fixture.finish().await;
 
     // Trusted home: idle, working, idle after a turn, approval, question.
-    let fixture = Fixture::start(Seed::Trusted).await;
+    let fixture = Fixture::start_in(Seed::Trusted, Some(recording.directory("cwd"))).await;
     fixture.install_integration().await;
     let id = fixture.new_session_id("states").await;
     fixture.wait_activity(&id, "idle").await;
