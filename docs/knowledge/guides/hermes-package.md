@@ -162,10 +162,11 @@ tag; the package tests compare the package with them.
   - `active_turn_prompt` (`working`): the Hermes staff symbol `⚕` before the
     prompt glyph, optionally followed by the `msg=interrupt …` placeholder of an
     empty composer during a turn (the compact layout, below 64 columns, has no
-    glyph and wraps the placeholder onto a second row from 54 columns down to
-    28), as the last of the bottom 8 non-empty lines, apart from the rule chrome
-    drawn below it; a terminal narrower than 28 columns wraps it onto three rows
-    and only the progress rules read such a turn; `active_turn_progress` and
+    glyph; the empty composer is one row high, so a narrow terminal clips the
+    placeholder, and its first 15 columns `⚕ msg=interrupt` still read as
+    working while a narrower terminal leaves only the progress rules), as the
+    last of the bottom 8 non-empty lines, apart from the rule chrome drawn below
+    it; `active_turn_progress` and
     `tui_active_turn` (`working`): a `[thinking]` line, `◆ aggregating` or the
     TUI's `Ctrl+C to interrupt…` there.
   - `idle_prompt` and `tui_idle_status` (`idle`): the classic prompt glyph,

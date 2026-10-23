@@ -2974,28 +2974,57 @@ mod tests {
         );
     }
 
+    /// The compact working row of a terminal `cols` cells wide: the empty
+    /// composer is one row high, so Hermes shows only the first `cols` cells
+    /// of the prompt and its placeholder.
+    fn hermes_clipped_compact_row(cols: usize) -> String {
+        "\u{2695} msg=interrupt \u{b7} /queue \u{b7} /bg \u{b7} /steer \u{b7} Ctrl+C cancel"
+            .chars()
+            .take(cols)
+            .collect()
+    }
+
     #[test]
-    fn a_wrapped_hermes_interrupt_placeholder_reads_working_at_every_narrow_width() {
-        for cols in [28_u16, 40, 54, 55, 60] {
+    fn a_clipped_hermes_interrupt_placeholder_reads_working_down_to_fifteen_columns() {
+        for cols in [15_u16, 20, 40, 54, 55, 63] {
             let started_at = instant();
             let mut detector = steady_detector(&RuntimeRef::hermes(), 10, cols, started_at);
+            let row = hermes_clipped_compact_row(usize::from(cols));
 
             let transitions = detector.feed(
                 started_at,
-                "\x1b[2J\x1b[Hanswer\r\n\u{2695} msg=interrupt \u{b7} /queue \u{b7} /bg \u{b7} /steer \u{b7} Ctrl+C cancel"
-                    .as_bytes(),
+                format!("\x1b[2J\x1b[Hanswer\r\n{row}").as_bytes(),
             );
 
             assert_eq!(
                 transitions,
                 vec![transition(AgentActivity::Working, StateSource::Screen)],
-                "{cols} columns"
+                "{cols} columns: {row:?}"
             );
         }
     }
 
     #[test]
-    fn a_wrapped_hermes_interrupt_placeholder_in_the_transcript_never_reads_working() {
+    fn a_hermes_placeholder_clipped_below_fifteen_columns_is_left_to_the_progress_rules() {
+        let started_at = instant();
+        let mut detector = steady_detector(&RuntimeRef::hermes(), 10, 14, started_at);
+        let row = hermes_clipped_compact_row(14);
+
+        let transitions = detector.feed(
+            started_at,
+            format!("\x1b[2J\x1b[Hanswer\r\n{row}").as_bytes(),
+        );
+
+        assert!(
+            transitions
+                .iter()
+                .all(|transition| transition.source != StateSource::Screen),
+            "{transitions:?}"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_hermes_interrupt_quote_in_the_transcript_never_reads_working() {
         let started_at = instant();
         let mut detector = steady_detector(&RuntimeRef::hermes(), 14, 40, started_at);
         let rule = "\u{2500}".repeat(30);
@@ -3074,6 +3103,49 @@ mod tests {
             "the gate was open"
         );
         assert_eq!(detector.latch_sightings, sightings, "{transitions:?}");
+    }
+
+    #[test]
+    fn a_hermes_idle_redraw_over_an_old_interrupt_placeholder_line_never_latches_working() {
+        let placeholder =
+            "msg=interrupt \u{b7} /queue \u{b7} /bg \u{b7} /steer \u{b7} Ctrl+C cancel";
+        for old_line in [
+            format!("\u{2695} \u{276f} {placeholder}"),
+            format!("\u{2695} {placeholder}"),
+        ] {
+            let started_at = instant();
+            let mut detector = steady_detector(&RuntimeRef::hermes(), 14, 80, started_at);
+            let mut screen = format!("\x1b[2J\x1b[H{old_line}\r\n");
+            for line in 1..=8 {
+                let _ = write!(screen, "out {line}\r\n");
+            }
+            screen.push_str("\u{276f} ");
+            detector.feed(started_at, screen.as_bytes());
+            assert_eq!(
+                detector.state.published_activity(),
+                Some(AgentActivity::Idle),
+                "the finished frame reads idle: {old_line:?}"
+            );
+            let sightings = detector.latch_sightings;
+            let evaluations = detector.latch_evaluations;
+
+            let mut redraw = String::from("\x1b[3;1H\x1b[J");
+            for line in 2..=8 {
+                let _ = write!(redraw, "out {line}\r\n");
+            }
+            redraw.push_str("\u{276f} ");
+            let transitions =
+                detector.feed(started_at + Duration::from_millis(10), redraw.as_bytes());
+
+            assert!(
+                detector.latch_evaluations > evaluations,
+                "the gate was open: {old_line:?}"
+            );
+            assert_eq!(
+                detector.latch_sightings, sightings,
+                "{old_line:?}: {transitions:?}"
+            );
+        }
     }
 
     #[test]
