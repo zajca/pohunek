@@ -19,6 +19,9 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use pohunek_daemon::notifications::{
+    AttentionCoordinator, AttentionCoordinatorTask, NotificationProjector, NotificationService,
+};
 use pohunek_daemon::procwatch::HostInspector;
 use pohunek_daemon::runtime::{
     EnvironmentSource, SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
@@ -30,7 +33,8 @@ use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::{worker_binary, workspace_root};
 use protocol::{
     AgentActivity, SessionId, SessionInfo, SessionInputParams, SessionInputWait, SessionNewParams,
-    StateSource, ENV_DAEMON_ID, ENV_SESSION_ID,
+    SessionTurnEventKind, SessionWaitTurnParams, SessionWaitTurnReason, StateSource, ENV_DAEMON_ID,
+    ENV_SESSION_ID,
 };
 
 const TEST_COLS: u16 = 100;
@@ -39,6 +43,9 @@ const TEST_ROWS: u16 = 24;
 const REPLY_HEX: &str = "1b5d373530313b3f1b5c";
 /// Bound of a wait that must be satisfied by the stand-in agent.
 const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
+/// Turn waits: a turn event follows the attention debounce (5 seconds by
+/// default), so the absence of one is only proved by a wait that outlasts it.
+const NO_TURN_WAIT_MS: u32 = 8_000;
 /// Captured Pi screens the stand-in draws, relative to `compat/pi/screens`.
 const IDLE_SCREEN: &str = "idle.txt";
 const WORKING_SCREEN: &str = "working.txt";
@@ -56,7 +63,7 @@ const UNFRAMED_SCREEN: &str = "overlays/unframed_fork_other_project_w100.txt";
 /// once. Commands: `g` working screen and record, `d` idle screen and done
 /// record, `b` blocked record, `c` Pi's own confirm over the screen, `s` the
 /// busy border with an idle record (a branch summary), `x` a screen no rule
-/// matches, `r` the idle screen, `t` a turn that reports working until the
+/// matches, `r` the idle screen, `w` a working and a done record in one write, `t` a turn that reports working until the
 /// FIFO yields a byte and then done, and `l` the clear record. In the `old`
 /// mode the screens change and no record is written.
 fn agent_script() -> String {
@@ -90,6 +97,7 @@ run() {{
     s) draw {working}; emit idle ;;
     x) draw {unframed} ;;
     r) draw {idle} ;;
+    w) if [ "$mode" = reply ]; then printf '\033]7501;state=working:app=pi\033\\\033]7501;state=done:app=pi\033\\'; fi ;;
     t) draw {working}; emit working; head -c 1 <&3 > /dev/null; draw {idle}; emit done ;;
     l) if [ "$mode" = reply ]; then printf '\033]7501;state=clear\033\\'; fi ;;
   esac
@@ -119,6 +127,8 @@ struct Fixture {
     env: TestEnv,
     registry: SessionRegistry,
     scratch: PathBuf,
+    projector: NotificationProjector,
+    _attention: AttentionCoordinatorTask,
 }
 
 impl Fixture {
@@ -193,10 +203,19 @@ impl Fixture {
         )
         .expect("the production registry opens the plugin root");
         catalog.install(&registry, env.root()).await;
+        // The daemon's turn events come from the projector, which turns a
+        // `working` to `idle` change of an armed turn into `turn_completed`.
+        let notifications = NotificationService::open(&env.root().join("daemon-data"))
+            .expect("open the notification inbox");
+        let (coordinator, attention) = AttentionCoordinator::spawn(notifications.clone(), &registry);
+        let projector = NotificationProjector::spawn(&registry, notifications, coordinator);
+        registry.spawn_agent_state_hooks();
         Self {
             env,
             registry,
             scratch,
+            projector,
+            _attention: attention,
         }
     }
 
@@ -257,6 +276,33 @@ impl Fixture {
             .await
     }
 
+    /// Waits up to `timeout_ms` for a `turn_completed` event of `id` newer than
+    /// `after` and returns the reason with the cursor for the next call.
+    async fn wait_turn(
+        &self,
+        id: &SessionId,
+        timeout_ms: u32,
+        after: Option<protocol::SessionTurnCursor>,
+    ) -> (SessionWaitTurnReason, protocol::SessionTurnCursor) {
+        let params = SessionWaitTurnParams::new(
+            vec![id.clone()],
+            vec![SessionTurnEventKind::TurnCompleted],
+            after,
+            Some(timeout_ms),
+        )
+        .expect("valid turn wait");
+        let result = self
+            .registry
+            .wait_turn(&params)
+            .await
+            .expect("session.wait_turn");
+        (result.reason, result.cursor)
+    }
+
+    async fn end(self) {
+        self.projector.shutdown().await;
+    }
+
     fn scratch_file(&self, name: &str) -> PathBuf {
         self.scratch.join(name)
     }
@@ -276,6 +322,33 @@ fn command(fixture: &Fixture, byte: u8) {
 
 const WORKING: (AgentActivity, StateSource) = (AgentActivity::Working, StateSource::OscProgress);
 const IDLE: (AgentActivity, StateSource) = (AgentActivity::Idle, StateSource::OscProgress);
+const BLOCKED: (AgentActivity, StateSource) = (AgentActivity::Blocked, StateSource::OscProgress);
+
+/// Waits until the visible screen of `id` holds a line with `needle` (or, with
+/// `present` false, none).
+async fn wait_screen(fixture: &Fixture, id: &SessionId, needle: &str, present: bool) {
+    wait_until(&format!("the screen to show {needle:?}: {present}"), || async {
+        let screen = fixture.registry.screen(id).await.ok()?;
+        (screen
+            .visible_lines
+            .iter()
+            .any(|line| line.contains(needle))
+            == present)
+            .then_some(())
+    })
+    .await;
+}
+
+/// The `agent_state` events published since `events` was subscribed.
+fn agent_states(events: &mut tokio::sync::broadcast::Receiver<protocol::Event>) -> usize {
+    let mut count = 0;
+    while let Ok(event) = events.try_recv() {
+        if event.event() == protocol::event::AGENT_STATE {
+            count += 1;
+        }
+    }
+    count
+}
 
 #[tokio::test]
 async fn the_shipped_pi_package_opts_in_and_the_worker_answers_its_probe_once() {
@@ -304,17 +377,26 @@ async fn the_shipped_pi_package_opts_in_and_the_worker_answers_its_probe_once() 
         "the shipped manifest declares app = pi: {detection:?}"
     );
 
+    // Neither the reply nor records without a delivered input open a turn.
+    command(&fixture, b'g');
+    fixture.wait_activity(&created.id, WORKING).await;
+    command(&fixture, b'd');
+    fixture.wait_activity(&created.id, IDLE).await;
+    let (reason, _) = fixture.wait_turn(&created.id, NO_TURN_WAIT_MS, None).await;
+    assert_eq!(reason, SessionWaitTurnReason::Timeout);
     let _ = fixture.registry.stop(&created.id).await;
+    fixture.end().await;
 }
 
 #[tokio::test]
-async fn a_pi_turn_is_working_then_idle_by_record() {
+async fn a_pi_turn_armed_by_input_completes_once_through_the_records() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
     let fixture = Fixture::new().await;
     let created = fixture.start("fake-reply-stdin").await;
     fixture.wait_activity(&created.id, IDLE).await;
+    let (_, cursor) = fixture.wait_turn(&created.id, 100, None).await;
 
     let working = fixture
         .input(&created.id, "t", AgentActivity::Working)
@@ -324,6 +406,15 @@ async fn a_pi_turn_is_working_then_idle_by_record() {
     assert_eq!(working.activity_source, Some(StateSource::OscProgress));
     command(&fixture, b'd');
     fixture.wait_activity(&created.id, IDLE).await;
+    let (reason, cursor) = fixture
+        .wait_turn(&created.id, WAIT_MS, Some(cursor))
+        .await;
+    assert_eq!(reason, SessionWaitTurnReason::Event);
+    let (reason, _) = fixture
+        .wait_turn(&created.id, NO_TURN_WAIT_MS, Some(cursor))
+        .await;
+    assert_eq!(reason, SessionWaitTurnReason::Timeout, "one turn, one event");
+
     // Idle evidence needs working evidence first.
     let release = async {
         fixture.wait_activity(&created.id, WORKING).await;
@@ -335,6 +426,27 @@ async fn a_pi_turn_is_working_then_idle_by_record() {
     assert_eq!(idle.activity, Some(AgentActivity::Idle));
     assert_eq!(idle.activity_source, Some(StateSource::OscProgress));
     let _ = fixture.registry.stop(&created.id).await;
+    fixture.end().await;
+}
+
+#[tokio::test]
+async fn a_pi_turn_shorter_than_one_sample_is_latched_working() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new().await;
+    let created = fixture.start("fake-reply-stdin").await;
+    fixture.wait_activity(&created.id, IDLE).await;
+
+    // The working and the done record arrive in one write.
+    let working = fixture
+        .input(&created.id, "w", AgentActivity::Working)
+        .await
+        .expect("a waited input sees the working record of a one-write turn");
+    assert_eq!(working.activity, Some(AgentActivity::Working));
+    fixture.wait_activity(&created.id, IDLE).await;
+    let _ = fixture.registry.stop(&created.id).await;
+    fixture.end().await;
 }
 
 #[tokio::test]
@@ -348,12 +460,7 @@ async fn a_pi_confirm_record_is_blocked_and_pis_own_confirm_stays_blocked_by_scr
 
     // An extension dialog: Pi reports blocked.
     command(&fixture, b'b');
-    fixture
-        .wait_activity(
-            &created.id,
-            (AgentActivity::Blocked, StateSource::OscProgress),
-        )
-        .await;
+    fixture.wait_activity(&created.id, BLOCKED).await;
     command(&fixture, b'g');
     fixture.wait_activity(&created.id, WORKING).await;
 
@@ -366,76 +473,83 @@ async fn a_pi_confirm_record_is_blocked_and_pis_own_confirm_stays_blocked_by_scr
     command(&fixture, b'g');
     fixture.wait_activity(&created.id, WORKING).await;
     let _ = fixture.registry.stop(&created.id).await;
+    fixture.end().await;
 }
 
 #[tokio::test]
-async fn a_pi_busy_border_with_an_idle_record_reads_idle_and_an_unmatched_screen_keeps_working() {
+async fn a_pi_busy_border_with_an_idle_record_stays_idle() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
     let fixture = Fixture::new().await;
     let created = fixture.start("fake-reply-fifo").await;
     fixture.wait_activity(&created.id, IDLE).await;
+    let mut events = fixture.registry.subscribe();
 
-    // A branch summary draws the busy border without a run: Pi's record is idle.
+    // A branch summary draws the busy border without a run: Pi's record is
+    // idle. The blocked record after it orders the busy border before the
+    // awaited edge, so any working edge would show up first.
     command(&fixture, b's');
-    wait_until("the busy border to be drawn", || async {
-        fixture
-            .registry
-            .screen(&created.id)
-            .await
-            .ok()
-            .filter(|screen| {
-                screen
-                    .visible_lines
-                    .iter()
-                    .any(|line| line.contains("Working"))
-            })
-    })
-    .await;
-    assert_eq!(fixture.activity(&created.id).await, Some(IDLE));
-
-    // A dialog drawn with ctx.ui.custom() matches no screen rule: the record
-    // decides.
-    command(&fixture, b'g');
-    fixture.wait_activity(&created.id, WORKING).await;
-    command(&fixture, b'x');
-    wait_until("the unframed screen to be drawn", || async {
-        fixture
-            .registry
-            .screen(&created.id)
-            .await
-            .ok()
-            .filter(|screen| {
-                !screen
-                    .visible_lines
-                    .iter()
-                    .any(|line| line.contains("Working"))
-            })
-    })
-    .await;
-    assert_eq!(fixture.activity(&created.id).await, Some(WORKING));
+    command(&fixture, b'b');
+    fixture.wait_activity(&created.id, BLOCKED).await;
+    assert_eq!(
+        agent_states(&mut events),
+        1,
+        "only the blocked edge: the busy border changed nothing"
+    );
+    wait_screen(&fixture, &created.id, "Working", true).await;
     let _ = fixture.registry.stop(&created.id).await;
+    fixture.end().await;
 }
 
 #[tokio::test]
-async fn a_pi_clear_record_hands_detection_back_to_the_screen() {
+async fn a_pi_screen_no_rule_matches_leaves_the_record_in_charge() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
     let fixture = Fixture::new().await;
     let created = fixture.start("fake-reply-fifo").await;
     fixture.wait_activity(&created.id, IDLE).await;
-    command(&fixture, b's');
     command(&fixture, b'g');
     fixture.wait_activity(&created.id, WORKING).await;
-    command(&fixture, b'r');
+    let mut events = fixture.registry.subscribe();
+
+    // A dialog drawn with ctx.ui.custom() matches no screen rule; the record
+    // says working and nothing else decides.
+    command(&fixture, b'x');
+    command(&fixture, b'd');
+    fixture.wait_activity(&created.id, IDLE).await;
+    assert_eq!(
+        agent_states(&mut events),
+        1,
+        "only the done edge: the unmatched screen changed nothing"
+    );
+    let _ = fixture.registry.stop(&created.id).await;
+    fixture.end().await;
+}
+
+#[tokio::test]
+async fn a_held_pi_record_outlives_screen_changes_until_pi_clears_it() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new().await;
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture.wait_activity(&created.id, IDLE).await;
+    command(&fixture, b'g');
+    fixture.wait_activity(&created.id, WORKING).await;
+
     // The idle screen cannot undo the held working record.
+    command(&fixture, b'r');
+    wait_screen(&fixture, &created.id, "Working", false).await;
+    assert_eq!(fixture.activity(&created.id).await, Some(WORKING));
+
     command(&fixture, b'l');
     fixture
         .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
         .await;
     let _ = fixture.registry.stop(&created.id).await;
+    fixture.end().await;
 }
 
 #[tokio::test]
@@ -466,4 +580,5 @@ async fn a_pi_release_without_program_status_is_classified_from_the_screen() {
         "an agent that sent no probe got no reply"
     );
     let _ = fixture.registry.stop(&created.id).await;
+    fixture.end().await;
 }
