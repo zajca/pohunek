@@ -2,7 +2,7 @@
 
 Rolling back from a completed 0.36 upgrade to 0.35.x is not supported: 0.36
 writes `service.toml` schema 7, store schema 11 and a newer runtime catalog, and
-selects official packages (Codex 1.2.2 or later, Claude 1.1.0, Pi 1.0.4) that
+selects official packages (Codex 1.2.2 or later, Pi 1.0.4 and, when the release carries it, Claude 1.1.0) that
 0.35.x cannot read. A failed `service upgrade` still rolls back automatically.
 When going back is unavoidable, restore the older packages and profile pins
 under 0.36 first; the ordered procedure is in

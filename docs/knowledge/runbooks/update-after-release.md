@@ -545,8 +545,8 @@ changes before recommending edits.
 Rolling back from a completed 0.36 upgrade to 0.35.x is not supported. 0.36
 writes `service.toml` at schema 7, migrates the session store to schema 11,
 records its own runtime catalog as the high-water mark, and selects official
-runtime packages that 0.35.x cannot read: Codex 1.2.2 or later, Claude 1.1.0 and
-Pi 1.0.4 (they carry a `[program_status]` table and `overrides_program_status`,
+runtime packages that 0.35.x cannot read: Codex 1.2.2 or later, Pi 1.0.4 and, when
+the release carries it, Claude 1.1.0 (they carry a `[program_status]` table and `overrides_program_status`,
 which the 0.35.x detect-manifest parser rejects). A failed `pohunek service
 upgrade` is not affected: it rolls back automatically and restores the previous
 packages, the catalog high-water mark and the host profiles byte for byte.
