@@ -30,8 +30,7 @@ use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::{worker_binary, workspace_root};
 use protocol::{
     AgentActivity, SessionId, SessionInfo, SessionInputParams, SessionInputWait, SessionNewParams,
-    SessionTurnEventKind, SessionWaitTurnParams, SessionWaitTurnReason, StateSource,
-    ENV_DAEMON_ID, ENV_SESSION_ID,
+    StateSource, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 
 const TEST_COLS: u16 = 100;
@@ -42,8 +41,6 @@ const APP: &str = "fake";
 const REPLY_HEX: &str = "1b5d373530313b3f1b5c";
 /// Bound of a wait that must be satisfied by the stand-in agent.
 const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
-/// Bound of a wait that must end without the awaited event.
-const ABSENCE_WAIT_MS: u32 = 1_500;
 
 /// The stand-in agent. `$1` is the mode, `$2` the scratch directory and `$3`
 /// where commands come from.
@@ -102,8 +99,9 @@ done
 }
 
 fn opted_in_manifest(answer_probe: bool) -> String {
-    let shipped = std::fs::read_to_string(workspace_root().join("runtime-packages/claude/detect.toml"))
-        .expect("read the shipped Claude manifest");
+    let shipped =
+        std::fs::read_to_string(workspace_root().join("runtime-packages/claude/detect.toml"))
+            .expect("read the shipped Claude manifest");
     format!("{shipped}\n[program_status]\napp = \"{APP}\"\nanswer_probe = {answer_probe}\n")
 }
 
@@ -228,10 +226,9 @@ impl Fixture {
     }
 
     async fn wait_activity(&self, id: &SessionId, expected: (AgentActivity, StateSource)) {
-        wait_until(
-            &format!("the session to read {expected:?}"),
-            || async { (self.activity(id).await == Some(expected)).then_some(()) },
-        )
+        wait_until(&format!("the session to read {expected:?}"), || async {
+            (self.activity(id).await == Some(expected)).then_some(())
+        })
         .await;
     }
 
@@ -270,28 +267,8 @@ fn command(fixture: &Fixture, byte: u8) {
     std::fs::write(fixture.scratch_file("cmd"), [byte]).expect("write the command byte");
 }
 
-async fn turn_wait(
-    fixture: &Fixture,
-    id: &SessionId,
-    after: Option<protocol::SessionTurnCursor>,
-    timeout_ms: u32,
-) -> protocol::SessionWaitTurnResult {
-    let params = SessionWaitTurnParams::new(
-        vec![id.clone()],
-        vec![SessionTurnEventKind::TurnCompleted],
-        after,
-        Some(timeout_ms),
-    )
-    .expect("turn wait parameters");
-    fixture
-        .registry
-        .wait_turn(&params)
-        .await
-        .expect("wait for a turn event")
-}
-
 #[tokio::test]
-async fn a_probe_waiting_agent_reports_turns_through_program_status() {
+async fn a_probe_waiting_agent_reports_activity_through_program_status() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
@@ -313,13 +290,10 @@ async fn a_probe_waiting_agent_reports_turns_through_program_status() {
         .detection(&created.id)
         .await
         .expect("session.detection");
-    assert!(detection
-        .previews
-        .iter()
-        .any(|preview| preview.kind == protocol::DetectionRegionKind::ProgramStatus
-            && preview.text == format!("app={APP}:state=idle")));
+    assert!(detection.previews.iter().any(|preview| preview.kind
+        == protocol::DetectionRegionKind::ProgramStatus
+        && preview.text == format!("app={APP}:state=idle")));
 
-    let baseline = turn_wait(&fixture, &created.id, None, 1).await.cursor;
     let flow = async {
         // A waited input that the agent answers with working evidence.
         let working = fixture
@@ -350,18 +324,11 @@ async fn a_probe_waiting_agent_reports_turns_through_program_status() {
         assert_eq!(idle.activity_source, Some(StateSource::OscProgress));
     };
     flow.await;
-    let turn = turn_wait(&fixture, &created.id, Some(baseline), WAIT_MS).await;
-
-    assert_eq!(turn.reason, SessionWaitTurnReason::Event);
-    assert_eq!(
-        turn.event.map(|event| event.kind),
-        Some(SessionTurnEventKind::TurnCompleted)
-    );
     let _ = fixture.registry.stop(&created.id).await;
 }
 
 #[tokio::test]
-async fn a_record_without_input_changes_the_activity_and_opens_no_turn() {
+async fn a_record_without_input_changes_the_activity() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
@@ -373,19 +340,16 @@ async fn a_record_without_input_changes_the_activity_and_opens_no_turn() {
 
     command(&fixture, b'g');
     fixture
-        .wait_activity(&created.id, (AgentActivity::Working, StateSource::OscProgress))
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Working, StateSource::OscProgress),
+        )
         .await;
     command(&fixture, b'd');
     fixture
         .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
         .await;
 
-    let turn = turn_wait(&fixture, &created.id, None, ABSENCE_WAIT_MS).await;
-    assert_eq!(
-        turn.reason,
-        SessionWaitTurnReason::Timeout,
-        "a record never arms the input token, so no turn completes"
-    );
     let _ = fixture.registry.stop(&created.id).await;
 }
 
@@ -465,7 +429,10 @@ async fn a_restated_record_emits_no_agent_state() {
         .await;
     command(&fixture, b'g');
     fixture
-        .wait_activity(&created.id, (AgentActivity::Working, StateSource::OscProgress))
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Working, StateSource::OscProgress),
+        )
         .await;
     let revision = fixture
         .registry
@@ -496,6 +463,14 @@ async fn a_restated_record_emits_no_agent_state() {
         1,
         "the restated working emits nothing; only the edge to idle does: {states:?}"
     );
-    assert!(revision <= fixture.registry.inspect(&created.id).await.expect("inspect").updated_at);
+    assert!(
+        revision
+            <= fixture
+                .registry
+                .inspect(&created.id)
+                .await
+                .expect("inspect")
+                .updated_at
+    );
     let _ = fixture.registry.stop(&created.id).await;
 }

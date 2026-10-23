@@ -254,8 +254,8 @@ fn every_record_state_is_held_whatever_the_terminator_and_the_chunking() {
     ];
     for (state, expected, canonical) in cases {
         for terminator in ["\x1b\\", "\x07"] {
-            let bytes = format!("\x1b]7501;state={state}:app={CLAUDE_APP}{terminator}")
-                .into_bytes();
+            let bytes =
+                format!("\x1b]7501;state={state}:app={CLAUDE_APP}{terminator}").into_bytes();
             for split in 0..=bytes.len() {
                 let mut harness = Harness::claude();
                 harness.feed(&captured("claude", "idle"));
@@ -362,9 +362,7 @@ fn a_report_with_an_unreadable_text_is_discarded_and_no_text_is_kept() {
         let mut harness = Harness::claude();
         harness.feed(&captured("claude", "idle"));
 
-        harness.feed(&record(&format!(
-            "state=working:app={CLAUDE_APP}:{pairs}"
-        )));
+        harness.feed(&record(&format!("state=working:app={CLAUDE_APP}:{pairs}")));
 
         assert_eq!(
             harness.activity() == WORKING,
@@ -431,7 +429,11 @@ fn a_record_of_another_app_or_without_an_app_is_ignored() {
     harness.feed(&captured("claude", "idle"));
     let before = harness.activity();
 
-    for payload in ["state=working:app=codex", "state=working", "state=working:app=%%"] {
+    for payload in [
+        "state=working:app=codex",
+        "state=working",
+        "state=working:app=%%",
+    ] {
         harness.feed(&record(payload));
 
         assert_eq!(harness.activity(), before, "{payload}");
@@ -508,7 +510,10 @@ fn a_manifest_without_the_table_ignores_records_and_rejects_a_stray_override() {
     harness.feed(&claude_record("working"));
 
     assert_eq!(harness.activity(), before);
-    assert!(harness.record_preview().is_none(), "no program_status region");
+    assert!(
+        harness.record_preview().is_none(),
+        "no program_status region"
+    );
 
     let stray = format!(
         "{}\n[[rules]]\nid = \"x\"\nstate = \"idle\"\npriority = 1\nregion = \"whole_recent\"\n\
@@ -753,7 +758,10 @@ fn no_record_means_every_captured_screen_reads_exactly_as_without_the_opt_in() {
                 continue;
             };
             for entry in entries.map(|entry| entry.expect("directory entry").path()) {
-                if entry.extension().is_some_and(|extension| extension == "txt") {
+                if entry
+                    .extension()
+                    .is_some_and(|extension| extension == "txt")
+                {
                     let stem = entry.file_stem().expect("file stem").to_string_lossy();
                     names.push(if sub.is_empty() {
                         stem.into_owned()
@@ -820,7 +828,10 @@ fn a_record_never_releases_or_holds_the_initial_input() {
         for state in ["idle", "done", "working"] {
             with_records.feed(&record(&format!("state={state}:app={app}")));
         }
-        assert!(!with_records.detector.input_ready(), "{runtime}: records alone");
+        assert!(
+            !with_records.detector.input_ready(),
+            "{runtime}: records alone"
+        );
 
         // Once the screen shows the prompt, both agree, whatever the record says.
         with_records.feed(&idle_screen);
@@ -847,11 +858,7 @@ fn a_record_is_not_a_visible_blocker_for_the_codex_startup_barrier() {
     // interleaved at every step. The readiness verdicts match the run without.
     let popup = captured("codex", "trust");
     let idle = captured("codex", "idle");
-    let steps: Vec<Vec<u8>> = vec![
-        popup,
-        b"\x1b[2J\x1b[H".to_vec(),
-        idle,
-    ];
+    let steps: Vec<Vec<u8>> = vec![popup, b"\x1b[2J\x1b[H".to_vec(), idle];
     let source = opted_in_source("codex", CODEX_APP, false);
     let verdicts = |with_records: bool| {
         let mut harness = pending(config(&source, InputReadiness::ManifestIdle));
@@ -881,7 +888,9 @@ fn a_report_text_with_bidirectional_or_format_characters_is_never_kept() {
     let mut harness = Harness::claude();
     harness.feed(&captured("claude", "idle"));
 
-    harness.feed(&record(&format!("state=working:app={CLAUDE_APP}:msg={encoded}")));
+    harness.feed(&record(&format!(
+        "state=working:app={CLAUDE_APP}:msg={encoded}"
+    )));
 
     assert_eq!(harness.activity(), WORKING);
     let exposed = format!(
@@ -891,4 +900,65 @@ fn a_report_text_with_bidirectional_or_format_characters_is_never_kept() {
         harness.transitions
     );
     assert!(!exposed.contains("evil") && !exposed.contains(&encoded));
+}
+
+/// Two records in one chunk, the way a sub-sample turn arrives.
+fn working_then_done() -> Vec<u8> {
+    [claude_record("working"), claude_record("done")].concat()
+}
+
+#[test]
+fn a_working_and_a_done_record_in_one_chunk_still_yield_working_evidence() {
+    let mut harness = Harness::claude();
+    harness.feed(&captured("claude", "idle"));
+
+    let transitions = harness.feed_raw(&working_then_done());
+
+    assert_eq!(
+        transitions
+            .first()
+            .map(|transition| (transition.activity, transition.source)),
+        WORKING,
+        "the working record sighted inside the chunk publishes working: {transitions:?}"
+    );
+    harness.settle();
+    assert_eq!(
+        harness.activity(),
+        IDLE,
+        "the chunk-end record confirms idle"
+    );
+}
+
+#[test]
+fn a_held_idle_record_suppresses_a_stale_spinner_latch() {
+    let mut harness = Harness::claude();
+    harness.feed(&captured("claude", "idle"));
+    harness.feed(&claude_record("idle"));
+
+    let chunk = [claude_stale_spinner(), captured("claude", "idle")].concat();
+    let transitions = harness.feed_raw(&chunk);
+
+    assert!(
+        transitions
+            .iter()
+            .all(|transition| transition.activity != AgentActivity::Working),
+        "no latched working over a held idle record: {transitions:?}"
+    );
+}
+
+#[test]
+fn a_published_working_state_closes_the_record_latch() {
+    let mut harness = Harness::claude();
+    harness.feed(&captured("claude", "idle"));
+    harness.feed(&claude_record("working"));
+    assert_eq!(harness.activity(), WORKING);
+
+    let transitions = harness.feed_raw(&working_then_done());
+
+    assert!(
+        transitions
+            .iter()
+            .all(|transition| transition.activity != AgentActivity::Working),
+        "no second working edge while working is published: {transitions:?}"
+    );
 }

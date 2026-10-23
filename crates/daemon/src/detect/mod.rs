@@ -26,8 +26,8 @@ pub use manifest::{
 pub use osc::{OscEvidence, OscParser};
 // The VT screen model lives in `pohunek-terminal` so the daemon and CLI share
 // one implementation instead of drifting copies.
-pub use pohunek_terminal::{ScreenObservation, ScreenRegion, ScreenTracker};
 use pohunek_terminal::{ProgramState, ProgramStatusRecord, ProgramStatusReport};
+pub use pohunek_terminal::{ScreenObservation, ScreenRegion, ScreenTracker};
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
@@ -343,7 +343,11 @@ impl Detector {
         // Under an agent manifest, a `Working` winner at one of those points is
         // remembered: a turn whose working title or frame is replaced by an idle
         // one inside the same chunk is still working evidence.
-        let mut latch = ChunkLatch::new(self.latch_gate_open(), recent_before.clone());
+        let mut latch = ChunkLatch::new(
+            self.latch_gate_open(),
+            recent_before.clone(),
+            self.program_status.clone(),
+        );
         let mut consumed = 0;
         for (item, end) in osc_events {
             self.feed_screen_segment(&bytes[consumed..end], &mut latch);
@@ -418,6 +422,7 @@ impl Detector {
 
     /// Evaluates the context after a completed OSC event.
     fn latch_at_osc_point(&self, latch: &mut ChunkLatch) {
+        latch.program_status.clone_from(&self.program_status);
         if let Some(manifest) = self.manifest.as_deref() {
             latch.evaluate(
                 manifest,
@@ -820,6 +825,9 @@ struct ChunkLatch {
     recent_before: String,
     /// Title and progress changes among the bytes consumed so far.
     osc_changes: OscChanges,
+    /// The program-status record as held at the latest point of the chunk, so
+    /// every point arbitrates with the record the stream had reached there.
+    program_status: Option<ProgramStatusRecord>,
     /// Whether characters were drawn at an earlier point of this chunk.
     drew: bool,
     evaluations: usize,
@@ -827,9 +835,10 @@ struct ChunkLatch {
 }
 
 impl ChunkLatch {
-    fn new(open: bool, recent_before: String) -> Self {
+    fn new(open: bool, recent_before: String, program_status: Option<ProgramStatusRecord>) -> Self {
         Self {
             open,
+            program_status,
             recent_before,
             osc_changes: OscChanges::default(),
             drew: false,
@@ -860,14 +869,17 @@ impl ChunkLatch {
             osc_title: self.osc_changes.title,
             osc_progress: self.osc_changes.progress,
         };
-        let hit = manifest_hit(
-            manifest,
-            screen,
-            latest_title,
-            latest_progress,
-            0,
-            0,
-            freshness,
+        let hit = overlay_program_status(
+            self.program_status.as_ref(),
+            manifest_hit(
+                manifest,
+                screen,
+                latest_title,
+                latest_progress,
+                0,
+                0,
+                freshness,
+            ),
         );
         if let Some(hit) = hit.filter(|hit| hit.evidence.activity == AgentActivity::Working) {
             self.sighted = Some(hit.evidence);
