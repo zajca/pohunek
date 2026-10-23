@@ -140,7 +140,7 @@ PTY root itself, reporting in process while it runs the frozen launch
 entrypoint, may set or update the launch identity) and
 `identity-subagent-v1` (the same plus subagent start and stop, the subagent
 snapshot and, for Claude only, the prompt-accepted report; the launch identity
-comes from the earliest process named for the provider). Under
+comes from the earliest process named for the provider, or running a native-installer release image `<provider>/versions/<release>`). Under
 `identity-subagent-v1` a hook, which runs as a descendant of the launch
 process, files that process's report, so any process the launch process
 starts can file it: the agent's process tree runs as the owner and is not an

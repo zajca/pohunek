@@ -1479,7 +1479,8 @@ A hook reports the conversation id through the worker, and the worker accepts it
 as the launch claim only from the launch process the session's hook schema
 declares. Under `NamedForProvider` (`identity-subagent-v1`; it is also the core
 default for a session without a schema, which is never reached because such a
-session admits no hook report) that is the process named for the provider that
+session admits no hook report) that is the process named for the provider (or a native-installer release image
+`<provider>/versions/<release>`) that
 started first below the PTY root, never an interpreter such as `node`. Under
 `FrozenRootEntrypoint` (`identity-v1`, used by Hermes, whose `hermes` entrypoint
 is a Python script) it is the PTY root alone, reporting in process: the worker

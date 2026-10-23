@@ -7588,7 +7588,46 @@ fn is_descendant_with(
     Ok(false)
 }
 
-/// Whether the executable file name of `pid` contains the provider name.
+/// Directory a provider's native installer keeps its release images in:
+/// `<install root>/<provider>/versions/<release>`. The directory name is the
+/// installer's contract (Claude Code's `~/.local/share/claude/versions/2.1.309`),
+/// and the launcher symlink `bin/<provider>` that points at the image carries
+/// the provider name only on the link, never on the resolved file.
+const NATIVE_VERSIONS_DIRECTORY: &str = "versions";
+
+/// Whether `executable`, already symlink-resolved, is a release image of a
+/// native installer: `.../<provider>/versions/<release>` with a release that
+/// starts with a digit and holds only version characters.
+///
+/// The evidence is the install root the resolved file lives under, which a
+/// process cannot choose by setting its own `comm` or `argv[0]`; it needs a
+/// file inside a directory pair named for the provider, the same one-file
+/// effort that naming an image for the provider takes. The release shape keeps
+/// siblings of the version directory (`.../claude/versions/cache.db`) out.
+fn is_native_release_image(executable: &Path, provider: &str) -> bool {
+    let provider = provider.to_ascii_lowercase();
+    let release_name = executable
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default();
+    let mut directories = executable.ancestors().skip(1).map(|directory| {
+        directory
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    });
+    release_name.starts_with(|first: char| first.is_ascii_digit())
+        && release_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+        && directories.next().as_deref() == Some(NATIVE_VERSIONS_DIRECTORY)
+        && directories.next().as_deref() == Some(provider.as_str())
+}
+
+/// Whether the executable of `pid` is named for the provider: its file name
+/// contains the provider name, or it is a release image below the provider's
+/// native install root ([`is_native_release_image`]).
 ///
 /// A process without a readable executable (another user's, or one that exited)
 /// is not named for any provider.
@@ -7608,7 +7647,8 @@ fn executable_is_named_for(
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    Ok(executable_name.contains(&provider.to_ascii_lowercase()))
+    Ok(executable_name.contains(&provider.to_ascii_lowercase())
+        || is_native_release_image(&executable, provider))
 }
 
 /// The hook-helper role of a provider: the first argument of the process its

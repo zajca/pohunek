@@ -1073,7 +1073,8 @@ kept strictly increasing by a counter. The launch-process rule decides which pro
 set the launch identity, and the worker alone applies it; the daemon holds an
 imported launch identity to the core ancestry matcher. `identity-subagent-v1`
 uses `NamedForProvider` (the earliest process at or below the PTY root whose
-executable is named for the provider, or its declared hook-helper child), which
+executable is named for the provider or is a native-installer release image
+`<provider>/versions/<release>`, or its declared hook-helper child), which
 is also the core default for a session without a schema, never reached because
 such a session admits no hook report. `identity-v1` uses `FrozenRootEntrypoint`:
 only the PTY root, reporting in process, whose report's kernel peer must be the

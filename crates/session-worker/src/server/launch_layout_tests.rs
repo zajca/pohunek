@@ -597,3 +597,55 @@ fn the_helper_role_of_one_provider_grants_nothing_to_another() {
             .unwrap()
     );
 }
+
+/// The npm layout (`claude.exe` inside the package) and the native installer
+/// layout (the launcher symlink resolves to a version-named image) both
+/// designate the agent, and the claim of that process verifies.
+#[test]
+fn claude_images_of_the_npm_and_the_native_installer_layouts_are_selected() {
+    for executable in [
+        "/home/dev/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+        "/home/dev/.local/share/claude/versions/2.1.309",
+        "/Users/dev/.local/share/claude/versions/2.1.309",
+        "/Users/dev/.local/share/Claude/versions/2.1.309-beta.1+7",
+    ] {
+        let table = table_with_agent(executable, &["claude"]);
+        assert_eq!(
+            selected(&table, "claude"),
+            Some((AGENT_PID, AGENT_START)),
+            "{executable}"
+        );
+        assert!(
+            verify_launch_claim_with(&table, &claim("claude", AGENT_PID, AGENT_START)).unwrap(),
+            "{executable}"
+        );
+    }
+}
+
+/// An image outside the provider's install root is not the agent, whatever
+/// `comm` or `argv[0]` claim: the version-named file must sit directly in
+/// `<provider>/versions/`, carry a release-shaped name, and belong to the
+/// provider being asked for.
+#[test]
+fn version_named_images_outside_the_provider_install_root_are_not_selected() {
+    let impostors: [(&str, &str); 7] = [
+        ("claude", "/tmp/2.1.309"),
+        ("claude", "/home/dev/.local/share/versions/2.1.309"),
+        ("claude", "/home/dev/.local/share/codex/versions/2.1.309"),
+        ("claude", "/home/dev/.local/share/claude/versions/cache.db"),
+        (
+            "claude",
+            "/home/dev/.local/share/claude/versions/2.1.309/helper",
+        ),
+        ("claude", "/home/dev/.local/share/claude/2.1.309"),
+        ("codex", "/home/dev/.local/share/claude/versions/2.1.309"),
+    ];
+    for (provider, executable) in impostors {
+        let table = table_with_agent(executable, &[provider]);
+        assert_eq!(selected(&table, provider), None, "{executable}");
+        assert!(
+            !verify_launch_claim_with(&table, &claim(provider, AGENT_PID, AGENT_START)).unwrap(),
+            "{executable}"
+        );
+    }
+}

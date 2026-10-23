@@ -1073,7 +1073,8 @@ Hooks have separate roles:
   rule. Under `NamedForProvider`, the rule of the subagent-capable schema (and
   the core default for a session without a schema, never reached because such
   a session admits no hook report), that is the designated immutable launch agent (the earliest process at or below the
-  PTY root whose executable is named for the provider) or the provider's
+  PTY root whose executable is named for the provider, or is a release image
+  `<provider>/versions/<release>` of its native installer) or the provider's
   hook-helper process the launch agent started directly (for Codex the
   `app-server` child it runs its hooks from; a same-provider child in any other
   role is refused). Under `FrozenRootEntrypoint`, the rule of the identity-only
