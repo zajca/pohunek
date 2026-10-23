@@ -29915,6 +29915,10 @@ def frame(status):
     return ("\x1b[2J\x1b[H" + status + "\r\n" + RULE + "\r\n❯ \r\n" + RULE + "\r\n  auto mode on").encode()
 os.write(1, frame("✻ Cogitated for 1s"))
 if sys.argv[1] == "-":
+    import termios
+    attrs = termios.tcgetattr(0)
+    attrs[3] &= ~termios.ECHO
+    termios.tcsetattr(0, termios.TCSANOW, attrs)
     sys.stdin.readline()
 else:
     with open(sys.argv[1]) as gate:
