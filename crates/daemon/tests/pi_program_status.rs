@@ -150,7 +150,7 @@ fn write_nested_pi_profile(agents: &Path, scratch: &Path) {
     std::fs::write(
         &outer,
         format!(
-            "cd {dir}\n{pi} {nested} &\nwait $!\nsleep 600\n",
+            "cd {dir}\n{pi} {nested} &\nwait $!\nprintf ready\nsleep 600\n",
             dir = scratch.display(),
             pi = pi_link.display(),
             nested = nested.display()
@@ -773,15 +773,12 @@ async fn a_nested_pis_held_record_does_not_outlive_the_pi() {
     // The Pi exits; the exit watch clears the active agent, the detector goes
     // back to the shell manifest and the held record is gone with it.
     std::fs::write(fixture.scratch_file("go2"), b"\n").expect("let the nested Pi exit");
-    wait_until("the shell manifest to take over", || async {
+    wait_screen(&fixture, &created.id, "ready", true).await;
+    wait_until("the shell manifest to read idle", || async {
         let info = fixture.registry.inspect(&created.id).await.ok()?;
-        eprintln!(
-            "DBG {:?} {:?} {:?} {:?}",
-            info.active_agent, info.active_agent_pid, info.state_source, info.activity
-        );
         (info.active_agent.is_none()
             && info.state_source != StateSource::OscProgress
-            && info.activity != Some(AgentActivity::Working))
+            && info.activity == Some(AgentActivity::Idle))
         .then_some(info)
     })
     .await;
