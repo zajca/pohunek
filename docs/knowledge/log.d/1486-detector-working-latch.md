@@ -11,3 +11,6 @@ observer now stays armed after startup (`ScreenTracker::resume_observation`).
 The Hermes package (1.0.2) reads the bare staff prompt as working only on the
 last non-empty line, so an old transcript prompt exposed by a partial idle
 redraw does not latch.
+The Codex package (1.2.2) reads a working title only when the spinner is
+followed by a thread or project name, so the `<spinner> | <project>` title of an
+idle unnamed thread's title generation no longer reads as a turn.
