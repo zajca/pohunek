@@ -117,7 +117,12 @@ impl SessionRegistry {
                         }
                         for transition in detector.tick(crate::time::now()) {
                             registry
-                                .record_detector_activity(&id, &runtime, transition)
+                                .record_detector_activity(
+                                &id,
+                                &runtime,
+                                applied_config_generation,
+                                transition,
+                            )
                                 .await;
                         }
                         // Flush a folded lag batch whose window has elapsed, so a
@@ -146,7 +151,12 @@ impl SessionRegistry {
                                 }
                                 for transition in transitions {
                                     registry
-                                        .record_detector_activity(&id, &runtime, transition)
+                                        .record_detector_activity(
+                                &id,
+                                &runtime,
+                                applied_config_generation,
+                                transition,
+                            )
                                         .await;
                                 }
                                 if let Some(path) = detector.take_cwd_hint() {
@@ -249,16 +259,17 @@ impl SessionRegistry {
         &self,
         id: &SessionId,
         expected: &RuntimeWatchIdentity,
+        config_generation: u64,
         transition: ActivityTransition,
     ) {
-        self.record_activity_scoped(id, Some(expected), transition)
+        self.record_activity_scoped(id, Some((expected, config_generation)), transition)
             .await;
     }
 
     async fn record_activity_scoped(
         &self,
         id: &SessionId,
-        expected: Option<&RuntimeWatchIdentity>,
+        expected: Option<(&RuntimeWatchIdentity, u64)>,
         transition: ActivityTransition,
     ) {
         let activity_epoch = self.daemon_instance_id().to_owned();
@@ -269,10 +280,24 @@ impl SessionRegistry {
                 return;
             };
 
-            if expected.is_some_and(|expected| !expected.matches(entry)) {
+            if expected.is_some_and(|(expected, _)| !expected.matches(entry)) {
                 debug!(
                     session_id = %id.0,
                     "detector activity arrived for a superseded runtime"
+                );
+                return;
+            }
+
+            // A transition computed under a manifest that a newer config has
+            // replaced (a nested agent left meanwhile) must not outlive it: the
+            // reconfigured detector starts from no published state and would
+            // never retract it.
+            if expected.is_some_and(|(_, generation)| {
+                generation < entry.detector_config.borrow().generation
+            }) {
+                debug!(
+                    session_id = %id.0,
+                    "detector activity arrived for a superseded detector config"
                 );
                 return;
             }

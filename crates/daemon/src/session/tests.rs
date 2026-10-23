@@ -6953,7 +6953,7 @@ async fn superseded_detector_output_cannot_stamp_replacement_runtime() {
     };
 
     registry
-        .record_detector_activity(&created.id, &expected, transition(AgentActivity::Idle))
+        .record_detector_activity(&created.id, &expected, 0, transition(AgentActivity::Idle))
         .await;
 
     let mut sessions = registry.inner.sessions.lock().await;
@@ -6963,6 +6963,49 @@ async fn superseded_detector_output_cannot_stamp_replacement_runtime() {
     assert!(entry.activity_evidence.is_empty());
     entry.info.runtime = original_runtime;
     drop(sessions);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_transition_computed_before_the_agent_left_is_dropped() {
+    let (registry, inspector, created) = mock_procwatch_registry("stale-detector-config").await;
+    let expected = RuntimeWatchIdentity::from_info(&created).expect("live detector identity");
+    let generation = |registry: &SessionRegistry| {
+        let registry = registry.clone();
+        let id = created.id.clone();
+        async move {
+            let sessions = registry.inner.sessions.lock().await;
+            let generation = sessions
+                .get(&id)
+                .expect("session entry")
+                .detector_config
+                .borrow()
+                .generation;
+            generation
+        }
+    };
+    observe_codex(&registry, &inspector, &created, Some(300)).await;
+    let under_agent = generation(&registry).await;
+    // The detector computed this reading under the nested agent's manifest.
+    let held = ActivityTransition {
+        activity: AgentActivity::Working,
+        source: protocol::StateSource::OscProgress,
+    };
+    observe_codex(&registry, &inspector, &created, None).await;
+    let after_exit = generation(&registry).await;
+    assert!(after_exit > under_agent, "the exit replaced the config");
+
+    registry
+        .record_detector_activity(&created.id, &expected, under_agent, held)
+        .await;
+    let info = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(info.activity, None, "{info:?}");
+
+    registry
+        .record_detector_activity(&created.id, &expected, after_exit, held)
+        .await;
+    let info = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(info.activity, Some(AgentActivity::Working), "{info:?}");
     let _ = registry.stop(&created.id).await;
 }
 
