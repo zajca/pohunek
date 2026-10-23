@@ -2790,13 +2790,15 @@ setenv`), else the `default environment` of the loaded job (`launchctl print
 gui/<uid>/<label>`), else, for a job that is not loaded, the launchd default an
 upgrade journaled while the job was loaded and the host has not rebooted since (the
 journal records the boot session UUID; after a reboot the persisted configuration decides only
-when `user.plist` was last modified before the current boot, and one modified later, or without a
-readable time, is refused; without a marker the persisted value must also equal the journaled one),
+when `user.plist` was last modified before the current boot; a forward gate refuses one modified later, or without a
+readable time, and a rollback goes on with it as a stand-in and a `warning:` line, or with launchd's standard `PATH`
+when its content cannot be read; without a marker the persisted value must also equal the journaled one),
 else, with no journaled default, the persisted launchd configuration when it is older than the boot (by the
 configured margin; no `user.plist` means launchd's standard `PATH`), and otherwise (newer than the boot, or a time that cannot be read) a
 forward gate is refused and a rollback goes on with the persisted value and a `warning:` line. A rollback judges with the same order,
 so the `PATH` it uses is the one the restored job gets where launchd can still
-report it; a `warning:` line names a journal that gave no default. An
+report it; the `warning:` line says that the `PATH` is a stand-in, because no launchd default `PATH`
+that is known to apply was available. An
 unrecognized `launchctl print` output refuses the upgrade with `service_manager_environment_unavailable`.
 On macOS a job whose launchd variables cannot be read takes none: any job when launchd has
 no `gui/<uid>` domain, as without a GUI session (a job without a recorded `PATH` then takes the

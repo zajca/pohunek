@@ -2900,13 +2900,13 @@ jobs:
           enable-cache: true
 
       # The runtime is provisioned by scripts/provision-hermes-compat, which
-      # needs curl, git, python3, tar, uv, and one SHA-256 tool (macOS ships
-      # shasum).
+      # needs curl, git, pkill, python3, tar, uv, and one SHA-256 tool (macOS
+      # ships shasum).
       - name: Require provisioning prerequisites
         shell: /bin/bash {0}
         run: |
           set -euo pipefail
-          for executable in curl git python3 tar uv shasum; do
+          for executable in curl git pkill python3 tar uv shasum; do
             command -v "$executable" >/dev/null 2>&1 \
               || { echo "required executable is unavailable: $executable" >&2; exit 1; }
           done
