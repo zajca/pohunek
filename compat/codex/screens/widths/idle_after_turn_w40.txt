@@ -15,10 +15,10 @@ and find issues
 
 • working done
 
-  Worked for 7s • 1:25 PM
+  Worked for 7s • 3:46 PM
 
 
 › Ask Codex to do anything
 
-  stub-model default · /tmp/ph
+  stub-model default · /dev/s…
   ← for agents · ?   ⚠ 1 · f2

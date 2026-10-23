@@ -1,6 +1,6 @@
 
   >_ OpenAI Codex (v0.164.0)
-     /tmp/ph-sample/work
+     /dev/shm/ph-codex/cwd
 
   To get started, describe a task or try one of these commands:
 
@@ -20,5 +20,5 @@
 
 › Ask Codex to do anything
 
-  stub-model default · /tmp/ph-sample/work
+  stub-model default · /dev/shm/ph-codex/cwd
   ← for agents · ? for shortcuts                       ⚠ 1 warning · f2 to view

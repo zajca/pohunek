@@ -15,10 +15,10 @@ Codex
 
 • working done
 
-  Worked for 7s • 1:25 PM
+  Worked for 7s • 3:46 PM
 
 
 › Ask Codex to do anything
 
-  stub-model default · /tmp/ph-sample/work
+  stub-model default · /dev/shm/ph-codex/cwd
   ← for agents · ? for shortcuts   ⚠ 1 warning · f2 to view

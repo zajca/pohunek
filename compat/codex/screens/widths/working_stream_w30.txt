@@ -1,6 +1,6 @@
 
   >_ OpenAI Codex (v
-     /tmp/ph-sample/
+     /dev/shm/ph-cod
 
   To get started, de
 

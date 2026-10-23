@@ -1,5 +1,5 @@
 › [hold] say hi
-  Worked for 7s • 1:
+  Worked for 7s • 3:
 
 
 › [approval] run it

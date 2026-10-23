@@ -1,2 +1,4 @@
 app=codex:state=idle
 app=codex:state=working
+app=codex:state=idle
+app=codex:state=working

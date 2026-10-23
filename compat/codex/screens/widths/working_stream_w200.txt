@@ -20,5 +20,5 @@ and find issues
 
 › Ask Codex to do anything
 
-  stub-model default · /tmp/ph
+  stub-model default · /dev/s…
   ← for agents · ?   ⚠ 1 · f2

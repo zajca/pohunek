@@ -2506,6 +2506,25 @@ impl Fixture {
         launched["ok"].clone()
     }
 
+    /// `session new` of the package profile in `cwd`.
+    async fn new_session_in(&self, name: &str, cwd: &Path) -> Value {
+        let (code, launched) = self
+            .harness
+            .json(&[
+                "session",
+                "new",
+                "--agent",
+                PROFILE,
+                "--cwd",
+                path_str(cwd),
+                "--name",
+                name,
+            ])
+            .await;
+        assert_eq!(code, 0, "{launched}");
+        launched["ok"].clone()
+    }
+
     /// Waits until the session's detected activity is `activity` and returns
     /// the session record that matched.
     async fn wait_activity(&self, id: &str, activity: &str) -> Value {
@@ -4580,10 +4599,13 @@ async fn capture_the_real_codex_screens() {
     let Some(directory) = capture_directory() else {
         return;
     };
+    let recording = capture::RecordingRoot::new("codex");
     let fixture = Fixture::start().await;
     fixture.install_integration().await;
 
-    let id = fixture.new_session("states").await["id"]
+    let id = fixture
+        .new_session_in("states", &recording.directory("cwd"))
+        .await["id"]
         .as_str()
         .expect("session id")
         .to_owned();
@@ -4659,10 +4681,13 @@ async fn capture_the_real_codex_background_terminal_screens() {
     let Some(directory) = capture_directory() else {
         return;
     };
+    let recording = capture::RecordingRoot::new("codex");
     let fixture = Fixture::start().await;
     fixture.install_integration().await;
 
-    let id = fixture.new_session("background").await["id"]
+    let id = fixture
+        .new_session_in("background", &recording.directory("cwd"))
+        .await["id"]
         .as_str()
         .expect("session id")
         .to_owned();

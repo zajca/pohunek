@@ -1,5 +1,5 @@
   >_ OpenAI Codex (v
-     /tmp/ph-sample/
+     /dev/shm/ph-cod
 
   To get started, de
 
@@ -15,7 +15,7 @@
 
 • working done
 
-  Worked for 7s • 1:
+  Worked for 7s • 3:
 
 
 › Ask Codex to do an

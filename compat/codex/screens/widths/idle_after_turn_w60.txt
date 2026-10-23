@@ -15,10 +15,10 @@ issues
 
 • working done
 
-  Worked for 7s • 1:25 PM
+  Worked for 7s • 3:46 PM
 
 
 › Ask Codex to do anything
 
-  stub-model default · /tmp/ph-sample/wo
+  stub-model default · /dev/shm/ph-code…
   ← for agents · ? for shortc  ⚠ 1 · f2

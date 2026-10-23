@@ -13,12 +13,12 @@ and find issues
 
 • working done
 
-  Worked for 1s • 1:33 PM
+  Worked for 1s • 3:45 PM
 
   1 background terminal runnin
 
 
 › Ask Codex to do anything
 
-  stub-model default · /tmp/ph
+  stub-model default · /dev/s…
   ← for agents · ?   ⚠ 1 · f2
