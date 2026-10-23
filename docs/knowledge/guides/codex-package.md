@@ -133,7 +133,7 @@ copies of that descriptor and its detection manifest in
   still waits for the title or the screen.
 - **Background terminals.** Codex reports `working` while a background
   terminal runs, also after the turn ended. The rule `background_terminals_idle`
-  (priority 650, `overrides_program_status`) reads idle for the footer
+  (priority 550, below `weak_blocker`; `overrides_program_status`) reads idle for the footer
   `N background terminal(s) running · /ps to view · /stop to close` when the
   working row of a running turn is not on screen, so a dev server left running
   does not keep the turn open. The footer is truncated, not wrapped, at narrow

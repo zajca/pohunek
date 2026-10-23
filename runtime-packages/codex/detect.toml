@@ -25,8 +25,8 @@
 # - background_terminals_idle: Codex reports `working` through OSC 7501 while a
 #   background terminal runs, with or without a turn. The footer `N background
 #   terminal(s) running` without the turn's working row is not a turn, so this
-#   rule reads idle over the record. The rule only takes part when the session
-#   reports program status (`[program_status]` below).
+#   rule reads idle over the record. Its priority is below `weak_blocker`, so a
+#   release that writes no records (0.160.0 to 0.162.x) keeps its blockers.
 #
 # Codex 0.163.0 and later report their state through OSC 7501 (root records
 # `state=<state>:app=codex`); older releases are read from the title and the
@@ -171,7 +171,7 @@ any = [
 [[rules]]
 id = "background_terminals_idle"
 state = "idle"
-priority = 650
+priority = 550
 region = "bottom_non_empty_lines(8)"
 overrides_program_status = true
 line_regex = ['^\s*\d+ background term']

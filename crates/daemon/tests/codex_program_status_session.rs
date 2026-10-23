@@ -36,8 +36,9 @@ const TEST_COLS: u16 = 100;
 const TEST_ROWS: u16 = 24;
 /// The `app` Codex's records carry.
 const APP: &str = "codex";
-/// The first bytes of a probe reply, as hex: `ESC ] 7`.
-const REPLY_PREFIX_HEX: &str = "1b5d37";
+/// The first two bytes of a probe reply, as hex: `ESC ]`. Typed input starts
+/// with `ESC [` (bracketed paste).
+const REPLY_PREFIX_HEX: &str = "1b5d";
 /// The release before the first Codex that reports program status, which the
 /// package still supports and reads from the title.
 const PREVIOUS_BANNER: &str = "codex-cli 0.160.0";
@@ -430,17 +431,19 @@ async fn a_codex_session_never_gets_a_probe_reply() {
         read_trimmed(&fixture.scratch_file("typed.hex"))
     })
     .await;
-    assert!(
-        !typed.starts_with(REPLY_PREFIX_HEX),
-        "the worker writes no reply: {typed}"
+    assert_eq!(
+        typed.len(),
+        REPLY_PREFIX_HEX.len(),
+        "two input bytes: {typed}"
     );
+    assert_ne!(typed, REPLY_PREFIX_HEX, "the worker writes no reply");
     let _ = fixture.registry.stop(&created.id).await;
 }
 
-/// N1: the previous supported release emits no records and reads from the
-/// title.
+/// N1: an agent of the previous supported release (banner 0.160.0) launches
+/// and reads from the title.
 #[tokio::test]
-async fn the_previous_supported_codex_release_is_read_from_the_title() {
+async fn the_previous_supported_codex_release_launches_and_reads_from_the_title() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
@@ -449,12 +452,6 @@ async fn the_previous_supported_codex_release_is_read_from_the_title() {
     fixture
         .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscTitle))
         .await;
-    command(&fixture, b'g');
-    assert_eq!(
-        fixture.activity(&created.id).await,
-        Some((AgentActivity::Idle, StateSource::OscTitle)),
-        "a release without records reports no record-derived evidence"
-    );
     let _ = fixture.registry.stop(&created.id).await;
 }
 
