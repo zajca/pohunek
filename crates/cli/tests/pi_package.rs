@@ -868,23 +868,30 @@ struct WidthFixture {
 /// file name is `<state>_w<columns>.txt`; states starting `idle`, `scroll_idle`
 /// or `rule_idle` mean idle, every other state is Pi at work.
 fn width_fixtures() -> Vec<WidthFixture> {
-    SCREEN_SETS.iter().flat_map(|set| width_fixtures_of(set)).collect()
+    SCREEN_SETS
+        .iter()
+        .flat_map(|set| width_fixtures_of(set))
+        .collect()
 }
 
 /// [`width_fixtures`] of the screen set `set`; the names of an earlier set end
 /// with its label.
 fn width_fixtures_of(set: &str) -> Vec<WidthFixture> {
-    let mut names: Vec<String> =
-        fs::read_dir(workspace_root().join("compat/pi/screens").join(set).join("widths"))
-            .expect("read the width fixtures")
-            .map(|entry| {
-                entry
-                    .expect("directory entry")
-                    .file_name()
-                    .into_string()
-                    .expect("UTF-8 file name")
-            })
-            .collect();
+    let mut names: Vec<String> = fs::read_dir(
+        workspace_root()
+            .join("compat/pi/screens")
+            .join(set)
+            .join("widths"),
+    )
+    .expect("read the width fixtures")
+    .map(|entry| {
+        entry
+            .expect("directory entry")
+            .file_name()
+            .into_string()
+            .expect("UTF-8 file name")
+    })
+    .collect();
     names.sort();
     names
         .into_iter()
@@ -1047,23 +1054,30 @@ struct OverlayFixture {
 /// Every overlay screen, captured by driving a real Pi in a terminal of each
 /// width with real key presses (model calls answered by a loopback stub).
 fn overlay_fixtures() -> Vec<OverlayFixture> {
-    SCREEN_SETS.iter().flat_map(|set| overlay_fixtures_of(set)).collect()
+    SCREEN_SETS
+        .iter()
+        .flat_map(|set| overlay_fixtures_of(set))
+        .collect()
 }
 
 /// [`overlay_fixtures`] of the screen set `set`; the names of an earlier set
 /// end with its label.
 fn overlay_fixtures_of(set: &str) -> Vec<OverlayFixture> {
-    let mut names: Vec<String> =
-        fs::read_dir(workspace_root().join("compat/pi/screens").join(set).join("overlays"))
-            .expect("read the overlay fixtures")
-            .map(|entry| {
-                entry
-                    .expect("directory entry")
-                    .file_name()
-                    .into_string()
-                    .expect("UTF-8 file name")
-            })
-            .collect();
+    let mut names: Vec<String> = fs::read_dir(
+        workspace_root()
+            .join("compat/pi/screens")
+            .join(set)
+            .join("overlays"),
+    )
+    .expect("read the overlay fixtures")
+    .map(|entry| {
+        entry
+            .expect("directory entry")
+            .file_name()
+            .into_string()
+            .expect("UTF-8 file name")
+    })
+    .collect();
     names.sort();
     names
         .into_iter()
@@ -2403,7 +2417,10 @@ async fn a_real_pi_reports_its_turn_dialog_and_exit_through_program_status() {
         check_sequence("exit", &raw);
     } else {
         wait_until("the quit session to end", || async {
-            let (code, inspected) = fixture.harness.json(&["session", "inspect", &quit_id]).await;
+            let (code, inspected) = fixture
+                .harness
+                .json(&["session", "inspect", &quit_id])
+                .await;
             assert_eq!(code, 0, "{inspected}");
             (inspected["ok"]["runtime"]["state"] != "live").then_some(())
         })
@@ -2589,7 +2606,10 @@ async fn record_the_pi_screens() {
                 .launch_sized(&format!("{name}-{width}"), &cwd, width)
                 .await;
             fixture.wait_activity(&id, "idle").await;
-            let (code, sent) = fixture.harness.json(&["session", "input", &id, &command]).await;
+            let (code, sent) = fixture
+                .harness
+                .json(&["session", "input", &id, &command])
+                .await;
             assert_eq!(code, 0, "{sent}");
             fixture.wait_activity(&id, "blocked").await;
             fixture

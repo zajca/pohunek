@@ -207,7 +207,8 @@ impl Fixture {
         // `working` to `idle` change of an armed turn into `turn_completed`.
         let notifications = NotificationService::open(&env.root().join("daemon-data"))
             .expect("open the notification inbox");
-        let (coordinator, attention) = AttentionCoordinator::spawn(notifications.clone(), &registry);
+        let (coordinator, attention) =
+            AttentionCoordinator::spawn(notifications.clone(), &registry);
         let projector = NotificationProjector::spawn(&registry, notifications, coordinator);
         registry.spawn_agent_state_hooks();
         Self {
@@ -327,15 +328,18 @@ const BLOCKED: (AgentActivity, StateSource) = (AgentActivity::Blocked, StateSour
 /// Waits until the visible screen of `id` holds a line with `needle` (or, with
 /// `present` false, none).
 async fn wait_screen(fixture: &Fixture, id: &SessionId, needle: &str, present: bool) {
-    wait_until(&format!("the screen to show {needle:?}: {present}"), || async {
-        let screen = fixture.registry.screen(id).await.ok()?;
-        (screen
-            .visible_lines
-            .iter()
-            .any(|line| line.contains(needle))
-            == present)
-            .then_some(())
-    })
+    wait_until(
+        &format!("the screen to show {needle:?}: {present}"),
+        || async {
+            let screen = fixture.registry.screen(id).await.ok()?;
+            (screen
+                .visible_lines
+                .iter()
+                .any(|line| line.contains(needle))
+                == present)
+                .then_some(())
+        },
+    )
     .await;
 }
 
@@ -394,14 +398,16 @@ async fn a_pi_turn_armed_by_input_completes_once_through_the_records() {
     assert_eq!(working.activity_source, Some(StateSource::OscProgress));
     command(&fixture, b'd');
     fixture.wait_activity(&created.id, IDLE).await;
-    let (reason, cursor) = fixture
-        .wait_turn(&created.id, WAIT_MS, Some(cursor))
-        .await;
+    let (reason, cursor) = fixture.wait_turn(&created.id, WAIT_MS, Some(cursor)).await;
     assert_eq!(reason, SessionWaitTurnReason::Event);
     let (reason, _) = fixture
         .wait_turn(&created.id, NO_TURN_WAIT_MS, Some(cursor))
         .await;
-    assert_eq!(reason, SessionWaitTurnReason::Timeout, "one turn, one event");
+    assert_eq!(
+        reason,
+        SessionWaitTurnReason::Timeout,
+        "one turn, one event"
+    );
 
     // Idle evidence needs working evidence first.
     let release = async {
