@@ -733,15 +733,21 @@ async fn a_session_of_another_runtime_gets_neither_the_field_nor_the_acceptance_
         let params = wait(PATIENT_MS);
         tokio::spawn(async move { registry.input(params).await })
     };
-    while !task.is_finished() {
+    // Each probe reports `working` then `idle`; the first report above the
+    // input's boundary answers the wait.
+    wait_until("the shell wait to be answered", || async {
+        if task.is_finished() {
+            return Some(());
+        }
         rig.registry
             .record_activity(&session.id, transition(AgentActivity::Working))
             .await;
         rig.registry
             .record_activity(&session.id, transition(AgentActivity::Idle))
             .await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+        None
+    })
+    .await;
     let result = task
         .await
         .expect("wait task joins")

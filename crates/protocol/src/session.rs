@@ -793,8 +793,9 @@ pub struct SessionInputResult {
     #[cfg_attr(feature = "ts", ts(optional))]
     pub submitted: Option<bool>,
     /// Present only when the request set
-    /// [`SessionInputWait::allow_prompt_accepted`] and the session's launch
-    /// runtime reports prompt acceptances (Claude). `true` when the agent's
+    /// [`SessionInputWait::allow_prompt_accepted`] and the session is a Claude
+    /// session on worker protocol 8 or newer whose hook schema admits the
+    /// prompt action. `true` when the agent's
     /// prompt-submit hook reported acceptance of this input before the result;
     /// the activity fields are then absent unless activity evidence also
     /// arrived.

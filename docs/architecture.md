@@ -1304,7 +1304,8 @@ before the deadline, and the agent was not `working` at the boundary: a busy
 agent queues the input, and its own `working` evidence answers. The result then
 carries `prompt_accepted: true` and no activity, source or revision, because
 no activity was observed. An opted-in result of a Claude session states `prompt_accepted` whatever
-answered it; a session of another runtime gets no submit mark, no field and the
+answered it; any other session (another runtime, an older worker) gets no submit mark, no
+field and the
 generic timeout message. An acceptance never answers an `idle` target and never stands in
 for the `working` evidence delayed-submit framing needs first: the daemon
 imports it up to one 100 ms poll after the agent read the prompt, before the

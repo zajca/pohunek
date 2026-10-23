@@ -30039,6 +30039,7 @@ async fn a_fast_turn_inside_one_chunk_satisfies_an_input_wait_for_working_and_en
             wait: Some(protocol::SessionInputWait {
                 until: Some(vec![AgentActivity::Working]),
                 timeout_ms: Some(5_000),
+                allow_prompt_accepted: None,
             }),
         })
         .await

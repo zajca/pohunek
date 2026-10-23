@@ -181,7 +181,8 @@ moment Enter is written can make the wait succeed on that report: the typed
 prompt is then submitted or queued. The report also precedes any other
 `UserPromptSubmit` hook that blocks the prompt, since Claude runs the hooks of
 one event in parallel; wait for `working` when the work itself must have started.
-The `prompt_accepted` field is absent for sessions of other runtimes.
+The `prompt_accepted` field is present only for a Claude session on worker
+protocol 8 or newer whose hook schema admits the prompt action.
 Generic typed Rust and TypeScript `Client.call` paths route waited input through
 the same helper, so they cannot bypass this validation. SIGINT or SIGTERM during
 a waited CLI input returns JSON code `session_input_interrupted` without a retry
