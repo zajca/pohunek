@@ -82,7 +82,7 @@ const GOLDEN_MANIFEST: &str = "compat/hermes/builtin-v0.34/detect.toml";
 const PACKAGE_ID: &str = "pohunek.runtime.hermes";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.0.1";
+const PACKAGE_VERSION: &str = "1.0.2";
 
 /// Profile that pins the runtime package in the installation scenario.
 const PROFILE: &str = "hermes-package-test";

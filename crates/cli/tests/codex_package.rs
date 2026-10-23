@@ -1846,6 +1846,19 @@ fn manifest_idle_formatting_storm_has_bounded_screen_observations() {
             screen.recent_text().contains('x'),
             "grid updates continue after observation ends"
         );
+        screen.resume_observation();
+        screen.feed(b"\x1b[H");
+        let mut observations = 0;
+        screen.feed_observed(&colored, &mut |_, _| observations += 1);
+        assert_eq!(observations, 1, "a resumed observation reports again");
+        screen.resume_observation();
+        screen.feed(b"\x1b[H");
+        let mut observations = 0;
+        screen.feed_observed(&colored, &mut |_, _| observations += 1);
+        assert_eq!(
+            observations, 1,
+            "resuming a live observation changes nothing"
+        );
     }
 }
 

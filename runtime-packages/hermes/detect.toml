@@ -42,14 +42,16 @@ visible_blocker = true
 contains = ["approval required", "Allow once", "Deny"]
 
 # During a model turn the classic prompt changes from the idle arrow to the
-# Hermes staff symbol. The bottom-lines bound prevents old transcript chrome
-# from keeping the session working after the prompt returns to idle.
+# Hermes staff symbol. The prompt must be the last non-empty line: old
+# transcript chrome that holds a bare staff prompt neither keeps the session
+# working after the prompt returns to idle nor reads as a working frame while
+# an idle redraw has erased and not yet reprinted the lines below it.
 [[rules]]
 id = "active_turn_prompt"
 state = "working"
 priority = 700
 region = "bottom_non_empty_lines(8)"
-line_regex = ['^\s*⚕\s+(?:❯|>|\$|#|›|»|→)\s*$']
+regex = ['(?:\A|\n)[ \t]*⚕[ \t]+(?:❯|>|\$|#|›|»|→)[ \t]*\z']
 
 # Reasoning and tool progress are painted immediately above the prompt while a
 # turn is active. These bounded signatures cover narrow terminals where the
