@@ -133,6 +133,50 @@ done
     )
 }
 
+/// Writes the ES4 profile `fake-shell-es4` and the files it runs in `scratch`.
+fn write_nested_pi_profile(agents: &Path, scratch: &Path) {
+    // ES4: a shell session whose foreground process is a `pi`, so procwatch
+    // switches the session to the Pi manifest. The nested `pi` waits on
+    // `go1`, reports `working`, waits on `go2` and exits.
+    let pi_link = scratch.join("pi");
+    std::os::unix::fs::symlink("/bin/sh", &pi_link).expect("link the nested pi");
+    let nested = scratch.join("nested.sh");
+    std::fs::write(
+        &nested,
+        "read _ < go1\nprintf '\\033]7501;state=working:app=pi\\033\\\\'\nread _ < go2\n",
+    )
+    .expect("write the nested pi script");
+    let outer = scratch.join("outer.sh");
+    std::fs::write(
+        &outer,
+        format!(
+            "cd {dir}\n{pi} {nested} &\nwait $!\nsleep 600\n",
+            dir = scratch.display(),
+            pi = pi_link.display(),
+            nested = nested.display()
+        ),
+    )
+    .expect("write the outer shell script");
+    std::fs::write(
+        agents.join("fake-shell-es4.toml"),
+        format!(
+            "base = \"shell\"\nprogram = \"/bin/sh\"\nargs = [\"{}\"]\n\n[env]\nPATH = \"/usr/bin:/bin\"\n",
+            outer.display()
+        ),
+    )
+    .expect("write the ES4 profile");
+    for gate in ["go1", "go2"] {
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(scratch.join(gate))
+                .status()
+                .expect("run mkfifo")
+                .success(),
+            "create the {gate} FIFO"
+        );
+    }
+}
+
 /// One worker-backed registry with the stand-in agent installed as profiles
 /// over the official Pi package.
 struct Fixture {
@@ -179,46 +223,7 @@ impl Fixture {
             )
             .expect("write the profile");
         }
-        // ES4: a shell session whose foreground process is a `pi`, so procwatch
-        // switches the session to the Pi manifest. The nested `pi` waits on
-        // `go1`, reports `working`, waits on `go2` and exits.
-        let pi_link = scratch.join("pi");
-        std::os::unix::fs::symlink("/bin/sh", &pi_link).expect("link the nested pi");
-        let nested = scratch.join("nested.sh");
-        std::fs::write(
-            &nested,
-            "read _ < go1\nprintf '\\033]7501;state=working:app=pi\\033\\\\'\nread _ < go2\n",
-        )
-        .expect("write the nested pi script");
-        let outer = scratch.join("outer.sh");
-        std::fs::write(
-            &outer,
-            format!(
-                "cd {dir}\n{pi} {nested} &\nwait $!\nsleep 600\n",
-                dir = scratch.display(),
-                pi = pi_link.display(),
-                nested = nested.display()
-            ),
-        )
-        .expect("write the outer shell script");
-        std::fs::write(
-            agents.join("fake-shell-es4.toml"),
-            format!(
-                "base = \"shell\"\nprogram = \"/bin/sh\"\nargs = [\"{}\"]\n\n[env]\nPATH = \"/usr/bin:/bin\"\n",
-                outer.display()
-            ),
-        )
-        .expect("write the ES4 profile");
-        for gate in ["go1", "go2"] {
-            assert!(
-                std::process::Command::new("mkfifo")
-                    .arg(scratch.join(gate))
-                    .status()
-                    .expect("run mkfifo")
-                    .success(),
-                "create the {gate} FIFO"
-            );
-        }
+        write_nested_pi_profile(&agents, &scratch);
         let fifo = scratch.join("cmd");
         assert!(
             std::process::Command::new("mkfifo")
