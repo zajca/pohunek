@@ -1485,6 +1485,7 @@ impl<'a> Engine<'a> {
                     path: &default,
                     boot_identity: None,
                 },
+                PathUse::Forward,
             )?;
         }
         if record.launchd_default_path.as_deref() == Some(default.as_str())
@@ -2715,7 +2716,8 @@ pub(crate) fn require_manager_variables(
 }
 
 /// The warning of a launchd `PATH` that was persisted: the job is not loaded and
-/// the transaction journal holds no launchd default. Only a transaction can have one.
+/// the transaction journal holds no launchd default that is known to apply (none,
+/// or one from before a reboot). Only a transaction can have one.
 #[cfg(target_os = "macos")]
 fn persisted_path_warnings(context: &Context, job: &JobPath) -> Vec<String> {
     if job.source != PathSource::Persisted {
@@ -2723,7 +2725,7 @@ fn persisted_path_warnings(context: &Context, job: &JobPath) -> Vec<String> {
     }
     let journal = context.paths().state_dir.join(record::FILE_NAME);
     let warning = format!(
-        "the launchd job is not loaded and the transaction journal {} holds no launchd default PATH, so the persisted launchd configuration was used (launchd's standard PATH when it cannot be read)",
+        "the launchd job is not loaded and the transaction journal {} holds no launchd default PATH that is known to apply, so the persisted launchd configuration was used (launchd's standard PATH when it cannot be read)",
         journal.display()
     );
     tracing::warn!(journal = %journal.display(), "{warning}");
@@ -3264,8 +3266,10 @@ fn manager_warnings(job: &JobPath) -> Vec<String> {
 ///   otherwise a forward judgement refuses and a rollback
 ///   ([`PathUse::Rollback`]) goes on with it, or with launchd's standard `PATH`
 ///   when it cannot be read, as [`PathSource::Persisted`]. After a reboot a
-///   journaled default gives way to the persisted configuration only when that
-///   is older than the boot, for a rollback too.
+///   journaled default gives way to the persisted configuration, which is then
+///   [`PathSource::PersistedActive`] when it is older than the boot; when that
+///   cannot be shown a forward judgement refuses and a rollback goes on as
+///   [`PathSource::Persisted`] with the same stand-ins.
 ///
 /// `journal_default` is the journal's `launchd_default_path` with its boot
 /// identity, for the transaction the call belongs to, or `None` outside one.
@@ -3525,7 +3529,7 @@ async fn launchd_job_path(
     } else if let Some(value) = loaded_default.clone() {
         (value, PathSource::LoadedDefault)
     } else if let Some(journal) = journal_default {
-        journaled_or_persisted_path(context, journal)?
+        journaled_or_persisted_path(context, journal, usage)?
     } else {
         unloaded_persisted_path(context, usage)?
     };
@@ -3638,15 +3642,19 @@ fn persisted_config_is_active(context: &Context) -> Result<(), String> {
 /// (a different kernel boot session UUID, which a clock change leaves alone) the
 /// persisted value is the active one only when `user.plist` was last modified
 /// before the current boot: a later write is pending, or applied and changed
-/// again, and equality with any earlier value proves nothing about it. A
-/// configuration modified after the boot, or whose time or the boot time cannot
-/// be read, is refused. Without a boot marker, or when the current boot identity
-/// cannot be read, the same time rule applies and the persisted value must also
-/// equal the journaled one.
+/// again, and equality with any earlier value proves nothing about it. Without a
+/// boot marker, or when the current boot identity cannot be read, the same time
+/// rule applies and the persisted value must also equal the journaled one.
+///
+/// A configuration that fails the rule, or whose time, content or the boot time
+/// cannot be read, refuses a forward gate. A rollback goes on with the persisted
+/// value as a stand-in, or with launchd's standard `PATH` when the content cannot
+/// be read, and says so, because refusing a rollback would strand the host.
 #[cfg(target_os = "macos")]
 fn journaled_or_persisted_path(
     context: &Context,
     journal: JournalDefault<'_>,
+    usage: PathUse,
 ) -> Result<(String, PathSource), Error> {
     let current = context.launchd_job().boot_identity();
     // The same boot needs no look at the persisted configuration, so an
@@ -3656,6 +3664,28 @@ fn journaled_or_persisted_path(
             return Ok((journal.path.to_owned(), PathSource::Journal));
         }
     }
+    match active_persisted_path_after_reboot(context, journal, &current) {
+        Ok(persisted) => Ok((persisted, PathSource::PersistedActive)),
+        Err(error) if usage == PathUse::Rollback => {
+            tracing::warn!(%error, "the launchd PATH of the unloaded job cannot be told");
+            let persisted = persisted_user_domain_path(context).unwrap_or_else(|error| {
+                tracing::warn!(%error, "the launchd user-domain configuration cannot be read");
+                pohunek_platform::supervisor::launchd::STANDARD_PATH.to_owned()
+            });
+            Ok((persisted, PathSource::Persisted))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The persisted launchd configuration when it is provably the active one after
+/// a boot change, or the reason it is not, as the forward refusal.
+#[cfg(target_os = "macos")]
+fn active_persisted_path_after_reboot(
+    context: &Context,
+    journal: JournalDefault<'_>,
+    current: &Result<String, String>,
+) -> Result<String, Error> {
     let boot_changed = journal.boot_identity.is_some() && current.is_ok();
     let refuse = |reason: String| {
         Error::ManagerEnvironment {
@@ -3701,14 +3731,14 @@ fn journaled_or_persisted_path(
         } else {
             format!(
                 "the current boot identity cannot be read ({})",
-                current.err().unwrap_or_default()
+                current.as_ref().err().cloned().unwrap_or_default()
             )
         };
         return Err(refuse(format!(
             "the persisted configuration differs from the PATH the upgrade journaled and {why}"
         )));
     }
-    Ok((persisted, PathSource::Persisted))
+    Ok(persisted)
 }
 
 /// The boot identity to journal next to a launchd default, or `None` with a

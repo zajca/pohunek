@@ -988,8 +988,9 @@ job's default; for a job that is not loaded, the journaled default of the
 transaction while the host has not rebooted since (the persisted configuration is not read then, so an unreadable one does not block it); and only when none of these is
 available, the persisted launchd configuration. A rollback therefore judges with
 the `PATH` the restored job gets where launchd can still say so. The
-persisted-configuration case is reported as a `warning:` line that names the
-journal, because it is the best evidence available and not launchd's answer.
+persisted-configuration case that is only a stand-in is reported as a `warning:`
+line that names the journal, because it is the best evidence available and not
+launchd's answer.
 
 Before any step stops or replaces a loaded job (the swap, the runtime apply, the
 migration stop, a rollback that stops the daemon) the CLI journals the default
@@ -1007,10 +1008,14 @@ boot and changed again, and its value says nothing about what launchd applied:
 equality with the journaled default or with any earlier value is never evidence.
 A journal without a boot UUID, or a host whose boot UUID cannot be read, cannot
 tell whether a reboot happened: the same time rule applies and the persisted
-value must also equal the journaled default. A configuration modified after the
-boot, one whose time cannot be read, or an unreadable boot time is refused with
-`service_manager_environment_unavailable`; the message names the fix (set the
-`PATH` with `launchctl setenv PATH <directories>` in the GUI session).
+value must also equal the journaled default. When the rule cannot be shown to hold, the two
+sides of a transaction differ:
+
+| Persisted configuration after a reboot | Forward gate (upgrade, resume, check) | Rollback and its gate |
+|---|---|---|
+| Older than the boot (and equal to the journaled default when the journal has no usable boot marker) | its `PATH`, no warning | its `PATH`, no warning |
+| Modified after the boot, one whose time cannot be read, an unreadable boot time, or (without a usable boot marker) a value that differs from the journaled default | refused with `service_manager_environment_unavailable`; the message names the fix (set the `PATH` with `launchctl setenv PATH <directories>` in the GUI session) | its `PATH` as a stand-in, with the `warning:` line, because refusing a rollback would strand the host |
+| Present but unreadable (permissions, corrupt content) | refused with `service_manager_environment_unavailable`, naming the read error | launchd's standard `PATH` as a stand-in, with the `warning:` line |
 
 The times compared are the later of a file's modification and status change time
 (so a copy or rename that preserves the modification time still counts), and the
