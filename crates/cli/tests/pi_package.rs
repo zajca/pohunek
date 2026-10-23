@@ -675,11 +675,15 @@ fn set_label(set: &str) -> String {
 fn captured_screens() -> Vec<(String, AgentActivity)> {
     SCREEN_SETS
         .iter()
-        .flat_map(|set| {
-            CAPTURED_SCREENS
-                .iter()
-                .map(move |(screen, expected)| (format!("{set}{screen}"), *expected))
-        })
+        .flat_map(|set| captured_screens_of(set))
+        .collect()
+}
+
+/// [`CAPTURED_SCREENS`] of the screen set `set`.
+fn captured_screens_of(set: &str) -> Vec<(String, AgentActivity)> {
+    CAPTURED_SCREENS
+        .iter()
+        .map(|(screen, expected)| (format!("{set}{screen}"), *expected))
         .collect()
 }
 
@@ -1009,14 +1013,24 @@ fn a_column_zero_rule_in_the_transcript_never_stands_in_for_the_upper_border() {
 /// exception: see [`a_draft_reads_idle_unless_it_reproduces_a_selector_list_or_a_dialog_hint`].
 #[test]
 fn hostile_text_in_the_transcript_or_the_draft_never_changes_the_classification() {
+    hostile_text_never_changes_the_classification_of(SCREEN_SETS[0]);
+}
+
+#[test]
+fn hostile_text_never_changes_the_classification_of_the_previous_release() {
+    hostile_text_never_changes_the_classification_of(SCREEN_SETS[1]);
+}
+
+/// The body of the hostile-text sweep over the screens of the set `set`.
+fn hostile_text_never_changes_the_classification_of(set: &str) {
     let definition = installed_definition();
     let mut checked = 0_usize;
-    for (screen, expected) in captured_screens() {
+    for (screen, expected) in captured_screens_of(set) {
         checked += sweep_hostile_rows(&definition, &screen, &screen_rows(&screen), 100, expected);
     }
     // The narrowest terminal, one whose busy borders close with one rule, and
     // the transcript-rule screens at 24 columns.
-    for fixture in width_fixtures().iter().filter(|fixture| {
+    for fixture in width_fixtures_of(set).iter().filter(|fixture| {
         fixture.columns == 20
             || (fixture.columns == 36 && fixture.name.starts_with("compaction"))
             || (fixture.columns == 24 && fixture.name.starts_with("rule_"))
@@ -1029,7 +1043,10 @@ fn hostile_text_in_the_transcript_or_the_draft_never_changes_the_classification(
             fixture.expected,
         );
     }
-    assert!(checked > 3500, "the sweep covers every row: {checked}");
+    assert!(
+        checked > 3500 / SCREEN_SETS.len(),
+        "the sweep covers every row of {set:?}: {checked}"
+    );
 }
 
 /// What an overlay screen of `compat/pi/screens/overlays/` waits for.
@@ -1225,6 +1242,16 @@ fn a_dialog_opened_from_the_idle_editor_is_published_as_blocked_and_closes_to_id
 
 #[test]
 fn transcript_text_never_changes_a_dialog_or_a_selector() {
+    transcript_text_never_changes_an_overlay_of(SCREEN_SETS[0]);
+}
+
+#[test]
+fn transcript_text_never_changes_an_overlay_of_the_previous_release() {
+    transcript_text_never_changes_an_overlay_of(SCREEN_SETS[1]);
+}
+
+/// The body of the transcript sweep over the overlays of the set `set`.
+fn transcript_text_never_changes_an_overlay_of(set: &str) {
     let definition = installed_definition();
     let mut checked = 0_usize;
     // Screens whose frame shows both borders; a taller overlay has no
@@ -1237,7 +1264,7 @@ fn transcript_text_never_changes_a_dialog_or_a_selector() {
             .count()
             >= 2
     };
-    for fixture in overlay_fixtures()
+    for fixture in overlay_fixtures_of(set)
         .iter()
         .filter(|fixture| fixture.columns == 100)
         .filter(framed)
@@ -1270,8 +1297,8 @@ fn transcript_text_never_changes_a_dialog_or_a_selector() {
         }
     }
     assert!(
-        checked > 2000,
-        "the sweep covers every transcript row: {checked}"
+        checked > 2000 / SCREEN_SETS.len(),
+        "the sweep covers every transcript row of {set:?}: {checked}"
     );
 }
 
