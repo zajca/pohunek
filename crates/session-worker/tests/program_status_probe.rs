@@ -30,8 +30,10 @@ const INPUT_STALL: Duration = Duration::from_secs(20);
 /// Bytes an attach-style write pushes at a program that does not read; far
 /// more than the PTY input queue holds.
 const STUCK_WRITE_BYTES: usize = 200_000;
-/// Echoed bytes that show the PTY input queue is full.
-const QUEUE_FULL_ECHO: usize = 4_000;
+/// Echoed bytes that show the stuck write has started. They stay below the
+/// smallest PTY input queue (1024 bytes on macOS); the write is far larger, so
+/// it cannot finish before the program drains its input.
+const WRITE_STARTED_ECHO: usize = 512;
 /// Delay of the paced plan's first fragment. It never elapses: the scenario
 /// drops the plan once it has seen the second probe.
 const PLAN_HOLD: Duration = Duration::from_secs(3600);
@@ -280,7 +282,7 @@ async fn a_probe_reply_stuck_behind_a_full_pty_never_blocks_output() {
     let cwd = tempdir().expect("temp dir");
     let gate = cwd.path().join("go");
     // Raw mode with echo: every byte the PTY accepts is echoed, which shows
-    // when the input queue is full. The program reads nothing until the gate
+    // that the write is under way. The program reads nothing until the gate
     // opens, then prints a probe and drains its input.
     let script = format!(
         "stty raw echo; printf READY; while [ ! -e '{gate}' ]; do :; done; \
@@ -296,7 +298,7 @@ async fn a_probe_reply_stuck_behind_a_full_pty_never_blocks_output() {
         let pty = pty.clone();
         tokio::spawn(async move { write_stream(&pty, &vec![b'z'; STUCK_WRITE_BYTES]).await })
     };
-    output_until(&pty, &"z".repeat(QUEUE_FULL_ECHO)).await;
+    output_until(&pty, &"z".repeat(WRITE_STARTED_ECHO)).await;
     std::fs::write(&gate, b"").expect("open the gate");
     // Output keeps flowing while the reply waits behind the stuck write.
     output_until(&pty, "P1").await;
