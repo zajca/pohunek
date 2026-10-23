@@ -1,12 +1,10 @@
 //! `NetBird` implementation of the generic overlay contract.
 
 use std::net::IpAddr;
-use std::sync::Arc;
 
 use overlay::{
-    BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, LocalIdentity,
-    OverlayError, OverlayFuture, OverlayId, OverlayRegistry, OverlaySnapshot, OverlayTransport,
-    ResolvedPeer, ResolvedSelector,
+    BindAddrError, DiscoveredPeer, ExternalIdentity, LocalIdentity, OverlayError, OverlayFuture,
+    OverlayId, OverlaySnapshot, OverlayTransport, ResolvedPeer, ResolvedSelector,
 };
 
 use crate::{NetbirdError, NetbirdStatus, Peer};
@@ -105,27 +103,6 @@ impl OverlayTransport for NetbirdTransport {
             Ok(local_identity_from_status(&status, self.id()))
         })
     }
-}
-
-/// Build the production registry from fail-fast `NetBird` configuration.
-///
-/// # Errors
-///
-/// Returns [`OverlayError::InvalidConfig`] for an invalid remote port or an
-/// impossible registry construction failure.
-pub fn configured_registry() -> Result<OverlayRegistry, OverlayError> {
-    let transport = Arc::new(NetbirdTransport::new());
-    let id = transport.id().clone();
-    let port = crate::remote_port().map_err(|error| map_error(error, &id))?;
-    let entry =
-        ConfiguredTransport::new(transport, port).map_err(|error| OverlayError::InvalidConfig {
-            overlay: id.clone(),
-            detail: error.to_string(),
-        })?;
-    OverlayRegistry::new(vec![entry]).map_err(|error| OverlayError::InvalidConfig {
-        overlay: id,
-        detail: error.to_string(),
-    })
 }
 
 async fn load_status(id: &OverlayId) -> Result<NetbirdStatus, OverlayError> {

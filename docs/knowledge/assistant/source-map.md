@@ -787,6 +787,7 @@ Protocol contracts and transport:
 - `crates/client/src/discovery.rs`
 
 - `crates/client/src/lib.rs`
+- `crates/client/src/overlay_config.rs`
 - `crates/client/src/notifications.rs`
 - `crates/client/src/transport.rs`
 - `crates/client/src/error.rs`

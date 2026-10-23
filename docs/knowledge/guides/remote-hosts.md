@@ -15,6 +15,37 @@ implemented authentication and credential foundation, including native `pohunek
 relay` commands, but it provides no remote-host enrollment, routing, attach, or
 team client. Those commands do not alter the owner path described here.
 
+## Overlay configuration
+
+A host works over exactly one overlay provider. Without configuration that is
+NetBird on TCP port 18722. The optional owner-private file
+`~/.config/pohunek/overlays.toml` (`$XDG_CONFIG_HOME/pohunek/overlays.toml`)
+sets the provider and the port for the CLI, the daemon and Rust clients alike:
+
+```toml
+providers = ["netbird"]
+port = 18722
+```
+
+- `providers` lists exactly one id; `netbird` is the only known id. Several
+  entries are refused until one host can run several overlays (#1113).
+- `port` is optional and must be in `1..=65535`; it is the port the daemon
+  listens on and the CLI dials, on every host that reads the file.
+- The directory must be owned by you and not writable by other accounts, even
+  without the file. The file must be a regular file owned by you with mode
+  `0600`, UTF-8, at most 64 KiB, with no unknown key.
+- Any violation is `overlay_configuration_invalid`; the message names the file
+  and a line number, never a value from it. `pohunekd` exits with the same code
+  before it takes a lock or touches its store.
+- The daemon reads the file at start, so restart it after a change
+  (`pohunek service` restarts the service daemon).
+- `POHUNEK_REMOTE_PORT` overrides `port` in the process that sees it, for
+  development and tests. A service-started daemon does not receive it; put a
+  port both sides must use in the file.
+- A daemon of an older release ignores the file and binds the environment value
+  or 18722. Upgrade and restart the remote host's daemon before you set `port`
+  there, or the CLI dials a port nothing listens on.
+
 Remote behavior is host-aware. The CLI uses `--host <host>` for commands that
 target a host, and session targets can use `<host>/<session-id>`.
 

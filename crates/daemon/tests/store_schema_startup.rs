@@ -106,6 +106,45 @@ async fn a_store_newer_than_the_daemon_fails_startup_and_is_left_untouched() {
     assert!(!layout.socket().exists(), "no listener before the refusal");
 }
 
+/// An unusable `overlays.toml` stops the daemon before it touches the store:
+/// the older store is neither migrated nor backed up.
+#[tokio::test]
+async fn an_invalid_overlay_configuration_fails_startup_before_the_store_migrates() {
+    let env = TestEnv::new().expect("create short test environment");
+    let layout = Layout::new(&env, V0_33_0_STORE);
+    let config_dir = env.config_home().join("pohunek");
+    fs::create_dir_all(&config_dir).expect("create config dir");
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700))
+        .expect("make config dir private");
+    let overlays = config_dir.join("overlays.toml");
+    fs::write(&overlays, "providers = []\n").expect("write overlays.toml");
+    fs::set_permissions(&overlays, fs::Permissions::from_mode(0o600))
+        .expect("make overlays.toml private");
+
+    let output = daemon_command(&env, &layout)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon")
+        .wait_with_output()
+        .await
+        .expect("collect daemon output");
+
+    assert!(!output.status.success(), "startup must fail closed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("overlay_configuration_invalid")
+            && stderr.contains(&overlays.display().to_string()),
+        "the error names the code and the file: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&layout.store).expect("read store"),
+        V0_33_0_STORE,
+        "the store is byte-identical"
+    );
+    assert!(!layout.backup(1).exists(), "no migration backup is written");
+    assert!(!layout.socket().exists(), "no listener before the refusal");
+}
+
 #[tokio::test]
 async fn an_older_store_is_migrated_with_a_backup_before_the_daemon_serves() {
     let env = TestEnv::new().expect("create short test environment");

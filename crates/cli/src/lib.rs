@@ -4,8 +4,8 @@
 //! `attach`, `completions`, `integration`, and `host` (discover/list/inspect). The grammar
 //! is host-aware
 //! (a `--host` flag and `<host>/<session-id>` targets); the *effective host*
-//! selects the transport, so local and remote (over `NetBird`) execute through one
-//! surface. Local behavior is unchanged from the local-only phase.
+//! selects the transport, so local and remote (over the configured overlay) execute
+//! through one surface. Local behavior is unchanged from the local-only phase.
 
 #![deny(unsafe_code)]
 
@@ -54,8 +54,8 @@ use crate::target::{Target, LOCAL_HOST};
 #[command(name = "pohunek", version, about, long_about = None)]
 struct Cli {
     /// Target host for the command. `local` (the default) and this machine's own
-    /// overlay name use this machine; any other name is resolved to a `NetBird`
-    /// peer and dialed over the mesh. A `<host>/<session-id>` target's host
+    /// overlay name use this machine; any other name is resolved to a peer of the
+    /// configured overlay and dialed over it. A `<host>/<session-id>` target's host
     /// overrides this flag for that command.
     #[arg(long, global = true, default_value = LOCAL_HOST)]
     host: String,
@@ -213,7 +213,7 @@ enum Commands {
         json: bool,
     },
 
-    /// Discover, list, and inspect remote hosts over `NetBird`.
+    /// Discover, list, and inspect remote hosts over the configured overlay.
     Host {
         #[command(subcommand)]
         action: HostAction,
@@ -463,7 +463,7 @@ enum ProjectAction {
 
 #[derive(Debug, Subcommand)]
 enum HostAction {
-    /// Enumerate `NetBird` peers and probe their daemons.
+    /// Enumerate overlay peers and probe their daemons.
     Discover {
         /// Re-probe peers even when a fresh standalone discovery cache exists.
         #[arg(long)]
@@ -473,7 +473,7 @@ enum HostAction {
         json: bool,
     },
 
-    /// List known hosts (live `NetBird` peers) with their classification.
+    /// List known hosts (live overlay peers) with their classification.
     List {
         /// Re-probe peers even when a fresh standalone discovery cache exists.
         #[arg(long)]
@@ -485,7 +485,7 @@ enum HostAction {
 
     /// Inspect one host's live capabilities (a direct daemon query).
     Inspect {
-        /// Host name to inspect (a `NetBird` peer name, or `local`).
+        /// Host name to inspect (an overlay peer name, or `local`).
         host: String,
         /// Emit machine-readable JSON instead of a table.
         #[arg(long)]
@@ -503,7 +503,7 @@ enum HostAction {
 enum HostGovernanceAction {
     /// Inspect safe governance state without changing enrollment or ownership.
     Inspect {
-        /// Host name to inspect (a `NetBird` peer name, or `local`).
+        /// Host name to inspect (an overlay peer name, or `local`).
         host: String,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
@@ -2612,7 +2612,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Host { action } => match action {
-            // Discovery is local NetBird state plus the CLI cache; no local
+            // Discovery is local overlay state plus the CLI cache; no local
             // daemon connection is needed.
             HostAction::Discover { refresh, json } => {
                 commands::host::run_discover(refresh, json).await?;
@@ -2914,7 +2914,7 @@ fn resolve_assistant_options(
 /// A positional [`Target`]'s host (when present) wins over the global `--host`
 /// flag; otherwise the global flag is used. `None` (no target) means "use the
 /// global flag" (commands that take only the flag). The returned string is the
-/// host name the transport selects on (`local`, or a `NetBird` peer name).
+/// host name the transport selects on (`local`, or an overlay peer name).
 #[must_use]
 fn effective_host(global: &str, target: Option<&Target>) -> String {
     match target.and_then(|t| t.host.as_deref()) {

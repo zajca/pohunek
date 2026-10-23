@@ -448,6 +448,12 @@ async fn run() -> Result<(), DaemonError> {
     )?;
     let paths = Paths::resolve()?;
 
+    // The overlay configuration decides which network the remote listener
+    // binds, so an unusable one stops the daemon before any lock, store
+    // migration or worker adoption.
+    let registry = pohunek_client::overlay_registry_from(&paths.config_dir)
+        .map_err(DaemonError::OverlayConfiguration)?;
+
     // 2. Acquire the durable data authority before opening any state service.
     // State and data roots are configured independently, so each needs its own
     // lifetime lock. Preparing the data root is safe before the lock because it
@@ -590,7 +596,6 @@ async fn run() -> Result<(), DaemonError> {
         .map_err(DaemonError::Reconcile)?;
 
     // 8. Bind the control socket (stale-socket recovery + 0600).
-    let registry = netbird::configured_registry()?;
     let health = HealthInfo::new(DAEMON_VERSION);
     let discovery = DiscoveryCache::new(registry.clone());
     let state = DaemonState::new_with_discovery(
@@ -1375,6 +1380,15 @@ mod tests {
         RemoteBind, REMOTE_BIND_MAX_RETRY_INTERVAL,
     };
 
+    /// A `NetBird` registry on the default port that reads no configuration file
+    /// and no environment variable.
+    fn netbird_registry() -> overlay::OverlayRegistry {
+        let transport = Arc::new(netbird::NetbirdTransport::new());
+        let entry = ConfiguredTransport::new(transport, pohunek_client::DEFAULT_REMOTE_PORT)
+            .expect("configured NetBird overlay");
+        overlay::OverlayRegistry::new(vec![entry]).expect("NetBird registry")
+    }
+
     async fn governance_service() -> (tempfile::TempDir, Arc<HostGovernanceService>) {
         let root = pohunek_test_support::tempdir().expect("create isolated host-governance root");
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
@@ -1408,7 +1422,7 @@ mod tests {
             HealthInfo::new("test"),
             SessionRegistry::default(),
             governance,
-            netbird::configured_registry().expect("configured registry"),
+            netbird_registry(),
         );
         let mut remote = Some(pohunek_daemon::api::RemoteServer::from_listener(
             listener, state,
@@ -1572,7 +1586,7 @@ mod tests {
             HealthInfo::new("test"),
             SessionRegistry::default(),
             governance,
-            netbird::configured_registry().expect("configured registry"),
+            netbird_registry(),
         );
         RemoteServer::bind_with(requested, state, &transport, |_| async {
             Ok(wrap(listener))
@@ -1685,7 +1699,7 @@ mod tests {
             HealthInfo::new("test"),
             SessionRegistry::default(),
             governance,
-            netbird::configured_registry().expect("configured registry"),
+            netbird_registry(),
         );
         let shutdown = CancellationToken::new();
         let supervisor_shutdown = shutdown.clone();

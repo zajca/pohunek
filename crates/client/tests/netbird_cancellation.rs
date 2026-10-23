@@ -63,6 +63,9 @@ async fn cancelling_discovery_kills_the_active_netbird_status_process() {
     let mut process_env = ProcessEnv::lock();
     process_env.set("PATH", bin.as_os_str());
     process_env.remove("POHUNEK_REMOTE_PORT");
+    // The absent config directory selects the NetBird default, whatever the
+    // runner's own configuration holds.
+    process_env.set("XDG_CONFIG_HOME", root.path().join("config"));
     let registry = default_overlay_registry().expect("production NetBird registry");
     let options = DiscoveryOptions::new().with_origin_source(OriginSource::Omitted);
     let discovery =
@@ -103,6 +106,9 @@ async fn concurrent_discovery_calls_complete_through_one_netbird_provider() {
     let mut process_env = ProcessEnv::lock();
     process_env.set("PATH", bin.as_os_str());
     process_env.remove("POHUNEK_REMOTE_PORT");
+    // The absent config directory selects the NetBird default, whatever the
+    // runner's own configuration holds.
+    process_env.set("XDG_CONFIG_HOME", root.path().join("config"));
     let registry = default_overlay_registry().expect("production NetBird registry");
     let options = DiscoveryOptions::new().with_origin_source(OriginSource::Omitted);
     let (first, second, third, fourth) = tokio::join!(

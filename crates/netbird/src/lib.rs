@@ -16,7 +16,6 @@
 //! - Validate a daemon control-listener bind address, failing closed
 //!   ([`validate_netbird_bind_addr`]) so the daemon never opens a socket on a
 //!   non-NetBird interface.
-//! - Resolve the remote control port from the environment ([`remote_port`]).
 //!
 //! `NetBird` assigns addresses from the RFC 6598 CGNAT range `100.64.0.0/10`
 //! (`100.64.0.0` ..= `100.127.255.255`); that range is the trust boundary used
@@ -26,18 +25,16 @@
 
 mod bind;
 mod host;
-mod port;
 mod status;
 mod transport;
 
 pub use bind::{validate_netbird_bind_addr, BindAddrError};
 pub use host::resolve_host;
-pub use port::{remote_port, DEFAULT_REMOTE_PORT, REMOTE_PORT_ENV};
 pub use status::{
     parse_status, run_status, run_status_async, run_status_with_program, NetbirdError,
     NetbirdStatus, Peer,
 };
-pub use transport::{configured_registry, NetbirdTransport, NETBIRD_OVERLAY_ID};
+pub use transport::{NetbirdTransport, NETBIRD_OVERLAY_ID};
 
 /// True when `ip` is an IPv4 address inside the `NetBird` CGNAT range
 /// `100.64.0.0/10` (RFC 6598).

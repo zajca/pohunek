@@ -41,6 +41,9 @@
 //! which write fixture files through a child process so that no write
 //! descriptor in this process can make a later `exec` fail with `ETXTBSY`.
 //!
+//! The [`bind_redirect`] module (Linux), holds the `LD_PRELOAD` shim that moves a
+//! daemon's overlay-range listener to loopback and records the original target.
+//!
 //! The `catalog` module, compiled with the `catalog` feature, holds a
 //! throwaway signing key, trust anchor and signed runtime catalog for tests
 //! that install an official package.
@@ -70,6 +73,8 @@
 
 // Rust guideline compliant 2026-10-14
 
+#[cfg(target_os = "linux")]
+pub mod bind_redirect;
 #[cfg(feature = "catalog")]
 pub mod catalog;
 pub mod env;

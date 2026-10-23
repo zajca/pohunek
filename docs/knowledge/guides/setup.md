@@ -250,7 +250,9 @@ carries the remediation. When `pohunek doctor` reaches the daemon, a check both 
 fails; optional capabilities are at most `warn`.
 
 Linux: `bin:git` (required), `bin:codex`, `bin:claude`, the socket, state and
-log directory writability checks, `netbird_cli`, and `schema_version`.
+log directory writability checks, `netbird_cli`, and `schema_version`. The
+provider and port the remote listener uses come from the optional
+`overlays.toml`; see [Remote hosts](remote-hosts.md#overlay-configuration).
 Executables count only when they are regular files the effective user can execute according to the kernel (`faccessat` with `X_OK`); a file it cannot execute is skipped and the `PATH` search continues. The writability probes create a randomly named file exclusively (never following a planted symlink) and remove it.
 
 macOS adds the following checks. The daemon report also includes redacted
