@@ -332,7 +332,16 @@ impl Detector {
 
         let has_process_activity = self.process_activity.observe(bytes);
         let recent_before = self.screen.recent_text();
-        let osc_events = self.osc.advance_with_offsets(bytes);
+        let mut osc_events = self.osc.advance_with_offsets(bytes);
+        // Without the opt-in a 7501 report is no event, so the screen is fed in
+        // the same segments as for any other output.
+        if self
+            .manifest
+            .as_ref()
+            .is_none_or(|manifest| manifest.program_status().is_none())
+        {
+            osc_events.retain(|(item, _end)| !matches!(item, OscEvidence::ProgramStatus(_)));
+        }
 
         // The screen is fed segment by segment, split at each completed OSC
         // event: every event is stamped against the screen as it looked where
@@ -378,10 +387,9 @@ impl Detector {
         // Only a chunk that ends idle latches: transcript text drawn ahead of a
         // dialog, or of a screen no rule names, must never read as working.
         if let Some(sighted) = sighted_working {
-            if hit
-                .as_ref()
-                .is_some_and(|hit| hit.evidence.activity == AgentActivity::Idle)
-            {
+            if hit.as_ref().is_some_and(|hit| {
+                hit.evidence.activity == AgentActivity::Idle && !hit.overrides_program_status
+            }) {
                 push_transition(&mut transitions, self.state.observe_evidence(now, sighted));
             }
         }
@@ -778,6 +786,13 @@ impl Detector {
     /// program-status record. Readiness reads [`Self::manifest_evidence`]
     /// instead, so a record never releases or holds a prompt.
     fn activity_evidence(&self, freshness: ContextFreshness) -> Option<ManifestEvidenceHit> {
+        // A held record is arbitrated against the whole screen: a dialog that
+        // stays visible while the chunk changes nothing on screen must still win.
+        let freshness = if self.program_status.is_some() {
+            ContextFreshness::all()
+        } else {
+            freshness
+        };
         overlay_program_status(
             self.program_status.as_ref(),
             self.manifest_evidence(freshness),
@@ -864,10 +879,14 @@ impl ChunkLatch {
         }
         self.evaluations += 1;
         self.drew |= drew_chars;
-        let freshness = ContextFreshness {
-            screen: self.drew || screen.recent_text() != self.recent_before,
-            osc_title: self.osc_changes.title,
-            osc_progress: self.osc_changes.progress,
+        let freshness = if self.program_status.is_some() {
+            ContextFreshness::all()
+        } else {
+            ContextFreshness {
+                screen: self.drew || screen.recent_text() != self.recent_before,
+                osc_title: self.osc_changes.title,
+                osc_progress: self.osc_changes.progress,
+            }
         };
         let hit = overlay_program_status(
             self.program_status.as_ref(),

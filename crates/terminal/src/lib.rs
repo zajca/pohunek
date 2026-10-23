@@ -23,8 +23,9 @@ pub use compositor::{Compositor, OverlayFrame, OverlayLine, MIN_ROWS};
 #[doc(inline)]
 pub use menu::{step, MenuEffect, MenuEvent, MenuKey, MenuOutcome, MenuState};
 pub use program_status::{
-    parse_payload as parse_program_status, strip_probe_replies, BlockedKind, ProbeGuard, ProbeSpan,
-    ProgramState, ProgramStatusRecord, ProgramStatusReport, PROBE_REPLY, PROGRAM_STATUS_COMMAND,
+    is_valid_app as is_valid_program_status_app, parse_payload as parse_program_status,
+    strip_probe_replies, BlockedKind, ProbeGuard, ProbeSpan, ProgramState, ProgramStatusRecord,
+    ProgramStatusReport, PROBE_REPLY, PROGRAM_STATUS_COMMAND,
 };
 #[doc(inline)]
 pub use screen::{ScreenObservation, ScreenRegion, ScreenTracker};

@@ -9,7 +9,6 @@
 // Rust guideline compliant 2026-06-26
 
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,6 +16,7 @@ use pohunek_daemon::agent::host::InputReadiness;
 use pohunek_daemon::detect::{
     ActivityTransition, DetectionConfig, Detector, DetectorConfig, Manifest, ManifestError,
 };
+use pohunek_test_support::workspace_root;
 use protocol::{AgentActivity, DetectionRegionKind, StateSource};
 
 /// Rows of the terminal the screens were captured on.
@@ -33,14 +33,6 @@ const SETTLE_TICKS: u32 = 12;
 const CLAUDE_APP: &str = "claude-code";
 /// The `app` the Codex test manifest opts in with.
 const CODEX_APP: &str = "codex";
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("the daemon crate sits two levels below the workspace root")
-        .to_path_buf()
-}
 
 fn read(relative: &str) -> String {
     fs::read_to_string(workspace_root().join(relative)).unwrap_or_else(|error| {
@@ -722,7 +714,7 @@ fn an_override_rule_beats_a_working_record_unless_a_stronger_rule_wins() {
 }
 
 #[test]
-fn a_manifest_without_the_table_behaves_as_before_while_records_arrive() {
+fn a_manifest_without_the_table_ignores_records_while_they_arrive() {
     let shell = || {
         let mut config = DetectorConfig::generic_shell();
         config.detection = fast_detection();
@@ -947,42 +939,72 @@ fn a_held_idle_record_suppresses_a_stale_spinner_latch() {
 }
 
 #[test]
-fn a_published_working_state_closes_the_record_latch() {
-    let mut harness = Harness::claude();
-    harness.feed(&captured("claude", "idle"));
-    harness.feed(&claude_record("working"));
-    assert_eq!(harness.activity(), WORKING);
+fn a_record_only_chunk_never_flips_a_visible_dialog_to_working() {
+    for record_state in ["working", "idle"] {
+        let mut harness = Harness::claude();
+        harness.feed(&captured("claude", "idle"));
+        harness.feed(&captured("claude", "trust"));
+        assert_eq!(
+            harness.activity(),
+            Some((AgentActivity::Blocked, StateSource::Screen))
+        );
+        let before = harness.changes();
 
-    let transitions = harness.feed_raw(&working_then_done());
+        // Chunks that change nothing on screen: a record, cursor output.
+        for chunk in [claude_record(record_state), b"\x1b[?25l".to_vec()] {
+            let transitions = harness.feed_raw(&chunk);
+            assert!(
+                transitions
+                    .iter()
+                    .all(|transition| transition.activity == AgentActivity::Blocked),
+                "{record_state}: the dialog stays blocked: {transitions:?}"
+            );
+        }
+        harness.settle();
+        assert_eq!(harness.changes(), before, "{record_state}");
+    }
+}
+
+#[test]
+fn an_override_repaint_with_a_working_record_adds_no_working_edge() {
+    let mut harness = override_harness();
+    harness.feed(&record("state=working:app=probe"));
+    harness.feed(&frame(Some("idle"), &["BACKGROUND-ONLY"]));
+    assert_eq!(
+        harness.activity(),
+        Some((AgentActivity::Idle, StateSource::Screen))
+    );
+
+    // A full repaint passes through a cleared screen before the footer returns.
+    let transitions = harness.feed_raw(&frame(Some("idle"), &["BACKGROUND-ONLY"]));
 
     assert!(
         transitions
             .iter()
             .all(|transition| transition.activity != AgentActivity::Working),
-        "no second working edge while working is published: {transitions:?}"
+        "{transitions:?}"
     );
 }
 
 #[test]
-fn an_adopted_detector_restores_the_record_from_a_covering_replay_only() {
-    let stream = [
-        captured("claude", "idle"),
-        claude_record("working"),
-        captured("claude", "idle"),
+fn a_report_is_not_an_event_without_the_opt_in() {
+    // A BEL-terminated record splits the screen feed into segments only when the
+    // manifest opted in; without it the output is handled as any other output.
+    let bytes = [
+        captured("codex", "idle"),
+        b"\x1b]7501;state=working:app=codex\x07".to_vec(),
     ]
     .concat();
+    let mut plain = Harness::new(config(
+        &read("runtime-packages/codex/detect.toml"),
+        InputReadiness::ManifestIdle,
+    ));
+    let mut stripped = Harness::new(config(
+        &read("runtime-packages/codex/detect.toml"),
+        InputReadiness::ManifestIdle,
+    ));
+    plain.feed(&bytes);
+    stripped.feed(&captured("codex", "idle"));
 
-    // A detector seeded from the retained raw output sees the record again.
-    let mut replayed = Harness::claude();
-    replayed.feed(&stream);
-    assert_eq!(replayed.activity(), WORKING);
-
-    // After an evicted ring the stream restarts from the rendered snapshot,
-    // which carries screen state but no record.
-    let mut tracker = pohunek_terminal::TerminalTracker::new(ROWS, COLUMNS);
-    tracker.feed(&stream);
-    let mut gapped = Harness::claude();
-    gapped.feed(&tracker.snapshot(0).ansi);
-    assert_eq!(gapped.record_preview().as_deref(), Some(""));
-    assert_ne!(gapped.activity(), WORKING);
+    assert_eq!(plain.transitions, stripped.transitions);
 }

@@ -2303,7 +2303,8 @@ fn session_detection_contract_has_exact_wire_shape() {
             "last_non_empty_above_prompt_box",
             "after_last_prompt_marker",
             "prompt_box_body",
-            "after_last_horizontal_rule"
+            "after_last_horizontal_rule",
+            "program_status"
         ],
         "previews": [{
             "kind": "top_non_empty_lines",

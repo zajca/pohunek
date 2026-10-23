@@ -434,12 +434,6 @@ async fn a_restated_record_emits_no_agent_state() {
             (AgentActivity::Working, StateSource::OscProgress),
         )
         .await;
-    let revision = fixture
-        .registry
-        .inspect(&created.id)
-        .await
-        .expect("inspect session")
-        .updated_at;
     let mut events = fixture.registry.subscribe();
 
     for _ in 0..5 {

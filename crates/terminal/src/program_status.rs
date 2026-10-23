@@ -179,7 +179,7 @@ pub fn parse_payload(payload: &[u8]) -> Option<ProgramStatusReport> {
                 "error" => (state, clear) = (Some(ProgramState::Error), false),
                 _ => return None,
             },
-            "app" => app = valid_app(value).then(|| value.to_owned()),
+            "app" => app = is_valid_app(value).then(|| value.to_owned()),
             "kind" => {
                 kind = match value {
                     "permission" => Some(BlockedKind::Permission),
@@ -213,7 +213,9 @@ pub fn parse_payload(payload: &[u8]) -> Option<ProgramStatusReport> {
     }))
 }
 
-fn valid_app(value: &str) -> bool {
+/// Whether `value` is a legal `app` name: 1-32 characters of `[A-Za-z0-9_.+-]`.
+#[must_use]
+pub fn is_valid_app(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_APP_BYTES
         && value

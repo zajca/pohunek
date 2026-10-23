@@ -1031,7 +1031,14 @@ mod tests {
         .expect("result deserializes");
 
         assert_eq!(result.session_id, created.id);
-        assert_eq!(result.supported_regions, DetectionRegionKind::ALL);
+        assert_eq!(
+            result.supported_regions,
+            DetectionRegionKind::ALL
+                .into_iter()
+                .filter(|kind| *kind != DetectionRegionKind::ProgramStatus)
+                .collect::<Vec<_>>(),
+            "a manifest without the program-status table lists no such region"
+        );
         assert_eq!(
             result
                 .previews

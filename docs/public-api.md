@@ -1819,8 +1819,7 @@ active manifest in manifest order:
     "last_non_empty_above_prompt_box",
     "after_last_prompt_marker",
     "prompt_box_body",
-    "after_last_horizontal_rule",
-    "program_status"
+    "after_last_horizontal_rule"
   ],
   "previews": [
     {
@@ -1833,11 +1832,12 @@ active manifest in manifest order:
 ```
 
 A manifest that declares `[program_status]` (see "Declaring program status" in
-the runtime-packages guide) also lists a `program_status` preview, whose
+the runtime-packages guide) adds `program_status` to `supported_regions` (only
+for such a session, so a client that predates the kind decodes every other
+result) and lists a `program_status` preview, whose
 `region` is `program_status` and whose `text` is the held record as
 `app=<app>:state=<state>[:kind=<kind>]`, or empty when none is held. Message,
-title and progress texts of a record are never stored or exposed. A client that
-does not know the kind drops it from `supported_regions`.
+title and progress texts of a record are never stored or exposed.
 
 Parameterized manifest syntax is `bottom_lines(N)`,
 `bottom_non_empty_lines(N)`, or `top_non_empty_lines(N)`; the preview's

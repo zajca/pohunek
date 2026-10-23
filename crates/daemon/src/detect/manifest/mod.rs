@@ -225,10 +225,7 @@ pub struct ProgramStatusConfig {
 
 impl ProgramStatusConfig {
     fn try_from_raw(raw: parser::RawProgramStatus) -> Result<Self, ManifestError> {
-        let valid = (1..=PROGRAM_STATUS_APP_MAX_BYTES).contains(&raw.app.len())
-            && raw.app.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'+' | b'-')
-            });
+        let valid = pohunek_terminal::is_valid_program_status_app(&raw.app);
         if !valid {
             return Err(ManifestError::InvalidProgramStatusApp { app: raw.app });
         }
@@ -250,9 +247,6 @@ impl ProgramStatusConfig {
         self.answer_probe
     }
 }
-
-/// Longest `app` name of the OSC 7501 protocol.
-const PROGRAM_STATUS_APP_MAX_BYTES: usize = 32;
 
 /// Process-level matchers compiled from a manifest `[process]` section.
 #[derive(Debug, Clone)]
