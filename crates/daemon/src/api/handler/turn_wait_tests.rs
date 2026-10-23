@@ -87,6 +87,14 @@ impl Fixture {
         self.state.notifications.as_ref().expect("notifications")
     }
 
+    /// The debounce coordinator the daemon components share.
+    pub(super) fn attention(&self) -> &crate::notifications::AttentionCoordinator {
+        self.state
+            .attention
+            .as_ref()
+            .expect("attention coordinator")
+    }
+
     /// Ends the projector as a daemon shutdown does: it drains what it was
     /// sent and stops.
     pub(super) async fn end_projector(&self) {

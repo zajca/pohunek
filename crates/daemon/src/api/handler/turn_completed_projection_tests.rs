@@ -1797,3 +1797,44 @@ async fn a_projector_that_ends_retries_the_seed_of_the_inputs_it_still_holds() {
     assert_eq!(records.len(), 1, "{records:?}");
     finish(&fixture, inhibitor, &session).await;
 }
+
+#[tokio::test]
+async fn a_resync_stamps_every_snapshot_with_the_moment_it_read_the_registry() {
+    let fixture = enabled_fixture();
+    let first = fixture.session("resync-first").await;
+    let second = fixture.session("resync-second").await;
+    fixture.activity(&first, "working").await;
+    fixture.activity(&second, "working").await;
+    settle().await;
+    // Only the resync projects from here on.
+    fixture.end_projector().await;
+    let listed = fixture.sessions.list().await;
+    assert_eq!(listed.len(), 2);
+    let victim = listed[1].id.0.clone();
+    let inhibitor = pause_clock().await;
+    let hold = fixture.notifications().hold_projector_seeds();
+
+    // The seed of the session listed first blocks, and an approval of the one
+    // listed second is minted meanwhile: it postdates the registry read the
+    // second snapshot stands for.
+    let resync = crate::notifications::resync_with_fresh_state(
+        &fixture.sessions,
+        fixture.notifications(),
+        fixture.attention(),
+    );
+    let mint = async {
+        guard("the resync to block in its first seed", hold.entered()).await;
+        approval_report(&fixture, &victim, 1).await;
+        hold.release();
+    };
+    tokio::join!(resync, mint);
+    settle().await;
+
+    flush_window().await;
+    let records = approval_records(&fixture).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["session_id"], victim.as_str(), "{records:?}");
+    assert_eq!(records[0]["status"], "unread", "{records:?}");
+    finish(&fixture, inhibitor, &first).await;
+    fixture.stop_all(&[&second]).await;
+}

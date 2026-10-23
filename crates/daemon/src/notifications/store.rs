@@ -681,8 +681,8 @@ impl NotificationStore {
     /// `turn:<session_id>`, marks `unread` and `read` `turn_completed` records
     /// as `acknowledged`. Records already acknowledged, archived, deleted, or
     /// unrelated to the key prefix are left untouched, so repeated calls are
-    /// idempotent. With `as_of`, records that other producers created after
-    /// that moment are left untouched too.
+    /// idempotent. With `as_of`, records that other producers created, or merged
+    /// a report into, after that moment are left untouched too.
     ///
     /// # Errors
     ///

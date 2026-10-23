@@ -209,6 +209,22 @@ async fn resync_from_registry(
     }
 }
 
+/// Runs one resync over `sessions` with a projector that has seen nothing yet.
+#[cfg(test)]
+pub(crate) async fn resync_with_fresh_state(
+    sessions: &SessionRegistry,
+    notifications: &NotificationService,
+    attention: &AttentionCoordinator,
+) {
+    resync_from_registry(
+        sessions,
+        notifications,
+        attention,
+        &mut ProjectorState::default(),
+    )
+    .await;
+}
+
 /// Return the shared session attention dedupe key.
 ///
 /// Scheme: `attention:<session_id>`. The key is source-independent so daemon

@@ -166,8 +166,8 @@ impl AttentionCoordinator {
     }
 
     /// A handle whose resolves act on what existed at `as_of`: records that
-    /// other producers created later, and pending entries they refreshed
-    /// later, are left alone.
+    /// other producers created or merged a report into later, and pending
+    /// entries they refreshed later, are left alone.
     #[must_use]
     pub(crate) fn as_of(&self, as_of: ResolveAsOf) -> Self {
         Self {
@@ -447,8 +447,8 @@ fn prefer(
 /// acknowledge visible records.
 ///
 /// A resolve `as_of` an earlier moment leaves alone the pending entry another
-/// producer refreshed after it and the visible records that producer created
-/// after it.
+/// producer refreshed after it and the visible records that producer created or
+/// merged a report into after it.
 ///
 /// An entry for a turn the daemon runs is not cancelled: the state of its turn
 /// decides whether it surfaces.

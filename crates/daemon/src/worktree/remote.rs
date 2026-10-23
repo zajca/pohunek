@@ -144,7 +144,8 @@ pub(super) fn plan_remote_branch(
     };
     // Refusing here, before the pre-create hook, keeps a doomed request free of
     // hook side effects; `move_branch` repeats the check under the admin lock,
-    // which is what closes the race with a concurrent `git worktree add`.
+    // which excludes the daemon's own concurrent `git worktree add` (the lock is
+    // in-process, so a `git worktree add` run in a terminal is not excluded).
     if matches!(action, Action::FastForward { .. } | Action::Reset { .. }) {
         refuse_held_branch(repository, branch)?;
     }
