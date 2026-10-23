@@ -179,6 +179,46 @@ impl Fixture {
             )
             .expect("write the profile");
         }
+        // ES4: a shell session whose foreground process is a `pi`, so procwatch
+        // switches the session to the Pi manifest. The nested `pi` waits on
+        // `go1`, reports `working`, waits on `go2` and exits.
+        let pi_link = scratch.join("pi");
+        std::os::unix::fs::symlink("/bin/sh", &pi_link).expect("link the nested pi");
+        let nested = scratch.join("nested.sh");
+        std::fs::write(
+            &nested,
+            "read _ < go1\nprintf '\\033]7501;state=working:app=pi\\033\\\\'\nread _ < go2\n",
+        )
+        .expect("write the nested pi script");
+        let outer = scratch.join("outer.sh");
+        std::fs::write(
+            &outer,
+            format!(
+                "cd {dir}\n{pi} {nested} &\nwait $!\nsleep 600\n",
+                dir = scratch.display(),
+                pi = pi_link.display(),
+                nested = nested.display()
+            ),
+        )
+        .expect("write the outer shell script");
+        std::fs::write(
+            agents.join("fake-shell-es4.toml"),
+            format!(
+                "base = \"shell\"\nprogram = \"/bin/sh\"\nargs = [\"{}\"]\n\n[env]\nPATH = \"/usr/bin:/bin\"\n",
+                outer.display()
+            ),
+        )
+        .expect("write the ES4 profile");
+        for gate in ["go1", "go2"] {
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(scratch.join(gate))
+                    .status()
+                    .expect("run mkfifo")
+                    .success(),
+                "create the {gate} FIFO"
+            );
+        }
         let fifo = scratch.join("cmd");
         assert!(
             std::process::Command::new("mkfifo")
@@ -204,6 +244,7 @@ impl Fixture {
                 shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 600"]),
                 agents_dir: Some(agents),
                 host_state_dir: Some(env.root().join("host-state")),
+                procwatch_poll: std::time::Duration::from_millis(100),
                 ..SessionRegistryConfig::default()
             },
             env.state_home().join("pohunek/plugins"),
@@ -681,7 +722,7 @@ async fn an_attached_clients_probe_reply_never_reaches_pi() {
 }
 
 #[tokio::test]
-async fn a_nested_pi_record_does_not_make_a_shell_session_report_working() {
+async fn a_record_is_ignored_under_a_manifest_without_the_table() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
@@ -689,9 +730,10 @@ async fn a_nested_pi_record_does_not_make_a_shell_session_report_working() {
     let created = fixture.start("fake-nested-fifo").await;
     wait_screen(&fixture, &created.id, "say hi", false).await;
 
-    // The stand-in reports `working` as a nested Pi with PI_PROGRAM_STATUS=1
-    // would. The next screen change arrives after the record in the byte
-    // stream, so the record has been seen once it shows.
+    // The stand-in is the shell session's own program, so the shell manifest
+    // stays active. Its `working` record is ignored because that manifest has
+    // no `[program_status]` table. The next screen change arrives after the
+    // record in the byte stream, so the record has been seen once it shows.
     command(&fixture, b'g');
     wait_screen(&fixture, &created.id, "say hi", true).await;
     command(&fixture, b'r');
@@ -702,6 +744,42 @@ async fn a_nested_pi_record_does_not_make_a_shell_session_report_working() {
         .await
         .expect("inspect session");
     assert_ne!(info.state_source, StateSource::OscProgress, "{info:?}");
+    let _ = fixture.registry.stop(&created.id).await;
+    fixture.end().await;
+}
+
+#[tokio::test]
+async fn a_nested_pis_held_record_does_not_outlive_the_pi() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new().await;
+    let created = fixture.start("fake-shell-es4").await;
+    wait_until("procwatch to attribute the nested Pi", || async {
+        let info = fixture.registry.inspect(&created.id).await.ok()?;
+        (info.active_agent.as_deref() == Some("pi")).then_some(())
+    })
+    .await;
+
+    // Under the Pi manifest the nested Pi's record is held and read.
+    std::fs::write(fixture.scratch_file("go1"), b"\n").expect("release the nested Pi");
+    fixture.wait_activity(&created.id, WORKING).await;
+
+    // The Pi exits; the exit watch clears the active agent, the detector goes
+    // back to the shell manifest and the held record is gone with it.
+    std::fs::write(fixture.scratch_file("go2"), b"\n").expect("let the nested Pi exit");
+    wait_until("the shell manifest to take over", || async {
+        let info = fixture.registry.inspect(&created.id).await.ok()?;
+        eprintln!(
+            "DBG {:?} {:?} {:?} {:?}",
+            info.active_agent, info.active_agent_pid, info.state_source, info.activity
+        );
+        (info.active_agent.is_none()
+            && info.state_source != StateSource::OscProgress
+            && info.activity != Some(AgentActivity::Working))
+        .then_some(info)
+    })
+    .await;
     let _ = fixture.registry.stop(&created.id).await;
     fixture.end().await;
 }

@@ -5,3 +5,7 @@ status: the session worker answers Pi's probe, and Pi's records decide the
 activity while a visible dialog still reads `blocked`. Pi 1.0.x keeps working
 from the screen alone; its captures stay as the previous release in
 `compat/pi/screens/n-1/`.
+
+A session no longer keeps an `osc_progress` activity after the agent that
+reported it leaves or is replaced: the activity is cleared (`state_source`
+`process`) and the new manifest's reading replaces it (#1550).

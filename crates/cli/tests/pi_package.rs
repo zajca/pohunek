@@ -55,6 +55,9 @@ const PACKAGE_ID: &str = "pohunek.runtime.pi";
 /// Profile the real-Pi tests launch through by default.
 const PROFILE: &str = "pi-test";
 
+/// Profile that holds Pi's start behind a gate.
+const GATED_PROFILE: &str = "pi-gated";
+
 fn package_dir() -> PathBuf {
     workspace_root().join(PACKAGE_DIR)
 }
@@ -1633,6 +1636,54 @@ impl Fixture {
         );
     }
 
+    /// Writes the profile [`GATED_PROFILE`]: the real `pi` behind a wrapper
+    /// that holds Pi's start until the returned FIFO is written, so a client
+    /// can attach before Pi prints anything. `pi --version` is not held.
+    fn write_gated_profile(&self) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let real = find_on_path("pi").expect("a `pi` on PATH");
+        let gate = self.harness.env.root().join("pi-gate");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&gate)
+                .status()
+                .expect("run mkfifo")
+                .success(),
+            "create the gate FIFO"
+        );
+        let wrapper = self.harness.env.root().join("gated-pi");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = --version ] || read -r _ < \"{}\"\nexec \"{}\" \"$@\"\n",
+                gate.display(),
+                real.display()
+            ),
+        )
+        .expect("write the gating wrapper");
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))
+            .expect("make the wrapper executable");
+        self.write_named_profile(
+            GATED_PROFILE,
+            &format!("program = \"{}\"\n", wrapper.display()),
+            "",
+        );
+        gate
+    }
+
+    /// Launches a session of [`GATED_PROFILE`]; Pi starts once `gate` is
+    /// released.
+    async fn new_gated_session(&self, name: &str) -> String {
+        let cwd = self.harness.env.cwd().to_path_buf();
+        let (code, launched) = self.launch(GATED_PROFILE, name, &cwd).await;
+        assert_eq!(code, 0, "{launched}");
+        launched["ok"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_owned()
+    }
+
     async fn new_session(&self, name: &str) -> Value {
         let cwd = self.harness.env.cwd().to_path_buf();
         let (code, launched) = self.launch(PROFILE, name, &cwd).await;
@@ -2317,11 +2368,17 @@ fn recorded_source() -> &'static str {
     }
 }
 
+/// Lets the gated Pi of [`Fixture::write_gated_profile`] start. The wrapper
+/// is already blocked reading the FIFO, so opening it for writing returns.
+async fn release_gate(gate: &Path) {
+    let gate = gate.to_path_buf();
+    tokio::task::spawn_blocking(move || fs::write(gate, b"\n").expect("release the gate"))
+        .await
+        .expect("the gate task");
+}
+
 /// Bytes requested per `session output` page.
 const OUTPUT_PAGE_BYTES: &str = "65536";
-
-/// Milliseconds one follow read waits at the end of the output.
-const EXIT_FOLLOW_WAIT_MS: &str = "500";
 
 /// A JSON number or string as command-line text.
 fn scalar(value: &Value) -> String {
@@ -2361,12 +2418,11 @@ impl OutputReader {
         })
     }
 
-    /// Appends every page after the cursor. A `wait_ms` keeps the last read
-    /// open at the end of the output, so an exit between two polls still
-    /// delivers its final bytes. Returns `false` once the runtime is gone.
-    async fn drain(&mut self, fixture: &Fixture, wait_ms: Option<&str>) -> bool {
+    /// Appends every page after the cursor until the output is read to its
+    /// end.
+    async fn drain(&mut self, fixture: &Fixture) {
         loop {
-            let mut arguments = vec![
+            let arguments = [
                 "session",
                 "output",
                 self.id.as_str(),
@@ -2379,14 +2435,8 @@ impl OutputReader {
                 "--max-bytes",
                 OUTPUT_PAGE_BYTES,
             ];
-            if let Some(wait_ms) = wait_ms {
-                arguments.extend(["--wait-ms", wait_ms]);
-            }
             let (code, page) = fixture.harness.json(&arguments).await;
-            if code != 0 {
-                assert!(wait_ms.is_some(), "session output page: {page}");
-                return false;
-            }
+            assert_eq!(code, 0, "session output page: {page}");
             let ok = &page["ok"];
             assert!(
                 ok.get("gap").is_none(),
@@ -2395,14 +2445,9 @@ impl OutputReader {
             self.bytes.extend(capture::output_bytes(&page));
             self.cursor = scalar(&ok["next_offset"]);
             if ok["has_more"] != true {
-                return true;
+                return;
             }
         }
-    }
-
-    /// The ordered root program-status records read so far.
-    fn records(&self) -> Vec<String> {
-        capture::program_status_records(&self.bytes)
     }
 }
 
@@ -2411,7 +2456,7 @@ async fn raw_output(fixture: &Fixture, id: &str) -> Vec<u8> {
     let mut reader = OutputReader::open(fixture, id)
         .await
         .expect("session output");
-    assert!(reader.drain(fixture, None).await, "session output pages");
+    reader.drain(fixture).await;
     reader.bytes
 }
 
@@ -2435,54 +2480,32 @@ fn check_sequence(name: &str, raw: &[u8]) {
 }
 
 /// Pi clears its record when it exits, so no working state outlives it.
+///
+/// A client attached before Pi starts reads the raw stream until the terminal
+/// closes it, so the records need no polling and an exit cannot slip between
+/// two reads.
 async fn pi_clears_its_record_on_exit(fixture: &Fixture, reports: bool) {
-    let quit = fixture.new_session("quit").await;
-    let quit_id = quit["id"].as_str().expect("session id").to_owned();
-    fixture.wait_activity(&quit_id, "idle").await;
-    // The reader is opened and drained before `/quit`, then follows the
-    // output across the exit.
-    let mut quit_reader = if reports {
-        let mut reader = OutputReader::open(fixture, &quit_id)
-            .await
-            .expect("the quit session is live");
-        assert!(reader.drain(fixture, None).await, "pages before /quit");
-        Some(reader)
-    } else {
-        None
-    };
+    let gate = fixture.write_gated_profile();
+    let id = fixture.new_gated_session("quit").await;
+    let client = AnsweringClient::attach(&fixture.harness.socket(), &id, false);
+    wait_until("the attach to deliver its snapshot", || async {
+        client.has_output().then_some(())
+    })
+    .await;
+    release_gate(&gate).await;
+    fixture.wait_activity(&id, "idle").await;
     let (code, sent) = fixture
         .harness
-        .json(&["session", "input", &quit_id, "/quit"])
+        .json(&["session", "input", &id, "/quit"])
         .await;
     assert_eq!(code, 0, "{sent}");
-    if let Some(reader) = quit_reader.as_mut() {
-        tokio::time::timeout(pohunek_test_support::wait::HANG_GUARD, async {
-            loop {
-                let alive = reader.drain(fixture, Some(EXIT_FOLLOW_WAIT_MS)).await;
-                if reader
-                    .records()
-                    .last()
-                    .is_some_and(|record| record == "clear")
-                {
-                    return;
-                }
-                assert!(alive, "Pi exited before its clear record was read");
-            }
-        })
+    let raw = tokio::task::spawn_blocking(move || client.finish())
         .await
-        .expect("Pi to clear its record on exit");
-        let raw = reader.bytes.clone();
+        .expect("the stream reader");
+    if reports {
         check_sequence("exit", &raw);
     } else {
-        wait_until("the quit session to end", || async {
-            let (code, inspected) = fixture
-                .harness
-                .json(&["session", "inspect", &quit_id])
-                .await;
-            assert_eq!(code, 0, "{inspected}");
-            (inspected["ok"]["runtime"]["state"] != "live").then_some(())
-        })
-        .await;
+        assert!(capture::program_status_records(&raw).is_empty());
     }
 }
 
@@ -2668,9 +2691,11 @@ impl Fixture {
 /// answers with the same bytes.
 const PROBE: &[u8] = b"\x1b]7501;?\x1b\\";
 
-/// A terminal client attached to a session that answers every 7501 probe it
-/// sees in the output, as an emulator that supports the query does.
+/// A terminal client attached to a session. It keeps every byte of the raw
+/// stream until the stream closes, and answers every 7501 probe it sees when
+/// `answer` is set, as an emulator that supports the query does.
 struct AnsweringClient {
+    bytes: Arc<std::sync::Mutex<Vec<u8>>>,
     probes: Arc<std::sync::atomic::AtomicUsize>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -2678,7 +2703,7 @@ struct AnsweringClient {
 }
 
 impl AnsweringClient {
-    fn attach(socket: &Path, session: &str) -> Self {
+    fn attach(socket: &Path, session: &str, answer: bool) -> Self {
         use std::io::{BufRead as _, Read as _, Write as _};
         use std::sync::atomic::Ordering;
 
@@ -2721,8 +2746,10 @@ impl AnsweringClient {
 
         let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let thread = {
-            let (probes, stop) = (Arc::clone(&probes), Arc::clone(&stop));
+            let (probes, stop, bytes) =
+                (Arc::clone(&probes), Arc::clone(&stop), Arc::clone(&bytes));
             std::thread::spawn(move || {
                 let mut window: Vec<u8> = Vec::new();
                 let mut chunk = [0_u8; 4096];
@@ -2741,7 +2768,15 @@ impl AnsweringClient {
                         Err(_) => return,
                     };
                     window.extend_from_slice(&chunk[..count]);
-                    while let Some(at) = window.windows(PROBE.len()).position(|w| w == PROBE) {
+                    bytes
+                        .lock()
+                        .expect("client bytes")
+                        .extend_from_slice(&chunk[..count]);
+                    while let Some(at) = window
+                        .windows(PROBE.len())
+                        .position(|w| w == PROBE)
+                        .filter(|_| answer)
+                    {
                         window.drain(..at + PROBE.len());
                         probes.fetch_add(1, Ordering::SeqCst);
                         if raw.write_all(PROBE).is_err() {
@@ -2754,11 +2789,26 @@ impl AnsweringClient {
             })
         };
         Self {
+            bytes,
             probes,
             stop,
             thread: Some(thread),
             _control: control,
         }
+    }
+
+    /// Whether the stream has delivered any byte, which means the daemon
+    /// registered the attach.
+    fn has_output(&self) -> bool {
+        !self.bytes.lock().expect("client bytes").is_empty()
+    }
+
+    /// Every byte of the stream, read until the session's terminal closed it.
+    fn finish(mut self) -> Vec<u8> {
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("the stream reader");
+        }
+        self.bytes.lock().expect("client bytes").clone()
     }
 
     /// Probes the client has seen and answered.
@@ -2793,14 +2843,19 @@ async fn an_attached_client_answering_the_probe_does_not_change_pis_reports() {
     fixture.install().await;
     fixture.write_profile();
 
-    let launched = fixture.new_session("attached-reply").await;
-    let id = launched["id"].as_str().expect("session id").to_owned();
-    let client = AnsweringClient::attach(&fixture.harness.socket(), &id);
+    let gate = fixture.write_gated_profile();
+    let id = fixture.new_gated_session("attached-reply").await;
+    let client = AnsweringClient::attach(&fixture.harness.socket(), &id, true);
+    wait_until("the attach to deliver its snapshot", || async {
+        client.has_output().then_some(())
+    })
+    .await;
+    release_gate(&gate).await;
     let idle = fixture.wait_activity(&id, "idle").await;
     assert_eq!(idle["state_source"], "osc_progress", "{idle}");
     assert!(
         client.answered() >= 1,
-        "the client saw Pi's probe and replied; it attached after Pi started otherwise"
+        "the client saw Pi's probe, which follows the gate, and replied"
     );
 
     let (code, sent) = fixture
