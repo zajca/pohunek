@@ -30,6 +30,49 @@ pub(crate) const CAPTURE_ROWS: &str = "24";
 // hermetic-allowed: #146 the text is a fixed replacement for the random fixture root in captured screens, never a host path
 pub(crate) const NEUTRAL_ROOT: &str = "/tmp/ph-sample";
 
+/// Directory below which a recording launches its sessions.
+///
+/// Agents print their working directory in a footer or a question and clip or
+/// wrap it at narrow widths, so a random fixture root would leak a host path
+/// into the captures that [`write_capture`] cannot neutralise. A recording
+/// launches its sessions in directories of this fixed, short root instead. It
+/// is `/dev/shm/ph-<name>` and is removed when the value is dropped.
+pub(crate) struct RecordingRoot {
+    path: std::path::PathBuf,
+}
+
+impl RecordingRoot {
+    /// Creates an empty root for the recording of runtime `name`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the directory cannot be created.
+    // hermetic-allowed: #1525 a fixed short path under tmpfs keeps recorded screens reproducible; recording is an opt-in run, never part of the gates
+    pub(crate) fn new(name: &str) -> Self {
+        let path = std::path::PathBuf::from(format!("/dev/shm/ph-{name}"));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create the recording root");
+        Self { path }
+    }
+
+    /// A fresh directory `name` below the root.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the directory cannot be created.
+    pub(crate) fn directory(&self, name: &str) -> std::path::PathBuf {
+        let path = self.path.join(name);
+        fs::create_dir_all(&path).expect("create a recording directory");
+        path
+    }
+}
+
+impl Drop for RecordingRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Extension of the program-status sequence golden.
 pub(crate) const PROGRAM_STATUS_EXTENSION: &str = "program-status";
 
