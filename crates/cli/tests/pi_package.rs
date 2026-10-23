@@ -1734,14 +1734,14 @@ async fn launch_and_converse(fixture: &Fixture) -> (String, String, PathBuf) {
 
     // Detection: the idle editor rule of the real screen.
     let idle = fixture.wait_activity(&id, "idle").await;
-    assert_eq!(idle["state_source"], "screen", "{idle}");
+    assert_eq!(idle["state_source"], recorded_source(), "{idle}");
 
     // Input: bracketed paste then a separate submit; the stub holds the reply
     // so the working rule is on screen.
     let (code, sent) = harness.json(&["session", "input", &id, PROMPT]).await;
     assert_eq!(code, 0, "{sent}");
     let working = fixture.wait_activity(&id, "working").await;
-    assert_eq!(working["state_source"], "screen", "{working}");
+    assert_eq!(working["state_source"], recorded_source(), "{working}");
     let lines = fixture.screen(&id).await;
     assert!(
         lines.iter().any(|line| line.contains("Working")),
@@ -2053,7 +2053,7 @@ async fn a_real_pi_dialog_or_trust_prompt_reads_blocked_never_idle() {
         .await;
     assert_eq!(code, 0, "{sent}");
     let blocked = fixture.wait_activity(&id, "blocked").await;
-    assert_eq!(blocked["state_source"], "screen", "{blocked}");
+    assert_eq!(blocked["state_source"], recorded_source(), "{blocked}");
     let lines = fixture.wait_screen_line(&id, "Allow tool call?").await;
     assert!(
         !activity_matches(&fixture, &id, "idle").await,
@@ -2224,41 +2224,139 @@ async fn a_real_pi_with_its_sessions_elsewhere_is_refused_at_launch() {
     fixture.harness.stop().await;
 }
 
-/// The ordered root program-status records of the session's retained output.
-async fn program_status_of(fixture: &Fixture, id: &str) -> Vec<String> {
-    let (code, output) = fixture.harness.json(&["session", "output", id]).await;
-    assert_eq!(code, 0, "{output}");
-    capture::program_status_records(&capture::output_bytes(&output))
+/// First release of Pi that reports its state as OSC 7501 program status.
+const PROGRAM_STATUS_RELEASE: (u64, u64) = (1, 1);
+
+/// Directory of the program-status sequence goldens, relative to the workspace
+/// root.
+const SEQUENCE_DIR: &str = "compat/pi/screens/sequences";
+
+/// Set to rewrite the sequence goldens from the run instead of comparing.
+const UPDATE_GOLDENS_VARIABLE: &str = "POHUNEK_PI_UPDATE_GOLDENS";
+
+/// Whether the `pi` on `PATH` reports program status; an earlier release is
+/// classified from the screen alone.
+fn pi_reports_program_status() -> bool {
+    let pi = find_on_path("pi").expect("a `pi` on PATH");
+    let output = std::process::Command::new(pi)
+        .arg("--version")
+        .output()
+        .expect("run `pi --version`");
+    let version = String::from_utf8(output.stdout).expect("UTF-8 version");
+    let mut parts = version.trim().split('.').map(|part| part.parse::<u64>());
+    let major = parts.next().and_then(Result::ok).expect("major version");
+    let minor = parts.next().and_then(Result::ok).expect("minor version");
+    (major, minor) >= PROGRAM_STATUS_RELEASE
 }
 
+/// The `state_source` a state read from the editor frame or the record has.
+fn recorded_source() -> &'static str {
+    if pi_reports_program_status() {
+        "osc_progress"
+    } else {
+        "screen"
+    }
+}
+
+/// The retained raw output of the session, or `None` once its terminal is gone.
+async fn raw_output(fixture: &Fixture, id: &str) -> Option<Vec<u8>> {
+    let (code, output) = fixture.harness.json(&["session", "output", id]).await;
+    (code == 0).then(|| capture::output_bytes(&output))
+}
+
+/// The ordered root program-status records of the session's retained output.
+async fn program_status_of(fixture: &Fixture, id: &str) -> Vec<String> {
+    let raw = raw_output(fixture, id).await.expect("session output");
+    capture::program_status_records(&raw)
+}
+
+/// Compares the records of `raw` with the golden `<name>.program-status`, or
+/// rewrites the golden when [`UPDATE_GOLDENS_VARIABLE`] is `1`.
+fn check_sequence(name: &str, raw: &[u8]) {
+    let directory = workspace_root().join(SEQUENCE_DIR);
+    if std::env::var(UPDATE_GOLDENS_VARIABLE).as_deref() == Ok("1") {
+        capture::write_program_status(&directory, name, raw);
+        return;
+    }
+    let golden = fs::read_to_string(directory.join(format!("{name}.program-status")))
+        .unwrap_or_else(|error| panic!("read the golden {name}: {error}"));
+    let expected: Vec<&str> = golden.lines().collect();
+    assert_eq!(capture::program_status_records(raw), expected, "{name}");
+}
+
+/// Pi's records, as the worker's probe reply enables them, cover a turn, an
+/// extension dialog and a clean exit; a release without program status stays
+/// on the screen.
+///
+/// Needs a `pi` on `PATH` and `POHUNEK_PI_E2E=1`; the model is a loopback
+/// stub.
 #[tokio::test]
 #[ignore = "needs a real `pi` on PATH; run with POHUNEK_PI_E2E=1 and --ignored"]
-async fn explore_pi_program_status() {
+async fn a_real_pi_reports_its_turn_dialog_and_exit_through_program_status() {
     require_real_pi();
+    let reports = pi_reports_program_status();
+    let source = recorded_source();
     let fixture = Fixture::start().await;
     fixture.install().await;
     fixture.write_profile();
     let marker = fixture.harness.env.root().join("approved");
     write_confirm_extension(&fixture, &marker);
 
-    let launched = fixture.new_session("explore").await;
+    let launched = fixture.new_session("program-status").await;
     let id = launched["id"].as_str().expect("session id").to_owned();
     let idle = fixture.wait_activity(&id, "idle").await;
-    eprintln!("IDLE {} {:?}", idle["state_source"], program_status_of(&fixture, &id).await);
-    let (code, sent) = fixture.harness.json(&["session", "input", &id, PROMPT]).await;
+    assert_eq!(idle["state_source"], source, "{idle}");
+
+    let (code, sent) = fixture
+        .harness
+        .json(&["session", "input", &id, PROMPT])
+        .await;
     assert_eq!(code, 0, "{sent}");
     let working = fixture.wait_activity(&id, "working").await;
-    eprintln!("WORKING {} {:?}", working["state_source"], program_status_of(&fixture, &id).await);
+    assert_eq!(working["state_source"], source, "{working}");
     fixture.stub.open_gate();
-    let idle = fixture.wait_activity(&id, "idle").await;
-    eprintln!("IDLE2 {} {:?}", idle["state_source"], program_status_of(&fixture, &id).await);
+    let settled = fixture.wait_activity(&id, "idle").await;
+    assert_eq!(settled["state_source"], source, "{settled}");
+    if reports {
+        check_sequence("turn", &raw_output(&fixture, &id).await.expect("output"));
+    } else {
+        assert!(program_status_of(&fixture, &id).await.is_empty());
+    }
+
     let (code, sent) = fixture
         .harness
         .json(&["session", "input", &id, &format!("/{CONFIRM_COMMAND}")])
         .await;
     assert_eq!(code, 0, "{sent}");
     let blocked = fixture.wait_activity(&id, "blocked").await;
-    eprintln!("BLOCKED {} {:?}", blocked["state_source"], program_status_of(&fixture, &id).await);
+    assert_eq!(blocked["state_source"], source, "{blocked}");
+    if reports {
+        check_sequence("dialog", &raw_output(&fixture, &id).await.expect("output"));
+    }
     fixture.stop(&id).await;
+
+    // Pi clears its record when it exits, so no working state outlives it.
+    let quit = fixture.new_session("quit").await;
+    let quit_id = quit["id"].as_str().expect("session id").to_owned();
+    fixture.wait_activity(&quit_id, "idle").await;
+    let (code, sent) = fixture
+        .harness
+        .json(&["session", "input", &quit_id, "/quit"])
+        .await;
+    assert_eq!(code, 0, "{sent}");
+    // The terminal is gone once Pi exits, so the records are read while the
+    // clear record is on its way and the last read before the exit is kept.
+    let raw = wait_until("Pi to clear its record on exit", || async {
+        let raw = raw_output(&fixture, &quit_id).await?;
+        capture::program_status_records(&raw)
+            .last()
+            .is_some_and(|record| record == "clear")
+            .then_some(raw)
+    })
+    .await;
+    if reports {
+        check_sequence("exit", &raw);
+    }
+    assert!(!marker.exists(), "no dialog was answered");
     fixture.harness.stop().await;
 }
