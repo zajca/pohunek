@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use pohunek_test_support::time::AutoAdvanceInhibitor;
+use pohunek_test_support::wait::guard;
 use protocol::{method, AgentActivity, NotificationKindPolicy, SessionId};
 use serde_json::{json, Value};
 
@@ -1590,6 +1591,69 @@ async fn a_pending_approval_survives_the_resume_replayed_after_it() {
         "the approval is still pending"
     );
 
+    flush_window().await;
+    let records = approval_records(&fixture).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["status"], "unread", "{records:?}");
+    finish(&fixture, inhibitor, &session).await;
+}
+
+#[tokio::test]
+async fn a_pending_approval_survives_the_resume_queued_before_it_behind_a_blocked_seed() {
+    let fixture = enabled_fixture();
+    fail_all_seeds(&fixture);
+    let hold = fixture.notifications().hold_projector_seeds();
+    let session = fixture.session("seed-blocked-pending-approval").await;
+    let inhibitor = pause_clock().await;
+
+    // The projector blocks in the seed of the session's first input. The resume
+    // is produced while it blocks, the approval after the resume, and the
+    // projector only dequeues the resume once the seed fails.
+    fixture.activity(&session, "idle").await;
+    guard("the projector to block in its seed", hold.entered()).await;
+    fixture.activity(&session, "working").await;
+    settle().await;
+    approval_report(&fixture, &session, 1).await;
+    hold.release();
+    guard("the projector to take the failed seed", hold.failed()).await;
+    settle().await;
+
+    recover_seeds(&fixture);
+    assert!(
+        debounce() > SEED_RETRY_DELAY + FLUSH_SLACK,
+        "the retry must run inside the approval's window"
+    );
+    advance_by(SEED_RETRY_DELAY + FLUSH_SLACK).await;
+    assert!(
+        approval_records(&fixture).await.is_empty(),
+        "the approval is still pending"
+    );
+
+    flush_window().await;
+    let records = approval_records(&fixture).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["status"], "unread", "{records:?}");
+    finish(&fixture, inhibitor, &session).await;
+}
+
+#[tokio::test]
+async fn a_pending_approval_survives_the_resume_queued_before_it_behind_a_slow_seed() {
+    let fixture = enabled_fixture();
+    let hold = fixture.notifications().hold_projector_seeds();
+    let session = fixture.session("seed-slow-pending-approval").await;
+    let inhibitor = pause_clock().await;
+
+    // The seed of the session's first input succeeds, but only after the resume
+    // and the approval behind it were produced.
+    fixture.activity(&session, "idle").await;
+    guard("the projector to block in its seed", hold.entered()).await;
+    fixture.activity(&session, "working").await;
+    settle().await;
+    approval_report(&fixture, &session, 1).await;
+    hold.release();
+    settle().await;
+
+    advance_by(SEED_RETRY_DELAY + FLUSH_SLACK).await;
     flush_window().await;
     let records = approval_records(&fixture).await;
     assert_eq!(records.len(), 1, "{records:?}");

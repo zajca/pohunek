@@ -465,6 +465,58 @@ struct NotificationServiceInner {
     /// The projector epoch seeds that still fail on purpose.
     #[cfg(test)]
     projector_seed_fault: std::sync::Mutex<Option<ProjectorSeedFault>>,
+    /// Holds the projector epoch seeds in their blocking call.
+    #[cfg(test)]
+    projector_seed_hold: std::sync::Mutex<Option<Arc<SeedHoldState>>>,
+}
+
+/// A test's grip on the projector's epoch seeds: each one stays in its
+/// blocking call until [`SeedHold::release`].
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct SeedHold {
+    state: Arc<SeedHoldState>,
+}
+
+/// A hold that is dropped releases its seeds, so a test that ends early does
+/// not leave a blocking thread parked.
+#[cfg(test)]
+impl Drop for SeedHold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct SeedHoldState {
+    released: std::sync::Mutex<bool>,
+    released_changed: std::sync::Condvar,
+    entered: tokio::sync::Notify,
+    failed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl SeedHold {
+    /// Completes once a seed is held in its blocking call.
+    pub(crate) async fn entered(&self) {
+        self.state.entered.notified().await;
+    }
+
+    /// Lets the held seeds go on.
+    pub(crate) fn release(&self) {
+        *self
+            .state
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.state.released_changed.notify_all();
+    }
+
+    /// Completes once the projector took a failed seed and deferred its input.
+    pub(crate) async fn failed(&self) {
+        self.state.failed.notified().await;
+    }
 }
 
 /// Seeds of the projector that fail on purpose: those of one session, or of
@@ -519,6 +571,8 @@ impl NotificationService {
                 next_id: AtomicU64::new(1),
                 #[cfg(test)]
                 projector_seed_fault: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                projector_seed_hold: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -534,6 +588,8 @@ impl NotificationService {
     /// timestamp.
     #[must_use]
     pub(crate) fn source_id_suffixes(&self, provider: &str, prefix: &str) -> Vec<(String, String)> {
+        #[cfg(test)]
+        self.hold_injected_seed();
         #[cfg(test)]
         if self.injected_seed_failure(prefix) {
             // A panic in the blocking read is the failure the projector's seed
@@ -555,6 +611,60 @@ impl NotificationService {
             session_id: session_id.map(str::to_owned),
             remaining: count,
         });
+    }
+
+    /// Makes the projector epoch seeds wait in their blocking call until the
+    /// returned hold is released.
+    #[cfg(test)]
+    pub(crate) fn hold_projector_seeds(&self) -> SeedHold {
+        let state = Arc::new(SeedHoldState::default());
+        *self
+            .inner
+            .projector_seed_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&state));
+        SeedHold { state }
+    }
+
+    #[cfg(test)]
+    fn current_seed_hold(&self) -> Option<Arc<SeedHoldState>> {
+        self.inner
+            .projector_seed_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn hold_injected_seed(&self) {
+        let Some(hold) = self.current_seed_hold() else {
+            return;
+        };
+        hold.entered.notify_one();
+        let released = hold
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_released, timeout) = hold
+            .released_changed
+            .wait_timeout_while(
+                released,
+                pohunek_test_support::wait::HANG_GUARD,
+                |released| !*released,
+            )
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !timeout.timed_out(),
+            "the held projector seed was never released"
+        );
+    }
+
+    /// Reports that the projector took a failed seed.
+    #[cfg(test)]
+    pub(crate) fn note_projector_seed_failed(&self) {
+        if let Some(hold) = self.current_seed_hold() {
+            hold.failed.notify_one();
+        }
     }
 
     /// Whether the seed that reads `prefix` is one the test made fail, which

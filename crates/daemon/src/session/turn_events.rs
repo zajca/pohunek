@@ -262,14 +262,42 @@ fn depart(record: &mut TurnRecord) -> Option<Handback> {
     }
 }
 
+/// The instant a turn change happened, on the clock other producers stamp their
+/// notification records with. It does not take part in comparisons: two edges
+/// are equal when they name the same change of the same turn.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EdgeStamp(pub(crate) std::time::Instant);
+
+impl EdgeStamp {
+    pub(crate) fn now() -> Self {
+        Self(std::time::Instant::now())
+    }
+}
+
+impl PartialEq for EdgeStamp {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for EdgeStamp {}
+
 /// A change of the turns of a session, in the order it happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TurnEdge {
     /// A new turn opened: what earlier turns of the session left unread is
     /// over.
-    Started(SessionId, TurnId),
+    Started(SessionId, TurnId, EdgeStamp),
     /// The turn went idle and its report is due.
-    Ended(SessionId, TurnId),
+    Ended(SessionId, TurnId, EdgeStamp),
+}
+
+impl TurnEdge {
+    /// The instant the turn change happened.
+    pub(crate) fn happened_at(&self) -> std::time::Instant {
+        let (Self::Started(_, _, stamp) | Self::Ended(_, _, stamp)) = self;
+        stamp.0
+    }
 }
 
 /// What one activity change did to the turns of a session.
@@ -741,10 +769,10 @@ impl TurnEvents {
     /// Opens a turn of unobserved start for an entry adopted while working.
     pub(crate) fn adopt(&self, session_id: &SessionId, owner: TurnOwner) {
         if let Some(id) = self.progress(session_id).adopt(owner) {
-            let _ = self
-                .inner
-                .edges
-                .send(TurnEdge::Started(session_id.clone(), id));
+            let _ =
+                self.inner
+                    .edges
+                    .send(TurnEdge::Started(session_id.clone(), id, EdgeStamp::now()));
         }
     }
 
@@ -917,16 +945,16 @@ impl TurnEvents {
             detector_observed,
         );
         if let Some(id) = change.started {
-            let _ = self
-                .inner
-                .edges
-                .send(TurnEdge::Started(session_id.clone(), id));
+            let _ =
+                self.inner
+                    .edges
+                    .send(TurnEdge::Started(session_id.clone(), id, EdgeStamp::now()));
         }
         if let Some(id) = change.ended {
-            let _ = self
-                .inner
-                .edges
-                .send(TurnEdge::Ended(session_id.clone(), id));
+            let _ =
+                self.inner
+                    .edges
+                    .send(TurnEdge::Ended(session_id.clone(), id, EdgeStamp::now()));
         }
     }
 

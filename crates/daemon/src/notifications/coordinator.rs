@@ -73,23 +73,34 @@ enum Command {
 /// The moment a resolve stands for, when it is applied later than the input
 /// that caused it.
 ///
-/// A resolve acts on what existed when its input arrived. Producers that do
+/// A resolve acts on what existed when its input was produced. Producers that do
 /// not queue behind the projector (provider hooks) keep creating records
 /// while the input waits, and those records belong after the resolve.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResolveAsOf {
-    /// Arrival on the clock other producers stamp their contributions with.
+    /// Production of the input, on the clock other producers stamp their
+    /// contributions with.
     pub(crate) minted_before: StdInstant,
-    /// Arrival on the coordinator's clock, the start of the stale-stop
-    /// suppression window.
+    /// Handling of the input on the coordinator's clock, the start of the
+    /// stale-stop suppression window.
     pub(crate) monotonic: Instant,
 }
 
 impl ResolveAsOf {
     /// The moment of this call.
+    #[cfg(test)]
     pub(crate) fn now() -> Self {
         Self {
             minted_before: StdInstant::now(),
+            monotonic: Instant::now(),
+        }
+    }
+
+    /// The moment `produced`, when the input was produced earlier than it is
+    /// handled. The stale-stop suppression window starts when it is handled.
+    pub(crate) fn at(produced: StdInstant) -> Self {
+        Self {
+            minted_before: produced,
             monotonic: Instant::now(),
         }
     }

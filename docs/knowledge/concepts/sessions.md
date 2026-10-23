@@ -358,10 +358,13 @@ those of the store. When that read fails, the session's inputs (events,
 snapshots and turn changes) wait in order and are projected after a retry that
 runs every second, so the notifications they derive arrive late. Only an outage
 that outlasts the bound of 256 inputs per session (the oldest is dropped with a
-warning) or the daemon's shutdown loses them. A queued input that ends a
+warning) or the daemon's shutdown loses them. An input that ends a
 condition (a turn that opens, an agent that resumes, a session that stops)
-ends only what existed when it arrived: a record that a provider hook created
-while the input waited stays as it is.
+ends only what existed when it was produced: the registry stamps an event or a
+turn change when it publishes it, and the projector stamps a registry snapshot
+just before it reads the registry. A record that a provider hook created after that moment stays as it is,
+whether the input waited in a backlog or was only handled late behind a slow
+seed.
 
 Unread `turn_completed` rows are bounded per session. A newer
 `turn:<session_id>` record acknowledges any older unread turn for that key with
