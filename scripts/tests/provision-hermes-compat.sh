@@ -22,6 +22,10 @@ git_marker="$test_root/git-started"
 git_calls="$test_root/git-calls"
 sleep_calls="$test_root/sleep-calls"
 credential_marker="$test_root/credential-environment-leaked"
+hang_marker="$test_root/git-fetch-hangs"
+hung_pid_file="$test_root/hung-fetch-pid"
+hung_child_pid_file="$test_root/hung-fetch-child-pid"
+real_sleep="$(command -v sleep)"
 cat >"$fake_bin/git" <<EOF
 #!/usr/bin/env bash
 touch "$git_marker"
@@ -29,9 +33,18 @@ printf '%s\n' "\$*" >>"$git_calls"
 if [[ -n "\${PIP_INDEX_URL:-}" || -n "\${UV_INDEX_URL:-}" ]]; then
   touch "$credential_marker"
 fi
-# Local repository setup succeeds; only the network fetch fails.
+# Local repository setup succeeds; only the network fetch fails, or hangs when
+# the hang marker exists (a connect that never completes).
 case " \$* " in
-  *" fetch "*) exit 99 ;;
+  *" fetch "*)
+    if [[ -e "$hang_marker" ]]; then
+      printf '%s\n' "\$\$" >"$hung_pid_file"
+      "$real_sleep" 60 &
+      printf '%s\n' "\$!" >"$hung_child_pid_file"
+      wait
+    fi
+    exit 99
+    ;;
 esac
 exit 0
 EOF
@@ -86,9 +99,42 @@ fi
 test "$(grep -c " fetch " "$git_calls")" -eq 3
 test "$(grep -c 'http.lowSpeedTime=60' "$git_calls")" -eq 3
 test "$(grep -c 'http.lowSpeedLimit=1024' "$git_calls")" -eq 3
-test "$(wc -l <"$sleep_calls")" -eq 2
+test "$(grep -cx 5 "$sleep_calls")" -eq 2
 grep -Fq 'cannot fetch the locked tag v2026.8.3 from https://github.com/NousResearch/hermes-agent after 3 attempts' "$test_root/stderr"
 grep -Fq 'fetching the locked tag v2026.8.3 (attempt 3 of 3)' "$test_root/stderr"
+
+# A fetch attempt that never completes is cut off at its wall-clock cap, the
+# stopped process is gone, and the failure names the cap. The cap is shortened
+# in a copy so the test stays fast.
+sed 's/^readonly FETCH_MAX_SECONDS=.*/readonly FETCH_MAX_SECONDS=1/' \
+  "$provision" >"$copy_root/scripts/provision-hermes-compat-capped"
+chmod 0755 "$copy_root/scripts/provision-hermes-compat-capped"
+grep -Fq 'readonly FETCH_MAX_SECONDS=1' "$copy_root/scripts/provision-hermes-compat-capped"
+touch "$hang_marker"
+: >"$git_calls"
+hang_started=$SECONDS
+if PATH="$fake_bin:/usr/bin:/bin" \
+  "$copy_root/scripts/provision-hermes-compat-capped" "$test_root/hung-fetch-install" \
+  >"$test_root/stdout" 2>"$test_root/stderr"; then
+  printf '%s\n' 'a hung fetch unexpectedly passed' >&2
+  exit 1
+fi
+test "$((SECONDS - hang_started))" -lt 20
+test "$(grep -c " fetch " "$git_calls")" -eq 3
+test "$(grep -c 'the fetch attempt exceeded 1s and was stopped' "$test_root/stderr")" -eq 3
+grep -Fq 'after 3 attempts (at most 1s each' "$test_root/stderr"
+hung_pid="$(tail -n 1 "$hung_pid_file")"
+if kill -0 "$hung_pid" 2>/dev/null; then
+  printf '%s\n' 'a timed-out fetch process is still running' >&2
+  exit 1
+fi
+hung_child_pid="$(tail -n 1 "$hung_child_pid_file")"
+if kill -0 "$hung_child_pid" 2>/dev/null; then
+  printf '%s\n' 'the transport helper of a timed-out fetch is still running' >&2
+  kill "$hung_child_pid"
+  exit 1
+fi
+rm -f "$hang_marker"
 
 # Hosts with only BSD userland (macOS) have `shasum` but no `sha256sum` and no
 # `realpath`. Run the provisioner with a PATH that offers exactly those tools:
@@ -98,7 +144,7 @@ grep -Fq 'fetching the locked tag v2026.8.3 (attempt 3 of 3)' "$test_root/stderr
 make_restricted_bin() {
   local dir="$1" tool
   mkdir -p "$dir"
-  for tool in bash curl dirname env mkdir tar touch uname; do
+  for tool in bash curl dirname env mkdir pkill tar touch uname; do
     ln -s "$(command -v "$tool")" "$dir/$tool"
   done
   ln -s "$fake_bin/git" "$dir/git"

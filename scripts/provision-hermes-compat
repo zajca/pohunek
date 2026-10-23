@@ -12,19 +12,21 @@ readonly PYTHON_MINIMUM_MINOR=11
 readonly PYTHON_MAXIMUM_MINOR=14
 
 # Network bounds of the git fetch and the CPython download; uv keeps its own
-# defaults (30 s read timeout, 3 retries). The download finishes, retries a
-# bounded number of times or fails with a message naming it. The git fetch has
-# no total cap and no connect timeout, only the stall bound: a transfer slower
-# than NETWORK_STALL_BYTES per second for NETWORK_STALL_SECONDS counts as
-# stalled, and a connect that never completes waits for libcurl's own default.
-# The last progress line names the phase, and the CI step timeout is the outer
-# backstop.
+# defaults (30 s read timeout, 3 retries). Both finish, retry a bounded number
+# of times or fail with a message naming them. git sets no libcurl connect
+# timeout (libcurl waits 300 s), so each fetch attempt runs under a wall-clock
+# cap of FETCH_MAX_SECONDS; a transfer slower than NETWORK_STALL_BYTES per
+# second for NETWORK_STALL_SECONDS also counts as stalled. The worst case,
+# NETWORK_ATTEMPTS x FETCH_MAX_SECONDS plus the retry delays, stays below the
+# CI step timeout, which is the outer backstop. The last progress line names
+# the phase.
 readonly NETWORK_ATTEMPTS=3
 readonly NETWORK_RETRY_DELAY_SECONDS=5
 readonly NETWORK_CONNECT_TIMEOUT_SECONDS=30
 readonly NETWORK_STALL_SECONDS=60
 readonly NETWORK_STALL_BYTES=1024
 readonly DOWNLOAD_MAX_SECONDS=120
+readonly FETCH_MAX_SECONDS=180
 
 # Pinned CPython runtime of the Hermes venv: a python-build-standalone
 # `install_only_stripped` build, downloaded and verified here rather than taken
@@ -60,7 +62,7 @@ if [[ "$install_root" != /* || "$install_root" == "/" || -e "$install_root" ]]; 
   fail "install root must be an unused absolute path other than /"
 fi
 
-for executable in curl git python3 tar uv; do
+for executable in curl git pkill python3 tar uv; do
   command -v "$executable" >/dev/null 2>&1 || fail "required executable is unavailable: $executable"
 done
 
@@ -267,13 +269,32 @@ python_root="$install_root/python"
 
 git init --quiet "$source_root" >&2
 git -C "$source_root" remote add origin "${repository}.git"
+# One fetch attempt, killed when it outlives FETCH_MAX_SECONDS. Polling the job
+# table keeps it free of a second process and works on bash 3.2.
+fetch_locked_tag() {
+  git -C "$source_root" -c credential.helper= -c core.askPass= \
+    -c http.lowSpeedLimit="$NETWORK_STALL_BYTES" -c http.lowSpeedTime="$NETWORK_STALL_SECONDS" \
+    fetch --quiet --no-tags --depth=1 origin "refs/tags/$tag:refs/tags/$tag" >&2 &
+  local fetch_pid=$! deadline=$((SECONDS + FETCH_MAX_SECONDS))
+  while [[ -n "$(jobs -rp)" ]]; do
+    if [[ "$SECONDS" -ge "$deadline" ]]; then
+      # git does not stop its transport helper when it is terminated.
+      pkill -TERM -P "$fetch_pid" 2>/dev/null || true
+      kill -TERM "$fetch_pid" 2>/dev/null || true
+      wait "$fetch_pid" 2>/dev/null || true
+      phase "the fetch attempt exceeded ${FETCH_MAX_SECONDS}s and was stopped"
+      return 1
+    fi
+    sleep 1
+  done
+  wait "$fetch_pid"
+}
+
 fetch_attempt=1
 phase "fetching the locked tag $tag (attempt $fetch_attempt of $NETWORK_ATTEMPTS)"
-until git -C "$source_root" -c credential.helper= -c core.askPass= \
-  -c http.lowSpeedLimit="$NETWORK_STALL_BYTES" -c http.lowSpeedTime="$NETWORK_STALL_SECONDS" \
-  fetch --quiet --no-tags --depth=1 origin "refs/tags/$tag:refs/tags/$tag" >&2; do
+until fetch_locked_tag; do
   [[ "$fetch_attempt" -lt "$NETWORK_ATTEMPTS" ]] \
-    || fail "cannot fetch the locked tag $tag from $repository after $NETWORK_ATTEMPTS attempts (a transfer below $NETWORK_STALL_BYTES bytes/s for $NETWORK_STALL_SECONDS s counts as stalled)"
+    || fail "cannot fetch the locked tag $tag from $repository after $NETWORK_ATTEMPTS attempts (at most ${FETCH_MAX_SECONDS}s each; a transfer below $NETWORK_STALL_BYTES bytes/s for $NETWORK_STALL_SECONDS s counts as stalled)"
   fetch_attempt=$((fetch_attempt + 1))
   sleep "$NETWORK_RETRY_DELAY_SECONDS"
   phase "fetching the locked tag $tag (attempt $fetch_attempt of $NETWORK_ATTEMPTS)"

@@ -144,7 +144,8 @@ pub(super) fn plan_remote_branch(
     };
     // Refusing here, before the pre-create hook, keeps a doomed request free of
     // hook side effects; `move_branch` repeats the check under the admin lock,
-    // which is what closes the race with a concurrent `git worktree add`.
+    // which excludes the daemon's own concurrent `git worktree add` (the lock is
+    // in-process, so a `git worktree add` run in a terminal is not excluded).
     if matches!(action, Action::FastForward { .. } | Action::Reset { .. }) {
         refuse_held_branch(repository, branch)?;
     }
@@ -317,8 +318,9 @@ pub(super) fn verify_start(
 /// Move `refs/heads/<branch>` from `old` to `new` while holding the repository's
 /// worktree admin lock, first keeping `old` as `refs/heads/<backup>` when asked.
 ///
-/// The lock keeps a concurrent `git worktree add` from checking the branch out
-/// between the in-use check and the update. A failed update is classified by the
+/// The lock keeps the daemon's own concurrent `git worktree add` from checking
+/// the branch out between the in-use check and the update; it is in-process, so
+/// a `git worktree add` run in a terminal is not excluded. A failed update is classified by the
 /// refs it left behind ([`settle`]), never by the failure itself: a transaction
 /// that timed out after committing, or one a concurrent identical request
 /// applied first, counts as applied.

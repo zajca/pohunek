@@ -362,8 +362,9 @@ warning) or the daemon's shutdown loses them. An input that ends a
 condition (a turn that opens, an agent that resumes, a session that stops)
 ends only what existed when it was produced: the registry stamps an event or a
 turn change when it publishes it, and the projector stamps a registry snapshot
-just before it reads the registry. A record that a provider hook created after that moment stays as it is,
-whether the input waited in a backlog or was only handled late behind a slow
+just before it reads the registry. A record that a provider hook created after that moment, or that
+a later hook report merged into, stays as it is (a record is ordered by its newest
+contribution), whether the input waited in a backlog or was only handled late behind a slow
 seed.
 
 Unread `turn_completed` rows are bounded per session. A newer
