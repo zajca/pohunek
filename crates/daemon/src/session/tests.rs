@@ -7665,6 +7665,13 @@ async fn create_acknowledged(
 /// The fake TUI shows no editable prompt, so the next create is parked before
 /// its readiness wait and its session is marked ready.
 fn arm_ready_mark(registry: &SessionRegistry) {
+    arm_ready_mark_after(registry, None);
+}
+
+/// [`arm_ready_mark`] that, given the state file of a scripted agent, also
+/// waits until the agent logged `ready`, so the typed input meets an agent
+/// that already disabled the terminal's echo.
+fn arm_ready_mark_after(registry: &SessionRegistry, agent_state: Option<PathBuf>) {
     let gate = hold_initial_input(registry);
     tokio::spawn({
         let registry = registry.clone();
@@ -7673,6 +7680,9 @@ fn arm_ready_mark(registry: &SessionRegistry) {
                 gate.entered.notified().await;
             })
             .await;
+            if let Some(state) = agent_state {
+                wait_for_file_contains(&state, "ready").await;
+            }
             let (ready_tx, ready_rx) = tokio::sync::watch::channel(true);
             let mut sessions = registry.inner.sessions.lock().await;
             let entry = sessions.values_mut().next().expect("committed session");
