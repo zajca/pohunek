@@ -393,8 +393,18 @@ async fn an_acceptance_without_input_is_never_activity_a_revision_an_event_or_a_
     assert_eq!(drain_agent_state(&mut events), 0, "no agent_state event");
     assert_eq!(rig.registry.inner.turns.latest(), turns, "no turn edge");
 
-    // The self-started record is older than the next Enter, so a waited input
-    // whose own hook never reports does not match it.
+    // A later turn of the agent's own, with output the detector reads as work,
+    // opens no turn either: no input armed it.
+    fs::write(&rig.noisy_flag, b"").expect("make the agent print output");
+    rig.self_start().await;
+    rig.wait_hook_runs(2).await;
+    rig.wait_imported(2).await;
+    rig.wait_working_evidence().await;
+    assert_eq!(rig.registry.inner.turns.latest(), turns, "no turn edge");
+    fs::remove_file(&rig.noisy_flag).expect("stop the output");
+
+    // The self-started records are older than the next Enter, so a waited input
+    // whose own hook never reports does not match them.
     fs::write(&rig.skip_flag, b"").expect("lose the next hook");
     let error = rig
         .input(vec![AgentActivity::Working], IMPATIENT_MS, Some(true))
