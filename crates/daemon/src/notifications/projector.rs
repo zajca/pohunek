@@ -199,9 +199,12 @@ async fn resync_from_registry(
     attention: &AttentionCoordinator,
     state: &mut ProjectorState,
 ) {
+    // Every snapshot stands for the registry as read here, however long the
+    // seeds of the sessions before it block.
+    let read_at = StdInstant::now();
     for session in sessions.list().await {
         state
-            .handle_session_snapshot_blocking(notifications, attention, &session)
+            .handle_session_snapshot_blocking(notifications, attention, &session, read_at)
             .await;
     }
 }
@@ -501,11 +504,14 @@ impl ProjectorState {
         }
     }
 
+    /// Projects `session`, a snapshot of the registry read at `read_at`; a
+    /// resolve it causes acts on what existed then.
     async fn handle_session_snapshot_blocking(
         &mut self,
         notifications: &NotificationService,
         attention: &AttentionCoordinator,
         session: &SessionInfo,
+        read_at: StdInstant,
     ) {
         if self.deferred.contains_key(&session.id)
             || !self
@@ -515,12 +521,16 @@ impl ProjectorState {
             self.defer(
                 &session.id,
                 DeferredInput::Snapshot(Box::new(session.clone())),
-                ResolveAsOf::now(),
+                ResolveAsOf::at(read_at),
             );
             return;
         }
-        self.project_session_snapshot(notifications, attention, session)
-            .await;
+        self.project_session_snapshot(
+            notifications,
+            &attention.as_of(ResolveAsOf::at(read_at)),
+            session,
+        )
+        .await;
     }
 
     async fn project_session_snapshot(
@@ -1262,8 +1272,9 @@ fn session_agent_kind(session: &SessionInfo) -> RuntimeRef {
 
 #[cfg(test)]
 mod tests {
-    use crate::notifications::ResolveAsOf;
+    use crate::notifications::{ResolveAsOf, SEED_RETRY_DELAY};
     use std::collections::BTreeMap;
+    use std::time::Instant as StdInstant;
 
     use protocol::{
         event, AgentActivity, Event, NotificationCreateParams, NotificationDeleteParams,
@@ -1473,6 +1484,107 @@ mod tests {
         assert!(
             backlog[0].arrived.monotonic > first.monotonic,
             "the collapsed snapshot resolves as of its own arrival"
+        );
+    }
+
+    /// A stopped snapshot, whose resolve acts on the attention records of its
+    /// session.
+    fn stopped_snapshot(session_id: &str) -> SessionInfo {
+        session_info(session_id, SessionState::Stopped, None)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_deferred_snapshot_resolves_as_of_the_moment_the_registry_was_read() {
+        let service = service("snapshot-deferred-read");
+        let (attention, _task) = spawn_coordinator(&service);
+        let mut projector = ProjectorState::default();
+        service.fail_projector_seeds(None, usize::MAX);
+
+        let read_at = StdInstant::now();
+        service
+            .create(provider_approval_params("s-1"))
+            .expect("create provider approval notification");
+        projector
+            .handle_session_snapshot_blocking(
+                &service,
+                &attention,
+                &stopped_snapshot("s-1"),
+                read_at,
+            )
+            .await;
+        service.fail_projector_seeds(None, 0);
+        tokio::time::advance(SEED_RETRY_DELAY + std::time::Duration::from_secs(1)).await;
+        projector.retry_deferred(&service, &attention).await;
+        settle().await;
+
+        let records = list(&service);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(
+            records[0].status,
+            NotificationStatus::Unread,
+            "the approval was minted after the registry was read"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_live_snapshot_resolves_as_of_the_moment_the_registry_was_read() {
+        let service = service("snapshot-live-read");
+        let (attention, _task) = spawn_coordinator(&service);
+        let mut projector = ProjectorState::default();
+
+        let read_at = StdInstant::now();
+        service
+            .create(provider_approval_params("s-1"))
+            .expect("create provider approval notification");
+        projector
+            .handle_session_snapshot_blocking(
+                &service,
+                &attention,
+                &stopped_snapshot("s-1"),
+                read_at,
+            )
+            .await;
+        settle().await;
+
+        let records = list(&service);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(
+            records[0].status,
+            NotificationStatus::Unread,
+            "the approval was minted after the registry was read"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_started_turn_edge_resolves_as_of_the_moment_it_happened() {
+        let service = service("edge-started-stamp");
+        enable_turn_completed(&service);
+        let (attention, _task) = spawn_coordinator(&service);
+        let mut projector = ProjectorState::default();
+
+        let happened = crate::session::EdgeStamp(StdInstant::now());
+        service
+            .create(provider_turn_params("s-1"))
+            .expect("create provider turn notification");
+        projector
+            .handle_turn_edge_blocking(
+                &service,
+                &attention,
+                crate::session::TurnEdge::Started(
+                    SessionId("s-1".to_owned()),
+                    crate::session::TurnId::numbered(1),
+                    happened,
+                ),
+            )
+            .await;
+        settle().await;
+
+        let records = list(&service);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(
+            records[0].status,
+            NotificationStatus::Unread,
+            "the turn report was minted after the turn opened"
         );
     }
 
