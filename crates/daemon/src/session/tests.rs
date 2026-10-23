@@ -8721,6 +8721,7 @@ async fn session_input_wait_timeout_recheck_rejects_evidence_after_deadline() {
         deadline,
         idle_requires_working: false,
         prompt_mark: None,
+        prompt_capable: false,
         prompt_opt_in: false,
     };
     tokio::time::advance(Duration::from_millis(11)).await;
@@ -8779,6 +8780,7 @@ async fn session_input_wait_retains_pre_deadline_evidence_after_late_same_activi
         deadline,
         idle_requires_working: false,
         prompt_mark: None,
+        prompt_capable: false,
         prompt_opt_in: false,
     };
     tokio::time::advance(Duration::from_millis(5)).await;
@@ -10800,6 +10802,7 @@ async fn session_input_wait_resnapshots_after_broadcast_lag() {
         deadline: tokio::time::Instant::now() + Duration::from_millis(250),
         idle_requires_working: false,
         prompt_mark: None,
+        prompt_capable: false,
         prompt_opt_in: false,
     };
 
@@ -10866,6 +10869,7 @@ async fn session_input_wait_uses_rapid_target_event_after_latest_state_changes()
         deadline: tokio::time::Instant::now() + Duration::from_millis(250),
         idle_requires_working: false,
         prompt_mark: None,
+        prompt_capable: false,
         prompt_opt_in: false,
     };
 
@@ -11011,6 +11015,7 @@ async fn an_input_wait_into_an_idle_session_settles_on_the_restated_idle() {
         deadline: tokio::time::Instant::now() + Duration::from_secs(5),
         idle_requires_working: false,
         prompt_mark: None,
+        prompt_capable: false,
         prompt_opt_in: false,
     };
 
@@ -11064,6 +11069,7 @@ async fn a_wait_on_one_session_settles_through_a_burst_of_another_sessions_event
         deadline: tokio::time::Instant::now() + Duration::from_secs(5),
         idle_requires_working: false,
         prompt_mark: None,
+        prompt_capable: false,
         prompt_opt_in: false,
     };
     let waiting = {
@@ -11161,6 +11167,7 @@ async fn session_input_wait_rejects_replaced_runtime() {
         deadline: tokio::time::Instant::now() + Duration::from_millis(250),
         idle_requires_working: false,
         prompt_mark: None,
+        prompt_capable: false,
         prompt_opt_in: false,
     };
     let replacement = {
@@ -11215,6 +11222,7 @@ async fn session_input_wait_rejects_runtime_exit() {
         deadline: tokio::time::Instant::now() + Duration::from_millis(250),
         idle_requires_working: false,
         prompt_mark: None,
+        prompt_capable: false,
         prompt_opt_in: false,
     };
     registry.stop(&created.id).await.expect("stop session");
@@ -11258,6 +11266,7 @@ async fn duplicate_agent_report_sequence_is_idempotent_for_input_waits() {
         deadline: tokio::time::Instant::now() + Duration::from_millis(250),
         idle_requires_working: false,
         prompt_mark: None,
+        prompt_capable: false,
         prompt_opt_in: false,
     };
     assert!(

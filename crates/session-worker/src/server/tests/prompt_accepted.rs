@@ -295,3 +295,26 @@ async fn the_acknowledgement_carries_the_submit_mark_only_from_protocol_8() {
     assert_eq!(older.bytes_written, 6);
     stop(&server, &pty).await;
 }
+
+#[tokio::test]
+async fn the_acknowledgement_carries_no_submit_mark_for_a_runtime_without_prompt_reports() {
+    let (server, pty, _directory) = launch_claim_fixture().await;
+    let (connection, lease_id) = controller_connection(&server);
+
+    for (index, launch_runtime) in ["shell", "codex"].into_iter().enumerate() {
+        server.shared.state.lock().await.launch_agent_base = Some(launch_runtime.to_owned());
+        let ack = write(
+            &server,
+            &connection,
+            &lease_id,
+            &format!("input-lease-initialize-{}", index + 1),
+        )
+        .await;
+        assert_eq!(
+            ack.submit_mark_ns, None,
+            "{launch_runtime} reports no prompt acceptance"
+        );
+        assert_eq!(ack.bytes_written, 6);
+    }
+    stop(&server, &pty).await;
+}

@@ -178,7 +178,10 @@ was refused or lost ends in `session_input_timeout`, which then names both
 missing kinds of evidence, and `session new --input-ack-timeout-ms` reports
 `prompt_delivered: false`. A prompt the agent starts on its own right at the
 moment Enter is written can make the wait succeed on that report: the typed
-prompt is then submitted or queued.
+prompt is then submitted or queued. The report also precedes any other
+`UserPromptSubmit` hook that blocks the prompt, since Claude runs the hooks of
+one event in parallel; wait for `working` when the work itself must have started.
+The `prompt_accepted` field is absent for sessions of other runtimes.
 Generic typed Rust and TypeScript `Client.call` paths route waited input through
 the same helper, so they cannot bypass this validation. SIGINT or SIGTERM during
 a waited CLI input returns JSON code `session_input_interrupted` without a retry

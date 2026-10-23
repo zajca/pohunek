@@ -52,6 +52,10 @@ pub(super) struct InputSubmission {
     /// the boundary: a busy agent queues the input, and its own `working`
     /// evidence already answers the wait.
     pub(super) prompt_mark: Option<u64>,
+    /// The worker reported a submit mark, so the session's launch runtime
+    /// reports prompt acceptances. Sessions of other runtimes never carry
+    /// `prompt_accepted` in a result.
+    pub(super) prompt_capable: bool,
     /// The caller opted in to a prompt acceptance satisfying a `working`
     /// target and to `prompt_accepted` in the result.
     pub(super) prompt_opt_in: bool,
@@ -196,7 +200,8 @@ impl SessionRegistry {
         let mut submission = self
             .write_waited_input(&params.session_id, &params.text, deadline)
             .await?;
-        submission.prompt_opt_in = wait.allow_prompt_accepted == Some(true);
+        submission.prompt_opt_in =
+            wait.allow_prompt_accepted == Some(true) && submission.prompt_capable;
         self.input_activity_snapshot(&params.session_id, Some(&submission.runtime))
             .await?;
         self.await_input_settled(&params.session_id, wait, submission, &mut events)
@@ -254,7 +259,7 @@ impl SessionRegistry {
         self.commit_initial_input(session_id).await?;
         submission.deadline =
             tokio::time::Instant::now() + Duration::from_millis(u64::from(ack_timeout_ms));
-        submission.prompt_opt_in = true;
+        submission.prompt_opt_in = submission.prompt_capable;
         let wait = SessionInputWait {
             until: Some(vec![AgentActivity::Working]),
             timeout_ms: Some(ack_timeout_ms),
@@ -514,6 +519,7 @@ impl SessionRegistry {
             deadline,
             idle_requires_working: false,
             prompt_mark: submission_prompt_mark(&boundary),
+            prompt_capable: boundary.prompt_mark.is_some(),
             prompt_opt_in: false,
         })
     }
@@ -645,6 +651,7 @@ impl SessionRegistry {
             deadline,
             idle_requires_working: true,
             prompt_mark: submission_prompt_mark(&boundary),
+            prompt_capable: boundary.prompt_mark.is_some(),
             prompt_opt_in: false,
         })
     }
@@ -1179,6 +1186,12 @@ fn submission_prompt_mark(boundary: &InputActivitySnapshot) -> Option<u64> {
 
 /// Whether the entry holds a prompt acceptance of the submission's runtime
 /// that the agent reported after the submit mark and before the deadline.
+///
+/// An acceptance proves the agent started its `UserPromptSubmit` hooks, not
+/// that the prompt reached the model: a parallel user hook that blocks the
+/// prompt can still discard it, and a turn the agent starts on its own before
+/// reading Enter is indistinguishable. Callers that need the work to have
+/// started wait for `working` activity.
 fn prompt_acceptance_recorded(entry: &SessionEntry, submission: &InputSubmission) -> bool {
     let Some(mark) = submission.prompt_mark else {
         return false;

@@ -1739,6 +1739,21 @@ fn validate_data_start(
     }
 }
 
+/// Whether the launch runtime's hook schema admits prompt acceptances, so a
+/// write receipt may carry a submit mark for it.
+async fn launch_reports_prompt_acceptance(shared: &Shared) -> bool {
+    let state = shared.state.lock().await;
+    state.launch_agent_base.as_deref().is_some_and(|provider| {
+        admit_hook(
+            state.hook_schema,
+            HookAction::PromptAccepted,
+            provider,
+            Some(provider),
+        )
+        .is_ok()
+    })
+}
+
 async fn write_request(
     shared: &Shared,
     connection: &Connection,
@@ -1776,7 +1791,8 @@ async fn write_request(
     .map_err(input_control_error)?;
     let reports_prompt_evidence = connection
         .selected_version
-        .is_some_and(|version| version >= protocol::PROMPT_EVIDENCE_VERSION);
+        .is_some_and(|version| version >= protocol::PROMPT_EVIDENCE_VERSION)
+        && launch_reports_prompt_acceptance(shared).await;
     Ok(ResponseKind::WriteCompleted {
         acknowledgement: WriteAck {
             write_id,
@@ -4505,7 +4521,7 @@ where
                 },
                 peer,
             )
-            .await?;
+            .await;
             return writer
                 .write(&HookResponse {
                     ok,
@@ -4648,16 +4664,13 @@ struct PromptAcceptedClaim<'a> {
 /// row: the daemon reads the sequence from the next inspect snapshot as
 /// delivery evidence for a submitted prompt. The stored sequence is clamped to
 /// the worker clock, so a forged future reading cannot outrank later reports.
-///
-/// # Errors
-///
-/// Returns an error when the runtime has no hook schema ancestry after
-/// admission.
+/// Returns whether the report was applied; a rejected report is logged and
+/// answered `ok: false`.
 async fn apply_prompt_accepted(
     shared: &Shared,
     claim: PromptAcceptedClaim<'_>,
     peer: &PeerContext,
-) -> Result<bool, WorkerError> {
+) -> bool {
     let mut guard = shared.state.lock().await;
     let state = &mut *guard;
     let current_runtime = state.worker_instance_id.as_ref().map(ToString::to_string);
@@ -4675,7 +4688,7 @@ async fn apply_prompt_accepted(
     .or_else(|| (!valid_identity_expiry(claim.expires_at)).then_some(RejectReason::ClaimExpired));
     if let Some(reason) = inadmissible {
         reject_identity(shared, "prompt_accepted", reason, peer);
-        return Ok(false);
+        return false;
     }
     let process_valid = admitted.is_ok_and(|schema| {
         state.pty.as_ref().is_some_and(|pty| {
@@ -4691,7 +4704,7 @@ async fn apply_prompt_accepted(
         })
     });
     if !process_valid {
-        return Ok(false);
+        return false;
     }
     let rejection = match state.journal.launch_identity.as_ref() {
         None => Some(RejectReason::LaunchIdentityPending),
@@ -4709,7 +4722,7 @@ async fn apply_prompt_accepted(
     };
     if let Some(reason) = rejection {
         reject_identity(shared, "prompt_accepted", reason, peer);
-        return Ok(false);
+        return false;
     }
     state.prompt_accepted_sequence = Some(crate::background::clamp_mark(claim.sequence));
     event!(
@@ -4720,7 +4733,7 @@ async fn apply_prompt_accepted(
         prompt.outcome = "applied",
         "prompt acceptance recorded",
     );
-    Ok(true)
+    true
 }
 
 /// Time an identity report spent before its answer, split by cause.

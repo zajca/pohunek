@@ -41,7 +41,8 @@ export type SessionInputResult = {
   submitted?: boolean;
   /**
    * Present only when the request set
-   * [`SessionInputWait::allow_prompt_accepted`]. `true` when the agent's
+   * [`SessionInputWait::allow_prompt_accepted`] and the session's launch
+   * runtime reports prompt acceptances (Claude). `true` when the agent's
    * prompt-submit hook reported acceptance of this input before the result;
    * the activity fields are then absent unless activity evidence also
    * arrived.

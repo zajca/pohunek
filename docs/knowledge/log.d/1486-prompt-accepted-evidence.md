@@ -18,7 +18,8 @@
   --input-ack-timeout-ms` counts it as the acknowledgement. The CLI always opts
   in and prints `prompt_accepted=true source=prompt-submit-hook`. A daemon that
   predates the field answers on activity alone; a protocol 3 connection drops
-  the option. Without any evidence the wait ends in `session_input_timeout`
+  the option. Only Claude sessions carry the field. A parallel user hook that
+  blocks the prompt can still discard it after the report. Without any evidence the wait ends in `session_input_timeout`
   whose message names both kinds of evidence.
 - Worker protocol 8 adds `WriteAck.submit_mark_ns` and
   `InspectSnapshot.prompt_accepted_sequence`; a version-7 connection sees

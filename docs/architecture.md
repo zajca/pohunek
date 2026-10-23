@@ -1303,8 +1303,9 @@ above that mark, it names the submission's runtime, the daemon received it
 before the deadline, and the agent was not `working` at the boundary: a busy
 agent queues the input, and its own `working` evidence answers. The result then
 carries `prompt_accepted: true` and no activity, source or revision, because
-no activity was observed. An opted-in result states `prompt_accepted` whatever
-answered it. An acceptance never answers an `idle` target and never stands in
+no activity was observed. An opted-in result of a Claude session states `prompt_accepted` whatever
+answered it; a session of another runtime gets no submit mark, no field and the
+generic timeout message. An acceptance never answers an `idle` target and never stands in
 for the `working` evidence delayed-submit framing needs first: the daemon
 imports it up to one 100 ms poll after the agent read the prompt, before the
 agent drew a spinner, so an `idle` restatement in that gap would read as a
@@ -1313,7 +1314,11 @@ deadline with `session_input_timeout`, and for an opted-in `working` wait the
 message names both. `session new --input-ack-timeout-ms` counts an acceptance
 as the acknowledgement. A turn the agent starts on its own between the Enter
 write and the agent reading Enter makes the wait succeed on that report; the
-typed prompt is then queued, so an acceptance means submitted or queued.
+typed prompt is then queued, so an acceptance means submitted or queued. The
+hook proves only that Claude started its `UserPromptSubmit` hooks: hooks of one
+event run in parallel, so another user hook that blocks the prompt can discard
+it after the report. Callers that need the work to have started wait for
+`working` activity.
 
 ### Hermes operator plugin
 

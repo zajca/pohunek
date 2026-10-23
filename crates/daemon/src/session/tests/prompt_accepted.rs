@@ -664,3 +664,92 @@ async fn an_acceptance_between_the_body_and_enter_is_not_this_submissions() {
     assert_eq!(error.code, "session_input_timeout");
     rig.finish().await;
 }
+
+#[tokio::test]
+async fn an_acceptance_never_arms_a_turn_for_output_the_agent_prints_on_its_own() {
+    let rig = Rig::start("prompt-no-turn", 0).await;
+    rig.registry
+        .turn_events()
+        .flap_window_handle()
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut edges = rig
+        .registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
+
+    // The agent's own prompt reaches the hook and is imported; a later prompt
+    // of its own makes it print output the detector reads as work, and it
+    // finishes. No input armed a turn, so the session opens and ends none.
+    rig.self_start().await;
+    rig.wait_hook_runs(1).await;
+    rig.wait_imported(1).await;
+    fs::write(&rig.noisy_flag, b"").expect("make the agent print output");
+    rig.self_start().await;
+    rig.wait_hook_runs(2).await;
+    rig.wait_working_evidence().await;
+    fs::remove_file(&rig.noisy_flag).expect("stop the output");
+    rig.registry
+        .record_activity(rig.id(), transition(AgentActivity::Idle))
+        .await;
+
+    assert_eq!(started_turns_and_ends(&mut edges), (0, 0));
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn a_session_of_another_runtime_gets_neither_the_field_nor_the_acceptance_wording() {
+    let rig = Rig::new("prompt-other-runtime", 0);
+    let session = shell_session(&rig.registry).await;
+    let wait = |timeout_ms| protocol::SessionInputParams {
+        session_id: session.id.clone(),
+        text: TYPED.to_owned(),
+        wait: Some(protocol::SessionInputWait {
+            until: Some(vec![AgentActivity::Working]),
+            timeout_ms: Some(timeout_ms),
+            allow_prompt_accepted: Some(true),
+        }),
+    };
+
+    // The shell's own activity may answer the wait or not; either way no
+    // acceptance is involved.
+    match rig.registry.input(wait(IMPATIENT_MS)).await {
+        Ok(result) => assert_eq!(
+            result.prompt_accepted, None,
+            "the runtime has no such field"
+        ),
+        Err(error) => {
+            assert_eq!(error.code, "session_input_timeout");
+            assert!(
+                !error.msg.contains("prompt acceptance"),
+                "the message names evidence the runtime cannot produce: {}",
+                error.msg
+            );
+        }
+    }
+
+    let task = {
+        let registry = rig.registry.clone();
+        let params = wait(PATIENT_MS);
+        tokio::spawn(async move { registry.input(params).await })
+    };
+    while !task.is_finished() {
+        rig.registry
+            .record_activity(&session.id, transition(AgentActivity::Working))
+            .await;
+        rig.registry
+            .record_activity(&session.id, transition(AgentActivity::Idle))
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let result = task
+        .await
+        .expect("wait task joins")
+        .expect("activity answers the wait");
+    assert_eq!(result.activity, Some(AgentActivity::Working));
+    assert_eq!(
+        result.prompt_accepted, None,
+        "the runtime has no such field"
+    );
+    let _ = rig.registry.stop(&session.id).await;
+}
