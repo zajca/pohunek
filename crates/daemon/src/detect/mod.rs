@@ -2933,6 +2933,113 @@ mod tests {
         );
     }
 
+    /// The captured classic working frame of Hermes 0.20.0
+    /// (`compat/hermes/goldens/working.txt`): the staff prompt carries the
+    /// placeholder Hermes paints into an empty composer while a turn runs, and
+    /// the rule chrome wraps one cell onto a second row.
+    fn hermes_working_frame() -> String {
+        let rule = "\u{2500}".repeat(99);
+        format!(
+            "\x1b[2J\x1b[H answer\r\n\r\n \u{2695} pohunek-compat-v1 \u{2502} 0/64K \u{2502} [\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}\u{2591}] 0%\r\n\r\n{rule}\r\n\u{2500}\r\n\r\n\u{2695} \u{276f} msg=interrupt \u{b7} /queue \u{b7} /bg \u{b7} /steer \u{b7} Ctrl+C cancel\r\n\r\n{rule}\r\n\u{2500}"
+        )
+    }
+
+    #[test]
+    fn a_hermes_working_prompt_with_its_interrupt_placeholder_reads_working() {
+        let started_at = instant();
+        let mut detector = steady_detector(&RuntimeRef::hermes(), 14, 100, started_at);
+
+        let transitions = detector.feed(started_at, hermes_working_frame().as_bytes());
+
+        assert_eq!(
+            transitions,
+            vec![transition(AgentActivity::Working, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn a_hermes_compact_working_prompt_without_the_arrow_reads_working() {
+        let started_at = instant();
+        let mut detector = steady_detector(&RuntimeRef::hermes(), 10, 60, started_at);
+
+        let transitions = detector.feed(
+            started_at,
+            "\x1b[2J\x1b[Hanswer\r\n\u{2695} msg=interrupt \u{b7} /queue \u{b7} /bg \u{b7} /steer \u{b7} Ctrl+C cancel"
+                .as_bytes(),
+        );
+
+        assert_eq!(
+            transitions,
+            vec![transition(AgentActivity::Working, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn a_wrapped_hermes_interrupt_placeholder_reads_working_at_every_narrow_width() {
+        for cols in [28_u16, 40, 54, 55, 60] {
+            let started_at = instant();
+            let mut detector = steady_detector(&RuntimeRef::hermes(), 10, cols, started_at);
+
+            let transitions = detector.feed(
+                started_at,
+                "\x1b[2J\x1b[Hanswer\r\n\u{2695} msg=interrupt \u{b7} /queue \u{b7} /bg \u{b7} /steer \u{b7} Ctrl+C cancel"
+                    .as_bytes(),
+            );
+
+            assert_eq!(
+                transitions,
+                vec![transition(AgentActivity::Working, StateSource::Screen)],
+                "{cols} columns"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrapped_hermes_interrupt_placeholder_in_the_transcript_never_reads_working() {
+        let started_at = instant();
+        let mut detector = steady_detector(&RuntimeRef::hermes(), 14, 40, started_at);
+        let rule = "\u{2500}".repeat(30);
+
+        // The quote wraps over two rows and is repainted above an idle prompt
+        // that was drawn first, then more output follows the quote.
+        let transitions = detector.feed(
+            started_at,
+            format!(
+                "\x1b[2J\x1b[10;1H{rule}\r\n\u{276f} \r\n{rule}\x1b[1;1H\u{2695} msg=interrupt \u{b7} /queue \u{b7} /bg \u{b7} /steer \u{b7} Ctrl+C cancel\r\nquoted above"
+            )
+            .as_bytes(),
+        );
+
+        assert_eq!(
+            transitions,
+            vec![transition(AgentActivity::Idle, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn a_hermes_interrupt_placeholder_in_the_transcript_above_the_idle_prompt_never_reads_working()
+    {
+        let started_at = instant();
+        let mut detector = steady_detector(&RuntimeRef::hermes(), 14, 100, started_at);
+        let rule = "\u{2500}".repeat(60);
+
+        // The idle prompt is drawn first and the assistant's quote of the
+        // working line is repainted above it, so the quote is never the last
+        // non-empty line.
+        let transitions = detector.feed(
+            started_at,
+            format!(
+                "\x1b[2J\x1b[10;1H{rule}\r\n\u{276f} \r\n{rule}\x1b[1;1H\u{2695} \u{276f} msg=interrupt \u{b7} /queue \u{b7} /bg \u{b7} /steer \u{b7} Ctrl+C cancel\r\nquoted above"
+            )
+            .as_bytes(),
+        );
+
+        assert_eq!(
+            transitions,
+            vec![transition(AgentActivity::Idle, StateSource::Screen)]
+        );
+    }
+
     #[test]
     fn a_hermes_idle_redraw_over_an_old_working_prompt_line_never_latches_working() {
         let started_at = instant();

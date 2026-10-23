@@ -82,16 +82,17 @@ const GOLDEN_MANIFEST: &str = "compat/hermes/builtin-v0.34/detect.toml";
 const GOLDEN_ACTIVE_TURN_PROMPT: &str = "# Hermes staff symbol. The bottom-lines bound prevents old transcript chrome\n# from keeping the session working after the prompt returns to idle.\n[[rules]]\nid = \"active_turn_prompt\"\nstate = \"working\"\npriority = 700\nregion = \"bottom_non_empty_lines(8)\"\nline_regex = ['^\\s*⚕\\s+(?:❯|>|\\$|#|›|»|→)\\s*$']\n";
 
 /// The one rule in which the package deliberately diverges from the built-in
-/// copy: the bare staff prompt counts as working only as the last non-empty
-/// line, so an old transcript prompt exposed by a partial idle redraw never
-/// reads as a working frame (#1486).
-const PACKAGE_ACTIVE_TURN_PROMPT: &str = "# Hermes staff symbol. The prompt must be the last non-empty line apart from\n# the rule chrome drawn below it: old transcript chrome that holds a bare staff\n# prompt neither keeps the session working after the prompt returns to idle\n# nor reads as a working frame while an idle redraw has erased and not yet\n# reprinted the lines below it.\n[[rules]]\nid = \"active_turn_prompt\"\nstate = \"working\"\npriority = 700\nregion = \"bottom_non_empty_lines(8)\"\nregex = ['(?:\\A|\\n)[ \\t]*⚕[ \\t]+(?:❯|>|\\$|#|›|»|→)[ \\t]*(?:\\n[ \\t]*─+[ \\t]*)*\\z']\n";
+/// copy: the staff prompt, bare or followed by the interrupt placeholder
+/// Hermes paints into an empty composer during a turn, counts as working only
+/// as the last non-empty line, so an old transcript prompt exposed by a partial
+/// idle redraw never reads as a working frame (#1486, #1524).
+const PACKAGE_ACTIVE_TURN_PROMPT: &str = "# Hermes staff symbol, and an empty composer shows the interrupt placeholder\n# after it (the compact layout drops the arrow, and a terminal of 28 to 54\n# columns wraps the placeholder onto a second row, which the second pattern\n# lists split point by split point). The prompt must be the last\n# non-empty line apart from the rule chrome drawn below it: old transcript\n# chrome that holds a staff prompt neither keeps the session working after the\n# prompt returns to idle nor reads as a working frame while an idle redraw has\n# erased and not yet reprinted the lines below it.\n[[rules]]\nid = \"active_turn_prompt\"\nstate = \"working\"\npriority = 700\nregion = \"bottom_non_empty_lines(8)\"\nany = [\n  { regex = ['(?:\\A|\\n)[ \\t]*⚕[ \\t]+(?:(?:❯|>|\\$|#|›|»|→)[ \\t]*(?:msg=interrupt[^\\n]*)?|msg=interrupt[^\\n]*)(?:\\n[ \\t]*─+[ \\t]*)*\\z'] },\n  { regex = ['(?:\\A|\\n)[ \\t]*⚕[ \\t]+(?:m[ \\t]*\\n[ \\t]*sg=interrupt · /queue · /bg · /steer · Ctrl\\+C cancel|ms[ \\t]*\\n[ \\t]*g=interrupt · /queue · /bg · /steer · Ctrl\\+C cancel|msg[ \\t]*\\n[ \\t]*=interrupt · /queue · /bg · /steer · Ctrl\\+C cancel|msg=[ \\t]*\\n[ \\t]*interrupt · /queue · /bg · /steer · Ctrl\\+C cancel|msg=i[ \\t]*\\n[ \\t]*nterrupt · /queue · /bg · /steer · Ctrl\\+C cancel|msg=in[ \\t]*\\n[ \\t]*terrupt · /queue · /bg · /steer · Ctrl\\+C cancel|msg=int[ \\t]*\\n[ \\t]*errupt · /queue · /bg · /steer · Ctrl\\+C cancel|msg=inte[ \\t]*\\n[ \\t]*rrupt · /queue · /bg · /steer · Ctrl\\+C cancel|msg=inter[ \\t]*\\n[ \\t]*rupt · /queue · /bg · /steer · Ctrl\\+C cancel|msg=interr[ \\t]*\\n[ \\t]*upt · /queue · /bg · /steer · Ctrl\\+C cancel|msg=interru[ \\t]*\\n[ \\t]*pt · /queue · /bg · /steer · Ctrl\\+C cancel|msg=interrup[ \\t]*\\n[ \\t]*t · /queue · /bg · /steer · Ctrl\\+C cancel|msg=interrupt[ \\t]*\\n[ \\t]*· /queue · /bg · /steer · Ctrl\\+C cancel|msg=interrupt ·[ \\t]*\\n[ \\t]*/queue · /bg · /steer · Ctrl\\+C cancel|msg=interrupt · /[ \\t]*\\n[ \\t]*queue · /bg · /steer · Ctrl\\+C cancel|msg=interrupt · /q[ \\t]*\\n[ \\t]*ueue · /bg · /steer · Ctrl\\+C cancel|msg=interrupt · /qu[ \\t]*\\n[ \\t]*eue · /bg · /steer · Ctrl\\+C cancel|msg=interrupt · /que[ \\t]*\\n[ \\t]*ue · /bg · /steer · Ctrl\\+C cancel|msg=interrupt · /queu[ \\t]*\\n[ \\t]*e · /bg · /steer · Ctrl\\+C cancel|msg=interrupt · /queue[ \\t]*\\n[ \\t]*· /bg · /steer · Ctrl\\+C cancel|msg=interrupt · /queue ·[ \\t]*\\n[ \\t]*/bg · /steer · Ctrl\\+C cancel|msg=interrupt · /queue · /[ \\t]*\\n[ \\t]*bg · /steer · Ctrl\\+C cancel|msg=interrupt · /queue · /b[ \\t]*\\n[ \\t]*g · /steer · Ctrl\\+C cancel|msg=interrupt · /queue · /bg[ \\t]*\\n[ \\t]*· /steer · Ctrl\\+C cancel|msg=interrupt · /queue · /bg ·[ \\t]*\\n[ \\t]*/steer · Ctrl\\+C cancel|msg=interrupt · /queue · /bg · /[ \\t]*\\n[ \\t]*steer · Ctrl\\+C cancel|msg=interrupt · /queue · /bg · /s[ \\t]*\\n[ \\t]*teer · Ctrl\\+C cancel|msg=interrupt · /queue · /bg · /st[ \\t]*\\n[ \\t]*eer · Ctrl\\+C cancel|msg=interrupt · /queue · /bg · /ste[ \\t]*\\n[ \\t]*er · Ctrl\\+C cancel|msg=interrupt · /queue · /bg · /stee[ \\t]*\\n[ \\t]*r · Ctrl\\+C cancel|msg=interrupt · /queue · /bg · /steer[ \\t]*\\n[ \\t]*· Ctrl\\+C cancel|msg=interrupt · /queue · /bg · /steer ·[ \\t]*\\n[ \\t]*Ctrl\\+C cancel|msg=interrupt · /queue · /bg · /steer · C[ \\t]*\\n[ \\t]*trl\\+C cancel|msg=interrupt · /queue · /bg · /steer · Ct[ \\t]*\\n[ \\t]*rl\\+C cancel|msg=interrupt · /queue · /bg · /steer · Ctr[ \\t]*\\n[ \\t]*l\\+C cancel|msg=interrupt · /queue · /bg · /steer · Ctrl[ \\t]*\\n[ \\t]*\\+C cancel|msg=interrupt · /queue · /bg · /steer · Ctrl\\+[ \\t]*\\n[ \\t]*C cancel|msg=interrupt · /queue · /bg · /steer · Ctrl\\+C[ \\t]*\\n[ \\t]*cancel|msg=interrupt · /queue · /bg · /steer · Ctrl\\+C c[ \\t]*\\n[ \\t]*ancel|msg=interrupt · /queue · /bg · /steer · Ctrl\\+C ca[ \\t]*\\n[ \\t]*ncel|msg=interrupt · /queue · /bg · /steer · Ctrl\\+C can[ \\t]*\\n[ \\t]*cel|msg=interrupt · /queue · /bg · /steer · Ctrl\\+C canc[ \\t]*\\n[ \\t]*el|msg=interrupt · /queue · /bg · /steer · Ctrl\\+C cance[ \\t]*\\n[ \\t]*l)[ \\t]*(?:\\n[ \\t]*─+[ \\t]*)*\\z'] },\n]\n";
 
 /// Package id the descriptor declares.
 const PACKAGE_ID: &str = "pohunek.runtime.hermes";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.0.2";
+const PACKAGE_VERSION: &str = "1.0.3";
 
 /// Profile that pins the runtime package in the installation scenario.
 const PROFILE: &str = "hermes-package-test";
@@ -2076,14 +2077,14 @@ async fn an_unusable_selection_without_an_install_is_a_typed_source_error() {
     let hermes = HermesFixture::new(&harness.env);
 
     let mut alternate = package_entries();
-    set_version(&mut alternate, "1.0.3");
+    set_version(&mut alternate, "1.0.4");
     let (bytes, alternate_digest) = archive_of(&alternate);
-    let archive = write_archive(&harness, "hermes-1.0.3.tar.zst", &bytes);
+    let archive = write_archive(&harness, "hermes-1.0.4.tar.zst", &bytes);
     let catalog = write_catalog(
         &harness,
         &key,
         2,
-        vec![catalog_entry("1.0.3", &alternate_digest)],
+        vec![catalog_entry("1.0.4", &alternate_digest)],
     );
     update_package(&harness, &archive, &catalog, &alternate_digest).await;
     let (code, removed) = harness
@@ -2312,17 +2313,17 @@ async fn update_moves_an_install_to_the_newly_selected_package() {
     assert_eq!(hermes.status(&harness).await["outdated"], false);
 
     let mut second = package_entries();
-    set_version(&mut second, "1.0.3");
+    set_version(&mut second, "1.0.4");
     let mut skill = entry(&second, &format!("operator/{SKILL_PATH}")).to_vec();
     skill.extend_from_slice(b"\n<!-- second package version -->\n");
     replace_operator_file(&mut second, SKILL_PATH, skill.clone());
     let (bytes, second_digest) = archive_of(&second);
-    let archive = write_archive(&harness, "hermes-1.0.3.tar.zst", &bytes);
+    let archive = write_archive(&harness, "hermes-1.0.4.tar.zst", &bytes);
     let catalog = write_catalog(
         &harness,
         &key,
         2,
-        vec![catalog_entry("1.0.3", &second_digest)],
+        vec![catalog_entry("1.0.4", &second_digest)],
     );
     update_package(&harness, &archive, &catalog, &second_digest).await;
     let status = hermes.status(&harness).await;
