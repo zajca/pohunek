@@ -580,7 +580,7 @@ async fn session_new_reports_prompt_delivered_from_the_acceptance_or_not_at_all(
         if lose_hook {
             fs::write(&rig.skip_flag, b"").expect("lose the hook");
         }
-        arm_ready_mark(&rig.registry);
+        arm_ready_mark_after(&rig.registry, Some(rig.state.clone()));
         let mut create = rig.params();
         create.input = Some(TYPED.to_owned());
         create.input_ack_timeout_ms = Some(if lose_hook { IMPATIENT_MS } else { PATIENT_MS });
