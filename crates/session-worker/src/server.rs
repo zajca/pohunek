@@ -7595,6 +7595,10 @@ fn is_descendant_with(
 /// the provider name only on the link, never on the resolved file.
 const NATIVE_VERSIONS_DIRECTORY: &str = "versions";
 
+/// Suffix the Linux kernel adds to the `/proc/<pid>/exe` target of a process
+/// whose executable file was unlinked.
+const DELETED_EXECUTABLE_SUFFIX: &str = " (deleted)";
+
 /// Whether `executable`, already symlink-resolved, is a release image of a
 /// native installer: `.../<provider>/versions/<release>` with a release that
 /// starts with a digit and holds only version characters.
@@ -7606,10 +7610,15 @@ const NATIVE_VERSIONS_DIRECTORY: &str = "versions";
 /// siblings of the version directory (`.../claude/versions/cache.db`) out.
 fn is_native_release_image(executable: &Path, provider: &str) -> bool {
     let provider = provider.to_ascii_lowercase();
+    // Linux appends this to the `/proc/<pid>/exe` target once the running file
+    // is unlinked, which the installer does to a release it replaced.
     let release_name = executable
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or_default();
+    let release_name = release_name
+        .strip_suffix(DELETED_EXECUTABLE_SUFFIX)
+        .unwrap_or(release_name);
     let mut directories = executable.ancestors().skip(1).map(|directory| {
         directory
             .file_name()
@@ -7726,10 +7735,11 @@ fn is_provider_child_of_launch(
 /// Selects the launch process for `provider` among `root` and its descendants.
 ///
 /// A process qualifies only when its executable file name contains the provider
-/// name. Interpreters (`node`, `bun`) never qualify by themselves, and neither
-/// does an interpreter's script argument: a wrapper install is accepted only
-/// when the process image that runs is itself named for the provider (a native
-/// binary or a launcher named for it). Anything else yields `None`, which
+/// name or it is a release image of the provider's native installer
+/// ([`is_native_release_image`]). Interpreters (`node`, `bun`) never qualify by
+/// themselves, and neither does an interpreter's script argument: a wrapper
+/// install is accepted only when the process image that runs is itself named
+/// for the provider (a native binary or a launcher named for it). Anything else yields `None`, which
 /// leaves the claim unaccepted. This is the [`LaunchProcess::NamedForProvider`]
 /// rule; a schema declaring [`LaunchProcess::FrozenRootEntrypoint`] designates
 /// the frozen PTY root instead.

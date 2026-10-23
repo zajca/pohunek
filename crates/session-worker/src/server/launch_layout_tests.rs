@@ -608,6 +608,8 @@ fn claude_images_of_the_npm_and_the_native_installer_layouts_are_selected() {
         "/home/dev/.local/share/claude/versions/2.1.309",
         "/Users/dev/.local/share/claude/versions/2.1.309",
         "/Users/dev/.local/share/Claude/versions/2.1.309-beta.1+7",
+        // The kernel's name for an image the installer unlinked while it ran.
+        "/home/dev/.local/share/claude/versions/2.1.309 (deleted)",
     ] {
         let table = table_with_agent(executable, &["claude"]);
         assert_eq!(
