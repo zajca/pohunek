@@ -22711,6 +22711,32 @@ generation "$1"
             let _ = fixture.registry.stop(&created.id).await;
         }
 
+        /// 1418 row 7: a snapshot that is read after the worker rejected an
+        /// attached forward and is not applied still drops it.
+        #[tokio::test]
+        async fn a_rejection_read_without_applying_a_snapshot_drops_the_forward() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            hold_a_committed_claim(&fixture, &created).await;
+            fixture
+                .registry
+                .inner
+                .sessions
+                .lock()
+                .await
+                .get(&created.id)
+                .expect("the session")
+                .cancel_runtime_watchers();
+            let stopped = lose_a_rejected_report(&fixture, &created).await;
+            drop(stopped);
+
+            observe_worker(&fixture, &created).await;
+
+            assert_eq!(tracked_operations(&fixture, &created.id).await, 0);
+            assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_010)).await);
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
         /// 1418: a snapshot of another worker instance says nothing about a
         /// forward sent to this one, even at the same revision.
         #[tokio::test]
