@@ -170,7 +170,7 @@ state the newer one wrote; the protocol and persisted-state boundaries in
 [update after release](update-after-release.md) are one-way, so after crossing one
 restore the complete newer component set instead.
 
-A completed upgrade to 0.36 cannot be rolled back to 0.35.x by installing the
+A completed upgrade to 0.36 cannot be rolled back to 0.35.2 by installing the
 older archive; follow
 [roll back after a completed 0.36 upgrade](update-after-release.md#roll-back-after-a-completed-036-upgrade),
 which restores the older packages first.

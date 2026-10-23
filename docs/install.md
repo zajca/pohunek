@@ -86,7 +86,7 @@ not raise the public protocol version or require a second coordinated boundary.
 Do not binary-downgrade a host after it has persisted Hermes enum values or the
 provider-keyed notification policy; recover by upgrading forward instead.
 
-A completed upgrade to 0.36 cannot be rolled back to 0.35.x by installing the
+A completed upgrade to 0.36 cannot be rolled back to 0.35.2 by installing the
 older archive; the ordered procedure is in
 [update after release](knowledge/runbooks/update-after-release.md#roll-back-after-a-completed-036-upgrade).
 
