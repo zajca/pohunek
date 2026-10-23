@@ -27,7 +27,8 @@ use pohunek_worker_protocol::{
     is_denylisted, read_frame, write_frame, AttachStart, BaseEnv, ControlCode, DaemonId, DataFrame,
     Dimensions, FrameHeader, FrameKind, Initialize, InitializeLimits, InputFragment, InputPolicy,
     LaunchIdentity, RuntimePhase, SecretBytes, SecretEnv, SessionId, StopPolicy, StreamId,
-    TransactionId, Version, WriteId, CURRENT_VERSION, MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
+    TransactionId, Version, WriteId, CURRENT_VERSION, MAX_CONTROL_LINE_BYTES,
+    MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
 };
 
 /// Bounds waiting for the worker socket and the child's exit.
@@ -412,8 +413,9 @@ const PTY_UNREAD_INPUT_CAPACITY: usize = 64 * 1024 + 4 * 1024;
 
 const _: () = assert!(
     OVERSIZED_LINES * (OVERSIZED_LINE_BYTES + 1) > PTY_UNREAD_INPUT_CAPACITY
-        && OVERSIZED_LINES * (OVERSIZED_LINE_BYTES + 1) <= MAX_DATA_PAYLOAD_BYTES,
-    "the oversized write must exceed what a PTY holds and fit one data frame"
+        && OVERSIZED_LINES * (OVERSIZED_LINE_BYTES + 1) <= MAX_DATA_PAYLOAD_BYTES
+        && OVERSIZED_LINES * (OVERSIZED_LINE_BYTES + 1) <= MAX_CONTROL_LINE_BYTES / 4,
+    "the oversized write must exceed what a PTY holds and fit one data frame and one control line (a byte array, about four JSON bytes per input byte)"
 );
 
 /// Initializes the fixture's worker with a child that never reads its
