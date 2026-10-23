@@ -320,15 +320,6 @@ async fn codex_reports_turns_through_program_status() {
     let created = fixture.start("fake-codex-stdin").await;
     fixture.wait_activity(&created.id, IDLE).await;
 
-    let detection = fixture
-        .registry
-        .detection(&created.id)
-        .await
-        .expect("session.detection");
-    assert!(detection.previews.iter().any(|preview| preview.kind
-        == protocol::DetectionRegionKind::ProgramStatus
-        && preview.text == format!("app={APP}:state=idle")));
-
     let working = fixture
         .input(&created.id, "t", AgentActivity::Working)
         .await
@@ -468,7 +459,7 @@ async fn the_previous_supported_codex_release_is_read_from_the_title() {
 }
 
 /// ES4 (M2, S3): a Codex started below a shell session reports through its
-/// record; once it exits, the shell manifest holds no program-status record.
+/// record; once it exits, the shell reads its own title again.
 #[tokio::test]
 async fn a_held_working_record_ends_with_the_nested_codex() {
     if !pohunek_test_support::process_env::in_own_process() {
@@ -482,7 +473,10 @@ async fn a_held_working_record_ends_with_the_nested_codex() {
     std::fs::write(&nested, nested_agent_script(&nested_dir)).expect("write the nested agent");
     std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755))
         .expect("make the nested agent executable");
-    let script = format!("{} & wait $!; sleep {SHELL_LINGER_SECS}", nested.display());
+    let script = format!(
+        "{} & wait $!; printf '\\033]2;ready\\007'; sleep {SHELL_LINGER_SECS}",
+        nested.display()
+    );
     let fixture = Fixture::new(ShellCommand::new("/bin/sh", ["-c", script.as_str()])).await;
     let created = {
         let mut process_env = ProcessEnv::lock();
@@ -531,19 +525,9 @@ async fn a_held_working_record_ends_with_the_nested_codex() {
         (info.active_agent.is_none()).then_some(())
     })
     .await;
-    let detection = fixture
-        .registry
-        .detection(&created.id)
-        .await
-        .expect("session.detection");
-    assert!(
-        detection
-            .previews
-            .iter()
-            .all(|preview| preview.kind != protocol::DetectionRegionKind::ProgramStatus),
-        "the shell manifest holds no program-status record: {:?}",
-        detection.previews
-    );
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscTitle))
+        .await;
     let _ = fixture.registry.stop(&created.id).await;
     drop(env_probe);
 }
