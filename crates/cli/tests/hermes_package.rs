@@ -1342,7 +1342,7 @@ async fn a_real_hermes_turn_uses_the_selected_package_and_public_session_screen(
     fs::write(
         &child_script,
         format!(
-            r"import os, sys
+            r"import json, os, sys
 def actual_executable():
     if sys.platform == 'linux':
         return os.readlink('/proc/self/exe')
@@ -1371,7 +1371,7 @@ try:
         status.write('executable=' + os.path.basename(actual_executable()) + '\n')
     reporter.identity('s4b-provider-child-spoof')
     if not identity_responses:
-        raise RuntimeError('the worker did not answer the identity report; send errors=' + ','.join(send_errors) + '; reporter failures=' + str(reporter.failures))
+        raise RuntimeError('the worker did not answer the identity report; send errors=' + ','.join(send_errors) + '; reporter failures=' + str(reporter.failures) + '; worker sends=' + json.dumps(reporter.worker_sends))
     claim_response = identity_responses[-1]
     barrier = socket.create_connection(({host:?}, {port}), timeout={STARTUP_BARRIER_SECONDS})
     barrier.sendall((str(os.getpid()) + ' ' + str(reporter.active) + ' ' + str(reporter.failures) + ' ' + os.path.basename(actual_executable()) + ' ' + str(os.getppid()) + ' ' + str(claim_response.get('launch_identity_accepted')) + ' ' + str(claim_response.get('launch_identity_status')) + '\n').encode('ascii'))

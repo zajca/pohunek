@@ -11,6 +11,7 @@ import importlib.util
 import base64
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -939,6 +940,31 @@ class HookTests(unittest.TestCase):
         reporter.pre_llm_call({"session_id": "native", "prompt": "must-not-leak"})
         self.assertLess(time.monotonic() - started, 0.2)
         self.assertGreaterEqual(reporter.failures, 1)
+
+    def test_worker_send_records_its_elapsed_time_whether_it_answers_or_misses_the_deadline(self) -> None:
+        reporter = Reporter("hermes", environ={
+            "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_INSTANCE_ID": "r-1",
+            "POHUNEK_WORKER_SOCKET_PATH": "/tmp/worker",
+        })
+        clock = [100.0]
+
+        def slow_answer(_endpoint: str, _message: dict[str, object]) -> dict[str, object]:
+            clock[0] += 0.125
+            return {"ok": True}
+
+        def missed_deadline(_endpoint: str, _message: dict[str, object]) -> dict[str, object]:
+            clock[0] += 0.25
+            raise socket.timeout("report deadline exceeded")
+
+        with mock.patch("pohunek._pohunek_reporter.time.monotonic", side_effect=lambda: clock[0]):
+            with mock.patch.object(reporter, "_send", side_effect=slow_answer):
+                self.assertTrue(reporter._send_worker({"type": "identity_report"}))
+            self.assertEqual(reporter.worker_sends, {"identity_report": {"elapsed_ms": 125.0, "outcome": "ok"}})
+
+            with mock.patch.object(reporter, "_send", side_effect=missed_deadline):
+                self.assertFalse(reporter._send_worker({"type": "identity_report"}))
+        self.assertEqual(reporter.worker_sends["identity_report"], {"elapsed_ms": 250.0, "outcome": "TimeoutError"})
+        self.assertEqual(reporter.failures, 1)
 
     def test_send_reads_fragmented_first_response_line(self) -> None:
         reporter = hook_reporter({})

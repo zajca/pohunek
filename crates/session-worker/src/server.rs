@@ -3862,6 +3862,9 @@ where
     let request: HookRequest =
         serde_json::from_value(value).map_err(|error| WorkerError::Protocol(error.to_string()))?;
     let mut launch_identity_status = LaunchClaimStatus::NotApplicable;
+    let answer_started = Instant::now();
+    let reports_identity = matches!(request, HookRequest::IdentityReport { .. });
+    let mut identity_timing = IdentityTiming::default();
     let (accepted, launch_identity_accepted, worker_instance_id, subagent_outcome) = match request {
         HookRequest::IdentityReport {
             worker_instance_id,
@@ -3875,6 +3878,7 @@ where
             session_source,
         } => {
             let mut state = shared.state.lock().await;
+            identity_timing.lock_wait = answer_started.elapsed();
             let current_runtime = state.worker_instance_id.as_ref().map(ToString::to_string);
             let admitted = admit_hook(
                 state.hook_schema,
@@ -4088,7 +4092,10 @@ where
                 };
                 if let Some((mut journal, background_cleared)) = admitted {
                     journal.updated_at = timestamp();
-                    persist(shared.journal.clone(), journal.clone()).await?;
+                    let persist_started = Instant::now();
+                    let persisted = persist(shared.journal.clone(), journal.clone()).await;
+                    identity_timing.persist += persist_started.elapsed();
+                    persisted?;
                     state.journal = journal;
                     state.identity_marks.record(reporting, sequence);
                     if let Some(reason) = background_cleared {
@@ -4110,7 +4117,10 @@ where
                         background_clear.is_some() && background::clear_at(&mut journal, sequence);
                     if deferred || cleared {
                         journal.updated_at = timestamp();
-                        persist(shared.journal.clone(), journal.clone()).await?;
+                        let persist_started = Instant::now();
+                        let persisted = persist(shared.journal.clone(), journal.clone()).await;
+                        identity_timing.persist += persist_started.elapsed();
+                        persisted?;
                         state.journal = journal;
                         if let (true, Some(reason)) = (cleared, background_clear) {
                             log_background_cleared(&shared, reason);
@@ -4547,14 +4557,63 @@ where
             }
         }
     }
-    writer
+    let written = writer
         .write(&HookResponse {
             ok: accepted,
             launch_identity_accepted,
             launch_identity_status,
         })
         .await
-        .map_err(|error| WorkerError::Protocol(error.to_string()))
+        .map_err(|error| WorkerError::Protocol(error.to_string()));
+    if reports_identity {
+        log_identity_answered(
+            &shared,
+            accepted,
+            written.is_ok(),
+            &identity_timing,
+            answer_started.elapsed(),
+        );
+    }
+    written
+}
+
+/// Time an identity report spent before its answer, split by cause.
+#[derive(Default)]
+struct IdentityTiming {
+    /// Wait for the shared worker state lock.
+    lock_wait: Duration,
+    /// Durable journal writes, fsync included.
+    persist: Duration,
+}
+
+/// Logs how long the worker took to answer one identity report, from the
+/// parsed request to the written response, so a reporter that misses its hook
+/// deadline can be compared with the worker's side.
+fn log_identity_answered(
+    shared: &Shared,
+    accepted: bool,
+    delivered: bool,
+    timing: &IdentityTiming,
+    answer: Duration,
+) {
+    event!(
+        name: "worker.identity.answered",
+        Level::INFO,
+        worker.id = %shared.worker_id,
+        session.id = %shared.session_id,
+        identity.operation = "identity_report",
+        identity.accepted = accepted,
+        identity.delivered = delivered,
+        identity.lock_wait_us = micros(timing.lock_wait),
+        identity.persist_us = micros(timing.persist),
+        identity.answer_us = micros(answer),
+        "identity report answered in {{identity.answer_us}} us, journal write {{identity.persist_us}} us",
+    );
+}
+
+/// Microseconds of `duration`, saturating at `u64::MAX`.
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Admits and applies one subagent snapshot, answering whether it was
@@ -7802,6 +7861,78 @@ mod tests {
                 .format(&time::format_description::well_known::Rfc3339).unwrap(),
             "reference_kind": "id", "native_reference": reference,
         })
+    }
+
+    /// Shared buffer a test subscriber writes its formatted events to.
+    #[derive(Clone, Default)]
+    struct EventCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for EventCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("event capture").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn logged_field(logged: &str, name: &str) -> u64 {
+        let marker = format!("{name}=");
+        let start = logged
+            .find(&marker)
+            .unwrap_or_else(|| panic!("{name} in {logged}"));
+        logged[start + marker.len()..]
+            .split(|character: char| !character.is_ascii_digit())
+            .next()
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or_else(|| panic!("{name} is a number in {logged}"))
+    }
+
+    #[tokio::test]
+    async fn an_identity_report_logs_its_answer_latency_with_the_journal_write() {
+        let (server, pty, _directory) = launch_claim_fixture().await;
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let capture = capture.clone();
+                move || capture.clone()
+            })
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        assert!(send_hook(&server, &pty, launch_report(&pty, 1, "ref-sentinel-5a1")).await);
+        drop(guard);
+
+        let logged =
+            String::from_utf8_lossy(&capture.0.lock().expect("event capture")).into_owned();
+        assert_eq!(
+            logged.matches("identity report answered").count(),
+            1,
+            "{logged}"
+        );
+        assert!(logged.contains("identity.accepted=true"), "{logged}");
+        assert!(logged.contains("identity.delivered=true"), "{logged}");
+        let (lock_wait, persist, answer) = (
+            logged_field(&logged, "identity.lock_wait_us"),
+            logged_field(&logged, "identity.persist_us"),
+            logged_field(&logged, "identity.answer_us"),
+        );
+        assert!(
+            persist > 0,
+            "an accepted report writes the journal: {logged}"
+        );
+        assert!(
+            answer >= lock_wait + persist,
+            "the answer covers the lock wait and the journal write: {logged}"
+        );
+        assert!(
+            !logged.contains("ref-sentinel-5a1"),
+            "no native reference is logged: {logged}"
+        );
     }
 
     #[tokio::test]
