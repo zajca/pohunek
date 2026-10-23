@@ -704,6 +704,9 @@ struct SessionRegistryInner {
     /// Sessions with a bounded input wait, which needs unchanged activity
     /// restated as evidence newer than its submit boundary.
     activity_evidence_waiters: std::sync::Mutex<HashMap<SessionId, usize>>,
+    /// Counter bumped whenever a prompt acceptance is imported, so a bounded
+    /// input wait re-reads its evidence without waiting for a public event.
+    prompt_wake: tokio::sync::watch::Sender<u64>,
     /// Turn-event journal, per-session turn progress, and turn waiter pool.
     turns: TurnEvents,
     /// Set when daemon process shutdown starts. Natural PTY exits observed after
@@ -927,6 +930,11 @@ struct SessionEntry {
     agent_incarnation: u64,
     /// Bounded runtime-scoped activity history for input-wait evidence.
     activity_evidence: VecDeque<ActivityEvidence>,
+    /// Bounded runtime-scoped prompt acceptances for input-wait evidence.
+    prompt_acceptances: VecDeque<PromptAcceptance>,
+    /// Newest prompt-acceptance sequence imported for the live runtime, so a
+    /// sequence already imported is never imported again with a fresh clock.
+    prompt_sequence_seen: Option<(SessionRuntimeIdentity, u64)>,
     /// Serializes complete input framing transactions for this logical session.
     input_gate: Arc<Mutex<()>>,
     /// Serializes the commits of the active identity: a worker metadata
@@ -1115,6 +1123,18 @@ struct DetectorInputs {
     preview: mpsc::Receiver<DetectionPreviewRequest>,
     input_ready: watch::Sender<bool>,
     initial_input_done: CancellationToken,
+}
+
+/// One report from the agent's prompt-submit hook that the worker applied, as
+/// the daemon imported it. It is delivery evidence for a waited input only: it
+/// never becomes activity, a revision, or a turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptAcceptance {
+    runtime: SessionRuntimeIdentity,
+    activity_epoch: String,
+    /// The hook's `CLOCK_MONOTONIC` start time, comparable with a submit mark.
+    sequence: u64,
+    received_at: tokio::time::Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2381,6 +2401,7 @@ impl SessionRegistry {
                 recent_attach_failures: Mutex::new(VecDeque::new()),
                 next_stream_id: AtomicU64::new(1),
                 next_write_id: AtomicU64::new(1),
+                prompt_wake: tokio::sync::watch::channel(0).0,
                 next_resize_sequence: AtomicU64::new(1),
                 observation_waiters: AtomicUsize::new(0),
                 observation_session_waiters: std::sync::Mutex::new(HashMap::new()),
@@ -6213,7 +6234,7 @@ impl SessionRegistry {
                 match inspected {
                     Ok((snapshot, order)) => {
                         registry
-                            .observe_worker_identity(&id, &snapshot, order)
+                            .observe_worker_snapshot(&id, &snapshot, order)
                             .await;
                         let worker_metadata = worker_metadata_fingerprint(&snapshot);
                         let initial_empty_metadata =

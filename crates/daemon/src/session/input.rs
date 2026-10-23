@@ -8,6 +8,7 @@ use protocol::{
 
 use crate::agent::host::{RuntimeDefinition, RuntimeHost};
 use crate::runtime::WriteReservation;
+use pohunek_worker_protocol::InspectSnapshot;
 
 use super::{
     broadcast, debug, event_concerns_other_session, not_running_refusal, runtime_loss_reason,
@@ -17,6 +18,7 @@ use super::{
     SessionInputParams, SessionInputResult, SessionInputWait, SessionRegistry,
     SessionRegistryConfig, SessionState, Worker,
 };
+use super::{live_runtime_identity, PromptAcceptance};
 
 pub(super) const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 pub(super) const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
@@ -30,6 +32,9 @@ pub(super) struct InputActivitySnapshot {
     pub(super) activity: Option<AgentActivity>,
     pub(super) revision: ActivityRevision,
     pub(super) runtime: SessionRuntimeIdentity,
+    /// The worker's `CLOCK_MONOTONIC` reading before the Enter write, on a
+    /// snapshot returned by a completed write; absent otherwise.
+    pub(super) prompt_mark: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +47,18 @@ pub(super) struct InputSubmission {
     /// shows the typed text and reads as `idle`, so an `idle` target counts
     /// only after `working` evidence above `after_revision`.
     pub(super) idle_requires_working: bool,
+    /// The worker's `CLOCK_MONOTONIC` reading taken before Enter was written.
+    /// Absent when the worker predates it, or when the agent was `working` at
+    /// the boundary: a busy agent queues the input, and its own `working`
+    /// evidence already answers the wait.
+    pub(super) prompt_mark: Option<u64>,
+    /// The worker reported a submit mark, so the session's launch runtime
+    /// reports prompt acceptances. Sessions of other runtimes never carry
+    /// `prompt_accepted` in a result.
+    pub(super) prompt_capable: bool,
+    /// The caller opted in to a prompt acceptance satisfying a `working`
+    /// target and to `prompt_accepted` in the result.
+    pub(super) prompt_opt_in: bool,
 }
 
 /// Phase of a daemon-paced submit that the waiting caller and the writing
@@ -111,10 +128,17 @@ pub(super) struct InputWritePlan {
 }
 
 impl InputSubmission {
+    /// Whether a prompt acceptance can answer this wait.
+    fn accepts_prompt(&self) -> bool {
+        self.prompt_opt_in && self.prompt_mark.is_some()
+    }
+
     /// The deadline error: delayed-submit input reports that Enter was
     /// written, since the submission exists only once its Enter was acknowledged.
-    fn timeout_error(&self, session_id: &SessionId) -> ProtocolError {
-        if self.idle_requires_working {
+    fn timeout_error(&self, session_id: &SessionId, targets: &[AgentActivity]) -> ProtocolError {
+        if self.accepts_prompt() && targets.contains(&AgentActivity::Working) {
+            ProtocolError::session_input_timeout_unacknowledged(&session_id.0)
+        } else if self.idle_requires_working {
             ProtocolError::session_input_timeout_after_enter(&session_id.0)
         } else {
             ProtocolError::session_input_timeout()
@@ -144,6 +168,7 @@ impl SessionRegistry {
                 activity_epoch: None,
                 activity_revision: None,
                 submitted: None,
+                prompt_accepted: None,
             });
         };
 
@@ -172,9 +197,11 @@ impl SessionRegistry {
         {
             return Err(ProtocolError::session_agent_blocked());
         }
-        let submission = self
+        let mut submission = self
             .write_waited_input(&params.session_id, &params.text, deadline)
             .await?;
+        submission.prompt_opt_in =
+            wait.allow_prompt_accepted == Some(true) && submission.prompt_capable;
         self.input_activity_snapshot(&params.session_id, Some(&submission.runtime))
             .await?;
         self.await_input_settled(&params.session_id, wait, submission, &mut events)
@@ -232,9 +259,11 @@ impl SessionRegistry {
         self.commit_initial_input(session_id).await?;
         submission.deadline =
             tokio::time::Instant::now() + Duration::from_millis(u64::from(ack_timeout_ms));
+        submission.prompt_opt_in = submission.prompt_capable;
         let wait = SessionInputWait {
             until: Some(vec![AgentActivity::Working]),
             timeout_ms: Some(ack_timeout_ms),
+            allow_prompt_accepted: Some(true),
         };
         match self
             .await_input_settled(session_id, wait, submission.clone(), &mut events)
@@ -489,6 +518,9 @@ impl SessionRegistry {
             after_revision: boundary.revision,
             deadline,
             idle_requires_working: false,
+            prompt_mark: submission_prompt_mark(&boundary),
+            prompt_capable: boundary.prompt_mark.is_some(),
+            prompt_opt_in: false,
         })
     }
 
@@ -618,6 +650,9 @@ impl SessionRegistry {
             after_revision: boundary.revision,
             deadline,
             idle_requires_working: true,
+            prompt_mark: submission_prompt_mark(&boundary),
+            prompt_capable: boundary.prompt_mark.is_some(),
+            prompt_opt_in: false,
         })
     }
 
@@ -737,7 +772,7 @@ impl SessionRegistry {
                 send_boundary.wait().await;
             }
             let completed_boundary = boundary.clone();
-            reservation
+            let completion = reservation
                 .commit(move || {
                     turns.note_input(&session_id);
                     let _sent = progress.claim_enter();
@@ -746,7 +781,10 @@ impl SessionRegistry {
                 })
                 .await
                 .map_err(worker_error_to_protocol)?;
-            Ok(completed_boundary)
+            Ok(InputActivitySnapshot {
+                prompt_mark: completion.submit_mark_ns,
+                ..completed_boundary
+            })
         });
         tokio::pin!(send_started_rx);
 
@@ -813,6 +851,13 @@ impl SessionRegistry {
         } else {
             until
         };
+        // Only a `working` target can be answered by a prompt acceptance. The
+        // receiver starts changed so the first pass reads acceptances imported
+        // before the wait began.
+        let mut waits_for_prompt =
+            submission.accepts_prompt() && targets.contains(&AgentActivity::Working);
+        let mut prompt_wake = self.inner.prompt_wake.subscribe();
+        prompt_wake.mark_changed();
         loop {
             tokio::select! {
                 biased;
@@ -833,7 +878,10 @@ impl SessionRegistry {
                     {
                         return Ok(result);
                     }
-                    return Err(submission.timeout_error(session_id));
+                    return Err(submission.timeout_error(session_id, targets));
+                }
+                woke = prompt_wake.changed(), if waits_for_prompt => {
+                    waits_for_prompt = woke.is_ok();
                 }
                 received = events.recv() => match received {
                     Err(broadcast::error::RecvError::Closed) => {
@@ -905,11 +953,14 @@ impl SessionRegistry {
         if current_runtime != submission.runtime {
             return Err(ProtocolError::session_runtime_changed());
         }
-        Ok(
-            matching_input_evidence(entry, targets, submission, event_revision)
-                .cloned()
-                .map(input_wait_result),
-        )
+        let accepted = submission.accepts_prompt() && prompt_acceptance_recorded(entry, submission);
+        let reported = submission.prompt_opt_in.then_some(accepted);
+        if let Some(evidence) = matching_input_evidence(entry, targets, submission, event_revision)
+        {
+            return Ok(Some(input_wait_result(evidence.clone(), reported)));
+        }
+        Ok((accepted && targets.contains(&AgentActivity::Working))
+            .then(|| prompt_wait_result(submission)))
     }
 
     /// Whether `working` evidence of the submission's own runtime sits above
@@ -922,7 +973,72 @@ impl SessionRegistry {
         let sessions = self.inner.sessions.lock().await;
         sessions.get(session_id).is_some_and(|entry| {
             matching_input_evidence(entry, &[AgentActivity::Working], submission, None).is_some()
+                || (submission.accepts_prompt() && prompt_acceptance_recorded(entry, submission))
         })
+    }
+
+    /// Imports the prompt acceptance a worker snapshot reports for the live
+    /// runtime, then wakes the bounded input waits.
+    ///
+    /// The acceptance is delivery evidence only. It is never recorded as
+    /// activity, never bumps the activity revision, and never touches the turn
+    /// journal, so a hook report cannot arm or close a turn.
+    pub(super) async fn observe_prompt_accepted(&self, id: &SessionId, snapshot: &InspectSnapshot) {
+        let Some(sequence) = snapshot.prompt_accepted_sequence else {
+            return;
+        };
+        let imported = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get_mut(id) else {
+                return;
+            };
+            let Some(runtime) = live_runtime_identity(entry) else {
+                return;
+            };
+            if snapshot
+                .worker_instance_id
+                .as_ref()
+                .is_none_or(|instance| instance.as_str() != runtime.worker_instance_id())
+            {
+                return;
+            }
+            let seen = match &entry.prompt_sequence_seen {
+                Some((seen_runtime, seen)) if *seen_runtime == runtime => Some(*seen),
+                _ => None,
+            };
+            if seen.is_some_and(|seen| sequence <= seen) {
+                return;
+            }
+            if seen.is_none() {
+                entry.prompt_acceptances.clear();
+            }
+            entry.prompt_sequence_seen = Some((runtime.clone(), sequence));
+            let received_at = tokio::time::Instant::now();
+            if let Some(cutoff) = received_at.checked_sub(super::ACTIVITY_EVIDENCE_RETENTION) {
+                while entry
+                    .prompt_acceptances
+                    .front()
+                    .is_some_and(|previous| previous.received_at < cutoff)
+                {
+                    entry.prompt_acceptances.pop_front();
+                }
+            }
+            entry.prompt_acceptances.push_back(PromptAcceptance {
+                runtime,
+                activity_epoch: self.daemon_instance_id().to_owned(),
+                sequence,
+                received_at,
+            });
+            while entry.prompt_acceptances.len() > super::MAX_ACTIVITY_EVIDENCE_HISTORY {
+                entry.prompt_acceptances.pop_front();
+            }
+            true
+        };
+        if imported {
+            self.inner
+                .prompt_wake
+                .send_modify(|wakes| *wakes = wakes.wrapping_add(1));
+        }
     }
 
     fn validate_input_wait(wait: &SessionInputWait) -> Result<(), ProtocolError> {
@@ -997,6 +1113,7 @@ fn input_activity_snapshot_for_entry(
         activity: entry.info.activity,
         revision: ActivityRevision::new(entry.activity_revision),
         runtime,
+        prompt_mark: None,
     })
 }
 
@@ -1027,7 +1144,10 @@ fn input_runtime_identity(
         .map_err(|_error| ProtocolError::session_terminal_unavailable())
 }
 
-fn input_wait_result(evidence: ActivityEvidence) -> SessionInputResult {
+fn input_wait_result(
+    evidence: ActivityEvidence,
+    prompt_accepted: Option<bool>,
+) -> SessionInputResult {
     SessionInputResult {
         accepted: true,
         activity: Some(evidence.activity),
@@ -1036,7 +1156,52 @@ fn input_wait_result(evidence: ActivityEvidence) -> SessionInputResult {
         activity_epoch: Some(evidence.activity_epoch),
         activity_revision: Some(evidence.revision),
         submitted: Some(true),
+        prompt_accepted,
     }
+}
+
+/// The result of a wait answered by a prompt acceptance alone: no activity was
+/// observed, so none is stated.
+fn prompt_wait_result(submission: &InputSubmission) -> SessionInputResult {
+    SessionInputResult {
+        accepted: true,
+        activity: None,
+        activity_source: None,
+        runtime: Some(submission.runtime.clone()),
+        activity_epoch: Some(submission.activity_epoch.clone()),
+        activity_revision: None,
+        submitted: Some(true),
+        prompt_accepted: Some(true),
+    }
+}
+
+/// The submit mark a completed write contributes to its submission: dropped
+/// when the agent was `working` at the boundary, because a busy agent queues
+/// the input and its own `working` evidence already answers the wait.
+fn submission_prompt_mark(boundary: &InputActivitySnapshot) -> Option<u64> {
+    boundary
+        .prompt_mark
+        .filter(|_| boundary.activity != Some(AgentActivity::Working))
+}
+
+/// Whether the entry holds a prompt acceptance of the submission's runtime
+/// that the agent reported after the submit mark and before the deadline.
+///
+/// An acceptance proves the agent started its `UserPromptSubmit` hooks, not
+/// that the prompt reached the model: a parallel user hook that blocks the
+/// prompt can still discard it, and a turn the agent starts on its own before
+/// reading Enter is indistinguishable. Callers that need the work to have
+/// started wait for `working` activity.
+fn prompt_acceptance_recorded(entry: &SessionEntry, submission: &InputSubmission) -> bool {
+    let Some(mark) = submission.prompt_mark else {
+        return false;
+    };
+    entry.prompt_acceptances.iter().any(|acceptance| {
+        acceptance.runtime == submission.runtime
+            && acceptance.activity_epoch == submission.activity_epoch
+            && acceptance.sequence > mark
+            && acceptance.received_at <= submission.deadline
+    })
 }
 
 fn input_wait_shutdown_error(message: &str) -> ProtocolError {
@@ -1294,14 +1459,17 @@ async fn run_delayed_submit(
         return Err(progress.not_submitted());
     }
     let turns = registry.inner.turns.clone();
-    reservation
+    let completion = reservation
         .commit_retaining(move || {
             turns.note_input(&session_id);
             drop(sessions);
         })
         .await
         .map_err(worker_error_to_protocol)?;
-    Ok(boundary)
+    Ok(InputActivitySnapshot {
+        prompt_mark: completion.submit_mark_ns,
+        ..boundary
+    })
 }
 
 pub(super) fn worker_input_fragments(

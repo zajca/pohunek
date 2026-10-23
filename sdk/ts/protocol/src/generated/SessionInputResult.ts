@@ -39,4 +39,14 @@ export type SessionInputResult = {
    * from daemons that predate the field.
    */
   submitted?: boolean;
+  /**
+   * Present only when the request set
+   * [`SessionInputWait::allow_prompt_accepted`] and the session is a Claude
+   * session on worker protocol 8 or newer whose hook schema admits the
+   * prompt action. `true` when the agent's
+   * prompt-submit hook reported acceptance of this input before the result;
+   * the activity fields are then absent unless activity evidence also
+   * arrived.
+   */
+  prompt_accepted?: boolean;
 };

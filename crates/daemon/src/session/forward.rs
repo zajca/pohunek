@@ -490,6 +490,18 @@ impl SessionRegistry {
         }
     }
 
+    /// Imports what the periodic sync's `snapshot` shows beyond metadata: the
+    /// forwarded-operation settlement and the prompt acceptance.
+    pub(super) async fn observe_worker_snapshot(
+        &self,
+        id: &SessionId,
+        snapshot: &InspectSnapshot,
+        order: ExchangeOrder,
+    ) {
+        self.observe_worker_identity(id, snapshot, order).await;
+        self.observe_prompt_accepted(id, snapshot).await;
+    }
+
     /// Applies the activity that waits for an identity commit once the commit
     /// is known: when the claim it belongs to is the session's, the activity is
     /// applied; when a newer worker state superseded the claim or the worker

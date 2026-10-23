@@ -1024,6 +1024,8 @@ impl SessionRegistry {
             entry_incarnation: super::next_entry_incarnation(),
             agent_incarnation: 0,
             activity_evidence: VecDeque::new(),
+            prompt_acceptances: VecDeque::new(),
+            prompt_sequence_seen: None,
             input_gate: Arc::new(Mutex::new(())),
             identity_commit: Arc::new(Mutex::new(())),
             identity_fence: None,

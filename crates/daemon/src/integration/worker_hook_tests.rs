@@ -5599,6 +5599,128 @@ with open(release, encoding="ascii") as handle:
             assert_private(&trace);
         }
 
+        /// Hook action of a submitted prompt, named as the line's `action`.
+        const PROMPT_SUBMIT: &str = "prompt-submit";
+
+        /// Reason of a worker that closed the connection without an answer.
+        const WORKER_CLOSED: &str = "worker_closed";
+
+        /// A prompt well past the input bound of every other action.
+        ///
+        /// The prompt-submit action never decodes its input, so the bound does
+        /// not apply and the report still goes out.
+        fn long_prompt() -> Value {
+            json!({
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "x".repeat(OTHER_INPUT_BOUND * 3),
+            })
+        }
+
+        /// The prompt-submit hook is the one hook that runs before every
+        /// prompt of every Claude on the host, and its output reaches the
+        /// model. Whatever fails, it exits 0 with no output, leaves one trace
+        /// line for a failure in a pohunek session, none outside it, and the
+        /// Codex hooks have no such action. A worker that predates the report
+        /// closes the connection on the unknown request type.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_prompt_submit_hook_is_silent_and_traced_on_every_failure_exit() {
+            let root = crate::test_support::scoped_dir("ph-trace-prompt-");
+            let old_worker = root.join("old-worker.sock");
+            let listener = tokio::net::UnixListener::bind(&old_worker).expect("bind old worker");
+            tokio::spawn(async move {
+                while let Ok((stream, _addr)) = listener.accept().await {
+                    let mut line = String::new();
+                    let _ = tokio::io::AsyncBufReadExt::read_line(
+                        &mut tokio::io::BufReader::new(stream),
+                        &mut line,
+                    )
+                    .await;
+                }
+            });
+            let absent_socket = root.join("absent-worker.sock");
+            let claude = state_asset(CLAUDE);
+            let prompt = long_prompt().to_string();
+            let steps = vec![
+                traced(
+                    &root,
+                    "refused",
+                    "",
+                    &claude,
+                    PROMPT_SUBMIT,
+                    prompt.as_bytes(),
+                ),
+                traced(
+                    &root,
+                    "absent",
+                    &format!(
+                        "export {}={};",
+                        protocol::ENV_WORKER_SOCKET_PATH,
+                        quoted(&absent_socket)
+                    ),
+                    &claude,
+                    PROMPT_SUBMIT,
+                    prompt.as_bytes(),
+                ),
+                traced(
+                    &root,
+                    "old-worker",
+                    &format!(
+                        "export {}={};",
+                        protocol::ENV_WORKER_SOCKET_PATH,
+                        quoted(&old_worker)
+                    ),
+                    &claude,
+                    PROMPT_SUBMIT,
+                    prompt.as_bytes(),
+                ),
+                traced(
+                    &root,
+                    "outside-session",
+                    &format!("unset {};", protocol::ENV_FLAG),
+                    &claude,
+                    PROMPT_SUBMIT,
+                    prompt.as_bytes(),
+                ),
+                traced(
+                    &root,
+                    "codex",
+                    "",
+                    &state_asset(CODEX),
+                    PROMPT_SUBMIT,
+                    prompt.as_bytes(),
+                ),
+            ];
+            let run = replay(&root, steps, &Rows::new()).await;
+            let snapshot = run.snapshots.last().expect("final snapshot").clone();
+            run.finish().await;
+
+            for name in [
+                "refused",
+                "absent",
+                "old-worker",
+                "outside-session",
+                "codex",
+            ] {
+                assert_silent(&root, name);
+            }
+            assert_eq!(snapshot.prompt_accepted_sequence, None);
+            let lines = trace_lines(&super::super::hook_trace_path(&root));
+            let [refused, absent, closed] = lines.as_slice() else {
+                panic!("one line per failure inside the session: {lines:?}");
+            };
+            assert_line(
+                refused,
+                &Expected::new(CLAUDE, PROMPT_SUBMIT, &[WORKER_REFUSED]),
+            );
+            assert_line(absent, &Expected::new(CLAUDE, PROMPT_SUBMIT, SOCKET_ABSENT));
+            assert_line(
+                closed,
+                &Expected::new(CLAUDE, PROMPT_SUBMIT, &[WORKER_CLOSED]),
+            );
+            let canaries = vec![root.display().to_string(), "x".repeat(64)];
+            assert_no_leak(&super::super::hook_trace_path(&root), &canaries);
+        }
+
         /// Test item 5 and the enabling rule: a failure exit writes nothing
         /// when either trace variable is absent, when the path is relative, or
         /// when the bound is not a positive integer, nor outside a pohunek

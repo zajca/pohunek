@@ -211,6 +211,9 @@ const SUBAGENT_STOP_ACTION: &str = "subagent-stop";
 /// run for Claude's `Stop` event; [`script_action`] tells them apart by the
 /// script that receives the argument.
 const SUBAGENT_SNAPSHOT_ACTION: &str = "stop";
+/// Action argument passed to the Claude state hook script when a prompt is
+/// submitted; the script reports prompt acceptance to the worker.
+const PROMPT_SUBMIT_ACTION: &str = "prompt-submit";
 /// `SessionStart` event name in the agents' hook config.
 const SESSION_START_EVENT: &str = "SessionStart";
 /// `SessionEnd` event name in Claude's hook config.
@@ -227,6 +230,8 @@ const CODEX_STOP_EVENT: &str = "Stop";
 const CLAUDE_NOTIFICATION_EVENT: &str = "Notification";
 /// Claude event fired when a turn completes.
 const CLAUDE_STOP_EVENT: &str = "Stop";
+/// Claude event that runs before each submitted prompt is sent to the model.
+const CLAUDE_USER_PROMPT_SUBMIT_EVENT: &str = "UserPromptSubmit";
 /// Claude event fired when a stop hook reports failure.
 const CLAUDE_STOP_FAILURE_EVENT: &str = "StopFailure";
 /// Codex trust identity name for `SessionStart`.
@@ -266,12 +271,13 @@ const CLAUDE_NOTIFICATION_MATCHERS: &[&str] = &[
 /// The Claude events the managed state hook is registered for, each with the
 /// action argument its command passes; every registration uses the matcher
 /// `*`.
-const CLAUDE_STATE_HOOKS: [(&str, &str); 5] = [
+const CLAUDE_STATE_HOOKS: [(&str, &str); 6] = [
     (SESSION_START_EVENT, HOOK_ACTION),
     (SESSION_END_EVENT, HOOK_RELEASE_ACTION),
     (SUBAGENT_START_EVENT, SUBAGENT_START_ACTION),
     (SUBAGENT_STOP_EVENT, SUBAGENT_STOP_ACTION),
     (CLAUDE_STOP_EVENT, SUBAGENT_SNAPSHOT_ACTION),
+    (CLAUDE_USER_PROMPT_SUBMIT_EVENT, PROMPT_SUBMIT_ACTION),
 ];
 
 /// Exact Unix mode written for Pohunek-managed hook executables.
@@ -306,6 +312,7 @@ const CLAUDE_REPORTED_ACTIONS: &[HookAction] = &[
     HookAction::SubagentStart,
     HookAction::SubagentStop,
     HookAction::SubagentSnapshot,
+    HookAction::PromptAccepted,
     HookAction::Notification,
 ];
 /// Hook operations the managed Codex asset set reports. Codex has no session
@@ -1252,6 +1259,13 @@ fn inspect_claude_registration(
             label: "Claude Stop (subagent snapshot)".to_owned(),
             event: CLAUDE_STOP_EVENT,
             command: hook_command(state_path, SUBAGENT_SNAPSHOT_ACTION),
+            matcher: Some("*"),
+            trust_event: None,
+        },
+        HookSpec {
+            label: "Claude UserPromptSubmit".to_owned(),
+            event: CLAUDE_USER_PROMPT_SUBMIT_EVENT,
+            command: hook_command(state_path, PROMPT_SUBMIT_ACTION),
             matcher: Some("*"),
             trust_event: None,
         },
@@ -2540,6 +2554,7 @@ fn script_action(role: ScriptRole, argument: &str) -> Option<HookAction> {
             SUBAGENT_START_ACTION => Some(HookAction::SubagentStart),
             SUBAGENT_STOP_ACTION => Some(HookAction::SubagentStop),
             SUBAGENT_SNAPSHOT_ACTION => Some(HookAction::SubagentSnapshot),
+            PROMPT_SUBMIT_ACTION => Some(HookAction::PromptAccepted),
             _ => None,
         },
         ScriptRole::Notify => match argument {
@@ -3392,13 +3407,13 @@ mod tests {
 
     use super::{
         codex_command_hook_trusted_hash, codex_hook_trust_key, hook_command, install_claude,
-        install_codex, shell_single_quote, toml_basic_string, CLAUDE_HOOK_ASSET, CODEX_HOOK_ASSET,
-        CODEX_NOTIFY_HOOK_ASSET, CODEX_SESSION_START_TRUST_EVENT,
-        CODEX_SUBAGENT_COMPATIBILITY_FIXTURE, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID,
-        ENV_SOCKET_PATH, EXPECTED_INTEGRATION_VERSION, HOOK_TIMEOUT_SECS,
-        INTEGRATION_VERSION_PREFIX, NOTIFY_HOOK_INSTALL_NAME, SESSION_START_EVENT,
-        STATE_HOOK_INSTALL_NAME, SUBAGENT_START_ACTION, SUBAGENT_START_EVENT, SUBAGENT_STOP_ACTION,
-        SUBAGENT_STOP_EVENT,
+        install_codex, shell_single_quote, toml_basic_string, CLAUDE_HOOK_ASSET,
+        CLAUDE_USER_PROMPT_SUBMIT_EVENT, CODEX_HOOK_ASSET, CODEX_NOTIFY_HOOK_ASSET,
+        CODEX_SESSION_START_TRUST_EVENT, CODEX_SUBAGENT_COMPATIBILITY_FIXTURE, ENV_FLAG,
+        ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH, EXPECTED_INTEGRATION_VERSION,
+        HOOK_TIMEOUT_SECS, INTEGRATION_VERSION_PREFIX, NOTIFY_HOOK_INSTALL_NAME,
+        PROMPT_SUBMIT_ACTION, SESSION_START_EVENT, STATE_HOOK_INSTALL_NAME, SUBAGENT_START_ACTION,
+        SUBAGENT_START_EVENT, SUBAGENT_STOP_ACTION, SUBAGENT_STOP_EVENT,
     };
 
     /// Large enough to expose unbounded hook stdin reads through pipe backpressure.
@@ -3420,7 +3435,7 @@ mod tests {
     /// State-hook requests expected from a successful release callback.
     const STATE_RELEASE_REQUEST_COUNT: usize = 1;
     /// Version header every managed state hook asset carries.
-    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=14";
+    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=15";
     /// Writable inheritable ACL used to prove mode bits alone are insufficient on macOS.
     #[cfg(target_os = "macos")]
     const WRITABLE_INHERITABLE_ACL: &str = "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit";
@@ -4804,6 +4819,74 @@ mod tests {
         assert_eq!(
             stop_commands, expected_stop,
             "the state hook's snapshot and the notification hook both run on Stop"
+        );
+        let prompt_commands = matcher_commands(&settings, CLAUDE_USER_PROMPT_SUBMIT_EVENT, "*");
+        assert_eq!(
+            prompt_commands,
+            vec![hook_command(&paths.hook_path, PROMPT_SUBMIT_ACTION)],
+            "the prompt-submit report is registered once under the `*` matcher"
+        );
+    }
+
+    #[test]
+    fn status_and_removal_cover_the_claude_prompt_submit_hook_and_version_fifteen() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
+        let claude = scoped_dir("status-claude-prompt-submit");
+        install_claude(&claude).expect("install Claude fixture");
+        let installed = explicit_status(&claude, RuntimeRef::claude());
+        assert_eq!(installed.state, protocol::IntegrationInstallState::Current);
+        assert_eq!(installed.installed_version, Some(15));
+
+        let settings_path = claude.join("settings.json");
+        let mut settings = read_json(&settings_path);
+        settings["hooks"]
+            .as_object_mut()
+            .expect("hooks object")
+            .remove(CLAUDE_USER_PROMPT_SUBMIT_EVENT);
+        fs::write(
+            &settings_path,
+            serde_json::to_vec_pretty(&settings).expect("serialize settings"),
+        )
+        .expect("write settings without the prompt hook");
+        let missing = explicit_status(&claude, RuntimeRef::claude());
+        assert_eq!(missing.state, protocol::IntegrationInstallState::Outdated);
+        assert!(
+            missing
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Claude UserPromptSubmit")),
+            "{:?}",
+            missing.warnings
+        );
+
+        install_claude(&claude).expect("reinstall repairs the registration");
+        let repaired = explicit_status(&claude, RuntimeRef::claude());
+        assert_eq!(repaired.state, protocol::IntegrationInstallState::Current);
+
+        // An install of the previous release still carries version 14.
+        let state_path = claude.join("hooks").join(STATE_HOOK_INSTALL_NAME);
+        let previous = fs::read_to_string(&state_path)
+            .expect("read the installed state hook")
+            .replacen(
+                &format!("{INTEGRATION_VERSION_PREFIX}{EXPECTED_INTEGRATION_VERSION}"),
+                &format!("{INTEGRATION_VERSION_PREFIX}14"),
+                1,
+            );
+        fs::write(&state_path, previous).expect("write a version-14 hook");
+        let outdated = explicit_status(&claude, RuntimeRef::claude());
+        assert_eq!(outdated.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(outdated.recovery, protocol::IntegrationRecovery::Reinstall);
+
+        install_claude(&claude).expect("reinstall the current hooks");
+        super::uninstall::uninstall_claude(&claude).expect("uninstall the Claude hooks");
+        let after = read_json(&settings_path);
+        assert!(
+            after["hooks"]
+                .get(CLAUDE_USER_PROMPT_SUBMIT_EVENT)
+                .is_none(),
+            "uninstall removes the prompt-submit registration: {after}"
         );
     }
 

@@ -875,6 +875,11 @@ pub struct WriteAck {
     pub write_id: WriteId,
     /// Total bytes written and flushed.
     pub bytes_written: u64,
+    /// `CLOCK_MONOTONIC` nanoseconds read immediately before the write of the
+    /// plan's last fragment, on the hooks' clock. Absent on a connection that
+    /// negotiated below [`crate::PROMPT_EVIDENCE_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submit_mark_ns: Option<u64>,
 }
 
 /// Records a child process terminal outcome.
@@ -1142,6 +1147,12 @@ pub struct InspectSnapshot {
     /// that negotiated below [`crate::ACTIVE_IDENTITY_FORWARD_VERSION`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_identity_revision: Option<u64>,
+    /// Sequence of the last prompt-acceptance report the worker applied for
+    /// the current runtime, in the hooks' monotonic clock. Absent before the
+    /// first report and on a connection that negotiated below
+    /// [`crate::PROMPT_EVIDENCE_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_accepted_sequence: Option<u64>,
     /// Whether `AcknowledgeTerminal` first lets every attached data stream
     /// deliver its remaining output and close frame. A worker that does not
     /// report this exits at once on the acknowledgement, so a daemon sends it

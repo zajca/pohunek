@@ -22,4 +22,12 @@ export type SessionInputWait = {
    * writes no input; a post-send timeout may have an unknown delivery outcome.
    */
   timeout_ms?: number;
+  /**
+   * Opts in to a `working` target being satisfied by the agent's own
+   * prompt-submit hook when no `working` activity was observed. The result
+   * then carries [`SessionInputResult::prompt_accepted`], and its activity
+   * fields are absent. A daemon that predates the field ignores it and
+   * answers on activity alone, without `prompt_accepted`.
+   */
+  allow_prompt_accepted?: boolean;
 };

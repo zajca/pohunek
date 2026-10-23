@@ -91,6 +91,18 @@ process or runtime, is the `worker.identity.rejected` warning with
 `identity.operation` `subagent_start`, `subagent_stop` or `subagent_snapshot`
 (the last also for a Claude task list that breaks a bound).
 
+When a waited `session.input` on a Claude session ends in
+`session_input_timeout` although the prompt reached the agent, check the
+prompt-submit report: the worker logs one `worker.prompt_accepted` INFO event per
+applied report, and a refused one is a `worker.identity.rejected` warning with
+`identity.operation` `prompt_accepted` and the reason (`prompt_reporter_not_launch`
+for a process other than the launch process, `launch_identity_pending` before
+the worker accepted a launch identity, `sequence_stale`, `claim_expired`). No log
+line at all means the hook did not reach the worker: its failure trace line
+has `action` `prompt-submit` (see the hook failure trace below), and a hook
+asset older than integration version 15 registers no `UserPromptSubmit` hook, so
+`pohunek integration status --agent claude` reports it `outdated`; reinstall it.
+
 The worker logs one `worker.identity.answered` INFO event per private
 `identity_report`, from the parsed request to the written response, with
 `identity.accepted`, `identity.delivered` (whether the response write

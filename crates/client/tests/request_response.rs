@@ -415,6 +415,7 @@ async fn input_wait_without_timeout_uses_dedicated_connection_and_headroom() {
             wait: Some(protocol::SessionInputWait {
                 until: Some(vec![protocol::AgentActivity::Idle]),
                 timeout_ms: None,
+                allow_prompt_accepted: None,
             }),
         })
         .await

@@ -3088,6 +3088,348 @@ async fn a_real_claude_subagent_is_reported_through_the_hook_schema() {
     fixture.finish().await;
 }
 
+/// Timeout, in seconds, of the recording hooks the prompt-submit scenarios add.
+const RECORDING_HOOK_TIMEOUT_SECS: u64 = 120;
+
+impl Fixture {
+    /// Registers a command hook for `event` in the fixture's Claude settings
+    /// that runs `body` as a shell script.
+    fn add_user_hook(&self, event: &str, name: &str, body: &str) -> PathBuf {
+        let script = self.harness.env.root().join(format!("{name}.sh"));
+        write_executable(&script, format!("#!/bin/sh\n{body}\n")).expect("write the user hook");
+        let path = self.claude_home.join("settings.json");
+        let mut settings: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings.json"))
+                .expect("settings.json is JSON");
+        settings["hooks"][event]
+            .as_array_mut()
+            .map(|entries| {
+                entries.push(serde_json::json!({
+                    "hooks": [{
+                        "type": "command",
+                        "command": path_str(&script),
+                        "timeout": RECORDING_HOOK_TIMEOUT_SECS,
+                    }],
+                }));
+            })
+            .unwrap_or_else(|| {
+                settings["hooks"][event] = serde_json::json!([{
+                    "hooks": [{
+                        "type": "command",
+                        "command": path_str(&script),
+                        "timeout": RECORDING_HOOK_TIMEOUT_SECS,
+                    }],
+                }]);
+            });
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&settings).expect("settings JSON"),
+        )
+        .expect("write settings.json");
+        script
+    }
+
+    /// Adds a hook for `event` that copies each input it receives to
+    /// `recorded/<event>-<unique>.json` and returns that directory.
+    fn record_hook_inputs(&self, event: &str) -> PathBuf {
+        let directory = self.harness.env.root().join("recorded");
+        fs::create_dir_all(&directory).expect("create the recording directory");
+        self.add_user_hook(
+            event,
+            &format!("record-{event}"),
+            &format!(
+                "cat > '{}/{event}-'\"$(date +%s%N)-$$\".json",
+                path_str(&directory)
+            ),
+        );
+        directory
+    }
+
+    /// The `UserPromptSubmit` applied-report log events of the worker.
+    fn prompt_reports(&self, id: &str) -> usize {
+        self.worker_events(id)
+            .iter()
+            .filter(|event| event.get("prompt.outcome").is_some())
+            .count()
+    }
+
+    /// The identity-rejection log events of the worker with `reason`.
+    fn rejections(&self, id: &str, reason: &str) -> usize {
+        self.worker_events(id)
+            .iter()
+            .filter(|event| {
+                event["identity.operation"] == "prompt_accepted"
+                    && event["identity.reason"] == reason
+            })
+            .count()
+    }
+}
+
+/// The inputs a recording hook stored for `event`, oldest first.
+fn recorded_inputs(directory: &Path, event: &str) -> Vec<Value> {
+    let mut files: Vec<PathBuf> = fs::read_dir(directory)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(&format!("{event}-")))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+        .iter()
+        .filter_map(|file| serde_json::from_slice(&fs::read(file).ok()?).ok())
+        .collect()
+}
+
+/// Golden of the real `UserPromptSubmit` behavior the prompt-submit report
+/// relies on, relative to the workspace root; the capture below writes it.
+const PROMPT_SUBMIT_GOLDEN: &str = "compat/claude/prompt-submit-hook.json";
+
+/// Text a hook prints on standard output to show Claude injects it.
+const CONTEXT_CANARY: &str = "PH-CONTEXT-CANARY-1486";
+
+/// Hook inputs of one prompt event, oldest first.
+fn prompts(inputs: &[Value]) -> Vec<String> {
+    inputs
+        .iter()
+        .map(|input| input["prompt"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+/// The managed `UserPromptSubmit` hook of a real Claude reports each prompt it
+/// is run for to the worker, once, before the prompt reaches the model, and
+/// only from the launch process.
+///
+/// The scenario runs against the pinned release and a loopback stub:
+/// - a second hook holds the prompt, so the report arrives while no model
+///   request exists;
+/// - a second hook prints a canary on standard output once, so the canary
+///   shows Claude injects hook output into the context and the managed hook's
+///   own empty output adds none;
+/// - a second hook runs a nested `claude -p` that inherits the session's
+///   environment: its hook fires with the nested process and is refused;
+/// - a Task subagent does not fire the hook for its own prompt, while the
+///   notification Claude starts a turn with when the subagent finishes does,
+///   and the worker accepts that report from the launch process.
+///
+/// With `POHUNEK_CLAUDE_CAPTURE_DIR` set the facts are written there as
+/// [`PROMPT_SUBMIT_GOLDEN`] for review.
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one real session carries every prompt-submit fact, so its hooks and stub are started once"
+)]
+async fn a_real_claude_prompt_submit_hook_reports_once_per_prompt_from_the_launch_process_only() {
+    require_real_claude();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    fixture.install_integration().await;
+    let settings =
+        fs::read_to_string(fixture.claude_home.join("settings.json")).expect("settings.json");
+    assert!(
+        settings.contains("UserPromptSubmit") && settings.contains("prompt-submit"),
+        "the integration registered the prompt-submit hook: {settings}"
+    );
+    let root = fixture.harness.env.root().to_path_buf();
+    let recorded = fixture.record_hook_inputs("UserPromptSubmit");
+    let flags = root.join("flags");
+    fs::create_dir_all(&flags).expect("create the flag directory");
+    let hold = StopHold {
+        fifo: root.join("prompt-hold.fifo"),
+        waiting: root.join("prompt-hold.waiting"),
+    };
+    let made = std::process::Command::new("mkfifo")
+        .arg(&hold.fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success(), "mkfifo {}", hold.fifo.display());
+    fixture.add_user_hook(
+        "UserPromptSubmit",
+        "prompt-control",
+        &format!(
+            "cat >/dev/null\n\
+             if [ -e '{flags}/hold' ]; then echo >>'{waiting}'; cat '{fifo}' >/dev/null; fi\n\
+             if [ -e '{flags}/canary' ]; then printf '{CONTEXT_CANARY}'; fi\n\
+             if [ -e '{flags}/nested' ] && [ -z \"$PH_NESTED\" ]; then \
+             PH_NESTED=1 claude -p 'nested say hi' >/dev/null 2>&1; fi",
+            flags = path_str(&flags),
+            waiting = path_str(&hold.waiting),
+            fifo = path_str(&hold.fifo),
+        ),
+    );
+    let id = fixture.new_session_id("prompt-submit").await;
+    fixture.wait_activity(&id, "idle").await;
+    fixture.wait_reported_conversation(&id).await;
+
+    // Once per typed prompt, and before the model request.
+    fs::write(flags.join("hold"), b"").expect("hold the prompt");
+    fixture.input(&id, PROMPT).await;
+    wait_until("the worker's prompt report", || async {
+        (fixture.prompt_reports(&id) == 1).then_some(())
+    })
+    .await;
+    assert_eq!(
+        fixture.stub.requests_containing(PROMPT),
+        0,
+        "the report arrived while Claude had not yet sent the prompt to the model"
+    );
+    fs::remove_file(flags.join("hold")).expect("stop holding");
+    hold.release(1).await;
+    wait_until("the model request", || async {
+        (fixture.stub.requests_containing(PROMPT) >= 1).then_some(())
+    })
+    .await;
+    fixture.wait_activity(&id, "idle").await;
+    let first = recorded_inputs(&recorded, "UserPromptSubmit");
+    assert_eq!(prompts(&first), [PROMPT], "{first:#?}");
+    assert_eq!(fixture.prompt_reports(&id), 1, "one report for one prompt");
+    let mut input_keys: Vec<String> = first[0]
+        .as_object()
+        .expect("the hook input is an object")
+        .keys()
+        .cloned()
+        .collect();
+    input_keys.sort();
+
+    // The managed hook adds nothing to the context; a hook that prints does.
+    let plain = fixture.stub.bodies_containing(PROMPT);
+    assert!(
+        plain
+            .iter()
+            .all(|body| !body.contains(CONTEXT_CANARY) && !body.contains("UserPromptSubmit")),
+        "the managed hook's empty output leaves the context unchanged"
+    );
+    fs::write(flags.join("canary"), b"").expect("print the canary");
+    fixture.input(&id, FOLLOW_UP_PROMPTS[0]).await;
+    wait_until("the second model request", || async {
+        (fixture.stub.requests_containing(FOLLOW_UP_PROMPTS[0]) >= 1).then_some(())
+    })
+    .await;
+    fixture.wait_activity(&id, "idle").await;
+    assert!(
+        fixture
+            .stub
+            .bodies_containing(FOLLOW_UP_PROMPTS[0])
+            .iter()
+            .any(|body| body.contains(CONTEXT_CANARY)),
+        "Claude injects hook output into the prompt context"
+    );
+    fs::remove_file(flags.join("canary")).expect("stop printing");
+    assert_eq!(fixture.prompt_reports(&id), 2);
+
+    // A nested `claude -p` fires with its own process and is refused.
+    fs::write(flags.join("nested"), b"").expect("run a nested Claude");
+    let before = recorded_inputs(&recorded, "UserPromptSubmit").len();
+    fixture.input(&id, FOLLOW_UP_PROMPTS[1]).await;
+    wait_until("the nested Claude's hook", || async {
+        (recorded_inputs(&recorded, "UserPromptSubmit").len() >= before + 2).then_some(())
+    })
+    .await;
+    fixture.wait_activity(&id, "idle").await;
+    fs::remove_file(flags.join("nested")).expect("stop nesting");
+    let nested = recorded_inputs(&recorded, "UserPromptSubmit");
+    assert_eq!(nested.len(), before + 2, "the outer and the nested prompt");
+    assert_eq!(
+        fixture.rejections(&id, "prompt_reporter_not_launch"),
+        1,
+        "the nested process's report named another process than the launch process"
+    );
+    assert_eq!(fixture.prompt_reports(&id), 3, "only the launch process's");
+
+    // A Task subagent fires no hook for its own prompt; the notification that
+    // starts Claude's next turn when it finishes does.
+    let typed = recorded_inputs(&recorded, "UserPromptSubmit").len();
+    fixture
+        .input(&id, &format!("{} start it", messages_stub::SUBAGENT_MARKER))
+        .await;
+    wait_until("the subagent's report-back turn", || async {
+        (recorded_inputs(&recorded, "UserPromptSubmit").len() >= typed + 2).then_some(())
+    })
+    .await;
+    fixture.wait_activity(&id, "idle").await;
+    let events = recorded_inputs(&recorded, "UserPromptSubmit");
+    let tail = prompts(&events[typed..]);
+    assert_eq!(tail.len(), 2, "{tail:#?}");
+    assert!(
+        tail[0].starts_with(messages_stub::SUBAGENT_MARKER),
+        "{tail:#?}"
+    );
+    assert!(tail[1].starts_with("<task-notification>"), "{tail:#?}");
+    assert!(
+        events.iter().all(|input| !input["prompt"]
+            .as_str()
+            .is_some_and(|prompt| prompt.contains(messages_stub::SUBAGENT_PROMPT))),
+        "the subagent's own prompt fired no hook"
+    );
+    assert_eq!(
+        fixture.prompt_reports(&id),
+        5,
+        "the typed prompt and the self-started report-back are both launch-process reports"
+    );
+
+    if let Some(directory) = std::env::var_os(CAPTURE_VARIABLE).map(PathBuf::from) {
+        let golden = serde_json::json!({
+            "schema": 1,
+            "release": locked_release(),
+            "event": "UserPromptSubmit",
+            "input_keys": input_keys,
+            "fires_once_per_typed_prompt": true,
+            "fires_before_the_model_request": true,
+            "hook_output_is_injected_into_the_context": true,
+            "managed_hook_adds_no_context": true,
+            "nested_claude_p_fires_with_its_own_process": true,
+            "task_subagent_own_prompt_fires": false,
+            "background_agent_report_back_fires": true,
+        });
+        fs::write(
+            directory.join("prompt-submit-hook.json"),
+            serde_json::to_vec_pretty(&golden).expect("golden JSON"),
+        )
+        .expect("write the golden");
+    }
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// The golden of the prompt-submit capture belongs to the locked release, and
+/// every fact the report relies on holds in it.
+#[test]
+fn the_prompt_submit_golden_records_the_facts_of_the_locked_release() {
+    let golden: Value = serde_json::from_slice(
+        &fs::read(workspace_root().join(PROMPT_SUBMIT_GOLDEN)).expect("read the golden"),
+    )
+    .expect("the golden is JSON");
+    assert_eq!(golden["schema"], 1);
+    assert_eq!(golden["release"], locked_release());
+    assert_eq!(golden["event"], "UserPromptSubmit");
+    for fact in [
+        "fires_once_per_typed_prompt",
+        "fires_before_the_model_request",
+        "hook_output_is_injected_into_the_context",
+        "managed_hook_adds_no_context",
+        "nested_claude_p_fires_with_its_own_process",
+        "background_agent_report_back_fires",
+    ] {
+        assert_eq!(golden[fact], true, "{fact}");
+    }
+    assert_eq!(
+        golden["task_subagent_own_prompt_fires"], false,
+        "a subagent's own prompt must not fire the hook the report relies on"
+    );
+    assert!(
+        golden["input_keys"]
+            .as_array()
+            .is_some_and(|keys| keys.iter().any(|key| key == "prompt")),
+        "the input carries the prompt the hook drains and never reads"
+    );
+}
+
 /// The row revision `row` reports.
 fn revision(row: &Value) -> u64 {
     row["revision"]

@@ -61,6 +61,7 @@ mod conflict_cleanup;
 mod lifecycle_queue;
 mod native_recovery;
 mod native_supersede;
+mod prompt_accepted;
 mod stale_worker_metadata;
 mod stop_monitoring;
 mod terminal_acknowledgement;
@@ -7080,6 +7081,7 @@ async fn session_input_wait_rejects_invalid_contract_before_delivery() {
                 wait: Some(protocol::SessionInputWait {
                     until: Some(vec![AgentActivity::Idle]),
                     timeout_ms,
+                    allow_prompt_accepted: None,
                 }),
             })
             .await
@@ -7140,6 +7142,7 @@ async fn session_input_wait_preserves_external_read_only_error() {
             wait: Some(protocol::SessionInputWait {
                 until: Some(vec![AgentActivity::Idle]),
                 timeout_ms: Some(100),
+                allow_prompt_accepted: None,
             }),
         })
         .await
@@ -7249,6 +7252,7 @@ async fn session_input_wait_times_out_with_typed_error() {
             wait: Some(protocol::SessionInputWait {
                 until: Some(vec![AgentActivity::Blocked]),
                 timeout_ms: Some(25),
+                allow_prompt_accepted: None,
             }),
         })
         .await
@@ -7282,6 +7286,7 @@ async fn session_input_wait_rejects_blocked_session_before_delivery() {
             wait: Some(protocol::SessionInputWait {
                 until: Some(vec![AgentActivity::Idle]),
                 timeout_ms: Some(250),
+                allow_prompt_accepted: None,
             }),
         })
         .await
@@ -7334,6 +7339,7 @@ async fn rejected_input_is_no_evidence_for_a_turn() {
             wait: Some(protocol::SessionInputWait {
                 until: Some(Vec::new()),
                 timeout_ms: Some(500),
+                allow_prompt_accepted: None,
             }),
         })
         .await
@@ -7415,6 +7421,7 @@ fn spawn_waited_input(
                     wait: Some(protocol::SessionInputWait {
                         until: Some(until),
                         timeout_ms: Some(timeout_ms),
+                        allow_prompt_accepted: None,
                     }),
                 })
                 .await
@@ -8058,6 +8065,7 @@ async fn session_input_wait_rejects_blocked_transition_during_gate_for_all_adapt
                         wait: Some(protocol::SessionInputWait {
                             until: Some(vec![AgentActivity::Idle]),
                             timeout_ms: Some(500),
+                            allow_prompt_accepted: None,
                         }),
                     })
                     .await
@@ -8135,6 +8143,7 @@ async fn session_input_wait_boundary_excludes_activity_before_worker_write_reser
                     wait: Some(protocol::SessionInputWait {
                         until: Some(vec![AgentActivity::Idle]),
                         timeout_ms: Some(150),
+                        allow_prompt_accepted: None,
                     }),
                 })
                 .await
@@ -8220,6 +8229,7 @@ async fn session_input_wait_serializes_activity_snapshot_with_send_start() {
             protocol::SessionInputWait {
                 until: Some(vec![AgentActivity::Idle]),
                 timeout_ms: Some(1_000),
+                allow_prompt_accepted: None,
             },
             submission.clone(),
             &mut events,
@@ -8269,6 +8279,7 @@ async fn session_input_wait_timeout_while_worker_reserved_never_sends_late_input
             wait: Some(protocol::SessionInputWait {
                 until: Some(vec![AgentActivity::Idle]),
                 timeout_ms: Some(25),
+                allow_prompt_accepted: None,
             }),
         })
         .await
@@ -8335,6 +8346,7 @@ async fn session_input_wait_shutdown_while_worker_reserved_never_sends_late_inpu
                     wait: Some(protocol::SessionInputWait {
                         until: Some(vec![AgentActivity::Idle]),
                         timeout_ms: Some(1_000),
+                        allow_prompt_accepted: None,
                     }),
                 })
                 .await
@@ -8672,6 +8684,7 @@ async fn session_input_wait_accepts_activity_between_submit_flush_and_ack() {
             protocol::SessionInputWait {
                 until: Some(Vec::new()),
                 timeout_ms: Some(1_000),
+                allow_prompt_accepted: None,
             },
             submission,
             &mut events,
@@ -8707,6 +8720,9 @@ async fn session_input_wait_timeout_recheck_rejects_evidence_after_deadline() {
         after_revision: snapshot.revision,
         deadline,
         idle_requires_working: false,
+        prompt_mark: None,
+        prompt_capable: false,
+        prompt_opt_in: false,
     };
     tokio::time::advance(Duration::from_millis(11)).await;
     assert!(
@@ -8727,6 +8743,7 @@ async fn session_input_wait_timeout_recheck_rejects_evidence_after_deadline() {
             protocol::SessionInputWait {
                 until: Some(vec![AgentActivity::Idle]),
                 timeout_ms: Some(10),
+                allow_prompt_accepted: None,
             },
             submission,
             &mut events,
@@ -8762,6 +8779,9 @@ async fn session_input_wait_retains_pre_deadline_evidence_after_late_same_activi
         after_revision: snapshot.revision,
         deadline,
         idle_requires_working: false,
+        prompt_mark: None,
+        prompt_capable: false,
+        prompt_opt_in: false,
     };
     tokio::time::advance(Duration::from_millis(5)).await;
     assert!(
@@ -10176,6 +10196,7 @@ fn a_journaled_native_reference_alone_changes_the_worker_metadata_fingerprint() 
         hook_schema: None,
         background: None,
         active_identity_revision: None,
+        prompt_accepted_sequence: None,
         drains_streams_on_terminal_ack: false,
     };
     let (first, second) = (
@@ -10780,6 +10801,9 @@ async fn session_input_wait_resnapshots_after_broadcast_lag() {
         after_revision: submitted_revision.revision,
         deadline: tokio::time::Instant::now() + Duration::from_millis(250),
         idle_requires_working: false,
+        prompt_mark: None,
+        prompt_capable: false,
+        prompt_opt_in: false,
     };
 
     let result = registry
@@ -10788,6 +10812,7 @@ async fn session_input_wait_resnapshots_after_broadcast_lag() {
             protocol::SessionInputWait {
                 until: Some(vec![AgentActivity::Idle]),
                 timeout_ms: Some(100),
+                allow_prompt_accepted: None,
             },
             submission,
             &mut events,
@@ -10843,6 +10868,9 @@ async fn session_input_wait_uses_rapid_target_event_after_latest_state_changes()
         after_revision: submitted.revision,
         deadline: tokio::time::Instant::now() + Duration::from_millis(250),
         idle_requires_working: false,
+        prompt_mark: None,
+        prompt_capable: false,
+        prompt_opt_in: false,
     };
 
     let result = registry
@@ -10851,6 +10879,7 @@ async fn session_input_wait_uses_rapid_target_event_after_latest_state_changes()
             protocol::SessionInputWait {
                 until: Some(vec![AgentActivity::Idle]),
                 timeout_ms: Some(100),
+                allow_prompt_accepted: None,
             },
             submission,
             &mut events,
@@ -10985,6 +11014,9 @@ async fn an_input_wait_into_an_idle_session_settles_on_the_restated_idle() {
         after_revision: boundary.revision,
         deadline: tokio::time::Instant::now() + Duration::from_secs(5),
         idle_requires_working: false,
+        prompt_mark: None,
+        prompt_capable: false,
+        prompt_opt_in: false,
     };
 
     let waiting = {
@@ -10997,6 +11029,7 @@ async fn an_input_wait_into_an_idle_session_settles_on_the_restated_idle() {
                     protocol::SessionInputWait {
                         until: Some(vec![AgentActivity::Idle]),
                         timeout_ms: Some(5_000),
+                        allow_prompt_accepted: None,
                     },
                     submission,
                     &mut events,
@@ -11035,6 +11068,9 @@ async fn a_wait_on_one_session_settles_through_a_burst_of_another_sessions_event
         after_revision: boundary.revision,
         deadline: tokio::time::Instant::now() + Duration::from_secs(5),
         idle_requires_working: false,
+        prompt_mark: None,
+        prompt_capable: false,
+        prompt_opt_in: false,
     };
     let waiting = {
         let registry = registry.clone();
@@ -11046,6 +11082,7 @@ async fn a_wait_on_one_session_settles_through_a_burst_of_another_sessions_event
                     protocol::SessionInputWait {
                         until: Some(vec![AgentActivity::Idle]),
                         timeout_ms: Some(5_000),
+                        allow_prompt_accepted: None,
                     },
                     submission,
                     &mut events,
@@ -11129,6 +11166,9 @@ async fn session_input_wait_rejects_replaced_runtime() {
         after_revision: submitted.revision,
         deadline: tokio::time::Instant::now() + Duration::from_millis(250),
         idle_requires_working: false,
+        prompt_mark: None,
+        prompt_capable: false,
+        prompt_opt_in: false,
     };
     let replacement = {
         let mut sessions = registry.inner.sessions.lock().await;
@@ -11147,6 +11187,7 @@ async fn session_input_wait_rejects_replaced_runtime() {
             protocol::SessionInputWait {
                 until: Some(vec![AgentActivity::Idle]),
                 timeout_ms: Some(100),
+                allow_prompt_accepted: None,
             },
             submission,
             &mut events,
@@ -11180,6 +11221,9 @@ async fn session_input_wait_rejects_runtime_exit() {
         after_revision: submitted.revision,
         deadline: tokio::time::Instant::now() + Duration::from_millis(250),
         idle_requires_working: false,
+        prompt_mark: None,
+        prompt_capable: false,
+        prompt_opt_in: false,
     };
     registry.stop(&created.id).await.expect("stop session");
 
@@ -11189,6 +11233,7 @@ async fn session_input_wait_rejects_runtime_exit() {
             protocol::SessionInputWait {
                 until: Some(vec![AgentActivity::Idle]),
                 timeout_ms: Some(100),
+                allow_prompt_accepted: None,
             },
             submission,
             &mut events,
@@ -11220,6 +11265,9 @@ async fn duplicate_agent_report_sequence_is_idempotent_for_input_waits() {
         after_revision: submitted.revision,
         deadline: tokio::time::Instant::now() + Duration::from_millis(250),
         idle_requires_working: false,
+        prompt_mark: None,
+        prompt_capable: false,
+        prompt_opt_in: false,
     };
     assert!(
         report_input_activity(&registry, &created.id, AgentActivity::Idle, 7)
@@ -11247,6 +11295,7 @@ async fn duplicate_agent_report_sequence_is_idempotent_for_input_waits() {
             protocol::SessionInputWait {
                 until: Some(vec![AgentActivity::Blocked]),
                 timeout_ms: Some(25),
+                allow_prompt_accepted: None,
             },
             submission,
             &mut events,
@@ -11279,6 +11328,7 @@ async fn session_input_wait_is_cancelled_by_daemon_shutdown() {
                     wait: Some(protocol::SessionInputWait {
                         until: Some(vec![AgentActivity::Blocked]),
                         timeout_ms: Some(1_000),
+                        allow_prompt_accepted: None,
                     }),
                 })
                 .await
@@ -11320,6 +11370,7 @@ async fn session_input_wait_obeys_per_session_waiter_limit() {
                     wait: Some(protocol::SessionInputWait {
                         until: Some(vec![AgentActivity::Blocked]),
                         timeout_ms: Some(1_000),
+                        allow_prompt_accepted: None,
                     }),
                 })
                 .await
@@ -11334,6 +11385,7 @@ async fn session_input_wait_obeys_per_session_waiter_limit() {
             wait: Some(protocol::SessionInputWait {
                 until: Some(vec![AgentActivity::Blocked]),
                 timeout_ms: Some(1_000),
+                allow_prompt_accepted: None,
             }),
         })
         .await
@@ -11376,6 +11428,7 @@ async fn session_input_wait_deduplicates_targets_and_requires_new_event() {
                             AgentActivity::Idle,
                         ]),
                         timeout_ms: Some(1_000),
+                        allow_prompt_accepted: None,
                     }),
                 })
                 .await
@@ -29986,6 +30039,7 @@ async fn a_fast_turn_inside_one_chunk_satisfies_an_input_wait_for_working_and_en
             wait: Some(protocol::SessionInputWait {
                 until: Some(vec![AgentActivity::Working]),
                 timeout_ms: Some(5_000),
+                allow_prompt_accepted: None,
             }),
         })
         .await

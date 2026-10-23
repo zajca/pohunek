@@ -44,6 +44,14 @@ pub const SUBAGENT_OBSERVATION_VERSION: Version = Version(5);
 /// its request.
 pub const ACTIVE_IDENTITY_FORWARD_VERSION: Version = Version(8);
 
+/// First version whose worker reports prompt-delivery evidence.
+///
+/// From version eight the write acknowledgement carries the monotonic time
+/// taken just before the plan's last fragment was written, and the snapshot
+/// carries the sequence of the last accepted prompt report. A version-seven
+/// peer receives neither field.
+pub const PROMPT_EVIDENCE_VERSION: Version = Version(8);
+
 /// Versions supported by this crate release.
 pub const SUPPORTED_RANGE: VersionRange = VersionRange {
     minimum: PREVIOUS_VERSION,

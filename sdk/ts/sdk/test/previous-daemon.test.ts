@@ -318,6 +318,36 @@ describe("client against a daemon of the previous release", () => {
     expect(daemon.seen.violations).toEqual([]);
   });
 
+  test("a session.input prompt opt-in is dropped before the previous daemon receives it", async () => {
+    const waited = { session_id: "s-42", text: "go", wait: { until: ["working"], timeout_ms: 500 } };
+    const previousResult = {
+      accepted: true,
+      activity: "working",
+      activity_source: "screen",
+      runtime: { runtime_id: "runtime-1", runtime_generation: "1" },
+      activity_epoch: "d-epoch-1",
+      activity_revision: "2",
+      submitted: true,
+    };
+    const daemon = await startPreviousDaemon(
+      { "session.input": previousResult },
+      false,
+      [{ method: "session.input", params: waited }],
+    );
+    const client = await connect(daemon);
+
+    const value = await client.sessionInput({
+      ...waited,
+      wait: { ...waited.wait, until: ["working"], allow_prompt_accepted: true },
+    });
+
+    expect(value).toEqual(renameKeysEverywhere(previousResult));
+    expect((value as { prompt_accepted?: boolean }).prompt_accepted).toBeUndefined();
+    expect(daemon.methods()).toEqual(["daemon.health", "session.input"]);
+    expect(daemon.seen.violations).toEqual([]);
+    await client.close();
+  });
+
   test("a version-dependent request learns the version before it is sent", async () => {
     const daemon = await startPreviousDaemon();
     const client = await connect(daemon);

@@ -254,6 +254,20 @@ captured screen through the package manifest.
   omits, and leaves listed rows to their own start and stop (see
   [sessions](../concepts/sessions.md); evidence in
   [#883](https://github.com/zajca/pohunek/issues/883)).
+- The installer registers the state hook for `UserPromptSubmit` (action
+  `prompt-submit`). The hook runs before every prompt, its standard output
+  would be injected into the model context and its exit code can block the
+  prompt, so it drains the prompt input without decoding it, prints nothing,
+  exits 0 on every path and makes one worker attempt with no daemon fallback.
+  The report (`prompt_accepted`) carries the provider, the agent's process
+  identity and the hook's `CLOCK_MONOTONIC` start time; the worker applies it
+  only from the launch identity process (not a nested `claude -p`), and the
+  daemon uses it as delivery evidence for a waited `session.input` that opted
+  in (see [sessions](../concepts/sessions.md)). It is never activity. Claude
+  fires `UserPromptSubmit` for turns it starts itself too (scheduled work,
+  `/loop`, background agents reporting back); such a report matches no input
+  unless it lands between a waited input's Enter write and Claude reading Enter.
+  The compatibility lock records the Claude Code run that exercised the hook.
 - The `session` action (Claude `SessionStart`) forwards the hook input `source`
   as `session_source` in its identity report only when it is `startup`,
   `resume`, `clear` or `compact`; any other value, or none, omits the key.
@@ -269,7 +283,7 @@ captured screen through the package manifest.
   with a reason other than `clear` clears it. A `/clear` keeps it, because Claude
   follows that release with a `SessionStart` of the same process.
 - A Claude state hook action (`session`, `release`, `subagent-start`,
-  `subagent-stop`, `stop`) that fails to deliver its report, including a `stop`
+  `subagent-stop`, `stop`, `prompt-submit`) that fails to deliver its report, including a `stop`
   that sends no snapshot, still exits 0 and appends one payload-free line per
   reason (`provider` `claude`, the action and a reason code) to the hook failure trace
   `pohunek-hooks.jsonl` in the pohunek log directory (see the

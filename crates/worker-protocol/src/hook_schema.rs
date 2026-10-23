@@ -31,6 +31,9 @@ pub enum HookAction {
     /// Reports the provider's own list of live background tasks at the end of
     /// a main-agent turn, which settles subagents whose stop was missed.
     SubagentSnapshot,
+    /// Reports that the provider accepted a submitted prompt, as delivery
+    /// evidence only; it never reports activity.
+    PromptAccepted,
     /// Forwards a provider notification.
     Notification,
 }
@@ -45,6 +48,7 @@ impl HookAction {
             Self::SubagentStart => "subagent_start",
             Self::SubagentStop => "subagent_stop",
             Self::SubagentSnapshot => "subagent_snapshot",
+            Self::PromptAccepted => "prompt_accepted",
             Self::Notification => "notification_create",
         }
     }
@@ -264,6 +268,7 @@ pub fn admit_hook(
         HookAction::SubagentStart | HookAction::SubagentStop | HookAction::SubagentSnapshot => {
             schema.admits_subagent_provider(provider)
         }
+        HookAction::PromptAccepted => schema.admits_prompt_provider(provider, launch_runtime),
         HookAction::IdentityReport | HookAction::IdentityRelease | HookAction::Notification => {
             schema.admits_identity_provider(provider, launch_runtime)
         }
@@ -287,6 +292,9 @@ pub struct HookSchema {
     pub identity_providers: &'static [&'static str],
     /// Provider ids allowed to report subagent lifecycle.
     pub subagent_providers: &'static [&'static str],
+    /// Provider ids allowed to report prompt acceptance, each only inside a
+    /// session launched as that provider.
+    pub prompt_providers: &'static [&'static str],
     /// Hook operations the schema admits.
     pub actions: &'static [HookAction],
     /// Native-reference kinds a report may carry.
@@ -329,6 +337,16 @@ impl HookSchema {
     pub fn admits_identity_provider(&self, provider: &str, launch_runtime: Option<&str>) -> bool {
         launch_runtime == Some(provider)
             || (self.nested_active && self.identity_providers.contains(&provider))
+    }
+
+    /// Whether `provider` may report prompt acceptance for a session launched
+    /// as `launch_runtime`.
+    ///
+    /// Only the session's own launch runtime qualifies, so an agent hosted in
+    /// the foreground of another runtime never reports it.
+    #[must_use]
+    pub fn admits_prompt_provider(&self, provider: &str, launch_runtime: Option<&str>) -> bool {
+        launch_runtime == Some(provider) && self.prompt_providers.contains(&provider)
     }
 
     /// Whether `provider` may report subagent lifecycle.
@@ -384,6 +402,9 @@ const SUBAGENT_PROVIDERS: &[&str] = &["codex", "claude"];
 /// subagent. Codex reports a resumed child with a stop alone, so it is absent.
 const STOP_REQUIRES_START_PROVIDERS: &[&str] = &["claude"];
 
+/// Provider ids whose hooks report prompt acceptance.
+const PROMPT_PROVIDERS: &[&str] = &["claude"];
+
 /// Hook operations of a runtime that reports identity and notifications only.
 const IDENTITY_ACTIONS: &[HookAction] = &[
     HookAction::IdentityReport,
@@ -398,6 +419,7 @@ const IDENTITY_SUBAGENT_ACTIONS: &[HookAction] = &[
     HookAction::SubagentStart,
     HookAction::SubagentStop,
     HookAction::SubagentSnapshot,
+    HookAction::PromptAccepted,
     HookAction::Notification,
 ];
 
@@ -410,6 +432,7 @@ const IDENTITY_V1: HookSchema = HookSchema {
     handlers: &["hermes-hook-v1"],
     identity_providers: HOOKED_PROVIDERS,
     subagent_providers: &[],
+    prompt_providers: &[],
     actions: IDENTITY_ACTIONS,
     reference_kinds: REFERENCE_KINDS,
     ancestry: AncestryMatcher::ManagedPtyDescendant,
@@ -426,6 +449,7 @@ const IDENTITY_SUBAGENT_V1: HookSchema = HookSchema {
     handlers: &["codex-hook-v1", "claude-hook-v1"],
     identity_providers: HOOKED_PROVIDERS,
     subagent_providers: SUBAGENT_PROVIDERS,
+    prompt_providers: PROMPT_PROVIDERS,
     actions: IDENTITY_SUBAGENT_ACTIONS,
     reference_kinds: REFERENCE_KINDS,
     ancestry: AncestryMatcher::ManagedPtyDescendant,

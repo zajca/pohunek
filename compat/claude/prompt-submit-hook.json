@@ -1,0 +1,21 @@
+{
+  "background_agent_report_back_fires": true,
+  "event": "UserPromptSubmit",
+  "fires_before_the_model_request": true,
+  "fires_once_per_typed_prompt": true,
+  "hook_output_is_injected_into_the_context": true,
+  "input_keys": [
+    "cwd",
+    "hook_event_name",
+    "permission_mode",
+    "prompt",
+    "prompt_id",
+    "session_id",
+    "transcript_path"
+  ],
+  "managed_hook_adds_no_context": true,
+  "nested_claude_p_fires_with_its_own_process": true,
+  "release": "2.1.289",
+  "schema": 1,
+  "task_subagent_own_prompt_fires": false
+}

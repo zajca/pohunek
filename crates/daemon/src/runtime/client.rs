@@ -185,6 +185,16 @@ pub struct StopWaits {
     pub answer: Duration,
 }
 
+/// What the worker acknowledged for one committed input plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WriteCompletion {
+    /// Bytes the worker wrote and flushed.
+    pub(crate) bytes_written: u64,
+    /// The worker's `CLOCK_MONOTONIC` reading just before the plan's last
+    /// fragment was written; absent from a worker that predates it.
+    pub(crate) submit_mark_ns: Option<u64>,
+}
+
 /// Prepared exclusive input write that has not started transport delivery.
 #[derive(Debug)]
 pub(crate) struct WriteReservation {
@@ -735,7 +745,11 @@ impl Worker {
     ///
     /// Returns [`WorkerError`] for unavailable runtime or worker rejection.
     pub async fn write(&self, fragments: Vec<InputFragment>) -> Result<u64, WorkerError> {
-        self.reserve_write(fragments).await?.commit(|| {}).await
+        self.reserve_write(fragments)
+            .await?
+            .commit(|| {})
+            .await
+            .map(|completion| completion.bytes_written)
     }
 
     /// Reserves the worker control connection and prepares one input plan.
@@ -1202,7 +1216,7 @@ impl WriteReservation {
     /// Returns [`WorkerError::TornStream`] when an earlier exchange left the
     /// connection unusable, and another [`WorkerError`] when the send, the
     /// acknowledgement read, or the worker rejects the plan.
-    pub(crate) async fn commit<F>(mut self, send_started: F) -> Result<u64, WorkerError>
+    pub(crate) async fn commit<F>(mut self, send_started: F) -> Result<WriteCompletion, WorkerError>
     where
         F: FnOnce(),
     {
@@ -1216,14 +1230,20 @@ impl WriteReservation {
     /// # Errors
     ///
     /// Same as [`Self::commit`].
-    pub(crate) async fn commit_retaining<F>(&mut self, send_started: F) -> Result<u64, WorkerError>
+    pub(crate) async fn commit_retaining<F>(
+        &mut self,
+        send_started: F,
+    ) -> Result<WriteCompletion, WorkerError>
     where
         F: FnOnce(),
     {
         let request = self.request.take().expect("a reservation commits once");
         let response = exchange_locked(&mut self.inner, request, send_started).await?;
         match response {
-            ResponseKind::WriteCompleted { acknowledgement } => Ok(acknowledgement.bytes_written),
+            ResponseKind::WriteCompleted { acknowledgement } => Ok(WriteCompletion {
+                bytes_written: acknowledgement.bytes_written,
+                submit_mark_ns: acknowledgement.submit_mark_ns,
+            }),
             other => response_error(other),
         }
     }
@@ -2532,6 +2552,7 @@ mod tests {
                     acknowledgement: pohunek_worker_protocol::WriteAck {
                         write_id: plan.write_id().clone(),
                         bytes_written: 1,
+                        submit_mark_ns: None,
                     },
                 },
             )

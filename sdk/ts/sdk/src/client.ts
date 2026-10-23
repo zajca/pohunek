@@ -228,7 +228,7 @@ export class Client {
         { ...params, wait },
         timeoutMs,
       );
-      return validateInputWaitResult(wait.until, result);
+      return validateInputWaitResult(wait, result);
     }
     return this.callDirect("session.input", params);
   }
@@ -736,9 +736,10 @@ function validatedInputWaitTimeout(wait: SessionInputWait): number {
 }
 
 function validateInputWaitResult(
-  until: NonNullable<SessionInputWait["until"]>,
+  wait: SessionInputWait & { until: NonNullable<SessionInputWait["until"]> },
   value: unknown,
 ): SessionInputResult {
+  const until = wait.until;
   if (typeof value !== "object" || value === null) {
     throw ClientError.inputWaitContract("the daemon returned a non-object result");
   }
@@ -747,6 +748,9 @@ function validateInputWaitResult(
     throw ClientError.inputWaitContract("the daemon did not confirm accepted delivery");
   }
   const activity = result["activity"];
+  if (activity === undefined && wait.allow_prompt_accepted === true) {
+    return validatePromptOnlyResult(until, result, value as SessionInputResult);
+  }
   const targets = until.length === 0 ? ["idle", "blocked"] : until;
   if (typeof activity !== "string" || !targets.includes(activity)) {
     throw ClientError.inputWaitContract(
@@ -766,6 +770,40 @@ function validateInputWaitResult(
     throw ClientError.inputWaitContract("the response omitted a valid activity revision");
   }
   return value as SessionInputResult;
+}
+
+/**
+ * A result without activity is valid only for a caller that opted in to a
+ * prompt acceptance and asked for `working`, and only when it carries the
+ * runtime and epoch with no partial activity evidence.
+ */
+function validatePromptOnlyResult(
+  until: NonNullable<SessionInputWait["until"]>,
+  result: Record<string, unknown>,
+  value: SessionInputResult,
+): SessionInputResult {
+  if (result["prompt_accepted"] !== true) {
+    throw ClientError.inputWaitContract(
+      "the response activity did not match the requested wait target",
+    );
+  }
+  if (!until.includes("working")) {
+    throw ClientError.inputWaitContract(
+      "a prompt acceptance does not satisfy the requested wait target",
+    );
+  }
+  if (
+    result["activity_source"] !== undefined
+    || result["activity_revision"] !== undefined
+    || !isRuntimeIdentity(result["runtime"])
+    || typeof result["activity_epoch"] !== "string"
+    || result["activity_epoch"].length === 0
+  ) {
+    throw ClientError.inputWaitContract(
+      "the prompt acceptance response omitted its runtime and epoch or carried partial activity evidence",
+    );
+  }
+  return value;
 }
 
 function isRuntimeIdentity(value: unknown): boolean {

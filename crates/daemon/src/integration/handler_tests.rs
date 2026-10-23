@@ -356,6 +356,7 @@ fn the_embedded_scripts_accept_only_arguments_the_registration_table_maps() {
             CLAUDE_HOOK_ASSET.as_str(),
             ScriptRole::State,
             vec![
+                "prompt-submit",
                 "release",
                 "session",
                 "stop",

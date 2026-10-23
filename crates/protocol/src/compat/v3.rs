@@ -176,6 +176,14 @@ fn translate_request(
             method: method.to_owned(),
         });
     }
+    // The option only widens what can satisfy a wait, and a protocol 3 result
+    // shows the caller it was not honored by lacking `prompt_accepted`, so the
+    // field is dropped instead of refusing the request.
+    if method == method::SESSION_INPUT && matches!(direction, Direction::ToLegacy) {
+        if let Some(wait) = params.get_mut("wait").and_then(Value::as_object_mut) {
+            wait.remove("allow_prompt_accepted");
+        }
+    }
     match method {
         method::SESSION_OUTPUT | method::SESSION_WAIT => {
             nested_identity(&mut params, "params.runtime", direction)?;

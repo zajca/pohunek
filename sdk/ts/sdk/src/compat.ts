@@ -192,6 +192,16 @@ export function downgradeRequestParams(version: number, method: string, params: 
     case "session.report_native_id":
       renameIn(translated, "params", "toLegacy");
       break;
+    case "session.input": {
+      // The option only widens what can satisfy a wait, and a previous
+      // result shows the caller it was not honored by lacking
+      // `prompt_accepted`, so it is dropped instead of refusing the request.
+      const wait = field(translated, "wait");
+      if (isObject(wait)) {
+        delete wait["allow_prompt_accepted"];
+      }
+      break;
+    }
     default:
       break;
   }

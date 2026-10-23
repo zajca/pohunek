@@ -73,7 +73,7 @@ pub const ENV_HOOK_TRACE_MAX_BYTES: &str = "POHUNEK_HOOK_TRACE_MAX_BYTES";
 /// Every managed daemon hook asset carries this version marker. It is exposed
 /// through `protocol` because CLI and SDK consumers need the same expected value
 /// without linking the daemon implementation.
-pub const EXPECTED_INTEGRATION_VERSION: u32 = 14;
+pub const EXPECTED_INTEGRATION_VERSION: u32 = 15;
 
 /// Parameters for `integration.install`.
 ///

@@ -553,7 +553,11 @@ demonstrably takes it up, in this order of preference:
    strip paste markers, convert CRLF to LF, remove one trailing newline) are
    pinned per provider version in the compatibility lock with goldens, and a
    provider upgrade that changes them fails the compatibility gate instead of
-   silently degrading every turn to uncorrelated;
+   silently degrading every turn to uncorrelated. The shipped Claude
+   prompt-submit report that answers a waited `session.input` is ordered by
+   time, not by digest, and carries no prompt content; a later optional
+   `prompt_digest` on that report is additive (see "Agent input injection" in
+   `docs/architecture.md`);
 3. (detection) the prompt reaching the agent's input and the agent acting on
    it.
 
