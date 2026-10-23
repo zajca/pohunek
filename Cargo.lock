@@ -2908,7 +2908,6 @@ dependencies = [
  "pohunek-hostcheck",
  "pohunek-knowledge",
  "pohunek-logging",
- "pohunek-netbird",
  "pohunek-overlay",
  "pohunek-package",
  "pohunek-paths",
