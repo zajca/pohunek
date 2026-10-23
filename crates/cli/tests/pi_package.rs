@@ -33,6 +33,8 @@ use pohunek_test_support::workspace_root;
 use protocol::{AgentActivity, BindingProvenance, StateSource};
 use serde_json::Value;
 
+#[path = "support/capture.rs"]
+mod capture;
 #[path = "support/model_stub.rs"]
 mod model_stub;
 #[path = "support/plugin_harness.rs"]
@@ -2218,6 +2220,45 @@ async fn a_real_pi_with_its_sessions_elsewhere_is_refused_at_launch() {
         .expect("session id")
         .to_owned();
     fixture.wait_activity(&id, "idle").await;
+    fixture.stop(&id).await;
+    fixture.harness.stop().await;
+}
+
+/// The ordered root program-status records of the session's retained output.
+async fn program_status_of(fixture: &Fixture, id: &str) -> Vec<String> {
+    let (code, output) = fixture.harness.json(&["session", "output", id]).await;
+    assert_eq!(code, 0, "{output}");
+    capture::program_status_records(&capture::output_bytes(&output))
+}
+
+#[tokio::test]
+#[ignore = "needs a real `pi` on PATH; run with POHUNEK_PI_E2E=1 and --ignored"]
+async fn explore_pi_program_status() {
+    require_real_pi();
+    let fixture = Fixture::start().await;
+    fixture.install().await;
+    fixture.write_profile();
+    let marker = fixture.harness.env.root().join("approved");
+    write_confirm_extension(&fixture, &marker);
+
+    let launched = fixture.new_session("explore").await;
+    let id = launched["id"].as_str().expect("session id").to_owned();
+    let idle = fixture.wait_activity(&id, "idle").await;
+    eprintln!("IDLE {} {:?}", idle["state_source"], program_status_of(&fixture, &id).await);
+    let (code, sent) = fixture.harness.json(&["session", "input", &id, PROMPT]).await;
+    assert_eq!(code, 0, "{sent}");
+    let working = fixture.wait_activity(&id, "working").await;
+    eprintln!("WORKING {} {:?}", working["state_source"], program_status_of(&fixture, &id).await);
+    fixture.stub.open_gate();
+    let idle = fixture.wait_activity(&id, "idle").await;
+    eprintln!("IDLE2 {} {:?}", idle["state_source"], program_status_of(&fixture, &id).await);
+    let (code, sent) = fixture
+        .harness
+        .json(&["session", "input", &id, &format!("/{CONFIRM_COMMAND}")])
+        .await;
+    assert_eq!(code, 0, "{sent}");
+    let blocked = fixture.wait_activity(&id, "blocked").await;
+    eprintln!("BLOCKED {} {:?}", blocked["state_source"], program_status_of(&fixture, &id).await);
     fixture.stop(&id).await;
     fixture.harness.stop().await;
 }
