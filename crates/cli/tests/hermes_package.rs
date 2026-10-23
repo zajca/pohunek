@@ -42,6 +42,8 @@ mod hermes_provider;
 mod interpreter;
 #[path = "support/plugin_harness.rs"]
 mod plugin_harness;
+#[path = "support/worker_identity_answers.rs"]
+mod worker_identity_answers;
 
 use hermes_provider::{write_home, HermesProvider};
 use plugin_harness::{path_str, Harness};
@@ -49,6 +51,7 @@ use pohunek_test_support::catalog::{
     attestations_for, catalog_of, host_platform, root_of, signed, test_key, ANY_CORE, RUNTIME_API,
     WINDOW_END, WINDOW_START,
 };
+use worker_identity_answers::identity_answered_events;
 
 /// Directory of the package, relative to the workspace root.
 const PACKAGE_DIR: &str = "runtime-packages/hermes";
@@ -259,6 +262,11 @@ fn catalog_entry(version: &str, digest: &PackageDigest) -> CatalogEntry {
         attestations: attestations_for(std::slice::from_ref(&platform)),
         core: ANY_CORE.to_owned(),
     }
+}
+
+/// Directory the harness's workers write their JSONL logs to.
+fn worker_log_dir(harness: &Harness) -> PathBuf {
+    harness.env.root().join("worker/state/pohunek/logs")
 }
 
 /// Starts a daemon whose host trusts the throwaway catalog signing key.
@@ -1185,6 +1193,47 @@ async fn assert_package_not_installed(
     assert_source_hint(harness, hermes, NOT_INSTALLED).await;
 }
 
+/// A barrier failure lists the worker's identity latency events and nothing else.
+#[test]
+fn a_barrier_failure_report_lists_the_workers_identity_latency_events_without_payload() {
+    let logs = pohunek_test_support::tempdir().expect("log directory");
+    let answered = |answer_us: u64| {
+        serde_json::json!({"fields": {
+            "message": "identity report answered in {identity.answer_us} us, journal write {identity.persist_us} us",
+            "identity.accepted": true, "identity.delivered": true,
+            "identity.lock_wait_us": 7, "identity.persist_us": 40, "identity.answer_us": answer_us,
+        }})
+        .to_string()
+    };
+    let noise = serde_json::json!({"fields": {
+        "message": "background snapshot cleared: {background.reason}", "secret": "must-not-print",
+    }})
+    .to_string();
+    let lines: Vec<String> = (0..40).map(&answered).collect();
+    fs::write(
+        logs.path().join("pohunek-session-s-1.jsonl"),
+        format!("{noise}\n{}\n", lines.join("\n")),
+    )
+    .expect("write worker log");
+
+    let events = identity_answered_events(logs.path());
+
+    assert_eq!(
+        events[0],
+        "worker identity answers: 32 shown, 8 earlier omitted"
+    );
+    assert_eq!(events.len(), 33);
+    assert_eq!(
+        events[32],
+        "worker event: identity answered accepted=Some(true) delivered=Some(true) lock_wait_us=Some(7) persist_us=Some(40) answer_us=Some(39)"
+    );
+    assert!(!events.join("\n").contains("must-not-print"));
+    assert_eq!(
+        identity_answered_events(&logs.path().join("missing"))[0],
+        "worker identity answers: log directory unavailable"
+    );
+}
+
 /// Verifies the installed official Hermes package and its failure boundaries.
 #[tokio::test]
 async fn the_signed_hermes_package_is_selected_and_failed_installs_preserve_it() {
@@ -1535,13 +1584,14 @@ if os.environ.get('HERMES_TEST_CHILD_PROBE') == '1' and not any(arg in ('--versi
             .expect("collect failed launch");
         panic!(
             "Python startup probe did not reach its barrier; probe={}, launch_exit={:?}, \
-             launch_stdout={}, launch_stderr={}, child_status={}, provider: {}",
+             launch_stdout={}, launch_stderr={}, child_status={}, provider: {}\n{}",
             fs::read_to_string(&probe_marker).unwrap_or_else(|_| "not imported".to_owned()),
             output.status.code(),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
             fs::read_to_string(&child_marker).unwrap_or_else(|_| "not started".to_owned()),
             provider.diagnostics(),
+            identity_answered_events(&worker_log_dir(&harness)).join("\n"),
         );
     };
     let (mut probe, _) = accepted.expect("accept startup probe");
