@@ -4,20 +4,32 @@
 # herdr fields (`visible_working`, `visible_idle`, `skip_state_update`) and
 # `unknown` menu/transcript rules are intentionally omitted.
 
-# The distribution and native-installer binary is `claude`; the npm package
-# installs the same executable as `bin/claude.exe`. The command line is argv
-# joined with spaces, so each pattern names the program at its start. Through
+# The distribution binary is `claude`; the npm package installs the same
+# executable as `bin/claude.exe`. The native installer runs the release image
+# `<install root>/claude/versions/<release>`, whose process name is the release
+# (`2.1.309`). The command line is argv joined with spaces, so each pattern
+# names the program at its start. Through
 # `node` or `bun` the script follows the flag options and is named `claude`
 # (also `.js`, `.mjs`, `.cjs`) or lies inside the `@anthropic-ai/claude-code`
 # package; another script whose name merely contains the word `claude` is not
 # Claude.
 [process]
-comm = ['^claude(\.exe)?$']
+comm = ['^claude(\.exe)?$', '^[0-9]+\.[0-9]+\.[0-9]+$']
 cmdline = [
   '^(\S*/)?claude(\.exe)?($| )',
+  '^(\S*/)?claude/versions/[0-9]+\.[0-9]+\.[0-9]+($| )',
   '^(\S*/)?(node|bun)( -\S+)* (\S*/)?claude(\.[cm]?js)?($| )',
   '^(\S*/)?(node|bun)( -\S+)* \S*/@anthropic-ai/claude-code/\S',
 ]
+
+# Claude Code reports its root state as OSC 7501 records once the session
+# worker answers its `ESC ] 7501 ; ? ST` probe. The record outranks stale
+# screen evidence; a visible dialog still wins (see the program-status layer in
+# docs/architecture.md). Background agents report as `id=` records, which are
+# ignored.
+[program_status]
+app = "claude-code"
+answer_probe = true
 
 # Claude Code 2.1.x leads its title with `◐`/`◑`, alternating every 960 ms
 # while a turn runs, and with `✳` while it waits. The braille range is the
@@ -30,8 +42,10 @@ region = "osc_title"
 regex = ['^[\x{2800}-\x{28FF}\x{25D0}\x{25D1}] ']
 
 # Live status spinner rendered above the prompt box while a turn runs, e.g.
-# "✻ Noodling… (12s · ↓ 1.2k tokens)" or "✻ Herding… (3s · thinking with high
-# effort)". The prompt box (`❯`) stays visible during work in current Claude
+# "✻ Noodling… (12s · ↓ 1.2k tokens)", "✻ Herding… (3s · thinking with high
+# effort)" or a bare "* Jiving…" at the start of a turn. The line is one verb
+# and an optional elapsed timer, so a transcript bullet such as
+# "* Then it waits… (see below)" is not a spinner. The prompt box (`❯`) stays visible during work in current Claude
 # Code TUIs, so without this rule every screen render matches `live_prompt_box`
 # and the published activity flaps to idle between OSC title updates. Must
 # outrank `live_prompt_box` (950) and stay below `live_blocked_form` (980).
@@ -42,7 +56,7 @@ id = "live_status_spinner"
 state = "working"
 priority = 960
 region = "whole_recent"
-line_regex = ['^[·✢✳✶✻✽*] \S.*… \(']
+line_regex = ['^[·✢✳✶✻✽*] \p{L}+…( \([0-9]+[smh]\b.*)?$']
 not = { any = [
   { contains = ["do you want to proceed?"] },
   { contains = ["esc to cancel"] },

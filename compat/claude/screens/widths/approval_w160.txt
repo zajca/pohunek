@@ -3,11 +3,11 @@
 
   done
 
-✻ Sautéed for 7s · done 3:37 PM
+✻ Crunched for 24s · done 2:06 PM
 
 ❯ [approval] run it
 
-● Creating the marker file
+  Creating the marker file
   ⎿  $ touch approved.txt
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

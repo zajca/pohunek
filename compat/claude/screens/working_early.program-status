@@ -1,0 +1,2 @@
+app=claude-code:state=idle
+app=claude-code:state=working

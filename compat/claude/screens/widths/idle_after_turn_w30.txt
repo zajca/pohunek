@@ -1,18 +1,18 @@
 
            Claude Code
- ▐▛███▛█   v2.1.289
+ ▐▛███▛█   v2.1.309
 ▝▜██████▀  Sonnet 4.5
  ▝▝   ▝▝   API Usage Billing
-           /tmp/ph-sample/work
+           /…/t/ph-gfxW6T/work
 
 
-❯ [hold] say hi
+❯ [hold] [stream-hold] say hi
 
 ● working
 
   done
 
-✻ Sautéed for 7s · done 3:37
+✻ Crunched for 24s · done 2:06
   PM
 
 

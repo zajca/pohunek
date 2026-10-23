@@ -1,10 +1,10 @@
 
-✻ Sautéed for 7s · done 3:37
+✻ Crunched for 24s · done 2:06
   PM
 
 ❯ [approval] run it
 
-● Creating the marker file
+  Creating the marker file
   ⎿  $ touch approved.txt
 
 ──────────────────────────────
@@ -16,9 +16,9 @@
  Do you want to proceed?
  ❯ 1. Yes
    2. Yes, and always allow
-      access to
-      /tmp/ph-sample/work from
-      this project
+      access to /mnt/m2_4t/t/p
+      h-gfxW6T/work from this
+      project
    3. No
 
  Esc to cancel · Tab to amend

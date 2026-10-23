@@ -1,11 +1,11 @@
 
-           Claude Code v2.1.289
+           Claude Code v2.1.309
  ▐▛███▛█   Sonnet 4.5
 ▝▜██████▀  API Usage Billing
- ▝▝   ▝▝   /tmp/ph-sample/work
+ ▝▝   ▝▝   /…/m2_4t/t/ph-gfxW6T/work
 
 
-❯ [hold] say hi
+❯ [hold] [stream-hold] say hi
 
 ● working
 
@@ -21,4 +21,4 @@
 ────────────────────────────────────────
 ❯
 ────────────────────────────────────────
-  ⏸ manual mode on · esc to interrupt…
+  ⏸ manual mode on · esc to interrupt
