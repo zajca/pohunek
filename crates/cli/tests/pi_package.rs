@@ -2506,15 +2506,16 @@ impl Fixture {
 /// extension can reach: the idle, working and after-turn editor at every
 /// width, the extension dialogs and Pi's project-trust question.
 ///
-/// Needs a `pi` on `PATH`, `POHUNEK_PI_E2E=1` and `POHUNEK_PI_CAPTURE_DIR`;
-/// without the directory the test fails by name.
+/// Needs a `pi` on `PATH`, `POHUNEK_PI_E2E=1` and `POHUNEK_PI_CAPTURE_DIR`. A
+/// run of the real-Pi tests without the directory skips it: it writes files
+/// instead of checking any.
 #[tokio::test]
 #[ignore = "records screens; run with POHUNEK_PI_E2E=1 and POHUNEK_PI_CAPTURE_DIR"]
 async fn record_the_pi_screens() {
+    let Some(target) = std::env::var_os(CAPTURE_VARIABLE).map(PathBuf::from) else {
+        return;
+    };
     require_real_pi();
-    let target = PathBuf::from(
-        std::env::var_os(CAPTURE_VARIABLE).unwrap_or_else(|| panic!("{CAPTURE_VARIABLE} is not set")),
-    );
     let fixture = Fixture::start().await;
     fixture.install().await;
     fixture.write_profile();
