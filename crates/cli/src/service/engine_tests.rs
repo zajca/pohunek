@@ -11149,7 +11149,7 @@ async fn rollback_after_journal(
     modified: Modified,
     edit_journal: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
     host: impl FnOnce(&FakeLaunchd),
-) -> Result<Vec<String>, Error> {
+) -> Result<RolledBackJudgement, Error> {
     let config_dir = harness.root.join("launchd-domain");
     std::fs::create_dir_all(&config_dir).expect("configuration directory");
     let domain = config_dir.join("user.plist");
@@ -11192,13 +11192,21 @@ async fn rollback_after_journal(
     harness.context = harness.context.clone().with_launchd_job(Arc::new(launchd));
     let preflight = ScriptedPreflight::default();
     let judged = Arc::clone(&preflight.search_paths);
-    harness
+    let report = harness
         .engine()
         .with_adoption_preflight(Box::new(preflight))
         .upgrade(&harness.staged(V1), V1)
         .await?;
     let judged = judged.lock().expect("search path lock").clone();
-    Ok(judged)
+    let warnings = report.rolled_back.expect("rolled back").warnings;
+    Ok(RolledBackJudgement { judged, warnings })
+}
+
+/// The `PATH`s a rollback judged with and the warnings it reported.
+#[cfg(target_os = "macos")]
+struct RolledBackJudgement {
+    judged: Vec<String>,
+    warnings: Vec<String>,
 }
 
 /// A host that rebooted since the upgrade journaled.
@@ -11211,29 +11219,46 @@ fn rebooted(launchd: &FakeLaunchd) {
 #[cfg(target_os = "macos")]
 const PENDING_PATH: &str = "/opt/pending/bin:/usr/bin";
 
+/// The rollback judged every gate with `expected`, the value launchd applies,
+/// and reported no warning.
 #[cfg(target_os = "macos")]
-fn assert_judged(judged: &Result<Vec<String>, Error>, expected: &str) {
-    let judged = judged.as_ref().expect("rolled back");
+fn assert_judged(result: &Result<RolledBackJudgement, Error>, expected: &str) {
+    let rolled_back = result.as_ref().expect("rolled back");
     assert!(
-        !judged.is_empty() && judged.iter().all(|path| path == expected),
-        "{judged:?}"
+        !rolled_back.judged.is_empty() && rolled_back.judged.iter().all(|path| path == expected),
+        "{:?}",
+        rolled_back.judged
+    );
+    assert!(
+        rolled_back.warnings.is_empty(),
+        "{:?}",
+        rolled_back.warnings
     );
 }
 
+/// The rollback was not refused: it judged every gate with `expected`, which
+/// stands in for what launchd applies, and reported one warning that says so.
 #[cfg(target_os = "macos")]
-fn assert_rollback_refused(result: &Result<Vec<String>, Error>, reason: &str) {
-    let error = result
+fn assert_stand_in(result: &Result<RolledBackJudgement, Error>, expected: &str) {
+    let rolled_back = result
         .as_ref()
-        .expect_err("which PATH is active cannot be told");
-    assert_eq!(error.code(), "service_manager_environment_unavailable");
-    let text = error.to_string();
+        .unwrap_or_else(|error| panic!("a rollback is not refused: {error}"));
     assert!(
-        text.contains(reason) && text.contains("launchctl setenv PATH"),
-        "{text}"
+        !rolled_back.judged.is_empty() && rolled_back.judged.iter().all(|path| path == expected),
+        "{:?}",
+        rolled_back.judged
+    );
+    assert_eq!(rolled_back.warnings.len(), 1, "{:?}", rolled_back.warnings);
+    assert!(
+        rolled_back.warnings[0].contains("persisted launchd configuration was used"),
+        "{:?}",
+        rolled_back.warnings
     );
     assert!(
-        !text.contains(PENDING_PATH) && !text.contains(JOURNALED_PATH),
-        "values stay out: {text}"
+        !rolled_back.warnings[0].contains(PENDING_PATH)
+            && !rolled_back.warnings[0].contains(JOURNALED_PATH),
+        "values stay out: {:?}",
+        rolled_back.warnings
     );
 }
 
@@ -11366,10 +11391,12 @@ async fn the_same_boot_does_not_need_a_readable_persisted_configuration() {
 
 /// The configuration scheduled `PATH` C, a reboot applied it, and it was then
 /// changed back to the journaled B: the file's value equals the journal's, but it
-/// was written after the boot, so launchd still applies C.
+/// was written after the boot, so launchd still applies C. A rollback goes on
+/// with the file's value as a stand-in and says so.
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn a_configuration_changed_back_to_the_journaled_value_after_a_reboot_is_refused() {
+async fn a_configuration_changed_back_to_the_journaled_value_after_a_reboot_is_not_taken_for_active(
+) {
     let mut harness = Harness::new();
     let judged = rollback_after_journal(
         &mut harness,
@@ -11380,7 +11407,7 @@ async fn a_configuration_changed_back_to_the_journaled_value_after_a_reboot_is_r
         rebooted,
     )
     .await;
-    assert_rollback_refused(&judged, "modified after the host booted");
+    assert_stand_in(&judged, JOURNALED_PATH);
 
     // B journaled, C scheduled and applied by the reboot, B written again: the
     // file equals what it held at the journal write, which proves nothing.
@@ -11394,7 +11421,7 @@ async fn a_configuration_changed_back_to_the_journaled_value_after_a_reboot_is_r
         rebooted,
     )
     .await;
-    assert_rollback_refused(&judged, "modified after the host booted");
+    assert_stand_in(&judged, JOURNALED_PATH);
 }
 
 /// The same value in a file that predates the boot is the one launchd applied.
@@ -11428,7 +11455,7 @@ async fn a_configuration_that_predates_the_boot_is_the_active_default() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn a_persisted_change_or_removal_after_the_boot_is_refused() {
+async fn a_persisted_change_or_removal_after_the_boot_is_a_rollback_stand_in() {
     const LATER: &str = "/opt/later/bin:/usr/bin";
     let mut harness = Harness::new();
     let judged = rollback_after_journal(
@@ -11440,7 +11467,7 @@ async fn a_persisted_change_or_removal_after_the_boot_is_refused() {
         rebooted,
     )
     .await;
-    assert_rollback_refused(&judged, "modified after the host booted");
+    assert_stand_in(&judged, LATER);
 
     // A removal is dated by the directory that held the file.
     let mut harness = Harness::new();
@@ -11453,7 +11480,10 @@ async fn a_persisted_change_or_removal_after_the_boot_is_refused() {
         rebooted,
     )
     .await;
-    assert_rollback_refused(&judged, "modified after the host booted");
+    assert_stand_in(
+        &judged,
+        pohunek_platform::supervisor::launchd::STANDARD_PATH,
+    );
 
     let mut harness = Harness::new();
     let judged = rollback_after_journal(
@@ -11489,7 +11519,7 @@ async fn a_persisted_configuration_is_dated_by_its_latest_change() {
             booted_an_hour_ago,
         )
         .await;
-        assert_rollback_refused(&judged, "modified after the host booted");
+        assert_stand_in(&judged, PENDING_PATH);
     }
     // A target changed after the boot, behind a link made earlier.
     let mut harness = Harness::new();
@@ -11502,7 +11532,7 @@ async fn a_persisted_configuration_is_dated_by_its_latest_change() {
         rebooted,
     )
     .await;
-    assert_rollback_refused(&judged, "modified after the host booted");
+    assert_stand_in(&judged, PENDING_PATH);
     // The same files are older than a boot that happened after them.
     let mut harness = Harness::new();
     let judged = rollback_after_journal(
@@ -11541,12 +11571,15 @@ async fn a_persisted_configuration_is_dated_by_its_latest_change() {
         rebooted,
     )
     .await;
-    assert_rollback_refused(&judged, "modified after the host booted");
+    assert_stand_in(
+        &judged,
+        pohunek_platform::supervisor::launchd::STANDARD_PATH,
+    );
 }
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn a_configuration_or_boot_time_that_cannot_be_dated_is_refused() {
+async fn a_configuration_or_boot_time_that_cannot_be_dated_is_a_rollback_stand_in() {
     let mut harness = Harness::new();
     let judged = rollback_after_journal(
         &mut harness,
@@ -11560,7 +11593,7 @@ async fn a_configuration_or_boot_time_that_cannot_be_dated_is_refused() {
         },
     )
     .await;
-    assert_rollback_refused(&judged, "boot time cannot be read");
+    assert_stand_in(&judged, PENDING_PATH);
 }
 
 /// Without a boot marker the time rule applies too, and the persisted value
@@ -11593,7 +11626,7 @@ async fn a_journal_without_a_boot_marker_is_used_only_when_the_file_predates_the
         rebooted,
     )
     .await;
-    assert_rollback_refused(&judged, "modified after the host booted");
+    assert_stand_in(&judged, JOURNALED_PATH);
 
     let mut harness = Harness::new();
     let judged = rollback_after_journal(
@@ -11605,7 +11638,7 @@ async fn a_journal_without_a_boot_marker_is_used_only_when_the_file_predates_the
         |_| {},
     )
     .await;
-    assert_rollback_refused(&judged, "no boot marker");
+    assert_stand_in(&judged, PENDING_PATH);
 }
 
 #[cfg(target_os = "macos")]
@@ -11634,7 +11667,105 @@ async fn an_unreadable_current_boot_identity_is_judged_like_a_missing_marker() {
         unreadable,
     )
     .await;
-    assert_rollback_refused(&judged, "current boot identity cannot be read");
+    assert_stand_in(&judged, PENDING_PATH);
+}
+
+/// A configuration whose content cannot be read after a reboot leaves the active
+/// `PATH` unknown: a rollback goes on with launchd's standard `PATH` and says so.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn an_unreadable_configuration_after_a_reboot_does_not_strand_a_rollback() {
+    let mut harness = Harness::new();
+    let judged = rollback_after_journal(
+        &mut harness,
+        PENDING_PATH,
+        Some("<not a property list"),
+        Modified::BeforeBoot,
+        |_| {},
+        rebooted,
+    )
+    .await;
+    assert_stand_in(
+        &judged,
+        pohunek_platform::supervisor::launchd::STANDARD_PATH,
+    );
+    harness.assert_installed(V1);
+}
+
+/// The rollback journals the default of the loaded job before it stops the job;
+/// with no readable boot identity and a `user.plist` that cannot prove the
+/// default, that step must not refuse the rollback.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_rollback_is_not_refused_while_it_journals_the_loaded_default() {
+    let mut harness = Harness::new();
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(PENDING_PATH)).expect("domain configuration");
+    harness.context = harness.context.clone().with_launchd_domain_config(&domain);
+    interrupted_upgrade_journal(&mut harness).await;
+    date(&domain, Modified::AfterBoot).expect("date");
+    let launchd = FakeLaunchd::new(Ok(loaded_job(CURRENT_PATH.to_owned())));
+    launchd.set_boot(Err("sysctl failed".to_owned()));
+    harness.context = harness.context.clone().with_launchd_job(Arc::new(launchd));
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(ScriptedPreflight::default()))
+        .upgrade(&harness.staged(V1), V1)
+        .await
+        .expect("the pending upgrade is rolled back");
+
+    assert!(harness.pending().is_none(), "the rollback finished");
+    harness.assert_installed(V1);
+}
+
+/// The same facts refuse the forward side of the transaction before any effect:
+/// the upgrade that resumes the pending one, and `service check` of it.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn after_a_reboot_a_forward_gate_still_refuses_a_persisted_path_it_cannot_prove() {
+    let cases: [(&str, Modified); 2] = [
+        (PENDING_PATH, Modified::AfterBoot),
+        ("<not a property list", Modified::BeforeBoot),
+    ];
+    for (content, modified) in cases {
+        let mut harness = Harness::new();
+        let (preflight, judged) =
+            interrupted_upgrade_with_a_pending_plist(&mut harness, Step::Definition).await;
+        let domain = harness.root.join("user.plist");
+        std::fs::write(&domain, launchd_domain_xml(content)).expect("domain configuration");
+        date(&domain, modified).expect("date");
+        let launchd = FakeLaunchd::new(Ok(not_loaded()));
+        rebooted(&launchd);
+        harness.context = harness.context.clone().with_launchd_job(Arc::new(launchd));
+
+        let error = crate::service::check_with_preflight(
+            &harness.context,
+            &harness.staged(V2),
+            &preflight,
+            V2,
+            false,
+        )
+        .await
+        .expect_err("the check cannot tell the PATH");
+        assert_eq!(error.code(), "service_manager_environment_unavailable");
+
+        let error = harness
+            .engine()
+            .with_adoption_preflight(Box::new(preflight))
+            .upgrade(&harness.staged(V2), V2)
+            .await
+            .expect_err("the resume cannot tell the PATH");
+        assert_eq!(error.code(), "service_manager_environment_unavailable");
+        assert!(
+            judged.lock().expect("search path lock").is_empty(),
+            "nothing was judged"
+        );
+        assert!(
+            harness.pending().is_some(),
+            "the pending upgrade is untouched"
+        );
+    }
 }
 
 /// A unit as the manager reports it: the unit file at `FragmentPath` with the
