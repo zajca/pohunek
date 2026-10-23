@@ -631,7 +631,7 @@ fn claude_images_of_the_npm_and_the_native_installer_layouts_are_selected() {
 #[test]
 fn version_named_images_outside_the_provider_install_root_are_not_selected() {
     let impostors: [(&str, &str); 7] = [
-        ("claude", "/tmp/2.1.309"),
+        ("claude", "/work/2.1.309"),
         ("claude", "/home/dev/.local/share/versions/2.1.309"),
         ("claude", "/home/dev/.local/share/codex/versions/2.1.309"),
         ("claude", "/home/dev/.local/share/claude/versions/cache.db"),
