@@ -551,7 +551,7 @@ packages that 0.35.2 cannot read:
 - Codex 1.3.0: its `detect.toml` has a `[program_status]` table and
   `overrides_program_status`, and its `runtime.toml` has `ready = "manifest_idle"`;
 - Pi 1.0.4: its `detect.toml` has a `[program_status]` table;
-- Claude 1.1.0 (when the release carries it): its `detect.toml` has a
+- Claude 1.1.0: its `detect.toml` has a
   `[program_status]` table. Claude 1.0.2 has neither and loads in 0.35.2.
 
 The 0.35.2 detect-manifest parser rejects the table and the key, and its runtime
