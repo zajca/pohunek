@@ -2,7 +2,7 @@
            Claude Code v2.1.309
  ▐▛███▛█   Sonnet 4.5
 ▝▜██████▀  API Usage Billing
- ▝▝   ▝▝   /…/m2_4t/t/ph-gfxW6T/work
+ ▝▝   ▝▝   /tmp/ph-sample/cwd
 
 
 ❯ [question] ask

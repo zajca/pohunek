@@ -2,9 +2,9 @@
  ▐▛███▛█   4.5
 ▝▜██████▀  API Usage
  ▝▝   ▝▝   Billing
-           /…/t/ph-g
-           fxW6T/wor
-           k
+           /…/shm/ph
+           -claude/c
+           wd
 
 
 ❯ [hold]
@@ -15,8 +15,8 @@
 
   done
 
-✻ Crunched for 24s ·
-  done 2:06 PM
+✻ Sautéed for 24s ·
+  done 3:52 PM
 
 ────────────────────
 ❯

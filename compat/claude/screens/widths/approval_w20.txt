@@ -1,3 +1,4 @@
+  Creating the
   marker file
   ⎿  $ touch
      approved.txt
@@ -15,10 +16,9 @@
    2. Yes, and
       always allow
       access to
-      /mnt/m2_4t/t/p
-      h-gfxW6T/work
-      from this
-   3. Nooject
+      /dev/shm/ph-cl
+      aude/cwd from
+   3. Nois project
 
  Esc to cancel ·
  Tab to amend

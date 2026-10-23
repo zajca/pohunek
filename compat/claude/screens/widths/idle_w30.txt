@@ -1,10 +1,10 @@
 
            Claude Code
- ▐▛███▛█   v2.1.309
-▝▜██████▀  Sonnet 4.5
- ▝▝   ▝▝   API Usage Billing
-           /…/t/ph-gfxW6T/work
-
+           v2.1.309
+ ▐▛███▛█   Sonnet 4.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/shm/ph-claude/cw
+           d
 
 
 

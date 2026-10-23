@@ -1,7 +1,7 @@
 
  ▐▛███▛█   Claude Code v2.1.309
 ▝▜██████▀  Sonnet 4.5 · API Usage Billing
- ▝▝   ▝▝   /tmp/ph-sample/work
+ ▝▝   ▝▝   /tmp/ph-sample/cwd
 
 
 ❯ [hold] [stream-hold] say hi
@@ -16,7 +16,7 @@
 
 
 
-· Newspapering… (16s)
+· Billowing… (16s)
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 ❯

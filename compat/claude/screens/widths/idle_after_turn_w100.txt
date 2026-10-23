@@ -1,7 +1,7 @@
 
  ▐▛███▛█   Claude Code v2.1.309
 ▝▜██████▀  Sonnet 4.5 · API Usage Billing
- ▝▝   ▝▝   /tmp/ph-sample/work
+ ▝▝   ▝▝   /tmp/ph-sample/cwd
 
 
 ❯ [hold] [stream-hold] say hi
@@ -10,7 +10,7 @@
 
   done
 
-✻ Crunched for 24s · done 2:06 PM
+✻ Sautéed for 24s · done 3:52 PM
 
 
 
