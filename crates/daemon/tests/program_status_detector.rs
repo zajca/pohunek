@@ -962,3 +962,27 @@ fn a_published_working_state_closes_the_record_latch() {
         "no second working edge while working is published: {transitions:?}"
     );
 }
+
+#[test]
+fn an_adopted_detector_restores_the_record_from_a_covering_replay_only() {
+    let stream = [
+        captured("claude", "idle"),
+        claude_record("working"),
+        captured("claude", "idle"),
+    ]
+    .concat();
+
+    // A detector seeded from the retained raw output sees the record again.
+    let mut replayed = Harness::claude();
+    replayed.feed(&stream);
+    assert_eq!(replayed.activity(), WORKING);
+
+    // After an evicted ring the stream restarts from the rendered snapshot,
+    // which carries screen state but no record.
+    let mut tracker = pohunek_terminal::TerminalTracker::new(ROWS, COLUMNS);
+    tracker.feed(&stream);
+    let mut gapped = Harness::claude();
+    gapped.feed(&tracker.snapshot(0).ansi);
+    assert_eq!(gapped.record_preview().as_deref(), Some(""));
+    assert_ne!(gapped.activity(), WORKING);
+}

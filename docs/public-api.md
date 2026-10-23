@@ -1546,7 +1546,8 @@ Important fields:
 - `state`: `starting`, `running`, `stopped`, `done`, or `failed`. `failed`
   also presents a runtime that was lost with an observed end (see `runtime`).
 - `state_source`: `osc_title`, `osc_progress`, `screen`, `process`, or
-  `report`.
+  `report`. `osc_progress` is an OSC status report of the program: OSC 9
+  progress or an OSC 7501 program-status record.
 - `activity`: optional `working`, `blocked`, or `idle`.
 - `native_session_id` / `native_session_path`: optional agent resume binding.
   These belong to the verified launch agent and follow its accepted conversation
@@ -1818,7 +1819,8 @@ active manifest in manifest order:
     "last_non_empty_above_prompt_box",
     "after_last_prompt_marker",
     "prompt_box_body",
-    "after_last_horizontal_rule"
+    "after_last_horizontal_rule",
+    "program_status"
   ],
   "previews": [
     {
@@ -1829,6 +1831,13 @@ active manifest in manifest order:
   ]
 }
 ```
+
+A manifest that declares `[program_status]` (see "Declaring program status" in
+the runtime-packages guide) also lists a `program_status` preview, whose
+`region` is `program_status` and whose `text` is the held record as
+`app=<app>:state=<state>[:kind=<kind>]`, or empty when none is held. Message,
+title and progress texts of a record are never stored or exposed. A client that
+does not know the kind drops it from `supported_regions`.
 
 Parameterized manifest syntax is `bottom_lines(N)`,
 `bottom_non_empty_lines(N)`, or `top_non_empty_lines(N)`; the preview's
