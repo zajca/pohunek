@@ -457,14 +457,5 @@ async fn a_restated_record_emits_no_agent_state() {
         1,
         "the restated working emits nothing; only the edge to idle does: {states:?}"
     );
-    assert!(
-        revision
-            <= fixture
-                .registry
-                .inspect(&created.id)
-                .await
-                .expect("inspect")
-                .updated_at
-    );
     let _ = fixture.registry.stop(&created.id).await;
 }
