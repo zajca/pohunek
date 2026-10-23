@@ -634,7 +634,13 @@ fn detector_with_columns(definition: &RuntimeDefinition, now: Instant, columns: 
     )
 }
 
-/// Fixture screens captured from a real Pi 1.0.2 and the activity each means.
+/// Directories of the captured screens, relative to `compat/pi/screens`: the
+/// set of the pinned release, then the previous release's set. The previous
+/// release stays launchable (`min` of the supported range), so its screens keep
+/// being classified.
+const SCREEN_SETS: [&str; 2] = ["", "n-1/"];
+
+/// Fixture screens captured from a real Pi and the activity each means.
 ///
 /// The `Working` and `Retrying` frames keep the editor rules while a turn runs,
 /// so the multi-line drafts (six lines, and a draft scrolled inside the
@@ -653,14 +659,35 @@ const CAPTURED_SCREENS: [(&str, AgentActivity); 10] = [
     ("retry.txt", AgentActivity::Working),
 ];
 
+/// Label that tells a screen set apart in failure messages.
+fn set_label(set: &str) -> String {
+    if set.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", set.trim_end_matches('/'))
+    }
+}
+
+/// [`CAPTURED_SCREENS`] of every screen set, as paths below `compat/pi/screens`.
+fn captured_screens() -> Vec<(String, AgentActivity)> {
+    SCREEN_SETS
+        .iter()
+        .flat_map(|set| {
+            CAPTURED_SCREENS
+                .iter()
+                .map(move |(screen, expected)| (format!("{set}{screen}"), *expected))
+        })
+        .collect()
+}
+
 #[test]
 fn every_captured_screen_is_classified_by_screen_evidence() {
     let definition = installed_definition();
-    for (screen, expected) in CAPTURED_SCREENS {
+    for (screen, expected) in captured_screens() {
         let started = Instant::now();
         let mut detector = detector(&definition, started);
         assert_eq!(
-            detector.feed(started, &screen_bytes(screen)),
+            detector.feed(started, &screen_bytes(&screen)),
             vec![pohunek_daemon::detect::ActivityTransition {
                 activity: expected,
                 source: StateSource::Screen,
@@ -841,16 +868,23 @@ struct WidthFixture {
 /// file name is `<state>_w<columns>.txt`; states starting `idle`, `scroll_idle`
 /// or `rule_idle` mean idle, every other state is Pi at work.
 fn width_fixtures() -> Vec<WidthFixture> {
-    let mut names: Vec<String> = fs::read_dir(workspace_root().join("compat/pi/screens/widths"))
-        .expect("read the width fixtures")
-        .map(|entry| {
-            entry
-                .expect("directory entry")
-                .file_name()
-                .into_string()
-                .expect("UTF-8 file name")
-        })
-        .collect();
+    SCREEN_SETS.iter().flat_map(|set| width_fixtures_of(set)).collect()
+}
+
+/// [`width_fixtures`] of the screen set `set`; the names of an earlier set end
+/// with its label.
+fn width_fixtures_of(set: &str) -> Vec<WidthFixture> {
+    let mut names: Vec<String> =
+        fs::read_dir(workspace_root().join("compat/pi/screens").join(set).join("widths"))
+            .expect("read the width fixtures")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .into_string()
+                    .expect("UTF-8 file name")
+            })
+            .collect();
     names.sort();
     names
         .into_iter()
@@ -862,13 +896,13 @@ fn width_fixtures() -> Vec<WidthFixture> {
                 .any(|prefix| state.starts_with(prefix));
             WidthFixture {
                 columns: columns.parse().expect("a column count"),
-                rows: screen_rows(&format!("widths/{name}")),
+                rows: screen_rows(&format!("{set}widths/{name}")),
                 expected: if idle {
                     AgentActivity::Idle
                 } else {
                     AgentActivity::Working
                 },
-                name,
+                name: format!("{name}{}", set_label(set)),
             }
         })
         .collect()
@@ -967,8 +1001,8 @@ fn a_column_zero_rule_in_the_transcript_never_stands_in_for_the_upper_border() {
 fn hostile_text_in_the_transcript_or_the_draft_never_changes_the_classification() {
     let definition = installed_definition();
     let mut checked = 0_usize;
-    for (screen, expected) in CAPTURED_SCREENS {
-        checked += sweep_hostile_rows(&definition, screen, &screen_rows(screen), 100, expected);
+    for (screen, expected) in captured_screens() {
+        checked += sweep_hostile_rows(&definition, &screen, &screen_rows(&screen), 100, expected);
     }
     // The narrowest terminal, one whose busy borders close with one rule, and
     // the transcript-rule screens at 24 columns.
@@ -1013,16 +1047,23 @@ struct OverlayFixture {
 /// Every overlay screen, captured by driving a real Pi in a terminal of each
 /// width with real key presses (model calls answered by a loopback stub).
 fn overlay_fixtures() -> Vec<OverlayFixture> {
-    let mut names: Vec<String> = fs::read_dir(workspace_root().join("compat/pi/screens/overlays"))
-        .expect("read the overlay fixtures")
-        .map(|entry| {
-            entry
-                .expect("directory entry")
-                .file_name()
-                .into_string()
-                .expect("UTF-8 file name")
-        })
-        .collect();
+    SCREEN_SETS.iter().flat_map(|set| overlay_fixtures_of(set)).collect()
+}
+
+/// [`overlay_fixtures`] of the screen set `set`; the names of an earlier set
+/// end with its label.
+fn overlay_fixtures_of(set: &str) -> Vec<OverlayFixture> {
+    let mut names: Vec<String> =
+        fs::read_dir(workspace_root().join("compat/pi/screens").join(set).join("overlays"))
+            .expect("read the overlay fixtures")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .into_string()
+                    .expect("UTF-8 file name")
+            })
+            .collect();
     names.sort();
     names
         .into_iter()
@@ -1038,8 +1079,8 @@ fn overlay_fixtures() -> Vec<OverlayFixture> {
             OverlayFixture {
                 kind,
                 columns: columns.parse().expect("a column count"),
-                rows: screen_rows(&format!("overlays/{name}")),
-                name,
+                rows: screen_rows(&format!("{set}overlays/{name}")),
+                name: format!("{name}{}", set_label(set)),
             }
         })
         .collect()
@@ -1096,7 +1137,10 @@ fn a_prompt_that_waits_for_an_answer_reads_blocked_at_every_width() {
             fixture.name
         );
     }
-    assert!(clipped <= 10, "dialogs without a frame: {clipped}");
+    assert!(
+        clipped <= 10 * SCREEN_SETS.len(),
+        "dialogs without a frame: {clipped}"
+    );
 }
 
 /// Whether the last plain border of `rows` is followed by at most four

@@ -1,0 +1,24 @@
+──────────────────────────────────────────────────
+
+ cwd from session file does not exist
+ /var/tmp/pi547/cap/home/gone
+
+ continue in current cwd
+ /var/tmp/pi547/cap/home/work
+
+ → Continue
+   Cancel
+
+ ↑↓ navigate  enter select  escape/ctrl+c cancel
+
+──────────────────────────────────────────────────
+
+
+
+
+
+
+
+
+
+

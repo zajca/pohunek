@@ -1,0 +1,24 @@
+[Extensions]
+  dialogs.ts
+
+
+ please run the tool
+
+
+
+ $ rm -rf build
+
+
+────────────────────────────────────────────────────────────
+
+ Allow tool call?
+ bash: rm -rf build
+
+ → Yes
+   No
+
+ ↑↓ navigate  enter select  escape/ctrl+c cancel
+
+────────────────────────────────────────────────────────────
+~/work
+↑1 ↓2 0.0%/128k (auto)                            stub-model

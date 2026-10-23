@@ -1,0 +1,24 @@
+ working done
+
+
+ [compaction]
+
+ Compacted from 3
+ tokens (ctrl+o to
+ expand)
+
+
+
+ retry me
+
+
+ Error: 503:
+ {"message":"overloaded
+ ","type":"server_error
+ ","code":null}
+
+── ⠦ Retrying (1/3) in ─
+
+────────────────────────
+~/work
+↑4 ↓8 ?/4.0k (auto)  stu
