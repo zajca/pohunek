@@ -1,9 +1,8 @@
 //! OSC 7501 program-status evidence in the activity detector.
 //!
-//! Claude's shipped manifest opts in; the other official packages do not yet,
-//! so their scenarios append a
-//! `[program_status]` table to the shipped manifest of a runtime and feed the
-//! detector the screens captured from the real agents (`compat/*/screens`)
+//! The Claude and Codex manifests ship their `[program_status]` table; a
+//! scenario for a runtime without one appends the table to the shipped manifest.
+//! The scenarios feed the detector the screens captured from the real agents (`compat/*/screens`)
 //! together with raw 7501 records, the way the session's output stream does.
 //! Time is a virtual `Instant`: nothing here sleeps.
 

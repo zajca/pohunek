@@ -336,8 +336,16 @@ manifest opts in) and the daemon holds the latest root record.
   capture scenarios; `the_captured_program_status_sequences_follow_the_claude_turn_lifecycle`
   pins them, and `a_program_status_record_arbitrates_with_the_real_claude_screens`
   replays the arbitration over the real screens.
+- A profile `[env]` entry `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` is the owner's
+  switch for Claude's terminal title and, per the binary, for the records; the
+  session is then screen-only. The switch is not recorded on 2.1.309.
+- Recorded on 2.1.309: an attached terminal's reply to the probe is dropped and
+  no part of it reaches the model
+  (`an_attached_clients_probe_reply_never_reaches_a_real_claude`), and a Claude
+  killed while its `working` record is held leaves a session that is not live
+  and not working (`a_held_working_record_does_not_outlive_a_killed_claude`).
 - Not recorded on 2.1.309: the Esc interrupt (the `Interrupted` marker and its
-  record), background agents, `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`, `CLAUDE_CODE_SESSION_KIND=bg`
+  record), background agents, `CLAUDE_CODE_SESSION_KIND=bg`
   and running under tmux; the test client cannot send a bare Esc.
 
 The native installer runs `<root>/claude/versions/<release>`. The kernel name

@@ -801,7 +801,7 @@ fn an_unpinned_profile_is_refused_when_a_retained_older_version_is_damaged() {
     host.write_claude_profile();
     let older = host.step(false).packages[0].digest.clone();
     let pinned_older = host.profile_text();
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.3");
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.1.1");
     host.publish_archives(2, &[("claude", &bytes, &digest)]);
     let newer = host.step(false);
     assert_eq!(newer.packages[0].status, PackageStatus::Installed);
@@ -841,7 +841,7 @@ fn digest_only_repair_state(host: &Host) -> (String, PackageDigest, PathBuf) {
     let older = host.step(false).packages[0].digest.clone();
     // Nothing references the older version once the profile is unpinned.
     host.write_profile("official", "base = \"claude\"\n");
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.3");
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.1.1");
     host.publish_archives(2, &[("claude", &bytes, &digest)]);
     let newer = host.step(false);
     assert_eq!(newer.packages[0].status, PackageStatus::Installed);

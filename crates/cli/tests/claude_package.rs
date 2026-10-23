@@ -1467,13 +1467,14 @@ fn the_first_run_and_trust_dialogs_are_blocked() {
     );
 }
 
-/// A reply that quotes the first-run and trust dialogs, the way this package's
+/// A reply that quotes the first-run, API-key and trust dialogs, the way this package's
 /// guide or an explanation of `/theme` does.
-const QUOTED_DIALOGS: [&str; 4] = [
+const QUOTED_DIALOGS: [&str; 5] = [
     "\u{25cf} The trust dialog offers \"Yes, I trust this folder\" and \"No, exit\";",
     "  press Enter to confirm. /theme asks you to choose the text style:",
     "  Dark mode or Light mode. Select login method: Claude account with",
-    "  subscription or Anthropic Console account.",
+    "  subscription or Anthropic Console account. The API key dialog says:",
+    "  Detected a custom API key in your environment. Use this API key?",
 ];
 
 /// `frame` with [`QUOTED_DIALOGS`] in its transcript above the prompt box, in
@@ -2138,9 +2139,8 @@ const STATUS_LINE_MARK: &str = "\u{2026} (";
 const VISIBLE_SOURCES: [&str; 3] = ["screen", "osc_title", "osc_progress"];
 
 /// How long the held-stream test watches for an idle reading, in milliseconds:
-/// longer than two of the 960 ms title changes of a running turn plus the
-/// daemon's 700 ms debounce cap, so a screen that read idle between title
-/// changes would publish.
+/// longer than the daemon's 700 ms debounce cap with margin, so a screen that
+/// reads idle while the turn runs would publish.
 const HELD_STREAM_WATCH_MS: &str = "3000";
 
 /// Looks `name` up on `PATH` the way the daemon resolves a program.
@@ -2503,8 +2503,8 @@ impl Fixture {
     }
 
     /// Waits until the session reports `working` on the strength of what Claude
-    /// shows, the screen or the running-turn title, not the byte-activity
-    /// fallback.
+    /// shows or reports (the screen, the 2.1.289 running-turn title or a
+    /// program-status record), not the byte-activity fallback.
     async fn wait_visible_working(&self, id: &str) -> Value {
         wait_until(
             &format!("working from the screen or title of {id}"),
@@ -3134,7 +3134,7 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
         "the real process {fact:?} is matched"
     );
 
-    // Idle: the prompt box and the `✳` title.
+    // Idle: the prompt box.
     fixture.wait_activity(&id, "idle").await;
     fixture.wait_screen_line(&id, "for shortcuts").await;
     assert_package_agrees(&fixture, &package, &id, AgentActivity::Idle).await;
@@ -3209,6 +3209,144 @@ async fn a_real_claude_turn_is_reported_through_program_status_records() {
     assert_eq!(idle["state_source"], "osc_progress", "{idle}");
 
     fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// The reply an attached terminal sends for the probe it saw in the replay.
+const CLIENT_PROBE_REPLY: &[u8] = b"\x1b]7501;?\x1b\\";
+
+impl Fixture {
+    /// Opens an attach stream on the session and returns its data connection,
+    /// the way an attached terminal client does.
+    async fn attach_stream(&self, id: &str) -> (String, pohunek_daemon::runtime::DataStream) {
+        let attach = self
+            .harness
+            .sessions
+            .attach(&protocol::SessionAttachParams {
+                session_id: protocol::SessionId(id.to_owned()),
+                initial_dimensions: None,
+                origin_session_id: None,
+                origin_daemon_id: None,
+                origin_worker_id: None,
+            })
+            .await
+            .expect("open an attach stream");
+        let redeemed = self
+            .harness
+            .sessions
+            .redeem_attach(&attach.stream_id)
+            .await
+            .expect("redeem the attach stream");
+        let pohunek_daemon::session::RedeemedRuntime::Worker(data) = redeemed.runtime;
+        (attach.stream_id.clone(), data)
+    }
+}
+
+/// Writes `bytes` as the attached client's input number `number`.
+async fn attached_input(
+    data: &mut pohunek_daemon::runtime::DataStream,
+    stream: &str,
+    number: u32,
+    bytes: &[u8],
+) {
+    let frame = pohunek_worker_protocol::DataFrame::new(
+        pohunek_worker_protocol::FrameHeader {
+            version: data.version,
+            stream_id: data.stream_id.clone(),
+            worker_instance_id: data.worker_instance_id.clone(),
+            kind: pohunek_worker_protocol::FrameKind::Input {
+                write_id: pohunek_worker_protocol::WriteId::new(format!(
+                    "attach-{stream}-{number}"
+                ))
+                .expect("write id"),
+            },
+        },
+        bytes.to_vec(),
+    )
+    .expect("attach input frame");
+    pohunek_worker_protocol::write_frame(&mut data.stream, &frame)
+        .await
+        .expect("send the client's input");
+}
+
+/// An attached terminal answers the probe it saw in the replay: exactly one
+/// reply reaches Claude (the worker's), the client's is dropped. A leaked reply
+/// would be typed into Claude's input and sent to the model with the prompt.
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+async fn an_attached_clients_probe_reply_never_reaches_a_real_claude() {
+    require_real_claude();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    let id = fixture.new_session_id("attached").await;
+    fixture.wait_activity(&id, "idle").await;
+
+    let (stream, mut data) = fixture.attach_stream(&id).await;
+    let prompt = format!("{} {PROMPT}", messages_stub::HOLD_MARKER);
+    let mut typed = CLIENT_PROBE_REPLY.to_vec();
+    typed.extend_from_slice(prompt.as_bytes());
+    attached_input(&mut data, &stream, 1, &typed).await;
+    fixture.wait_screen_line(&id, PROMPT).await;
+    attached_input(&mut data, &stream, 2, b"\r").await;
+
+    let working = fixture.wait_activity(&id, "working").await;
+    assert_eq!(working["state_source"], "osc_progress", "{working}");
+    fixture.stub.open_gate();
+    fixture
+        .wait_screen_line(&id, messages_stub::SECOND_CHUNK)
+        .await;
+    let idle = fixture.wait_activity(&id, "idle").await;
+    assert_eq!(idle["state_source"], "osc_progress", "{idle}");
+
+    assert!(
+        !fixture.stub.bodies_containing(PROMPT).is_empty(),
+        "the turn reached the model"
+    );
+    assert!(
+        fixture.stub.bodies_containing("7501").is_empty(),
+        "no part of the client's reply reached the model"
+    );
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// A real Claude killed while its `working` record is held leaves a session
+/// that is not live and not working.
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+async fn a_held_working_record_does_not_outlive_a_killed_claude() {
+    require_real_claude();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    let id = fixture.new_session_id("killed").await;
+    fixture.wait_activity(&id, "idle").await;
+    fixture
+        .input(&id, &format!("{} {PROMPT}", messages_stub::HOLD_MARKER))
+        .await;
+    let working = fixture.wait_activity(&id, "working").await;
+    assert_eq!(working["state_source"], "osc_progress", "{working}");
+
+    let pid = fixture.inspect(&id).await["pid"]
+        .as_i64()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .expect("the launch process id");
+    let command = fs::read(format!("/proc/{pid}/cmdline")).expect("the launch process");
+    assert!(
+        String::from_utf8_lossy(&command).contains("claude"),
+        "pid {pid} is the Claude launch process"
+    );
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .expect("kill the verified Claude process");
+
+    wait_until(&format!("session {id} to stop being live"), || async {
+        let inspected = fixture.inspect(&id).await;
+        (inspected["runtime"]["state"] != "live").then_some(inspected)
+    })
+    .await;
+    let after = fixture.inspect(&id).await;
+    assert_ne!(after["activity"], "working", "{after}");
+    fixture.stub.open_gate();
     fixture.finish().await;
 }
 

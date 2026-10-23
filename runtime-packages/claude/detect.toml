@@ -31,9 +31,11 @@ cmdline = [
 app = "claude-code"
 answer_probe = true
 
-# Claude Code 2.1.x leads its title with `◐`/`◑`, alternating every 960 ms
-# while a turn runs, and with `✳` while it waits. The braille range is the
-# working title of the herdr manifest this one is ported from.
+# Claude Code 2.1.289 leads its title with `◐`/`◑`, alternating every 960 ms
+# while a turn runs, and with `✳` while it waits. 2.1.309 sets the plain title
+# `Claude Code` once the probe is answered, so this rule and `osc_title_idle`
+# serve a Claude that sets state titles. The braille range is the working title
+# of the herdr manifest this one is ported from.
 [[rules]]
 id = "osc_title_working"
 state = "working"
