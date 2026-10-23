@@ -101,7 +101,7 @@ const GOLDEN_MANIFEST_NAME: &str = "codex";
 const PACKAGE_ID: &str = "pohunek.runtime.codex";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.2.1";
+const PACKAGE_VERSION: &str = "1.2.2";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -435,6 +435,38 @@ fn the_package_manifest_preserves_builtin_rules_and_adds_startup_dialog_rules() 
                 )
             )
         });
+    // The package deliberately diverges from the built-in copy in one rule: the
+    // working title must name a thread or project after the spinner, so the
+    // title-generation placeholder of an idle unnamed thread (`⠴ | cxw`) is not
+    // a working turn (#1486).
+    let golden_working = golden["rules"]
+        .as_array()
+        .and_then(|rules| {
+            rules
+                .iter()
+                .find(|rule| rule["id"].as_str() == Some("osc_title_working"))
+        })
+        .expect("the golden working title rule")["regex"]
+        .clone();
+    let working = builtin_rules
+        .get_mut("rules")
+        .and_then(toml::Value::as_array_mut)
+        .and_then(|rules| {
+            rules
+                .iter_mut()
+                .find(|rule| rule["id"].as_str() == Some("osc_title_working"))
+        })
+        .expect("the package working title rule");
+    assert_eq!(
+        working["regex"].as_array().map(Vec::len),
+        Some(1),
+        "one working title pattern"
+    );
+    assert_eq!(
+        working["regex"][0].as_str(),
+        Some(r"^[\x{2800}-\x{28FF}] [^|\s]")
+    );
+    working["regex"] = golden_working;
     assert_eq!(builtin_rules, golden);
     let ids: Vec<&str> = package["rules"]
         .as_array()
@@ -1927,7 +1959,11 @@ fn the_terminal_title_rules_read_idle_from_the_absence_of_a_spinner() {
     for (title, expected) in [
         ("\u{280b} project", working),
         ("\u{2834} \u{2834} | project", working),
-        ("\u{28ff} ", working),
+        ("\u{280b} my-thread | project", working),
+        // The title-generation placeholder of an idle unnamed thread, and a
+        // spinner that names nothing, are not a running turn (#1486).
+        ("\u{2834} | project", idle),
+        ("\u{28ff} ", idle),
         ("[ ! ] Action Required | project", blocked),
         ("[ . ] Action Required | project", blocked),
         ("Action Required", blocked),

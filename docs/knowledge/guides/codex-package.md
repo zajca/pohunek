@@ -102,7 +102,10 @@ copies of that descriptor and its detection manifest in
 - Detection (`detect.toml`): process matchers are the kernel name `codex` or a
   command line whose program is `codex`. Codex reports its state through the
   terminal title, so the idle, working and blocked rules read the title:
-  a title that starts with a braille spinner means `working`; a title that
+  a title that starts with a braille spinner and a space, followed by a thread
+  or project name rather than the `|` separator, means `working` (the
+  `<spinner> | <project>` title of an idle unnamed thread's title generation is
+  idle); a title that
   contains `Action Required` (Codex writes `[ ! ] Action Required | <dir>`,
   alternating `[ . ]`) means `blocked` and outranks `working`; any other
   non-blank title means `idle`, read from the absence of a spinner and of
@@ -163,7 +166,7 @@ classifies every one of them through the package manifest.
   title. The additional visible startup dialogs below use the same strict
   blocker/freshness behavior.
 - **Visible login and incompatible-settings dialogs hold initial input.**
-  Package 1.2.1 recognizes the captured Codex 0.160.0 login selection at
+  Package 1.2.2 recognizes the captured Codex 0.160.0 login selection at
   80/160 columns by its welcome heading, all three sign-in/API-key choices
   and continue hint. API-key entry requires the welcome and entry headings,
   storage hint, input-box heading and both save/back hints. The incompatible

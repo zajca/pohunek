@@ -2746,6 +2746,52 @@ mod tests {
     }
 
     #[test]
+    fn a_codex_title_generation_spinner_on_an_idle_thread_never_latches_working() {
+        let started_at = instant();
+        let mut detector = steady_detector(&RuntimeRef::codex(), 8, 120, started_at);
+        let sightings = detector.latch_sightings;
+
+        // An idle unnamed thread spins its title-generation placeholder: the
+        // braille frame is followed by the separator, not by a thread name.
+        let transitions = detector.feed(
+            started_at,
+            "\x1b]2;\u{2834} | cxw\x07\x1b]2;cxw\x07".as_bytes(),
+        );
+
+        assert_eq!(detector.latch_sightings, sightings, "{transitions:?}");
+        assert!(transitions
+            .iter()
+            .all(|transition| transition.activity != AgentActivity::Working));
+    }
+
+    #[test]
+    fn a_codex_working_title_with_a_thread_name_still_latches_working() {
+        let started_at = instant();
+        let mut detector = steady_detector(&RuntimeRef::codex(), 8, 120, started_at);
+
+        for title in [
+            "\u{280b} cxw",
+            "\u{2834} \u{2834} | cxw",
+            "\u{280b} my-thread | cxw",
+        ] {
+            let transitions = detector.feed(
+                started_at,
+                format!("\x1b]2;{title}\x07\x1b]2;cxw\x07").as_bytes(),
+            );
+            assert_eq!(
+                transitions.first(),
+                Some(&transition(AgentActivity::Working, StateSource::OscTitle)),
+                "{title}: {transitions:?}"
+            );
+            detector.reconfigure(started_at, {
+                let mut config = package_config(&RuntimeRef::codex());
+                config.detection = self::config().detection;
+                config
+            });
+        }
+    }
+
+    #[test]
     fn a_pi_working_frame_and_an_idle_frame_in_one_chunk_still_yield_working_evidence() {
         let started_at = instant();
         let mut detector = pi_detector(started_at);

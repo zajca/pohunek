@@ -8,7 +8,9 @@
 #
 # - osc_title_blocked: the title carries "Action Required" while a tool approval
 #   or a question waits for the user.
-# - osc_title_working: the title starts with a braille spinner while a turn runs.
+# - osc_title_working: the title starts with a braille spinner followed by a
+#   thread or project name while a turn runs. The title-generation placeholder
+#   of an idle unnamed thread (`<spinner> | <project>`) is not a turn.
 # - osc_title_idle: any other non-empty title means idle. Idle is read from the
 #   absence of the spinner and of "Action Required", not from a title of its own.
 # - workspace_trust_prompt: the first-run trust dialog pinned at the top of the
@@ -40,7 +42,7 @@ id = "osc_title_working"
 state = "working"
 priority = 1050
 region = "osc_title"
-regex = ['^[\x{2800}-\x{28FF}] ']
+regex = ['^[\x{2800}-\x{28FF}] [^|\s]']
 
 # The first-run workspace trust dialog is pinned at the top of the visible
 # screen. Require the exact question and both numbered choices so transcript
