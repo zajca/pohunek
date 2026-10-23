@@ -1,0 +1,24 @@
+
+  To get started, de
+
+  /init - create an
+  /status - show cur
+  /permissions - cho
+  /model - choose wh
+  /review - review a
+
+
+› [background] go
+
+
+• working done
+
+  Worked for 1s • 1:
+
+  1 background termi
+
+
+› Ask Codex to do an
+
+  stub-model default
+  ← for agents · ? f

@@ -4627,3 +4627,47 @@ async fn capture_the_real_codex_screens() {
     fixture.stop(&id).await;
     fixture.finish().await;
 }
+
+/// Records the screens of a real Codex that keeps a background terminal after
+/// its turn: the turn that starts the command, then the idle composer with the
+/// background-terminal footer, with the program-status sequence of the run.
+#[tokio::test]
+#[ignore = "refreshes compat/codex/screens from a real `codex`; run with POHUNEK_CODEX_CAPTURE_DIR and --ignored"]
+async fn capture_the_real_codex_background_terminal_screens() {
+    let Some(directory) = capture_directory() else {
+        return;
+    };
+    let fixture = Fixture::start().await;
+    fixture.install_integration().await;
+
+    let id = fixture.new_session("background").await["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    fixture.wait_activity(&id, "idle").await;
+    fixture.wait_screen_line(&id, "Ask Codex").await;
+    fixture
+        .input(&id, &format!("{} go", responses_stub::BACKGROUND_MARKER))
+        .await;
+    fixture.wait_activity(&id, "working").await;
+    fixture.wait_screen_line(&id, BACKGROUND_FOOTER_MARK).await;
+    fixture
+        .capture(&directory, &id, "background_terminal_early")
+        .await;
+    fixture.wait_activity(&id, "idle").await;
+    fixture.wait_screen_line(&id, BACKGROUND_FOOTER_MARK).await;
+    fixture
+        .capture(&directory, &id, "background_terminal")
+        .await;
+    fixture
+        .capture_widths(&directory, &id, "background_terminal", true)
+        .await;
+    fixture
+        .capture_program_status(&directory, &id, "background_terminal")
+        .await;
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// Text of the footer Codex shows while a background terminal runs.
+const BACKGROUND_FOOTER_MARK: &str = "background terminal";

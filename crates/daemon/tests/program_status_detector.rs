@@ -848,7 +848,7 @@ fn a_record_never_releases_or_holds_the_initial_input() {
 fn a_record_is_not_a_visible_blocker_for_the_codex_startup_barrier() {
     // A startup popup is drawn, cleared, and the idle title arrives; records are
     // interleaved at every step. The readiness verdicts match the run without.
-    let popup = captured("codex", "trust");
+    let popup = captured("codex", "n-1/trust");
     let idle = captured("codex", "idle");
     let steps: Vec<Vec<u8>> = vec![popup, b"\x1b[2J\x1b[H".to_vec(), idle];
     let source = opted_in_source("codex", CODEX_APP, false);
