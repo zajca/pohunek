@@ -108,7 +108,7 @@ const GOLDEN_MANIFEST_NAME: &str = "codex";
 const PACKAGE_ID: &str = "pohunek.runtime.codex";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.2.2";
+const PACKAGE_VERSION: &str = "1.3.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -2528,14 +2528,21 @@ impl Fixture {
         .await
     }
 
-    /// Waits until the session reports `activity` on the strength of the
-    /// terminal title.
+    /// Waits until the session reports `activity` and the terminal title shows
+    /// it: a braille spinner for working. The activity itself may come from
+    /// the program-status record, which can precede the title.
     async fn wait_title_evidence(&self, id: &str, activity: &str) {
         wait_until(&format!("{activity} from the title of {id}"), || async {
             let (code, inspected) = self.harness.json(&["session", "inspect", id]).await;
             assert_eq!(code, 0, "{inspected}");
-            (inspected["ok"]["activity"] == activity
-                && inspected["ok"]["state_source"] == "osc_title")
+            let (title, _rows) = self.screen(id).await;
+            let spinner = title.as_deref().is_some_and(|title| {
+                title
+                    .chars()
+                    .next()
+                    .is_some_and(|first| ('\u{2800}'..='\u{28ff}').contains(&first))
+            });
+            (inspected["ok"]["activity"] == activity && (spinner || activity != "working"))
                 .then_some(())
         })
         .await;
@@ -2721,9 +2728,9 @@ async fn a_real_codex_session_launches_and_is_detected_through_package_facts() {
     assert_eq!(launched["capabilities"]["resume"], true);
     assert_eq!(launched["capabilities"]["fork"], false);
 
-    // Idle: the title Codex sets at startup, read by the daemon and the package.
+    // Idle: the program-status record Codex writes at startup, read by the daemon; the package agrees from the title.
     let idle = fixture.wait_activity(&id, "idle").await;
-    assert_eq!(idle["state_source"], "osc_title", "{idle}");
+    assert_eq!(idle["state_source"], "osc_progress", "{idle}");
     assert_package_agrees(&fixture, &package, &id, AgentActivity::Idle).await;
 
     // Input: bracketed paste, then a separate submit after the descriptor's
@@ -3107,7 +3114,7 @@ async fn a_real_codex_approval_prompt_is_blocked_by_title_and_screen() {
         .await;
     assert_eq!(code, 0, "{sent}");
     let blocked = fixture.wait_activity(&id, "blocked").await;
-    assert_eq!(blocked["state_source"], "osc_title", "{blocked}");
+    assert_eq!(blocked["state_source"], "osc_progress", "{blocked}");
     let rows = fixture
         .wait_screen_line(&id, "Would you like to run the following command?")
         .await;
@@ -4975,4 +4982,110 @@ fn a_footer_line_next_to_the_working_row_does_not_override_the_record() {
     run.feed(&frame_bytes(Some("work"), &rows))
         .record("working");
     assert_eq!(run.activity(), WORKING_BY_RECORD, "{:?}", run.published);
+}
+
+/// The root records of the session's retained output so far.
+async fn program_status_of(fixture: &Fixture, id: &str) -> Vec<String> {
+    capture::program_status_records(&fixture.raw_output(id).await)
+}
+
+/// A waited input: `session input --until <activity>`.
+async fn input_until(fixture: &Fixture, id: &str, text: &str, activity: &str) -> Value {
+    let (code, sent) = fixture
+        .harness
+        .json(&[
+            "session",
+            "input",
+            id,
+            text,
+            "--until",
+            activity,
+            "--timeout",
+            WAIT_SLICE_MS,
+        ])
+        .await;
+    assert_eq!(code, 0, "{sent}");
+    sent["ok"].clone()
+}
+
+/// A real Codex 0.164.0 reports a held turn, a settled turn, a tool approval
+/// and a background terminal through OSC 7501, and the package reads them: a
+/// waited input sees working from the record, a permission prompt is blocked,
+/// a background terminal after the turn reads idle, and a stopped session
+/// keeps no working reading.
+#[tokio::test]
+#[ignore = "needs a real `codex` on PATH; run with POHUNEK_CODEX_E2E=1 and --ignored"]
+async fn a_real_codex_is_read_through_program_status() {
+    require_real_codex();
+    let fixture = Fixture::start().await;
+    fixture.install_integration().await;
+
+    let id = fixture.new_session("program-status").await["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    fixture.wait_activity(&id, "idle").await;
+
+    let working = input_until(
+        &fixture,
+        &id,
+        &format!("{} {PROMPT}", responses_stub::HOLD_MARKER),
+        "working",
+    )
+    .await;
+    assert_eq!(working["activity"], "working", "{working}");
+    fixture.wait_screen_line(&id, WORKING_ROW_MARK).await;
+    assert!(
+        program_status_of(&fixture, &id)
+            .await
+            .last()
+            .is_some_and(|record| record == "app=codex:state=working"),
+        "the record says working while the turn is held"
+    );
+    fixture.stub.open_gate();
+    fixture.wait_activity(&id, "idle").await;
+    let records = program_status_of(&fixture, &id).await;
+    assert!(
+        records
+            .last()
+            .is_some_and(|record| record == "app=codex:state=done" || record.ends_with("idle")),
+        "the turn ends with done or idle: {records:?}"
+    );
+
+    fixture
+        .input(&id, &format!("{} run it", responses_stub::APPROVAL_MARKER))
+        .await;
+    let blocked = fixture.wait_activity(&id, "blocked").await;
+    assert!(
+        program_status_of(&fixture, &id)
+            .await
+            .iter()
+            .any(|record| record == "app=codex:state=blocked:kind=permission"),
+        "the record says blocked for a permission prompt: {blocked}"
+    );
+    fixture.stop(&id).await;
+
+    let id = fixture.new_session("background").await["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    fixture.wait_activity(&id, "idle").await;
+    input_until(
+        &fixture,
+        &id,
+        &format!("{} go", responses_stub::BACKGROUND_MARKER),
+        "working",
+    )
+    .await;
+    fixture.wait_screen_line(&id, BACKGROUND_FOOTER_MARK).await;
+    let idle = fixture.wait_activity(&id, "idle").await;
+    assert_eq!(
+        program_status_of(&fixture, &id).await.last(),
+        Some(&"app=codex:state=working".to_owned()),
+        "the record still says working with the background terminal running: {idle}"
+    );
+    fixture.stop(&id).await;
+    let stopped = fixture.harness.json(&["session", "inspect", &id]).await.1;
+    assert_ne!(stopped["ok"]["activity"], "working", "{stopped}");
+    fixture.finish().await;
 }
