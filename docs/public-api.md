@@ -4638,7 +4638,8 @@ client adopts the file when it bumps its pin.
 Diagnostics. `pohunek doctor` checks the overlays that are configured instead
 of NetBird unconditionally: one `<overlay>_cli` check per overlay, in the place
 `netbird_cli` held (see `daemon.doctor`). It also reports `overlay_config`: `fail`
-when `overlays.toml` is refused, `warn` when the running daemon serves another
+when `overlays.toml` is refused or `POHUNEK_REMOTE_PORT` is unusable (the message
+names which, and no overlay is probed), `warn` when the running daemon serves another
 overlay or port than the file configures, with the text "restart the daemon to
 apply", and `ok` otherwise. A daemon that reports no overlay (an older release)
 or does not answer is not compared. When `POHUNEK_REMOTE_PORT` is set in the

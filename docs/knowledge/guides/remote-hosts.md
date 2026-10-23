@@ -189,10 +189,11 @@ macOS-specific routing, bridging, or relay mode.
   (`/opt/homebrew/bin`, `/usr/local/bin` among them). An executable another
   account could replace is never used. `pohunek doctor` reports `netbird_cli`
   through the same lookup. Its warning has several causes: read the detail. A
-  "not found" detail means no trusted `netbird` was located; install NetBird or
-  fix the ownership and permissions of the directory holding it. A "local state
-  is unavailable" or "no NetBird IP" detail means the CLI was found but is not
-  logged in or its daemon is down. When the daemon answers, the entry reads
+  "not installed or not trusted" detail means no trusted `netbird` was located;
+  install NetBird or fix the ownership and permissions of the directory holding
+  it. A "local netbird state is unavailable" or "no netbird address resolved"
+  detail means the CLI was found but is not logged in, its daemon is down or it
+  did not answer in time. When the daemon answers, the entry reads
   `local: ...; daemon: ...` and the worse status wins: read each side, because
   a warning from one process does not prove the other cannot find the CLI.
   On nix-darwin, `/run/current-system/sw/bin/netbird` is accepted when the

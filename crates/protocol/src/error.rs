@@ -702,7 +702,7 @@ impl ProtocolError {
 
     /// The canonical `transport/host_unreachable` error.
     ///
-    /// Raised when a `NetBird` TCP connection to the host's daemon control port
+    /// Raised when an overlay TCP connection to the host's daemon control port
     /// could not be opened (the peer is offline or the port is closed). Names the
     /// host and carries a `recover` hint. Code is stable: `host_unreachable`.
     #[must_use]
@@ -710,7 +710,7 @@ impl ProtocolError {
         Self::new(
             ErrorClass::Transport,
             "host_unreachable",
-            format!("could not open a NetBird connection to host '{host}'"),
+            format!("could not open an overlay connection to host '{host}'"),
             Some("check that the host is online and its pohunek daemon is running".to_owned()),
         )
     }

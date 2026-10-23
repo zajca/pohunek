@@ -135,24 +135,29 @@ fn cli_check(diagnostic: &OverlayDiagnostic, from_file: bool) -> DoctorCheck {
             name,
             DoctorStatus::Warn,
             format!(
-                "the {id} CLI is not installed; {id} is the default overlay and optional (remote \
-                 hosts need it)"
+                "the {id} CLI is not installed or not trusted; {id} is the default overlay and \
+                 optional (remote hosts need it)"
             ),
         ),
         Some(OverlayError::ListenerAddressMissing(_)) => DoctorCheck::new(
             name,
             DoctorStatus::Warn,
-            format!("found, but no {id} address resolved (not logged in or daemon down)"),
+            format!("the {id} CLI answered, but no {id} address resolved (not logged in or daemon down)"),
+        ),
+        Some(OverlayError::StateUnavailable { detail, .. }) => DoctorCheck::new(
+            name,
+            DoctorStatus::Warn,
+            format!("local {id} state is unavailable: {detail}"),
         ),
         Some(error) => DoctorCheck::new(
             name,
             DoctorStatus::Warn,
-            format!("found, but local state is unavailable: {error}"),
+            format!("local {id} state is unavailable: {error}"),
         ),
         None => DoctorCheck::new(
             name,
             DoctorStatus::Warn,
-            format!("found, but the {id} provider reported no address"),
+            format!("the {id} provider reported no address"),
         ),
     }
 }

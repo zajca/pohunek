@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::join_all;
 use netbird::{NetbirdTransport, NETBIRD_OVERLAY_ID};
 use overlay::{
     ConfiguredTransport, OverlayDiagnostic, OverlayError, OverlayRegistry, OverlayTransport,
@@ -232,21 +233,19 @@ pub fn default_overlay_registry() -> Result<OverlayRegistry, ClientError> {
     OverlayConfig::load()?.registry()
 }
 
-/// Probe every overlay of `registry` for its listener state within `budget`.
+/// Probe every overlay of `registry` for its listener state.
 ///
-/// A provider that has not answered when the budget elapses is reported as
-/// unavailable instead of stalling the caller, so a hung provider CLI cannot
-/// outlast a doctor request.
+/// Each provider gets `budget` on its own: one that has not answered when it
+/// elapses is reported as unavailable, so a hung provider CLI neither outlasts a
+/// doctor request nor hides the state of a healthy one.
 pub async fn diagnose_overlays(
     registry: &OverlayRegistry,
     budget: Duration,
 ) -> Vec<OverlayDiagnostic> {
-    match tokio::time::timeout(budget, registry.diagnostics()).await {
-        Ok(diagnostics) => diagnostics,
-        Err(_elapsed) => registry
-            .entries()
-            .iter()
-            .map(|entry| OverlayDiagnostic {
+    join_all(registry.entries().iter().map(|entry| async move {
+        match tokio::time::timeout(budget, entry.diagnostic()).await {
+            Ok(diagnostic) => diagnostic,
+            Err(_elapsed) => OverlayDiagnostic {
                 overlay: entry.id().clone(),
                 port: entry.port(),
                 listener: None,
@@ -254,9 +253,10 @@ pub async fn diagnose_overlays(
                     overlay: entry.id().clone(),
                     detail: format!("the provider did not answer within {budget:?}"),
                 }),
-            })
-            .collect(),
-    }
+            },
+        }
+    }))
+    .await
 }
 
 /// Resolve `<config_home>/pohunek`.

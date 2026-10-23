@@ -84,16 +84,21 @@ pub(crate) async fn diagnose(paths: &Paths) -> Result<Report, CliError> {
             path,
         })
         .collect();
-    let overlay_config = OverlayConfig::load_from(&paths.config_dir);
-    let overlay_diagnostics = match overlay_config.as_ref().map(OverlayConfig::registry) {
-        Ok(Ok(registry)) => {
-            pohunek_client::diagnose_overlays(&registry, hostcheck::OVERLAY_PROBE_BUDGET).await
+    let overlay_state = OverlayConfig::load_from(&paths.config_dir).and_then(|config| {
+        let registry = config.registry()?;
+        Ok((config, registry))
+    });
+    let overlay_diagnostics = match &overlay_state {
+        Ok((_, registry)) => {
+            pohunek_client::diagnose_overlays(registry, hostcheck::OVERLAY_PROBE_BUDGET).await
         }
-        Ok(Err(_)) | Err(_) => Vec::new(),
+        Err(_) => Vec::new(),
     };
     let overlays = OverlayChecks {
         diagnostics: &overlay_diagnostics,
-        from_file: overlay_config.as_ref().is_ok_and(OverlayConfig::from_file),
+        from_file: overlay_state
+            .as_ref()
+            .is_ok_and(|(config, _)| config.from_file()),
     };
     let mut checks = hostcheck::standard_checks(StandardCheckInputs {
         socket_dir: &paths.runtime_dir,
@@ -143,7 +148,7 @@ pub(crate) async fn diagnose(paths: &Paths) -> Result<Report, CliError> {
         checks.push(launchd_job_check(job_status, connected, supervision));
     }
     checks.push(overlay_config_check(
-        &overlay_config,
+        overlay_state.as_ref().map(|(config, _)| config),
         remote
             .as_deref()
             .map(hostcheck::overlay_checks::reported_overlays)
@@ -162,12 +167,15 @@ pub(crate) async fn diagnose(paths: &Paths) -> Result<Report, CliError> {
 
 /// Report `overlays.toml` and whether the running daemon serves the same overlay.
 ///
-/// `daemon` is what the daemon reported, or `None` when it did not answer. A
+/// `config` is the configuration and registry the CLI would use, or why it
+/// cannot build them (an unusable `overlays.toml`, or an unusable
+/// `POHUNEK_REMOTE_PORT`, which the message names). `daemon` is what the daemon
+/// reported, or `None` when it did not answer. A
 /// daemon that reports no overlay is older than the report and cannot be
 /// compared. `port_override` notes that `POHUNEK_REMOTE_PORT` in this shell
 /// changes the port the file would give.
 fn overlay_config_check(
-    config: &Result<OverlayConfig, ClientError>,
+    config: Result<&OverlayConfig, &ClientError>,
     daemon: Option<&[ReportedOverlay]>,
     port_override: bool,
 ) -> DoctorCheck {
@@ -177,7 +185,7 @@ fn overlay_config_check(
             return DoctorCheck::new(
                 OVERLAY_CONFIG_CHECK,
                 Status::Fail,
-                format!("{error}; fix or remove the file and run 'pohunek doctor' again"),
+                format!("{error}; no overlay is probed until it is fixed, then run 'pohunek doctor' again"),
             );
         }
     };

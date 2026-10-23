@@ -255,6 +255,31 @@ fn an_unusable_file_fails_the_overlay_config_check() {
     );
 }
 
+/// An unusable `POHUNEK_REMOTE_PORT` is named as the cause even though no file
+/// exists, and no provider is probed.
+#[test]
+fn an_unusable_port_override_is_named_instead_of_blaming_a_file() {
+    let fixture = Fixture::new(true);
+
+    let output = fixture
+        .pohunek()
+        .env("POHUNEK_REMOTE_PORT", "not-a-port")
+        .args(["doctor", "--json"])
+        .output()
+        .expect("run doctor");
+
+    let checks = checks_of(&output);
+    let config = check(&checks, "overlay_config");
+    assert_eq!(config["status"], "fail", "{config}");
+    assert!(detail(config).contains("POHUNEK_REMOTE_PORT"), "{config}");
+    assert!(!detail(config).contains("remove the file"), "{config}");
+    assert!(
+        !names(&checks).contains(&"netbird_cli"),
+        "{:?}",
+        names(&checks)
+    );
+}
+
 /// The daemon reports its overlay and listener state, and the CLI compares its
 /// own file with it: a file changed after the daemon started is flagged.
 #[test]

@@ -445,23 +445,16 @@ impl ClientError {
                 source,
             } => {
                 let route = describe_route(overlay.as_deref(), *address, *port);
-                let recover = match overlay {
-                    Some(overlay) => format!(
+                let mut err = ProtocolError::host_unreachable(host);
+                err.msg = format!("{} ({route}): {source}", err.msg);
+                if let Some(overlay) = overlay {
+                    err.recover = Some(format!(
                         "check that the host is online, that its pohunek daemon is running and \
                          that its overlays.toml lists '{overlay}' as its provider; a daemon \
                          started with another provider does not listen on {overlay}"
-                    ),
-                    None => "check that the host is online and its pohunek daemon is running"
-                        .to_owned(),
-                };
-                ProtocolError::new(
-                    ErrorClass::Transport,
-                    "host_unreachable",
-                    format!(
-                        "could not open an overlay connection to host '{host}' ({route}): {source}"
-                    ),
-                    Some(recover),
-                )
+                    ));
+                }
+                err
             }
             ClientError::RemoteDaemonUnavailable { host } => {
                 ProtocolError::remote_daemon_unavailable(host)
@@ -692,8 +685,6 @@ fn ambiguity_hint(candidates: &[overlay::HostCandidate]) -> String {
     }
 }
 
-/// Message of a lifecycle deadline that elapsed while the daemon `action` was
-/// still pending.
 /// The overlay and socket address a failed connection dialled, for messages.
 fn describe_route(overlay: Option<&str>, address: IpAddr, port: u16) -> String {
     let target = SocketAddr::new(address, port);
@@ -703,6 +694,8 @@ fn describe_route(overlay: Option<&str>, address: IpAddr, port: u16) -> String {
     }
 }
 
+/// Message of a lifecycle deadline that elapsed while the daemon `action` was
+/// still pending.
 fn lifecycle_timeout_message(host: Option<&str>, timeout: Duration, action: &str) -> String {
     host.map_or_else(
         || format!("timed out after {timeout:?} waiting for the local daemon to {action}"),
