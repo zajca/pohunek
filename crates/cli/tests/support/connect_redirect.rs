@@ -93,8 +93,7 @@ int connect(int fd, const struct sockaddr *address, socklen_t length) {
                     (void)close(output);
                 }
             }
-            /* The fixture listens on IPv4 loopback; a dual-stack socket reaches it
-               through the IPv4-mapped form. */
+            /* The fixture listens on IPv4 loopback, reached through the mapped form. */
             struct sockaddr_in6 redirected = *original;
             memset(&redirected.sin6_addr, 0, sizeof(redirected.sin6_addr));
             redirected.sin6_addr.s6_addr[10] = 0xff;

@@ -2175,6 +2175,7 @@ async fn bind_scripted(
                 .expect("open real isolated host-governance service"),
         ),
         support::overlay_registry(),
+        pohunek_daemon::api::OverlaySource::Default,
     );
     // The overlay address is not bindable here; a loopback socket stands in.
     let stand_in = TcpListener::bind("127.0.0.1:0")

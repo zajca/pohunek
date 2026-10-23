@@ -272,8 +272,8 @@ async fn spawn_server_with_overlay(
         overlay,
         pohunek_daemon::api::OverlaySource::Default,
     )
-        .await
-        .expect("server binds");
+    .await
+    .expect("server binds");
     let (tx, rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
         server
