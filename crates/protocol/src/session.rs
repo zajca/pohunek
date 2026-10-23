@@ -994,7 +994,8 @@ pub enum DetectionRegionKind {
     PromptBoxBody,
     /// Visible text after the last horizontal rule.
     AfterLastHorizontalRule,
-    /// Canonical form of the held OSC 7501 program-status record.
+    /// Canonical form of the held OSC 7501 program-status record. The daemon
+    /// returns no preview of it while this enum is strict for older clients.
     ProgramStatus,
 }
 

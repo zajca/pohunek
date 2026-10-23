@@ -1137,8 +1137,9 @@ the screen rules stay the fallback.
   changes nothing.
 - **Wire.** The source is the existing `osc_progress` ("an OSC status report of
   the program"), so older SDKs that validate the closed `StateSource` set keep
-  working. `session.detection` shows a `program_status` region with the
-  canonical `app=<app>:state=<state>[:kind=<kind>]` or an empty text.
+  working. `session.detection` does not expose the record: the
+  `DetectionRegionKind` enum is strict on the wire, so the `program_status`
+  preview waits for the tolerant decode of #1337.
 - **Probe answer.** Programs such as Claude Code and Pi enable their reports only
   after the terminal echoes the probe. The session worker answers it when the
   launch's manifest sets `answer_probe = true` (see Durable Session Workers).

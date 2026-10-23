@@ -385,10 +385,17 @@ impl Detector {
 
         let mut transitions = Vec::new();
         // Only a chunk that ends idle latches: transcript text drawn ahead of a
-        // dialog, or of a screen no rule names, must never read as working.
+        // dialog, or of a screen no rule names, must never read as working. An
+        // override winner also stops the latch while the held record is
+        // working, because the record's own working edge is already refused.
+        let record_working = self
+            .program_status
+            .as_ref()
+            .is_some_and(|record| record.state == ProgramState::Working);
         if let Some(sighted) = sighted_working {
             if hit.as_ref().is_some_and(|hit| {
-                hit.evidence.activity == AgentActivity::Idle && !hit.overrides_program_status
+                hit.evidence.activity == AgentActivity::Idle
+                    && !(hit.overrides_program_status && record_working)
             }) {
                 push_transition(&mut transitions, self.state.observe_evidence(now, sighted));
             }

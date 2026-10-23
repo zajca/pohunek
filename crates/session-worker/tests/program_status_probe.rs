@@ -32,9 +32,9 @@ const INPUT_STALL: Duration = Duration::from_secs(20);
 const STUCK_WRITE_BYTES: usize = 200_000;
 /// Echoed bytes that show the PTY input queue is full.
 const QUEUE_FULL_ECHO: usize = 4_000;
-/// Hold the paced plan keeps the input lock for, longer than the time the
-/// reply task needs to queue behind it.
-const PLAN_HOLD: Duration = Duration::from_millis(400);
+/// Delay of the paced plan's first fragment. It never elapses: the scenario
+/// drops the plan once it has seen the second probe.
+const PLAN_HOLD: Duration = Duration::from_secs(3600);
 
 fn spawn(script: &str, cwd: &Path, answers_probe: bool) -> PtyOwner {
     let config = WorkerConfig::new();
@@ -224,13 +224,14 @@ async fn a_probe_reply_waits_for_a_paced_plan_and_coalesces() {
     let cwd = tempdir().expect("temp dir");
     // The shell prints a probe after reading the plan's first fragment and a
     // second one once the test opened the gate; the plan holds the input lock
-    // for its delay, so the second probe finds the first reply still pending.
+    // until the test drops it, so the second probe finds the first reply still
+    // pending.
     let gate = cwd.path().join("go");
     let script = format!(
         "stty raw -echo; head -c 1 >/dev/null; printf '{PROBE_ST}'; printf P1; \
-         while [ ! -e '{gate}' ]; do :; done; printf 'x{PROBE_ST}'; {dump1} {dump2}",
+         while [ ! -e '{gate}' ]; do :; done; printf 'x{PROBE_ST}P2'; {dump1} {dump2}",
         gate = gate.display(),
-        dump1 = read_dump(1, 1 + REPLY_BYTES),
+        dump1 = read_dump(1, REPLY_BYTES),
         dump2 = read_dump(2, 1)
     );
     let pty = spawn(&script, cwd.path(), true);
@@ -254,13 +255,15 @@ async fn a_probe_reply_waits_for_a_paced_plan_and_coalesces() {
     };
     output_until(&pty, "P1").await;
     std::fs::write(&gate, b"").expect("open the gate");
-    paced.await.expect("plan task").expect("paced plan");
+    output_until(&pty, "P2").await;
+    paced.abort();
+    let _ = paced.await;
     let output = output_until(&pty, ":END1").await;
 
     assert_eq!(
         dump(&output, 1),
-        format!("62{REPLY_HEX}"),
-        "the reply follows the whole plan"
+        REPLY_HEX,
+        "the single reply is written once the plan released the lock"
     );
     // A second reply would sit in the input ahead of the marker.
     write_stream(&pty, b"Z").await;

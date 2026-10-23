@@ -450,7 +450,8 @@ impl<'de> Deserialize<'de> for Response {
 pub enum StateSource {
     /// Derived from the OSC terminal title.
     OscTitle,
-    /// Derived from OSC progress reports.
+    /// Derived from an OSC 9 progress report or an OSC 7501 program status
+    /// record.
     OscProgress,
     /// Derived from screen-content manifest matching.
     Screen,

@@ -33,6 +33,43 @@ use protocol::{
     StateSource, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 
+/// `session.detection` as a client that predates the program-status region
+/// kind decodes it: a strict closed set of kinds.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyDetection {
+    #[serde(rename = "session_id")]
+    _session_id: String,
+    supported_regions: Vec<LegacyKind>,
+    previews: Vec<LegacyPreview>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPreview {
+    #[serde(rename = "kind")]
+    _kind: LegacyKind,
+    #[serde(rename = "region")]
+    _region: String,
+    #[serde(rename = "text")]
+    _text: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyKind {
+    OscTitle,
+    OscProgress,
+    WholeRecent,
+    BottomLines,
+    BottomNonEmptyLines,
+    TopNonEmptyLines,
+    LastNonEmptyAbovePromptBox,
+    AfterLastPromptMarker,
+    PromptBoxBody,
+    AfterLastHorizontalRule,
+}
+
 const TEST_COLS: u16 = 100;
 const TEST_ROWS: u16 = 24;
 /// The `app` the stand-in agent's records carry and its manifest opts in with.
@@ -291,9 +328,13 @@ async fn a_probe_waiting_agent_reports_activity_through_program_status() {
         .detection(&created.id)
         .await
         .expect("session.detection");
-    assert!(detection.previews.iter().any(|preview| preview.kind
-        == protocol::DetectionRegionKind::ProgramStatus
-        && preview.text == format!("app={APP}:state=idle")));
+    // A client that predates the program-status kind decodes the result: the
+    // record is not on the wire.
+    let wire = serde_json::to_value(&detection).expect("serialize session.detection");
+    let legacy: LegacyDetection =
+        serde_json::from_value(wire).expect("an older client decodes session.detection");
+    assert_eq!(legacy.supported_regions.len(), 10);
+    assert!(!legacy.previews.is_empty());
 
     let flow = async {
         // A waited input that the agent answers with working evidence.

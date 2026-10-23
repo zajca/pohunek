@@ -1832,12 +1832,11 @@ active manifest in manifest order:
 ```
 
 A manifest that declares `[program_status]` (see "Declaring program status" in
-the runtime-packages guide) adds `program_status` to `supported_regions` (only
-for such a session, so a client that predates the kind decodes every other
-result) and lists a `program_status` preview, whose
-`region` is `program_status` and whose `text` is the held record as
-`app=<app>:state=<state>[:kind=<kind>]`, or empty when none is held. Message,
-title and progress texts of a record are never stored or exposed.
+the runtime-packages guide) takes part in activity detection, but `session.detection` neither lists
+`program_status` in `supported_regions` nor returns a preview for it:
+`DetectionRegionKind` is a strict enum on the wire, so a client that predates
+the kind would fail to decode the result. Message, title and progress texts of
+a record are never stored or exposed.
 
 Parameterized manifest syntax is `bottom_lines(N)`,
 `bottom_non_empty_lines(N)`, or `top_non_empty_lines(N)`; the preview's

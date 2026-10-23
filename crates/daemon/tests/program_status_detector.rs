@@ -987,6 +987,43 @@ fn an_override_repaint_with_a_working_record_adds_no_working_edge() {
 }
 
 #[test]
+fn an_override_rule_keeps_the_working_latch_without_a_working_record() {
+    let latched = |prefix: &[u8], record_after: &[u8]| {
+        let mut harness = override_harness();
+        harness.feed(&frame(Some("idle"), &["BACKGROUND-ONLY"]));
+        let chunk = [
+            prefix,
+            &frame(Some("RUNNING"), &["BACKGROUND-ONLY"]),
+            record_after,
+            &frame(Some("idle"), &["BACKGROUND-ONLY"]),
+        ]
+        .concat();
+        harness.feed_raw(&chunk)
+    };
+
+    // No record at all: an older program that never reports.
+    let without_record = latched(b"", b"");
+    assert!(
+        without_record
+            .iter()
+            .any(|transition| transition.activity == AgentActivity::Working),
+        "the turn title latches working: {without_record:?}"
+    );
+
+    // A working record that moved to done inside the chunk.
+    let finished = latched(
+        &record("state=working:app=probe"),
+        &record("state=done:app=probe"),
+    );
+    assert!(
+        finished
+            .iter()
+            .any(|transition| transition.activity == AgentActivity::Working),
+        "the finished turn still latches working: {finished:?}"
+    );
+}
+
+#[test]
 fn a_report_is_not_an_event_without_the_opt_in() {
     // A BEL-terminated record splits the screen feed into segments only when the
     // manifest opted in; without it the output is handled as any other output.
