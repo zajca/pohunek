@@ -338,10 +338,7 @@ impl Detector {
         }
         self.feed_screen_segment(&bytes[consumed..], &mut latch);
         #[cfg(test)]
-        {
-            self.latch_evaluations += latch.evaluations;
-            self.latch_sightings += usize::from(latch.sighted.is_some());
-        }
+        self.record_latch_counters(&latch);
         let osc_changes = latch.osc_changes;
         let sighted_working = latch.sighted;
 
@@ -379,6 +376,12 @@ impl Detector {
         }
 
         transitions
+    }
+
+    #[cfg(test)]
+    fn record_latch_counters(&mut self, latch: &ChunkLatch) {
+        self.latch_evaluations += latch.evaluations;
+        self.latch_sightings += usize::from(latch.sighted.is_some());
     }
 
     /// Whether the manifest takes part in the working latch.
@@ -1104,6 +1107,7 @@ fn push_transition(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::time::{Duration, Instant};
 
     use protocol::{AgentActivity, RuntimeRef, StateSource};
@@ -2600,7 +2604,7 @@ mod tests {
             "\u{2500}\u{2500}\u{2500}\u{2500}",
             "  auto mode on",
         ] {
-            repaint.push_str(&format!("\x1b[2K{line}\r\n"));
+            let _ = write!(repaint, "\x1b[2K{line}\r\n");
         }
         let transitions = detector.feed(started_at + Duration::from_millis(10), repaint.as_bytes());
 
@@ -2803,7 +2807,7 @@ mod tests {
         // idle prompt.
         let mut screen = String::from("\x1b[2J\x1b[H\u{2695} \u{276f}\r\n");
         for line in 1..=8 {
-            screen.push_str(&format!("out {line}\r\n"));
+            let _ = write!(screen, "out {line}\r\n");
         }
         screen.push_str("\u{276f} ");
         detector.feed(started_at, screen.as_bytes());
@@ -2819,7 +2823,7 @@ mod tests {
         // staff prompt inside the bottom window, then reprints the rest.
         let mut redraw = String::from("\x1b[3;1H\x1b[J");
         for line in 2..=8 {
-            redraw.push_str(&format!("out {line}\r\n"));
+            let _ = write!(redraw, "out {line}\r\n");
         }
         redraw.push_str("\u{276f} ");
         let transitions = detector.feed(started_at + Duration::from_millis(10), redraw.as_bytes());
