@@ -1333,7 +1333,9 @@ version_probe = { parser = "semver-v1", args = ["--version"], min = "1.0.0", bel
 four tokens) is the probe argv, and `[min, below)` is the supported release
 range, so a package update can move the range without a daemon release. The
 official packages declare `min` as their tested minimum (the verified release,
-except Pi, which accepts from 1.0.0 and is verified on 1.4.0, with the 1.0.2 captures kept as the previous release) and `below` as
+except Pi, which accepts from 1.0.0 and is verified on 1.4.0, with the 1.0.2 captures kept as the previous release, and Codex, whose
+`min` is the previous verified release, with its captures kept in the
+repository) and `below` as
 the next major release (codex `[0.160.0, 1.0.0)`, claude
 `[2.1.289, 3.0.0)`, hermes `[0.20.0, 1.0.0)`, pi `[1.0.0, 2.0.0)`), because hosts
 update the agent CLIs independently of pohunek. The

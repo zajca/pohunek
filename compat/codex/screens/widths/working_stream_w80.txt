@@ -1,24 +1,24 @@
-  /status - show current session configuration
-  /permissions - choose what Codex is allowed to do
-  /model - choose what model and reasoning effort to use
-  /review - review any changes and find issues
+current session
+configuration
+  /permissions -
+choose what Codex is
+allowed to do
+  /model - choose
+what model and
+reasoning effort to
+use
+  /review - review
+any changes and find
+issues
 
 
-› HOLD EARLY a
+› [hold] say hi
 
 
-• working done
-
-  Worked for 3s • 9:54 PM
+• working
 
 
-› HOLD b
+› Ask Codex to do a
 
-
-• Working (2s • esc to interrupt)
-
-
-› Ask Codex to do anything
-
-  stub-model default · /tmp/cxw · ⠙
-  ← for agents · ? for shortcuts                       ⚠ 1 warning · f2 to view
+  stub-model defaul…
+  ← for a  ⚠ 1 · f2

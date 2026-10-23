@@ -1,7 +1,6 @@
-  >_ OpenAI Codex (v0.160.0)
-     /tmp/cxw
 
-  A hunch is a perfectly respectable starting point.
+  >_ OpenAI Codex (v0.164.0)
+     /dev/shm/ph-codex/cwd
 
   To get started, describe a task or try one of these commands:
 
@@ -12,13 +11,14 @@
   /review - review any changes and find issues
 
 
-› HOLD EARLY a
+› [hold] say hi
 
 
-• Working (2s • esc to interrupt)
+
+• Working (0s • esc to interrupt)
 
 
 › Ask Codex to do anything
 
-  stub-model default · /tmp/cxw · ⠴
+  stub-model default · /dev/shm/ph-codex/cwd
   ← for agents · ? for shortcuts                                           ⚠ 1 warning · f2 to view

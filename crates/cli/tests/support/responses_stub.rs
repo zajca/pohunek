@@ -43,6 +43,17 @@ pub(crate) const APPROVAL_MARKER: &str = "[approval]";
 /// Shell command the approval reply asks to run.
 pub(crate) const APPROVAL_COMMAND: &str = "touch approved.txt";
 
+/// Prompt text that makes the stub answer with a command that keeps running
+/// after Codex stops waiting for it: a background terminal.
+pub(crate) const BACKGROUND_MARKER: &str = "[background]";
+
+/// Shell command the background reply starts.
+pub(crate) const BACKGROUND_COMMAND: &str = "sleep 3600";
+
+/// How long Codex waits for the background command before it returns the turn
+/// to the model, in milliseconds.
+const BACKGROUND_YIELD_MS: u64 = 1000;
+
 /// Largest request body the stub reads, in bytes.
 ///
 /// Agent requests carry the system prompt, tool declarations and the
@@ -202,10 +213,11 @@ fn respond(stream: TcpStream, state: &State) -> io::Result<()> {
         "response.created",
         &serde_json::json!({ "type": "response.created", "response": { "id": "resp_stub" } }),
     )?;
-    let answers_with_command =
-        request.body.contains(APPROVAL_MARKER) && !request.body.contains(TOOL_RESULT_MARKER);
-    if answers_with_command {
+    let no_tool_result = !request.body.contains(TOOL_RESULT_MARKER);
+    if request.body.contains(APPROVAL_MARKER) && no_tool_result {
         send_approval_command(&mut writer)?;
+    } else if request.body.contains(BACKGROUND_MARKER) && no_tool_result {
+        send_background_command(&mut writer)?;
     } else {
         send_text(&mut writer, state, request.body.contains(HOLD_MARKER))?;
     }
@@ -303,6 +315,30 @@ fn send_approval_command(writer: &mut TcpStream) -> io::Result<()> {
             "cmd": APPROVAL_COMMAND,
             "sandbox_permissions": "require_escalated",
             "justification": "Create the marker file",
+        })
+        .to_string(),
+    });
+    for name in ["response.output_item.added", "response.output_item.done"] {
+        send_event(
+            writer,
+            name,
+            &serde_json::json!({ "type": name, "output_index": 0, "item": call }),
+        )?;
+    }
+    Ok(())
+}
+
+/// Streams a shell tool call whose command outlives the wait Codex gives it, so
+/// Codex keeps it as a background terminal after the turn.
+fn send_background_command(writer: &mut TcpStream) -> io::Result<()> {
+    let call = serde_json::json!({
+        "type": "function_call",
+        "id": "fc_stub",
+        "call_id": "call_stub",
+        "name": "exec_command",
+        "arguments": serde_json::json!({
+            "cmd": BACKGROUND_COMMAND,
+            "yield_time_ms": BACKGROUND_YIELD_MS,
         })
         .to_string(),
     });

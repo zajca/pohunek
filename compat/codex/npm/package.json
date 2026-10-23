@@ -4,6 +4,6 @@
   "private": true,
   "description": "Pinned npm install set of the locked codex release; staged by `cargo xtask compat stage-upstream`.",
   "dependencies": {
-    "@openai/codex": "0.160.0"
+    "@openai/codex": "0.164.0"
   }
 }
