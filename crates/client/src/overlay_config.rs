@@ -5,17 +5,21 @@
 //! port the remote control listener uses. The file is optional: when it or its
 //! directory is absent, the host works over `NetBird` on [`DEFAULT_REMOTE_PORT`].
 //!
-//! Every component of the config directory path is opened without following
-//! symlinks and must be owned by the user (or by root and not writable) and not
-//! be writable by other accounts, so a symlinked or group-writable `~/.config`
-//! is refused even when the file is absent. The directory, when it exists,
-//! must be one no other account can write,
-//! whether or not the file is there, because another account could otherwise
-//! plant the file. When the file exists it must be a regular file owned by the
-//! user with mode `0600`. Parsing is strict: unknown keys, wrong types and
-//! out-of-range values fail with [`ClientError::OverlayConfiguration`] before
-//! any provider is consulted. Error messages carry the file path and, at most,
-//! a line number, never a value from the file.
+//! When nothing exists at the file path (checked without following a symlink at
+//! the file itself), there is no configuration to trust: the defaults apply and
+//! the directory is not inspected, so a symlinked or group-writable
+//! `~/.config` never blocks a host that did not opt in. A writer in an unsafe
+//! directory can then only make a file appear, which is refused by the checks
+//! below, or delete it, which falls back to the `NetBird` default.
+//!
+//! When anything exists at that path (file, symlink, FIFO), every component of
+//! the config directory path is opened without following symlinks and must be
+//! owned by the user (or by root and not writable) and not be writable by other
+//! accounts, and the file must be a regular file owned by the user with mode
+//! `0600`. Parsing is strict: unknown keys, wrong types and out-of-range values
+//! fail with [`ClientError::OverlayConfiguration`] before any provider is
+//! consulted. Error messages carry the file path and, at most, a line number,
+//! never a value from the file.
 //!
 //! `POHUNEK_REMOTE_PORT`, when set, overrides the file's `port`. The file is
 //! validated either way.
@@ -230,6 +234,18 @@ fn read_file(config_dir: &Path) -> Result<Option<String>, ClientError> {
         path: path.clone(),
         reason,
     };
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            return Ok(None)
+        }
+        Err(error) => {
+            return Err(invalid(format!(
+                "the file cannot be inspected: {}",
+                error.kind()
+            )))
+        }
+    }
     let bytes = match TrustedDir::open_absolute_owner_safe(config_dir, FORBIDDEN_DIRECTORY_BITS)
         .and_then(|dir| dir.read_file(OVERLAY_CONFIG_FILE, FILE_MODE, MAX_FILE_BYTES))
     {
@@ -327,8 +343,8 @@ fn unsafe_reason(error: &FsError) -> String {
             error.io_kind().unwrap_or(ErrorKind::Other)
         ),
         _ => format!(
-            "the directory must be owned by you and not writable by other accounts, even \
-             without a {OVERLAY_CONFIG_FILE}, and {OVERLAY_CONFIG_FILE} must be a regular file \
+            "the directory path must hold no symlink and be owned by you and not writable by \
+             other accounts, and {OVERLAY_CONFIG_FILE} must be a regular file \
              owned by you with mode {FILE_MODE:o}"
         ),
     }

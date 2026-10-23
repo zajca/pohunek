@@ -398,14 +398,6 @@ fn an_untrusted_file_or_directory_fails_before_any_provider_call() {
         );
     }
 
-    // Directory writable by others with no file at all: a planted file could
-    // appear later, so the directory alone is refused.
-    let fixture = Fixture::new();
-    fixture.make_config_dir(0o757);
-    let path = fixture.config_dir().join("overlays.toml");
-    assert_invalid(&fixture.run(&["host", "list", "--json"]), &path);
-    assert!(!fixture.netbird_was_consulted(), "directory 0757, no file");
-
     // A symlink is never followed, even to a valid private file.
     let fixture = Fixture::new();
     let dir = fixture.make_config_dir(0o700);
@@ -468,5 +460,57 @@ fn a_host_flag_with_an_invalid_file_reports_the_configuration_error() {
     let path = fixture.write_config("providers = []\n", 0o600);
     let output = fixture.run(&["--host", "somepeer", "session", "list", "--json"]);
     assert_invalid(&output, &path);
+    assert!(!fixture.netbird_was_consulted());
+}
+
+/// No file means no configuration to trust: an unsafe directory does not
+/// block the NetBird default.
+#[test]
+fn an_absent_file_under_an_unsafe_directory_uses_the_defaults() {
+    // Group- and world-writable config directory.
+    for mode in [0o770, 0o757, 0o777] {
+        let fixture = Fixture::new();
+        fixture.make_config_dir(mode);
+        let records = host_records(&fixture.run(&["host", "list", "--json"]));
+        assert_eq!(records[0]["overlay"], "netbird", "directory {mode:o}");
+        assert_eq!(
+            records[0]["port"],
+            pohunek_client::DEFAULT_REMOTE_PORT,
+            "directory {mode:o}"
+        );
+    }
+
+    // The config home reached through a symlink (stow, home-manager).
+    let fixture = Fixture::new();
+    fixture.make_config_dir(0o700);
+    let link = fixture.env.root().join("config-link");
+    symlink(fixture.env.config_home(), &link).expect("symlink the config home");
+    let output = fixture
+        .command()
+        .env("XDG_CONFIG_HOME", &link)
+        .args(["host", "list", "--json"])
+        .output()
+        .expect("run host list");
+    let records = host_records(&output);
+    assert_eq!(records[0]["overlay"], "netbird");
+    assert_eq!(records[0]["port"], pohunek_client::DEFAULT_REMOTE_PORT);
+}
+
+/// A present file is trusted only through a safe path: a valid file below a
+/// symlinked config home is refused.
+#[test]
+fn a_present_file_under_a_symlinked_config_home_is_refused() {
+    let fixture = Fixture::new();
+    let path = fixture.write_config("providers = [\"netbird\"]\n", 0o600);
+    let link = fixture.env.root().join("config-link");
+    symlink(fixture.env.config_home(), &link).expect("symlink the config home");
+    let output = fixture
+        .command()
+        .env("XDG_CONFIG_HOME", &link)
+        .args(["host", "list", "--json"])
+        .output()
+        .expect("run host list");
+    assert_invalid(&output, &link.join("pohunek/overlays.toml"));
+    let _ = path;
     assert!(!fixture.netbird_was_consulted());
 }

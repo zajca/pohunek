@@ -31,9 +31,14 @@ port = 18722
   entries are refused until one host can run several overlays (#1113).
 - `port` is optional and must be in `1..=65535`; it is the port the daemon
   listens on and the CLI dials, on every host that reads the file.
-- Every component of the directory path (`~/.config` included) must be a real
+- When nothing exists at `overlays.toml`, the defaults apply and the directory
+  is not inspected (a symlinked or group-writable `~/.config` is fine): there
+  is no configuration to trust, and a writer in an unsafe directory can only
+  make a file appear, which is then refused, or delete it, which falls back to
+  the NetBird default. When anything exists at that path (file, symlink, FIFO),
+  every component of the directory path (`~/.config` included) must be a real
   directory, not a symlink, owned by you or root and not writable by other
-  accounts, even without the file. The file must be a regular file owned by you with mode
+  accounts. The file must be a regular file owned by you with mode
   `0600`, UTF-8, at most 64 KiB, with no unknown key.
 - Any violation is `overlay_configuration_invalid`; the message names the file
   and a line number, never a value from it. `pohunekd` exits with the same code
