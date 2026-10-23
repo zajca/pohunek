@@ -2961,9 +2961,10 @@ const SILENT_AGENT_STALL_TIMEOUT: Duration = Duration::from_millis(300);
 const STALL_SCENARIO_SHUTDOWN_GUARD: Duration = Duration::from_secs(30);
 
 /// Lines in the oversized input, about 134 KB in all. A PTY whose program
-/// does not read takes more than its 4 KiB line-discipline queue: Linux also
-/// buffers up to 64 KiB in the tty layer, and an input that fits is accepted
-/// at once. The input is larger than both, so the write always stalls.
+/// does not read holds only a few KiB: on Linux the tty flip buffer limit
+/// (8 KiB, `tty_buffer_set_limit` in `drivers/tty/pty.c`) plus the 4 KiB
+/// line-discipline queue (`N_TTY_BUF_SIZE`), and an input that fits is
+/// accepted at once. The input is far larger, so the write always stalls.
 const OVERSIZED_INPUT_LINES: usize = 1_700;
 
 /// Bytes per oversized input line.
