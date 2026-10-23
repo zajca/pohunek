@@ -22627,6 +22627,8 @@ generation "$1"
                 journaled_claim_sequence(&fixture, &created.id).await,
                 Some(6)
             );
+            // The adopted claim carries the caller's public order (2020).
+            assert!(!memory_report_is_recorded(&fixture, unbound_report(&created, 2_015)).await);
             let _ = fixture.registry.stop(&created.id).await;
         }
 
@@ -22824,6 +22826,8 @@ generation "$1"
                 journaled_claim_sequence(&fixture, &created.id).await,
                 Some(6)
             );
+            // The adopted claim carries the caller's public order (2020).
+            assert!(!memory_report_is_recorded(&fixture, unbound_report(&created, 2_015)).await);
             let _ = fixture.registry.stop(&created.id).await;
         }
 
@@ -22846,6 +22850,7 @@ generation "$1"
             let fixture = codex_fixture(FORWARD_CONNECT);
             let (created, _job, _) = fixture.create_agent("codex-agent").await;
             hold_a_committed_claim(&fixture, &created).await;
+            let instance = worker_instance_of(&fixture, &created.id).await;
             let directory = fixture.journal_dir(&created.id);
             let restore = Writable(directory.clone());
             std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
@@ -22868,6 +22873,10 @@ generation "$1"
             wait_until_nothing_is_tracked(&fixture, &created.id).await;
 
             drop(restore);
+            assert_eq!(worker_instance_of(&fixture, &created.id).await, instance);
+            // The dropped forward no longer holds the journal: a memory report
+            // newer than it is admitted.
+            assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_030)).await);
             let _ = fixture.registry.stop(&created.id).await;
         }
 
