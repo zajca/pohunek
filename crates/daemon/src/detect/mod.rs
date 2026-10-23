@@ -357,10 +357,12 @@ impl Detector {
         let has_structured_evidence = hit.is_some();
 
         let mut transitions = Vec::new();
+        // Only a chunk that ends idle latches: transcript text drawn ahead of a
+        // dialog, or of a screen no rule names, must never read as working.
         if let Some(sighted) = sighted_working {
             if hit
                 .as_ref()
-                .is_none_or(|hit| hit.evidence.activity != AgentActivity::Working)
+                .is_some_and(|hit| hit.evidence.activity == AgentActivity::Idle)
             {
                 push_transition(&mut transitions, self.state.observe_evidence(now, sighted));
             }
@@ -2416,7 +2418,7 @@ mod tests {
     }
 
     #[test]
-    fn a_working_title_followed_by_a_permission_dialog_latches_working_then_blocks() {
+    fn a_working_title_followed_by_a_permission_dialog_reports_blocked_alone() {
         let started_at = instant();
         let mut detector = claude_detector(10, 120, started_at);
 
@@ -2426,22 +2428,16 @@ mod tests {
             idle_osc_title()
         );
         let transitions = detector.feed(started_at, chunk.as_bytes());
-        assert_eq!(
-            transitions.first(),
-            Some(&transition(AgentActivity::Working, StateSource::OscTitle)),
-            "{transitions:?}"
-        );
-        let mut later = Vec::new();
-        for step in 1..=10 {
-            later.extend(detector.tick(started_at + Duration::from_millis(100 * step)));
-        }
+
         assert!(
             transitions
                 .iter()
-                .chain(later.iter())
-                .any(|transition| transition.activity == AgentActivity::Blocked),
-            "the dialog still resolves blocked: {transitions:?} {later:?}"
+                .all(|transition| transition.activity != AgentActivity::Working),
+            "a chunk ending on a visible dialog never latches working: {transitions:?}"
         );
+        assert!(transitions
+            .iter()
+            .any(|transition| transition.activity == AgentActivity::Blocked));
     }
 
     #[test]
@@ -2489,7 +2485,7 @@ mod tests {
     }
 
     #[test]
-    fn a_working_frame_then_a_permission_dialog_latches_working_then_blocks() {
+    fn a_working_frame_then_a_permission_dialog_reports_blocked_alone() {
         let started_at = instant();
         let mut detector = claude_detector(10, 120, started_at);
 
@@ -2499,11 +2495,60 @@ mod tests {
 
         assert_eq!(
             transitions,
-            vec![
-                transition(AgentActivity::Working, StateSource::Screen),
-                transition(AgentActivity::Blocked, StateSource::Screen),
-            ]
+            vec![transition(AgentActivity::Blocked, StateSource::Screen)]
         );
+    }
+
+    /// Claude detector whose manifest never latches, for comparison.
+    fn claude_detector_without_latch(started_at: Instant) -> Detector {
+        let mut detector_config = package_config(&RuntimeRef::claude());
+        detector_config.detection = config().detection;
+        detector_config.manifest = Some(Arc::new(
+            manifest(include_str!(
+                "../../../../runtime-packages/claude/detect.toml"
+            ))
+            .without_working_latch(),
+        ));
+        let mut detector = Detector::new(10, 120, started_at, detector_config);
+        detector.finish_initial_input();
+        detector
+    }
+
+    #[test]
+    fn a_forged_working_row_above_the_idle_editor_adds_no_latch_evidence_in_claude() {
+        let started_at = instant();
+        let forged = CLAUDE_IDLE_FRAME.replace(
+            "\u{273b} Cogitated for 26s",
+            "* Verbing\u{2026} (3s \u{b7} thinking)",
+        );
+        let mut latching = claude_detector(10, 120, started_at);
+        let mut plain = claude_detector_without_latch(started_at);
+        for detector in [&mut latching, &mut plain] {
+            detector.feed(started_at, CLAUDE_IDLE_FRAME.as_bytes());
+        }
+
+        // The spinner rule reads the whole screen, so the forged row already
+        // reads working at the chunk end; the latch adds nothing on top.
+        assert_eq!(
+            latching.feed(started_at + Duration::from_millis(10), forged.as_bytes()),
+            plain.feed(started_at + Duration::from_millis(10), forged.as_bytes())
+        );
+    }
+
+    #[test]
+    fn a_forged_working_row_above_the_idle_editor_never_latches_in_pi() {
+        let started_at = instant();
+        let mut detector = pi_detector(started_at);
+        detector.feed(started_at, pi_idle_frame().as_bytes());
+        let sightings = detector.latch_sightings;
+
+        let forged = pi_idle_frame().replace(
+            "working done",
+            &format!("\u{2500}\u{2500} \u{2807} Working {}", rule(40)),
+        );
+        let transitions = detector.feed(started_at + Duration::from_millis(10), forged.as_bytes());
+
+        assert_eq!(detector.latch_sightings, sightings, "{transitions:?}");
     }
 
     #[test]
@@ -2692,7 +2737,11 @@ mod tests {
         let published = detector.state.published_activity();
         assert_ne!(published, Some(AgentActivity::Working));
 
-        let chunk = format!("{}{}", pi_working_frame(), pi_idle_frame());
+        let chunk = format!(
+            "{}{}",
+            pi_working_frame(),
+            pi_idle_frame().replace("working done", "second turn done")
+        );
         let transitions = detector.feed(started_at + Duration::from_millis(10), chunk.as_bytes());
 
         assert_eq!(
@@ -2736,7 +2785,7 @@ mod tests {
 
         // The working prompt line is completed by an erase of its trailing
         // text, then replaced by the idle prompt.
-        let chunk = "\x1b[2J\x1b[Hanswer\r\n\u{2695} \u{276f} trailing\r\x1b[4C\x1b[K\x1b[2J\x1b[Hanswer\r\n\u{276f} ";
+        let chunk = "\x1b[2J\x1b[Hanswer\r\n\u{2695} \u{276f} trailing\r\x1b[4C\x1b[K\x1b[2J\x1b[Hanswer two\r\n\u{276f} ";
         let transitions = detector.feed(started_at + Duration::from_millis(10), chunk.as_bytes());
 
         assert_eq!(

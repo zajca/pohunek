@@ -7,3 +7,7 @@ fast turn. The detector evaluates an agent manifest at each OSC title or
 progress event and at each ordered screen observation point of the chunk; the
 generic shell manifest is unchanged. Under an agent manifest the terminal
 observer now stays armed after startup (`ScreenTracker::resume_observation`).
+
+The Hermes package (1.0.2) reads the bare staff prompt as working only on the
+last non-empty line, so an old transcript prompt exposed by a partial idle
+redraw does not latch.
