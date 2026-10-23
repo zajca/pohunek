@@ -91,6 +91,18 @@ process or runtime, is the `worker.identity.rejected` warning with
 `identity.operation` `subagent_start`, `subagent_stop` or `subagent_snapshot`
 (the last also for a Claude task list that breaks a bound).
 
+The worker logs one `worker.identity.answered` INFO event per private
+`identity_report`, from the parsed request to the written response, with
+`identity.accepted`, `identity.delivered` (whether the response write
+succeeded) and the durations `identity.lock_wait_us` (wait for the worker
+state), `identity.persist_us` (the durable journal writes, fsync included) and
+`identity.answer_us` (the whole answer). Compare `identity.answer_us` with the
+reporter's own `elapsed_ms` for the same send (`Reporter.worker_sends` of the
+Hermes hook reporter): a report that missed the hook deadline (0.25 s by
+default, 1.0 s at most) while `identity.answer_us` is small never reached the
+worker's handler in time, and one with a large `identity.persist_us` waited on
+the journal write. The event carries no claim payload or native reference.
+
 At every Claude main-turn end the state hook sends the worker a snapshot of
 Claude's running background tasks. The worker logs one
 `worker.subagent.snapshot.applied` at INFO per admitted snapshot, with
@@ -193,8 +205,8 @@ reports it `outdated`; reinstall it); and a session worker started by a release
 without the snapshot claim, which refuses it.
 
 A claim, snapshot or identity report that never reached the worker log (no
-`claim.ignored`, `claim.refused`, `snapshot.applied` or `identity.rejected`
-line) was dropped by the state hook itself, which always exits 0 so it never
+`claim.ignored`, `claim.refused`, `snapshot.applied`, `identity.answered` or
+`identity.rejected` line) was dropped by the state hook itself, which always exits 0 so it never
 breaks the provider. The hook records why in the hook failure trace,
 `~/.local/state/pohunek/logs/pohunek-hooks.jsonl` (the pohunek log directory;
 the worker passes the path to every managed child as `POHUNEK_HOOK_TRACE_PATH`

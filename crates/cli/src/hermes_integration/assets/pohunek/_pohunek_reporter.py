@@ -72,6 +72,7 @@ class Reporter:
         self._sequence = 0
         self._native_id: str | None = None
         self.failures = 0
+        self.worker_sends: dict[str, dict[str, Any]] = {}
 
     @property
     def active(self) -> bool:
@@ -157,17 +158,33 @@ class Reporter:
     def _send_worker(self, message: dict[str, Any]) -> bool:
         if not self._worker_socket:
             return False
+        started = time.monotonic()
+        outcome = "error"
         try:
             response = self._send(self._worker_socket, message)
             if isinstance(response, dict) and response.get("ok") is True and "err" not in response:
                 # A pending launch claim is durably owned and retried by the worker.
                 # Public fallback must not race that immutable launch decision.
+                outcome = "ok"
                 return True
+            outcome = "rejected"
             self._record_failure()
             return False
-        except Exception:
+        except Exception as error:
+            outcome = type(error).__name__
             self._record_failure()
             return False
+        finally:
+            self._record_worker_send(message.get("type"), started, outcome)
+
+    def _record_worker_send(self, kind: Any, started: float, outcome: str) -> None:
+        # The last send of each message type with its elapsed time, so a send
+        # that misses the hook deadline reports how long it actually took.
+        if isinstance(kind, str):
+            self.worker_sends[kind] = {
+                "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+                "outcome": outcome,
+            }
 
     def _send_public(self, method: str, params: dict[str, Any]) -> None:
         if not isinstance(method, str) or method not in _PUBLIC_METHODS:

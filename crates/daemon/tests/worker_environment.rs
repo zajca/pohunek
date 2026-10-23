@@ -398,17 +398,24 @@ async fn previous_version_child_gets_the_base_environment_without_service_manage
 const SILENT_CHILD_STALL_MS: u64 = 300;
 
 /// Lines in the oversized write, about 134 KB in all. A PTY whose program does
-/// not read takes more than its 4 KiB line-discipline queue: Linux also buffers
-/// up to 64 KiB in the tty layer, and a write that fits is accepted, and
-/// acknowledged, at once. The write is larger than both, so it always stays
-/// pending until the child reads.
+/// not read holds only a few KiB, so a write this large always stays pending
+/// until the child reads. On Linux the capacity is limited by the PTY's flip
+/// buffer limit (8 KiB, set by `tty_buffer_set_limit` in `drivers/tty/pty.c`;
+/// the 640 KiB `TTYB_DEFAULT_MEM_LIMIT` of `tty_buffer.c` does not apply to
+/// PTYs) and the 4 KiB line-discipline queue (`N_TTY_BUF_SIZE`); a buffer
+/// without a flag area can hold up to twice its accounted size. One write of
+/// this blob was accepted up to 15,360 bytes canonical and 13,824 raw on
+/// 7.2.9 with 4 KiB pages. macOS `ptcwrite` (xnu `bsd/kern/tty_dev.c`) blocks
+/// at `TTYHOG - 2` = 1022 bytes (`bsd/sys/tty.h`).
 const OVERSIZED_LINES: usize = 1_700;
 
 /// Bytes per oversized write line.
 const OVERSIZED_LINE_BYTES: usize = 78;
 
-/// Bytes a Linux PTY can hold for a program that does not read: the tty
-/// layer's buffer limit plus the line-discipline queue.
+/// Bound the oversized write must exceed: a deliberate 68 KiB, several times
+/// the measured figures above. A kernel with 64 KiB pages (`TTY_BUFFER_PAGE`
+/// about 32 KiB) would hold at most about 84 KiB even with the twofold slack,
+/// still below the 134 KB write.
 const PTY_UNREAD_INPUT_CAPACITY: usize = 64 * 1024 + 4 * 1024;
 
 const _: () = assert!(
