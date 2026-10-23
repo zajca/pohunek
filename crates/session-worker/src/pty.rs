@@ -671,6 +671,13 @@ impl PtyOwner {
         self.output.subscribe(after_offset)
     }
 
+    /// Forgets the resize ordering recorded for every source.
+    ///
+    /// The terminal size itself is kept.
+    pub async fn clear_resize_sources(&self) {
+        self.resize.lock().await.sequences.clear();
+    }
+
     /// Applies a monotonic source-specific resize.
     ///
     /// Returns `false` for duplicate or older source sequences.

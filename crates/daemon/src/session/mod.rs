@@ -5478,14 +5478,25 @@ impl SessionRegistry {
                     .inner
                     .next_resize_sequence
                     .fetch_add(1, Ordering::Relaxed);
-                let source_id = pohunek_worker_protocol::StreamId::new("daemon-resize")
-                    .map_err(|error| runtime_error("worker_resize_invalid", error.to_string()))?;
                 let dimensions = pohunek_worker_protocol::Dimensions::new(cols, rows)
                     .map_err(|error| runtime_error("worker_resize_invalid", error.to_string()))?;
-                worker
-                    .resize(source_id, sequence, dimensions)
+                let update = worker
+                    .resize(sequence, dimensions)
                     .await
-                    .map_err(worker_error_to_protocol)?
+                    .map_err(worker_error_to_protocol)?;
+                let applied = update.dimensions();
+                if applied != dimensions {
+                    warn!(
+                        session_id = %id.0,
+                        sequence,
+                        requested_cols = cols,
+                        requested_rows = rows,
+                        applied_cols = applied.columns(),
+                        applied_rows = applied.rows(),
+                        "worker kept its terminal size instead of applying the resize"
+                    );
+                }
+                update
             }
             RuntimeHandle::Unavailable(state) => {
                 return Err(unavailable_runtime_error(id, state, loss_reason.as_deref()));

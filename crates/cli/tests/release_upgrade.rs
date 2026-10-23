@@ -234,6 +234,17 @@ const SILENT_PROFILE: &str = "silent-claude";
 /// Host profile of the Codex agent, launched after the upgrade.
 const CODEX_PROFILE: &str = "fake-codex";
 
+/// Column counts of the resizes the previous release's daemon applies to the
+/// live session. Its worker keeps the highest resize sequence it accepted, so
+/// more than one is needed to outrun the first resize of the head's daemon.
+const RESIZES_BEFORE_UPGRADE_COLS: [u16; 2] = [90, 91];
+
+/// Size the head's daemon resizes the adopted live session to.
+const RESIZE_AFTER_UPGRADE: (u16, u16) = (110, 40);
+
+/// Rows of every resize before the upgrade.
+const ROWS_BEFORE_UPGRADE: u16 = 30;
+
 /// Native id the live session's launch reports through the previous release's
 /// hook.
 const NATIVE_BEFORE: &str = "native-before-upgrade";
@@ -539,6 +550,27 @@ fn runtime(info: &Value) -> Option<Runtime> {
 
 fn inspect(cli: &Cli, id: &str) -> Option<Value> {
     cli.try_json(&["session", "inspect", id, "--json"]).ok()
+}
+
+/// Resizes `id` through `cli` and returns the `(cols, rows)` its result reports
+/// the session to have.
+fn resize(cli: &Cli, id: &str, cols: u16, rows: u16) -> (u64, u64) {
+    let result = cli.json(&[
+        "session",
+        "resize",
+        id,
+        "--cols",
+        &cols.to_string(),
+        "--rows",
+        &rows.to_string(),
+        "--json",
+    ]);
+    let dimension = |name: &str| {
+        result["session"][name]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{}: resize result has no {name}: {result}", cli.label))
+    };
+    (dimension("cols"), dimension("rows"))
 }
 
 /// Waits until `id` reports a live runtime and returns its identity.
@@ -2232,6 +2264,37 @@ impl Upgrade {
         after
     }
 
+    /// The previous release's daemon resizes the live session, so its worker
+    /// holds resize sequences from that daemon.
+    fn resize_live_on_previous(&self) {
+        for cols in RESIZES_BEFORE_UPGRADE_COLS {
+            assert_eq!(
+                resize(&self.previous, &self.id, cols, ROWS_BEFORE_UPGRADE),
+                (u64::from(cols), u64::from(ROWS_BEFORE_UPGRADE)),
+                "the previous release applies its own resize"
+            );
+        }
+    }
+
+    /// The head's daemon numbers its resizes from the start, below the
+    /// sequences the previous release's worker kept; the adopted worker must
+    /// still apply them, and the session must report the applied size.
+    fn assert_resize_applied_by_adopted_worker(&self) {
+        let (cols, rows) = RESIZE_AFTER_UPGRADE;
+        let requested = (u64::from(cols), u64::from(rows));
+        assert_eq!(
+            resize(&self.head, &self.id, cols, rows),
+            requested,
+            "the adopted previous-release worker must apply the head daemon's resize"
+        );
+        let inspected = inspect(&self.head, &self.id).expect("inspect the resized session");
+        assert_eq!(
+            (inspected["cols"].as_u64(), inspected["rows"].as_u64()),
+            (Some(requested.0), Some(requested.1)),
+            "the session reports the applied size: {inspected}"
+        );
+    }
+
     /// This build serves the package `digest` of `package_id`, healthy,
     /// enabled, and referenced by a session.
     fn assert_package_served(&self, package_id: &str, digest: &str) {
@@ -2456,9 +2519,11 @@ fn previous_release_session_survives_the_upgrade_to_head() {
     let (upgrade, before) = start_on_previous(run, previous, head);
     upgrade.capture_previous_goldens();
     upgrade.point_claude_agent_at_newer_range();
+    upgrade.resize_live_on_previous();
     upgrade.upgrade();
     upgrade.assert_downgrade_guard();
     let after = upgrade.assert_adopted(&before.live, before.daemon);
+    upgrade.assert_resize_applied_by_adopted_worker();
     upgrade.assert_session_works();
     upgrade.assert_head_links_a_package_of_its_format();
     upgrade.assert_previous_client(&after);
