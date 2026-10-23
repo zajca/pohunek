@@ -412,11 +412,11 @@ const OVERSIZED_LINES: usize = 1_700;
 /// Bytes per oversized write line.
 const OVERSIZED_LINE_BYTES: usize = 78;
 
-/// Bound the oversized write must exceed: a deliberate 68 KiB, several times
-/// the measured figures above. A kernel with 64 KiB pages (`TTY_BUFFER_PAGE`
-/// about 32 KiB) would hold at most about 84 KiB even with the twofold slack,
-/// still below the 134 KB write.
-const PTY_UNREAD_INPUT_CAPACITY: usize = 64 * 1024 + 4 * 1024;
+/// Bound the oversized write must exceed: 96 KiB, several times the measured
+/// figures above and above the worst case for a kernel with 64 KiB pages
+/// (`TTY_BUFFER_PAGE` about 32 KiB), which would hold at most about 84 KiB
+/// even with the twofold slack. The 134 KB write stays larger.
+const PTY_UNREAD_INPUT_CAPACITY: usize = 96 * 1024;
 
 const _: () = assert!(
     OVERSIZED_LINES * (OVERSIZED_LINE_BYTES + 1) > PTY_UNREAD_INPUT_CAPACITY
