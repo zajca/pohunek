@@ -42,16 +42,50 @@ pub(crate) struct RecordingRoot {
 }
 
 impl RecordingRoot {
-    /// Creates an empty root for the recording of runtime `name`.
+    /// Creates an empty, owner-private root for the recording of runtime `name`.
+    ///
+    /// A leftover root of the current user is replaced. The call refuses a
+    /// root that is a symlink or belongs to another user: `/dev/shm` is shared
+    /// and sticky, so such a directory is not ours to remove or to run in.
     ///
     /// # Panics
     ///
-    /// Panics when the directory cannot be created.
+    /// Panics when an existing root is not a directory of the current user,
+    /// cannot be removed, or the new directory cannot be created with mode
+    /// 0700.
     // hermetic-allowed: #1525 a fixed short path under tmpfs keeps recorded screens reproducible; recording is an opt-in run, never part of the gates
     pub(crate) fn new(name: &str) -> Self {
+        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+
         let path = std::path::PathBuf::from(format!("/dev/shm/ph-{name}"));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).expect("create the recording root");
+        // The owner of the current process, read from its own `/proc` entry.
+        let me = fs::metadata("/proc/self")
+            .expect("read the current user")
+            .uid();
+        match fs::symlink_metadata(&path) {
+            Ok(existing) => {
+                assert!(
+                    existing.is_dir() && existing.uid() == me,
+                    "{} exists and is not a directory of the current user",
+                    path.display()
+                );
+                fs::remove_dir_all(&path).expect("remove the previous recording root");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("inspect {}: {error}", path.display()),
+        }
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .expect("create the recording root");
+        let created = fs::symlink_metadata(&path).expect("inspect the recording root");
+        assert!(
+            created.is_dir()
+                && created.uid() == me
+                && created.permissions().mode() & 0o777 == 0o700,
+            "{} is not an owner-private directory",
+            path.display()
+        );
         Self { path }
     }
 
