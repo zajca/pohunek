@@ -1,7 +1,8 @@
+Warning: No project session found with id '01a168b3-573f-7991-afca-a820049ee65f'; creating a new session with that id.
 ────────────────────────────────────────
 
  Trust project folder?
- /var/tmp/pi547/cap/home/proj
+ /tmp/ph-sample/project
 
  This allows pi to load .pi settings
  and resources, install missing project
@@ -10,7 +11,7 @@
 
  → Trust
    Trust parent folder
- (/var/tmp/pi547/cap/home)
+ (/tmp/ph-sample)
    Trust (this session only)
    Do not trust
    Do not trust (this session only)
@@ -19,6 +20,3 @@
  escape/ctrl+c cancel
 
 ────────────────────────────────────────
-
-
-

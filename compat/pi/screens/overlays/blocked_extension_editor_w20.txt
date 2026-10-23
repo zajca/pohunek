@@ -1,15 +1,15 @@
 
 [Extensions]
-  dialogs.ts
+  confirm.ts,
+dialogs.ts
 
 
 ────────────────────
 
- Edit the commit
- message
+ Edit text
 
 ────────────────────
-Fix the parser
+prefill
 ────────────────────
 
  enter submit
@@ -20,5 +20,5 @@ Fix the parser
  external editor
 
 ────────────────────
-~/work
+/mnt/m2_4t/t/ph-J...
 0.0%/128k (auto)  st

@@ -1,4 +1,4 @@
- e/proj
+ /project
 
  This allows pi to load
  .pi settings and
@@ -9,8 +9,8 @@
 
  → Trust
    Trust parent folder
- (/var/tmp/pi547/cap/ho
- me)
+ (/mnt/m2_4t/t/ph-JZYp4
+ 1)
    Trust (this session
  only)
    Do not trust

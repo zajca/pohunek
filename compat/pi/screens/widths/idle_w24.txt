@@ -1,5 +1,4 @@
-
- ▀▀█  v1.0.2
+ ▀▀█  v1.4.0
  █▀ █ escape interrupt
  · ctrl+c/ctrl+d
  clear/exit · /
@@ -14,11 +13,12 @@
  its docs. Ask it how
  to use or extend Pi.
 
-
+[Extensions]
+  confirm.ts, dialogs.ts
 
 
 ────────────────────────
 
 ────────────────────────
-~/work
-0.0%/4.0k (auto)  stub-m
+/mnt/m2_4t/t/ph-JZYp4...
+0.0%/128k (auto)  stub-m

@@ -2404,3 +2404,198 @@ async fn a_real_pi_reports_its_turn_dialog_and_exit_through_program_status() {
     assert!(!marker.exists(), "no dialog was answered");
     fixture.harness.stop().await;
 }
+
+/// Opt-in variable of the screen capture: the directory the screens are
+/// written to (`compat/pi/screens` of the workspace when recording a release).
+const CAPTURE_VARIABLE: &str = "POHUNEK_PI_CAPTURE_DIR";
+
+/// Terminal widths of the recorded idle and working screens.
+const STATE_WIDTHS: [u16; 18] = [
+    20, 24, 30, 36, 40, 44, 46, 48, 50, 52, 56, 60, 70, 80, 100, 120, 160, 200,
+];
+
+/// Terminal widths of the recorded dialog screens.
+const DIALOG_WIDTHS: [u16; 10] = [20, 24, 30, 40, 50, 60, 80, 100, 120, 200];
+
+/// Width of the single-screen captures (`idle.txt`, `working.txt`,
+/// `idle_after_turn.txt`).
+const SINGLE_SCREEN_WIDTH: u16 = 100;
+
+/// Extension commands that open the other dialog kinds, with the screen name.
+const DIALOG_COMMANDS: [(&str, &str); 3] = [
+    ("pohunek-select", "extension_select"),
+    ("pohunek-input", "extension_input"),
+    ("pohunek-editor", "extension_editor"),
+];
+
+/// Writes an agent-directory extension with a select, an input and an editor
+/// dialog command.
+fn write_dialog_extension(fixture: &Fixture) {
+    let extensions = fixture.harness.env.home().join(".pi/agent/extensions");
+    fs::create_dir_all(&extensions).expect("create the extensions directory");
+    fs::write(
+        extensions.join("dialogs.ts"),
+        "export default function (pi) {\n\
+           pi.registerCommand(\"pohunek-select\", { description: \"Select\", handler: async (_args, ctx) => { await ctx.ui.select(\"Pick one\", [\"alpha\", \"beta\"]); } });\n\
+           pi.registerCommand(\"pohunek-input\", { description: \"Input\", handler: async (_args, ctx) => { await ctx.ui.input(\"Name\", \"placeholder\"); } });\n\
+           pi.registerCommand(\"pohunek-editor\", { description: \"Editor\", handler: async (_args, ctx) => { await ctx.ui.editor(\"Edit text\", \"prefill\"); } });\n\
+         }\n",
+    )
+    .expect("write the dialog extension");
+}
+
+impl Fixture {
+    /// Runs `session new` of the default profile in `cwd` at `cols` columns
+    /// and returns the session id.
+    async fn launch_sized(&self, name: &str, cwd: &Path, cols: u16) -> String {
+        let cols = cols.to_string();
+        let (code, launched) = self
+            .harness
+            .json(&[
+                "session",
+                "new",
+                "--agent",
+                PROFILE,
+                "--cwd",
+                path_str(cwd),
+                "--name",
+                name,
+                "--cols",
+                &cols,
+            ])
+            .await;
+        assert_eq!(code, 0, "{launched}");
+        launched["ok"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_owned()
+    }
+
+    /// Waits until the visible screen of `id` draws Pi's busy border: a rule
+    /// that starts `── ` and a braille spinner. Byte activity alone can read
+    /// working while the editor still shows its idle frame.
+    async fn wait_busy_border(&self, id: &str) -> Vec<String> {
+        wait_until("Pi's busy border", || async {
+            let lines = self.screen(id).await;
+            lines
+                .iter()
+                .any(|line| {
+                    line.strip_prefix("── ")
+                        .and_then(|rest| rest.chars().next())
+                        .is_some_and(|spinner| ('\u{2800}'..='\u{28ff}').contains(&spinner))
+                })
+                .then_some(lines)
+        })
+        .await
+    }
+
+    /// Writes the visible rows of `id` as `<name>.txt` below `directory`.
+    async fn capture(&self, id: &str, directory: &Path, name: &str) {
+        let rows = self.screen(id).await;
+        capture::write_capture(
+            directory,
+            name,
+            path_str(self.harness.env.root()),
+            None,
+            &rows,
+        );
+    }
+}
+
+/// Records the screens of the `pi` on `PATH` that a loopback model and an
+/// extension can reach: the idle, working and after-turn editor at every
+/// width, the extension dialogs and Pi's project-trust question.
+///
+/// Needs a `pi` on `PATH`, `POHUNEK_PI_E2E=1` and `POHUNEK_PI_CAPTURE_DIR`;
+/// without the directory the test fails by name.
+#[tokio::test]
+#[ignore = "records screens; run with POHUNEK_PI_E2E=1 and POHUNEK_PI_CAPTURE_DIR"]
+async fn record_the_pi_screens() {
+    require_real_pi();
+    let target = PathBuf::from(
+        std::env::var_os(CAPTURE_VARIABLE).unwrap_or_else(|| panic!("{CAPTURE_VARIABLE} is not set")),
+    );
+    let fixture = Fixture::start().await;
+    fixture.install().await;
+    fixture.write_profile();
+    let marker = fixture.harness.env.root().join("approved");
+    write_confirm_extension(&fixture, &marker);
+    write_dialog_extension(&fixture);
+    let cwd = fixture.harness.env.cwd().to_path_buf();
+
+    for width in STATE_WIDTHS {
+        let id = fixture
+            .launch_sized(&format!("state-{width}"), &cwd, width)
+            .await;
+        fixture.wait_activity(&id, "idle").await;
+        fixture
+            .capture(&id, &target.join("widths"), &format!("idle_w{width}"))
+            .await;
+        if width == SINGLE_SCREEN_WIDTH {
+            fixture.capture(&id, &target, "idle").await;
+        }
+        let (code, sent) = fixture
+            .harness
+            .json(&["session", "input", &id, PROMPT])
+            .await;
+        assert_eq!(code, 0, "{sent}");
+        fixture.wait_activity(&id, "working").await;
+        fixture.wait_busy_border(&id).await;
+        fixture
+            .capture(&id, &target.join("widths"), &format!("working_w{width}"))
+            .await;
+        if width == SINGLE_SCREEN_WIDTH {
+            fixture.capture(&id, &target, "working").await;
+            fixture.stub.open_gate();
+            fixture.wait_activity(&id, "idle").await;
+            fixture
+                .wait_screen_line(
+                    &id,
+                    &format!("{}{}", model_stub::FIRST_CHUNK, model_stub::SECOND_CHUNK),
+                )
+                .await;
+            fixture.capture(&id, &target, "idle_after_turn").await;
+            fixture.stub.close_gate();
+        }
+        fixture.stop(&id).await;
+    }
+
+    let project = fixture.harness.env.root().join("project");
+    fs::create_dir_all(project.join(".pi/extensions")).expect("create the project extensions");
+    fs::write(
+        project.join(".pi/extensions/project.ts"),
+        "export default function () {}\n",
+    )
+    .expect("write the project extension");
+    for width in DIALOG_WIDTHS {
+        let overlays = target.join("overlays");
+        let mut dialogs = vec![(format!("/{CONFIRM_COMMAND}"), "extension_confirm")];
+        dialogs.extend(
+            DIALOG_COMMANDS
+                .iter()
+                .map(|(command, name)| (format!("/{command}"), *name)),
+        );
+        for (command, name) in dialogs {
+            let id = fixture
+                .launch_sized(&format!("{name}-{width}"), &cwd, width)
+                .await;
+            fixture.wait_activity(&id, "idle").await;
+            let (code, sent) = fixture.harness.json(&["session", "input", &id, &command]).await;
+            assert_eq!(code, 0, "{sent}");
+            fixture.wait_activity(&id, "blocked").await;
+            fixture
+                .capture(&id, &overlays, &format!("blocked_{name}_w{width}"))
+                .await;
+            fixture.stop(&id).await;
+        }
+        let id = fixture
+            .launch_sized(&format!("trust-{width}"), &project, width)
+            .await;
+        fixture.wait_activity(&id, "blocked").await;
+        fixture
+            .capture(&id, &overlays, &format!("blocked_project_trust_w{width}"))
+            .await;
+        fixture.stop(&id).await;
+    }
+    fixture.harness.stop().await;
+}

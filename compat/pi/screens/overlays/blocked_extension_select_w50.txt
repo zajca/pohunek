@@ -1,3 +1,4 @@
+ █▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit
   · / commands · ! bash · ctrl+o more
  Press ctrl+o to show full startup help and
  loaded resources.
@@ -6,19 +7,18 @@
  docs. Ask it how to use or extend Pi.
 
 [Extensions]
-  dialogs.ts
+  confirm.ts, dialogs.ts
 
 
 ──────────────────────────────────────────────────
 
- Dangerous command detected. Allow?
+ Pick one
 
- → Allow once
-   Allow always
-   Deny
+ → alpha
+   beta
 
  ↑↓ navigate  enter select  escape/ctrl+c cancel
 
 ──────────────────────────────────────────────────
-~/work
+/tmp/ph-sample/work
 0.0%/128k (auto)                        stub-model

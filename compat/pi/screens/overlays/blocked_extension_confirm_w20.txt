@@ -1,15 +1,15 @@
- look up its docs.
  Ask it how to use
  or extend Pi.
 
 [Extensions]
-  dialogs.ts
+  confirm.ts,
+dialogs.ts
 
 
 ────────────────────
 
  Allow tool call?
- bash: rm -rf build
+ bash: touch marker
 
  → Yes
    No
@@ -20,5 +20,5 @@
  cancel
 
 ────────────────────
-~/work
+/mnt/m2_4t/t/ph-J...
 0.0%/128k (auto)  st

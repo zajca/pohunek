@@ -7,8 +7,8 @@
  → Trust
    Trust parent
  folder
- (/var/tmp/pi547/ca
- p/home)
+ (/mnt/m2_4t/t/ph-J
+ ZYp41)
    Trust (this
  session only)
    Do not trust

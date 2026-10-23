@@ -1,5 +1,5 @@
 
- ▀▀█  v1.0.2
+ ▀▀█  v1.4.0
  █▀ █ escape interrupt · ctrl+c/ctrl+d
  clear/exit · / commands · ! bash · ctrl+o more
  Press ctrl+o to show full startup help and
@@ -8,8 +8,8 @@
  Pi can explain its own features and look up
  its docs. Ask it how to use or extend Pi.
 
-
-
+[Extensions]
+  confirm.ts, dialogs.ts
 
 
 
@@ -20,5 +20,5 @@
 ────────────────────────────────────────────────
 
 ────────────────────────────────────────────────
-~/work
-0.0%/4.0k (auto)                      stub-model
+/tmp/ph-sample/work
+0.0%/128k (auto)                      stub-model
