@@ -193,6 +193,7 @@ async fn start_servers(condition: GovernanceCondition) -> Servers {
         registry,
         Arc::clone(&governance),
         crate::test_support::overlay_registry(),
+        crate::api::OverlaySource::Default,
     );
     let remote_state = state.clone();
     assert!(

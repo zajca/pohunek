@@ -4642,9 +4642,15 @@ when `overlays.toml` is refused or `POHUNEK_REMOTE_PORT` is unusable (the messag
 names which, and no overlay is probed), `warn` when the running daemon serves another
 overlay or port than the file configures, with the text "restart the daemon to
 apply", and `ok` otherwise. A daemon that reports no overlay (an older release)
-or does not answer is not compared. When `POHUNEK_REMOTE_PORT` is set in the
+or does not answer is not compared, except that a daemon that answers with no overlay check while `overlays.toml` is present is flagged the same way: it ignores the file. When `POHUNEK_REMOTE_PORT` is set in the
 shell that runs `pohunek doctor`, the warning names it, because it overrides the
 file's `port` for that process only.
+
+The daemon library ties the doctor's severity to the registry it serves:
+`DaemonState::new` and `DaemonState::new_with_discovery` take an
+`OverlaySource` (`File` when `overlays.toml` listed the providers, `Default`
+for the NetBird default of an absent file; `OverlaySource::of(&OverlayConfig)`
+derives it), so no state carries a source its registry did not come from.
 
 Public daemon construction is registry-explicit. `DaemonState::new` and
 `ControlServer::bind` require a validated `OverlayRegistry`, and the shared

@@ -346,6 +346,7 @@ async fn spawn_worker_backed_server_with(
         registry,
         governance_service(socket).await,
         support::overlay_registry(),
+        pohunek_daemon::api::OverlaySource::Default,
     );
     let server = ControlServer::bind_with_state(socket, state)
         .await

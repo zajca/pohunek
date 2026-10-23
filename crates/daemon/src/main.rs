@@ -41,7 +41,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use overlay::{ConfiguredTransport, OverlayId, OverlayRegistry};
-use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, OpenedListener, RemoteServer};
+use pohunek_daemon::api::{
+    ControlServer, DaemonState, HealthInfo, OpenedListener, OverlaySource, RemoteServer,
+};
 use pohunek_daemon::catalog_anchor::CatalogTrust;
 use pohunek_daemon::discovery::DiscoveryCache;
 use pohunek_daemon::events::{spawn_drain, EventLog};
@@ -456,7 +458,7 @@ async fn run() -> Result<(), DaemonError> {
     let registry = overlay_config
         .registry()
         .map_err(DaemonError::OverlayConfiguration)?;
-    let overlays_from_file = overlay_config.from_file();
+    let overlay_source = OverlaySource::of(&overlay_config);
 
     // 2. Acquire the durable data authority before opening any state service.
     // State and data roots are configured independently, so each needs its own
@@ -607,8 +609,8 @@ async fn run() -> Result<(), DaemonError> {
         sessions.clone(),
         Arc::clone(&governance),
         discovery.clone(),
+        overlay_source,
     )
-    .with_overlays_from_file(overlays_from_file)
     .with_notifications(notifications.clone())
     .with_attention_coordinator(attention_coordinator.clone());
     let server = ControlServer::bind_with_state(&paths.socket, state).await?;
@@ -621,8 +623,8 @@ async fn run() -> Result<(), DaemonError> {
         sessions.clone(),
         governance,
         discovery,
+        overlay_source,
     )
-    .with_overlays_from_file(overlays_from_file)
     .with_notifications(notifications.clone())
     .with_attention_coordinator(attention_coordinator.clone());
     // Reconciliation and every required local listener are ready. A manual
@@ -1429,6 +1431,7 @@ mod tests {
             SessionRegistry::default(),
             governance,
             netbird_registry(),
+            pohunek_daemon::api::OverlaySource::Default,
         );
         let mut remote = Some(pohunek_daemon::api::RemoteServer::from_listener(
             listener, state,
@@ -1593,6 +1596,7 @@ mod tests {
             SessionRegistry::default(),
             governance,
             netbird_registry(),
+            pohunek_daemon::api::OverlaySource::Default,
         );
         RemoteServer::bind_with(requested, state, &transport, |_| async {
             Ok(wrap(listener))
@@ -1706,6 +1710,7 @@ mod tests {
             SessionRegistry::default(),
             governance,
             netbird_registry(),
+            pohunek_daemon::api::OverlaySource::Default,
         );
         let shutdown = CancellationToken::new();
         let supervisor_shutdown = shutdown.clone();

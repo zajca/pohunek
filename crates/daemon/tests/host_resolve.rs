@@ -176,6 +176,7 @@ impl Daemon {
             sessions,
             governance,
             registry(),
+            pohunek_daemon::api::OverlaySource::Default,
         );
         let remote_state = state.clone();
         let unix = ControlServer::bind_with_state(&socket, state)

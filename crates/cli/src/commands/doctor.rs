@@ -170,9 +170,10 @@ pub(crate) async fn diagnose(paths: &Paths) -> Result<Report, CliError> {
 /// `config` is the configuration and registry the CLI would use, or why it
 /// cannot build them (an unusable `overlays.toml`, or an unusable
 /// `POHUNEK_REMOTE_PORT`, which the message names). `daemon` is what the daemon
-/// reported, or `None` when it did not answer. A
-/// daemon that reports no overlay is older than the report and cannot be
-/// compared. `port_override` notes that `POHUNEK_REMOTE_PORT` in this shell
+/// reported, or `None` when it did not answer, which cannot be compared. A
+/// daemon that answers without any overlay check predates `overlays.toml`, so
+/// it ignores a file that is present and is flagged; without a file it serves
+/// the default the CLI uses too. `port_override` notes that `POHUNEK_REMOTE_PORT` in this shell
 /// changes the port the file would give.
 fn overlay_config_check(
     config: Result<&OverlayConfig, &ClientError>,
@@ -200,13 +201,25 @@ fn overlay_config_check(
     } else {
         "the default (no overlays.toml)"
     };
-    let reported = daemon.filter(|reported| !reported.is_empty());
-    let Some(reported) = reported else {
-        return DoctorCheck::new(
-            OVERLAY_CONFIG_CHECK,
-            Status::Ok,
-            format!("{source} configures {expected}"),
-        );
+    let reported = match daemon {
+        Some([]) if config.from_file() => {
+            return DoctorCheck::new(
+                OVERLAY_CONFIG_CHECK,
+                Status::Warn,
+                format!(
+                    "{source} configures {expected} but the running daemon reports no overlay \
+                     (it predates overlays.toml or runs without it); restart the daemon to apply"
+                ),
+            );
+        }
+        Some(reported) if !reported.is_empty() => reported,
+        _ => {
+            return DoctorCheck::new(
+                OVERLAY_CONFIG_CHECK,
+                Status::Ok,
+                format!("{source} configures {expected}"),
+            );
+        }
     };
     let agrees = reported.len() == config.providers().len()
         && config.providers().iter().all(|id| {

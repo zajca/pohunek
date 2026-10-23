@@ -21,3 +21,7 @@
   the configured overlay through the same provider transport the daemon and the
   client use, bounded by the overlay probe budget that now counts toward the
   `daemon.doctor` request timeout.
+- `pohunek doctor` also flags a present `overlays.toml` when the daemon answers
+  without any overlay check, as a daemon that predates the file does.
+  `DaemonState::new` and `new_with_discovery` of `pohunek-daemon` take an
+  `OverlaySource` argument.

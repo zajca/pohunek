@@ -184,6 +184,7 @@ async fn spawn_dual_servers_with(
         registry,
         governance_service(&socket).await,
         support::overlay_registry(),
+        pohunek_daemon::api::OverlaySource::Default,
     );
     let remote_state = state.clone();
     assert!(Arc::ptr_eq(&state.governance, &remote_state.governance));
@@ -2064,6 +2065,7 @@ async fn bind_rejects_non_netbird_address() {
                 .expect("open real isolated host-governance service"),
         ),
         support::overlay_registry(),
+        pohunek_daemon::api::OverlaySource::Default,
     );
     let transport = netbird::NetbirdTransport::new();
     for literal in [

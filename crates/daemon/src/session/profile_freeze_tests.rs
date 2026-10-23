@@ -659,6 +659,7 @@ fn daemon_state(registry: &SessionRegistry, transport: ControlTransport) -> Daem
         registry.clone(),
         Arc::new(crate::governance::HostGovernanceService::open_test()),
         crate::test_support::overlay_registry(),
+        crate::api::OverlaySource::Default,
     )
     .with_transport(transport)
 }

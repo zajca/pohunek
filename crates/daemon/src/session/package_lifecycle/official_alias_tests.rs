@@ -5790,6 +5790,7 @@ async fn a_hook_notification_gets_the_retryable_error_only_when_it_opted_in() {
         released.restarted.registry.clone(),
         std::sync::Arc::new(crate::governance::HostGovernanceService::open_test()),
         crate::test_support::overlay_registry(),
+        crate::api::OverlaySource::Default,
     )
     .with_notifications(notifications);
     tokio::time::pause();
@@ -5853,6 +5854,7 @@ async fn a_claude_hook_retries_until_the_unpinned_sessions_worker_is_back() {
         released.restarted.registry.clone(),
         std::sync::Arc::new(crate::governance::HostGovernanceService::open_test()),
         crate::test_support::overlay_registry(),
+        crate::api::OverlaySource::Default,
     )
     .with_notifications(notifications.clone())
     .with_attention_coordinator(attention);

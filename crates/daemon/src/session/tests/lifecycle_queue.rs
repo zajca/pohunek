@@ -38,6 +38,7 @@ impl Rig {
             registry.clone(),
             Arc::new(crate::governance::HostGovernanceService::open_test()),
             crate::test_support::overlay_registry(),
+            crate::api::OverlaySource::Default,
         );
         let server = crate::api::ControlServer::bind_with_state(&socket, state)
             .await

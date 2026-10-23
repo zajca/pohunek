@@ -335,6 +335,7 @@ mod tests {
             SessionRegistry::new_with_runtimes(SessionRegistryConfig::default(), official_host()),
             governance,
             crate::test_support::overlay_registry(),
+            crate::api::OverlaySource::Default,
         )
         .with_transport(transport);
         (state, dir)

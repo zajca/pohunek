@@ -415,6 +415,50 @@ fn doctor_renders_daemon_profile_failures_and_redacts_details_in_human_and_json(
     );
 }
 
+/// A daemon that answers `daemon.doctor` without any overlay check, as one of
+/// an earlier release does, ignores `overlays.toml`: the CLI flags a present
+/// file instead of reporting agreement, and stays quiet without a file.
+#[test]
+fn doctor_flags_a_file_the_answering_daemon_does_not_report() {
+    let home = TestHome::new();
+    let _fixture = FixtureDaemon::start(&home.socket(), Scenario::DoctorReport);
+    let overlay_config = |home: &TestHome| -> Value {
+        let output = home
+            .command()
+            .args(["doctor", "--json"])
+            .output()
+            .expect("run doctor process");
+        let document: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("doctor JSON: {error}\n{}", describe(&output)));
+        document["ok"]["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .find(|check| check["name"] == "overlay_config")
+            .cloned()
+            .expect("overlay_config check")
+    };
+
+    let absent = overlay_config(&home);
+    assert_eq!(absent["status"], "ok", "{absent}");
+
+    let dir = home.env.config_home().join("pohunek");
+    fs::create_dir_all(&dir).expect("create the config directory");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("private config dir");
+    let file = dir.join("overlays.toml");
+    fs::write(&file, "providers = [\"netbird\"]\n").expect("write overlays.toml");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).expect("private file");
+    let present = overlay_config(&home);
+    assert_eq!(present["status"], "warn", "{present}");
+    assert!(
+        present["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("restart the daemon to apply"),
+        "{present}"
+    );
+}
+
 #[test]
 fn doctor_reports_only_a_safe_netbird_self_address() {
     let home = TestHome::new();

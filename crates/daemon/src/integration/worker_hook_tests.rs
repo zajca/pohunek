@@ -63,6 +63,7 @@ impl DaemonStub {
                 sessions,
                 Arc::new(crate::governance::HostGovernanceService::open_test()),
                 crate::test_support::overlay_registry(),
+                crate::api::OverlaySource::Default,
             )
             .with_notifications(notifications.clone())
             .with_attention_coordinator(attention),

@@ -11949,6 +11949,7 @@ async fn detection_rpc_returns_a_bounded_typed_error_for_oversized_previews() {
         registry.clone(),
         Arc::new(crate::governance::HostGovernanceService::open_test()),
         crate::test_support::overlay_registry(),
+        crate::api::OverlaySource::Default,
     );
 
     let line = serde_json::to_string(&request).expect("request serializes");
@@ -20911,6 +20912,7 @@ async fn remove_over_the_wire(
         registry.clone(),
         Arc::new(crate::governance::HostGovernanceService::open_test()),
         crate::test_support::overlay_registry(),
+        crate::api::OverlaySource::Default,
     );
     let request = Request::new("remove-1", method, serde_json::json!(id)).expect("valid request");
     crate::api::handle_request(&request, &state)
@@ -25557,6 +25559,7 @@ impl HookRig {
             registry.clone(),
             Arc::new(crate::governance::HostGovernanceService::open_test()),
             crate::test_support::overlay_registry(),
+            crate::api::OverlaySource::Default,
         )
         .with_notifications(notifications.clone());
         let server = crate::api::ControlServer::bind_with_state(&socket, state.clone())

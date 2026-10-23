@@ -84,9 +84,9 @@ pub struct DaemonState {
     pub attention: Option<AttentionCoordinator>,
     /// TTL-cached `NetBird` host discovery, shared across connections.
     pub discovery: DiscoveryCache,
-    /// Whether the configured overlays were listed in `overlays.toml`, which
-    /// makes a missing provider CLI a doctor failure rather than a warning.
-    pub overlays_from_file: bool,
+    /// Where the registry of `discovery` came from, which decides how severe a
+    /// missing provider CLI is in the doctor.
+    pub overlay_source: OverlaySource,
     /// The transport the connections served with this state arrive on.
     pub transport: ControlTransport,
     /// The kernel-attested peer of the one local connection this state serves.
@@ -94,6 +94,35 @@ pub struct DaemonState {
     /// Set per accepted Unix connection. `None` on every other state, so a
     /// caller without an attested peer is refused where one is required.
     pub control_peer: Option<Arc<ControlPeer>>,
+}
+
+/// Where a daemon's overlay registry came from.
+///
+/// The doctor treats a missing provider CLI as a failure for an overlay the
+/// owner listed in `overlays.toml` and as a warning for the `NetBird` default of
+/// an absent file, so every state is built with the source of its registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlaySource {
+    /// The default of an absent `overlays.toml`.
+    Default,
+    /// The providers listed in `overlays.toml`.
+    File,
+}
+
+impl OverlaySource {
+    /// The source of a loaded overlay configuration.
+    #[must_use]
+    pub fn of(config: &pohunek_client::OverlayConfig) -> Self {
+        if config.from_file() {
+            Self::File
+        } else {
+            Self::Default
+        }
+    }
+
+    fn from_file(self) -> bool {
+        self == Self::File
+    }
 }
 
 impl DaemonState {
@@ -104,8 +133,15 @@ impl DaemonState {
         sessions: SessionRegistry,
         governance: Arc<HostGovernanceService>,
         registry: OverlayRegistry,
+        overlay_source: OverlaySource,
     ) -> Self {
-        Self::new_with_discovery(health, sessions, governance, DiscoveryCache::new(registry))
+        Self::new_with_discovery(
+            health,
+            sessions,
+            governance,
+            DiscoveryCache::new(registry),
+            overlay_source,
+        )
     }
 
     /// Construct shared daemon state with an existing discovery cache.
@@ -115,6 +151,7 @@ impl DaemonState {
         sessions: SessionRegistry,
         governance: Arc<HostGovernanceService>,
         discovery: DiscoveryCache,
+        overlay_source: OverlaySource,
     ) -> Self {
         Self {
             health,
@@ -123,7 +160,7 @@ impl DaemonState {
             notifications: None,
             attention: None,
             discovery,
-            overlays_from_file: false,
+            overlay_source,
             transport: ControlTransport::default(),
             control_peer: None,
         }
@@ -144,13 +181,6 @@ impl DaemonState {
     #[must_use]
     pub fn with_control_peer(mut self, peer: Option<Arc<ControlPeer>>) -> Self {
         self.control_peer = peer;
-        self
-    }
-
-    /// Record whether the configured overlays were listed in `overlays.toml`.
-    #[must_use]
-    pub fn with_overlays_from_file(mut self, from_file: bool) -> Self {
-        self.overlays_from_file = from_file;
         self
     }
 
@@ -442,7 +472,7 @@ async fn handle_negotiated(
                 &state.governance,
                 &state.sessions,
                 state.discovery.registry(),
-                state.overlays_from_file,
+                state.overlay_source.from_file(),
                 state.transport,
             )
             .await
@@ -668,6 +698,7 @@ mod tests {
             sessions,
             Arc::new(crate::governance::HostGovernanceService::open_test()),
             crate::test_support::overlay_registry(),
+            super::OverlaySource::Default,
         )
     }
 

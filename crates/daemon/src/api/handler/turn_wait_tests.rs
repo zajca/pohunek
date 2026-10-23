@@ -169,6 +169,7 @@ impl Fixture {
             sessions.clone(),
             Arc::new(crate::governance::HostGovernanceService::open_test()),
             crate::test_support::overlay_registry(),
+            crate::api::OverlaySource::Default,
         )
         .with_notifications(notifications)
         .with_attention_coordinator(attention);
