@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use pohunek_worker_protocol::{
-    ActiveIdentityOutcome, ForwardedActiveRelease, ForwardedActiveReport, ProcessIdentity,
-    ReportedSession, ReportedSessionKind, ACTIVE_IDENTITY_FORWARD_VERSION,
+    ActiveIdentityOutcome, ForwardedActiveRelease, ForwardedActiveReport, InspectSnapshot,
+    ProcessIdentity, ReportedSession, ReportedSessionKind, ACTIVE_IDENTITY_FORWARD_VERSION,
 };
 use protocol::{
     event, AgentActivity, SessionId, SessionReleaseAgentParams, SessionReleaseAgentResult,
@@ -29,7 +29,7 @@ use super::{
     SessionRegistry, WorkerMetadataApplyOutcome,
 };
 use crate::agent::ResolvedAgent;
-use crate::runtime::{Worker, WorkerError};
+use crate::runtime::{ExchangeOrder, SentAt, Worker, WorkerError};
 
 /// What a bound release's forward left behind.
 pub(super) struct ForwardedRelease {
@@ -172,8 +172,8 @@ impl SessionRegistry {
         let deadline = self.forward_bound();
         // Built before the request leaves, so an operation the worker may hold
         // is tracked whatever happens to the task that sends it.
-        let pending = Box::new(self.unacknowledged_report(&id, context.clone()).await);
-        let sent_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pending = Box::new(self.unacknowledged_report(&id, context.clone(), None).await);
+        let sent_flag = Arc::new(SentAt::new());
         let task_sent = Arc::clone(&sent_flag);
         let held = guard.take();
         let task = tokio::spawn(async move {
@@ -206,7 +206,9 @@ impl SessionRegistry {
                         .note_forward_failed(&id, ForwardedOperation::Report, &error)
                         .await;
                     Forwarded::Unacknowledged(Unacknowledged::Report(Box::new(
-                        registry.unacknowledged_report(&id, context).await,
+                        registry
+                            .unacknowledged_report(&id, context, task_sent.get().copied())
+                            .await,
                     )))
                 }
                 Ok(Err(error)) => {
@@ -220,9 +222,11 @@ impl SessionRegistry {
                         .note_forward_timed_out(&id, deadline, ForwardedOperation::Report)
                         .await;
                     // A request that never left was not seen by the worker.
-                    if task_sent.load(std::sync::atomic::Ordering::Acquire) {
+                    if let Some(sent) = task_sent.get().copied() {
                         Forwarded::Unacknowledged(Unacknowledged::Report(Box::new(
-                            registry.unacknowledged_report(&id, context).await,
+                            registry
+                                .unacknowledged_report(&id, context, Some(sent))
+                                .await,
                         )))
                     } else {
                         Forwarded::MemoryOnly
@@ -248,8 +252,11 @@ impl SessionRegistry {
                     cause = %error,
                     "forwarding an active-agent report did not finish; tracking what it sent"
                 );
-                if sent_flag.load(std::sync::atomic::Ordering::Acquire) {
-                    Forwarded::Unacknowledged(Unacknowledged::Report(pending))
+                if let Some(sent) = sent_flag.get().copied() {
+                    Forwarded::Unacknowledged(Unacknowledged::Report(Box::new(PendingActivity {
+                        sent: Some(sent),
+                        ..*pending
+                    })))
                 } else {
                     Forwarded::MemoryOnly
                 }
@@ -312,8 +319,11 @@ impl SessionRegistry {
         let deadline = self.forward_bound();
         // Built before the request leaves, so an operation the worker may hold
         // is tracked whatever happens to the task that sends it.
-        let pending = Box::new(self.unacknowledged_release(&id, context.clone()).await);
-        let sent_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pending = Box::new(
+            self.unacknowledged_release(&id, context.clone(), None)
+                .await,
+        );
+        let sent_flag = Arc::new(SentAt::new());
         let task_sent = Arc::clone(&sent_flag);
         let held = guard.take();
         let task = tokio::spawn(async move {
@@ -355,7 +365,9 @@ impl SessionRegistry {
                         .await;
                     (
                         Forwarded::Unacknowledged(Unacknowledged::Release(Box::new(
-                            registry.unacknowledged_release(&id, context).await,
+                            registry
+                                .unacknowledged_release(&id, context, task_sent.get().copied())
+                                .await,
                         ))),
                         true,
                     )
@@ -371,9 +383,11 @@ impl SessionRegistry {
                         .note_forward_timed_out(&id, deadline, ForwardedOperation::Release)
                         .await;
                     // A request that never left was not seen by the worker.
-                    let forwarded = if task_sent.load(std::sync::atomic::Ordering::Acquire) {
+                    let forwarded = if let Some(sent) = task_sent.get().copied() {
                         Forwarded::Unacknowledged(Unacknowledged::Release(Box::new(
-                            registry.unacknowledged_release(&id, context).await,
+                            registry
+                                .unacknowledged_release(&id, context, Some(sent))
+                                .await,
                         )))
                     } else {
                         Forwarded::MemoryOnly
@@ -403,8 +417,11 @@ impl SessionRegistry {
                     cause = %error,
                     "forwarding an active-agent release did not finish; tracking what it sent"
                 );
-                let outcome = if sent_flag.load(std::sync::atomic::Ordering::Acquire) {
-                    Forwarded::Unacknowledged(Unacknowledged::Release(pending))
+                let outcome = if let Some(sent) = sent_flag.get().copied() {
+                    Forwarded::Unacknowledged(Unacknowledged::Release(Box::new(PendingRelease {
+                        sent: Some(sent),
+                        ..*pending
+                    })))
                 } else {
                     Forwarded::MemoryOnly
                 };
@@ -426,6 +443,53 @@ impl SessionRegistry {
         Some(commit.lock_owned().await)
     }
 
+    /// Keeps `snapshot`, read at `order`, as the newest observation of the
+    /// worker's identity unless a later one is held. Returns whether an
+    /// operation the session tracks is now known to be rejected.
+    pub(super) async fn record_identity_observation(
+        &self,
+        id: &SessionId,
+        snapshot: &InspectSnapshot,
+        order: ExchangeOrder,
+    ) -> bool {
+        let (Some(instance), Some(revision)) = (
+            snapshot.worker_instance_id.as_ref(),
+            snapshot.active_identity_revision,
+        ) else {
+            return false;
+        };
+        let mut sessions = self.inner.sessions.lock().await;
+        let Some(entry) = sessions.get_mut(id) else {
+            return false;
+        };
+        claim::observe_identity(
+            entry,
+            IdentityFence {
+                worker_instance_id: instance.to_string(),
+                revision,
+            },
+            order,
+        )
+    }
+
+    /// Records a snapshot the periodic sync read and drops the forwarded
+    /// operations it shows the worker rejected. The identity-commit guard is
+    /// taken only when there is one, so a sync that finds nothing to drop
+    /// never queues behind a report.
+    pub(super) async fn observe_worker_identity(
+        &self,
+        id: &SessionId,
+        snapshot: &InspectSnapshot,
+        order: ExchangeOrder,
+    ) {
+        if !self.record_identity_observation(id, snapshot, order).await {
+            return;
+        }
+        if let Some(_commit) = self.lock_identity_commit(id).await {
+            self.settle_pending_activity(id).await;
+        }
+    }
+
     /// Applies the activity that waits for an identity commit once the commit
     /// is known: when the claim it belongs to is the session's, the activity is
     /// applied; when a newer worker state superseded the claim or the worker
@@ -436,28 +500,33 @@ impl SessionRegistry {
             let Some(entry) = sessions.get_mut(id) else {
                 return;
             };
+            let fence = entry.identity_fence.clone();
+            let observed = entry.identity_observed.clone();
             if entry.pending_release.as_ref().is_some_and(|release| {
-                release.state(entry.identity_fence.as_ref()) != PendingState::Waiting
+                release.state(fence.as_ref(), observed.as_ref()) != PendingState::Waiting
             }) {
                 entry.pending_release = None;
             }
-            let fence = entry.identity_fence.clone();
             entry.displaced_pending.retain(|operation| {
                 let state = match operation {
-                    Unacknowledged::Report(pending) => pending_state(pending, fence.as_ref()),
-                    Unacknowledged::Release(pending) => pending.state(fence.as_ref()),
+                    Unacknowledged::Report(pending) => {
+                        pending_state(pending, fence.as_ref(), observed.as_ref())
+                    }
+                    Unacknowledged::Release(pending) => {
+                        pending.state(fence.as_ref(), observed.as_ref())
+                    }
                 };
                 state == PendingState::Waiting
             });
             let Some(pending) = entry.pending_activity.take() else {
                 return;
             };
-            match pending_state(&pending, entry.identity_fence.as_ref()) {
+            match pending_state(&pending, fence.as_ref(), observed.as_ref()) {
                 PendingState::Waiting => {
                     entry.pending_activity = Some(pending);
                     return;
                 }
-                PendingState::Obsolete => return,
+                PendingState::Obsolete | PendingState::Rejected => return,
                 PendingState::Settled => {}
             }
             if is_terminal(entry.info.state) || !owns(entry, &pending.key) {
@@ -537,6 +606,7 @@ impl SessionRegistry {
             activity,
             epoch,
             admitted: claim::next_admission(),
+            sent: None,
         });
         // A slower, older task never replaces the activity of a newer report.
         let newer_waits = entry.pending_activity.as_ref().is_some_and(|waiting| {
@@ -641,7 +711,7 @@ impl SessionRegistry {
                 self.note_forwarded_release(id, revision, context).await;
             }
         }
-        self.commit_forwarded_snapshot(id, worker, revision).await;
+        Box::pin(self.commit_forwarded_snapshot(id, worker, revision)).await;
         self.settle_pending_activity(id).await;
     }
 
@@ -671,6 +741,7 @@ impl SessionRegistry {
                     seq: context.seq,
                 },
                 admitted: claim::next_admission(),
+                sent: None,
             }));
         }
     }
@@ -708,6 +779,7 @@ impl SessionRegistry {
         &self,
         id: &SessionId,
         context: ForwardedReportContext,
+        sent: Option<ExchangeOrder>,
     ) -> PendingActivity {
         PendingActivity {
             revision: self.fence_at_send(id, &context.instance).await,
@@ -720,6 +792,7 @@ impl SessionRegistry {
             activity: None,
             epoch: String::new(),
             admitted: claim::next_admission(),
+            sent,
         }
     }
 
@@ -728,6 +801,7 @@ impl SessionRegistry {
         &self,
         id: &SessionId,
         context: ForwardedReleaseContext,
+        sent: Option<ExchangeOrder>,
     ) -> PendingRelease {
         PendingRelease {
             revision: self.fence_at_send(id, &context.instance).await,
@@ -742,6 +816,7 @@ impl SessionRegistry {
                 seq: context.seq,
             },
             admitted: claim::next_admission(),
+            sent,
         }
     }
 
@@ -777,8 +852,11 @@ impl SessionRegistry {
     /// The caller holds the session's identity-commit guard.
     async fn commit_forwarded_snapshot(&self, id: &SessionId, worker: &Worker, revision: u64) {
         let deadline = self.forward_bound();
-        let snapshot = match tokio::time::timeout(deadline, worker.inspect()).await {
-            Ok(Ok(snapshot)) => snapshot,
+        let snapshot = match tokio::time::timeout(deadline, worker.inspect_ordered()).await {
+            Ok(Ok((snapshot, order))) => {
+                self.record_identity_observation(id, &snapshot, order).await;
+                snapshot
+            }
             Err(_) => {
                 warn!(
                     name: "session.active_identity.commit_deferred",

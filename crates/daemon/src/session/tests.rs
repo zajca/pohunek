@@ -16389,9 +16389,7 @@ async fn reconnect_rejects_a_replacement_worker_before_mutating_registry() {
     };
     let mut events = registry.subscribe();
 
-    let outcome = registry
-        .adopt_reconnected_worker(&created.id, &expected, worker)
-        .await;
+    let outcome = Box::pin(registry.adopt_reconnected_worker(&created.id, &expected, worker)).await;
 
     assert!(matches!(
         outcome,
@@ -16449,9 +16447,8 @@ async fn reconnect_persistence_failure_retries_without_orphaning_live_handle() {
     // A live worker task may change the entry before the adoption commits;
     // that refusal writes nothing, so the armed store fault stays for the
     // retry that reaches the write.
-    let mut failed = registry
-        .adopt_reconnected_worker(&created.id, &expected, worker.clone())
-        .await;
+    let mut failed =
+        Box::pin(registry.adopt_reconnected_worker(&created.id, &expected, worker.clone())).await;
     for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
         if !matches!(
             failed,
@@ -16460,9 +16457,9 @@ async fn reconnect_persistence_failure_retries_without_orphaning_live_handle() {
             break;
         }
         tokio::task::yield_now().await;
-        failed = registry
-            .adopt_reconnected_worker(&created.id, &expected, worker.clone())
-            .await;
+        failed =
+            Box::pin(registry.adopt_reconnected_worker(&created.id, &expected, worker.clone()))
+                .await;
     }
     assert!(
         matches!(
@@ -16921,10 +16918,7 @@ async fn assert_reconnect_transition_applied(
     // transition's derivation and its commit. Production retries this
     // explicit outcome.
     for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
-        match registry
-            .adopt_reconnected_worker(id, expected, worker.clone())
-            .await
-        {
+        match Box::pin(registry.adopt_reconnected_worker(id, expected, worker.clone())).await {
             super::RuntimeTransitionOutcome::Applied(_) => return,
             super::RuntimeTransitionOutcome::RetryableConcurrentChange => {
                 tokio::task::yield_now().await;
@@ -27620,6 +27614,7 @@ async fn the_activity_of_a_superseded_claim_is_dropped() {
             activity: Some(AgentActivity::Working),
             epoch: "epoch".to_owned(),
             admitted: crate::session::claim::next_admission(),
+            sent: None,
         }));
     };
 
@@ -27914,6 +27909,7 @@ async fn activity_waiting_for_a_replaced_worker_instance_is_dropped() {
             activity: Some(AgentActivity::Blocked),
             epoch: "epoch".to_owned(),
             admitted: crate::session::claim::next_admission(),
+            sent: None,
         }));
     };
 
@@ -29808,6 +29804,7 @@ fn blocked_pending(
         activity: Some(AgentActivity::Blocked),
         epoch: "epoch".to_owned(),
         admitted: crate::session::claim::next_admission(),
+        sent: None,
     }
 }
 

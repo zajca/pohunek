@@ -1027,6 +1027,7 @@ impl SessionRegistry {
             input_gate: Arc::new(Mutex::new(())),
             identity_commit: Arc::new(Mutex::new(())),
             identity_fence: None,
+            identity_observed: None,
             pending_activity: None,
             pending_release: None,
             displaced_pending: Vec::new(),

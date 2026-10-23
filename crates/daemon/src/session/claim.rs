@@ -6,6 +6,7 @@
 //! claim of the same variant.
 
 use super::{IdentityFence, SessionEntry};
+use crate::runtime::ExchangeOrder;
 use protocol::AgentActivity;
 
 /// The identity of a journaled claim: who claims, under which worker sequence.
@@ -119,6 +120,57 @@ pub(super) struct PendingActivity {
     pub(super) epoch: String,
     /// Where the operation stands in this daemon's admission order.
     pub(super) admitted: u64,
+    /// Where the request stands in the order the worker handles them; absent
+    /// for an accepted operation.
+    pub(super) sent: Option<ExchangeOrder>,
+}
+
+/// The newest snapshot of the worker's identity this daemon read, with where
+/// its request stands in the order the worker handles them. It is kept apart
+/// from the committed fence: a snapshot that changes nothing the daemon
+/// projects is never applied, yet it still proves what the worker had handled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct IdentityObservation {
+    pub(super) fence: IdentityFence,
+    pub(super) order: ExchangeOrder,
+}
+
+/// Records the snapshot `fence` of the worker read at `order`, unless a
+/// snapshot read later is held. Returns whether a pending operation of `entry`
+/// is rejected by what the entry now holds.
+pub(super) fn observe_identity(
+    entry: &mut SessionEntry,
+    fence: IdentityFence,
+    order: ExchangeOrder,
+) -> bool {
+    if entry
+        .identity_observed
+        .as_ref()
+        .is_none_or(|held| held.order < order)
+    {
+        entry.identity_observed = Some(IdentityObservation { fence, order });
+    }
+    has_rejected_pending(entry)
+}
+
+/// Whether an operation `entry` tracks is known to be rejected by the worker.
+pub(super) fn has_rejected_pending(entry: &SessionEntry) -> bool {
+    let fence = entry.identity_fence.as_ref();
+    let observed = entry.identity_observed.as_ref();
+    let report = entry.pending_activity.as_deref().map(Pending::Report);
+    let release = entry.pending_release.as_deref().map(Pending::Release);
+    let displaced = entry
+        .displaced_pending
+        .iter()
+        .map(|operation| match operation {
+            Unacknowledged::Report(pending) => Pending::Report(pending),
+            Unacknowledged::Release(pending) => Pending::Release(pending),
+        });
+    report
+        .into_iter()
+        .chain(release)
+        .chain(displaced)
+        .any(|pending| pending.state(fence, observed) == PendingState::Rejected)
 }
 
 /// What a snapshot's fence position means for an activity waiting on `pending`.
@@ -130,31 +182,45 @@ pub(super) enum PendingState {
     Settled,
     /// The worker instance changed, so the report cannot be committed.
     Obsolete,
+    /// The worker handled the request and did not journal it.
+    Rejected,
 }
 
 pub(super) fn pending_state(
     pending: &PendingActivity,
     fence: Option<&IdentityFence>,
+    observed: Option<&IdentityObservation>,
 ) -> PendingState {
-    revision_state(&pending.revision, pending.acknowledged, fence)
+    revision_state(
+        (&pending.revision, pending.acknowledged, pending.sent),
+        fence,
+        observed,
+    )
 }
 
 /// Where a pending operation stands against the fence. An operation whose
 /// answer timed out is settled only by a revision above the fence it was sent
-/// at. A timed-out request the worker rejected leaves the revision unchanged,
-/// so its pending stays until the revision rises or the worker instance
-/// changes; the daemon cannot tell a rejection from a request still queued.
+/// at.
+///
+/// The worker raises its identity revision only for a request it journals, so
+/// a snapshot read after the worker handled such a request that still shows the
+/// revision the request was sent at proves the worker rejected it. A snapshot
+/// read earlier proves nothing, because the request may still be queued, and
+/// the operation waits.
 fn revision_state(
-    revision: &IdentityFence,
-    acknowledged: bool,
+    (revision, acknowledged, sent): (&IdentityFence, bool, Option<ExchangeOrder>),
     fence: Option<&IdentityFence>,
+    observed: Option<&IdentityObservation>,
 ) -> PendingState {
+    if fence.is_some_and(|fence| fence.worker_instance_id != revision.worker_instance_id) {
+        return PendingState::Obsolete;
+    }
+    if !acknowledged && rejected_by(revision, sent, observed) {
+        return PendingState::Rejected;
+    }
     let Some(fence) = fence else {
         return PendingState::Waiting;
     };
-    if fence.worker_instance_id != revision.worker_instance_id {
-        return PendingState::Obsolete;
-    }
     let passed = if acknowledged {
         fence.revision >= revision.revision
     } else {
@@ -165,6 +231,21 @@ fn revision_state(
     } else {
         PendingState::Waiting
     }
+}
+
+/// Whether `observed` is a snapshot of the worker instance of `revision`, read
+/// after the request sent at `sent` was handled, at the revision it was sent at.
+fn rejected_by(
+    revision: &IdentityFence,
+    sent: Option<ExchangeOrder>,
+    observed: Option<&IdentityObservation>,
+) -> bool {
+    let (Some(sent), Some(observed)) = (sent, observed) else {
+        return false;
+    };
+    observed.fence.worker_instance_id == revision.worker_instance_id
+        && observed.order > sent
+        && observed.fence.revision == revision.revision
 }
 
 /// What the worker's journal holds for the session as far as this daemon
@@ -202,6 +283,25 @@ impl Pending<'_> {
         }
     }
 
+    fn sent(&self) -> Option<ExchangeOrder> {
+        match self {
+            Self::Report(pending) => pending.sent,
+            Self::Release(pending) => pending.sent,
+        }
+    }
+
+    fn state(
+        &self,
+        fence: Option<&IdentityFence>,
+        observed: Option<&IdentityObservation>,
+    ) -> PendingState {
+        revision_state(
+            (self.revision(), self.acknowledged(), self.sent()),
+            fence,
+            observed,
+        )
+    }
+
     fn shadow(&self) -> Shadow {
         match self {
             Self::Report(pending) => Shadow {
@@ -235,9 +335,10 @@ impl Pending<'_> {
 }
 
 /// The operations of `entry` that wait for their adoption on the worker
-/// instance in use.
+/// instance in use, apart from the ones the worker rejected.
 fn pending_operations(entry: &SessionEntry) -> impl Iterator<Item = Pending<'_>> {
     let fence = entry.identity_fence.as_ref();
+    let observed = entry.identity_observed.as_ref();
     let report = entry.pending_activity.as_deref().map(Pending::Report);
     let release = entry.pending_release.as_deref().map(Pending::Release);
     let displaced = entry
@@ -252,8 +353,10 @@ fn pending_operations(entry: &SessionEntry) -> impl Iterator<Item = Pending<'_>>
         .chain(release)
         .chain(displaced)
         .filter(move |pending| {
-            revision_state(pending.revision(), pending.acknowledged(), fence)
-                != PendingState::Obsolete
+            !matches!(
+                pending.state(fence, observed),
+                PendingState::Obsolete | PendingState::Rejected
+            )
         })
 }
 
@@ -400,6 +503,9 @@ pub(super) struct PendingRelease {
     pub(super) public: PublicOrder,
     /// Where the operation stands in this daemon's admission order.
     pub(super) admitted: u64,
+    /// Where the request stands in the order the worker handles them; absent
+    /// for an accepted operation.
+    pub(super) sent: Option<ExchangeOrder>,
 }
 
 impl PendingRelease {
@@ -413,9 +519,17 @@ impl PendingRelease {
         }
     }
 
-    /// Where the release stands against the fence.
-    pub(super) fn state(&self, fence: Option<&IdentityFence>) -> PendingState {
-        revision_state(&self.revision, self.acknowledged, fence)
+    /// Where the release stands against the fence and the newest snapshot read.
+    pub(super) fn state(
+        &self,
+        fence: Option<&IdentityFence>,
+        observed: Option<&IdentityObservation>,
+    ) -> PendingState {
+        revision_state(
+            (&self.revision, self.acknowledged, self.sent),
+            fence,
+            observed,
+        )
     }
 }
 
@@ -432,9 +546,10 @@ pub(super) enum Unacknowledged {
 /// carries the activity it applies once adopted; an unacknowledged one takes
 /// the slot of its kind otherwise, and the one it replaces stays tracked.
 ///
-/// None is dropped before its revision settles it: each one needs its own
-/// forward to reach the worker and then wait out the worker bound, and the
-/// next applied snapshot settles every operation its revision covers.
+/// None is dropped to make room: each one needs its own forward to reach the
+/// worker and then wait out the worker bound. A snapshot's revision settles
+/// every operation it covers, and a snapshot read after the worker handled an
+/// operation's request without raising the revision drops that operation.
 pub(super) fn attach_unacknowledged(entry: &mut SessionEntry, operation: Unacknowledged) {
     let displaced = match operation {
         Unacknowledged::Report(pending) => match &entry.pending_activity {
