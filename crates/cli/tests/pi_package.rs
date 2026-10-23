@@ -2388,18 +2388,26 @@ async fn a_real_pi_reports_its_turn_dialog_and_exit_through_program_status() {
         .json(&["session", "input", &quit_id, "/quit"])
         .await;
     assert_eq!(code, 0, "{sent}");
-    // The terminal is gone once Pi exits, so the records are read while the
-    // clear record is on its way and the last read before the exit is kept.
-    let raw = wait_until("Pi to clear its record on exit", || async {
-        let raw = raw_output(&fixture, &quit_id).await?;
-        capture::program_status_records(&raw)
-            .last()
-            .is_some_and(|record| record == "clear")
-            .then_some(raw)
-    })
-    .await;
     if reports {
+        // The terminal is gone once Pi exits, so the records are read while
+        // the clear record is on its way and the last read before the exit is
+        // kept.
+        let raw = wait_until("Pi to clear its record on exit", || async {
+            let raw = raw_output(&fixture, &quit_id).await?;
+            capture::program_status_records(&raw)
+                .last()
+                .is_some_and(|record| record == "clear")
+                .then_some(raw)
+        })
+        .await;
         check_sequence("exit", &raw);
+    } else {
+        wait_until("the quit session to end", || async {
+            let (code, inspected) = fixture.harness.json(&["session", "inspect", &quit_id]).await;
+            assert_eq!(code, 0, "{inspected}");
+            (inspected["ok"]["runtime"]["state"] != "live").then_some(())
+        })
+        .await;
     }
     assert!(!marker.exists(), "no dialog was answered");
     fixture.harness.stop().await;
