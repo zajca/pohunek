@@ -171,8 +171,8 @@ every test except the first-run capture runs without egress.
 ## Verified against a real Claude Code 2.1.309
 
 The locked release is 2.1.309; the screens of the previous verified release,
-2.1.289, stay in `compat/claude/screens/n-1/` and every screen scenario runs
-over both sets. The text below describes the captures of the locked release
+2.1.289, stay in `compat/claude/screens/n-1/` and the screen scenarios that read a title or compare goldens run
+over them as well as over the current set. The text below describes the captures of the locked release
 unless it names 2.1.289.
 
 The screens in `compat/claude/screens/` (named screens at 100 columns, widths 20
@@ -307,7 +307,7 @@ captured screen through the package manifest.
 
 ## Program status (OSC 7501)
 
-Claude Code 2.1.295 and later report their root state as OSC 7501 records
+Claude Code 2.1.309 reports its root state as OSC 7501 records
 (`ESC ] 7501 ; state=<state>:app=claude-code ST`) once the terminal answers the
 probe `ESC ] 7501 ; ? ST` with the same bytes. The manifest opts in with
 `[program_status] app = "claude-code"`, `answer_probe = true`, so the session
@@ -317,31 +317,28 @@ manifest opts in) and the daemon holds the latest root record.
 - Mapping: `working` reads working, `blocked` (`kind=permission` or
   `question`) reads blocked, `done`, `idle` and `error` read idle. All are
   reported as `state_source = osc_progress`. Records of background agents carry
-  an `id=` and are ignored, so the root reads idle while background agents run.
+  an `id=` and are ignored by the detector.
 - A visible dialog on the screen always wins over a record that is not
   `blocked`: the folder trust, theme, login, API-key and permission dialogs stay
-  blocked, whatever a (forged or stale) record says. The API-key dialog has
-  its own visible-blocker rule, because the rule that read it before has no
-  visible-blocker flag.
+  blocked, whatever a (forged or stale) record says. The API-key dialog is read
+  by its own visible-blocker rule `api_key_approval_dialog`.
 - A held record ends with a root `state=clear`, with any detector
   reconfiguration (a nested agent exiting, a package refresh) and with the
   runtime. Initial-input readiness ignores the record: the prompt box decides.
-- With the probe answered Claude sets the plain title `Claude Code` in every
-  state, so the title rules read nothing from it. Without a record (Claude
-  2.1.289 and older, `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`, a
-  `CLAUDE_CODE_SESSION_KIND=bg` session, or a probe whose reply lost the race
-  against a client's DA1 reply) detection is screen-only exactly as before; the
-  2.1.289 screens in `n-1/` keep the title rules evidenced.
-- Under tmux Claude does not enable the records (screen and zellij were not
-  checked); a Claude started inside a shell session is screen-only because the shell session's
-  manifest does not answer the probe.
+- With the probe answered Claude 2.1.309 sets the plain title `Claude Code` in
+  every state, so the title rules read nothing from it. Without a record
+  (Claude 2.1.289, which sets the state titles, or a probe that is not
+  answered) detection is screen-only; the 2.1.289 screens in `n-1/` keep the
+  title rules evidenced. A Claude started inside a shell session is
+  screen-only because the shell session's manifest does not answer the probe.
 - The captured record sequences are `compat/claude/screens/<state>.program-status`
   (one ordered root record per line), recorded from the real agent by the
   capture scenarios; `the_captured_program_status_sequences_follow_the_claude_turn_lifecycle`
   pins them, and `a_program_status_record_arbitrates_with_the_real_claude_screens`
   replays the arbitration over the real screens.
-- Esc during a turn reports `idle` (`stopped`) in the binary; no capture of the
-  `Interrupted` marker exists because the test client cannot send a bare Esc.
+- Not recorded on 2.1.309: the Esc interrupt (the `Interrupted` marker and its
+  record), background agents, `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`, `CLAUDE_CODE_SESSION_KIND=bg`
+  and running under tmux; the test client cannot send a bare Esc.
 
 The native installer runs `<root>/claude/versions/<release>`. The kernel name
 of a process started from the resolved image is the release (`2.1.309`), one
@@ -349,8 +346,10 @@ started through the `claude` launcher symlink is named `claude`; either way the
 command line names `claude` or the image, which the manifest's process matchers
 accept. The worker designates such an image as the launch agent (a resolved
 executable in a `claude/versions/` directory), which `SessionStart` binding
-needs. The npm layout (`bin/claude.exe`) and the native layout both pass the
-SessionStart, resume, fork and UserPromptSubmit scenarios against 2.1.309.
+needs. The real-claude scenarios (SessionStart, resume, fork, UserPromptSubmit,
+program status) pass against 2.1.309 started from the npm layout
+(`bin/claude.exe`) and from a local copy of the native layout built from the
+locked native binary (`claude/versions/<release>` plus a launcher symlink).
 
 ## Detection beyond the built-in manifest
 

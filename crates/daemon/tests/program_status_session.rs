@@ -1,8 +1,8 @@
 //! OSC 7501 program status through a real session: worker, PTY and registry.
 //!
-//! The official packages do not opt in yet, so the sessions here run a host
-//! profile over the official Claude package whose override manifest is the
-//! shipped Claude manifest plus a `[program_status]` table. The program is a
+//! The sessions here run a host profile over the official Claude package whose
+//! override manifest is the shipped Claude manifest with its `[program_status]`
+//! table set per scenario. The program is a
 //! POSIX shell stand-in for a probe-waiting agent: it prints the 7501 probe,
 //! waits for the worker's reply, draws a Claude prompt box and reports its
 //! state by raw records when it reads a command byte.

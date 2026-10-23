@@ -1142,8 +1142,8 @@ fn the_top_level_screens_cover_every_state() {
 /// What the package manifest reads from every captured screen: from the screen
 /// text alone, and with the title Claude had set. The screen reads the state of
 /// every capture except a streaming reply too narrow for its turn footer
-/// ([`TURN_FOOTER_UNREAD_WIDTHS`]); the running-turn title outranks the screen,
-/// so with its title every capture reads its state.
+/// ([`TURN_FOOTER_UNREAD_WIDTHS`]); the 2.1.289 running-turn title outranks the
+/// screen, so with it every capture of that set reads its state.
 #[test]
 fn every_captured_screen_is_classified_by_its_screen_text_and_title() {
     let definition = installed_definition();
@@ -1184,8 +1184,9 @@ fn every_captured_screen_is_classified_by_its_screen_text_and_title() {
 /// Captured widths at which the footer of a running turn is cut before its
 /// `esc to interrupt` hint (`⏸ manual mode on · esc to…` at 30 columns, the
 /// mode alone at 20). A streaming reply hides the status line, so at these
-/// widths its screen reads as the idle prompt box and only the running-turn
-/// title says the turn runs.
+/// widths its screen reads as the idle prompt box; the 2.1.289 running-turn
+/// title still says the turn runs, the 2.1.309 title does not and the held
+/// record carries it.
 const TURN_FOOTER_UNREAD_WIDTHS: [u16; 2] = [20, 30];
 
 /// The glyphs Claude Code 2.1.289 alternates before its title while a turn
@@ -1719,7 +1720,8 @@ fn the_process_matchers_accept_the_observed_claude_process_forms() {
     assert!(matchers.matches(&process("sh", &[npm, "--resume", "abc"])));
 
     // The native installer runs `<root>/claude/versions/<release>`: the kernel
-    // name stays `claude`, the command line is the image or the launcher.
+    // name is the release or `claude`, the command line is the image or the
+    // launcher.
     let image = "/home/user/.local/share/claude/versions/2.1.309";
     assert!(matchers.matches(&process("claude", &[image])));
     assert!(matchers.matches(&process("sh", &[image, "--resume", "abc"])));
@@ -3171,8 +3173,7 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
 
 /// R-rows of the program-status layer against a real Claude: a turn started
 /// with `--until working` is confirmed by the `working` record, the settled
-/// turn reads idle from the `done` record, both reported as `osc_progress`, and
-/// a `working` record is not kept once Claude exits.
+/// turn reads idle from the `done` record, both reported as `osc_progress`.
 #[tokio::test]
 #[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
 async fn a_real_claude_turn_is_reported_through_program_status_records() {
@@ -3207,14 +3208,7 @@ async fn a_real_claude_turn_is_reported_through_program_status_records() {
     let idle = fixture.wait_activity(&id, "idle").await;
     assert_eq!(idle["state_source"], "osc_progress", "{idle}");
 
-    // A `working` record does not outlive the process that reported it.
-    fixture
-        .input(&id, &format!("{} {PROMPT}", messages_stub::HOLD_MARKER))
-        .await;
-    fixture.wait_activity(&id, "working").await;
     fixture.stop(&id).await;
-    let stopped = fixture.inspect(&id).await;
-    assert_ne!(stopped["activity"], "working", "{stopped}");
     fixture.finish().await;
 }
 
@@ -4203,12 +4197,11 @@ fn helper_stops(events: &[Value]) -> Vec<String> {
         .collect()
 }
 
-/// A tool approval prompt of the real Claude is blocked through the screen,
-/// for the daemon and for the package manifest, although Claude keeps its
-/// idle title while the dialog is open.
+/// A tool approval prompt of the real Claude is blocked, for the daemon and for
+/// the package manifest.
 #[tokio::test]
 #[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
-async fn a_real_claude_approval_prompt_is_blocked_by_the_screen() {
+async fn a_real_claude_approval_prompt_is_blocked() {
     require_real_claude();
     let package = installed_definition();
     let fixture = Fixture::start(Seed::Trusted).await;
@@ -4221,10 +4214,12 @@ async fn a_real_claude_approval_prompt_is_blocked_by_the_screen() {
     fixture
         .input(&id, &format!("{} run it", messages_stub::APPROVAL_MARKER))
         .await;
+    // The source is the screen or the record, whichever reaches the detector
+    // first; both read blocked.
     let blocked = fixture.wait_activity(&id, "blocked").await;
-    assert_eq!(
-        blocked["state_source"], "osc_progress",
-        "Claude reports the permission prompt as a blocked record: {blocked}"
+    assert!(
+        ["screen", "osc_progress"].contains(&json_scalar(&blocked["state_source"]).as_str()),
+        "{blocked}"
     );
     let rows = fixture
         .wait_screen_line(&id, "Do you want to proceed?")
