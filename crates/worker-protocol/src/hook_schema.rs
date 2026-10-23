@@ -143,8 +143,9 @@ impl AncestryMatcher {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchProcess {
     /// The earliest-started process at or below the PTY root whose executable
-    /// file name contains the provider name, or the provider's hook-helper
-    /// child of it.
+    /// file name contains the provider name or whose resolved executable is a
+    /// release image `<provider>/versions/<release>` of the provider's native
+    /// installer, or the provider's hook-helper child of it.
     ///
     /// An interpreter or an interpreter's script argument never qualifies, so
     /// this rule fits a runtime whose running process image is named for the
