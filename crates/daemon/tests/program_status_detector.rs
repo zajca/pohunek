@@ -40,11 +40,34 @@ fn read(relative: &str) -> String {
     })
 }
 
-/// The shipped manifest of `runtime`, with the opt-in table appended.
+/// The shipped manifest of `runtime` without its `[program_status]` table, so a
+/// package that already opts in is also read as a screen-only manifest.
+fn plain_source(runtime: &str) -> String {
+    let shipped = read(&format!("runtime-packages/{runtime}/detect.toml"));
+    let mut kept = String::new();
+    let mut in_table = false;
+    for line in shipped.lines() {
+        if line.trim() == "[program_status]" {
+            in_table = true;
+            continue;
+        }
+        if in_table && (line.starts_with('[') || line.trim().is_empty()) {
+            in_table = false;
+        }
+        if !in_table {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    kept
+}
+
+/// The shipped manifest of `runtime`, with the opt-in table `app` and
+/// `answer_probe` name in place of its own.
 fn opted_in_source(runtime: &str, app: &str, answer_probe: bool) -> String {
     format!(
         "{}\n[program_status]\napp = \"{app}\"\nanswer_probe = {answer_probe}\n",
-        read(&format!("runtime-packages/{runtime}/detect.toml"))
+        plain_source(runtime)
     )
 }
 
@@ -745,7 +768,7 @@ fn no_record_means_every_captured_screen_reads_exactly_as_without_the_opt_in() {
     ] {
         let directory = workspace_root().join(format!("compat/{runtime}/screens"));
         let mut names = Vec::new();
-        for sub in ["", "widths"] {
+        for sub in ["", "widths", "n-1", "n-1/widths"] {
             let Ok(entries) = fs::read_dir(directory.join(sub)) else {
                 continue;
             };
@@ -767,10 +790,7 @@ fn no_record_means_every_captured_screen_reads_exactly_as_without_the_opt_in() {
         assert!(!names.is_empty(), "{runtime} has captured screens");
         for name in names {
             let bytes = captured(runtime, &name);
-            let mut plain = Harness::new(config(
-                &read(&format!("runtime-packages/{runtime}/detect.toml")),
-                readiness,
-            ));
+            let mut plain = Harness::new(config(&plain_source(runtime), readiness));
             let mut opted = Harness::new(config(&opted_in_source(runtime, app, true), readiness));
             plain.feed(&bytes);
             opted.feed(&bytes);
@@ -810,6 +830,12 @@ fn a_record_never_releases_or_holds_the_initial_input() {
             CODEX_APP,
             InputReadiness::ManifestIdle,
             captured("codex", "idle"),
+        ),
+        (
+            "pi",
+            "pi",
+            InputReadiness::ScreenIdle,
+            captured("pi", "idle"),
         ),
     ] {
         let source = opted_in_source(runtime, app, true);

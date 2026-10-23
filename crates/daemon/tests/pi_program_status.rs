@@ -59,13 +59,18 @@ const UNFRAMED_SCREEN: &str = "overlays/unframed_fork_other_project_w100.txt";
 /// reads (the worker's reply) before it draws the idle screen and reports
 /// idle; in the `old` mode it draws the idle screen and nothing else. A
 /// command read from the terminal (`stdin` source) runs on Enter, as a
-/// submitted prompt does, with Pi's bracketed-paste framing ignored; one read from the `cmd` FIFO (`fifo` source) runs at
-/// once. Commands: `g` working screen and record, `d` idle screen and done
-/// record, `b` blocked record, `c` Pi's own confirm over the screen, `s` the
-/// busy border with an idle record (a branch summary), `x` a screen no rule
-/// matches, `r` the idle screen, `w` a working and a done record in one write, `t` a turn that reports working until the
-/// FIFO yields a byte and then done, and `l` the clear record. In the `old`
-/// mode the screens change and no record is written.
+/// submitted prompt does, with Pi's bracketed-paste framing ignored; one read
+/// from the `cmd` FIFO (`fifo` source) runs at once. With the FIFO source the
+/// agent also records any further input bytes that arrive within a second of
+/// the reply (`extra.hex`), so a second reply would show.
+///
+/// Commands: `g` working screen and record, `d` idle screen and done record,
+/// `b` blocked record, `c` Pi's own confirm over the screen, `s` the busy
+/// border with an idle record (a branch summary), `x` a screen no rule matches,
+/// `r` the idle screen, `w` a working and a done record in one write, `t` a
+/// turn that reports working until the FIFO yields a byte and then done, and
+/// `l` the clear record. In the `old` mode the screens change and no record is
+/// written.
 fn agent_script() -> String {
     format!(
         r#"#!/bin/sh
@@ -82,6 +87,9 @@ emit() {{
 if [ "$mode" = reply ]; then
   printf '\033]7501;?\033\\'
   head -c 10 | od -An -v -tx1 | tr -d ' \n' > "$dir/reply.hex"
+  if [ "$source" = fifo ]; then
+    timeout 1 head -c 10 | od -An -v -tx1 | tr -d ' \n' > "$dir/extra.hex"
+  fi
 fi
 draw {idle}
 emit idle
@@ -368,6 +376,11 @@ async fn the_shipped_pi_package_opts_in_and_the_worker_answers_its_probe_once() 
     .await;
     assert_eq!(reply, REPLY_HEX, "the reply is the fixed probe reply");
     fixture.wait_activity(&created.id, IDLE).await;
+    assert_eq!(
+        std::fs::read_to_string(fixture.scratch_file("extra.hex")).expect("extra.hex"),
+        "",
+        "the probe was answered once"
+    );
 
     // Neither the reply nor records without a delivered input open a turn.
     command(&fixture, b'g');
@@ -431,6 +444,7 @@ async fn a_pi_turn_shorter_than_one_sample_is_latched_working() {
     let fixture = Fixture::new().await;
     let created = fixture.start("fake-reply-stdin").await;
     fixture.wait_activity(&created.id, IDLE).await;
+    let (_, cursor) = fixture.wait_turn(&created.id, 100, None).await;
 
     // The working and the done record arrive in one write.
     let working = fixture
@@ -439,6 +453,12 @@ async fn a_pi_turn_shorter_than_one_sample_is_latched_working() {
         .expect("a waited input sees the working record of a one-write turn");
     assert_eq!(working.activity, Some(AgentActivity::Working));
     fixture.wait_activity(&created.id, IDLE).await;
+    let (reason, cursor) = fixture.wait_turn(&created.id, WAIT_MS, Some(cursor)).await;
+    assert_eq!(reason, SessionWaitTurnReason::Event, "the turn completes");
+    let (reason, _) = fixture
+        .wait_turn(&created.id, NO_TURN_WAIT_MS, Some(cursor))
+        .await;
+    assert_eq!(reason, SessionWaitTurnReason::Timeout, "once");
     let _ = fixture.registry.stop(&created.id).await;
     fixture.end().await;
 }
@@ -466,6 +486,14 @@ async fn a_pi_confirm_record_is_blocked_and_pis_own_confirm_stays_blocked_by_scr
         .await;
     command(&fixture, b'g');
     fixture.wait_activity(&created.id, WORKING).await;
+
+    // The same holds with an idle record, as at Pi's startup questions.
+    command(&fixture, b'd');
+    fixture.wait_activity(&created.id, IDLE).await;
+    command(&fixture, b'c');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Blocked, StateSource::Screen))
+        .await;
     let _ = fixture.registry.stop(&created.id).await;
     fixture.end().await;
 }

@@ -636,8 +636,8 @@ fn detector_with_columns(definition: &RuntimeDefinition, now: Instant, columns: 
 
 /// Directories of the captured screens, relative to `compat/pi/screens`: the
 /// set of the pinned release, then the previous release's set. The previous
-/// release stays launchable (`min` of the supported range), so its screens keep
-/// being classified.
+/// release is inside the supported range, so its screens keep being
+/// classified.
 const SCREEN_SETS: [&str; 2] = ["", "n-1/"];
 
 /// Fixture screens captured from a real Pi and the activity each means.
@@ -864,7 +864,7 @@ struct WidthFixture {
     expected: AgentActivity,
 }
 
-/// Every screen rendered by the real Pi 1.0.2 at a given terminal width. The
+/// Every screen rendered by a real Pi at a given terminal width. The
 /// file name is `<state>_w<columns>.txt`; states starting `idle`, `scroll_idle`
 /// or `rule_idle` mean idle, every other state is Pi at work.
 fn width_fixtures() -> Vec<WidthFixture> {
@@ -1042,7 +1042,7 @@ enum OverlayKind {
     Unframed,
 }
 
-/// A screen a real Pi 1.0.2 drew in place of its editor, named
+/// A screen a real Pi drew in place of its editor, named
 /// `<blocked|selector|unframed>_<what>_w<columns>.txt`.
 struct OverlayFixture {
     name: String,
@@ -1790,7 +1790,8 @@ async fn launch_and_converse(fixture: &Fixture) -> (String, String, PathBuf) {
         .expect("the daemon assigned a native reference")
         .to_owned();
 
-    // Detection: the idle editor rule of the real screen.
+    // Detection: Pi's program-status record when the release reports one, else
+    // the idle editor rule of the real screen.
     let idle = fixture.wait_activity(&id, "idle").await;
     assert_eq!(idle["state_source"], recorded_source(), "{idle}");
 
@@ -2393,6 +2394,31 @@ async fn a_real_pi_reports_its_turn_dialog_and_exit_through_program_status() {
     }
     fixture.stop(&id).await;
 
+    // A session stopped mid-run does not keep the working state its record
+    // held.
+    fixture.stub.close_gate();
+    let busy = fixture.new_session("stopped-mid-run").await;
+    let busy_id = busy["id"].as_str().expect("session id").to_owned();
+    fixture.wait_activity(&busy_id, "idle").await;
+    let (code, sent) = fixture
+        .harness
+        .json(&["session", "input", &busy_id, PROMPT])
+        .await;
+    assert_eq!(code, 0, "{sent}");
+    let working = fixture.wait_activity(&busy_id, "working").await;
+    assert_eq!(working["state_source"], source, "{working}");
+    fixture.stop(&busy_id).await;
+    let (code, inspected) = fixture
+        .harness
+        .json(&["session", "inspect", &busy_id])
+        .await;
+    assert_eq!(code, 0, "{inspected}");
+    assert_ne!(
+        inspected["ok"]["activity"], "working",
+        "a stopped session is not working: {inspected}"
+    );
+    fixture.stub.open_gate();
+
     // Pi clears its record when it exits, so no working state outlives it.
     let quit = fixture.new_session("quit").await;
     let quit_id = quit["id"].as_str().expect("session id").to_owned();
@@ -2403,17 +2429,20 @@ async fn a_real_pi_reports_its_turn_dialog_and_exit_through_program_status() {
         .await;
     assert_eq!(code, 0, "{sent}");
     if reports {
-        // The terminal is gone once Pi exits, so the records are read while
-        // the clear record is on its way and the last read before the exit is
-        // kept.
+        // The output is readable only while the runtime is live, so the
+        // records are polled until the clear record shows. An exit that
+        // outruns the poll fails the test instead of hanging it.
         let raw = wait_until("Pi to clear its record on exit", || async {
-            let raw = raw_output(&fixture, &quit_id).await?;
-            capture::program_status_records(&raw)
-                .last()
-                .is_some_and(|record| record == "clear")
-                .then_some(raw)
+            match raw_output(&fixture, &quit_id).await {
+                Some(raw) => capture::program_status_records(&raw)
+                    .last()
+                    .is_some_and(|record| record == "clear")
+                    .then_some(Some(raw)),
+                None => Some(None),
+            }
         })
-        .await;
+        .await
+        .expect("Pi exited before its clear record was read");
         check_sequence("exit", &raw);
     } else {
         wait_until("the quit session to end", || async {

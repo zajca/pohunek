@@ -43,8 +43,8 @@ reserved, so either way of installing serves it.
 
 - Launch: `pi` with the first prompt as a positional argument, and bracketed
   paste followed by a separate Enter 150 ms later for later input.
-- Readiness: `ready = "screen_idle"`. Pi 1.0.2 enables bracketed paste about
-  130 ms after spawn, before it draws any screen, so a host profile's initial
+- Readiness: `ready = "screen_idle"`. Pi enables bracketed paste about
+  130 ms after spawn (measured on 1.0.2), before it draws any screen, so a host profile's initial
   input (written into the terminal, not passed as an argument) waits for the
   idle editor frame, the `idle_editor_rule` of the detection manifest. A
   session whose editor frame does not show within the host's
@@ -66,8 +66,9 @@ reserved, so either way of installing serves it.
   `answer_probe = true`. Pi 1.1.0 and later print an OSC 7501 probe at start and
   report `working`, `done`, `idle`, `error`, `blocked` (kind `permission`,
   `question` or `auth`) and `clear` only after the terminal answers; the session
-  worker answers once per probe, so a Pi launched by pohunek reports and its
-  records, not the screen, decide the activity (`state_source` `osc_progress`).
+  worker answers each probe once, so a Pi launched by pohunek reports, and its
+  records rather than the screen decide the activity (`state_source`
+  `osc_progress`).
   A visible dialog the screen rules see still wins over a non-blocked record, so
   Pi's own confirms (project trust, missing cwd, branch summary, session import)
   stay `blocked`. Pi 1.0.x prints no probe and is read from the screen alone.
@@ -75,7 +76,13 @@ reserved, so either way of installing serves it.
   reads as Pi's record says (working during a run); the branch-summary busy
   border reads `idle`, as Pi declares it; `error` reads as `idle`; a Pi nested
   under a shell session gets no probe reply and stays screen-only; a profile
-  that sets `PI_PROGRAM_STATUS=0` also gives screen-only detection.
+  that sets `PI_PROGRAM_STATUS=0` also gives screen-only detection. A client's
+  own reply to the probe can reach Pi before the worker's reply when the worker
+  has to wait behind a paced input; Pi then reads "no program status" for that
+  process. After an adoption with an evicted output ring, or after a package
+  refresh, the held record is lost until Pi's next record. Anything that can write
+  to the terminal can forge a record: it can set working or idle when no visible
+  blocker is on screen, as it can forge screen text today.
 - Native reference: `strategy = "assigned"` with `assign_fork = true`. The
   daemon generates a UUID, starts `pi --session-id <id>` (Pi creates the
   conversation with that id), resumes with `pi --session <id>`, and forks with
@@ -252,9 +259,9 @@ Update procedure for a new Pi release: stage it (`cargo xtask compat stage-upstr
 record the screens again (`record_the_pi_screens` with `POHUNEK_PI_E2E=1` and
 `POHUNEK_PI_CAPTURE_DIR`) and the program-status sequences (`POHUNEK_PI_UPDATE_GOLDENS=1`
 with the real-Pi program-status test, written to `compat/pi/screens/sequences/`),
-and bump the package `version`. The previous release's captures move to
-`compat/pi/screens/n-1/` and `min` rises to that release; the manifest tests run
-over both sets. Screens a loopback model and an extension cannot reach (retry,
-compaction, overflow, scrolled drafts, login and selector screens, the missing-cwd
-and fork questions) are carried over from the previous set until they are
-recorded again.
+and bump the package `version`. The oldest `n-1/` set is deleted, the current
+set moves to `n-1/` and `min` rises to that release; the manifest tests run
+over both sets. Screens the recording does not produce (retry, compaction, overflow,
+autocompaction, scrolled and six-line drafts, transcript-rule widths, mid-turn
+permission, trust selector, login, selector, missing-cwd and fork screens) are
+carried over unchanged from the previous release until they are recorded again.

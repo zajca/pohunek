@@ -393,10 +393,10 @@ in [the architecture](architecture.md#runtime-packages-and-trust) and the
 Pi (`pi`, the Pi coding agent) is an optional runtime delivered as a runtime
 package, not compiled into the daemon. The package declares launch, native
 resume and fork, input framing, and detection for Pi `1.x` from `1.0.0` (verified
-on `1.0.2`); the supported range and the verified release are in
+on `1.4.0`, with the `1.0.2` captures kept as the previous release); the supported range and the verified release are in
 `compat/pi/compatibility-lock.json`. It needs a
 Pi on the daemon's `PATH` (`npm install --global
-@earendil-works/pi-coding-agent@1.0.2`, Node 22.19 or newer). A release install
+@earendil-works/pi-coding-agent@1.4.0`, Node 22.19 or newer). A release install
 takes the official package from the daemon archive as above; a checkout builds
 the archive and trusts it by its digest instead.
 
