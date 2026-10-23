@@ -126,7 +126,8 @@ impl Drop for PendingSocket<'_> {
 }
 
 impl ControlServer {
-    /// Bind the control socket at `socket_path` with a validated overlay registry.
+    /// Bind the control socket at `socket_path` with a validated overlay registry
+    /// and the [`OverlaySource`] that registry was built from.
     ///
     /// The parent directory is created (mode `0700`) if missing. If a socket
     /// file already exists, it is probed: a live daemon there is a hard error
@@ -142,6 +143,7 @@ impl ControlServer {
         health: HealthInfo,
         governance: Arc<HostGovernanceService>,
         registry: pohunek_client::OverlayRegistry,
+        overlay_source: crate::api::OverlaySource,
     ) -> Result<Self, DaemonError> {
         Self::bind_with_state(
             socket_path,
@@ -150,7 +152,7 @@ impl ControlServer {
                 SessionRegistry::default(),
                 governance,
                 registry,
-                crate::api::OverlaySource::Default,
+                overlay_source,
             ),
         )
         .await
