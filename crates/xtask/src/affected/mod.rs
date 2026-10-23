@@ -1641,9 +1641,12 @@ mod tests {
             ),
             (
                 "compat/pi/screens/widths/idle_w20.txt",
-                &["pohunek-cli", "xtask"],
+                &["pohunek-cli", "pohunek-daemon", "xtask"],
             ),
-            ("compat/pi/npm/package-lock.json", &["pohunek-cli", "xtask"]),
+            (
+                "compat/pi/npm/package-lock.json",
+                &["pohunek-cli", "pohunek-daemon", "xtask"],
+            ),
             (
                 "compat/claude/screens/idle.txt",
                 &["pohunek-daemon", "pohunek-cli", "xtask"],
