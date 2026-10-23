@@ -1,12 +1,13 @@
 # Runtime descriptor of the Codex CLI package.
 #
-# Verified against Codex 0.160.0 (compat/codex/compatibility-lock.json). The
+# Verified against Codex 0.164.0 (compat/codex/compatibility-lock.json); the
+# captures of 0.160.0, the minimum, stay in compat/codex/screens/n-1. The
 # supported release range below is `[min, below)`; the CI check keeps it equal
 # to the lock's range.
 
 schema = 1
 id = "pohunek.runtime.codex"
-version = "1.2.2"
+version = "1.3.0"
 runtime_api = 1
 
 [runtime]

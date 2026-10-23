@@ -51,6 +51,8 @@ use protocol::{
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
+#[path = "support/capture.rs"]
+mod capture;
 #[path = "support/native_reference_diagnostics.rs"]
 mod native_reference_diagnostics;
 #[path = "support/plugin_harness.rs"]
@@ -74,6 +76,11 @@ const LOCK_PATH: &str = "compat/codex/compatibility-lock.json";
 
 /// Captured screens, relative to the workspace root.
 const SCREENS_DIR: &str = "compat/codex/screens";
+
+/// Screens of the previous verified release, kept so the supported minimum
+/// stays verified. Dialogs the newest release could not be recaptured for
+/// (login, trust, question) live only here.
+const PREVIOUS_SCREENS_DIR: &str = "compat/codex/screens/n-1";
 
 /// Where release [`GOLDEN_TAG`] kept the built-in Codex descriptor, relative
 /// to the workspace root; the golden's header names it.
@@ -101,7 +108,7 @@ const GOLDEN_MANIFEST_NAME: &str = "codex";
 const PACKAGE_ID: &str = "pohunek.runtime.codex";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.2.2";
+const PACKAGE_VERSION: &str = "1.3.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -417,7 +424,8 @@ const UPDATE_POPUP_RULE: &str = "startup_update_prompt";
 fn the_package_manifest_preserves_builtin_rules_and_adds_startup_dialog_rules() {
     let package = read_toml(&format!("{PACKAGE_DIR}/detect.toml"));
     let golden_text = golden_body(GOLDEN_MANIFEST, BUILTIN_MANIFEST);
-    let golden: toml::Table = golden_text.parse().expect("the golden is TOML");
+    let mut golden: toml::Table = golden_text.parse().expect("the golden is TOML");
+    drop_dead_strings(&mut golden);
     let mut builtin_rules = package.clone();
     builtin_rules
         .get_mut("rules")
@@ -432,9 +440,11 @@ fn the_package_manifest_preserves_builtin_rules_and_adds_startup_dialog_rules() 
                         | "startup_login_prompt"
                         | "startup_api_key_prompt"
                         | "startup_incompatible_settings_prompt"
+                        | BACKGROUND_RULE
                 )
             )
         });
+    builtin_rules.remove("program_status");
     // The package deliberately diverges from the built-in copy in one rule: the
     // working title must name a thread or project after the spinner, so the
     // title-generation placeholder of an idle unnamed thread (`⠴ | cxw`) is not
@@ -479,7 +489,6 @@ fn the_package_manifest_preserves_builtin_rules_and_adds_startup_dialog_rules() 
         [
             "osc_title_blocked",
             "osc_title_working",
-            "workspace_trust_prompt",
             FOLDER_TRUST_RULE,
             "startup_login_prompt",
             "startup_api_key_prompt",
@@ -487,9 +496,36 @@ fn the_package_manifest_preserves_builtin_rules_and_adds_startup_dialog_rules() 
             UPDATE_POPUP_RULE,
             "live_strong_blocker",
             "weak_blocker",
+            BACKGROUND_RULE,
             "osc_title_idle",
         ]
     );
+}
+
+/// Rule the package adds to the golden built-in manifest: a background
+/// terminal without a running turn reads idle over a working program-status
+/// record.
+const BACKGROUND_RULE: &str = "background_terminals_idle";
+
+/// The golden built-in manifest without the strings Codex never draws: the
+/// `workspace_trust_prompt` rule, `allow command?` and `yes (y)`.
+fn drop_dead_strings(golden: &mut toml::Table) {
+    let rules = golden
+        .get_mut("rules")
+        .and_then(toml::Value::as_array_mut)
+        .expect("rules");
+    rules.retain(|rule| rule["id"].as_str() != Some("workspace_trust_prompt"));
+    for rule in rules.iter_mut() {
+        let Some(any) = rule.get_mut("any").and_then(toml::Value::as_array_mut) else {
+            continue;
+        };
+        any.retain(|matcher| {
+            !matches!(
+                matcher["contains"][0].as_str(),
+                Some("allow command?" | "yes (y)")
+            )
+        });
+    }
 }
 
 #[test]
@@ -698,6 +734,8 @@ impl Meaning {
 /// `widths/<state>_w<columns>.txt`, with the OSC title Codex had set in
 /// `<same name>.title` when the capture had one.
 struct Frame {
+    /// Whether the screen belongs to the previous verified release.
+    previous: bool,
     name: String,
     state: String,
     columns: u16,
@@ -727,7 +765,7 @@ impl Frame {
 /// Columns of the top-level fixtures.
 const DEFAULT_COLUMNS: u16 = 100;
 
-fn load_frame(directory: &Path, name: &str, state: &str, columns: u16) -> Frame {
+fn load_frame(directory: &Path, previous: bool, name: &str, state: &str, columns: u16) -> Frame {
     let rows = rows_of(
         &fs::read_to_string(directory.join(format!("{name}.txt"))).expect("read the screen"),
     );
@@ -735,6 +773,7 @@ fn load_frame(directory: &Path, name: &str, state: &str, columns: u16) -> Frame 
         .ok()
         .map(|title| title.trim_end_matches('\n').to_owned());
     Frame {
+        previous,
         name: name.to_owned(),
         state: state.to_owned(),
         columns,
@@ -762,24 +801,34 @@ fn fixture_names(directory: &Path) -> Vec<String> {
 
 /// The screens captured at 100 columns, one per state.
 fn top_level_frames() -> Vec<Frame> {
-    let directory = workspace_root().join(SCREENS_DIR);
-    fixture_names(&directory)
+    [(SCREENS_DIR, false), (PREVIOUS_SCREENS_DIR, true)]
         .into_iter()
-        .map(|name| load_frame(&directory, &name, &name, DEFAULT_COLUMNS))
+        .flat_map(|(set, previous)| {
+            let directory = workspace_root().join(set);
+            fixture_names(&directory)
+                .into_iter()
+                .map(|name| load_frame(&directory, previous, &name, &name, DEFAULT_COLUMNS))
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
 /// Every screen captured at a given terminal width. The file name is
 /// `<state>_w<columns>.txt`.
 fn width_frames() -> Vec<Frame> {
-    let directory = workspace_root().join(SCREENS_DIR).join("widths");
-    fixture_names(&directory)
+    [(SCREENS_DIR, false), (PREVIOUS_SCREENS_DIR, true)]
         .into_iter()
-        .map(|name| {
-            let (state, columns) = name.rsplit_once("_w").expect("a `_w<columns>` suffix");
-            let columns = columns.parse().expect("a column count");
-            let state = state.to_owned();
-            load_frame(&directory, &name, &state, columns)
+        .flat_map(|(set, previous)| {
+            let directory = workspace_root().join(set).join("widths");
+            fixture_names(&directory)
+                .into_iter()
+                .map(|name| {
+                    let (state, columns) = name.rsplit_once("_w").expect("a `_w<columns>` suffix");
+                    let columns = columns.parse().expect("a column count");
+                    let state = state.to_owned();
+                    load_frame(&directory, previous, &name, &state, columns)
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -855,7 +904,10 @@ fn the_captured_screens_span_the_supported_terminal_widths() {
         "trust",
     ] {
         let count = frames.iter().filter(|frame| frame.state == state).count();
-        assert_eq!(count, 9, "{state} is captured at every width");
+        assert!(
+            count >= 9 && count % 9 == 0,
+            "{state} is captured at every width of each release set: {count}"
+        );
     }
     let titled = frames.iter().filter(|frame| frame.title.is_some()).count();
     assert!(titled >= 40, "titles captured with the screens: {titled}");
@@ -894,6 +946,7 @@ fn the_terminal_title_and_not_the_rows_decides_idle_working_and_blocked() {
     let definition = installed_definition();
     let idle = load_frame(
         &workspace_root().join(SCREENS_DIR),
+        false,
         "idle",
         "idle",
         DEFAULT_COLUMNS,
@@ -925,8 +978,12 @@ fn a_tool_approval_or_question_is_blocked_from_the_screen_alone_when_its_line_is
         if frame.meaning() != Meaning::Blocked {
             continue;
         }
-        let expected =
-            (frame.columns >= SCREEN_BLOCKER_MIN_COLUMNS).then_some(AgentActivity::Blocked);
+        let intact = if frame.previous {
+            frame.columns >= SCREEN_BLOCKER_MIN_COLUMNS
+        } else {
+            !SCREEN_BLOCKER_GAP_COLUMNS.contains(&frame.columns)
+        };
+        let expected = intact.then_some(AgentActivity::Blocked);
         assert_eq!(
             screen_activity(&definition, &frame.rows, frame.columns),
             expected,
@@ -942,6 +999,11 @@ fn a_tool_approval_or_question_is_blocked_from_the_screen_alone_when_its_line_is
 /// question prompts is still on one row; below it the line wraps and the screen
 /// rule cannot match.
 const SCREEN_BLOCKER_MIN_COLUMNS: u16 = 30;
+
+/// Width of the newest release's approval capture whose question and
+/// confirmation lines are scrolled out of the 24 rows (the screen ends in a
+/// `↓` marker), so only the title speaks.
+const SCREEN_BLOCKER_GAP_COLUMNS: [u16; 1] = [30];
 
 #[test]
 fn working_is_read_from_the_title_because_the_screen_has_no_working_rule() {
@@ -962,34 +1024,25 @@ fn dialog(lines: &[&str]) -> Vec<String> {
     lines.iter().map(|line| (*line).to_owned()).collect()
 }
 
+/// The `Do you trust the contents of this directory?` wording is not in the
+/// source of any supported Codex release; the folder dialog has its own rule.
 #[test]
-fn the_workspace_trust_rule_matches_its_dialog_at_the_top_of_the_screen_only() {
+fn the_retired_workspace_trust_wording_is_not_a_blocker() {
     let definition = installed_definition();
-    let trust = [
-        "Do you trust the contents of this directory?",
-        "\u{203a} 1. Yes, continue",
-        "  2. No, quit",
-    ];
-    assert_eq!(
-        screen_activity(&definition, &dialog(&trust), 80),
-        Some(AgentActivity::Blocked)
-    );
-    let repository = ["  Do you trust this repository?", "  1. Yes", "  2. No"];
-    assert_eq!(
-        screen_activity(&definition, &dialog(&repository), 80),
-        Some(AgentActivity::Blocked)
-    );
-
-    // Prose in a transcript that discusses trust is not the dialog: the rule
-    // needs the question and both choices, in the first eight lines.
-    let prose = [
-        "Do you trust the contents of this directory?",
-        "I would answer yes.",
-    ];
-    assert_eq!(screen_activity(&definition, &dialog(&prose), 80), None);
-    let mut buried = vec![String::from("line"); 9];
-    buried.extend(dialog(&trust));
-    assert_eq!(screen_activity(&definition, &buried, 80), None);
+    for dialog_lines in [
+        &[
+            "Do you trust the contents of this directory?",
+            "\u{203a} 1. Yes, continue",
+            "  2. No, quit",
+        ][..],
+        &["  Do you trust this repository?", "  1. Yes", "  2. No"],
+    ] {
+        assert_eq!(
+            screen_activity(&definition, &dialog(dialog_lines), 80),
+            None,
+            "{dialog_lines:?}"
+        );
+    }
 }
 
 #[test]
@@ -1901,7 +1954,6 @@ fn the_confirmation_rules_read_the_text_after_the_last_prompt_marker() {
         "Press enter to confirm or esc to cancel",
         "tab to add notes | enter to submit answer | esc to interrupt",
         "enter to submit all",
-        "Allow command? 1. Yes",
     ] {
         let live = dialog(&["\u{203a} do it", phrase]);
         assert_eq!(
@@ -1917,6 +1969,9 @@ fn the_confirmation_rules_read_the_text_after_the_last_prompt_marker() {
             "{phrase} before the newest prompt"
         );
     }
+    // Codex 0.160 and later never draw this prompt.
+    let removed = dialog(&["\u{203a} do it", "Allow command? 1. Yes"]);
+    assert_eq!(screen_activity(&definition, &removed, 80), None);
 }
 
 #[test]
@@ -1924,7 +1979,6 @@ fn the_weak_blocker_phrases_block_anywhere_in_the_recent_screen() {
     let definition = installed_definition();
     for screen in [
         &["Apply the patch? [y/n]"][..],
-        &["Run it: yes (y)"],
         &["Do you want to proceed?", "\u{276f} 1. Yes"],
         &["Would you like to continue?", "yes or no"],
     ] {
@@ -1936,6 +1990,7 @@ fn the_weak_blocker_phrases_block_anywhere_in_the_recent_screen() {
     }
     for screen in [
         &["Do you want to proceed?"][..],
+        &["Run it: yes (y)"],
         &["would you like"],
         &["nothing to see"],
     ] {
@@ -2083,16 +2138,9 @@ fn the_package_manifest_behaves_like_the_builtin_manifest_on_every_frame() {
             compared += 1;
         }
     }
-    let synthetic: [&[&str]; 9] = [
-        &[
-            "Do you trust the contents of this directory?",
-            "1. Yes, continue",
-            "2. No",
-        ],
-        &["Do you trust this repository?", "1. Yes", "2. No"],
+    let synthetic: [&[&str]; 6] = [
         &["\u{203a} go", "Press enter to confirm or esc to cancel"],
         &["\u{203a} go", "enter to submit answer"],
-        &["\u{203a} go", "allow command?"],
         &["[y/n]"],
         &["Do you want to proceed?", "\u{276f} 1. Yes"],
         &["Would you like to go on?", "yes"],
@@ -2401,6 +2449,26 @@ impl Fixture {
         );
     }
 
+    /// Lets later sessions run shell commands without a sandbox or a prompt.
+    /// The command sandbox needs unprivileged user namespaces, which a CI
+    /// runner may refuse, and a background terminal only exists once the
+    /// command has started.
+    fn run_commands_unsandboxed(&self) {
+        let path = self.codex_home.join("config.toml");
+        let config = fs::read_to_string(&path).expect("config.toml");
+        let relaxed = config
+            .replace(
+                "approval_policy = \"on-request\"",
+                "approval_policy = \"never\"",
+            )
+            .replace(
+                "sandbox_mode = \"read-only\"",
+                "sandbox_mode = \"danger-full-access\"",
+            );
+        assert_ne!(relaxed, config, "the policy keys are in the config");
+        fs::write(path, relaxed).expect("write config.toml");
+    }
+
     /// The inventory entry `host inspect local` reports for `profile`.
     async fn inventory_entry(&self, profile: &str) -> Value {
         let (code, host) = self.harness.json(&["host", "inspect", "local"]).await;
@@ -2458,6 +2526,25 @@ impl Fixture {
         launched["ok"].clone()
     }
 
+    /// `session new` of the package profile in `cwd`.
+    async fn new_session_in(&self, name: &str, cwd: &Path) -> Value {
+        let (code, launched) = self
+            .harness
+            .json(&[
+                "session",
+                "new",
+                "--agent",
+                PROFILE,
+                "--cwd",
+                path_str(cwd),
+                "--name",
+                name,
+            ])
+            .await;
+        assert_eq!(code, 0, "{launched}");
+        launched["ok"].clone()
+    }
+
     /// Waits until the session's detected activity is `activity` and returns
     /// the session record that matched.
     async fn wait_activity(&self, id: &str, activity: &str) -> Value {
@@ -2480,14 +2567,21 @@ impl Fixture {
         .await
     }
 
-    /// Waits until the session reports `activity` on the strength of the
-    /// terminal title.
+    /// Waits until the session reports `activity` and the terminal title shows
+    /// it: a braille spinner for working. The activity itself may come from
+    /// the program-status record, which can precede the title.
     async fn wait_title_evidence(&self, id: &str, activity: &str) {
         wait_until(&format!("{activity} from the title of {id}"), || async {
             let (code, inspected) = self.harness.json(&["session", "inspect", id]).await;
             assert_eq!(code, 0, "{inspected}");
-            (inspected["ok"]["activity"] == activity
-                && inspected["ok"]["state_source"] == "osc_title")
+            let (title, _rows) = self.screen(id).await;
+            let spinner = title.as_deref().is_some_and(|title| {
+                title
+                    .chars()
+                    .next()
+                    .is_some_and(|first| ('\u{2800}'..='\u{28ff}').contains(&first))
+            });
+            (inspected["ok"]["activity"] == activity && (spinner || activity != "working"))
                 .then_some(())
         })
         .await;
@@ -2673,9 +2767,9 @@ async fn a_real_codex_session_launches_and_is_detected_through_package_facts() {
     assert_eq!(launched["capabilities"]["resume"], true);
     assert_eq!(launched["capabilities"]["fork"], false);
 
-    // Idle: the title Codex sets at startup, read by the daemon and the package.
+    // Idle: the program-status record Codex writes at startup, read by the daemon; the package agrees from the title.
     let idle = fixture.wait_activity(&id, "idle").await;
-    assert_eq!(idle["state_source"], "osc_title", "{idle}");
+    assert_eq!(idle["state_source"], "osc_progress", "{idle}");
     assert_package_agrees(&fixture, &package, &id, AgentActivity::Idle).await;
 
     // Input: bracketed paste, then a separate submit after the descriptor's
@@ -3059,7 +3153,7 @@ async fn a_real_codex_approval_prompt_is_blocked_by_title_and_screen() {
         .await;
     assert_eq!(code, 0, "{sent}");
     let blocked = fixture.wait_activity(&id, "blocked").await;
-    assert_eq!(blocked["state_source"], "osc_title", "{blocked}");
+    assert_eq!(blocked["state_source"], "osc_progress", "{blocked}");
     let rows = fixture
         .wait_screen_line(&id, "Would you like to run the following command?")
         .await;
@@ -4347,4 +4441,717 @@ fn the_process_guard_leaves_a_process_of_another_environment_alone() {
     assert!(is_alive(foreign), "a process below another root survives");
     ProcessGuard::new(other.root()).reap();
     assert!(!is_alive(foreign));
+}
+
+#[test]
+fn program_status_records_keep_root_records_in_order_without_repeats() {
+    let raw = b"x\x1b]7501;?\x07\x1b]7501;state=working:app=codex\x1b\\\
+        \x1b]7501;state=working:app=codex\x07\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\\
+        \x1b]7501;state=idle:id=child1:app=codex\x07\x1b]7501;state=bogus\x07\
+        \x1b]7501;state=done:app=codex\x07\x1b]7501;state=clear\x07\x1b]7501;state=idle:app=co";
+    assert_eq!(
+        capture::program_status_records(raw),
+        [
+            "app=codex:state=working",
+            "app=codex:state=blocked:kind=permission",
+            "app=codex:state=done",
+            "clear",
+        ]
+    );
+}
+
+#[test]
+fn a_program_status_golden_is_written_one_record_per_line() {
+    let directory = pohunek_test_support::tempdir().expect("tempdir");
+    capture::write_program_status(
+        directory.path(),
+        "sample",
+        b"\x1b]7501;state=idle:app=codex\x07",
+    );
+    let text = fs::read_to_string(directory.path().join("sample.program-status")).expect("golden");
+    assert_eq!(text, "app=codex:state=idle\n");
+}
+
+/// Variable naming the directory the capture test writes to.
+const CAPTURE_VARIABLE: &str = "POHUNEK_CODEX_CAPTURE_DIR";
+
+/// Most raw output bytes one `session output` page returns.
+const OUTPUT_PAGE_BYTES: &str = "65536";
+
+/// How long a resized screen is given to redraw before it is read, in
+/// milliseconds.
+const REDRAW_PAUSE_MS: u64 = 700;
+
+/// Footer text of the working row: the interrupt hint.
+const WORKING_ROW_MARK: &str = "to interrupt)";
+
+impl Fixture {
+    async fn input(&self, id: &str, text: &str) {
+        let (code, sent) = self.harness.json(&["session", "input", id, text]).await;
+        assert_eq!(code, 0, "{sent}");
+    }
+
+    /// Records the session's screen and title as `<name>` below `directory`.
+    async fn capture(&self, directory: &Path, id: &str, name: &str) {
+        let (title, rows) = self.screen(id).await;
+        capture::write_capture(
+            directory,
+            name,
+            path_str(self.harness.env.root()),
+            title.as_deref(),
+            &rows,
+        );
+    }
+
+    async fn resize(&self, id: &str, columns: u16) {
+        let (code, resized) = self
+            .harness
+            .json(&[
+                "session",
+                "resize",
+                id,
+                "--cols",
+                &columns.to_string(),
+                "--rows",
+                capture::CAPTURE_ROWS,
+            ])
+            .await;
+        assert_eq!(code, 0, "{resized}");
+        // timing-allowed: #146 capture-only redraw pause; the screen tracker exposes no redraw-complete signal
+        tokio::time::sleep(Duration::from_millis(REDRAW_PAUSE_MS)).await;
+    }
+
+    /// Records the current state at every width as `widths/<state>_w<columns>`,
+    /// waiting for the screen to stop changing first when `settle`, then
+    /// restores the default width.
+    async fn capture_widths(&self, directory: &Path, id: &str, state: &str, settle: bool) {
+        let widths = directory.join("widths");
+        for columns in capture::CAPTURE_WIDTHS {
+            self.resize(id, columns).await;
+            if settle {
+                let previous = std::cell::RefCell::new(self.screen(id).await);
+                wait_until(&format!("{state} to settle at {columns}"), || async {
+                    // timing-allowed: #146 capture-only redraw pause; the screen tracker exposes no redraw-complete signal
+                    tokio::time::sleep(Duration::from_millis(REDRAW_PAUSE_MS)).await;
+                    let current = self.screen(id).await;
+                    let stable = current == *previous.borrow();
+                    *previous.borrow_mut() = current;
+                    stable.then_some(())
+                })
+                .await;
+            }
+            self.capture(&widths, id, &format!("{state}_w{columns}"))
+                .await;
+        }
+        self.resize(id, DEFAULT_COLUMNS).await;
+    }
+
+    /// Every retained raw output byte of the session's current runtime.
+    async fn raw_output(&self, id: &str) -> Vec<u8> {
+        let (code, inspected) = self.harness.json(&["session", "inspect", id]).await;
+        assert_eq!(code, 0, "{inspected}");
+        let runtime = &inspected["ok"]["runtime"];
+        let worker = runtime["worker_instance_id"].as_str().expect("worker id");
+        let generation = json_scalar(&runtime["runtime_generation"]);
+        let mut bytes = Vec::new();
+        let mut offset = "0".to_owned();
+        loop {
+            let (code, page) = self
+                .harness
+                .json(&[
+                    "session",
+                    "output",
+                    id,
+                    "--worker-instance-id",
+                    worker,
+                    "--runtime-generation",
+                    &generation,
+                    "--after-offset",
+                    &offset,
+                    "--max-bytes",
+                    OUTPUT_PAGE_BYTES,
+                ])
+                .await;
+            assert_eq!(code, 0, "{page}");
+            bytes.extend(capture::output_bytes(&page));
+            offset = json_scalar(&page["ok"]["next_offset"]);
+            if page["ok"]["has_more"] != true {
+                return bytes;
+            }
+        }
+    }
+
+    /// Records the ordered root program-status records seen so far as
+    /// `<name>.program-status`.
+    async fn capture_program_status(&self, directory: &Path, id: &str, name: &str) {
+        let raw = self.raw_output(id).await;
+        capture::write_program_status(directory, name, &raw);
+    }
+}
+
+/// A JSON number or string as a command-line argument.
+fn json_scalar(value: &Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), str::to_owned)
+}
+
+/// The directory the capture test writes to, from `POHUNEK_CODEX_CAPTURE_DIR`.
+fn capture_directory() -> Option<PathBuf> {
+    let Some(directory) = std::env::var_os(CAPTURE_VARIABLE).map(PathBuf::from) else {
+        eprintln!("{CAPTURE_VARIABLE} is not set; nothing captured");
+        return None;
+    };
+    require_real_codex();
+    assert!(directory.is_absolute(), "{CAPTURE_VARIABLE} is absolute");
+    fs::create_dir_all(&directory).expect("create the capture directory");
+    Some(directory)
+}
+
+/// Records the screens of a real Codex into the directory named by
+/// `POHUNEK_CODEX_CAPTURE_DIR`: idle, a held turn, the screen after a turn and
+/// a tool approval, each at every width, with the program-status sequence of
+/// each scenario. The run needs no network beyond the loopback stub. Without
+/// the variable the test does nothing.
+#[tokio::test]
+#[ignore = "refreshes compat/codex/screens from a real `codex`; run with POHUNEK_CODEX_CAPTURE_DIR and --ignored"]
+async fn capture_the_real_codex_screens() {
+    let Some(directory) = capture_directory() else {
+        return;
+    };
+    let recording = capture::RecordingRoot::new("codex");
+    let fixture = Fixture::start().await;
+    fixture.install_integration().await;
+
+    let id = fixture
+        .new_session_in("states", &recording.directory("cwd"))
+        .await["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    fixture.wait_activity(&id, "idle").await;
+    fixture.wait_screen_line(&id, "Ask Codex").await;
+    fixture.capture(&directory, &id, "idle").await;
+    fixture.capture_widths(&directory, &id, "idle", true).await;
+    fixture
+        .capture_program_status(&directory, &id, "idle")
+        .await;
+
+    fixture
+        .input(&id, &format!("{} {PROMPT}", responses_stub::HOLD_MARKER))
+        .await;
+    fixture.wait_activity(&id, "working").await;
+    fixture.wait_screen_line(&id, WORKING_ROW_MARK).await;
+    fixture.capture(&directory, &id, "working_early").await;
+    fixture
+        .wait_screen_line(&id, responses_stub::FIRST_CHUNK)
+        .await;
+    fixture.capture(&directory, &id, "working_stream").await;
+    fixture
+        .capture_widths(&directory, &id, "working_stream", false)
+        .await;
+
+    fixture.stub.open_gate();
+    fixture.wait_activity(&id, "idle").await;
+    fixture
+        .wait_screen_line(&id, responses_stub::SECOND_CHUNK.trim())
+        .await;
+    fixture.capture(&directory, &id, "idle_after_turn").await;
+    fixture
+        .capture_widths(&directory, &id, "idle_after_turn", true)
+        .await;
+    fixture
+        .capture_program_status(&directory, &id, "turn")
+        .await;
+
+    fixture
+        .input(&id, &format!("{} run it", responses_stub::APPROVAL_MARKER))
+        .await;
+    fixture.wait_activity(&id, "blocked").await;
+    fixture
+        .wait_screen_line(&id, "Would you like to run the following command?")
+        .await;
+    fixture.capture(&directory, &id, "approval").await;
+    fixture
+        .capture_widths(&directory, &id, "approval", true)
+        .await;
+    fixture
+        .capture_program_status(&directory, &id, "approval")
+        .await;
+
+    let raw = fixture.raw_output(&id).await;
+    fs::write(
+        directory.join("alternate-screen.txt"),
+        format!(
+            "{}\n",
+            raw.windows(8).any(|window| window == b"\x1b[?1049h")
+        ),
+    )
+    .expect("write the alternate-screen fact");
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// Records the screens of a real Codex that keeps a background terminal after
+/// its turn: the turn that starts the command, then the idle composer with the
+/// background-terminal footer, with the program-status sequence of the run.
+#[tokio::test]
+#[ignore = "refreshes compat/codex/screens from a real `codex`; run with POHUNEK_CODEX_CAPTURE_DIR and --ignored"]
+async fn capture_the_real_codex_background_terminal_screens() {
+    let Some(directory) = capture_directory() else {
+        return;
+    };
+    let recording = capture::RecordingRoot::new("codex");
+    let fixture = Fixture::start().await;
+    fixture.install_integration().await;
+
+    fixture.run_commands_unsandboxed();
+    let id = fixture
+        .new_session_in("background", &recording.directory("cwd"))
+        .await["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    fixture.wait_activity(&id, "idle").await;
+    fixture.wait_screen_line(&id, "Ask Codex").await;
+    fixture
+        .input(&id, &format!("{} go", responses_stub::BACKGROUND_MARKER))
+        .await;
+    fixture.wait_activity(&id, "working").await;
+    fixture.wait_screen_line(&id, BACKGROUND_FOOTER_MARK).await;
+    fixture
+        .capture(&directory, &id, "background_terminal_early")
+        .await;
+    fixture.wait_activity(&id, "idle").await;
+    fixture.wait_screen_line(&id, BACKGROUND_FOOTER_MARK).await;
+    fixture
+        .capture(&directory, &id, "background_terminal")
+        .await;
+    fixture
+        .capture_widths(&directory, &id, "background_terminal", true)
+        .await;
+    fixture
+        .capture_program_status(&directory, &id, "background_terminal")
+        .await;
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// Text of the footer Codex shows while a background terminal runs.
+const BACKGROUND_FOOTER_MARK: &str = "background terminal";
+
+// Program-status (OSC 7501) arbitration over screens captured from a real
+// Codex. Time is a virtual `Instant`: nothing here sleeps.
+
+/// Virtual time between two evidence steps.
+const STEP: Duration = Duration::from_millis(10);
+
+/// Virtual time the debounce needs to confirm an idle or blocked candidate.
+const SETTLE_STEP: Duration = Duration::from_millis(100);
+
+/// Settling ticks after which every debounced candidate has published.
+const SETTLE_TICKS: u32 = 12;
+
+/// Directory of the background-terminal captures.
+const BACKGROUND_SCREENS_DIR: &str = "compat/codex/screens/background";
+
+/// A detector over the package manifest and a virtual clock.
+struct ProgramStatusRun {
+    detector: Detector,
+    now: Instant,
+    published: Vec<(AgentActivity, StateSource)>,
+}
+
+impl ProgramStatusRun {
+    fn new(columns: u16) -> Self {
+        let now = Instant::now();
+        let definition = installed_definition();
+        let mut detector = detector_for(definition.manifest(), now, columns);
+        detector.finish_initial_input();
+        Self {
+            detector,
+            now,
+            published: Vec::new(),
+        }
+    }
+
+    fn note(&mut self, seen: Vec<ActivityTransition>) {
+        for transition in seen {
+            let change = (transition.activity, transition.source);
+            if self.published.last() != Some(&change) {
+                self.published.push(change);
+            }
+        }
+    }
+
+    fn settle(&mut self) {
+        for _ in 0..SETTLE_TICKS {
+            self.now += SETTLE_STEP;
+            let seen = self.detector.tick(self.now);
+            self.note(seen);
+        }
+    }
+
+    /// Feeds one chunk and lets the debounce settle.
+    fn feed(&mut self, bytes: &[u8]) -> &mut Self {
+        self.now += STEP;
+        let seen = self.detector.feed(self.now, bytes);
+        self.note(seen);
+        self.settle();
+        self
+    }
+
+    /// Feeds a root record of Codex.
+    fn record(&mut self, state: &str) -> &mut Self {
+        self.feed(format!("\x1b]7501;state={state}:app=codex\x1b\\").as_bytes())
+    }
+
+    /// The activity and source of the latest published transition.
+    fn activity(&self) -> Option<(AgentActivity, StateSource)> {
+        self.published.last().copied()
+    }
+}
+
+/// A captured screen of `directory`, as the terminal receives it.
+fn captured_bytes(directory: &str, name: &str) -> Vec<u8> {
+    let frame = load_frame(
+        &workspace_root().join(directory),
+        false,
+        name,
+        name,
+        DEFAULT_COLUMNS,
+    );
+    frame_bytes(frame.title.as_deref(), &frame.rows)
+}
+
+const WORKING_BY_RECORD: Option<(AgentActivity, StateSource)> =
+    Some((AgentActivity::Working, StateSource::OscProgress));
+const IDLE_BY_RECORD: Option<(AgentActivity, StateSource)> =
+    Some((AgentActivity::Idle, StateSource::OscProgress));
+const BLOCKED_BY_RECORD: Option<(AgentActivity, StateSource)> =
+    Some((AgentActivity::Blocked, StateSource::OscProgress));
+
+/// The run reads working, from the title or from the record.
+fn assert_working(run: &ProgramStatusRun) {
+    assert_eq!(
+        run.activity().map(|(activity, _source)| activity),
+        Some(AgentActivity::Working),
+        "{:?}",
+        run.published
+    );
+}
+
+/// A6: a background terminal with no turn running reads idle although the
+/// record says working.
+#[test]
+fn a_background_terminal_after_the_turn_reads_idle_although_the_record_works() {
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&captured_bytes(
+        BACKGROUND_SCREENS_DIR,
+        "background_terminal",
+    ))
+    .record("working");
+    assert_eq!(
+        run.activity(),
+        Some((AgentActivity::Idle, StateSource::Screen)),
+        "{:?}",
+        run.published
+    );
+}
+
+/// A6 at every captured width: the footer is truncated, not wrapped.
+#[test]
+fn the_background_terminal_footer_overrides_the_record_at_every_captured_width() {
+    for columns in capture::CAPTURE_WIDTHS {
+        let mut run = ProgramStatusRun::new(columns);
+        run.feed(&captured_bytes(
+            &format!("{BACKGROUND_SCREENS_DIR}/widths"),
+            &format!("background_terminal_w{columns}"),
+        ))
+        .record("working");
+        assert_eq!(
+            run.activity(),
+            Some((AgentActivity::Idle, StateSource::Screen)),
+            "{columns} columns: {:?}",
+            run.published
+        );
+    }
+}
+
+/// A7: during a turn the working row and the braille title keep the record's
+/// working, although the same footer is on screen.
+#[test]
+fn a_turn_with_a_background_terminal_footer_stays_working() {
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&captured_bytes(
+        BACKGROUND_SCREENS_DIR,
+        "background_terminal_early",
+    ))
+    .record("working");
+    assert_working(&run);
+}
+
+/// A7 without the title animation: the working row alone, with an idle title,
+/// is not a background-only state.
+#[test]
+fn the_working_row_keeps_working_when_the_title_does_not_animate() {
+    let frame = load_frame(
+        &workspace_root().join(BACKGROUND_SCREENS_DIR),
+        false,
+        "background_terminal_early",
+        "background_terminal_early",
+        DEFAULT_COLUMNS,
+    );
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&frame_bytes(Some("work"), &frame.rows))
+        .record("working");
+    assert_eq!(run.activity(), WORKING_BY_RECORD, "{:?}", run.published);
+}
+
+/// A8 and A10: Enter written and not yet acknowledged, or an active goal
+/// between turns, shows an idle title, no row and no footer. The record's
+/// working stands.
+#[test]
+fn a_working_record_over_an_idle_composer_reads_working() {
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&captured_bytes(SCREENS_DIR, "idle"))
+        .record("working");
+    assert_eq!(run.activity(), WORKING_BY_RECORD, "{:?}", run.published);
+}
+
+/// A1/A4/A9: done, then idle after a key press, is one idle reading; a stale
+/// spinner title does not outrank a held done.
+#[test]
+fn done_and_idle_records_read_idle_and_beat_a_stale_spinner_title() {
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&captured_bytes(SCREENS_DIR, "working_stream"))
+        .record("working");
+    assert_working(&run);
+    run.record("done");
+    assert_eq!(run.activity(), IDLE_BY_RECORD, "{:?}", run.published);
+    let after_done = run.published.len();
+    run.record("idle");
+    assert_eq!(
+        run.published.len(),
+        after_done,
+        "done followed by idle is no transition: {:?}",
+        run.published
+    );
+}
+
+/// A2: a visible startup dialog beats a non-blocked record.
+#[test]
+fn a_visible_dialog_beats_a_working_or_idle_record() {
+    for state in ["working", "idle"] {
+        let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+        run.feed(&captured_bytes(PREVIOUS_SCREENS_DIR, "trust"))
+            .record(state);
+        assert_eq!(
+            run.activity(),
+            Some((AgentActivity::Blocked, StateSource::Screen)),
+            "{state}: {:?}",
+            run.published
+        );
+    }
+}
+
+/// A3: a blocked record blocks over an idle screen.
+#[test]
+fn a_blocked_record_blocks_over_an_idle_screen() {
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&captured_bytes(SCREENS_DIR, "idle"))
+        .feed(b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\");
+    run.settle();
+    assert_eq!(run.activity(), BLOCKED_BY_RECORD, "{:?}", run.published);
+}
+
+/// A5: a weak blocker in the transcript does not hide a working record.
+#[test]
+fn a_weak_blocker_in_the_transcript_does_not_hide_a_working_record() {
+    let mut rows = load_frame(
+        &workspace_root().join(SCREENS_DIR),
+        false,
+        "working_stream",
+        "working_stream",
+        DEFAULT_COLUMNS,
+    )
+    .rows;
+    rows[4] = "  Proceed with the migration? [y/n]".to_owned();
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&frame_bytes(Some("work"), &rows))
+        .record("working");
+    assert_eq!(run.activity(), WORKING_BY_RECORD, "{:?}", run.published);
+}
+
+/// The row that tells a turn from a background-only footer never appears on
+/// the idle or after-turn captures, at any width of either release set.
+#[test]
+fn the_background_terminal_override_never_fires_on_a_screen_without_the_footer() {
+    for frame in top_level_frames().into_iter().chain(width_frames()) {
+        if !matches!(frame.meaning(), Meaning::Idle) {
+            continue;
+        }
+        let mut run = ProgramStatusRun::new(frame.columns);
+        run.feed(&frame_bytes(frame.title.as_deref(), &frame.rows))
+            .record("working");
+        assert_eq!(
+            run.activity(),
+            WORKING_BY_RECORD,
+            "{}: {:?}",
+            frame.name,
+            run.published
+        );
+    }
+}
+
+/// A footer line next to the working row of a running turn is no
+/// background-only state: the row's elapsed-time group gates the override off.
+#[test]
+fn a_footer_line_next_to_the_working_row_does_not_override_the_record() {
+    let mut rows = load_frame(
+        &workspace_root().join(SCREENS_DIR),
+        false,
+        "working_early",
+        "working_early",
+        DEFAULT_COLUMNS,
+    )
+    .rows;
+    assert!(
+        rows.iter().any(|row| row.contains(WORKING_ROW_MARK)),
+        "the capture shows the working row: {rows:#?}"
+    );
+    rows.insert(
+        rows.len() - 3,
+        "  1 background terminal running \u{b7} /ps to view \u{b7} /stop to close".to_owned(),
+    );
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&frame_bytes(Some("work"), &rows))
+        .record("working");
+    assert_eq!(run.activity(), WORKING_BY_RECORD, "{:?}", run.published);
+}
+
+/// The root records of the session's retained output so far.
+async fn program_status_of(fixture: &Fixture, id: &str) -> Vec<String> {
+    capture::program_status_records(&fixture.raw_output(id).await)
+}
+
+/// A waited input: `session input --until <activity>`.
+async fn input_until(fixture: &Fixture, id: &str, text: &str, activity: &str) -> Value {
+    let (code, sent) = fixture
+        .harness
+        .json(&[
+            "session",
+            "input",
+            id,
+            text,
+            "--until",
+            activity,
+            "--timeout",
+            WAIT_SLICE_MS,
+        ])
+        .await;
+    assert_eq!(code, 0, "{sent}");
+    sent["ok"].clone()
+}
+
+/// A real Codex 0.164.0 reports a held turn, a settled turn, a tool approval
+/// and a background terminal through OSC 7501, and the package reads them: a
+/// waited input sees working from the record, a permission prompt is blocked,
+/// a background terminal after the turn reads idle, and a stopped session
+/// keeps no working reading.
+#[tokio::test]
+#[ignore = "needs a real `codex` on PATH; run with POHUNEK_CODEX_E2E=1 and --ignored"]
+async fn a_real_codex_is_read_through_program_status() {
+    require_real_codex();
+    let fixture = Fixture::start().await;
+    fixture.install_integration().await;
+
+    let id = fixture.new_session("program-status").await["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    fixture.wait_activity(&id, "idle").await;
+
+    let working = input_until(
+        &fixture,
+        &id,
+        &format!("{} {PROMPT}", responses_stub::HOLD_MARKER),
+        "working",
+    )
+    .await;
+    assert_eq!(working["activity"], "working", "{working}");
+    fixture.wait_screen_line(&id, WORKING_ROW_MARK).await;
+    assert!(
+        program_status_of(&fixture, &id)
+            .await
+            .last()
+            .is_some_and(|record| record == "app=codex:state=working"),
+        "the record says working while the turn is held"
+    );
+    fixture.stub.open_gate();
+    fixture.wait_activity(&id, "idle").await;
+    let records = program_status_of(&fixture, &id).await;
+    assert!(
+        records
+            .last()
+            .is_some_and(|record| record == "app=codex:state=done" || record.ends_with("idle")),
+        "the turn ends with done or idle: {records:?}"
+    );
+
+    fixture
+        .input(&id, &format!("{} run it", responses_stub::APPROVAL_MARKER))
+        .await;
+    let blocked = fixture.wait_activity(&id, "blocked").await;
+    assert!(
+        program_status_of(&fixture, &id)
+            .await
+            .iter()
+            .any(|record| record == "app=codex:state=blocked:kind=permission"),
+        "the record says blocked for a permission prompt: {blocked}"
+    );
+    fixture.stop(&id).await;
+
+    fixture.run_commands_unsandboxed();
+    let id = fixture.new_session("background").await["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    fixture.wait_activity(&id, "idle").await;
+    input_until(
+        &fixture,
+        &id,
+        &format!("{} go", responses_stub::BACKGROUND_MARKER),
+        "working",
+    )
+    .await;
+    fixture.wait_screen_line(&id, BACKGROUND_FOOTER_MARK).await;
+    let idle = fixture.wait_activity(&id, "idle").await;
+    assert_eq!(
+        program_status_of(&fixture, &id).await.last(),
+        Some(&"app=codex:state=working".to_owned()),
+        "the record still says working with the background terminal running: {idle}"
+    );
+    fixture.stop(&id).await;
+    let stopped = fixture.harness.json(&["session", "inspect", &id]).await.1;
+    assert_ne!(stopped["ok"]["activity"], "working", "{stopped}");
+    fixture.finish().await;
+}
+
+/// N1/A13: a release that writes no records keeps its blockers next to the
+/// background-terminal footer.
+#[test]
+fn a_weak_blocker_still_blocks_next_to_the_background_terminal_footer_without_a_record() {
+    let rows = dialog(&[
+        "\u{2022} Apply the patch? [y/n]",
+        "  1 background terminal running \u{b7} /ps to view \u{b7} /stop to close",
+        "\u{203a} Ask Codex to do anything",
+    ]);
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&frame_bytes(Some("work"), &rows));
+    assert_eq!(
+        run.activity(),
+        Some((AgentActivity::Blocked, StateSource::Screen)),
+        "{:?}",
+        run.published
+    );
 }

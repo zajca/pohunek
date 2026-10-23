@@ -1,8 +1,6 @@
 
-  >_ OpenAI Codex (v0.160.0)
-     /tmp/cxw
-
-  Hello again, carbon-based collaborator.
+  >_ OpenAI Codex (v0.164.0)
+     /dev/shm/ph-codex/cwd
 
   To get started, describe a task or try one of these commands:
 
@@ -18,7 +16,9 @@
 
 
 
+
+
 › Ask Codex to do anything
 
-  stub-model default · /tmp/cxw
+  stub-model default · /dev/shm/ph-codex/cwd
   ← for agents · ? for shortcuts

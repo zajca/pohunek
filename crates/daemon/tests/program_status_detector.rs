@@ -40,12 +40,27 @@ fn read(relative: &str) -> String {
     })
 }
 
-/// The shipped manifest of `runtime`, with the opt-in table appended.
+/// The shipped manifest of `runtime` as an opted-in manifest: as shipped when it
+/// already declares `[program_status]`, else with the table appended.
 fn opted_in_source(runtime: &str, app: &str, answer_probe: bool) -> String {
-    format!(
-        "{}\n[program_status]\napp = \"{app}\"\nanswer_probe = {answer_probe}\n",
-        read(&format!("runtime-packages/{runtime}/detect.toml"))
-    )
+    let shipped = read(&format!("runtime-packages/{runtime}/detect.toml"));
+    if shipped.contains("\n[program_status]") {
+        return shipped;
+    }
+    format!("{shipped}\n[program_status]\napp = \"{app}\"\nanswer_probe = {answer_probe}\n")
+}
+
+/// The shipped manifest of `runtime` without the opt-in: no `[program_status]`
+/// table and no rule that overrides a record.
+fn plain_source(runtime: &str) -> String {
+    let mut table: toml::Table = read(&format!("runtime-packages/{runtime}/detect.toml"))
+        .parse()
+        .expect("the shipped manifest is TOML");
+    table.remove("program_status");
+    if let Some(rules) = table.get_mut("rules").and_then(toml::Value::as_array_mut) {
+        rules.retain(|rule| rule.get("overrides_program_status").is_none());
+    }
+    table.to_string()
 }
 
 fn fast_detection() -> DetectionConfig {
@@ -97,10 +112,7 @@ impl Harness {
     }
 
     fn claude_without_opt_in() -> Self {
-        Self::new(config(
-            &read("runtime-packages/claude/detect.toml"),
-            InputReadiness::ScreenIdle,
-        ))
+        Self::new(config(&plain_source("claude"), InputReadiness::ScreenIdle))
     }
 
     fn codex() -> Self {
@@ -767,10 +779,7 @@ fn no_record_means_every_captured_screen_reads_exactly_as_without_the_opt_in() {
         assert!(!names.is_empty(), "{runtime} has captured screens");
         for name in names {
             let bytes = captured(runtime, &name);
-            let mut plain = Harness::new(config(
-                &read(&format!("runtime-packages/{runtime}/detect.toml")),
-                readiness,
-            ));
+            let mut plain = Harness::new(config(&plain_source(runtime), readiness));
             let mut opted = Harness::new(config(&opted_in_source(runtime, app, true), readiness));
             plain.feed(&bytes);
             opted.feed(&bytes);
@@ -848,7 +857,7 @@ fn a_record_never_releases_or_holds_the_initial_input() {
 fn a_record_is_not_a_visible_blocker_for_the_codex_startup_barrier() {
     // A startup popup is drawn, cleared, and the idle title arrives; records are
     // interleaved at every step. The readiness verdicts match the run without.
-    let popup = captured("codex", "trust");
+    let popup = captured("codex", "n-1/trust");
     let idle = captured("codex", "idle");
     let steps: Vec<Vec<u8>> = vec![popup, b"\x1b[2J\x1b[H".to_vec(), idle];
     let source = opted_in_source("codex", CODEX_APP, false);
@@ -1032,14 +1041,8 @@ fn a_report_is_not_an_event_without_the_opt_in() {
         b"\x1b]7501;state=working:app=codex\x07".to_vec(),
     ]
     .concat();
-    let mut plain = Harness::new(config(
-        &read("runtime-packages/codex/detect.toml"),
-        InputReadiness::ManifestIdle,
-    ));
-    let mut stripped = Harness::new(config(
-        &read("runtime-packages/codex/detect.toml"),
-        InputReadiness::ManifestIdle,
-    ));
+    let mut plain = Harness::new(config(&plain_source("codex"), InputReadiness::ManifestIdle));
+    let mut stripped = Harness::new(config(&plain_source("codex"), InputReadiness::ManifestIdle));
     plain.feed(&bytes);
     stripped.feed(&captured("codex", "idle"));
 

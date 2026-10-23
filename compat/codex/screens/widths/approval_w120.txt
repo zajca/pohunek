@@ -1,8 +1,8 @@
-  /model - choose what model and reasoning effort to use
-  /review - review any changes and find issues
+› [hold] say hi
+  Worked for 7s • 3:46 PM
 
 
-› RUNTOOL please
+› [approval] run it
 
 
 • Running touch approved.txt
