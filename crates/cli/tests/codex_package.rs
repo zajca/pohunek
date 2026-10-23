@@ -51,6 +51,8 @@ use protocol::{
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
+#[path = "support/capture.rs"]
+mod capture;
 #[path = "support/native_reference_diagnostics.rs"]
 mod native_reference_diagnostics;
 #[path = "support/plugin_harness.rs"]
@@ -4347,4 +4349,33 @@ fn the_process_guard_leaves_a_process_of_another_environment_alone() {
     assert!(is_alive(foreign), "a process below another root survives");
     ProcessGuard::new(other.root()).reap();
     assert!(!is_alive(foreign));
+}
+
+#[test]
+fn program_status_records_keep_root_records_in_order_without_repeats() {
+    let raw = b"x\x1b]7501;?\x07\x1b]7501;state=working:app=codex\x1b\\\
+        \x1b]7501;state=working:app=codex\x07\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\\
+        \x1b]7501;state=idle:id=child1:app=codex\x07\x1b]7501;state=bogus\x07\
+        \x1b]7501;state=done:app=codex\x07\x1b]7501;state=clear\x07\x1b]7501;state=idle:app=co";
+    assert_eq!(
+        capture::program_status_records(raw),
+        [
+            "app=codex:state=working",
+            "app=codex:state=blocked:kind=permission",
+            "app=codex:state=done",
+            "clear",
+        ]
+    );
+}
+
+#[test]
+fn a_program_status_golden_is_written_one_record_per_line() {
+    let directory = pohunek_test_support::tempdir().expect("tempdir");
+    capture::write_program_status(
+        directory.path(),
+        "sample",
+        b"\x1b]7501;state=idle:app=codex\x07",
+    );
+    let text = fs::read_to_string(directory.path().join("sample.program-status")).expect("golden");
+    assert_eq!(text, "app=codex:state=idle\n");
 }
