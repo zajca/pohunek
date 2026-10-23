@@ -1923,7 +1923,8 @@ pub(super) fn apply_observed_transition(
     entry.info.active_agent_pid = Some(observed.pid);
     entry.info.active_agent_session_id = None;
     entry.info.active_agent_session_path = None;
-    if report_activity_was_current {
+    if report_activity_was_current || entry.info.state_source == protocol::StateSource::OscProgress
+    {
         entry.info.activity = None;
         entry.info.state_source = protocol::StateSource::Process;
     }

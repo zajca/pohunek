@@ -1,0 +1,24 @@
+ Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.
+
+
+ say hi
+
+
+ working done
+
+
+ second
+
+
+ working done
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+line one
+line two
+line three
+line four
+line five
+line six
+────────────────────────────────────────────────────────────────────────────────────────────────────
+~/work
+↑2 ↓4 0.0%/128k (auto)                                                                    stub-model

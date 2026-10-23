@@ -1,0 +1,24 @@
+ Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.
+
+[Extensions]
+  dialogs.ts
+
+
+ first question
+
+
+ working done
+
+
+ Fork from Message
+ Select a user message to copy the active path up to that point into a new session
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+› first question
+  Message 1 of 1
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+~/work
+↑1 ↓2 0.0%/128k (auto)                                                                    stub-model

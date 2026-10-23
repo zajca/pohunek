@@ -1,7 +1,3 @@
- ▀▀█  v1.0.2
- █▀ █ escape
- interrupt ·
- ctrl+c/ctrl+d
  clear/exit · /
  commands · ! bash
  · ctrl+o more
@@ -16,9 +12,13 @@
  Ask it how to use
  or extend Pi.
 
+[Extensions]
+  confirm.ts,
+dialogs.ts
+
 
 ────────────────────
 
 ────────────────────
-~/work
-0.0%/4.0k (auto)  st
+/dev/shm/ph-pi/cwd
+0.0%/128k (auto)  st

@@ -1,0 +1,24 @@
+ resources.
+
+ Pi can explain its
+ own features and
+ look up its docs.
+ Ask it how to use
+ or extend Pi.
+
+[Extensions]
+  dialogs.ts
+
+
+────────────────────
+ Login to Anthropic
+
+ Enter Anthropic
+ API key
+>
+ (escape/ctrl+c to
+ cancel, enter to
+ submit)
+────────────────────
+~/work
+0.0%/128k (auto)  st

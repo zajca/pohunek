@@ -2716,10 +2716,10 @@ const PI_PACKAGE: &str = "pohunek.runtime.pi";
 
 /// The version of the Pi package `runtime-packages/pi` builds, which
 /// [`Host::with_installed_pi`] installs.
-const PI_INSTALLED_VERSION: &str = "1.0.3";
+const PI_INSTALLED_VERSION: &str = "1.0.4";
 
 /// A version newer than [`PI_INSTALLED_VERSION`], published as a later release.
-const PI_NEWER_VERSION: &str = "1.0.4";
+const PI_NEWER_VERSION: &str = "1.0.5";
 
 /// A version older than [`PI_INSTALLED_VERSION`], published as an earlier release.
 const PI_OLDER_VERSION: &str = "1.0.2";

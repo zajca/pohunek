@@ -1,0 +1,24 @@
+
+ Error: 503: {"message":"overloaded","type":"server_error"}
+
+ Error: 503: {"message":"overloaded","type":"server_error"}
+
+ Error: Retry failed after 3 attempts: 503: {"message":"overloaded","type":"server_error"}
+
+
+ work
+
+
+ working
+
+── ⠹ Working ─────────────────────────────── ↑ 24 more ─────────────────────────────────────────────
+row 25
+row 26
+row 27
+row 28
+row 29
+row 30
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+~/work
+↑4 ↓8 ?/128k (auto)                                                                       stub-model

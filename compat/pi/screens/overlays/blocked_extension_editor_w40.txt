@@ -4,15 +4,15 @@
  extend Pi.
 
 [Extensions]
-  dialogs.ts
+  confirm.ts, dialogs.ts
 
 
 ────────────────────────────────────────
 
- Edit the commit message
+ Edit text
 
 ────────────────────────────────────────
-Fix the parser
+prefill
 ────────────────────────────────────────
 
  enter submit  shift+enter/ctrl+j
@@ -20,5 +20,5 @@ Fix the parser
  external editor
 
 ────────────────────────────────────────
-~/work
+/dev/shm/ph-pi/cwd
 0.0%/128k (auto)              stub-model

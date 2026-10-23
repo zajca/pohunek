@@ -1,24 +1,24 @@
- dolor sit amet lorem ipsum dolor sit amet lorem
- ipsum dolor sit amet lorem ipsum dolor sit amet
- lorem ipsum dolor sit amet lorem ipsum dolor sit
- amet lorem ipsum dolor sit amet lorem ipsum dolor
- sit amet lorem ipsum dolor sit amet lorem ipsum
- dolor sit amet lorem ipsum dolor sit amet lorem
- ipsum dolor sit amet lorem ipsum dolor sit amet
- lorem ipsum dolor sit amet lorem ipsum dolor sit
- amet lorem ipsum dolor sit amet
+
+ ▀▀█  v1.4.0
+ █▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit ·
+ / commands · ! bash · ctrl+o more
+ Press ctrl+o to show full startup help and loaded
+ resources.
+
+ Pi can explain its own features and look up its
+ docs. Ask it how to use or extend Pi.
+
+[Extensions]
+  confirm.ts, dialogs.ts
 
 
- working done
-
-
- second
+ say hi
 
 
  working
 
-── ⠇ Working ───────────────────────────────────────
+── ⠹ Working ───────────────────────────────────────
 
 ────────────────────────────────────────────────────
-~/work
-↑2 ↓4 0.1%/4.0k (auto)                    stub-model
+/dev/shm/ph-pi/cwd
+1.1%/128k (auto)                          stub-model

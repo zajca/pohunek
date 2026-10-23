@@ -5,13 +5,13 @@
  extend Pi.
 
 [Extensions]
-  dialogs.ts
+  confirm.ts, dialogs.ts
 
 
 ──────────────────────────────
 
  Allow tool call?
- bash: rm -rf build
+ bash: touch marker
 
  → Yes
    No
@@ -20,5 +20,5 @@
  escape/ctrl+c cancel
 
 ──────────────────────────────
-~/work
+/dev/shm/ph-pi/cwd
 0.0%/128k (auto)    stub-model

@@ -1,12 +1,12 @@
 # Runtime descriptor of the Pi coding agent package.
 #
-# Verified against Pi 1.0.2 (compat/pi/compatibility-lock.json). The supported
+# Verified against Pi 1.4.0 (compat/pi/compatibility-lock.json). The supported
 # release range below is `[min, below)`; the CI check keeps it equal to the
 # lock's range.
 
 schema = 1
 id = "pohunek.runtime.pi"
-version = "1.0.3"
+version = "1.0.4"
 runtime_api = 1
 
 [runtime]

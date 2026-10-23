@@ -1,0 +1,4 @@
+app=pi:state=idle
+app=pi:state=working
+app=pi:state=done
+app=pi:state=blocked:kind=permission

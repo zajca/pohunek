@@ -1,4 +1,4 @@
- ▀▀█  v1.0.2
+ ▀▀█  v1.4.0
  █▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit
   · / commands · ! bash · ctrl+o more
  Press ctrl+o to show full startup help and
@@ -8,17 +8,17 @@
  docs. Ask it how to use or extend Pi.
 
 [Extensions]
-  dialogs.ts
+  confirm.ts, dialogs.ts
 
 
 ──────────────────────────────────────────────────
 
- Reason for the change
+ Name
 
 >
 
  enter submit  escape/ctrl+c cancel
 
 ──────────────────────────────────────────────────
-~/work
+/dev/shm/ph-pi/cwd
 0.0%/128k (auto)                        stub-model

@@ -1333,7 +1333,7 @@ version_probe = { parser = "semver-v1", args = ["--version"], min = "1.0.0", bel
 four tokens) is the probe argv, and `[min, below)` is the supported release
 range, so a package update can move the range without a daemon release. The
 official packages declare `min` as their tested minimum (the verified release,
-except Pi, which accepts from 1.0.0 and is verified on 1.0.2, and Codex, whose
+except Pi, which accepts from 1.0.0 and is verified on 1.4.0, with the 1.0.2 captures kept as the previous release, and Codex, whose
 `min` is the previous verified release, with its captures kept in the
 repository) and `below` as
 the next major release (codex `[0.160.0, 1.0.0)`, claude
@@ -2322,6 +2322,10 @@ metadata store's canonical path (its directory resolved through
 a cache directory never share a root. It replaces a `TMPDIR` the allowlist
 forwards, so concurrent sessions never share temporary names; a profile that
 sets `TMPDIR` in its `[env]` keeps its own value and gets no private directory.
+A profile over an agent whose manifest declares `[program_status]` can switch the
+agent's program status off with the agent's own variable (`PI_PROGRAM_STATUS=0`
+for Pi, `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` for Claude); detection is then
+screen-only.
 The directory and the directories above it up to `session-tmp` have mode 0700 and must
 be directories of the daemon's user reached without a symlink; a launch whose
 directory fails that check fails with runtime-class `session_tmpdir_unsafe`,

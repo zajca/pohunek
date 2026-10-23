@@ -33,6 +33,8 @@ use pohunek_test_support::workspace_root;
 use protocol::{AgentActivity, BindingProvenance, StateSource};
 use serde_json::Value;
 
+#[path = "support/capture.rs"]
+mod capture;
 #[path = "support/model_stub.rs"]
 mod model_stub;
 #[path = "support/plugin_harness.rs"]
@@ -52,6 +54,9 @@ const PACKAGE_ID: &str = "pohunek.runtime.pi";
 
 /// Profile the real-Pi tests launch through by default.
 const PROFILE: &str = "pi-test";
+
+/// Profile that holds Pi's start behind a gate.
+const GATED_PROFILE: &str = "pi-gated";
 
 fn package_dir() -> PathBuf {
     workspace_root().join(PACKAGE_DIR)
@@ -114,7 +119,7 @@ fn the_descriptor_declares_the_verified_pi_launch_contract() {
     match &definition.binding().provenance {
         BindingProvenance::Package { package, .. } => {
             assert_eq!(package.id.as_str(), PACKAGE_ID);
-            assert_eq!(package.version.as_str(), "1.0.3");
+            assert_eq!(package.version.as_str(), "1.0.4");
         }
         other @ BindingProvenance::Builtin { .. } => {
             panic!("a package-served runtime, got {other:?}")
@@ -632,7 +637,13 @@ fn detector_with_columns(definition: &RuntimeDefinition, now: Instant, columns: 
     )
 }
 
-/// Fixture screens captured from a real Pi 1.0.2 and the activity each means.
+/// Directories of the captured screens, relative to `compat/pi/screens`: the
+/// set of the pinned release, then the previous release's set. The previous
+/// release is inside the supported range, so its screens keep being
+/// classified.
+const SCREEN_SETS: [&str; 2] = ["", "n-1/"];
+
+/// Fixture screens captured from a real Pi and the activity each means.
 ///
 /// The `Working` and `Retrying` frames keep the editor rules while a turn runs,
 /// so the multi-line drafts (six lines, and a draft scrolled inside the
@@ -651,14 +662,39 @@ const CAPTURED_SCREENS: [(&str, AgentActivity); 10] = [
     ("retry.txt", AgentActivity::Working),
 ];
 
+/// Label that tells a screen set apart in failure messages.
+fn set_label(set: &str) -> String {
+    if set.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", set.trim_end_matches('/'))
+    }
+}
+
+/// [`CAPTURED_SCREENS`] of every screen set, as paths below `compat/pi/screens`.
+fn captured_screens() -> Vec<(String, AgentActivity)> {
+    SCREEN_SETS
+        .iter()
+        .flat_map(|set| captured_screens_of(set))
+        .collect()
+}
+
+/// [`CAPTURED_SCREENS`] of the screen set `set`.
+fn captured_screens_of(set: &str) -> Vec<(String, AgentActivity)> {
+    CAPTURED_SCREENS
+        .iter()
+        .map(|(screen, expected)| (format!("{set}{screen}"), *expected))
+        .collect()
+}
+
 #[test]
 fn every_captured_screen_is_classified_by_screen_evidence() {
     let definition = installed_definition();
-    for (screen, expected) in CAPTURED_SCREENS {
+    for (screen, expected) in captured_screens() {
         let started = Instant::now();
         let mut detector = detector(&definition, started);
         assert_eq!(
-            detector.feed(started, &screen_bytes(screen)),
+            detector.feed(started, &screen_bytes(&screen)),
             vec![pohunek_daemon::detect::ActivityTransition {
                 activity: expected,
                 source: StateSource::Screen,
@@ -835,20 +871,34 @@ struct WidthFixture {
     expected: AgentActivity,
 }
 
-/// Every screen rendered by the real Pi 1.0.2 at a given terminal width. The
+/// Every screen rendered by a real Pi at a given terminal width. The
 /// file name is `<state>_w<columns>.txt`; states starting `idle`, `scroll_idle`
 /// or `rule_idle` mean idle, every other state is Pi at work.
 fn width_fixtures() -> Vec<WidthFixture> {
-    let mut names: Vec<String> = fs::read_dir(workspace_root().join("compat/pi/screens/widths"))
-        .expect("read the width fixtures")
-        .map(|entry| {
-            entry
-                .expect("directory entry")
-                .file_name()
-                .into_string()
-                .expect("UTF-8 file name")
-        })
-        .collect();
+    SCREEN_SETS
+        .iter()
+        .flat_map(|set| width_fixtures_of(set))
+        .collect()
+}
+
+/// [`width_fixtures`] of the screen set `set`; the names of an earlier set end
+/// with its label.
+fn width_fixtures_of(set: &str) -> Vec<WidthFixture> {
+    let mut names: Vec<String> = fs::read_dir(
+        workspace_root()
+            .join("compat/pi/screens")
+            .join(set)
+            .join("widths"),
+    )
+    .expect("read the width fixtures")
+    .map(|entry| {
+        entry
+            .expect("directory entry")
+            .file_name()
+            .into_string()
+            .expect("UTF-8 file name")
+    })
+    .collect();
     names.sort();
     names
         .into_iter()
@@ -860,13 +910,13 @@ fn width_fixtures() -> Vec<WidthFixture> {
                 .any(|prefix| state.starts_with(prefix));
             WidthFixture {
                 columns: columns.parse().expect("a column count"),
-                rows: screen_rows(&format!("widths/{name}")),
+                rows: screen_rows(&format!("{set}widths/{name}")),
                 expected: if idle {
                     AgentActivity::Idle
                 } else {
                     AgentActivity::Working
                 },
-                name,
+                name: format!("{name}{}", set_label(set)),
             }
         })
         .collect()
@@ -963,14 +1013,24 @@ fn a_column_zero_rule_in_the_transcript_never_stands_in_for_the_upper_border() {
 /// exception: see [`a_draft_reads_idle_unless_it_reproduces_a_selector_list_or_a_dialog_hint`].
 #[test]
 fn hostile_text_in_the_transcript_or_the_draft_never_changes_the_classification() {
+    hostile_text_never_changes_the_classification_of(SCREEN_SETS[0]);
+}
+
+#[test]
+fn hostile_text_never_changes_the_classification_of_the_previous_release() {
+    hostile_text_never_changes_the_classification_of(SCREEN_SETS[1]);
+}
+
+/// The body of the hostile-text sweep over the screens of the set `set`.
+fn hostile_text_never_changes_the_classification_of(set: &str) {
     let definition = installed_definition();
     let mut checked = 0_usize;
-    for (screen, expected) in CAPTURED_SCREENS {
-        checked += sweep_hostile_rows(&definition, screen, &screen_rows(screen), 100, expected);
+    for (screen, expected) in captured_screens_of(set) {
+        checked += sweep_hostile_rows(&definition, &screen, &screen_rows(&screen), 100, expected);
     }
     // The narrowest terminal, one whose busy borders close with one rule, and
     // the transcript-rule screens at 24 columns.
-    for fixture in width_fixtures().iter().filter(|fixture| {
+    for fixture in width_fixtures_of(set).iter().filter(|fixture| {
         fixture.columns == 20
             || (fixture.columns == 36 && fixture.name.starts_with("compaction"))
             || (fixture.columns == 24 && fixture.name.starts_with("rule_"))
@@ -983,7 +1043,10 @@ fn hostile_text_in_the_transcript_or_the_draft_never_changes_the_classification(
             fixture.expected,
         );
     }
-    assert!(checked > 3500, "the sweep covers every row: {checked}");
+    assert!(
+        checked > 3500 / SCREEN_SETS.len(),
+        "the sweep covers every row of {set:?}: {checked}"
+    );
 }
 
 /// What an overlay screen of `compat/pi/screens/overlays/` waits for.
@@ -999,7 +1062,7 @@ enum OverlayKind {
     Unframed,
 }
 
-/// A screen a real Pi 1.0.2 drew in place of its editor, named
+/// A screen a real Pi drew in place of its editor, named
 /// `<blocked|selector|unframed>_<what>_w<columns>.txt`.
 struct OverlayFixture {
     name: String,
@@ -1011,16 +1074,30 @@ struct OverlayFixture {
 /// Every overlay screen, captured by driving a real Pi in a terminal of each
 /// width with real key presses (model calls answered by a loopback stub).
 fn overlay_fixtures() -> Vec<OverlayFixture> {
-    let mut names: Vec<String> = fs::read_dir(workspace_root().join("compat/pi/screens/overlays"))
-        .expect("read the overlay fixtures")
-        .map(|entry| {
-            entry
-                .expect("directory entry")
-                .file_name()
-                .into_string()
-                .expect("UTF-8 file name")
-        })
-        .collect();
+    SCREEN_SETS
+        .iter()
+        .flat_map(|set| overlay_fixtures_of(set))
+        .collect()
+}
+
+/// [`overlay_fixtures`] of the screen set `set`; the names of an earlier set
+/// end with its label.
+fn overlay_fixtures_of(set: &str) -> Vec<OverlayFixture> {
+    let mut names: Vec<String> = fs::read_dir(
+        workspace_root()
+            .join("compat/pi/screens")
+            .join(set)
+            .join("overlays"),
+    )
+    .expect("read the overlay fixtures")
+    .map(|entry| {
+        entry
+            .expect("directory entry")
+            .file_name()
+            .into_string()
+            .expect("UTF-8 file name")
+    })
+    .collect();
     names.sort();
     names
         .into_iter()
@@ -1036,8 +1113,8 @@ fn overlay_fixtures() -> Vec<OverlayFixture> {
             OverlayFixture {
                 kind,
                 columns: columns.parse().expect("a column count"),
-                rows: screen_rows(&format!("overlays/{name}")),
-                name,
+                rows: screen_rows(&format!("{set}overlays/{name}")),
+                name: format!("{name}{}", set_label(set)),
             }
         })
         .collect()
@@ -1094,7 +1171,10 @@ fn a_prompt_that_waits_for_an_answer_reads_blocked_at_every_width() {
             fixture.name
         );
     }
-    assert!(clipped <= 10, "dialogs without a frame: {clipped}");
+    assert!(
+        clipped <= 10 * SCREEN_SETS.len(),
+        "dialogs without a frame: {clipped}"
+    );
 }
 
 /// Whether the last plain border of `rows` is followed by at most four
@@ -1162,6 +1242,16 @@ fn a_dialog_opened_from_the_idle_editor_is_published_as_blocked_and_closes_to_id
 
 #[test]
 fn transcript_text_never_changes_a_dialog_or_a_selector() {
+    transcript_text_never_changes_an_overlay_of(SCREEN_SETS[0]);
+}
+
+#[test]
+fn transcript_text_never_changes_an_overlay_of_the_previous_release() {
+    transcript_text_never_changes_an_overlay_of(SCREEN_SETS[1]);
+}
+
+/// The body of the transcript sweep over the overlays of the set `set`.
+fn transcript_text_never_changes_an_overlay_of(set: &str) {
     let definition = installed_definition();
     let mut checked = 0_usize;
     // Screens whose frame shows both borders; a taller overlay has no
@@ -1174,7 +1264,7 @@ fn transcript_text_never_changes_a_dialog_or_a_selector() {
             .count()
             >= 2
     };
-    for fixture in overlay_fixtures()
+    for fixture in overlay_fixtures_of(set)
         .iter()
         .filter(|fixture| fixture.columns == 100)
         .filter(framed)
@@ -1207,8 +1297,8 @@ fn transcript_text_never_changes_a_dialog_or_a_selector() {
         }
     }
     assert!(
-        checked > 2000,
-        "the sweep covers every transcript row: {checked}"
+        checked > 2000 / SCREEN_SETS.len(),
+        "the sweep covers every transcript row of {set:?}: {checked}"
     );
 }
 
@@ -1573,6 +1663,54 @@ impl Fixture {
         );
     }
 
+    /// Writes the profile [`GATED_PROFILE`]: the real `pi` behind a wrapper
+    /// that holds Pi's start until the returned FIFO is written, so a client
+    /// can attach before Pi prints anything. `pi --version` is not held.
+    fn write_gated_profile(&self) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let real = find_on_path("pi").expect("a `pi` on PATH");
+        let gate = self.harness.env.root().join("pi-gate");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&gate)
+                .status()
+                .expect("run mkfifo")
+                .success(),
+            "create the gate FIFO"
+        );
+        let wrapper = self.harness.env.root().join("gated-pi");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = --version ] || read -r _ < \"{}\"\nexec \"{}\" \"$@\"\n",
+                gate.display(),
+                real.display()
+            ),
+        )
+        .expect("write the gating wrapper");
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))
+            .expect("make the wrapper executable");
+        self.write_named_profile(
+            GATED_PROFILE,
+            &format!("program = \"{}\"\n", wrapper.display()),
+            "",
+        );
+        gate
+    }
+
+    /// Launches a session of [`GATED_PROFILE`]; Pi starts once `gate` is
+    /// released.
+    async fn new_gated_session(&self, name: &str) -> String {
+        let cwd = self.harness.env.cwd().to_path_buf();
+        let (code, launched) = self.launch(GATED_PROFILE, name, &cwd).await;
+        assert_eq!(code, 0, "{launched}");
+        launched["ok"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_owned()
+    }
+
     async fn new_session(&self, name: &str) -> Value {
         let cwd = self.harness.env.cwd().to_path_buf();
         let (code, launched) = self.launch(PROFILE, name, &cwd).await;
@@ -1730,16 +1868,17 @@ async fn launch_and_converse(fixture: &Fixture) -> (String, String, PathBuf) {
         .expect("the daemon assigned a native reference")
         .to_owned();
 
-    // Detection: the idle editor rule of the real screen.
+    // Detection: Pi's program-status record when the release reports one, else
+    // the idle editor rule of the real screen.
     let idle = fixture.wait_activity(&id, "idle").await;
-    assert_eq!(idle["state_source"], "screen", "{idle}");
+    assert_eq!(idle["state_source"], recorded_source(), "{idle}");
 
     // Input: bracketed paste then a separate submit; the stub holds the reply
     // so the working rule is on screen.
     let (code, sent) = harness.json(&["session", "input", &id, PROMPT]).await;
     assert_eq!(code, 0, "{sent}");
     let working = fixture.wait_activity(&id, "working").await;
-    assert_eq!(working["state_source"], "screen", "{working}");
+    assert_eq!(working["state_source"], recorded_source(), "{working}");
     let lines = fixture.screen(&id).await;
     assert!(
         lines.iter().any(|line| line.contains("Working")),
@@ -2051,7 +2190,7 @@ async fn a_real_pi_dialog_or_trust_prompt_reads_blocked_never_idle() {
         .await;
     assert_eq!(code, 0, "{sent}");
     let blocked = fixture.wait_activity(&id, "blocked").await;
-    assert_eq!(blocked["state_source"], "screen", "{blocked}");
+    assert_eq!(blocked["state_source"], recorded_source(), "{blocked}");
     let lines = fixture.wait_screen_line(&id, "Allow tool call?").await;
     assert!(
         !activity_matches(&fixture, &id, "idle").await,
@@ -2219,5 +2358,656 @@ async fn a_real_pi_with_its_sessions_elsewhere_is_refused_at_launch() {
         .to_owned();
     fixture.wait_activity(&id, "idle").await;
     fixture.stop(&id).await;
+    fixture.harness.stop().await;
+}
+
+/// First release of Pi that reports its state as OSC 7501 program status.
+const PROGRAM_STATUS_RELEASE: (u64, u64) = (1, 1);
+
+/// Directory of the program-status sequence goldens, relative to the workspace
+/// root.
+const SEQUENCE_DIR: &str = "compat/pi/screens/sequences";
+
+/// Set to rewrite the sequence goldens from the run instead of comparing.
+const UPDATE_GOLDENS_VARIABLE: &str = "POHUNEK_PI_UPDATE_GOLDENS";
+
+/// Whether the `pi` on `PATH` reports program status; an earlier release is
+/// classified from the screen alone.
+fn pi_reports_program_status() -> bool {
+    let pi = find_on_path("pi").expect("a `pi` on PATH");
+    let output = std::process::Command::new(pi)
+        .arg("--version")
+        .output()
+        .expect("run `pi --version`");
+    let version = String::from_utf8(output.stdout).expect("UTF-8 version");
+    let mut parts = version.trim().split('.').map(str::parse::<u64>);
+    let major = parts.next().and_then(Result::ok).expect("major version");
+    let minor = parts.next().and_then(Result::ok).expect("minor version");
+    (major, minor) >= PROGRAM_STATUS_RELEASE
+}
+
+/// The `state_source` a state read from the editor frame or the record has.
+fn recorded_source() -> &'static str {
+    if pi_reports_program_status() {
+        "osc_progress"
+    } else {
+        "screen"
+    }
+}
+
+/// Lets the gated Pi of [`Fixture::write_gated_profile`] start. The wrapper
+/// is already blocked reading the FIFO, so opening it for writing returns.
+async fn release_gate(gate: &Path) {
+    let gate = gate.to_path_buf();
+    tokio::task::spawn_blocking(move || fs::write(gate, b"\n").expect("release the gate"))
+        .await
+        .expect("the gate task");
+}
+
+/// Bytes requested per `session output` page.
+const OUTPUT_PAGE_BYTES: &str = "65536";
+
+/// A JSON number or string as command-line text.
+fn scalar(value: &Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), str::to_owned)
+}
+
+/// The retained output of a session, read from offset 0 in explicit pages so
+/// that a long run cannot push the first records out of a newest-tail read.
+struct OutputReader {
+    id: String,
+    worker_instance_id: String,
+    runtime_generation: String,
+    cursor: String,
+    bytes: Vec<u8>,
+}
+
+impl OutputReader {
+    /// Opens a reader on the live runtime of `id`, or `None` once its
+    /// terminal is gone.
+    async fn open(fixture: &Fixture, id: &str) -> Option<Self> {
+        let (code, tail) = fixture.harness.json(&["session", "output", id]).await;
+        if code != 0 {
+            return None;
+        }
+        let ok = &tail["ok"];
+        Some(Self {
+            id: id.to_owned(),
+            worker_instance_id: ok["worker_instance_id"]
+                .as_str()
+                .expect("worker instance id")
+                .to_owned(),
+            runtime_generation: scalar(&ok["runtime_generation"]),
+            cursor: "0".to_owned(),
+            bytes: Vec::new(),
+        })
+    }
+
+    /// Appends every page after the cursor until the output is read to its
+    /// end.
+    async fn drain(&mut self, fixture: &Fixture) {
+        loop {
+            let arguments = [
+                "session",
+                "output",
+                self.id.as_str(),
+                "--worker-instance-id",
+                self.worker_instance_id.as_str(),
+                "--runtime-generation",
+                self.runtime_generation.as_str(),
+                "--after-offset",
+                self.cursor.as_str(),
+                "--max-bytes",
+                OUTPUT_PAGE_BYTES,
+            ];
+            let (code, page) = fixture.harness.json(&arguments).await;
+            assert_eq!(code, 0, "session output page: {page}");
+            let ok = &page["ok"];
+            assert!(
+                ok.get("gap").is_none(),
+                "output history was evicted: {page}"
+            );
+            self.bytes.extend(capture::output_bytes(&page));
+            self.cursor = scalar(&ok["next_offset"]);
+            if ok["has_more"] != true {
+                return;
+            }
+        }
+    }
+}
+
+/// The whole retained output of the live session.
+async fn raw_output(fixture: &Fixture, id: &str) -> Vec<u8> {
+    let mut reader = OutputReader::open(fixture, id)
+        .await
+        .expect("session output");
+    reader.drain(fixture).await;
+    reader.bytes
+}
+
+/// The ordered root program-status records of the session's retained output.
+async fn program_status_of(fixture: &Fixture, id: &str) -> Vec<String> {
+    capture::program_status_records(&raw_output(fixture, id).await)
+}
+
+/// Compares the records of `raw` with the golden `<name>.program-status`, or
+/// rewrites the golden when [`UPDATE_GOLDENS_VARIABLE`] is `1`.
+fn check_sequence(name: &str, raw: &[u8]) {
+    let directory = workspace_root().join(SEQUENCE_DIR);
+    if std::env::var(UPDATE_GOLDENS_VARIABLE).as_deref() == Ok("1") {
+        capture::write_program_status(&directory, name, raw);
+        return;
+    }
+    let golden = fs::read_to_string(directory.join(format!("{name}.program-status")))
+        .unwrap_or_else(|error| panic!("read the golden {name}: {error}"));
+    let expected: Vec<&str> = golden.lines().collect();
+    assert_eq!(capture::program_status_records(raw), expected, "{name}");
+}
+
+/// Pi clears its record when it exits, so no working state outlives it.
+///
+/// A client attached before Pi starts reads the raw stream until the terminal
+/// closes it, so the records need no polling and an exit cannot slip between
+/// two reads.
+async fn pi_clears_its_record_on_exit(fixture: &Fixture, reports: bool) {
+    let gate = fixture.write_gated_profile();
+    let id = fixture.new_gated_session("quit").await;
+    let client = AnsweringClient::attach(&fixture.harness.socket(), &id, false);
+    wait_until("the attach to deliver its snapshot", || async {
+        client.has_output().then_some(())
+    })
+    .await;
+    release_gate(&gate).await;
+    fixture.wait_activity(&id, "idle").await;
+    let (code, sent) = fixture
+        .harness
+        .json(&["session", "input", &id, "/quit"])
+        .await;
+    assert_eq!(code, 0, "{sent}");
+    let raw = tokio::task::spawn_blocking(move || client.finish())
+        .await
+        .expect("the stream reader");
+    if reports {
+        check_sequence("exit", &raw);
+    } else {
+        assert!(capture::program_status_records(&raw).is_empty());
+    }
+}
+
+/// Pi's records, as the worker's probe reply enables them, cover a turn, an
+/// extension dialog and a clean exit; a release without program status stays
+/// on the screen.
+///
+/// Needs a `pi` on `PATH` and `POHUNEK_PI_E2E=1`; the model is a loopback
+/// stub.
+#[tokio::test]
+#[ignore = "needs a real `pi` on PATH; run with POHUNEK_PI_E2E=1 and --ignored"]
+async fn a_real_pi_reports_its_turn_dialog_and_exit_through_program_status() {
+    require_real_pi();
+    let reports = pi_reports_program_status();
+    let source = recorded_source();
+    let fixture = Fixture::start().await;
+    fixture.install().await;
+    fixture.write_profile();
+    let marker = fixture.harness.env.root().join("approved");
+    write_confirm_extension(&fixture, &marker);
+
+    let launched = fixture.new_session("program-status").await;
+    let id = launched["id"].as_str().expect("session id").to_owned();
+    let idle = fixture.wait_activity(&id, "idle").await;
+    assert_eq!(idle["state_source"], source, "{idle}");
+
+    let (code, sent) = fixture
+        .harness
+        .json(&["session", "input", &id, PROMPT])
+        .await;
+    assert_eq!(code, 0, "{sent}");
+    let working = fixture.wait_activity(&id, "working").await;
+    assert_eq!(working["state_source"], source, "{working}");
+    fixture.stub.open_gate();
+    let settled = fixture.wait_activity(&id, "idle").await;
+    assert_eq!(settled["state_source"], source, "{settled}");
+    if reports {
+        check_sequence("turn", &raw_output(&fixture, &id).await);
+    } else {
+        assert!(program_status_of(&fixture, &id).await.is_empty());
+    }
+
+    let (code, sent) = fixture
+        .harness
+        .json(&["session", "input", &id, &format!("/{CONFIRM_COMMAND}")])
+        .await;
+    assert_eq!(code, 0, "{sent}");
+    let blocked = fixture.wait_activity(&id, "blocked").await;
+    assert_eq!(blocked["state_source"], source, "{blocked}");
+    if reports {
+        check_sequence("dialog", &raw_output(&fixture, &id).await);
+    }
+    fixture.stop(&id).await;
+
+    // A session stopped mid-run does not keep the working state its record
+    // held.
+    fixture.stub.close_gate();
+    let busy = fixture.new_session("stopped-mid-run").await;
+    let busy_id = busy["id"].as_str().expect("session id").to_owned();
+    fixture.wait_activity(&busy_id, "idle").await;
+    let (code, sent) = fixture
+        .harness
+        .json(&["session", "input", &busy_id, PROMPT])
+        .await;
+    assert_eq!(code, 0, "{sent}");
+    let working = fixture.wait_activity(&busy_id, "working").await;
+    assert_eq!(working["state_source"], source, "{working}");
+    fixture.stop(&busy_id).await;
+    let (code, inspected) = fixture
+        .harness
+        .json(&["session", "inspect", &busy_id])
+        .await;
+    assert_eq!(code, 0, "{inspected}");
+    assert_ne!(
+        inspected["ok"]["activity"], "working",
+        "a stopped session is not working: {inspected}"
+    );
+    fixture.stub.open_gate();
+
+    pi_clears_its_record_on_exit(&fixture, reports).await;
+    assert!(!marker.exists(), "no dialog was answered");
+    fixture.harness.stop().await;
+}
+
+/// Opt-in variable of the screen capture: the directory the screens are
+/// written to (`compat/pi/screens` of the workspace when recording a release).
+const CAPTURE_VARIABLE: &str = "POHUNEK_PI_CAPTURE_DIR";
+
+/// Terminal widths of the recorded idle and working screens.
+const STATE_WIDTHS: [u16; 18] = [
+    20, 24, 30, 36, 40, 44, 46, 48, 50, 52, 56, 60, 70, 80, 100, 120, 160, 200,
+];
+
+/// Terminal widths of the recorded dialog screens.
+const DIALOG_WIDTHS: [u16; 10] = [20, 24, 30, 40, 50, 60, 80, 100, 120, 200];
+
+/// Width of the single-screen captures (`idle.txt`, `working.txt`,
+/// `idle_after_turn.txt`).
+const SINGLE_SCREEN_WIDTH: u16 = 100;
+
+/// Extension commands that open the other dialog kinds, with the screen name.
+const DIALOG_COMMANDS: [(&str, &str); 3] = [
+    ("pohunek-select", "extension_select"),
+    ("pohunek-input", "extension_input"),
+    ("pohunek-editor", "extension_editor"),
+];
+
+/// Writes an agent-directory extension with a select, an input and an editor
+/// dialog command.
+fn write_dialog_extension(fixture: &Fixture) {
+    let extensions = fixture.harness.env.home().join(".pi/agent/extensions");
+    fs::create_dir_all(&extensions).expect("create the extensions directory");
+    fs::write(
+        extensions.join("dialogs.ts"),
+        "export default function (pi) {\n\
+           pi.registerCommand(\"pohunek-select\", { description: \"Select\", handler: async (_args, ctx) => { await ctx.ui.select(\"Pick one\", [\"alpha\", \"beta\"]); } });\n\
+           pi.registerCommand(\"pohunek-input\", { description: \"Input\", handler: async (_args, ctx) => { await ctx.ui.input(\"Name\", \"placeholder\"); } });\n\
+           pi.registerCommand(\"pohunek-editor\", { description: \"Editor\", handler: async (_args, ctx) => { await ctx.ui.editor(\"Edit text\", \"prefill\"); } });\n\
+         }\n",
+    )
+    .expect("write the dialog extension");
+}
+
+impl Fixture {
+    /// Runs `session new` of the default profile in `cwd` at `cols` columns
+    /// and returns the session id.
+    async fn launch_sized(&self, name: &str, cwd: &Path, cols: u16) -> String {
+        let cols = cols.to_string();
+        let (code, launched) = self
+            .harness
+            .json(&[
+                "session",
+                "new",
+                "--agent",
+                PROFILE,
+                "--cwd",
+                path_str(cwd),
+                "--name",
+                name,
+                "--cols",
+                &cols,
+            ])
+            .await;
+        assert_eq!(code, 0, "{launched}");
+        launched["ok"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_owned()
+    }
+
+    /// Waits until the visible screen of `id` draws Pi's busy border: a rule
+    /// that starts `── ` and a braille spinner. Byte activity alone can read
+    /// working while the editor still shows its idle frame.
+    async fn wait_busy_border(&self, id: &str) -> Vec<String> {
+        wait_until("Pi's busy border", || async {
+            let lines = self.screen(id).await;
+            lines
+                .iter()
+                .any(|line| {
+                    line.strip_prefix("── ")
+                        .and_then(|rest| rest.chars().next())
+                        .is_some_and(|spinner| ('\u{2800}'..='\u{28ff}').contains(&spinner))
+                })
+                .then_some(lines)
+        })
+        .await
+    }
+
+    /// Writes the visible rows of `id` as `<name>.txt` below `directory`.
+    async fn capture(&self, id: &str, directory: &Path, name: &str) {
+        let rows = self.screen(id).await;
+        capture::write_capture(
+            directory,
+            name,
+            path_str(self.harness.env.root()),
+            None,
+            &rows,
+        );
+    }
+}
+
+/// Pi's program-status probe, which a terminal that supports the query
+/// answers with the same bytes.
+const PROBE: &[u8] = b"\x1b]7501;?\x1b\\";
+
+/// A terminal client attached to a session. It keeps every byte of the raw
+/// stream until the stream closes, and answers every 7501 probe it sees when
+/// `answer` is set, as an emulator that supports the query does.
+struct AnsweringClient {
+    bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+    probes: Arc<std::sync::atomic::AtomicUsize>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    _control: std::os::unix::net::UnixStream,
+}
+
+impl AnsweringClient {
+    fn attach(socket: &Path, session: &str, answer: bool) -> Self {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        use std::sync::atomic::Ordering;
+
+        let mut control = std::os::unix::net::UnixStream::connect(socket).expect("connect");
+        let params = protocol::SessionAttachParams {
+            session_id: protocol::SessionId(session.to_owned()),
+            initial_dimensions: None,
+            origin_session_id: None,
+            origin_daemon_id: None,
+            origin_worker_id: None,
+        };
+        let request = protocol::Request::new(
+            "pi-attach",
+            protocol::method::SESSION_ATTACH,
+            serde_json::to_value(params).expect("attach params"),
+        )
+        .expect("a valid request");
+        writeln!(
+            control,
+            "{}",
+            serde_json::to_string(&request).expect("serialize the request")
+        )
+        .expect("send session.attach");
+        let mut line = String::new();
+        std::io::BufReader::new(&control)
+            .read_line(&mut line)
+            .expect("read the attach response");
+        let response: protocol::Response =
+            serde_json::from_str(&line).expect("parse the attach response");
+        let result: protocol::SessionAttachResult = serde_json::from_value(
+            response
+                .into_result()
+                .unwrap_or_else(|error| panic!("session.attach: {error}")),
+        )
+        .expect("attach result");
+        let mut raw = std::os::unix::net::UnixStream::connect(socket).expect("connect the stream");
+        writeln!(raw, "{{\"attach\":\"{}\"}}", result.stream_id).expect("send the header");
+        raw.set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("read timeout");
+
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let thread = {
+            let (probes, stop, bytes) =
+                (Arc::clone(&probes), Arc::clone(&stop), Arc::clone(&bytes));
+            std::thread::spawn(move || {
+                let mut window: Vec<u8> = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                while !stop.load(Ordering::SeqCst) {
+                    let count = match raw.read(&mut chunk) {
+                        Ok(0) => return,
+                        Ok(count) => count,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(_) => return,
+                    };
+                    window.extend_from_slice(&chunk[..count]);
+                    bytes
+                        .lock()
+                        .expect("client bytes")
+                        .extend_from_slice(&chunk[..count]);
+                    while let Some(at) = window
+                        .windows(PROBE.len())
+                        .position(|w| w == PROBE)
+                        .filter(|_| answer)
+                    {
+                        window.drain(..at + PROBE.len());
+                        probes.fetch_add(1, Ordering::SeqCst);
+                        if raw.write_all(PROBE).is_err() {
+                            return;
+                        }
+                    }
+                    let keep = window.len().saturating_sub(PROBE.len());
+                    window.drain(..keep);
+                }
+            })
+        };
+        Self {
+            bytes,
+            probes,
+            stop,
+            thread: Some(thread),
+            _control: control,
+        }
+    }
+
+    /// Whether the stream has delivered any byte, which means the daemon
+    /// registered the attach.
+    fn has_output(&self) -> bool {
+        !self.bytes.lock().expect("client bytes").is_empty()
+    }
+
+    /// Every byte of the stream, read until the session's terminal closed it.
+    fn finish(mut self) -> Vec<u8> {
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("the stream reader");
+        }
+        self.bytes.lock().expect("client bytes").clone()
+    }
+
+    /// Probes the client has seen and answered.
+    fn answered(&self) -> usize {
+        self.probes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for AnsweringClient {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _joined = thread.join();
+        }
+    }
+}
+
+/// A terminal client that answers Pi's probe itself leaves Pi's records and
+/// editor as they are without it: the worker is the only responder for the
+/// PTY, so a reply the client sends is dropped before it reaches Pi.
+///
+/// Needs a `pi` on `PATH` and `POHUNEK_PI_E2E=1`; the model is a loopback
+/// stub. A release that sends no probe has nothing to answer and is skipped.
+#[tokio::test]
+#[ignore = "needs a real `pi` on PATH; run with POHUNEK_PI_E2E=1 and --ignored"]
+async fn an_attached_client_answering_the_probe_does_not_change_pis_reports() {
+    require_real_pi();
+    if !pi_reports_program_status() {
+        return;
+    }
+    let fixture = Fixture::start().await;
+    fixture.install().await;
+    fixture.write_profile();
+
+    let gate = fixture.write_gated_profile();
+    let id = fixture.new_gated_session("attached-reply").await;
+    let client = AnsweringClient::attach(&fixture.harness.socket(), &id, true);
+    wait_until("the attach to deliver its snapshot", || async {
+        client.has_output().then_some(())
+    })
+    .await;
+    release_gate(&gate).await;
+    let idle = fixture.wait_activity(&id, "idle").await;
+    assert_eq!(idle["state_source"], "osc_progress", "{idle}");
+    assert!(
+        client.answered() >= 1,
+        "the client saw Pi's probe, which follows the gate, and replied"
+    );
+
+    let (code, sent) = fixture
+        .harness
+        .json(&["session", "input", &id, PROMPT])
+        .await;
+    assert_eq!(code, 0, "{sent}");
+    let working = fixture.wait_activity(&id, "working").await;
+    assert_eq!(working["state_source"], "osc_progress", "{working}");
+    fixture.stub.open_gate();
+    let settled = fixture.wait_activity(&id, "idle").await;
+    assert_eq!(settled["state_source"], "osc_progress", "{settled}");
+
+    // The same records as a turn without a client, and no reply text in the
+    // editor.
+    check_sequence("turn", &raw_output(&fixture, &id).await);
+    let screen = fixture.screen(&id).await;
+    assert!(
+        screen.iter().all(|row| !row.contains("7501")),
+        "a probe reply reached Pi's editor: {screen:?}"
+    );
+    drop(client);
+    fixture.stop(&id).await;
+    fixture.harness.stop().await;
+}
+
+/// Records the screens of the `pi` on `PATH` that a loopback model and an
+/// extension can reach: the idle, working and after-turn editor at every
+/// width, the extension dialogs and Pi's project-trust question.
+///
+/// Needs a `pi` on `PATH`, `POHUNEK_PI_E2E=1` and `POHUNEK_PI_CAPTURE_DIR`. A
+/// run of the real-Pi tests without the directory skips it: it writes files
+/// instead of checking any.
+#[tokio::test]
+#[ignore = "records screens; run with POHUNEK_PI_E2E=1 and POHUNEK_PI_CAPTURE_DIR"]
+async fn record_the_pi_screens() {
+    let Some(target) = std::env::var_os(CAPTURE_VARIABLE).map(PathBuf::from) else {
+        return;
+    };
+    require_real_pi();
+    let fixture = Fixture::start().await;
+    fixture.install().await;
+    fixture.write_profile();
+    let marker = fixture.harness.env.root().join("approved");
+    write_confirm_extension(&fixture, &marker);
+    write_dialog_extension(&fixture);
+    let recording = capture::RecordingRoot::new("pi");
+    let cwd = recording.directory("cwd");
+
+    for width in STATE_WIDTHS {
+        let id = fixture
+            .launch_sized(&format!("state-{width}"), &cwd, width)
+            .await;
+        fixture.wait_activity(&id, "idle").await;
+        fixture
+            .capture(&id, &target.join("widths"), &format!("idle_w{width}"))
+            .await;
+        if width == SINGLE_SCREEN_WIDTH {
+            fixture.capture(&id, &target, "idle").await;
+        }
+        let (code, sent) = fixture
+            .harness
+            .json(&["session", "input", &id, PROMPT])
+            .await;
+        assert_eq!(code, 0, "{sent}");
+        fixture.wait_activity(&id, "working").await;
+        fixture.wait_busy_border(&id).await;
+        fixture
+            .capture(&id, &target.join("widths"), &format!("working_w{width}"))
+            .await;
+        if width == SINGLE_SCREEN_WIDTH {
+            fixture.capture(&id, &target, "working").await;
+            fixture.stub.open_gate();
+            fixture.wait_activity(&id, "idle").await;
+            fixture
+                .wait_screen_line(
+                    &id,
+                    &format!("{}{}", model_stub::FIRST_CHUNK, model_stub::SECOND_CHUNK),
+                )
+                .await;
+            fixture.capture(&id, &target, "idle_after_turn").await;
+            fixture.stub.close_gate();
+        }
+        fixture.stop(&id).await;
+    }
+
+    let project = recording.directory("project");
+    fs::create_dir_all(project.join(".pi/extensions")).expect("create the project extensions");
+    fs::write(
+        project.join(".pi/extensions/project.ts"),
+        "export default function () {}\n",
+    )
+    .expect("write the project extension");
+    for width in DIALOG_WIDTHS {
+        let overlays = target.join("overlays");
+        let mut dialogs = vec![(format!("/{CONFIRM_COMMAND}"), "extension_confirm")];
+        dialogs.extend(
+            DIALOG_COMMANDS
+                .iter()
+                .map(|(command, name)| (format!("/{command}"), *name)),
+        );
+        for (command, name) in dialogs {
+            let id = fixture
+                .launch_sized(&format!("{name}-{width}"), &cwd, width)
+                .await;
+            fixture.wait_activity(&id, "idle").await;
+            let (code, sent) = fixture
+                .harness
+                .json(&["session", "input", &id, &command])
+                .await;
+            assert_eq!(code, 0, "{sent}");
+            fixture.wait_activity(&id, "blocked").await;
+            fixture
+                .capture(&id, &overlays, &format!("blocked_{name}_w{width}"))
+                .await;
+            fixture.stop(&id).await;
+        }
+        let id = fixture
+            .launch_sized(&format!("trust-{width}"), &project, width)
+            .await;
+        fixture.wait_activity(&id, "blocked").await;
+        fixture
+            .capture(&id, &overlays, &format!("blocked_project_trust_w{width}"))
+            .await;
+        fixture.stop(&id).await;
+    }
     fixture.harness.stop().await;
 }

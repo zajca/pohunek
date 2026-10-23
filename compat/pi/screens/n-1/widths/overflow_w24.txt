@@ -1,0 +1,24 @@
+ ipsum dolor sit amet
+
+
+ working done
+
+
+ trigger
+
+
+ Error: 400:
+ {"message":"This
+ model's maximum
+ context length is 4000
+ tokens. prompt is too
+ long:
+ context_length_exceede
+ d","type":"server_erro
+ r","code":null}
+
+── ⠧ Context overflow ──
+
+────────────────────────
+~/work
+↑2 ↓4 76.4%/4.0k (auto)

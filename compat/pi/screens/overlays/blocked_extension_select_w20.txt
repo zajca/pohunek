@@ -1,18 +1,18 @@
+ look up its docs.
  Ask it how to use
  or extend Pi.
 
 [Extensions]
-  dialogs.ts
+  confirm.ts,
+dialogs.ts
 
 
 ────────────────────
 
- Dangerous command
- detected. Allow?
+ Pick one
 
- → Allow once
-   Allow always
-   Deny
+ → alpha
+   beta
 
  ↑↓ navigate  enter
   select
@@ -20,5 +20,5 @@
  cancel
 
 ────────────────────
-~/work
+/dev/shm/ph-pi/cwd
 0.0%/128k (auto)  st

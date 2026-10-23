@@ -1,0 +1,24 @@
+Session found in different project: /var/tmp/pi547/cap/home/gone
+Fork this session into current directory? [y/N]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

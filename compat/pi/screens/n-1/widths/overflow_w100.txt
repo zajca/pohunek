@@ -1,0 +1,24 @@
+ sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem
+ ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit
+ amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum
+ dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet
+ lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor
+ sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem
+ ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit
+ amet lorem ipsum dolor sit amet
+
+
+ working done
+
+
+ trigger
+
+
+ Error: 400: {"message":"This model's maximum context length is 4000 tokens. prompt is too long:
+ context_length_exceeded","type":"server_error","code":null}
+
+── ⠧ Context overflow detected, Auto-compacting... (escape to cancel) ──────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+~/work
+↑2 ↓4 76.4%/4.0k (auto)                                                                   stub-model

@@ -1,0 +1,24 @@
+
+────────────────────
+
+ Project trust
+ /var/tmp/pi547/cap
+ /home/work
+
+ Saved decision:
+ none
+ Current session:
+ trusted
+
+ →   Trust
+     Trust parent
+ folder
+ (/var/tmp/pi547/ca
+ p/home)
+     Do not trust
+
+ ↑↓ navigate  enter
+  save
+ escape/ctrl+c
+ cancel
+~/work

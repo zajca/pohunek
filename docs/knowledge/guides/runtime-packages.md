@@ -413,8 +413,8 @@ osc_progress`, never used for input readiness, and dropped on `clear`, on a
 detector reconfigure and after a lag resync. See "Agent state detection" in
 `docs/architecture.md`. A host profile can switch the feature off for a
 program that has an own switch (`PI_PROGRAM_STATUS=0`,
-`CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`); detection is then screen-only. Official
-packages do not declare the table yet.
+`CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`); detection is then screen-only. The
+official Pi and Codex packages declare the table; the other official packages do not yet.
 
 ## Versioning official packages
 

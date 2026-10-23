@@ -1,7 +1,8 @@
+ a new session with that id.
 ──────────────────────────────
 
  Trust project folder?
- /var/tmp/pi547/cap/home/proj
+ /dev/shm/ph-pi/project
 
  This allows pi to load .pi
  settings and resources,
@@ -11,7 +12,7 @@
 
  → Trust
    Trust parent folder
- (/var/tmp/pi547/cap/home)
+ (/dev/shm/ph-pi)
    Trust (this session only)
    Do not trust
    Do not trust (this session
@@ -21,4 +22,3 @@
  escape/ctrl+c cancel
 
 ──────────────────────────────
-

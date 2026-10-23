@@ -1,0 +1,24 @@
+
+ ▀▀█  v1.0.2
+ █▀ █ escape
+ interrupt ·
+ ctrl+c/ctrl+d
+ clear/exit · /
+ commands · ! bash
+ · ctrl+o more
+ ↓ Jump to latest me
+
+ Steering: x
+ ↳ Alt+Up to edi...
+
+── ⠏ ───────────────
+row 25
+row 26
+row 27
+row 28
+row 29
+row 30
+
+────────────────────
+~/work
+37.0%/4.0k (auto)  s

@@ -1,0 +1,3 @@
+app=pi:state=idle
+app=pi:state=working
+app=pi:state=done

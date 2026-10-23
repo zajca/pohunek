@@ -1,5 +1,5 @@
 
- ▀▀█  v1.0.2
+ ▀▀█  v1.4.0
  █▀ █ escape interrupt ·
  ctrl+c/ctrl+d clear/exit · /
   commands · ! bash · ctrl+o
@@ -13,12 +13,12 @@
  docs. Ask it how to use or
  extend Pi.
 
-
-
+[Extensions]
+  confirm.ts, dialogs.ts
 
 
 ──────────────────────────────
 
 ──────────────────────────────
-~/work
-0.0%/4.0k (auto)    stub-model
+/dev/shm/ph-pi/cwd
+0.0%/128k (auto)    stub-model

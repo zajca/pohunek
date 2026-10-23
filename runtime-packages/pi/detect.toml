@@ -1,4 +1,4 @@
-# Pi 1.0.2 activity manifest, matched against a real terminal session.
+# Pi activity manifest (verified with 1.4.0), matched against a real terminal session.
 #
 # Frame structure, anchored at the bottom of the visible screen (derived from
 # the captured screens in compat/pi/screens/, which cover terminal widths 20 to
@@ -71,6 +71,18 @@
 # directory? [y/N]" question before the interface starts, which is not drawn in
 # a frame (pohunek relaunches a session in its own working directory, where Pi
 # does not ask it).
+
+# Pi 1.1.0 and later report their state as OSC 7501 program-status records once
+# the terminal answers Pi's probe, which the session worker does for this
+# manifest (`answer_probe`). The record is the root record of `app = "pi"`;
+# earlier releases emit none and are classified from the screen alone. Pi's own
+# confirms and the branch-summary border are not reported as blocked by the
+# record: the dialog rule below keeps the confirms blocked, and the
+# branch-summary border reads idle, as Pi itself declares it. A dialog drawn
+# with ctx.ui.custom() has no screen rule and reads as the record says.
+[program_status]
+app = "pi"
+answer_probe = true
 
 [process]
 # Pi retitles its process to `pi` shortly after start (kernel name and argv),

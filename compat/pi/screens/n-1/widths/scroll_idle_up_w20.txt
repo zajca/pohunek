@@ -1,0 +1,24 @@
+ · ctrl+o more
+ Press ctrl+o to
+ show full startup
+ help and loaded
+ resources.
+
+ Pi can explain its
+ own features and
+ look up its docs.
+ Ask it how to use
+ or extend Pi.
+
+
+──── ↑ 24 more ─────
+row 25
+row 26
+row 27
+row 28
+row 29
+row 30
+
+────────────────────
+~/work
+0.0%/4.0k (auto)  st

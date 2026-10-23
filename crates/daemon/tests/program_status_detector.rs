@@ -757,7 +757,7 @@ fn no_record_means_every_captured_screen_reads_exactly_as_without_the_opt_in() {
     ] {
         let directory = workspace_root().join(format!("compat/{runtime}/screens"));
         let mut names = Vec::new();
-        for sub in ["", "widths"] {
+        for sub in ["", "widths", "n-1", "n-1/widths"] {
             let Ok(entries) = fs::read_dir(directory.join(sub)) else {
                 continue;
             };
@@ -819,6 +819,12 @@ fn a_record_never_releases_or_holds_the_initial_input() {
             CODEX_APP,
             InputReadiness::ManifestIdle,
             captured("codex", "idle"),
+        ),
+        (
+            "pi",
+            "pi",
+            InputReadiness::ScreenIdle,
+            captured("pi", "idle"),
         ),
     ] {
         let source = opted_in_source(runtime, app, true);
