@@ -5,7 +5,11 @@
 //! port the remote control listener uses. The file is optional: when it or its
 //! directory is absent, the host works over `NetBird` on [`DEFAULT_REMOTE_PORT`].
 //!
-//! The directory, when it exists, must be one no other account can write,
+//! Every component of the config directory path is opened without following
+//! symlinks and must be owned by the user (or by root and not writable) and not
+//! be writable by other accounts, so a symlinked or group-writable `~/.config`
+//! is refused even when the file is absent. The directory, when it exists,
+//! must be one no other account can write,
 //! whether or not the file is there, because another account could otherwise
 //! plant the file. When the file exists it must be a regular file owned by the
 //! user with mode `0600`. Parsing is strict: unknown keys, wrong types and
@@ -90,11 +94,20 @@ impl Provider {
 /// Issue that lifts the one-overlay-per-host limit, named in the error.
 const MULTI_OVERLAY_ISSUE: &str = "#1113";
 
+/// One `providers` entry. A non-string entry is kept as such, so the entry
+/// count is checked before the entries are.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Entry {
+    Id(String),
+    Other(serde::de::IgnoredAny),
+}
+
 /// Raw shape of `overlays.toml`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    providers: Vec<String>,
+    providers: Vec<Entry>,
     /// Wide on purpose: an out-of-range number reports the accepted range
     /// instead of a bare type error.
     port: Option<i64>,
@@ -258,7 +271,10 @@ fn parse(text: &str) -> Result<OverlayConfig, String> {
     let providers = raw
         .providers
         .iter()
-        .map(|id| Provider::from_id(id))
+        .map(|entry| match entry {
+            Entry::Id(id) => Provider::from_id(id),
+            Entry::Other(_) => None,
+        })
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| {
             format!(

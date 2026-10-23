@@ -31,14 +31,15 @@ port = 18722
   entries are refused until one host can run several overlays (#1113).
 - `port` is optional and must be in `1..=65535`; it is the port the daemon
   listens on and the CLI dials, on every host that reads the file.
-- The directory must be owned by you and not writable by other accounts, even
-  without the file. The file must be a regular file owned by you with mode
+- Every component of the directory path (`~/.config` included) must be a real
+  directory, not a symlink, owned by you or root and not writable by other
+  accounts, even without the file. The file must be a regular file owned by you with mode
   `0600`, UTF-8, at most 64 KiB, with no unknown key.
 - Any violation is `overlay_configuration_invalid`; the message names the file
   and a line number, never a value from it. `pohunekd` exits with the same code
   before it takes a lock or touches its store.
-- The daemon reads the file at start, so restart it after a change
-  (`pohunek service` restarts the service daemon).
+- The daemon reads the file at start, so restart it after a change (restart
+  the service unit with the service manager; live workers keep running).
 - `POHUNEK_REMOTE_PORT` overrides `port` in the process that sees it, for
   development and tests. A service-started daemon does not receive it; put a
   port both sides must use in the file.

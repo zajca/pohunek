@@ -296,6 +296,12 @@ fn an_unusable_file_content_fails_before_any_provider_call() {
             &["tailscale"],
         ),
         (
+            "two entries, one of them not a string",
+            b"providers = [\"netbird\", 1]\n".to_vec(),
+            &["more than one overlay", "#1113"],
+            &[],
+        ),
+        (
             "port zero",
             b"providers = [\"netbird\"]\nport = 0\n".to_vec(),
             &["port must be a number in 1..=65535"],

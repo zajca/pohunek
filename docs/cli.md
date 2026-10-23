@@ -180,8 +180,9 @@ providers = ["netbird"]   # exactly one provider; netbird is the only id so far
 port = 18722              # optional, 1..=65535
 ```
 
-The directory must be owned by you and not writable by other accounts, and the
-file must be a regular file owned by you with mode `0600`. A problem with the
+Every component of the directory path must be a real directory (no symlink)
+owned by you or root and not writable by other accounts, even without the file,
+and the file must be a regular file owned by you with mode `0600`. A problem with the
 file or the directory is `overlay_configuration_invalid`; the CLI and the daemon
 refuse to continue, and the message names the file, never a value in it. The
 daemon reads the file at start: restart it after a change. `POHUNEK_REMOTE_PORT`

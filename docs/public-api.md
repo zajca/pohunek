@@ -4588,8 +4588,9 @@ port = 18722              # optional; TCP port of the remote control listener
 ```
 
 The file is optional. When it or its directory is absent the host works over
-`netbird` on port 18722. The directory must be owned by the user and not
-writable by other accounts, whether or not the file exists, and the file must be
+`netbird` on port 18722. Every component of the directory path must be a real directory (no symlink)
+owned by the user or root and not writable by other accounts, whether or not
+the file exists, and the file must be
 a regular file owned by the user with mode `0600` and at most 64 KiB, in
 UTF-8. Parsing is strict: unknown keys and wrong types fail. `providers` takes
 exactly one known id (`netbird`); several providers on one host are not
