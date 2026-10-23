@@ -48,6 +48,8 @@ use protocol::{
 };
 use serde_json::Value;
 
+#[path = "support/capture.rs"]
+mod capture;
 #[path = "support/messages_stub.rs"]
 mod messages_stub;
 #[path = "support/plugin_harness.rs"]
@@ -98,7 +100,7 @@ const GOLDEN_MANIFEST_NAME: &str = "claude";
 const PACKAGE_ID: &str = "pohunek.runtime.claude";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.0.2";
+const PACKAGE_VERSION: &str = "1.1.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -274,7 +276,7 @@ impl Meaning {
     fn of(state: &str) -> Self {
         match state {
             "idle" | "idle_after_turn" => Self::Idle,
-            "working_early" | "working_stream" => Self::Working,
+            "working_early" | "working_star_frame" | "working_stream" => Self::Working,
             "approval" | "askuser" | "apikey" | "theme" | "login" | "trust" => Self::Blocked,
             other => panic!("unknown fixture state {other}"),
         }
@@ -297,6 +299,7 @@ const FIRST_RUN_STATES: [&str; 4] = ["apikey", "theme", "login", "trust"];
 /// `widths/<state>_w<columns>.txt`, with the OSC title Claude had set in
 /// `<same name>.title` when the capture had one.
 struct Frame {
+    set: ScreenSet,
     name: String,
     state: String,
     columns: u16,
@@ -323,7 +326,38 @@ impl Frame {
     }
 }
 
-fn load_frame(directory: &Path, name: &str, state: &str, columns: u16) -> Frame {
+/// The two release sets of captured screens: the locked release and the
+/// previous verified release (`n-1`), which stays in the repository so the
+/// bottom of the supported range remains evidenced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScreenSet {
+    Current,
+    Previous,
+}
+
+impl ScreenSet {
+    const ALL: [Self; 2] = [Self::Current, Self::Previous];
+
+    fn directory(self) -> PathBuf {
+        let current = workspace_root().join(SCREENS_DIR);
+        match self {
+            Self::Current => current,
+            Self::Previous => current.join("n-1"),
+        }
+    }
+}
+
+fn load_frame(set: ScreenSet, name: &str, state: &str, columns: u16) -> Frame {
+    load_frame_from(set, &set.directory(), name, state, columns)
+}
+
+fn load_frame_from(
+    set: ScreenSet,
+    directory: &Path,
+    name: &str,
+    state: &str,
+    columns: u16,
+) -> Frame {
     let rows = rows_of(
         &fs::read_to_string(directory.join(format!("{name}.txt"))).expect("read the screen"),
     );
@@ -331,6 +365,7 @@ fn load_frame(directory: &Path, name: &str, state: &str, columns: u16) -> Frame 
         .ok()
         .map(|title| title.trim_end_matches('\n').to_owned());
     Frame {
+        set,
         name: name.to_owned(),
         state: state.to_owned(),
         columns,
@@ -356,27 +391,43 @@ fn fixture_names(directory: &Path) -> Vec<String> {
     names
 }
 
-/// The screens captured at 100 columns, one per state.
-fn top_level_frames() -> Vec<Frame> {
-    let directory = workspace_root().join(SCREENS_DIR);
+/// The screens of `set` captured at 100 columns, one per state.
+fn top_level_frames_of(set: ScreenSet) -> Vec<Frame> {
+    let directory = set.directory();
     fixture_names(&directory)
         .into_iter()
-        .map(|name| load_frame(&directory, &name, &name, DEFAULT_COLUMNS))
+        .map(|name| load_frame_from(set, &directory, &name, &name, DEFAULT_COLUMNS))
         .collect()
 }
 
-/// Every screen captured at a given terminal width. The file name is
+/// The 100-column screens of both release sets.
+fn top_level_frames() -> Vec<Frame> {
+    ScreenSet::ALL
+        .into_iter()
+        .flat_map(top_level_frames_of)
+        .collect()
+}
+
+/// Every screen of `set` captured at a given terminal width. The file name is
 /// `<state>_w<columns>.txt`.
-fn width_frames() -> Vec<Frame> {
-    let directory = workspace_root().join(SCREENS_DIR).join("widths");
+fn width_frames_of(set: ScreenSet) -> Vec<Frame> {
+    let directory = set.directory().join("widths");
     fixture_names(&directory)
         .into_iter()
         .map(|name| {
             let (state, columns) = name.rsplit_once("_w").expect("a `_w<columns>` suffix");
             let columns = columns.parse().expect("a column count");
             let state = state.to_owned();
-            load_frame(&directory, &name, &state, columns)
+            load_frame_from(set, &directory, &name, &state, columns)
         })
+        .collect()
+}
+
+/// The width screens of both release sets.
+fn width_frames() -> Vec<Frame> {
+    ScreenSet::ALL
+        .into_iter()
+        .flat_map(width_frames_of)
         .collect()
 }
 
@@ -610,7 +661,9 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
 
 /// Rules of the golden manifest the package changes for #613, each with the
 /// matcher fields the change replaces; every other field stays equal.
-const CHANGED_613_RULES: [(&str, &[&str]); 3] = [
+const CHANGED_613_RULES: [(&str, &[&str]); 4] = [
+    // The spinner line is one verb and an optional elapsed timer (#1524).
+    ("live_status_spinner", &["line_regex"]),
     // The `◐`/`◑` running-turn title.
     ("osc_title_working", &["regex"]),
     // The selection form footer wrapped at narrow widths.
@@ -620,13 +673,15 @@ const CHANGED_613_RULES: [(&str, &[&str]); 3] = [
 ];
 
 /// Rules the package adds for #613, each with the rule it follows.
-const ADDED_613_RULES: [(&str, &str); 4] = [
+const ADDED_613_RULES: [(&str, &str); 5] = [
     // The `esc to interrupt` footer of a running turn.
     ("live_turn_footer", "live_status_spinner"),
     // The first-run and folder trust dialogs.
     ("theme_picker", "dynamic_workflow_prompt"),
     ("login_method_list", "theme_picker"),
     ("folder_trust_dialog", "login_method_list"),
+    // The API-key approval dialog, a visible blocker over a held record (#1525).
+    ("api_key_approval_dialog", "folder_trust_dialog"),
 ];
 
 /// The id of a manifest rule table.
@@ -655,6 +710,17 @@ fn the_package_manifest_file_is_the_golden_manifest_with_the_613_rules() {
     let golden_text = golden_body(GOLDEN_MANIFEST, BUILTIN_MANIFEST);
     let golden: toml::Table = golden_text.parse().expect("the golden is TOML");
 
+    let mut package = package;
+    let program_status = package
+        .remove("program_status")
+        .expect("the manifest opts in to program status");
+    assert_eq!(
+        program_status,
+        toml::Value::Table(toml::Table::from_iter([
+            ("app".to_owned(), "claude-code".into()),
+            ("answer_probe".to_owned(), true.into()),
+        ]))
+    );
     assert_eq!(
         package.keys().collect::<Vec<_>>(),
         golden.keys().collect::<Vec<_>>()
@@ -704,6 +770,214 @@ fn the_package_manifest_file_is_the_golden_manifest_with_the_613_rules() {
     }
 }
 
+/// An OSC 7501 root record of Claude Code.
+fn record(state: &str) -> Vec<u8> {
+    format!("\x1b]7501;state={state}:app=claude-code\x1b\\").into_bytes()
+}
+
+/// The activity and source of the last transition a fresh detector emits for
+/// `chunks` fed in order.
+fn last_transition(
+    definition: &RuntimeDefinition,
+    columns: u16,
+    chunks: &[Vec<u8>],
+) -> Option<(AgentActivity, StateSource)> {
+    let started = Instant::now();
+    let mut detector = detector_for(definition, started, columns);
+    let mut seen = Vec::new();
+    for chunk in chunks {
+        seen.extend(detector.feed(started, chunk));
+    }
+    seen.last()
+        .map(|transition| (transition.activity, transition.source))
+}
+
+fn current_frame(name: &str) -> Frame {
+    load_frame(ScreenSet::Current, name, name, DEFAULT_COLUMNS)
+}
+
+/// The records a real Claude 2.1.309 reported, in order, while the capture
+/// scenarios ran: the turn lifecycle the manifest arbitrates on.
+#[test]
+fn the_captured_program_status_sequences_follow_the_claude_turn_lifecycle() {
+    let read = |name: &str| -> Vec<String> {
+        let path = ScreenSet::Current
+            .directory()
+            .join(format!("{name}.program-status"));
+        fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    let record = |state: &str| format!("app=claude-code:state={state}");
+    assert_eq!(read("idle"), [record("idle")]);
+    assert_eq!(
+        read("working_early"),
+        [record("idle"), record("working")],
+        "a running turn reports working"
+    );
+    assert_eq!(
+        read("idle_after_turn"),
+        [record("idle"), record("working"), record("done")],
+        "a finished turn reports done"
+    );
+    assert_eq!(
+        read("approval").last(),
+        Some(&record("blocked:kind=permission")),
+        "a tool approval reports a blocked permission"
+    );
+    assert_eq!(
+        read("askuser").last(),
+        Some(&record("blocked:kind=question")),
+        "a question reports a blocked question"
+    );
+}
+
+/// The held record and the real Claude screens: the record keeps a prompt box
+/// working while a turn runs, ends a stale spinner, and never hides a dialog
+/// the screen rules see. Records of a child agent or of another app change
+/// nothing.
+#[test]
+fn a_program_status_record_arbitrates_with_the_real_claude_screens() {
+    let definition = installed_definition();
+    let screen = |name: &str| frame_bytes(None, &current_frame(name).rows);
+    let after = |name: &str, state: &str| {
+        last_transition(&definition, DEFAULT_COLUMNS, &[screen(name), record(state)])
+    };
+
+    // A1: working while the prompt box reads idle.
+    assert_eq!(
+        after("idle", "working"),
+        Some((AgentActivity::Working, StateSource::OscProgress))
+    );
+    // A3: blocked outranks any screen.
+    assert_eq!(
+        after("idle", "blocked:kind=question"),
+        Some((AgentActivity::Blocked, StateSource::OscProgress))
+    );
+    // A4: a finished turn ends the spinner line the screen still shows.
+    for state in ["done", "idle", "error"] {
+        assert_eq!(
+            after("working_early", state),
+            Some((AgentActivity::Idle, StateSource::OscProgress)),
+            "{state} over a stale spinner"
+        );
+    }
+    // A2/S1: a visible dialog wins over a non-blocked record, a forged one included.
+    for dialog in ["trust", "approval", "askuser", "theme", "login", "apikey"] {
+        for state in ["working", "idle", "done"] {
+            assert_eq!(
+                after(dialog, state),
+                Some((AgentActivity::Blocked, StateSource::Screen)),
+                "{dialog} with a {state} record"
+            );
+        }
+    }
+    // A14, S2: a child record, another app and a malformed record change nothing.
+    let held = [screen("idle"), record("working")];
+    for ignored in [
+        &b"\x1b]7501;state=idle:app=claude-code:id=agent-1\x1b\\"[..],
+        b"\x1b]7501;state=clear:app=claude-code:id=agent-1\x1b\\",
+        b"\x1b]7501;state=idle:app=codex\x1b\\",
+        b"\x1b]7501;state=idle\x1b\\",
+        b"\x1b]7501;state=bogus:app=claude-code\x1b\\",
+    ] {
+        let mut chunks = held.to_vec();
+        chunks.push(ignored.to_vec());
+        assert_eq!(
+            last_transition(&definition, DEFAULT_COLUMNS, &chunks),
+            Some((AgentActivity::Working, StateSource::OscProgress)),
+            "{}",
+            String::from_utf8_lossy(ignored)
+        );
+    }
+    // A root clear drops the record: the screen speaks again.
+    let mut chunks = held.to_vec();
+    chunks.push(b"\x1b]7501;state=clear\x1b\\".to_vec());
+    chunks.push(screen("idle_after_turn"));
+    assert_eq!(
+        last_transition(&definition, DEFAULT_COLUMNS, &chunks),
+        Some((AgentActivity::Idle, StateSource::Screen))
+    );
+}
+
+/// A markdown bullet in the transcript is not the spinner line, so a finished
+/// turn that quotes one reads idle on the screen alone.
+#[test]
+fn a_transcript_bullet_is_not_a_spinner_line() {
+    let definition = installed_definition();
+    for set in ScreenSet::ALL {
+        let mut rows = load_frame(set, "idle_after_turn", "idle_after_turn", DEFAULT_COLUMNS).rows;
+        rows.insert(2, "* Then it waits\u{2026} (see below)".to_owned());
+        assert_eq!(
+            screen_activity(&definition, &rows, DEFAULT_COLUMNS),
+            Some(AgentActivity::Idle),
+            "{set:?}"
+        );
+    }
+    for line in [
+        "\u{2722} Architecting\u{2026} (16s)",
+        "* Jiving\u{2026}",
+        "\u{273b} Sau\u{e9}ing\u{2026} (1m 5s \u{b7} \u{2193} 2.6k tokens)",
+        "\u{2736} Dilly-dallying\u{2026} (4s \u{b7} \u{2193} 12 tokens)",
+        "\u{2733} Compacting conversation\u{2026} (12s)",
+        "\u{2722} Beboppin\u{2019}\u{2026}",
+    ] {
+        let mut rows = current_frame("idle").rows;
+        rows.insert(2, line.to_owned());
+        assert_eq!(
+            screen_activity(&definition, &rows, DEFAULT_COLUMNS),
+            Some(AgentActivity::Working),
+            "{line}"
+        );
+    }
+}
+
+/// A13: with no record held (an older Claude, a profile that turns the title
+/// and records off, a probe that was never answered) the manifest reads every
+/// captured screen of both releases exactly as it does without the opt-in.
+#[test]
+fn without_a_record_every_captured_screen_reads_as_without_the_opt_in() {
+    let with = installed_definition();
+    let mut table = read_toml(&format!("{PACKAGE_DIR}/detect.toml"));
+    assert!(table.remove("program_status").is_some());
+    let without = Manifest::parse_str(&toml::to_string(&table).expect("the manifest serializes"))
+        .expect("the manifest without the opt-in parses");
+    let mut compared = 0_usize;
+    for frame in top_level_frames().into_iter().chain(width_frames()) {
+        for title in [frame.title.as_deref(), None] {
+            let started = Instant::now();
+            let bytes = frame_bytes(title, &frame.rows);
+            let mut baseline = Detector::new(
+                24,
+                frame.columns,
+                started,
+                DetectorConfig {
+                    detection: DetectionConfig {
+                        recheck_after: Duration::from_millis(100),
+                        confirmations: 1,
+                        cap: Duration::from_millis(700),
+                        stable_visible_refresh: Duration::from_millis(800),
+                        startup_grace: Duration::ZERO,
+                    },
+                    manifest: Some(Arc::new(without.clone())),
+                    input_readiness: with.input_readiness(),
+                },
+            );
+            assert_eq!(
+                transitions(&with, title, &frame.rows, frame.columns),
+                baseline.feed(started, &bytes),
+                "{} of {:?} with title {title:?}",
+                frame.name,
+                frame.set
+            );
+            compared += 1;
+        }
+    }
+    assert!(compared >= 250, "frames compared: {compared}");
+}
+
 #[test]
 fn the_supported_range_equals_the_compatibility_lock() {
     let definition = installed_definition();
@@ -725,10 +999,19 @@ fn the_supported_range_equals_the_compatibility_lock() {
 
     let release =
         ProbeVersion::parse(&locked_release()).expect("the locked release is MAJOR.MINOR.PATCH");
+    assert!(
+        release > policy.min(),
+        "the range starts at the previous verified release"
+    );
     assert_eq!(
-        release,
-        policy.min(),
-        "the range starts at the one release that was verified"
+        screens_banner_release(&workspace_root().join(SCREENS_DIR)),
+        release.to_string(),
+        "the captured screens come from the locked release"
+    );
+    assert_eq!(
+        screens_banner_release(&workspace_root().join(SCREENS_DIR).join("n-1")),
+        policy.min().to_string(),
+        "the previous release's screens stay in the repository"
     );
     assert!(
         policy.supports(release),
@@ -751,6 +1034,20 @@ fn the_supported_range_equals_the_compatibility_lock() {
         format!("{next_major}.0.0"),
         "the range runs from the verified minimum to the next major release"
     );
+}
+
+/// The release in the `Claude Code v<release>` banner of a screen set.
+fn screens_banner_release(directory: &Path) -> String {
+    let idle = fs::read_to_string(directory.join("idle.txt")).expect("the idle screen");
+    let banner = idle
+        .lines()
+        .find_map(|line| line.split_once("Claude Code v").map(|(_, rest)| rest))
+        .expect("the banner row");
+    banner
+        .split_whitespace()
+        .next()
+        .expect("a release after the banner")
+        .to_owned()
 }
 
 #[test]
@@ -815,32 +1112,38 @@ fn live_activity(
 
 #[test]
 fn the_top_level_screens_cover_every_state() {
-    let states: BTreeSet<String> = top_level_frames()
-        .into_iter()
-        .map(|frame| frame.state)
-        .collect();
-    assert_eq!(
-        states.iter().map(String::as_str).collect::<Vec<_>>(),
-        [
-            "apikey",
-            "approval",
-            "askuser",
-            "idle",
-            "idle_after_turn",
-            "login",
-            "theme",
-            "trust",
-            "working_early",
-            "working_stream",
-        ]
-    );
+    let states = |set| -> Vec<String> {
+        top_level_frames_of(set)
+            .into_iter()
+            .map(|frame| frame.state)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+    let previous = [
+        "apikey",
+        "approval",
+        "askuser",
+        "idle",
+        "idle_after_turn",
+        "login",
+        "theme",
+        "trust",
+        "working_early",
+        "working_stream",
+    ];
+    assert_eq!(states(ScreenSet::Previous), previous);
+    let mut current = previous.to_vec();
+    current.push("working_star_frame");
+    current.sort_unstable();
+    assert_eq!(states(ScreenSet::Current), current);
 }
 
 /// What the package manifest reads from every captured screen: from the screen
 /// text alone, and with the title Claude had set. The screen reads the state of
 /// every capture except a streaming reply too narrow for its turn footer
-/// ([`TURN_FOOTER_UNREAD_WIDTHS`]); the running-turn title outranks the screen,
-/// so with its title every capture reads its state.
+/// ([`TURN_FOOTER_UNREAD_WIDTHS`]); the 2.1.289 running-turn title outranks the
+/// screen, so with it every capture of that set reads its state.
 #[test]
 fn every_captured_screen_is_classified_by_its_screen_text_and_title() {
     let definition = installed_definition();
@@ -859,18 +1162,18 @@ fn every_captured_screen_is_classified_by_its_screen_text_and_title() {
             "{} from the screen",
             frame.name
         );
-        let source = if frame
+        let glyph = frame
             .title
             .as_deref()
-            .is_some_and(|title| title.starts_with(TURN_GLYPHS))
-        {
-            StateSource::OscTitle
+            .is_some_and(|title| title.starts_with(TURN_GLYPHS));
+        let (titled, source) = if glyph {
+            (meant, StateSource::OscTitle)
         } else {
-            StateSource::Screen
+            (from_screen, StateSource::Screen)
         };
         assert_eq!(
             frame.evidence(&definition),
-            Some((meant, source)),
+            Some((titled, source)),
             "{} with title {:?}",
             frame.name,
             frame.title
@@ -881,8 +1184,9 @@ fn every_captured_screen_is_classified_by_its_screen_text_and_title() {
 /// Captured widths at which the footer of a running turn is cut before its
 /// `esc to interrupt` hint (`⏸ manual mode on · esc to…` at 30 columns, the
 /// mode alone at 20). A streaming reply hides the status line, so at these
-/// widths its screen reads as the idle prompt box and only the running-turn
-/// title says the turn runs.
+/// widths its screen reads as the idle prompt box; the 2.1.289 running-turn
+/// title still says the turn runs, the 2.1.309 title does not and the held
+/// record carries it.
 const TURN_FOOTER_UNREAD_WIDTHS: [u16; 2] = [20, 30];
 
 /// The glyphs Claude Code 2.1.289 alternates before its title while a turn
@@ -891,7 +1195,13 @@ const TURN_GLYPHS: [char; 2] = ['\u{25d0}', '\u{25d1}'];
 
 #[test]
 fn the_captured_screens_span_the_supported_terminal_widths() {
-    let frames = width_frames();
+    for set in ScreenSet::ALL {
+        spans_the_supported_widths(set);
+    }
+}
+
+fn spans_the_supported_widths(set: ScreenSet) {
+    let frames = width_frames_of(set);
     let widths: BTreeSet<u16> = frames.iter().map(|frame| frame.columns).collect();
     assert_eq!(
         widths.into_iter().collect::<Vec<_>>(),
@@ -910,7 +1220,10 @@ fn the_captured_screens_span_the_supported_terminal_widths() {
         assert_eq!(count, 9, "{state} is captured at every width");
     }
     let titled = frames.iter().filter(|frame| frame.title.is_some()).count();
-    assert!(titled >= 40, "titles captured with the screens: {titled}");
+    assert!(
+        titled >= 40,
+        "titles captured with the screens of {set:?}: {titled}"
+    );
     assert!(
         frames
             .iter()
@@ -925,9 +1238,10 @@ fn the_captured_screens_span_the_supported_terminal_widths() {
 /// circle-quadrant glyph (`◐ ◑ …`) while a turn runs.
 #[test]
 fn the_captured_titles_are_the_idle_asterisk_and_the_working_circle() {
-    let titles: BTreeSet<String> = top_level_frames()
+    let previous = ScreenSet::Previous;
+    let titles: BTreeSet<String> = top_level_frames_of(previous)
         .into_iter()
-        .chain(width_frames())
+        .chain(width_frames_of(previous))
         .filter_map(|frame| frame.title)
         .collect();
     let glyphs: BTreeSet<char> = titles
@@ -939,6 +1253,30 @@ fn the_captured_titles_are_the_idle_asterisk_and_the_working_circle() {
         ['\u{25d0}', '\u{25d1}', '\u{2733}']
     );
     assert!(titles.iter().all(|title| title.ends_with(" Claude Code")));
+}
+
+/// Once the terminal answered Claude's program-status probe, Claude 2.1.309
+/// sets the plain title `Claude Code` in every state and leaves the state to
+/// the OSC 7501 records. The title rules read nothing from it.
+#[test]
+fn a_probe_answered_claude_sets_a_plain_title_in_every_state() {
+    let definition = installed_definition();
+    let current = ScreenSet::Current;
+    let frames: Vec<Frame> = top_level_frames_of(current)
+        .into_iter()
+        .chain(width_frames_of(current))
+        .filter(|frame| frame.title.is_some())
+        .collect();
+    assert!(frames.len() >= 40, "titled captures: {}", frames.len());
+    for frame in frames {
+        assert_eq!(
+            frame.title.as_deref(),
+            Some("Claude Code"),
+            "{}",
+            frame.name
+        );
+    }
+    assert_eq!(title_activity(&definition, "Claude Code"), None);
 }
 
 /// The title alone reads idle for the asterisk and working for the two glyphs
@@ -973,9 +1311,10 @@ fn the_title_reads_idle_for_the_asterisk_and_working_for_the_turn_glyphs() {
 #[test]
 fn a_streaming_reply_reads_working_from_its_title_and_turn_footer() {
     let definition = installed_definition();
-    for frame in top_level_frames()
+    let previous = ScreenSet::Previous;
+    for frame in top_level_frames_of(previous)
         .into_iter()
-        .chain(width_frames())
+        .chain(width_frames_of(previous))
         .filter(|frame| frame.state == "working_stream")
     {
         let title = frame.title.as_deref().expect("a working title");
@@ -1020,7 +1359,7 @@ const STATUS_GLYPHS: [char; 7] = [
 fn the_status_spinner_line_makes_a_running_turn_working() {
     let definition = installed_definition();
     let early = load_frame(
-        &workspace_root().join(SCREENS_DIR),
+        ScreenSet::Current,
         "working_early",
         "working_early",
         DEFAULT_COLUMNS,
@@ -1075,7 +1414,11 @@ fn a_tool_approval_or_question_is_blocked_although_the_title_says_idle() {
             continue;
         }
         let title = frame.title.as_deref().expect("a title");
-        assert_eq!(title, "\u{2733} Claude Code");
+        let expected = match frame.set {
+            ScreenSet::Previous => "\u{2733} Claude Code",
+            ScreenSet::Current => PROGRAM_STATUS_TITLE,
+        };
+        assert_eq!(title, expected);
         assert_eq!(
             live_activity(&definition, title, &frame.rows, frame.columns),
             Some(AgentActivity::Blocked),
@@ -1084,7 +1427,10 @@ fn a_tool_approval_or_question_is_blocked_although_the_title_says_idle() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 20, "approval and question screens at every width");
+    assert_eq!(
+        checked, 40,
+        "approval and question screens at every width of both sets"
+    );
 }
 
 /// The first-run dialogs (theme picker, API-key approval, login method list)
@@ -1107,13 +1453,11 @@ fn the_first_run_and_trust_dialogs_are_blocked() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 22, "theme, login and every apikey and trust width");
-    let trust = load_frame(
-        &workspace_root().join(SCREENS_DIR),
-        "trust",
-        "trust",
-        DEFAULT_COLUMNS,
+    assert_eq!(
+        checked, 44,
+        "theme, login and every apikey and trust width of both sets"
     );
+    let trust = load_frame(ScreenSet::Current, "trust", "trust", DEFAULT_COLUMNS);
     assert!(
         trust
             .rows
@@ -1123,13 +1467,14 @@ fn the_first_run_and_trust_dialogs_are_blocked() {
     );
 }
 
-/// A reply that quotes the first-run and trust dialogs, the way this package's
+/// A reply that quotes the first-run, API-key and trust dialogs, the way this package's
 /// guide or an explanation of `/theme` does.
-const QUOTED_DIALOGS: [&str; 4] = [
+const QUOTED_DIALOGS: [&str; 5] = [
     "\u{25cf} The trust dialog offers \"Yes, I trust this folder\" and \"No, exit\";",
     "  press Enter to confirm. /theme asks you to choose the text style:",
     "  Dark mode or Light mode. Select login method: Claude account with",
-    "  subscription or Anthropic Console account.",
+    "  subscription or Anthropic Console account. The API key dialog says:",
+    "  Detected a custom API key in your environment. Use this API key?",
 ];
 
 /// `frame` with [`QUOTED_DIALOGS`] in its transcript above the prompt box, in
@@ -1164,20 +1509,21 @@ fn with_quoted_dialogs(frame: &Frame) -> Vec<String> {
 #[test]
 fn quoted_dialog_text_in_the_transcript_is_not_a_dialog() {
     let definition = installed_definition();
-    let directory = workspace_root().join(SCREENS_DIR);
-    for (name, expected) in [
-        ("idle", AgentActivity::Idle),
-        ("idle_after_turn", AgentActivity::Idle),
-        ("working_early", AgentActivity::Working),
-        ("working_stream", AgentActivity::Working),
-    ] {
-        let frame = load_frame(&directory, name, name, DEFAULT_COLUMNS);
-        let rows = with_quoted_dialogs(&frame);
-        assert_eq!(
-            screen_activity(&definition, &rows, frame.columns),
-            Some(expected),
-            "{name} quoting the dialogs: {rows:#?}"
-        );
+    for set in ScreenSet::ALL {
+        for (name, expected) in [
+            ("idle", AgentActivity::Idle),
+            ("idle_after_turn", AgentActivity::Idle),
+            ("working_early", AgentActivity::Working),
+            ("working_stream", AgentActivity::Working),
+        ] {
+            let frame = load_frame(set, name, name, DEFAULT_COLUMNS);
+            let rows = with_quoted_dialogs(&frame);
+            assert_eq!(
+                screen_activity(&definition, &rows, frame.columns),
+                Some(expected),
+                "{name} of {set:?} quoting the dialogs: {rows:#?}"
+            );
+        }
     }
 }
 
@@ -1236,9 +1582,11 @@ fn screen_rule(definition: &RuntimeDefinition, rows: &[String], columns: u16) ->
     let context = detector
         .region_previews()
         .into_iter()
-        .map(|preview| {
-            let region: ManifestRegion = preview.region.parse().expect("a manifest region");
-            (region, preview.text)
+        // The detector's previews also hold the program-status record, which is
+        // no manifest region.
+        .filter_map(|preview| {
+            let region: ManifestRegion = preview.region.parse().ok()?;
+            Some((region, preview.text))
         })
         .filter(|(region, _)| {
             !matches!(
@@ -1299,10 +1647,7 @@ fn the_completed_turn_line_with_its_done_time_reads_idle_through_its_rule() {
             "live_prompt_box"
         } else {
             assert!(
-                frame
-                    .rows
-                    .iter()
-                    .any(|row| row.ends_with(" \u{b7} done 3:37 PM")),
+                frame.rows.iter().any(|row| row.contains(" \u{b7} done ")),
                 "{} shows the done time",
                 frame.name
             );
@@ -1316,7 +1661,7 @@ fn the_completed_turn_line_with_its_done_time_reads_idle_through_its_rule() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 10, "idle_after_turn at every width");
+    assert_eq!(checked, 20, "idle_after_turn at every width of both sets");
 }
 
 fn process(comm: &str, cmdline: &[&str]) -> ProcessFact {
@@ -1374,6 +1719,19 @@ fn the_process_matchers_accept_the_observed_claude_process_forms() {
     assert!(matchers.matches(&process("claude.exe", &[npm])));
     assert!(matchers.matches(&process("claude.exe", &["other"])));
     assert!(matchers.matches(&process("sh", &[npm, "--resume", "abc"])));
+
+    // The native installer runs `<root>/claude/versions/<release>`: the kernel
+    // name is the release or `claude`, the command line is the image or the
+    // launcher.
+    let image = "/home/user/.local/share/claude/versions/2.1.309";
+    assert!(matchers.matches(&process("claude", &[image])));
+    assert!(matchers.matches(&process("sh", &[image, "--resume", "abc"])));
+    assert!(!matchers.matches(&process("2.1.309", &["other"])));
+    assert!(!matchers.matches(&process(
+        "sh",
+        &["/home/user/.local/share/codex/versions/0.164.0"]
+    )));
+    assert!(!matchers.matches(&process("sh", &["/work/claude/versions/cache.db"])));
 
     // A script that merely carries `claude` in its name is not Claude.
     for (comm, cmdline) in [
@@ -1637,7 +1995,14 @@ fn the_package_manifest_behaves_like_the_builtin_manifest_on_every_frame() {
     let golden = golden_definition();
     let mut compared = 0_usize;
     let mut reclassified = BTreeSet::new();
-    for frame in top_level_frames().into_iter().chain(width_frames()) {
+    // The exceptions are the frames of the release the golden manifest was
+    // written for; the current release's screens are covered by the rule
+    // scenarios above.
+    let previous = ScreenSet::Previous;
+    for frame in top_level_frames_of(previous)
+        .into_iter()
+        .chain(width_frames_of(previous))
+    {
         let fed_titles = if frame.title.is_some() {
             vec![frame.title.as_deref(), None]
         } else {
@@ -1739,9 +2104,9 @@ const CAPTURE_VARIABLE: &str = "POHUNEK_CLAUDE_CAPTURE_DIR";
 /// Profile the real-Claude tests launch through.
 const PROFILE: &str = "claude-test";
 
-/// Start of the terminal title Claude sets while it waits for input: a
-/// six-teardrop-spoked asterisk (U+2733) and a space, then the product name.
-const IDLE_TITLE_PREFIX: &str = "\u{2733} ";
+/// The title Claude sets once the terminal answered its program-status probe:
+/// the status glyph is left to the records.
+const PROGRAM_STATUS_TITLE: &str = "Claude Code";
 
 /// The prompt the tests submit.
 const PROMPT: &str = "say hi";
@@ -1769,13 +2134,13 @@ const WAIT_SLICE_MS: &str = "8000";
 /// `✶ Billowing… (3s · ↓ 2 tokens)`.
 const STATUS_LINE_MARK: &str = "\u{2026} (";
 
-/// State sources of what Claude shows: the screen and the terminal title.
-const VISIBLE_SOURCES: [&str; 2] = ["screen", "osc_title"];
+/// State sources of what Claude shows or reports in the terminal stream: the
+/// screen, the terminal title and the OSC 7501 program-status record.
+const VISIBLE_SOURCES: [&str; 3] = ["screen", "osc_title", "osc_progress"];
 
 /// How long the held-stream test watches for an idle reading, in milliseconds:
-/// longer than two of the 960 ms title changes of a running turn plus the
-/// daemon's 700 ms debounce cap, so a screen that read idle between title
-/// changes would publish.
+/// longer than the daemon's 700 ms debounce cap with margin, so a screen that
+/// reads idle while the turn runs would publish.
 const HELD_STREAM_WATCH_MS: &str = "3000";
 
 /// Looks `name` up on `PATH` the way the daemon resolves a program.
@@ -1872,6 +2237,10 @@ struct Fixture {
     harness: Harness,
     stub: MessagesStub,
     claude_home: PathBuf,
+    /// Working directory of the launched sessions.
+    cwd: PathBuf,
+    /// Prefix of every host path a recorded screen may show.
+    capture_root: PathBuf,
     /// Digest of the installed package archive.
     digest: PackageDigest,
 }
@@ -1880,6 +2249,12 @@ impl Fixture {
     /// Starts a fixture whose daemon serves `claude` from the installed
     /// official package, the only source of `claude`.
     async fn start(seed: Seed) -> Self {
+        Self::start_in(seed, None).await
+    }
+
+    /// Starts a fixture whose sessions run in `cwd` when given, so a recorded
+    /// screen shows a fixed path instead of the test's scratch directory.
+    async fn start_in(seed: Seed, cwd: Option<PathBuf>) -> Self {
         let key = test_key();
         let anchor =
             HostTrustAnchor::new(vec![root_of(&key, WINDOW_START, WINDOW_END)], Vec::new())
@@ -1890,11 +2265,23 @@ impl Fixture {
         let stub = MessagesStub::start();
         let claude_home = harness.env.root().join("claude-home");
         fs::create_dir_all(&claude_home).expect("create the Claude home");
+        let (cwd, capture_root) = match cwd {
+            Some(cwd) => {
+                let root = cwd.parent().expect("a recording directory has a root");
+                (cwd.clone(), root.to_path_buf())
+            }
+            None => (
+                harness.env.cwd().to_path_buf(),
+                harness.env.root().to_path_buf(),
+            ),
+        };
         let fixture = Self {
             processes,
             harness,
             stub,
             claude_home,
+            cwd,
+            capture_root,
             digest,
         };
         fixture.seed(seed);
@@ -1909,7 +2296,7 @@ impl Fixture {
         if seed == Seed::Fresh {
             return;
         }
-        let cwd = path_str(self.harness.env.cwd()).to_owned();
+        let cwd = path_str(&self.cwd).to_owned();
         let key = messages_stub::API_KEY;
         let suffix = &key[key.len() - APPROVED_KEY_SUFFIX_LEN..];
         let mut config = serde_json::json!({
@@ -2051,7 +2438,7 @@ impl Fixture {
     /// `session new` of `profile` in the fixture's working directory, at
     /// `columns` wide.
     async fn launch_at(&self, profile: &str, name: &str, columns: u16) -> (i32, Value) {
-        let cwd = self.harness.env.cwd().to_path_buf();
+        let cwd = self.cwd.clone();
         self.harness
             .json(&[
                 "session",
@@ -2116,8 +2503,8 @@ impl Fixture {
     }
 
     /// Waits until the session reports `working` on the strength of what Claude
-    /// shows, the screen or the running-turn title, not the byte-activity
-    /// fallback.
+    /// shows or reports (the screen, the 2.1.289 running-turn title or a
+    /// program-status record), not the byte-activity fallback.
     async fn wait_visible_working(&self, id: &str) -> Value {
         wait_until(
             &format!("working from the screen or title of {id}"),
@@ -2153,21 +2540,6 @@ impl Fixture {
             let (_title, rows) = self.screen(id).await;
             rows.iter().any(|row| row.contains(needle)).then_some(rows)
         })
-        .await
-    }
-
-    /// Waits until the terminal title starts with `prefix` and returns the
-    /// rows on screen at that moment.
-    async fn wait_title_prefix(&self, id: &str, prefix: &str) -> Vec<String> {
-        wait_until(
-            &format!("a terminal title starting with {prefix:?}"),
-            || async {
-                let (title, rows) = self.screen(id).await;
-                title
-                    .is_some_and(|title| title.starts_with(prefix))
-                    .then_some(rows)
-            },
-        )
         .await
     }
 
@@ -2469,57 +2841,91 @@ async fn install_package(harness: &Harness, key: &ed25519_dalek::SigningKey) -> 
     digest
 }
 
+/// Largest page of retained output read at once, in bytes.
+const OUTPUT_PAGE_BYTES: &str = "65536";
+
+/// A JSON number or string as a command-line argument.
+fn json_scalar(value: &Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), str::to_owned)
+}
+
 /// Columns of the top-level fixtures.
 const DEFAULT_COLUMNS: u16 = 100;
-
-/// Terminal widths every captured state is also recorded at.
-const CAPTURE_WIDTHS: [u16; 9] = [20, 30, 40, 60, 80, 100, 120, 160, 200];
-
-/// Rows of every captured screen.
-const CAPTURE_ROWS: &str = "24";
 
 /// How long a resized screen is given to redraw before it is read, in
 /// milliseconds. Claude redraws within a frame; the pause only has to outlast
 /// that and the daemon's screen tracker.
 const REDRAW_PAUSE_MS: u64 = 700;
 
-/// Replacement for the random part of the throwaway root in captured text, so
-/// the files are reproducible.
-// hermetic-allowed: #146 the text is a fixed replacement for the random fixture root in captured screens, never a host path
-const NEUTRAL_ROOT: &str = "/tmp/ph-sample";
-
-/// Writes one captured screen: `<name>.txt` holds the rows and `<name>.title`
-/// the terminal title when Claude had set one.
-fn write_capture(directory: &Path, name: &str, root: &Path, title: Option<&str>, rows: &[String]) {
-    fs::create_dir_all(directory).expect("create the capture directory");
-    let root = path_str(root);
-    let text = rows.iter().fold(String::new(), |mut text, row| {
-        text.push_str(&row.replace(root, NEUTRAL_ROOT));
-        text.push('\n');
-        text
-    });
-    fs::write(directory.join(format!("{name}.txt")), text).expect("write the screen");
-    if let Some(title) = title {
-        fs::write(
-            directory.join(format!("{name}.title")),
-            format!("{}\n", title.replace(root, NEUTRAL_ROOT)),
-        )
-        .expect("write the title");
-    }
-}
-
 impl Fixture {
     /// Records the session's current screen and title as `<name>` below
     /// `directory`.
     async fn capture(&self, directory: &Path, id: &str, name: &str) {
         let (title, rows) = self.screen(id).await;
-        write_capture(
+        capture::write_capture(
             directory,
             name,
-            self.harness.env.root(),
+            path_str(&self.capture_root),
             title.as_deref(),
             &rows,
         );
+    }
+
+    /// Every retained raw output byte of the session's current runtime.
+    async fn raw_output(&self, id: &str) -> Vec<u8> {
+        let inspected = self.inspect(id).await;
+        let runtime = &inspected["runtime"];
+        let worker = runtime["worker_instance_id"].as_str().expect("worker id");
+        let generation = json_scalar(&runtime["runtime_generation"]);
+        let mut bytes = Vec::new();
+        let mut offset = "0".to_owned();
+        loop {
+            let (code, page) = self
+                .harness
+                .json(&[
+                    "session",
+                    "output",
+                    id,
+                    "--worker-instance-id",
+                    worker,
+                    "--runtime-generation",
+                    &generation,
+                    "--after-offset",
+                    &offset,
+                    "--max-bytes",
+                    OUTPUT_PAGE_BYTES,
+                ])
+                .await;
+            assert_eq!(code, 0, "{page}");
+            bytes.extend(capture::output_bytes(&page));
+            offset = json_scalar(&page["ok"]["next_offset"]);
+            if page["ok"]["has_more"] != true {
+                return bytes;
+            }
+        }
+    }
+
+    /// Records the ordered root program-status records seen so far as
+    /// `<name>.program-status`.
+    async fn capture_program_status(&self, directory: &Path, id: &str, name: &str) {
+        let raw = self.raw_output(id).await;
+        capture::write_program_status(directory, name, &raw);
+    }
+
+    /// Waits until a visible row starts with `prefix` and returns the rows.
+    async fn wait_screen_row_starting(&self, id: &str, prefix: &str) -> Vec<String> {
+        wait_until(
+            &format!("a screen row starting with {prefix:?}"),
+            || async {
+                let (_title, rows) = self.screen(id).await;
+                rows.iter()
+                    .any(|row| row.starts_with(prefix))
+                    .then_some(rows)
+            },
+        )
+        .await
     }
 
     async fn resize(&self, id: &str, columns: u16) {
@@ -2532,7 +2938,7 @@ impl Fixture {
                 "--cols",
                 &columns.to_string(),
                 "--rows",
-                CAPTURE_ROWS,
+                capture::CAPTURE_ROWS,
             ])
             .await;
         assert_eq!(code, 0, "{resized}");
@@ -2546,7 +2952,7 @@ impl Fixture {
     /// restores the default width.
     async fn capture_widths(&self, directory: &Path, id: &str, state: &str, settle: bool) {
         let widths = directory.join("widths");
-        for columns in CAPTURE_WIDTHS {
+        for columns in capture::CAPTURE_WIDTHS {
             self.resize(id, columns).await;
             if settle {
                 let previous = std::cell::RefCell::new(self.screen(id).await);
@@ -2713,8 +3119,14 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
         .process_matchers()
         .expect("the manifest declares process matchers");
     let fact = process_fact_of(launch_pid);
+    // The native installer's image, started by its resolved path, is named
+    // for its release.
+    let native_image = fact.cmdline.first().is_some_and(|argv0| {
+        argv0.contains("/claude/versions/")
+            && fact.comm.chars().all(|c| c.is_ascii_digit() || c == '.')
+    });
     assert!(
-        ["claude", "claude.exe"].contains(&fact.comm.as_str()),
+        native_image || ["claude", "claude.exe"].contains(&fact.comm.as_str()),
         "an unexpected Claude process name: {fact:?}"
     );
     assert!(
@@ -2722,7 +3134,7 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
         "the real process {fact:?} is matched"
     );
 
-    // Idle: the prompt box and the `✳` title.
+    // Idle: the prompt box.
     fixture.wait_activity(&id, "idle").await;
     fixture.wait_screen_line(&id, "for shortcuts").await;
     assert_package_agrees(&fixture, &package, &id, AgentActivity::Idle).await;
@@ -2752,7 +3164,6 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
     fixture
         .wait_screen_line(&id, messages_stub::SECOND_CHUNK)
         .await;
-    fixture.wait_title_prefix(&id, IDLE_TITLE_PREFIX).await;
     fixture.wait_activity(&id, "idle").await;
     assert_package_agrees(&fixture, &package, &id, AgentActivity::Idle).await;
 
@@ -2760,11 +3171,190 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
     fixture.finish().await;
 }
 
+/// R-rows of the program-status layer against a real Claude: a turn started
+/// with `--until working` is confirmed by the `working` record, the settled
+/// turn reads idle from the `done` record, both reported as `osc_progress`.
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+async fn a_real_claude_turn_is_reported_through_program_status_records() {
+    require_real_claude();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    let id = fixture.new_session_id("records").await;
+    fixture.wait_activity(&id, "idle").await;
+
+    let prompt = format!("{} {PROMPT}", messages_stub::HOLD_MARKER);
+    let (code, started) = fixture
+        .harness
+        .json(&[
+            "session",
+            "input",
+            &id,
+            &prompt,
+            "--until",
+            "working",
+            "--timeout",
+            WAIT_SLICE_MS,
+        ])
+        .await;
+    assert_eq!(code, 0, "{started}");
+    let working = fixture.inspect(&id).await;
+    assert_eq!(working["activity"], "working", "{started}");
+    assert_eq!(working["state_source"], "osc_progress", "{working}");
+
+    fixture.stub.open_gate();
+    fixture
+        .wait_screen_line(&id, messages_stub::SECOND_CHUNK)
+        .await;
+    let idle = fixture.wait_activity(&id, "idle").await;
+    assert_eq!(idle["state_source"], "osc_progress", "{idle}");
+
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// The reply an attached terminal sends for the probe it saw in the replay.
+const CLIENT_PROBE_REPLY: &[u8] = b"\x1b]7501;?\x1b\\";
+
+impl Fixture {
+    /// Opens an attach stream on the session and returns its data connection,
+    /// the way an attached terminal client does.
+    async fn attach_stream(&self, id: &str) -> (String, pohunek_daemon::runtime::DataStream) {
+        let attach = self
+            .harness
+            .sessions
+            .attach(&protocol::SessionAttachParams {
+                session_id: protocol::SessionId(id.to_owned()),
+                initial_dimensions: None,
+                origin_session_id: None,
+                origin_daemon_id: None,
+                origin_worker_id: None,
+            })
+            .await
+            .expect("open an attach stream");
+        let redeemed = self
+            .harness
+            .sessions
+            .redeem_attach(&attach.stream_id)
+            .await
+            .expect("redeem the attach stream");
+        let pohunek_daemon::session::RedeemedRuntime::Worker(data) = redeemed.runtime;
+        (attach.stream_id.clone(), data)
+    }
+}
+
+/// Writes `bytes` as the attached client's input number `number`.
+async fn attached_input(
+    data: &mut pohunek_daemon::runtime::DataStream,
+    stream: &str,
+    number: u32,
+    bytes: &[u8],
+) {
+    let frame = pohunek_worker_protocol::DataFrame::new(
+        pohunek_worker_protocol::FrameHeader {
+            version: data.version,
+            stream_id: data.stream_id.clone(),
+            worker_instance_id: data.worker_instance_id.clone(),
+            kind: pohunek_worker_protocol::FrameKind::Input {
+                write_id: pohunek_worker_protocol::WriteId::new(format!(
+                    "attach-{stream}-{number}"
+                ))
+                .expect("write id"),
+            },
+        },
+        bytes.to_vec(),
+    )
+    .expect("attach input frame");
+    pohunek_worker_protocol::write_frame(&mut data.stream, &frame)
+        .await
+        .expect("send the client's input");
+}
+
+/// An attached terminal answers the probe it saw in the replay: exactly one
+/// reply reaches Claude (the worker's), the client's is dropped. A leaked reply
+/// would be typed into Claude's input and sent to the model with the prompt.
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+async fn an_attached_clients_probe_reply_never_reaches_a_real_claude() {
+    require_real_claude();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    let id = fixture.new_session_id("attached").await;
+    fixture.wait_activity(&id, "idle").await;
+
+    let (stream, mut data) = fixture.attach_stream(&id).await;
+    let prompt = format!("{} {PROMPT}", messages_stub::HOLD_MARKER);
+    let mut typed = CLIENT_PROBE_REPLY.to_vec();
+    typed.extend_from_slice(prompt.as_bytes());
+    attached_input(&mut data, &stream, 1, &typed).await;
+    fixture.wait_screen_line(&id, PROMPT).await;
+    attached_input(&mut data, &stream, 2, b"\r").await;
+
+    let working = fixture.wait_activity(&id, "working").await;
+    assert_eq!(working["state_source"], "osc_progress", "{working}");
+    fixture.stub.open_gate();
+    fixture
+        .wait_screen_line(&id, messages_stub::SECOND_CHUNK)
+        .await;
+    let idle = fixture.wait_activity(&id, "idle").await;
+    assert_eq!(idle["state_source"], "osc_progress", "{idle}");
+
+    assert!(
+        !fixture.stub.bodies_containing(PROMPT).is_empty(),
+        "the turn reached the model"
+    );
+    assert!(
+        fixture.stub.bodies_containing("7501").is_empty(),
+        "no part of the client's reply reached the model"
+    );
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// A real Claude killed while its `working` record is held leaves a session
+/// that is not live and not working.
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+async fn a_held_working_record_does_not_outlive_a_killed_claude() {
+    require_real_claude();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    let id = fixture.new_session_id("killed").await;
+    fixture.wait_activity(&id, "idle").await;
+    fixture
+        .input(&id, &format!("{} {PROMPT}", messages_stub::HOLD_MARKER))
+        .await;
+    let working = fixture.wait_activity(&id, "working").await;
+    assert_eq!(working["state_source"], "osc_progress", "{working}");
+
+    let pid = fixture.inspect(&id).await["pid"]
+        .as_i64()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .expect("the launch process id");
+    let command = fs::read(format!("/proc/{pid}/cmdline")).expect("the launch process");
+    assert!(
+        String::from_utf8_lossy(&command).contains("claude"),
+        "pid {pid} is the Claude launch process"
+    );
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .expect("kill the verified Claude process");
+
+    wait_until(&format!("session {id} to stop being live"), || async {
+        let inspected = fixture.inspect(&id).await;
+        (inspected["runtime"]["state"] != "live").then_some(inspected)
+    })
+    .await;
+    let after = fixture.inspect(&id).await;
+    assert_ne!(after["activity"], "working", "{after}");
+    fixture.stub.open_gate();
+    fixture.finish().await;
+}
+
 /// A reply held mid-stream: Claude draws the first paragraph and removes the
-/// status line, while the title keeps alternating its running-turn glyphs and
-/// the footer reads `esc to interrupt`. The daemon keeps the session working
-/// for longer than two title changes and the package manifest reads the live
-/// screen as working. The turn finishes once the stream gate opens.
+/// status line, its `working` record stays held and the footer reads `esc to
+/// interrupt`. The daemon keeps the session working for the whole watch and
+/// the package manifest reads the live screen as working. The turn finishes
+/// once the stream gate opens.
 #[tokio::test]
 #[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
 async fn a_real_claude_reply_held_mid_stream_reads_working() {
@@ -2793,9 +3383,10 @@ async fn a_real_claude_reply_held_mid_stream_reads_working() {
         "the second chunk waits for the stream gate: {rows:#?}"
     );
     let (title, _rows) = fixture.screen(&id).await;
-    assert!(
-        title.is_some_and(|title| title.starts_with(TURN_GLYPHS)),
-        "the title still shows a running turn"
+    assert_eq!(
+        title.as_deref(),
+        Some(PROGRAM_STATUS_TITLE),
+        "the title carries no turn glyph; the records report the turn"
     );
     let (code, waited) = fixture
         .harness
@@ -2824,7 +3415,7 @@ async fn a_real_claude_reply_held_mid_stream_reads_working() {
     fixture
         .wait_screen_line(&id, messages_stub::SECOND_CHUNK)
         .await;
-    fixture.wait_title_prefix(&id, IDLE_TITLE_PREFIX).await;
+    fixture.wait_activity(&id, "idle").await;
 
     fixture.stop(&id).await;
     fixture.finish().await;
@@ -3744,12 +4335,11 @@ fn helper_stops(events: &[Value]) -> Vec<String> {
         .collect()
 }
 
-/// A tool approval prompt of the real Claude is blocked through the screen,
-/// for the daemon and for the package manifest, although Claude keeps its
-/// idle title while the dialog is open.
+/// A tool approval prompt of the real Claude is blocked, for the daemon and for
+/// the package manifest.
 #[tokio::test]
 #[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
-async fn a_real_claude_approval_prompt_is_blocked_by_the_screen() {
+async fn a_real_claude_approval_prompt_is_blocked() {
     require_real_claude();
     let package = installed_definition();
     let fixture = Fixture::start(Seed::Trusted).await;
@@ -3762,8 +4352,13 @@ async fn a_real_claude_approval_prompt_is_blocked_by_the_screen() {
     fixture
         .input(&id, &format!("{} run it", messages_stub::APPROVAL_MARKER))
         .await;
+    // The source is the screen or the record, whichever reaches the detector
+    // first; both read blocked.
     let blocked = fixture.wait_activity(&id, "blocked").await;
-    assert_eq!(blocked["state_source"], "screen", "{blocked}");
+    assert!(
+        ["screen", "osc_progress"].contains(&json_scalar(&blocked["state_source"]).as_str()),
+        "{blocked}"
+    );
     let rows = fixture
         .wait_screen_line(&id, "Do you want to proceed?")
         .await;
@@ -3773,9 +4368,10 @@ async fn a_real_claude_approval_prompt_is_blocked_by_the_screen() {
         "the prompt names the command: {rows:#?}"
     );
     let (title, _rows) = fixture.screen(&id).await;
-    assert!(
-        title.is_some_and(|title| title.starts_with(IDLE_TITLE_PREFIX)),
-        "Claude keeps its idle title while the dialog is open"
+    assert_eq!(
+        title.as_deref(),
+        Some(PROGRAM_STATUS_TITLE),
+        "Claude sets no status glyph while it reports its state in program-status records"
     );
     assert_package_agrees(&fixture, &package, &id, AgentActivity::Blocked).await;
 
@@ -4982,7 +5578,8 @@ async fn capture_the_real_claude_first_run_screens() {
     let Some(directory) = capture_directory() else {
         return;
     };
-    let fixture = Fixture::start(Seed::Fresh).await;
+    let recording = capture::RecordingRoot::new("claude");
+    let fixture = Fixture::start_in(Seed::Fresh, Some(recording.directory("cwd"))).await;
     let id = fixture.new_session_id("first-run").await;
     fixture
         .wait_screen_line(&id, "Choose the text style that looks best")
@@ -5017,8 +5614,10 @@ async fn capture_the_real_claude_screens() {
         return;
     };
 
+    let recording = capture::RecordingRoot::new("claude");
+
     // Onboarded home, untrusted folder.
-    let fixture = Fixture::start(Seed::Onboarded).await;
+    let fixture = Fixture::start_in(Seed::Onboarded, Some(recording.directory("cwd"))).await;
     let id = fixture.new_session_id("trust").await;
     fixture.wait_screen_line(&id, "Quick safety check").await;
     fixture.capture(&directory, &id, "trust").await;
@@ -5027,12 +5626,15 @@ async fn capture_the_real_claude_screens() {
     fixture.finish().await;
 
     // Trusted home: idle, working, idle after a turn, approval, question.
-    let fixture = Fixture::start(Seed::Trusted).await;
+    let fixture = Fixture::start_in(Seed::Trusted, Some(recording.directory("cwd"))).await;
     fixture.install_integration().await;
     let id = fixture.new_session_id("states").await;
     fixture.wait_activity(&id, "idle").await;
     fixture.wait_screen_line(&id, "for shortcuts").await;
     fixture.capture(&directory, &id, "idle").await;
+    fixture
+        .capture_program_status(&directory, &id, "idle")
+        .await;
     fixture.capture_widths(&directory, &id, "idle", true).await;
 
     fixture
@@ -5048,6 +5650,12 @@ async fn capture_the_real_claude_screens() {
     fixture.wait_visible_working(&id).await;
     fixture.wait_screen_line(&id, STATUS_LINE_MARK).await;
     fixture.capture(&directory, &id, "working_early").await;
+    fixture
+        .capture_program_status(&directory, &id, "working_early")
+        .await;
+    // The `*` frame of the spinner glyph cycle, which a markdown bullet shares.
+    fixture.wait_screen_row_starting(&id, "* ").await;
+    fixture.capture(&directory, &id, "working_star_frame").await;
     fixture.stub.open_gate();
     fixture
         .wait_screen_line(&id, messages_stub::FIRST_CHUNK)
@@ -5061,9 +5669,11 @@ async fn capture_the_real_claude_screens() {
     fixture
         .wait_screen_line(&id, messages_stub::SECOND_CHUNK)
         .await;
-    fixture.wait_title_prefix(&id, IDLE_TITLE_PREFIX).await;
     fixture.wait_activity(&id, "idle").await;
     fixture.capture(&directory, &id, "idle_after_turn").await;
+    fixture
+        .capture_program_status(&directory, &id, "idle_after_turn")
+        .await;
     fixture
         .capture_widths(&directory, &id, "idle_after_turn", true)
         .await;
@@ -5076,6 +5686,9 @@ async fn capture_the_real_claude_screens() {
         .wait_screen_line(&id, "Do you want to proceed?")
         .await;
     fixture.capture(&directory, &id, "approval").await;
+    fixture
+        .capture_program_status(&directory, &id, "approval")
+        .await;
     fixture
         .capture_widths(&directory, &id, "approval", true)
         .await;
@@ -5091,6 +5704,9 @@ async fn capture_the_real_claude_screens() {
         .wait_screen_line(&id, messages_stub::QUESTION_TEXT)
         .await;
     fixture.capture(&directory, &id, "askuser").await;
+    fixture
+        .capture_program_status(&directory, &id, "askuser")
+        .await;
     fixture
         .capture_widths(&directory, &id, "askuser", true)
         .await;

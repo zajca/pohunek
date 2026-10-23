@@ -8,7 +8,7 @@ app and arbitrates it with the screen rules; the evidence is reported as
 answers the program's 7501 probe (the daemon sets the new additive
 `Initialize` field `answers_program_status_probe`) and drops the attached
 terminal's duplicate reply. `session.detection` does not show the record
-yet, because older clients cannot decode a new region kind. The Pi and Codex packages opt in
+yet, because older clients cannot decode a new region kind. The Pi, Codex and Claude packages opt in
 (see their own entries); the other official runtimes behave as
 before. See [runtime packages](guides/runtime-packages.md) and
 [sessions](concepts/sessions.md).

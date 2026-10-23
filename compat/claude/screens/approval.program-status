@@ -1,0 +1,5 @@
+app=claude-code:state=idle
+app=claude-code:state=working
+app=claude-code:state=done
+app=claude-code:state=working
+app=claude-code:state=blocked:kind=permission

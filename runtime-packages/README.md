@@ -43,7 +43,7 @@ Packages: [`pi`](pi) (Pi coding agent 1.x from 1.0.0; install steps in
 `docs/install.md`), [`codex`](codex) (Codex 0.x from 0.160.0, verified on 0.164.0; serves the reserved
 `codex` id only through the signed catalog that every Linux daemon archive ships
 since 0.34.2; see `docs/knowledge/guides/codex-package.md`),
-[`claude`](claude) (Claude Code 2.x from 2.1.289; serves the reserved `claude`
+[`claude`](claude) (Claude Code 2.x from 2.1.289, verified on 2.1.309; serves the reserved `claude`
 id only through the same signed catalog; see
 `docs/knowledge/guides/claude-package.md`) and [`hermes`](hermes) (Hermes Agent
 0.x from 0.20.0 with its operator plugin payload; serves the reserved `hermes` id only

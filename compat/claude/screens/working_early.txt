@@ -1,13 +1,10 @@
 
- ▐▛███▛█   Claude Code v2.1.289
+ ▐▛███▛█   Claude Code v2.1.309
 ▝▜██████▀  Sonnet 4.5 · API Usage Billing
- ▝▝   ▝▝   /tmp/ph-sample/work
+ ▝▝   ▝▝   /tmp/ph-sample/cwd
 
 
-❯ [hold] say hi
-
-
-
+❯ [hold] [stream-hold] say hi
 
 
 
@@ -16,9 +13,12 @@
 
 
 
-✻ Meandering… (0s · ↓ 2 tokens)
+
+
+
+· Billowing… (16s)
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 ❯
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-  ⏸ manual mode on · esc to interrupt · ← for agents
+  ⏸ manual mode on · esc to interrupt

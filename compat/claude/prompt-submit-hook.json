@@ -15,7 +15,7 @@
   ],
   "managed_hook_adds_no_context": true,
   "nested_claude_p_fires_with_its_own_process": true,
-  "release": "2.1.289",
+  "release": "2.1.309",
   "schema": 1,
   "task_subagent_own_prompt_fires": false
 }

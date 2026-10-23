@@ -1,5 +1,5 @@
 
-✻ Sautéed for 7s · done 3:37
+✻ Sautéed for 24s · done 3:52
   PM
 
 ❯ [approval] run it
@@ -17,8 +17,8 @@
  ❯ 1. Yes
    2. Yes, and always allow
       access to
-      /tmp/ph-sample/work from
-      this project
+      /tmp/ph-sample/cwd
+      from this project
    3. No
 
  Esc to cancel · Tab to amend

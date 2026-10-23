@@ -16,8 +16,8 @@
    2. Yes, and
       always allow
       access to
-      /tmp/ph-sample
-      /work from
+      /dev/shm/ph-cl
+      aude/cwd from
    3. Nois project
 
  Esc to cancel ·

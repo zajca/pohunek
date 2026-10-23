@@ -1,5 +1,5 @@
 
- /tmp/ph-sample/work
+ /tmp/ph-sample/cwd
 
  Quick safety check: Is this
  a project you created or one

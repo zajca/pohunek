@@ -1,8 +1,8 @@
 //! OSC 7501 program status through a real session: worker, PTY and registry.
 //!
-//! The official packages do not opt in yet, so the sessions here run a host
-//! profile over the official Claude package whose override manifest is the
-//! shipped Claude manifest plus a `[program_status]` table. The program is a
+//! The sessions here run a host profile over the official Claude package whose
+//! override manifest is the shipped Claude manifest with its `[program_status]`
+//! table set per scenario. The program is a
 //! POSIX shell stand-in for a probe-waiting agent: it prints the 7501 probe,
 //! waits for the worker's reply, draws a Claude prompt box and reports its
 //! state by raw records when it reads a command byte.
@@ -135,10 +135,27 @@ done
     )
 }
 
+/// The shipped Claude manifest with its `[program_status]` table replaced by one
+/// that sets `answer_probe` as the scenario needs.
 fn opted_in_manifest(answer_probe: bool) -> String {
+    let mut in_table = false;
     let shipped =
         std::fs::read_to_string(workspace_root().join("runtime-packages/claude/detect.toml"))
-            .expect("read the shipped Claude manifest");
+            .expect("read the shipped Claude manifest")
+            .lines()
+            .filter(|line| {
+                if line.trim() == "[program_status]" {
+                    in_table = true;
+                } else if in_table && line.trim().is_empty() {
+                    in_table = false;
+                }
+                !in_table
+            })
+            .fold(String::new(), |mut source, line| {
+                source.push_str(line);
+                source.push('\n');
+                source
+            });
     format!("{shipped}\n[program_status]\napp = \"{APP}\"\nanswer_probe = {answer_probe}\n")
 }
 

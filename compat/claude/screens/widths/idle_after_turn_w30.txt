@@ -1,20 +1,20 @@
 
            Claude Code
- ▐▛███▛█   v2.1.289
-▝▜██████▀  Sonnet 4.5
- ▝▝   ▝▝   API Usage Billing
-           /tmp/ph-sample/work
+           v2.1.309
+ ▐▛███▛█   Sonnet 4.5
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/shm/ph-claude/cw
+           d
 
 
-❯ [hold] say hi
+❯ [hold] [stream-hold] say hi
 
 ● working
 
   done
 
-✻ Sautéed for 7s · done 3:37
+✻ Sautéed for 24s · done 3:52
   PM
-
 
 
 

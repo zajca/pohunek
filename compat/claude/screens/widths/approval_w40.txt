@@ -1,7 +1,7 @@
 
   done
 
-✻ Sautéed for 7s · done 3:37 PM
+✻ Sautéed for 24s · done 3:52 PM
 
 ❯ [approval] run it
 
@@ -17,7 +17,7 @@
  Do you want to proceed?
  ❯ 1. Yes
    2. Yes, and always allow access to
-      /tmp/ph-sample/work from this
+      /tmp/ph-sample/cwd from this
       project
    3. No
 
