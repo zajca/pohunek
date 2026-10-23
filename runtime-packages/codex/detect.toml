@@ -1,4 +1,4 @@
-# Codex 0.160.0 activity manifest.
+# Codex 0.164.0 activity manifest.
 #
 # Codex reports its state through the terminal title, so the idle, working and
 # blocked rules read the title; the screen rules cover prompts that block the
@@ -13,8 +13,6 @@
 #   of an idle unnamed thread (`<spinner> | <project>`) is not a turn.
 # - osc_title_idle: any other non-empty title means idle. Idle is read from the
 #   absence of the spinner and of "Action Required", not from a title of its own.
-# - workspace_trust_prompt: the first-run trust dialog pinned at the top of the
-#   screen.
 # - folder_trust_prompt: the folder trust dialog Codex 0.160 shows for a
 #   working directory with a project-local .codex/config.toml.
 # - startup_update_prompt: the update popup Codex 0.160 draws over the screen
@@ -24,6 +22,20 @@
 #   startup_incompatible_settings_prompt: complete visible startup dialogs,
 #   captured at 80/160 columns in compat/codex/screens/startup-dialogs/.
 # - live_strong_blocker and weak_blocker: confirmation prompts on screen.
+# - background_terminals_idle: Codex reports `working` through OSC 7501 while a
+#   background terminal runs, with or without a turn. The footer `N background
+#   terminal(s) running` without the turn's working row is not a turn, so this
+#   rule reads idle over the record. The rule only takes part when the session
+#   reports program status (`[program_status]` below).
+#
+# Codex 0.163.0 and later report their state through OSC 7501 (root records
+# `state=<state>:app=codex`); older releases are read from the title and the
+# screen alone. Codex starts a turn's MCP servers before the turn: the title
+# spinner and the `Starting MCP servers` row read as working until startup
+# ends, which does not release a prompt held by `manifest_idle`.
+
+[program_status]
+app = "codex"
 
 [process]
 comm = ["^codex$"]
@@ -43,21 +55,6 @@ state = "working"
 priority = 1050
 region = "osc_title"
 regex = ['^[\x{2800}-\x{28FF}] [^|\s]']
-
-# The first-run workspace trust dialog is pinned at the top of the visible
-# screen. Require the exact question and both numbered choices so transcript
-# prose that merely discusses trusting a repository cannot trigger the rule.
-[[rules]]
-id = "workspace_trust_prompt"
-state = "blocked"
-priority = 1000
-region = "top_non_empty_lines(8)"
-visible_blocker = true
-all = [
-  { line_regex = ['(?i)^\s*(?:do you )?trust (?:the contents of this directory|this repository)\?\s*$'] },
-  { line_regex = ['(?i)^\s*(?:›|❯)?\s*1\.\s*yes\b'] },
-  { line_regex = ['(?i)^\s*2\.\s*no\b'] },
-]
 
 # The complete folder dialog can occupy 28 nonempty lines at 20 columns.
 # Require its heading at the start of the bounded region, its question and
@@ -153,7 +150,6 @@ any = [
   { contains = ["press enter to confirm or esc to cancel"] },
   { contains = ["enter to submit answer"] },
   { contains = ["enter to submit all"] },
-  { contains = ["allow command?"] },
 ]
 
 [[rules]]
@@ -163,10 +159,23 @@ priority = 600
 region = "whole_recent"
 any = [
   { contains = ["[y/n]"] },
-  { contains = ["yes (y)"] },
   { contains = ["do you want to"], any = [{ contains = ["yes"] }, { contains = ["❯"] }] },
   { contains = ["would you like to"], any = [{ contains = ["yes"] }, { contains = ["❯"] }] },
 ]
+
+# The footer of a background terminal is a line of its own below the transcript;
+# the working row of a running turn carries the same words after its interrupt
+# hint, so the row's elapsed-time group tells a turn from a background-only
+# state. The footer is truncated, not wrapped, at narrow widths: `1 background
+# termi` is the shortest captured form.
+[[rules]]
+id = "background_terminals_idle"
+state = "idle"
+priority = 650
+region = "bottom_non_empty_lines(8)"
+overrides_program_status = true
+line_regex = ['^\s*\d+ background term']
+not = { regex = ['\((?:\d+h \d{2}m \d{2}s|\d+m \d{2}s|\d+s) • (?:[^()]*to interr|esc)'] }
 
 [[rules]]
 id = "osc_title_idle"

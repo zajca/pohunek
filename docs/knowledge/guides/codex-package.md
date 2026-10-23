@@ -2,7 +2,7 @@
 type: Guide
 id: guide/codex-package
 title: Codex runtime package
-description: The official Codex runtime package source (Codex 0.160.0 and later 0.x releases), the only source of the codex runtime, what it declares and keeps equal to the built-in Codex runtime of release 0.34.2, what was verified against a real Codex, and the gaps found.
+description: The official Codex runtime package source (Codex 0.x releases from 0.160.0, verified on 0.164.0), the only source of the codex runtime, what it declares and keeps equal to the built-in Codex runtime of release 0.34.2, what was verified against a real Codex, and the gaps found.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
@@ -85,14 +85,15 @@ copies of that descriptor and its detection manifest in
   [runtime packages](runtime-packages.md#declaring-input-readiness).
 - Version: `version_probe = { parser = "semver-line-v1", args = ["--version"],
   min = "0.160.0", below = "1.0.0", line = "codex-cli {version}" }`. `codex
-  --version` prints `codex-cli 0.160.0` on standard output; the probe reads only
+  --version` prints `codex-cli 0.164.0` on standard output; the probe reads only
   that first line, so the `WARNING: proceeding, even though we could not create
   PATH aliases` line Codex writes to standard error when its home is under a
   temporary directory is ignored. A pre-release (`codex-cli 0.161.0-rc.1`) or
   any other wording is unsupported. The range is a lower bound: `min` is the
-  release that was verified and `below` is the next major, because hosts update
-  the Codex CLI independently of pohunek and a refused launch breaks every Codex
-  session. Releases above 0.160.0 are accepted by policy, not verified.
+  previous verified release, whose captures stay in `compat/codex/screens/n-1`,
+  and `below` is the next major, because hosts update the Codex CLI
+  independently of pohunek and a refused launch breaks every Codex session.
+  Releases above 0.164.0 are accepted by policy, not verified.
 - Native reference: `strategy = "hook"`; resume is `codex resume <id>`; fork is
   unsupported.
 - Integration: handler `codex-hook-v1` with hook schema `identity-subagent-v1`.
@@ -110,31 +111,82 @@ copies of that descriptor and its detection manifest in
   alternating `[ . ]`) means `blocked` and outranks `working`; any other
   non-blank title means `idle`, read from the absence of a spinner and of
   `Action Required` rather than from a title of its own. Screen rules cover
-  prompts that block the turn: the first-run workspace trust dialog at the top
-  of the screen, the startup update popup (`startup_update_prompt`, below),
+  prompts that block the turn: the folder trust dialog at the top of the
+  screen, the startup update popup (`startup_update_prompt`, below),
   the confirmation lines Codex prints after its last prompt
   marker (`press enter to confirm or esc to cancel`, `enter to submit answer`,
-  `enter to submit all`, `allow command?`) and the weaker `[y/n]`-style prompts
+  `enter to submit all`) and the weaker `[y/n]`-style prompts
   anywhere in the recent screen.
+- Program status: the manifest declares `[program_status] app = "codex"`.
+  Codex 0.163.0 and later write OSC 7501 root records
+  (`state=idle|working|blocked|done|error`, `app=codex`, `kind` with
+  `blocked`) whenever stdout is a terminal, so the package never answers a
+  probe (no `answer_probe`) and a session needs no setup. The detector holds
+  the latest record and arbitrates it with the title and screen rules (see
+  [runtime packages](runtime-packages.md)): a visible dialog beats a
+  `working`, `done`, `idle` or `error` record, a `blocked` record blocks, a
+  held `done` or `idle` beats a stale spinner title, and the record's
+  `working` stands over an idle title. `done` turns into `idle` on the next
+  key press; both read idle, so that change is no transition. `error` reads
+  idle. Codex 0.160.0 to 0.162.x emit no records and read from the title and
+  the screen alone. A record never releases the initial prompt: `manifest_idle`
+  still waits for the title or the screen.
+- **Background terminals.** Codex reports `working` while a background
+  terminal runs, also after the turn ended. The rule `background_terminals_idle`
+  (priority 650, `overrides_program_status`) reads idle for the footer
+  `N background terminal(s) running · /ps to view · /stop to close` when the
+  working row of a running turn is not on screen, so a dev server left running
+  does not keep the turn open. The footer is truncated, not wrapped, at narrow
+  widths (`1 background termi` at 20 and 30 columns); the rule matches
+  `N background term`. While a turn runs the footer joins the working row and
+  the row's `(Ns • esc to interrupt)` group gates the rule off. A goal that
+  continues between turns, and the window between Enter and the server's
+  acknowledgement (idle title, no row, no footer), read `working` from the
+  record.
+- **MCP startup.** The title spinner and the `Starting MCP servers` row show
+  working while MCP servers start, before any turn; the record is `working`
+  too. Readiness is unaffected: `manifest_idle` reads the title and the screen.
+- **Known limits.** A forged record can set working or idle when no dialog is
+  visible, as forged titles and screen text can. After a daemon adoption whose
+  output ring was evicted the record is lost until Codex writes the next one;
+  a same-owner manifest refresh drops the held record the same way. Under GNU
+  Screen (`STY` set) Codex 0.164 writes ASCII spinner glyphs in the title; the
+  record is unaffected.
 
-## Verified against a real Codex 0.160.0
+## Verified against a real Codex 0.164.0
 
 The screens in `compat/codex/screens/` (named screens at 100 columns, widths 20
 to 200 in `widths/`, each with the OSC title Codex had set in a `.title` file)
-were captured from a real interactive Codex in a PTY with a fresh `CODEX_HOME`,
-a loopback Responses stub as the model provider, no credential, and no network
-(a network namespace with only loopback). They cover the idle screen, a turn
-held before its first output (`Working (2s • esc to interrupt)`), a streaming
-reply, the screen after a turn, a tool approval prompt (`Would you like to run
-the following command?`), a question prompt (`request_user_input`), the
-first-run folder dialog, and the sign-in screen. `crates/cli/tests/codex_package.rs`
-classifies every one of them through the package manifest.
+were captured from a real interactive Codex 0.164.0 in a PTY with a fresh
+`CODEX_HOME`, a loopback Responses stub as the model provider, no credential,
+and no network (a network namespace with only loopback). They cover the idle
+screen, a turn held before its first output (`Working (0s • esc to
+interrupt)`), a streaming reply, the screen after a turn, a tool approval
+prompt (`Would you like to run the following command?`) and, in
+`background/`, a background terminal that outlives its turn. The
+`*.program-status` files beside them are the ordered, de-duplicated OSC 7501
+root records of the same runs (`capture_the_real_codex_screens` and
+`capture_the_real_codex_background_terminal_screens` write the screens and the
+sequences; `POHUNEK_CODEX_CAPTURE_DIR` names the output directory). The
+captures run in the alternate screen: Codex enters it (`ESC [ ? 1049 h`) by
+default. The question prompt, the sign-in screen, the first-run folder dialog,
+the startup dialogs and the update popup could not be recaptured on 0.164.0
+(no stub marker reaches them, or no newer release exists to announce); they are
+the captures of 0.160.0 in `compat/codex/screens/n-1`, `startup-dialogs` and
+`update-popup`, as are the 0.160.0 versions of every screen above.
+`crates/cli/tests/codex_package.rs` classifies every one of them, of both
+releases, through the package manifest. After a turn Codex 0.164.0 shows no
+selection popup with the hermetic configuration, and the next input reaches the
+composer.
 
 - Title rules: idle, working and blocked are read from the title at every
-  captured width; the screen text has no working or idle rule.
-- Screen rules: the approval and question prompts are blocked from the screen
-  text alone at 30 columns and wider. At 20 columns the confirmation line wraps
-  and only the title says blocked.
+  captured width; the screen text has no working or idle rule, apart from the
+  background-terminal footer above.
+- Screen rules: the 0.164.0 approval prompt is blocked from the screen text
+  alone at every captured width except 30, where the question and the
+  confirmation line scroll out of the 24 rows; there only the title and the
+  record say blocked. The 0.160.0 approval and question prompts are blocked
+  from the screen text alone at 30 columns and wider.
 - `codex resume <id>` against a fresh home restores the conversation from
   Codex's own session store (checked by hand; the id is the one in
   `sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl`).
@@ -179,8 +231,9 @@ classifies every one of them through the package manifest.
   carries a project-local `.codex/config.toml`. The `folder_trust_prompt`
   requires `Folder access` at the beginning of the top 32 nonempty lines,
   the question and both complete choices, allowing line wrapping. Real
-  captures cover 20/30/80/160 columns. The older `workspace_trust_prompt`
-  wording remains unchanged. Quoted transcripts and incomplete dialogs do
+  captures cover 20/30/80/160 columns. The older `Do you trust the contents of
+  this directory?` wording, `allow command?` and `yes (y)` appear in no release
+  since 0.160.0 and have no rule. Quoted transcripts and incomplete dialogs do
   not establish these blockers.
 - **These rules recognize visible dialogs, not completed startup.** The held
   dialogs set no title; a stale idle title in regressions is synthetic.
@@ -221,7 +274,7 @@ classifies every one of them through the package manifest.
   the pohunek log directory (see the
   [debug-session-runtime](../runbooks/debug-session-runtime.md) runbook).
 - **Process forms.** The helper process has kernel name `codex` too, so the
-  matchers accept it. An npm install (`@openai/codex@0.160.0`) launches the tree
+  matchers accept it. An npm install (`@openai/codex@0.164.0`) launches the tree
   `node …/@openai/codex/bin/codex.js` (the launched process), the native
   `…/vendor/x86_64-unknown-linux-musl/bin/codex` below it, and the `codex
   app-server` below that; a native package install has no launcher. The
@@ -232,10 +285,11 @@ classifies every one of them through the package manifest.
 ## Not verified
 
 The compaction and retry screens, the `PermissionRequest`, `Stop` and subagent
-hooks, a Codex that starts in the alternate screen, terminals narrower than 20
+hooks, a Codex with `tui.animations = false` or a `tui.terminal_title` without
+`activity` (the record still reports), terminals narrower than 20
 columns, macOS and Windows, a real-network run (the real-Codex tests switch off
 update checks, analytics, plugin sync and connectors but do not prove the
-absence of egress), and the older folder-dialog wording the rule still names.
+absence of egress).
 
 ## How the package is kept honest
 
@@ -303,9 +357,12 @@ absence of egress), and the older folder-dialog wording the rule still names.
   --include-ignored --test-threads 1 codex_package::`; without the variable and a `codex` on
   `PATH` they fail by name instead of skipping.
 - The `codex-package` CI job installs exactly the locked release from npm
-  (`@openai/codex@0.160.0`), builds the archive with `cargo xtask package build`
+  (`@openai/codex@0.164.0`), builds the archive with `cargo xtask package build`
   and runs that file.
 
-Update procedure for a new Codex release: install it, rerun the real-Codex
-tests, recapture the screens if the interface changed, move the lock and the
-descriptor's `min`/`below` together, and bump the package `version`.
+Update procedure for a new Codex release: install it from the locked npm tree,
+rerun the real-Codex tests, recapture the screens and program-status sequences
+with `POHUNEK_CODEX_CAPTURE_DIR` (in a network namespace with only loopback),
+move the previous captures to `compat/codex/screens/n-1` (the older set is
+deleted and `min` raised to the previous release), move the lock and the
+descriptor's `below` together, and bump the package `version`.

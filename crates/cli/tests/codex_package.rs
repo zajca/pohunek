@@ -424,7 +424,8 @@ const UPDATE_POPUP_RULE: &str = "startup_update_prompt";
 fn the_package_manifest_preserves_builtin_rules_and_adds_startup_dialog_rules() {
     let package = read_toml(&format!("{PACKAGE_DIR}/detect.toml"));
     let golden_text = golden_body(GOLDEN_MANIFEST, BUILTIN_MANIFEST);
-    let golden: toml::Table = golden_text.parse().expect("the golden is TOML");
+    let mut golden: toml::Table = golden_text.parse().expect("the golden is TOML");
+    drop_dead_strings(&mut golden);
     let mut builtin_rules = package.clone();
     builtin_rules
         .get_mut("rules")
@@ -439,9 +440,11 @@ fn the_package_manifest_preserves_builtin_rules_and_adds_startup_dialog_rules() 
                         | "startup_login_prompt"
                         | "startup_api_key_prompt"
                         | "startup_incompatible_settings_prompt"
+                        | BACKGROUND_RULE
                 )
             )
         });
+    builtin_rules.remove("program_status");
     // The package deliberately diverges from the built-in copy in one rule: the
     // working title must name a thread or project after the spinner, so the
     // title-generation placeholder of an idle unnamed thread (`⠴ | cxw`) is not
@@ -486,7 +489,6 @@ fn the_package_manifest_preserves_builtin_rules_and_adds_startup_dialog_rules() 
         [
             "osc_title_blocked",
             "osc_title_working",
-            "workspace_trust_prompt",
             FOLDER_TRUST_RULE,
             "startup_login_prompt",
             "startup_api_key_prompt",
@@ -494,9 +496,36 @@ fn the_package_manifest_preserves_builtin_rules_and_adds_startup_dialog_rules() 
             UPDATE_POPUP_RULE,
             "live_strong_blocker",
             "weak_blocker",
+            BACKGROUND_RULE,
             "osc_title_idle",
         ]
     );
+}
+
+/// Rule the package adds to the golden built-in manifest: a background
+/// terminal without a running turn reads idle over a working program-status
+/// record.
+const BACKGROUND_RULE: &str = "background_terminals_idle";
+
+/// The golden built-in manifest without the strings Codex never draws: the
+/// `workspace_trust_prompt` rule, `allow command?` and `yes (y)`.
+fn drop_dead_strings(golden: &mut toml::Table) {
+    let rules = golden
+        .get_mut("rules")
+        .and_then(toml::Value::as_array_mut)
+        .expect("rules");
+    rules.retain(|rule| rule["id"].as_str() != Some("workspace_trust_prompt"));
+    for rule in rules.iter_mut() {
+        let Some(any) = rule.get_mut("any").and_then(toml::Value::as_array_mut) else {
+            continue;
+        };
+        any.retain(|matcher| {
+            !matches!(
+                matcher["contains"][0].as_str(),
+                Some("allow command?" | "yes (y)")
+            )
+        });
+    }
 }
 
 #[test]
@@ -995,34 +1024,25 @@ fn dialog(lines: &[&str]) -> Vec<String> {
     lines.iter().map(|line| (*line).to_owned()).collect()
 }
 
+/// The `Do you trust the contents of this directory?` wording is not in the
+/// source of any supported Codex release; the folder dialog has its own rule.
 #[test]
-fn the_workspace_trust_rule_matches_its_dialog_at_the_top_of_the_screen_only() {
+fn the_retired_workspace_trust_wording_is_not_a_blocker() {
     let definition = installed_definition();
-    let trust = [
-        "Do you trust the contents of this directory?",
-        "\u{203a} 1. Yes, continue",
-        "  2. No, quit",
-    ];
-    assert_eq!(
-        screen_activity(&definition, &dialog(&trust), 80),
-        Some(AgentActivity::Blocked)
-    );
-    let repository = ["  Do you trust this repository?", "  1. Yes", "  2. No"];
-    assert_eq!(
-        screen_activity(&definition, &dialog(&repository), 80),
-        Some(AgentActivity::Blocked)
-    );
-
-    // Prose in a transcript that discusses trust is not the dialog: the rule
-    // needs the question and both choices, in the first eight lines.
-    let prose = [
-        "Do you trust the contents of this directory?",
-        "I would answer yes.",
-    ];
-    assert_eq!(screen_activity(&definition, &dialog(&prose), 80), None);
-    let mut buried = vec![String::from("line"); 9];
-    buried.extend(dialog(&trust));
-    assert_eq!(screen_activity(&definition, &buried, 80), None);
+    for dialog_lines in [
+        &[
+            "Do you trust the contents of this directory?",
+            "\u{203a} 1. Yes, continue",
+            "  2. No, quit",
+        ][..],
+        &["  Do you trust this repository?", "  1. Yes", "  2. No"],
+    ] {
+        assert_eq!(
+            screen_activity(&definition, &dialog(dialog_lines), 80),
+            None,
+            "{dialog_lines:?}"
+        );
+    }
 }
 
 #[test]
@@ -1934,7 +1954,6 @@ fn the_confirmation_rules_read_the_text_after_the_last_prompt_marker() {
         "Press enter to confirm or esc to cancel",
         "tab to add notes | enter to submit answer | esc to interrupt",
         "enter to submit all",
-        "Allow command? 1. Yes",
     ] {
         let live = dialog(&["\u{203a} do it", phrase]);
         assert_eq!(
@@ -1950,6 +1969,9 @@ fn the_confirmation_rules_read_the_text_after_the_last_prompt_marker() {
             "{phrase} before the newest prompt"
         );
     }
+    // Codex 0.160 and later never draw this prompt.
+    let removed = dialog(&["\u{203a} do it", "Allow command? 1. Yes"]);
+    assert_eq!(screen_activity(&definition, &removed, 80), None);
 }
 
 #[test]
@@ -1957,7 +1979,6 @@ fn the_weak_blocker_phrases_block_anywhere_in_the_recent_screen() {
     let definition = installed_definition();
     for screen in [
         &["Apply the patch? [y/n]"][..],
-        &["Run it: yes (y)"],
         &["Do you want to proceed?", "\u{276f} 1. Yes"],
         &["Would you like to continue?", "yes or no"],
     ] {
@@ -1969,6 +1990,7 @@ fn the_weak_blocker_phrases_block_anywhere_in_the_recent_screen() {
     }
     for screen in [
         &["Do you want to proceed?"][..],
+        &["Run it: yes (y)"],
         &["would you like"],
         &["nothing to see"],
     ] {
@@ -2116,16 +2138,9 @@ fn the_package_manifest_behaves_like_the_builtin_manifest_on_every_frame() {
             compared += 1;
         }
     }
-    let synthetic: [&[&str]; 9] = [
-        &[
-            "Do you trust the contents of this directory?",
-            "1. Yes, continue",
-            "2. No",
-        ],
-        &["Do you trust this repository?", "1. Yes", "2. No"],
+    let synthetic: [&[&str]; 6] = [
         &["\u{203a} go", "Press enter to confirm or esc to cancel"],
         &["\u{203a} go", "enter to submit answer"],
-        &["\u{203a} go", "allow command?"],
         &["[y/n]"],
         &["Do you want to proceed?", "\u{276f} 1. Yes"],
         &["Would you like to go on?", "yes"],
@@ -4671,3 +4686,293 @@ async fn capture_the_real_codex_background_terminal_screens() {
 
 /// Text of the footer Codex shows while a background terminal runs.
 const BACKGROUND_FOOTER_MARK: &str = "background terminal";
+
+// Program-status (OSC 7501) arbitration over screens captured from a real
+// Codex. Time is a virtual `Instant`: nothing here sleeps.
+
+/// Virtual time between two evidence steps.
+const STEP: Duration = Duration::from_millis(10);
+
+/// Virtual time the debounce needs to confirm an idle or blocked candidate.
+const SETTLE_STEP: Duration = Duration::from_millis(100);
+
+/// Settling ticks after which every debounced candidate has published.
+const SETTLE_TICKS: u32 = 12;
+
+/// Directory of the background-terminal captures.
+const BACKGROUND_SCREENS_DIR: &str = "compat/codex/screens/background";
+
+/// A detector over the package manifest and a virtual clock.
+struct ProgramStatusRun {
+    detector: Detector,
+    now: Instant,
+    published: Vec<(AgentActivity, StateSource)>,
+}
+
+impl ProgramStatusRun {
+    fn new(columns: u16) -> Self {
+        let now = Instant::now();
+        let definition = installed_definition();
+        let mut detector = detector_for(definition.manifest(), now, columns);
+        detector.finish_initial_input();
+        Self {
+            detector,
+            now,
+            published: Vec::new(),
+        }
+    }
+
+    fn note(&mut self, seen: Vec<ActivityTransition>) {
+        for transition in seen {
+            let change = (transition.activity, transition.source);
+            if self.published.last() != Some(&change) {
+                self.published.push(change);
+            }
+        }
+    }
+
+    fn settle(&mut self) {
+        for _ in 0..SETTLE_TICKS {
+            self.now += SETTLE_STEP;
+            let seen = self.detector.tick(self.now);
+            self.note(seen);
+        }
+    }
+
+    /// Feeds one chunk and lets the debounce settle.
+    fn feed(&mut self, bytes: &[u8]) -> &mut Self {
+        self.now += STEP;
+        let seen = self.detector.feed(self.now, bytes);
+        self.note(seen);
+        self.settle();
+        self
+    }
+
+    /// Feeds a root record of Codex.
+    fn record(&mut self, state: &str) -> &mut Self {
+        self.feed(format!("\x1b]7501;state={state}:app=codex\x1b\\").as_bytes())
+    }
+
+    /// The activity and source of the latest published transition.
+    fn activity(&self) -> Option<(AgentActivity, StateSource)> {
+        self.published.last().copied()
+    }
+}
+
+/// A captured screen of `directory`, as the terminal receives it.
+fn captured_bytes(directory: &str, name: &str) -> Vec<u8> {
+    let frame = load_frame(
+        &workspace_root().join(directory),
+        false,
+        name,
+        name,
+        DEFAULT_COLUMNS,
+    );
+    frame_bytes(frame.title.as_deref(), &frame.rows)
+}
+
+const WORKING_BY_RECORD: Option<(AgentActivity, StateSource)> =
+    Some((AgentActivity::Working, StateSource::OscProgress));
+const IDLE_BY_RECORD: Option<(AgentActivity, StateSource)> =
+    Some((AgentActivity::Idle, StateSource::OscProgress));
+const BLOCKED_BY_RECORD: Option<(AgentActivity, StateSource)> =
+    Some((AgentActivity::Blocked, StateSource::OscProgress));
+
+/// The run reads working, from the title or from the record.
+fn assert_working(run: &ProgramStatusRun) {
+    assert_eq!(
+        run.activity().map(|(activity, _source)| activity),
+        Some(AgentActivity::Working),
+        "{:?}",
+        run.published
+    );
+}
+
+/// A6: a background terminal with no turn running reads idle although the
+/// record says working.
+#[test]
+fn a_background_terminal_after_the_turn_reads_idle_although_the_record_works() {
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&captured_bytes(
+        BACKGROUND_SCREENS_DIR,
+        "background_terminal",
+    ))
+    .record("working");
+    assert_eq!(
+        run.activity(),
+        Some((AgentActivity::Idle, StateSource::Screen)),
+        "{:?}",
+        run.published
+    );
+}
+
+/// A6 at every captured width: the footer is truncated, not wrapped.
+#[test]
+fn the_background_terminal_footer_overrides_the_record_at_every_captured_width() {
+    for columns in capture::CAPTURE_WIDTHS {
+        let mut run = ProgramStatusRun::new(columns);
+        run.feed(&captured_bytes(
+            &format!("{BACKGROUND_SCREENS_DIR}/widths"),
+            &format!("background_terminal_w{columns}"),
+        ))
+        .record("working");
+        assert_eq!(
+            run.activity(),
+            Some((AgentActivity::Idle, StateSource::Screen)),
+            "{columns} columns: {:?}",
+            run.published
+        );
+    }
+}
+
+/// A7: during a turn the working row and the braille title keep the record's
+/// working, although the same footer is on screen.
+#[test]
+fn a_turn_with_a_background_terminal_footer_stays_working() {
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&captured_bytes(
+        BACKGROUND_SCREENS_DIR,
+        "background_terminal_early",
+    ))
+    .record("working");
+    assert_working(&run);
+}
+
+/// A7 without the title animation: the working row alone, with an idle title,
+/// is not a background-only state.
+#[test]
+fn the_working_row_keeps_working_when_the_title_does_not_animate() {
+    let frame = load_frame(
+        &workspace_root().join(BACKGROUND_SCREENS_DIR),
+        false,
+        "background_terminal_early",
+        "background_terminal_early",
+        DEFAULT_COLUMNS,
+    );
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&frame_bytes(Some("work"), &frame.rows))
+        .record("working");
+    assert_eq!(run.activity(), WORKING_BY_RECORD, "{:?}", run.published);
+}
+
+/// A8 and A10: Enter written and not yet acknowledged, or an active goal
+/// between turns, shows an idle title, no row and no footer. The record's
+/// working stands.
+#[test]
+fn a_working_record_over_an_idle_composer_reads_working() {
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&captured_bytes(SCREENS_DIR, "idle"))
+        .record("working");
+    assert_eq!(run.activity(), WORKING_BY_RECORD, "{:?}", run.published);
+}
+
+/// A1/A4/A9: done, then idle after a key press, is one idle reading; a stale
+/// spinner title does not outrank a held done.
+#[test]
+fn done_and_idle_records_read_idle_and_beat_a_stale_spinner_title() {
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&captured_bytes(SCREENS_DIR, "working_stream"))
+        .record("working");
+    assert_working(&run);
+    run.record("done");
+    assert_eq!(run.activity(), IDLE_BY_RECORD, "{:?}", run.published);
+    let after_done = run.published.len();
+    run.record("idle");
+    assert_eq!(
+        run.published.len(),
+        after_done,
+        "done followed by idle is no transition: {:?}",
+        run.published
+    );
+}
+
+/// A2: a visible startup dialog beats a non-blocked record.
+#[test]
+fn a_visible_dialog_beats_a_working_or_idle_record() {
+    for state in ["working", "idle"] {
+        let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+        run.feed(&captured_bytes(PREVIOUS_SCREENS_DIR, "trust"))
+            .record(state);
+        assert_eq!(
+            run.activity(),
+            Some((AgentActivity::Blocked, StateSource::Screen)),
+            "{state}: {:?}",
+            run.published
+        );
+    }
+}
+
+/// A3: a blocked record blocks over an idle screen.
+#[test]
+fn a_blocked_record_blocks_over_an_idle_screen() {
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&captured_bytes(SCREENS_DIR, "idle"))
+        .feed(b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\");
+    run.settle();
+    assert_eq!(run.activity(), BLOCKED_BY_RECORD, "{:?}", run.published);
+}
+
+/// A5: a weak blocker in the transcript does not hide a working record.
+#[test]
+fn a_weak_blocker_in_the_transcript_does_not_hide_a_working_record() {
+    let mut rows = load_frame(
+        &workspace_root().join(SCREENS_DIR),
+        false,
+        "working_stream",
+        "working_stream",
+        DEFAULT_COLUMNS,
+    )
+    .rows;
+    rows[4] = "  Proceed with the migration? [y/n]".to_owned();
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&frame_bytes(Some("work"), &rows))
+        .record("working");
+    assert_eq!(run.activity(), WORKING_BY_RECORD, "{:?}", run.published);
+}
+
+/// The row that tells a turn from a background-only footer never appears on
+/// the idle or after-turn captures, at any width of either release set.
+#[test]
+fn the_background_terminal_override_never_fires_on_a_screen_without_the_footer() {
+    for frame in top_level_frames().into_iter().chain(width_frames()) {
+        if !matches!(frame.meaning(), Meaning::Idle) {
+            continue;
+        }
+        let mut run = ProgramStatusRun::new(frame.columns);
+        run.feed(&frame_bytes(frame.title.as_deref(), &frame.rows))
+            .record("working");
+        assert_eq!(
+            run.activity(),
+            WORKING_BY_RECORD,
+            "{}: {:?}",
+            frame.name,
+            run.published
+        );
+    }
+}
+
+/// A footer line next to the working row of a running turn is no
+/// background-only state: the row's elapsed-time group gates the override off.
+#[test]
+fn a_footer_line_next_to_the_working_row_does_not_override_the_record() {
+    let mut rows = load_frame(
+        &workspace_root().join(SCREENS_DIR),
+        false,
+        "working_early",
+        "working_early",
+        DEFAULT_COLUMNS,
+    )
+    .rows;
+    assert!(
+        rows.iter().any(|row| row.contains(WORKING_ROW_MARK)),
+        "the capture shows the working row: {rows:#?}"
+    );
+    rows.insert(
+        rows.len() - 3,
+        "  1 background terminal running \u{b7} /ps to view \u{b7} /stop to close".to_owned(),
+    );
+    let mut run = ProgramStatusRun::new(DEFAULT_COLUMNS);
+    run.feed(&frame_bytes(Some("work"), &rows))
+        .record("working");
+    assert_eq!(run.activity(), WORKING_BY_RECORD, "{:?}", run.published);
+}
