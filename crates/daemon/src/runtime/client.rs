@@ -22,6 +22,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 /// Prefix for daemon-generated, producer-scoped control input identifiers.
 const INPUT_WRITE_ID_PREFIX: &str = "input";
+/// Prefix for the resize source identifier of a controller lease.
+const RESIZE_SOURCE_ID_PREFIX: &str = "daemon-resize";
 /// Maximum wait for the worker's attach readiness frame.
 ///
 /// The frame follows a redeemed one-use token and requires no user input, so a
@@ -803,20 +805,25 @@ impl Worker {
         })
     }
 
-    /// Applies an ordered PTY resize.
+    /// Applies a PTY resize ordered by `sequence` within the current controller
+    /// lease.
+    ///
+    /// The worker compares sequences per source id for its whole life, so the
+    /// source id names the lease the request travels on: a daemon that adopts
+    /// the worker later numbers its resizes from the start under a new lease.
     ///
     /// # Errors
     ///
     /// Returns [`WorkerError`] for unavailable runtime or worker rejection.
     pub async fn resize(
         &self,
-        source_id: StreamId,
         sequence: u64,
         dimensions: Dimensions,
     ) -> Result<DimensionUpdate, WorkerError> {
         let order = Arc::clone(&self.dimension_order).lock_owned().await;
         let mut inner = self.inner.lock().await;
         let scope = scope(&inner)?;
+        let source_id = resize_source_id(&inner.lease_id)?;
         let response = request_locked(
             &mut inner,
             self.next_request_id("resize")?,
@@ -1566,6 +1573,11 @@ async fn read_ordered_attach_ready(
 
 fn input_write_id(lease_id: &LeaseId, sequence: u64) -> Result<WriteId, WorkerError> {
     WriteId::new(format!("{INPUT_WRITE_ID_PREFIX}-{lease_id}-{sequence}"))
+        .map_err(|error| WorkerError::Protocol(error.to_string()))
+}
+
+fn resize_source_id(lease_id: &LeaseId) -> Result<StreamId, WorkerError> {
+    StreamId::new(format!("{RESIZE_SOURCE_ID_PREFIX}-{lease_id}"))
         .map_err(|error| WorkerError::Protocol(error.to_string()))
 }
 

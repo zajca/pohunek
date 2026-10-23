@@ -1031,16 +1031,10 @@ async fn handle_request(
             .await
         }
         RequestKind::AcquireController {
-            daemon_instance_id,
+            daemon_instance_id: daemon_id,
             challenge,
-            requested_capabilities,
-        } => acquire_request(
-            shared,
-            connection,
-            &daemon_instance_id,
-            &challenge,
-            &requested_capabilities,
-        ),
+            requested_capabilities: requested,
+        } => acquire_request(shared, connection, &daemon_id, &challenge, &requested).await,
         RequestKind::Inspect { lease_id } => inspect_request(shared, connection, &lease_id).await,
         RequestKind::Initialize {
             lease_id,
@@ -1164,7 +1158,7 @@ async fn negotiate_request(
     })
 }
 
-fn acquire_request(
+async fn acquire_request(
     shared: &Shared,
     connection: &mut Connection,
     daemon_id: &DaemonId,
@@ -1197,6 +1191,12 @@ fn acquire_request(
         .lease
         .acquire(owner.clone(), lease_id.to_string())
         .map_err(lease_control_error)?;
+    // Leases are exclusive and never stolen, so resize ordering means nothing
+    // across them; the map would otherwise gain an entry per daemon restart.
+    let pty = shared.state.lock().await.pty.clone();
+    if let Some(pty) = pty {
+        pty.clear_resize_sources().await;
+    }
     let selected = connection.selected_version.ok_or_else(identity_mismatch)?;
     let granted_capabilities = capabilities(selected)
         .into_iter()

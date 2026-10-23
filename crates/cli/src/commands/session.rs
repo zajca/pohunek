@@ -1473,7 +1473,10 @@ pub(crate) async fn run_resize(
             crate::commands::render_json_with_v3_identity(method::SESSION_RESIZE, &result)?
         );
     } else {
-        println!("resized {} to {cols}x{rows}", target.session_id);
+        println!(
+            "resized {} to {}x{}",
+            target.session_id, result.session.cols, result.session.rows
+        );
     }
     Ok(())
 }

@@ -466,7 +466,11 @@ the sweep. The CLI flag is
 `--worker-instance-id`.
 The worker owns the PTY master, root child handle, reader and reaper, bounded raw
 output ring, terminal tracker, input deduplication, resize sequencing, and final
-outcome. The daemon owns the stable session id, launch snapshot, project and
+outcome. Resize sources are scoped to the controller lease (`daemon-resize-<lease id>`),
+so a resize ordering never spans a daemon restart: a replacement daemon numbers
+its resizes from the start under its own lease and the worker applies them. The
+daemon logs a warning when the dimensions a worker reports differ from the ones
+requested. The daemon owns the stable session id, launch snapshot, project and
 worktree association, native recovery reference, desired state, and lifecycle
 transaction.
 

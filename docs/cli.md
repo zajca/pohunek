@@ -107,7 +107,7 @@ cannot be pinned: the operation fails before its first connection with
 | `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing; use `--stdin` for non-argv input. `--until <activity>` (repeatable) and `--timeout <ms>` wait for the agent's reaction in the same call; `--until working` confirms that the agent started on the input (`submitted: true`), by activity or, on a Claude session, by the prompt-submit hook (`prompt_accepted: true`). |
 | `pohunek session screen <target>` | Read the current rendered terminal; `--json` preserves runtime identity, watermark, geometry, cursor, and visible lines. A stopped or finished session answers `session_terminal_unavailable`. |
 | `pohunek session read <target> [--source <source>] [--lines <n>] [--format <format>] [--json]` | Read a bounded terminal capture; the source defaults to the current visible screen. |
-| `pohunek session resize <target> --cols <n> --rows <n> [--json]` | Resize a managed session terminal. |
+| `pohunek session resize <target> --cols <n> --rows <n> [--json]` | Resize a managed session terminal; prints the size the worker applied. |
 | `pohunek session metadata <target> [--set k=v] [--clear k] [--json]` | Merge or clear owner-controlled session metadata (both flags repeat). |
 | `pohunek session runtime-inventory [--json]` | List the durable worker runtime endpoints of the host. |
 | `pohunek session policy get [--json]` | Show the session retention policy and the idle-stop default (`idle_stop_after`, `not supported by this daemon` on a daemon that predates it). With `--json` the result carries `retention` and, from a daemon that serves it, `idle_stop`. |

@@ -251,6 +251,9 @@ async fn the_daemon_starts_on_a_newer_minor_file_and_warns_per_key() {
     assert!(!logged.contains(UNKNOWN_KEY_SECRET), "{logged}");
 }
 
+/// Column counts of the resizes each session gets before the first restart.
+const RESIZES_BEFORE_RESTART_COLS: [u16; 2] = [90, 91];
+
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(
     target_os = "linux",
@@ -269,6 +272,23 @@ async fn two_workers_survive_graceful_restart_and_sigkill() {
     }
     let jobs = sorted_ids(&before);
     assert_eq!(fixture.job_ids().await, jobs, "one job per session");
+
+    // Each worker records the highest resize sequence it accepted from this
+    // daemon; the resizes after the restarts must not be ordered against it.
+    let mut resizer = fixture.client().await;
+    for session in &sessions {
+        for cols in RESIZES_BEFORE_RESTART_COLS {
+            resizer
+                .call::<method::SessionResize>(SessionResizeParams {
+                    session_id: SessionId(session.clone()),
+                    cols,
+                    rows: 30,
+                })
+                .await
+                .expect("resize before the first restart");
+        }
+    }
+    drop(resizer);
 
     let restarted = fixture.restart_daemon().await;
     assert_ne!(restarted, first_daemon);

@@ -1069,7 +1069,11 @@ before close when the connection remains writable.
 ### 13.2 Resize
 
 Resize requests carry a runtime ID, attachment or control source ID, and
-monotonic source sequence. Duplicate or older source sequences are ignored.
+monotonic source sequence. Duplicate or older source sequences are ignored. The
+daemon names its resize source after the controller lease
+(`daemon-resize-<lease id>`), so ordering holds within one lease and never spans
+a daemon restart; a worker clears its recorded sequences when it grants a new
+lease.
 Initial attach dimensions are bound to the one-shot stream grant and applied
 when that grant is redeemed. The daemon retains the public last-attach-wins
 policy: the last serialized attach redemption or later explicit resize wins. A
