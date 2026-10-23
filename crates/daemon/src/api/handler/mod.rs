@@ -120,7 +120,7 @@ impl OverlaySource {
         }
     }
 
-    fn from_file(self) -> bool {
+    fn is_file(self) -> bool {
         self == Self::File
     }
 }
@@ -472,7 +472,7 @@ async fn handle_negotiated(
                 &state.governance,
                 &state.sessions,
                 state.discovery.registry(),
-                state.overlay_source.from_file(),
+                state.overlay_source.is_file(),
                 state.transport,
             )
             .await
