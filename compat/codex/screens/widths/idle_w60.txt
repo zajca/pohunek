@@ -20,5 +20,5 @@ issues
 
 › Ask Codex to do anything
 
-  stub-model default · /mnt/m2_4t/t/ph-…
+  stub-model default · /tmp/ph-sample/wo
   ← for agents · ? for shortcuts

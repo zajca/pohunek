@@ -1,5 +1,5 @@
   >_ OpenAI Codex (v0.164.0)
-     /mnt/…/t/ph-W4P423/work
+     /tmp/ph-sample/work    
 
   To get started, describe a
 task or try one of these
@@ -20,5 +20,5 @@ and find issues
 
 › Ask Codex to do anything
 
-  stub-model default · /mnt/m…
+  stub-model default · /tmp/ph
   ← for agents · ? for shortcu

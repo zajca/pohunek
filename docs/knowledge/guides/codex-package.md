@@ -139,19 +139,23 @@ copies of that descriptor and its detection manifest in
   does not keep the turn open. The footer is truncated, not wrapped, at narrow
   widths (`1 background termi` at 20 and 30 columns); the rule matches
   `N background term`. While a turn runs the footer joins the working row and
-  the row's `(Ns • esc to interrupt)` group gates the rule off. A goal that
-  continues between turns, and the window between Enter and the server's
-  acknowledgement (idle title, no row, no footer), read `working` from the
-  record.
-- **MCP startup.** The title spinner and the `Starting MCP servers` row show
-  working while MCP servers start, before any turn; the record is `working`
-  too. Readiness is unaffected: `manifest_idle` reads the title and the screen.
+  the row's `(Ns • esc to interrupt)` group gates the rule off. A screen
+  with an idle title, no row and no footer reads `working` from the record
+  (synthetic scenario). The window between Enter and the server's
+  acknowledgement and a goal that continues between turns would look like that
+  from the Codex source; neither was recorded on 0.164.0.
+- **MCP startup.** The Codex source treats MCP startup as running work
+  (title spinner, `Starting MCP servers` row, `working` record) before any
+  turn; the recorded startup sequence of 0.164.0 shows `idle`, `working`,
+  `idle`, but no MCP server was configured, so the window is not recorded.
+  Readiness is unaffected: a record never releases the initial prompt, and
+  `manifest_idle` reads the title and the screen.
 - **Known limits.** A forged record can set working or idle when no dialog is
   visible, as forged titles and screen text can. After a daemon adoption whose
   output ring was evicted the record is lost until Codex writes the next one;
   a same-owner manifest refresh drops the held record the same way. Under GNU
-  Screen (`STY` set) Codex 0.164 writes ASCII spinner glyphs in the title; the
-  record is unaffected.
+  Screen (`STY` set) the Codex 0.164 source writes ASCII spinner glyphs in the
+  title (not recorded); the record is unaffected.
 
 ## Verified against a real Codex 0.164.0
 

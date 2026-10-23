@@ -1,5 +1,5 @@
   >_ OpenAI Codex (v
-     /mnt/m2_4t/t/ph
+     /tmp/ph-sample/
 
   To get started, de
 
