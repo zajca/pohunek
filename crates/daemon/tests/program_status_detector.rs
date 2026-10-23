@@ -1,6 +1,6 @@
 //! OSC 7501 program-status evidence in the activity detector.
 //!
-//! The Claude and Codex manifests ship their `[program_status]` table; a
+//! The Pi, Codex and Claude manifests ship their `[program_status]` table; a
 //! scenario for a runtime without one appends the table to the shipped manifest.
 //! The scenarios feed the detector the screens captured from the real agents (`compat/*/screens`)
 //! together with raw 7501 records, the way the session's output stream does.

@@ -346,7 +346,9 @@ manifest opts in) and the daemon holds the latest root record.
   and not working (`a_held_working_record_does_not_outlive_a_killed_claude`).
 - Not recorded on 2.1.309: the Esc interrupt (the `Interrupted` marker and its
   record), background agents, `CLAUDE_CODE_SESSION_KIND=bg`
-  and running under tmux; the test client cannot send a bare Esc.
+  and running under tmux. The Esc interrupt is a gap in the scenarios, not in
+  the tooling: `attached_input` writes raw bytes, so a bare Esc can be sent
+  (#1554).
 
 The native installer runs `<root>/claude/versions/<release>`. The kernel name
 of a process started from the resolved image is the release (`2.1.309`), one
@@ -424,7 +426,7 @@ Limits that remain:
 ## Not verified
 
 Releases other than 2.1.309 and 2.1.289 (the range above the lock is a policy, not a
-verification), the Esc interrupt marker, the attached client answering the probe itself, the
+verification), the Esc interrupt marker, the
 Homebrew and apt installs (the npm install and the distribution package ship the
 same binary), macOS and Windows, a real login or a real model, plan mode,
 compaction, MCP and other dialogs, the `PermissionRequest` hook, terminals

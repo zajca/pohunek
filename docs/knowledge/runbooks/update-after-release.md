@@ -540,6 +540,59 @@ When the assistant feature is available, its update intent should use bundle
 version metadata and `changed_in` frontmatter to explain version-specific
 changes before recommending edits.
 
+## Roll back after a completed 0.36 upgrade
+
+Rolling back from a completed 0.36 upgrade to 0.35.2 is not supported (the
+procedure below is written for 0.35.2 and its package versions). 0.36 writes
+`service.toml` at schema 7, migrates the session store to schema 11, records its
+own runtime catalog as the high-water mark, and selects official runtime
+packages that 0.35.2 cannot read:
+
+- Codex 1.3.0: its `detect.toml` has a `[program_status]` table and
+  `overrides_program_status`, and its `runtime.toml` has `ready = "manifest_idle"`;
+- Pi 1.0.4: its `detect.toml` has a `[program_status]` table;
+- Claude 1.1.0: its `detect.toml` has a
+  `[program_status]` table. Claude 1.0.2 has no such table and loads in 0.35.2.
+
+The 0.35.2 detect-manifest parser rejects the table and the key, and its runtime
+definition parser rejects the `ready` value. A failed `pohunek service upgrade`
+is not affected: it rolls back automatically and restores the previous packages,
+the catalog high-water mark and the host profiles byte for byte.
+
+If you must go back after a completed upgrade, run these steps in this order.
+Steps 1 and 2 need the 0.36 binaries still installed:
+
+1. Check that `pohunek plugin list` still shows the 0.35.2 versions (Codex
+   1.1.1, Claude 1.0.2, Pi 1.0.3). Select each one:
+   `pohunek plugin select pohunek.runtime.codex --version 1.1.1`, the same for
+   `pohunek.runtime.claude --version 1.0.2`, and for `pohunek.runtime.pi
+   --version 1.0.3` when Pi was updated. For Codex and Claude this needs the
+   0.35.2 versions still installed: 0.36 cannot reinstall an uninstalled one,
+   because it refuses the 0.35.2 catalog as older than its high-water mark and
+   refuses a digest-trusted install of an official runtime. Without them, the
+   only way is forward. Pi is not a reserved runtime id in 0.36 and 0.35.2 does
+   not plan it, so a missing Pi 1.0.3 does not block steps 3 to 5; reinstalling
+   it by digest under 0.36 is not traced.
+2. Run `pohunek plugin profile migrate <name> --yes` for every profile over
+   those runtimes, so the profile pins the selected version.
+3. End all sessions, then run `pohunek service uninstall` without `--purge`: it
+   keeps the store, the packages and the profiles. The 0.35.2 `service upgrade`
+   cannot read the 0.36 `service.toml` (`UnsupportedSchema`).
+4. Move `<data_dir>/metadata.jsonl.pre-schema-10` over `metadata.jsonl`
+   (`mv`, so the backup is consumed: a later upgrade keeps an existing backup
+   instead of writing a fresh one, and a second rollback would restore the old
+   one). Sessions recorded under 0.36 are lost. If there is no backup, the store
+   was empty when 0.36 first started and nothing was migrated: move
+   `metadata.jsonl` aside instead, so 0.35.2 starts from an empty store.
+5. Run the 0.35.2 archive's `packaging/install-daemon.sh`.
+
+Ignore that run's advice to select the newer package again or to leave pinned
+profiles alone: both assume the newer package loads. Do not roll the binaries
+back first. 0.35.2 then refuses the install or upgrade
+(`service_upgrade_runtimes_refused`, `release_runtime_catalog_unavailable`, because its
+verifier rejects the lower catalog sequence), and it can neither select the
+older Pi nor migrate a profile while Pi 1.0.4 is selected.
+
 ## Upgrade preflight
 
 `pohunek service upgrade` and `pohunek service check` of an existing service
