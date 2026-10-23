@@ -464,7 +464,7 @@ fn a_host_flag_with_an_invalid_file_reports_the_configuration_error() {
 }
 
 /// No file means no configuration to trust: an unsafe directory does not
-/// block the NetBird default.
+/// block the `NetBird` default.
 #[test]
 fn an_absent_file_under_an_unsafe_directory_uses_the_defaults() {
     // Group- and world-writable config directory.
