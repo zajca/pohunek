@@ -2,6 +2,8 @@
 //!
 //! A CLI test loads the library with `LD_PRELOAD` to reach a fixture daemon on
 //! `127.0.0.1` through the real `NetBird` resolver, which refuses a loopback peer.
+//! `POHUNEK_TEST_CONNECT_REDIRECT_PORT` replaces the redirected port when the
+//! fixture listens elsewhere than the dialed port.
 
 // Rust guideline compliant 2026-10-14
 
@@ -58,6 +60,10 @@ int connect(int fd, const struct sockaddr *address, socklen_t length) {
             }
             struct sockaddr_in redirected = *original;
             redirected.sin_addr.s_addr = htonl(0x7f000001U);
+            const char *port = getenv("POHUNEK_TEST_CONNECT_REDIRECT_PORT");
+            if (port != NULL && atoi(port) > 0 && atoi(port) < 65536) {
+                redirected.sin_port = htons((unsigned short)atoi(port));
+            }
             return real_connect(fd, (const struct sockaddr *)&redirected, sizeof(redirected));
         }
     }

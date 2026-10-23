@@ -9,7 +9,6 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
-use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -28,6 +27,10 @@ const SELF_ADDRESS: &str = "100.64.0.7";
 /// The address the fake `netbird` reports for the remote peer.
 const PEER_ADDRESS: &str = "100.64.0.8";
 
+/// The port `overlays.toml` configures. The daemon's overlay bind is moved to
+/// an ephemeral loopback port, so this number never occupies a real socket.
+const CONFIGURED_PORT: u16 = 9731;
+
 /// A daemon process, killed and reaped on drop.
 struct Daemon(Child);
 
@@ -36,14 +39,6 @@ impl Drop for Daemon {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-fn free_loopback_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind an ephemeral loopback port")
-        .local_addr()
-        .expect("read the ephemeral port")
-        .port()
 }
 
 fn write_fake_netbird(bin: &Path) {
@@ -65,7 +60,7 @@ fn a_service_started_daemon_binds_the_port_of_the_file() {
     let env = TestEnv::new().expect("create the hermetic test environment");
     let bin = env.root().join("bin");
     write_fake_netbird(&bin);
-    let port = free_loopback_port();
+    let port = CONFIGURED_PORT;
 
     let config_dir = env.config_home().join("pohunek");
     fs::create_dir_all(&config_dir).expect("create the config directory");
@@ -106,21 +101,26 @@ fn a_service_started_daemon_binds_the_port_of_the_file() {
         .expect("spawn pohunekd");
     let _daemon = Daemon(child);
 
+    let bound_prefix = format!("{SELF_ADDRESS}:{port} -> 127.0.0.1:");
     let bound = poll_until("the daemon to attempt its overlay bind", || {
         fs::read_to_string(&bind_capture)
             .ok()
             .filter(|text| !text.is_empty())
     });
-    assert!(
-        bound
-            .lines()
-            .any(|line| line == format!("{SELF_ADDRESS}:{port}")),
-        "the daemon binds the file's port on the overlay address: {bound:?}"
-    );
+    let local_port: u16 = bound
+        .lines()
+        .find_map(|line| line.strip_prefix(&bound_prefix))
+        .unwrap_or_else(|| {
+            panic!("the daemon binds the file's port on the overlay address: {bound:?}")
+        })
+        .parse()
+        .expect("the redirected loopback port");
+    assert_ne!(local_port, 0, "the redirected bind succeeded: {bound:?}");
 
-    // The CLI of the same user dials the peer on the same port.
+    // The CLI of the same user dials the peer on the same port; the shim
+    // sends the connection to the redirected listener.
     poll_until("the redirected listener to accept connections", || {
-        std::net::TcpStream::connect(("127.0.0.1", port))
+        std::net::TcpStream::connect(("127.0.0.1", local_port))
             .ok()
             .map(drop)
     });
@@ -129,6 +129,7 @@ fn a_service_started_daemon_binds_the_port_of_the_file() {
         .env("PATH", &bin)
         .env("LD_PRELOAD", &connect_library)
         .env("POHUNEK_TEST_CONNECT_CAPTURE", &connect_capture)
+        .env("POHUNEK_TEST_CONNECT_REDIRECT_PORT", local_port.to_string())
         .args(["--host", "fixture-remote", "session", "list", "--json"])
         .output()
         .expect("run the remote CLI");

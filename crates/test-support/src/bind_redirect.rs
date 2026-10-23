@@ -3,10 +3,11 @@
 //! The daemon refuses to bind its remote control listener outside the overlay's
 //! address range, and a test host has no overlay address. A scenario loads the
 //! library built here with `LD_PRELOAD` into the real daemon: the shim records
-//! the original `100.64.0.0/10` bind target, then binds the same port on
+//! the original `100.64.0.0/10` bind target, then binds an ephemeral port on
 //! `127.0.0.1` instead, so the daemon serves and a client reaches it through a
-//! `connect()` redirect. Nothing is linked into or enabled by a production
-//! binary.
+//! `connect()` redirect to that port. The original port never occupies a real
+//! socket, so a scenario can configure any port number without a collision. Nothing is
+//! linked into or enabled by a production binary.
 
 // Rust guideline compliant 2026-10-23
 
@@ -18,7 +19,8 @@ pub const CAPTURE_ENV: &str = "POHUNEK_TEST_BIND_CAPTURE";
 
 /// Compiles the interposer into `dir` and returns the library path and the
 /// file it appends every original overlay-range bind target to, one
-/// `<ip>:<port>` line per bind. The shim reads the file name from
+/// `<ip>:<port> -> 127.0.0.1:<local port>` line per bind (local port `0` when
+/// the bind failed). The shim reads the file name from
 /// [`CAPTURE_ENV`].
 ///
 /// # Panics
@@ -54,21 +56,31 @@ int bind(int fd, const struct sockaddr *address, socklen_t length) {
         const struct sockaddr_in *original = (const struct sockaddr_in *)address;
         unsigned int host = ntohl(original->sin_addr.s_addr);
         if ((host & 0xffc00000U) == 0x64400000U) {
+            struct sockaddr_in redirected = *original;
+            redirected.sin_addr.s_addr = htonl(0x7f000001U);
+            redirected.sin_port = 0;
+            int result = real_bind(fd, (const struct sockaddr *)&redirected, sizeof(redirected));
             const char *capture = getenv("POHUNEK_TEST_BIND_CAPTURE");
             if (capture != NULL) {
+                struct sockaddr_in bound;
+                socklen_t bound_length = sizeof(bound);
+                unsigned int local_port = 0;
+                if (result == 0 &&
+                    getsockname(fd, (struct sockaddr *)&bound, &bound_length) == 0) {
+                    local_port = ntohs(bound.sin_port);
+                }
                 char ip[INET_ADDRSTRLEN];
-                char line[96];
+                char line[128];
                 inet_ntop(AF_INET, &original->sin_addr, ip, sizeof(ip));
-                int count = snprintf(line, sizeof(line), "%s:%u\n", ip, ntohs(original->sin_port));
+                int count = snprintf(line, sizeof(line), "%s:%u -> 127.0.0.1:%u\n", ip,
+                                     ntohs(original->sin_port), local_port);
                 int output = open(capture, O_WRONLY | O_CREAT | O_APPEND, 0600);
                 if (output >= 0) {
                     (void)write(output, line, (size_t)count);
                     (void)close(output);
                 }
             }
-            struct sockaddr_in redirected = *original;
-            redirected.sin_addr.s_addr = htonl(0x7f000001U);
-            return real_bind(fd, (const struct sockaddr *)&redirected, sizeof(redirected));
+            return result;
         }
     }
     return real_bind(fd, address, length);
