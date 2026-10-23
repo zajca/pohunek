@@ -22433,6 +22433,31 @@ generation "$1"
                 .and_then(|runtime| runtime.worker_instance_id)
         }
 
+        async fn newest_observation(
+            fixture: &Fixture,
+            id: &SessionId,
+        ) -> Option<crate::runtime::ExchangeOrder> {
+            let sessions = fixture.registry.inner.sessions.lock().await;
+            sessions
+                .get(id)?
+                .identity_observed
+                .as_ref()
+                .map(|observed| observed.order)
+        }
+
+        /// Waits until the periodic sync read the worker twice, so it applied
+        /// the metadata of the committed claim once and the next snapshot is
+        /// the same as the one it applied.
+        async fn wait_for_two_syncs(fixture: &Fixture, id: &SessionId) {
+            for _ in 0..2 {
+                let before = newest_observation(fixture, id).await;
+                wait_until("the periodic sync to read the worker", || async {
+                    (newest_observation(fixture, id).await > before).then_some(())
+                })
+                .await;
+            }
+        }
+
         async fn wait_until_nothing_is_tracked(fixture: &Fixture, id: &SessionId) {
             wait_until("the forwarded operation to be settled", || async {
                 (tracked_operations(fixture, id).await == 0).then_some(())
@@ -22486,6 +22511,7 @@ generation "$1"
             let fixture = codex_fixture(FORWARD_CONNECT);
             let (created, _job, _) = fixture.create_agent("codex-agent").await;
             hold_a_committed_claim(&fixture, &created).await;
+            wait_for_two_syncs(&fixture, &created.id).await;
             let stopped = lose_a_rejected_report(&fixture, &created).await;
 
             drop(stopped);
@@ -22682,6 +22708,43 @@ generation "$1"
 
             assert!(!lost.recorded);
             assert!(memory_report_is_recorded(&fixture, unbound_report(&created, 2_010)).await);
+            let _ = fixture.registry.stop(&created.id).await;
+        }
+
+        /// 1418: a snapshot of another worker instance says nothing about a
+        /// forward sent to this one, even at the same revision.
+        #[tokio::test]
+        async fn a_snapshot_of_another_worker_instance_does_not_drop_the_forward() {
+            let fixture = codex_fixture(FORWARD_CONNECT);
+            let (created, _job, _) = fixture.create_agent("codex-agent").await;
+            hold_a_committed_claim(&fixture, &created).await;
+            fixture
+                .registry
+                .inner
+                .sessions
+                .lock()
+                .await
+                .get(&created.id)
+                .expect("the session")
+                .cancel_runtime_watchers();
+            let stopped = lose_a_rejected_report(&fixture, &created).await;
+            drop(stopped);
+            let worker =
+                crate::session::tests::session_worker(&fixture.registry, &created.id).await;
+            let (mut other, order) = worker.inspect_ordered().await.expect("a snapshot");
+            other.worker_instance_id = Some(
+                pohunek_worker_protocol::WorkerInstanceId::new("another-instance")
+                    .expect("an instance id"),
+            );
+
+            fixture
+                .registry
+                .observe_worker_identity(&created.id, &other, order)
+                .await;
+            assert_eq!(tracked_operations(&fixture, &created.id).await, 1);
+
+            observe_worker(&fixture, &created).await;
+            assert_eq!(tracked_operations(&fixture, &created.id).await, 0);
             let _ = fixture.registry.stop(&created.id).await;
         }
 
