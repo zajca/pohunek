@@ -21,7 +21,7 @@ pub use machine::{ActivityEvidence, ActivityTransition, DetectionConfig, StateMa
 pub(crate) use manifest::MAX_MANIFEST_SOURCE_BYTES;
 pub use manifest::{
     Manifest, ManifestError, ManifestMatch, ManifestRegion, MatchContext, MatcherKind,
-    ProcessMatchers,
+    ProcessMatchers, ProgramStatusConfig,
 };
 pub use osc::{OscEvidence, OscParser};
 // The VT screen model lives in `pohunek-terminal` so the daemon and CLI share
@@ -60,6 +60,16 @@ pub struct DetectorConfig {
 }
 
 impl DetectorConfig {
+    /// Whether the session worker answers the runtime's OSC 7501 probe: the
+    /// manifest opts in with `[program_status] answer_probe = true`.
+    #[must_use]
+    pub fn answers_program_status_probe(&self) -> bool {
+        self.manifest
+            .as_ref()
+            .and_then(|manifest| manifest.program_status())
+            .is_some_and(ProgramStatusConfig::answer_probe)
+    }
+
     /// Production detector config using the embedded generic shell manifest.
     #[must_use]
     pub fn generic_shell() -> Self {
@@ -543,6 +553,7 @@ impl Detector {
                 self.latest_cwd_hint = Some(path);
                 false
             }
+            OscEvidence::ProgramStatus(_) => false,
         }
     }
 

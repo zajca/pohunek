@@ -31,6 +31,7 @@ use parser::{MAX_MATCHERS, MAX_MATCHER_BYTES};
 pub struct Manifest {
     rules: Vec<Rule>,
     process: Option<ProcessMatchers>,
+    program_status: Option<ProgramStatusConfig>,
     /// The source the rules and matchers were compiled from.
     source: Arc<str>,
     /// Whether the detector may latch a working sighting from inside one
@@ -65,10 +66,21 @@ impl Manifest {
             });
         }
 
+        let program_status = raw
+            .program_status
+            .map(ProgramStatusConfig::try_from_raw)
+            .transpose()?;
         let mut budget = ComplexityBudget::default();
         let mut rules = Vec::with_capacity(raw.rules.len());
         for raw_rule in raw.rules {
             rules.push(Rule::try_from_raw(raw_rule, &mut budget)?);
+        }
+        if program_status.is_none() {
+            if let Some(rule) = rules.iter().find(|rule| rule.overrides_program_status) {
+                return Err(ManifestError::OverrideWithoutProgramStatus {
+                    rule_id: rule.id.clone(),
+                });
+            }
         }
         let process = raw
             .process
@@ -78,6 +90,7 @@ impl Manifest {
         Ok(Self {
             rules,
             process,
+            program_status,
             source: Arc::from(source),
             latches_working: true,
         })
@@ -125,6 +138,7 @@ impl Manifest {
             priority: rule.priority,
             region: rule.region.clone(),
             visible_blocker: rule.visible_blocker,
+            overrides_program_status: rule.overrides_program_status,
         })
     }
 
@@ -177,6 +191,13 @@ impl Manifest {
         })
     }
 
+    /// Returns the program-status settings when this manifest declares
+    /// `[program_status]`.
+    #[must_use]
+    pub fn program_status(&self) -> Option<&ProgramStatusConfig> {
+        self.program_status.as_ref()
+    }
+
     /// Returns process matchers when this manifest declares `[process]`.
     #[must_use]
     pub fn process_matchers(&self) -> Option<&ProcessMatchers> {
@@ -189,6 +210,49 @@ impl Manifest {
         self.rules.is_empty() && self.process.as_ref().is_none_or(ProcessMatchers::is_empty)
     }
 }
+
+/// Settings compiled from a manifest `[program_status]` table.
+///
+/// The table opts the runtime in to OSC 7501 program-status evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramStatusConfig {
+    /// The `app` name the runtime's root records carry; records of any other
+    /// app are ignored.
+    app: String,
+    /// Whether the session worker answers the runtime's 7501 probe.
+    answer_probe: bool,
+}
+
+impl ProgramStatusConfig {
+    fn try_from_raw(raw: parser::RawProgramStatus) -> Result<Self, ManifestError> {
+        let valid = (1..=PROGRAM_STATUS_APP_MAX_BYTES).contains(&raw.app.len())
+            && raw.app.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'+' | b'-')
+            });
+        if !valid {
+            return Err(ManifestError::InvalidProgramStatusApp { app: raw.app });
+        }
+        Ok(Self {
+            app: raw.app,
+            answer_probe: raw.answer_probe.unwrap_or(false),
+        })
+    }
+
+    /// The `app` name of the runtime's root records.
+    #[must_use]
+    pub fn app(&self) -> &str {
+        &self.app
+    }
+
+    /// Whether the session worker answers the runtime's 7501 probe.
+    #[must_use]
+    pub fn answer_probe(&self) -> bool {
+        self.answer_probe
+    }
+}
+
+/// Longest `app` name of the OSC 7501 protocol.
+const PROGRAM_STATUS_APP_MAX_BYTES: usize = 32;
 
 /// Process-level matchers compiled from a manifest `[process]` section.
 #[derive(Debug, Clone)]
@@ -229,6 +293,8 @@ pub struct ManifestMatch {
     pub priority: i32,
     pub region: ManifestRegion,
     pub visible_blocker: bool,
+    /// The rule, as the screen winner, beats a non-blocked program-status record.
+    pub overrides_program_status: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -378,6 +444,7 @@ mod tests {
                 priority: 20,
                 region: ManifestRegion::WholeRecent,
                 visible_blocker: false,
+                overrides_program_status: false,
             })
         );
     }

@@ -1,3 +1,7 @@
+use pohunek_terminal::{
+    parse_program_status, ProgramStatusReport, PROGRAM_STATUS_COMMAND as PROGRAM_STATUS,
+};
+
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 const MAX_OSC_COMMAND_BYTES: usize = 16;
@@ -12,6 +16,8 @@ pub enum OscEvidence {
     Title(String),
     Progress(String),
     Cwd(String),
+    /// A parsed OSC 7501 program-status report, never a probe.
+    ProgramStatus(ProgramStatusReport),
 }
 
 #[derive(Debug, Default)]
@@ -194,6 +200,7 @@ impl OscParser {
 
     fn is_supported_command(&self) -> bool {
         matches!(self.command.as_slice(), b"0" | b"2" | b"7" | b"9")
+            || self.command == PROGRAM_STATUS
     }
 
     fn finish_osc(&mut self, offset: usize, evidence: &mut Vec<(OscEvidence, usize)>) {
@@ -201,6 +208,9 @@ impl OscParser {
             b"0" | b"2" => Some(OscEvidence::Title(self.payload_string())),
             b"7" => self.cwd_payload().map(OscEvidence::Cwd),
             b"9" => Some(OscEvidence::Progress(self.payload_string())),
+            command if command == PROGRAM_STATUS => parse_program_status(&self.payload)
+                .filter(|report| *report != ProgramStatusReport::Probe)
+                .map(OscEvidence::ProgramStatus),
             _ => None,
         };
 

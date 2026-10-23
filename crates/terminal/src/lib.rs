@@ -14,6 +14,7 @@
 
 mod compositor;
 mod menu;
+mod program_status;
 mod screen;
 mod snapshot;
 
@@ -21,6 +22,10 @@ mod snapshot;
 pub use compositor::{Compositor, OverlayFrame, OverlayLine, MIN_ROWS};
 #[doc(inline)]
 pub use menu::{step, MenuEffect, MenuEvent, MenuKey, MenuOutcome, MenuState};
+pub use program_status::{
+    parse_payload as parse_program_status, strip_probe_replies, BlockedKind, ProbeGuard, ProbeSpan,
+    ProgramState, ProgramStatusRecord, ProgramStatusReport, PROBE_REPLY, PROGRAM_STATUS_COMMAND,
+};
 #[doc(inline)]
 pub use screen::{ScreenObservation, ScreenRegion, ScreenTracker};
 pub use snapshot::{TerminalSnapshot, TerminalTracker};

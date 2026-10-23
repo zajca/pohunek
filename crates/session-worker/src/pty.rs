@@ -248,6 +248,7 @@ pub struct PtyOwner {
     resize: Arc<AsyncMutex<ResizeState>>,
     cleanup: Arc<AsyncMutex<CleanupState>>,
     reap_tx: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    answers_program_status_probe: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,7 +437,17 @@ impl PtyOwner {
         subscriber_bytes: usize,
         input_dedup_entries: usize,
         input_stall: Option<Duration>,
+        answers_program_status_probe: bool,
     ) -> Result<Self, PtyError> {
+        let probe_runtime = if answers_program_status_probe {
+            Some(tokio::runtime::Handle::try_current().map_err(|source| {
+                PtyError::Io(io::Error::other(format!(
+                    "answering the program status probe needs a tokio runtime: {source}"
+                )))
+            })?)
+        } else {
+            None
+        };
         if command.cols == 0 || command.rows == 0 {
             return Err(PtyError::InvalidDimensions {
                 cols: command.cols,
@@ -485,6 +496,8 @@ impl PtyOwner {
         let input = WriteCoordinator::new(writer, input_dedup_entries, input_stall)
             .map_err(|source| PtyError::Io(io::Error::other(source)))?;
         let output = OutputHub::new(history_bytes, subscriber_bytes, command.rows, command.cols)?;
+        // Armed before the reader starts, so the first probe is never missed.
+        let probe_replies = probe_runtime.as_ref().map(|_| output.answer_probes());
         let output_order = Arc::new(Mutex::new(()));
 
         let child = child_spawn::spawn_pty_child(&command, &tty_name)
@@ -611,6 +624,9 @@ impl PtyOwner {
                 return Err(PtyError::Io(source));
             }
         };
+        if let (Some(runtime), Some(replies)) = (probe_runtime, probe_replies) {
+            runtime.spawn(crate::probe::answer_probes(replies, input.clone()));
+        }
         startup.commit();
         // The worker's slave descriptor closes only after the reader is released.
         // A root that already exited leaves this as the slave's last close, and
@@ -638,7 +654,17 @@ impl PtyOwner {
             })),
             cleanup: Arc::new(AsyncMutex::new(CleanupState::Active)),
             reap_tx: Arc::new(Mutex::new(Some(reap_tx))),
+            answers_program_status_probe,
         })
+    }
+
+    /// Whether the worker answers the child's OSC 7501 program-status probe.
+    ///
+    /// While it does, the worker is the only responder for this PTY, so an
+    /// attached terminal's own reply is dropped from its input.
+    #[must_use]
+    pub fn answers_program_status_probe(&self) -> bool {
+        self.answers_program_status_probe
     }
 
     /// Returns the retained root and process-group identity.
@@ -2263,6 +2289,7 @@ mod tests {
             config.subscriber_bytes,
             config.input_dedup_entries,
             config.input_stall,
+            config.answer_program_status_probe,
         )
         .expect("spawn PTY")
     }

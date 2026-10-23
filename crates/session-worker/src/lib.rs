@@ -28,6 +28,7 @@ mod launch;
 mod lease;
 mod notification;
 mod output;
+mod probe;
 mod pty;
 mod server;
 mod service;

@@ -65,6 +65,7 @@ fn spawn(command: Command) -> Result<PtyOwner, PtyError> {
         config.subscriber_bytes,
         config.input_dedup_entries,
         config.input_stall,
+        config.answer_program_status_probe,
     )
 }
 

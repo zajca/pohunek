@@ -3266,6 +3266,7 @@ dependencies = [
 name = "pohunek-terminal"
 version = "0.35.2"
 dependencies = [
+ "base64 0.22.1",
  "serde",
  "unicode-width",
  "vt100",

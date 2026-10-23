@@ -47,6 +47,7 @@ pub(super) struct Rule {
     pub(super) priority: i32,
     pub(super) region: ManifestRegion,
     pub(super) visible_blocker: bool,
+    pub(super) overrides_program_status: bool,
     pub(super) gate: Gate,
 }
 
@@ -68,6 +69,7 @@ impl Rule {
             not,
             gates,
             visible_blocker,
+            overrides_program_status,
         } = raw;
 
         let activity = parse_activity(&id, state)?;
@@ -92,6 +94,7 @@ impl Rule {
             priority,
             region: parsed_region,
             visible_blocker: visible_blocker.unwrap_or(false),
+            overrides_program_status: overrides_program_status.unwrap_or(false),
             gate,
         })
     }
@@ -387,6 +390,14 @@ pub(super) struct RawManifest {
     #[serde(default)]
     pub(super) rules: Vec<RawRule>,
     pub(super) process: Option<RawProcessSection>,
+    pub(super) program_status: Option<RawProgramStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RawProgramStatus {
+    pub(super) app: String,
+    pub(super) answer_probe: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -411,6 +422,7 @@ pub(super) struct RawRule {
     not: Option<Box<RawGate>>,
     gates: Option<RawGate>,
     visible_blocker: Option<bool>,
+    overrides_program_status: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
