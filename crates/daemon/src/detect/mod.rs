@@ -186,7 +186,9 @@ pub(crate) fn shared_generic_shell_manifest() -> &'static Arc<Manifest> {
     static MANIFEST: OnceLock<Arc<Manifest>> = OnceLock::new();
     MANIFEST.get_or_init(|| {
         Arc::new(
-            Manifest::parse_str(GENERIC_SHELL_MANIFEST).expect("generic shell manifest must parse"),
+            Manifest::parse_str(GENERIC_SHELL_MANIFEST)
+                .expect("generic shell manifest must parse")
+                .without_working_latch(),
         )
     })
 }
@@ -370,7 +372,7 @@ impl Detector {
             && self
                 .manifest
                 .as_ref()
-                .is_some_and(|manifest| !Arc::ptr_eq(manifest, shared_generic_shell_manifest()))
+                .is_some_and(|manifest| manifest.latches_working())
     }
 
     /// The `Working` winner over the bytes consumed so far, if there is one.
@@ -2316,10 +2318,7 @@ mod tests {
         let started_at = instant();
         let mut detector = Detector::new(3, 80, started_at, config());
 
-        let transitions = detector.feed(
-            started_at,
-            b"\x1b]2;running\x07\x1b]2;bash\x07",
-        );
+        let transitions = detector.feed(started_at, b"\x1b]2;running\x07\x1b]2;bash\x07");
 
         assert!(
             transitions

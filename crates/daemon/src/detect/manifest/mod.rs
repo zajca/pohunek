@@ -33,6 +33,9 @@ pub struct Manifest {
     process: Option<ProcessMatchers>,
     /// The source the rules and matchers were compiled from.
     source: Arc<str>,
+    /// Whether the detector may latch a working sighting from inside one
+    /// output chunk. Every manifest does except the generic shell one.
+    latches_working: bool,
 }
 
 /// A manifest compiles deterministically from its source, so two manifests
@@ -76,7 +79,22 @@ impl Manifest {
             rules,
             process,
             source: Arc::from(source),
+            latches_working: true,
         })
+    }
+
+    /// Marks the manifest as one whose working rules are too loose to latch
+    /// from output that is erased within a chunk.
+    #[must_use]
+    pub(crate) fn without_working_latch(mut self) -> Self {
+        self.latches_working = false;
+        self
+    }
+
+    /// Whether a working sighting inside one output chunk counts as evidence.
+    #[must_use]
+    pub(crate) fn latches_working(&self) -> bool {
+        self.latches_working
     }
 
     #[must_use]
