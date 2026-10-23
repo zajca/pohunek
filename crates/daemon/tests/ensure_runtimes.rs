@@ -959,7 +959,7 @@ fn selected_root_missing_state(host: &Host) -> (String, PackageDigest) {
     host.write_profile("other", "base = \"claude\"\n");
     let older = host.step(false).packages[0].digest.clone();
     let pinned_older = host.profile_text_of("other");
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.3");
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.1.1");
     host.publish_archives(2, &[("claude", &bytes, &digest)]);
     let newer = host.step(false);
     assert_eq!(newer.packages[0].status, PackageStatus::Installed);
