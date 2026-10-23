@@ -1,24 +1,24 @@
-
-  Would you like
-  to run the
-  following
-  command?
-
-  Environment:
-  local
-
-  Reason: Create
-  the marker file
-
-  $ touch
-  approved.txt
+› [hold] say hi
+  Worked for 7s • 1:
 
 
-› 1. Yes, proceed
-     (y)
+› [approval] run it
+
+
+• Running touch appr
+
+
+  Would you like to
+
+  Environment: local
+
+  Reason: Create the
+
+  $ touch approved.t
+
+
+› 1. Yes, proceed (y
   2. Yes, and don't
-     ask again for
-↓
-  Press enter to
-  confirm or esc to
-  cancel
+  3. No, and tell Co
+
+  Press enter to con

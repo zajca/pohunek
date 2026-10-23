@@ -77,6 +77,11 @@ const LOCK_PATH: &str = "compat/codex/compatibility-lock.json";
 /// Captured screens, relative to the workspace root.
 const SCREENS_DIR: &str = "compat/codex/screens";
 
+/// Screens of the previous verified release, kept so the supported minimum
+/// stays verified. Dialogs the newest release could not be recaptured for
+/// (login, trust, question) live only here.
+const PREVIOUS_SCREENS_DIR: &str = "compat/codex/screens/n-1";
+
 /// Where release [`GOLDEN_TAG`] kept the built-in Codex descriptor, relative
 /// to the workspace root; the golden's header names it.
 const BUILTIN_DESCRIPTOR: &str = "crates/daemon/src/agent/builtin/codex.toml";
@@ -700,6 +705,8 @@ impl Meaning {
 /// `widths/<state>_w<columns>.txt`, with the OSC title Codex had set in
 /// `<same name>.title` when the capture had one.
 struct Frame {
+    /// Whether the screen belongs to the previous verified release.
+    previous: bool,
     name: String,
     state: String,
     columns: u16,
@@ -729,7 +736,7 @@ impl Frame {
 /// Columns of the top-level fixtures.
 const DEFAULT_COLUMNS: u16 = 100;
 
-fn load_frame(directory: &Path, name: &str, state: &str, columns: u16) -> Frame {
+fn load_frame(directory: &Path, previous: bool, name: &str, state: &str, columns: u16) -> Frame {
     let rows = rows_of(
         &fs::read_to_string(directory.join(format!("{name}.txt"))).expect("read the screen"),
     );
@@ -737,6 +744,7 @@ fn load_frame(directory: &Path, name: &str, state: &str, columns: u16) -> Frame 
         .ok()
         .map(|title| title.trim_end_matches('\n').to_owned());
     Frame {
+        previous,
         name: name.to_owned(),
         state: state.to_owned(),
         columns,
@@ -764,24 +772,34 @@ fn fixture_names(directory: &Path) -> Vec<String> {
 
 /// The screens captured at 100 columns, one per state.
 fn top_level_frames() -> Vec<Frame> {
-    let directory = workspace_root().join(SCREENS_DIR);
-    fixture_names(&directory)
+    [(SCREENS_DIR, false), (PREVIOUS_SCREENS_DIR, true)]
         .into_iter()
-        .map(|name| load_frame(&directory, &name, &name, DEFAULT_COLUMNS))
+        .flat_map(|(set, previous)| {
+            let directory = workspace_root().join(set);
+            fixture_names(&directory)
+                .into_iter()
+                .map(|name| load_frame(&directory, previous, &name, &name, DEFAULT_COLUMNS))
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
 /// Every screen captured at a given terminal width. The file name is
 /// `<state>_w<columns>.txt`.
 fn width_frames() -> Vec<Frame> {
-    let directory = workspace_root().join(SCREENS_DIR).join("widths");
-    fixture_names(&directory)
+    [(SCREENS_DIR, false), (PREVIOUS_SCREENS_DIR, true)]
         .into_iter()
-        .map(|name| {
-            let (state, columns) = name.rsplit_once("_w").expect("a `_w<columns>` suffix");
-            let columns = columns.parse().expect("a column count");
-            let state = state.to_owned();
-            load_frame(&directory, &name, &state, columns)
+        .flat_map(|(set, previous)| {
+            let directory = workspace_root().join(set).join("widths");
+            fixture_names(&directory)
+                .into_iter()
+                .map(|name| {
+                    let (state, columns) = name.rsplit_once("_w").expect("a `_w<columns>` suffix");
+                    let columns = columns.parse().expect("a column count");
+                    let state = state.to_owned();
+                    load_frame(&directory, previous, &name, &state, columns)
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -857,7 +875,10 @@ fn the_captured_screens_span_the_supported_terminal_widths() {
         "trust",
     ] {
         let count = frames.iter().filter(|frame| frame.state == state).count();
-        assert_eq!(count, 9, "{state} is captured at every width");
+        assert!(
+            count >= 9 && count % 9 == 0,
+            "{state} is captured at every width of each release set: {count}"
+        );
     }
     let titled = frames.iter().filter(|frame| frame.title.is_some()).count();
     assert!(titled >= 40, "titles captured with the screens: {titled}");
@@ -896,6 +917,7 @@ fn the_terminal_title_and_not_the_rows_decides_idle_working_and_blocked() {
     let definition = installed_definition();
     let idle = load_frame(
         &workspace_root().join(SCREENS_DIR),
+        false,
         "idle",
         "idle",
         DEFAULT_COLUMNS,
@@ -927,8 +949,12 @@ fn a_tool_approval_or_question_is_blocked_from_the_screen_alone_when_its_line_is
         if frame.meaning() != Meaning::Blocked {
             continue;
         }
-        let expected =
-            (frame.columns >= SCREEN_BLOCKER_MIN_COLUMNS).then_some(AgentActivity::Blocked);
+        let intact = if frame.previous {
+            frame.columns >= SCREEN_BLOCKER_MIN_COLUMNS
+        } else {
+            !SCREEN_BLOCKER_GAP_COLUMNS.contains(&frame.columns)
+        };
+        let expected = intact.then_some(AgentActivity::Blocked);
         assert_eq!(
             screen_activity(&definition, &frame.rows, frame.columns),
             expected,
@@ -944,6 +970,11 @@ fn a_tool_approval_or_question_is_blocked_from_the_screen_alone_when_its_line_is
 /// question prompts is still on one row; below it the line wraps and the screen
 /// rule cannot match.
 const SCREEN_BLOCKER_MIN_COLUMNS: u16 = 30;
+
+/// Width of the newest release's approval capture whose question and
+/// confirmation lines are scrolled out of the 24 rows (the screen ends in a
+/// `↓` marker), so only the title speaks.
+const SCREEN_BLOCKER_GAP_COLUMNS: [u16; 1] = [30];
 
 #[test]
 fn working_is_read_from_the_title_because_the_screen_has_no_working_rule() {
@@ -4378,4 +4409,221 @@ fn a_program_status_golden_is_written_one_record_per_line() {
     );
     let text = fs::read_to_string(directory.path().join("sample.program-status")).expect("golden");
     assert_eq!(text, "app=codex:state=idle\n");
+}
+
+/// Variable naming the directory the capture test writes to.
+const CAPTURE_VARIABLE: &str = "POHUNEK_CODEX_CAPTURE_DIR";
+
+/// Most raw output bytes one `session output` page returns.
+const OUTPUT_PAGE_BYTES: &str = "65536";
+
+/// How long a resized screen is given to redraw before it is read, in
+/// milliseconds.
+const REDRAW_PAUSE_MS: u64 = 700;
+
+/// Footer text of the working row: the interrupt hint.
+const WORKING_ROW_MARK: &str = "to interrupt)";
+
+impl Fixture {
+    async fn input(&self, id: &str, text: &str) {
+        let (code, sent) = self.harness.json(&["session", "input", id, text]).await;
+        assert_eq!(code, 0, "{sent}");
+    }
+
+    /// Records the session's screen and title as `<name>` below `directory`.
+    async fn capture(&self, directory: &Path, id: &str, name: &str) {
+        let (title, rows) = self.screen(id).await;
+        capture::write_capture(
+            directory,
+            name,
+            path_str(self.harness.env.root()),
+            title.as_deref(),
+            &rows,
+        );
+    }
+
+    async fn resize(&self, id: &str, columns: u16) {
+        let (code, resized) = self
+            .harness
+            .json(&[
+                "session",
+                "resize",
+                id,
+                "--cols",
+                &columns.to_string(),
+                "--rows",
+                capture::CAPTURE_ROWS,
+            ])
+            .await;
+        assert_eq!(code, 0, "{resized}");
+        // timing-allowed: #146 capture-only redraw pause; the screen tracker exposes no redraw-complete signal
+        tokio::time::sleep(Duration::from_millis(REDRAW_PAUSE_MS)).await;
+    }
+
+    /// Records the current state at every width as `widths/<state>_w<columns>`,
+    /// waiting for the screen to stop changing first when `settle`, then
+    /// restores the default width.
+    async fn capture_widths(&self, directory: &Path, id: &str, state: &str, settle: bool) {
+        let widths = directory.join("widths");
+        for columns in capture::CAPTURE_WIDTHS {
+            self.resize(id, columns).await;
+            if settle {
+                let previous = std::cell::RefCell::new(self.screen(id).await);
+                wait_until(&format!("{state} to settle at {columns}"), || async {
+                    // timing-allowed: #146 capture-only redraw pause; the screen tracker exposes no redraw-complete signal
+                    tokio::time::sleep(Duration::from_millis(REDRAW_PAUSE_MS)).await;
+                    let current = self.screen(id).await;
+                    let stable = current == *previous.borrow();
+                    *previous.borrow_mut() = current;
+                    stable.then_some(())
+                })
+                .await;
+            }
+            self.capture(&widths, id, &format!("{state}_w{columns}"))
+                .await;
+        }
+        self.resize(id, DEFAULT_COLUMNS).await;
+    }
+
+    /// Every retained raw output byte of the session's current runtime.
+    async fn raw_output(&self, id: &str) -> Vec<u8> {
+        let (code, inspected) = self.harness.json(&["session", "inspect", id]).await;
+        assert_eq!(code, 0, "{inspected}");
+        let runtime = &inspected["ok"]["runtime"];
+        let worker = runtime["worker_instance_id"].as_str().expect("worker id");
+        let generation = json_scalar(&runtime["runtime_generation"]);
+        let mut bytes = Vec::new();
+        let mut offset = "0".to_owned();
+        loop {
+            let (code, page) = self
+                .harness
+                .json(&[
+                    "session",
+                    "output",
+                    id,
+                    "--worker-instance-id",
+                    worker,
+                    "--runtime-generation",
+                    &generation,
+                    "--after-offset",
+                    &offset,
+                    "--max-bytes",
+                    OUTPUT_PAGE_BYTES,
+                ])
+                .await;
+            assert_eq!(code, 0, "{page}");
+            bytes.extend(capture::output_bytes(&page));
+            offset = json_scalar(&page["ok"]["next_offset"]);
+            if page["ok"]["has_more"] != true {
+                return bytes;
+            }
+        }
+    }
+
+    /// Records the ordered root program-status records seen so far as
+    /// `<name>.program-status`.
+    async fn capture_program_status(&self, directory: &Path, id: &str, name: &str) {
+        let raw = self.raw_output(id).await;
+        capture::write_program_status(directory, name, &raw);
+    }
+}
+
+/// A JSON number or string as a command-line argument.
+fn json_scalar(value: &Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), str::to_owned)
+}
+
+/// The directory the capture test writes to, from `POHUNEK_CODEX_CAPTURE_DIR`.
+fn capture_directory() -> Option<PathBuf> {
+    let Some(directory) = std::env::var_os(CAPTURE_VARIABLE).map(PathBuf::from) else {
+        eprintln!("{CAPTURE_VARIABLE} is not set; nothing captured");
+        return None;
+    };
+    require_real_codex();
+    assert!(directory.is_absolute(), "{CAPTURE_VARIABLE} is absolute");
+    fs::create_dir_all(&directory).expect("create the capture directory");
+    Some(directory)
+}
+
+/// Records the screens of a real Codex into the directory named by
+/// `POHUNEK_CODEX_CAPTURE_DIR`: idle, a held turn, the screen after a turn and
+/// a tool approval, each at every width, with the program-status sequence of
+/// each scenario. The run needs no network beyond the loopback stub. Without
+/// the variable the test does nothing.
+#[tokio::test]
+#[ignore = "refreshes compat/codex/screens from a real `codex`; run with POHUNEK_CODEX_CAPTURE_DIR and --ignored"]
+async fn capture_the_real_codex_screens() {
+    let Some(directory) = capture_directory() else {
+        return;
+    };
+    let fixture = Fixture::start().await;
+    fixture.install_integration().await;
+
+    let id = fixture.new_session("states").await["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    fixture.wait_activity(&id, "idle").await;
+    fixture.wait_screen_line(&id, "Ask Codex").await;
+    fixture.capture(&directory, &id, "idle").await;
+    fixture.capture_widths(&directory, &id, "idle", true).await;
+    fixture
+        .capture_program_status(&directory, &id, "idle")
+        .await;
+
+    fixture
+        .input(&id, &format!("{} {PROMPT}", responses_stub::HOLD_MARKER))
+        .await;
+    fixture.wait_activity(&id, "working").await;
+    fixture.wait_screen_line(&id, WORKING_ROW_MARK).await;
+    fixture.capture(&directory, &id, "working_early").await;
+    fixture
+        .wait_screen_line(&id, responses_stub::FIRST_CHUNK)
+        .await;
+    fixture.capture(&directory, &id, "working_stream").await;
+    fixture
+        .capture_widths(&directory, &id, "working_stream", false)
+        .await;
+
+    fixture.stub.open_gate();
+    fixture.wait_activity(&id, "idle").await;
+    fixture
+        .wait_screen_line(&id, responses_stub::SECOND_CHUNK.trim())
+        .await;
+    fixture.capture(&directory, &id, "idle_after_turn").await;
+    fixture
+        .capture_widths(&directory, &id, "idle_after_turn", true)
+        .await;
+    fixture
+        .capture_program_status(&directory, &id, "turn")
+        .await;
+
+    fixture
+        .input(&id, &format!("{} run it", responses_stub::APPROVAL_MARKER))
+        .await;
+    fixture.wait_activity(&id, "blocked").await;
+    fixture
+        .wait_screen_line(&id, "Would you like to run the following command?")
+        .await;
+    fixture.capture(&directory, &id, "approval").await;
+    fixture
+        .capture_widths(&directory, &id, "approval", true)
+        .await;
+    fixture
+        .capture_program_status(&directory, &id, "approval")
+        .await;
+
+    let raw = fixture.raw_output(&id).await;
+    fs::write(
+        directory.join("alternate-screen.txt"),
+        format!(
+            "{}\n",
+            raw.windows(8).any(|window| window == b"\x1b[?1049h")
+        ),
+    )
+    .expect("write the alternate-screen fact");
+    fixture.stop(&id).await;
+    fixture.finish().await;
 }

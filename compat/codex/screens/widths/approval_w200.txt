@@ -1,11 +1,11 @@
-  /model - choose what model and reasoning effort to use
-  /review - review any changes and find issues
+› [hold] say hi
+  Worked for 7s • 1:25 PM
 
 
-› RUNTOOL please
+› [approval] run it
 
 
-• Running touch approved.txt
+◦ Running touch approved.txt
 
 
   Would you like to run the following command?

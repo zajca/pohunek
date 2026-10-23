@@ -1,24 +1,24 @@
-choose what Codex is
-allowed to do
-  /model - choose
-what model and
-reasoning effort to
-use
-  /review - review
-any changes and find
-issues
+  >_ OpenAI Codex (v
+     /mnt/m2_4t/t/ph
+
+  To get started, de
+
+  /init - create an
+  /status - show cur
+  /permissions - cho
+  /model - choose wh
+  /review - review a
 
 
-› HOLD EARLY a
+› [hold] say hi
 
 
 • working done
 
-  Worked for 3s •
-  9:53 PM
+  Worked for 7s • 1:
 
 
-› Ask Codex to do a
+› Ask Codex to do an
 
-  stub-model defaul…
-  ← for a  ⚠ 1 · f2
+  stub-model default
+  ← for agents · ? f
