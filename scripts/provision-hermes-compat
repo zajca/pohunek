@@ -62,7 +62,7 @@ if [[ "$install_root" != /* || "$install_root" == "/" || -e "$install_root" ]]; 
   fail "install root must be an unused absolute path other than /"
 fi
 
-for executable in curl git python3 tar uv; do
+for executable in curl git pkill python3 tar uv; do
   command -v "$executable" >/dev/null 2>&1 || fail "required executable is unavailable: $executable"
 done
 
@@ -278,6 +278,8 @@ fetch_locked_tag() {
   local fetch_pid=$! deadline=$((SECONDS + FETCH_MAX_SECONDS))
   while [[ -n "$(jobs -rp)" ]]; do
     if [[ "$SECONDS" -ge "$deadline" ]]; then
+      # git does not stop its transport helper when it is terminated.
+      pkill -TERM -P "$fetch_pid" 2>/dev/null || true
       kill -TERM "$fetch_pid" 2>/dev/null || true
       wait "$fetch_pid" 2>/dev/null || true
       phase "the fetch attempt exceeded ${FETCH_MAX_SECONDS}s and was stopped"

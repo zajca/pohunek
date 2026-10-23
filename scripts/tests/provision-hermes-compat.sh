@@ -24,6 +24,7 @@ sleep_calls="$test_root/sleep-calls"
 credential_marker="$test_root/credential-environment-leaked"
 hang_marker="$test_root/git-fetch-hangs"
 hung_pid_file="$test_root/hung-fetch-pid"
+hung_child_pid_file="$test_root/hung-fetch-child-pid"
 real_sleep="$(command -v sleep)"
 cat >"$fake_bin/git" <<EOF
 #!/usr/bin/env bash
@@ -38,7 +39,9 @@ case " \$* " in
   *" fetch "*)
     if [[ -e "$hang_marker" ]]; then
       printf '%s\n' "\$\$" >"$hung_pid_file"
-      exec "$real_sleep" 60
+      "$real_sleep" 60 &
+      printf '%s\n' "\$!" >"$hung_child_pid_file"
+      wait
     fi
     exit 99
     ;;
@@ -125,6 +128,12 @@ if kill -0 "$hung_pid" 2>/dev/null; then
   printf '%s\n' 'a timed-out fetch process is still running' >&2
   exit 1
 fi
+hung_child_pid="$(tail -n 1 "$hung_child_pid_file")"
+if kill -0 "$hung_child_pid" 2>/dev/null; then
+  printf '%s\n' 'the transport helper of a timed-out fetch is still running' >&2
+  kill "$hung_child_pid"
+  exit 1
+fi
 rm -f "$hang_marker"
 
 # Hosts with only BSD userland (macOS) have `shasum` but no `sha256sum` and no
@@ -135,7 +144,7 @@ rm -f "$hang_marker"
 make_restricted_bin() {
   local dir="$1" tool
   mkdir -p "$dir"
-  for tool in bash curl dirname env mkdir tar touch uname; do
+  for tool in bash curl dirname env mkdir pkill tar touch uname; do
     ln -s "$(command -v "$tool")" "$dir/$tool"
   done
   ln -s "$fake_bin/git" "$dir/git"
